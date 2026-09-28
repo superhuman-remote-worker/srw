@@ -114,6 +114,7 @@ BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
     "message_route_reconciler",
     "officer_backlog",
     "ide_sweeper",
+    "job_creation_continuation",
     "ws_sweeper",
     "ide_settings_sweeper",
     "gc_sweeper",
@@ -550,6 +551,18 @@ async def start_background_tasks(
             ide_session.ide_session_ttl_sweeper,
             ide_sessions=ide_session.ide_session_service,
         ),
+    )
+    from orchestrator.services.job_creation_continuation import (
+        JobCreationContinuationRunner,
+    )
+
+    tasks.start(
+        "job_creation_continuation",
+        JobCreationContinuationRunner(
+            db=resources.postgres_db,
+            provisioner=container_provisioner_module.container_provisioner,
+            shutdown_event=resources.shutdown_event,
+        ).run(),
     )
     tasks.start(
         "ws_sweeper",

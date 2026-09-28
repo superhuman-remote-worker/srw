@@ -22574,9 +22574,7 @@ class PostgresDB:
                     "WHERE id=$1 FOR UPDATE",
                     job_uuid,
                 )
-                if owner is None or owner["status"] in {
-                    "completed", "failed", "cancelled"
-                }:
+                if owner is None or owner["status"] not in {"created", "processing"}:
                     return None
                 try:
                     context = _strict_json_object(owner["context"], label="context")
@@ -22595,6 +22593,19 @@ class PostgresDB:
                     or workspace.get("_creation_claim_token")
                     != str(creation_claim_token)
                     or WORKER_EXECUTION_HOLD_KEY in context
+                ):
+                    return None
+                execution = await conn.fetchrow(
+                    "SELECT harness_adapter, "
+                    "created_at + (resolved->'spec'->>'timeoutSeconds')::double precision "
+                    "* interval '1 second' > clock_timestamp() AS within_deadline "
+                    "FROM srw_execution_specs WHERE work_kind='Job' AND work_id=$1 "
+                    "FOR SHARE",
+                    job_uuid,
+                )
+                if execution is not None and (
+                    execution["harness_adapter"] != "srw/v1"
+                    or execution["within_deadline"] is not True
                 ):
                     return None
                 receipt = await conn.fetchrow(
@@ -37555,6 +37566,47 @@ class PostgresDB:
             cursor=cursor,
             exhausted=len(rows) < bounded_limit,
         )
+
+    async def list_current_job_creation_candidates(self, *, after=None, limit=32):
+        """Page open v1 Job receipts; each row is only an observation hint."""
+
+        bounded_limit = max(1, min(int(limit), 64))
+        after_created, after_id = after if after is not None else (None, None)
+        rows = await self.fetch(
+            "SELECT r.created_at, r.id AS reservation_id, r.owner_id AS job_id, "
+            "r.claim_token, r.pod_uid "
+            "FROM managed_repository_workspace_creation_reservations r "
+            "JOIN jobs j ON j.id=r.owner_id "
+            "WHERE r.owner_kind='job' AND r.scope='workspace_container' "
+            "AND r.operation_kind='create' AND r.phase='runtime_bound' "
+            "AND r.startup_protocol_version=1 AND r.settled_at IS NULL "
+            "AND r.cancel_requested_at IS NULL "
+            "AND r.startup_state IN ('observing','waiting_capacity','starting') "
+            "AND r.runtime_incarnation=r.pod_uid AND r.pod_uid IS NOT NULL "
+            "AND j.status IN ('created','processing') "
+            "AND NOT (j.context ? '_worker_execution_hold') "
+            "AND j.context->'workspace_container'->>'provisioner'='k8s' "
+            "AND j.context->'workspace_container'->>'status' "
+            "IN ('created','creating','pending') "
+            "AND j.context->'workspace_container'->>'_creation_reservation_id'=r.id::text "
+            "AND j.context->'workspace_container'->>'_creation_claim_token'=r.claim_token::text "
+            "AND j.context->'workspace_container'->>'_runtime_incarnation'=r.pod_uid::text "
+            "AND NOT EXISTS (SELECT 1 FROM managed_repository_workspace_cleanup_intents c "
+            "WHERE c.owner_kind='job' AND c.owner_id=j.id "
+            "AND c.scope='workspace_container' AND c.settled_at IS NULL) "
+            "AND ($1::timestamptz IS NULL OR (r.created_at,r.id)>($1,$2::uuid)) "
+            "ORDER BY r.created_at,r.id LIMIT $3",
+            after_created,
+            UUID(str(after_id)) if after_id is not None else None,
+            bounded_limit,
+        )
+        return {
+            "candidates": tuple(dict(row) for row in rows),
+            "cursor": (rows[-1]["created_at"], str(rows[-1]["reservation_id"]))
+            if rows
+            else after,
+            "exhausted": len(rows) < bounded_limit,
+        }
 
     async def current_session_creation_candidate_is_exact(self, candidate) -> bool:
         """Recheck the immutable source and current owner under a caller's guard."""

@@ -1088,6 +1088,23 @@ class ContainerProvisioner:
         if fresh:
             return False
         await self._session_observation_checkpoint(owner, stateless_creation_generation)
+        if owner.kind == "job" and operation_kind == "create":
+            current = await self.get_current_workspace_creation_result(
+                owner, operation_kind="create"
+            )
+            if (
+                isinstance(current, dict)
+                and current.get("startup_protocol_version") == 1
+                and current.get("phase") == "runtime_bound"
+                and current.get("settled_at") is None
+                and current.get("cancel_requested_at") is None
+                and current.get("pod_uid") is not None
+                and current.get("pod_uid") == current.get("runtime_incarnation")
+            ):
+                # A capable gate-off replica may see v1 work admitted by an
+                # activated peer. Its existing exact owner/receipt projection
+                # is accepted pending work, never a fresh create or failure.
+                return True
         reserve = getattr(
             type(self._db),
             "reserve_managed_repository_workspace_creation",
@@ -1226,6 +1243,21 @@ class ContainerProvisioner:
                         reservation=reservation,
                     )
         if not created:
+            if owner.kind == "job" and operation_kind == "create":
+                current = await self.get_current_workspace_creation_result(
+                    owner, operation_kind="create"
+                )
+                if (
+                    isinstance(current, dict)
+                    and str(current.get("id")) == str(reservation["id"])
+                    and current.get("claim_token") == reservation["claim_token"]
+                    and current.get("startup_protocol_version") == 1
+                    and current.get("phase") == "runtime_bound"
+                    and current.get("settled_at") is None
+                    and current.get("cancel_requested_at") is None
+                    and current.get("pod_uid") == current.get("runtime_incarnation")
+                ):
+                    return True
             if reservation.get("external_mutation_started_at") is None:
                 abort = getattr(
                     type(self._db),
@@ -1248,6 +1280,28 @@ class ContainerProvisioner:
         runtime = reservation.get("runtime_incarnation")
         if runtime is None:
             return False
+        if owner.kind == "job" and operation_kind == "create":
+            current = await self.get_current_workspace_creation_result(
+                owner, operation_kind="create"
+            )
+            if (
+                isinstance(current, dict)
+                and str(current.get("id")) == str(reservation["id"])
+                and current.get("claim_token") == reservation["claim_token"]
+                and current.get("startup_protocol_version") == 1
+                and current.get("cancel_requested_at") is None
+                and current.get("pod_uid") == current.get("runtime_incarnation")
+            ):
+                if (
+                    current.get("phase") == "runtime_bound"
+                    and current.get("settled_at") is None
+                ):
+                    return True
+                if (
+                    current.get("phase") == "settled"
+                    and current.get("settled_at") is not None
+                ):
+                    return True
         return bool(
             await settle(
                 self._db,
@@ -2248,6 +2302,182 @@ class ContainerProvisioner:
                 prepared, pod_ip=pod_ip, readiness_error=readiness_error
             )
 
+    async def continue_job_workspace_creation(
+        self,
+        job_id: str,
+        reservation_id: str,
+        claim_token: int,
+        pod_uid: str,
+        observation_check: SessionCreationObservationBudget | None = None,
+    ) -> bool:
+        """Observe an already-bound v1 Job Pod without issuing a create effect."""
+
+        owner = WorkspaceOwner.job(job_id)
+        if not self._k8s_available or self._db is None:
+            return False
+        async with self._workspace_mutation_guard(
+            owner, scope="workspace_container", wait=False
+        ) as owned:
+            if not owned:
+                return False
+            receipt = await self.get_current_workspace_creation_result(
+                owner, operation_kind="create"
+            )
+            if not isinstance(receipt, dict) or any(
+                (
+                    str(receipt.get("id")) != reservation_id,
+                    receipt.get("claim_token") != claim_token,
+                    str(receipt.get("pod_uid") or "") != pod_uid,
+                    str(receipt.get("runtime_incarnation") or "") != pod_uid,
+                    receipt.get("phase") != "runtime_bound",
+                    receipt.get("startup_protocol_version") != 1,
+                    receipt.get("settled_at") is not None,
+                    receipt.get("cancel_requested_at") is not None,
+                    receipt.get("startup_state") == "attention",
+                )
+            ):
+                return False
+            job = await self._db.get_job(owner.id)
+            if not job or str(job.get("status") or "") not in {
+                "created",
+                "processing",
+            }:
+                return False
+            now_db = await self._db.fetchval("SELECT clock_timestamp()")
+            if receipt["expires_at"] <= now_db:
+                rotated = await self._db.reserve_managed_repository_workspace_creation(
+                    owner.id,
+                    owner_kind="job",
+                    scope="workspace_container",
+                    claimant=f"container-continue:{uuid4()}",
+                    lease_seconds=1800,
+                    operation_kind="create",
+                    desired_manifest_digest=receipt["desired_manifest_digest"],
+                    expected_existing_reservation_id=reservation_id,
+                    expected_existing_claim_token=claim_token,
+                )
+                if not isinstance(rotated, dict):
+                    return False
+                receipt = await self.get_current_workspace_creation_result(
+                    owner, operation_kind="create"
+                )
+                if (
+                    not isinstance(receipt, dict)
+                    or receipt.get("claim_token") != rotated.get("claim_token")
+                    or str(receipt.get("id")) != reservation_id
+                    or str(receipt.get("pod_uid")) != pod_uid
+                ):
+                    return False
+            network_tier = await self._resolve_network_tier(
+                owner.id, kind=owner.network_tier_kind
+            )
+            pvc_name = _pvc_name_for(owner) if receipt.get("pvc_uid") else None
+            seed_cm = (
+                self._seed_configmap_name(owner.pod_name)
+                if receipt.get("seed_configmap_uid")
+                else None
+            )
+            pod = await self._bounded_kubernetes_call(
+                self._core_api.read_namespaced_pod,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+            self._require_workspace_pod_connection_identity(
+                pod,
+                owner=owner,
+                expected_runtime_incarnation=pod_uid,
+                expected_creation_generation=None,
+                expected_network_tier=network_tier,
+                expected_pvc_name=pvc_name,
+                expected_seed_configmap=seed_cm,
+            )
+            self._require_workspace_creation_reservation_annotation(
+                pod, reservation_id=reservation_id
+            )
+            seed_needs_state = False
+            if seed_cm:
+                seed = await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_config_map,
+                    name=seed_cm,
+                    namespace=self._namespace,
+                )
+                if self._require_stateless_seed_configmap_identity(
+                    seed,
+                    owner=owner,
+                    pod_name=owner.pod_name,
+                    creation_reservation_id=reservation_id,
+                ) != str(receipt["seed_configmap_uid"]):
+                    return False
+                self._require_seed_configmap_pod_owner_reference(
+                    seed, pod_name=owner.pod_name, runtime_incarnation=pod_uid
+                )
+                seed_needs_state = (getattr(seed, "data", None) or {}).get(
+                    "expect-state"
+                ) == "1"
+            if receipt.get("scheduled_at") is None:
+                profile = await self._sandbox_profile(
+                    owner,
+                    cpu="500m",
+                    memory="1Gi",
+                    cpu_limit="2000m",
+                    memory_limit="4Gi",
+                    image=None,
+                )
+                plan = await self._workspace_creation_plan(
+                    owner, profile=profile, stateless_creation_generation=None
+                )
+                if plan["digest"] != receipt["desired_manifest_digest"]:
+                    return False
+                pull_image = (
+                    profile.image if profile.image != self._workspace_image else None
+                )
+            else:
+                workspace_containers = [
+                    item
+                    for item in (getattr(pod.spec, "containers", None) or ())
+                    if _resource_field(item, "name") == "workspace"
+                ]
+                if len(workspace_containers) != 1:
+                    return False
+                pull_image = (
+                    _resource_field(workspace_containers[0], "image")
+                    if receipt.get("pull_budget_seconds") is not None
+                    else None
+                )
+
+            async def mutation_authority() -> bool:
+                return await self._workspace_creation_reservation_is_current(
+                    owner, receipt, scope="workspace_container"
+                )
+
+            prepared = _PreparedWorkspaceCreation(
+                owner=owner,
+                _creation_reservation=MappingProxyType(dict(receipt)),
+                strict_stateless=False,
+                stateless_creation_generation=None,
+                pod_name=owner.pod_name,
+                runtime_incarnation=pod_uid,
+                network_tier=network_tier,
+                pvc_name=pvc_name,
+                seed_cm=seed_cm,
+                pvc_reattach=False,
+                seed_needs_state=seed_needs_state,
+                mutation_authority=mutation_authority,
+                namespace=self._namespace,
+                pull_image=pull_image,
+            )
+        pod_ip = await self._observe_prepared_workspace(
+            prepared, observation_check=observation_check
+        )
+        async with self._workspace_mutation_guard(
+            owner, scope="workspace_container", wait=False
+        ) as owned:
+            if not owned or not await self._prepared_workspace_authority_is_current(
+                prepared, observed_pod_ip=pod_ip
+            ):
+                return False
+            return await self._complete_prepared_workspace(prepared, pod_ip=pod_ip)
+
     async def _prepare_workspace_reserved(
         self,
         owner: WorkspaceOwner,
@@ -2920,7 +3150,9 @@ class ContainerProvisioner:
             return False
 
     async def _observe_prepared_workspace(
-        self, prepared: _PreparedWorkspaceCreation
+        self,
+        prepared: _PreparedWorkspaceCreation,
+        observation_check: SessionCreationObservationBudget | None = None,
     ) -> str | None:
         owner = prepared.owner
         _creation_reservation = prepared._creation_reservation
@@ -2968,8 +3200,15 @@ class ContainerProvisioner:
             expected_pvc_name=pvc_name,
             expected_seed_configmap=seed_cm,
             pull_image=prepared.pull_image,
+            observation_check=observation_check,
             authority_check=check_authority,
-            startup_reservation=(_creation_reservation if strict_stateless else None),
+            startup_reservation=(
+                _creation_reservation
+                if strict_stateless
+                or owner.kind == "job"
+                and _creation_reservation.get("operation_kind") == "create"
+                else None
+            ),
         )
 
     async def _complete_prepared_workspace(
@@ -3175,6 +3414,59 @@ class ContainerProvisioner:
                             mutation_authority=mutation_authority,
                         ):
                             return False
+                    if owner.kind == "job":
+                        current = await self.get_current_workspace_creation_result(
+                            owner, operation_kind="create"
+                        )
+                        if (
+                            isinstance(current, dict)
+                            and str(current.get("id"))
+                            == str(_creation_reservation["id"])
+                            and current.get("claim_token")
+                            == _creation_reservation["claim_token"]
+                            and current.get("startup_protocol_version") == 1
+                        ):
+                            (
+                                backing_id,
+                                fingerprint,
+                                trusted_uid,
+                            ) = await self._trusted_pod_ssh_identity(
+                                pod_name,
+                                pvc_name=pvc_name,
+                                expected_owner=owner,
+                                expected_runtime_incarnation=runtime_incarnation,
+                                expected_network_tier=network_tier,
+                                expected_seed_configmap=seed_cm,
+                                expected_pvc_uid=(
+                                    str(_creation_reservation["pvc_uid"])
+                                    if _creation_reservation.get("pvc_uid")
+                                    else None
+                                ),
+                            )
+                            complete_job = getattr(
+                                type(self._db), "complete_job_workspace_creation", None
+                            )
+                            return bool(
+                                callable(complete_job)
+                                and await complete_job(
+                                    self._db,
+                                    owner.id,
+                                    runtime_incarnation=trusted_uid,
+                                    backing_id=backing_id,
+                                    ssh_host_key_fingerprint=fingerprint,
+                                    pod_ip=pod_ip,
+                                    port=30022,
+                                    creation_reservation_id=str(
+                                        _creation_reservation["id"]
+                                    ),
+                                    creation_claim_token=int(
+                                        _creation_reservation["claim_token"]
+                                    ),
+                                    host=self._workspace_dns(owner)
+                                    if pvc_name
+                                    else None,
+                                )
+                            )
                     if not await self._workspace_creation_reservation_is_current(
                         owner,
                         _creation_reservation,
