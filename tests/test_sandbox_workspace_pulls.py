@@ -82,6 +82,47 @@ def test_backoff_is_pulling_until_the_budget_then_fails():
     assert verdict(pod("ErrImagePull", age_seconds=601)).state == "failed"
 
 
+def test_late_scheduled_pod_gets_its_full_pull_budget_from_scheduled_clock():
+    old_pod = pod("ImagePullBackOff", age_seconds=900)
+    assert (
+        classify_image_pull(
+            old_pod,
+            image=IMAGE,
+            now=NOW,
+            pull_timeout_seconds=600,
+            started_at=NOW - timedelta(seconds=30),
+        ).state
+        == "pulling"
+    )
+    expired = classify_image_pull(
+        old_pod,
+        image=IMAGE,
+        now=NOW,
+        pull_timeout_seconds=600,
+        started_at=NOW - timedelta(seconds=601),
+    )
+    assert expired.state == "failed"
+    assert expired.failure_reason_code == "pull_deadline"
+    invalid = classify_image_pull(
+        pod("InvalidImageName", age_seconds=900),
+        image=IMAGE,
+        now=NOW,
+        pull_timeout_seconds=600,
+        started_at=NOW - timedelta(seconds=30),
+    )
+    assert invalid.state == "failed"
+    assert invalid.failure_reason_code == "invalid_image"
+    bad_config = classify_image_pull(
+        pod("CreateContainerConfigError", age_seconds=900),
+        image=IMAGE,
+        now=NOW,
+        pull_timeout_seconds=600,
+        started_at=NOW - timedelta(seconds=30),
+    )
+    assert bad_config.state == "failed"
+    assert bad_config.failure_reason_code == "invalid_configuration"
+
+
 def test_container_creating_never_fails_on_its_own():
     assert verdict(pod("ContainerCreating", age_seconds=9999)).state == "pulling"
 

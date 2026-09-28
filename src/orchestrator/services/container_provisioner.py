@@ -32,7 +32,20 @@ from uuid import UUID, uuid4
 from shared.container_recovery import ContainerRecoveryCleanup
 from shared.workspace_recovery import WorkspaceRecoveryCode
 
+from orchestrator.database.container_startup_stage import (
+    BoundPodObserved,
+    ReadyObservedAt,
+    ScheduledAt,
+    StageBudgets,
+    StartupAttention,
+    Unknown,
+    classify_exact_pod_schedule,
+    scheduled_stage_deadlines,
+)
 from orchestrator.database.session_creation_candidates import SessionCreationCandidate
+from orchestrator.services.container_startup_config import (
+    startup_stage_activation_enabled,
+)
 from orchestrator.services.session_creation_observation import (
     SessionCreationObservationBudget,
 )
@@ -2956,6 +2969,7 @@ class ContainerProvisioner:
             expected_seed_configmap=seed_cm,
             pull_image=prepared.pull_image,
             authority_check=check_authority,
+            startup_reservation=(_creation_reservation if strict_stateless else None),
         )
 
     async def _complete_prepared_workspace(
@@ -5423,12 +5437,19 @@ class ContainerProvisioner:
                 **(
                     {"readiness_started_at": self._background_pod_clock(pod)}
                     if expected_creation is not None
+                    and _creation_reservation.get("startup_protocol_version") != 1
+                    and not startup_stage_activation_enabled()
                     else {}
                 ),
                 authority_check=lambda: self._session_observation_checkpoint(
                     owner, generation
                 ),
                 observation_check=observation_check,
+                startup_reservation=(
+                    _creation_reservation
+                    if _creation_reservation.get("operation_kind") == "create"
+                    else None
+                ),
             )
             if not pod_ip:
                 return True
@@ -15346,6 +15367,296 @@ class ContainerProvisioner:
             )
         return started
 
+    async def _observe_container_startup_stage(
+        self,
+        pod_name: str,
+        *,
+        owner: WorkspaceOwner,
+        reservation: Mapping[str, Any],
+        expected_runtime_incarnation: str,
+        expected_creation_generation: str | None,
+        expected_network_tier: str | None,
+        expected_pvc_name: str | None | object,
+        expected_seed_configmap: str | None | object,
+        timeout: int,
+        pull_image: str | None,
+        observation_check: SessionCreationObservationBudget | None,
+        authority_check: Callable[[], Awaitable[None]] | None,
+    ) -> str | None:
+        """Observe one exact Pod and its frozen stage; never create or replace it.
+
+        This single-observation adapter is also suitable for a bounded Job
+        continuation pass. The database owns every durable stage transition.
+        """
+
+        async def refresh() -> dict[str, Any] | None:
+            current = await self.get_current_workspace_creation_result(
+                owner, operation_kind="create"
+            )
+            if not isinstance(current, dict) or (
+                str(current.get("id")) != str(reservation["id"])
+                or int(current.get("claim_token") or 0)
+                != int(reservation["claim_token"])
+                or str(current.get("runtime_incarnation") or "")
+                != expected_runtime_incarnation
+                or current.get("phase") != "runtime_bound"
+                or current.get("settled_at") is not None
+                or current.get("cancel_requested_at") is not None
+            ):
+                return None
+            return current
+
+        async def record(
+            observation: Any, *, budgets: StageBudgets | None = None
+        ) -> bool:
+            observe = getattr(type(self._db), "observe_container_startup", None)
+            return bool(
+                callable(observe)
+                and await observe(
+                    self._db,
+                    "thread" if owner.kind == "session" else "job",
+                    owner.id,
+                    str(reservation["id"]),
+                    int(reservation["claim_token"]),
+                    expected_runtime_incarnation,
+                    observation,
+                    budgets=budgets,
+                    adopt_if_unmarked=startup_stage_activation_enabled(),
+                )
+            )
+
+        if observation_check is not None:
+            observation_check()
+        if authority_check is not None:
+            await authority_check()
+        pod = await self._bounded_kubernetes_call(
+            self._core_api.read_namespaced_pod,
+            name=pod_name,
+            namespace=self._namespace,
+        )
+        self._require_workspace_pod_connection_identity(
+            pod,
+            owner=owner,
+            expected_runtime_incarnation=expected_runtime_incarnation,
+            expected_creation_generation=expected_creation_generation,
+            expected_network_tier=expected_network_tier,
+            expected_pvc_name=expected_pvc_name,
+            expected_seed_configmap=expected_seed_configmap,
+        )
+        self._require_workspace_creation_reservation_annotation(
+            pod, reservation_id=str(reservation["id"])
+        )
+        if observation_check is not None:
+            observation_check.start()
+        current = await refresh()
+        if current is None:
+            return None
+        if current.get("startup_protocol_version") != 1:
+            if not await record(BoundPodObserved()):
+                return None
+            current = await refresh()
+            if current is None or current.get("startup_protocol_version") != 1:
+                return None
+
+        now = datetime.now(timezone.utc)
+        schedule = classify_exact_pod_schedule(pod, expected_runtime_incarnation, now)
+        if isinstance(schedule, Unknown):
+            return None
+        if isinstance(schedule, ScheduledAt):
+            budgets = (
+                StageBudgets(
+                    timeout,
+                    self._image_pull_timeout if pull_image is not None else None,
+                    self._ssh_auth_ready_timeout,
+                )
+                if current.get("scheduled_at") is None
+                else None
+            )
+            if not await record(schedule, budgets=budgets):
+                return None
+        else:
+            if not await record(schedule):
+                return None
+            return None
+        current = await refresh()
+        if (
+            current is None
+            or current.get("startup_protocol_version") != 1
+            or current.get("startup_state") == "attention"
+            or current.get("scheduled_at") is None
+        ):
+            return None
+        frozen = StageBudgets(
+            current["ready_budget_seconds"],
+            current.get("pull_budget_seconds"),
+            current["ssh_budget_seconds"],
+        )
+        bounds = scheduled_stage_deadlines(current["scheduled_at"], frozen)
+
+        ready_conditions = [
+            condition
+            for condition in (getattr(pod.status, "conditions", None) or ())
+            if getattr(condition, "type", None) == "Ready"
+        ]
+        if len(ready_conditions) > 1:
+            return None
+        ready_condition = ready_conditions[0] if ready_conditions else None
+        workspace_status = next(
+            (
+                status
+                for status in (getattr(pod.status, "container_statuses", None) or ())
+                if getattr(status, "name", None) == "workspace"
+            ),
+            None,
+        )
+        if getattr(
+            getattr(workspace_status, "state", None), "waiting", None
+        ) is not None and (
+            getattr(workspace_status, "ready", False)
+            or ready_condition is not None
+            and getattr(ready_condition, "status", None) == "True"
+        ):
+            # A waiting container and Ready evidence cannot jointly prove an
+            # invalid image or grant an SSH attempt from this observation.
+            return None
+        verdict = None
+        if pull_image is not None:
+            verdict = classify_image_pull(
+                pod,
+                image=pull_image,
+                now=now,
+                pull_timeout_seconds=max(
+                    frozen.ready_seconds, frozen.pull_seconds or 0
+                ),
+                started_at=bounds.scheduled_at,
+            )
+            if verdict.state == "failed" and verdict.failure_reason_code in {
+                "invalid_image",
+                "invalid_configuration",
+            }:
+                await record(StartupAttention(verdict.failure_reason_code))
+                return None
+
+        if (
+            ready_condition is not None
+            and getattr(ready_condition, "status", None) == "True"
+        ):
+            ready_at = getattr(ready_condition, "last_transition_time", None)
+            if (
+                not isinstance(ready_at, datetime)
+                or ready_at.tzinfo is None
+                or ready_at.utcoffset() is None
+                or not bounds.scheduled_at <= ready_at.astimezone(timezone.utc) <= now
+            ):
+                return None
+            if current.get("startup_first_ready_at") is None:
+                if not await record(ReadyObservedAt(ready_at.astimezone(timezone.utc))):
+                    return None
+                current = await refresh()
+                if current is None or current.get("startup_state") == "attention":
+                    return None
+        elif now > bounds.readiness_deadline_at:
+            await record(
+                StartupAttention(
+                    "pull_deadline"
+                    if verdict is not None
+                    and verdict.failure_reason_code == "pull_deadline"
+                    else "readiness_deadline"
+                )
+            )
+            return None
+        else:
+            return None
+
+        first_ready_at = current.get("startup_first_ready_at")
+        ssh_deadline = (
+            bounds.ssh_deadline_for_ready(
+                first_ready_at, now=datetime.now(timezone.utc)
+            )
+            if first_ready_at is not None
+            else None
+        )
+        if ssh_deadline is None:
+            await record(StartupAttention("ssh_deadline"))
+            return None
+        if (
+            pod.status.phase != "Running"
+            or not pod.status.pod_ip
+            or not pod.status.container_statuses
+            or not all(status.ready for status in pod.status.container_statuses)
+        ):
+            return None
+
+        key_path = resolve_ssh_key_path()
+        try:
+            fingerprint = workspace_private_key_fingerprint(key_path)
+        except SSHPrivateKeyError as exc:
+            raise WorkspaceSSHAuthenticationError(str(exc)) from exc
+
+        async def check_current() -> None:
+            if authority_check is not None:
+                await authority_check()
+            if await refresh() is None:
+                raise _WorkspaceCreationAuthorityLost(
+                    "container startup reservation authority revoked"
+                )
+
+        remaining = (ssh_deadline - datetime.now(timezone.utc)).total_seconds()
+        if remaining <= 0:
+            await record(StartupAttention("ssh_deadline"))
+            return None
+        ready, attempts, last_error = await wait_for_agent_ssh(
+            pod.status.pod_ip,
+            30022,
+            deadline_s=remaining,
+            **(
+                {"observation_check": observation_check}
+                if observation_check is not None
+                else {}
+            ),
+            connect_timeout_s=self._ssh_auth_connect_timeout,
+            interval_s=self._ssh_auth_poll_interval,
+            key_path=key_path,
+            authority_check=check_current,
+        )
+        if not ready:
+            if datetime.now(timezone.utc) > ssh_deadline:
+                await record(StartupAttention("ssh_deadline"))
+            return None
+        confirmed = await self._bounded_kubernetes_call(
+            self._core_api.read_namespaced_pod,
+            name=pod_name,
+            namespace=self._namespace,
+        )
+        self._require_workspace_pod_connection_identity(
+            confirmed,
+            owner=owner,
+            expected_runtime_incarnation=expected_runtime_incarnation,
+            expected_creation_generation=expected_creation_generation,
+            expected_network_tier=expected_network_tier,
+            expected_pvc_name=expected_pvc_name,
+            expected_seed_configmap=expected_seed_configmap,
+        )
+        self._require_workspace_creation_reservation_annotation(
+            confirmed, reservation_id=str(reservation["id"])
+        )
+        if (
+            confirmed.status.phase != "Running"
+            or confirmed.status.pod_ip != pod.status.pod_ip
+            or not confirmed.status.container_statuses
+            or not all(status.ready for status in confirmed.status.container_statuses)
+        ):
+            return None
+        await check_current()
+        logger.info(
+            "Workspace SSH authenticated: %s @ %s:30022 (attempts=%d, key=%s)",
+            pod_name,
+            pod.status.pod_ip,
+            attempts,
+            fingerprint,
+        )
+        return pod.status.pod_ip
+
     async def _wait_for_ready(
         self,
         pod_name: str,
@@ -15364,6 +15675,7 @@ class ContainerProvisioner:
         readiness_started_at: datetime | None = None,
         observation_check: SessionCreationObservationBudget | None = None,
         authority_check: Callable[[], Awaitable[None]] | None = None,
+        startup_reservation: Mapping[str, Any] | None = None,
     ) -> Optional[str]:
         """Poll until the pod is ready and accepts the configured SSH key.
 
@@ -15379,6 +15691,39 @@ class ContainerProvisioner:
                 pull budget is spent. While it is still pulling, the wait
                 extends up to that budget.
         """
+        if (
+            startup_reservation is not None
+            and expected_owner is not None
+            and expected_runtime_incarnation is not None
+            and self._db is not None
+        ):
+            receipt = await self.get_current_workspace_creation_result(
+                expected_owner, operation_kind="create"
+            )
+            if not isinstance(receipt, dict) or (
+                str(receipt.get("id")) != str(startup_reservation.get("id"))
+                or int(receipt.get("claim_token") or 0)
+                != int(startup_reservation.get("claim_token") or 0)
+            ):
+                return None
+            if (
+                receipt.get("startup_protocol_version") == 1
+                or startup_stage_activation_enabled()
+            ):
+                return await self._observe_container_startup_stage(
+                    pod_name,
+                    owner=expected_owner,
+                    reservation=receipt,
+                    expected_runtime_incarnation=expected_runtime_incarnation,
+                    expected_creation_generation=expected_creation_generation,
+                    expected_network_tier=expected_network_tier,
+                    expected_pvc_name=expected_pvc_name,
+                    expected_seed_configmap=expected_seed_configmap,
+                    timeout=timeout,
+                    pull_image=pull_image,
+                    observation_check=observation_check,
+                    authority_check=authority_check,
+                )
         loop = asyncio.get_event_loop()
         elapsed = (
             max(0, (datetime.now(timezone.utc) - readiness_started_at).total_seconds())

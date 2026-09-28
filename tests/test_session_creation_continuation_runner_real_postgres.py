@@ -154,6 +154,119 @@ def shared_provider(db, cases, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_v1_unscheduled_session_keeps_same_uid_until_later_ready(db, monkeypatch):
+    """An open exact source can acquire a schedule after an earlier wait."""
+
+    from orchestrator.services.session_creation_continuation import (
+        SessionCreationContinuationRunner,
+    )
+
+    case, source, original = await leave_exact_source_after_end_disconnect(
+        db, monkeypatch, "stateless"
+    )
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    provider = reconstructed_provider(db, case, monkeypatch)
+    pod = case.cluster.objects["pod"]
+    pod.spec.node_name = None
+    pod.status.phase = "Pending"
+    pod.status.conditions = [
+        SimpleNamespace(type="PodScheduled", status="False", reason="Unschedulable")
+    ]
+    runner = SessionCreationContinuationRunner(
+        db=db, provisioner=provider, shutdown_event=asyncio.Event()
+    )
+    (candidate,) = (await db.list_current_session_creation_candidates()).candidates
+    assert not await runner._continue(candidate)
+    waiting = await exact_source(db, case, "stateless")
+    assert waiting["id"] == source["id"]
+    assert waiting["pod_uid"] == source["pod_uid"]
+    assert waiting["startup_protocol_version"] == 1
+    assert waiting["startup_state"] == "waiting_capacity"
+    assert waiting["scheduled_at"] is None
+
+    scheduled = datetime.now(timezone.utc)
+    pod.spec.node_name = "node8"
+    ready_external_runtime(case, monkeypatch)
+    pod.status.conditions = [
+        SimpleNamespace(
+            type="PodScheduled", status="True", last_transition_time=scheduled
+        ),
+        SimpleNamespace(type="Ready", status="True", last_transition_time=scheduled),
+    ]
+    (candidate,) = (await db.list_current_session_creation_candidates()).candidates
+    assert await runner._continue(candidate)
+    settled = await exact_source(db, case, "stateless")
+    assert settled["id"] == source["id"]
+    assert settled["pod_uid"] == source["pod_uid"]
+    assert settled["scheduled_at"] == scheduled
+    assert settled["startup_first_ready_at"] == scheduled
+    assert settled["settled_at"] is not None
+    assert (await db.get_thread(case.thread_id))["runtime_generation"] == original[
+        "runtime_generation"
+    ]
+    assert case.cluster.pod_create_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_v1_scheduled_pull_deadline_is_sticky_across_continuation(
+    db, monkeypatch
+):
+    from orchestrator.services.session_creation_continuation import (
+        SessionCreationContinuationRunner,
+    )
+
+    case, source, _ = await leave_exact_source_after_end_disconnect(
+        db, monkeypatch, "stateless"
+    )
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    provider = reconstructed_provider(db, case, monkeypatch)
+    provider._reattach_ready_timeout = 2
+    provider._image_pull_timeout = 2
+    pod = case.cluster.objects["pod"]
+    scheduled = datetime.now(timezone.utc)
+    pod.spec.node_name = "node8"
+    pod.status.conditions = [
+        SimpleNamespace(
+            type="PodScheduled", status="True", last_transition_time=scheduled
+        )
+    ]
+    runner = SessionCreationContinuationRunner(
+        db=db, provisioner=provider, shutdown_event=asyncio.Event()
+    )
+    (candidate,) = (await db.list_current_session_creation_candidates()).candidates
+    assert not await runner._continue(candidate)
+    starting = await exact_source(db, case, "stateless")
+    assert starting["scheduled_at"] == scheduled
+    assert starting["startup_state"] == "starting"
+    assert starting["ready_budget_seconds"] == 2
+    assert starting["pull_budget_seconds"] == 2
+
+    await asyncio.sleep(2.2)
+    (candidate,) = (await db.list_current_session_creation_candidates()).candidates
+    assert not await runner._continue(candidate)
+    attention = await exact_source(db, case, "stateless")
+    assert attention["startup_state"] == "attention"
+    assert attention["startup_reason_code"] == "pull_deadline"
+    assert attention["settled_at"] is None
+    assert attention["scheduled_at"] == scheduled
+
+    ready_external_runtime(case, monkeypatch)
+    pod.status.conditions.append(
+        SimpleNamespace(
+            type="Ready", status="True", last_transition_time=datetime.now(timezone.utc)
+        )
+    )
+    (candidate,) = (await db.list_current_session_creation_candidates()).candidates
+    assert not await runner._continue(candidate)
+    held = await exact_source(db, case, "stateless")
+    assert held["startup_state"] == "attention"
+    assert held["settled_at"] is None
+    assert held["scheduled_at"] == scheduled
+    assert held["id"] == source["id"]
+    assert case.cluster.pod_create_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_two_slow_sources_yield_slots_to_later_ready_source(db, monkeypatch):
     from orchestrator.services.session_creation_continuation import (
         SessionCreationContinuationRunner,

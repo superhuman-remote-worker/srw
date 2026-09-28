@@ -263,10 +263,18 @@ _STILL_PULLING = (
 class PullVerdict:
     state: Literal["ok", "pulling", "failed"]
     message: str | None = None
+    failure_reason_code: (
+        Literal["invalid_image", "invalid_configuration", "pull_deadline"] | None
+    ) = None
 
 
 def classify_image_pull(
-    pod: Any, *, image: str, now: datetime, pull_timeout_seconds: float
+    pod: Any,
+    *,
+    image: str,
+    now: datetime,
+    pull_timeout_seconds: float,
+    started_at: datetime | None = None,
 ) -> PullVerdict:
     """Classify the workspace container's waiting state for a custom image."""
     statuses = getattr(getattr(pod, "status", None), "container_statuses", None) or []
@@ -280,16 +288,30 @@ def classify_image_pull(
     if waiting.message:
         message += f" ({waiting.message})"
     if reason in _FAIL_AT_ONCE:
-        return PullVerdict("failed", message)
+        return PullVerdict("failed", message, "invalid_image")
+    if started_at is not None and reason == "CreateContainerConfigError":
+        # Version-1 startup observes this exact scheduled Pod as a proven
+        # configuration failure. Keep legacy unmarked pull timing unchanged.
+        return PullVerdict("failed", message, "invalid_configuration")
     if reason not in _STILL_PULLING:
         return PullVerdict("ok")
-    created = getattr(pod.metadata, "creation_timestamp", None)
+    created = (
+        started_at
+        if started_at is not None
+        else getattr(pod.metadata, "creation_timestamp", None)
+    )
     if (
         reason in _FAIL_AFTER_BUDGET
         and created is not None
         and (now - created).total_seconds() >= pull_timeout_seconds
     ):
-        return PullVerdict("failed", message)
+        return PullVerdict(
+            "failed",
+            message,
+            "invalid_configuration"
+            if reason == "CreateContainerConfigError"
+            else "pull_deadline",
+        )
     return PullVerdict("pulling")
 
 
