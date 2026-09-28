@@ -45,6 +45,10 @@ from orchestrator.services.pinned_k8s_effect import (
     run_bounded_k8s_call,
     run_bounded_k8s_mutation,
 )
+from orchestrator.services.session_workspace_policy import (
+    AGENT_POD_STARTUP_ALLOWANCE_S,
+    session_pod_startup_allowance_s,
+)
 from orchestrator.services.session_runtime_admission import (
     ThreadRuntimeAuthority,
     same_thread_runtime_authority,
@@ -253,6 +257,22 @@ class PersistentProvisioner:
             )
             return None
 
+    async def _session_startup_allowance_s(self, thread_id: str) -> int | None:
+        """Startup allowance for a Pod that attaches ``thread_id`` in startup."""
+
+        if self._db is None:
+            return None
+        try:
+            thread = await self._db.get_thread(thread_id)
+        except Exception:
+            logger.exception(
+                "Persistent provision startup allowance read failed: %s", thread_id
+            )
+            return None
+        if thread is None:
+            return None
+        return session_pod_startup_allowance_s(thread)
+
     async def _runtime_authority_matches(
         self, expected: ThreadRuntimeAuthority | None
     ) -> bool:
@@ -318,6 +338,14 @@ class PersistentProvisioner:
             expected_runtime_generation is not None
             and runtime_authority.generation != expected_runtime_generation
         ):
+            return PersistentPodCreateResult(
+                PersistentPodCreateStatus.FAILED,
+                f"persistent-{thread_id[:12]}",
+                failure_class="session_not_preparable",
+            )
+        # The Pod attaches this session inside startup.
+        startup_allowance_s = await self._session_startup_allowance_s(thread_id)
+        if startup_allowance_s is None:
             return PersistentPodCreateResult(
                 PersistentPodCreateStatus.FAILED,
                 f"persistent-{thread_id[:12]}",
@@ -488,6 +516,7 @@ class PersistentProvisioner:
             provision_attempt=provision_attempt,
             image_ref=image_ref,
             namespace=intent_namespace,
+            startup_allowance_s=startup_allowance_s,
         )
         if not await self._runtime_authority_matches(runtime_authority):
             return PersistentPodCreateResult(
@@ -1809,6 +1838,7 @@ class PersistentProvisioner:
         provision_attempt: Optional[str] = None,
         image_ref: Optional[str] = None,
         namespace: Optional[str] = None,
+        startup_allowance_s: int = AGENT_POD_STARTUP_ALLOWANCE_S,
     ) -> dict:
         """Build the Kubernetes Pod manifest for a persistent agent.
 
@@ -2041,7 +2071,10 @@ class PersistentProvisioner:
                                 "path": "/health",
                                 "port": 8001,
                             },
-                            "failureThreshold": 10,
+                            # The agent attaches this thread inside startup:
+                            # cover that session's readiness budget too
+                            # (session_pod_startup_allowance_s).
+                            "failureThreshold": -(-startup_allowance_s // 10),
                             "periodSeconds": 10,
                         },
                         "resources": {

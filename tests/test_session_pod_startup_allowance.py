@@ -128,14 +128,14 @@ def test_the_orchestrator_readiness_budget_exceeds_the_agent_attach_budget():
     [("vm", False), ("vm", True), ("sandbox", False)],
 )
 async def test_dedicated_session_pod_allows_its_attach(backend, preparation):
-    body = await _agent_session_pod(
-        _thread_metadata(backend, preparation=preparation)
-    )
+    body = await _agent_session_pod(_thread_metadata(backend, preparation=preparation))
 
     allowance = _allowance(body)
     assert allowance >= _required(backend, preparation=preparation)
     if backend == "vm":
-        assert allowance > PRE_ATTACH_ALLOWANCE_S + persistent_app._vm_upgrade_poll_timeout
+        assert (
+            allowance > PRE_ATTACH_ALLOWANCE_S + persistent_app._vm_upgrade_poll_timeout
+        )
     if preparation:
         assert allowance > PreparationSettings.from_environment().wait_budget
 

@@ -115,6 +115,51 @@ def session_ready_timeout_s(
     return int(os.environ.get("WS_READY_TIMEOUT_S", "180"))
 
 
+# Every agent Pod's startup allowance before any session attach: process
+# start, agent initialization and registration (the startup probe's 100 s).
+AGENT_POD_STARTUP_ALLOWANCE_S = 100
+
+
+def session_pod_startup_allowance_s(thread: Any) -> int:
+    """Startup-probe allowance for an agent Pod bound to ``thread`` at creation.
+
+    A thread-bound agent attaches its session inside FastAPI lifespan startup,
+    so it serves no ``/health`` until that attach completes; a VM-tier attach
+    waits for the VM. The allowance is the pre-attach allowance plus this
+    session's readiness budget (``session_ready_timeout_s``), which the
+    orchestrator already waits after registration and which is sized above
+    the agent's own attach budget. The agent therefore gives up first with its
+    truthful reason, and the kubelet never ends an attach the orchestrator is
+    still waiting for (knowledge-base/knowledge/issues/
+    dedicated_vm_session_ended_at_attach_by_startup_probe.md).
+    """
+    import json
+
+    from orchestrator.services.stateless_workspace_gate import (
+        declared_thread_workspace_backend,
+        thread_metadata_object,
+    )
+
+    metadata = thread_metadata_object(thread)
+    config_override = metadata.get("config_override") or {}
+    if isinstance(config_override, str):
+        try:
+            config_override = json.loads(config_override)
+        except (json.JSONDecodeError, TypeError):
+            config_override = {}
+    if not isinstance(config_override, dict):
+        config_override = {}
+    vm = metadata.get("vm")
+    return AGENT_POD_STARTUP_ALLOWANCE_S + session_ready_timeout_s(
+        declared_thread_workspace_backend(thread),
+        preparation=bool(
+            preparation_wait_budget(
+                config_override, vm=vm if isinstance(vm, dict) else None
+            )
+        ),
+    )
+
+
 def preparation_wait_budget(config_override, vm=None):
     """Additional bounded startup time for an execution-owned preparation."""
     workspace = (config_override or {}).get("workspace") or {}

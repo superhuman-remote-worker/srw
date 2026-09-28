@@ -48,6 +48,10 @@ from orchestrator.services.pinned_k8s_effect import (
     run_bounded_k8s_call,
     run_bounded_k8s_mutation,
 )
+from orchestrator.services.session_workspace_policy import (
+    AGENT_POD_STARTUP_ALLOWANCE_S,
+    session_pod_startup_allowance_s,
+)
 from orchestrator.services.session_runtime_admission import (
     ThreadRuntimeAuthority,
     same_thread_runtime_authority,
@@ -535,6 +539,23 @@ class AgentProvisioner:
             )
             return False
 
+    async def _session_startup_allowance_s(self, thread_id: str) -> int | None:
+        """Startup allowance for a Pod that attaches ``thread_id`` in startup."""
+
+        if self._db is None:
+            return None
+        try:
+            thread = await self._db.get_thread(thread_id)
+        except Exception:
+            logger.exception(
+                "Session startup allowance read failed before provisioning: %s",
+                thread_id,
+            )
+            return None
+        if thread is None:
+            return None
+        return session_pod_startup_allowance_s(thread)
+
     async def provision_agent(
         self,
         purpose: str,
@@ -591,6 +612,12 @@ class AgentProvisioner:
                 thread_id,
             )
             return None
+        startup_allowance_s: int | None = AGENT_POD_STARTUP_ALLOWANCE_S
+        if purpose == "session" and thread_id:
+            # A thread-bound Pod attaches its session inside startup.
+            startup_allowance_s = await self._session_startup_allowance_s(thread_id)
+            if startup_allowance_s is None:
+                return None
 
         # Capacity check with reservation-aware eviction
         counts = await self.active_counts_by_purpose()
@@ -772,6 +799,7 @@ class AgentProvisioner:
             ),
             provision_attempt=provision_attempt,
             namespace=intent_namespace,
+            startup_allowance_s=startup_allowance_s,
         )
 
         if purpose == "session" and not await self._same_session_runtime_authority(
@@ -2799,6 +2827,7 @@ class AgentProvisioner:
         session_runtime_generation: Optional[str] = None,
         provision_attempt: Optional[str] = None,
         namespace: Optional[str] = None,
+        startup_allowance_s: int = AGENT_POD_STARTUP_ALLOWANCE_S,
     ) -> dict:
         """Build the Kubernetes Pod manifest for an agent.
 
@@ -3008,8 +3037,10 @@ class AgentProvisioner:
                     "httpGet": {"path": "/health", "port": 8001},
                     # Poll quickly so the Kubernetes Ready bit can catch up
                     # with the agent's own ready heartbeat before dispatch.
-                    # Keep the original 100s total startup allowance.
-                    "failureThreshold": 100,
+                    # 100 s for job and pool Pods; a thread-bound session Pod
+                    # attaches inside startup and also gets that session's
+                    # readiness budget (session_pod_startup_allowance_s).
+                    "failureThreshold": startup_allowance_s,
                     "periodSeconds": 1,
                 },
                 "resources": {
