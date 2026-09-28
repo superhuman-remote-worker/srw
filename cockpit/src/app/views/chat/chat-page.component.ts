@@ -282,6 +282,7 @@ export class ChatPageComponent implements OnInit, OnDestroy {
     readonly viewport = inject(ViewportService);
     private readonly destroyRef = inject(DestroyRef);
     private routeGeneration = 0;
+    private readonly routeThreadId = signal<string | null>(null);
     private subagentRefreshInterval: ReturnType<typeof setInterval> | null = null;
     /** The route generation whose child detail/history pair is currently in flight. */
     private subagentRefreshInFlightGeneration: number | null = null;
@@ -380,6 +381,16 @@ export class ChatPageComponent implements OnInit, OnDestroy {
     private readonly isDraftRoute = this.route.snapshot.data['draft'] === true;
 
     constructor() {
+        // A viewed ending thread can disappear after a permanent Delete
+        // settles in the background. The service reports only an exact 404;
+        // route identity keeps a late observation from moving another view.
+        effect(() => {
+            const deleted = this.chat.deletedThreadId();
+            if (deleted && deleted === this.routeThreadId() && deleted === this.chat.threadId()) {
+                void this.router.navigate(['/sessions']);
+            }
+        });
+
         // Draft flow: when the first send creates the thread
         // (_createFromDraftSession → createAndConnect sets threadId), move the
         // URL from / to the session. No replaceUrl — Back returns to a fresh
@@ -686,6 +697,7 @@ export class ChatPageComponent implements OnInit, OnDestroy {
 
     private handleThreadRoute(threadId: string | null): void {
         const routeGeneration = ++this.routeGeneration;
+        this.routeThreadId.set(threadId);
         this.stopSubagentRefresh();
         // A stale request from the previous route is still subscribed until it
         // settles, but its generation guard cannot paint this route. Releasing
