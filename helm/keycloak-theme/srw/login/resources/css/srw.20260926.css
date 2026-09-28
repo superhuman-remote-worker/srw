@@ -78,6 +78,15 @@
 }
 
 /*
+ * The card is a cockpit panel on the page ground. PatternFly paints it
+ * --light-100 (#fff) in light and --300 (#26292d) in dark, both set on
+ * .pf-v5-c-login at this specificity, so the later file wins in both modes.
+ */
+.pf-v5-c-login {
+  --pf-v5-c-login__main--BackgroundColor: var(--pf-v5-global--BackgroundColor--100);
+}
+
+/*
  * keycloak.v2 hard-codes the header to a light colour with !important, which
  * only works against its dark background image. We load later, so an equal
  * !important at equal specificity wins.

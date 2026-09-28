@@ -146,6 +146,24 @@ def test_header_wrapper_colour_is_forced() -> None:
     assert "!important" in found.group(0)
 
 
+def test_card_is_a_panel_not_patternfly_white_or_grey() -> None:
+    """PatternFly paints the card #fff (light) and #26292d (dark). Routing it
+    through BackgroundColor--100 puts it on panel-bg in both modes, which the
+    palette tests above already pin.
+
+    Scoped to the bare .pf-v5-c-login block: PatternFly sets the variable on
+    that selector in both modes, so a rule anywhere else loses or leaks.
+    """
+    rules = _css_rules(LOGIN_CSS.read_text())
+    found = re.search(r"(?:^|\})\s*\.pf-v5-c-login\s*\{[^}]*\}", rules)
+    assert found, "no bare .pf-v5-c-login rule block"
+    assert re.search(
+        r"--pf-v5-c-login__main--BackgroundColor:\s*"
+        r"var\(--pf-v5-global--BackgroundColor--100\)",
+        found.group(0),
+    )
+
+
 def test_no_external_font_dependency() -> None:
     """The login page must work when everything else is down, and must not leak
     every login attempt's IP to a third party."""

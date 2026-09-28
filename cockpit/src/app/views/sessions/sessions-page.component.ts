@@ -471,8 +471,8 @@ const ENDING_POLL_MAX_MS = 15_000;
       font-size: 10px;
       padding: 1px 6px;
       border-radius: var(--radius-tag);
-      border: 1px solid color-mix(in srgb, var(--accent, #6366f1) 45%, transparent);
-      color: var(--accent, #6366f1);
+      border: 1px solid color-mix(in srgb, var(--accent-color) 45%, transparent);
+      color: var(--accent-color);
       white-space: nowrap;
     }
     .session-officer-badge[data-kind='conference'] {
