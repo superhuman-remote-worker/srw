@@ -41,6 +41,7 @@ import {
     shouldFoldToolRun,
     shouldPin,
     shouldSendOnEnter,
+    shouldShowReconnectBanner,
     textSizeToCss,
     uploadStageAnnounceKey,
     uploadStageFor,
@@ -90,6 +91,21 @@ describe('isStartupBannerVisible', () => {
     it('hides the banner once the session is no longer starting', () => {
         expect(isStartupBannerVisible(false, 3)).toBe(false);
         expect(isStartupBannerVisible(false, 0)).toBe(false);
+    });
+});
+
+describe('shouldShowReconnectBanner', () => {
+    it('offers manual recovery for a ready created thread with a closed journal', () => {
+        expect(shouldShowReconnectBanner('connecting', 'created', true, 1, 0)).toBe(true);
+        expect(shouldShowReconnectBanner('error', 'active', true, 1, 0)).toBe(true);
+    });
+
+    it('keeps End and startup controls separate', () => {
+        expect(shouldShowReconnectBanner('disconnected', 'ended', true, 1, 3)).toBe(false);
+        expect(shouldShowReconnectBanner('connecting', 'created', false, 1, 0)).toBe(false);
+        expect(shouldShowReconnectBanner('connected', 'active', true, 1, 3)).toBe(false);
+        expect(shouldShowReconnectBanner('error', 'active', true, 0, 3)).toBe(false);
+        expect(shouldShowReconnectBanner('disconnected', 'active', true, 0, 3)).toBe(true);
     });
 });
 

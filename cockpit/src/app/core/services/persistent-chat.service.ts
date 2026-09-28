@@ -38,6 +38,7 @@ import type { SessionQueueState } from '../models/api.model';
 import { ErrorMessageService } from './error-message.service';
 import { IndexedDbService } from './indexed-db.service';
 import { NotificationService } from './notification.service';
+import { classifySseProbeFailure, sseRetryDelayMs } from './sse-recovery';
 import { classifyResumeError, ConfigDriftItem } from './resume-error';
 import { reduce, ReducerAction } from './turn-reducer';
 import {
@@ -1573,6 +1574,14 @@ export class PersistentChatService {
 
   private sse: EventSource | null = null;
   private sseWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+  private sseRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private sseRetryProbeInFlight: { generation: number } | null = null;
+  private sseRetryAttempt = 0;
+  private sseRecoveryHalted = false;
+  /** A reopened transport cannot grant controls until a fresh owner read
+   * proves the current status and runtime generation after the gap. */
+  private sseRecoveryPending = false;
+  private sseRecoveryExpectedGeneration: string | null = null;
   // One-shot fallback: force a reconnect if "Stopping…" doesn't clear after
   // an interrupt POST (lost ack frame). Armed in interrupt(), cleared by the
   // isInterrupting invariant effect.
@@ -1980,6 +1989,7 @@ export class PersistentChatService {
   private _controlPlaneAllowed(threadId: string, openingGeneration?: number): boolean {
     return (
       !this.intentionalClose &&
+      !this.sseRecoveryPending &&
       this.threadId() === threadId &&
       this.terminalControlThreadId !== threadId &&
       this.invalidBindingRuntime?.threadId !== threadId &&
@@ -3279,12 +3289,18 @@ export class PersistentChatService {
 
     es.onopen = () => {
       if (this.sse !== es) return; // superseded — ignore late open
+      if (this.sseRecoveryPending) {
+        void this._verifyRecoveredSse(threadId, connectGeneration, es);
+        return;
+      }
       this.zone.run(() => {
         const wasReconnecting = this.connectionState() !== 'connected';
         const terminalReviewOnly = this.terminalControlThreadId === threadId;
         const bindingInvalid = this.invalidBindingRuntime?.threadId === threadId;
         const bindingRecovering = this.bindingRecoveryRuntime?.threadId === threadId;
-        const controlUnavailable = terminalReviewOnly || bindingInvalid || bindingRecovering;
+        const successorUnverified = this.successorRuntime?.threadId === threadId &&
+          this.sessionRuntimeGeneration !== this.successorRuntime.generation;
+        const controlUnavailable = terminalReviewOnly || bindingInvalid || bindingRecovering || successorUnverified;
         // EventSource liveness is not agent/control readiness. An ended
         // session deliberately retains (and may reopen) this stream for late
         // protected staging, but must not regain the green Connected UI or
@@ -3294,7 +3310,7 @@ export class PersistentChatService {
             ? 'error'
             : terminalReviewOnly
               ? 'disconnected'
-              : bindingRecovering
+              : bindingRecovering || successorUnverified
                 ? 'connecting'
                 : 'connected',
         );
@@ -3344,23 +3360,25 @@ export class PersistentChatService {
       if (this.sse !== es) return;
       this.zone.run(() => {
         if (this.sse !== es) return;
+        if (!this.sseRecoveryPending) {
+          this.sseRecoveryExpectedGeneration = this.sessionRuntimeGeneration
+            ?? this.successorRuntime?.generation
+            ?? this.retiredRuntimeGeneration;
+        }
+        this.sseRecoveryPending = true;
+        this.reconnectAttempt.update((n) => n + 1);
+        const bindingInvalid = this.invalidBindingRuntime?.threadId === threadId;
+        const terminalReviewOnly = this.terminalControlThreadId === threadId;
+        this.connectionState.set(bindingInvalid ? 'error' : terminalReviewOnly ? 'disconnected' : 'connecting');
+        if (bindingInvalid) {
+          this.error.set(this.transloco.translate('errors.sessions.bindingInvalid'));
+        }
         if (es.readyState === EventSource.CLOSED) {
-          // Terminal — auth failure, thread gone, etc. The browser
-          // gave up. Don't bury the UI in a generic banner; let
-          // the threadStatus refresh below surface "ended" if
-          // that's what happened.
           this._stopSseWatchdog();
-          this.connectionState.set('error');
-          this.reconnectGaveUp.set(true);
-          this._refreshStatusAfterDrop(threadId, connectGeneration);
-        } else {
-          // CONNECTING — the browser is retrying. Show reconnecting.
-          const bindingInvalid = this.invalidBindingRuntime?.threadId === threadId;
-          this.connectionState.set(bindingInvalid ? 'error' : 'connecting');
-          if (bindingInvalid) {
-            this.error.set(this.transloco.translate('errors.sessions.bindingInvalid'));
-          }
-          this.reconnectAttempt.update((n) => n + 1);
+          this._dropControlWs();
+          es.close();
+          this.sse = null;
+          this._scheduleClosedSseRetry(threadId, connectGeneration);
         }
       });
     };
@@ -3418,15 +3436,20 @@ export class PersistentChatService {
       // (with replay-from-cursor) take over.
       this._stopSseWatchdog();
       this.zone.run(() => {
+        this.sseRecoveryExpectedGeneration = this.sessionRuntimeGeneration
+          ?? this.successorRuntime?.generation
+          ?? this.retiredRuntimeGeneration;
+        this.sseRecoveryPending = true;
         if (this.sse) {
           this.sse.close();
           this.sse = null;
         }
+        this._dropControlWs();
         this.connectionState.set(
           this.invalidBindingRuntime?.threadId === threadId ? 'error' : 'connecting',
         );
         this.reconnectAttempt.update((n) => n + 1);
-        void this._openSse(threadId);
+        this._scheduleClosedSseRetry(threadId, generation);
       });
     }, SSE_WATCHDOG_INTERVAL_MS);
   }
@@ -3463,6 +3486,12 @@ export class PersistentChatService {
       this.sse.readyState !== EventSource.OPEN ||
       Date.now() - this.sseLastEventAt > SSE_WATCHDOG_TIMEOUT_MS;
     if (sseStale) {
+      if (this.sseRecoveryPending && !this.sse) {
+        if (this.sseRetryTimer) clearTimeout(this.sseRetryTimer);
+        this.sseRetryTimer = null;
+        void this._retryClosedSse(tid, this.connectGeneration);
+        return;
+      }
       // A dead WS is retired now, so nothing is written into it while the
       // stream reconnects; the reopen's onopen then re-ensures it (Change 2).
       if (!terminalControl && (force || this._controlWsSilent())) this._dropControlWs();
@@ -3680,23 +3709,164 @@ export class PersistentChatService {
     void this.cache.setThreadCursor(threadId, epoch, seq);
   }
 
-  /**
-   * After SSE drops to CLOSED, the agent may have flipped this thread to
-   * `ended` (idle archive, /done from another client). Re-fetch meta so the
-   * UI swaps to the resume card instead of stuck on "connection error".
-   */
-  private _refreshStatusAfterDrop(threadId: string, generation: number): void {
-    setTimeout(async () => {
-      if (!this._isCurrentConnect(threadId, generation)) return;
-      await this.loadThreadMeta(threadId, generation);
-      if (
-        this._isCurrentConnect(threadId, generation) &&
-        this.terminalControlThreadId === threadId &&
-        (!this.sse || this.sse.readyState === EventSource.CLOSED)
-      ) {
-        this.reconnectNow();
+  /** A closed EventSource will not retry itself. Keep one bounded owner probe
+   *  in flight and reopen only after authoritative metadata is readable. */
+  private _scheduleClosedSseRetry(threadId: string, generation: number): void {
+    if (this.intentionalClose || this.sseRecoveryHalted || !this._isCurrentConnect(threadId, generation) ||
+        this.sseRetryTimer || this.sseRetryProbeInFlight) return;
+    this.sseRetryTimer = setTimeout(() => {
+      this.sseRetryTimer = null;
+      void this._retryClosedSse(threadId, generation);
+    }, sseRetryDelayMs(this.sseRetryAttempt++));
+  }
+
+  private async _probeRecoveredOwner(threadId: string, generation: number): Promise<
+    { detail: any; failure: null } | { detail: null; failure: 'auth' | 'gone' | 'retry' }
+  > {
+    try {
+      await firstValueFrom(this.http.get<any>(
+        `${environment.apiUrl}/persistent/threads/${threadId}`,
+      ).pipe(timeout({ first: THREAD_META_RESPONSE_TIMEOUT_MS })));
+      if (!this._isCurrentConnect(threadId, generation) || this.intentionalClose) {
+        return { detail: null, failure: 'retry' };
       }
-    }, 1500);
+      // The typed probe classifies HTTP failures. The canonical reader also
+      // applies End/pending state, under its existing generation guards.
+      const observation = await this.loadThreadMeta(threadId, generation, {
+        fresh: true,
+      });
+      if (!observation || !['created', 'active', 'awaiting_user', 'ending', 'ended', 'suspended']
+          .includes(String(observation.status))) return { detail: null, failure: 'retry' };
+      if (observation.runtime_retirement_pending !== true &&
+          ['created', 'active', 'awaiting_user'].includes(String(observation.status)) &&
+          !this._canonicalRuntimeGeneration(observation.session_runtime_generation)) {
+        return { detail: null, failure: 'retry' };
+      }
+      return { detail: observation, failure: null };
+    } catch (error) {
+      return { detail: null, failure: classifySseProbeFailure(error) };
+    }
+  }
+
+  private _stopClosedSseRecovery(): void {
+    if (this.sseRetryTimer) clearTimeout(this.sseRetryTimer);
+    this.sseRetryTimer = null;
+    this.sseRetryAttempt = 0;
+    this.sseRecoveryHalted = false;
+    this.sseRetryProbeInFlight = null;
+    this.sseRecoveryPending = false;
+    this.sseRecoveryExpectedGeneration = null;
+  }
+
+  private async _acceptRecoveredSuccessor(
+    threadId: string, generation: number, detail: any,
+  ): Promise<boolean> {
+    const runtime = this._canonicalRuntimeGeneration(detail.session_runtime_generation);
+    if (!runtime || detail.runtime_retirement_pending !== false ||
+        !['created', 'active', 'awaiting_user'].includes(String(detail.status))) return false;
+    if (await this._reconcileExternalResume(threadId)) return true;
+    if (!this._isCurrentConnect(threadId, generation) || this.intentionalClose ||
+        this.terminalControlThreadId === threadId || this.endRequest?.threadId === threadId) return false;
+    this.successorRuntime = { threadId, generation: runtime };
+    await this.connect(threadId, { preserveReviewPlane: true });
+    return true;
+  }
+
+  private async _retryClosedSse(threadId: string, generation: number): Promise<void> {
+    if (this.intentionalClose || this.sseRecoveryHalted || !this._isCurrentConnect(threadId, generation) ||
+        this.sse || this.sseRetryProbeInFlight) return;
+    const probe = { generation };
+    this.sseRetryProbeInFlight = probe;
+    const result = await this._probeRecoveredOwner(threadId, generation);
+    if (this.sseRetryProbeInFlight === probe) this.sseRetryProbeInFlight = null;
+    if (this.intentionalClose || !this._isCurrentConnect(threadId, generation) || this.sse) return;
+    if (result.failure === 'auth' || result.failure === 'gone') {
+      this.sseRecoveryHalted = true;
+      this.reconnectGaveUp.set(true);
+      this.connectionState.set('error');
+      return;
+    }
+    if (result.failure) {
+      this._scheduleClosedSseRetry(threadId, generation);
+      return;
+    }
+    const detail = result.detail;
+    const runtime = this._canonicalRuntimeGeneration(detail.session_runtime_generation);
+    if (!this.sseRecoveryExpectedGeneration && runtime) this.sseRecoveryExpectedGeneration = runtime;
+    const expected = this.sseRecoveryExpectedGeneration;
+    const reviewOnly = detail.runtime_retirement_pending === true ||
+      ['ending', 'ended', 'suspended'].includes(String(detail.status));
+    if (expected && !runtime && !reviewOnly) {
+      this._scheduleClosedSseRetry(threadId, generation);
+      return;
+    }
+    if (expected && runtime !== expected && !reviewOnly) {
+      if (await this._acceptRecoveredSuccessor(threadId, generation, detail)) return;
+      this._scheduleClosedSseRetry(threadId, generation);
+      return;
+    }
+    if (this.endRequest?.threadId === threadId) {
+      this._scheduleClosedSseRetry(threadId, generation);
+      return;
+    }
+    await this._openSse(threadId);
+  }
+
+  /** An SSE handshake is not proof of owner access or the current runtime.
+   *  Verify both before restoring Connected and its control transport. */
+  private async _verifyRecoveredSse(
+    threadId: string, generation: number, es: EventSource,
+  ): Promise<void> {
+    if (this.sse !== es || !this._isCurrentConnect(threadId, generation)) return;
+    if (this.sseRetryProbeInFlight) return;
+    const probe = { generation };
+    this.sseRetryProbeInFlight = probe;
+    const result = await this._probeRecoveredOwner(threadId, generation);
+    if (this.sseRetryProbeInFlight === probe) this.sseRetryProbeInFlight = null;
+    if (this.sse !== es || !this._isCurrentConnect(threadId, generation) || this.intentionalClose) {
+      if (!this.intentionalClose && this._isCurrentConnect(threadId, generation) && !this.sse) {
+        this._scheduleClosedSseRetry(threadId, generation);
+      }
+      return;
+    }
+    if (es.readyState !== EventSource.OPEN) return;
+    const runtime = this._canonicalRuntimeGeneration(result.detail?.session_runtime_generation);
+    const expected = this.sseRecoveryExpectedGeneration;
+    const reviewOnly = result.detail?.runtime_retirement_pending === true ||
+      ['ending', 'ended', 'suspended'].includes(String(result.detail?.status));
+    if (this.endRequest?.threadId === threadId || result.failure ||
+        (expected && runtime !== expected && !reviewOnly)) {
+      es.close();
+      this.sse = null;
+      if (result.failure === 'auth' || result.failure === 'gone') {
+        this.sseRecoveryHalted = true;
+        this.reconnectGaveUp.set(true);
+        this.connectionState.set('error');
+      } else {
+        if (!expected || runtime === expected || !result.detail ||
+            !(await this._acceptRecoveredSuccessor(threadId, generation, result.detail))) {
+          this._scheduleClosedSseRetry(threadId, generation);
+        }
+      }
+      return;
+    }
+    this._stopClosedSseRecovery();
+    const terminal = this.terminalControlThreadId === threadId ||
+      this.threadStatus() === 'ending' || this.threadStatus() === 'ended' ||
+      this.threadStatus() === 'suspended';
+    const bindingInvalid = this.invalidBindingRuntime?.threadId === threadId;
+    const bindingRecovering = this.bindingRecoveryRuntime?.threadId === threadId;
+    const successorUnverified = this.successorRuntime?.threadId === threadId &&
+      this.sessionRuntimeGeneration !== this.successorRuntime.generation;
+    this.zone.run(() => {
+      this.connectionState.set(bindingInvalid ? 'error' : terminal ? 'disconnected' :
+        bindingRecovering || successorUnverified ? 'connecting' : 'connected');
+      if (!bindingInvalid && !this.sessionSnapshotFailed) this.error.set(null);
+      this.reconnectAttempt.set(0);
+      this.reconnectGaveUp.set(false);
+      this._startSseWatchdog(threadId);
+      if (!terminal && !bindingInvalid) this._ensureControlWs();
+    });
   }
 
   // ── Control WS (slash commands + permission decisions) ───────────────
@@ -3912,9 +4082,15 @@ export class PersistentChatService {
       : null;
     // G2 is now the installed runtime; ordinary exact-generation binding
     // recovery must remain free to adopt a later G3 if this binding fails.
-    if (this.successorRuntime?.threadId === threadId &&
-        this.sessionRuntimeGeneration === this.successorRuntime.generation) {
+    const successorVerified = this.successorRuntime?.threadId === threadId &&
+      this.sessionRuntimeGeneration === this.successorRuntime.generation;
+    if (successorVerified) {
       this.successorRuntime = null;
+      if (this.sse?.readyState === EventSource.OPEN &&
+          this.terminalControlThreadId !== threadId &&
+          this.invalidBindingRuntime?.threadId !== threadId) {
+        this.connectionState.set('connected');
+      }
     }
     this.controlCapabilities.set(
       connection?.controls && typeof connection.controls === 'object'
@@ -4675,6 +4851,19 @@ export class PersistentChatService {
 
     this.reconnectGaveUp.set(false);
     this.reconnectAttempt.set(0);
+    this.sseRecoveryHalted = false;
+
+    if (this.sseRetryTimer) clearTimeout(this.sseRetryTimer);
+    this.sseRetryTimer = null;
+    if (this.sseRecoveryPending) {
+      if (this.sse) {
+        this.sse.close();
+        this.sse = null;
+      }
+      void this._retryClosedSse(tid, this.connectGeneration);
+      return;
+    }
+
     if (this.sse) {
       this.sse.close();
       this.sse = null;
@@ -4717,6 +4906,7 @@ export class PersistentChatService {
     // Invalidates cache/REST continuations from any in-flight connect even
     // when no transport has been installed yet.
     this.connectGeneration++;
+    this._stopClosedSseRecovery();
     // Let a newer thread claim control-WS opening immediately; the stale
     // async resolver observes its invalidated generation before install.
     this.controlWsOpeningGeneration++;
@@ -5352,13 +5542,19 @@ export class PersistentChatService {
     const lockKey = this.threadId();
     if (!lockKey) return; // nothing is flushable without a thread
     if (this.flushTokens.has(lockKey)) return;
+    if (this.sseRecoveryPending && this.sessionReady() && this.outbox().length > 0) {
+      this.outboxStalled.set(true);
+      return;
+    }
     const token = {};
     this.flushTokens.set(lockKey, token);
     try {
-      while (!this.intentionalClose && this.sessionReady() && this.outbox().length > 0) {
+      while (this._controlPlaneAllowed(lockKey) && this.sessionReady() && this.outbox().length > 0) {
         const head = this.outbox()[0];
         const tidAtPost = this.threadId();
         if (!tidAtPost) break;
+        const connectAtPost = this.connectGeneration;
+        const runtimeAtPost = this.sessionRuntimeGeneration;
         // Bump the attempt counter and, for a landing-draft item queued
         // before its thread existed (threadId ''), pin it to the thread
         // that now exists. Through the signal, never in place: the
@@ -5436,6 +5632,17 @@ export class PersistentChatService {
           this.outbox.update((q) =>
             q.map((i) => (i.localId === head.localId ? { ...i, content } : i)),
           );
+        }
+        // Upload may outlive a CLOSED stream, End, navigation or a successor
+        // connect. Keep the unaccepted item queued; no G1 send may slip into
+        // G2 while owner/stream/binding recovery is still unresolved.
+        if (!this.sessionReady() || !this._controlPlaneAllowed(tidAtPost) ||
+            this.connectGeneration !== connectAtPost ||
+            this.sessionRuntimeGeneration !== runtimeAtPost) {
+          if (this.threadId() === tidAtPost && this.outboxIds().has(item.localId)) {
+            this.outboxStalled.set(true);
+          }
+          return;
         }
         this.postingLocalIds.add(head.localId);
         let result: { ok: boolean; status: number; stale?: boolean };
@@ -5698,6 +5905,12 @@ export class PersistentChatService {
    */
   retryQueuedSends(): void {
     const threadId = this.threadId();
+    if (threadId && this.sseRecoveryPending) {
+      // A manual retry cannot prove the owner while a CLOSED journal is
+      // recovering. Keep Retry/Discard visible for the next user decision.
+      this.outboxStalled.set(true);
+      return;
+    }
     if (threadId && this.invalidBindingRuntime?.threadId === threadId) {
       // Exact authority rejected this generation. Keep the item queued, but
       // never turn a user click into another send or erase the actionable

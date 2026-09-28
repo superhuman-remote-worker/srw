@@ -3078,6 +3078,281 @@ describe('PersistentChatService — SSE error handling', () => {
     vi.clearAllMocks();
   });
 
+  it('recovers a live same-generation journal after CLOSED during a temporary API outage', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      let available = true;
+      ctx.mockHttp.get.mockImplementation((url: string) =>
+        url.endsWith('/api/persistent/threads/recover-live') && !available
+          ? throwError(() => ({ status: 503 }))
+          : activeSessionGet(url),
+      );
+      await ctx.service.connect('recover-live');
+      await vi.advanceTimersByTimeAsync(0);
+      const first = ctx.sseInstances[0];
+      fireSseOpen(first);
+      expect(ctx.service.connectionState()).toBe('connected');
+
+      available = false;
+      fireSseTerminalError(first);
+      expect(ctx.service.isConnected()).toBe(false);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(ctx.sseInstances).toHaveLength(1);
+
+      available = true;
+      await vi.advanceTimersByTimeAsync(35_000);
+      expect(ctx.sseInstances.length).toBeGreaterThan(1);
+      const recovered = ctx.sseInstances.at(-1)!;
+      fireSseOpen(recovered);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ctx.service.connectionState()).toBe('connected');
+      expect(first.close).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('recovers a CLOSED initial journal handshake without an earlier onopen', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      ctx.mockHttp.get.mockImplementation(activeSessionGet);
+      await ctx.service.connect('initial-handshake-closed');
+      const first = ctx.sseInstances[0];
+      fireSseTerminalError(first);
+      expect(ctx.service.isConnected()).toBe(false);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(ctx.sseInstances).toHaveLength(2);
+      fireSseOpen(ctx.sseInstances[1]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ctx.service.connectionState()).toBe('connected');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reopens terminal review after CLOSED even when owner metadata clears G', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      let ended = false;
+      ctx.mockHttp.get.mockImplementation((url: string) =>
+        activeSessionGet(url).pipe(map((row) =>
+          url.endsWith('/api/persistent/threads/terminal-null') && ended
+            ? { ...row, status: 'ended', session_runtime_generation: null }
+            : row)),
+      );
+      await ctx.service.connect('terminal-null');
+      fireSseOpen(ctx.sseInstances[0]);
+      const connectionReads = ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/sessions/terminal-null/connection')).length;
+      ended = true;
+      fireSseTerminalError(ctx.sseInstances[0]);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(ctx.sseInstances).toHaveLength(2);
+      fireSseOpen(ctx.sseInstances[1]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ctx.service.threadStatus()).toBe('ended');
+      expect(ctx.service.connectionState()).toBe('disconnected');
+      expect(ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/sessions/terminal-null/connection'))).toHaveLength(connectionReads);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps one timed owner probe in flight and retries after its timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      let hung = false;
+      ctx.mockHttp.get.mockImplementation((url: string) =>
+        hung && url.endsWith('/api/persistent/threads/probe-timeout')
+          ? NEVER : activeSessionGet(url),
+      );
+      await ctx.service.connect('probe-timeout');
+      const first = ctx.sseInstances[0];
+      fireSseOpen(first);
+      const initialReads = ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/persistent/threads/probe-timeout')).length;
+      hung = true;
+      fireSseTerminalError(first);
+      await vi.advanceTimersByTimeAsync(10_000);
+      const reads = ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/persistent/threads/probe-timeout'));
+      expect(reads).toHaveLength(initialReads + 1); // one unresolved probe
+      hung = false;
+      await vi.advanceTimersByTimeAsync(35_000);
+      expect(ctx.sseInstances.length).toBeGreaterThan(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a recovered successor connecting until its exact binding is verified', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      const generationB = '66666666-6666-4666-8666-666666666666';
+      const binding = new Subject<any>();
+      let runtime = SESSION_RUNTIME_GENERATION;
+      ctx.mockHttp.get.mockImplementation((url: string) =>
+        url.endsWith('/connection') && runtime === generationB
+          ? binding.asObservable()
+          : activeSessionGet(url).pipe(map((row) => ({
+              ...row, session_runtime_generation: runtime, runtime_retirement_pending: false,
+            }))),
+      );
+      await ctx.service.connect('successor-after-close');
+      fireSseOpen(ctx.sseInstances[0]);
+      runtime = generationB;
+      fireSseTerminalError(ctx.sseInstances[0]);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(ctx.sseInstances.length).toBe(2);
+      fireSseOpen(ctx.sseInstances[1]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ctx.service.connectionState()).toBe('connecting');
+      binding.next({
+        state: 'ready', control_socket: 'none', pinned_runtime_generation_contract: 1,
+        session_runtime_generation: generationB,
+      });
+      binding.complete();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ctx.service.connectionState()).toBe('connected');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels CLOSED recovery when the view disconnects', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      ctx.mockHttp.get.mockImplementation((url: string) => activeSessionGet(url));
+      await ctx.service.connect('closed-navigate');
+      fireSseOpen(ctx.sseInstances[0]);
+      fireSseTerminalError(ctx.sseInstances[0]);
+      ctx.service.disconnect();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(ctx.sseInstances).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not grant live controls when first-connect recovery lacks a canonical runtime', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      ctx.mockHttp.get.mockImplementation(() =>
+        of({ status: 'active', total_turns: 0, messages: [], total: 0 }),
+      );
+      await ctx.service.connect('missing-recovery-generation');
+      fireSseOpen(ctx.sseInstances[0]);
+      fireSseTerminalError(ctx.sseInstances[0]);
+      await vi.advanceTimersByTimeAsync(35_000);
+      expect(ctx.sseInstances).toHaveLength(1);
+      expect(ctx.service.connectionState()).toBe('connecting');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shares one owner probe when a reopened stream closes during onopen verification', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      const held = new Subject<any>();
+      let hold = false;
+      ctx.mockHttp.get.mockImplementation((url: string) =>
+        hold && url.endsWith('/api/persistent/threads/verify-race')
+          ? held.asObservable() : activeSessionGet(url),
+      );
+      await ctx.service.connect('verify-race');
+      fireSseOpen(ctx.sseInstances[0]);
+      fireSseTerminalError(ctx.sseInstances[0]);
+      await vi.advanceTimersByTimeAsync(2_000);
+      const reopened = ctx.sseInstances[1];
+      expect(reopened).toBeDefined();
+      hold = true;
+      fireSseOpen(reopened);
+      fireSseTerminalError(reopened);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(ctx.sseInstances).toHaveLength(2);
+      hold = false;
+      held.next({ status: 'active' });
+      held.complete();
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(ctx.sseInstances).toHaveLength(3);
+      expect(ctx.service.connectionState()).toBe('connecting');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps an uploaded queued send unsent when CLOSED begins before its POST', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      ctx.mockHttp.get.mockImplementation(activeSessionGet);
+      await ctx.service.connect('upload-during-gap');
+      fireSseOpen(ctx.sseInstances[0]);
+      let releaseUpload!: (result: { ok: boolean; status: number }) => void;
+      const upload = new Promise<{ ok: boolean; status: number }>((resolve) => {
+        releaseUpload = resolve;
+      });
+      vi.spyOn(ctx.service as any, '_uploadStage').mockReturnValue(upload);
+      ctx.service.outbox.set([{
+        localId: 'queued-upload', displayContent: 'send after recovery',
+        threadId: 'upload-during-gap', attempts: 0,
+        pendingFiles: [{ id: 'file-1', status: 'queued' } as any],
+      }]);
+      const flush = (ctx.service as any)._flushOutbox();
+      fireSseTerminalError(ctx.sseInstances[0]);
+      releaseUpload({ ok: true, status: 200 });
+      await flush;
+      expect(ctx.mockHttp.post.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/persistent/threads/upload-during-gap/input'))).toHaveLength(0);
+      expect(ctx.service.outbox().map((item) => item.localId)).toEqual(['queued-upload']);
+      expect(ctx.service.outboxStalled()).toBe(true);
+      await (ctx.service as any)._flushOutbox();
+      expect(ctx.mockHttp.post.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/api/persistent/threads/upload-during-gap/input'))).toHaveLength(0);
+      ctx.service.retryQueuedSends();
+      expect(ctx.service.outboxStalled()).toBe(true);
+      ctx.service.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps binding recovery unverified when the journal reopens before /connection', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      let holdBinding = false;
+      ctx.mockHttp.get.mockImplementation((url: string) =>
+        holdBinding && url.endsWith('/connection') ? NEVER : activeSessionGet(url),
+      );
+      await ctx.service.connect('binding-recovery-gap');
+      fireSseOpen(ctx.sseInstances[0]);
+      fireSseTerminalError(ctx.sseInstances[0]);
+      await vi.advanceTimersByTimeAsync(2_000);
+      holdBinding = true;
+      (ctx.service as any).bindingRecoveryRuntime = {
+        threadId: 'binding-recovery-gap',
+        rejectedGeneration: SESSION_RUNTIME_GENERATION,
+        candidateGeneration: '66666666-6666-4666-8666-666666666666',
+      };
+      fireSseOpen(ctx.sseInstances[1]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ctx.service.connectionState()).toBe('connecting');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('bumps reconnectAttempt on transient onerror (browser retrying)', async () => {
     const ctx = createService();
     ctx.mockHttp.get.mockImplementation(() =>
@@ -3096,30 +3371,47 @@ describe('PersistentChatService — SSE error handling', () => {
     expect(ctx.service.reconnectAttempt()).toBe(2);
   });
 
-  it('sets reconnectGaveUp + error state on terminal CLOSED', async () => {
-    const ctx = createService();
-    ctx.mockHttp.get.mockImplementation(() =>
-      of({ status: 'active', total_turns: 0, messages: [], total: 0 }),
-    );
-    await ctx.service.connect('thread-term');
-    const es = ctx.sseInstances[0];
-    fireSseOpen(es);
+  it.each([401, 404])('stops automatic CLOSED recovery after an authoritative %i, even on wake', async (status) => {
+    vi.useFakeTimers();
+    try {
+      const ctx = createService();
+      let denied = false;
+      ctx.mockHttp.get.mockImplementation((url: string) =>
+        denied && url.endsWith('/api/persistent/threads/thread-term')
+          ? throwError(() => ({ status }))
+          : activeSessionGet(url),
+      );
+      await ctx.service.connect('thread-term');
+      const es = ctx.sseInstances[0];
+      fireSseOpen(es);
 
-    fireSseTerminalError(es);
-    expect(ctx.service.connectionState()).toBe('error');
-    expect(ctx.service.reconnectGaveUp()).toBe(true);
+      denied = true;
+      fireSseTerminalError(es);
+      expect(ctx.service.connectionState()).toBe('connecting');
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(ctx.service.connectionState()).toBe('error');
+      expect(ctx.service.reconnectGaveUp()).toBe(true);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(ctx.sseInstances).toHaveLength(1);
+      const reads = ctx.mockHttp.get.mock.calls.length;
+      window.dispatchEvent(new Event('online'));
+      window.dispatchEvent(new Event('focus'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ctx.mockHttp.get.mock.calls).toHaveLength(reads);
+      expect(ctx.sseInstances).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('reconnectNow() drops the existing SSE and opens a fresh one', async () => {
     const ctx = createService();
-    ctx.mockHttp.get.mockImplementation(() =>
-      of({ status: 'active', total_turns: 0, messages: [], total: 0 }),
-    );
+    ctx.mockHttp.get.mockImplementation(activeSessionGet);
     await ctx.service.connect('thread-rn');
     const first = ctx.sseInstances[0];
     fireSseOpen(first);
     fireSseTerminalError(first);
-    expect(ctx.service.reconnectGaveUp()).toBe(true);
+    expect(ctx.service.connectionState()).toBe('connecting');
 
     ctx.service.reconnectNow();
     // _openSse awaits cache.getThreadCursor — drain microtasks.
@@ -3128,6 +3420,8 @@ describe('PersistentChatService — SSE error handling', () => {
     expect(first.close).toHaveBeenCalled();
     expect(ctx.sseInstances.length).toBe(2);
     expect(ctx.service.reconnectGaveUp()).toBe(false);
+    fireSseOpen(ctx.sseInstances[1]);
+    await new Promise((r) => setTimeout(r, 0));
     expect(ctx.service.reconnectAttempt()).toBe(0);
   });
 });
@@ -3151,9 +3445,7 @@ describe('PersistentChatService — SSE liveness watchdog', () => {
 
   it('force-reopens the SSE when no event arrives for > 45s', async () => {
     const ctx = createService();
-    ctx.mockHttp.get.mockImplementation(() =>
-      of({ status: 'active', total_turns: 0, messages: [], total: 0 }),
-    );
+    ctx.mockHttp.get.mockImplementation(activeSessionGet);
     await ctx.service.connect('thread-wd');
     // Drain the _openSse microtask chain (await getThreadCursor) so the
     // first EventSource has been constructed.
@@ -3163,8 +3455,9 @@ describe('PersistentChatService — SSE liveness watchdog', () => {
     fireSseOpen(first);
     expect(ctx.sseInstances.length).toBe(1);
 
-    // 50s of silence — past the 45s watchdog threshold.
-    await vi.advanceTimersByTimeAsync(50_000);
+    // 52s of silence — past the 45s watchdog threshold and first bounded
+    // owner probe before the replacement stream opens.
+    await vi.advanceTimersByTimeAsync(52_000);
 
     expect(first.close).toHaveBeenCalled();
     expect(ctx.sseInstances.length).toBe(2);
@@ -3229,7 +3522,7 @@ describe('PersistentChatService — SSE liveness watchdog', () => {
     expect(ctx.sseInstances.length).toBe(1);
   });
 
-  it('does not start a watchdog on terminal CLOSED', async () => {
+  it('does not leave the old watchdog running after terminal CLOSED', async () => {
     const ctx = createService();
     ctx.mockHttp.get.mockImplementation(() =>
       of({ status: 'active', total_turns: 0, messages: [], total: 0 }),
@@ -3240,11 +3533,11 @@ describe('PersistentChatService — SSE liveness watchdog', () => {
     const first = ctx.sseInstances[0];
     fireSseOpen(first);
     fireSseTerminalError(first);
-    expect(ctx.service.reconnectGaveUp()).toBe(true);
-
-    // After terminal close, no further reopens should happen no matter
-    // how much time passes.
-    await vi.advanceTimersByTimeAsync(120_000);
+    // The recovery timer may probe/reopen, but the old 5s watchdog must not
+    // read metadata before that timer fires.
+    const reads = ctx.mockHttp.get.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(500);
+    expect(ctx.mockHttp.get.mock.calls.length).toBe(reads);
     expect(ctx.sseInstances.length).toBe(1);
   });
 });
@@ -6477,6 +6770,11 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
       );
       ctx.mockHttp.get.mockImplementation(
         connectGetMock({
+          threadMeta: {
+            status: 'active', total_turns: 0,
+            session_runtime_generation: SESSION_RUNTIME_GENERATION,
+            runtime_retirement_pending: false,
+          },
           connectionResponses: [
             throwError(() => ({
               status: 409,
@@ -6527,7 +6825,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
       expect(ctx.service.connectionState()).toBe('error');
       expect(ctx.service.error()).toBe('errors.sessions.bindingInvalid');
 
-      await vi.advanceTimersByTimeAsync(50_000);
+      await vi.advanceTimersByTimeAsync(52_000);
       const watchdogSse = ctx.sseInstances.at(-1)!;
       expect(watchdogSse).not.toBe(manualSse);
       fireSseOpen(watchdogSse);
@@ -7870,7 +8168,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
       await flushMicrotasks();
 
       expect(ctx.service.threadStatus()).toBe('ended');
-      expect(ctx.wsInstances[0].close).toHaveBeenCalledWith(1000);
+      expect(ctx.wsInstances[0].close).toHaveBeenCalledWith(4002, 'heartbeat timeout');
       expect(ctx.sseInstances.length).toBeGreaterThanOrEqual(2);
       expect(ctx.service.cloudChangesCount()).toBe(1);
       const connectionCalls = ctx.mockHttp.get.mock.calls.filter((call: any[]) =>
@@ -10349,8 +10647,9 @@ describe('PersistentChatService — waking from sleep with silently dead transpo
     await vi.advanceTimersByTimeAsync(5_000);
 
     expect(ctx.sseInstances[0].close).toHaveBeenCalled();
-    expect(ctx.sseInstances).toHaveLength(2);
     expect(ctx.service.connectionState()).toBe('connecting');
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(ctx.sseInstances).toHaveLength(2);
   });
 
   it('a wake event retires the dead control WS too, instead of trusting its OPEN readyState', async () => {

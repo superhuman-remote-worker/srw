@@ -321,6 +321,22 @@ export function isStartupBannerVisible(isStartingSession: boolean, turnCount: nu
     return isStartingSession && turnCount > 0;
 }
 
+/** Keep manual recovery visible after a stream fails, even for a newly
+ *  created thread with no completed turn yet. End and startup own their
+ *  separate controls. */
+export function shouldShowReconnectBanner(
+    connection: 'disconnected' | 'connecting' | 'connected' | 'error',
+    status: string | null,
+    sessionReady: boolean,
+    retryAttempt: number,
+    turnCount: number,
+): boolean {
+    return sessionReady
+        && ['created', 'active', 'awaiting_user'].includes(status ?? '')
+        && connection !== 'connected'
+        && (retryAttempt > 0 || (connection === 'disconnected' && status === 'active' && turnCount > 0));
+}
+
 /** Queued-turn bubble escalation: NN/g's 10 s attention limit, then an
  *  elapsed counter from 60 s. Time-based only — never a queue position. */
 export const QUEUE_BUSY_AFTER_MS = 10_000;
@@ -3225,12 +3241,13 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         return this.transloco.translate(key);
     });
 
-    readonly isShowingReconnectBanner = computed(() =>
-        this.chat.connectionState() === 'disconnected'
-        && this.chat.threadStatus() === 'active'
-        && this.chat.sessionReady()
-        && this.chat.turns().length > 0,
-    );
+    readonly isShowingReconnectBanner = computed(() => shouldShowReconnectBanner(
+        this.chat.connectionState(),
+        this.chat.threadStatus(),
+        this.chat.sessionReady(),
+        this.chat.reconnectAttempt(),
+        this.chat.turns().length,
+    ));
 
     readonly scrolledAway = signal(false);
     readonly newMessageCount = signal(0);
