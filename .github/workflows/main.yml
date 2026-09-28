@@ -341,7 +341,7 @@ jobs:
         #   convert_config). Same threat model — we don't convert or load attacker-
         #   supplied checkpoints, and no fix versions are listed upstream.
         run: >-
-          pip-audit --desc
+          python scripts/retry_pip_audit.py -- pip-audit --desc
           --ignore-vuln CVE-2026-4539
           --ignore-vuln CVE-2026-25645
           --ignore-vuln CVE-2026-3219
