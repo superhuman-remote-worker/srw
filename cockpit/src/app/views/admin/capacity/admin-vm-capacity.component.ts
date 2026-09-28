@@ -67,6 +67,29 @@ const HELD_ROWS = ['unbound', 'bound_reserved', 'active', 'warm', 'teardown', 't
             </div>
           </div>
 
+          @if (cluster.admission_budget; as budget) {
+            <h4>{{ 'admin.capacity.vm.budget' | transloco }}</h4>
+            <p class="subtle">{{ 'admin.capacity.vm.budgetDescription' | transloco }}</p>
+            <div class="table-wrap">
+              <table class="app-table" data-testid="vm-budget-table">
+                <thead><tr><th scope="col">{{ 'admin.capacity.vm.categoryHeading' | transloco }}</th><th scope="col">CPU <span class="unit">(m)</span></th><th scope="col">{{ 'admin.capacity.vm.memory' | transloco }} <span class="unit">(B)</span></th><th scope="col">{{ 'admin.capacity.vm.storage' | transloco }} <span class="unit">(B)</span></th><th scope="col">KVM</th><th scope="col">TUN</th><th scope="col">vhost-net</th></tr></thead>
+                <tbody>
+                  <tr><th scope="row">{{ 'admin.capacity.vm.budgetInstallation' | transloco }}</th>
+                    <td>{{ known(budget.installation.cpu_millicores) }}</td><td>{{ known(budget.installation.memory_bytes) }}</td><td>{{ known(budget.installation.ephemeral_storage_bytes) }}</td><td>{{ known(budget.installation.kvm_devices) }}</td><td>{{ known(budget.installation.tun_devices) }}</td><td>{{ known(budget.installation.vhost_net_devices) }}</td>
+                  </tr>
+                  <tr><th scope="row">{{ 'admin.capacity.vm.budgetPerOwner' | transloco }}</th>
+                    <td>{{ known(budget.per_owner.cpu_millicores) }}</td><td>{{ known(budget.per_owner.memory_bytes) }}</td><td>{{ known(budget.per_owner.ephemeral_storage_bytes) }}</td><td>{{ known(budget.per_owner.kvm_devices) }}</td><td>{{ known(budget.per_owner.tun_devices) }}</td><td>{{ known(budget.per_owner.vhost_net_devices) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="subtle">{{ 'admin.capacity.vm.cpuCost' | transloco: {
+              numerator: known(budget.cpu_cost.millicores_per_vcpu_numerator),
+              denominator: known(budget.cpu_cost.millicores_per_vcpu_denominator),
+              overhead: known(budget.cpu_cost.launcher_overhead_millicores)
+            } }}</p>
+          }
+
           <h4>{{ 'admin.capacity.vm.held' | transloco }}</h4>
           <p class="subtle">{{ 'admin.capacity.vm.heldDescription' | transloco }}</p>
           <div class="table-wrap">

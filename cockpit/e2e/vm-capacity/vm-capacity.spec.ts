@@ -52,6 +52,14 @@ function capacity(fresh = false) {
           request_fit_required: true, resources: totals}] : null,
         orphaned_held: fresh ? {count: 0, resources: zero} : null,
         pending_external: fresh ? zero : null,
+        admission_budget: {
+          installation: {...zero, cpu_millicores: 17250, memory_bytes: 30064771072,
+            ephemeral_storage_bytes: 10737418240, kvm_devices: 8, tun_devices: 8, vhost_net_devices: 8},
+          per_owner: {...zero, cpu_millicores: 8615, memory_bytes: 17179869184,
+            ephemeral_storage_bytes: 5368709120, kvm_devices: 4, tun_devices: 4, vhost_net_devices: 4},
+          cpu_cost: {millicores_per_vcpu_numerator: 1375,
+            millicores_per_vcpu_denominator: 4, launcher_overhead_millicores: 25},
+        },
         count_backstop: {observed: fresh ? 0 : null, maximum: null,
           reason: 'maximum_not_observed'},
       }]},
@@ -66,6 +74,8 @@ test('operator sees durable holds and unknown count without guessed availability
   await expect(vm).toBeVisible();
   await expect(vm.getByTestId('vm-held-table')).toContainText(info.project.name === 'phone-de' ? '2.000' : '2,000');
   await expect(vm.getByTestId('vm-held-table')).toContainText('–');
+  await expect(vm.getByTestId('vm-budget-table').locator('tbody tr')).toHaveCount(2);
+  await expect(vm.getByTestId('vm-budget-table')).toContainText(info.project.name === 'phone-de' ? '17.250' : '17,250');
   await expect(vm.getByTestId('vm-totals-table')).toHaveCount(0);
   await expect(vm).toContainText('– / –');
   expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBeLessThanOrEqual(1);
@@ -79,6 +89,7 @@ test('operator can inspect node accounting with keyboard and sees observed zero'
   await page.goto('/admin/capacity', {waitUntil: 'domcontentloaded'});
   const vm = page.getByTestId('vm-capacity');
   await expect(vm).toContainText('0 / –');
+  await expect(vm.getByTestId('vm-budget-table').locator('tbody tr')).toHaveCount(2);
   const summary = vm.locator('details summary');
   await summary.focus();
   await expect(summary).toBeFocused();

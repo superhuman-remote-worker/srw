@@ -1,13 +1,14 @@
 """Admin VM occupancy comes from one read-only durable snapshot."""
 
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import json
 from uuid import uuid4
 
 import pytest
 
-from orchestrator.services.vm_resource_capacity import vm_capacity_snapshot
+from orchestrator.services.vm_resource_capacity import _project, vm_capacity_snapshot
+from shared.vm_resource_policy import validate_enforcement_resource_policy
 from tests.test_vm_resource_whole_store_real_postgres import (
     db as _capacity_db,
     whole_schema,  # noqa: F401
@@ -20,6 +21,7 @@ from tests.test_vm_resource_whole_store_real_postgres import (
     waiter,  # noqa: F401
 )
 from tests.test_vm_resource_inventory_real_postgres import publish, successor
+from tests.test_vm_resource_policy import enforcement_policy
 
 db = _capacity_db
 
@@ -28,6 +30,21 @@ def cluster(result, inventory):
     return next(
         c for c in result["clusters"] if c["cluster_id"] == inventory.cluster_id
     )
+
+
+def test_legacy_policy_has_no_six_dimensional_budget_projection():
+    document = enforcement_policy()
+    parsed = validate_enforcement_resource_policy(document)
+    policy = {
+        "cluster_id": parsed.inventory.cluster_id,
+        "namespace": parsed.inventory.namespace,
+        "mode": "shadow",
+        "policy_digest": parsed.policy_digest,
+        "document": document,
+    }
+    value = _project(policy, None, [], [], datetime.now(timezone.utc))
+    assert value["admission_budget"] is None
+    assert value["reason"] == "inventory_missing"
 
 
 class LaterClock:
@@ -80,6 +97,13 @@ async def test_reserved_charge_and_external_demand_have_separate_vectors(db):
     assert cluster["totals"]["unbound"] == demand.to_six_dict()
     assert cluster["totals"]["external"] == dict.fromkeys(demand.to_six_dict(), 0)
     assert cluster["held"]["unbound"] == demand.to_six_dict()
+    assert cluster["admission_budget"]["installation"]["cpu_millicores"] == 805
+    assert cluster["admission_budget"]["per_owner"]["cpu_millicores"] == 805
+    assert cluster["admission_budget"]["cpu_cost"] == {
+        "millicores_per_vcpu_numerator": 1000,
+        "millicores_per_vcpu_denominator": 10,
+        "launcher_overhead_millicores": 5,
+    }
     assert cluster["count_backstop"]["maximum"] is None
     assert cluster["count_backstop"]["observed"] == 0
     assert await db.fetchval("SELECT count(*) FROM vm_resource_reservations") == before
@@ -103,6 +127,8 @@ async def test_stale_inventory_keeps_held_demand_when_policy_is_not_enforcing(db
     assert value["available"] is False and value["reason"] == "inventory_stale"
     assert value["totals"] is None and value["nodes"] is None
     assert value["held"]["unbound"] == demand.to_six_dict()
+    assert value["admission_budget"]["installation"]["memory_bytes"] == demand.memory_bytes
+    assert value["admission_budget"]["per_owner"]["cpu_millicores"] == 805
     assert value["count_backstop"]["observed"] is None
 
 

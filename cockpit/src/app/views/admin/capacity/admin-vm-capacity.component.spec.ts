@@ -38,6 +38,7 @@ function capacity(available = false): AdminVMCapacity {
       nodes: available ? [{name: 'worker-a', general_exclusion: null, request_fit_required: true, resources: totals}] : null,
       orphaned_held: available ? {count: 0, resources: zero} : null,
       pending_external: available ? zero : null,
+      admission_budget: null,
       count_backstop: {observed: available ? 0 : null, maximum: null, reason: 'maximum_not_observed'},
     }],
   };
@@ -79,5 +80,33 @@ describe('AdminVMCapacityComponent', () => {
     expect(host.querySelector('details summary')?.textContent).toContain('(1)');
     expect(host.textContent).toContain('worker-a');
     expect(host.textContent).not.toContain('ETA');
+  });
+
+  it('shows configured installation and per-owner budgets while node accounting is stale', () => {
+    const view = capacity();
+    view.clusters[0].admission_budget = {
+      installation: {...zero, cpu_millicores: 17250, memory_bytes: 30064771072,
+        ephemeral_storage_bytes: 10737418240, kvm_devices: 8, tun_devices: 8, vhost_net_devices: 8},
+      per_owner: {...zero, cpu_millicores: 8615, memory_bytes: 17179869184,
+        ephemeral_storage_bytes: 5368709120, kvm_devices: 4, tun_devices: 4, vhost_net_devices: 4},
+      cpu_cost: {millicores_per_vcpu_numerator: 1375,
+        millicores_per_vcpu_denominator: 4, launcher_overhead_millicores: 25},
+    };
+    const fixture = TestBed.createComponent(AdminVMCapacityComponent);
+    Object.defineProperty(fixture.componentInstance, 'vm', {value: signal(view)});
+    fixture.detectChanges();
+    const host = fixture.nativeElement as HTMLElement;
+    const table = host.querySelector('[data-testid="vm-budget-table"]');
+    expect(table?.querySelectorAll('tbody tr')).toHaveLength(2);
+    expect(table?.textContent).toContain('Installation');
+    expect(table?.textContent).toContain('Per owner');
+    expect(table?.textContent).toContain('17,250');
+    expect(table?.textContent).toContain('30,064,771,072');
+    expect(table?.textContent).toContain('10,737,418,240');
+    expect(table?.textContent).toContain('8,615');
+    expect(host.textContent).toContain('1,375');
+    expect(host.textContent).toContain('25m');
+    expect(host.querySelector('[data-testid="vm-totals-table"]')).toBeNull();
+    expect(host.textContent).toContain('– / –');
   });
 });
