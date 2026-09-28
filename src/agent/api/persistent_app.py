@@ -5245,7 +5245,9 @@ async def _terminate_session(
                     elif result != "actuator_requested" and _dedicated_pod_owes_exit(
                         reason, termination_thread_id, mark_thread=mark_thread
                     ):
-                        # A handed-off VM End is still pending; the Pod stays.
+                        # A dedicated Pod exits once it settled its own End.
+                        # An End handed to the VM retirement actuator is still
+                        # pending, so in either branch the Pod stays for it.
                         _schedule_exit(delay=1.0)
                     return result
                 except asyncio.CancelledError:

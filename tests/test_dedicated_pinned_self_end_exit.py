@@ -9,7 +9,8 @@ dedicated Pod (``--thread-id`` / ``SESSION_BOUND_THREAD_ID``) can serve no
 other thread, so once its bound thread has settled it must exit. Pool and dual
 Pods (no bound thread) must not: the pool owns their lifecycle. An unproven
 settlement must never exit either — the fenced process is the only local
-retry owner.
+retry owner — and neither may an End handed to the VM retirement actuator,
+which is still pending.
 
 See knowledge-base/knowledge/issues/agent_initiated_pinned_end_wedges_permanent_delete.md.
 """
@@ -162,6 +163,25 @@ async def test_watchdog_reasons_keep_exiting_exactly_once(reason, bound_thread):
     exit_fn = await _terminate(reason, bound_thread=bound_thread)
 
     exit_fn.assert_called_once_with(delay=1.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bound_thread", [THREAD, None])
+@pytest.mark.parametrize("reason", SELF_END_REASONS + WATCHDOG_REASONS)
+async def test_pending_vm_actuator_handoff_never_exits(reason, bound_thread):
+    """A VM End handed to the retirement actuator has not settled yet.
+
+    Neither the dedicated self-End exit nor a watchdog's exit may run: the
+    Pod stays until the actuator settles the End it was handed.
+    """
+
+    inner = AsyncMock(return_value="actuator_requested")
+    with _attached_runtime(inner=inner, bound_thread=bound_thread) as exit_fn:
+        result = await pa._terminate_session(reason)
+
+    assert result == "actuator_requested"
+    inner.assert_awaited_once()
+    exit_fn.assert_not_called()
 
 
 @pytest.mark.asyncio
