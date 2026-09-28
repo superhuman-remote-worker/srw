@@ -1825,6 +1825,10 @@ class IdeSessionService:
                     process.stdin.write(secret)
                     await process.stdin.drain()
                     process.stdin.close()
+                    # drain() only waits for backpressure; uvloop can retain
+                    # this bytearray until its queued write is flushed. Wait
+                    # for stdin closure before erasing the same buffer.
+                    await process.stdin.wait_closed()
                     secret[:] = b"\x00" * len(secret)
                     exit_code = await process.wait()
                     if exit_code != 0:

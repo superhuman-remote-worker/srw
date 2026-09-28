@@ -570,6 +570,7 @@ async def test_repository_key_ssh_is_killed_and_reaped_on_lease_cancellation(
     process = MagicMock(returncode=None)
     process.stdin = MagicMock()
     process.stdin.drain = AsyncMock(return_value=None)
+    process.stdin.wait_closed = AsyncMock(return_value=None)
     started = asyncio.Event()
     blocker = asyncio.Event()
 
@@ -592,7 +593,7 @@ async def test_repository_key_ssh_is_killed_and_reaped_on_lease_cancellation(
         new=AsyncMock(return_value=process),
     ):
         task = asyncio.create_task(svc._run_secret_stdin_process(["ssh"], secret))
-        await started.wait()
+        await asyncio.wait_for(started.wait(), timeout=2)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

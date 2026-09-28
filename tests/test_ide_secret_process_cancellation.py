@@ -17,6 +17,28 @@ from shared.runtime.core.managed_repository import (
 )
 
 
+@pytest.mark.parametrize("loop_backend", ["asyncio", "uvloop"])
+def test_secret_stdin_reaches_child_before_buffer_erasure(loop_backend):
+    loop_factory = (
+        asyncio.new_event_loop
+        if loop_backend == "asyncio"
+        else pytest.importorskip("uvloop").new_event_loop
+    )
+    secret = bytearray(b"disposable-stdin-canary\n")
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; raise SystemExit(0 if sys.stdin.buffer.read() == "
+        "b'disposable-stdin-canary\\n' else 65)",
+    ]
+    with asyncio.Runner(loop_factory=loop_factory) as runner:
+        received = runner.run(
+            IdeSessionService._run_secret_stdin_process(command, secret)
+        )
+    assert secret == bytearray(len(secret))
+    assert received, "mutable stdin buffer was erased before the child received it"
+
+
 @pytest.mark.asyncio
 async def test_failed_secret_process_reports_only_fixed_phase_and_exit_code(caplog):
     secret_text = "stdin-private-key-canary"
@@ -122,7 +144,7 @@ async def test_secret_stdin_write_failure_is_not_misreported_as_spawn(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("phase", ["spawn", "drain", "wait"])
+@pytest.mark.parametrize("phase", ["spawn", "drain", "close", "wait"])
 async def test_secret_process_cancellation_joins_child_and_erases_key(
     monkeypatch, tmp_path, phase
 ):
@@ -164,6 +186,13 @@ async def test_secret_process_cancellation_joins_child_and_erases_key(
                 await drain()
 
             monkeypatch.setattr(child.stdin, "drain", observed_drain)
+        elif phase == "close":
+
+            async def delayed_close():
+                reached.set()
+                await asyncio.Event().wait()
+
+            monkeypatch.setattr(child.stdin, "wait_closed", delayed_close)
         return child
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
