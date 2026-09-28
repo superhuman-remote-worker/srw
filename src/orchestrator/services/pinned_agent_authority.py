@@ -451,11 +451,15 @@ async def reconcile_pinned_warm_binding_protections(
         if status == "protected" and not await begin_release(protection_id):
             unresolved += 1
             continue
-        if status == "releasing" and row.get("deleted_owner_release"):
-            # Older writers could leave an ordinary release at a deleted
-            # owner. Its state alone grants no terminal-only Pod proof.
-            unresolved += 1
-            continue
+        # R3.2's unpublished writer (superseded by 0301) left an ordinary
+        # release at an owner deleted under this life's exact permanent
+        # receipt when its follow-up release failed. That state alone grants
+        # no Pod proof and cannot become terminal_release, so it settles only
+        # through the terminal-only release: the exact Pod must be terminal or
+        # absent, and it never returns to the pool.
+        deleted_owner_releasing = status == "releasing" and bool(
+            row.get("deleted_owner_release")
+        )
         if status == "terminal_release" and (
             not row.get("deleted_owner_release")
             or begin_deleted_release is None
@@ -465,10 +469,16 @@ async def reconcile_pinned_warm_binding_protections(
             continue
         release_result = (
             await release(row, terminal_only=True)
-            if status == "terminal_release"
+            if status == "terminal_release" or deleted_owner_releasing
             else await release(row)
         )
         if not isinstance(release_result, dict):
+            unresolved += 1
+            continue
+        if deleted_owner_releasing and (
+            release_result.get("outcome") != "exact_absent_v1"
+            or release_result.get("agent_present")
+        ):
             unresolved += 1
             continue
         if await complete_release(
