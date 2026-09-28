@@ -19,6 +19,14 @@ life records its exact Pod, an incomplete shape still records nothing, a
 permanent Delete retires exactly the Pods the records prove, and a live warm
 life's permanent Delete settles its protection record.
 
+The local k3d development database took a third path. It applied these two
+files, successfully, as ``0286_capture_claimless_retired_agent_pod.sql`` and
+``0287_permanent_retirement_releases_warm_protection.sql`` (source 131dd22ee)
+before upstream published its own 0286-0300. That exact 281-row history is
+rebuilt here from the published bytes under their historical names, as an
+ordinary (non-superuser) owner on PostgreSQL 15 like the deployed server, with
+retirement records written both before and while the historical pair ran.
+
 See knowledge-base/knowledge/features/codebase_restructure_r32_acceptance_followup_2026_09_26.md.
 """
 
@@ -26,6 +34,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from types import SimpleNamespace as NS
 from uuid import uuid4
 
 import asyncpg
@@ -48,6 +57,115 @@ WARM_RELEASE_MIGRATION = "0302_permanent_retirement_releases_warm_protection.sql
 LOCAL_MIGRATIONS = {CAPTURE_MIGRATION, WARM_RELEASE_MIGRATION}
 UPSTREAM_HEAD = "0300_ide_restore_zero_effect_cancellation.sql"
 NAMESPACE = self_end.NAMESPACE
+
+# The deployed local history: 131dd22ee's app chain, exactly as the k3d
+# database recorded it (read-only inspection, 2026-09-28): 281 successful rows
+# ending with the pair under its historical names and these checksums.
+DEPLOYED_HISTORY_THROUGH = "0285"
+DEPLOYED_PAIR = {
+    "0286_capture_claimless_retired_agent_pod.sql": (
+        CAPTURE_MIGRATION,
+        "a2d08b52d9197d52e43da0859bf328be91c16fbb94feea31c1cdf2e1694bac2e",
+    ),
+    "0287_permanent_retirement_releases_warm_protection.sql": (
+        WARM_RELEASE_MIGRATION,
+        "c8df370587940ecebc93c0c53a4ff48e29e1d761018fb5b78e318321f2be6d8f",
+    ),
+}
+DEPLOYED_LEDGER_ROWS = 281
+PAIR_FUNCTIONS = (
+    "capture_retired_pinned_agent_pod",
+    "validate_thread_agent_warm_binding_protection",
+)
+LEDGER_QUERY = "SELECT * FROM public.schema_migrations ORDER BY filename"
+FUNCTION_IDENTITY_QUERY = """
+SELECT p.proname,
+       p.oid::bigint AS oid,
+       pg_catalog.pg_get_userbyid(p.proowner) AS owner,
+       pg_catalog.md5(p.prosrc) AS source,
+       ARRAY(
+           SELECT t.tgrelid::regclass::text || ':' || t.tgname
+             FROM pg_catalog.pg_trigger t
+            WHERE t.tgfoid = p.oid
+            ORDER BY 1
+       ) AS triggers
+  FROM pg_catalog.pg_proc p
+ WHERE p.pronamespace = 'public'::regnamespace
+   AND p.proname = ANY($1::text[])
+ ORDER BY p.proname
+"""
+# Every application catalog object a migration can create or change, without
+# owners or OIDs (each test database has its own owner role).
+CATALOG_QUERY = """
+WITH ns AS (
+    SELECT oid, nspname FROM pg_catalog.pg_namespace
+     WHERE nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+       AND nspname NOT LIKE 'pg_temp_%' AND nspname NOT LIKE 'pg_toast_temp_%'
+)
+SELECT line FROM (
+    SELECT format('relation %s.%s %s', ns.nspname, c.relname, c.relkind) AS line
+      FROM pg_catalog.pg_class c JOIN ns ON ns.oid = c.relnamespace
+     WHERE c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f', 'i', 'I', 'c')
+    UNION ALL
+    SELECT format('column %s.%s %s %s notnull=%s default=%s identity=%s generated=%s',
+                  c.oid::regclass, a.attnum, a.attname,
+                  pg_catalog.format_type(a.atttypid, a.atttypmod), a.attnotnull,
+                  pg_catalog.pg_get_expr(d.adbin, d.adrelid), a.attidentity,
+                  a.attgenerated)
+      FROM pg_catalog.pg_attribute a
+      JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+      JOIN ns ON ns.oid = c.relnamespace
+      LEFT JOIN pg_catalog.pg_attrdef d
+        ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+     WHERE a.attnum > 0 AND NOT a.attisdropped
+       AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'c')
+    UNION ALL
+    SELECT format('constraint %s %s %s validated=%s deferrable=%s deferred=%s',
+                  co.conrelid::regclass, co.conname,
+                  pg_catalog.pg_get_constraintdef(co.oid), co.convalidated,
+                  co.condeferrable, co.condeferred)
+      FROM pg_catalog.pg_constraint co JOIN ns ON ns.oid = co.connamespace
+    UNION ALL
+    SELECT format('index %s valid=%s ready=%s', pg_catalog.pg_get_indexdef(i.indexrelid),
+                  i.indisvalid, i.indisready)
+      FROM pg_catalog.pg_index i
+      JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
+      JOIN ns ON ns.oid = c.relnamespace
+    UNION ALL
+    SELECT format('trigger %s enabled=%s', pg_catalog.pg_get_triggerdef(t.oid),
+                  t.tgenabled)
+      FROM pg_catalog.pg_trigger t
+      JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+      JOIN ns ON ns.oid = c.relnamespace
+     WHERE NOT t.tgisinternal
+    UNION ALL
+    SELECT format('function %s %s', p.oid::regprocedure,
+                  pg_catalog.md5(pg_catalog.pg_get_functiondef(p.oid)))
+      FROM pg_catalog.pg_proc p JOIN ns ON ns.oid = p.pronamespace
+     WHERE p.prokind IN ('f', 'p')
+    UNION ALL
+    SELECT format('view %s %s', c.oid::regclass,
+                  pg_catalog.md5(pg_catalog.pg_get_viewdef(c.oid)))
+      FROM pg_catalog.pg_class c JOIN ns ON ns.oid = c.relnamespace
+     WHERE c.relkind IN ('v', 'm')
+    UNION ALL
+    SELECT format('enum %s %s', t.typname,
+                  string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder))
+      FROM pg_catalog.pg_type t
+      JOIN ns ON ns.oid = t.typnamespace
+      JOIN pg_catalog.pg_enum e ON e.enumtypid = t.oid
+     GROUP BY t.typname
+    UNION ALL
+    SELECT format('policy %s %s %s %s', pol.polrelid::regclass, pol.polname,
+                  pg_catalog.pg_get_expr(pol.polqual, pol.polrelid),
+                  pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid))
+      FROM pg_catalog.pg_policy pol
+    UNION ALL
+    SELECT format('extension %s %s', extname, extversion)
+      FROM pg_catalog.pg_extension
+) catalog
+ORDER BY line
+"""
 
 
 @pytest.fixture(scope="module")
@@ -121,16 +239,30 @@ async def store(empty_dsn, upstream_ledger, monkeypatch):
         crypto.reset_cipher_cache()
 
 
-@pytest.fixture
-def stack(store, monkeypatch):
+def _dedicated_stack(store, monkeypatch):
     k8s = self_end.SelfEndK8sApi()
     provider = AgentProvisioner()
     provider._k8s_available = True
     provider._core_api = k8s
     provider._namespace = NAMESPACE
+    # The retirement operations bind the application's store when built.
     monkeypatch.setattr(main.app.state.resources, "postgres_db", store)
     monkeypatch.setattr(agent_provisioner_module, "agent_provisioner", provider)
-    return self_end.Stack(store, k8s)
+    stack = self_end.Stack(store, k8s)
+    stack.provider = provider
+    return stack
+
+
+def _use_dedicated(stack, monkeypatch):
+    """Reinstall the dedicated provisioner after a warm helper replaced it."""
+
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", stack.db)
+    monkeypatch.setattr(agent_provisioner_module, "agent_provisioner", stack.provider)
+
+
+@pytest.fixture
+def stack(store, monkeypatch):
+    return _dedicated_stack(store, monkeypatch)
 
 
 async def _outcomes(db, thread_ids):
@@ -302,3 +434,312 @@ async def test_upgrade_keeps_warm_history_and_settles_a_live_warm_life(
     assert [
         row for row in await _warm_rows(db) if row["thread_id"] == ended["thread"]
     ] == history
+
+
+# ---------------------------------------------------------------------------
+# The deployed local history: the pair applied as 0286/0287
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def owned_databases(server_dsn):
+    """Create databases owned by ordinary logins, as the deployed servers are.
+
+    The migration runner connects as the owner, so every function the chain
+    creates or replaces belongs to it. Test records are written through the
+    server administrator, which some shared fixtures need.
+    """
+
+    created = []
+    base, host = server_dsn.rsplit("/", 1)[0], server_dsn.split("@", 1)[1]
+    host = host.rsplit("/", 1)[0]
+
+    async def new():
+        name = f"hist_{uuid4().hex[:12]}"
+        admin = await asyncpg.connect(server_dsn)
+        try:
+            await admin.execute(f"CREATE ROLE {name} LOGIN PASSWORD '{name}'")
+            await admin.execute(f"CREATE DATABASE {name} OWNER {name}")
+        finally:
+            await admin.close()
+        created.append(name)
+        return NS(
+            name=name,
+            owner_dsn=f"postgresql://{name}:{name}@{host}/{name}",
+            admin_dsn=f"{base}/{name}",
+        )
+
+    yield new
+    admin = await asyncpg.connect(server_dsn)
+    try:
+        for name in created:
+            await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+            await admin.execute(f'DROP ROLE IF EXISTS "{name}"')
+    finally:
+        await admin.close()
+
+
+def _stage(tmp_path, name, *, through):
+    staged = tmp_path / name
+    staged.mkdir()
+    for path in migrate.discover(MIGRATIONS):
+        if path.name.split("_", 1)[0] <= through:
+            shutil.copy2(path, staged / path.name)
+    return staged
+
+
+def _stage_deployed_history(tmp_path, name="deployed-history"):
+    """131dd22ee's app chain: everything through 0285 plus the historical pair."""
+
+    staged = _stage(tmp_path, name, through=DEPLOYED_HISTORY_THROUGH)
+    for historical, (canonical, checksum) in DEPLOYED_PAIR.items():
+        shutil.copy2(MIGRATIONS / canonical, staged / historical)
+        assert migrate._checksum((staged / historical).read_text()) == checksum
+    return staged
+
+
+async def _run_as_owner(database, directory, *, dry_run=False):
+    pool = await asyncpg.create_pool(database.owner_dsn, min_size=1, max_size=2)
+    try:
+        assert await pool.fetchval("SHOW is_superuser") == "off"
+        await migrate.run_migrations(pool, directory, dry_run=dry_run)
+    finally:
+        await pool.close()
+
+
+async def _fetch(dsn, query, *args):
+    conn = await asyncpg.connect(dsn)
+    try:
+        return await conn.fetch(query, *args)
+    finally:
+        await conn.close()
+
+
+async def _ledger(database):
+    return [dict(row) for row in await _fetch(database.admin_dsn, LEDGER_QUERY)]
+
+
+async def _catalog(database):
+    return [row["line"] for row in await _fetch(database.admin_dsn, CATALOG_QUERY)]
+
+
+async def _pair_functions(database):
+    return [
+        dict(row)
+        for row in await _fetch(
+            database.admin_dsn, FUNCTION_IDENTITY_QUERY, list(PAIR_FUNCTIONS)
+        )
+    ]
+
+
+async def _application_data(database):
+    """Every row of every application table, with its column set."""
+
+    tables = await _fetch(
+        database.admin_dsn,
+        "SELECT c.oid::regclass::text AS name, "
+        "ARRAY(SELECT a.attname::text FROM pg_catalog.pg_attribute a "
+        "       WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped "
+        "       ORDER BY a.attnum) AS columns "
+        "FROM pg_catalog.pg_class c "
+        "WHERE c.relnamespace = 'public'::regnamespace "
+        "AND c.relkind IN ('r', 'p') AND NOT c.relispartition "
+        "AND c.relname <> 'schema_migrations' ORDER BY 1",
+    )
+    data = {}
+    for table in tables:
+        rows = await _fetch(
+            database.admin_dsn,
+            f"SELECT to_jsonb(t)::text AS row FROM {table['name']} t",
+        )
+        data[table["name"]] = (
+            list(table["columns"]),
+            [json.loads(row["row"]) for row in rows],
+        )
+    return data
+
+
+def _project(before, after):
+    """``after`` restricted to the tables and columns ``before`` had."""
+
+    projected = {}
+    for table, (columns, _) in before.items():
+        _, rows = after[table]
+        projected[table] = (
+            columns,
+            sorted(
+                ({key: row[key] for key in columns} for row in rows),
+                key=lambda row: json.dumps(row, sort_keys=True),
+            ),
+        )
+    return projected
+
+
+def _sorted(data):
+    return {
+        table: (
+            columns,
+            sorted(rows, key=lambda row: json.dumps(row, sort_keys=True)),
+        )
+        for table, (columns, rows) in data.items()
+    }
+
+
+async def _open_store(database, monkeypatch):
+    monkeypatch.setenv("EXPERTS_DB_ENABLED", "false")
+    monkeypatch.setenv("APP_ENCRYPTION_KEY", "P" * 32)
+    crypto.reset_cipher_cache()
+    db = PostgresDB(
+        connection_string=database.admin_dsn, min_connections=1, max_connections=10
+    )
+    await db.connect()
+    return db
+
+
+async def _warm_permanent_delete(store, monkeypatch):
+    live, api, _, warm_stack = await self_end._bind_warm_life(store, monkeypatch)
+    handoff = await self_end._owner_permanent_then_agent_ack(warm_stack, live)
+    assert handoff.get("retiring_agent_exit_authorized") is True
+    api.mark_terminal("agents-a", live["pod_name"])
+    result = await self_end._durable_retry(warm_stack, live)
+    assert result.get("status") == "deleted", result
+    await self_end._assert_warm_ledger_settled(store, live, outcome="exact_absent_v1")
+    return live
+
+
+@pytest.mark.asyncio
+async def test_upgrade_from_the_deployed_local_0286_0287_history(
+    owned_databases, tmp_path, monkeypatch
+):
+    through_0285 = _stage(tmp_path, "through-0285", through=DEPLOYED_HISTORY_THROUGH)
+    deployed = _stage_deployed_history(tmp_path)
+    canonical = {path.name for path in migrate.discover(MIGRATIONS)}
+    history = await owned_databases()
+    await _run_as_owner(history, through_0285)
+
+    store = await _open_store(history, monkeypatch)
+    try:
+        stack = _dedicated_stack(store, monkeypatch)
+        # Records written before the pair: 0224's capture, 0200's warm check.
+        pre_claimed = await self_end._bind_life(
+            stack, await self_end._thread(store), with_claim=True
+        )
+        await self_end._agent_settles_soft_end(stack, pre_claimed)
+        pre_claimless = await self_end._bind_life(
+            stack, await self_end._thread(store), with_claim=False
+        )
+        await self_end._agent_settles_soft_end(stack, pre_claimless)
+        assert await self_end._outcome_proof(store, pre_claimless) is None
+        warm_ended, _, _, warm_stack = await self_end._bind_warm_life(
+            store, monkeypatch
+        )
+        await self_end._warm_agent_self_end(warm_stack, warm_ended)
+
+        # The pair under its historical names, as the k3d database ran it.
+        await _run_as_owner(history, deployed)
+        deployed_ledger = await _ledger(history)
+        assert len(deployed_ledger) == DEPLOYED_LEDGER_ROWS
+        assert all(row["success"] for row in deployed_ledger)
+        assert max(row["filename"] for row in deployed_ledger) == max(DEPLOYED_PAIR)
+        assert {
+            row["filename"]: row["checksum"]
+            for row in deployed_ledger
+            if row["filename"] in DEPLOYED_PAIR
+        } == {name: checksum for name, (_, checksum) in DEPLOYED_PAIR.items()}
+
+        # Records written while the historical pair ran: a claim-less life
+        # recorded its Pod, and a live warm life's permanent Delete settled its
+        # protection (both impossible before the pair).
+        _use_dedicated(stack, monkeypatch)
+        pair_claimless = await self_end._bind_life(
+            stack, await self_end._thread(store), with_claim=False
+        )
+        await self_end._agent_settles_soft_end(stack, pair_claimless)
+        assert (await self_end._outcome_proof(store, pair_claimless))[
+            "pod_uid"
+        ] == pair_claimless["pod_uid"]
+        await _warm_permanent_delete(store, monkeypatch)
+
+        functions_before = await _pair_functions(history)
+        assert [row["owner"] for row in functions_before] == [history.name] * 2
+        catalog_before = await _catalog(history)
+        data_before = await _application_data(history)
+
+        # A dry run of the published chain is observational.
+        await _run_as_owner(history, MIGRATIONS, dry_run=True)
+        assert await _ledger(history) == deployed_ledger
+        assert await _catalog(history) == catalog_before
+
+        await _run_as_owner(history, MIGRATIONS)
+        upgraded = await _ledger(history)
+        deployed_names = {row["filename"] for row in deployed_ledger}
+        # Every deployed row, both historical names included, is untouched.
+        assert [
+            row for row in upgraded if row["filename"] in deployed_names
+        ] == deployed_ledger
+        # Everything published that the history lacks applied at its own
+        # position: upstream 0286-0300 and the canonical pair.
+        assert {row["filename"] for row in upgraded} == canonical | deployed_names
+        assert {
+            row["filename"]: row["checksum"]
+            for row in upgraded
+            if row["filename"] in LOCAL_MIGRATIONS
+        } == {name: checksum for name, checksum in DEPLOYED_PAIR.values()}
+        assert all(row["success"] for row in upgraded)
+        # The canonical files replaced both functions in place: same object,
+        # owner, source and trigger bindings as the historical pair left them.
+        assert await _pair_functions(history) == functions_before
+        # Application data is preserved; upstream only added columns.
+        data_after = await _application_data(history)
+        assert _project(data_before, data_after) == _sorted(data_before)
+
+        # The same schema as a fresh installation of the published chain.
+        fresh = await owned_databases()
+        await _run_as_owner(fresh, MIGRATIONS)
+        fresh_ledger = await _ledger(fresh)
+        assert {row["filename"] for row in fresh_ledger} == canonical
+        assert not (deployed_names - canonical) & {
+            row["filename"] for row in fresh_ledger
+        }
+        catalog_after = await _catalog(history)
+        assert catalog_after == await _catalog(fresh)
+        assert [
+            (row["proname"], row["source"], row["triggers"])
+            for row in await _pair_functions(fresh)
+        ] == [
+            (row["proname"], row["source"], row["triggers"]) for row in functions_before
+        ]
+
+        # A second startup changes nothing.
+        await _run_as_owner(history, MIGRATIONS)
+        assert await _ledger(history) == upgraded
+        assert await _catalog(history) == catalog_after
+
+        # Retirement after the upgrade: a new claim-less life records its Pod;
+        # permanent Delete retires exactly the Pods the records prove (the
+        # pre-pair claim-less life has none, so its Pod keeps its protection);
+        # a live warm life's permanent Delete settles its protection.
+        _use_dedicated(stack, monkeypatch)
+        fresh_claimless = await self_end._bind_life(
+            stack, await self_end._thread(store), with_claim=False
+        )
+        await self_end._agent_settles_soft_end(stack, fresh_claimless)
+        assert (await self_end._outcome_proof(store, fresh_claimless))[
+            "pod_uid"
+        ] == fresh_claimless["pod_uid"]
+        lives = (pre_claimed, pre_claimless, pair_claimless, fresh_claimless)
+        for life in lives:
+            stack.k8s.exit_and_reap(life)
+            outcomes = await self_end._delete_until_settled(stack, life["thread"])
+            assert outcomes[-1] == "deleted", outcomes
+            assert await store.get_thread(life["thread"]) is None
+        assert sorted(stack.k8s.removed_pods) == sorted(
+            life["pod_uid"] for life in (pre_claimed, pair_claimless, fresh_claimless)
+        )
+        kept = self_end._pod(stack, pre_claimless)
+        assert kept is not None
+        assert kept.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
+        await _warm_permanent_delete(store, monkeypatch)
+    finally:
+        await store.close()
+        crypto.reset_cipher_cache()
