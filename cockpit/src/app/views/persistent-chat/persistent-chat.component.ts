@@ -66,6 +66,7 @@ import {buildDelegateBatchMembers, DelegateBatchMember} from '../../core/models/
 import {toolCardViewFromEvent} from '../../core/tools/tool-card-adapters';
 import {ApiService, IdeSessionStatus} from '../../core/services/api.service';
 import {workspaceLifecycleReasonKey} from '../../core/util/vm-lifecycle';
+import {workspaceCreationMessageKey} from '../../core/util/workspace-creation';
 import {I18nService} from '../../core/services/i18n.service';
 import {FileHandlingService} from '../../core/services/file-handling.service';
 import {ChatPreferencesService, type ChatTextSize, type ReadingWidth} from '../../core/services/chat-preferences.service';
@@ -1167,6 +1168,11 @@ export function clearDraft(threadId: string | null): void {
           }
         </div>
       }
+      @if (chat.workspaceCreation(); as creation) {
+        <div class="vm-lifecycle" role="status">
+          {{ workspaceCreationMessageKey(creation) | transloco }}
+        </div>
+      }
 
       <!-- Pending protected-cloud review. Deliberately OUTSIDE the
            isConnected() gate above: the review API serves ended threads on
@@ -1804,6 +1810,7 @@ export function clearDraft(threadId: string | null): void {
               @if (chat.sessionReady()) {
                 <app-chat-empty-state
                   variant="ready"
+                  [workspaceCreation]="chat.workspaceCreation()"
                   [suggestions]="displayedSuggestions()"
                   (suggestionPicked)="pickSuggestion($event)"
                 />
@@ -2966,6 +2973,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     // IDE status
     readonly ideStatus = signal<IdeSessionStatus | null>(null);
     readonly lifecycleReasonKey = workspaceLifecycleReasonKey;
+    readonly workspaceCreationMessageKey = workspaceCreationMessageKey;
     private idePollingTimer: ReturnType<typeof setInterval> | null = null;
     private pendingVmIdeOpen: PendingVmIdeOpen | null = null;
     private vmIdeOpenDestroyed = false;

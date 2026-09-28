@@ -113,6 +113,42 @@ describe('workspace recovery detail', () => {
   });
 });
 
+describe('typed workspace creation detail', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+  afterEach(() => TestBed.resetTestingModule());
+
+  it('shows scheduler uncertainty without exposing raw diagnostics or hiding legacy VM state', () => {
+    TestBed.configureTestingModule({
+      imports: [JobDetailPanelComponent, TranslocoTestingModule.forRoot({
+        langs: {en}, translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+      })],
+      providers: [provideRouter([])],
+    });
+    const transloco = TestBed.inject(TranslocoService);
+    transloco.setTranslation(en, 'en');
+    transloco.setActiveLang('en');
+    const fixture = TestBed.createComponent(JobDetailPanelComponent);
+    Object.defineProperty(fixture.componentInstance, 'job', {value: signal({
+      id: 'job-startup', description: 'Start workspace', status: 'created',
+      created_at: '2026-09-28T08:00:00Z',
+      workspace_creation: {stage: 'scheduling', state: 'waiting_capacity',
+        reason_code: 'scheduler_unschedulable', readiness_deadline_at: null,
+        private_diagnostic: '0/3 nodes had taint secret'},
+      vm_creation: {state: 'observing', message: 'VM observation', resumable: true},
+    } as unknown as JobSummary)});
+    Object.defineProperty(fixture.componentInstance, 'data', {value: signal(null)});
+
+    fixture.detectChanges();
+    const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+    expect(text).toContain('Waiting for scheduling');
+    expect(text).not.toContain('insufficient capacity');
+    expect(text).not.toContain('0/3 nodes');
+    expect(text).toContain('VM observation');
+  });
+});
+
 describe('held-for-review reason', () => {
   const reason = 'Delivery unproven: the final commit did not land, so deliverable path(s) output/report.md are not in the pushed revision.';
 

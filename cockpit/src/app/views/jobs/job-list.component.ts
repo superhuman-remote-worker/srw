@@ -43,6 +43,7 @@ import {
 } from '../../core/util/job-status';
 import {JobListParams} from '../../core/models/audit.model';
 import {workspaceLifecycleReasonKey} from '../../core/util/vm-lifecycle';
+import {workspaceCreationMessageKey} from '../../core/util/workspace-creation';
 import {MultiSelectOption} from '../../ui/multi-select';
 import {JobFilterBarComponent} from './job-filter-bar.component';
 import {JobFilterPanelComponent} from './job-filter-panel.component';
@@ -373,7 +374,13 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                         }
                       </div>
                     }
-                    @if (row.job.status === 'failed' && row.job.error_message && !row.job.vm_creation) {
+                    @if (row.job.workspace_creation; as creation) {
+                      <div class="workspace-recovery" [class.attention]="creation.state === 'attention'"
+                           [style.padding-left.px]="row.isChild ? 16 : 0" role="status">
+                        {{ workspaceCreationMessageKey(creation) | transloco }}
+                      </div>
+                    }
+                    @if (row.job.status === 'failed' && row.job.error_message && !row.job.vm_creation && !row.job.workspace_creation) {
                       <div class="job-error" [style.padding-left.px]="row.isChild ? 16 : 0" [title]="row.job.error_message">
                         {{ 'jobs.failureReason' | transloco }}: {{ row.job.error_message }}
                       </div>
@@ -1220,6 +1227,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
   ],
 })
 export class JobListComponent implements OnInit, OnDestroy {
+  readonly workspaceCreationMessageKey = workspaceCreationMessageKey;
   private readonly api = inject(ApiService);
   private readonly data = inject(DataService);
   private readonly userService = inject(UserService);

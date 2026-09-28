@@ -12907,6 +12907,37 @@ describe('PersistentChatService — pending End visibility reconciliation', () =
     expect(ctx.service.turnCount()).toBe(12);
   });
 
+  it('replaces typed workspace creation with null when a newer metadata read omits it', async () => {
+    meta = {...meta, workspace_creation: {
+      stage: 'scheduling', state: 'waiting_capacity', reason_code: 'scheduler_unschedulable',
+      readiness_deadline_at: null,
+    }};
+    await connected();
+    expect(ctx.service.workspaceCreation()?.state).toBe('waiting_capacity');
+    meta = {execution_lane: 'pinned'};
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(ctx.service.workspaceCreation()).toBeNull();
+  });
+
+  it('does not restore the old workspace creation from a late read after navigation', async () => {
+    await connected();
+    const late = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation((url: string) =>
+      metaUrl.test(url) ? late : activeSessionGet(url),
+    );
+    await vi.advanceTimersByTimeAsync(5000);
+    ctx.mockHttp.get.mockImplementation(activeSessionGet);
+    await ctx.service.connect('other');
+    expect(ctx.service.workspaceCreation()).toBeNull();
+    late.next({status: 'active', workspace_creation: {
+      stage: 'readiness', state: 'attention', reason_code: 'invalid_image',
+      readiness_deadline_at: null,
+    }});
+    late.complete();
+    await flushMicrotasks();
+    expect(ctx.service.workspaceCreation()).toBeNull();
+  });
+
   it('still hydrates full metadata when recovery meets an in-flight lifecycle read', async () => {
     await connected();
     const response = new Subject<any>();

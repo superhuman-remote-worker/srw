@@ -111,6 +111,15 @@ describe('ChatEmptyStateComponent variants', () => {
     expect(text(root)).toContain('The agent is connected and listening');
   });
 
+  it('does not claim the agent is listening while typed creation needs attention', () => {
+    const root = render({variant: 'ready', suggestions: [], workspaceCreation: {
+      stage: 'readiness', state: 'attention', reason_code: 'invalid_image',
+      readiness_deadline_at: null,
+    }});
+    expect(text(root)).toContain('Workspace needs attention');
+    expect(text(root)).not.toContain('agent is connected and listening');
+  });
+
   it('renders both the connectors control and the advanced link for "draft"', () => {
     const root = render({
       variant: 'draft',

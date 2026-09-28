@@ -1,4 +1,5 @@
-import {signal, ɵresolveComponentResources} from '@angular/core';
+import {CUSTOM_ELEMENTS_SCHEMA, Pipe, PipeTransform, signal, ɵresolveComponentResources} from '@angular/core';
+import {DatePipe} from '@angular/common';
 import {TestBed} from '@angular/core/testing';
 import {ActivatedRoute, Router} from '@angular/router';
 import {TranslocoService, TranslocoTestingModule} from '@jsverse/transloco';
@@ -16,8 +17,19 @@ import {JobListComponent, jobCloudAction} from './job-list.component';
 // the i18n parity gate and ships as the raw key string.
 import en from '../../../assets/i18n/en.json';
 
+@Pipe({name: 'transloco', standalone: true})
+class WorkspaceCreationTranslocoPipe implements PipeTransform {
+  transform(key: string): string {
+    if (key.startsWith('workspaceCreation.')) {
+      return (en.workspaceCreation as Record<string, string>)[key.split('.')[1]] ?? key;
+    }
+    return key;
+  }
+}
+
 /**
- * The template is replaced with an empty one for every spec here.
+ * Most logic specs replace the template with an empty one. The typed startup
+ * tests below render the actual row while stubbing unrelated UI children.
  *
  * Not laziness — the JIT compiler vitest runs cannot see initializer-based
  * inputs (`input()`/`model()`), so property-binding any signal input in a
@@ -29,6 +41,7 @@ import en from '../../../assets/i18n/en.json';
 function mountLogic(overrides: {
   api?: Partial<ApiService>;
   params?: BehaviorSubject<ReturnType<typeof paramMap>>;
+  rendered?: boolean;
 } = {}) {
   const navigate = vi.fn().mockResolvedValue(true);
   const api = {
@@ -72,13 +85,57 @@ function mountLogic(overrides: {
       },
     ],
   });
-  TestBed.overrideComponent(JobListComponent, {set: {template: '', imports: []}});
+  TestBed.overrideComponent(JobListComponent, overrides.rendered
+    ? {set: {imports: [WorkspaceCreationTranslocoPipe, DatePipe], schemas: [CUSTOM_ELEMENTS_SCHEMA]}}
+    : {set: {template: '', imports: []}});
   const transloco = TestBed.inject(TranslocoService);
   transloco.setTranslation(en, 'en');
   transloco.setActiveLang('en');
   const fixture = TestBed.createComponent(JobListComponent);
   return {fixture, component: fixture.componentInstance, api, navigate};
 }
+
+describe('typed workspace creation on job rows', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+  afterEach(() => TestBed.resetTestingModule());
+
+  it('renders waiting for scheduling with the native Cancel control', async () => {
+    const {fixture, component} = mountLogic({rendered: true, api: {
+      getJobsPage: vi.fn().mockReturnValue(of(page([job('startup', {
+        status: 'created', workspace_creation: {stage: 'scheduling', state: 'waiting_capacity',
+          reason_code: 'scheduler_unschedulable', readiness_deadline_at: null},
+      })]))),
+    }});
+    fixture.detectChanges();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fixture.detectChanges();
+    const row = (fixture.nativeElement as HTMLElement).querySelector('tr:not(.detail-row) .prompt-cell') as HTMLElement;
+    expect(row.textContent).toContain('Waiting for scheduling');
+    const cancel = [...(fixture.nativeElement as HTMLElement).querySelectorAll('app-menu-item')]
+      .find((item) => item.textContent?.includes('jobs.action.cancel'));
+    expect(cancel).toBeTruthy();
+    cancel!.dispatchEvent(new CustomEvent('activated'));
+    expect(component.confirmCancelOpen()).toBe(true);
+  });
+
+  it('shows typed attention without echoing a failed job raw scheduler diagnostic', async () => {
+    const {fixture} = mountLogic({rendered: true, api: {
+      getJobsPage: vi.fn().mockReturnValue(of(page([job('failed-startup', {
+        status: 'failed', error_message: '0/3 nodes had a private taint',
+        workspace_creation: {stage: 'readiness', state: 'attention',
+          reason_code: 'invalid_configuration', readiness_deadline_at: null},
+      })]))),
+    }});
+    fixture.detectChanges();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fixture.detectChanges();
+    const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+    expect(text).toContain('Workspace needs attention');
+    expect(text).not.toContain('0/3 nodes');
+  });
+});
 
 function paramMap(values: Record<string, string | string[]>) {
   const normalised = new Map<string, string[]>(
