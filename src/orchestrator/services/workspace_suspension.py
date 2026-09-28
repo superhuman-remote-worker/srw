@@ -464,6 +464,7 @@ class WorkspaceSuspensionService:
                         owner,
                         claimant=claimant,
                         lease_seconds=300,
+                        expected_runtime_incarnation=runtime_incarnation,
                     )
                 )
             except Exception:

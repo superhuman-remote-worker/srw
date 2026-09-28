@@ -1312,6 +1312,7 @@ class ContainerProvisioner:
         *,
         claimant: str,
         lease_seconds: int = 300,
+        expected_runtime_incarnation: str | None = None,
     ) -> dict[str, Any] | None:
         """Lease exact-B workspace extraction work across replicas."""
 
@@ -1320,6 +1321,7 @@ class ContainerProvisioner:
             scope="workspace_container",
             claimant=claimant,
             lease_seconds=lease_seconds,
+            expected_runtime_incarnation=expected_runtime_incarnation,
         )
 
     async def claim_ide_restore_work(
@@ -1328,6 +1330,7 @@ class ContainerProvisioner:
         *,
         claimant: str,
         lease_seconds: int = 300,
+        expected_runtime_incarnation: str | None = None,
     ) -> dict[str, Any] | None:
         """Lease exact-B IDE repository/profile work across replicas."""
 
@@ -1336,6 +1339,7 @@ class ContainerProvisioner:
             scope="ide",
             claimant=claimant,
             lease_seconds=lease_seconds,
+            expected_runtime_incarnation=expected_runtime_incarnation,
         )
 
     async def _claim_restore_work(
@@ -1345,6 +1349,7 @@ class ContainerProvisioner:
         scope: Literal["workspace_container", "ide"],
         claimant: str,
         lease_seconds: int,
+        expected_runtime_incarnation: str | None = None,
     ) -> dict[str, Any] | None:
         if self._db is None or (owner.kind == "session" and scope == "ide"):
             return None
@@ -1362,6 +1367,7 @@ class ContainerProvisioner:
             scope=scope,
             claimant=claimant,
             lease_seconds=lease_seconds,
+            expected_runtime_incarnation=expected_runtime_incarnation,
         )
 
     async def release_workspace_restore_work(
@@ -11610,12 +11616,37 @@ class ContainerProvisioner:
                         name=observed_seed,
                         namespace=self._namespace,
                     )
-                    self._require_stateless_seed_configmap_identity(
+                    existing_seed_uid = self._require_stateless_seed_configmap_identity(
                         existing_seed,
                         owner=owner,
                         pod_name=pod_name,
                         creation_reservation_id=str(_creation_reservation["id"]),
                     )
+                    try:
+                        seed_owner_reference = (
+                            self._exact_seed_configmap_pod_owner_reference(
+                                existing_seed,
+                                pod_name=pod_name,
+                                runtime_incarnation=runtime_incarnation,
+                            )
+                        )
+                    except WorkspaceRuntimeAuthorityError:
+                        return None
+                    if seed_owner_reference is None:
+                        if not await self._begin_workspace_creation_effect(
+                            owner,
+                            _creation_reservation,
+                            scope="ide",
+                            resource_kind="seed",
+                        ) or not await self._adopt_configmap(
+                            observed_seed,
+                            created_pod,
+                            expected_owner=owner,
+                            expected_configmap_uid=existing_seed_uid,
+                            creation_reservation_id=str(_creation_reservation["id"]),
+                            mutation_authority=mutation_authority,
+                        ):
+                            return None
                 elif seed_cm is not None:
                     # A response may be ambiguous after seed creation. Leave
                     # the exact reservation-owned ConfigMap for reconciliation
@@ -14009,6 +14040,61 @@ class ContainerProvisioner:
                                 "workspace seed ConfigMap resource version is missing"
                             )
                         body["metadata"]["resourceVersion"] = resource_version
+                        references = getattr(
+                            getattr(existing, "metadata", None),
+                            "owner_references",
+                            None,
+                        )
+                        if references:
+                            pod = await self._bounded_kubernetes_call(
+                                self._core_api.read_namespaced_pod,
+                                name=pod_name,
+                                namespace=self._namespace,
+                            )
+                            pod_uid = self._require_workspace_pod_owner(
+                                pod,
+                                owner=expected_owner,
+                                allow_owner_unlabeled=False,
+                                expected_pod_name=pod_name,
+                                expected_component=(
+                                    "ide-session" if pod_name.startswith("ide-") else None
+                                ),
+                            )
+                            if creation_reservation_id is not None:
+                                self._require_workspace_creation_reservation_annotation(
+                                    pod, reservation_id=creation_reservation_id
+                                )
+                            pod_metadata = getattr(pod, "metadata", None)
+                            pod_annotations = getattr(pod_metadata, "annotations", None)
+                            pod_labels = getattr(pod_metadata, "labels", None)
+                            if (
+                                expected_creation_generation is not None
+                                and (
+                                    not isinstance(pod_annotations, dict)
+                                    or pod_annotations.get(
+                                        WORKSPACE_RUNTIME_CREATION_ANNOTATION
+                                    ) != expected_creation_generation
+                                )
+                            ) or (
+                                expected_provision_attempt is not None
+                                and (
+                                    not isinstance(pod_labels, dict)
+                                    or pod_labels.get(WORKSPACE_PROVISION_ATTEMPT_LABEL)
+                                    != expected_provision_attempt
+                                    or pod_labels.get(WORKSPACE_PROVISION_GENERATION_LABEL)
+                                    != expected_runtime_generation
+                                )
+                            ):
+                                raise WorkspaceRuntimeAuthorityError(
+                                    "workspace seed ConfigMap Pod generation changed"
+                                )
+                            body["metadata"]["ownerReferences"] = [
+                                self._exact_seed_configmap_pod_owner_reference(
+                                    existing,
+                                    pod_name=pod_name,
+                                    runtime_incarnation=pod_uid,
+                                )
+                            ]
                     if (
                         mutation_authority is not None
                         and not await mutation_authority()
@@ -14035,6 +14121,68 @@ class ContainerProvisioner:
                             pod_name=pod_name,
                             creation_reservation_id=creation_reservation_id,
                         )
+                        if body["metadata"].get("ownerReferences"):
+                            preserved_reference = body["metadata"][
+                                "ownerReferences"
+                            ][0]
+                            if self._exact_seed_configmap_pod_owner_reference(
+                                observed,
+                                pod_name=pod_name,
+                                runtime_incarnation=preserved_reference["uid"],
+                            ) != preserved_reference:
+                                raise WorkspaceRuntimeAuthorityError(
+                                    "workspace seed ConfigMap Pod ownership changed"
+                                )
+                            current_pod = await self._bounded_kubernetes_call(
+                                self._core_api.read_namespaced_pod,
+                                name=pod_name,
+                                namespace=self._namespace,
+                            )
+                            current_uid = self._require_workspace_pod_owner(
+                                current_pod,
+                                owner=expected_owner,
+                                allow_owner_unlabeled=False,
+                                expected_pod_name=pod_name,
+                                expected_component=(
+                                    "ide-session" if pod_name.startswith("ide-") else None
+                                ),
+                            )
+                            if current_uid != preserved_reference["uid"]:
+                                raise WorkspaceRuntimeAuthorityError(
+                                    "workspace seed ConfigMap Pod UID changed during replace"
+                                )
+                            if creation_reservation_id is not None:
+                                self._require_workspace_creation_reservation_annotation(
+                                    current_pod, reservation_id=creation_reservation_id
+                                )
+                            current_metadata = getattr(current_pod, "metadata", None)
+                            current_annotations = getattr(
+                                current_metadata, "annotations", None
+                            )
+                            current_labels = getattr(current_metadata, "labels", None)
+                            if (
+                                expected_creation_generation is not None
+                                and (
+                                    not isinstance(current_annotations, dict)
+                                    or current_annotations.get(
+                                        WORKSPACE_RUNTIME_CREATION_ANNOTATION
+                                    ) != expected_creation_generation
+                                )
+                            ) or (
+                                expected_provision_attempt is not None
+                                and (
+                                    not isinstance(current_labels, dict)
+                                    or current_labels.get(
+                                        WORKSPACE_PROVISION_ATTEMPT_LABEL
+                                    ) != expected_provision_attempt
+                                    or current_labels.get(
+                                        WORKSPACE_PROVISION_GENERATION_LABEL
+                                    ) != expected_runtime_generation
+                                )
+                            ):
+                                raise WorkspaceRuntimeAuthorityError(
+                                    "workspace seed ConfigMap Pod generation changed"
+                                )
                         if expected_provision_attempt is not None:
                             self._require_pinned_workspace_resource_identity(
                                 observed,
@@ -14605,6 +14753,47 @@ class ContainerProvisioner:
             raise WorkspaceRuntimeAuthorityError(
                 "workspace seed ConfigMap Pod ownership changed"
             )
+
+    @staticmethod
+    def _exact_seed_configmap_pod_owner_reference(
+        configmap: Any,
+        *,
+        pod_name: str,
+        runtime_incarnation: str,
+    ) -> dict[str, Any] | None:
+        """Preserve only one owner reference to the attested Pod."""
+
+        references = getattr(
+            getattr(configmap, "metadata", None), "owner_references", None
+        )
+        if references in (None, []):
+            return None
+        if not isinstance(references, (list, tuple)) or len(references) != 1:
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace seed ConfigMap Pod ownership changed"
+            )
+        reference = references[0]
+        if (
+            _resource_field(reference, "api_version", "apiVersion") != "v1"
+            or _resource_field(reference, "kind") != "Pod"
+            or _resource_field(reference, "name") != pod_name
+            or str(_resource_field(reference, "uid") or "")
+            != runtime_incarnation
+            or _resource_field(reference, "controller") is not True
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "workspace seed ConfigMap Pod ownership changed"
+            )
+        return {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "name": pod_name,
+            "uid": runtime_incarnation,
+            "controller": True,
+            "blockOwnerDeletion": _resource_field(
+                reference, "block_owner_deletion", "blockOwnerDeletion"
+            ) is True,
+        }
 
     def _build_pod_manifest(
         self,

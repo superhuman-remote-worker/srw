@@ -1117,6 +1117,7 @@ class IdeSessionService:
                     job_id,
                     claimant=claimant,
                     lease_seconds=300,
+                    expected_runtime_incarnation=runtime_incarnation,
                 )
             except Exception:
                 logger.warning(
@@ -1251,13 +1252,49 @@ class IdeSessionService:
         operation_id: str | None,
         creation_reservation: dict[str, Any] | None = None,
         replacement_restore_context: dict[str, Any] | None = None,
+        expected_runtime: str | None = None,
     ) -> tuple[str, str] | None:
         """Create B, or resume the exact B after a committed/lost response."""
 
         if not self._container_provisioner:
             return None
+        if expected_runtime is not None:
+            if creation_reservation is not None:
+                reserved_runtime = creation_reservation.get("runtime_incarnation")
+                if _canonical_runtime(
+                    str(reserved_runtime) if reserved_runtime is not None else None
+                ) != expected_runtime:
+                    return None
+            elif operation_id is not None:
+                return None
         if operation_id is None:
-            current = await self._current_ide_restore_runtime(job_id)
+            if creation_reservation is not None:
+                current_creation = (
+                    await self._container_provisioner.get_current_ide_creation_result(
+                        job_id
+                    )
+                )
+                if current_creation is not None and (
+                    str(current_creation.get("id") or "")
+                    != str(creation_reservation.get("id") or "")
+                    or str(current_creation.get("claim_token") or "")
+                    != str(creation_reservation.get("claim_token") or "")
+                ):
+                    return None
+                current = (
+                    await self._current_ide_restore_runtime(
+                        job_id, creation=current_creation
+                    )
+                    if current_creation is not None
+                    else None
+                )
+            else:
+                current = await self._current_ide_restore_runtime(job_id)
+            if expected_runtime is not None and creation_reservation is None:
+                # An unbound maintenance callback may only continue its
+                # already-settled B; it must never create successor C.
+                if current is None or current[0] != expected_runtime:
+                    return None
             if current is not None:
                 return current
         try:
@@ -1340,6 +1377,7 @@ class IdeSessionService:
                     job_id,
                     operation_id=restore_operation_id,
                     creation_reservation=creation_reservation,
+                    expected_runtime=expected_restore_runtime,
                     replacement_restore_context=(
                         {
                             **(restore_context or {}),
@@ -1354,6 +1392,11 @@ class IdeSessionService:
                 if restored is None:
                     return
                 runtime, _pod_ip = restored
+                if (
+                    expected_restore_runtime is not None
+                    and runtime != expected_restore_runtime
+                ):
+                    return
                 managed_restore_claim = await self._claim_ide_restore_work(
                     job_id,
                     runtime_incarnation=runtime,

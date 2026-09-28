@@ -17159,6 +17159,7 @@ class PostgresDB:
         scope: str,
         claimant: str,
         lease_seconds: int = 300,
+        expected_runtime_incarnation: str | None = None,
     ) -> dict[str, Any] | None:
         """Lease post-create work for the exact settled current restore Pod."""
 
@@ -17166,6 +17167,14 @@ class PostgresDB:
             owner_uuid = UUID(str(owner_id))
         except (TypeError, ValueError):
             return None
+        if expected_runtime_incarnation is not None:
+            try:
+                expected_runtime_incarnation = _canonical_uuid_text(
+                    expected_runtime_incarnation,
+                    label="expected workspace restore runtime",
+                )
+            except (TypeError, ValueError, RuntimeError):
+                return None
         if (
             owner_kind not in {"job", "thread"}
             or scope not in {"workspace_container", "ide"}
@@ -17217,6 +17226,11 @@ class PostgresDB:
                     reservation_id = UUID(str(runtime.get("_creation_reservation_id")))
                     creation_claim_token = int(runtime.get("_creation_claim_token"))
                 except (TypeError, ValueError, RuntimeError):
+                    return None
+                if (
+                    expected_runtime_incarnation is not None
+                    and current_runtime != expected_runtime_incarnation
+                ):
                     return None
                 if (
                     await conn.fetchrow(

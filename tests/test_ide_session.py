@@ -115,8 +115,11 @@ def service_factory():
     )
     container_provisioner.get_ide_creation_result = AsyncMock(return_value=creation)
 
-    async def claim_restore_work(_job_id, *, claimant, lease_seconds=300):
+    async def claim_restore_work(
+        _job_id, *, claimant, lease_seconds=300, expected_runtime_incarnation
+    ):
         assert lease_seconds == 300
+        assert expected_runtime_incarnation == IDE_RUNTIME
         return {
             **creation,
             "restore_work_claimed_by": claimant,
@@ -841,6 +844,7 @@ async def test_replacement_restore_passes_fresh_request_context_to_first_b_publi
     assert svc._create_or_resume_k8s_ide.await_args.kwargs == {
         "operation_id": retired,
         "creation_reservation": None,
+        "expected_runtime": None,
         "replacement_restore_context": request,
     }
 
@@ -1179,9 +1183,12 @@ async def test_two_ide_service_instances_run_exact_b_effects_once(service_factor
     shared = first._container_provisioner
     claimed = False
 
-    async def claim(_job_id, *, claimant, lease_seconds=300):
+    async def claim(
+        _job_id, *, claimant, lease_seconds=300, expected_runtime_incarnation
+    ):
         nonlocal claimed
         assert lease_seconds == 300
+        assert expected_runtime_incarnation == IDE_RUNTIME
         if claimed:
             return None
         claimed = True
@@ -1229,7 +1236,10 @@ async def test_ide_restart_reclaims_expired_work_token(service_factory):
     svc = service_factory
     creation = svc._container_provisioner.get_current_ide_creation_result.return_value
 
-    async def reclaim(_job_id, *, claimant, lease_seconds=300):
+    async def reclaim(
+        _job_id, *, claimant, lease_seconds=300, expected_runtime_incarnation
+    ):
+        assert expected_runtime_incarnation == IDE_RUNTIME
         return {
             **creation,
             "restore_work_claimed_by": claimant,

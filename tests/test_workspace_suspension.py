@@ -155,8 +155,11 @@ def make_service(*, s3_available=True, k8s_available=True):
         return_value=creation_result
     )
 
-    async def claim_restore_work(_owner, *, claimant, lease_seconds=300):
+    async def claim_restore_work(
+        _owner, *, claimant, lease_seconds=300, expected_runtime_incarnation
+    ):
         assert lease_seconds == 300
+        assert expected_runtime_incarnation == SUCCESSOR_RUNTIME
         return {
             **creation_result,
             "restore_work_claimed_by": claimant,
@@ -625,9 +628,12 @@ class TestRestoreWorkspace:
         second._container_provisioner = shared
         claimed = False
 
-        async def claim(_owner, *, claimant, lease_seconds=300):
+        async def claim(
+            _owner, *, claimant, lease_seconds=300, expected_runtime_incarnation
+        ):
             nonlocal claimed
             assert lease_seconds == 300
+            assert expected_runtime_incarnation == SUCCESSOR_RUNTIME
             if claimed:
                 return None
             claimed = True
@@ -667,8 +673,11 @@ class TestRestoreWorkspace:
         configure_job_restore(svc)
         observed_claimant = None
 
-        async def reclaim(_owner, *, claimant, lease_seconds=300):
+        async def reclaim(
+            _owner, *, claimant, lease_seconds=300, expected_runtime_incarnation
+        ):
             nonlocal observed_claimant
+            assert expected_runtime_incarnation == SUCCESSOR_RUNTIME
             observed_claimant = claimant
             return {
                 **svc._container_provisioner.get_workspace_creation_result.return_value,
@@ -2849,8 +2858,11 @@ class TestStrictTerminalSessionRestore:
             )
         )
 
-        async def claim_restore_work(_owner, *, claimant, lease_seconds=300):
+        async def claim_restore_work(
+            _owner, *, claimant, lease_seconds=300, expected_runtime_incarnation
+        ):
             assert lease_seconds == 300
+            assert expected_runtime_incarnation == authority.runtime_incarnation
             return {
                 **creation,
                 "restore_work_claimed_by": claimant,

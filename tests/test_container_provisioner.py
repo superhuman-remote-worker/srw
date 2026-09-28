@@ -7342,6 +7342,78 @@ class TestWorkspaceNamedResourceAuthority:
         assert body["metadata"]["labels"][self.OWNER.label_key] == self.OWNER.id
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reference_case", ("exact", "foreign", "pod_replaced")
+    )
+    async def test_seed_conflict_keeps_only_exact_pod_owner_reference(
+        self, reference_case
+    ):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAuthorityError,
+        )
+
+        class _Conflict(Exception):
+            status = 409
+
+        p = self._provisioner()
+        referenced_uid = str(uuid4()) if reference_case == "foreign" else self.POD_UID
+        seed = self._seed(
+            p,
+            owner_references=[
+                SimpleNamespace(
+                    api_version="v1",
+                    kind="Pod",
+                    name=self.OWNER.pod_name,
+                    uid=referenced_uid,
+                    controller=True,
+                    block_owner_deletion=False,
+                )
+            ],
+        )
+        p._core_api.create_namespaced_config_map.side_effect = _Conflict()
+        p._core_api.read_namespaced_config_map.side_effect = lambda **_kwargs: seed
+        incumbent = TestStrictStatelessWorkspaceCreation._pod()
+        replacement = TestStrictStatelessWorkspaceCreation._pod(runtime=str(uuid4()))
+        if reference_case == "pod_replaced":
+            p._core_api.read_namespaced_pod.side_effect = [incumbent, replacement]
+        else:
+            p._core_api.read_namespaced_pod.return_value = incumbent
+
+        def replace_seed(*, body, **_kwargs):
+            seed.metadata.owner_references = [
+                SimpleNamespace(
+                    api_version=ref["apiVersion"],
+                    kind=ref["kind"],
+                    name=ref["name"],
+                    uid=ref["uid"],
+                    controller=ref["controller"],
+                    block_owner_deletion=ref["blockOwnerDeletion"],
+                )
+                for ref in body["metadata"].get("ownerReferences", [])
+            ]
+            return seed
+
+        p._core_api.replace_namespaced_config_map.side_effect = replace_seed
+        request = p._create_seed_configmap(
+            self.OWNER.pod_name,
+            {"settings.json": {"content": "{}"}},
+            expected_owner=self.OWNER,
+            expected_creation_generation=self.GENERATION,
+        )
+        if reference_case != "exact":
+            with pytest.raises(WorkspaceRuntimeAuthorityError):
+                await request
+            if reference_case == "foreign":
+                p._core_api.replace_namespaced_config_map.assert_not_called()
+                assert seed.metadata.owner_references[0].uid == referenced_uid
+            else:
+                p._core_api.replace_namespaced_config_map.assert_called_once()
+        else:
+            assert await request == p._seed_configmap_name(self.OWNER.pod_name)
+            assert len(seed.metadata.owner_references) == 1
+            assert seed.metadata.owner_references[0].uid == self.POD_UID
+
+    @pytest.mark.asyncio
     async def test_seed_adoption_and_delete_are_uid_preconditioned(self):
         p = self._provisioner()
         pod = TestStrictStatelessWorkspaceCreation._pod(
@@ -7661,9 +7733,12 @@ class TestIdePodResourceAuthority:
                 deletion_timestamp=None,
                 owner_references=[
                     SimpleNamespace(
+                        api_version="v1",
+                        kind="Pod",
                         name=f"ide-{cls.JOB_ID[:12]}",
                         uid=cls.RUNTIME,
                         controller=True,
+                        block_owner_deletion=False,
                     )
                 ],
             )
@@ -7747,6 +7822,59 @@ class TestIdePodResourceAuthority:
         # Phase-B state is never detached from the reservation. This fixture
         # has no state to stream, so no synchronous seed is created.
         p._seed_workspace_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("foreign_reference", (False, True))
+    async def test_live_409_repairs_only_exact_unowned_seed(
+        self, foreign_reference
+    ):
+        class _Conflict(Exception):
+            status = 409
+
+        p = self._provisioner()
+        pod_name = f"ide-{self.JOB_ID[:12]}"
+        seed_name = p._seed_configmap_name(pod_name)
+        p._create_seed_configmap.return_value = seed_name
+        p._adopt_configmap = type(p)._adopt_configmap.__get__(p)
+        p._core_api.create_namespaced_pod.side_effect = _Conflict()
+        p._core_api.read_namespaced_pod.return_value = self._pod(
+            p, seed_name=seed_name
+        )
+        seed = self._seed(p)
+        seed.metadata.owner_references = []
+        if foreign_reference:
+            seed.metadata.owner_references = [
+                SimpleNamespace(
+                    name=pod_name,
+                    uid=str(uuid4()),
+                    controller=True,
+                )
+            ]
+        p._core_api.read_namespaced_config_map.side_effect = lambda **_kwargs: seed
+
+        def adopt_seed(*, body, **_kwargs):
+            seed.metadata.owner_references = [
+                SimpleNamespace(
+                    name=ref["name"],
+                    uid=ref["uid"],
+                    controller=ref["controller"],
+                )
+                for ref in body["metadata"]["ownerReferences"]
+            ]
+            return seed
+
+        p._core_api.patch_namespaced_config_map.side_effect = adopt_seed
+
+        result = await p.create_ide_pod(self.JOB_ID)
+        if foreign_reference:
+            assert result is None
+            p._core_api.patch_namespaced_config_map.assert_not_called()
+            assert seed.metadata.owner_references[0].uid != self.RUNTIME
+        else:
+            assert result == "10.42.0.30"
+            assert len(seed.metadata.owner_references) == 1
+            assert seed.metadata.owner_references[0].uid == self.RUNTIME
+
 
     @pytest.mark.asyncio
     async def test_live_409_malformed_storage_refuses_without_seed_cleanup(self):

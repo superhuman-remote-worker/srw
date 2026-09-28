@@ -18,6 +18,8 @@ from testcontainers.postgres import PostgresContainer
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.services.container_provisioner import ContainerProvisioner
 from orchestrator.services.ide_session import IdeSessionService
+from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+from orchestrator.services.workspace_suspension import WorkspaceSuspensionService
 from shared.worker_execution_hold import WORKER_EXECUTION_HOLD_KEY
 
 
@@ -749,7 +751,17 @@ async def test_ide_restore_worklist_finds_settled_runtime_with_unfinished_work(d
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "owner_change",
-    (None, "wrong_uid", "wrong_token", "wrong_reservation"),
+    (
+        None,
+        "wrong_uid",
+        "wrong_token",
+        "wrong_reservation",
+        "stale_callback",
+        "stale_unsettled",
+        "stale_claim",
+        "bound_replay",
+        "stale_initial",
+    ),
 )
 async def test_settled_ide_db_uuid_allows_only_exact_owner_restore_work_claim(
     db, owner_change
@@ -802,11 +814,12 @@ async def test_settled_ide_db_uuid_allows_only_exact_owner_restore_work_claim(
             "pod_ip": "10.42.0.31",
         },
     )
-    assert await db.settle_managed_repository_workspace_creation_reservation(
-        str(job_id), **gate, runtime_incarnation=str(runtime)
-    )
+    if owner_change not in {"stale_unsettled", "bound_replay"}:
+        assert await db.settle_managed_repository_workspace_creation_reservation(
+            str(job_id), **gate, runtime_incarnation=str(runtime)
+        )
 
-    if owner_change is not None:
+    if owner_change in {"wrong_uid", "wrong_token", "wrong_reservation"}:
         field, value = {
             "wrong_uid": ("_runtime_incarnation", str(uuid4())),
             "wrong_token": ("_creation_claim_token", "99999"),
@@ -821,28 +834,117 @@ async def test_settled_ide_db_uuid_allows_only_exact_owner_restore_work_claim(
                 ["ide_session", field],
                 value,
             )
+    if owner_change == "bound_replay":
+        async with db.acquire() as conn:
+            reservation = dict(
+                await conn.fetchrow(
+                    "SELECT * FROM managed_repository_workspace_creation_reservations "
+                    "WHERE id = $1",
+                    reservation["id"],
+                )
+            )
+        assert reservation["runtime_incarnation"] == runtime
 
     provisioner = ContainerProvisioner()
     provisioner._db = db
+    provisioner._k8s_available = True
+    provisioner.create_ide_pod = AsyncMock(
+        side_effect=AssertionError("settled IDE must not create another Pod")
+    )
     service = IdeSessionService()
     service.connect(db, None, None, container_provisioner=provisioner)
     receipt = await provisioner.get_current_ide_creation_result(str(job_id))
-    if owner_change is not None:
+    if owner_change in {"wrong_uid", "wrong_token", "wrong_reservation"}:
         assert receipt is None
         assert await service._current_ide_restore_runtime(str(job_id)) is None
         return
 
-    assert receipt is not None
-    assert isinstance(receipt["runtime_incarnation"], UUID)
-    assert await service._current_ide_restore_runtime(str(job_id)) == (
-        str(runtime), "10.42.0.31"
+    if owner_change in {"stale_unsettled", "bound_replay"}:
+        assert receipt is not None
+        assert receipt["result_kind"] is None
+        assert await service._current_ide_restore_runtime(str(job_id)) is None
+    else:
+        assert receipt is not None
+        assert isinstance(receipt["runtime_incarnation"], UUID)
+        assert await service._current_ide_restore_runtime(str(job_id)) == (
+            str(runtime), "10.42.0.31"
+        )
+    if owner_change == "stale_claim":
+        assert await service._claim_ide_restore_work(
+            str(job_id), runtime_incarnation=str(uuid4())
+        ) is None
+        async with db.acquire() as conn:
+            claimed_by = await conn.fetchval(
+                "SELECT restore_work_claimed_by FROM "
+                "managed_repository_workspace_creation_reservations WHERE id = $1",
+                reservation["id"],
+            )
+        assert claimed_by is None
+        return
+    if owner_change == "stale_initial":
+        stale_reservation = {
+            **reservation,
+            "id": uuid4(),
+            "runtime_incarnation": uuid4(),
+        }
+    else:
+        stale_reservation = None
+    if owner_change == "bound_replay":
+        async def settle_exact_bound_pod(_job_id, *, creation_reservation):
+            assert creation_reservation["id"] == reservation["id"]
+            assert await db.settle_managed_repository_workspace_creation_reservation(
+                str(job_id), **gate, runtime_incarnation=str(runtime)
+            )
+            return "10.42.0.31"
+
+        provisioner.create_ide_pod.side_effect = settle_exact_bound_pod
+    service._restore_gitea_container = AsyncMock(return_value=True)
+    job = await service._get_job(str(job_id))
+    assert job is not None
+    await service._restore_session(
+        str(job_id),
+        job,
+        "gitea",
+        8,
+        "16Gi",
+        restore_context={"snapshot_type": "gitea"},
+        expected_restore_runtime=(
+            None
+            if owner_change == "stale_initial"
+            else str(uuid4())
+            if owner_change in {"stale_callback", "stale_unsettled"}
+            else str(runtime)
+        ),
+        creation_reservation=(
+            reservation
+            if owner_change == "bound_replay"
+            else stale_reservation
+        ),
     )
-    claim = await service._claim_ide_restore_work(
-        str(job_id), runtime_incarnation=str(runtime)
-    )
-    assert claim is not None
-    assert claim[1]["id"] == reservation["id"]
-    assert claim[1]["runtime_incarnation"] == runtime
+    if owner_change == "bound_replay":
+        provisioner.create_ide_pod.assert_awaited_once()
+    else:
+        provisioner.create_ide_pod.assert_not_awaited()
+    async with db.acquire() as conn:
+        completed = await conn.fetchrow(
+            "SELECT j.context #>> '{ide_session,status}' AS ide_status, "
+            "j.context #>> '{ide_session,_runtime_incarnation}' AS owner_runtime, "
+            "r.restore_work_completed_at, r.restore_work_result_kind "
+            "FROM jobs j JOIN managed_repository_workspace_creation_reservations r "
+            "ON r.id = $2 WHERE j.id = $1",
+            job_id,
+            reservation["id"],
+        )
+    assert completed["owner_runtime"] == str(runtime)
+    if owner_change in {"stale_callback", "stale_unsettled", "stale_initial"}:
+        service._restore_gitea_container.assert_not_awaited()
+        assert completed["ide_status"] == "restoring"
+        assert completed["restore_work_completed_at"] is None
+        return
+    service._restore_gitea_container.assert_awaited_once()
+    assert completed["ide_status"] == "active"
+    assert completed["restore_work_completed_at"] is not None
+    assert completed["restore_work_result_kind"] == "active"
 
 
 @pytest.mark.asyncio
@@ -2417,6 +2519,44 @@ async def _create_settled_restore_generation(
         runtime_incarnation=str(runtime_uid),
     )
     return str(owner_id), str(runtime_uid), reservation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_kind", ("job", "thread"))
+async def test_stale_workspace_restore_callback_does_not_claim_successor_lease(
+    db, owner_kind
+):
+    owner_id, current_runtime, reservation = await _create_settled_restore_generation(
+        db, owner_kind=owner_kind, scope="workspace_container"
+    )
+    stale_runtime = str(uuid4())
+    owner = (
+        WorkspaceOwner.job(owner_id)
+        if owner_kind == "job"
+        else WorkspaceOwner.session(owner_id)
+    )
+    provisioner = ContainerProvisioner()
+    provisioner._db = db
+    service = WorkspaceSuspensionService()
+    service._container_provisioner = provisioner
+
+    assert await service._claim_workspace_restore_work(
+        owner, runtime_incarnation=stale_runtime
+    ) is None
+    async with db.acquire() as conn:
+        unclaimed = await conn.fetchrow(
+            "SELECT restore_work_claimed_by, restore_work_claim_token "
+            "FROM managed_repository_workspace_creation_reservations WHERE id = $1",
+            reservation["id"],
+        )
+    assert unclaimed["restore_work_claimed_by"] is None
+    assert unclaimed["restore_work_claim_token"] == 0
+
+    exact_claim = await service._claim_workspace_restore_work(
+        owner, runtime_incarnation=current_runtime
+    )
+    assert exact_claim is not None
+    assert exact_claim[1]["runtime_incarnation"] == UUID(current_runtime)
 
 
 @pytest.mark.asyncio
