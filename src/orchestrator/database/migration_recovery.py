@@ -6,10 +6,16 @@ original file. Such compatibility must pin the filename and both exact hashes;
 it never rewrites the ledger, replays applied SQL, or accepts a failed row.
 
 A successful row can also name a file that was published under another name.
-That compatibility pins the historical filename, the canonical filename and
-the one exact checksum both share; it only keeps the historical row from
-counting as a missing file. The row stays as recorded, and the canonical file
-is ordinary: it applies at its own position under its own name.
+That compatibility pins the historical filename, the canonical filename, the
+canonical checksum and the exact historical checksums reviewed as the same
+statement; it only keeps the historical row from counting as a missing file.
+The row stays as recorded, and the canonical file is ordinary: it applies at
+its own position under its own name.
+
+A successful row can finally name an unpublished file whose effect published
+migrations replaced. That contract pins the historical filename and checksum
+and the exact superseding files; while those are on disk with their reviewed
+bytes, the row is retained unchanged and nothing replays on its behalf.
 
 Non-transactional DDL can commit its physical side effect before the migration
 ledger is updated, or leave an unusable catalog object behind when it fails.
@@ -51,54 +57,89 @@ APPLIED_CHECKSUM_COMPATIBILITIES: dict[str, AppliedChecksumCompatibility] = {
             "915246808c5714610aeb98faac61d96b5a2a72a81cba26677ba2d9b636325424"
         ),
     ),
-    # The R3.2 capture migration (see RENAMED_APPLIED_MIGRATIONS below) was
-    # renumbered locally with a rewritten two-line header comment; its SQL
-    # statement is byte-identical. On 2026-09-28 the local k3d database applied
-    # that variant as 0301 after its two historical rows had been deleted by
-    # hand. Only the bytes first applied anywhere (131dd22ee, as 0286) are
-    # canonical; that database keeps its row as recorded and nothing replays.
-    "0301_capture_claimless_retired_agent_pod.sql": AppliedChecksumCompatibility(
-        canonical_checksum=(
-            "a2d08b52d9197d52e43da0859bf328be91c16fbb94feea31c1cdf2e1694bac2e"
+}
+
+
+@dataclass(frozen=True)
+class RenamedAppliedMigration:
+    """One reviewed successful ledger row whose exact statement has a new name."""
+
+    canonical_filename: str
+    checksum: str
+    historical_checksums: tuple[str, ...]
+
+
+# R3.2's claim-less retired-Pod capture (one CREATE OR REPLACE of 0224's
+# capture_retired_pinned_agent_pod trigger function; no data) has carried
+# three names. The local k3d development database applied it as 0286 from
+# 131dd22ee (2026-09-27), and after a manual ledger repair again as 0301 from
+# 50d0af34a, whose copy differed only in a rewritten two-line header comment
+# (587ed9b5...). Local develop 9270a8aa1 published the original bytes as 0301.
+# Upstream then took 0301-0305, so the statement is published as 0306 with the
+# bytes first applied (a2d08b52...). Historical rows stay exactly as recorded
+# and the canonical file applies at its own position, re-running the same
+# statement once: upstream's 0286-0305 neither define that function nor write
+# through its trigger, so the replay keeps its identity, owner, privileges and
+# trigger binding (tests/test_claimless_retired_agent_pod_upgrade_real_postgres.py).
+# Only these names and checksums are accepted; a failed row is not.
+RENAMED_APPLIED_MIGRATIONS: dict[str, RenamedAppliedMigration] = {
+    "0286_capture_claimless_retired_agent_pod.sql": RenamedAppliedMigration(
+        canonical_filename="0306_capture_claimless_retired_agent_pod.sql",
+        checksum="a2d08b52d9197d52e43da0859bf328be91c16fbb94feea31c1cdf2e1694bac2e",
+        historical_checksums=(
+            "a2d08b52d9197d52e43da0859bf328be91c16fbb94feea31c1cdf2e1694bac2e",
         ),
-        historical_checksum=(
-            "587ed9b5edc56bd4946cf0637c679eaba1484ce5237da7f45b1873542fe838e5"
+    ),
+    "0301_capture_claimless_retired_agent_pod.sql": RenamedAppliedMigration(
+        canonical_filename="0306_capture_claimless_retired_agent_pod.sql",
+        checksum="a2d08b52d9197d52e43da0859bf328be91c16fbb94feea31c1cdf2e1694bac2e",
+        historical_checksums=(
+            "a2d08b52d9197d52e43da0859bf328be91c16fbb94feea31c1cdf2e1694bac2e",
+            "587ed9b5edc56bd4946cf0637c679eaba1484ce5237da7f45b1873542fe838e5",
         ),
     ),
 }
 
 
 @dataclass(frozen=True)
-class RenamedAppliedMigration:
-    """One reviewed successful ledger row whose exact file has a new name."""
+class SupersededAppliedMigration:
+    """One reviewed successful ledger row whose effect published files replaced."""
 
-    canonical_filename: str
     checksum: str
+    superseded_by: tuple[tuple[str, str], ...]
 
 
-# R3.2 wrote these two app migrations as 0286/0287. The local k3d development
-# database applied them successfully under those names (source 131dd22ee,
-# checksums below) before upstream published its own 0286-0300, and they are
-# published as 0301/0302 with the same bytes. Each file is one
-# CREATE OR REPLACE FUNCTION of an existing trigger function (0224's
-# capture_retired_pinned_agent_pod, 0200's
-# validate_thread_agent_warm_binding_protection) and changes no data; upstream's
-# 0286-0300 neither define those functions nor write through their triggers,
-# so the historical order leaves the same result. On that database the historical rows
-# stay exactly as recorded; the canonical files still apply after upstream's
-# 0286-0300, re-running these reviewed bytes once so the function bodies,
-# ledger and migration head match every other installation. Their replay keeps
-# each function's identity, owner, privileges and trigger bindings (see
-# tests/test_claimless_retired_agent_pod_upgrade_real_postgres.py). Only the
-# exact name and checksum below are accepted; a failed row is not.
-RENAMED_APPLIED_MIGRATIONS: dict[str, RenamedAppliedMigration] = {
-    "0286_capture_claimless_retired_agent_pod.sql": RenamedAppliedMigration(
-        canonical_filename="0301_capture_claimless_retired_agent_pod.sql",
-        checksum="a2d08b52d9197d52e43da0859bf328be91c16fbb94feea31c1cdf2e1694bac2e",
+# R3.2's warm-release validator (0200's validate_thread_agent_warm_binding_protection
+# with a `releasing` branch accepted at a deleted owner) was applied locally as
+# 0287 (131dd22ee) and as 0302 (50d0af34a, 9270a8aa1), never published. Upstream's
+# 0301 fixed the same defect with a fenced `terminal_release` state, and its text
+# replacement requires 0200's `releasing` branch. 0300z restores 0200's body
+# on exactly this variant before 0301 runs; replaying the R3.2 file after 0301
+# would delete the `terminal_release` branch. The row is retained unchanged,
+# never replayed, and accepted only while both superseding files are on disk
+# with these bytes.
+_R32_WARM_VALIDATOR_SUPERSEDED_BY = (
+    (
+        "0300z_restore_upstream_warm_binding_validator.sql",
+        "6591dde15e2619e592579795cb670f111469d940143eeeed3aaf88a7155594ad",
     ),
-    "0287_permanent_retirement_releases_warm_protection.sql": RenamedAppliedMigration(
-        canonical_filename="0302_permanent_retirement_releases_warm_protection.sql",
-        checksum="c8df370587940ecebc93c0c53a4ff48e29e1d761018fb5b78e318321f2be6d8f",
+    (
+        "0301_pinned_permanent_warm_release.sql",
+        "8a07a05bcf8aeb26a463d85b5a64cfd55f3c8a8f135d477b6067cef687abe9f9",
+    ),
+)
+SUPERSEDED_APPLIED_MIGRATIONS: dict[str, SupersededAppliedMigration] = {
+    "0287_permanent_retirement_releases_warm_protection.sql": (
+        SupersededAppliedMigration(
+            checksum="c8df370587940ecebc93c0c53a4ff48e29e1d761018fb5b78e318321f2be6d8f",
+            superseded_by=_R32_WARM_VALIDATOR_SUPERSEDED_BY,
+        )
+    ),
+    "0302_permanent_retirement_releases_warm_protection.sql": (
+        SupersededAppliedMigration(
+            checksum="c8df370587940ecebc93c0c53a4ff48e29e1d761018fb5b78e318321f2be6d8f",
+            superseded_by=_R32_WARM_VALIDATOR_SUPERSEDED_BY,
+        )
     ),
 }
 

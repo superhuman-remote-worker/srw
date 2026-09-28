@@ -2241,36 +2241,6 @@ class PinnedRetirementOperations:
             persistent_provisioner=self.dependencies.persistent_provisioner,
         )
 
-    async def _complete_permanent_warm_binding_release(
-        self,
-        retirement: Mapping[str, Any],
-    ) -> bool:
-        """Finish the warm finalizer receipt a permanent delete left ``releasing``.
-
-        The thread row is gone and the exact Pod was stopped before it, so this
-        normally settles ``exact_absent_v1`` at once. Any shortfall stays with
-        the leader's warm reconciler, which retries ``releasing`` rows.
-        """
-
-        if not bool(retirement.get("permanent")):
-            return True
-        context = retirement.get("context")
-        context = {} if context is None else context
-        marker = context.get("agent_pod") if isinstance(context, Mapping) else None
-        protection_id = (
-            str(marker.get("warm_binding_protection") or "")
-            if isinstance(marker, Mapping)
-            else ""
-        )
-        if not protection_id:
-            return True
-        return await release_pinned_warm_binding_protection(
-            self.dependencies.store,
-            protection_id=protection_id,
-            agent_provisioner=self.dependencies.agent_provisioner,
-            persistent_provisioner=self.dependencies.persistent_provisioner,
-        )
-
     async def _cleanup_pinned_thread_retirement(
         self,
         retirement: Mapping[str, Any],
@@ -2762,7 +2732,6 @@ class PinnedRetirementOperations:
     complete_retiring_soft_warm_binding_release = (
         _complete_retiring_soft_warm_binding_release
     )
-    complete_permanent_warm_binding_release = _complete_permanent_warm_binding_release
     cleanup_pinned_thread_retirement = _cleanup_pinned_thread_retirement
 
 

@@ -2455,56 +2455,6 @@ def _pinned_retirement_external_cleanup_matches(
     return bool(valid and isinstance(receipt, dict) and receipt == expected)
 
 
-async def _lock_permanent_warm_binding_release(
-    conn: Any,
-    thread_uuid: UUID,
-    *,
-    runtime_generation: Any,
-    agent_id: str,
-    retirement_context: dict[str, Any],
-) -> UUID | None:
-    """Lock the warm protection a permanent retirement captured, if any.
-
-    Only the exact ``bound`` row of this life qualifies: its thread,
-    generation, attach token, agent and Pod must all be the captured ones.
-    Anything else refuses the delete, leaving the retirement retryable.
-    """
-
-    captured_agent_pod = retirement_context.get("agent_pod")
-    warm_marker = (
-        captured_agent_pod.get("warm_binding_protection")
-        if isinstance(captured_agent_pod, dict)
-        else None
-    )
-    if not warm_marker:
-        return None
-    try:
-        protection_id = UUID(str(warm_marker))
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("permanent pinned delete warm context is malformed") from exc
-    warm = await conn.fetchrow(
-        "SELECT * FROM thread_agent_warm_binding_protections "
-        "WHERE protection_id=$1::uuid FOR UPDATE",
-        protection_id,
-    )
-    if not (
-        warm is not None
-        and agent_id
-        and str(warm["status"] or "") == "bound"
-        and str(warm["thread_id"]) == str(thread_uuid)
-        and str(warm["runtime_generation"]) == str(runtime_generation)
-        and str(warm["runtime_attach_token"])
-        == str(retirement_context.get("runtime_attach_token") or "")
-        and str(warm["agent_id"]) == str(agent_id)
-        and str(warm["agent_id"]) == str(retirement_context.get("agent_id") or "")
-        and str(warm["namespace"]) == str(captured_agent_pod.get("namespace") or "")
-        and str(warm["pod_name"]) == str(captured_agent_pod.get("pod_name") or "")
-        and str(warm["pod_uid"]) == str(captured_agent_pod.get("pod_uid") or "")
-    ):
-        raise RuntimeError("permanent pinned delete lost warm binding authority")
-    return protection_id
-
-
 class PostgresDB:
     """PostgreSQL database manager with async connection pooling.
 
@@ -38282,7 +38232,7 @@ class PostgresDB:
                         WHERE warm.thread_id=t.id
                           AND warm.runtime_generation=t.runtime_generation
                           AND warm.status IN
-                              ('planned','protecting','protected','bound','releasing')
+                              ('planned','protecting','protected','bound','releasing','terminal_release')
                    )
                 """,
                 parsed_thread,
@@ -38352,7 +38302,8 @@ class PostgresDB:
                     "SELECT * FROM thread_agent_warm_binding_protections "
                     "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid "
                     "AND status IN "
-                    "('planned','protecting','protected','bound','releasing') "
+                    "('planned','protecting','protected','bound','releasing',"
+                    "'terminal_release') "
                     "FOR UPDATE",
                     parsed_thread,
                     parsed_generation,
@@ -38712,7 +38663,7 @@ class PostgresDB:
                         WHERE warm.thread_id=t.id
                           AND warm.runtime_generation=t.runtime_generation
                           AND warm.status IN
-                              ('planned','protecting','protected','bound','releasing')
+                              ('planned','protecting','protected','bound','releasing','terminal_release')
                    )
                  ORDER BY t.created_at,t.id
                  LIMIT $1
@@ -38734,11 +38685,24 @@ class PostgresDB:
             return []
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM thread_agent_warm_binding_protections "
-                "WHERE ((status='planned' AND lease_expires_at<=now()) "
+                "WITH candidates AS (SELECT warm.*, "
+                "(NOT EXISTS (SELECT 1 FROM threads owner "
+                "WHERE owner.id=warm.thread_id) AND EXISTS ("
+                "SELECT 1 FROM thread_runtime_retirement_outcomes outcome "
+                "WHERE outcome.thread_id=warm.thread_id "
+                "AND outcome.runtime_generation=warm.runtime_generation "
+                "AND outcome.agent_id=warm.agent_id "
+                "AND outcome.runtime_attach_token=warm.runtime_attach_token "
+                "AND outcome.disposition='ended' AND outcome.permanent=true "
+                "AND outcome.outcome='deleted')) AS deleted_owner_release "
+                "FROM thread_agent_warm_binding_protections warm) "
+                "SELECT * FROM candidates WHERE "
+                "((status='planned' AND lease_expires_at<=now()) "
                 "OR (status='protecting' AND effect_expires_at<=now()) "
-                "OR (status IN ('protected','releasing') "
-                "AND lease_expires_at<=now())) "
+                "OR (status IN ('protected','releasing','terminal_release') "
+                "AND lease_expires_at<=now()) "
+                "OR (status='bound' AND lease_expires_at<=now() "
+                "AND deleted_owner_release)) "
                 "AND ($2::uuid IS NULL OR thread_id=$2::uuid) "
                 "ORDER BY COALESCE(effect_expires_at,lease_expires_at),"
                 "protection_id LIMIT $1",
@@ -38746,6 +38710,36 @@ class PostgresDB:
                 parsed_thread,
             )
         return [dict(row) for row in rows]
+
+    async def begin_deleted_pinned_warm_binding_release(
+        self, protection_id: str
+    ) -> bool:
+        """Claim an old bound Pod only under its exact deleted-owner receipt."""
+
+        try:
+            parsed = UUID(str(protection_id))
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            changed = await conn.execute(
+                "UPDATE thread_agent_warm_binding_protections warm SET "
+                "status='terminal_release',release_started_at=transaction_timestamp() "
+                "WHERE warm.protection_id=$1::uuid AND warm.status='bound' "
+                "AND warm.lease_expires_at<=now() "
+                "AND public.pinned_deleted_owner_warm_release_authorized(warm)",
+                parsed,
+            )
+            if changed == "UPDATE 1":
+                return True
+            return bool(
+                await conn.fetchval(
+                    "SELECT status='terminal_release' AND "
+                    "public.pinned_deleted_owner_warm_release_authorized(warm) "
+                    "FROM thread_agent_warm_binding_protections warm "
+                    "WHERE protection_id=$1::uuid",
+                    parsed,
+                )
+            )
 
     async def abort_unmodified_pinned_warm_binding(
         self,
@@ -38909,22 +38903,31 @@ class PostgresDB:
                     return False
                 if str(warm["status"]) == "released":
                     return True
-                if str(warm["status"]) != "releasing":
+                status = str(warm["status"])
+                if status not in {"releasing", "terminal_release"}:
+                    return False
+                if status == "terminal_release" and (
+                    release_outcome != "exact_absent_v1" or agent_present
+                ):
                     return False
                 changed = await conn.execute(
                     "UPDATE thread_agent_warm_binding_protections SET "
                     "status='released',release_outcome=$2,"
                     "released_at=transaction_timestamp() "
-                    "WHERE protection_id=$1::uuid AND status='releasing'",
+                    "WHERE protection_id=$1::uuid AND status=$3",
                     parsed,
                     release_outcome,
+                    status,
                 )
                 agent_changed = await conn.execute(
                     "UPDATE agents SET status=$2 "
                     "WHERE id=$1::uuid AND thread_id IS NULL "
-                    "AND current_job_id IS NULL AND status='draining'",
+                    "AND current_job_id IS NULL AND status='draining' "
+                    "AND hostname=$3 AND pod_uid=$4",
                     warm["agent_id"],
                     "ready" if agent_present else "offline",
+                    warm["pod_name"],
+                    warm["pod_uid"],
                 )
                 if changed != "UPDATE 1":
                     raise RuntimeError("warm finalizer release CAS lost")
@@ -45307,6 +45310,63 @@ class PostgresDB:
                     raise RuntimeError(
                         "permanent thread delete has nonreciprocal agent authority"
                     )
+                warm_release = None
+                if expected_runtime_retirement_token is not None:
+                    assert retirement_context is not None
+                    captured_pod = retirement_context.get("agent_pod")
+                    captured_pod = {} if captured_pod is None else captured_pod
+                    if not isinstance(captured_pod, dict):
+                        raise RuntimeError("permanent warm Pod marker is malformed")
+                    protection_id = captured_pod.get("warm_binding_protection")
+                    if protection_id:
+                        try:
+                            parsed_protection_id = UUID(str(protection_id))
+                        except (TypeError, ValueError) as exc:
+                            raise RuntimeError(
+                                "permanent warm Pod marker is malformed"
+                            ) from exc
+                        # The owner lock was acquired first. NOWAIT avoids a
+                        # bind (warm -> owner) deadlock; the whole deletion
+                        # transaction remains retryable if bind still owns it.
+                        warm_release = await conn.fetchrow(
+                            "SELECT * FROM thread_agent_warm_binding_protections "
+                            "WHERE protection_id=$1::uuid FOR UPDATE NOWAIT",
+                            parsed_protection_id,
+                        )
+                        if not (
+                            warm_release is not None
+                            and str(warm_release["status"]) == "bound"
+                            and str(warm_release["thread_id"]) == str(thread_uuid)
+                            and str(warm_release["runtime_generation"])
+                            == str(expected_runtime_generation)
+                            and str(warm_release["runtime_attach_token"])
+                            == str(retirement_context.get("runtime_attach_token") or "")
+                            and str(warm_release["agent_id"])
+                            == str(expected_inverse_agent)
+                            and str(warm_release["namespace"])
+                            == str(captured_pod.get("namespace") or "")
+                            and str(warm_release["pod_name"])
+                            == str(captured_pod.get("pod_name") or "")
+                            and str(warm_release["pod_uid"])
+                            == str(captured_pod.get("pod_uid") or "")
+                            and str(captured_pod.get("protection_protocol") or "")
+                            == "finalizer_v1"
+                        ):
+                            raise RuntimeError(
+                                "permanent warm Pod release lacks exact authority"
+                            )
+                    elif await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM "
+                        "thread_agent_warm_binding_protections "
+                        "WHERE thread_id=$1::uuid "
+                        "AND runtime_generation=$2::uuid "
+                        "AND status='bound')",
+                        thread_uuid,
+                        expected_runtime_generation,
+                    ):
+                        raise RuntimeError(
+                            "permanent warm Pod release marker is missing"
+                        )
                 if stateless and expected_inverse_agent:
                     raise RuntimeError(
                         "permanent stateless delete retains agent authority"
@@ -45385,26 +45445,25 @@ class PostgresDB:
                     )
                 else:
                     assert retirement_context is not None
-                    warm_release_id = await _lock_permanent_warm_binding_release(
-                        conn,
-                        thread_uuid,
-                        runtime_generation=thread["runtime_generation"],
-                        agent_id=expected_inverse_agent,
-                        retirement_context=retirement_context,
-                    )
                     if expected_inverse_agent:
-                        # A warm-pool actor drains like soft settlement leaves
-                        # it: its protection release returns or retires it.
-                        detached = await conn.execute(
-                            "UPDATE agents SET thread_id=NULL "
-                            "WHERE id=$1::uuid AND thread_id=$2::uuid"
-                            if warm_release_id is None
-                            else "UPDATE agents SET thread_id=NULL, "
-                            "status='draining' "
-                            "WHERE id=$1::uuid AND thread_id=$2::uuid",
-                            UUID(expected_inverse_agent),
-                            thread_uuid,
-                        )
+                        if warm_release is None:
+                            detached = await conn.execute(
+                                "UPDATE agents SET thread_id=NULL "
+                                "WHERE id=$1::uuid AND thread_id=$2::uuid",
+                                UUID(expected_inverse_agent),
+                                thread_uuid,
+                            )
+                        else:
+                            detached = await conn.execute(
+                                "UPDATE agents SET thread_id=NULL,status='draining' "
+                                "WHERE id=$1::uuid AND thread_id=$2::uuid "
+                                "AND status='session' AND current_job_id IS NULL "
+                                "AND hostname=$3 AND pod_uid=$4",
+                                UUID(expected_inverse_agent),
+                                thread_uuid,
+                                warm_release["pod_name"],
+                                warm_release["pod_uid"],
+                            )
                         if detached != "UPDATE 1":
                             raise RuntimeError(
                                 "permanent pinned delete lost reciprocal agent authority"
@@ -45432,6 +45491,18 @@ class PostgresDB:
                         raise RuntimeError(
                             "permanent retirement outcome conflicts with exact authority"
                         )
+                    if warm_release is not None:
+                        warm_changed = await conn.execute(
+                            "UPDATE thread_agent_warm_binding_protections SET "
+                            "status='terminal_release',"
+                            "release_started_at=transaction_timestamp() "
+                            "WHERE protection_id=$1::uuid AND status='bound'",
+                            warm_release["protection_id"],
+                        )
+                        if warm_changed != "UPDATE 1":
+                            raise RuntimeError(
+                                "permanent warm Pod release CAS lost exact authority"
+                            )
                     deleted = await conn.execute(
                         "DELETE FROM threads WHERE id = $1 "
                         "AND runtime_generation = $2::uuid "
@@ -45445,22 +45516,6 @@ class PostgresDB:
                         raise RuntimeError(
                             "permanent pinned delete lost retirement authority"
                         )
-                    if warm_release_id is not None:
-                        # The exact Pod is already stopped. Its protection row
-                        # can only leave ``bound`` in this transaction: once the
-                        # thread row is gone, nothing else may fence it (0302).
-                        warm_changed = await conn.execute(
-                            "UPDATE thread_agent_warm_binding_protections SET "
-                            "status='releasing',"
-                            "release_started_at=transaction_timestamp() "
-                            "WHERE protection_id=$1::uuid AND status='bound'",
-                            warm_release_id,
-                        )
-                        if warm_changed != "UPDATE 1":
-                            raise RuntimeError(
-                                "permanent pinned delete warm release CAS lost "
-                                "exact authority"
-                            )
 
     async def update_thread_status(self, thread_id: str, status: str) -> None:
         """Update thread status.

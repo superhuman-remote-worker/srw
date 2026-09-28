@@ -164,6 +164,9 @@ async def reconcile_pinned_warm_binding_protections(
     publish = getattr(db, "publish_pinned_warm_binding_protection", None)
     bind = getattr(db, "bind_pinned_warm_agent", None)
     begin_release = getattr(db, "begin_pinned_warm_binding_release", None)
+    begin_deleted_release = getattr(
+        db, "begin_deleted_pinned_warm_binding_release", None
+    )
     complete_release = getattr(db, "complete_pinned_warm_binding_release", None)
     abort = getattr(db, "abort_unmodified_pinned_warm_binding", None)
     if any(
@@ -407,9 +410,18 @@ async def reconcile_pinned_warm_binding_protections(
             else:
                 unresolved += 1
             continue
-        if source != "attach":
+        if source != "attach" and not row.get("deleted_owner_release"):
             unresolved += 1
             continue
+        if status == "bound":
+            if (
+                not row.get("deleted_owner_release")
+                or begin_deleted_release is None
+                or not await begin_deleted_release(protection_id)
+            ):
+                unresolved += 1
+                continue
+            status = "terminal_release"
         if status == "planned":
             observation = await observe(row)
             state = str(observation.get("state") or "")
@@ -439,7 +451,23 @@ async def reconcile_pinned_warm_binding_protections(
         if status == "protected" and not await begin_release(protection_id):
             unresolved += 1
             continue
-        release_result = await release(row)
+        if status == "releasing" and row.get("deleted_owner_release"):
+            # Older writers could leave an ordinary release at a deleted
+            # owner. Its state alone grants no terminal-only Pod proof.
+            unresolved += 1
+            continue
+        if status == "terminal_release" and (
+            not row.get("deleted_owner_release")
+            or begin_deleted_release is None
+            or not await begin_deleted_release(protection_id)
+        ):
+            unresolved += 1
+            continue
+        release_result = (
+            await release(row, terminal_only=True)
+            if status == "terminal_release"
+            else await release(row)
+        )
         if not isinstance(release_result, dict):
             unresolved += 1
             continue

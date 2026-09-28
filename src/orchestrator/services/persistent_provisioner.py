@@ -1191,7 +1191,7 @@ class PersistentProvisioner:
         )
 
     async def release_planned_pinned_warm_agent_authority(
-        self, authority: dict[str, Any]
+        self, authority: dict[str, Any], *, terminal_only: bool = False
     ) -> dict[str, Any] | None:
         if not self._k8s_available or self._core_api is None:
             return None
@@ -1201,6 +1201,7 @@ class PersistentProvisioner:
             pod_name=str(authority.get("pod_name") or ""),
             expected_pod_uid=str(authority.get("pod_uid") or ""),
             expected_labels=self._warm_binding_labels(authority),
+            terminal_only=terminal_only,
         )
 
     async def fence_agent_pod_provision_intent(

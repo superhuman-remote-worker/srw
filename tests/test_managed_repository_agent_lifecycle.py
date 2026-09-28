@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
+import shlex
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -278,6 +281,59 @@ def test_real_agent_launch_reuse_generation_replace_and_retire(
         _run(managed_repository_agent_zero_command(home_path=str(tmp_path))).returncode
         == 0
     )
+
+
+def test_repository_agent_does_not_inherit_ide_setup_lock(
+    short_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Older OpenSSH retains inherited fds and would wedge the next IDE setup."""
+    real_agent = shutil.which("ssh-agent")
+    assert real_agent
+    bin_dir = short_home / "bin"
+    bin_dir.mkdir()
+    observed = short_home / "inherited-locks.json"
+    wrapper = bin_dir / "ssh-agent"
+    wrapper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "inherited = []\n"
+        "for fd in (8, 9):\n"
+        "    try:\n"
+        "        os.fstat(fd)\n"
+        "    except OSError:\n"
+        "        continue\n"
+        "    inherited.append(fd)\n"
+        f"Path({str(observed)!r}).write_text(json.dumps(inherited))\n"
+        f"os.execv({real_agent!r}, [{real_agent!r}, *sys.argv[1:]])\n"
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    authority_id = str(uuid4())
+    key, _, _ = _deploy_keypair()
+    launch = managed_repository_agent_launch_command(
+        home_path=str(short_home), authority_id=authority_id, generation=1
+    )
+    command = (
+        f"exec 8>{shlex.quote(str(short_home / 'setup.lock'))}; flock -x 8; " + launch
+    )
+    try:
+        result = _run(command, secret=key.encode())
+        assert result.returncode == 0, result.stderr.decode(errors="replace")
+        assert json.loads(observed.read_text()) == []
+    finally:
+        retired = _run(
+            managed_repository_agent_retirement_command(
+                home_path=str(short_home), authority_ids=[authority_id]
+            )
+        )
+        assert retired.returncode == 0
+        assert (
+            _run(
+                managed_repository_agent_zero_command(home_path=str(short_home))
+            ).returncode
+            == 0
+        )
 
 
 def test_failed_key_or_proof_rolls_back_real_spawn(short_home: Path) -> None:

@@ -1062,8 +1062,31 @@ async def _assert_warm_ledger_settled(db, life, *, outcome):
     assert not await db.fetchval(
         "SELECT count(*) FROM thread_agent_warm_binding_protections "
         "WHERE agent_id=$1::uuid "
-        "AND status IN ('planned','protecting','protected','bound','releasing')",
+        "AND status IN ('planned','protecting','protected','bound','releasing',"
+        "'terminal_release')",
         life["agent"],
+    )
+
+
+async def _reconcile_expired_warm_release(db, life, provisioner):
+    """Run the leader's warm reconciler once the release lease has expired."""
+
+    from orchestrator.services.pinned_agent_authority import (
+        reconcile_pinned_warm_binding_protections,
+    )
+
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            # Fixture time travel only: the reconciler takes expired leases.
+            await conn.execute("SET LOCAL session_replication_role='replica'")
+            await conn.execute(
+                "UPDATE thread_agent_warm_binding_protections "
+                "SET lease_expires_at=created_at+interval '1 millisecond' "
+                "WHERE thread_id=$1::uuid",
+                life["thread"],
+            )
+    return await reconcile_pinned_warm_binding_protections(
+        db, agent_provisioner=provisioner, persistent_provisioner=None
     )
 
 
@@ -1073,12 +1096,12 @@ async def test_active_warm_permanent_delete_settles_its_warm_protection(
 ):
     """The exact stop of a warm Pod must also settle its durable protection.
 
-    A ``bound`` row whose thread row is gone can never move again (``bound``
-    only leaves through ``releasing``, which the reciprocity check fences on
-    the thread row), so the settlement has to happen with the delete.
+    The delete moves the exact ``bound`` row to ``terminal_release`` in its own
+    transaction (0301); the leader's reconciler then releases only the exact
+    terminal Pod and settles ``exact_absent_v1``, never returning it to the pool.
     """
 
-    life, api, _, stack = await _bind_warm_life(db, monkeypatch)
+    life, api, provisioner, stack = await _bind_warm_life(db, monkeypatch)
     handoff = await _owner_permanent_then_agent_ack(stack, life)
     assert handoff.get("retiring_agent_exit_authorized") is True
     api.mark_terminal("agents-a", life["pod_name"])
@@ -1088,6 +1111,10 @@ async def test_active_warm_permanent_delete_settles_its_warm_protection(
     assert result.get("status") == "deleted", result
     assert await db.get_thread(life["thread"]) is None
     assert ("agents-a", life["pod_name"]) not in api.pods
+    assert [row["status"] for row in await _warm_protections(db, life)] == [
+        "terminal_release"
+    ]
+    await _reconcile_expired_warm_release(db, life, provisioner)
     await _assert_warm_ledger_settled(db, life, outcome="exact_absent_v1")
     agent = await db.fetchrow(
         "SELECT status,thread_id FROM agents WHERE id=$1::uuid", life["agent"]
@@ -1126,11 +1153,15 @@ async def test_warm_self_end_releases_its_protection_then_deletes(db, monkeypatc
         None,
     ],
 )
-async def test_absent_thread_warm_release_needs_its_exact_permanent_outcome(
+async def test_absent_thread_warm_release_is_terminal_and_needs_its_exact_outcome(
     db, monkeypatch, fault
 ):
-    """``releasing`` without a thread row is fenced only by this life's
-    permanent ``deleted`` outcome and a detached, draining actor."""
+    """Without a thread row only ``terminal_release`` may leave ``bound``, fenced
+    by this life's permanent ``deleted`` outcome and a detached, draining actor.
+
+    Ordinary ``releasing`` at an absent thread (R3.2's superseded variant) is
+    refused in every case: its release path may return a Pod to the pool.
+    """
 
     import asyncpg
 
@@ -1166,20 +1197,24 @@ async def test_absent_thread_warm_release_needs_its_exact_permanent_outcome(
                     "settled" if fault == "soft_outcome" else "deleted",
                 )
 
-    async def release():
+    async def release(status):
         async with db.acquire() as conn:
             async with conn.transaction():
                 return await conn.execute(
                     "UPDATE thread_agent_warm_binding_protections SET "
-                    "status='releasing',release_started_at=transaction_timestamp() "
+                    "status=$2,release_started_at=transaction_timestamp() "
                     "WHERE protection_id=$1::uuid AND status='bound'",
                     protection,
+                    status,
                 )
 
+    with pytest.raises(asyncpg.exceptions.CheckViolationError):
+        await release("releasing")
+    assert (await _warm_protections(db, life))[0]["status"] == "bound"
     if fault is None:
-        assert await release() == "UPDATE 1"
-        assert (await _warm_protections(db, life))[0]["status"] == "releasing"
+        assert await release("terminal_release") == "UPDATE 1"
+        assert (await _warm_protections(db, life))[0]["status"] == "terminal_release"
     else:
         with pytest.raises(asyncpg.exceptions.CheckViolationError):
-            await release()
+            await release("terminal_release")
         assert (await _warm_protections(db, life))[0]["status"] == "bound"

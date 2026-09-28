@@ -12602,6 +12602,24 @@ class ContainerProvisioner:
             return "replacement"
         return self._classify_exact_ide_pod(pod, observed)
 
+    async def ide_pod_live(
+        self,
+        job_id: str,
+        *,
+        expected_runtime_incarnation: str,
+    ) -> bool | None:
+        """Probe the exact IDE Pod without treating uncertainty as absence."""
+
+        authority = await self._ide_pod_authority(
+            job_id,
+            expected_runtime_incarnation=expected_runtime_incarnation,
+        )
+        if authority == "exact_live":
+            return True
+        if authority in {"exact_absent", "exact_terminal", "replacement"}:
+            return False
+        return None
+
     async def attest_ide_runtime(
         self,
         job_id: str,

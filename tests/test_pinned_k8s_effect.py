@@ -232,3 +232,63 @@ async def test_warm_release_removes_finalizer_from_exact_terminal_deleting_pod()
         expected_pod_uid="pod-u1",
         expected_labels={"authority": "exact"},
     ) == {"outcome": "exact_absent_v1", "agent_present": False}
+
+
+@pytest.mark.asyncio
+async def test_terminal_warm_delete_cannot_delete_same_name_successor():
+    class Conflict(Exception):
+        status = 409
+
+    class CoreApi:
+        def __init__(self) -> None:
+            self.pod = SimpleNamespace(
+                metadata=SimpleNamespace(
+                    uid="old-uid",
+                    resource_version="41",
+                    labels={"authority": "exact"},
+                    finalizers=[PINNED_AUTHORITY_FINALIZER],
+                    annotations=None,
+                    deletion_timestamp=None,
+                ),
+                status=SimpleNamespace(
+                    phase="Succeeded",
+                    container_statuses=[
+                        SimpleNamespace(
+                            state=SimpleNamespace(terminated=SimpleNamespace())
+                        )
+                    ],
+                ),
+            )
+
+        def read_namespaced_pod(self, *, name, namespace, _request_timeout=None):
+            del name, namespace, _request_timeout
+            return self.pod
+
+        def delete_namespaced_pod(
+            self, *, name, namespace, body, _request_timeout=None
+        ):
+            del name, namespace, _request_timeout
+            self.pod.metadata.uid = "successor-uid"
+            self.pod.status.phase = "Running"
+            if body.get("preconditions", {}).get("uid") != self.pod.metadata.uid:
+                raise Conflict()
+            self.pod.metadata.deletion_timestamp = "now"
+
+        def patch_namespaced_pod(self, **_kwargs):
+            raise AssertionError("successor finalizer cannot be patched")
+
+    api = CoreApi()
+    assert (
+        await release_planned_pinned_pod_authority(
+            api,
+            namespace="agents-a",
+            pod_name="warm-pod",
+            expected_pod_uid="old-uid",
+            expected_labels={"authority": "exact"},
+            terminal_only=True,
+        )
+        is None
+    )
+    assert api.pod.metadata.uid == "successor-uid"
+    assert api.pod.metadata.deletion_timestamp is None
+    assert api.pod.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]

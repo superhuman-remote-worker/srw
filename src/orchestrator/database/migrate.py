@@ -3,18 +3,20 @@
 Apply versioned SQL files from ``src/orchestrator/database/migrations/{app,audit,vector}/``
 in lexicographic order, tracked in a ``schema_migrations`` table on each DB.
 
-Applied files are immutable. The reviewed historical exceptions are vector
-0025's published pgvector-preload variant and app 0301's renumbered-header
-variant: migration_recovery pins each exact filename, canonical on-disk
-checksum, and alternate successful-ledger checksum. Acceptance preserves the
-complete successful ledger row and never replays its SQL. Dirty rows and all
-unreviewed checksum drift still fail closed.
+Applied files are immutable. The reviewed historical exception is vector
+0025's published pgvector-preload variant: migration_recovery pins its exact
+filename, canonical on-disk checksum, and alternate successful-ledger checksum.
+Acceptance preserves the complete successful ledger row and never replays its
+SQL. Dirty rows and all unreviewed checksum drift still fail closed.
 
-Two reviewed app files were applied under earlier names and published under
-new ones (migration_recovery.RENAMED_APPLIED_MIGRATIONS). Their exact historical
-rows are retained and not treated as missing files; the canonical files apply
-like any other pending file. Unknown names, other checksums, failed rows and a
-missing or different canonical file still fail closed.
+One reviewed app statement was applied under earlier names and published under
+a new one (migration_recovery.RENAMED_APPLIED_MIGRATIONS), and one unpublished
+app file was superseded by published migrations
+(migration_recovery.SUPERSEDED_APPLIED_MIGRATIONS). Their exact historical rows
+are retained and not treated as missing files: a renamed statement's canonical
+file applies like any other pending file, and a superseded file never replays.
+Unknown names, other checksums, failed rows and a missing or different
+canonical or superseding file still fail closed.
 
 Design rationale and operational runbook live in ``knowledge-base/knowledge/db_migration.md``.
 """
@@ -38,6 +40,7 @@ from orchestrator.database.migration_recovery import (
     APPLIED_CHECKSUM_COMPATIBILITIES,
     NOTX_RECOVERIES,
     RENAMED_APPLIED_MIGRATIONS,
+    SUPERSEDED_APPLIED_MIGRATIONS,
     ConcurrentIndexRecovery,
 )
 from shared.db_url import build_postgres_url
@@ -539,10 +542,11 @@ def _renamed_applied_history(
     """Return the historical rows an exact reviewed rename accounts for.
 
     A row qualifies only when its filename is registered, its successful
-    checksum is the reviewed one, and the canonical file is on disk with those
-    same bytes. The row is retained unchanged; nothing is marked applied on its
-    behalf, so the canonical file still applies under its own name. Any other
-    registered row is refused outright rather than reported as merely missing.
+    checksum is one reviewed for that name, and the canonical file is on disk
+    with its reviewed bytes. The row is retained unchanged; nothing is marked
+    applied on its behalf, so the canonical file still applies under its own
+    name. Any other registered row is refused outright rather than reported as
+    merely missing.
     """
 
     on_disk = {path.name: path for path in files}
@@ -551,7 +555,7 @@ def _renamed_applied_history(
         renamed = RENAMED_APPLIED_MIGRATIONS.get(filename)
         if renamed is None:
             continue
-        if applied[filename] != renamed.checksum:
+        if applied[filename] not in renamed.historical_checksums:
             raise RuntimeError(
                 f"checksum changed: {filename} (a renamed migration's historical "
                 "row must be the exact reviewed artifact)"
@@ -567,6 +571,47 @@ def _renamed_applied_history(
             filename,
             renamed.canonical_filename,
             "applied" if renamed.canonical_filename in applied else "pending",
+        )
+        retained.add(filename)
+    return retained
+
+
+def _superseded_applied_history(
+    stray: set[str],
+    applied: dict[str, str],
+    files: list[Path],
+) -> set[str]:
+    """Return the historical rows an exact reviewed supersession accounts for.
+
+    A row qualifies only when its filename is registered, its successful
+    checksum is the reviewed one, and every superseding file is on disk with
+    its reviewed bytes. The row is retained unchanged and its SQL never runs
+    again; the superseding files apply (or already applied) at their own
+    positions. Any other registered row is refused outright.
+    """
+
+    on_disk = {path.name: path for path in files}
+    retained: set[str] = set()
+    for filename in sorted(stray):
+        superseded = SUPERSEDED_APPLIED_MIGRATIONS.get(filename)
+        if superseded is None:
+            continue
+        if applied[filename] != superseded.checksum:
+            raise RuntimeError(
+                f"checksum changed: {filename} (a superseded migration's "
+                "historical row must be the exact reviewed artifact)"
+            )
+        for successor, checksum in superseded.superseded_by:
+            path = on_disk.get(successor)
+            if path is None or _checksum(path.read_text()) != checksum:
+                raise RuntimeError(
+                    f"superseded migration {filename} requires "
+                    f"{successor} on disk with its reviewed checksum"
+                )
+        log.warning(
+            "retained superseded ledger row %s; replaced by %s",
+            filename,
+            ", ".join(successor for successor, _ in superseded.superseded_by),
         )
         retained.add(filename)
     return retained
@@ -910,6 +955,7 @@ async def run_migrations(
 
                 stray = set(applied) - {p.name for p in files}
                 stray -= _renamed_applied_history(stray, applied, files)
+                stray -= _superseded_applied_history(stray, applied, files)
                 if stray:
                     raise RuntimeError(f"applied but missing on disk: {sorted(stray)}")
 

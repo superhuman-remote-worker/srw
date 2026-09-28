@@ -1430,9 +1430,6 @@ async def _end_thread_flow_owned(
     _complete_retiring_soft_warm_binding_release = (
         pinned.complete_retiring_soft_warm_binding_release
     )
-    _complete_permanent_warm_binding_release = (
-        pinned.complete_permanent_warm_binding_release
-    )
     _pinned_retirement_is_current = pinned.pinned_retirement_is_current
     _pre_registration_agent_pod_zero_candidate = (
         pinned.pre_registration_agent_pod_zero_candidate
@@ -2267,25 +2264,6 @@ async def _end_thread_flow_owned(
                         expected_runtime_retirement_token=str(retirement["token"]),
                         expected_runtime_generation=str(retirement["generation"]),
                     )
-                    # The delete moved a captured warm protection to
-                    # ``releasing``; the thread is gone either way, so a
-                    # shortfall here is the warm reconciler's, not a 503.
-                    try:
-                        released = await _complete_permanent_warm_binding_release(
-                            retirement
-                        )
-                    except Exception:
-                        released = False
-                        logger.exception(
-                            "Warm protection release after deleting thread %s failed",
-                            thread_id,
-                        )
-                    if not released:
-                        logger.warning(
-                            "Warm protection release for deleted thread %s is "
-                            "left to the reconciler",
-                            thread_id,
-                        )
                 else:
                     settled = await postgres_db.settle_pinned_thread_retirement(
                         thread_id,
