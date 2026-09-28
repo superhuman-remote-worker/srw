@@ -677,3 +677,125 @@ async def test_acceptance_and_unknown_pod_keep_real_resource_charge(db, monkeypa
     assert current["runtime_retirement_token"] is not None
     assert current["status"] != "ended"
     assert not await db.resume_thread(thread_id)
+
+
+# ---------------------------------------------------------------------------
+# Soft End keeps the root disk; a later permanent Delete reclaims it
+# ---------------------------------------------------------------------------
+
+
+async def _soft_end_settled(db, monkeypatch):
+    """A legacy (non-v3) VM thread whose soft End retained its root disk."""
+
+    ids, retirement, request, events, k8s, provider = await scenario(db, monkeypatch)
+    assert await db.request_pinned_thread_retirement_actuator(ids["thread"], **request)
+    candidate = (await db.list_retryable_pinned_retirements())[0]
+    assert await detector.retry_pending_pinned_retirement(
+        candidate,
+        dependencies=composition.stale_agent_detector_dependencies(
+            main.app.state.resources
+        ),
+    )
+    assert events == ["pod-stop", "vm-stop"]
+    ended = await db.get_thread(ids["thread"])
+    assert ended["status"] == "ended"
+    vm = fixtures._json(ended["metadata"])["vm"]
+    ids["vm"] = vm
+    return ids, retirement, provider
+
+
+async def _cleanup_admissions(db, thread_id):
+    rows = await db.fetch(
+        "SELECT id,request_id,source,intent_digest,completed_at,outcome,pvc_uid "
+        "FROM vm_workspace_cleanup_admissions "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid ORDER BY admitted_at",
+        thread_id,
+    )
+    return [dict(row) for row in rows]
+
+
+async def _owner_delete_until_settled(db, thread_id, attempts=4):
+    operations = composition.thread_retirement_operations(main.app.state.resources)
+    results = []
+    for _ in range(attempts):
+        current = await db.get_thread(thread_id)
+        if current is None:
+            break
+        try:
+            results.append(
+                await operations.end_thread_flow(
+                    thread_id, current, permanent=True, force=True
+                )
+            )
+        except HTTPException as exc:
+            results.append({"http": exc.status_code, "detail": exc.detail})
+    return results
+
+
+def _purging_provider(provider, ids, purges, *, fail_first=False):
+    async def purge(thread_id, identity, **kwargs):
+        assert thread_id == ids["thread"]
+        assert kwargs["purge_disk"] is True
+        purges.append(
+            (
+                identity.provision_generation,
+                identity.vm_uid,
+                identity.rootdisk_pvc_uid,
+            )
+        )
+        if fail_first and len(purges) == 1:
+            return VMTeardownResult("unknown", False)
+        return VMTeardownResult("completed", True)
+
+    provider.release_vm_captured = purge
+
+
+@pytest.mark.asyncio
+async def test_soft_end_then_permanent_delete_reclaims_the_retained_disk(
+    db, monkeypatch
+):
+    ids, _, provider = await _soft_end_settled(db, monkeypatch)
+    keep = await _cleanup_admissions(db, ids["thread"])
+    assert [(row["source"], row["outcome"]) for row in keep] == [
+        ("pinned_thread_retirement", "completed")
+    ]
+    purges = []
+    _purging_provider(provider, ids, purges)
+
+    results = await _owner_delete_until_settled(db, ids["thread"])
+
+    assert await db.get_thread(ids["thread"]) is None, results
+    vm = ids["vm"]
+    assert purges == [
+        (vm["provision_generation"], vm["vm_uid"], vm["rootdisk_pvc_uid"])
+    ]
+    admissions = await _cleanup_admissions(db, ids["thread"])
+    # The soft End's keep admission is untouched; the purge is its own exact
+    # admission for the same VM and disk, under a different request ID.
+    assert admissions[0] == keep[0]
+    assert len(admissions) == 2
+    purge = admissions[1]
+    assert purge["source"] == "pinned_thread_retirement"
+    assert purge["pvc_uid"] == keep[0]["pvc_uid"]
+    assert purge["request_id"] != keep[0]["request_id"]
+    assert purge["intent_digest"] != keep[0]["intent_digest"]
+    assert (purge["outcome"], purge["completed_at"] is not None) == ("completed", True)
+
+
+@pytest.mark.asyncio
+async def test_interrupted_permanent_delete_retries_its_own_purge_admission(
+    db, monkeypatch
+):
+    ids, _, provider = await _soft_end_settled(db, monkeypatch)
+    purges = []
+    _purging_provider(provider, ids, purges, fail_first=True)
+
+    results = await _owner_delete_until_settled(db, ids["thread"])
+
+    assert await db.get_thread(ids["thread"]) is None, results
+    # The unknown first purge left its admission open; the retry reused it
+    # (same request ID, one purge admission) instead of minting another.
+    assert len(purges) == 2 and purges[0] == purges[1]
+    admissions = await _cleanup_admissions(db, ids["thread"])
+    assert len(admissions) == 2
+    assert admissions[1]["outcome"] == "completed"
