@@ -102,6 +102,7 @@ def reads_wire(monkeypatch):
     acquired.__aexit__ = AsyncMock(side_effect=release)
     db = SimpleNamespace(
         acquire=MagicMock(return_value=acquired),
+        container_workspace_creation_views=AsyncMock(return_value={}),
         get_project=AsyncMock(side_effect=project),
         query_jobs=AsyncMock(
             return_value=SimpleNamespace(
@@ -282,6 +283,31 @@ async def test_detail_audit_and_private_projection_preserve_jsonb_and_extensions
 
 
 @pytest.mark.asyncio
+async def test_detail_reads_exact_startup_view_after_owner_gate(reads_wire):
+    view = {
+        "stage": "readiness",
+        "state": "attention",
+        "reason_code": "invalid_image",
+        "readiness_deadline_at": STAMP,
+    }
+    reads_wire.state.job["status"] = "processing"
+    reads_wire.db.container_workspace_creation_views.return_value = {UUID(JOB): view}
+    response = await get(reads_wire, DETAIL)
+    assert response.status_code == 200
+    assert response.json()["workspace_creation"] == {
+        **view,
+        "readiness_deadline_at": "2026-09-07T08:00:00Z",
+    }
+    reads_wire.db.container_workspace_creation_views.assert_awaited_once_with(
+        "job", [JOB]
+    )
+    reads_wire.db.container_workspace_creation_views.reset_mock()
+    denied = await get(reads_wire, DETAIL, authenticated=False)
+    assert denied.status_code == 401
+    reads_wire.db.container_workspace_creation_views.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_stats_wire_ignores_status_and_preserves_future_status_counts(reads_wire):
     reads_wire.state.stats["existing_extension"] = {"id": UUID(CHILD), "at": STAMP}
     response = await get(
@@ -444,6 +470,7 @@ def isolated_app(label, owner, count):
     acquired.__aexit__ = AsyncMock(return_value=None)
     store = SimpleNamespace(
         acquire=MagicMock(return_value=acquired),
+        container_workspace_creation_views=AsyncMock(return_value={}),
         get_project=AsyncMock(return_value={"main_cloud_folder_handle": None}),
         query_jobs=AsyncMock(
             return_value=SimpleNamespace(

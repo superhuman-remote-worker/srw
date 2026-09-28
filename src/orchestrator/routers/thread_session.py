@@ -14,6 +14,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
@@ -110,6 +111,12 @@ async def get_thread(
         current_thread_creations=creations,
     )
     result["workspace_lifecycle"] = states.get(thread_id)
+    creations = await store.container_workspace_creation_views("thread", [thread_id])
+    result["workspace_creation"] = (
+        None
+        if thread.get("status") in {"ended", "suspended"}
+        else creations.get(UUID(thread_id))
+    )
     if not result.get("ssh_handle"):
         try:
             result["ssh_handle"] = await store.ensure_thread_ssh_handle(thread_id)

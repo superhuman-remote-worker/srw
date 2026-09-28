@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 
 from orchestrator.routers import thread_admission, thread_files, thread_session
 from orchestrator.services.thread_projection import redact_thread_metadata
@@ -44,6 +45,7 @@ class ProjectionStore:
         self.list_thread_mounts = AsyncMock(return_value=[])
         self.list_thread_mounts_bulk = AsyncMock(return_value={})
         self.list_threads = AsyncMock(side_effect=lambda **_: [dict(self.row)])
+        self.container_workspace_creation_views = AsyncMock(return_value={})
 
     @asynccontextmanager
     async def acquire(self):
@@ -123,3 +125,44 @@ async def test_current_creation_progress_is_composed_on_every_thread_read(
             assert payload["vm_creation"]["state"] == state
             assert payload["vm_creation"]["request_id"] == str(store.request_id)
     assert "runtime_attach_token" not in payload
+
+
+@pytest.mark.asyncio
+async def test_session_list_batches_current_container_view_after_approval(monkeypatch):
+    store = ProjectionStore("created", "queued")
+    store.supports_vm_creation_retry = False
+    store.row["execution_lane"] = "stateless"
+    store.row["metadata"] = {
+        "workspace_container": {"provisioner": "k8s", "status": "creating"}
+    }
+    view = {
+        "stage": "scheduling",
+        "state": "waiting_capacity",
+        "reason_code": "scheduler_unschedulable",
+        "readiness_deadline_at": None,
+    }
+    store.container_workspace_creation_views.return_value = {store.thread_id: view}
+    approved = AsyncMock(return_value={"id": str(store.user_id), "is_admin": False})
+    dependencies = SimpleNamespace(
+        store=store,
+        require_approved_user=approved,
+        resolve_cloud_session_url=lambda *_: None,
+        redact_thread_metadata=redact_thread_metadata,
+    )
+    monkeypatch.setattr(
+        thread_admission, "get_thread_admission_dependencies", lambda _: dependencies
+    )
+    monkeypatch.setattr(
+        thread_admission, "read_vm_idle_states", AsyncMock(return_value={})
+    )
+    result = await thread_admission.list_threads(SimpleNamespace())
+    assert result["threads"][0]["workspace_creation"] == view
+    store.container_workspace_creation_views.assert_awaited_once_with(
+        "thread", [str(store.thread_id)]
+    )
+    approved.assert_awaited_once()
+    store.container_workspace_creation_views.reset_mock()
+    approved.side_effect = HTTPException(status_code=403, detail="not approved")
+    with pytest.raises(HTTPException):
+        await thread_admission.list_threads(SimpleNamespace())
+    store.container_workspace_creation_views.assert_not_awaited()

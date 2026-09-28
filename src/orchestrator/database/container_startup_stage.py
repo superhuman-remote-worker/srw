@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import isfinite
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, Mapping, TypeAlias, TypedDict
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +47,95 @@ class StartupAttention:
 
 
 SchedulingObservation: TypeAlias = Unknown | Unscheduled | ScheduledAt
+
+
+class WorkspaceCreationView(TypedDict):
+    """The complete allowlisted public container creation projection."""
+
+    stage: str
+    state: str
+    reason_code: str
+    readiness_deadline_at: datetime | None
+
+
+def public_workspace_creation_view(
+    row: Mapping[str, Any],
+) -> WorkspaceCreationView | None:
+    """Project a prefiltered exact receipt without exporting its authority fields."""
+
+    if row["startup_protocol_version"] is None:
+        if (
+            row["phase"] == "settled"
+            and row["result_kind"] == "settled"
+            and row["settled_at"] is not None
+            and row["workspace_status"] == "creating"
+        ):
+            reason = "legacy_receipt_held"
+        elif (
+            row["phase"] == "runtime_bound"
+            and row["result_kind"] is None
+            and row["settled_at"] is None
+            and row["cancel_requested_at"] is None
+        ):
+            reason = "observation_pending"
+        else:
+            return None
+        return {
+            "stage": "scheduling",
+            "state": "observing",
+            "reason_code": reason,
+            "readiness_deadline_at": None,
+        }
+    if (
+        row["startup_protocol_version"] != 1
+        or row["phase"] != "runtime_bound"
+        or row["result_kind"] is not None
+        or row["settled_at"] is not None
+        or row["cancel_requested_at"] is not None
+    ):
+        return None
+    stage = row["startup_stage"]
+    state = row["startup_state"]
+    reason = row["startup_reason_code"]
+    scheduled_at = row["scheduled_at"]
+    if stage == "scheduling" and scheduled_at is None:
+        if (state, reason) not in {
+            ("observing", "observation_pending"),
+            ("observing", "scheduling_other"),
+            ("waiting_capacity", "scheduler_unschedulable"),
+            ("waiting_capacity", "insufficient_capacity"),
+        }:
+            return None
+        deadline = None
+    elif stage == "readiness" and _aware(scheduled_at):
+        if (state, reason) not in {
+            ("starting", "scheduled"),
+            ("attention", "invalid_image"),
+            ("attention", "invalid_configuration"),
+            ("attention", "pull_deadline"),
+            ("attention", "readiness_deadline"),
+            ("attention", "ssh_deadline"),
+        }:
+            return None
+        try:
+            budgets = StageBudgets(
+                row["ready_budget_seconds"],
+                row["pull_budget_seconds"],
+                row["ssh_budget_seconds"],
+            )
+            deadline = scheduled_stage_deadlines(
+                scheduled_at, budgets
+            ).readiness_deadline_at
+        except (TypeError, ValueError, OverflowError):
+            return None
+    else:
+        return None
+    return {
+        "stage": stage,
+        "state": state,
+        "reason_code": reason,
+        "readiness_deadline_at": deadline,
+    }
 
 
 def _finite_positive_seconds(value: Any) -> float:

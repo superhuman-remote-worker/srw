@@ -69,6 +69,8 @@ from orchestrator.database.container_startup_stage import (
     StartupAttention,
     Unknown,
     Unscheduled,
+    WorkspaceCreationView,
+    public_workspace_creation_view,
 )
 
 from orchestrator.services.datasource_policy_errors import (
@@ -17007,6 +17009,82 @@ class PostgresDB:
                     lease_seconds,
                 )
                 return dict(row) if row is not None else None
+
+    async def container_workspace_creation_views(
+        self, owner_kind: str, owner_ids: Sequence[str | UUID]
+    ) -> dict[UUID, WorkspaceCreationView]:
+        """Read public startup state for exact current receipts in one snapshot.
+
+        Callers first apply their normal owner visibility gate. This read does
+        not claim, renew, adopt or change a creation receipt.
+        """
+
+        if owner_kind not in {"job", "thread"} or not owner_ids:
+            return {}
+        try:
+            ids = list(dict.fromkeys(UUID(str(value)) for value in owner_ids))
+        except (TypeError, ValueError):
+            return {}
+        if owner_kind == "job":
+            owner_table, owner_json = "jobs", "context"
+            owner_guard = "j.status NOT IN ('completed','failed','cancelled')"
+            initial_guard = "TRUE"
+            cleanup_guard = "AND c.settled_at IS NULL"
+        else:
+            owner_table, owner_json = "threads", "metadata"
+            owner_guard = (
+                "j.status IN ('created','active','awaiting_user') "
+                "AND j.execution_lane='stateless' "
+                "AND j.runtime_generation=r.thread_runtime_generation"
+            )
+            initial_guard = (
+                "j.metadata #>> '{workspace_container,provisioner}'='k8s' "
+                "AND j.metadata #> '{workspace_container,_runtime_creation}'="
+                "jsonb_build_object('generation',j.runtime_generation::text,"
+                "'mode','create','attempted',true,'replaces_uid',NULL) "
+                "AND COALESCE(j.metadata #> '{workspace_container,_snapshot_restore_required}',"
+                "'false'::jsonb)='false'::jsonb "
+                "AND COALESCE(j.metadata->'protected_cloud','false'::jsonb)='false'::jsonb "
+                "AND NOT (j.metadata ?| ARRAY["
+                "'_stateless_workspace_retirement_pending','_stateless_claim_retirement',"
+                "'_stateless_claim_loss_hold','_stateless_claim_losses'])"
+            )
+            cleanup_guard = ""
+        query = (
+            "SELECT r.owner_id,r.phase,r.result_kind,r.settled_at,"
+            "r.cancel_requested_at,r.startup_protocol_version,r.startup_stage,"
+            "r.startup_state,r.startup_reason_code,r.scheduled_at,"
+            "r.ready_budget_seconds,r.pull_budget_seconds,r.ssh_budget_seconds,"
+            f"j.{owner_json} #>> '{{workspace_container,status}}' AS workspace_status "
+            f"FROM {owner_table} j JOIN "
+            "managed_repository_workspace_creation_reservations r "
+            "ON r.owner_kind=$2 AND r.owner_id=j.id "
+            "AND r.scope='workspace_container' AND r.operation_kind='create' "
+            f"AND r.id::text=j.{owner_json} #>> "
+            "'{workspace_container,_creation_reservation_id}' "
+            f"AND r.claim_token::text=j.{owner_json} #>> "
+            "'{workspace_container,_creation_claim_token}' "
+            f"AND r.runtime_incarnation::text=j.{owner_json} #>> "
+            "'{workspace_container,_runtime_incarnation}' "
+            "AND r.pod_uid=r.runtime_incarnation "
+            "WHERE j.id=ANY($1::uuid[]) "
+            "AND (r.settled_at IS NULL OR $2='job') "
+            f"AND {owner_guard} AND {initial_guard} "
+            f"AND j.{owner_json} #>> '{{workspace_container,status}}' "
+            "IN ('creating','pending','created') "
+            "AND NOT EXISTS (SELECT 1 FROM "
+            "managed_repository_workspace_cleanup_intents c "
+            "WHERE c.owner_kind=$2 AND c.owner_id=j.id "
+            f"AND c.scope='workspace_container' {cleanup_guard})"
+        )
+        async with self.acquire() as conn:
+            rows = await conn.fetch(query, ids, owner_kind)
+        views: dict[UUID, WorkspaceCreationView] = {}
+        for row in rows:
+            view = public_workspace_creation_view(row)
+            if view is not None:
+                views[row["owner_id"]] = view
+        return views
 
     async def get_managed_repository_workspace_creation_result(
         self,

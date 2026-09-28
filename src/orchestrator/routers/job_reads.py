@@ -8,6 +8,7 @@ startup. Main retains forwarding functions only for existing direct callers.
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Awaitable, Callable
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request
 
@@ -143,6 +144,15 @@ async def list_jobs(
     )
     for job in result["jobs"]:
         job["workspace_lifecycle"] = states.get(str(job["id"]))
+    creations = await dependencies.store.container_workspace_creation_views(
+        "job", [str(job["id"]) for job in result["jobs"]]
+    )
+    for job in result["jobs"]:
+        job["workspace_creation"] = (
+            None
+            if job.get("status") in {"completed", "failed", "cancelled"}
+            else creations.get(UUID(str(job["id"])))
+        )
     return result
 
 
@@ -167,6 +177,14 @@ async def get_job(
         result["workspace_lifecycle"] = states.get(job_id)
     else:
         result["workspace_lifecycle"] = None
+    creations = await dependencies.store.container_workspace_creation_views(
+        "job", [job_id]
+    )
+    result["workspace_creation"] = (
+        None
+        if job.get("status") in {"completed", "failed", "cancelled"}
+        else creations.get(UUID(job_id))
+    )
     return result
 
 
