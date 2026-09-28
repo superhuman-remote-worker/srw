@@ -152,6 +152,69 @@ def test_current_thread_creation_supersedes_only_empty_idle_history(status, stat
     assert project_vm_idle_state(row, thread_creation=creation) is None
 
 
+def test_existing_empty_history_creation_projection_keeps_suspended_status_behavior():
+    row = _thread_owner()
+    request_id = str(uuid4())
+    row.update(
+        status="suspended",
+        workspace_idle_episode=None,
+        workspace_idle_revision=2,
+        idle_phase=None,
+    )
+    row["metadata"]["vm"] = {
+        "status": "ssh_pending",
+        "creation_request_id": request_id,
+    }
+    assert (
+        project_vm_idle_state(
+            row,
+            thread_creation={
+                "request_id": request_id,
+                "state": "reconciling",
+                "stage": "creation",
+            },
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["malformed_episode", "other_wait", "idle_operation", "retirement", "suspended"],
+)
+def test_proven_retained_predecessor_episode_does_not_hide_other_holds(fault):
+    row = _thread_owner()
+    request_id = str(uuid4())
+    row.update(
+        status="created",
+        idle_phase=None,
+        idle_operation_id=None,
+        retained_prior_idle_episode_proven=True,
+    )
+    row["metadata"]["vm"] = {"status": "ssh_pending", "creation_request_id": request_id}
+    row["workspace_idle_episode"]["wait_kind"] = "natural_pause"
+    creation = {
+        "request_id": request_id,
+        "stage": "creation",
+        "state": "reconciling",
+    }
+    if fault == "malformed_episode":
+        row["workspace_idle_episode"] = {"wait_kind": "natural_pause"}
+    elif fault == "other_wait":
+        row["workspace_idle_episode"]["wait_kind"] = "human_review"
+    elif fault == "idle_operation":
+        row["idle_operation_id"] = str(uuid4())
+    elif fault == "suspended":
+        row["status"] = "suspended"
+    else:
+        row["runtime_retirement_token"] = str(uuid4())
+
+    assert project_vm_idle_state(row, thread_creation=creation) == {
+        "state": "release_held",
+        "reason_code": "identity_unverified",
+    }
+
+
 @pytest.mark.parametrize(
     "fault",
     [

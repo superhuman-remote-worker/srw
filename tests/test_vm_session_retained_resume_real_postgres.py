@@ -6,14 +6,25 @@ Resume, protected actor binding, workspace dispatch and source insertion are rea
 """
 
 import json
+from dataclasses import replace
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
 
 from orchestrator.services.session_provisioner import ensure_session_workspace
+from orchestrator.services.vm_creation_owner_view import thread_creation_views
+from orchestrator.services.vm_idle_public import read_vm_idle_states
 from orchestrator.services.vm_provisioner import VMProvisioner
 from orchestrator.services.workspace_suspension import WorkspaceSuspensionService
+from shared.workspace_idle_policy import (
+    IdleEpisode,
+    RuntimeIdentity,
+    episode_document,
+    read_episode,
+)
+from shared.workspace_idle_store import apply_idle_transition_on_conn
 from tests.test_pinned_vm_initial_binding_real_postgres import _bind_protected_agent
 from tests.test_vm_creation_actuation import setup as _controller_setup
 from tests.test_vm_thread_retained_disk_purge_real_postgres import (
@@ -177,6 +188,237 @@ async def test_native_retained_resume_admits_exact_disk_after_new_actor_binding(
     assert resumed["expected_pvc_uid"] == UUID(case["pvc_uid"]), (
         "Ordinary Resume source lacks exact retained-PVC authority"
     )
+
+
+@pytest.mark.asyncio
+async def test_native_retained_resume_creation_hides_only_proven_prior_idle_episode(
+    db, monkeypatch
+):
+    case, _, current, suspension = await retained_resume(
+        db, monkeypatch, ready=True, marker=False, bind=True
+    )
+    thread_id = str(case["thread_id"])
+    prior = await db.fetchrow(
+        "SELECT provision_generation,vm_uid FROM vm_resource_thread_cleanup_authorities "
+        "WHERE thread_id=$1",
+        case["thread_id"],
+    )
+    assert prior is not None
+    episode = IdleEpisode(
+        str(uuid4()),
+        1,
+        "natural_pause",
+        str(uuid4()),
+        datetime.now(timezone.utc),
+        None,
+        0,
+        RuntimeIdentity(
+            "thread",
+            thread_id,
+            "vm",
+            str(prior["provision_generation"]),
+            str(prior["vm_uid"]),
+        ),
+    )
+
+    async def set_episode(value, revision):
+        await db.execute(
+            "UPDATE threads SET workspace_idle_revision=$3, "
+            "workspace_idle_episode=$2::jsonb WHERE id=$1",
+            case["thread_id"],
+            json.dumps(value),
+            revision,
+        )
+
+    async def visible_state():
+        creations = await thread_creation_views(
+            db, [thread_id], viewer_user_id=str(current["user_id"])
+        )
+        assert creations[thread_id]["stage"] == "creation"
+        states = await read_vm_idle_states(
+            db,
+            owner_kind="thread",
+            owner_ids=[thread_id],
+            current_thread_creations=creations,
+        )
+        return creations[thread_id], states.get(thread_id)
+
+    await set_episode(episode_document(episode), 1)
+    await ensure_session_workspace(
+        thread_id,
+        db=db,
+        provisioner=None,
+        suspension=suspension,
+        expected_runtime_generation=str(current["runtime_generation"]),
+    )
+    creation, state = await visible_state()
+    assert creation["state"] in {"queued", "resolving", "reconciling"}
+    assert state is None, "The exact cleaned predecessor's natural pause is historical"
+    assert await db.fetchval(
+        "SELECT workspace_idle_episode IS NOT NULL FROM threads WHERE id=$1",
+        case["thread_id"],
+    ), "Projection must preserve the prior episode"
+
+    current_provision = await db.fetchval(
+        "SELECT metadata->'vm'->>'provision_generation' FROM threads WHERE id=$1",
+        case["thread_id"],
+    )
+    for revision, wrong in enumerate(
+        (
+            replace(
+                episode,
+                runtime_identity=replace(
+                    episode.runtime_identity, runtime_uid=str(uuid4())
+                ),
+            ),
+            replace(
+                episode,
+                runtime_identity=replace(
+                    episode.runtime_identity,
+                    runtime_generation=current_provision,
+                ),
+            ),
+        ),
+        start=2,
+    ):
+        await set_episode(episode_document(replace(wrong, revision=revision)), revision)
+        creation, state = await visible_state()
+        assert state == {"state": "release_held", "reason_code": "identity_unverified"}
+
+
+@pytest.mark.asyncio
+async def test_native_retained_resume_ready_without_input_hides_proven_prior_idle_episode(
+    db, monkeypatch
+):
+    from tests import test_vm_resource_thread_source_real_postgres as sources
+    from orchestrator.services.vm_provisioning_phases import VMProvisioningPhaseStore
+
+    publish = VMProvisioningPhaseStore.publish_thread_ready
+
+    async def publish_with_prior_idle(self, thread_id, generation, *args, **kwargs):
+        accepted = await publish(self, thread_id, generation, *args, **kwargs)
+        assert accepted
+        async with db.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT * FROM threads WHERE id=$1::uuid FOR UPDATE", thread_id
+            )
+            vm = json.loads(row["metadata"])["vm"]
+            await apply_idle_transition_on_conn(
+                conn,
+                runtime=RuntimeIdentity(
+                    "thread", str(row["id"]), "vm", generation, vm["vm_uid"]
+                ),
+                event="enter",
+                expected_revision=0,
+                expected_episode_id=None,
+                wait_kind="natural_pause",
+                wait_key=str(uuid4()),
+            )
+        return accepted
+
+    monkeypatch.setattr(
+        VMProvisioningPhaseStore, "publish_thread_ready", publish_with_prior_idle
+    )
+    (
+        case,
+        _,
+        current,
+        source,
+        _,
+        admitted,
+        observations,
+        carrier,
+    ) = await resumed_effects(db, monkeypatch, adopt=True)
+    monkeypatch.setattr(VMProvisioningPhaseStore, "publish_thread_ready", publish)
+    thread_id = str(case["thread_id"])
+    prior_episode = await db.fetchrow(
+        "SELECT workspace_idle_revision,workspace_idle_episode FROM threads WHERE id=$1",
+        case["thread_id"],
+    )
+    assert prior_episode["workspace_idle_revision"] == 1
+    episode = read_episode(
+        json.loads(prior_episode["workspace_idle_episode"]), revision=1
+    )
+    assert episode.wait_kind == "natural_pause"
+
+    async def adopted(*args, **kwargs):
+        return (
+            None,
+            case["inventory"],
+            case["resume_sample"],
+            case["demand"],
+            case["thread_id"],
+            current["runtime_generation"],
+            source["provision_generation"],
+            source["request_id"],
+            admitted,
+            observations,
+            carrier,
+        )
+
+    monkeypatch.setattr(sources, "_adopted_charged_thread", adopted)
+    prepared = await sources._ready_charged_thread(db, monkeypatch)
+    assert await VMProvisioningPhaseStore(db).publish_thread_ready(
+        thread_id,
+        str(source["provision_generation"]),
+        prepared["registration"],
+        prepared["vm_uid"],
+        prepared["updates"],
+    )
+    assert await db.fetchval(
+        "SELECT ready_at IS NOT NULL FROM vm_creation_retries WHERE request_id=$1",
+        source["request_id"],
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_idle_operations WHERE owner_kind='thread' AND owner_id=$1",
+            case["thread_id"],
+        )
+        == 0
+    )
+    assert (
+        await thread_creation_views(
+            db, [thread_id], viewer_user_id=str(current["user_id"])
+        )
+        == {}
+    )
+    state = await read_vm_idle_states(db, owner_kind="thread", owner_ids=[thread_id])
+    assert state[thread_id] == {"state": "ready"}
+    assert await db.fetchval(
+        "SELECT workspace_idle_episode IS NOT NULL FROM threads WHERE id=$1",
+        case["thread_id"],
+    ), "Projection must not clear the predecessor's idle evidence"
+    for revision, wrong_identity in enumerate(
+        (
+            replace(episode.runtime_identity, runtime_uid=str(uuid4())),
+            replace(
+                episode.runtime_identity,
+                runtime_generation=str(source["provision_generation"]),
+                runtime_uid=str(prepared["vm_uid"]),
+            ),
+        ),
+        start=2,
+    ):
+        wrong = replace(episode, revision=revision, runtime_identity=wrong_identity)
+        await db.execute(
+            "UPDATE threads SET workspace_idle_revision=$3, "
+            "workspace_idle_episode=$2::jsonb WHERE id=$1",
+            case["thread_id"],
+            json.dumps(episode_document(wrong)),
+            revision,
+        )
+        state = await read_vm_idle_states(
+            db, owner_kind="thread", owner_ids=[thread_id]
+        )
+        if revision == 2:
+            assert state[thread_id] == {
+                "state": "release_held",
+                "reason_code": "identity_unverified",
+            }
+        else:
+            assert state[thread_id]["state"] == "warm", (
+                "A current episode retains its current warm state"
+            )
 
 
 @pytest.mark.asyncio

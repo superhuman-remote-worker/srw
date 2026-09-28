@@ -108,14 +108,24 @@ def project_vm_idle_state(
     ):
         return None
 
-    # Ordinary Resume preserves the owner's idle revision. A matching current
-    # source can still be starting after an earlier episode ended; its creation
-    # view describes that progress without inventing an idle identity failure.
+    # Ordinary Resume preserves the owner's idle revision and may retain its
+    # last natural-pause episode. The owner-scoped durable proof below must
+    # identify that exact cleaned predecessor; a current or uncertain episode
+    # still holds.
     if (
         owner_kind == "thread"
         and row.get("runtime_retirement_token") is None
-        and row.get("workspace_idle_episode") is None
         and phase is None
+        and (
+            row.get("workspace_idle_episode") is None
+            or (
+                episode is not None
+                and row["status"] in {"created", "active", "awaiting_user"}
+                and episode.wait_kind == "natural_pause"
+                and row.get("idle_operation_id") is None
+                and row.get("retained_prior_idle_episode_proven") is True
+            )
+        )
         and thread_creation_is_starting(vm, thread_creation)
     ):
         return None
@@ -138,6 +148,16 @@ def project_vm_idle_state(
     ):
         return {"state": "release_held", "reason_code": "identity_unverified"}
     if episode is None:
+        return {"state": "ready"}
+    if (
+        owner_kind == "thread"
+        and row["status"] in {"created", "active", "awaiting_user"}
+        and row.get("runtime_retirement_token") is None
+        and phase is None
+        and row.get("idle_operation_id") is None
+        and episode.wait_kind == "natural_pause"
+        and row.get("retained_prior_idle_episode_proven") is True
+    ):
         return {"state": "ready"}
     identity = episode.runtime_identity
     if (
@@ -178,14 +198,79 @@ async def read_vm_idle_states(
         if owner_kind == "thread"
         else ""
     )
+    retained_prior_episode_proof = (
+        """
+        EXISTS (
+            SELECT 1 FROM vm_creation_retries retry
+            JOIN vm_thread_retained_resumes resume
+              ON resume.id=retry.thread_retained_resume_id
+            JOIN vm_resource_thread_cleanup_authorities prior
+              ON prior.cleanup_admission_id=resume.compute_cleanup_admission_id
+            JOIN vm_resource_thread_cleanup_stops stopped
+              ON stopped.cleanup_admission_id=prior.cleanup_admission_id
+            JOIN vm_workspace_cleanup_admissions cleanup
+              ON cleanup.id=prior.cleanup_admission_id
+            JOIN vm_resource_reservations charge
+              ON charge.id=prior.reservation_id
+            JOIN thread_runtime_retirement_outcomes terminal
+              ON terminal.thread_id=prior.thread_id
+             AND terminal.runtime_generation=prior.runtime_generation
+             AND terminal.retirement_token=prior.retirement_token
+            WHERE owner.kind='session' AND owner.execution_lane='pinned'
+              AND owner.status IN ('created','active','awaiting_user')
+              AND owner.runtime_retirement_token IS NULL
+              AND retry.owner_kind='thread' AND retry.thread_id=owner.id
+              AND retry.thread_runtime_generation=owner.runtime_generation
+              AND retry.thread_agent_id IS NOT DISTINCT FROM owner.agent_id
+              AND retry.thread_attach_token IS NOT DISTINCT FROM owner.runtime_attach_token
+              AND retry.thread_owner_user_id IS NOT DISTINCT FROM owner.user_id
+              AND retry.thread_owner_project_id IS NOT DISTINCT FROM owner.project_id
+              AND retry.provision_generation::text=owner.metadata->'vm'->>'provision_generation'
+              AND retry.request_id::text=owner.metadata->'vm'->>'creation_request_id'
+              AND retry.thread_wake_operation_id::text IS NOT DISTINCT FROM
+                  owner.metadata->'vm'->>'idle_wake_operation_id'
+              AND retry.state IN ('queued','resolving','reconciling','succeeded')
+              AND (
+                  (owner.metadata->'vm'->>'status'='ready'
+                   AND retry.state='succeeded' AND retry.ready_at IS NOT NULL)
+                  OR (owner.metadata->'vm'->>'status' IN
+                      ('pending','provisioning','created','ssh_pending')
+                      AND retry.ready_at IS NULL)
+              )
+              AND public.valid_vm_thread_retained_resume_source(retry)
+              AND resume.thread_id=owner.id
+              AND resume.runtime_generation=owner.runtime_generation
+              AND resume.request_id=retry.request_id
+              AND resume.provision_generation=retry.provision_generation
+              AND prior.thread_id=owner.id AND prior.purge_disk=false
+              AND prior.pvc_uid=retry.expected_pvc_uid
+              AND cleanup.completed_at IS NOT NULL AND cleanup.outcome='completed'
+              AND stopped.accepted_at<=terminal.settled_at
+              AND terminal.outcome='settled' AND terminal.disposition='ended'
+              AND terminal.permanent=false
+              AND charge.state='released'
+              AND charge.release_evidence->>'kind'='exact_cleanup_compute_absent'
+              AND charge.release_evidence->>'cleanup_admission_id'=prior.cleanup_admission_id::text
+              AND owner.workspace_idle_episode->>'wait_kind'='natural_pause'
+              AND owner.workspace_idle_episode#>>'{runtime_identity,owner_kind}'='thread'
+              AND owner.workspace_idle_episode#>>'{runtime_identity,owner_id}'=owner.id::text
+              AND owner.workspace_idle_episode#>>'{runtime_identity,backend}'='vm'
+              AND owner.workspace_idle_episode#>>'{runtime_identity,runtime_generation}'=prior.provision_generation::text
+              AND owner.workspace_idle_episode#>>'{runtime_identity,runtime_uid}'=prior.vm_uid::text
+        ) AS retained_prior_idle_episode_proven,
+        """
+        if owner_kind == "thread"
+        else "false AS retained_prior_idle_episode_proven,"
+    )
     async with store.acquire() as conn:
         rows = await conn.fetch(
             f"SELECT owner.id,owner.status,owner.execution_lane,owner.{document},"
             f"{retirement_fields}owner.workspace_idle_episode,owner.workspace_idle_revision,"
-            "op.phase AS idle_phase,op.episode_id AS idle_episode_id,"
+            f"{retained_prior_episode_proof}"
+            "op.id AS idle_operation_id,op.phase AS idle_phase,op.episode_id AS idle_episode_id,"
             "op.reason AS idle_reason,op.retry_after AS idle_retry_after "
             f"FROM {table} owner LEFT JOIN LATERAL ("
-            "SELECT phase,episode_id,reason,retry_after FROM vm_idle_operations "
+            "SELECT id,phase,episode_id,reason,retry_after FROM vm_idle_operations "
             "WHERE owner_kind=$1 AND owner_id=owner.id "
             "ORDER BY admitted_at DESC,id DESC LIMIT 1) op ON TRUE "
             "WHERE owner.id=ANY($2::uuid[])",

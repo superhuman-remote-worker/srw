@@ -26,9 +26,15 @@ from tests.test_vm_session_retained_resume_real_postgres import (
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exit_prior_episode",
+    [True, False],
+    ids=["exited-history", "captured-natural-pause"],
+)
 async def test_native_retained_resume_with_prior_idle_history_projects_creation(
     db,
     monkeypatch,
+    exit_prior_episode,
 ):
     publish = VMProvisioningPhaseStore.publish_thread_ready
 
@@ -57,13 +63,14 @@ async def test_native_retained_resume_with_prior_idle_history_projects_creation(
                 wait_kind="natural_pause",
                 wait_key=str(uuid4()),
             )
-            await apply_idle_transition_on_conn(
-                conn,
-                runtime=identity,
-                event="exit",
-                expected_revision=entered.revision,
-                expected_episode_id=entered.episode.episode_id,
-            )
+            if exit_prior_episode:
+                await apply_idle_transition_on_conn(
+                    conn,
+                    runtime=identity,
+                    event="exit",
+                    expected_revision=entered.revision,
+                    expected_episode_id=entered.episode.episode_id,
+                )
         return accepted
 
     monkeypatch.setattr(
@@ -101,8 +108,8 @@ async def test_native_retained_resume_with_prior_idle_history_projects_creation(
         require_status_not_ready=True,
     )
     current = await db.get_thread(thread_id)
-    assert current["workspace_idle_revision"] == 2
-    assert current["workspace_idle_episode"] is None
+    assert current["workspace_idle_revision"] == (2 if exit_prior_episode else 1)
+    assert (current["workspace_idle_episode"] is None) is exit_prior_episode
     assert await db.fetchval("SELECT count(*) FROM vm_idle_operations") == 0
     progress = await thread_creation_views(
         db,
