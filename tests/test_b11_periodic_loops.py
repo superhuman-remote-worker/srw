@@ -321,6 +321,7 @@ class TestIdeSessionTtlSweeper:
             _Forbidden("ide_session_service"),
         )
         sessions = MagicMock()
+        sessions.reconcile_pending_ide_restore_attempts = AsyncMock(return_value=0)
         sessions.check_ttl_all = AsyncMock(side_effect=[RuntimeError("db down"), 3])
 
         cadence = await _drive(
@@ -332,6 +333,10 @@ class TestIdeSessionTtlSweeper:
         )
 
         assert cadence.timeouts == [60.0, 60.0]
+        assert sessions.reconcile_pending_ide_restore_attempts.await_args_list == [
+            call(limit=25),
+            call(limit=25),
+        ]
         assert sessions.check_ttl_all.await_count == 2
         assert _records(caplog, ide_session_module) == [
             ("INFO", "IDE session TTL sweeper started"),
