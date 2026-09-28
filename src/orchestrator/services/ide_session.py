@@ -69,6 +69,32 @@ from shared.runtime.core.managed_repository import (
 logger = logging.getLogger(__name__)
 
 _VM_READY_TIMEOUT_SECONDS = 420
+_IDE_GIT_DIAGNOSTIC_PHASES = frozenset(
+    {
+        "authority",
+        "host_key",
+        "child_exit",
+        "child_timeout",
+        "child_spawn_error",
+        "child_io_error",
+    }
+)
+
+
+def _log_ide_git_setup_failure(
+    phase: str, *, job_id: str | None, exit_code: int | None = None
+) -> None:
+    """Record a fixed stage and child code, never key, command, or stderr."""
+
+    safe_phase = phase if phase in _IDE_GIT_DIAGNOSTIC_PHASES else "unknown"
+    safe_job = _canonical_runtime(job_id) or "-"
+    safe_code = exit_code if type(exit_code) is int else "-"
+    logger.warning(
+        "IDE scoped Git diagnostic job=%s phase=%s exit_code=%s",
+        safe_job,
+        safe_phase,
+        safe_code,
+    )
 
 
 def _canonical_runtime(value: Any) -> str | None:
@@ -1773,7 +1799,11 @@ class IdeSessionService:
 
     @staticmethod
     async def _run_secret_stdin_process(
-        command: list[str], secret: bytearray, *, timeout: float = 120.0
+        command: list[str],
+        secret: bytearray,
+        *,
+        timeout: float = 120.0,
+        diagnostic_job_id: str | None = None,
     ) -> bool:
         """Run a trusted command without retaining or reporting its output."""
 
@@ -1796,8 +1826,14 @@ class IdeSessionService:
                     await process.stdin.drain()
                     process.stdin.close()
                     secret[:] = b"\x00" * len(secret)
-                    await process.wait()
-                    return process.returncode == 0
+                    exit_code = await process.wait()
+                    if exit_code != 0:
+                        _log_ide_git_setup_failure(
+                            "child_exit",
+                            job_id=diagnostic_job_id,
+                            exit_code=exit_code,
+                        )
+                    return exit_code == 0
 
             # The owned subprocess is cancellable: let lease loss interrupt
             # drain/wait, then terminate and reap below before releasing it.
@@ -1810,9 +1846,16 @@ class IdeSessionService:
             if process is not None and process.returncode is None:
                 await stop_and_reap(process)
             raise
-        except (OSError, asyncio.TimeoutError):
+        except asyncio.TimeoutError:
             if process is not None and process.returncode is None:
                 await stop_and_reap(process)
+            _log_ide_git_setup_failure("child_timeout", job_id=diagnostic_job_id)
+            return False
+        except OSError:
+            phase = "child_io_error" if process is not None else "child_spawn_error"
+            if process is not None and process.returncode is None:
+                await stop_and_reap(process)
+            _log_ide_git_setup_failure(phase, job_id=diagnostic_job_id)
             return False
         finally:
             for index in range(len(secret)):
@@ -1859,11 +1902,17 @@ class IdeSessionService:
                     expected_host_key_fingerprint=(expected_host_key_fingerprint),
                 ) as ssh_command:
                     return await self._run_secret_stdin_process(
-                        ssh_command, private_key
+                        ssh_command,
+                        private_key,
+                        diagnostic_job_id=job_id,
                     )
             finally:
                 private_key[:] = b"\x00" * len(private_key)
-        except (ManagedRepositoryAuthorityError, SSHHostKeyVerificationError):
+        except ManagedRepositoryAuthorityError:
+            _log_ide_git_setup_failure("authority", job_id=job_id)
+            return False
+        except SSHHostKeyVerificationError:
+            _log_ide_git_setup_failure("host_key", job_id=job_id)
             return False
 
     async def _restore_k8s_ide_container(
@@ -2137,6 +2186,7 @@ class IdeSessionService:
                             git_command,
                         ],
                         private_key,
+                        diagnostic_job_id=job_id,
                     )
             except ManagedRepositoryAuthorityError:
                 installed = False
