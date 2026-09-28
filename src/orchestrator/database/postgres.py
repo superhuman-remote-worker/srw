@@ -22598,15 +22598,12 @@ class PostgresDB:
                 execution = await conn.fetchrow(
                     "SELECT harness_adapter, "
                     "created_at + (resolved->'spec'->>'timeoutSeconds')::double precision "
-                    "* interval '1 second' > clock_timestamp() AS within_deadline "
+                    "* interval '1 second' AS deadline_at "
                     "FROM srw_execution_specs WHERE work_kind='Job' AND work_id=$1 "
                     "FOR SHARE",
                     job_uuid,
                 )
-                if execution is not None and (
-                    execution["harness_adapter"] != "srw/v1"
-                    or execution["within_deadline"] is not True
-                ):
+                if execution is not None and execution["harness_adapter"] != "srw/v1":
                     return None
                 receipt = await conn.fetchrow(
                     "SELECT * FROM managed_repository_workspace_creation_reservations "
@@ -22616,13 +22613,11 @@ class PostgresDB:
                     receipt_uuid,
                     job_uuid,
                 )
-                now = await conn.fetchval("SELECT clock_timestamp()")
                 if (
                     receipt is None
                     or receipt["phase"] != "runtime_bound"
                     or receipt["settled_at"] is not None
                     or receipt["cancel_requested_at"] is not None
-                    or receipt["expires_at"] <= now
                     or receipt["claim_token"] != creation_claim_token
                     or receipt["runtime_incarnation"] != runtime_uuid
                     or receipt["pod_uid"] != runtime_uuid
@@ -22650,8 +22645,6 @@ class PostgresDB:
                     + timedelta(seconds=receipt["ssh_budget_seconds"]),
                     hard_bound + timedelta(seconds=receipt["ssh_budget_seconds"]),
                 )
-                if now >= ssh_bound:
-                    return None
                 workspace.update(
                     {
                         "status": "ready",
@@ -22675,18 +22668,38 @@ class PostgresDB:
                     "backing_id": backing_id,
                     "ssh_host_key_fingerprint": ssh_host_key_fingerprint,
                 }
+                now = await conn.fetchval("SELECT clock_timestamp()")
+                if (
+                    receipt["expires_at"] <= now
+                    or now >= ssh_bound
+                    or (
+                        execution is not None
+                        and (
+                            execution["deadline_at"] is None
+                            or now >= execution["deadline_at"]
+                        )
+                    )
+                ):
+                    return None
                 await conn.fetchval(
                     "SELECT set_config('srw.container_startup_ready_receipt', "
                     "$1, true)",
                     str(receipt_uuid),
                 )
                 published = await conn.execute(
-                    "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
+                    "UPDATE jobs SET context=$2::jsonb WHERE id=$1 "
+                    "AND clock_timestamp()<$3::timestamptz "
+                    "AND clock_timestamp()<$4::timestamptz "
+                    "AND ($5::timestamptz IS NULL "
+                    "OR clock_timestamp()<$5::timestamptz)",
                     job_uuid,
                     json.dumps(context),
+                    receipt["expires_at"],
+                    ssh_bound,
+                    execution["deadline_at"] if execution is not None else None,
                 )
                 if published != "UPDATE 1":
-                    raise RuntimeError("Job Ready publication lost owner row")
+                    return None
                 closed = await conn.execute(
                     "UPDATE managed_repository_workspace_creation_reservations "
                     "SET settled_at=clock_timestamp(), phase='settled', "

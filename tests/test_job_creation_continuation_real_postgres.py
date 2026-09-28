@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -134,6 +135,68 @@ async def test_job_ready_cas_refuses_expired_frozen_execution(db):
     )
     assert (await stage._reservation(db, receipt))["settled_at"] is None
     assert (await fixtures._workspace(db, job_id))["status"] == "creating"
+
+
+@pytest.mark.asyncio
+async def test_job_ready_cas_refuses_execution_expired_while_waiting_for_receipt_lock(
+    db,
+):
+    job_id, receipt, pod_uid, _ = await stage._bound_job(db)
+    kwargs = stage._observe_kwargs(job_id, receipt, pod_uid)
+    assert await db.observe_container_startup(
+        **kwargs, observation=BoundPodObserved(), adopt_if_unmarked=True
+    )
+    scheduled_at = datetime.now(timezone.utc)
+    assert await db.observe_container_startup(
+        **kwargs,
+        observation=ScheduledAt(scheduled_at),
+        budgets=StageBudgets(120, None, 30),
+    )
+    assert await db.observe_container_startup(
+        **kwargs, observation=ReadyObservedAt(datetime.now(timezone.utc))
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO srw_execution_specs "
+            "(work_kind,work_id,document,resolved,revision,harness_adapter,created_at) "
+            "VALUES('Job',$1,$2::jsonb,$3::jsonb,$4,'srw/v1',clock_timestamp())",
+            job_id,
+            json.dumps({}),
+            json.dumps({"spec": {"timeoutSeconds": 2}}),
+            str(uuid4()),
+        )
+    async with db.acquire() as blocker:
+        async with blocker.transaction():
+            await blocker.fetchval(
+                "SELECT id FROM managed_repository_workspace_creation_reservations "
+                "WHERE id=$1 FOR UPDATE",
+                receipt["id"],
+            )
+            completion = asyncio.create_task(
+                db.complete_job_workspace_creation(
+                    str(job_id),
+                    runtime_incarnation=pod_uid,
+                    backing_id=f"k8s-pod:agent-workspaces:{pod_uid}",
+                    ssh_host_key_fingerprint="SHA256:" + "A" * 43,
+                    pod_ip="10.42.0.50",
+                    port=30022,
+                    creation_reservation_id=str(receipt["id"]),
+                    creation_claim_token=int(receipt["claim_token"]),
+                )
+            )
+            await asyncio.sleep(0.5)
+            assert not completion.done(), "completion did not wait for receipt lock"
+            await asyncio.sleep(2.4)
+    assert await asyncio.wait_for(completion, 5) is None
+    assert (await stage._reservation(db, receipt))["settled_at"] is None
+    assert (await fixtures._workspace(db, job_id))["status"] == "creating"
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT context ? '_workspace_binding' FROM jobs WHERE id=$1", job_id
+            )
+            is False
+        )
 
 
 @pytest.mark.asyncio
