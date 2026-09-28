@@ -350,7 +350,7 @@ export function heldForReviewReason(
           }
         </section>
       }
-      @if (job().workspace_creation; as creation) {
+      @if (workspaceCreation(); as creation) {
         <section class="recovery-detail" [class.attention]="creation.state === 'attention'" role="status">
           <strong>{{ workspaceCreationMessageKey(creation) | transloco }}</strong>
         </section>
@@ -913,6 +913,13 @@ export class JobDetailPanelComponent {
   readonly job = input.required<JobSummary>();
   /** Null until the lazy load for this job has been kicked off. */
   readonly data = input<JobDetailState | null>(null);
+  /** Once the detail read finishes, its projection supersedes the list snapshot, including null. */
+  readonly workspaceCreation = computed(() => {
+    const data = this.data();
+    return data === null || data.loading
+      ? this.job().workspace_creation
+      : data.detail?.workspace_creation;
+  });
   /**
    * Children the SERVER returned for this root — i.e. the ones matching the
    * current filter, not every child that exists. The copy says so; a bare count

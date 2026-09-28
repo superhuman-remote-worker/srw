@@ -12,6 +12,7 @@ import {
   jobModelLabel,
   liveSubjobCount,
   JobDetailPanelComponent,
+  type JobDetailState,
   shortJobId,
   subagentElapsedSeconds,
   subagentStatusTone,
@@ -118,6 +119,74 @@ describe('typed workspace creation detail', () => {
     await ɵresolveComponentResources(() => Promise.resolve(''));
   });
   afterEach(() => TestBed.resetTestingModule());
+
+  function renderPanel(job: Partial<JobSummary>) {
+    TestBed.configureTestingModule({
+      imports: [JobDetailPanelComponent, TranslocoTestingModule.forRoot({
+        langs: {en}, translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+      })],
+      providers: [provideRouter([])],
+    });
+    const transloco = TestBed.inject(TranslocoService);
+    transloco.setTranslation(en, 'en');
+    transloco.setActiveLang('en');
+    const fixture = TestBed.createComponent(JobDetailPanelComponent);
+    Object.defineProperty(fixture.componentInstance, 'job', {value: signal({
+      id: 'job-startup', description: 'Start workspace', status: 'created',
+      created_at: '2026-09-28T08:00:00Z', ...job,
+    } as JobSummary)});
+    const data = signal<JobDetailState | null>(null);
+    Object.defineProperty(fixture.componentInstance, 'data', {value: data});
+    fixture.detectChanges();
+    return {fixture, data};
+  }
+
+  function loadedDetail(workspace_creation?: Job['workspace_creation']): JobDetailState {
+    return {
+      loading: false, error: false,
+      detail: {id: 'job-startup', status: 'created', workspace_creation} as Job,
+      usage: null, progress: null, usageSubtree: null, loadingSubtree: false,
+      subtreeAttempted: false, subjobs: null, subagents: null,
+    };
+  }
+
+  const observing = {stage: 'scheduling', state: 'observing',
+    reason_code: 'observation_pending', readiness_deadline_at: null} as const;
+  const attention = {stage: 'readiness', state: 'attention',
+    reason_code: 'invalid_image', readiness_deadline_at: null} as const;
+
+  it('replaces the list observation with newer attention from the loaded detail', () => {
+    const {fixture, data} = renderPanel({workspace_creation: observing});
+    expect((fixture.nativeElement as HTMLElement).textContent).toContain('Checking workspace scheduling');
+
+    data.set(loadedDetail(attention));
+    fixture.detectChanges();
+    const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+    expect(text).toContain('Workspace needs attention: its image is invalid.');
+    expect(text).not.toContain('Checking workspace scheduling');
+  });
+
+  it('shows typed creation supplied only by the loaded detail', () => {
+    const {fixture, data} = renderPanel({});
+    data.set(loadedDetail(attention));
+    fixture.detectChanges();
+    expect((fixture.nativeElement as HTMLElement).textContent)
+      .toContain('Workspace needs attention: its image is invalid.');
+  });
+
+  it.each(['null', 'omitted'] as const)(
+    'clears stale list creation when the fresh detail projection is %s',
+    (kind) => {
+      const {fixture, data} = renderPanel({workspace_creation: observing});
+      expect((fixture.nativeElement as HTMLElement).textContent).toContain('Checking workspace scheduling');
+      const state = loadedDetail(kind === 'null' ? null : undefined);
+      if (kind === 'omitted') delete state.detail!.workspace_creation;
+      data.set(state);
+      fixture.detectChanges();
+      expect((fixture.nativeElement as HTMLElement).textContent)
+        .not.toContain('Checking workspace scheduling');
+    },
+  );
 
   it('shows scheduler uncertainty without exposing raw diagnostics or hiding legacy VM state', () => {
     TestBed.configureTestingModule({
