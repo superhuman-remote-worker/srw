@@ -4581,9 +4581,7 @@ async def test_pinned_thread_purge_after_keep_takes_its_own_stable_request_id(
             store, thread_id=thread_id, identity=identity, purge_disk=True
         )
         assert retry.admission_id == purge.admission_id
-    assert await store.complete_cleanup_permit(
-        purge.admission_id, outcome="completed"
-    )
+    assert await store.complete_cleanup_permit(purge.admission_id, outcome="completed")
     replay = await acquire_pinned_thread_retirement_cleanup_permit(
         store, thread_id=thread_id, identity=identity, purge_disk=True
     )
