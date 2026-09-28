@@ -1,6 +1,5 @@
 -- Soft settlement also captures the exact Pod of a claim-less dedicated life.
--- (Numbered 0301: written as 0286, renumbered at integration because
--- origin/develop carries 0286-0300.)
+-- (Numbered 0286: origin/develop already carries 0284 and 0285.)
 --
 -- 0224 recorded the retired Pod only for lives that mounted an agent workspace
 -- claim. A dedicated Pod without one (workspace.pvcEnabled false) still
