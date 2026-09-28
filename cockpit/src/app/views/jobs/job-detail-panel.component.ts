@@ -913,10 +913,10 @@ export class JobDetailPanelComponent {
   readonly job = input.required<JobSummary>();
   /** Null until the lazy load for this job has been kicked off. */
   readonly data = input<JobDetailState | null>(null);
-  /** Once the detail read finishes, its projection supersedes the list snapshot, including null. */
+  /** A successful detail read supersedes the list snapshot, including a null projection. */
   readonly workspaceCreation = computed(() => {
     const data = this.data();
-    return data === null || data.loading
+    return data === null || data.loading || data.error
       ? this.job().workspace_creation
       : data.detail?.workspace_creation;
   });

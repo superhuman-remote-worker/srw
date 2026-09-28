@@ -188,6 +188,14 @@ describe('typed workspace creation detail', () => {
     },
   );
 
+  it('retains the list observation when the detail load fails', () => {
+    const {fixture, data} = renderPanel({workspace_creation: observing});
+    data.set({...loadedDetail(), detail: null, error: true});
+    fixture.detectChanges();
+    expect((fixture.nativeElement as HTMLElement).textContent)
+      .toContain('Checking workspace scheduling');
+  });
+
   it('shows scheduler uncertainty without exposing raw diagnostics or hiding legacy VM state', () => {
     TestBed.configureTestingModule({
       imports: [JobDetailPanelComponent, TranslocoTestingModule.forRoot({
