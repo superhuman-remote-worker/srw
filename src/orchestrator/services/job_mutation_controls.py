@@ -627,12 +627,32 @@ class JobControlOperations:
                         if pending is False:
                             return True
                         if pending is not None:
+                            # An admitted VM terminal parent may still be open
+                            # after its initial physical delete returned
+                            # retry_pending. Replaying strict checkpoint prune
+                            # first would be refused by that same parent; the
+                            # Job/PVC/generation/request/digest and queue-done
+                            # proof selects only the original cleanup to
+                            # finish before the ordinary prune.
+                            prior_vm_cleanup = False
+                            quiesce_parent = getattr(
+                                d.store,
+                                "quiesce_cancelled_stateless_vm_parent",
+                                None,
+                            )
+                            if quiesce_parent is not None:
+                                prior_vm_cleanup = (
+                                    await quiesce_parent(job_id)
+                                ) is True
+                            if prior_vm_cleanup:
+                                await d.archive_and_cleanup_workspace(job_id)
                             settled = await d.store.finalize_cancelled_stateless_job(
                                 job_id
                             )
                         if settled:
                             try:
-                                await d.archive_and_cleanup_workspace(job_id)
+                                if not prior_vm_cleanup:
+                                    await d.archive_and_cleanup_workspace(job_id)
                             except Exception as exc:
                                 d.logger.warning(
                                     "Workspace cleanup failed for cancelled stateless job %s: %s",

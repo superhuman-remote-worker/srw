@@ -10,6 +10,7 @@ import os
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
@@ -26,6 +27,8 @@ from orchestrator.services import (
 from orchestrator.services.vm_workspace_recovery_store import (
     VMWorkspaceRecoveryStore,
     WorkspaceRecoveryControlConflict,
+    acquire_vm_cleanup_permit,
+    vm_cleanup_request_identity,
 )
 from shared.run_queue import reap_expired, unpark_unit
 from shared.workspace_recovery import (
@@ -1321,6 +1324,300 @@ async def test_terminal_checkpoint_prune_resumes_cancelled_open_admission(
     assert len(replayed) == 1
     assert replayed[0]["id"] == admissions[0]["id"]
     assert replayed[0]["outcome"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stateless_vm_replays_only_exact_open_terminal_parent(
+    app_pg,
+) -> None:
+    """A quiesced Cancel can retire its own parent before retrying strict prune."""
+
+    job_id, generation, vm_uid, pvc_uid = (uuid4() for _ in range(4))
+    vm = {
+        "status": "retiring_process_zero",
+        "provision_generation": str(generation),
+        "identity_authenticated": True,
+        "identity_provision_generation": str(generation),
+        "vm_uid": str(vm_uid),
+        "rootdisk_pvc_uid": str(pvc_uid),
+    }
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, execution_lane, context) "
+            "VALUES ($1, 'cancel terminal replay', 'cancelled', 'stateless', $2::jsonb)",
+            job_id,
+            json.dumps({"vm": vm, "_stateless_cancel_cleanup_pending": True}),
+        )
+        await conn.execute(
+            "INSERT INTO run_queue(unit_id,unit_kind,state,lease_token) "
+            "VALUES ($1,'worker_batch','done',3)",
+            job_id,
+        )
+    store = VMWorkspaceRecoveryStore(app_pg)
+    identity = SimpleNamespace(
+        provision_generation=str(generation),
+        vm_uid=str(vm_uid),
+        rootdisk_pvc_uid=str(pvc_uid),
+    )
+    parent = await acquire_vm_cleanup_permit(
+        store,
+        owner_kind="job",
+        owner_id=job_id,
+        identity=identity,
+        source="job_terminal_vm_release",
+        purge_disk=True,
+    )
+    assert parent.allowed and parent.admission_id is not None
+    db = postgres_db(app_pg)
+    assert await db.quiesce_cancelled_stateless_vm_parent(str(job_id)) is True
+
+    # The selector does not wait behind the normal cleanup lock order. Its
+    # snapshot ends before archive reacquires exact authority to do effects.
+    blocker = await app_pg.acquire()
+    block_tx = blocker.transaction()
+    await block_tx.start()
+    try:
+        await blocker.fetchrow(
+            "SELECT id FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
+            parent.admission_id,
+        )
+        await blocker.fetchrow(
+            "SELECT unit_id FROM run_queue WHERE unit_id=$1 FOR UPDATE",
+            job_id,
+        )
+        assert (
+            await asyncio.wait_for(
+                db.quiesce_cancelled_stateless_vm_parent(str(job_id)),
+                timeout=1,
+            )
+            is True
+        )
+    finally:
+        await block_tx.rollback()
+        await app_pg.release(blocker)
+
+    # A same-owner Resume cannot insert a successor while the cancellation
+    # marker persists, including between the selector and archive.
+    async with app_pg.acquire() as conn, conn.transaction():
+        assert (
+            await db._queue_job_for_resume_on_conn(
+                conn,
+                job_id,
+                None,
+                void_completion_decision=True,
+                stateless_only=True,
+                expected_status="cancelled",
+            )
+            is None
+        )
+
+    # A parked worker is closed by the old queue-first finalizer; the next
+    # sweep may then replay the already-admitted terminal VM parent.
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE run_queue SET state='parked' WHERE unit_id=$1", job_id
+        )
+    assert await db.quiesce_cancelled_stateless_vm_parent(str(job_id)) is False
+    with pytest.raises(RuntimeError, match="blocked by workspace recovery authority"):
+        await db.finalize_cancelled_stateless_job(str(job_id))
+    async with app_pg.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT state FROM run_queue WHERE unit_id=$1",
+                job_id,
+            )
+            == "done"
+        )
+    assert await db.quiesce_cancelled_stateless_vm_parent(str(job_id)) is True
+
+    # Neither an active worker nor live workspace access takes this path.
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE run_queue SET state='leased' WHERE unit_id=$1", job_id
+        )
+    assert await db.quiesce_cancelled_stateless_vm_parent(str(job_id)) is False
+    async with app_pg.acquire() as conn:
+        await conn.execute("UPDATE run_queue SET state='done' WHERE unit_id=$1", job_id)
+        lease_id = uuid4()
+        await conn.execute(
+            "INSERT INTO vm_idle_access_leases "
+            "(id,owner_kind,owner_id,provision_generation,vm_uid,kind,claimed_by,"
+            "expires_at,max_expires_at) VALUES "
+            "($1,'job',$2,$3,$4,'ide','w6-test',"
+            "clock_timestamp()+interval '2 minutes',"
+            "clock_timestamp()+interval '1 hour')",
+            lease_id,
+            job_id,
+            generation,
+            vm_uid,
+        )
+    assert await db.quiesce_cancelled_stateless_vm_parent(str(job_id)) is False
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_idle_access_leases SET closed_at=clock_timestamp() WHERE id=$1",
+            lease_id,
+        )
+    assert await db.quiesce_cancelled_stateless_vm_parent(str(job_id)) is True
+    # A newly committed recovery hold cannot borrow the completed queue fence.
+    recovery_id = await insert_recovery(app_pg, owner_id=job_id)
+    assert await db.quiesce_cancelled_stateless_vm_parent(str(job_id)) is False
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_workspace_recoveries SET phase='cancelled',"
+            "resolved_at=clock_timestamp() "
+            "WHERE id=$1",
+            recovery_id,
+        )
+        await conn.execute(
+            "UPDATE vm_workspace_cleanup_admissions SET completed_at=clock_timestamp(),"
+            "outcome='completed' WHERE id=$1",
+            parent.admission_id,
+        )
+    assert await db.quiesce_cancelled_stateless_vm_parent(str(job_id)) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stale_field",
+    [
+        "provision_generation",
+        "vm_uid",
+        "rootdisk_pvc_uid",
+        "workspace_storage",
+        "request_id",
+        "intent_digest",
+    ],
+)
+async def test_cancelled_stateless_vm_refuses_stale_terminal_parent(
+    app_pg,
+    stale_field,
+) -> None:
+    """A predecessor or mismatched parent cannot retire a current successor."""
+
+    job_id, generation, vm_uid, pvc_uid = (uuid4() for _ in range(4))
+    vm = {
+        "status": "retiring_process_zero",
+        "provision_generation": str(generation),
+        "identity_authenticated": True,
+        "identity_provision_generation": str(generation),
+        "vm_uid": str(vm_uid),
+        "rootdisk_pvc_uid": str(pvc_uid),
+    }
+    stale = dict(vm)
+    if stale_field == "workspace_storage":
+        vm["workspace_storage"] = {"uid": str(uuid4())}
+    else:
+        stale[stale_field] = str(uuid4())
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, execution_lane, context) "
+            "VALUES ($1, 'cancel predecessor', 'cancelled', 'stateless', $2::jsonb)",
+            job_id,
+            json.dumps({"vm": vm, "_stateless_cancel_cleanup_pending": True}),
+        )
+        await conn.execute(
+            "INSERT INTO run_queue(unit_id,unit_kind,state,lease_token) "
+            "VALUES ($1,'worker_batch','done',3)",
+            job_id,
+        )
+    identity = SimpleNamespace(
+        provision_generation=stale["provision_generation"],
+        vm_uid=stale["vm_uid"],
+        rootdisk_pvc_uid=stale["rootdisk_pvc_uid"],
+    )
+    store = VMWorkspaceRecoveryStore(app_pg)
+    if stale_field in {"request_id", "intent_digest"}:
+        _, expected_pvc, request_id, digest, _ = vm_cleanup_request_identity(
+            owner_kind="job",
+            owner_id=job_id,
+            identity=identity,
+            source="job_terminal_vm_release",
+            purge_disk=True,
+        )
+        parent = await store.acquire_cleanup_permit(
+            owner_kind="job",
+            owner_id=job_id,
+            pvc_uid=expected_pvc,
+            request_id=uuid4() if stale_field == "request_id" else request_id,
+            source="job_terminal_vm_release",
+            intent_digest=(
+                "sha256:wrong-terminal-intent"
+                if stale_field == "intent_digest"
+                else digest
+            ),
+        )
+    else:
+        parent = await acquire_vm_cleanup_permit(
+            store,
+            owner_kind="job",
+            owner_id=job_id,
+            identity=identity,
+            source="job_terminal_vm_release",
+            purge_disk=True,
+        )
+    assert parent.allowed
+    assert (
+        await postgres_db(app_pg).quiesce_cancelled_stateless_vm_parent(str(job_id))
+        is False
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inherits", [True, False])
+async def test_cancelled_child_uses_canonical_workspace_owner(
+    app_pg,
+    inherits,
+) -> None:
+    parent_id, child_id, generation, vm_uid, pvc_uid = (uuid4() for _ in range(5))
+    vm = {
+        "status": "retiring_process_zero",
+        "provision_generation": str(generation),
+        "identity_authenticated": True,
+        "identity_provision_generation": str(generation),
+        "vm_uid": str(vm_uid),
+        "rootdisk_pvc_uid": str(pvc_uid),
+    }
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs(id,description,status,execution_lane,context) "
+            "VALUES($1,'parent','cancelled','stateless',$2::jsonb)",
+            parent_id,
+            json.dumps({"vm": vm} if inherits else {}),
+        )
+        await conn.execute(
+            "INSERT INTO jobs(id,description,status,execution_lane,parent_job_id,context) "
+            "VALUES($1,'child','cancelled','stateless',$2,$3::jsonb)",
+            child_id,
+            parent_id,
+            json.dumps(
+                {
+                    "vm": vm,
+                    "inherits_parent_workspace": inherits,
+                    "_stateless_cancel_cleanup_pending": True,
+                }
+            ),
+        )
+        await conn.execute(
+            "INSERT INTO run_queue(unit_id,unit_kind,state,lease_token) "
+            "VALUES($1,'worker_batch','done',3)",
+            child_id,
+        )
+    parent = await acquire_vm_cleanup_permit(
+        VMWorkspaceRecoveryStore(app_pg),
+        owner_kind="job",
+        owner_id=parent_id if inherits else child_id,
+        identity=SimpleNamespace(
+            provision_generation=str(generation),
+            vm_uid=str(vm_uid),
+            rootdisk_pvc_uid=str(pvc_uid),
+        ),
+        source="job_terminal_vm_release",
+        purge_disk=True,
+    )
+    assert parent.allowed
+    assert await postgres_db(app_pg).quiesce_cancelled_stateless_vm_parent(
+        str(child_id)
+    ) is (not inherits)
 
 
 @pytest.mark.asyncio

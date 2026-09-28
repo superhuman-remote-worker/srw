@@ -113,6 +113,132 @@ async def test_cancelled_stateless_vm_returns_durable_pending_without_snapshot_w
 
 
 @pytest.mark.asyncio
+async def test_cancelled_stateless_vm_replays_current_parent_before_checkpoint_prune():
+    """An open exact parent must not strand strict prune and its cancel hold."""
+
+    calls = []
+
+    @asynccontextmanager
+    async def lock(_job_id):
+        yield True
+
+    async def parent(_job_id):
+        calls.append("queue_and_parent_proven")
+        return True
+
+    async def archive(_job_id):
+        calls.append("terminal_vm_parent_completed")
+
+    async def finalize(_job_id):
+        calls.append("strict_checkpoint_prune")
+        assert "terminal_vm_parent_completed" in calls
+        return True
+
+    async def complete(_job_id):
+        calls.append("cancel_marker_cleared")
+        return True
+
+    store = SimpleNamespace(
+        stateless_cancel_cleanup_lock=lock,
+        stateless_cancel_cleanup_pending=AsyncMock(return_value=True),
+        quiesce_cancelled_stateless_vm_parent=parent,
+        finalize_cancelled_stateless_job=finalize,
+        complete_stateless_cancel_cleanup=complete,
+    )
+    operation = controls(store=store, archive=archive)
+    assert (
+        await operation.wait_for_stateless_cancel_settle(
+            JOB_ID,
+            timeout_seconds=0,
+        )
+        is True
+    )
+    assert calls == [
+        "queue_and_parent_proven",
+        "terminal_vm_parent_completed",
+        "strict_checkpoint_prune",
+        "cancel_marker_cleared",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stateless_vm_parent_response_loss_keeps_marker_until_replay():
+    """A lost reply after parent completion retries from durable state."""
+
+    calls = []
+
+    @asynccontextmanager
+    async def lock(_job_id):
+        yield True
+
+    parent = AsyncMock(side_effect=[True, False])
+
+    async def archive(_job_id):
+        calls.append("archive")
+        if len(calls) == 1:
+            raise asyncio.CancelledError()
+
+    async def finalize(_job_id):
+        calls.append("prune")
+        return True
+
+    async def complete(_job_id):
+        calls.append("marker")
+        return True
+
+    store = SimpleNamespace(
+        stateless_cancel_cleanup_lock=lock,
+        stateless_cancel_cleanup_pending=AsyncMock(return_value=True),
+        quiesce_cancelled_stateless_vm_parent=parent,
+        finalize_cancelled_stateless_job=finalize,
+        complete_stateless_cancel_cleanup=complete,
+    )
+    operation = controls(store=store, archive=archive)
+    with pytest.raises(asyncio.CancelledError):
+        await operation.wait_for_stateless_cancel_settle(JOB_ID, timeout_seconds=0)
+    assert calls == ["archive"]
+    assert (
+        await operation.wait_for_stateless_cancel_settle(
+            JOB_ID,
+            timeout_seconds=0,
+        )
+        is True
+    )
+    assert calls == ["archive", "prune", "archive", "marker"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stateless_vm_mismatched_parent_keeps_original_prune_order():
+    calls = []
+
+    @asynccontextmanager
+    async def lock(_job_id):
+        yield True
+
+    async def finalize(_job_id):
+        calls.append("prune")
+        raise RuntimeError("checkpoint authority held")
+
+    archive = AsyncMock()
+    store = SimpleNamespace(
+        stateless_cancel_cleanup_lock=lock,
+        stateless_cancel_cleanup_pending=AsyncMock(return_value=True),
+        quiesce_cancelled_stateless_vm_parent=AsyncMock(return_value=False),
+        finalize_cancelled_stateless_job=finalize,
+    )
+    operation = controls(store=store, archive=archive)
+    assert (
+        await operation.wait_for_stateless_cancel_settle(
+            JOB_ID,
+            timeout_seconds=0,
+        )
+        is False
+    )
+    assert calls == ["prune"]
+    archive.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("inherited", [False, True])
 async def test_duplicate_non_vm_or_inherited_stateless_cancel_settles_marker(inherited):
     context = {"_stateless_cancel_cleanup_pending": True}

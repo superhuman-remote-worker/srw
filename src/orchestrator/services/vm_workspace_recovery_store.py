@@ -472,6 +472,49 @@ async def acquire_vm_cleanup_permit(
 ) -> CleanupPermit:
     """Admit one exact VM/PVC cleanup intent through recovery authority."""
 
+    canonical_owner, pvc_uid, request_id, intent_digest, resource_intent = (
+        vm_cleanup_request_identity(
+            owner_kind=owner_kind,
+            owner_id=owner_id,
+            identity=identity,
+            source=source,
+            purge_disk=purge_disk,
+        )
+    )
+    arguments = dict(
+        owner_kind=owner_kind,
+        owner_id=canonical_owner,
+        pvc_uid=pvc_uid,
+        request_id=request_id,
+        source=source,
+        intent_digest=intent_digest,
+    )
+    if _conn is None:
+        permit = await recovery_store.acquire_cleanup_permit(**arguments)
+    else:
+        permit = await recovery_store.acquire_cleanup_permit_on_conn(_conn, **arguments)
+    bound = bind_vm_cleanup_permit(
+        permit, request_id=request_id, intent=resource_intent
+    )
+    if (
+        bound.allowed
+        and owner_kind in {"job", "thread"}
+        and source != "vm_idle_release"
+    ):
+        await prepare_vm_cleanup_resource(recovery_store, bound, _conn=_conn)
+    return bound
+
+
+def vm_cleanup_request_identity(
+    *,
+    owner_kind: str,
+    owner_id: str | UUID,
+    identity: Any,
+    source: str,
+    purge_disk: bool,
+) -> tuple[UUID, UUID | None, UUID, str, dict[str, Any]]:
+    """Derive the same immutable request/intent used by cleanup admission."""
+
     canonical_owner = _cleanup_uuid(owner_id, namespace=f"{owner_kind}-owner")
     raw_pvc_uid = getattr(identity, "rootdisk_pvc_uid", None)
     pvc_uid = (
@@ -500,22 +543,13 @@ async def acquire_vm_cleanup_permit(
         "source": source,
     }
     request_id = uuid5(NAMESPACE_URL, f"vm-workspace-cleanup:{intent}")
-    arguments = dict(
-        owner_kind=owner_kind,
-        owner_id=canonical_owner,
-        pvc_uid=pvc_uid,
-        request_id=request_id,
-        source=source,
-        intent_digest=cleanup_intent_digest(resource_intent),
+    return (
+        canonical_owner,
+        pvc_uid,
+        request_id,
+        cleanup_intent_digest(resource_intent),
+        resource_intent,
     )
-    if _conn is None:
-        permit = await recovery_store.acquire_cleanup_permit(**arguments)
-    else:
-        permit = await recovery_store.acquire_cleanup_permit_on_conn(_conn, **arguments)
-    bound = bind_vm_cleanup_permit(permit, request_id=request_id, intent=resource_intent)
-    if bound.allowed and owner_kind in {"job", "thread"} and source != "vm_idle_release":
-        await prepare_vm_cleanup_resource(recovery_store, bound, _conn=_conn)
-    return bound
 
 
 async def _vm_cleanup_resource_scope(conn, recovery_store, permit):

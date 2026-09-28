@@ -2429,6 +2429,11 @@ async def test_cascade_cancel_retry_settles_existing_child_cleanup_marker(monkey
 async def test_cancel_settle_prunes_then_cleans_workspace(monkeypatch):
     from orchestrator import main
 
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "quiesce_cancelled_stateless_vm_parent",
+        AsyncMock(return_value=False),
+    )
     finalize = AsyncMock(side_effect=(False, True))
     monkeypatch.setattr(
         main.app.state.resources.postgres_db,
@@ -2476,6 +2481,11 @@ async def test_cancel_settle_keeps_resume_block_until_workspace_cleanup_succeeds
 ):
     from orchestrator import main
 
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "quiesce_cancelled_stateless_vm_parent",
+        AsyncMock(return_value=False),
+    )
     finalize = AsyncMock(return_value=True)
     monkeypatch.setattr(
         main.app.state.resources.postgres_db,
@@ -2521,6 +2531,11 @@ async def test_cancel_settle_keeps_resume_block_until_workspace_cleanup_succeeds
 async def test_concurrent_cancel_settlers_run_destructive_cleanup_once(monkeypatch):
     from orchestrator import main
 
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "quiesce_cancelled_stateless_vm_parent",
+        AsyncMock(return_value=False),
+    )
     cleanup_lock = asyncio.Lock()
     marker_pending = True
 

@@ -5428,6 +5428,142 @@ class PostgresDB:
             )
         return row is not None
 
+    async def quiesce_cancelled_stateless_vm_parent(self, job_id: str) -> bool:
+        """Select only this Cancel's open VM parent after its worker is done.
+
+        This permits the service to replay an already-admitted exact terminal
+        cleanup before a second checkpoint prune. It issues no cleanup permit
+        and grants no effect by itself; the ordinary archive path revalidates
+        the parent, resource policy and physical stop before settlement.
+        """
+        try:
+            owner_id = UUID(job_id)
+        except (TypeError, ValueError):
+            return False
+
+        from types import SimpleNamespace
+        from orchestrator.services.vm_workspace_recovery_store import (
+            _job_workspace_owner,
+            vm_cleanup_request_identity,
+        )
+
+        # A coherent read-only snapshot avoids inverting the cleanup path's
+        # owner/PVC -> parent -> queue -> Job lock order. This predicate grants
+        # no effect; the subsequent archive reacquires and validates the exact
+        # parent through that established order after this transaction ends.
+        async with (
+            self.acquire() as conn,
+            conn.transaction(
+                isolation="repeatable_read",
+                readonly=True,
+            ),
+        ):
+            queue = await conn.fetchrow(
+                "SELECT state FROM run_queue WHERE unit_id=$1 "
+                "AND unit_kind='worker_batch'",
+                owner_id,
+            )
+            if queue is None or queue["state"] != "done":
+                return False
+            row = await conn.fetchrow(
+                "SELECT status::text AS status, execution_lane, parent_job_id, "
+                "context FROM jobs WHERE id=$1",
+                owner_id,
+            )
+            if (
+                row is None
+                or row["status"] != "cancelled"
+                or row["execution_lane"] != "stateless"
+            ):
+                return False
+            context = row["context"] or {}
+            if isinstance(context, str):
+                try:
+                    context = json.loads(context)
+                except (TypeError, ValueError):
+                    return False
+            if (
+                not isinstance(context, dict)
+                or context.get("_stateless_cancel_cleanup_pending") is not True
+            ):
+                return False
+            canonical_owner, ambiguous = _job_workspace_owner(owner_id, row)
+            if ambiguous or canonical_owner != owner_id:
+                return False
+            vm = context.get("vm")
+            if not isinstance(vm, dict) or vm.get("workspace_storage") is not None:
+                # Retained storage needs its durable reservation proof, which
+                # this narrow purge-parent continuation does not infer.
+                return False
+            try:
+                generation = vm["provision_generation"]
+                vm_uid = vm["vm_uid"]
+                pvc_uid = vm["rootdisk_pvc_uid"]
+                if any(
+                    not isinstance(value, str) or str(UUID(value)) != value
+                    for value in (generation, vm_uid, pvc_uid)
+                ):
+                    return False
+            except (KeyError, TypeError, ValueError, AttributeError):
+                return False
+            if (
+                vm.get("identity_authenticated") is not True
+                or vm.get("identity_provision_generation") != generation
+            ):
+                return False
+            if await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases "
+                "WHERE owner_kind='job' AND owner_id=$1 AND closed_at IS NULL "
+                "AND expires_at>clock_timestamp())",
+                owner_id,
+            ):
+                return False
+            if await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_workspace_recoveries r "
+                "LEFT JOIN vm_workspace_recovery_retention_pins p "
+                "ON p.recovery_id=r.id AND p.released_at IS NULL "
+                "WHERE r.resolved_at IS NULL AND "
+                "((r.owner_kind='job' AND r.owner_id=$1) OR p.pvc_uid=$2))",
+                owner_id,
+                UUID(pvc_uid),
+            ):
+                return False
+            if await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs "
+                "WHERE job_id=$1 AND resolved_at IS NULL)",
+                owner_id,
+            ):
+                return False
+            expected_owner, expected_pvc, request_id, digest, _ = (
+                vm_cleanup_request_identity(
+                    owner_kind="job",
+                    owner_id=owner_id,
+                    identity=SimpleNamespace(
+                        provision_generation=generation,
+                        vm_uid=vm_uid,
+                        rootdisk_pvc_uid=pvc_uid,
+                    ),
+                    source="job_terminal_vm_release",
+                    purge_disk=True,
+                )
+            )
+            parents = await conn.fetch(
+                "SELECT owner_id,pvc_uid,request_id,intent_digest,"
+                "parent_admission_id FROM vm_workspace_cleanup_admissions "
+                "WHERE owner_kind='job' AND owner_id=$1 "
+                "AND source='job_terminal_vm_release' "
+                "AND completed_at IS NULL ORDER BY admitted_at LIMIT 2",
+                owner_id,
+            )
+            return bool(
+                len(parents) == 1
+                and parents[0]["owner_id"] == expected_owner
+                and parents[0]["pvc_uid"] == expected_pvc
+                and parents[0]["request_id"] == request_id
+                and parents[0]["intent_digest"] == digest
+                and parents[0]["parent_admission_id"] is None
+            )
+
     async def finalize_cancelled_stateless_job(self, job_id: str) -> bool:
         """Finish cleanup only after a cancelled worker lease has quiesced.
 
