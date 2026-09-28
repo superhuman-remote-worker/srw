@@ -25,8 +25,8 @@ ordinary login like the deployed servers:
 
 Retirement records are written through the production End funnel before the
 upgrade: claim and claim-less soft End, a warm soft End, a warm permanent
-Delete by the historical writer (R3.2's settled ``releasing`` release, or
-upstream's in-flight ``terminal_release``) and, where it
+Delete by the historical writer (R3.2's ``releasing`` release, both settled
+and left unsettled, or upstream's in-flight ``terminal_release``) and, where it
 existed, a ``bound`` row left at a deleted owner by the pre-fix writer. The
 upgrade must keep every historical ledger row and record, reach the same
 catalog as H1, replace functions in place and change nothing on a second
@@ -877,7 +877,10 @@ async def _local_writer_records(store, stack, monkeypatch):
         "pod_uid"
     ]
     settled = await _warm_permanent_delete(store, monkeypatch, writer="r32")
-    return NS(claimless=claimless, settled=settled)
+    unsettled = await _warm_permanent_delete(
+        store, monkeypatch, writer="r32", complete=False
+    )
+    return NS(claimless=claimless, settled=settled, unsettled=unsettled)
 
 
 async def _assert_local_upgrade(
@@ -940,6 +943,7 @@ async def _assert_local_upgrade(
         "released",
         "exact_absent_v1",
     )
+    await _reconcile_to_released(store, local.unsettled)
     if pre_fix is not None:
         await _reconcile_to_released(store, pre_fix)
 
@@ -1097,6 +1101,7 @@ async def test_upgrade_from_the_repaired_k3d_history(
         assert historical <= {row["filename"] for row in upgraded}
         (early_row,) = await _warm_rows(store, early.settled.life["thread"])
         assert early_row["status"] == "released"
+        await _reconcile_to_released(store, early.unsettled)
     finally:
         await store.close()
         crypto.reset_cipher_cache()

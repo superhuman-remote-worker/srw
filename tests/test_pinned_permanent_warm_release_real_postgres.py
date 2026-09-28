@@ -222,6 +222,99 @@ async def test_legacy_deleted_owner_releases_only_terminal_exact_pod(db, monkeyp
     assert ("agents-a", ids["pod_name"]) not in api.pods
 
 
+async def _r32_deleted_owner_release(db, monkeypatch):
+    """Model R3.2's unpublished delete: an ordinary release at a deleted owner.
+
+    R3.2 validated ``releasing`` at an absent thread on the exact permanent
+    receipt, detached the actor as ``draining`` and released the Pod right
+    after the commit. When that follow-up failed the row stayed ``releasing``.
+    """
+
+    ids, api, provider = await _bound_warm_thread(db, monkeypatch)
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    await fixtures._authorize_and_ack(db, ids, retirement)
+    assert await db.clear_pinned_retirement_physical_runtime_endpoint(
+        ids["thread"],
+        runtime_generation=retirement["generation"],
+        retirement_token=retirement["token"],
+        completed_quiescence_protocol="agent_runtime_zero_v1",
+    )
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            # Fixture construction for the historical state only.
+            await conn.execute("SET LOCAL session_replication_role='replica'")
+            await conn.execute(
+                "UPDATE agents SET thread_id=NULL,status='draining' WHERE id=$1::uuid",
+                UUID(ids["agent"]),
+            )
+            await conn.execute(
+                "INSERT INTO thread_runtime_retirement_outcomes "
+                "(thread_id,runtime_generation,retirement_token,agent_id,"
+                "runtime_attach_token,disposition,permanent,outcome) VALUES "
+                "($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,'ended',true,'deleted')",
+                UUID(ids["thread"]),
+                UUID(ids["runtime_generation"]),
+                UUID(retirement["token"]),
+                UUID(ids["agent"]),
+                UUID(ids["attach_token"]),
+            )
+            await conn.execute(
+                "DELETE FROM threads WHERE id=$1::uuid", UUID(ids["thread"])
+            )
+            await conn.execute(
+                "UPDATE thread_agent_warm_binding_protections "
+                "SET status='releasing',release_started_at=now(),"
+                "lease_expires_at=created_at+interval '1 millisecond' "
+                "WHERE thread_id=$1::uuid",
+                UUID(ids["thread"]),
+            )
+    return ids, api, provider
+
+
+@pytest.mark.asyncio
+async def test_r32_release_at_deleted_owner_settles_only_through_terminal_pod(
+    db, monkeypatch
+):
+    """A stranded R3.2 release settles exactly and never returns its Pod."""
+
+    ids, api, provider = await _r32_deleted_owner_release(db, monkeypatch)
+    pod = api.pods[("agents-a", ids["pod_name"])]
+
+    async def state():
+        async with db.acquire() as conn:
+            warm = await conn.fetchrow(
+                "SELECT status,release_outcome FROM "
+                "thread_agent_warm_binding_protections WHERE thread_id=$1::uuid",
+                UUID(ids["thread"]),
+            )
+            actor = await conn.fetchval(
+                "SELECT status::text FROM agents WHERE id=$1::uuid",
+                UUID(ids["agent"]),
+            )
+        return dict(warm), actor
+
+    # The exact Pod still runs: its finalizer stays and the actor stays out.
+    await reconcile_pinned_warm_binding_protections(
+        db, agent_provisioner=provider, persistent_provisioner=None
+    )
+    assert pod.metadata.finalizers == [fixtures.PINNED_AUTHORITY_FINALIZER]
+    assert await state() == (
+        {"status": "releasing", "release_outcome": None},
+        "draining",
+    )
+
+    api.mark_terminal("agents-a", ids["pod_name"])
+    pod.metadata.deletion_timestamp = "now"
+    await reconcile_pinned_warm_binding_protections(
+        db, agent_provisioner=provider, persistent_provisioner=None
+    )
+    assert await state() == (
+        {"status": "released", "release_outcome": "exact_absent_v1"},
+        "offline",
+    )
+    assert ("agents-a", ids["pod_name"]) not in api.pods
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "receipt_change", ["missing", "wrong_attach", "wrong_generation"]
