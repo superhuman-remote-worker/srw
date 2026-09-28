@@ -15410,6 +15410,7 @@ class ContainerProvisioner:
                         seed,
                         owner=expected_owner,
                         generation=expected_creation_generation,
+                        pod_name=pod_name,
                     )
                 )
                 if pinned_attempt and (
@@ -15616,6 +15617,7 @@ class ContainerProvisioner:
                         confirmed_seed,
                         owner=expected_owner,
                         generation=expected_creation_generation,
+                        pod_name=pod_name,
                     )
                 )
                 if confirmed_seed_uid != trusted_seed_uid:

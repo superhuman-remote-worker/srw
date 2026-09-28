@@ -3198,6 +3198,7 @@ class _PinnedSessionContainerDB(_CreationReservationDBDouble):
 
 class TestStrictStatelessWorkspaceCreation:
     THREAD_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    IDE_JOB_ID = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
     GENERATION = "11111111-2222-4333-8444-555555555555"
     RUNTIME = "66666666-7777-4888-8999-aaaaaaaaaaaa"
 
@@ -3438,6 +3439,115 @@ class TestStrictStatelessWorkspaceCreation:
             )
         )
         return p
+
+    @classmethod
+    def _ide_attestation_objects(cls, provisioner):
+        """A Job IDE Pod and its seed, distinct from the Job workspace Pod."""
+        owner = WorkspaceOwner.job(cls.IDE_JOB_ID)
+        pod_name = f"ide-{owner.id[:12]}"
+        seed_name = f"code-server-config-{pod_name}"
+        pod = cls._pod(seed_name=seed_name)
+        pod.metadata.name = pod_name
+        pod.metadata.labels = {
+            "app": "srw-workspace",
+            owner.label_key: owner.id,
+            "srw/component": "ide-session",
+            "srw.io/component": "agent-workspace",
+            "srw.io/network-tier": "internet-only",
+        }
+        seed = cls._seed(provisioner)
+        seed.metadata.name = seed_name
+        seed.metadata.labels.pop(cls._owner().label_key)
+        seed.metadata.labels[owner.label_key] = owner.id
+        seed.metadata.owner_references[0].name = pod_name
+        return owner, pod_name, seed_name, pod, seed
+
+    @pytest.mark.asyncio
+    async def test_ide_host_key_attests_seed_named_for_ide_pod(self):
+        p = self._provisioner()
+        owner, pod_name, seed_name, pod, seed = self._ide_attestation_objects(p)
+        p._core_api.read_namespaced_pod.side_effect = [pod, pod]
+        p._core_api.read_namespaced_config_map.side_effect = [seed, seed]
+
+        with patch(
+            "orchestrator.services.container_provisioner.k8s_stream",
+            return_value="256 SHA256:trusted host (ED25519)",
+        ):
+            backing_id, fingerprint, runtime = await p._trusted_pod_ssh_identity(
+                pod_name,
+                expected_owner=owner,
+                expected_runtime_incarnation=self.RUNTIME,
+                expected_network_tier="internet-only",
+                expected_seed_configmap=seed_name,
+                expected_pod_name=pod_name,
+                expected_component="ide-session",
+            )
+
+        assert backing_id == f"k8s-pod:{p._namespace}:{self.RUNTIME}"
+        assert fingerprint == "SHA256:trusted"
+        assert runtime == self.RUNTIME
+        assert p._core_api.read_namespaced_config_map.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_ide_host_key_rejects_foreign_seed_owner(self):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAuthorityError,
+        )
+
+        p = self._provisioner()
+        owner, pod_name, seed_name, pod, seed = self._ide_attestation_objects(p)
+        seed.metadata.labels[owner.label_key] = self.THREAD_ID
+        p._core_api.read_namespaced_pod.return_value = pod
+        p._core_api.read_namespaced_config_map.return_value = seed
+
+        with pytest.raises(
+            WorkspaceRuntimeAuthorityError,
+            match="workspace seed ConfigMap owner authority changed",
+        ):
+            await p._trusted_pod_ssh_identity(
+                pod_name,
+                expected_owner=owner,
+                expected_runtime_incarnation=self.RUNTIME,
+                expected_network_tier="internet-only",
+                expected_seed_configmap=seed_name,
+                expected_pod_name=pod_name,
+                expected_component="ide-session",
+            )
+
+    @pytest.mark.asyncio
+    async def test_ide_host_key_rejects_seed_uid_change_after_exec(self):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAuthorityError,
+        )
+
+        p = self._provisioner()
+        owner, pod_name, seed_name, pod, seed = self._ide_attestation_objects(p)
+        confirmed_seed = self._seed(p)
+        confirmed_seed.metadata.name = seed_name
+        confirmed_seed.metadata.labels.pop(self._owner().label_key)
+        confirmed_seed.metadata.labels[owner.label_key] = owner.id
+        confirmed_seed.metadata.owner_references[0].name = pod_name
+        confirmed_seed.metadata.uid = "99999999-aaaa-4bbb-8ccc-eeeeeeeeeeee"
+        p._core_api.read_namespaced_pod.side_effect = [pod, pod]
+        p._core_api.read_namespaced_config_map.side_effect = [seed, confirmed_seed]
+
+        with patch(
+            "orchestrator.services.container_provisioner.k8s_stream",
+            return_value="256 SHA256:trusted host (ED25519)",
+        ):
+            with pytest.raises(
+                WorkspaceRuntimeAuthorityError,
+                match="workspace seed ConfigMap UID changed",
+            ):
+                await p._trusted_pod_ssh_identity(
+                    pod_name,
+                    expected_owner=owner,
+                    expected_runtime_incarnation=self.RUNTIME,
+                    expected_network_tier="internet-only",
+                    expected_seed_configmap=seed_name,
+                    expected_pod_name=pod_name,
+                    expected_component="ide-session",
+                )
 
     @classmethod
     async def _active_reservation(cls, db):
