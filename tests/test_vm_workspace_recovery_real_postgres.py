@@ -27,7 +27,9 @@ from orchestrator.services import (
 from orchestrator.services.vm_workspace_recovery_store import (
     VMWorkspaceRecoveryStore,
     WorkspaceRecoveryControlConflict,
+    acquire_pinned_thread_retirement_cleanup_permit,
     acquire_vm_cleanup_permit,
+    pinned_thread_purge_successor_request_id,
     vm_cleanup_request_identity,
 )
 from shared.run_queue import reap_expired, unpark_unit
@@ -4502,3 +4504,176 @@ async def test_admission_rechecks_canonical_membership_shape(
                 "SELECT state, lease_token FROM run_queue WHERE unit_id=$1", reporter_id
             )
         ) == ("parked", 28)
+
+
+# ---------------------------------------------------------------------------
+# Legacy pinned thread retirement: keep, then purge of the same VM identity
+# ---------------------------------------------------------------------------
+
+
+def _legacy_thread_vm():
+    return SimpleNamespace(
+        provision_generation=str(uuid4()),
+        vm_uid=str(uuid4()),
+        rootdisk_pvc_uid=str(uuid4()),
+    )
+
+
+def _thread_cleanup_ids(thread_id, identity):
+    return {
+        purge: vm_cleanup_request_identity(
+            owner_kind="thread",
+            owner_id=thread_id,
+            identity=identity,
+            source="pinned_thread_retirement",
+            purge_disk=purge,
+        )
+        for purge in (False, True)
+    }
+
+
+async def _thread_admissions(app_pg, owner):
+    rows = await app_pg.fetch(
+        "SELECT id,request_id,intent_digest,completed_at,outcome "
+        "FROM vm_workspace_cleanup_admissions WHERE owner_kind='thread' "
+        "AND owner_id=$1 ORDER BY admitted_at",
+        owner,
+    )
+    return [dict(row) for row in rows]
+
+
+@pytest.mark.asyncio
+async def test_pinned_thread_purge_after_keep_takes_its_own_stable_request_id(
+    app_pg,
+) -> None:
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
+    thread_id, identity = str(uuid4()), _legacy_thread_vm()
+    ids = _thread_cleanup_ids(thread_id, identity)
+    owner, _, shared_id, keep_digest, _ = ids[False]
+    purge_digest = ids[True][3]
+
+    keep = await acquire_pinned_thread_retirement_cleanup_permit(
+        store, thread_id=thread_id, identity=identity, purge_disk=False
+    )
+    assert keep.allowed
+    # Retrying the same soft End keeps the historical request ID.
+    again = await acquire_pinned_thread_retirement_cleanup_permit(
+        store, thread_id=thread_id, identity=identity, purge_disk=False
+    )
+    assert again.admission_id == keep.admission_id
+    assert await store.complete_cleanup_permit(keep.admission_id, outcome="completed")
+    keep_row = (await _thread_admissions(app_pg, owner))[0]
+    assert (keep_row["request_id"], keep_row["intent_digest"]) == (
+        shared_id,
+        keep_digest,
+    )
+
+    purge = await acquire_pinned_thread_retirement_cleanup_permit(
+        store, thread_id=thread_id, identity=identity, purge_disk=True
+    )
+    assert purge.allowed and purge.admission_id != keep.admission_id
+    successor = pinned_thread_purge_successor_request_id(shared_id)
+    assert purge.parent_cleanup["request_id"] == str(successor)
+    assert purge.parent_cleanup["intent"]["purge_disk"] is True
+    # Interrupted and repeated Deletes reuse the purge's own admission.
+    for _ in range(2):
+        retry = await acquire_pinned_thread_retirement_cleanup_permit(
+            store, thread_id=thread_id, identity=identity, purge_disk=True
+        )
+        assert retry.admission_id == purge.admission_id
+    assert await store.complete_cleanup_permit(
+        purge.admission_id, outcome="completed"
+    )
+    replay = await acquire_pinned_thread_retirement_cleanup_permit(
+        store, thread_id=thread_id, identity=identity, purge_disk=True
+    )
+    assert replay.admission_id == purge.admission_id
+    assert replay.completed_outcome == "completed"
+    rows = await _thread_admissions(app_pg, owner)
+    assert rows[0] == keep_row
+    assert [(row["request_id"], row["intent_digest"]) for row in rows[1:]] == [
+        (successor, purge_digest)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pinned_thread_purge_waits_for_an_open_keep(app_pg) -> None:
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
+    thread_id, identity = str(uuid4()), _legacy_thread_vm()
+    owner = _thread_cleanup_ids(thread_id, identity)[False][0]
+    keep = await acquire_pinned_thread_retirement_cleanup_permit(
+        store, thread_id=thread_id, identity=identity, purge_disk=False
+    )
+    before = await _thread_admissions(app_pg, owner)
+
+    purge = await acquire_pinned_thread_retirement_cleanup_permit(
+        store, thread_id=thread_id, identity=identity, purge_disk=True
+    )
+
+    assert not purge.allowed
+    assert purge.reason == "workspace_cleanup_already_admitted"
+    assert purge.admission_id == keep.admission_id
+    assert await _thread_admissions(app_pg, owner) == before
+
+
+@pytest.mark.asyncio
+async def test_pinned_thread_purge_refuses_a_mismatched_shared_request(
+    app_pg,
+) -> None:
+    """Only this identity's exact keep admission earns the purge successor."""
+
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
+    thread_id, identity = str(uuid4()), _legacy_thread_vm()
+    owner, pvc_uid, shared_id, _, _ = _thread_cleanup_ids(thread_id, identity)[False]
+    unknown = await store.acquire_cleanup_permit(
+        owner_kind="thread",
+        owner_id=owner,
+        pvc_uid=pvc_uid,
+        request_id=shared_id,
+        source="pinned_thread_retirement",
+        intent_digest="sha256:unreviewed-intent",
+    )
+    assert await store.complete_cleanup_permit(
+        unknown.admission_id, outcome="completed"
+    )
+    before = await _thread_admissions(app_pg, owner)
+
+    with pytest.raises(WorkspaceRecoveryControlConflict) as refused:
+        await acquire_pinned_thread_retirement_cleanup_permit(
+            store, thread_id=thread_id, identity=identity, purge_disk=True
+        )
+
+    assert refused.value.code == "cleanup_request_id_reused"
+    assert await _thread_admissions(app_pg, owner) == before
+
+
+@pytest.mark.asyncio
+async def test_pinned_thread_purge_without_keep_keeps_the_historical_request_id(
+    app_pg,
+) -> None:
+    """A live session's Delete, or a purge admitted before this contract."""
+
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
+    thread_id, identity = str(uuid4()), _legacy_thread_vm()
+    owner, _, shared_id, purge_digest, _ = _thread_cleanup_ids(thread_id, identity)[
+        True
+    ]
+    historical = await acquire_vm_cleanup_permit(
+        store,
+        owner_kind="thread",
+        owner_id=thread_id,
+        identity=identity,
+        source="pinned_thread_retirement",
+        purge_disk=True,
+    )
+
+    purge = await acquire_pinned_thread_retirement_cleanup_permit(
+        store, thread_id=thread_id, identity=identity, purge_disk=True
+    )
+
+    assert purge.admission_id == historical.admission_id
+    assert purge.parent_cleanup["request_id"] == str(shared_id)
+    assert [
+        (row["request_id"], row["intent_digest"])
+        for row in await _thread_admissions(app_pg, owner)
+    ] == [(shared_id, purge_digest)]

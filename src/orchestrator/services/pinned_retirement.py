@@ -30,7 +30,7 @@ from orchestrator.services.pinned_agent_authority import (
 )
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from orchestrator.services.vm_workspace_recovery_store import (
-    acquire_vm_cleanup_permit,
+    acquire_pinned_thread_retirement_cleanup_permit,
     vm_cleanup_kwargs,
     completed_cleanup_outcome,
     complete_vm_cleanup_permit,
@@ -84,12 +84,10 @@ class PinnedRetirementOperations:
             )
             if retained is not None:
                 return retained if retained.allowed else None
-        permit = await acquire_vm_cleanup_permit(
+        permit = await acquire_pinned_thread_retirement_cleanup_permit(
             self.dependencies.recovery_store,
-            owner_kind="thread",
-            owner_id=thread_id,
+            thread_id=thread_id,
             identity=identity,
-            source="pinned_thread_retirement",
             purge_disk=purge_disk,
         )
         return permit if permit.allowed else None

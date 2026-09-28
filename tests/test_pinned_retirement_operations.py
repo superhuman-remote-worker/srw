@@ -713,7 +713,9 @@ async def test_retained_disk_refusal_never_falls_through_to_ordinary_cleanup(
 
     monkeypatch.setattr(retained, "acquire_retained_disk_purge", retained_boundary)
     monkeypatch.setattr(
-        retirement_module, "acquire_vm_cleanup_permit", ordinary_boundary
+        retirement_module,
+        "acquire_pinned_thread_retirement_cleanup_permit",
+        ordinary_boundary,
     )
     result = await operation._admit_vm_cleanup(
         "owner", identity, purge_disk=True, retirement=current

@@ -345,6 +345,8 @@ class CleanupPermit:
     completed_outcome: str | None = None
     parent_cleanup: Mapping[str, Any] | None = None
     creation_disposition: Mapping[str, Any] | None = None
+    # Set when admission used a reviewed successor instead of the asked ID.
+    request_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,8 +471,12 @@ async def acquire_vm_cleanup_permit(
     source: str,
     purge_disk: bool,
     _conn: Any = None,
+    _purge_successor: tuple[str, UUID] | None = None,
 ) -> CleanupPermit:
-    """Admit one exact VM/PVC cleanup intent through recovery authority."""
+    """Admit one exact VM/PVC cleanup intent through recovery authority.
+
+    ``_purge_successor`` is only for ``acquire_pinned_thread_retirement_cleanup_permit``.
+    """
 
     canonical_owner, pvc_uid, request_id, intent_digest, resource_intent = (
         vm_cleanup_request_identity(
@@ -489,12 +495,16 @@ async def acquire_vm_cleanup_permit(
         source=source,
         intent_digest=intent_digest,
     )
+    if _purge_successor is not None:
+        arguments["purge_successor"] = _purge_successor
     if _conn is None:
         permit = await recovery_store.acquire_cleanup_permit(**arguments)
     else:
         permit = await recovery_store.acquire_cleanup_permit_on_conn(_conn, **arguments)
     bound = bind_vm_cleanup_permit(
-        permit, request_id=request_id, intent=resource_intent
+        permit,
+        request_id=getattr(permit, "request_id", None) or request_id,
+        intent=resource_intent,
     )
     if (
         bound.allowed
@@ -503,6 +513,65 @@ async def acquire_vm_cleanup_permit(
     ):
         await prepare_vm_cleanup_resource(recovery_store, bound, _conn=_conn)
     return bound
+
+
+PINNED_THREAD_RETIREMENT_CLEANUP_SOURCE = "pinned_thread_retirement"
+
+
+def pinned_thread_purge_successor_request_id(keep_request_id: UUID) -> UUID:
+    """The purge's own request ID after a keep admission holds the shared one."""
+
+    return uuid5(
+        NAMESPACE_URL, f"vm-workspace-cleanup-purge-after-keep:{keep_request_id}"
+    )
+
+
+async def acquire_pinned_thread_retirement_cleanup_permit(
+    recovery_store: Any,
+    *,
+    thread_id: str | UUID,
+    identity: Any,
+    purge_disk: bool,
+) -> CleanupPermit:
+    """Admit a legacy (non-v3) pinned thread VM cleanup for its disposition.
+
+    A soft End keeps the root disk and a later permanent Delete purges it: two
+    retirement operations on one VM identity. The ordinary derivation gives both
+    one request ID (the disposition is only in the intent digest), so the Delete
+    after a soft End met the keep's completed admission and was refused for
+    ever. The keep, and a purge with no keep before it (Delete of a live
+    session), keep that historical ID. A purge whose historical ID already holds
+    exactly this identity's keep admission is admitted under a deterministic
+    successor ID, decided under the admission's own locks: the same for every
+    retry of the Delete, never minted per attempt, and the keep row stays as
+    recorded. Any other intent under the historical ID still raises
+    ``cleanup_request_id_reused``; every exact owner/PVC/generation check of the
+    admission is unchanged.
+    """
+
+    source = PINNED_THREAD_RETIREMENT_CLEANUP_SOURCE
+    purge_successor = None
+    if purge_disk:
+        _, _, shared_request_id, keep_digest, _ = vm_cleanup_request_identity(
+            owner_kind="thread",
+            owner_id=thread_id,
+            identity=identity,
+            source=source,
+            purge_disk=False,
+        )
+        purge_successor = (
+            keep_digest,
+            pinned_thread_purge_successor_request_id(shared_request_id),
+        )
+    return await acquire_vm_cleanup_permit(
+        recovery_store,
+        owner_kind="thread",
+        owner_id=thread_id,
+        identity=identity,
+        source=source,
+        purge_disk=purge_disk,
+        _purge_successor=purge_successor,
+    )
 
 
 def vm_cleanup_request_identity(
@@ -1550,6 +1619,7 @@ class VMWorkspaceRecoveryStore:
         parent_cleanup: Mapping[str, Any] | None = None,
         parent_provision_generation: str | None = None,
         expected_vm_uid: str | None = None,
+        purge_successor: tuple[str, UUID] | None = None,
     ) -> CleanupPermit:
         """Serialize destructive admission with recovery and its exact disk pin."""
         async with self.db.acquire() as conn:
@@ -1566,6 +1636,7 @@ class VMWorkspaceRecoveryStore:
                     parent_cleanup=parent_cleanup,
                     parent_provision_generation=parent_provision_generation,
                     expected_vm_uid=expected_vm_uid,
+                    purge_successor=purge_successor,
                 )
 
     async def acquire_cleanup_permit_on_conn(
@@ -1582,8 +1653,15 @@ class VMWorkspaceRecoveryStore:
         parent_cleanup: Mapping[str, Any] | None = None,
         parent_provision_generation: str | None = None,
         expected_vm_uid: str | None = None,
+        purge_successor: tuple[str, UUID] | None = None,
     ) -> CleanupPermit:
-        """Serialize destructive admission with recovery and its exact disk pin."""
+        """Serialize destructive admission with recovery and its exact disk pin.
+
+        ``purge_successor`` is ``(keep_digest, successor_request_id)``: when
+        ``request_id`` already holds exactly that keep admission for this owner,
+        PVC and source, the purge is admitted under the successor ID instead
+        (``acquire_pinned_thread_retirement_cleanup_permit``).
+        """
 
         if not isinstance(intent_digest, str) or not intent_digest:
             raise ValueError("cleanup intent digest must be nonempty")
@@ -1732,6 +1810,27 @@ class VMWorkspaceRecoveryStore:
             owner_id,
             request_id,
         )
+        admitted_request_id = None
+        if (
+            purge_successor is not None
+            and parent_cleanup is None
+            and prior is not None
+            and prior["intent_digest"] == purge_successor[0]
+            and prior["source"] == source
+            and prior["pvc_uid"] == pvc_uid
+            and prior["parent_admission_id"] is None
+        ):
+            # The shared ID recorded this identity's keep; the purge is the
+            # distinct later operation and owns its own deterministic ID.
+            request_id = admitted_request_id = purge_successor[1]
+            prior = await conn.fetchrow(
+                "SELECT id,completed_at,pvc_uid,source,intent_digest,outcome,"
+                "parent_admission_id FROM vm_workspace_cleanup_admissions "
+                "WHERE owner_kind=$1 AND owner_id=$2 AND request_id=$3 FOR UPDATE",
+                owner_kind,
+                owner_id,
+                request_id,
+            )
         if parent_identity is not None:
             parent = await conn.fetchrow(
                 "SELECT owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,completed_at,parent_admission_id "
@@ -1834,6 +1933,7 @@ class VMWorkspaceRecoveryStore:
                 completed_outcome=(
                     prior["outcome"] if prior["completed_at"] is not None else None
                 ),
+                request_id=admitted_request_id,
             )
         active_cleanup = await conn.fetchrow(
             "SELECT id FROM vm_workspace_cleanup_admissions "
@@ -1906,7 +2006,9 @@ class VMWorkspaceRecoveryStore:
             intent_digest,
             parent_id,
         )
-        return CleanupPermit(allowed=True, admission_id=admission_id)
+        return CleanupPermit(
+            allowed=True, admission_id=admission_id, request_id=admitted_request_id
+        )
 
     async def complete_cleanup_permit(
         self,
