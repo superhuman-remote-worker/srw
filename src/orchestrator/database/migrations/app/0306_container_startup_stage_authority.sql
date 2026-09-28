@@ -118,7 +118,14 @@ BEGIN
     IF NEW.cancel_requested_at IS NOT NULL THEN
         -- Native Cancel rotates the claim, then updates the owner projection
         -- in its owner-ordered transaction. Its physical cleanup/abort path
-        -- must retain the receipt and does not grant a later Ready.
+        -- must retain the receipt and does not grant a later Ready or a
+        -- successful creation settlement. Do not let this branch bypass the
+        -- Ready marker check below by writing settled after cancellation.
+        IF NEW.phase = 'settled' OR NEW.result_kind = 'settled' THEN
+            RAISE EXCEPTION 'cancelled container startup cannot settle Ready'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'managed_workspace_startup_stage_authority';
+        END IF;
         RETURN NEW;
     END IF;
     IF TG_OP = 'UPDATE' AND OLD.startup_protocol_version = 1

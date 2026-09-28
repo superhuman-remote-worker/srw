@@ -231,6 +231,59 @@ async def test_waiting_capacity_keeps_native_cancellation_authority(db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("owner_kind", ["job", "thread"])
+@pytest.mark.parametrize("startup_state", ["starting", "attention"])
+async def test_native_cancel_cannot_be_rewritten_as_v1_ready_settlement(
+    db, owner_kind, startup_state
+):
+    if owner_kind == "job":
+        owner_id, reservation, pod_uid, _ = await _bound_job(db)
+    else:
+        owner_id, _, reservation, pod_uid = await _bound_thread(db)
+    kwargs = dict(
+        owner_kind=owner_kind,
+        owner_id=str(owner_id),
+        reservation_id=str(reservation["id"]),
+        claim_token=int(reservation["claim_token"]),
+        pod_uid=pod_uid,
+    )
+    assert await db.observe_container_startup(
+        **kwargs,
+        observation=Unscheduled("scheduler_unschedulable"),
+        adopt_if_unmarked=True,
+    )
+    assert await db.observe_container_startup(
+        **kwargs,
+        observation=ScheduledAt(datetime.now(timezone.utc)),
+        budgets=StageBudgets(ready_seconds=180, pull_seconds=None, ssh_seconds=30),
+    )
+    if startup_state == "attention":
+        assert await db.observe_container_startup(
+            **kwargs, observation=StartupAttention("invalid_image")
+        )
+    cancelled = await db.request_managed_repository_workspace_creation_cancellation(
+        str(owner_id),
+        owner_kind=owner_kind,
+        scope="workspace_container",
+        target_disposition="deleted",
+        reclaim_shared_resources=False,
+        claimant="startup-cleanup",
+    )
+    assert cancelled is not None and cancelled["cancel_requested_at"] is not None
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                "UPDATE managed_repository_workspace_creation_reservations "
+                "SET phase='settled',result_kind='settled',"
+                "settled_at=clock_timestamp() WHERE id=$1",
+                reservation["id"],
+            )
+    after = await _reservation(db, reservation)
+    assert after["cancel_requested_at"] is not None
+    assert after["settled_at"] is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("invalid", ["partial", "sub_microsecond_budget"])
 async def test_direct_writer_cannot_store_malformed_v1_shape(db, invalid):
     job_id, reservation, _, _ = await _bound_job(db)
