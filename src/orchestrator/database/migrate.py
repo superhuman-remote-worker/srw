@@ -3,11 +3,12 @@
 Apply versioned SQL files from ``src/orchestrator/database/migrations/{app,audit,vector}/``
 in lexicographic order, tracked in a ``schema_migrations`` table on each DB.
 
-Applied files are immutable. The one reviewed historical exception is vector
-0025's published pgvector-preload variant: migration_recovery pins its exact
-filename, canonical on-disk checksum, and alternate successful-ledger checksum.
-Acceptance preserves the complete successful ledger row and never replays its
-SQL. Dirty rows and all unreviewed checksum drift still fail closed.
+Applied files are immutable. The reviewed historical exceptions are vector
+0025's published pgvector-preload variant and app 0301's renumbered-header
+variant: migration_recovery pins each exact filename, canonical on-disk
+checksum, and alternate successful-ledger checksum. Acceptance preserves the
+complete successful ledger row and never replays its SQL. Dirty rows and all
+unreviewed checksum drift still fail closed.
 
 Two reviewed app files were applied under earlier names and published under
 new ones (migration_recovery.RENAMED_APPLIED_MIGRATIONS). Their exact historical

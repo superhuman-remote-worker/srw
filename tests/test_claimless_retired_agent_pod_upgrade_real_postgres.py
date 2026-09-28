@@ -50,7 +50,9 @@ from testcontainers.postgres import PostgresContainer
 from orchestrator import main
 from orchestrator.database import migrate
 from orchestrator.database.migration_recovery import (
+    APPLIED_CHECKSUM_COMPATIBILITIES,
     RENAMED_APPLIED_MIGRATIONS,
+    AppliedChecksumCompatibility,
     RenamedAppliedMigration,
 )
 from orchestrator.database.postgres import PostgresDB
@@ -906,6 +908,24 @@ def _stage_develop_50d0af34a(tmp_path):
     shutil.copytree(MIGRATIONS, staged)
     (staged / CAPTURE_MIGRATION).write_text(_renumbered_0301_sql())
     return staged
+
+
+def test_repaired_0301_variant_is_pinned_and_differs_only_in_its_header():
+    assert APPLIED_CHECKSUM_COMPATIBILITIES[
+        CAPTURE_MIGRATION
+    ] == AppliedChecksumCompatibility(
+        canonical_checksum=DEPLOYED_PAIR[
+            "0286_capture_claimless_retired_agent_pod.sql"
+        ][1],
+        historical_checksum=REPAIRED_0301_CHECKSUM,
+    )
+    original = (MIGRATIONS / CAPTURE_MIGRATION).read_text()
+    variant = _renumbered_0301_sql()
+    # Same executable statement: only the leading comment differs.
+    for sql in (original, variant):
+        assert len(migrate._top_level_sql_statements(sql)) == 1
+    start = original.index("CREATE OR REPLACE FUNCTION")
+    assert variant[variant.index("CREATE OR REPLACE FUNCTION") :] == original[start:]
 
 
 @pytest.mark.asyncio

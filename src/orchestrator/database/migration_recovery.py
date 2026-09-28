@@ -50,7 +50,21 @@ APPLIED_CHECKSUM_COMPATIBILITIES: dict[str, AppliedChecksumCompatibility] = {
         historical_checksum=(
             "915246808c5714610aeb98faac61d96b5a2a72a81cba26677ba2d9b636325424"
         ),
-    )
+    ),
+    # The R3.2 capture migration (see RENAMED_APPLIED_MIGRATIONS below) was
+    # renumbered locally with a rewritten two-line header comment; its SQL
+    # statement is byte-identical. On 2026-09-28 the local k3d database applied
+    # that variant as 0301 after its two historical rows had been deleted by
+    # hand. Only the bytes first applied anywhere (131dd22ee, as 0286) are
+    # canonical; that database keeps its row as recorded and nothing replays.
+    "0301_capture_claimless_retired_agent_pod.sql": AppliedChecksumCompatibility(
+        canonical_checksum=(
+            "a2d08b52d9197d52e43da0859bf328be91c16fbb94feea31c1cdf2e1694bac2e"
+        ),
+        historical_checksum=(
+            "587ed9b5edc56bd4946cf0637c679eaba1484ce5237da7f45b1873542fe838e5"
+        ),
+    ),
 }
 
 
