@@ -30,8 +30,8 @@ pg_dsn = fixtures.pg_dsn
 _schema_applied = fixtures._schema_applied
 
 
-async def _bound_job(db):
-    job_id = await fixtures._job(db)
+async def _bound_job(db, *, job_id=None):
+    job_id = job_id or await fixtures._job(db)
     reservation = await db.reserve_managed_repository_workspace_creation(
         str(job_id),
         owner_kind="job",
@@ -56,17 +56,16 @@ async def _bound_job(db):
     )
     async with db.acquire() as conn:
         await conn.execute(
-            "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
+            "UPDATE jobs SET context=jsonb_set(COALESCE(context,'{}'::jsonb),"
+            "'{workspace_container}',$2::jsonb) WHERE id=$1",
             job_id,
             json.dumps(
                 {
-                    "workspace_container": {
-                        "provisioner": "k8s",
-                        "status": "creating",
-                        "_runtime_incarnation": pod_uid,
-                        "_creation_reservation_id": str(reservation["id"]),
-                        "_creation_claim_token": str(reservation["claim_token"]),
-                    }
+                    "provisioner": "k8s",
+                    "status": "creating",
+                    "_runtime_incarnation": pod_uid,
+                    "_creation_reservation_id": str(reservation["id"]),
+                    "_creation_claim_token": str(reservation["claim_token"]),
                 }
             ),
         )
@@ -348,8 +347,8 @@ async def test_exact_bound_pod_can_adopt_observing_without_guessing_clock(db):
     assert dict(await _reservation(db, reservation)) == starting
 
 
-async def _starting_job(db, budgets=None):
-    job_id, reservation, pod_uid, gate = await _bound_job(db)
+async def _starting_job(db, budgets=None, *, job_id=None):
+    job_id, reservation, pod_uid, gate = await _bound_job(db, job_id=job_id)
     kwargs = _observe_kwargs(job_id, reservation, pod_uid)
     scheduled_at = datetime.now(timezone.utc)
     assert await db.observe_container_startup(
@@ -401,6 +400,39 @@ async def test_job_authenticated_ready_and_receipt_settle_in_one_commit(db):
     assert closed["settled_at"] is not None
     assert closed["scheduled_at"] == scheduled_at
     assert closed["startup_first_ready_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_job_without_execution_timeout_can_publish_exact_ready(db):
+    db.manifest_runtime_image = "test.invalid/srw:installed"
+    created = await db.create_job(description="SRW Job without an execution timeout")
+    job_id = created["id"]
+    execution = await db.fetchrow(
+        "SELECT harness_adapter,resolved #>> '{spec,timeoutSeconds}' AS timeout "
+        "FROM srw_execution_specs WHERE work_kind='Job' AND work_id=$1",
+        job_id,
+    )
+    assert execution is not None
+    assert execution["harness_adapter"] == "srw/v1"
+    assert execution["timeout"] is None
+    job_id, reservation, pod_uid, _, kwargs, _ = await _starting_job(db, job_id=job_id)
+    assert await db.observe_container_startup(
+        **kwargs,
+        observation=ReadyObservedAt(datetime.now(timezone.utc)),
+        adopt_if_unmarked=False,
+    )
+    assert await db.complete_job_workspace_creation(
+        **_job_ready_call(job_id, reservation, pod_uid)
+    )
+    ready = await db.get_job(str(job_id))
+    context = (
+        json.loads(ready["context"])
+        if isinstance(ready["context"], str)
+        else ready["context"]
+    )
+    assert context["workspace_container"]["status"] == "ready"
+    settled = await _reservation(db, reservation)
+    assert settled["phase"] == settled["result_kind"] == "settled"
 
 
 @pytest.mark.asyncio

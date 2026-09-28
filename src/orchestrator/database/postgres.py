@@ -22674,10 +22674,8 @@ class PostgresDB:
                     or now >= ssh_bound
                     or (
                         execution is not None
-                        and (
-                            execution["deadline_at"] is None
-                            or now >= execution["deadline_at"]
-                        )
+                        and execution["deadline_at"] is not None
+                        and now >= execution["deadline_at"]
                     )
                 ):
                     return None
