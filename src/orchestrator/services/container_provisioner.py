@@ -11152,6 +11152,7 @@ class ContainerProvisioner:
         *,
         operation_id: str | None = None,
         creation_reservation: dict[str, Any] | None = None,
+        replacement_restore_context: dict[str, Any] | None = None,
     ) -> Optional[str]:
         """Create an IDE only under one durable owner/scope reservation."""
 
@@ -11176,6 +11177,40 @@ class ContainerProvisioner:
                 )
             except ValueError:
                 return None
+        if replacement_restore_context is not None and (
+            operation_id is None
+            or not isinstance(replacement_restore_context, dict)
+            or set(replacement_restore_context)
+            - {
+                "status",
+                "source",
+                "snapshot_type",
+                "started_at",
+                "code_server_url",
+                "last_activity",
+                "idle_timeout_minutes",
+                "max_lifetime_minutes",
+                "estimated_seconds",
+                "cpu_cores",
+                "memory",
+            }
+            or replacement_restore_context.get("status") != "restoring"
+            or (
+                replacement_restore_context.get("source"),
+                replacement_restore_context.get("snapshot_type"),
+            )
+            not in {("gitea", "gitea"), ("snapshot", "pod")}
+            or replacement_restore_context.get("code_server_url") is not None
+            or replacement_restore_context.get("last_activity") is not None
+            or (
+                "started_at" in replacement_restore_context
+                and (
+                    not isinstance(replacement_restore_context["started_at"], str)
+                    or not replacement_restore_context["started_at"]
+                )
+            )
+        ):
+            return None
         claimant = f"ide-restore:{operation_id or uuid4()}"
         creation_plan = await self._ide_creation_plan(
             job_id,
@@ -11223,6 +11258,8 @@ class ContainerProvisioner:
                 memory_limit=memory_limit,
                 _creation_reservation=reservation,
                 _creation_plan=creation_plan,
+                _replacement_restore=operation_id is not None,
+                _replacement_restore_context=replacement_restore_context,
             )
         if pod_ip is None:
             fingerprint = reservation.get("lifecycle_fingerprint")
@@ -11345,6 +11382,8 @@ class ContainerProvisioner:
         *,
         _creation_reservation: dict[str, Any] | None = None,
         _creation_plan: dict[str, Any] | None = None,
+        _replacement_restore: bool = False,
+        _replacement_restore_context: dict[str, Any] | None = None,
     ) -> Optional[str]:
         """Create a lightweight IDE pod for browsing a job's workspace.
 
@@ -11371,6 +11410,18 @@ class ContainerProvisioner:
 
         pod_name = f"ide-{job_id[:12]}"
         network_tier = str(_creation_plan["network_tier"])
+        replacement_projection = (
+            {
+                "status": "restoring",
+                "_restore_attempt_id": None,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "last_activity": None,
+                "code_server_url": None,
+                **(_replacement_restore_context or {}),
+            }
+            if _replacement_restore
+            else {}
+        )
 
         owner = WorkspaceOwner.job(job_id)
         if not await self._start_workspace_creation_reservation(
@@ -11527,6 +11578,7 @@ class ContainerProvisioner:
             ) or not await self._db.merge_ide_session_context(
                 job_id,
                 {
+                    **replacement_projection,
                     WORKSPACE_RUNTIME_INCARNATION_KEY: runtime_incarnation,
                     WORKSPACE_CREATION_RESERVATION_CONTEXT_KEY: str(
                         _creation_reservation["id"]
@@ -11661,6 +11713,7 @@ class ContainerProvisioner:
                 ) or not await self._db.merge_ide_session_context(
                     job_id,
                     {
+                        **replacement_projection,
                         WORKSPACE_RUNTIME_INCARNATION_KEY: runtime_incarnation,
                         WORKSPACE_CREATION_RESERVATION_CONTEXT_KEY: str(
                             _creation_reservation["id"]

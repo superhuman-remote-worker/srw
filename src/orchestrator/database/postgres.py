@@ -19295,6 +19295,47 @@ class PostgresDB:
             )
         return [dict(row) for row in rows]
 
+    async def get_current_unsettled_ide_restore_attempt(
+        self, owner_id: str
+    ) -> dict[str, Any] | None:
+        """Read only the attempt named by this Job's current IDE intent.
+
+        This observation cannot claim work. The subsequent exact reservation
+        reacquisition rechecks the owner, attempt, generation and lease under
+        the owner row lock before any external operation is scheduled.
+        """
+
+        try:
+            owner_uuid = UUID(str(owner_id))
+        except (TypeError, ValueError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT r.* FROM jobs j JOIN "
+                "managed_repository_workspace_creation_reservations r "
+                "ON r.owner_kind = 'job' AND r.owner_id = j.id "
+                "AND r.scope = 'ide' AND r.operation_kind = 'restore' "
+                "WHERE j.id = $1 "
+                "AND j.context #>> '{ide_session,status}' = 'restoring' "
+                "AND j.context #>> '{ide_session,restore_type}' = 'k8s_container' "
+                "AND (j.context #>> '{ide_session,_runtime_incarnation}' IS NULL "
+                "OR j.context #>> '{ide_session,_runtime_incarnation}' = "
+                "r.runtime_incarnation::text) "
+                "AND j.context #>> '{ide_session,_creation_reservation_id}' = r.id::text "
+                "AND j.context #>> '{ide_session,_creation_claim_token}' = r.claim_token::text "
+                "AND j.context #>> '{ide_session,_restore_attempt_id}' = "
+                "r.lifecycle_fingerprint->>'restore_attempt_id' "
+                "AND r.lifecycle_fingerprint ? 'restore_attempt_id' "
+                "AND j.context #>> '{ide_session,source}' = "
+                "r.lifecycle_fingerprint->>'restore_source' "
+                "AND j.context #>> '{ide_session,snapshot_type}' = "
+                "r.lifecycle_fingerprint->>'restore_snapshot_type' "
+                "AND r.settled_at IS NULL AND r.cancel_requested_at IS NULL "
+                "AND r.result_kind IS NULL",
+                owner_uuid,
+            )
+        return dict(row) if row is not None else None
+
     async def claim_managed_repository_workspace_creation_reconciliation(
         self,
         reservation_id: str,

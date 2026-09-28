@@ -62,13 +62,13 @@ DECLARE
                 MESSAGE = 'IDE runtime identity is required before destructive teardown';$old$;
     new_fragment TEXT := $new$        ELSIF destructive_transition AND runtime_id IS NULL
            AND old_ide <> '{}'::JSONB
-           AND NOT (
+           AND (
                TG_OP = 'UPDATE'
                AND source_kind = 'job'
                AND public.managed_repo_uidless_ide_abort_authorized_now(
                    source_id, old_state, new_state
                )
-           ) THEN
+           ) IS NOT TRUE THEN
             RAISE EXCEPTION USING
                 ERRCODE = '23514',
                 CONSTRAINT = 'managed_repository_ide_runtime_identity_required',

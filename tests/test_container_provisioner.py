@@ -7769,6 +7769,48 @@ class TestIdePodResourceAuthority:
         p._delete_seed_configmap.assert_not_awaited()
         p._wait_for_ready.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_replacement_409_publishes_b_without_predecessor_attempt_marker(self):
+        class _Conflict(Exception):
+            status = 409
+
+        p = self._provisioner()
+        p._core_api.create_namespaced_pod.side_effect = _Conflict()
+        p._core_api.read_namespaced_pod.return_value = self._pod(p)
+
+        result = await p.create_ide_pod(
+            self.JOB_ID,
+            operation_id="33333333-3333-4333-8333-333333333333",
+            replacement_restore_context={
+                "status": "restoring",
+                "source": "gitea",
+                "snapshot_type": "gitea",
+                "started_at": "2026-09-28T05:00:00+00:00",
+                "last_activity": None,
+                "code_server_url": None,
+                "idle_timeout_minutes": 30,
+                "max_lifetime_minutes": 240,
+            },
+        )
+
+        assert result == "10.42.0.30"
+        assert p._core_api.create_namespaced_pod.call_count == 1
+        assert p._db.merge_ide_session_context.await_count == 2
+        for call in p._db.merge_ide_session_context.await_args_list:
+            updates = call.args[1]
+            assert updates["_restore_attempt_id"] is None
+            assert updates["status"] == "restoring"
+            assert updates["source"] == "gitea"
+            assert updates["snapshot_type"] == "gitea"
+            assert updates["started_at"] == "2026-09-28T05:00:00+00:00"
+            assert updates["last_activity"] is None
+            assert updates["code_server_url"] is None
+            assert updates["max_lifetime_minutes"] == 240
+            assert updates["_runtime_incarnation"] == self.RUNTIME
+            assert updates["_creation_reservation_id"] == (
+                "33333333-3333-4333-8333-333333333333"
+            )
+
     def test_ide_manifest_installs_universal_process_zero_finalizer(self):
         p = self._provisioner()
         manifest = p._build_pod_manifest(

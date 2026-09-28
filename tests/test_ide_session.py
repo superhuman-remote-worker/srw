@@ -768,16 +768,27 @@ async def test_maintenance_continues_expired_exact_ide_attempt_without_owner_pos
     pending = {
         "id": IDE_RESERVATION,
         "owner_id": job["id"],
+        "owner_kind": "job",
+        "scope": "ide",
+        "operation_kind": "restore",
+        "phase": "reserved",
         "reservation_generation": 9,
         "claim_token": IDE_CLAIM_TOKEN,
         "desired_manifest_digest": "a" * 64,
-        "lifecycle_fingerprint": {"restore_attempt_id": attempt_id},
+        "lifecycle_fingerprint": {
+            "restore_attempt_id": attempt_id,
+            "restore_source": "gitea",
+            "restore_snapshot_type": "gitea",
+        },
     }
     claimed = {**pending, "claimed_by": "ide-maintenance", "claim_token": 8}
     svc._db.list_pending_ide_restore_attempts = AsyncMock(return_value=[pending])
     svc._db.get_job = AsyncMock(return_value=job)
     svc._db.reserve_managed_repository_workspace_creation = AsyncMock(
         return_value=claimed
+    )
+    svc._container_provisioner._ide_creation_plan = AsyncMock(
+        return_value={"digest": "a" * 64}
     )
     svc._restore_session = AsyncMock()
 
@@ -798,6 +809,40 @@ async def test_maintenance_continues_expired_exact_ide_attempt_without_owner_pos
         == attempt_id
     )
     assert svc._restore_session.await_args.kwargs["creation_reservation"] == claimed
+
+
+@pytest.mark.asyncio
+async def test_replacement_restore_passes_fresh_request_context_to_first_b_publication(
+    service_factory,
+):
+    svc = service_factory
+    retired = "33333333-3333-4333-8333-333333333333"
+    request = {
+        "status": "restoring",
+        "source": "gitea",
+        "snapshot_type": "gitea",
+        "started_at": "2026-09-28T05:00:00+00:00",
+        "last_activity": None,
+        "code_server_url": None,
+        "max_lifetime_minutes": 240,
+    }
+    svc._create_or_resume_k8s_ide = AsyncMock(return_value=None)
+
+    await svc._restore_session(
+        "job-replacement-b",
+        {"id": "job-replacement-b", "repo_name": "demo/repo"},
+        "gitea",
+        8,
+        "16Gi",
+        restore_operation_id=retired,
+        restore_context=request,
+    )
+
+    assert svc._create_or_resume_k8s_ide.await_args.kwargs == {
+        "operation_id": retired,
+        "creation_reservation": None,
+        "replacement_restore_context": request,
+    }
 
 
 @pytest.mark.asyncio

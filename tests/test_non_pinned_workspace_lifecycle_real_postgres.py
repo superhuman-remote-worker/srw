@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -3799,3 +3800,682 @@ async def test_0196_settled_creation_still_requires_exact_terminal_cleanup(db):
         assert (
             await conn.execute("DELETE FROM jobs WHERE id = $1", owner_id) == "DELETE 1"
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restore_type", (None, "vm"))
+async def test_0300_stale_cancel_receipt_cannot_clear_malformed_ide(db, restore_type):
+    job_id, attempt_id = uuid4(), uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, repo_name, context) "
+            "VALUES ($1, 'malformed IDE guard', 'completed', 'owned-repo', '{}'::jsonb)",
+            job_id,
+        )
+    admitted = await db.begin_managed_ide_restore_attempt(
+        str(job_id),
+        attempt_id=str(attempt_id),
+        proposed_context={
+            "status": "restoring",
+            "source": "gitea",
+            "snapshot_type": "gitea",
+            "restore_type": "k8s_container",
+            "started_at": "2026-09-28T00:00:00Z",
+        },
+        desired_manifest_digest="e" * 64,
+        claimant="ide-issuer:malformed",
+    )
+    assert admitted["disposition"] == "accepted"
+    row = admitted["reservation"]
+    closed = await db.cancel_managed_ide_restore_attempt(
+        str(job_id),
+        attempt_id=str(attempt_id),
+        reservation_id=str(row["id"]),
+        claim_token=int(row["claim_token"]),
+        claimant="ide-stop:malformed",
+    )
+    assert closed and closed["result_kind"] == "aborted"
+    malformed = {
+        "status": "restoring",
+        "source": "gitea",
+        "snapshot_type": "gitea",
+        "_restore_attempt_id": str(attempt_id),
+        "_creation_reservation_id": str(row["id"]),
+        "_creation_claim_token": str(row["claim_token"]),
+    }
+    if restore_type is not None:
+        malformed["restore_type"] = restore_type
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            "UPDATE jobs SET context = jsonb_set(context, '{ide_session}', "
+            "$2::jsonb) WHERE id = $1",
+            job_id,
+            json.dumps(malformed),
+        )
+        # The receipt exists, but its old transaction and malformed source
+        # cannot authorize a second destructive projection.
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                "UPDATE jobs SET context = jsonb_set(context, "
+                "'{ide_session,status}', '\"expired\"'::jsonb) WHERE id = $1",
+                job_id,
+            )
+
+
+
+@pytest.mark.asyncio
+async def test_post_reclaims_only_expired_exact_ide_attempt(db, monkeypatch):
+    job_id, attempt_id = uuid4(), uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, repo_name, context) "
+            "VALUES ($1, 'POST IDE reclaim', 'completed', 'owned-repo', '{}'::jsonb)",
+            job_id,
+        )
+    admitted = await db.begin_managed_ide_restore_attempt(
+        str(job_id),
+        attempt_id=str(attempt_id),
+        proposed_context={
+            "status": "restoring",
+            "source": "gitea",
+            "snapshot_type": "gitea",
+            "restore_type": "k8s_container",
+            "started_at": "2026-09-28T00:00:00Z",
+        },
+        desired_manifest_digest="a" * 64,
+        claimant="ide-issuer:lost-post",
+    )
+    assert admitted["disposition"] == "accepted"
+    first = admitted["reservation"]
+    provisioner = ContainerProvisioner()
+    provisioner._db = db
+    provisioner._k8s_available = True
+    provisioner._ide_creation_plan = AsyncMock(return_value={"digest": "a" * 64})
+    service = IdeSessionService()
+    service.connect(db, None, None, container_provisioner=provisioner)
+    service.get_session_status = AsyncMock(return_value={"status": "restoring"})
+    service._schedule_restore_task = MagicMock()
+    monkeypatch.setattr(
+        "orchestrator.services.ide_session.contained_ide_status", lambda: None
+    )
+
+    # An active claimant must remain held, even for the same exact attempt.
+    assert (await service.start_session(str(job_id)))["status"] == "restoring"
+    service._schedule_restore_task.assert_not_called()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE managed_repository_workspace_creation_reservations "
+            "SET created_at = now() - interval '2 minutes', "
+            "expires_at = now() - interval '1 second' WHERE id = $1",
+            first["id"],
+        )
+
+    assert (await service.start_session(str(job_id)))["status"] == "restoring"
+    service._schedule_restore_task.assert_called_once()
+    claimed = service._schedule_restore_task.call_args.kwargs["creation_reservation"]
+    assert claimed["id"] == first["id"]
+    assert claimed["reservation_generation"] == first["reservation_generation"]
+    assert claimed["claim_token"] != first["claim_token"]
+    async with db.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, claim_token FROM "
+            "managed_repository_workspace_creation_reservations "
+            "WHERE owner_kind = 'job' AND owner_id = $1 AND scope = 'ide'",
+            job_id,
+        )
+        ide = await conn.fetchval(
+            "SELECT context->'ide_session' FROM jobs WHERE id = $1", job_id
+        )
+    ide = json.loads(ide) if isinstance(ide, str) else ide
+    assert len(rows) == 1 and rows[0]["id"] == first["id"]
+    assert ide["_restore_attempt_id"] == str(attempt_id)
+    assert ide["_creation_claim_token"] == str(claimed["claim_token"])
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ("stale_token", "stale_attempt", "plan_drift"))
+async def test_post_refuses_stale_or_changed_ide_attempt(db, monkeypatch, mutation):
+    job_id, attempt_id = uuid4(), uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, repo_name, context) "
+            "VALUES ($1, 'POST IDE refusal', 'completed', 'owned-repo', '{}'::jsonb)",
+            job_id,
+        )
+    admitted = await db.begin_managed_ide_restore_attempt(
+        str(job_id),
+        attempt_id=str(attempt_id),
+        proposed_context={
+            "status": "restoring",
+            "source": "gitea",
+            "snapshot_type": "gitea",
+            "restore_type": "k8s_container",
+            "started_at": "2026-09-28T00:00:00Z",
+        },
+        desired_manifest_digest="a" * 64,
+        claimant="ide-issuer:refused-post",
+    )
+    assert admitted["disposition"] == "accepted"
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE managed_repository_workspace_creation_reservations "
+            "SET created_at = now() - interval '2 minutes', "
+            "expires_at = now() - interval '1 second' WHERE id = $1",
+            admitted["reservation"]["id"],
+        )
+        if mutation in {"stale_token", "stale_attempt"}:
+            field = (
+                "_creation_claim_token"
+                if mutation == "stale_token"
+                else "_restore_attempt_id"
+            )
+            await conn.execute(
+                "UPDATE jobs SET context = jsonb_set(context, $2::text[], "
+                "to_jsonb($3::text)) WHERE id = $1",
+                job_id,
+                ["ide_session", field],
+                "99999" if mutation == "stale_token" else str(uuid4()),
+            )
+    provisioner = ContainerProvisioner()
+    provisioner._db = db
+    provisioner._k8s_available = True
+    provisioner._ide_creation_plan = AsyncMock(
+        return_value={"digest": "b" * 64 if mutation == "plan_drift" else "a" * 64}
+    )
+    service = IdeSessionService()
+    service.connect(db, None, None, container_provisioner=provisioner)
+    service.get_session_status = AsyncMock(return_value={"status": "restoring"})
+    service._schedule_restore_task = MagicMock()
+    monkeypatch.setattr(
+        "orchestrator.services.ide_session.contained_ide_status", lambda: None
+    )
+
+    assert (await service.start_session(str(job_id)))["status"] == "restoring"
+    service._schedule_restore_task.assert_not_called()
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, claim_token FROM "
+            "managed_repository_workspace_creation_reservations WHERE id = $1",
+            admitted["reservation"]["id"],
+        )
+    assert row["claim_token"] == admitted["reservation"]["claim_token"]
+
+
+
+async def _legacy_runtime_bound_ide(db):
+    job_id, runtime = uuid4(), uuid4()
+    session = {
+        "status": "restoring",
+        "source": "gitea",
+        "snapshot_type": "gitea",
+        "restore_type": "k8s_container",
+        "started_at": "2026-09-28T00:00:00Z",
+    }
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, repo_name, context) "
+            "VALUES ($1, 'legacy runtime-bound IDE', 'cancelled', 'owned-repo', "
+            "$2::jsonb)",
+            job_id,
+            json.dumps({"ide_session": session}),
+        )
+    row = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="ide",
+        operation_kind="restore",
+        claimant="ide-restore:old-issuer",
+        desired_manifest_digest="a" * 64,
+    )
+    assert row is not None
+    gate = dict(
+        owner_kind="job",
+        scope="ide",
+        reservation_generation=int(row["reservation_generation"]),
+        claimant="ide-restore:old-issuer",
+        claim_token=int(row["claim_token"]),
+    )
+    assert await db.mark_managed_repository_workspace_creation_started(
+        str(job_id), **gate
+    )
+    assert await db.begin_managed_repository_workspace_creation_effect(
+        str(job_id), **gate, resource_kind="pod"
+    )
+    assert await db.authorize_managed_repository_workspace_creation_runtime(
+        str(job_id), **gate, runtime_incarnation=str(runtime)
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context = jsonb_set(context, '{ide_session}', "
+            "context->'ide_session' || $2::jsonb) WHERE id = $1",
+            job_id,
+            json.dumps(
+                {
+                    "_runtime_incarnation": str(runtime),
+                    "_creation_reservation_id": str(row["id"]),
+                    "_creation_claim_token": str(row["claim_token"]),
+                    "container_name": f"ide-{str(job_id)[:12]}",
+                }
+            ),
+        )
+    return job_id, row, runtime
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "expired",
+        "active_claim",
+        "wrong_uid",
+        "wrong_token",
+        "wrong_scope",
+        "cleanup_hold",
+    ),
+)
+async def test_post_legacy_runtime_bound_replays_only_exact_receipt(
+    db, monkeypatch, mutation
+):
+    job_id, first, runtime = await _legacy_runtime_bound_ide(db)
+    async with db.acquire() as conn:
+        if mutation != "active_claim":
+            await conn.execute(
+                "UPDATE managed_repository_workspace_creation_reservations "
+                "SET created_at = now() - interval '2 minutes', "
+                "expires_at = now() - interval '1 second' WHERE id = $1",
+                first["id"],
+            )
+        if mutation in {"wrong_uid", "wrong_token"}:
+            field = (
+                "_runtime_incarnation"
+                if mutation == "wrong_uid"
+                else "_creation_claim_token"
+            )
+            await _execute_pre_0195(
+                conn,
+                "UPDATE jobs SET context = jsonb_set(context, $2::text[], "
+                "to_jsonb($3::text)) WHERE id = $1",
+                job_id,
+                ["ide_session", field],
+                str(uuid4()) if mutation == "wrong_uid" else "99999",
+            )
+        if mutation == "wrong_scope":
+            await conn.execute(
+                "UPDATE managed_repository_workspace_creation_reservations "
+                "SET scope = 'workspace_container' WHERE id = $1",
+                first["id"],
+            )
+        if mutation == "cleanup_hold":
+            await conn.execute(
+                "INSERT INTO managed_repository_workspace_cleanup_intents "
+                "(owner_kind, owner_id, scope, runtime_incarnation, pod_uid, "
+                "target_disposition) VALUES ('job', $1, 'ide', $2, $2, 'expired')",
+                job_id,
+                runtime,
+            )
+    provisioner = ContainerProvisioner()
+    provisioner._db = db
+    provisioner._k8s_available = True
+    provisioner._ide_creation_plan = AsyncMock(return_value={"digest": "a" * 64})
+    service = IdeSessionService()
+    service.connect(db, None, None, container_provisioner=provisioner)
+    service.get_session_status = AsyncMock(return_value={"status": "restoring"})
+    service._schedule_restore_task = MagicMock()
+    monkeypatch.setattr(
+        "orchestrator.services.ide_session.contained_ide_status", lambda: None
+    )
+
+    assert (await service.start_session(str(job_id)))["status"] == "restoring"
+    async with db.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, claim_token, runtime_incarnation FROM "
+            "managed_repository_workspace_creation_reservations "
+            "WHERE owner_kind = 'job' AND owner_id = $1",
+            job_id,
+        )
+    assert len(rows) == 1 and rows[0]["id"] == first["id"]
+    assert rows[0]["runtime_incarnation"] == runtime
+    if mutation == "expired":
+        service._schedule_restore_task.assert_called_once()
+        claimed = service._schedule_restore_task.call_args.kwargs[
+            "creation_reservation"
+        ]
+        assert claimed["id"] == first["id"]
+        assert claimed["claim_token"] != first["claim_token"]
+        assert rows[0]["claim_token"] == claimed["claim_token"]
+    else:
+        service._schedule_restore_task.assert_not_called()
+        assert rows[0]["claim_token"] == first["claim_token"]
+
+
+
+@pytest.mark.asyncio
+async def test_post_keeps_uidless_legacy_projection_held(db, monkeypatch):
+    job_id = uuid4()
+    async with db.acquire() as conn:
+        await _execute_pre_0195(
+            conn,
+            "INSERT INTO jobs (id, description, status, repo_name, context) "
+            "VALUES ($1, 'unreceipted legacy IDE', 'cancelled', 'owned-repo', $2::jsonb)",
+            job_id,
+            json.dumps(
+                {
+                    "ide_session": {
+                        "status": "restoring",
+                        "source": "gitea",
+                        "snapshot_type": "gitea",
+                        "restore_type": "k8s_container",
+                    }
+                }
+            ),
+        )
+    provisioner = ContainerProvisioner()
+    provisioner._db = db
+    provisioner._k8s_available = True
+    service = IdeSessionService()
+    service.connect(db, None, None, container_provisioner=provisioner)
+    service.get_session_status = AsyncMock(return_value={"status": "restoring"})
+    service._schedule_restore_task = MagicMock()
+    monkeypatch.setattr(
+        "orchestrator.services.ide_session.contained_ide_status", lambda: None
+    )
+
+    assert (await service.start_session(str(job_id)))["status"] == "restoring"
+    service._schedule_restore_task.assert_not_called()
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM managed_repository_workspace_creation_reservations "
+                "WHERE owner_kind = 'job' AND owner_id = $1",
+                job_id,
+            )
+            == 0
+        )
+
+
+
+@pytest.mark.asyncio
+async def test_post_reclaims_new_attempt_after_exact_runtime_publication(
+    db, monkeypatch
+):
+    job_id, attempt_id, runtime = uuid4(), uuid4(), uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, repo_name, context) "
+            "VALUES ($1, 'runtime-bound IDE attempt', 'cancelled', 'owned-repo', '{}'::jsonb)",
+            job_id,
+        )
+    admitted = await db.begin_managed_ide_restore_attempt(
+        str(job_id),
+        attempt_id=str(attempt_id),
+        proposed_context={
+            "status": "restoring",
+            "source": "gitea",
+            "snapshot_type": "gitea",
+            "restore_type": "k8s_container",
+            "started_at": "2026-09-28T00:00:00Z",
+        },
+        desired_manifest_digest="a" * 64,
+        claimant="ide-issuer:runtime-bound",
+    )
+    assert admitted["disposition"] == "accepted"
+    first = admitted["reservation"]
+    gate = dict(
+        owner_kind="job",
+        scope="ide",
+        reservation_generation=int(first["reservation_generation"]),
+        claimant="ide-issuer:runtime-bound",
+        claim_token=int(first["claim_token"]),
+    )
+    assert await db.mark_managed_repository_workspace_creation_started(
+        str(job_id), **gate
+    )
+    assert await db.begin_managed_repository_workspace_creation_effect(
+        str(job_id), **gate, resource_kind="pod"
+    )
+    assert await db.authorize_managed_repository_workspace_creation_runtime(
+        str(job_id), **gate, runtime_incarnation=str(runtime)
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context = jsonb_set(context, "
+            "'{ide_session,_runtime_incarnation}', to_jsonb($2::text)) WHERE id = $1",
+            job_id,
+            str(runtime),
+        )
+        await conn.execute(
+            "UPDATE managed_repository_workspace_creation_reservations "
+            "SET created_at = now() - interval '2 minutes', "
+            "expires_at = now() - interval '1 second' WHERE id = $1",
+            first["id"],
+        )
+    provisioner = ContainerProvisioner()
+    provisioner._db = db
+    provisioner._k8s_available = True
+    provisioner._ide_creation_plan = AsyncMock(return_value={"digest": "a" * 64})
+    service = IdeSessionService()
+    service.connect(db, None, None, container_provisioner=provisioner)
+    service.get_session_status = AsyncMock(return_value={"status": "restoring"})
+    service._schedule_restore_task = MagicMock()
+    monkeypatch.setattr(
+        "orchestrator.services.ide_session.contained_ide_status", lambda: None
+    )
+
+    assert (await service.start_session(str(job_id)))["status"] == "restoring"
+    service._schedule_restore_task.assert_called_once()
+    claimed = service._schedule_restore_task.call_args.kwargs["creation_reservation"]
+    assert claimed["id"] == first["id"]
+    assert claimed["runtime_incarnation"] == runtime
+    assert claimed["claim_token"] != first["claim_token"]
+    async with db.acquire() as conn:
+        ide = await conn.fetchval(
+            "SELECT context->'ide_session' FROM jobs WHERE id = $1", job_id
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM managed_repository_workspace_creation_reservations "
+                "WHERE owner_kind = 'job' AND owner_id = $1",
+                job_id,
+            )
+            == 1
+        )
+    ide = json.loads(ide) if isinstance(ide, str) else ide
+    assert ide["_runtime_incarnation"] == str(runtime)
+    assert ide["_restore_attempt_id"] == str(attempt_id)
+    assert ide["_creation_claim_token"] == str(claimed["claim_token"])
+
+
+
+@pytest.mark.asyncio
+async def test_atomic_a_retirement_b_publication_clears_a_attempt_lineage(
+    db, monkeypatch
+):
+    job_id, attempt_id, runtime_a, runtime_b = uuid4(), uuid4(), uuid4(), uuid4()
+    old_start = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    new_start = datetime.now(timezone.utc).isoformat()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, repo_name, context) "
+            "VALUES ($1, 'atomic A then B IDE', 'cancelled', 'owned-repo', '{}'::jsonb)",
+            job_id,
+        )
+    admitted = await db.begin_managed_ide_restore_attempt(
+        str(job_id),
+        attempt_id=str(attempt_id),
+        proposed_context={
+            "status": "restoring",
+            "source": "gitea",
+            "snapshot_type": "gitea",
+            "restore_type": "k8s_container",
+            "started_at": old_start,
+            "max_lifetime_minutes": 240,
+        },
+        desired_manifest_digest="a" * 64,
+        claimant="ide-issuer:cycle-a",
+    )
+    assert admitted["disposition"] == "accepted"
+    first = admitted["reservation"]
+    gate_a = dict(
+        owner_kind="job",
+        scope="ide",
+        reservation_generation=int(first["reservation_generation"]),
+        claimant="ide-issuer:cycle-a",
+        claim_token=int(first["claim_token"]),
+    )
+    assert await db.mark_managed_repository_workspace_creation_started(
+        str(job_id), **gate_a
+    )
+    assert await db.begin_managed_repository_workspace_creation_effect(
+        str(job_id), **gate_a, resource_kind="pod"
+    )
+    assert await db.authorize_managed_repository_workspace_creation_runtime(
+        str(job_id), **gate_a, runtime_incarnation=str(runtime_a)
+    )
+    assert await db.merge_ide_session_context(
+        str(job_id),
+        {
+            "_runtime_incarnation": str(runtime_a),
+            "_creation_reservation_id": str(first["id"]),
+            "_creation_claim_token": str(first["claim_token"]),
+            "container_name": f"ide-{str(job_id)[:12]}",
+            "pod_ip": "10.42.0.31",
+        },
+    )
+    assert await db.settle_managed_repository_workspace_creation_reservation(
+        str(job_id), **gate_a, runtime_incarnation=str(runtime_a)
+    )
+    intent = await db.prepare_managed_repository_workspace_cleanup_intent(
+        str(job_id),
+        owner_kind="job",
+        scope="ide",
+        runtime_incarnation=str(runtime_a),
+        target_disposition="expired",
+        reclaim_shared_resources=False,
+        pod_uid=str(runtime_a),
+        resources_captured=True,
+    )
+    assert intent is not None
+    claimed_cleanup = await db.claim_managed_repository_workspace_cleanup_intent(
+        str(intent["id"]), claimant="ide-stop:cycle-a"
+    )
+    assert claimed_cleanup is not None
+    assert await db.record_managed_repository_workspace_process_zero(
+        str(job_id),
+        owner_kind="job",
+        scope="ide",
+        provisioner="k8s",
+        runtime_incarnation=str(runtime_a),
+    )
+    assert await db.settle_managed_repository_workspace_cleanup_intent(
+        str(job_id),
+        owner_kind="job",
+        scope="ide",
+        runtime_incarnation=str(runtime_a),
+        intent_generation=int(claimed_cleanup["intent_generation"]),
+        claimant=str(claimed_cleanup["claimed_by"]),
+        claim_token=int(claimed_cleanup["claim_token"]),
+    )
+    async with db.acquire() as conn:
+        retired = await conn.fetchval(
+            "SELECT context->'ide_session' FROM jobs WHERE id = $1", job_id
+        )
+    retired = json.loads(retired) if isinstance(retired, str) else retired
+    assert retired["status"] == "expired"
+    assert retired["_restore_attempt_id"] == str(attempt_id)
+    assert retired["started_at"] == old_start
+
+    second = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="ide",
+        operation_kind="restore",
+        claimant=f"ide-restore:{runtime_a}",
+        desired_manifest_digest="a" * 64,
+    )
+    assert second is not None and second["id"] != first["id"]
+    gate_b = dict(
+        owner_kind="job",
+        scope="ide",
+        reservation_generation=int(second["reservation_generation"]),
+        claimant=f"ide-restore:{runtime_a}",
+        claim_token=int(second["claim_token"]),
+    )
+    assert await db.mark_managed_repository_workspace_creation_started(
+        str(job_id), **gate_b
+    )
+    assert await db.begin_managed_repository_workspace_creation_effect(
+        str(job_id), **gate_b, resource_kind="pod"
+    )
+    assert await db.authorize_managed_repository_workspace_creation_runtime(
+        str(job_id), **gate_b, runtime_incarnation=str(runtime_b)
+    )
+    # This is the exact first-B publication shape emitted by the provisioner.
+    # The previous A attempt remains in its historical reservation, while the
+    # owner now names B alone even if the issuer crashes before settlement.
+    assert await db.merge_ide_session_context(
+        str(job_id),
+        {
+            "status": "restoring",
+            "source": "gitea",
+            "snapshot_type": "gitea",
+            "_restore_attempt_id": None,
+            "started_at": new_start,
+            "last_activity": None,
+            "code_server_url": None,
+            "max_lifetime_minutes": 240,
+            "_runtime_incarnation": str(runtime_b),
+            "_creation_reservation_id": str(second["id"]),
+            "_creation_claim_token": str(second["claim_token"]),
+            "container_name": f"ide-{str(job_id)[:12]}",
+        },
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE managed_repository_workspace_creation_reservations "
+            "SET created_at = now() - interval '2 minutes', "
+            "expires_at = now() - interval '1 second' WHERE id = $1",
+            second["id"],
+        )
+    provisioner = ContainerProvisioner()
+    provisioner._db = db
+    provisioner._k8s_available = True
+    provisioner._ide_creation_plan = AsyncMock(return_value={"digest": "a" * 64})
+    service = IdeSessionService()
+    service.connect(db, None, None, container_provisioner=provisioner)
+    service.get_session_status = AsyncMock(return_value={"status": "restoring"})
+    service._schedule_restore_task = MagicMock()
+    monkeypatch.setattr(
+        "orchestrator.services.ide_session.contained_ide_status", lambda: None
+    )
+
+    assert (await service.start_session(str(job_id)))["status"] == "restoring"
+    service._schedule_restore_task.assert_called_once()
+    replay = service._schedule_restore_task.call_args.kwargs["creation_reservation"]
+    assert replay["id"] == second["id"]
+    assert replay["runtime_incarnation"] == runtime_b
+    assert replay["claim_token"] != second["claim_token"]
+    async with db.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, lifecycle_fingerprint FROM "
+            "managed_repository_workspace_creation_reservations "
+            "WHERE owner_kind = 'job' AND owner_id = $1 ORDER BY reservation_generation",
+            job_id,
+        )
+        current = await conn.fetchval(
+            "SELECT context->'ide_session' FROM jobs WHERE id = $1", job_id
+        )
+    current = json.loads(current) if isinstance(current, str) else current
+    assert [row["id"] for row in rows] == [first["id"], second["id"]]
+    history = rows[0]["lifecycle_fingerprint"]
+    history = json.loads(history) if isinstance(history, str) else history
+    assert history["restore_attempt_id"] == str(attempt_id)
+    assert current.get("_restore_attempt_id") is None
+    assert current["started_at"] == new_start
+    assert current["started_at"] != old_start
+    assert current["last_activity"] is None
+    assert current["code_server_url"] is None
+    assert current["_runtime_incarnation"] == str(runtime_b)
+    assert current["_creation_reservation_id"] == str(second["id"])
