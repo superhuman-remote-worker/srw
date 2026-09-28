@@ -27,6 +27,20 @@ class ScheduledAt:
     scheduled_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class ReadyObservedAt:
+    """The first exact Kubernetes Ready transition for this Pod."""
+
+    ready_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class StartupAttention:
+    """An attested invalidity or elapsed frozen startup bound."""
+
+    reason_code: str
+
+
 SchedulingObservation: TypeAlias = Unknown | Unscheduled | ScheduledAt
 
 
