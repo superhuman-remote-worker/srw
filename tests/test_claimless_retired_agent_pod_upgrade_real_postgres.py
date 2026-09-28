@@ -42,6 +42,7 @@ import shutil
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace as NS
+from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -66,6 +67,7 @@ from orchestrator.services.pinned_agent_authority import (
     release_pinned_warm_binding_protection,
 )
 from orchestrator.services.pinned_k8s_effect import PINNED_AUTHORITY_FINALIZER
+from orchestrator.services.session_router import SessionRouterService
 from orchestrator.security import crypto
 from tests import test_pinned_permanent_warm_release_real_postgres as upstream_warm
 from tests import test_self_ended_pinned_retirement_real_postgres as self_end
@@ -458,6 +460,24 @@ def _dedicated_stack(store, monkeypatch):
     # The retirement operations bind the application's store when built.
     monkeypatch.setattr(main.app.state.resources, "postgres_db", store)
     monkeypatch.setattr(agent_provisioner_module, "agent_provisioner", provider)
+    # Route teardown must not load the ambient kubeconfig (none in CI).
+    core_api, networking_api = MagicMock(), MagicMock()
+    core_api.read_namespaced_service.side_effect = (
+        self_end.authority_fixtures._K8sError(404)
+    )
+    networking_api.read_namespaced_ingress.side_effect = (
+        self_end.authority_fixtures._K8sError(404)
+    )
+    monkeypatch.setattr(
+        main.app.state.resources,
+        "session_router",
+        SessionRouterService(
+            namespace=NAMESPACE,
+            ingress_host="unused.example",
+            core_api=core_api,
+            networking_api=networking_api,
+        ),
+    )
     stack = self_end.Stack(store, k8s)
     stack.provider = provider
     return stack
