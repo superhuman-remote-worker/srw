@@ -26,6 +26,11 @@ before upstream published its own 0286-0300. That exact 281-row history is
 rebuilt here from the published bytes under their historical names, as an
 ordinary (non-superuser) owner on PostgreSQL 15 like the deployed server, with
 retirement records written both before and while the historical pair ran.
+``migration_recovery.RENAMED_APPLIED_MIGRATIONS`` keeps those two exact rows
+from counting as missing files; the canonical files then apply after upstream's
+0286-0300 like everywhere else, re-running the same reviewed bytes once. The
+result must equal a fresh installation, keep every record, and replace each
+function in place; anything but the exact reviewed rows is still refused.
 
 See knowledge-base/knowledge/features/codebase_restructure_r32_acceptance_followup_2026_09_26.md.
 """
@@ -44,6 +49,10 @@ from testcontainers.postgres import PostgresContainer
 
 from orchestrator import main
 from orchestrator.database import migrate
+from orchestrator.database.migration_recovery import (
+    RENAMED_APPLIED_MIGRATIONS,
+    RenamedAppliedMigration,
+)
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.services import agent_provisioner as agent_provisioner_module
 from orchestrator.services.agent_provisioner import AgentProvisioner
@@ -83,6 +92,9 @@ SELECT p.proname,
        p.oid::bigint AS oid,
        pg_catalog.pg_get_userbyid(p.proowner) AS owner,
        pg_catalog.md5(p.prosrc) AS source,
+       p.proacl::text AS acl,
+       p.prosecdef AS security_definer,
+       p.proconfig AS config,
        ARRAY(
            SELECT t.tgrelid::regclass::text || ':' || t.tgname
              FROM pg_catalog.pg_trigger t
@@ -743,3 +755,109 @@ async def test_upgrade_from_the_deployed_local_0286_0287_history(
     finally:
         await store.close()
         crypto.reset_cipher_cache()
+
+
+def test_renamed_history_contract_is_exact_and_replay_safe():
+    """Pin the reviewed rename, and the property its replay relies on."""
+
+    on_disk = {path.name for path in migrate.discover(MIGRATIONS)}
+    assert RENAMED_APPLIED_MIGRATIONS == {
+        historical: RenamedAppliedMigration(
+            canonical_filename=canonical, checksum=checksum
+        )
+        for historical, (canonical, checksum) in DEPLOYED_PAIR.items()
+    }
+    for historical, renamed in RENAMED_APPLIED_MIGRATIONS.items():
+        assert historical not in on_disk
+        assert renamed.canonical_filename in on_disk
+        sql = (MIGRATIONS / renamed.canonical_filename).read_text()
+        assert migrate._checksum(sql) == renamed.checksum
+        # One statement replacing an existing trigger function; no data.
+        statements = migrate._top_level_sql_statements(sql)
+        assert len(statements) == 1
+        assert migrate._leading_sql_keywords(sql, limit=4) == (
+            "CREATE",
+            "OR",
+            "REPLACE",
+            "FUNCTION",
+        )
+        assert "RETURNS trigger" in sql
+
+
+async def _set_function_owner(database, name, owner=None):
+    admin = await asyncpg.connect(database.admin_dsn)
+    try:
+        quoted = await admin.fetchval(
+            "SELECT pg_catalog.quote_ident(COALESCE($1::text, current_user))", owner
+        )
+        await admin.execute(f"ALTER FUNCTION public.{name}() OWNER TO {quoted}")
+    finally:
+        await admin.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "unregistered_name",
+        "other_historical_checksum",
+        "failed_historical_row",
+        "changed_canonical_file",
+        "missing_canonical_file",
+    ],
+)
+async def test_renamed_history_refuses_anything_but_the_reviewed_rows(
+    owned_databases, tmp_path, mutation
+):
+    capture_row, warm_row = DEPLOYED_PAIR
+    history = _stage_deployed_history(tmp_path)
+    published = tmp_path / "published"
+    shutil.copytree(MIGRATIONS, published)
+    database = await owned_databases()
+    if mutation == "unregistered_name":
+        renamed = "0286_capture_claimless_retired_agent_pod_v2.sql"
+        (history / capture_row).rename(history / renamed)
+        expected = rf"applied but missing on disk: \['{renamed}'\]"
+    elif mutation == "other_historical_checksum":
+        path = history / capture_row
+        path.write_text(path.read_text() + "\n-- unreviewed historical edit\n")
+        expected = rf"checksum changed: {capture_row}"
+    elif mutation == "failed_historical_row":
+        expected = rf"dirty migration '{capture_row}'"
+    elif mutation == "changed_canonical_file":
+        path = published / CAPTURE_MIGRATION
+        path.write_text(path.read_text() + "\n-- unreviewed published edit\n")
+        expected = rf"renamed migration {capture_row} requires {CAPTURE_MIGRATION}"
+    elif mutation == "missing_canonical_file":
+        (published / WARM_RELEASE_MIGRATION).unlink()
+        expected = rf"renamed migration {warm_row} requires {WARM_RELEASE_MIGRATION}"
+    else:
+        raise AssertionError(mutation)
+
+    if mutation == "failed_historical_row":
+        # PostgreSQL refuses the owner's CREATE OR REPLACE of a function it
+        # does not own; the runner records the failure with the exact
+        # historical checksum. Restoring ownership afterwards must not turn
+        # that failed row into replay authority.
+        await _run_as_owner(
+            database,
+            _stage(tmp_path, "through-0285", through=DEPLOYED_HISTORY_THROUGH),
+        )
+        await _set_function_owner(database, PAIR_FUNCTIONS[0])
+        with pytest.raises(asyncpg.InsufficientPrivilegeError, match="must be owner"):
+            await _run_as_owner(database, history)
+        await _set_function_owner(database, PAIR_FUNCTIONS[0], database.name)
+    else:
+        await _run_as_owner(database, history)
+    ledger = await _ledger(database)
+    catalog = await _catalog(database)
+    if mutation == "failed_historical_row":
+        failed = next(row for row in ledger if row["filename"] == capture_row)
+        assert failed["success"] is False
+        assert failed["checksum"] == DEPLOYED_PAIR[capture_row][1]
+
+    for dry_run in (False, True):
+        with pytest.raises(RuntimeError, match=expected):
+            await _run_as_owner(database, published, dry_run=dry_run)
+        assert await _ledger(database) == ledger
+        assert await _catalog(database) == catalog
