@@ -147,6 +147,13 @@ def provider(db, observed_pod):
     provisioner = Fixture._provisioner(db)
     provisioner._core_api.read_namespaced_pod.return_value = observed_pod
     provisioner._ssh_auth_ready_timeout = 30
+    provisioner._trusted_pod_ssh_identity = AsyncMock(
+        return_value=(
+            f"k8s-pod:superhuman-remote-worker:{Fixture.RUNTIME}",
+            "SHA256:" + "A" * 43,
+            Fixture.RUNTIME,
+        )
+    )
     return provisioner
 
 
@@ -260,6 +267,9 @@ async def test_first_ready_clock_freezes_and_bounds_ssh_on_same_uid(monkeypatch)
     assert await observe(p, db) == "10.42.0.8"
     assert db._creation_reservation["startup_first_ready_at"] == ready_at
     assert ssh.await_args.kwargs["deadline_s"] < 30
+    assert ssh.await_args.kwargs["expected_host_key_fingerprint"] == (
+        "SHA256:" + "A" * 43
+    )
 
     p._core_api.read_namespaced_pod.return_value = pod(
         scheduled=scheduled, ready=ready_at + timedelta(seconds=3)
