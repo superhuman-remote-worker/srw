@@ -38232,7 +38232,7 @@ class PostgresDB:
                         WHERE warm.thread_id=t.id
                           AND warm.runtime_generation=t.runtime_generation
                           AND warm.status IN
-                              ('planned','protecting','protected','bound','releasing')
+                              ('planned','protecting','protected','bound','releasing','terminal_release')
                    )
                 """,
                 parsed_thread,
@@ -38302,7 +38302,8 @@ class PostgresDB:
                     "SELECT * FROM thread_agent_warm_binding_protections "
                     "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid "
                     "AND status IN "
-                    "('planned','protecting','protected','bound','releasing') "
+                    "('planned','protecting','protected','bound','releasing',"
+                    "'terminal_release') "
                     "FOR UPDATE",
                     parsed_thread,
                     parsed_generation,
@@ -38662,7 +38663,7 @@ class PostgresDB:
                         WHERE warm.thread_id=t.id
                           AND warm.runtime_generation=t.runtime_generation
                           AND warm.status IN
-                              ('planned','protecting','protected','bound','releasing')
+                              ('planned','protecting','protected','bound','releasing','terminal_release')
                    )
                  ORDER BY t.created_at,t.id
                  LIMIT $1
@@ -38698,7 +38699,7 @@ class PostgresDB:
                 "SELECT * FROM candidates WHERE "
                 "((status='planned' AND lease_expires_at<=now()) "
                 "OR (status='protecting' AND effect_expires_at<=now()) "
-                "OR (status IN ('protected','releasing') "
+                "OR (status IN ('protected','releasing','terminal_release') "
                 "AND lease_expires_at<=now()) "
                 "OR (status='bound' AND lease_expires_at<=now() "
                 "AND deleted_owner_release)) "
@@ -38722,7 +38723,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             changed = await conn.execute(
                 "UPDATE thread_agent_warm_binding_protections warm SET "
-                "status='releasing',release_started_at=transaction_timestamp() "
+                "status='terminal_release',release_started_at=transaction_timestamp() "
                 "WHERE warm.protection_id=$1::uuid AND warm.status='bound' "
                 "AND warm.lease_expires_at<=now() "
                 "AND public.pinned_deleted_owner_warm_release_authorized(warm)",
@@ -38732,7 +38733,7 @@ class PostgresDB:
                 return True
             return bool(
                 await conn.fetchval(
-                    "SELECT status='releasing' AND "
+                    "SELECT status='terminal_release' AND "
                     "public.pinned_deleted_owner_warm_release_authorized(warm) "
                     "FROM thread_agent_warm_binding_protections warm "
                     "WHERE protection_id=$1::uuid",
@@ -38902,15 +38903,21 @@ class PostgresDB:
                     return False
                 if str(warm["status"]) == "released":
                     return True
-                if str(warm["status"]) != "releasing":
+                status = str(warm["status"])
+                if status not in {"releasing", "terminal_release"}:
+                    return False
+                if status == "terminal_release" and (
+                    release_outcome != "exact_absent_v1" or agent_present
+                ):
                     return False
                 changed = await conn.execute(
                     "UPDATE thread_agent_warm_binding_protections SET "
                     "status='released',release_outcome=$2,"
                     "released_at=transaction_timestamp() "
-                    "WHERE protection_id=$1::uuid AND status='releasing'",
+                    "WHERE protection_id=$1::uuid AND status=$3",
                     parsed,
                     release_outcome,
+                    status,
                 )
                 agent_changed = await conn.execute(
                     "UPDATE agents SET status=$2 "
@@ -45487,7 +45494,7 @@ class PostgresDB:
                     if warm_release is not None:
                         warm_changed = await conn.execute(
                             "UPDATE thread_agent_warm_binding_protections SET "
-                            "status='releasing',"
+                            "status='terminal_release',"
                             "release_started_at=transaction_timestamp() "
                             "WHERE protection_id=$1::uuid AND status='bound'",
                             warm_release["protection_id"],

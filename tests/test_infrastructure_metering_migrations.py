@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0301_pinned_permanent_warm_release.sql"
+    / "src/orchestrator/database/migrations/app/0305_validate_pinned_permanent_warm_release.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

@@ -421,7 +421,7 @@ async def reconcile_pinned_warm_binding_protections(
             ):
                 unresolved += 1
                 continue
-            status = "releasing"
+            status = "terminal_release"
         if status == "planned":
             observation = await observe(row)
             state = str(observation.get("state") or "")
@@ -451,19 +451,21 @@ async def reconcile_pinned_warm_binding_protections(
         if status == "protected" and not await begin_release(protection_id):
             unresolved += 1
             continue
-        if (
-            row.get("deleted_owner_release")
-            and status == "releasing"
-            and (
-                begin_deleted_release is None
-                or not await begin_deleted_release(protection_id)
-            )
+        if status == "releasing" and row.get("deleted_owner_release"):
+            # Older writers could leave an ordinary release at a deleted
+            # owner. Its state alone grants no terminal-only Pod proof.
+            unresolved += 1
+            continue
+        if status == "terminal_release" and (
+            not row.get("deleted_owner_release")
+            or begin_deleted_release is None
+            or not await begin_deleted_release(protection_id)
         ):
             unresolved += 1
             continue
         release_result = (
             await release(row, terminal_only=True)
-            if row.get("deleted_owner_release")
+            if status == "terminal_release"
             else await release(row)
         )
         if not isinstance(release_result, dict):
