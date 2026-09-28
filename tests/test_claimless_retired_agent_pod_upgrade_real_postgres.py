@@ -861,3 +861,150 @@ async def test_renamed_history_refuses_anything_but_the_reviewed_rows(
             await _run_as_owner(database, published, dry_run=dry_run)
         assert await _ledger(database) == ledger
         assert await _catalog(database) == catalog
+
+
+# ---------------------------------------------------------------------------
+# The k3d database after the 2026-09-28 manual ledger repair
+# ---------------------------------------------------------------------------
+
+# On 2026-09-28 a Tilt deploy of local develop 50d0af34a met the deployed
+# history above and refused it. A concurrent session then deleted the two
+# historical rows by hand (after saving the ledger) and restarted: upstream's
+# 0286-0300 applied, and the pair re-ran as 0301/0302 from 50d0af34a, whose
+# 0301 carried a renumbered header comment. A read-only inspection afterwards
+# found 296 rows equal to the published chain except that one checksum.
+REPAIRED_0301_CHECKSUM = (
+    "587ed9b5edc56bd4946cf0637c679eaba1484ce5237da7f45b1873542fe838e5"
+)
+ORIGINAL_0301_HEADER = (
+    "-- (Numbered 0286: origin/develop already carries 0284 and 0285.)\n"
+)
+RENUMBERED_0301_HEADER = (
+    "-- (Numbered 0301: written as 0286, renumbered at integration because\n"
+    "-- origin/develop carries 0286-0300.)\n"
+)
+# The deleted rows exactly as the saved ledger holds them.
+DELETED_HISTORICAL_ROWS = (
+    ("0286_capture_claimless_retired_agent_pod.sql", 0),
+    ("0287_permanent_retirement_releases_warm_protection.sql", 2),
+)
+DELETED_ROWS_APPLIED_AT = "2026-09-27 07:47:57.62744+00"
+
+
+def _renumbered_0301_sql():
+    original = (MIGRATIONS / CAPTURE_MIGRATION).read_text()
+    assert original.count(ORIGINAL_0301_HEADER) == 1
+    variant = original.replace(ORIGINAL_0301_HEADER, RENUMBERED_0301_HEADER, 1)
+    assert migrate._checksum(variant) == REPAIRED_0301_CHECKSUM
+    return variant
+
+
+def _stage_develop_50d0af34a(tmp_path):
+    """The published chain as local develop 50d0af34a carried it."""
+
+    staged = tmp_path / "develop-50d0af34a"
+    shutil.copytree(MIGRATIONS, staged)
+    (staged / CAPTURE_MIGRATION).write_text(_renumbered_0301_sql())
+    return staged
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restored_rows", [False, True])
+async def test_upgrade_from_the_repaired_k3d_history(
+    owned_databases, tmp_path, restored_rows
+):
+    database = await owned_databases()
+    await _run_as_owner(database, _stage_deployed_history(tmp_path))
+    admin = await asyncpg.connect(database.admin_dsn)
+    try:
+        # The manual repair: delete exactly the two historical rows.
+        deleted = await admin.fetch(
+            "DELETE FROM public.schema_migrations "
+            "WHERE filename = ANY($1::text[]) RETURNING filename, checksum",
+            list(DEPLOYED_PAIR),
+        )
+        assert {row["filename"]: row["checksum"] for row in deleted} == {
+            name: checksum for name, (_, checksum) in DEPLOYED_PAIR.items()
+        }
+    finally:
+        await admin.close()
+    await _run_as_owner(database, _stage_develop_50d0af34a(tmp_path))
+    ledger = await _ledger(database)
+    canonical = {path.name for path in migrate.discover(MIGRATIONS)}
+    assert {row["filename"] for row in ledger} == canonical
+    assert {
+        row["filename"]: row["checksum"]
+        for row in ledger
+        if row["filename"] in LOCAL_MIGRATIONS
+    } == {
+        CAPTURE_MIGRATION: REPAIRED_0301_CHECKSUM,
+        WARM_RELEASE_MIGRATION: DEPLOYED_PAIR[
+            "0287_permanent_retirement_releases_warm_protection.sql"
+        ][1],
+    }
+    if restored_rows:
+        # The optional restoration of the deleted rows from the saved ledger.
+        admin = await asyncpg.connect(database.admin_dsn)
+        try:
+            for filename, execution_ms in DELETED_HISTORICAL_ROWS:
+                await admin.execute(
+                    "INSERT INTO public.schema_migrations"
+                    "(filename, checksum, applied_at, applied_by, execution_ms) "
+                    "VALUES ($1, $2, $3::text::timestamptz, 'srw', $4)",
+                    filename,
+                    DEPLOYED_PAIR[filename][1],
+                    DELETED_ROWS_APPLIED_AT,
+                    execution_ms,
+                )
+        finally:
+            await admin.close()
+        ledger = await _ledger(database)
+    # A replay of either function would now fail at PostgreSQL's ownership
+    # boundary, so a passing upgrade proves nothing re-ran.
+    for name in PAIR_FUNCTIONS:
+        await _set_function_owner(database, name)
+    catalog = await _catalog(database)
+    data = await _application_data(database)
+
+    for dry_run in (True, False, False):
+        await _run_as_owner(database, MIGRATIONS, dry_run=dry_run)
+        assert await _ledger(database) == ledger
+        assert await _catalog(database) == catalog
+        assert await _application_data(database) == data
+
+    fresh = await owned_databases()
+    await _run_as_owner(fresh, MIGRATIONS)
+    for name in PAIR_FUNCTIONS:
+        await _set_function_owner(fresh, name)
+    assert await _catalog(fresh) == catalog
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["other_variant", "reverse_variant"])
+async def test_repaired_k3d_history_refuses_other_0301_bytes(
+    owned_databases, tmp_path, mutation
+):
+    history = _stage_develop_50d0af34a(tmp_path)
+    published = tmp_path / "published"
+    shutil.copytree(MIGRATIONS, published)
+    if mutation == "other_variant":
+        path = history / CAPTURE_MIGRATION
+        path.write_text(path.read_text() + "\n-- unreviewed historical edit\n")
+    elif mutation == "reverse_variant":
+        # Only the original bytes are canonical: a database that applied them
+        # must not accept the renumbered variant on disk.
+        (history / CAPTURE_MIGRATION).write_text(
+            (MIGRATIONS / CAPTURE_MIGRATION).read_text()
+        )
+        (published / CAPTURE_MIGRATION).write_text(_renumbered_0301_sql())
+    else:
+        raise AssertionError(mutation)
+    database = await owned_databases()
+    await _run_as_owner(database, history)
+    ledger = await _ledger(database)
+    for dry_run in (False, True):
+        with pytest.raises(
+            RuntimeError, match=f"checksum changed: {CAPTURE_MIGRATION}"
+        ):
+            await _run_as_owner(database, published, dry_run=dry_run)
+        assert await _ledger(database) == ledger
