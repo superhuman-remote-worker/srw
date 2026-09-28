@@ -102,6 +102,24 @@ function isSubscriptionDiscovery(
 }
 
 /**
+ * The `params_json` a bulk import would store for `m`, for a single add from
+ * the form: the routing block (mirrors `routing_params_block` in
+ * `src/shared/subscription_routing.py`, including the neutral Chat Completions
+ * protocol for a needs-review model) plus the advertised output limit.
+ */
+function subscriptionRoutingParams(m: SubscriptionDiscoveredModel): Record<string, unknown> {
+  const needsReview = m.support === 'needs_review';
+  const routing: Record<string, unknown> = {
+    client_protocol: m.client_protocol || 'openai-chat',
+  };
+  if (m.sources.length > 0) routing['subscription_sources'] = [...m.sources];
+  if (needsReview) routing['needs_review'] = true;
+  const params: Record<string, unknown> = {routing};
+  if (m.max_output_tokens) params['max_output_tokens'] = m.max_output_tokens;
+  return params;
+}
+
+/**
  * Build the `capabilities[]` pre-fill from the discovery hint array.
  * Filters to known capability values and de-duplicates while preserving
  * the order the orchestrator emitted (chat-capable rows already include
@@ -424,6 +442,11 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                     <span class="muted">
                       Click a model to autofill ID and label:
                     </span>
+                  } @else if (subscriptionModels().length > 0) {
+                    <span class="muted">
+                      Tick models to add them in bulk, or use Fill form to add one with
+                      your own settings:
+                    </span>
                   }
                 </div>
 
@@ -480,7 +503,9 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                       variant="primary"
                       size="sm"
                       [loading]="importing()"
-                      [disabled]="importing() || subscriptionSelection().size === 0"
+                      [disabled]="
+                        importing() || importCapInvalid() || subscriptionSelection().size === 0
+                      "
                       (clicked)="addSelectedModels()"
                     >
                       Add selected ({{ subscriptionSelection().size }})
@@ -489,11 +514,39 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                       variant="secondary"
                       size="sm"
                       [loading]="importing()"
-                      [disabled]="importing() || importableCount() === 0"
+                      [disabled]="importing() || importCapInvalid() || importableCount() === 0"
                       (clicked)="addAllSupportedModels()"
                     >
                       Add all supported models ({{ importableCount() }})
                     </app-button>
+                  </div>
+
+                  <div class="subs-cap">
+                    <span class="subs-cap-label">Cap context window at</span>
+                    <app-input
+                      type="text"
+                      list="subs-cap-presets"
+                      size="sm"
+                      [value]="importCapText()"
+                      placeholder="Model maximum"
+                      ariaLabel="Cap context window at"
+                      [invalid]="importCapInvalid()"
+                      [disabled]="importing()"
+                      (valueChange)="importCapText.set($event)"
+                    />
+                    <datalist id="subs-cap-presets">
+                      @for (p of contextWindowPresets; track p.tokens) {
+                        <option [value]="p.label" [label]="p.tokens"></option>
+                      }
+                    </datalist>
+                    <span class="muted">
+                      @if (importCapInvalid()) {
+                        Enter a token count such as 200k or 200000.
+                      } @else {
+                        Each model added in bulk gets the smaller of this and its own
+                        maximum. Leave empty to keep each model's maximum.
+                      }
+                    </span>
                   </div>
 
                   @if (importResult(); as result) {
@@ -512,20 +565,15 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                         [class.unsupported]="m.support === 'unsupported_modality'"
                       >
                         <app-checkbox
+                          class="subs-model-pick"
                           size="sm"
                           [checked]="isSelected(m.id)"
                           [disabled]="m.registered || m.support === 'unsupported_modality'"
                           [ariaLabel]="m.id"
                           (changed)="toggleSelection(m, $event)"
-                        />
-                        <button
-                          type="button"
-                          class="subs-model-id mono"
-                          (click)="applySubscriptionModel(m)"
-                          title="Autofill the form with this model"
                         >
-                          {{ m.id }}
-                        </button>
+                          <span class="subs-model-id mono">{{ m.id }}</span>
+                        </app-checkbox>
                         <span class="subs-model-sources">
                           @if (m.sources.length > 0) {
                             @for (source of m.sources; track source) {
@@ -549,6 +597,17 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                         } @else if (m.support === 'needs_review') {
                           <app-badge tone="warning" size="xs">needs review</app-badge>
                         }
+                        @if (!m.registered && m.support !== 'unsupported_modality') {
+                          <app-button
+                            variant="ghost"
+                            size="sm"
+                            [ariaLabel]="'Fill the form below with ' + m.id"
+                            [disabled]="creating()"
+                            (clicked)="applySubscriptionModel(m)"
+                          >
+                            Fill form
+                          </app-button>
+                        }
                       </div>
                     }
                   </div>
@@ -556,7 +615,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
               </div>
             }
 
-            <div class="form-row two-col">
+            <div class="form-row two-col" #modelForm [class.form-flash]="formFlash()">
               <app-form-field label="Model ID">
                 <app-input
                   [value]="formModelId()"
@@ -610,7 +669,7 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                 <p class="field-hint field-hint--warn">{{ error }}</p>
               }
             } @else {
-              <div class="form-row two-col chat-model-config">
+              <div class="form-row two-col chat-model-config" [class.form-flash]="formFlash()">
                 <app-form-field label="Family">
                   <app-select
                     [value]="formFamily()"
@@ -1037,6 +1096,8 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
       display: flex;
       align-items: center;
       gap: 8px;
+      /* The sm "Fill form" button's height, so rows without one line up. */
+      min-height: 28px;
       padding: 4px 6px;
       border-radius: var(--radius-control);
       font-size: 12px;
@@ -1047,18 +1108,39 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
     .subs-model-row.unsupported {
       opacity: 0.6;
     }
-    .subs-model-id {
+    /* The whole name is the checkbox's label, so clicking it ticks the box. */
+    .subs-model-pick {
       flex: 1;
-      text-align: left;
-      background: none;
-      border: none;
-      padding: 0;
-      cursor: pointer;
+      min-width: 0;
+    }
+    .subs-model-id {
       color: var(--text-primary);
       font-size: 12px;
     }
-    .subs-model-id:hover {
-      text-decoration: underline;
+    .subs-cap {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin: 8px 0;
+      font-size: 12px;
+    }
+    .subs-cap-label {
+      color: var(--text-secondary);
+    }
+    .subs-cap app-input {
+      width: 140px;
+      flex: none;
+    }
+    .form-row {
+      border-radius: var(--radius-control);
+      transition:
+        background-color 0.4s ease,
+        box-shadow 0.4s ease;
+    }
+    .form-row.form-flash {
+      background: color-mix(in srgb, var(--accent-color) 12%, transparent);
+      box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent-color) 12%, transparent);
     }
     .subs-model-sources {
       display: flex;
@@ -1175,6 +1257,7 @@ export class AdminCatalogComponent implements OnInit {
   private readonly transloco = inject(TranslocoService);
 
   private readonly discoverPaneRef = viewChild<ElementRef<HTMLElement>>('discoverPane');
+  private readonly modelFormRef = viewChild<ElementRef<HTMLElement>>('modelForm');
 
   readonly capabilities: CatalogCapability[] = CATALOG_CAPABILITIES;
   /** Shared compact token formatter for the "Context" column. */
@@ -1304,6 +1387,17 @@ export class AdminCatalogComponent implements OnInit {
   readonly importing = signal(false);
   readonly importResult = signal<SubscriptionImportResult | null>(null);
   readonly modelFilter = signal('');
+  /** Bulk-import context cap as typed ("200k", "200000"); empty = model maximum. */
+  readonly importCapText = signal('');
+  readonly importCap = computed(() => parseTokens(this.importCapText()));
+  readonly importCapInvalid = computed(() => {
+    if (!this.importCapText().trim()) return false;
+    const cap = this.importCap();
+    return cap == null || cap <= 0;
+  });
+  /** Briefly highlights the form after "Fill form" so the jump is visible. */
+  readonly formFlash = signal(false);
+  private formFlashTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Candidates matching the search box, unsupported ones sorted last. */
   readonly filteredSubscriptionModels = computed(() => {
@@ -1513,6 +1607,9 @@ export class AdminCatalogComponent implements OnInit {
   onProviderKeyChange(value: string | null): void {
     this.formProviderKey.set(value ?? '');
     this.discoveredModels.set([]);
+    this.subscriptionModels.set([]);
+    this.subscriptionSelection.set(new Set<string>());
+    this.importResult.set(null);
     this.discoverError.set('');
     // Provider change invalidates any prior model-specific autofill — wiping
     // the form fields prevents a stale model_id from being submitted under a
@@ -1573,13 +1670,22 @@ export class AdminCatalogComponent implements OnInit {
       params['provider'] = this.formSearchProvider();
       params['ops'] = this.formSearchOps();
     }
+    // A discovered proxy model carries routing (client protocol, serving
+    // accounts) and an output limit the form has no fields for. Without the
+    // routing block the row falls back to the Responses factory whatever the
+    // model is, so take them from discovery — filled or typed alike.
+    const modelId = this.formModelId().trim();
+    const candidate = this.selectedIsSubscription()
+      ? (this.subscriptionModels().find((m) => m.id === modelId) ?? null)
+      : null;
+    if (candidate) Object.assign(params, subscriptionRoutingParams(candidate));
     const paramsJson = Object.keys(params).length ? params : undefined;
     this.creating.set(true);
     this.models
       .createModel({
         provider_kind: kind,
         provider_ref: ref,
-        model_id: this.formModelId().trim(),
+        model_id: modelId,
         display_label: this.formDisplayLabel().trim(),
         capabilities,
         family: this.researchCapabilitiesSelected() ? 'default' : this.formFamily().trim(),
@@ -1599,6 +1705,7 @@ export class AdminCatalogComponent implements OnInit {
           this.formSearchProvider.set('');
           this.formSearchOps.set([]);
           this.creating.set(false);
+          if (candidate) this.markRegistered(candidate.id);
         },
         error: (err) => {
           this.formError.set(err?.error?.detail ?? 'Failed to add model.');
@@ -1778,23 +1885,26 @@ export class AdminCatalogComponent implements OnInit {
 
   private runImport(modelIds: string[] | undefined, includeReview: boolean): void {
     const endpointId = this.selectedEndpointRef();
-    if (!endpointId) return;
+    if (!endpointId || this.importCapInvalid()) return;
     this.importing.set(true);
     this.importResult.set(null);
-    this.providers.importSubscriptionModels(endpointId, modelIds, includeReview).subscribe({
-      next: (result) => {
-        this.importing.set(false);
-        this.importResult.set(result);
-        this.clearSelection();
-        // Re-run discovery so the registration state (and any drift) is read
-        // back from the catalog rather than assumed from the import result.
-        this.discoverFromEndpoint(endpointId);
-      },
-      error: (err) => {
-        this.importing.set(false);
-        this.discoverError.set(err?.error?.detail ?? 'Import failed.');
-      },
-    });
+    this.providers
+      .importSubscriptionModels(endpointId, modelIds, includeReview, this.importCap())
+      .subscribe({
+        next: (result) => {
+          this.importing.set(false);
+          this.clearSelection();
+          // Re-run discovery so the registration state (and any drift) is read
+          // back from the catalog rather than assumed from the import result.
+          // It resets the summary, so the summary is set after it.
+          this.discoverFromEndpoint(endpointId);
+          this.importResult.set(result);
+        },
+        error: (err) => {
+          this.importing.set(false);
+          this.discoverError.set(err?.error?.detail ?? 'Import failed.');
+        },
+      });
   }
 
   /** Pre-fill the single-model form from a subscription candidate. */
@@ -1808,6 +1918,28 @@ export class AdminCatalogComponent implements OnInit {
       this.detectAndSetFamily(m.id);
     }
     this.formContextWindow.set(m.context_window ?? null);
+    this.formError.set('');
+    this.revealForm();
+  }
+
+  /** Reflect a single-form add in the subscription list without a rediscovery,
+   * which would drop the operator's other ticked models. */
+  private markRegistered(modelId: string): void {
+    this.subscriptionModels.update((rows) =>
+      rows.map((m) => (m.id === modelId ? {...m, registered: true} : m)),
+    );
+    const selection = new Set(this.subscriptionSelection());
+    if (selection.delete(modelId)) this.subscriptionSelection.set(selection);
+  }
+
+  /** Scroll the filled form into view and flash it: the list sits above it
+   * and can be long enough that the fill would otherwise happen off-screen. */
+  private revealForm(): void {
+    // Optional call: jsdom (the spec environment) has no scrollIntoView.
+    this.modelFormRef()?.nativeElement.scrollIntoView?.({behavior: 'smooth', block: 'start'});
+    if (this.formFlashTimer) clearTimeout(this.formFlashTimer);
+    this.formFlash.set(true);
+    this.formFlashTimer = setTimeout(() => this.formFlash.set(false), 1200);
   }
 
   applyDiscoveredModel(m: LlmEndpointDiscoveredModel): void {

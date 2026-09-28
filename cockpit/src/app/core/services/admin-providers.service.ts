@@ -16,6 +16,7 @@ import {
   SubscriptionImportResult,
 } from '../models/api.model';
 import {environment} from '../environment';
+import {AdminModelsService} from './admin-models.service';
 import {ModelService} from './model.service';
 import {ReadinessService} from './readiness.service';
 
@@ -163,6 +164,7 @@ export class AdminProvidersService {
   private readonly http = inject(HttpClient);
   private readonly readiness = inject(ReadinessService);
   private readonly modelService = inject(ModelService);
+  private readonly adminModels = inject(AdminModelsService);
   private readonly baseUrl = environment.apiUrl;
 
   readonly systemApiKeys = signal<SystemApiKeyEntry[]>([]);
@@ -360,20 +362,30 @@ export class AdminProvidersService {
   /**
    * Bulk-register discovered models. Omit `modelIds` for "add all supported
    * models". Idempotent — already-registered rows are skipped, never rewritten,
-   * so manual catalog edits survive a rediscovery.
+   * so manual catalog edits survive a rediscovery. `contextWindowCap` lowers
+   * each new row's window to at most that value; null keeps the advertised
+   * maximum.
    */
   importSubscriptionModels(
     endpointId: string,
     modelIds?: string[],
     includeNeedsReview = false,
+    contextWindowCap: number | null = null,
   ): Observable<SubscriptionImportResult> {
     return this.http
       .post<SubscriptionImportResult>(
         `${this.baseUrl}/admin/providers/endpoints/${endpointId}/models/import`,
-        {model_ids: modelIds ?? null, include_needs_review: includeNeedsReview},
+        {
+          model_ids: modelIds ?? null,
+          include_needs_review: includeNeedsReview,
+          context_window_cap: contextWindowCap,
+        },
       )
       .pipe(
         tap(() => {
+          // The catalog table reads AdminModelsService; without this the new
+          // rows only appear after a page reload.
+          this.adminModels.loadModels();
           this.readiness.load();
           this.modelService.load(undefined, true);
         }),

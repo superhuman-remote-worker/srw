@@ -287,7 +287,7 @@ describe('AdminCatalogComponent — subscription proxy source', () => {
       component.toggleSelection(candidate({id: 'a'}), true);
       component.addSelectedModels();
 
-      expect(providers.importSubscriptionModels).toHaveBeenCalledWith('ep-subs', ['a'], false);
+      expect(providers.importSubscriptionModels).toHaveBeenCalledWith('ep-subs', ['a'], false, null);
     });
 
     it('opts into review only when a review row was explicitly selected', () => {
@@ -302,7 +302,7 @@ describe('AdminCatalogComponent — subscription proxy source', () => {
       component.toggleSelection(candidate({id: 'mystery', support: 'needs_review'}), true);
       component.addSelectedModels();
 
-      expect(providers.importSubscriptionModels).toHaveBeenCalledWith('ep-subs', ['mystery'], true);
+      expect(providers.importSubscriptionModels).toHaveBeenCalledWith('ep-subs', ['mystery'], true, null);
     });
 
     it('"Add all supported" lets the server pick — never the client filter', () => {
@@ -317,7 +317,7 @@ describe('AdminCatalogComponent — subscription proxy source', () => {
       component.modelFilter.set('a');
       component.addAllSupportedModels();
 
-      expect(providers.importSubscriptionModels).toHaveBeenCalledWith('ep-subs', undefined, false);
+      expect(providers.importSubscriptionModels).toHaveBeenCalledWith('ep-subs', undefined, false, null);
     });
 
     it('re-reads registration state from the catalog after an import', () => {
@@ -354,6 +354,166 @@ describe('AdminCatalogComponent — subscription proxy source', () => {
 
       expect(component.discoverError()).toBe('inventory unreadable');
       expect(component.importResult()).toBeNull();
+    });
+
+    it('keeps the import summary visible after the post-import rediscovery', () => {
+      const providers = makeProviders([SUBSCRIPTION_ENDPOINT]);
+      providers.discoverSystemEndpointModels = vi.fn(() =>
+        of(discovery([candidate({id: 'a'})])),
+      ) as never;
+      const summary = {created: ['a'], skipped: [], rejected: []};
+      providers.importSubscriptionModels = vi.fn(() => of(summary)) as never;
+      const component = setup(providers).componentInstance;
+
+      component.formProviderKey.set('endpoint:ep-subs');
+      component.discoverFromEndpoint('ep-subs');
+      component.toggleSelection(candidate({id: 'a'}), true);
+      component.addSelectedModels();
+
+      expect(component.importResult()).toEqual(summary);
+    });
+
+    it('sends the context cap, parsed from a preset label', () => {
+      const providers = makeProviders([SUBSCRIPTION_ENDPOINT]);
+      providers.discoverSystemEndpointModels = vi.fn(() =>
+        of(discovery([candidate({id: 'a'})])),
+      ) as never;
+      const component = setup(providers).componentInstance;
+
+      component.formProviderKey.set('endpoint:ep-subs');
+      component.discoverFromEndpoint('ep-subs');
+      component.importCapText.set('256k');
+      component.addAllSupportedModels();
+
+      expect(providers.importSubscriptionModels).toHaveBeenCalledWith(
+        'ep-subs',
+        undefined,
+        false,
+        262144,
+      );
+    });
+
+    it('refuses to import while the cap is not a token count', () => {
+      const providers = makeProviders([SUBSCRIPTION_ENDPOINT]);
+      providers.discoverSystemEndpointModels = vi.fn(() =>
+        of(discovery([candidate({id: 'a'})])),
+      ) as never;
+      const component = setup(providers).componentInstance;
+
+      component.formProviderKey.set('endpoint:ep-subs');
+      component.discoverFromEndpoint('ep-subs');
+      component.importCapText.set('lots');
+      expect(component.importCapInvalid()).toBe(true);
+      component.addAllSupportedModels();
+
+      expect(providers.importSubscriptionModels).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('fill form', () => {
+    it('fills the single-model form, context window included', () => {
+      const providers = makeProviders([SUBSCRIPTION_ENDPOINT]);
+      const component = setup(providers).componentInstance;
+
+      component.formProviderKey.set('endpoint:ep-subs');
+      component.applySubscriptionModel(candidate());
+
+      expect(component.formModelId()).toBe('gpt-5.6-sol');
+      expect(component.formDisplayLabel()).toBe('GPT 5.6 Sol');
+      expect(component.formFamily()).toBe('codex');
+      expect(component.formContextWindow()).toBe(372000);
+      expect(component.formFlash()).toBe(true);
+    });
+
+    it('adds a filled model with the routing a bulk import would store', () => {
+      const providers = makeProviders([SUBSCRIPTION_ENDPOINT]);
+      providers.discoverSystemEndpointModels = vi.fn(() =>
+        of(discovery([candidate(), candidate({id: 'other'})])),
+      ) as never;
+      const component = setup(providers).componentInstance;
+
+      component.formProviderKey.set('endpoint:ep-subs');
+      component.discoverFromEndpoint('ep-subs');
+      component.toggleSelection(candidate(), true);
+      component.toggleSelection(candidate({id: 'other'}), true);
+      component.applySubscriptionModel(candidate());
+      component.onContextWindowChange('200000');
+      component.submit();
+
+      expect(models.createModel).toHaveBeenCalledWith(
+        expect.objectContaining({
+          provider_kind: 'endpoint',
+          provider_ref: 'ep-subs',
+          model_id: 'gpt-5.6-sol',
+          context_window: 200000,
+          params_json: {
+            routing: {client_protocol: 'openai-responses', subscription_sources: ['codex']},
+            max_output_tokens: 128000,
+          },
+        }),
+      );
+      // The added model reads as registered; the rest of the selection stays.
+      const added = component.subscriptionModels().find((m) => m.id === 'gpt-5.6-sol');
+      expect(added?.registered).toBe(true);
+      expect(Array.from(component.subscriptionSelection())).toEqual(['other']);
+    });
+
+    it('stores a needs-review model on the neutral protocol, flagged', () => {
+      const providers = makeProviders([SUBSCRIPTION_ENDPOINT]);
+      const mystery = candidate({
+        id: 'mystery',
+        client_protocol: null,
+        sources: [],
+        max_output_tokens: null,
+        support: 'needs_review',
+      });
+      providers.discoverSystemEndpointModels = vi.fn(() => of(discovery([mystery]))) as never;
+      const component = setup(providers).componentInstance;
+
+      component.formProviderKey.set('endpoint:ep-subs');
+      component.discoverFromEndpoint('ep-subs');
+      component.applySubscriptionModel(mystery);
+      component.submit();
+
+      expect(models.createModel).toHaveBeenCalledWith(
+        expect.objectContaining({
+          params_json: {routing: {client_protocol: 'openai-chat', needs_review: true}},
+        }),
+      );
+    });
+
+    it('sends no routing for an id discovery never advertised', () => {
+      const providers = makeProviders([SUBSCRIPTION_ENDPOINT]);
+      providers.discoverSystemEndpointModels = vi.fn(() =>
+        of(discovery([candidate()])),
+      ) as never;
+      const component = setup(providers).componentInstance;
+
+      component.formProviderKey.set('endpoint:ep-subs');
+      component.discoverFromEndpoint('ep-subs');
+      component.applySubscriptionModel(candidate());
+      component.formModelId.set('something-else');
+      component.submit();
+
+      expect(models.createModel).toHaveBeenCalledWith(
+        expect.objectContaining({model_id: 'something-else', params_json: undefined}),
+      );
+    });
+
+    it('drops the subscription list when the provider changes', () => {
+      const providers = makeProviders([SUBSCRIPTION_ENDPOINT, PLAIN_ENDPOINT]);
+      providers.discoverSystemEndpointModels = vi.fn(() =>
+        of(discovery([candidate()])),
+      ) as never;
+      const component = setup(providers).componentInstance;
+
+      component.formProviderKey.set('endpoint:ep-subs');
+      component.discoverFromEndpoint('ep-subs');
+      component.toggleSelection(candidate(), true);
+      component.onProviderKeyChange('endpoint:ep-vllm');
+
+      expect(component.subscriptionModels()).toEqual([]);
+      expect(component.subscriptionSelection().size).toBe(0);
     });
   });
 });
