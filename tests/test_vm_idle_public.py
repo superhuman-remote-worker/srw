@@ -108,6 +108,42 @@ def test_initial_vm_provisioning_has_no_idle_lifecycle(status, owner_kind):
     assert project_vm_idle_state(row) is None
 
 
+@pytest.mark.parametrize("status", ["created", "paused"])
+def test_initial_job_configuration_wait_has_no_idle_lifecycle(status):
+    row = _owner()
+    row["status"] = status
+    row["context"]["vm"] = {"status": "waiting_creation_configuration"}
+    row["workspace_idle_episode"] = None
+    row["workspace_idle_revision"] = 0
+    row["idle_phase"] = None
+    row["idle_episode_id"] = None
+
+    assert project_vm_idle_state(row) is None
+
+
+@pytest.mark.parametrize("fault", ["prior_history", "episode", "operation", "thread"])
+def test_configuration_wait_cannot_hide_existing_or_unsupported_idle_state(fault):
+    row = _owner()
+    row["status"] = "paused"
+    row["context"]["vm"] = {"status": "waiting_creation_configuration"}
+    if fault != "episode":
+        row["workspace_idle_episode"] = None
+        row["workspace_idle_revision"] = 0
+    if fault == "prior_history":
+        row["workspace_idle_revision"] = 2
+    elif fault == "operation":
+        row["idle_phase"] = "wake_held"
+    elif fault == "thread":
+        row["owner_kind"] = "thread"
+        row["execution_lane"] = "pinned"
+        row["metadata"] = row.pop("context")
+
+    assert project_vm_idle_state(row) == {
+        "state": "release_held",
+        "reason_code": "identity_unverified",
+    }
+
+
 @pytest.mark.parametrize("status", ["provisioning", "created", "ssh_pending"])
 def test_nonready_vm_with_existing_idle_operation_keeps_its_lifecycle(status):
     row = _owner()
