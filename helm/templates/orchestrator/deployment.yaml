@@ -59,6 +59,9 @@ spec:
         # replace the process even when the optional Reloader is disabled.
         checksum/manifest-hosting: {{ toJson .Values.manifestHosting | sha256sum | quote }}
         checksum/workspace-cleanup-reconciliation: {{ dict "enabled" $workspaceCleanupProtocol | toJson | sha256sum | quote }}
+        # Activation and deactivation must replace every orchestrator even
+        # without Reloader. This switch only admits new v1 startup receipts.
+        checksum/container-startup-stage-authority: {{ dict "enabled" (get (.Values.orchestrator.containerStartupStageAuthority | default dict) "enabled" | default false) | toJson | sha256sum | quote }}
         checksum/workspace-preparation: {{ include "srw.vmPreparationEnvironment" . | sha256sum | quote }}
         checksum/workspace-lifecycle-protocol-cutover: {{ dict "enabled" $workspaceLifecycleCutover | toJson | sha256sum | quote }}
         checksum/workspace-lifecycle-service-account: {{ .Values.orchestrator.workspaceLifecycleServiceAccountGeneration | default "0197" | toString | sha256sum | quote }}
@@ -123,6 +126,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_CLEANUP_RECONCILIATION_ENABLED
+            - name: CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED
             # The orchestrator is the only reader of this key
             # (services/pinned_k8s_effect.py). Without it the bounded legacy
             # namespace search collapses to the release namespace alone, which
