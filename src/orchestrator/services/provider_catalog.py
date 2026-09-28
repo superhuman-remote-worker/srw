@@ -618,6 +618,7 @@ class ProviderCatalogService:
             candidates=result.candidates,
             requested_ids=body.model_ids,
             include_review=body.include_needs_review,
+            context_window_cap=body.context_window_cap,
         )
         if outcome.created:
             await try_auto_pin_required_defaults(self.store)

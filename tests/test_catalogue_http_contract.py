@@ -593,6 +593,7 @@ async def test_subscription_import_passes_selection_and_keeps_partial_outcome(
         json={
             "model_ids": ["new-model", "existing-model", "video-model"],
             "include_needs_review": True,
+            "context_window_cap": 200_000,
         },
     )
     assert response.status_code == 200
@@ -603,7 +604,25 @@ async def test_subscription_import_passes_selection_and_keeps_partial_outcome(
         candidates=result.candidates,
         requested_ids=["new-model", "existing-model", "video-model"],
         include_review=True,
+        context_window_cap=200_000,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cap", [0, -1])
+async def test_subscription_import_refuses_a_non_positive_context_cap(catalogue, cap):
+    from shared.subscription_routing import SUBSCRIPTION_PROXY_TRANSPORT
+
+    catalogue.store.get_system_llm_endpoint.return_value = endpoint_row(
+        transport_kind=SUBSCRIPTION_PROXY_TRANSPORT
+    )
+    response = await catalogue.request(
+        "POST",
+        f"/api/admin/providers/endpoints/{ROW_ID}/models/import",
+        json={"context_window_cap": cap},
+    )
+    assert response.status_code == 422
+    catalogue.subscription_import.assert_not_awaited()
 
 
 @pytest.mark.asyncio

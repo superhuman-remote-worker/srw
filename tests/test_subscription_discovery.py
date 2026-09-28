@@ -362,6 +362,56 @@ class TestImport:
         assert kwargs["params_json"]["max_output_tokens"] == 65536
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("advertised", "cap", "stored"),
+        [
+            (262_144, 200_000, 200_000),  # the cap lowers the advertised maximum
+            (131_072, 200_000, 131_072),  # ...and never raises it
+        ],
+    )
+    async def test_context_window_cap_clamps_the_advertised_maximum(
+        self, advertised, cap, stored
+    ):
+        db = self._db()
+        await discovery.import_candidates(
+            db=db,
+            endpoint_id=ENDPOINT_ID,
+            candidates=[self._candidate(context_window=advertised)],
+            requested_ids=None,
+            include_review=False,
+            context_window_cap=cap,
+        )
+        assert db.create_model.await_args.kwargs["context_window"] == stored
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("family_window", "stored"),
+        [
+            (128_000, None),  # the family default already fits: keep tracking it
+            (1_000_000, 200_000),  # the family default exceeds the cap: pin the cap
+            (None, 200_000),  # unknown family default: pin the cap
+        ],
+    )
+    async def test_context_window_cap_without_an_advertised_maximum(
+        self, monkeypatch, family_window, stored
+    ):
+        from shared.runtime.core import model_registry
+
+        monkeypatch.setattr(
+            model_registry, "_family_context_window", lambda _model_id: family_window
+        )
+        db = self._db()
+        await discovery.import_candidates(
+            db=db,
+            endpoint_id=ENDPOINT_ID,
+            candidates=[self._candidate(context_window=None)],
+            requested_ids=None,
+            include_review=False,
+            context_window_cap=200_000,
+        )
+        assert db.create_model.await_args.kwargs["context_window"] == stored
+
+    @pytest.mark.asyncio
     async def test_add_selected_ignores_the_rest(self):
         db = self._db()
         outcome = await discovery.import_candidates(
