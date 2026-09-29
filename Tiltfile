@@ -287,6 +287,7 @@ docker_build(
         'docker/browser-exec',
         'docker/check-browser-stream.py',
         'docker/assert-browser-stack.sh',
+        'docker/assert-workspace-contract.sh',
     ],
     ignore=[
         '.git/',

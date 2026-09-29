@@ -54,11 +54,52 @@ orchestrator log.
 
 ## Images
 
-Any image may be used. It must implement the SRW workspace contract: the
-`agent-host` user, sshd on port 30022 with SRW's certificate settings, and tmux.
-For Sessions, code-server must listen on port 38080 with `auth: password` and
-the `HASHED_PASSWORD` value SRW injects; without that value it must not start.
-Build your image `FROM` an SRW base image so it inherits that contract.
+Any image may be used. It must implement the SRW workspace contract. The simplest
+way is to build `FROM` an SRW base image, which already does.
+
+| The image provides | SRW needs it for |
+| --- | --- |
+| The `agent-host` user (uid 1000, shell bash) | every login |
+| sshd on port 30022 with SRW's key, certificate and principals settings; `ssh-keygen`; the sftp server | readiness, file tools, host identity |
+| An entrypoint that installs the key from `/tmp/ssh-pubkey`, generates host keys and starts sshd | readiness |
+| `tmux`, `bash`, `flock`, `timeout`, `mktemp`, `grep`, `awk`, `sed` | shell tools and attach |
+| `python3` | ending a workspace, installing credentials, restoring snapshots |
+| `tar`, `zstd` | suspend and restore |
+| `git`, `ssh-agent`, `ssh-add` | git versioning and repository datasources |
+| code-server on port 38080 with `auth: password` and the `HASHED_PASSWORD` value SRW injects; without that value it must not start | the Session IDE, and recovery after an aborted attach |
+| `rclone` 1.70.0 or later, `fusermount3`, `mountpoint`, `fuse-overlayfs` 1.13 or later, `/cloud` owned by `agent-host` | the cloud mount (trusted images only) |
+| No `sudo` | the sudo policy |
+
+SRW base images contain `/usr/local/bin/assert-workspace-contract`. Run it as the
+last step of your own build to check your image:
+
+```dockerfile
+FROM ghcr.io/superhuman-remote-worker/srw-workspace-minimal:<tag>
+RUN apt-get update && apt-get install -y --no-install-recommends golang
+RUN /usr/local/bin/assert-workspace-contract
+```
+
+### SRW base images
+
+| Image | Contains |
+| --- | --- |
+| `srw-workspace-minimal` | The contract above, the browser stack (Chromium, Playwright, browser-use) and a small CLI set: curl, wget, jq, less, vim-tiny, nano, ripgrep, zip. About 3.1 GB unpacked. |
+| `srw-workspace` | Everything in minimal, plus Node.js 22 with TypeScript and Prettier, compilers and `-dev` libraries, `psql`, `mongosh` and `cypher-shell`, pandoc, poppler and ffmpeg. About 5.7 GB unpacked. |
+
+An Expert whose instructions assume Node, a compiler or a database client fails
+on `srw-workspace-minimal` with "command not found". Use `srw-workspace`, or add
+what you need in your own image.
+
+**Install system-wide in your own Dockerfile.** The base images set `PIP_TARGET`
+and `npm_config_prefix` to directories under `/home/agent-host`, so that the
+workspace user can install packages without root. The workspace volume is
+mounted over that directory, so anything your build installs there is hidden.
+Unset the variable for build-time installs:
+
+```dockerfile
+RUN env -u PIP_TARGET pip install --break-system-packages <package>
+RUN env -u npm_config_prefix npm install -g <package>
+```
 
 - **Use images only from authors you trust.** The image runs with the workspace
   owner's secrets: the credential connectors attached to the work and its
