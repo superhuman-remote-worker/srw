@@ -297,6 +297,33 @@ docker_build(
 )
 
 # -----------------------------------------------------------------------------
+# Workspace (minimal) — the container-minimal built-in template's image.
+# Without this, image.workspaceMinimal keeps pointing at GHCR on every local
+# k3d, and the built-in's Job waits on a pull that never succeeds. Same
+# Dockerfile, stopped at the `minimal` stage; `full` above is `FROM minimal`,
+# so this build reuses that build's cached layers (and vice versa).
+# -----------------------------------------------------------------------------
+docker_build(
+    'srw-workspace-minimal',
+    context='.',
+    dockerfile='docker/Dockerfile.workspace',
+    target='minimal',
+    only=[
+        'docker/Dockerfile.workspace',
+        'docker/workspace-entrypoint.sh',
+        'docker/browser-exec',
+        'docker/check-browser-stream.py',
+        'docker/assert-browser-stack.sh',
+        'docker/assert-workspace-contract.sh',
+    ],
+    ignore=[
+        '.git/',
+        '.playwright-mcp/',
+        '.tilt-state/',
+    ],
+)
+
+# -----------------------------------------------------------------------------
 # Vendored chart dependencies. `helm/charts/` is gitignored (*.tgz), so a fresh
 # clone has no collabora-online tarball and `helm upgrade` refuses to run at all
 # — the dependency-presence check fires before `collabora.enabled` is evaluated,
@@ -393,6 +420,7 @@ _srw_images = [
     ('srw-agent', 'image.agent.repository', 'image.agent.tag'),
     ('srw-mcp', 'image.mcp.repository', 'image.mcp.tag'),
     ('srw-workspace', 'image.workspace.repository', 'image.workspace.tag'),
+    ('srw-workspace-minimal', 'image.workspaceMinimal.repository', 'image.workspaceMinimal.tag'),
     ('srw-vm-controller', 'vmController.image.repository', 'vmController.image.tag'),
     ('srw-vm-preparer', 'vmController.preparation.image.repository', 'vmController.preparation.image.tag'),
 ]
