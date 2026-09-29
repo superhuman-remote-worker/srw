@@ -766,6 +766,49 @@ class TestToolsAndDelegation:
             accepted,
         )
 
+    async def test_a_session_sets_its_own_fanout_cap_but_not_the_gate(
+        self, apply, fakes
+    ):
+        # parallel_subagents.md D2: the cap is overridable per session; the
+        # fan-out gate stays operator and expert configuration.
+        result = await apply(
+            THREAD,
+            pinned_row(user_id=None),
+            {"delegation": {"enabled": True, "session_max_concurrent": 12}},
+            None,
+            request=REQUEST,
+            actor=None,
+        )
+        accepted = {"delegation": {"enabled": True, "session_max_concurrent": 12}}
+        assert result == (accepted, None)
+        assert fakes.only("store.merge_thread_config_override")[0] == (
+            THREAD,
+            accepted,
+        )
+        for delegation, detail in (
+            (
+                {"session_max_concurrent": 21},
+                "config_override.delegation.session_max_concurrent must be an "
+                "integer from 1 to 20",
+            ),
+            (
+                {"session_fanout": True},
+                "config_override.delegation.session_fanout is not a session "
+                "delegation setting",
+            ),
+        ):
+            error = await _refused(
+                apply,
+                THREAD,
+                pinned_row(),
+                {"delegation": delegation},
+                [DS_A],
+                request=REQUEST,
+                actor=ACTOR,
+            )
+            assert error.status_code == 400
+            assert error.detail == detail
+
     @pytest.mark.parametrize("delegation", [{}, {"mode": "light", "max_depth": 2}])
     async def test_an_empty_delegation_block_is_dropped(self, apply, fakes, delegation):
         result = await apply(

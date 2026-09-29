@@ -455,6 +455,30 @@ async def test_happy_path_returns_watermarks_and_shared_assembly(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_session_bundle_advertises_batch_settle_beside_attach(monkeypatch):
+    """The capability rides at the top level of the bundle. ``attach`` is
+    splatted into the agent's ``_attach_session``, and a deployed image without
+    the new parameter would refuse every claim (parallel_subagents.md §12)."""
+    from orchestrator import main as orch_main
+
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
+    _patch(monkeypatch, orch_main, db)
+
+    out = await unit_claim_bundle.claim_bundle_for_unit(
+        UNIT_ID,
+        lease_token=7,
+        pod_name=POD_NAME,
+        pod_uid=POD_UID,
+        dependencies=sessions_composition.unit_claim_bundle_dependencies(
+            orch_main.app.state.resources
+        ),
+    )
+
+    assert out["session_subagent_batch_settle_contract"] == 1
+    assert "session_subagent_batch_settle_contract" not in out["attach"]
+
+
+@pytest.mark.asyncio
 async def test_session_bundle_stolen_during_slow_assembly_is_rejected(monkeypatch):
     """No attach credentials cross the response boundary after a token steal."""
 

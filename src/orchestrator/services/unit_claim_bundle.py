@@ -65,6 +65,10 @@ from orchestrator.services.stateless_workspace_gate import (
 from orchestrator.services.vm_provisioner import vm_provisioner
 from shared.runtime.core.loader import canonical_config_name
 from shared.session_retirement import STATELESS_STOP_KEYS, stateless_stop_markers
+from shared.session_subagent_batch import (
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT,
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
+)
 from shared.workspace_contract import (
     WorkspaceContractError,
     resolve_workspace_contract,
@@ -1061,5 +1065,13 @@ async def _assemble_claim_bundle(
             "input_seq": row["input_seq"],
             "consumed_seq": row["consumed_seq"],
         },
+        # ``attach`` is splatted into the agent's ``_attach_session``, which
+        # has no ``**kwargs``: a key it does not know fails every claim of an
+        # agent image that predates it. Capabilities therefore ride beside
+        # it; this one says the orchestrator settles an abandoned delegation
+        # turn as one batch (parallel_subagents.md §12).
+        SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: (
+            SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT
+        ),
         "attach": attach,
     }

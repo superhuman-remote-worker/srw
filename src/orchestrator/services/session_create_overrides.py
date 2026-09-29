@@ -108,10 +108,21 @@ def bridge_nested_llm_override(
     return bridged
 
 
-#: The live ``delegation`` keys after U3 (loader.normalize_delegation_block).
+#: The ``delegation`` keys a session request may set: the live keys after U3
+#: (loader.normalize_delegation_block) plus the session's own fan-out cap
+#: (parallel_subagents.md D2: overridable per expert and per session). The
+#: fan-out gates ``session_fanout`` / ``session_fanout_pinned`` are operator
+#: and expert configuration and stay refused here.
 DELEGATION_KEYS: frozenset[str] = frozenset(
-    {"enabled", "max_concurrent", "run_in_background_default"}
+    {
+        "enabled",
+        "max_concurrent",
+        "run_in_background_default",
+        "session_max_concurrent",
+    }
 )
+#: How many children one session turn runs at once (D2): 1 to 20.
+SESSION_MAX_CONCURRENT_RANGE: tuple[int, int] = (1, 20)
 #: Pre-U3 keys the loader drops with a deprecation warning; tolerated here for
 #: the same reason (a stored layer may still carry them), never persisted. One
 #: source of truth: the loader's own list, so the two boundaries cannot drift.
@@ -158,6 +169,18 @@ def validate_delegation_override(value: Any) -> dict[str, Any]:
             if not isinstance(raw, bool):
                 raise SessionOverrideError(
                     f"config_override.delegation.{key} must be a boolean"
+                )
+            out[key] = raw
+        elif key == "session_max_concurrent":
+            low, high = SESSION_MAX_CONCURRENT_RANGE
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, int)
+                or not low <= raw <= high
+            ):
+                raise SessionOverrideError(
+                    "config_override.delegation.session_max_concurrent must be "
+                    f"an integer from {low} to {high}"
                 )
             out[key] = raw
         else:

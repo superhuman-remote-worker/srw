@@ -191,6 +191,47 @@ class TestDelegationOverride:
         with pytest.raises(SessionOverrideError):
             validate_delegation_override(bad)
 
+    @pytest.mark.parametrize("cap", [1, 6, 20])
+    def test_a_session_may_set_its_own_fanout_cap(self, cap):
+        # parallel_subagents.md D2: the session cap is overridable per session.
+        from orchestrator.services.session_create_overrides import (
+            validate_delegation_override,
+        )
+
+        assert validate_delegation_override(
+            {"enabled": True, "session_max_concurrent": cap}
+        ) == {"enabled": True, "session_max_concurrent": cap}
+
+    @pytest.mark.parametrize("cap", [0, 21, -1, True, False, "6", 6.0, None])
+    def test_the_session_cap_is_an_integer_from_1_to_20(self, cap):
+        from orchestrator.services.session_create_overrides import (
+            validate_delegation_override,
+        )
+
+        with pytest.raises(SessionOverrideError, match="from 1 to 20"):
+            validate_delegation_override({"session_max_concurrent": cap})
+
+    @pytest.mark.parametrize("gate", ["session_fanout", "session_fanout_pinned"])
+    def test_the_fanout_gates_stay_operator_configuration(self, gate):
+        from orchestrator.services.session_create_overrides import (
+            validate_delegation_override,
+        )
+
+        with pytest.raises(SessionOverrideError, match="not a session delegation"):
+            validate_delegation_override({"enabled": True, gate: True})
+
+    def test_the_bridge_carries_the_session_cap(self):
+        from orchestrator.services.session_create_overrides import (
+            bridge_nested_delegation_override,
+        )
+
+        rebuilt: dict = {"tools": {"delegation": ["delegate_agent"]}}
+        bridged = bridge_nested_delegation_override(
+            {"delegation": {"enabled": True, "session_max_concurrent": 8}}, rebuilt
+        )
+        assert rebuilt["delegation"] == {"enabled": True, "session_max_concurrent": 8}
+        assert bridged == ["delegation.enabled", "delegation.session_max_concurrent"]
+
     def test_legacy_keys_are_tolerated_and_dropped(self):
         # The loader drops these with a deprecation warning; a stored layer may
         # still carry them, so they must not turn a valid request into a 400.

@@ -91,6 +91,10 @@ from orchestrator.services.session_runtime_identity import (
     expected_agent_shas,
     thread_uses_pinned_execution,
 )
+from shared.session_subagent_batch import (
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT,
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -900,6 +904,14 @@ async def send_session_attach_locked(
             )
         return release not in {"released", "already_detached"}
     payload["session_runtime_attach_token"] = attach_token
+    # This orchestrator settles an abandoned delegation turn as one batch
+    # (parallel_subagents.md §12). Both pinned /session/attach handlers read
+    # named fields, so the key is safe for agents that predate it; it is NOT
+    # part of the shared payload, which the stateless executor splats into
+    # ``_attach_session`` (the claim bundle advertises it beside ``attach``).
+    payload[SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY] = (
+        SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT
+    )
 
     current = await store.get_thread(thread_id)
     if (

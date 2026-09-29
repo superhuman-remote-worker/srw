@@ -1256,6 +1256,84 @@ class TestSendSessionAttachPayload:
             "narration_mode": expected_narration,
         }
 
+    # The keyword parameters of ``agent.api.persistent_app._attach_session``
+    # in the deployed agent images, frozen on purpose. The stateless executor
+    # calls ``pa._attach_session(**claim_bundle["attach"])`` and the function
+    # has no ``**kwargs``, so a payload key outside this set makes every
+    # stateless claim of an older image fail with ``TypeError``. Orchestrators
+    # roll out first (parallel_subagents.md §12): never widen this set while
+    # an image without the new parameter can still claim units. A capability
+    # belongs beside ``attach`` in the claim bundle instead.
+    ATTACH_SESSION_KEYWORDS_OF_DEPLOYED_AGENTS = frozenset(
+        {
+            "thread_id",
+            "config_override",
+            "resolved_config",
+            "project_ids",
+            "datasources",
+            "config_name",
+            "runtime_actor",
+            "pinned_status_identity_contract",
+            "pinned_runtime_generation_contract",
+            "session_runtime_generation",
+            "session_runtime_attach_token",
+            "conversation_revision",
+            "events_epoch",
+            "workspace_generation",
+            "workspace_runtime_incarnation",
+        }
+    )
+
+    @pytest.mark.asyncio
+    async def test_shared_attach_payload_splats_into_deployed_attach_session(self):
+        thread = self._thread(user_id="owner-1")
+        with (
+            patch.object(
+                orch_main.app.state.resources.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                workspace_tier_policy_module,
+                "inject_lite_workspace_config",
+                side_effect=lambda value, **_kwargs: value,
+            ),
+            patch.object(
+                thread_mount_rows_module,
+                "thread_project_ids",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                thread_project_authorization_module,
+                "revalidate_thread_project_ids",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                thread_datasource_authorization_module,
+                "resolve_authorized_thread_datasources",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                session_config_resolution_module,
+                "resolve_session_config",
+                AsyncMock(return_value=None),
+            ),
+        ):
+            payload = await session_attach_payload.assemble_session_attach_payload(
+                self.thread_id,
+                config_override={"llm": {"model": "m"}},
+                dependencies=preparation_composition.session_attach_payload_dependencies(
+                    orch_main.app.state.resources
+                ),
+            )
+
+        assert payload is not None
+        unknown = set(payload) - self.ATTACH_SESSION_KEYWORDS_OF_DEPLOYED_AGENTS
+        assert unknown == set(), (
+            f"stateless attach keys {sorted(unknown)} would fail every claim "
+            "of a deployed agent (see ATTACH_SESSION_KEYWORDS_OF_DEPLOYED_AGENTS)"
+        )
+
     @pytest.mark.asyncio
     async def test_attach_materializes_scalars_in_legacy_config_fallback(self):
         thread = self._thread(
