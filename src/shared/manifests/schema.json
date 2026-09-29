@@ -480,6 +480,9 @@
             },
             "storage": {
               "$ref": "#/$defs/Quantity"
+            },
+            "requests": {
+              "$ref": "#/$defs/Compute"
             }
           }
         },

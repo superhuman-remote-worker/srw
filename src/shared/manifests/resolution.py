@@ -234,6 +234,39 @@ class _Bundle:
                         )
         elif kind == "WorkspaceTemplate":
             spec.setdefault("retention", "Delete")
+            resources = spec.get("resources", {})
+            requests = resources.get("requests", {})
+            if requests and spec["backend"] != "sandbox":
+                fail(
+                    "UnsupportedWorkspace",
+                    "Only container workspaces support resources.requests.",
+                    document=number,
+                    path=pointer((*path, "resources", "requests")),
+                )
+            for field in ("cpu", "memory"):
+                if field not in requests:
+                    continue
+                request_path = (*path, "resources", "requests", field)
+                if field not in resources:
+                    fail(
+                        "InvalidResources",
+                        "A resource request needs its maximum in the same template.",
+                        document=number,
+                        path=pointer(request_path),
+                    )
+                request, limit = requests[field], resources[field]
+                if field == "memory":
+                    request = _quantity(request, number=number, path=request_path)
+                    limit = _quantity(
+                        limit, number=number, path=(*path, "resources", field)
+                    )
+                if request > limit:
+                    fail(
+                        "InvalidResources",
+                        "Resource request exceeds its limit.",
+                        document=number,
+                        path=pointer(request_path),
+                    )
             if spec["backend"] == "virtual" and (
                 spec.get("environment")
                 or spec.get("initialize")
