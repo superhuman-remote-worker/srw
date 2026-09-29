@@ -62,6 +62,25 @@ _LEDGER_TIMEOUT_S = 5.0
 _ORPHAN_PARTIAL_MAX_CHARS = 4000
 
 
+def _orphan_row_counter(row: Mapping[str, Any], name: str) -> int:
+    """A recovered child's ``turns``/``tokens`` from either listing shape.
+
+    A worker ledger lists database rows (``total_turns``); a session ledger
+    lists the orchestrator's roster payload (``turns``). Reading only the
+    database name sent zeros for every session orphan, and the orchestrator
+    refuses a terminal retry whose counters differ from the stored ones.
+    """
+    for key in (f"total_{name}", name):
+        value = row.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
 class _BackgroundSettled(Exception):
     """Internal non-error edge for a queued child stopped before provider I/O."""
 
@@ -1841,8 +1860,8 @@ class SubagentRuntime:
                                 message=envelope,
                                 status=terminal_status,
                                 outcome=terminal_outcome,
-                                turns=int(row.get("total_turns") or 0),
-                                tokens=int(row.get("total_tokens") or 0),
+                                turns=_orphan_row_counter(row, "turns"),
+                                tokens=_orphan_row_counter(row, "tokens"),
                                 report_path=row.get("report_path") or None,
                                 error=(
                                     row.get("subagent_error")
@@ -1900,8 +1919,8 @@ class SubagentRuntime:
                         subagent_id,
                         status="interrupted",
                         outcome="interrupted:parent_restart",
-                        turns=int(row.get("total_turns") or 0),
-                        tokens=int(row.get("total_tokens") or 0),
+                        turns=_orphan_row_counter(row, "turns"),
+                        tokens=_orphan_row_counter(row, "tokens"),
                         report_path=row.get("report_path") or None,
                         error="the parent runtime restarted",
                     )
@@ -1956,8 +1975,8 @@ class SubagentRuntime:
                 run.terminal_fields = {
                     "status": "interrupted",
                     "outcome": "interrupted:parent_restart",
-                    "turns": int(row.get("total_turns") or 0),
-                    "tokens": int(row.get("total_tokens") or 0),
+                    "turns": _orphan_row_counter(row, "turns"),
+                    "tokens": _orphan_row_counter(row, "tokens"),
                     "report_path": row.get("report_path") or None,
                     "error": run.error,
                 }
