@@ -110,6 +110,7 @@ POST   /api/agents/threads                                                      
 POST   /api/agents/threads/{parent_thread_id}/subagents                                 pat=refused         internal:require_internal
 POST   /api/agents/threads/{parent_thread_id}/subagents/by-call                         pat=refused         internal:require_internal
 POST   /api/agents/threads/{parent_thread_id}/subagents/live                            pat=refused         internal:require_internal
+POST   /api/agents/threads/{parent_thread_id}/subagents/settle-batch                    pat=refused         internal:require_internal
 POST   /api/agents/threads/{parent_thread_id}/subagents/{thread_id}                     pat=refused         internal:require_internal
 POST   /api/agents/threads/{parent_thread_id}/subagents/{thread_id}/reopen              pat=refused         internal:require_internal
 POST   /api/agents/threads/{parent_thread_id}/subagents/{thread_id}/terminal            pat=refused         internal:require_internal

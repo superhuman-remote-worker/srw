@@ -47,6 +47,10 @@ from orchestrator.services.stateless_workspace_gate import (
     thread_metadata_object,
 )
 from shared.backend_kinds import LITE_BACKENDS
+from shared.session_subagent_batch import (
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT,
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -498,6 +502,12 @@ async def assemble_session_attach_payload(
         # every admitted pinned lifecycle write must carry this identity.
         "pinned_status_identity_contract": 1,
         "pinned_runtime_generation_contract": 1,
+        # This orchestrator settles an abandoned delegation turn as one batch
+        # (parallel_subagents.md §12). An agent widens a session delegation
+        # batch past one child only against an orchestrator advertising it.
+        SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: (
+            SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT
+        ),
         "session_runtime_generation": (
             final_runtime_authority.generation
             if final_runtime_authority is not None

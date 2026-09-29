@@ -1,8 +1,8 @@
 """Agent-facing thread creation, message persistence and subagent children.
 
 Extracted verbatim from ``orchestrator.main`` (R1.B06, lane C, census group
-``S_CHILD``). Thirteen routes over three surfaces that share one transport
-(``X-Internal-Key``) and nothing else:
+``S_CHILD``), plus the session batch settle added later. Fourteen routes over
+three surfaces that share one transport (``X-Internal-Key``) and nothing else:
 
 * ``POST /api/agents/threads`` **provisions a session** — it resolves the
   application session expert, creates the thread, mints a scoped Gitea
@@ -61,6 +61,7 @@ from uuid import UUID
 from fastapi import HTTPException, Request
 
 from orchestrator.schemas.agent_child_threads import (
+    AgentSessionSubagentBatchSettleRequest,
     AgentSessionSubagentByCallRequest,
     AgentSessionSubagentCreateRequest,
     AgentSessionSubagentQueryRequest,
@@ -517,11 +518,17 @@ async def agent_list_live_session_subagent_threads(
     *,
     dependencies: AgentChildThreadDependencies,
 ) -> dict[str, Any]:
-    """List session child recovery candidates under exact authority."""
+    """List session child recovery candidates under exact authority.
+
+    ``recovery_turns`` is additive: one plan per parent turn of a candidate,
+    naming every ``delegate_agent`` call of the turn with its class, so an
+    agent can settle the turn as one batch. Agents that predate it read only
+    ``subagents``.
+    """
     postgres_db = dependencies.store
 
     try:
-        rows = await postgres_db.list_live_session_subagent_threads(
+        listed = await postgres_db.list_live_session_subagent_recovery(
             parent_thread_id,
             parent_authority=session_subagent_authority_wire(body.parent_authority),
         )
@@ -529,10 +536,12 @@ async def agent_list_live_session_subagent_threads(
         raise HTTPException(status_code=409, detail=exc.detail()) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    rows = listed["subagents"]
     return {
         "parent_thread_id": parent_thread_id,
         "count": len(rows),
         "subagents": [_subagent_thread_payload(row) for row in rows],
+        "recovery_turns": listed["recovery_turns"],
     }
 
 
@@ -665,6 +674,55 @@ async def agent_terminalize_session_subagent_thread(
     return result
 
 
+async def agent_settle_session_subagent_batch(
+    request: Request,
+    parent_thread_id: str,
+    body: AgentSessionSubagentBatchSettleRequest,
+    *,
+    dependencies: AgentChildThreadDependencies,
+) -> dict[str, Any]:
+    """Settle one abandoned session delegation turn as one batch.
+
+    Idempotent per parent input: a retry after a lost response returns the
+    committed continuation as ``idempotent``. ``applied``,
+    ``idempotent``, ``already_delivered`` and ``nothing_to_recover`` are
+    successes. A request that does not name exactly the turn's owed children
+    at their generations is a 409 whose detail is the server's view
+    (``result: stale``); nothing is written.
+    """
+    postgres_db = dependencies.store
+
+    try:
+        result = await postgres_db.settle_session_subagent_batch(
+            parent_thread_id=parent_thread_id,
+            parent_authority=session_subagent_authority_wire(body.parent_authority),
+            parent_input_message_id=str(body.parent_input_message_id),
+            parent_iteration=body.parent_iteration,
+            members=[member.model_dump(mode="json") for member in body.members],
+        )
+    except SessionParentAuthorityRefused as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
+    except InputDeliveryConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "subagent_delivery_conflict", "message": str(exc)},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="Session or parent input not found")
+    if result.get("result") not in {
+        "applied",
+        "idempotent",
+        "already_delivered",
+        "nothing_to_recover",
+    }:
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
 async def agent_save_message(
     request: Request,
     thread_id: str,
@@ -724,6 +782,7 @@ __all__ = [
     "agent_reopen_session_subagent_thread",
     "agent_reopen_subagent_thread",
     "agent_save_message",
+    "agent_settle_session_subagent_batch",
     "agent_terminalize_session_subagent_thread",
     "agent_terminalize_subagent_thread",
     "session_subagent_authority_wire",

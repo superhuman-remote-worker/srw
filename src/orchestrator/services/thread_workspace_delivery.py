@@ -77,6 +77,10 @@ from orchestrator.services.workspace_suspension import (
     WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY,
 )
 from shared.backend_kinds import LITE_BACKENDS
+from shared.session_subagent_batch import (
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT,
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1283,6 +1287,11 @@ async def agent_get_thread_workspace_locked(
         "status": ws.get("status", "none"),
         "pinned_status_identity_contract": 1,
         "pinned_runtime_generation_contract": 1,
+        # Same advertisement as the pushed attach payload
+        # (session_attach_payload): batch settle of a delegation turn.
+        SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: (
+            SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT
+        ),
         "session_runtime_generation": (
             final_runtime_authority.generation
             if final_runtime_authority is not None

@@ -268,7 +268,9 @@ class TestSessionLifecycleRoutes:
     async def test_live_get_and_by_call_return_session_parent_rows(self, monkeypatch):
         row = _row()
         db = SimpleNamespace(
-            list_live_session_subagent_threads=AsyncMock(return_value=[row]),
+            list_live_session_subagent_recovery=AsyncMock(
+                return_value={"subagents": [row], "recovery_turns": []}
+            ),
             get_session_subagent_thread=AsyncMock(return_value=row),
             get_session_subagent_thread_by_call=AsyncMock(return_value=row),
         )

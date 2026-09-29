@@ -49,6 +49,18 @@ from orchestrator.database.dispatch_discovery import (
     JobDiscoveryCursor,
     discovery_page_bounds,
 )
+from orchestrator.database.session_subagent_recovery import (
+    advance_recovery_watermark,
+    delivery_disposition,
+    end_session_child,
+    final_parent_response_seq,
+    load_recovery_parent_input,
+    parent_turn_completed as recovered_turn_completed,
+    plan_recovery_turns,
+    settle_recovery_source,
+    settle_session_subagent_batch as _settle_session_subagent_batch,
+    stamp_recovered_child,
+)
 
 from orchestrator.services.datasource_policy_errors import (
     DatasourcePolicyError as DatasourcePolicyError,
@@ -36148,70 +36160,66 @@ class PostgresDB:
                     parent_authority,
                     parent_thread_id=parent_uuid,
                 )
-                rows = await conn.fetch(
-                    f"""
-                    SELECT {self._SUBAGENT_THREAD_COLUMNS},
-                           CASE WHEN status = 'ended'
-                                THEN 'terminal_foreground'
-                                ELSE 'live'
-                           END AS recovery_kind
-                      FROM threads
-                     WHERE kind = 'subagent'
-                       AND parent_job_id IS NULL
-                       AND parent_thread_id = $1
-                       AND (
-                           (
-                               status IN ('created', 'active')
-                               AND subagent_status IN ('queued', 'running')
-                           )
-                           OR (
-                               status = 'ended'
-                               AND subagent_outcome IS DISTINCT FROM
-                                   'cancelled:parent_retired'
-                               AND parent_tool_call_id IS NOT NULL
-                               AND COALESCE(
-                                   metadata->'subagent'->>'run_in_background',
-                                   'false'
-                               ) = 'false'
-                               AND (
-                                   metadata->>
-                                       'subagent_foreground_recovery_generation'
-                               ) IS DISTINCT FROM runtime_generation::text
-                               -- The ToolMessage is the delivery fact: a child
-                               -- whose synchronous result is durable in the
-                               -- parent transcript has nothing to recover.
-                               AND NOT EXISTS (
-                                   SELECT 1
-                                     FROM thread_messages AS parent_result
-                                    WHERE parent_result.thread_id = $1
-                                      AND parent_result.role = 'tool'
-                                      AND parent_result.tool_call_id =
-                                          threads.parent_tool_call_id
-                                      AND parent_result.rewound_at IS NULL
-                               )
-                               AND EXISTS (
-                                   SELECT 1
-                                     FROM thread_messages AS parent_call
-                                     CROSS JOIN LATERAL jsonb_array_elements(
-                                         COALESCE(
-                                             parent_call.tool_calls,
-                                             '[]'::jsonb
-                                         )
-                                     ) AS tool_call
-                                    WHERE parent_call.thread_id = $1
-                                      AND parent_call.role = 'ai'
-                                      AND parent_call.rewound_at IS NULL
-                                      AND tool_call->>'id' =
-                                          threads.parent_tool_call_id
-                               )
-                           )
-                       )
-                     ORDER BY created_at, id
-                     FOR SHARE
-                    """,
-                    parent_uuid,
-                )
+                return await self._fetch_live_session_subagent_rows(conn, parent_uuid)
+
+    async def _fetch_live_session_subagent_rows(
+        self, conn: Any, parent_uuid: UUID
+    ) -> List[Dict[str, Any]]:
+        # One predicate with rewind's pending-child check (shared.thread_rewind):
+        # what recovery still owes is exactly what blocks a rewind.
+        from shared.thread_rewind import LIVE_SESSION_CHILD_PREDICATE_SQL
+
+        rows = await conn.fetch(
+            f"""
+            SELECT {self._SUBAGENT_THREAD_COLUMNS},
+                   CASE WHEN child.status = 'ended'
+                        THEN 'terminal_foreground'
+                        ELSE 'live'
+                   END AS recovery_kind
+              FROM threads AS child
+             WHERE {LIVE_SESSION_CHILD_PREDICATE_SQL}
+             ORDER BY child.created_at, child.id
+             FOR SHARE
+            """,
+            parent_uuid,
+        )
         return [dict(row) for row in rows]
+
+    async def list_live_session_subagent_recovery(
+        self,
+        parent_thread_id: str,
+        *,
+        parent_authority: Any,
+    ) -> Dict[str, Any]:
+        """The recovery candidates plus one plan per turn that owns them.
+
+        ``subagents`` is exactly :meth:`list_live_session_subagent_threads`.
+        ``recovery_turns`` names, for each parent turn of a candidate, the
+        turn's delegation calls in provider order with the class of each, so a
+        successor can settle the turn as one batch
+        (``settle_session_subagent_batch``). Both come from one transaction.
+        """
+
+        try:
+            parent_uuid = UUID(str(parent_thread_id))
+        except (ValueError, TypeError, AttributeError):
+            return {"subagents": [], "recovery_turns": []}
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                parsed = coerce_session_parent_authority(parent_authority)
+                await require_session_parent_authority(
+                    conn,
+                    parsed,
+                    parent_thread_id=parent_uuid,
+                )
+                rows = await self._fetch_live_session_subagent_rows(conn, parent_uuid)
+                plans = await plan_recovery_turns(
+                    conn,
+                    parsed,
+                    parent_thread_id=parent_uuid,
+                    candidates=rows,
+                )
+        return {"subagents": rows, "recovery_turns": plans}
 
     async def get_session_subagent_thread(
         self,
@@ -36474,7 +36482,6 @@ class PostgresDB:
                     )
                 supersedes_input_seq: int | None = None
                 recovery_turn_number: int | None = None
-                source_delivery_id: UUID | None = None
                 source_delivery_state: str | None = None
                 source_already_complete = False
                 parent_iteration: int | None = None
@@ -36501,61 +36508,20 @@ class PostgresDB:
                         raise ValueError(
                             "foreground recovery has no exact parent messages"
                         ) from exc
-                    parent_input = await conn.fetchrow(
-                        """
-                        SELECT message.seq, message.role, delivery.delivery_id,
-                               delivery.state AS delivery_state
-                          FROM thread_messages AS message
-                          LEFT JOIN thread_input_deliveries AS delivery
-                            ON delivery.thread_id = message.thread_id
-                           AND delivery.message_id = message.id
-                         WHERE message.id = $1
-                           AND message.thread_id = $2
-                           AND message.turn_number = $3
-                           AND message.rewound_at IS NULL
-                           AND (
-                               message.role = 'human'
-                               OR (
-                                   message.role = 'event'
-                                   AND delivery.state IN ('admitted', 'settled')
-                               )
-                         )
-                        """,
-                        parent_input_message_id,
-                        parent_uuid,
-                        parent_iteration,
+                    # The input, its supersession and whether it is already
+                    # consumed are turn-level facts, shared with the batch
+                    # settle (session_subagent_recovery).
+                    recovery_input = await load_recovery_parent_input(
+                        conn,
+                        execution_lane=parsed.execution_lane,
+                        parent_thread_id=parent_uuid,
+                        parent_input_message_id=parent_input_message_id,
+                        parent_iteration=parent_iteration,
                     )
-                    if parent_input is None:
-                        raise ValueError("foreground recovery parent input is missing")
-                    supersedes_input_seq = int(parent_input["seq"])
-                    if parsed.execution_lane == "stateless":
-                        recovery_turn_number = parent_iteration
-                    raw_source_delivery_id = parent_input.get("delivery_id")
-                    source_delivery_id = (
-                        UUID(str(raw_source_delivery_id))
-                        if raw_source_delivery_id is not None
-                        else None
-                    )
-                    source_delivery_state = (
-                        str(parent_input.get("delivery_state") or "") or None
-                    )
-                    if parent_input.get("role") == "event":
-                        if source_delivery_id is None:
-                            raise ValueError(
-                                "foreground recovery event input has no delivery"
-                            )
-                    if parsed.execution_lane == "stateless":
-                        queue_consumed = await conn.fetchval(
-                            "SELECT consumed_seq FROM run_queue WHERE unit_id=$1",
-                            parent_uuid,
-                        )
-                        source_already_complete = (
-                            queue_consumed is not None
-                            and int(queue_consumed) >= supersedes_input_seq
-                        )
-                    else:
-                        queue_consumed = None
-                        source_already_complete = source_delivery_state == "settled"
+                    supersedes_input_seq = recovery_input.seq
+                    recovery_turn_number = recovery_input.recovery_turn_number
+                    source_delivery_state = recovery_input.delivery_state
+                    source_already_complete = recovery_input.source_already_complete
 
                     # Recovery from facts. The parent's ToolMessage for this
                     # call IS the child's delivery: when it is durable, an ended
@@ -36642,40 +36608,12 @@ class PostgresDB:
                         # the turn may still owe its answer and the watermark
                         # is left alone — the next claim replays with the
                         # ToolMessage in the transcript.
-                        parent_turn_completed = bool(
-                            await conn.fetchval(
-                                """
-                                SELECT EXISTS (
-                                    SELECT 1
-                                      FROM thread_events AS frame
-                                     WHERE frame.thread_id = $1
-                                       AND frame.kind = 'turn.completed'
-                                       AND (frame.payload->>'turn_id') = $2::text
-                                       AND frame.created_at >= (
-                                           SELECT created_at
-                                             FROM thread_messages
-                                            WHERE id = $3
-                                       )
-                                )
-                                OR EXISTS (
-                                    SELECT 1
-                                      FROM thread_messages AS answer
-                                     WHERE answer.thread_id = $1
-                                       AND answer.role = 'ai'
-                                       AND answer.turn_number = $5
-                                       AND answer.seq > $4
-                                       AND answer.rewound_at IS NULL
-                                       AND jsonb_array_length(
-                                           COALESCE(answer.tool_calls, '[]'::jsonb)
-                                       ) = 0
-                                )
-                                """,
-                                parent_uuid,
-                                str(int(parent_iteration)),
-                                parent_ai_message_id,
-                                int(parent_ai_seq),
-                                int(parent_iteration),
-                            )
+                        parent_turn_completed = await recovered_turn_completed(
+                            conn,
+                            parent_thread_id=parent_uuid,
+                            parent_iteration=parent_iteration,
+                            parent_ai_message_id=parent_ai_message_id,
+                            parent_ai_seq=int(parent_ai_seq),
                         )
 
                     if (
@@ -36683,100 +36621,21 @@ class PostgresDB:
                         and not source_already_complete
                         and (not delivered_by_tool_message or parent_turn_completed)
                     ):
-                        oldest_pending = await conn.fetchval(
-                            """
-                            SELECT min(message.seq)
-                              FROM thread_messages AS message
-                              LEFT JOIN thread_input_deliveries AS delivery
-                                ON delivery.message_id = message.id
-                               AND delivery.thread_id = message.thread_id
-                             WHERE message.thread_id = $1
-                               AND message.seq > COALESCE($2, -1)
-                               AND message.rewound_at IS NULL
-                               AND (
-                                   message.seq = $3
-                                   OR
-                                   message.role = 'human'
-                                   OR (
-                                       message.role = 'event'
-                                       AND delivery.execution_lane = 'stateless'
-                                       AND delivery.state IN (
-                                           'persisted', 'queued', 'deferred'
-                                       )
-                                   )
-                               )
-                            """,
-                            parent_uuid,
-                            queue_consumed,
-                            supersedes_input_seq,
+                        await advance_recovery_watermark(
+                            conn,
+                            parsed,
+                            parent_thread_id=parent_uuid,
+                            parent_input=recovery_input,
                         )
-                        if oldest_pending != supersedes_input_seq:
-                            raise ValueError(
-                                "stateless foreground recovery would skip another input"
-                            )
-                        advanced = await conn.fetchval(
-                            """
-                            UPDATE run_queue
-                               SET consumed_seq = GREATEST(
-                                       COALESCE(consumed_seq, -1), $2
-                                   )
-                             WHERE unit_id = $1
-                               AND unit_kind = 'session_turn'
-                               AND state = 'leased'
-                               AND lease_token = $3
-                               AND leased_by = $4
-                               AND input_delivery_capable_lease_token = $3
-                            RETURNING consumed_seq
-                            """,
-                            parent_uuid,
-                            supersedes_input_seq,
-                            int(parsed.lease_token or 0),
-                            str(parsed.executor_id),
-                        )
-                        if advanced is None:
-                            raise SessionParentAuthorityRefused(
-                                "stateless_parent_not_current"
-                            )
                     if source_delivery_state == "admitted":
-                        settled_source = await conn.fetchval(
-                            """
-                            UPDATE thread_input_deliveries
-                               SET state = 'settled',
-                                   settled_at = COALESCE(
-                                       settled_at, CURRENT_TIMESTAMP
-                                   ),
-                                   updated_at = statement_timestamp()
-                             WHERE delivery_id = $1
-                               AND thread_id = $2
-                               AND message_id = (
-                                   SELECT id FROM thread_messages
-                                    WHERE thread_id = $2 AND seq = $3
-                               )
-                               AND state = 'admitted'
-                            RETURNING delivery_id
-                            """,
-                            source_delivery_id,
-                            parent_uuid,
-                            supersedes_input_seq,
+                        await settle_recovery_source(
+                            conn,
+                            parent_thread_id=parent_uuid,
+                            parent_input=recovery_input,
                         )
-                        if settled_source is None:
-                            raise ValueError(
-                                "foreground recovery lost source input authority"
-                            )
                     if delivered_by_tool_message:
-                        await conn.execute(
-                            """
-                            UPDATE threads
-                               SET metadata = jsonb_set(
-                                   COALESCE(metadata, '{}'::jsonb),
-                                   '{subagent_foreground_recovery_generation}',
-                                   to_jsonb($2::text),
-                                   true
-                               )
-                             WHERE id = $1
-                            """,
-                            child_uuid,
-                            str(expected_generation),
+                        await stamp_recovered_child(
+                            conn, child_uuid, expected_generation
                         )
                         return {
                             "result": "already_delivered",
@@ -36797,163 +36656,36 @@ class PostgresDB:
                 parent_result_already_durable = False
                 if foreground_orphan_recovery:
                     # call_id, parent_ai_seq and parent_result_seq were settled
-                    # above, before the watermark side effects.
-                    stateless_finalized_end_seq: int | None = None
-                    stateless_completion_effect_present = False
-                    if parsed.execution_lane == "stateless":
-                        stateless_completion_effect_present = bool(
-                            await conn.fetchval(
-                                """
-                                SELECT EXISTS (
-                                    SELECT 1
-                                      FROM thread_messages AS source
-                                      JOIN completion_effects AS effect
-                                        ON effect.producer_kind = 'session_turn'
-                                       AND effect.producer_id =
-                                               source.turn_execution_id
-                                       AND effect.effect_name =
-                                               'final_memory_extraction'
-                                     WHERE source.id = $2
-                                       AND source.thread_id = $1
-                                )
-                                """,
-                                parent_uuid,
-                                parent_input_message_id,
-                            )
+                    # above, before the watermark side effects. The final
+                    # answer, behind an authoritative turn boundary, is a
+                    # turn-level fact shared with the batch settle.
+                    final_parent_response = (
+                        await final_parent_response_seq(
+                            conn,
+                            execution_lane=parsed.execution_lane,
+                            parent_thread_id=parent_uuid,
+                            parent_input=recovery_input,
+                            parent_iteration=parent_iteration,
+                            after_seq=int(parent_ai_seq),
                         )
-                        stateless_finalized_end_seq = await conn.fetchval(
-                            """
-                            SELECT CASE WHEN count(*) = 1 THEN min(
-                                       (effect.detail->>'end_seq')::bigint
-                                   ) END
-                              FROM thread_messages AS source
-                              JOIN completion_effects AS effect
-                                ON effect.producer_kind = 'session_turn'
-                               AND effect.producer_id = source.turn_execution_id
-                               AND effect.effect_name = 'final_memory_extraction'
-                               AND effect.scope_id = $1
-                               AND effect.effect_group = 'memory_extraction'
-                             WHERE source.id = $2
-                               AND source.thread_id = $1
-                               AND source.seq = $3
-                               AND source.turn_execution_id IS NOT NULL
-                               AND effect.detail @> jsonb_build_object(
-                                   'input_message_id', source.id,
-                                   'turn_number', $4::integer
-                               )
-                               AND jsonb_typeof(
-                                   effect.detail->'boundary_seq'
-                               ) = 'number'
-                               AND jsonb_typeof(
-                                   effect.detail->'end_seq'
-                               ) = 'number'
-                               AND (effect.detail->>'boundary_seq')::bigint =
-                                       source.seq
-                            """,
-                            parent_uuid,
-                            parent_input_message_id,
-                            supersedes_input_seq,
-                            parent_iteration,
-                        )
-                    final_parent_response_seq = await conn.fetchval(
-                        """
-                                SELECT min(response.seq)
-                                  FROM thread_messages AS response
-                                 WHERE response.thread_id = $1
-                                   AND response.role = 'ai'
-                                   AND response.turn_number = $2
-                                   AND response.seq > $3
-                                   AND response.rewound_at IS NULL
-                                   AND jsonb_array_length(
-                                       COALESCE(response.tool_calls, '[]'::jsonb)
-                                   ) = 0
-                        """,
-                        parent_uuid,
-                        parent_iteration,
-                        int(parent_ai_seq),
+                        is not None
                     )
-                    final_parent_response = final_parent_response_seq is not None
-                    if final_parent_response and not source_already_complete:
-                        finalized_turn_boundary = False
-                        if parsed.execution_lane == "stateless":
-                            if stateless_completion_effect_present:
-                                finalized_turn_boundary = bool(
-                                    stateless_finalized_end_seq is not None
-                                    and int(stateless_finalized_end_seq)
-                                    >= int(final_parent_response_seq)
-                                )
-                            else:
-                                # Incremental final-AI persistence can win just
-                                # before the batch reconcile that creates the
-                                # memory effect. The exact live lease, oldest
-                                # source, immutable parent call, and unique
-                                # final row are sufficient to checkpoint the
-                                # response without a second provider turn.
-                                finalized_turn_boundary = True
-                        else:
-                            # Pinned delivery settlement is the authoritative
-                            # no-second-provider boundary.  Memory/Git effects
-                            # run after the final AI row and are healable; a
-                            # crash between them must not replay the provider.
-                            finalized_turn_boundary = source_delivery_state in {
-                                "admitted",
-                                "settled",
-                            }
-                        if not finalized_turn_boundary:
-                            raise ValueError(
-                                "foreground recovery found a final parent response "
-                                "without an authoritative settled turn boundary"
-                            )
                     if final_parent_response:
                         if not already_terminal:
-                            await conn.execute(
-                                """
-                                UPDATE threads
-                                   SET status = 'ended',
-                                       subagent_status = $4,
-                                       subagent_outcome = COALESCE(
-                                           $5, subagent_outcome
-                                       ),
-                                       total_turns = COALESCE($6, total_turns),
-                                       total_tokens = COALESCE($7, total_tokens),
-                                       report_path = COALESCE($8, report_path),
-                                       subagent_error = COALESCE(
-                                           $9, subagent_error
-                                       ),
-                                       ended_at = COALESCE(
-                                           ended_at, CURRENT_TIMESTAMP
-                                       ),
-                                       last_activity = CURRENT_TIMESTAMP
-                                 WHERE id = $1
-                                   AND kind = 'subagent'
-                                   AND parent_job_id IS NULL
-                                   AND parent_thread_id = $2
-                                   AND runtime_generation = $3
-                                   AND status <> 'ended'
-                                """,
-                                child_uuid,
-                                parent_uuid,
-                                expected_generation,
-                                terminal_kind,
-                                outcome,
-                                turns,
-                                tokens,
-                                report_path,
-                                error,
+                            await end_session_child(
+                                conn,
+                                child_id=child_uuid,
+                                parent_thread_id=parent_uuid,
+                                runtime_generation=expected_generation,
+                                subagent_status=terminal_kind,
+                                outcome=outcome,
+                                turns=turns,
+                                tokens=tokens,
+                                report_path=report_path,
+                                error=error,
                             )
-                        await conn.execute(
-                            """
-                            UPDATE threads
-                               SET metadata = jsonb_set(
-                                   COALESCE(metadata, '{}'::jsonb),
-                                   '{subagent_foreground_recovery_generation}',
-                                   to_jsonb($2::text),
-                                   true
-                               )
-                             WHERE id = $1
-                            """,
-                            child_uuid,
-                            str(expected_generation),
+                        await stamp_recovered_child(
+                            conn, child_uuid, expected_generation
                         )
                         return {
                             "result": "already_delivered",
@@ -37023,37 +36755,19 @@ class PostgresDB:
                                 "terminal session child retry changed its " + field
                             )
                 if not already_terminal:
-                    ended = await conn.fetchval(
-                        """
-                        UPDATE threads
-                           SET status = 'ended',
-                               subagent_status = $4,
-                               subagent_outcome = COALESCE($5, subagent_outcome),
-                               total_turns = COALESCE($6, total_turns),
-                               total_tokens = COALESCE($7, total_tokens),
-                               report_path = COALESCE($8, report_path),
-                               subagent_error = COALESCE($9, subagent_error),
-                               ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP),
-                               last_activity = CURRENT_TIMESTAMP
-                         WHERE id = $1
-                           AND kind = 'subagent'
-                           AND parent_job_id IS NULL
-                           AND parent_thread_id = $2
-                           AND runtime_generation = $3
-                           AND status <> 'ended'
-                        RETURNING id
-                        """,
-                        child_uuid,
-                        parent_uuid,
-                        expected_generation,
-                        terminal_kind,
-                        outcome,
-                        turns,
-                        tokens,
-                        report_path,
-                        error,
+                    ended = await end_session_child(
+                        conn,
+                        child_id=child_uuid,
+                        parent_thread_id=parent_uuid,
+                        runtime_generation=expected_generation,
+                        subagent_status=terminal_kind,
+                        outcome=outcome,
+                        turns=turns,
+                        tokens=tokens,
+                        report_path=report_path,
+                        error=error,
                     )
-                    if ended is None:
+                    if not ended:
                         return {
                             "result": "stale",
                             "thread_id": str(child_uuid),
@@ -37130,14 +36844,7 @@ class PostgresDB:
                         )
                 if delivery is not None and not delivery.get("execution_disposition"):
                     delivery = dict(delivery)
-                    delivery["execution_disposition"] = (
-                        "historical"
-                        if delivery.get("rewound_at") is not None
-                        and str(delivery.get("state") or "") in {"admitted", "settled"}
-                        else "superseded"
-                        if delivery.get("rewound_at") is not None
-                        else "current"
-                    )
+                    delivery["execution_disposition"] = delivery_disposition(delivery)
                 result = {
                     "result": (
                         "idempotent"
@@ -37166,35 +36873,48 @@ class PostgresDB:
                         "role": "event",
                         "message_id": str(delivery.get("message_id") or ""),
                         "state": str(delivery.get("state") or ""),
-                        "execution_disposition": str(
-                            delivery.get("execution_disposition")
-                            or (
-                                "historical"
-                                if delivery.get("rewound_at") is not None
-                                and str(delivery.get("state") or "")
-                                in {"admitted", "settled"}
-                                else "superseded"
-                                if delivery.get("rewound_at") is not None
-                                else "current"
-                            )
-                        ),
+                        "execution_disposition": delivery_disposition(delivery),
                     }
                 if foreground_orphan_recovery:
-                    await conn.execute(
-                        """
-                        UPDATE threads
-                           SET metadata = jsonb_set(
-                               COALESCE(metadata, '{}'::jsonb),
-                               '{subagent_foreground_recovery_generation}',
-                               to_jsonb($2::text),
-                               true
-                           )
-                         WHERE id = $1
-                        """,
-                        child_uuid,
-                        str(expected_generation),
-                    )
+                    await stamp_recovered_child(conn, child_uuid, expected_generation)
                 return result
+
+    async def settle_session_subagent_batch(
+        self,
+        *,
+        parent_thread_id: str,
+        parent_authority: Any,
+        parent_input_message_id: str,
+        parent_iteration: int,
+        members: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any] | None:
+        """Settle one abandoned delegation turn of a session in one transaction.
+
+        The successor names every child the turn still owes (the turn's
+        live-list candidates) with its generation, terminal facts and the text
+        of its result. The server classifies every ``delegate_agent`` call of
+        the turn from durable facts, writes one tool result per undelivered
+        call in provider order and one continuation that supersedes the
+        abandoned input, advances the watermark or settles the source
+        delivery, and stamps the members — all or nothing. The turn is the
+        idempotency key. See ``session_subagent_recovery``.
+        """
+
+        try:
+            parent_uuid = UUID(str(parent_thread_id))
+            input_uuid = UUID(str(parent_input_message_id))
+        except (ValueError, TypeError, AttributeError):
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                return await _settle_session_subagent_batch(
+                    conn,
+                    coerce_session_parent_authority(parent_authority),
+                    parent_thread_id=parent_uuid,
+                    parent_input_message_id=input_uuid,
+                    parent_iteration=parent_iteration,
+                    members=members,
+                )
 
     async def list_current_session_creation_candidates(self, *, after=None, limit=32):
         """Page durable sources; invalid hints still advance the scan cursor."""

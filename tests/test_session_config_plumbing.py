@@ -1469,6 +1469,42 @@ class TestSendSessionAttachPayload:
         assert call["json"]["runtime_actor"]["access_credential"].startswith("sra_")
 
     @pytest.mark.asyncio
+    async def test_payload_advertises_the_batch_settle_contract(self):
+        """The agent learns at attach that this orchestrator settles an
+        abandoned delegation turn as one batch (parallel_subagents.md §12)."""
+        _FakeAsyncClient.response_status = 500
+        thread = self._thread()
+        with (
+            patch.object(
+                orch_main.app.state.resources.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                thread_mount_rows_module,
+                "thread_project_ids",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                deployment_gates_module, "is_experts_db_enabled", return_value=False
+            ),
+            patch.object(httpx, "AsyncClient", _FakeAsyncClient),
+        ):
+            await session_attach_binding_module.send_session_attach(
+                {"id": self.agent_id, "pod_ip": "10.0.0.1", "pod_port": 8001},
+                self.thread_id,
+                {"llm": {"model": "m"}},
+                ["p1"],
+                datasources=None,
+                config_name="session_base",
+                dependencies=sessions_composition.session_attach_binding_dependencies(
+                    orch_main.app.state.resources
+                ),
+            )
+        (call,) = _FakeAsyncClient.calls
+        assert call["json"]["session_subagent_batch_settle_contract"] == 1
+
+    @pytest.mark.asyncio
     async def test_attach_refuses_revoked_persisted_datasource_before_http(self):
         datasource_id = "11111111-2222-3333-4444-555555555555"
         thread = self._thread(

@@ -12,10 +12,10 @@ Two shapes are deliberate rather than accidental:
   explicit NULL-only compatibility field, not an oversight. A worker child
   belongs solely to the job named in the path; session children use the
   separate ``/api/agents/threads/...`` routes.
-* The five ``AgentSessionSubagent*`` bodies inherit from one query base so the
-  parent authority can never be omitted from a session-child operation, and the
-  create body sets ``extra="forbid"`` so an agent build that invents a field
-  fails loudly instead of having it silently dropped.
+* The ``AgentSessionSubagent*`` request bodies inherit from one query base so
+  the parent authority can never be omitted from a session-child operation, and
+  the create and batch-settle bodies set ``extra="forbid"`` so an agent build
+  that invents a field fails loudly instead of having it silently dropped.
 """
 
 from __future__ import annotations
@@ -24,10 +24,15 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from shared.session_subagent_authority import (
     SessionParentAuthority as AgentSessionSubagentAuthority,
+)
+from shared.session_subagent_batch import (
+    BATCH_MAX_MEMBERS,
+    BATCH_MESSAGE_MAX_CHARS,
+    MEMBER_MESSAGE_MAX_CHARS,
 )
 from shared.subagent_parent_authority import ParentExecutionAuthority
 
@@ -164,7 +169,60 @@ class AgentSessionSubagentTerminalRequest(AgentSessionSubagentQueryRequest):
     foreground_orphan_recovery: bool = False
 
 
+class AgentSessionSubagentBatchMember(BaseModel):
+    """One child the successor names in a batch settle, at its generation.
+
+    The terminal facts use the single-child terminal request's bounds. A
+    child that ended before the restart states its stored facts; a child that
+    was still live states ``interrupted`` / ``interrupted:parent_restart``.
+    ``message`` is the text of the call's result, required exactly for the
+    calls the recovery plan marks ``needs_message``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    thread_id: UUID
+    runtime_generation: UUID
+    subagent_status: str = Field(..., min_length=1, max_length=120)
+    outcome: str | None = Field(default=None, max_length=4000)
+    turns: int | None = Field(default=None, ge=0)
+    tokens: int | None = Field(default=None, ge=0)
+    report_path: str | None = Field(default=None, max_length=4000)
+    error: str | None = Field(default=None, max_length=20_000)
+    message: str | None = Field(default=None, max_length=MEMBER_MESSAGE_MAX_CHARS)
+
+
+class AgentSessionSubagentBatchSettleRequest(AgentSessionSubagentQueryRequest):
+    """Settle one abandoned delegation turn: the input and its owed children.
+
+    Bounded per member and in total: every text lands in one transaction and
+    in one parent transcript.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    parent_input_message_id: UUID
+    parent_iteration: int = Field(..., ge=1, strict=True)
+    members: list[AgentSessionSubagentBatchMember] = Field(
+        default_factory=list, max_length=BATCH_MAX_MEMBERS
+    )
+
+    @model_validator(mode="after")
+    def _bounded_batch(self) -> "AgentSessionSubagentBatchSettleRequest":
+        children = [member.thread_id for member in self.members]
+        if len(set(children)) != len(children):
+            raise ValueError("a batch settle names one child twice")
+        total = sum(len(member.message or "") for member in self.members)
+        if total > BATCH_MESSAGE_MAX_CHARS:
+            raise ValueError(
+                f"batch settle messages exceed {BATCH_MESSAGE_MAX_CHARS} characters"
+            )
+        return self
+
+
 __all__ = [
+    "AgentSessionSubagentBatchMember",
+    "AgentSessionSubagentBatchSettleRequest",
     "AgentSessionSubagentByCallRequest",
     "AgentSessionSubagentCreateRequest",
     "AgentSessionSubagentQueryRequest",
