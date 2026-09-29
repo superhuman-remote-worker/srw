@@ -914,7 +914,7 @@ immutable budgets; authenticated Ready settles the receipt. An expired budget
 leaves an attention state with normal Cancel/End controls. A Job's execution
 deadline remains independent and can cancel it while it waits for capacity.
 
-Deploy the capable application and migrations `0306`/`0307` with this value off
+Deploy the capable application and migrations `0309`/`0310` with this value off
 first. Before enabling it in a separate rollout, verify that every pre-bridge
 orchestrator Pod UID and process is gone, including detached Job workspace
 creators and Session creation callbacks. Ready replica counts, dispatcher drain
