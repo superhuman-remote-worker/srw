@@ -34,6 +34,9 @@ class _Contract:
 
 @pytest.fixture
 def wire(monkeypatch):
+    # The upgrade resolves the shipped chain: no built-ins declared.
+    monkeypatch.delenv("WORKSPACE_DEFAULTS", raising=False)
+    monkeypatch.delenv("WORKSPACE_BUILTIN_TEMPLATES", raising=False)
     events: list[str] = []
 
     async def require_job_access(request, store, job_id):
@@ -69,7 +72,7 @@ def wire(monkeypatch):
         return state.repo
 
     state = SimpleNamespace(
-        job={"id": JOB, "status": "processing", "context": {}},
+        job={"id": JOB, "status": "processing", "context": {}, "user_id": USER["id"]},
         repo=("srw-job", "main"),
         approve_error=None,
         grants_error=None,
@@ -83,6 +86,7 @@ def wire(monkeypatch):
         begin_job_workspace_tier_transition=AsyncMock(
             side_effect=lambda *_a, **_kw: state.transitioned
         ),
+        get_user=AsyncMock(return_value=USER),
     )
     forge = SimpleNamespace(
         is_initialized=True,
@@ -586,7 +590,15 @@ class TestProvisionJobWorkspace:
             "requested_backend": "virtual",
             "assignment_source": "runtime_workspace_upgrade",
             "expected_status": "processing",
+            "upgrade_config": {
+                "sources": {
+                    "tier": "upgrade",
+                    "template": "builtin",
+                    "template_name": None,
+                }
+            },
         }
+        wire.holder.store.get_user.assert_awaited_once_with(USER["id"])
         await asyncio.sleep(0)
         wire.holder.provisioner.create_workspace.assert_awaited_once_with(("job", JOB))
 

@@ -131,3 +131,130 @@ async def check_installation_workspace_defaults(db: Any) -> list[str]:
         logging.getLogger(__name__).error("Workspace defaults: %s", problem)
     _PROBLEMS[:] = problems
     return problems
+
+
+NO_SUCH_TEMPLATE = "No template named '{name}' is available here."
+CONTAINER_UPGRADE_UNAVAILABLE = (
+    "Container upgrades of a running Session are unavailable; "
+    "start a new Session with this template."
+)
+OWNER_UNAVAILABLE = "The execution owner is unavailable."
+
+
+async def work_owner(db: Any, user_id: Any) -> dict:
+    """The user whose templates an upgrade reads; never the caller."""
+    owner = await db.get_user(str(user_id)) if user_id else None
+    if not owner:
+        raise HTTPException(409, OWNER_UNAVAILABLE)
+    return owner
+
+
+async def find_readable_template(
+    db: Any, user: dict, *, project_id: str | None, name: str
+) -> tuple[dict, str]:
+    """Project, then the user's Account, then Catalog/shared: first readable wins."""
+    from orchestrator.services.manifest_authority import ManifestAuthority
+    from orchestrator.services.manifest_store import ManifestStore
+    from shared.workspace_defaults import CATALOG_SHARED, backend_mode
+
+    scopes = []
+    if project_id:
+        scopes.append({"kind": "Project", "name": str(project_id)})
+    scopes += [{"kind": "Account", "name": str(user["id"])}, dict(CATALOG_SHARED)]
+    store, authority = ManifestStore(db), ManifestAuthority(db, user)
+    for scope in scopes:
+        row = await store.by_name("WorkspaceTemplate", scope, name)
+        if row is None:
+            continue
+        await authority.resource(row)
+        return (
+            {"ref": {"name": name, "scope": scope}},
+            backend_mode(row["resolved"]["spec"]["backend"]),
+        )
+    raise HTTPException(404, NO_SUCH_TEMPLATE.format(name=name))
+
+
+async def render_upgrade_workspace(
+    db: Any,
+    user: dict,
+    *,
+    role: str,
+    project_id: str | None,
+    current_backend: str,
+    requested_backend: str | None = None,
+    template_name: str | None = None,
+) -> tuple[str, dict, dict]:
+    """The workspace an upgrade provisions: a named template, else the chain's.
+
+    Returns ``(mode, rendered_config, sources_record)``; ``rendered_config`` is
+    ``srw_workspace_config`` output.
+    """
+    from copy import deepcopy
+
+    from orchestrator.services.manifest_authority import ManifestAuthority
+    from orchestrator.services.manifest_resolution import LiveManifestResolver
+    from orchestrator.services.manifest_store import ManifestStore
+    from orchestrator.services.manifest_workspace_selection import srw_workspace_config
+    from shared.manifests.errors import ManifestError
+    from shared.workspace_defaults import MODE_RANK, UPGRADE_REFUSED, backend_mode
+
+    current = backend_mode(current_backend)
+    resolution = None
+    if template_name:
+        selection, mode = await find_readable_template(
+            db, user, project_id=project_id, name=template_name
+        )
+        if MODE_RANK[mode] <= MODE_RANK[current]:
+            raise HTTPException(400, UPGRADE_REFUSED)
+        binding = {"template": selection}
+        sources = {
+            "tier": "explicit",
+            "template": "explicit",
+            "template_name": template_name,
+        }
+    else:
+        resolution = await resolve_workspace_defaults(
+            db,
+            role=role,
+            project_id=project_id,
+            upgrade=Upgrade(
+                current=current,
+                requested=backend_mode(requested_backend)
+                if requested_backend
+                else None,
+            ),
+        )
+        mode, binding = resolution.mode, resolution.binding()
+        sources = workspace_sources_record(
+            {
+                "sources": resolution.sources(),
+                "template_name": resolution.template_name(),
+            }
+        )
+    resolver = LiveManifestResolver(ManifestStore(db), ManifestAuthority(db, user))
+    scope = (
+        {"kind": "Project", "name": str(project_id)}
+        if project_id
+        else resolver.authority.account
+    )
+    resolved = deepcopy(binding)
+    try:
+        resolved["template"] = await resolver.selection(
+            "WorkspaceTemplate", resolved["template"], scope, []
+        )
+    except HTTPException as exc:
+        if (
+            resolution is not None
+            and resolution.template_name() is not None
+            and exc.status_code == 422
+            and exc.detail == MISSING_REFERENCE
+        ):
+            raise HTTPException(409, missing_template_message(resolution)) from None
+        raise
+    except ManifestError as exc:
+        raise HTTPException(422, str(exc)) from None
+    # A template edited to another backend after it was chosen must never
+    # move work to a different tier: fail closed.
+    if backend_mode(resolved["template"]["inline"]["backend"]) != mode:
+        raise HTTPException(409, WRONG_TIER_TEMPLATE.format(tier=mode))
+    return mode, srw_workspace_config(resolved), sources

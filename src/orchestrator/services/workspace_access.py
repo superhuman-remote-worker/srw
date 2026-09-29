@@ -212,6 +212,22 @@ async def provision_job_workspace(
     # (-> _poll_job_workspace_ready) for the ready connection block, then swaps
     # in place. No status change, no _trigger_dispatch — the running agent owns
     # the swap (the whole point of the in-process design, §4.3 W1).
+    # The container provisions the defaults chain's container template, read
+    # as the Job's owner and recorded with the pending marker.
+    from orchestrator.services.workspace_defaults_resolution import (
+        render_upgrade_workspace,
+        work_owner,
+    )
+
+    owner = await work_owner(dependencies.store, job.get("user_id"))
+    _, upgrade_config, upgrade_sources = await render_upgrade_workspace(
+        dependencies.store,
+        owner,
+        role="worker",
+        project_id=str(job["project_id"]) if job.get("project_id") else None,
+        current_backend=workspace_contract.assigned_backend,
+        requested_backend="sandbox",
+    )
     transitioned = await dependencies.store.begin_job_workspace_tier_transition(
         job_id,
         expected_backend=workspace_contract.assigned_backend,
@@ -219,6 +235,10 @@ async def provision_job_workspace(
         requested_backend=workspace_contract.requested_backend,
         assignment_source="runtime_workspace_upgrade",
         expected_status=str(job.get("status") or ""),
+        upgrade_config={
+            **upgrade_config.get("sandbox", {}),
+            "sources": upgrade_sources,
+        },
     )
     if not transitioned:
         refreshed = await dependencies.store.get_job(job_id)

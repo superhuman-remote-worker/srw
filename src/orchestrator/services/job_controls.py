@@ -2419,11 +2419,28 @@ class JobControlOperations:
                 )
 
             # 4. Build the VM-request delta — merged into context.vm below so any
-            #    existing vm siblings are preserved.
+            #    existing vm siblings are preserved. The VM provisions the
+            #    defaults chain's VM template, read as the Job's owner.
+            from orchestrator.services.workspace_defaults_resolution import (
+                render_upgrade_workspace,
+                work_owner,
+            )
+
+            owner = await work_owner(self.dependencies.store, job.get("user_id"))
+            _, upgrade_config, upgrade_sources = await render_upgrade_workspace(
+                self.dependencies.store,
+                owner,
+                role="worker",
+                project_id=str(job["project_id"]) if job.get("project_id") else None,
+                current_backend="sandbox",
+                requested_backend="vm",
+            )
             vm_updates = {
                 "requested": True,
                 "upgrade_from": "container",
                 "upgrade_command": frozen_data.get("command", ""),
+                "upgrade_config": upgrade_config.get("vm", {}),
+                "upgrade_sources": upgrade_sources,
             }
             upgraded_workspace_contract = {
                 "version": 1,

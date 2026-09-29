@@ -28,9 +28,14 @@ class AgentThreadConfigUpdateRequest(BaseModel):
 
 
 class ThreadWorkspaceUpgradeRequest(BaseModel):
-    """Body for ``POST /api/agents/threads/{id}/upgrade-to-workspace``."""
+    """Body for ``POST /api/agents/threads/{id}/upgrade-to-workspace``.
 
-    target_tier: str = "sandbox"
+    ``target_tier`` None means the next tier up; ``template`` names a template
+    the Session's owner can read (Project, Account, then Catalog).
+    """
+
+    target_tier: str | None = None
+    template: str | None = None
 
 
 class ThreadConfigPatchRequest(BaseModel):

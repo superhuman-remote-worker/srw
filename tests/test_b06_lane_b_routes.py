@@ -34,6 +34,7 @@ USER = {"id": "55555555-5555-4555-8555-555555555555", "is_admin": False}
 def _thread(**over: Any) -> dict[str, Any]:
     row = {
         "id": THREAD,
+        "user_id": USER["id"],
         "execution_lane": "pinned",
         "status": "created",
         "metadata": {},
@@ -146,6 +147,7 @@ def _config_deps(**over: Any) -> tcu.ThreadConfigUpdateDependencies:
             return_value={"delivery_override": {"llm": {"api_key": "sk-live"}}}
         ),
         merge_thread_vm_context=AsyncMock(),
+        get_user=AsyncMock(return_value=USER),
     )
     for key, value in store_over.items():
         setattr(store, key, value)
@@ -178,6 +180,13 @@ def _config_deps(**over: Any) -> tcu.ThreadConfigUpdateDependencies:
     return tcu.ThreadConfigUpdateDependencies(
         recovery_store=SimpleNamespace(), **fields
     )
+
+
+@pytest.fixture(autouse=True)
+def shipped_chart(monkeypatch) -> None:
+    """Upgrades resolve the shipped chain: no built-ins declared."""
+    monkeypatch.delenv("WORKSPACE_DEFAULTS", raising=False)
+    monkeypatch.delenv("WORKSPACE_BUILTIN_TEMPLATES", raising=False)
 
 
 @pytest.fixture(autouse=True)

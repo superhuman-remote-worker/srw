@@ -88,6 +88,7 @@ from orchestrator.services.vm_workspace_recovery_store import (
     completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
+from shared.backend_kinds import LITE_BACKENDS, VM_BACKENDS
 from shared.run_queue import LANE_PINNED
 from shared.runtime.core.loader import canonical_config_name
 
@@ -728,6 +729,63 @@ def require_unprotected_workspace_upgrade(
     return raw_metadata
 
 
+def _refuse_stateless_upgrade(thread: dict[str, Any]) -> None:
+    if thread.get("execution_lane") != LANE_PINNED:
+        raise HTTPException(
+            status_code=409,
+            detail="Workspace upgrades are not yet supported on the stateless lane",
+        )
+
+
+# A Session VM upgrade stamps the vm tier before its VM exists
+# (begin_pinned_thread_vm_provisioning). When that VM failed or the agent
+# aborted it (abort-vm-upgrade), the Session still runs below the vm tier and
+# retrying must stay possible.
+_RETRYABLE_VM_STATUSES = frozenset({"failed", "aborted"})
+
+
+def _upgrade_current_backend(
+    thread: dict[str, Any], metadata: Mapping[str, Any]
+) -> str:
+    """The tier a Session upgrades from, for the upgrade's tier check."""
+    backend = thread_workspace_backend(thread) or "virtual"
+    vm = metadata.get("vm")
+    if (
+        backend in VM_BACKENDS
+        and isinstance(vm, Mapping)
+        and vm.get("status") in _RETRYABLE_VM_STATUSES
+    ):
+        return "sandbox"
+    return backend
+
+
+def _thread_project_id(thread: dict[str, Any]) -> str | None:
+    return str(thread["project_id"]) if thread.get("project_id") else None
+
+
+async def _vm_upgrade_guards(
+    thread: dict[str, Any], dependencies: ThreadConfigUpdateDependencies
+) -> dict[str, Any]:
+    """The VM upgrade's refusals, all before any template is read or effect."""
+    _refuse_stateless_upgrade(thread)
+
+    metadata = require_unprotected_workspace_upgrade(thread)
+
+    # Sec-1 — authorize BEFORE provisioning (fail-closed). This endpoint is the
+    # target of both the sandbox→VM sudo path and the lite→vm delegation from
+    # /upgrade-to-workspace; it previously ran ungated. The shared gate enforces
+    # the global vm_workspaces kill-switch + per-user can_use_vm + the
+    # vm_workspace PDP grant (workspace_tier_upgrade.md §4.4 Sec-1 / Phase 2).
+    await dependencies.enforce_workspace_upgrade_grants(thread, target_tier="vm")
+
+    if not dependencies.vm_provisioner.is_available:
+        raise HTTPException(
+            status_code=503,
+            detail="VM provisioning not available (no NATS or K8s)",
+        )
+    return metadata
+
+
 async def agent_update_thread_config(
     request: Request,
     thread_id: str,
@@ -767,34 +825,20 @@ async def agent_upgrade_thread_to_vm(
     thread_id: str,
     *,
     dependencies: ThreadConfigUpdateDependencies,
+    template_name: str | None = None,
 ) -> dict[str, Any]:
-    """Body of ``POST /api/agents/threads/{thread_id}/upgrade-to-vm``."""
+    """Body of ``POST /api/agents/threads/{thread_id}/upgrade-to-vm``.
+
+    The VM provisions ``template_name``, else the defaults chain's VM template,
+    read as the Session's owner (Slice A2b).
+    """
     await dependencies.require_internal(request)
     vm_provisioner = dependencies.vm_provisioner
     thread = await dependencies.store.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
 
-    if thread.get("execution_lane") != LANE_PINNED:
-        raise HTTPException(
-            status_code=409,
-            detail="Workspace upgrades are not yet supported on the stateless lane",
-        )
-
-    metadata = require_unprotected_workspace_upgrade(thread)
-
-    # Sec-1 — authorize BEFORE provisioning (fail-closed). This endpoint is the
-    # target of both the sandbox→VM sudo path and the lite→vm delegation from
-    # /upgrade-to-workspace; it previously ran ungated. The shared gate enforces
-    # the global vm_workspaces kill-switch + per-user can_use_vm + the
-    # vm_workspace PDP grant (workspace_tier_upgrade.md §4.4 Sec-1 / Phase 2).
-    await dependencies.enforce_workspace_upgrade_grants(thread, target_tier="vm")
-
-    if not vm_provisioner.is_available:
-        raise HTTPException(
-            status_code=503,
-            detail="VM provisioning not available (no NATS or K8s)",
-        )
+    await _vm_upgrade_guards(thread, dependencies)
 
     # The capability read above is advisory.  Serialize with End/protected
     # lifecycle work, then re-read and install the provision generation under
@@ -831,6 +875,32 @@ async def agent_upgrade_thread_to_vm(
                 "thread_id": thread_id,
                 "message": "VM already provisioned or in progress",
             }
+
+        from orchestrator.services.workspace_defaults_resolution import (
+            render_upgrade_workspace,
+            work_owner,
+        )
+
+        owner = await work_owner(dependencies.store, thread.get("user_id"))
+        _, upgrade_config, upgrade_sources = await render_upgrade_workspace(
+            dependencies.store,
+            owner,
+            role="session",
+            project_id=_thread_project_id(thread),
+            current_backend=_upgrade_current_backend(thread, metadata),
+            requested_backend="vm",
+            template_name=template_name,
+        )
+        # Recorded before the VM exists, so this provisioning and every later
+        # one of this Session (retry, wake) reads the template's options.
+        upgrade = {
+            "upgrade_config": upgrade_config.get("vm", {}),
+            "upgrade_sources": upgrade_sources,
+        }
+        await dependencies.store.merge_thread_vm_context(thread_id, upgrade)
+        # The provision CAS compares metadata.vm exactly: expect the merge.
+        vm_ctx = {**(vm_ctx or {}), **upgrade}
+        thread = {**thread, "metadata": {**metadata, "vm": vm_ctx}}
 
         options = await vm_provisioning_options(
             dependencies.store,
@@ -945,8 +1015,11 @@ async def agent_upgrade_thread_to_workspace(
     """Body of ``POST /api/agents/threads/{thread_id}/upgrade-to-workspace``."""
     await dependencies.require_internal(request)
     container_provisioner = dependencies.container_provisioner
-    target_tier = (body.target_tier if body else "sandbox") or "sandbox"
-    if target_tier not in ("sandbox", "vm"):
+    target_tier = body.target_tier if body else None
+    template_name = body.template if body else None
+    if target_tier == "container":
+        target_tier = "sandbox"
+    if target_tier not in (None, "sandbox", "vm"):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -954,6 +1027,37 @@ async def agent_upgrade_thread_to_workspace(
                 f"got {target_tier!r}"
             ),
         )
+    if template_name or target_tier is None:
+        thread = await dependencies.store.get_thread(thread_id)
+        if not thread:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        if template_name:
+            # A running Session takes a template only as a VM: container
+            # upgrades are refused inside the agent (Kubernetes hot workspace
+            # upgrades need exact runtime authority). So the VM path's guards
+            # refuse before the template is read, and run again on that path.
+            metadata = await _vm_upgrade_guards(thread, dependencies)
+            from orchestrator.services.workspace_defaults_resolution import (
+                CONTAINER_UPGRADE_UNAVAILABLE,
+                render_upgrade_workspace,
+                work_owner,
+            )
+
+            owner = await work_owner(dependencies.store, thread.get("user_id"))
+            mode, _, _ = await render_upgrade_workspace(
+                dependencies.store,
+                owner,
+                role="session",
+                project_id=_thread_project_id(thread),
+                current_backend=_upgrade_current_backend(thread, metadata),
+                template_name=template_name,
+            )
+            if mode != "vm":
+                raise HTTPException(409, CONTAINER_UPGRADE_UNAVAILABLE)
+            target_tier = "vm"
+        else:
+            current = thread_workspace_backend(thread) or "virtual"
+            target_tier = "sandbox" if current in LITE_BACKENDS else "vm"
 
     # vm targets reuse the operator-gated VM provisioning path: it runs the same
     # enforce_workspace_upgrade_grants gate, provisions the VM, and records
@@ -963,19 +1067,20 @@ async def agent_upgrade_thread_to_workspace(
     # (workspace_tier_upgrade.md Phase 2). Keeping a single client method +
     # endpoint means the agent stays uniform across tiers.
     if target_tier == "vm":
-        return await agent_upgrade_thread_to_vm(
-            request, thread_id, dependencies=dependencies
+        result = await agent_upgrade_thread_to_vm(
+            request,
+            thread_id,
+            dependencies=dependencies,
+            template_name=template_name,
         )
+        # The caller may have left the tier to the chain: always name it.
+        return {**result, "target_tier": "vm"}
 
     thread = await dependencies.store.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
 
-    if thread.get("execution_lane") != LANE_PINNED:
-        raise HTTPException(
-            status_code=409,
-            detail="Workspace upgrades are not yet supported on the stateless lane",
-        )
+    _refuse_stateless_upgrade(thread)
 
     metadata = require_unprotected_workspace_upgrade(thread)
 

@@ -12645,6 +12645,7 @@ class PostgresDB:
         requested_backend: str | None,
         assignment_source: str,
         expected_status: str,
+        upgrade_config: dict | None = None,
     ) -> bool:
         """Atomically authorize an intentional in-process workspace upgrade.
 
@@ -12657,6 +12658,10 @@ class PostgresDB:
         This is deliberately narrower than a general JSONB patch.  Today the
         only supported in-process job transition is ``virtual|none`` to
         ``sandbox``.  VM approval has its own status/control transaction.
+
+        ``upgrade_config`` (the upgrade's rendered container template) lands
+        in ``context.workspace_container`` in the same statement as the
+        ``pending`` marker, so the provisioner never sees one without the other.
         """
 
         import json as json_module
@@ -12676,6 +12681,9 @@ class PostgresDB:
             "assigned_backend": target_backend,
             "assignment_source": assignment_source,
         }
+        pending: dict[str, Any] = {"status": "pending"}
+        if upgrade_config is not None:
+            pending["upgrade_config"] = upgrade_config
         normalized_config_backend = (
             "CASE lower(COALESCE(config_override->'workspace'->>'backend', "
             "'sandbox')) WHEN 'container' THEN 'sandbox' "
@@ -12692,7 +12700,7 @@ class PostgresDB:
                        ),
                        '{{workspace_container}}',
                        COALESCE(context->'workspace_container', '{{}}'::jsonb)
-                           || '{{"status":"pending"}}'::jsonb
+                           || $6::jsonb
                    ),
                    config_override = jsonb_set(
                        COALESCE(config_override, '{{}}'::jsonb),
@@ -12725,6 +12733,7 @@ class PostgresDB:
                 target_backend,
                 expected_status,
                 expected_backend,
+                json_module.dumps(pending),
             )
         return row is not None
 
