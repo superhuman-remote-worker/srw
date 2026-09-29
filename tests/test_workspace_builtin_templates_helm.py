@@ -83,12 +83,12 @@ def test_specs_carry_a_backend_an_image_and_sizes():
     assert declared["virtual"]["spec"] == {"backend": "virtual"}
     assert declared["container-full"]["spec"] == {
         "backend": "sandbox",
-        "environment": {"image": env["WORKSPACE_IMAGE"]},
+        "environment": {"image": env["WORKSPACE_IMAGE"], "pullPolicy": "Always"},
         "resources": sizes,
     }
     assert declared["container-minimal"]["spec"] == {
         "backend": "sandbox",
-        "environment": {"image": MINIMAL + ":latest"},
+        "environment": {"image": MINIMAL + ":latest", "pullPolicy": "Always"},
         "resources": sizes,
     }
     assert declared["vm-full"]["spec"]["backend"] == "vm"
@@ -186,7 +186,36 @@ def test_the_new_variable_is_the_last_orchestrator_variable():
     entries = _orchestrator(documents)["spec"]["template"]["spec"]["containers"][0][
         "env"
     ]
-    assert entries[-1]["name"] == "WORKSPACE_BUILTIN_TEMPLATES"
+    # WORKSPACE_DEFAULTS (Slice A2b, Task 8) is appended after
+    # WORKSPACE_BUILTIN_TEMPLATES, which is itself appended-at-the-end (see
+    # helm/templates/orchestrator/deployment.yaml); appending, never
+    # inserting, avoids the Kubernetes strategic-merge `env[N].valueFrom`
+    # patch bug.
+    assert entries[-2]["name"] == "WORKSPACE_BUILTIN_TEMPLATES"
+    assert entries[-1]["name"] == "WORKSPACE_DEFAULTS"
+
+
+def test_container_builtins_carry_the_installation_pull_policy():
+    declared = builtins()
+    assert declared["container-full"]["spec"]["environment"]["pullPolicy"] == "Always"
+    assert (
+        declared["container-minimal"]["spec"]["environment"]["pullPolicy"] == "Always"
+    )
+    assert "pullPolicy" not in declared["vm-full"]["spec"].get("environment", {})
+
+
+def test_container_builtins_follow_an_overridden_pull_policy():
+    declared = builtins("image.workspace.pullPolicy=IfNotPresent")
+    assert (
+        declared["container-full"]["spec"]["environment"]["pullPolicy"]
+        == "IfNotPresent"
+    )
+    # workspaceMinimal has no pullPolicy of its own; it falls back to
+    # image.workspace.pullPolicy.
+    assert (
+        declared["container-minimal"]["spec"]["environment"]["pullPolicy"]
+        == "IfNotPresent"
+    )
 
 
 @pytest.mark.parametrize(

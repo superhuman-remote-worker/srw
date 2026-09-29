@@ -146,6 +146,11 @@ uses, so a workspace on it is the installation image in every respect.
       "srw.io/display-name" "Virtual"
       "srw.io/description" "A workspace without a container or a VM."))
     "spec" (dict "backend" "virtual")) -}}
+{{- $minimalEnvironment := dict "image" (include "srw.imageRef" (dict "image" .Values.image.workspaceMinimal)) -}}
+{{- $minimalPullPolicy := .Values.image.workspaceMinimal.pullPolicy | default .Values.image.workspace.pullPolicy -}}
+{{- if $minimalPullPolicy -}}
+{{- $_ := set $minimalEnvironment "pullPolicy" $minimalPullPolicy -}}
+{{- end -}}
 {{- $templates = append $templates (dict
     "apiVersion" "srw/v1alpha1"
     "kind" "WorkspaceTemplate"
@@ -154,8 +159,12 @@ uses, so a workspace on it is the installation image in every respect.
       "srw.io/description" "SRW tools, a browser and the IDE. The base for your own image."))
     "spec" (dict
       "backend" "sandbox"
-      "environment" (dict "image" (include "srw.imageRef" (dict "image" .Values.image.workspaceMinimal)))
+      "environment" $minimalEnvironment
       "resources" $sizes)) -}}
+{{- $fullEnvironment := dict "image" (include "srw.imageRef" (dict "image" .Values.image.workspace)) -}}
+{{- if .Values.image.workspace.pullPolicy -}}
+{{- $_ := set $fullEnvironment "pullPolicy" .Values.image.workspace.pullPolicy -}}
+{{- end -}}
 {{- $templates = append $templates (dict
     "apiVersion" "srw/v1alpha1"
     "kind" "WorkspaceTemplate"
@@ -164,7 +173,7 @@ uses, so a workspace on it is the installation image in every respect.
       "srw.io/description" "Minimal plus Node.js, compilers, database clients and document tools."))
     "spec" (dict
       "backend" "sandbox"
-      "environment" (dict "image" (include "srw.imageRef" (dict "image" .Values.image.workspace)))
+      "environment" $fullEnvironment
       "resources" $sizes)) -}}
 {{- if ne (include "srw.vmMode" .) "off" -}}
 {{- $templates = append $templates (dict
@@ -183,6 +192,15 @@ uses, so a workspace on it is the installation image in every respect.
 {{- end -}}
 {{- end -}}
 {{- $templates | toJson -}}
+{{- end }}
+
+{{/*
+Workspace defaults (Slice A2b) as the JSON object the orchestrator reads from
+WORKSPACE_DEFAULTS. Empty template names mean the built-in for the tier.
+*/}}
+{{- define "srw.workspaceDefaultsJson" -}}
+{{- $d := .Values.workspace.defaults | default dict -}}
+{{- dict "jobs" ($d.jobs | default "container") "sessions" ($d.sessions | default "virtual") "container" ($d.container | default "") "vm" ($d.vm | default "") | toJson -}}
 {{- end }}
 
 {{/*

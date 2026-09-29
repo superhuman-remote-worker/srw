@@ -830,6 +830,7 @@ data:
   # profile. The orchestrator reduces every entry to its repository.
   WORKSPACE_TRUSTED_IMAGE_REPOSITORIES: {{ append (.Values.workspace.images.trustedRepositories | default (list)) (include "srw.imageRef" (dict "image" .Values.image.workspaceMinimal)) | toJson | quote }}
   WORKSPACE_BUILTIN_TEMPLATES: {{ include "srw.builtinWorkspaceTemplatesJson" . | quote }}
+  WORKSPACE_DEFAULTS: {{ include "srw.workspaceDefaultsJson" . | quote }}
   WORKSPACE_CUSTOM_IMAGES_PRIVILEGED: {{ ternary "true" "false" .Values.workspace.customImages.privileged | quote }}
   WORKSPACE_IMAGE_PULL_TIMEOUT_SECONDS: {{ .Values.workspace.imagePullTimeoutSeconds | int | quote }}
 

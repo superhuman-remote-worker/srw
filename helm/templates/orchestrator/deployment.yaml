@@ -1917,6 +1917,13 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_BUILTIN_TEMPLATES
                   optional: true
+            # Appended at the end on purpose; see the note above.
+            - name: WORKSPACE_DEFAULTS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_DEFAULTS
+                  optional: true
           volumeMounts:
             - name: workspace
               mountPath: /workspace

@@ -2762,6 +2762,16 @@ workspace:
       cpu: 8
       memory: 16Gi
       storage: 30Gi
+  # What a Job or Session gets when nobody names a workspace (Slice A2b).
+  # Modes: none | virtual | container | vm. A template name refers to a
+  # WorkspaceTemplate in Catalog/shared; empty means the built-in
+  # (container-full, vm-full), or the plain backend when builtinTemplates is
+  # off. A Project's own defaults win over these.
+  defaults:
+    jobs: container
+    sessions: virtual
+    container: ""
+    vm: ""
   # -- How long a custom workspace image may take to pull before a Job fails
   # with the pull error. The installation image is prewarmed and unaffected.
   # Job containers are dispatched one at a time, so while a custom image is

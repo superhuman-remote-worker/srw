@@ -2506,6 +2506,16 @@
             }
           }
         },
+        "defaults": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "jobs": {"enum": ["none", "virtual", "container", "vm"]},
+            "sessions": {"enum": ["none", "virtual", "container", "vm"]},
+            "container": {"type": "string", "pattern": "^$|^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"},
+            "vm": {"type": "string", "pattern": "^$|^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"}
+          }
+        },
         "imagePullTimeoutSeconds": {"type": "integer", "minimum": 60, "maximum": 3600}
       }
     }
