@@ -97,6 +97,10 @@ from shared.job_freeze_types import (
     AUTO_CONTINUE_FREEZE_TYPES,
     FREEZE_TYPE_BATCH_BOUNDARY,
 )
+from shared.persistent_input_delivery import (
+    stale_admission_answered_sql,
+    stale_stateless_admission_sql,
+)
 from shared.run_queue import (
     HEARTBEAT_INTERVAL_SECONDS,
     LANE_STATELESS,
@@ -236,10 +240,26 @@ def _enabled_env(name: str, default: bool = False) -> bool:
 # roles ('human'/'ai'); rewound rows are dead timelines and must not be
 # answered. ``seq > COALESCE(consumed_seq, -1)`` — a NULL consumed watermark
 # means nothing was ever answered, so the oldest human row qualifies.
-_PENDING_INPUT_SQL = """
+#
+# An event is owed while its delivery is persisted/queued/deferred, or while
+# it is an admission of an older lease that never settled: the executor that
+# admitted it died in the turn (parallel_subagents.md §8, "Recovery turn
+# killed"; K4). ``delivery_state`` tells the executor which, and
+# ``admission_answered`` whether that turn already reached its durable end, in
+# which case the executor settles it instead of serving it again
+# (``stale_stateless_admission_sql`` / ``stale_admission_answered_sql``).
+_OWED_STALE_ADMISSION = stale_stateless_admission_sql(
+    lease_token="queue.lease_token", watermark="$2::bigint"
+)
+_PENDING_INPUT_SQL = f"""
     SELECT message.id, message.seq, message.content, message.turn_number,
            message.role, delivery.delivery_id, delivery.supersedes_input_seq,
-           superseded.role AS supersedes_input_role
+           superseded.role AS supersedes_input_role,
+           delivery.state AS delivery_state,
+           CASE WHEN delivery.state = 'admitted'
+                THEN {stale_admission_answered_sql()}
+                ELSE FALSE
+           END AS admission_answered
     FROM thread_messages AS message
     LEFT JOIN thread_input_deliveries AS delivery
       ON delivery.message_id = message.id
@@ -247,6 +267,8 @@ _PENDING_INPUT_SQL = """
     LEFT JOIN thread_messages AS superseded
       ON superseded.thread_id = message.thread_id
      AND superseded.seq = delivery.supersedes_input_seq
+    LEFT JOIN run_queue AS queue
+      ON queue.unit_id = message.thread_id
     WHERE message.thread_id = $1
       AND message.rewound_at IS NULL
       AND (
@@ -257,6 +279,8 @@ _PENDING_INPUT_SQL = """
               AND delivery.execution_lane = 'stateless'
               AND delivery.state IN ('persisted', 'queued', 'deferred')
           )
+          OR
+          (message.role = 'event' AND {_OWED_STALE_ADMISSION})
       )
     ORDER BY
         CASE
@@ -280,15 +304,28 @@ SELECT GREATEST(COALESCE(consumed_seq, -1), $4::bigint)
    AND input_delivery_capable_lease_token = $2
 """
 
-_PENDING_EVENT_EXISTS_SQL = """
+# Skip-if-answered runs before attach and may complete the unit only when no
+# event is owed. An older lease's unsettled admission is owed too, answered or
+# not: the ordinary path then either serves it again or, when its turn already
+# ended, settles it (settling needs the claimant authority the bundle stamps).
+_OWED_STALE_ADMISSION_OF_QUEUE = stale_stateless_admission_sql(
+    lease_token="queue.lease_token", watermark="queue.consumed_seq"
+)
+_PENDING_EVENT_EXISTS_SQL = f"""
 SELECT EXISTS (
     SELECT 1
       FROM thread_input_deliveries AS delivery
       JOIN thread_messages AS message ON message.id = delivery.message_id
+      LEFT JOIN run_queue AS queue ON queue.unit_id = delivery.thread_id
      WHERE delivery.thread_id = $1
-       AND delivery.execution_lane = 'stateless'
-       AND delivery.state IN ('persisted', 'queued', 'deferred')
        AND message.rewound_at IS NULL
+       AND (
+           (
+               delivery.execution_lane = 'stateless'
+               AND delivery.state IN ('persisted', 'queued', 'deferred')
+           )
+           OR (message.role = 'event' AND {_OWED_STALE_ADMISSION_OF_QUEUE})
+       )
 )
 """
 
@@ -684,6 +721,11 @@ def strip_restored_pending_humans(
     never in ``pending_rows``) legitimately remains in context as history —
     matching today's documented behavior for accepted-but-unconsumed notices.
 
+    One kind of pending event is restored: an older lease's admission that
+    never settled (``delivery_state == 'admitted'``), which the executor
+    serves again. Its restored copy is stripped like a human one; the event
+    is injected once, as the input of the turn that serves it.
+
     Mutates ``messages`` in place; returns the number of messages removed.
     """
     if not messages or not pending_rows:
@@ -691,8 +733,13 @@ def strip_restored_pending_humans(
     # Event deliveries are deliberately excluded by transcript restore until
     # provider admission. Keep only rows that restore actually loaded, or an
     # event after a human row would stop the tail matcher and duplicate the
-    # human on a fresh attach.
-    remaining = [row for row in pending_rows if row.get("role", "human") == "human"]
+    # human on a fresh attach. An admitted event was loaded.
+    remaining = [
+        row
+        for row in pending_rows
+        if row.get("role", "human") == "human"
+        or row.get("delivery_state") == "admitted"
+    ]
     pending_ids = {
         str(row["id"]): row for row in remaining if row.get("id") is not None
     }
@@ -799,6 +846,7 @@ _TRANSIENT_RELEASE_REASONS = frozenset(
         "pending_event_query_failed",  # DB
         "event_delivery_claim_failed",  # DB
         "event_delivery_claim_lost",  # lost a race for the delivery
+        "stale_admission_settle_failed",  # DB / lease loss
         "control_inbox_failed",  # DB / owner fence
         # DB or lease loss; a corrupt receipt cannot be told apart here.
         "stale_interrupt_recovery_failed",
@@ -4163,6 +4211,30 @@ class StatelessTurnExecutor:
             logger.warning("pending-input query failed for unit %s: %s", unit_id, e)
             await self._release(claim, reason="pending_query_failed")
             return
+        # (f2) An event an older lease admitted and never settled is owed
+        # again (its executor died in the turn). When that turn already
+        # reached its durable end, settle it here instead: serving it again
+        # would answer it twice. What is left is served below; the claim of
+        # its delivery re-queues it under this lease.
+        if any(
+            row.get("delivery_state") == "admitted" and row.get("admission_answered")
+            for row in pending
+        ):
+            try:
+                pending = await self._settle_answered_stale_admissions(
+                    claim, unit_id, consumed_seq, pending
+                )
+            except Exception:
+                logger.warning(
+                    "settling an answered stale event admission failed for "
+                    "unit %s token=%d",
+                    unit_id,
+                    token,
+                    exc_info=True,
+                )
+                await self._detach_cached_session("stale_admission_settle_failed")
+                await self._release(claim, reason="stale_admission_settle_failed")
+                return
         if not pending:
             # Enqueue without input (possible race) — nothing to answer.
             fallback = (
@@ -4853,9 +4925,56 @@ class StatelessTurnExecutor:
                     if r.get("supersedes_input_role") is not None
                     else None
                 ),
+                "delivery_state": (
+                    str(r.get("delivery_state"))
+                    if r.get("delivery_state") is not None
+                    else None
+                ),
+                "admission_answered": bool(r.get("admission_answered")),
             }
             for r in rows
         ]
+
+    async def _settle_answered_stale_admissions(
+        self,
+        claim: ClaimedUnit,
+        unit_id: str,
+        consumed_seq: Optional[int],
+        pending: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Settle each older lease's admission whose turn already ended.
+
+        Its executor died after the turn's durable end and before the loop
+        settled the delivery (or the settle lost a race with the completion).
+        The DB re-checks both facts under this claim's exact authority; the
+        pending rows are then read again. Raises when the settle cannot run
+        under this claim.
+        """
+
+        for row in pending:
+            if not (
+                row.get("delivery_state") == "admitted"
+                and row.get("admission_answered")
+                and row.get("delivery_id")
+            ):
+                continue
+            outcome = await self._db.settle_answered_stateless_admission(
+                thread_id=unit_id,
+                delivery_id=str(row["delivery_id"]),
+                lease_token=claim.lease_token,
+                executor_id=self._pod_name,
+                pod_uid=self._pod_uid,
+            )
+            logger.info(
+                "stale event admission whose turn already ended: unit=%s "
+                "token=%d seq=%s delivery=%s outcome=%s",
+                unit_id,
+                claim.lease_token,
+                row.get("seq"),
+                str(row["delivery_id"])[:8],
+                outcome,
+            )
+        return await self._fetch_pending_rows(unit_id, consumed_seq)
 
     async def _heartbeat_loop(
         self, claim: ClaimedUnit, claim_lost: asyncio.Event | None = None

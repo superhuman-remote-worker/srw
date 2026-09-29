@@ -1033,6 +1033,126 @@ class TestHappyPath:
             {"unit_id": unit, "lease_token": 12, "consumed_seq": 3}
         ]
 
+    @staticmethod
+    def _stale_admission(row_id: str, delivery_id: str, *, answered: bool):
+        """An older lease's unsettled admission of a batch continuation, as
+        the pending query returns it (parallel_subagents §8, K4)."""
+
+        return {
+            "id": row_id,
+            "seq": 9,
+            "content": "[subagent recovery] continue",
+            "turn_number": 3,
+            "role": "event",
+            "delivery_id": delivery_id,
+            "supersedes_input_seq": 5,
+            "supersedes_input_role": "human",
+            "delivery_state": "admitted",
+            "admission_answered": answered,
+        }
+
+    @pytest.mark.asyncio
+    async def test_an_owed_stale_admission_is_claimed_and_served(self, harness):
+        unit = uuid4()
+        row_id, delivery_id = str(uuid4()), str(uuid4())
+        harness.db.pending_rows = [
+            self._stale_admission(row_id, delivery_id, answered=False)
+        ]
+        harness.restored_turn_count = 3
+        harness.db.settle_answered_stateless_admission = AsyncMock()
+        harness.db.claim_stateless_input_delivery = AsyncMock(
+            return_value={"message_id": row_id, "seq": 9, "claim_generation": 5}
+        )
+
+        await harness.executor._serve_claim(
+            make_claim(unit_id=unit, token=12, input_seq=9, consumed_seq=5)
+        )
+        await _finish(harness)
+
+        harness.db.settle_answered_stateless_admission.assert_not_awaited()
+        harness.db.claim_stateless_input_delivery.assert_awaited_once()
+        assert harness.consumed == [
+            {
+                "content": "[subagent recovery] continue",
+                "id": row_id,
+                "role": "event",
+                "delivery_id": delivery_id,
+                "claim_generation": 5,
+                "supersedes_input_seq": 5,
+            }
+        ]
+        assert harness.calls["complete"] == [
+            {"unit_id": unit, "lease_token": 12, "consumed_seq": 5}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_an_answered_stale_admission_is_settled_not_served(self, harness):
+        unit = uuid4()
+        row_id, delivery_id = str(uuid4()), str(uuid4())
+        harness.db.pending_rows = [
+            self._stale_admission(row_id, delivery_id, answered=True)
+        ]
+        fetches_before_settle: List[int] = []
+
+        async def settle(**kwargs):
+            fetches_before_settle.append(len(harness.db.fetch_calls))
+            harness.db.pending_rows = []
+            return "settled"
+
+        harness.db.settle_answered_stateless_admission = AsyncMock(side_effect=settle)
+        harness.db.claim_stateless_input_delivery = AsyncMock()
+
+        await harness.executor._serve_claim(
+            make_claim(unit_id=unit, token=12, input_seq=9, consumed_seq=5)
+        )
+        await _finish(harness)
+
+        harness.db.settle_answered_stateless_admission.assert_awaited_once_with(
+            thread_id=str(unit),
+            delivery_id=delivery_id,
+            lease_token=12,
+            executor_id="test-pod",
+            pod_uid=harness.executor._pod_uid,
+        )
+        harness.db.claim_stateless_input_delivery.assert_not_awaited()
+        assert harness.consumed == []
+        # The pending rows are read again after the settle, and nothing is
+        # left: the unit completes at its input watermark.
+        pending_reads = [
+            index
+            for index, (sql, _args) in enumerate(harness.db.fetch_calls)
+            if sql == te._PENDING_INPUT_SQL
+        ]
+        assert len(pending_reads) == 2
+        assert pending_reads[0] < fetches_before_settle[0] <= pending_reads[1]
+        assert harness.calls["complete"] == [
+            {"unit_id": unit, "lease_token": 12, "consumed_seq": 9}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_stale_admission_settle_releases_without_serving(
+        self, harness
+    ):
+        unit = uuid4()
+        harness.db.pending_rows = [
+            self._stale_admission(str(uuid4()), str(uuid4()), answered=True)
+        ]
+        harness.db.settle_answered_stateless_admission = AsyncMock(
+            side_effect=RuntimeError("stateless queue lease was lost")
+        )
+        harness.db.claim_stateless_input_delivery = AsyncMock()
+
+        await harness.executor._serve_claim(
+            make_claim(unit_id=unit, token=12, input_seq=9, consumed_seq=5)
+        )
+        await _finish(harness)
+
+        harness.db.claim_stateless_input_delivery.assert_not_awaited()
+        assert harness.consumed == []
+        assert not harness.calls["complete"]
+        assert [call["lease_token"] for call in harness.calls["release"]] == [12]
+        assert not te._release_is_deterministic("stale_admission_settle_failed")
+
     def test_completed_input_checkpoint(self):
         checkpoint = te.completed_input_checkpoint
         assert checkpoint({"seq": 9}, claim_consumed_seq=None) == 9
@@ -2849,6 +2969,41 @@ class TestStripRestoredPending:
         removed = te.strip_restored_pending_humans(msgs, pending)
         assert removed == 1
         assert msgs == []
+
+    def test_a_restored_stale_admission_is_stripped_before_it_is_served(self):
+        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+        # An older lease's admission that never settled is restored (restore
+        # loads admitted rows) and served again: strip its copy by id, keep a
+        # queued event (never restored) out of the tail matcher.
+        msgs = [
+            HumanMessage(content="compare four countries", id="h"),
+            AIMessage(
+                content="", id="ai", tool_calls=[{"id": "c1", "name": "t", "args": {}}]
+            ),
+            ToolMessage(content="report", tool_call_id="c1", id="r"),
+            HumanMessage(content="[recovered] continue", id="continuation"),
+        ]
+        pending = [
+            {
+                "id": "continuation",
+                "seq": 9,
+                "content": "[recovered] continue",
+                "role": "event",
+                "delivery_id": "d-1",
+                "delivery_state": "admitted",
+            },
+            {
+                "id": "wake",
+                "seq": 10,
+                "content": "[wake]",
+                "role": "event",
+                "delivery_id": "d-2",
+                "delivery_state": "queued",
+            },
+        ]
+        assert te.strip_restored_pending_humans(msgs, pending) == 1
+        assert [m.id for m in msgs] == ["h", "ai", "r"]
 
     def test_empty_inputs_are_noops(self):
         assert te.strip_restored_pending_humans([], [{"id": "a"}]) == 0

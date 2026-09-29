@@ -2490,6 +2490,32 @@ class PostgresDB:
                     pod_uid=pod_uid,
                 )
 
+    async def settle_answered_stateless_admission(
+        self,
+        *,
+        thread_id: str,
+        delivery_id: str,
+        lease_token: int,
+        executor_id: str,
+        pod_uid: str,
+    ) -> Optional[str]:
+        """Settle an older lease's admission whose turn already ended."""
+
+        from shared.persistent_input_delivery import (
+            settle_answered_stateless_admission,
+        )
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                return await settle_answered_stateless_admission(
+                    conn,
+                    thread_id=thread_id,
+                    delivery_id=delivery_id,
+                    lease_token=lease_token,
+                    executor_id=executor_id,
+                    pod_uid=pod_uid,
+                )
+
     async def transition_stateless_input_delivery(
         self,
         *,

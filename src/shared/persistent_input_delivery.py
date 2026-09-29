@@ -56,6 +56,101 @@ def _with_idle_exit(update_sql: str) -> str:
     )
 
 
+def stale_admission_answered_sql(
+    *, delivery: str = "delivery", message: str = "message"
+) -> str:
+    """SQL predicate: the admitted event's own turn reached a durable end.
+
+    The same two proofs as skip-if-answered for a human input
+    (``_ANSWERED_BY_TRANSCRIPT_SQL`` in ``agent.api.turn_executor``): the
+    turn's authoritative final reconcile minted ``turn_execution_id`` on this
+    input row (the loop runs it at every turn end, an error included), or the
+    loop's incremental writer already persisted the turn's final answer
+    (content, no tool calls) after the input. The turn is the one the
+    admission recorded.
+    """
+
+    return f"""(
+        {message}.turn_execution_id IS NOT NULL
+        OR EXISTS (
+            SELECT 1
+              FROM thread_messages AS answer
+             WHERE answer.thread_id = {message}.thread_id
+               AND answer.role = 'ai'
+               AND answer.rewound_at IS NULL
+               AND answer.turn_number = COALESCE(
+                   {delivery}.admitted_turn_number, {message}.turn_number
+               )
+               AND answer.seq > {message}.seq
+               AND COALESCE(answer.content, '') <> ''
+               AND (
+                   answer.tool_calls IS NULL
+                   OR jsonb_typeof(answer.tool_calls) <> 'array'
+                   OR jsonb_array_length(answer.tool_calls) = 0
+               )
+        )
+    )"""
+
+
+def stale_stateless_admission_sql(
+    *,
+    lease_token: str,
+    watermark: str,
+    delivery: str = "delivery",
+    message: str = "message",
+) -> str:
+    """SQL predicate: an event admitted under an older lease that never settled.
+
+    A stateless event input is served under the ``run_queue`` lease that
+    claimed it (``owner_run_queue_lease_token``); a human input is owed while
+    its seq is above the watermark. When the executor that admitted the event
+    dies before the loop settles it, the delivery stays ``admitted`` and no
+    later claim would serve it again (parallel_subagents.md §8, "Recovery turn
+    killed", found live as K4). Such an admission is owed to the next lease:
+    served again when its turn left no durable end, settled when it did
+    (``stale_admission_answered_sql``). The guards:
+
+    * ``owner_run_queue_lease_token < lease_token``: every claim and every
+      reaper steal advances the unit's token, so only an admission of an older
+      lease qualifies. The current lease's own admission (a turn in flight) is
+      never selected again.
+    * no live ``subagent`` continuation supersedes the event: a recovery turn
+      that delegated and died is settled against the event instead
+      (parallel_subagents.md D3). That settle also settles this delivery; the
+      guard keeps a superseded event from being served even if it did not.
+    * an unanswered admission only while its seq is above the watermark. The
+      watermark never moves past one (the pending query selects it before any
+      later input, and the no-pending completion runs only when nothing is
+      owed), so this excludes only history stranded before this rule, which
+      must not be replayed into a newer conversation. An answered admission is
+      settled wherever it sits: its own checkpoint may have passed it when the
+      loop's settle lost the race with the completion, and an unsettled
+      delivery blocks rewind.
+
+    ``lease_token`` and ``watermark`` are SQL expressions (a parameter or a
+    ``run_queue`` column); the aliases name the caller's delivery and message
+    rows.
+    """
+
+    answered = stale_admission_answered_sql(delivery=delivery, message=message)
+    return f"""(
+        {delivery}.execution_lane = 'stateless'
+        AND {delivery}.state = 'admitted'
+        AND {delivery}.owner_run_queue_lease_token < {lease_token}
+        AND ({message}.seq > COALESCE({watermark}, -1) OR {answered})
+        AND NOT EXISTS (
+            SELECT 1
+              FROM thread_input_deliveries AS successor
+              JOIN thread_messages AS successor_message
+                ON successor_message.id = successor.message_id
+             WHERE successor.thread_id = {delivery}.thread_id
+               AND successor.source = 'subagent'
+               AND successor.supersedes_input_seq = {message}.seq
+               AND successor_message.rewound_at IS NULL
+        )
+    )"""
+
+
 async def lock_runtime_authority(
     conn: Any,
     *,
@@ -162,7 +257,7 @@ async def _lock_stateless_runtime_authority(
         raise InputDeliveryAuthorityLost("stateless pod incarnation was lost")
     queue = await conn.fetchrow(
         "SELECT unit_id, unit_kind, state, lease_token, leased_by, "
-        "input_delivery_capable_lease_token FROM run_queue "
+        "input_delivery_capable_lease_token, consumed_seq FROM run_queue "
         f"WHERE unit_id = $1 {lock_clause}",
         thread_uuid,
     )
@@ -663,20 +758,34 @@ async def claim_stateless_input_delivery(
     executor_id: str,
     pod_uid: str,
 ) -> dict[str, Any] | None:
-    """Bind one pending event to the exact current stateless queue lease."""
+    """Bind one pending event to the exact current stateless queue lease.
+
+    A pending event is ``persisted``, ``queued`` or ``deferred``, or an
+    admission of an older lease that never settled and whose turn left no
+    durable answer (``stale_stateless_admission_sql``): its executor died in
+    the turn, so it is owed again. Such an admission returns to ``queued``
+    under this lease with a new claim generation, and the caller admits it
+    again. An answered one is refused here; the executor settles it instead
+    (``settle_answered_stateless_admission``).
+    """
 
     thread_uuid = UUID(str(thread_id))
     delivery_uuid = UUID(str(delivery_id))
-    thread, _queue = await _lock_stateless_runtime_authority(
+    thread, queue = await _lock_stateless_runtime_authority(
         conn,
         thread_id=thread_uuid,
         lease_token=lease_token,
         executor_id=executor_id,
         pod_uid=pod_uid,
     )
+    stale = stale_stateless_admission_sql(
+        lease_token="$4::bigint", watermark="$5::bigint"
+    )
+    answered = stale_admission_answered_sql()
     row = await conn.fetchrow(
         "SELECT delivery.*, message.seq, message.role, message.content, "
-        "message.turn_number, message.rewound_at "
+        "message.turn_number, message.rewound_at, "
+        f"{stale} AS stale_admission, {answered} AS admission_answered "
         "FROM thread_input_deliveries AS delivery "
         "JOIN thread_messages AS message ON message.id = delivery.message_id "
         "WHERE delivery.delivery_id = $1 AND delivery.thread_id = $2 "
@@ -687,12 +796,22 @@ async def claim_stateless_input_delivery(
         delivery_uuid,
         thread_uuid,
         int(thread.get("conversation_revision") or 0),
+        int(lease_token),
+        queue.get("consumed_seq"),
+    )
+    owed_admission = (
+        row is not None
+        and bool(row["stale_admission"])
+        and not bool(row["admission_answered"])
     )
     if (
         row is None
         or str(row["execution_lane"] or "") != "stateless"
         or str(row["role"] or "") != "event"
-        or str(row["state"] or "") not in {"persisted", "queued", "deferred"}
+        or (
+            str(row["state"] or "") not in {"persisted", "queued", "deferred"}
+            and not owed_admission
+        )
     ):
         return None
     same_claim = (
@@ -700,21 +819,26 @@ async def claim_stateless_input_delivery(
         and str(row["owner_executor"] or "") == str(executor_id)
         and str(row["owner_executor_pod_uid"] or "") == str(pod_uid)
     )
+    # An owed admission clears its admission receipt (the row shape requires
+    # it off 'admitted'); the next admission records the turn that runs.
     claimed = await conn.fetchrow(
         "UPDATE thread_input_deliveries SET state = 'queued', "
         "claim_generation = claim_generation + $2::bigint, "
         "owner_run_queue_lease_token = $3, owner_executor = $4, "
         "owner_executor_pod_uid = $5, owned_at = statement_timestamp(), "
         "queued_at = COALESCE(queued_at, statement_timestamp()), "
+        "admitted_at = NULL, admitted_turn_number = NULL, "
         "deferred_reason = NULL, deferred_at = NULL, "
         "updated_at = statement_timestamp() WHERE delivery_id = $1 "
         "AND execution_lane = 'stateless' "
-        "AND state IN ('persisted', 'queued', 'deferred') RETURNING *",
+        "AND (state IN ('persisted', 'queued', 'deferred') "
+        "OR (state = 'admitted' AND $6::boolean)) RETURNING *",
         delivery_uuid,
         0 if same_claim else 1,
         int(lease_token),
         str(executor_id),
         str(pod_uid),
+        owed_admission,
     )
     if claimed is None:
         return None
@@ -729,6 +853,72 @@ async def claim_stateless_input_delivery(
         }
     )
     return result
+
+
+async def settle_answered_stateless_admission(
+    conn: Any,
+    *,
+    thread_id: str | UUID,
+    delivery_id: str | UUID,
+    lease_token: int,
+    executor_id: str,
+    pod_uid: str,
+) -> str | None:
+    """Settle an older lease's admission whose turn already reached its end.
+
+    The executor that admitted the event died after the turn's durable end
+    (its final answer or its final reconcile) and before the loop settled the
+    delivery, or its settle lost a race with the queue completion. Serving it
+    again would answer it twice, so the current exact claimant settles it.
+
+    Returns ``"settled"``; ``"owed"`` when the admission is stale but its turn
+    has no durable end (the caller serves it again through
+    ``claim_stateless_input_delivery``); ``None`` when the row is not a stale
+    admission of this unit. Raises ``InputDeliveryAuthorityLost`` when the
+    caller is not the exact current claimant.
+    """
+
+    thread_uuid = UUID(str(thread_id))
+    delivery_uuid = UUID(str(delivery_id))
+    thread, queue = await _lock_stateless_runtime_authority(
+        conn,
+        thread_id=thread_uuid,
+        lease_token=lease_token,
+        executor_id=executor_id,
+        pod_uid=pod_uid,
+    )
+    stale = stale_stateless_admission_sql(
+        lease_token="$4::bigint", watermark="$5::bigint"
+    )
+    answered = stale_admission_answered_sql()
+    row = await conn.fetchrow(
+        f"SELECT {answered} AS admission_answered "
+        "FROM thread_input_deliveries AS delivery "
+        "JOIN thread_messages AS message ON message.id = delivery.message_id "
+        "WHERE delivery.delivery_id = $1 AND delivery.thread_id = $2 "
+        "AND message.role = 'event' AND message.rewound_at IS NULL "
+        "AND (delivery.conversation_revision=$3 OR "
+        "(delivery.conversation_revision IS NULL AND $3=0)) "
+        f"AND {stale} "
+        "FOR UPDATE OF delivery",
+        delivery_uuid,
+        thread_uuid,
+        int(thread.get("conversation_revision") or 0),
+        int(lease_token),
+        queue.get("consumed_seq"),
+    )
+    if row is None:
+        return None
+    if not bool(row["admission_answered"]):
+        return "owed"
+    settled = await conn.fetchval(
+        "UPDATE thread_input_deliveries SET state = 'settled', "
+        "settled_at = statement_timestamp(), updated_at = statement_timestamp() "
+        "WHERE delivery_id = $1 AND execution_lane = 'stateless' "
+        "AND state = 'admitted' RETURNING delivery_id",
+        delivery_uuid,
+    )
+    return "settled" if settled is not None else None
 
 
 async def transition_stateless_input_delivery(
