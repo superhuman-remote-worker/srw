@@ -953,6 +953,48 @@ def fold_system_messages(messages: list) -> list:
     return out
 
 
+def mark_anthropic_cache_breakpoints(messages: list, payload_messages: list) -> list:
+    """Put Anthropic cache breakpoints on the system prompt and the last stable message.
+
+    The per-turn injections (todos, memory, knowledge, ...) sit at the tail of
+    every request and change each turn. A breakpoint on the last message, which
+    is what the subscription proxy places when the caller sends none, writes
+    the cache entry inside that tail, so no later request can read it.
+    Breakpoints on the system prompt and on the last message before the
+    injections leave the history readable from cache on the next turn.
+    Measured through CLIProxyAPI on 2026-09-29: 81-84% of input cached with
+    these two markers, against a fixed ~2.6k tokens without.
+
+    ``messages`` are the LangChain messages ``payload_messages`` were converted
+    from. The conversion is one-to-one; on a length mismatch the indices cannot
+    be mapped and the payload is returned unchanged. Returns a new list.
+    """
+    from shared.runtime.core.workspace_injection import is_workspace_injection_message
+
+    if len(messages) != len(payload_messages):
+        return payload_messages
+    system_idx = next(
+        (
+            i
+            for i, m in enumerate(payload_messages)
+            if m.get("role") in ("system", "developer")
+        ),
+        None,
+    )
+    last_stable_idx = next(
+        (
+            i
+            for i in range(len(messages) - 1, -1, -1)
+            if not is_workspace_injection_message(messages[i])
+        ),
+        None,
+    )
+    out = list(payload_messages)
+    for idx in {system_idx, last_stable_idx} - {None}:
+        out[idx] = {**out[idx], "cache_control": {"type": "ephemeral"}}
+    return out
+
+
 class ReasoningChatOpenAI(ChatOpenAI):
     """ChatOpenAI that captures reasoning_content and validates context limits.
 
@@ -979,6 +1021,10 @@ class ReasoningChatOpenAI(ChatOpenAI):
     # Family setting `single_system_message` (model_config_matrix.yaml): fold
     # the request down to one leading system message before it is sent.
     single_system_message: bool = False
+
+    # Claude over an OpenAI-format transport (the subscription proxy): add
+    # explicit cache breakpoints — see mark_anthropic_cache_breakpoints.
+    anthropic_cache_breakpoints: bool = False
 
     # Use PrivateAttr for Pydantic compatibility
     _reasoning_client: ReasoningCapturingClient = PrivateAttr(default=None)
@@ -1019,6 +1065,12 @@ class ReasoningChatOpenAI(ChatOpenAI):
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
         if self.single_system_message and isinstance(payload.get("messages"), list):
             payload["messages"] = fold_system_messages(payload["messages"])
+        if self.anthropic_cache_breakpoints and isinstance(
+            payload.get("messages"), list
+        ):
+            payload["messages"] = mark_anthropic_cache_breakpoints(
+                self._convert_input(input_).to_messages(), payload["messages"]
+            )
         return payload
 
     def _post_process_result(self, result):

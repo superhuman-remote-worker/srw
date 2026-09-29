@@ -32,6 +32,7 @@ from shared.runtime.core.delegation_settings import (
     clamp_session_max_concurrent,
 )
 from shared.runtime.core.expert_resolution import ASSEMBLER_OWNED_PROMPT_TOKENS
+from shared.runtime.core.llm_retry import _is_codex_proxy_url
 from shared.runtime.core.model_registry import family_of
 from shared.runtime.core.tool_policy import (
     assert_tool_policy_canonical,
@@ -2078,9 +2079,12 @@ class LLMConfig:
     # OpenAI cache-routing hint, injected at RUNTIME by callers that own a
     # stable conversation identity (the session paths pass a per-thread key so
     # the provider-side prefix cache survives pod rotation on the stateless
-    # lane — stateless_agents.md OQ5). Never set from YAML, and only
-    # transmitted to first-party OpenAI: compatible endpoints (vLLM et al.)
-    # may reject unknown body fields and run their own keyless prefix caches.
+    # lane — stateless_agents.md OQ5; worker jobs pass a per-job key). Never
+    # set from YAML. Transmitted as the `prompt_cache_key` body field to
+    # first-party OpenAI and the subscription proxy's Codex lane, and as the
+    # proxy's `X-Session-ID` session-affinity header. Other compatible
+    # endpoints (vLLM et al.) may reject unknown body fields and run their own
+    # keyless prefix caches, so they get neither.
     prompt_cache_key: Optional[str] = None
 
     # The one phase override that survived U1 (context compaction).
@@ -4359,6 +4363,22 @@ def _env_fallback_key(
     return value if value else default
 
 
+def _subscription_proxy_session_headers(
+    config: LLMConfig, base_url: Optional[str]
+) -> Dict[str, str]:
+    """``X-Session-ID`` for a subscription-proxy call that has a conversation key.
+
+    CLIProxyAPI with ``routing.session-affinity`` binds a session to one
+    account, and provider prompt caches are per account, so without a stable
+    key consecutive turns can land on different caches. The proxy reads the
+    session key from this header. Empty for any other endpoint, or when the
+    caller set no ``prompt_cache_key``.
+    """
+    if config.prompt_cache_key and base_url and _is_codex_proxy_url(base_url):
+        return {"X-Session-ID": config.prompt_cache_key}
+    return {}
+
+
 def _create_openai_llm(
     config: LLMConfig,
     limits: Optional[LimitsConfig] = None,
@@ -4512,6 +4532,12 @@ def _create_openai_llm(
     # readable reasoning summary and an empty thinking block.
     if config.extra_headers:
         llm_kwargs["default_headers"] = dict(config.extra_headers)
+    session_headers = _subscription_proxy_session_headers(config, base_url)
+    if session_headers:
+        llm_kwargs["default_headers"] = {
+            **session_headers,
+            **llm_kwargs.get("default_headers", {}),
+        }
 
     max_tokens = _resolve_max_output_tokens(config, limits)
     llm_kwargs["max_tokens"] = max_tokens
@@ -4538,6 +4564,16 @@ def _create_openai_llm(
     # only (Qwen3.8 raises on any other) — see fold_system_messages.
     if resolve_model_settings(config.model).get("single_system_message") is True:
         llm_kwargs["single_system_message"] = True
+
+    # Claude through the subscription proxy: without explicit breakpoints the
+    # proxy marks the last message, which is the per-turn injection tail, and
+    # the history never reads from cache (compaction refactor note, F17).
+    if (
+        base_url
+        and _is_codex_proxy_url(base_url)
+        and family_of(config.model).startswith("claude")
+    ):
+        llm_kwargs["anthropic_cache_breakpoints"] = True
 
     llm = ReasoningChatOpenAI(**llm_kwargs)
 
@@ -5111,6 +5147,15 @@ def _create_codex_llm(
 
     if model_kwargs:
         llm_kwargs["model_kwargs"] = model_kwargs
+
+    # Per-conversation key: the proxy's session affinity reads the header, and
+    # its Codex executor forwards a caller `prompt_cache_key` upstream (also as
+    # the Session-Id header ChatGPT routes cache affinity on) instead of
+    # deriving one from the first user message.
+    session_headers = _subscription_proxy_session_headers(config, base_url)
+    if session_headers:
+        llm_kwargs["default_headers"] = session_headers
+        extra_body.setdefault("prompt_cache_key", config.prompt_cache_key)
 
     if extra_body:
         llm_kwargs["extra_body"] = extra_body

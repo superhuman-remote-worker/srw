@@ -3056,6 +3056,14 @@ codexProxy:
   # upstream error the status endpoint won't explain, then flip it back.
   requestLog: false
   debug: false
+  # Keep a conversation on one connected account. Provider prompt caches are
+  # per account, and the proxy's default round-robin moves every request to
+  # the next one, so with several accounts a conversation's turns read none of
+  # each other's cache. SRW sends the job or thread id as `X-Session-ID`
+  # (LLMConfig.prompt_cache_key). A 429 or an unavailable account still fails
+  # over to another one. Supported since at least v7.2.110.
+  sessionAffinity: true
+  sessionAffinityTtl: "1h"
   # Optional dedicated *inference* credential, distinct from the management
   # key. CLIProxyAPI guards /v0/management/* with MANAGEMENT_PASSWORD and
   # /v1/* with its own access-manager API keys; SRW historically stored the

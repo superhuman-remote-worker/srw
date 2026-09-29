@@ -547,7 +547,14 @@ class UniversalAgent:
         # with the tiers.
         self._model_config_warnings: List[str] = []
 
-        self._llm = create_llm(llm_config, limits=limits)
+        # A per-job conversation key keeps a job's turns on one proxy account
+        # and one provider cache (LLMConfig.prompt_cache_key). Only the main
+        # client carries it; the boot-time build has no job yet.
+        main_config = llm_config
+        job_id = getattr(self, "_current_job_id", None)
+        if job_id:
+            main_config = _dc_replace(llm_config, prompt_cache_key=f"srw-job-{job_id}")
+        self._llm = create_llm(main_config, limits=limits)
         self._strategic_llm = self._llm
         self._tactical_llm = self._llm
         logger.info(f"Created LLM for all phases: {llm_config.model}")
