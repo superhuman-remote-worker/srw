@@ -115,7 +115,7 @@ FOR UPDATE
 _LOCK_QUEUE_UNIT_SQL = """
 SELECT unit_kind, state, lease_token, leased_by, last_leased_by,
        leased_until, max_attempts, attempts_since_completion,
-       queued_at, run_after,
+       queued_at, run_after, park_reason,
        input_seq, consumed_seq,
        control_input_seq, control_consumed_seq
        , interrupt_admission_lease_token, interrupt_admission_turn_id
@@ -160,6 +160,9 @@ RETURNING id
 """
 
 
+# The hold replaces the row's disposition while the lost claimant may still
+# write. The metadata hold keeps the intended one (a parked row keeps its park
+# reason there), and ``acknowledge_session_claim_quiesced`` restores it.
 _PARK_CLAIM_LOSS_HOLD_SQL = """
 UPDATE run_queue
 SET state = 'parked',
@@ -996,7 +999,7 @@ async def _steal_session_with_claim_loss(
             }
         if raw_ledger:
             metadata[CLAIM_LOSS_LEDGER_KEY] = raw_ledger
-            metadata[CLAIM_LOSS_HOLD_KEY] = {
+            hold = {
                 "lease_token": int(unit.lease_token),
                 "intended_state": str(settled_queue["state"]),
                 "attempts_since_completion": int(
@@ -1005,6 +1008,12 @@ async def _steal_session_with_claim_loss(
                 "queued_at": _json_timestamp(settled_queue["queued_at"]),
                 "run_after": _json_timestamp(settled_queue["run_after"]),
             }
+            if str(settled_queue["state"]) == "parked":
+                # The hold overwrites the reason below. Keep the steal's own
+                # (``reaper_max_attempts``) so the release restores the reason
+                # the owner sees, and the owner's retry, with the state.
+                hold["park_reason"] = settled_queue["park_reason"]
+            metadata[CLAIM_LOSS_HOLD_KEY] = hold
         else:
             metadata.pop(CLAIM_LOSS_LEDGER_KEY, None)
             metadata.pop(CLAIM_LOSS_HOLD_KEY, None)

@@ -36,6 +36,8 @@ import agent.api.persistent_app as pa
 import agent.api.turn_executor as te
 from agent.api.lease_context import LeaseHandle, current_lease
 from agent.api.persistent_app import _db_rows_to_lc_messages
+from orchestrator.routers import thread_transport
+from orchestrator.services import run_queue_reaper as reaper
 from shared import run_queue
 from shared.persistent_input_delivery import (
     claim_stateless_input_delivery,
@@ -50,6 +52,9 @@ from shared.run_queue import (
     reap_expired,
     record_input_seq,
 )
+from shared.session_retirement import acknowledge_session_claim_quiesced
+from shared.session_subagent_authority import session_subagent_delivery_id
+from tests.test_b10_session_queries_real_postgres import _request, _transport
 from tests.test_session_subagent_batch_recovery_pg import THIRD, THIRD_UID, _Agent
 from tests.test_session_subagent_batch_settle_pg import (
     POD,
@@ -755,31 +760,59 @@ async def test_an_officer_wake_admitted_by_a_dead_executor_is_served_again(
         await pool.close()
 
 
+async def _steal_through_the_production_reaper(
+    pool: asyncpg.Pool, thread_id: UUID
+) -> None:
+    """The claimant is killed and the orchestrator reaper steals its lease the
+    way production does: an exact claimant becomes claim-loss debt and the
+    unit sits behind a claim-loss hold until that claimant is proven gone."""
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE run_queue SET leased_until = now() - interval '1 hour' "
+            "WHERE unit_id = $1 AND state = 'leased'",
+            thread_id,
+        )
+        stolen = await reap_expired(
+            conn,
+            unit_kind=UNIT_KIND_SESSION_TURN,
+            grace_seconds=0.0,
+            backoff_base_seconds=0.0,
+            jitter=0.0,
+            session_steal=reaper._try_steal_session_with_claim_loss,
+        )
+    assert [unit.unit_id for unit in stolen] == [thread_id]
+
+
 @pytest.mark.asyncio
 async def test_repeated_kills_of_one_event_turn_park_at_max_attempts(
     pg_dsn: str,
 ) -> None:
     """Every successor serves the owed admission again; the claim count since
-    the last completion bounds it, and the reaper parks the unit."""
+    the last completion bounds it (parallel_subagents.md §8, "The unit keeps
+    dying"). Through the production steal each kill leaves a claim-loss hold,
+    and once the dead claimant is proven gone the unit shows the reason it was
+    parked for, and its owner may retry it."""
 
     pool = await _fresh_pool(pg_dsn)
     try:
         session, wake = await _wake_thread(pool)
+        orchestrator = _orchestrator_db(pool)
         generations = []
         for index in range(10):
+            pod, pod_uid = f"executor-{index}", f"executor-uid-{index}"
             async with pool.acquire() as conn:
                 claim = await claim_unit(
                     conn,
                     unit_kind=UNIT_KIND_SESSION_TURN,
-                    pod_name=f"executor-{index}",
+                    pod_name=pod,
                     prefer_unit_id=session,
                 )
             if claim is None:
                 break
-            pod = f"executor-{index}"
             async with pool.acquire() as conn:
                 await _stamp_stateless_claim(
-                    conn, session, token=claim.lease_token, pod=pod, pod_uid=pod
+                    conn, session, token=claim.lease_token, pod=pod, pod_uid=pod_uid
                 )
                 ids = [
                     row["id"]
@@ -795,12 +828,36 @@ async def test_repeated_kills_of_one_event_turn_park_at_max_attempts(
                 lease={
                     "lease_token": claim.lease_token,
                     "executor_id": pod,
-                    "executor_pod_uid": pod,
+                    "executor_pod_uid": pod_uid,
                 },
                 turn_number=int(wake["turn_number"]),
             )
             generations.append(admitted["claim_generation"])
-            await _die(pool, session)
+            await _steal_through_the_production_reaper(pool, session)
+            held = await _queue(pool, session)
+            assert (held["state"], held["park_reason"]) == ("parked", "claim_loss_hold")
+            # The dead claimant is proven gone (its own drain ACK, or the
+            # reconciler observing its exact Pod UID terminated).
+            assert await acknowledge_session_claim_quiesced(
+                pool,
+                thread_id=session,
+                previous_lease_token=claim.lease_token,
+                leased_by=pod,
+                pod_uid=pod_uid,
+            )
+            released = await _queue(pool, session)
+            if released["state"] == "parked":
+                break
+            # Released to its intended state, the hold's reason goes too.
+            async with pool.acquire() as conn:
+                parked_at = await conn.fetchval(
+                    "SELECT parked_at FROM run_queue WHERE unit_id = $1", session
+                )
+            assert (released["state"], released["park_reason"], parked_at) == (
+                "queued",
+                None,
+                None,
+            )
         queue = await _queue(pool, session)
         assert (queue["state"], queue["park_reason"]) == (
             "parked",
@@ -810,10 +867,220 @@ async def test_repeated_kills_of_one_event_turn_park_at_max_attempts(
             max_attempts = await conn.fetchval(
                 "SELECT max_attempts FROM run_queue WHERE unit_id = $1", session
             )
+            owner = await conn.fetchval(
+                "SELECT user_id FROM threads WHERE id = $1", session
+            )
         assert len(generations) == max_attempts
         assert generations == list(range(1, max_attempts + 1))
         assert (await _delivery(pool, wake["delivery_id"]))["state"] == "admitted"
+
+        # The owner's retry is accepted, and the next claim serves the event.
+        revived = await thread_transport.thread_queue_retry(
+            str(session),
+            _request(),
+            dependencies=_transport(orchestrator, owner, {"id": session}),
+        )
+        assert revived["state"] == "queued"
+        assert revived["park_reason"] == "reaper_max_attempts"
+        queue = await _queue(pool, session)
+        assert (queue["state"], queue["park_reason"]) == ("queued", None)
+        assert queue["attempts_since_completion"] == 0
+        async with pool.acquire() as conn:
+            claim = await claim_unit(
+                conn,
+                unit_kind=UNIT_KIND_SESSION_TURN,
+                pod_name="executor-after-retry",
+                prefer_unit_id=session,
+            )
+            assert claim is not None
+            rows = await conn.fetch(
+                te._PENDING_INPUT_SQL, session, claim.consumed_seq, 10
+            )
+        assert [str(row["id"]) for row in rows] == [str(wake["message_id"])]
     finally:
+        await pool.close()
+
+
+# ---------------------------------------------------------------------------
+# The per-child recovery of an event turn leaves an owed event for replay
+# ---------------------------------------------------------------------------
+
+
+async def _wake_turn_delegated_one_child(pool, orchestrator, *, final_answer: bool):
+    """A wake's turn delegated one child, which completed; its ToolMessage is
+    durable in the parent transcript, then the executor was killed (with or
+    without a final answer)."""
+
+    session, wake = await _wake_thread(pool)
+    lease = await _claim_as(pool, session, POD, POD_UID)
+    await _admit(
+        pool,
+        session,
+        wake["delivery_id"],
+        lease=lease,
+        turn_number=int(wake["turn_number"]),
+    )
+    authority = {
+        "version": 1,
+        "execution_lane": "stateless",
+        "parent_thread_id": str(session),
+        **lease,
+    }
+    ai_id, call_id = uuid4(), f"call_after_the_wake_{uuid4().hex[:8]}"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO thread_messages "
+            "(id, thread_id, role, content, tool_calls, turn_number) "
+            "VALUES ($1, $2, 'ai', '', $3::jsonb, 1)",
+            ai_id,
+            session,
+            json.dumps([{"id": call_id, "name": "delegate_agent", "args": {}}]),
+        )
+    child = await orchestrator.create_session_subagent_thread(
+        parent_thread_id=str(session),
+        parent_authority=authority,
+        handle="reader-0001",
+        subagent_type="reader",
+        parent_tool_call_id=call_id,
+        parent_input_message_id=str(wake["message_id"]),
+        parent_ai_message_id=str(ai_id),
+        parent_iteration=1,
+    )
+    ended = await orchestrator.terminalize_session_subagent_thread(
+        parent_thread_id=str(session),
+        parent_authority=authority,
+        thread_id=child["thread_id"],
+        runtime_generation=child["runtime_generation"],
+        subagent_status="completed",
+        outcome="completed",
+        turns=3,
+        tokens=900,
+    )
+    assert ended is not None and ended["result"] == "applied"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO thread_messages "
+            "(id, thread_id, role, content, tool_call_id, turn_number) "
+            "VALUES ($1, $2, 'tool', '[subagent reader-0001] the report', $3, 1)",
+            uuid4(),
+            session,
+            call_id,
+        )
+        if final_answer:
+            await conn.execute(
+                "INSERT INTO thread_messages "
+                "(id, thread_id, role, content, turn_number) "
+                "VALUES ($1, $2, 'ai', 'The nightly report is fine.', 1)",
+                uuid4(),
+                session,
+            )
+    await _die(pool, session)
+    return session, wake, child
+
+
+def _recover_child(child: dict, claim: ClaimedUnit, session: UUID, pod, uid) -> dict:
+    return dict(
+        parent_thread_id=str(session),
+        parent_authority={
+            "version": 1,
+            "execution_lane": "stateless",
+            "parent_thread_id": str(session),
+            "lease_token": claim.lease_token,
+            "executor_id": pod,
+            "executor_pod_uid": uid,
+        },
+        thread_id=child["thread_id"],
+        runtime_generation=child["runtime_generation"],
+        subagent_status="completed",
+        outcome="completed",
+        turns=3,
+        tokens=900,
+        delivery_id=str(
+            session_subagent_delivery_id(
+                UUID(child["thread_id"]), UUID(child["runtime_generation"])
+            )
+        ),
+        message="[subagent reader-0001 · reader · completed] transcript envelope",
+        foreground_orphan_recovery=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_per_child_recovery_leaves_an_unanswered_event_to_be_served_again(
+    pg_dsn: str, monkeypatch, harness
+) -> None:
+    """The child's ToolMessage is durable and the turn has no answer: the
+    per-child recovery (a stale listing, a racing call, an older agent)
+    answers ``already_delivered`` and must neither consume nor settle the
+    event: no watermark and no continuation stands for it, so the next turn
+    serves it again, with the report in the transcript."""
+
+    pool = await _fresh_pool(pg_dsn)
+    try:
+        orchestrator = _orchestrator_db(pool)
+        session, wake, child = await _wake_turn_delegated_one_child(
+            pool, orchestrator, final_answer=False
+        )
+        executor = _Executor(
+            harness, monkeypatch, pool, pod=SUCCESSOR, pod_uid=SUCCESSOR_UID
+        )
+        claim = await executor.claim(session)
+        assert claim is not None
+        recovered = await orchestrator.terminalize_session_subagent_thread(
+            **_recover_child(child, claim, session, SUCCESSOR, SUCCESSOR_UID)
+        )
+        assert recovered["result"] == "already_delivered"
+        assert (await _delivery(pool, wake["delivery_id"]))["state"] == "admitted"
+        assert (await _queue(pool, session))["consumed_seq"] < wake["seq"]
+
+        await executor.h.executor._serve_claim(claim)
+        assert await executor.drive(session) == 0
+
+        (served,) = executor.served
+        assert served["item"]["id"] == str(wake["message_id"])
+        assert str(wake["message_id"]) not in served["context"]
+        assert (await _delivery(pool, wake["delivery_id"]))["state"] == "settled"
+        assert await _answers(pool, session) == [ANSWER]
+        queue = await _queue(pool, session)
+        assert (queue["state"], queue["consumed_seq"]) == ("done", wake["seq"])
+    finally:
+        await harness.cleanup()
+        await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_per_child_recovery_consumes_an_event_its_turn_answered(
+    pg_dsn: str, monkeypatch, harness
+) -> None:
+    """Unchanged: when the turn did answer, the per-child recovery consumes
+    the event (watermark and settlement) and nothing is served again."""
+
+    pool = await _fresh_pool(pg_dsn)
+    try:
+        orchestrator = _orchestrator_db(pool)
+        session, wake, child = await _wake_turn_delegated_one_child(
+            pool, orchestrator, final_answer=True
+        )
+        executor = _Executor(
+            harness, monkeypatch, pool, pod=SUCCESSOR, pod_uid=SUCCESSOR_UID
+        )
+        claim = await executor.claim(session)
+        assert claim is not None
+        recovered = await orchestrator.terminalize_session_subagent_thread(
+            **_recover_child(child, claim, session, SUCCESSOR, SUCCESSOR_UID)
+        )
+        assert recovered["result"] == "already_delivered"
+        assert (await _delivery(pool, wake["delivery_id"]))["state"] == "settled"
+        assert (await _queue(pool, session))["consumed_seq"] == wake["seq"]
+
+        await executor.h.executor._serve_claim(claim)
+        assert await executor.drive(session) == 0
+
+        assert executor.served == []
+        assert await _answers(pool, session) == ["The nightly report is fine."]
+        assert (await _queue(pool, session))["state"] == "done"
+    finally:
+        await harness.cleanup()
         await pool.close()
 
 

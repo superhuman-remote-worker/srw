@@ -498,6 +498,9 @@ def claim_loss_hold(metadata: dict[str, Any]) -> dict[str, Any] | None:
     state = str(raw.get("intended_state") or "")
     if token <= 0 or attempts < 0 or state not in {"queued", "parked", "done"}:
         raise RuntimeError("stateless claim-loss hold is malformed")
+    reason = raw.get("park_reason")
+    if reason is not None and (not isinstance(reason, str) or not reason.strip()):
+        raise RuntimeError("stateless claim-loss hold is malformed")
     return dict(raw)
 
 
@@ -681,6 +684,10 @@ async def acknowledge_session_claim_quiesced(
             if updated is None:
                 return False
             if restore is not None:
+                # The hold's own ``claim_loss_hold`` reason goes with it: a
+                # parked row gets back the reason it was parked for (a hold
+                # stored before the reason was kept can only have come from
+                # the steal's max-attempts park), any other state none.
                 restored = await conn.fetchval(
                     """
                     UPDATE run_queue
@@ -688,7 +695,13 @@ async def acknowledge_session_claim_quiesced(
                         attempts_since_completion = $4::integer,
                         run_after = COALESCE($5::text::timestamptz, run_after),
                         queued_at = CASE WHEN $6::text IS NULL THEN queued_at
-                                         ELSE $6::text::timestamptz END
+                                         ELSE $6::text::timestamptz END,
+                        park_reason = CASE WHEN $3::text = 'parked'
+                                           THEN COALESCE($7::text,
+                                                         'reaper_max_attempts')
+                                           ELSE NULL END,
+                        parked_at = CASE WHEN $3::text = 'parked'
+                                         THEN parked_at ELSE NULL END
                     WHERE unit_id = $1::uuid
                       AND unit_kind = 'session_turn'
                       AND state = 'parked'
@@ -702,6 +715,7 @@ async def acknowledge_session_claim_quiesced(
                     int(restore["attempts_since_completion"]),
                     restore.get("run_after"),
                     restore.get("queued_at"),
+                    restore.get("park_reason"),
                 )
                 if restored is None:
                     raise RuntimeError("claim-loss settlement lost its parked hold")

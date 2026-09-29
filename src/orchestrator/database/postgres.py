@@ -36627,7 +36627,20 @@ class PostgresDB:
                             parent_thread_id=parent_uuid,
                             parent_input=recovery_input,
                         )
-                    if source_delivery_state == "admitted":
+                    # A stateless event input its turn still owes stays
+                    # admitted. As with a human input here, the next claim
+                    # serves it again with the ToolMessage in the transcript
+                    # (the executor serves an older lease's unsettled
+                    # admission again). Settling it would lose it: neither a
+                    # watermark nor a continuation stands for it.
+                    event_still_owed = (
+                        parsed.execution_lane == "stateless"
+                        and recovery_input.role == "event"
+                        and not source_already_complete
+                        and delivered_by_tool_message
+                        and not parent_turn_completed
+                    )
+                    if source_delivery_state == "admitted" and not event_still_owed:
                         await settle_recovery_source(
                             conn,
                             parent_thread_id=parent_uuid,
