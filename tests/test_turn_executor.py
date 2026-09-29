@@ -224,6 +224,10 @@ class FakeDB:
         # Step 4a shutdown classification: do all persisted tool calls of the
         # pending turn have their ToolMessage? (None = query fails → park)
         self.tool_effects_durable: Optional[bool] = None
+        # The delegation branch of that classification (parallel_subagents
+        # §8): may a successor settle the in-flight batch? (None = query
+        # fails → park)
+        self.delegation_batch_recoverable: Optional[bool] = False
         # Error releases lock the stateless thread before their queue CAS.
         self.thread_row: Optional[Dict[str, Any]] = {
             "execution_lane": "stateless",
@@ -274,6 +278,10 @@ class FakeDB:
             if self.tool_effects_durable is None:
                 raise RuntimeError("durability probe unavailable")
             return self.tool_effects_durable
+        if sql == te._DELEGATION_BATCH_RECOVERABLE_SQL:
+            if self.delegation_batch_recoverable is None:
+                raise RuntimeError("delegation probe unavailable")
+            return self.delegation_batch_recoverable
         return None
 
 
@@ -367,6 +375,7 @@ class Harness:
         pa._turn_tool_execution_identity = None
         pa._session_input._interrupt_mode = None
         pa._session_input._interrupt_target_turn_id = None
+        pa._session_input._interrupt_cause = None
         pa._session_input._hard_interrupt_event = asyncio.Event()
         pa._turn_event_open = False
         pa._pending_cloud_push_task = None
@@ -764,6 +773,7 @@ _INPUT_SAVED_ATTRS = (
     "_queue",
     "_interrupt_mode",
     "_interrupt_target_turn_id",
+    "_interrupt_cause",
     "_hard_interrupt_event",
 )
 
@@ -2663,6 +2673,27 @@ class TestLeaseLost:
         assert harness.executor._attached_fingerprint is None
 
     @pytest.mark.asyncio
+    async def test_heartbeat_loss_abort_is_tagged_lease_lost(
+        self, harness, monkeypatch
+    ):
+        """The abort is the platform's, never a person's Stop, so a running
+        delegation batch leaves it pending (parallel_subagents.md §8); its
+        children stop at their own lost-authority check."""
+
+        monkeypatch.setattr(te, "HEARTBEAT_INTERVAL_SECONDS", 0.01)
+        harness.heartbeat_result = None
+        harness.loop_behavior = "hang"
+        harness.db.pending_rows = [{"id": str(uuid4()), "seq": 2, "content": "hi"}]
+        claim = make_claim(unit_id=uuid4(), token=11, input_seq=2)
+
+        await asyncio.wait_for(harness.executor._serve_claim(claim), timeout=5.0)
+        await _finish(harness)
+
+        assert pa._session_input.interrupt_mode in ("hard", "graceful")
+        assert pa._session_input.interrupt_cause == "lease_lost"
+        assert not harness.calls["release"] and not harness.calls["complete"]
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("tool_inflight", "expected_mode", "hard_event_set"),
         [
@@ -3678,3 +3709,112 @@ class TestCommitThenEffects:
         assert harness.calls["park"]
         assert harness.park_reasons[-1] == "shutdown_cancelled"
         assert not harness.calls["release"]
+
+    # parallel_subagents.md §8: a graceful shutdown during a session's
+    # delegation batch releases the claim for a successor to settle.
+
+    @pytest.mark.asyncio
+    async def test_cancel_mid_turn_during_a_delegation_batch_releases(self, harness):
+        harness.loop_behavior = "hang"
+        harness.db.pending_rows = [{"id": str(uuid4()), "seq": 4, "content": "mid"}]
+        harness.db.tool_effects_durable = False  # the batch's calls are open
+        harness.db.delegation_batch_recoverable = True
+        claim = make_claim(token=96, input_seq=4, consumed_seq=3)
+        signals: List[Dict[str, Any]] = []
+        original_signal = pa._session_input.signal_interrupt_for_turn
+
+        def _spy_signal(turn_id, **kwargs):
+            signals.append({"turn_id": turn_id, **kwargs})
+            return original_signal(turn_id, **kwargs)
+
+        serving = asyncio.create_task(harness.executor._serve_claim(claim))
+        harness.executor._task = serving
+        deadline = asyncio.get_running_loop().time() + 2
+        while not harness.calls["interrupt_open"]:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.005)
+        batch = _BatchRuntime(opened=[("call-a", "child-a"), ("call-b", "child-b")])
+        pa._session.tool_context.subagent_runtime = batch
+        harness.mark_tool_effect(1)
+        with patch.object(pa._session_input, "signal_interrupt_for_turn", _spy_signal):
+            await asyncio.wait_for(harness.executor.stop(timeout=0), timeout=5)
+        await _finish(harness)
+
+        # The platform's own abort, never a person's Stop: the batch leaves it
+        # pending, and the turn is then cancelled with its children marked.
+        assert signals == [{"turn_id": 1, "force_graceful": True, "cause": "shutdown"}]
+        assert pa._session_input.interrupt_cause == "shutdown"
+        assert batch.left_for_successor == 1
+        # Branch (3b): released for the successor, input not consumed.
+        assert harness.calls["release"] == [
+            {
+                "unit_id": claim.unit_id,
+                "lease_token": 96,
+                "backoff_seconds": 0.0,
+                "error": True,
+            }
+        ]
+        assert not harness.calls["park"] and not harness.calls["complete"]
+        assert harness.disposition_order[-2:] == ["terminate", "release"]
+        # Asked with the children this process opened, before the detach.
+        (probe,) = [
+            args
+            for sql, args in harness.db.fetch_calls
+            if sql == te._DELEGATION_BATCH_RECOVERABLE_SQL
+        ]
+        assert probe == (claim.unit_id, 3, ["child-a", "child-b"], ["call-a", "call-b"])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("recoverable", [False, None])
+    async def test_cancel_mid_turn_with_another_open_call_still_parks(
+        self, harness, recoverable
+    ):
+        harness.loop_behavior = "hang"
+        harness.db.pending_rows = [{"id": str(uuid4()), "seq": 4, "content": "mid"}]
+        harness.db.tool_effects_durable = False
+        # False: a call outside a delegation-only batch has no result, or an
+        # opened child has no row. None: the probe failed.
+        harness.db.delegation_batch_recoverable = recoverable
+        claim = make_claim(token=97, input_seq=4)
+        serving = asyncio.create_task(harness.executor._serve_claim(claim))
+        harness.executor._task = serving
+        await asyncio.sleep(0.1)
+        harness.executor._tool_effect_identity = (str(claim.unit_id), 97, 1)
+        harness.executor._abort_grace_seconds = 0.05
+        await asyncio.wait_for(harness.executor.stop(timeout=0), timeout=5)
+        await _finish(harness)
+        assert harness.calls["park"]
+        assert harness.park_reasons[-1] == "shutdown_cancelled"
+        assert not harness.calls["release"]
+
+    @pytest.mark.asyncio
+    async def test_a_detached_session_is_never_released_as_a_delegation_batch(
+        self, harness
+    ):
+        """No attached session means no process-local list of opened
+        children: the delegation branch cannot be proven and parks."""
+
+        claim = make_claim(token=98, input_seq=4)
+        harness.db.delegation_batch_recoverable = True
+        pa._session = None
+        assert await harness.executor._delegation_batch_recoverable(pa, claim) is False
+        pa._session = FakeSession()
+        pa._thread_id = str(uuid4())  # another thread's session
+        assert await harness.executor._delegation_batch_recoverable(pa, claim) is False
+        pa._thread_id = str(claim.unit_id)
+        assert await harness.executor._delegation_batch_recoverable(pa, claim) is True
+        assert not any(
+            sql == te._DELEGATION_BATCH_RECOVERABLE_SQL and args[2]
+            for sql, args in harness.db.fetch_calls
+        )
+
+
+class _BatchRuntime:
+    """The two members of ``SubagentRuntime`` the executor's shutdown reads."""
+
+    def __init__(self, opened):
+        self.foreground_opened = list(opened)
+        self.left_for_successor = 0
+
+    def leave_foreground_for_successor(self) -> None:
+        self.left_for_successor += 1

@@ -611,6 +611,17 @@ class PersistentLoopCallbacks:
     # value behaves like "graceful" (preserves partial response).
     check_interrupt: Callable[[], Optional[str]]
 
+    # Read-only: who asked for the pending interrupt of the current turn,
+    # without consuming it. ``"user"`` (``USER_INTERRUPT_CAUSE``) is a person's
+    # Stop; any other value is the platform's own abort (a stateless executor
+    # shutting down or losing its lease). Only the delegation batch reads it:
+    # it stops its children for a person and leaves a platform abort pending,
+    # so the batch keeps running, writes nothing when the turn is then
+    # cancelled, and the successor settles it (parallel_subagents.md §8).
+    # Optional: None ⇒ every interrupt counts as a person's Stop (previous
+    # behaviour).
+    peek_interrupt_cause: Optional[Callable[[], Optional[str]]] = None
+
     # Notify the client that a workspace upgrade is available. Fires for BOTH a
     # sandbox sudo intercept asking for a VM (freeze_type=vm_upgrade_required)
     # and a lite agent's request_workspace_upgrade asking for a sandbox
@@ -998,6 +1009,10 @@ async def _await_or_hard_interrupt(
 #: How often a running delegation batch polls ``check_interrupt``. A Stop that
 #: lands while a tool runs is "graceful", which sets no event to wait on.
 _DELEGATION_INTERRUPT_POLL_S = 0.25
+#: ``PersistentLoopCallbacks.peek_interrupt_cause`` of a person's Stop. Equal
+#: to ``agent.api.session_input.INTERRUPT_CAUSE_USER`` (pinned by a test; the
+#: loop does not import the transport layer).
+USER_INTERRUPT_CAUSE = "user"
 #: Strict persistence of one delegation result. The write is an upsert by the
 #: message id, so a retry can never produce a second row.
 _DELEGATION_RESULT_PERSIST_ATTEMPTS = 3
@@ -1096,13 +1111,25 @@ class _DelegationBatchOutcome:
 
 
 async def _await_turn_interrupt(
-    check_interrupt: Callable[[], Any], hard_event: Optional[asyncio.Event]
+    check_interrupt: Callable[[], Any],
+    hard_event: Optional[asyncio.Event],
+    peek_cause: Optional[Callable[[], Optional[str]]] = None,
 ) -> str:
-    """Poll the turn's one-shot interrupt flag; return its mode once set."""
+    """Poll the turn's one-shot interrupt flag; return its mode once set.
+
+    Only a person's Stop is consumed. An interrupt the platform raised
+    (``peek_cause`` names anything but ``USER_INTERRUPT_CAUSE``) stays pending
+    and unconsumed: the batch keeps running, and the executor that raised it
+    cancels the turn next, which writes no result (§8). The peek and the
+    consume run with no await between them. Without ``peek_cause`` every
+    interrupt is a person's.
+    """
     while True:
-        mode = check_interrupt()
-        if mode:
-            return mode if isinstance(mode, str) else "graceful"
+        cause = peek_cause() if peek_cause is not None else None
+        if cause is None or cause == USER_INTERRUPT_CAUSE:
+            mode = check_interrupt()
+            if mode:
+                return mode if isinstance(mode, str) else "graceful"
         if hard_event is not None and not hard_event.is_set():
             try:
                 await asyncio.wait_for(
@@ -1120,12 +1147,15 @@ async def _supervise_delegation_batch(
     check_interrupt: Callable[[], Any],
     hard_interrupt_event: Optional[asyncio.Event],
     stop_children: Callable[[], Awaitable[Any]],
+    peek_interrupt_cause: Optional[Callable[[], Optional[str]]] = None,
 ) -> _DelegationBatchOutcome:
     """Wait until every call task of a delegation batch has ended.
 
     - Stop (the turn's interrupt flag) is raced against the batch (D4):
       ``stop_children`` runs once and the batch keeps waiting, so every call
-      still ends with its own result.
+      still ends with its own result. Only a person's Stop counts; an
+      interrupt the platform raised (``peek_interrupt_cause``) is left
+      pending and the batch keeps running (§8).
     - A call that fails on its own is its own outcome; the siblings keep
       running. A ``WorkspaceUnavailableError`` is the exception: the siblings
       share the dead workspace, so they are cancelled and each is reported
@@ -1140,7 +1170,9 @@ async def _supervise_delegation_batch(
     outcome = _DelegationBatchOutcome()
     pending = set(tasks)
     watcher = asyncio.ensure_future(
-        _await_turn_interrupt(check_interrupt, hard_interrupt_event)
+        _await_turn_interrupt(
+            check_interrupt, hard_interrupt_event, peek_interrupt_cause
+        )
     )
     try:
         while pending:
@@ -3890,12 +3922,15 @@ async def _execute_turn(
                 ]
                 # A cancellation of this turn (shutdown, drain) propagates from
                 # here after every child task is cancelled and joined, and no
-                # result is written: the successor settles the batch.
+                # result is written: the successor settles the batch. The
+                # executor's own shutdown abort is not a Stop: it stays
+                # pending until that cancellation arrives.
                 _batch = await _supervise_delegation_batch(
                     _delegation_tasks,
                     check_interrupt=callbacks.check_interrupt,
                     hard_interrupt_event=callbacks.hard_interrupt_event,
                     stop_children=_stop_delegation_children,
+                    peek_interrupt_cause=callbacks.peek_interrupt_cause,
                 )
                 for slot, task in zip(_approved_slots, _delegation_tasks):
                     if task.cancelled():

@@ -43,7 +43,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Tuple
 
 from agent.core.context import sanitize_history_for_provider_boundary
 
@@ -277,6 +277,16 @@ class SubagentRuntime:
         # Set by ``stop_foreground_batch`` for the current batch only;
         # ``begin_batch`` clears it.
         self._foreground_stop: Optional[str] = None
+        # Set once by ``leave_foreground_for_successor`` (a stateless
+        # executor's graceful shutdown) and never cleared: this runtime is
+        # being torn down, and its cancelled foreground children keep the
+        # durable rows a crash would leave.
+        self._foreground_left_for_successor = False
+        # (parent tool call id, child id) of every foreground child whose
+        # durable row this runtime opened in the current batch, in open order.
+        # ``begin_batch`` clears it. Read at shutdown to check, against the
+        # database, that every child that may have run has its row.
+        self._foreground_opened: List[Tuple[str, str]] = []
         self._active: Dict[str, SubagentDriver] = {}
         self._records: Dict[Tuple[str, str], SubagentRecord] = {}
         self._inflight: Dict[Tuple[str, str], asyncio.Future] = {}
@@ -389,6 +399,7 @@ class SubagentRuntime:
         self._batch_size = max(1, size)
         # A new batch starts unstopped: a Stop belongs to the batch it hit.
         self._foreground_stop = None
+        self._foreground_opened = []
 
     @property
     def batch_size(self) -> int:
@@ -398,6 +409,51 @@ class SubagentRuntime:
     def foreground_batch_stopped(self) -> bool:
         """Whether the current foreground batch was stopped (D4)."""
         return self._foreground_stop is not None
+
+    @property
+    def foreground_opened(self) -> List[Tuple[str, str]]:
+        """``(parent tool call id, child id)`` of every foreground child whose
+        durable row this runtime opened in the current batch.
+
+        A child runs only after its row is open, so this is every child of
+        the batch that may have done work. A call still queued behind the cap
+        or still being built is not in it: it has done nothing.
+        """
+        return list(self._foreground_opened)
+
+    @property
+    def foreground_left_for_successor(self) -> bool:
+        return self._foreground_left_for_successor
+
+    def leave_foreground_for_successor(self) -> None:
+        """Hand the foreground batch to the next process (graceful shutdown).
+
+        Set by a stateless executor immediately before it cancels a turn it
+        could not finish in its shutdown window. From then on, a foreground
+        child cancelled before it finished writes no terminal row: it stays
+        ``running`` exactly as a crash leaves it, so the successor's settle
+        classifies it live and ends it ``interrupted:parent_restart``
+        (parallel_subagents.md §8). A child that already finished keeps its
+        terminal row and report; a call that never opened a row stays
+        without one. A person's Stop and every other cancellation are
+        unaffected. Never cleared: the runtime is torn down with the session.
+
+        A call that reaches a new child after this (queued behind the cap and
+        handed a freed slot, or still being built) opens no row, makes no
+        provider call and returns no result: it waits for the cancellation
+        that follows, and the successor reports it as not started.
+        """
+        self._foreground_left_for_successor = True
+
+    async def _await_successor_cancellation(self, call: SubagentCall) -> NoReturn:
+        """Hold a foreground call the successor now owns until the shutdown
+        cancels its turn. Returning anything would become a tool result."""
+        logger.info(
+            "subagent call %s held for the successor (parent shutting down)",
+            call.tool_call_id or "<no id>",
+        )
+        await asyncio.get_running_loop().create_future()
+        raise AssertionError("unreachable: the held call is only ever cancelled")
 
     async def stop_foreground_batch(
         self, *, grace_s: float = BATCH_STOP_GRACE_S
@@ -543,6 +599,8 @@ class SubagentRuntime:
     ) -> str:
         if not self._accepting:
             return "Error: subagent runtime is quiescing; no new work accepted"
+        if self._foreground_left_for_successor:
+            await self._await_successor_cancellation(call)
         if self._foreground_stop is not None:
             return stopped_not_started_text()
         isolation = str(call.isolation or entry.get("isolation") or "shared")
@@ -550,6 +608,10 @@ class SubagentRuntime:
         subagent_id = str(uuid.uuid4())
 
         async with self._semaphore:
+            if self._foreground_left_for_successor:
+                # Queued behind the cap when the batch was handed over: a
+                # freed slot must not start it (§8, "not started").
+                await self._await_successor_cancellation(call)
             if self._foreground_stop is not None:
                 # Queued behind the cap when the turn was stopped.
                 return stopped_not_started_text()
@@ -591,6 +653,10 @@ class SubagentRuntime:
             if not self._accepting:
                 await build.release()
                 return "Error: subagent runtime is quiescing; child was not started"
+            if self._foreground_left_for_successor:
+                # Handed over while its environment was being built: no row.
+                await build.release()
+                await self._await_successor_cancellation(call)
             if self._foreground_stop is not None:
                 # Stopped while its environment was being built: no row yet.
                 await build.release()
@@ -637,6 +703,8 @@ class SubagentRuntime:
             except BaseException:
                 await driver.close()
                 raise
+            if call.tool_call_id:
+                self._foreground_opened.append((str(call.tool_call_id), subagent_id))
             self._active[handle] = driver
             logger.info(
                 "subagent %s (%s) spawned: isolation=%s write_policy=%s tools=%d "
@@ -651,12 +719,29 @@ class SubagentRuntime:
                 call.fork,
             )
             try:
+                if self._foreground_left_for_successor:
+                    # Handed over while its row was being opened: the row
+                    # stays as opened (the successor interrupts it), and the
+                    # child never reaches its first provider call.
+                    await self._await_successor_cancellation(call)
                 if self._foreground_stop is not None:
                     # The Stop landed while the row was being opened: the
                     # child ends stopped before its first provider call.
                     await driver.graceful_stop(self._foreground_stop, timeout=0.0)
                 result = await driver.run(call.prompt)
             except asyncio.CancelledError:
+                if self._foreground_left_for_successor:
+                    # Graceful shutdown: leave the row running, as a crash
+                    # would, for the successor's settle to interrupt (§8).
+                    logger.info(
+                        "subagent %s (%s) left running for the successor "
+                        "(parent shutting down): %d turns, %d tokens",
+                        handle,
+                        name,
+                        driver.provider_calls,
+                        driver.tokens,
+                    )
+                    raise
                 await self._commit_foreground_terminal(
                     handle,
                     subagent_id,

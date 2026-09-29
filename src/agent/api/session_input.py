@@ -40,6 +40,19 @@ _logger = logging.getLogger(__name__)
 # Bounded durable-inbox poll while the pinned loop waits for input.
 PINNED_INPUT_POLL_SECONDS = 1.0
 
+# Who asked for an interrupt. A person (the interrupt API, a legacy socket or
+# REST Stop, a rewind) is ``user``. The stateless executor tags its own
+# aborts: ``shutdown`` when the process is being replaced, ``lease_lost`` when
+# its claim was taken away. A delegation batch stops its children only for a
+# person; a platform abort leaves the batch to the successor
+# (parallel_subagents.md §8).
+INTERRUPT_CAUSE_USER = "user"
+INTERRUPT_CAUSE_SHUTDOWN = "shutdown"
+INTERRUPT_CAUSE_LEASE_LOST = "lease_lost"
+INTERRUPT_CAUSES = frozenset(
+    {INTERRUPT_CAUSE_USER, INTERRUPT_CAUSE_SHUTDOWN, INTERRUPT_CAUSE_LEASE_LOST}
+)
+
 
 @dataclass(frozen=True, slots=True)
 class SessionRuntimeIdentity:
@@ -132,6 +145,10 @@ class SessionInputRuntime:
         # successor turn.
         self._interrupt_mode: Optional[str] = None
         self._interrupt_target_turn_id: Optional[int] = None
+        # Who asked for the pending interrupt (``INTERRUPT_CAUSES``). Part of
+        # the same logical value as the mode and target: set and cleared with
+        # them.
+        self._interrupt_cause: Optional[str] = None
         # Set with a hard interrupt so the loop can tear down a blocked LLM /
         # auxiliary await immediately. Created per attach, cleared whenever
         # the interrupt is consumed or cleared.
@@ -163,6 +180,10 @@ class SessionInputRuntime:
         return self._interrupt_target_turn_id
 
     @property
+    def interrupt_cause(self) -> Optional[str]:
+        return self._interrupt_cause
+
+    @property
     def queued_claims(self) -> frozenset[tuple[str, int]]:
         return frozenset(self._queued_claims)
 
@@ -182,6 +203,7 @@ class SessionInputRuntime:
         self._queue = None
         self._interrupt_mode = None
         self._interrupt_target_turn_id = None
+        self._interrupt_cause = None
         self._hard_interrupt_event = asyncio.Event()
         self._reclaim_lock = asyncio.Lock()
         self._queued_claims.clear()
@@ -198,6 +220,7 @@ class SessionInputRuntime:
         self._queue = None
         self._interrupt_mode = None
         self._interrupt_target_turn_id = None
+        self._interrupt_cause = None
         self._hard_interrupt_event = None
         self._queued_claims.clear()
 
@@ -964,8 +987,8 @@ class SessionInputRuntime:
         """Clear one pending interrupt without crossing a turn boundary.
 
         When ``target_turn_id`` is supplied, a newer turn's pending interrupt
-        is left untouched. Mode, target and the hard-event signal are one
-        logical value and are always cleared together.
+        is left untouched. Mode, target, cause and the hard-event signal are
+        one logical value and are always cleared together.
         """
 
         if target_turn_id is not None and self._interrupt_target_turn_id != int(
@@ -979,6 +1002,7 @@ class SessionInputRuntime:
         )
         self._interrupt_mode = None
         self._interrupt_target_turn_id = None
+        self._interrupt_cause = None
         if self._hard_interrupt_event is not None:
             self._hard_interrupt_event.clear()
         return had_interrupt
@@ -988,6 +1012,7 @@ class SessionInputRuntime:
         target_turn_id: int,
         *,
         force_graceful: bool = False,
+        cause: str = INTERRUPT_CAUSE_USER,
     ) -> Optional[str]:
         """Synchronously signal RAM iff ``target_turn_id`` is still active.
 
@@ -995,8 +1020,15 @@ class SessionInputRuntime:
         half of the exact-target fence: the database protects the lease
         generation, while this method prevents a late request for turn N from
         interrupting turn N+1 after an in-process transition.
+
+        ``cause`` says who asked (``INTERRUPT_CAUSES``). A person's pending
+        Stop for the same turn keeps its cause when the platform signals on
+        top of it: the Stop was asked for first and must still reach a
+        delegation batch.
         """
 
+        if cause not in INTERRUPT_CAUSES:
+            raise ValueError(f"unknown interrupt cause: {cause!r}")
         session = self._ports.session()
         if (
             session is None
@@ -1005,6 +1037,12 @@ class SessionInputRuntime:
         ):
             return None
         mode = "graceful" if (self._ports.tool_inflight() or force_graceful) else "hard"
+        if not (
+            self._interrupt_mode is not None
+            and self._interrupt_target_turn_id == int(target_turn_id)
+            and self._interrupt_cause == INTERRUPT_CAUSE_USER
+        ):
+            self._interrupt_cause = cause
         self._interrupt_mode = mode
         self._interrupt_target_turn_id = int(target_turn_id)
         # Hard interrupt with no tool in flight ⇒ the loop is parked in an LLM /
@@ -1013,6 +1051,25 @@ class SessionInputRuntime:
         if mode == "hard" and self._hard_interrupt_event is not None:
             self._hard_interrupt_event.set()
         return mode
+
+    def peek_interrupt_cause(self) -> Optional[str]:
+        """Who asked for the pending interrupt of the current turn, unconsumed.
+
+        ``None`` when nothing is pending for the current turn. A stale or
+        unscoped interrupt also reads ``None`` here; ``check_interrupt``
+        discards it. Never mutates state.
+        """
+
+        if self._interrupt_mode is None:
+            return None
+        session = self._ports.session()
+        current_turn_id = int(session.turn_count) if session is not None else None
+        if (
+            self._interrupt_target_turn_id is None
+            or self._interrupt_target_turn_id != current_turn_id
+        ):
+            return None
+        return self._interrupt_cause or INTERRUPT_CAUSE_USER
 
     def check_interrupt(self) -> Optional[str]:
         """One-shot read of the interrupt flag. Returns the mode or None.

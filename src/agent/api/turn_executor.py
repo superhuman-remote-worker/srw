@@ -88,6 +88,10 @@ from agent.api.orchestrator_client import (
     ClaimBundleError,
     CompletionNonTerminalReportError,
 )
+from agent.api.session_input import (
+    INTERRUPT_CAUSE_LEASE_LOST,
+    INTERRUPT_CAUSE_SHUTDOWN,
+)
 from shared.event_journal import append_system_frame, bump_epoch
 from shared.job_freeze_types import (
     AUTO_CONTINUE_FREEZE_TYPES,
@@ -375,6 +379,61 @@ SELECT NOT EXISTS (
               AND result_row.tool_call_id = tool_call ->> 'id'
        )
 )
+"""
+
+# Shutdown classification, the delegation branch (parallel_subagents.md §6.3,
+# §8): a cancelled turn whose only tool calls without a result are the calls
+# of a delegation-only batch is released for a successor to settle, not
+# parked. True iff
+#   * some persisted call has no result row (else the branch above applies),
+#   * every assistant row holding such a call carries delegate_agent calls
+#     only (a mixed batch never runs; any other call keeps today's park), and
+#   * every child this process opened a row for in the batch ($3 child ids,
+#     $4 their tool call ids, from the runtime) has that durable row for
+#     exactly its call. A child runs only after its row is open, so the
+#     successor then sees every child that may have done work, and a call
+#     with no row did nothing.
+_DELEGATION_BATCH_RECOVERABLE_SQL = """
+WITH unanswered AS (
+    SELECT call_row.tool_calls AS row_calls
+      FROM thread_messages AS call_row
+     CROSS JOIN LATERAL jsonb_array_elements(
+         CASE WHEN jsonb_typeof(call_row.tool_calls) = 'array'
+              THEN call_row.tool_calls ELSE '[]'::jsonb END
+     ) AS tool_call
+     WHERE call_row.thread_id = $1
+       AND call_row.role = 'ai'
+       AND call_row.rewound_at IS NULL
+       AND call_row.seq > $2::bigint
+       AND NOT EXISTS (
+           SELECT 1
+             FROM thread_messages AS result_row
+            WHERE result_row.thread_id = call_row.thread_id
+              AND result_row.role = 'tool'
+              AND result_row.rewound_at IS NULL
+              AND result_row.seq > call_row.seq
+              AND result_row.tool_call_id = tool_call ->> 'id'
+       )
+)
+SELECT EXISTS (SELECT 1 FROM unanswered)
+   AND NOT EXISTS (
+       SELECT 1
+         FROM unanswered
+        CROSS JOIN LATERAL jsonb_array_elements(unanswered.row_calls) AS sibling
+        WHERE sibling ->> 'name' IS DISTINCT FROM 'delegate_agent'
+   )
+   AND NOT EXISTS (
+       SELECT 1
+         FROM unnest($3::text[], $4::text[]) AS opened(child_id, tool_call_id)
+        WHERE NOT EXISTS (
+            SELECT 1
+              FROM threads AS child
+             WHERE child.parent_thread_id = $1
+               AND child.parent_tool_call_id = opened.tool_call_id
+               AND child.kind = 'subagent'
+               AND child.id::text = opened.child_id
+        )
+   )
 """
 
 
@@ -1194,10 +1253,14 @@ class StatelessTurnExecutor:
                         int(self._lease.lease_token),
                     )
                 self._lease.mark_lost()
+            # Tagged as the platform's own abort: a running delegation batch
+            # does not treat it as a person's Stop and keeps its children
+            # (parallel_subagents.md §8); every other turn stops as before.
             self._abort_turn_politely(
                 pa,
                 target_turn_id=target_turn_id,
                 force_graceful=tool_execution_started,
+                cause=INTERRUPT_CAUSE_SHUTDOWN,
             )
             try:
                 await asyncio.wait_for(asyncio.shield(task), self._abort_grace_seconds)
@@ -1205,8 +1268,12 @@ class StatelessTurnExecutor:
                 logger.error(
                     "stateless executor still running after interrupt — "
                     "cancelling; a quiesced post-effect claim will be parked "
-                    "instead of retried"
+                    "instead of retried unless its turn can be continued"
                 )
+                # The turn is abandoned to a successor. A delegation child
+                # this cancellation interrupts keeps the durable row a crash
+                # leaves, for the successor's settle to interrupt.
+                self._leave_subagents_for_successor(pa)
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
@@ -3738,8 +3805,11 @@ class StatelessTurnExecutor:
         settled, no tool effect crossed — release with attempts++. (3) not
         settled, effect crossed, but every persisted tool call has its
         durable ToolMessage — release: the successor continues from the
-        transcript. (4) an in-flight tool with no result row — the only
-        remaining park.
+        transcript. (3b) the calls without a result are those of a
+        delegation-only batch whose opened children all have their rows —
+        release: the successor settles the batch (parallel_subagents.md §8).
+        (4) any other in-flight tool with no result row — the only remaining
+        park.
         """
 
         pa = _pa()
@@ -3791,6 +3861,17 @@ class StatelessTurnExecutor:
                 logger.warning(
                     "shutdown mid-turn after tool effects, all results durable: "
                     "releasing unit=%s token=%d for a successor to continue",
+                    claim.unit_id,
+                    claim.lease_token,
+                )
+                tool_execution_started = False
+            elif await self._delegation_batch_recoverable(pa, claim):
+                # The children are stopped by the detach below and keep the
+                # rows a crash leaves; the input stays unconsumed, and the
+                # successor's attach settles the batch and continues the turn.
+                logger.warning(
+                    "shutdown mid-turn during a delegation batch: releasing "
+                    "unit=%s token=%d for a successor to settle",
                     claim.unit_id,
                     claim.lease_token,
                 )
@@ -4466,8 +4547,12 @@ class StatelessTurnExecutor:
             )
             turn_id = self._owned_abort_target(pa)
             # Signal before interrupt-watcher close/drain: those are remote/DB
-            # joins and must not delay the process-local abort edge.
-            self._abort_turn_politely(pa, target_turn_id=turn_id)
+            # joins and must not delay the process-local abort edge. A
+            # delegation batch leaves this abort pending: its children stop at
+            # their own lost-authority check, and their saves are refused.
+            self._abort_turn_politely(
+                pa, target_turn_id=turn_id, cause=INTERRUPT_CAUSE_LEASE_LOST
+            )
             if turn_id is not None:
                 await self._close_interrupt_window(
                     pa,
@@ -5194,6 +5279,7 @@ class StatelessTurnExecutor:
         *,
         target_turn_id: Optional[int],
         force_graceful: bool = False,
+        cause: str = INTERRUPT_CAUSE_SHUTDOWN,
     ) -> bool:
         """Interrupt the loop the way the interrupt verb does: graceful while
         a tool call is mid-invoke, hard otherwise (cancels a blocked LLM
@@ -5202,6 +5288,10 @@ class StatelessTurnExecutor:
         Stateless lease loss may race the end of a turn. Never synthesize an
         unscoped flag: the persistent-loop helper atomically verifies that the
         exact durable turn is still active before mutating interrupt state.
+
+        ``cause`` is never a person's: ``shutdown`` from ``stop``,
+        ``lease_lost`` when the claim was taken away. A delegation batch
+        leaves such an interrupt pending instead of stopping its children.
         """
         if (
             isinstance(target_turn_id, bool)
@@ -5216,6 +5306,7 @@ class StatelessTurnExecutor:
             mode = pa._session_input.signal_interrupt_for_turn(
                 target_turn_id,
                 force_graceful=force_graceful,
+                cause=cause,
             )
         except Exception:
             logger.warning("failed to signal turn abort", exc_info=True)
@@ -5228,11 +5319,81 @@ class StatelessTurnExecutor:
             )
             return False
         logger.info(
-            "turn abort requested (mode=%s target_turn=%d)",
+            "turn abort requested (mode=%s cause=%s target_turn=%d)",
             mode,
+            cause,
             target_turn_id,
         )
         return True
+
+    @staticmethod
+    def _session_subagent_runtime(pa: Any) -> Any:
+        """The attached session's delegation runtime, or ``None``."""
+
+        session = getattr(pa, "_session", None)
+        context = getattr(session, "tool_context", None)
+        return getattr(context, "subagent_runtime", None)
+
+    def _leave_subagents_for_successor(self, pa: Any) -> None:
+        """Mark the attached session's foreground children for a successor.
+
+        Explicit, never inferred: only ``stop`` calls it, right before it
+        cancels a turn it could not finish in the shutdown window. Children
+        cancelled after this keep their ``running`` rows (a crash's durable
+        state); a person's Stop and every other cancellation keep writing
+        their terminal rows.
+        """
+
+        try:
+            runtime = self._session_subagent_runtime(pa)
+            leave = getattr(runtime, "leave_foreground_for_successor", None)
+            if callable(leave):
+                leave()
+        except Exception:
+            # The children then commit ``cancelled`` rows: the settle reports
+            # them as ended, never loses them.
+            logger.warning(
+                "could not hand the delegation batch to a successor",
+                exc_info=True,
+            )
+
+    async def _delegation_batch_recoverable(self, pa: Any, claim: ClaimedUnit) -> bool:
+        """The in-flight turn's only unresolved effects are a delegation batch
+        a successor can settle (``_DELEGATION_BATCH_RECOVERABLE_SQL``).
+
+        Reads the children this process opened from the attached runtime
+        before the physical detach tears it down, and checks each against its
+        durable row. Any doubt (no session, no reader, a failed query) keeps
+        today's park.
+        """
+
+        if getattr(pa, "_session", None) is None or str(
+            getattr(pa, "_thread_id", "") or ""
+        ) != str(claim.unit_id):
+            return False
+        fetchval = getattr(self._db, "fetchval", None)
+        if fetchval is None:
+            return False
+        try:
+            runtime = self._session_subagent_runtime(pa)
+            opened = list(getattr(runtime, "foreground_opened", None) or [])
+            call_ids = [str(tool_call_id) for tool_call_id, _ in opened]
+            child_ids = [str(child_id) for _, child_id in opened]
+            value = await fetchval(
+                _DELEGATION_BATCH_RECOVERABLE_SQL,
+                claim.unit_id,
+                claim.consumed_seq if claim.consumed_seq is not None else -1,
+                child_ids,
+                call_ids,
+            )
+        except Exception:
+            logger.warning(
+                "delegation-batch recoverability check failed for unit %s; parking",
+                claim.unit_id,
+                exc_info=True,
+            )
+            return False
+        return value is True
 
     async def _wait_turn_unwind(
         self, turn_done: asyncio.Event, loop_task: Optional[asyncio.Task]

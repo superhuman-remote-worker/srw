@@ -1786,6 +1786,7 @@ def _ensure_persistent_loop_started(
             on_turn_complete=_loop_on_turn_complete,
             on_error=_loop_on_error,
             check_interrupt=_session_input.check_interrupt,
+            peek_interrupt_cause=_session_input.peek_interrupt_cause,
             on_workspace_upgrade_needed=_loop_on_workspace_upgrade_needed,
             on_workspace_commit=_loop_on_workspace_commit,
             on_context_compacted=_loop_on_context_compacted,
