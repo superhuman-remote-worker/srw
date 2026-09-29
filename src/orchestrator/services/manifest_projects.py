@@ -543,6 +543,11 @@ async def persist_project_resource(
             resource["id"],
             resource["revision"],
         )
+        from orchestrator.services.project_workspace_defaults import (
+            sync_manifest_defaults,
+        )
+
+        await sync_manifest_defaults(db, resource)
         return resource
     owner_id = (
         (previous.get("owner_id") if previous else None)

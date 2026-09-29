@@ -29,6 +29,7 @@ from orchestrator.services.manifest_projects import (
 )
 from orchestrator.services.manifest_resources import ManifestResourceService
 from orchestrator.services.manifest_store import ManifestStore
+from orchestrator.services.project_workspace_defaults import read_project_defaults
 from shared.manifests import validate_documents
 from shared.manifests.resolution import content_revision
 from shared.runtime.core.expert_resolution import build_expert_config
@@ -773,6 +774,61 @@ async def test_native_resource_delete_cannot_remove_a_personal_default_expert(db
         user_id=str(owner["id"]), expert_type="worker"
     )
     assert default["id"] == expert["id"]
+
+
+@pytest.mark.asyncio
+async def test_persist_project_resource_early_branch_resyncs_workspace_defaults_revision(
+    db,
+):
+    owner, _ = await db.create_user_with_default_project("Owner")
+    service = ManifestResourceService(db)
+    workspace = {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "WorkspaceTemplate",
+        "metadata": {"name": "box"},
+        "spec": {"backend": "vm"},
+    }
+    await service.apply(json.dumps(workspace), owner, format="json")
+    project_doc = {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "Project",
+        "metadata": {"name": "native-team"},
+        "spec": {
+            "description": "first",
+            "resources": {
+                "workspaces": {
+                    "box": {
+                        "ref": {
+                            "name": "box",
+                            "scope": {"kind": "Account", "name": str(owner["id"])},
+                        }
+                    }
+                }
+            },
+            "defaults": {"workspace": {"jobs": "vm", "vm": "box"}},
+        },
+    }
+    applied = await service.apply(json.dumps(project_doc), owner, format="json")
+    project_row = next(
+        item for item in applied["resources"] if item["resource"]["kind"] == "Project"
+    )
+    project_id = await db.fetchval(
+        "SELECT linked_id FROM srw_resources WHERE id=$1", UUID(project_row["uid"])
+    )
+    before = await read_project_defaults(db, project_id)
+    assert before.manifest_revision == project_row["revision"]
+
+    # A native Project's early rebuild branch: only description/display-name
+    # change, but that still hashes into a new active_revision. This is the
+    # real production trigger (PostgresDB.update_project()).
+    assert await db.update_project(str(project_id), description="second")
+    updated = await ManifestStore(db).by_link("Project", project_id)
+    assert updated["revision"] != project_row["revision"]
+    assert updated["active_revision"] == updated["revision"]
+
+    after = await read_project_defaults(db, project_id)
+    assert after.jobs == "vm"
+    assert after.manifest_revision == updated["revision"]
 
 
 @pytest.mark.asyncio
