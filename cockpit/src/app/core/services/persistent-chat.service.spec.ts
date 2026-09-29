@@ -10,6 +10,7 @@ import {
   historyToTurns,
   cloudCountFromSummary,
   describeAppliedConfig,
+  parseRunningTools,
 } from './persistent-chat.service';
 import { ApiService } from './api.service';
 import { CapabilitiesService } from './capabilities.service';
@@ -18,6 +19,7 @@ import { NotificationService } from './notification.service';
 import { AppToastService } from '../../ui/toast';
 import {
   AssistantTurn,
+  groupEvents,
   isAssistantTurn,
   isSystemTurn,
   isToolCall,
@@ -1178,7 +1180,7 @@ describe('PersistentChatService — connect()', () => {
     fireSseMessage(sseInstances[0], { method: 'token', params: { content: 'Completed.' } }, '0:5519');
     (service as any)._flushDeltas();
     expect(service.isStreaming()).toBe(true);
-    service.runningTool.set({ id: 'c1', tool: 'shell_execute', args: {} });
+    service.runningTools.set([{ id: 'c1', tool: 'shell_execute', args: {} }]);
 
     (service as any)._handleEvent({
       method: 'session.state',
@@ -1195,7 +1197,7 @@ describe('PersistentChatService — connect()', () => {
     const turn = service.turns().find(isAssistantTurn) as AssistantTurn;
     expect(turn.status).toBe('interrupted');
     expect((turn.events[0] as TextEvent).content).toBe('Completed.');
-    expect(service.runningTool()).toBeNull();
+    expect(service.runningTools()).toEqual([]);
     // A pinned welcome frame (no durable source) keeps the historical
     // reopen-only behaviour: it is followed by the exact WS state.
     fireSseMessage(sseInstances[0], { method: 'turn.started', params: { turn_id: 5 } }, '0:5521');
@@ -5823,11 +5825,11 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
       '5:81',
     );
 
-    expect(ctx.service.runningTool()).toEqual({
+    expect(ctx.service.runningTools()).toEqual([{
       id: 'tool-live',
       tool: 'run_command',
       args: { cmd: 'make' },
-    });
+    }]);
     expect(ctx.service.pendingPermissions()).toEqual([
       {
         id: 'tool-gated',
@@ -8866,7 +8868,7 @@ describe('PersistentChatService — interrupt self-healing', () => {
 
     expect(service.isStreaming()).toBe(false);
     expect(service.currentTurnId()).toBeNull();
-    expect(service.runningTool()).toBeNull();
+    expect(service.runningTools()).toEqual([]);
     expect(service.isInterrupting()).toBe(false);
     expect(service.pendingTurnCount()).toBe(0);
     expect(service.turns().find((turn) => turn.id === '1')).toMatchObject({
@@ -10273,6 +10275,103 @@ describe('PersistentChatService — usage.updated telemetry', () => {
       ] as never);
       const tools = (turns[0] as AssistantTurn).events.filter(isToolCall);
       expect(tools[0]).toMatchObject({ decision: 'expired', status: 'expired' });
+    });
+  });
+
+  describe('historyToTurns — a subagent fan-out is grouped by the message that issued it', () => {
+    // Two model responses in one turn, each fanning out to two subagents,
+    // with nothing between them. Contiguity alone would render one batch of
+    // four; the AI row id keeps them apart.
+    const ai = (id: string, calls: string[]) => ({
+      id,
+      role: 'ai',
+      content: null,
+      tool_calls: calls.map((callId) => ({
+        name: 'delegate_agent',
+        args: { subagent_type: 'explorer', description: callId },
+        id: callId,
+      })),
+      turn_number: 3,
+      created_at: null,
+    });
+    const tool = (callId: string) => ({
+      id: `r-${callId}`,
+      role: 'tool',
+      content: 'report',
+      tool_calls: null,
+      tool_call_id: callId,
+      turn_number: 3,
+      created_at: null,
+    });
+
+    it('stamps each call with its AI row id', () => {
+      const turns = historyToTurns([ai('m1', ['d1', 'd2']), tool('d1'), tool('d2')] as never);
+      const calls = (turns[0] as AssistantTurn).events.filter(isToolCall);
+      expect(calls.map((c) => c.messageKey)).toEqual(['m1', 'm1']);
+    });
+
+    it('renders two back-to-back fan-outs as two batches', () => {
+      const turns = historyToTurns([
+        ai('m1', ['d1', 'd2']), tool('d1'), tool('d2'),
+        ai('m2', ['d3', 'd4']), tool('d3'), tool('d4'),
+      ] as never);
+      const groups = groupEvents((turns[0] as AssistantTurn).events);
+      expect(groups.map((g) => g.kind)).toEqual(['delegate_batch', 'delegate_batch']);
+      expect(groups.map((g) => (g.kind === 'single' ? [g.event.id] : g.events.map((e) => e.id))))
+        .toEqual([['d1', 'd2'], ['d3', 'd4']]);
+    });
+  });
+
+  describe('running-command snapshot — several calls in flight', () => {
+    it('parses the single running_tool every server sends today', () => {
+      expect(parseRunningTools({ running_tool: { id: 'c1', tool: 'run_command', args: { cmd: 'make' } } }))
+        .toEqual([{ id: 'c1', tool: 'run_command', args: { cmd: 'make' } }]);
+      expect(parseRunningTools({ running_tool: null })).toEqual([]);
+      // No tool name: nothing to show, as the single field always did.
+      expect(parseRunningTools({ running_tool: { id: 'c1' } })).toEqual([]);
+    });
+
+    it('prefers a running_tools list when a server sends one', () => {
+      expect(
+        parseRunningTools({
+          running_tool: { id: 'd1', tool: 'delegate_agent', args: {} },
+          running_tools: [
+            { id: 'd1', tool: 'delegate_agent', args: {} },
+            { id: 'd2', tool: 'delegate_agent' },
+            { id: 'bad' },
+          ],
+        }),
+      ).toEqual([
+        { id: 'd1', tool: 'delegate_agent', args: {} },
+        { id: 'd2', tool: 'delegate_agent', args: {} },
+      ]);
+    });
+
+    it('drops only the finished call on tool.completed, keeping its running siblings', () => {
+      const { service } = createService();
+      (service as any)._handleEvent({
+        method: 'session.state',
+        params: {
+          running_tools: [
+            { id: 'd1', tool: 'delegate_agent', args: {} },
+            { id: 'd2', tool: 'delegate_agent', args: {} },
+          ],
+        },
+      });
+      expect(service.runningTools().map((rt) => rt.id)).toEqual(['d1', 'd2']);
+
+      (service as any)._handleEvent({ method: 'tool.completed', params: { id: 'd1', result: 'ok' } });
+      expect(service.runningTools().map((rt) => rt.id)).toEqual(['d2']);
+
+      (service as any)._handleEvent({ method: 'tool.completed', params: { id: 'd2', result: 'ok' } });
+      expect(service.runningTools()).toEqual([]);
+    });
+
+    it('leaves the snapshot alone on a session.state that names neither field', () => {
+      const { service } = createService();
+      service.runningTools.set([{ id: 'c1', tool: 'run_command', args: {} }]);
+      (service as any)._handleEvent({ method: 'session.state', params: { model: 'm' } });
+      expect(service.runningTools()).toEqual([{ id: 'c1', tool: 'run_command', args: {} }]);
     });
   });
 

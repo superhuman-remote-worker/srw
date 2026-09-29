@@ -32,7 +32,7 @@ import {
     sshWorkspaceReachable,
     pickCurrentStartupStep,
     pickRewindCandidates,
-    pickRunningCommandCard,
+    pickRunningCommandCards,
     pickWorkspaceOfferCard,
     PersistentChatComponent,
     readingWidthToCss,
@@ -398,39 +398,47 @@ describe('pickCurrentStartupStep', () => {
     });
 });
 
-describe('pickRunningCommandCard', () => {
+describe('pickRunningCommandCards', () => {
     const rt = {id: 'tc1', tool: 'run_command', args: {command: 'sleep 99'}};
+    const runningTurn = (...ids: string[]): AssistantTurn => ({
+        kind: 'assistant',
+        id: 't1',
+        status: 'streaming',
+        startedAt: 0,
+        events: ids.map((id) => ({
+            kind: 'tool_call' as const,
+            id,
+            tool: 'run_command',
+            args: {},
+            status: 'running' as const,
+            startedAt: 0,
+        })),
+    });
 
-    it('returns null when nothing is running', () => {
-        expect(pickRunningCommandCard(null, [])).toBeNull();
+    it('returns nothing when nothing is running', () => {
+        expect(pickRunningCommandCards([], [])).toEqual([]);
     });
 
     it('surfaces the running tool when it is not yet in any turn (cold reattach mid-turn)', () => {
         // Cold reload mid-turn: REST history lacks the in-flight turn, so the
         // only signal is the welcome frame's running_tool — show the card.
-        expect(pickRunningCommandCard(rt, [])).toEqual(rt);
+        expect(pickRunningCommandCards([rt], [])).toEqual([rt]);
     });
 
     it('suppresses the card when the tool call is already in a visible turn (warm reconnect)', () => {
         // Warm reconnect: the turn (with its own tool card) is still on screen,
         // so the standalone card would double-render — suppress it.
-        const turn: AssistantTurn = {
-            kind: 'assistant',
-            id: 't1',
-            status: 'streaming',
-            startedAt: 0,
-            events: [
-                {
-                    kind: 'tool_call',
-                    id: 'tc1',
-                    tool: 'run_command',
-                    args: {},
-                    status: 'running',
-                    startedAt: 0,
-                },
-            ],
-        };
-        expect(pickRunningCommandCard(rt, [turn])).toBeNull();
+        expect(pickRunningCommandCards([rt], [runningTurn('tc1')])).toEqual([]);
+    });
+
+    it('shows one card per in-flight call of a parallel batch, minus the ones on screen', () => {
+        // A subagent fan-out blocks on several calls at once. The single-valued
+        // snapshot showed one child of N after a cold reload.
+        const a = {id: 'd1', tool: 'delegate_agent', args: {}};
+        const b = {id: 'd2', tool: 'delegate_agent', args: {}};
+        const c = {id: 'd3', tool: 'delegate_agent', args: {}};
+        expect(pickRunningCommandCards([a, b, c], [])).toEqual([a, b, c]);
+        expect(pickRunningCommandCards([a, b, c], [runningTurn('d2')])).toEqual([a, c]);
     });
 });
 

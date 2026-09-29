@@ -101,6 +101,17 @@
       "review": "{{count}} zur Prüfung",
       "notCreated": "Job wurde nicht erstellt"
     },
+    "delegateBatch": {
+      "title": "{{count}} Subagenten",
+      "finished": "{{done}}/{{total}} beendet",
+      "failed": "{{count}} fehlgeschlagen",
+      "status": {
+        "pending": "Wartet auf Freigabe",
+        "denied": "Abgelehnt",
+        "expired": "Nicht ausgeführt",
+        "notStarted": "Nicht gestartet"
+      }
+    },
     "view": {
       "rendered": "Gerendert",
       "raw": "Quelltext"

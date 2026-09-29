@@ -246,7 +246,7 @@ export interface ToolCallInfo {
 }
 
 /**
- * The tool call the agent is currently blocked on, delivered in the
+ * A tool call the agent is currently blocked on, delivered in the
  * session.state welcome frame so a (re)attaching client can render a
  * running-command card even when the in-flight turn isn't in REST history yet
  * (it's persisted only at turn end).
@@ -632,6 +632,12 @@ interface SessionStateSnapshot extends Record<string, unknown> {
   model: string | null;
   temperature: number | null;
   running_tool: RunningToolInfo | null;
+  /**
+   * Every call in flight, for a parallel batch (e.g. a subagent fan-out).
+   * Not sent by any server yet — both producers report only one call — so
+   * `running_tool` stays the fallback. See `parseRunningTools`.
+   */
+  running_tools?: RunningToolInfo[] | null;
   pending_permissions: unknown[];
   /** Present on task-aware servers; omitted by older rolling-deploy peers. */
   tasks?: SessionTask[];
@@ -1129,10 +1135,12 @@ export class PersistentChatService {
 
   // --- Running-command snapshot ---
   // Set from the session.state welcome frame on (re)attach when the loop is
-  // blocked in a tool call; cleared when that tool completes or the turn ends.
-  // Lets the UI show a "running command" card instead of a blank "Connecting…"
-  // during a long mid-turn block (the in-flight turn isn't in REST history).
-  readonly runningTool = signal<RunningToolInfo | null>(null);
+  // blocked in tool calls; each entry is dropped when its tool completes, and
+  // all of them when the turn ends. Lets the UI show "running command" cards
+  // instead of a blank "Connecting…" during a long mid-turn block (the
+  // in-flight turn isn't in REST history). A list, because a parallel batch
+  // (a subagent fan-out) blocks on several calls at once.
+  readonly runningTools = signal<RunningToolInfo[]>([]);
 
   // --- Narration state ---
   readonly narrationMode = signal<NarrationMode>('auto');
@@ -2404,7 +2412,7 @@ export class PersistentChatService {
       // Config-drift dialog state is per-thread; a stale drift list
       // from the previous thread must not survive a genuine switch.
       this.pendingDrift.set(null);
-      this.runningTool.set(null);
+      this.runningTools.set([]);
       this.citationsByCid.set(new Map());
       this.citationsLoaded.set(false);
       if (!preserveReviewPlane) {
@@ -7272,7 +7280,7 @@ export class PersistentChatService {
           this.conversation().activeAssistantTurnId != null
         ) {
           this._closeActiveTurnIfAny('turn_interrupted');
-          this.runningTool.set(null);
+          this.runningTools.set([]);
           this.compaction.set(null);
         }
         if (params['model']) {
@@ -7281,13 +7289,10 @@ export class PersistentChatService {
         if (params['temperature'] != null) {
           this.temperature.set(params['temperature'] as number);
         }
-        // Running-command snapshot: only act when the key is present so
+        // Running-command snapshot: only act when a key is present so
         // a metadata-only session.state from another channel can't clobber it.
-        if ('running_tool' in params) {
-          const rt = params['running_tool'] as Partial<RunningToolInfo> | null;
-          this.runningTool.set(
-            rt && rt.tool ? { id: rt.id ?? '', tool: rt.tool, args: rt.args ?? {} } : null,
-          );
+        if ('running_tools' in params || 'running_tool' in params) {
+          this.runningTools.set(parseRunningTools(params));
         }
         // Pending supervised gates: re-render the approval card a
         // dropped stream (or a reload) would otherwise strand, leaving
@@ -7444,18 +7449,21 @@ export class PersistentChatService {
         });
         break;
 
-      case 'tool.completed':
+      case 'tool.completed': {
+        const completedId = (params['id'] as string) || '';
         this.dispatch({
           type: 'tool_completed',
-          toolUseId: (params['id'] as string) || '',
+          toolUseId: completedId,
           result: (params['result'] as string) || '',
           isError: !!params['is_error'],
           timestamp: now,
         });
-        if (this.runningTool()?.id === ((params['id'] as string) || '')) {
-          this.runningTool.set(null);
+        // Only the finished call leaves; its siblings in a batch still run.
+        if (this.runningTools().some((rt) => rt.id === completedId)) {
+          this.runningTools.update((list) => list.filter((rt) => rt.id !== completedId));
         }
         break;
+      }
 
       case 'permission.request_batch': {
         const list = this._toPermissionRequests(params['requests']);
@@ -7589,7 +7597,7 @@ export class PersistentChatService {
 
         const closedActive = this._interruptTurnIfSafe(targetId, now, coveredBySnapshot);
         if (closedActive) {
-          this.runningTool.set(null);
+          this.runningTools.set([]);
           this.pendingTurnCount.set(0);
           this.isWaitingForInput.set(false);
           this.compaction.set(null);
@@ -7626,7 +7634,7 @@ export class PersistentChatService {
           if (pending && turnId === String(pending.targetTurnId)) {
             this._clearPendingInterruptRequest(pending);
           }
-          if (wasActive) this.runningTool.set(null);
+          if (wasActive) this.runningTools.set([]);
         }
         // A compaction never outlives its turn — clear a stale block
         // (e.g. the pod died mid-fold and the turn was closed).
@@ -7669,7 +7677,7 @@ export class PersistentChatService {
         // it across reloads (session_silent_failure_audit.md #2).
         this._closeActiveTurnIfAny('turn_interrupted');
         this.isInterrupting.set(false);
-        this.runningTool.set(null);
+        this.runningTools.set([]);
         this.compaction.set(null);
         // Conservative reset: a queued send may still run after the
         // failed turn, but its turn.started decrement is clamped —
@@ -7712,7 +7720,7 @@ export class PersistentChatService {
         const targetId = String(targetTurnId);
         const closedActive = this._interruptTurnIfSafe(targetId, now, coveredBySnapshot);
         if (closedActive) {
-          this.runningTool.set(null);
+          this.runningTools.set([]);
           this.pendingTurnCount.set(0);
         }
         // Any exact acknowledgement for this same turn makes a local
@@ -8548,6 +8556,31 @@ export function cloudCountFromSummary(s: ThreadCloudDiffSummary | null): number 
 // no better here than a user bubble.
 const SYNTHETIC_IMAGE_DELIVERY_RE = /^Image content from tool call \S+:\s*$/;
 
+/**
+ * The in-flight tool calls a `session.state` snapshot reports.
+ *
+ * `running_tools` (every unanswered call of the batch) wins when present;
+ * otherwise the single `running_tool` both producers send today — the agent's
+ * welcome frame names the first unanswered call of the last tool-calling
+ * message, and the orchestrator's durable snapshot the latest unmatched
+ * `tool.started`. So a cold reattach in the middle of a subagent fan-out shows
+ * one running card until a server sends the list. Entries without a tool
+ * name are dropped, as the single field always did.
+ */
+export function parseRunningTools(params: Record<string, unknown>): RunningToolInfo[] {
+  const toInfo = (raw: unknown): RunningToolInfo | null => {
+    if (!raw || typeof raw !== 'object') return null;
+    const rt = raw as Partial<RunningToolInfo>;
+    return rt.tool ? { id: rt.id ?? '', tool: rt.tool, args: rt.args ?? {} } : null;
+  };
+  const list = params['running_tools'];
+  if (Array.isArray(list)) {
+    return list.map(toInfo).filter((rt): rt is RunningToolInfo => rt !== null);
+  }
+  const single = toInfo(params['running_tool']);
+  return single ? [single] : [];
+}
+
 export function historyToTurns(messages: HistoryMessage[]): Turn[] {
   const turns: Turn[] = [];
   const turnByNumber = new Map<number, AssistantTurn>();
@@ -8724,6 +8757,9 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
           // the live SSE path sets this from the same registry.
           category: tc.category,
           startedAt: ts,
+          // The AI row that carried the call: calls sharing it were issued in
+          // one model response, which is what makes a delegate fan-out.
+          messageKey: m.id,
         };
         turn.events.push(event);
         if (tc.id) toolCallById.set(tc.id, event);

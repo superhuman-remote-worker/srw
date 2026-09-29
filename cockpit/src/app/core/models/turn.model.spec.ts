@@ -9,6 +9,7 @@ import {
     foldWakeCycles,
     FoldableEvent,
     groupEvents,
+    isFollowedByAnswer,
     isQuietWakeTurn,
     isSessionBoundary,
     isSitrepTurn,
@@ -41,6 +42,10 @@ const notify = (id: string): ToolCallEvent =>
 const job = (id: string, status: ToolCallStatus = 'completed'): ToolCallEvent =>
     ({kind: 'tool_call', id, tool: 'create_job', args: {description: 'd'}, status, startedAt: 0});
 const comp = (id: string): CompactionEvent => ({kind: 'compaction', id, summary: 'compacted', startedAt: 0});
+/** A delegate_agent call carried by assistant message `msg`. */
+const dlg = (id: string, msg: string | undefined, status: ToolCallStatus = 'completed'): ToolCallEvent =>
+    ({kind: 'tool_call', id, tool: 'delegate_agent', args: {subagent_type: 'explorer', description: id},
+        status, startedAt: 0, messageKey: msg});
 
 /** Ids in a group, folded / batched / single — keeps the assertions readable. */
 const idsOf = (g: EventGroup): string[] =>
@@ -345,6 +350,105 @@ describe('groupEvents', () => {
         it('does not disturb a turn with no job calls', () => {
             const g = groupEvents([tool('b0'), tool('b1'), tool('b2')]);
             expect(shapeOf(g)).toEqual(['folded(b0,b1)', 'single(b2)']);
+        });
+    });
+
+    describe('delegate fan-out', () => {
+        it('groups the delegate calls of one message into one batch', () => {
+            expect(shapeOf(groupEvents([dlg('b0', 'm1'), dlg('b1', 'm1'), dlg('b2', 'm1')])))
+                .toEqual(['delegate_batch(b0,b1,b2)']);
+        });
+
+        it('batches while in flight and after the results land, the same way', () => {
+            const running = groupEvents([dlg('b0', 'm1', 'running'), dlg('b1', 'm1', 'running')]);
+            const done = groupEvents([dlg('b0', 'm1'), dlg('b1', 'm1')]);
+            expect(shapeOf(running)).toEqual(['delegate_batch(b0,b1)']);
+            expect(shapeOf(done)).toEqual(['delegate_batch(b0,b1)']);
+        });
+
+        it('never folds a finished batch into a chip', () => {
+            // pinnedEventIds() pins only the turn's LAST call once nothing is in
+            // flight; without the batch this rendered 'folded(b0,b1)' plus
+            // 'single(b2)' — two children buried in a "2× delegations" chip.
+            const g = groupEvents([dlg('b0', 'm1'), dlg('b1', 'm1'), dlg('b2', 'm1')]);
+            expect(g.map(x => x.kind)).not.toContain('folded');
+        });
+
+        it('keeps a single delegation exactly as before: a card, and foldable once finished', () => {
+            // In flight or latest: pinned, an ordinary card.
+            expect(shapeOf(groupEvents([dlg('b0', 'm1', 'running')]))).toEqual(['single(b0)']);
+            expect(shapeOf(groupEvents([tool('b0'), dlg('b1', 'm2')]))).toEqual(['single(b0)', 'single(b1)']);
+            // Finished and not the latest call: folds with its neighbours, as
+            // any finished tool call does.
+            expect(shapeOf(groupEvents([tool('b0'), dlg('b1', 'm2'), tool('b2'), tool('b3')])))
+                .toEqual(['folded(b0,b1,b2)', 'single(b3)']);
+        });
+
+        it('keeps two back-to-back single delegations apart', () => {
+            // Two responses of one call each, nothing between them: two
+            // ordinary cards, not a batch of two.
+            const g = groupEvents([dlg('b0', 'm1', 'running'), dlg('b1', 'm2', 'running')]);
+            expect(shapeOf(g)).toEqual(['single(b0)', 'single(b1)']);
+        });
+
+        it('splits back-to-back fan-outs by message', () => {
+            const g = groupEvents([dlg('b0', 'm1'), dlg('b1', 'm1'), dlg('b2', 'm2'), dlg('b3', 'm2')]);
+            expect(shapeOf(g)).toEqual(['delegate_batch(b0,b1)', 'delegate_batch(b2,b3)']);
+        });
+
+        it('leaves the lone call of a message next to a fan-out as an ordinary card', () => {
+            const g = groupEvents([dlg('b0', 'm1'), dlg('b1', 'm2'), dlg('b2', 'm2')]);
+            expect(shapeOf(g)).toEqual(['single(b0)', 'delegate_batch(b1,b2)']);
+        });
+
+        it('breaks the batch on anything between two calls', () => {
+            const g = groupEvents([dlg('b0', 'm1'), tool('b1'), dlg('b2', 'm1')]);
+            expect(g.map(x => x.kind)).not.toContain('delegate_batch');
+        });
+
+        it('falls back to contiguity for calls without a message key', () => {
+            expect(shapeOf(groupEvents([dlg('b0', undefined), dlg('b1', undefined)])))
+                .toEqual(['delegate_batch(b0,b1)']);
+        });
+
+        it('does not disturb a job batch beside it', () => {
+            const g = groupEvents([job('b0'), job('b1'), dlg('b2', 'm2'), dlg('b3', 'm2')]);
+            expect(shapeOf(g)).toEqual(['job_batch(b0,b1)', 'delegate_batch(b2,b3)']);
+        });
+
+        it('ids the batch by its first member so @for track stays stable', () => {
+            expect(groupEvents([dlg('b0', 'm1'), dlg('b1', 'm1')])[0].id).toBe('b0');
+        });
+    });
+
+    describe('isFollowedByAnswer (is a fan-out without results still running?)', () => {
+        const turnOf = (id: string, events: TurnEvent[]): AssistantTurn =>
+            ({kind: 'assistant', id, events, status: 'done', startedAt: 0});
+        const user: Turn = {kind: 'user', id: 'u', content: 'hi', timestamp: 0};
+        const notice: Turn = {kind: 'system', id: 's', content: 'resumed', timestamp: 0};
+
+        it('is false while nothing but user and system rows follow the batch', () => {
+            // Input typed during a batch, or a recovery notice, is no answer.
+            const t = turnOf('t1', [txt('b0', 'on it'), dlg('b1', 'm1'), dlg('b2', 'm1')]);
+            expect(isFollowedByAnswer([user, t, user, notice], t, 'b2')).toBe(false);
+        });
+
+        it('is true when prose follows in the same turn', () => {
+            // A stateless recovery reuses the abandoned turn number, so its
+            // answer lands in the same bubble.
+            const t = turnOf('t1', [dlg('b1', 'm1'), dlg('b2', 'm1'), txt('b3', 'done')]);
+            expect(isFollowedByAnswer([t], t, 'b2')).toBe(true);
+        });
+
+        it('is true when a later assistant turn has prose', () => {
+            const t = turnOf('t1', [dlg('b1', 'm1'), dlg('b2', 'm1')]);
+            const later = turnOf('t2', [txt('c0', 'answer')]);
+            expect(isFollowedByAnswer([t, user, later], t, 'b2')).toBe(true);
+        });
+
+        it('ignores prose before the batch', () => {
+            const t = turnOf('t1', [txt('b0', 'plan'), dlg('b1', 'm1'), dlg('b2', 'm1')]);
+            expect(isFollowedByAnswer([t], t, 'b2')).toBe(false);
         });
     });
 

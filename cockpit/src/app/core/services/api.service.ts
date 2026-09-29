@@ -56,6 +56,7 @@ import {
     JobUsage,
     JobSubagentRoster,
     JobSubjobRoster,
+    ThreadSubagentRoster,
     JobRejectResult,
     JobReviewSessionResult,
     JobStatistics,
@@ -2322,6 +2323,22 @@ export class ApiService {
         return of(null);
       }),
     );
+  }
+
+  /**
+   * The children one session delegated (`delegate_agent`), live and ended.
+   * Null on failure, so a poller keeps the rows it already has instead of
+   * blanking a card on one transient error.
+   */
+  getSessionSubagents(threadId: string): Observable<ThreadSubagentRoster | null> {
+    return this.http
+      .get<ThreadSubagentRoster>(`${this.baseUrl}/persistent/threads/${threadId}/subagents`)
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to fetch subagents for session ${threadId}:`, error);
+          return of(null);
+        }),
+      );
   }
 
   // ===== Repo Browser Endpoints (Gitea proxy) =====

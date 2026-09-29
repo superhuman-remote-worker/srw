@@ -2695,6 +2695,19 @@ export interface JobSubagentRoster {
   subagents: JobSubagent[];
 }
 
+/**
+ * `GET /api/persistent/threads/{thread_id}/subagents` — the children one
+ * session delegated, in spawn order. Same row projection as the job roster
+ * (`subagent_thread_payload`); `parent_tool_call_id` joins a row to the
+ * `delegate_agent` call that spawned it. A call still queued behind the
+ * concurrency cap has no row yet.
+ */
+export interface ThreadSubagentRoster {
+  parent_thread_id: string;
+  count: number;
+  subagents: JobSubagent[];
+}
+
 export type JobUsageState = 'measured' | 'no_usage' | 'predates_ledger' | 'unavailable';
 
 /** `GET /api/jobs/{job_id}/usage` — see per_job_cost_and_token_accounting.md §7. */

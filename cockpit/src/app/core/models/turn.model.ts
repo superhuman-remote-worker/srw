@@ -1,5 +1,5 @@
 import {ChatAttachment, ToolCallInfo} from '../services/persistent-chat.service';
-import {JOB_TOOL, NOTIFY_USER_TOOL, SLEEP_TOOL} from './tool-card.model';
+import {DELEGATE_TOOL, JOB_TOOL, NOTIFY_USER_TOOL, SLEEP_TOOL} from './tool-card.model';
 
 /**
  * Turn-based conversation model for the persistent chat UI.
@@ -56,6 +56,16 @@ export interface ToolCallEvent extends ToolCallInfo {
     /** Optional secondary status for nicer rendering (exit code, error class). */
     resultStatus?: 'ok' | 'error' | 'denied';
     exitCode?: number;
+    /**
+     * Which assistant message carried this call. Calls with the same key were
+     * issued together, in one model response. History sets the AI row id; the
+     * live stream carries no message id on tool frames, so the reducer stamps
+     * a synthetic key there (see `liveMessageKey` in `turn-reducer.ts`).
+     * Compare keys for equality only — the two sources never mix within one
+     * call. Absent on events built before this existed; grouping then falls
+     * back to contiguity.
+     */
+    messageKey?: string;
 }
 
 /**
@@ -384,7 +394,14 @@ export type EventGroup =
      * one card with a row per job instead of N stacked cards. Client-side only —
      * there is no `batch_id` and no backend concept behind this.
      */
-    | {kind: 'job_batch'; id: string; events: ToolCallEvent[]};
+    | {kind: 'job_batch'; id: string; events: ToolCallEvent[]}
+    /**
+     * A subagent fan-out: two or more `delegate_agent` calls issued in one
+     * assistant message, rendered as one card with a row per child. Grouped by
+     * `messageKey`, not by contiguity alone — two consecutive single-call
+     * delegations are two ordinary cards.
+     */
+    | {kind: 'delegate_batch'; id: string; events: ToolCallEvent[]};
 
 /**
  * Below this many foldable events in a row, render them as plain cards instead
@@ -398,6 +415,13 @@ export const MIN_FOLD_RUN = 2;
  * in a "batch" is just a card with a redundant header.
  */
 export const MIN_JOB_BATCH = 2;
+
+/**
+ * Below this many `delegate_agent` calls in one assistant message, render them
+ * as ordinary cards. A single delegation keeps today's card and fold behaviour
+ * exactly.
+ */
+export const MIN_DELEGATE_BATCH = 2;
 
 export function isFoldable(e: TurnEvent): e is FoldableEvent {
     if (e.kind === 'thought') return true;
@@ -418,6 +442,75 @@ export function isFoldable(e: TurnEvent): e is FoldableEvent {
 /** A `create_job` call — the only event that forms a `job_batch`. */
 export function isJobCall(e: TurnEvent): e is ToolCallEvent {
     return e.kind === 'tool_call' && e.tool === JOB_TOOL;
+}
+
+/** A `delegate_agent` call — the only event that forms a `delegate_batch`. */
+export function isDelegateCall(e: TurnEvent): e is ToolCallEvent {
+    return e.kind === 'tool_call' && e.tool === DELEGATE_TOOL;
+}
+
+/**
+ * Ids of the `delegate_agent` calls that belong to a fan-out: a contiguous run
+ * of at least {@link MIN_DELEGATE_BATCH} such calls sharing one `messageKey`.
+ *
+ * Computed on the raw event list, before folding, because a batched call must
+ * not fold: pinnedEventIds() keeps only the turn's last call once a batch
+ * finishes, which would bury N−1 children in a "N× delegations" chip — the
+ * failure the job batch was built to fix. A call outside a batch stays
+ * foldable, so a single delegation renders exactly as before.
+ *
+ * A session rejects a batch that mixes `delegate_agent` with other tools, so
+ * the calls of one fan-out are contiguous; anything between two calls breaks
+ * the run.
+ */
+function delegateBatchIds(events: TurnEvent[]): Set<string> {
+    const ids = new Set<string>();
+    let run: ToolCallEvent[] = [];
+    const flush = () => {
+        if (run.length >= MIN_DELEGATE_BATCH) for (const e of run) ids.add(e.id);
+        run = [];
+    };
+    for (const e of events) {
+        if (!isDelegateCall(e)) {
+            flush();
+            continue;
+        }
+        if (run.length > 0 && run[run.length - 1].messageKey !== e.messageKey) flush();
+        run.push(e);
+    }
+    flush();
+    return ids;
+}
+
+/**
+ * Whether assistant prose follows event `eventId` of `turn` anywhere later in
+ * the transcript: in the same turn after it, or in any later assistant turn.
+ *
+ * Prose after a tool call means the model was asked again, so that call's
+ * turn has moved on. For a call still without a result this separates the
+ * two cases history cannot tell apart by status: a fan-out still running
+ * (nothing follows it yet) and one a crash abandoned (a recovery answered
+ * after it). User and system rows do not count — input typed during a batch
+ * and a recovery notice both arrive while the batch may still be running.
+ */
+export function isFollowedByAnswer(
+    turns: readonly Turn[],
+    turn: AssistantTurn,
+    eventId: string,
+): boolean {
+    const at = turns.indexOf(turn);
+    if (at < 0) return false;
+    const from = turn.events.findIndex((e) => e.id === eventId);
+    if (from >= 0) {
+        for (let i = from + 1; i < turn.events.length; i++) {
+            if (isText(turn.events[i])) return true;
+        }
+    }
+    for (let t = at + 1; t < turns.length; t++) {
+        const later = turns[t];
+        if (isAssistantTurn(later) && later.events.some(isText)) return true;
+    }
+    return false;
 }
 
 /**
@@ -458,12 +551,14 @@ export function pinnedEventIds(events: TurnEvent[]): Set<string> {
  * is too significant to hide. Every other event folds unless it's pinned, and
  * contiguous unpinned stretches merge into one chip. Order is preserved, so a
  * completed call sandwiched between two in-flight ones simply renders inline.
+ * Job fan-outs and subagent fan-outs never fold; each becomes one batch group.
  *
  * A group's `id` (= its first member's event id, stable across SSE replay) is
  * suitable for `@for (… ; track group.id)`.
  */
 export function groupEvents(events: TurnEvent[]): EventGroup[] {
     const pinned = pinnedEventIds(events);
+    const delegateBatched = delegateBatchIds(events);
     const groups: EventGroup[] = [];
     let run: FoldableEvent[] = [];
     const flush = () => {
@@ -476,7 +571,7 @@ export function groupEvents(events: TurnEvent[]): EventGroup[] {
         run = [];
     };
     for (const e of events) {
-        if (isFoldable(e) && !pinned.has(e.id)) {
+        if (isFoldable(e) && !pinned.has(e.id) && !delegateBatched.has(e.id)) {
             run.push(e);
         } else {
             flush();
@@ -484,34 +579,52 @@ export function groupEvents(events: TurnEvent[]): EventGroup[] {
         }
     }
     flush();
-    return batchJobCalls(groups);
+    const jobs = batchRuns(groups, 'job_batch', isJobCall, MIN_JOB_BATCH);
+    if (delegateBatched.size === 0) return jobs;
+    return batchRuns(
+        jobs,
+        'delegate_batch',
+        (e): e is ToolCallEvent => delegateBatched.has(e.id) && isDelegateCall(e),
+        MIN_DELEGATE_BATCH,
+        (prev, next) => prev.messageKey === next.messageKey,
+    );
 }
 
 /**
- * Merge contiguous job-call singles into one `job_batch`.
+ * Merge contiguous member singles into one batch group (`job_batch` for
+ * `create_job`, `delegate_batch` for `delegate_agent`).
  *
  * A post-pass over the finished groups rather than a branch inside the loop
  * above, because it must merge *across* whatever the fold pass produced while
- * preserving order exactly: a job call is never foldable, so it always arrives
- * here as its own `single`, and anything between two job calls (text, a folded
+ * preserving order exactly: a member is never folded, so it always arrives
+ * here as its own `single`, and anything between two members (text, a folded
  * chip, a thought) breaks the run — which is what you want, since it means the
- * agent said or did something between the two dispatches.
+ * agent said or did something between the two dispatches. `sameRun` splits a
+ * run further; the delegate batch uses it to keep two back-to-back messages
+ * apart.
  */
-function batchJobCalls(groups: EventGroup[]): EventGroup[] {
-    if (!groups.some((g) => g.kind === 'single' && isJobCall(g.event))) return groups;
+function batchRuns(
+    groups: EventGroup[],
+    kind: 'job_batch' | 'delegate_batch',
+    isMember: (e: TurnEvent) => e is ToolCallEvent,
+    minSize: number,
+    sameRun: (prev: ToolCallEvent, next: ToolCallEvent) => boolean = () => true,
+): EventGroup[] {
+    if (!groups.some((g) => g.kind === 'single' && isMember(g.event))) return groups;
     const out: EventGroup[] = [];
     let run: ToolCallEvent[] = [];
     const flush = () => {
         if (run.length === 0) return;
-        if (run.length < MIN_JOB_BATCH) {
+        if (run.length < minSize) {
             for (const e of run) out.push({kind: 'single', id: e.id, event: e});
         } else {
-            out.push({kind: 'job_batch', id: run[0].id, events: run});
+            out.push({kind, id: run[0].id, events: run});
         }
         run = [];
     };
     for (const g of groups) {
-        if (g.kind === 'single' && isJobCall(g.event)) {
+        if (g.kind === 'single' && isMember(g.event)) {
+            if (run.length > 0 && !sameRun(run[run.length - 1], g.event)) flush();
             run.push(g.event);
         } else {
             flush();

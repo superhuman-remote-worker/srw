@@ -3,6 +3,7 @@ import {
     AssistantTurn,
     ConversationState,
     EMPTY_CONVERSATION,
+    groupEvents,
     isAssistantTurn,
     isToolCall,
     TextEvent,
@@ -738,6 +739,101 @@ describe('turn-reducer — tool calls', () => {
         expect(turn.events).toHaveLength(2);
         expect((turn.events[0] as ThoughtEvent).status).toBe('done');
         expect(turn.events[1].kind).toBe('tool_call');
+    });
+});
+
+describe('turn-reducer — message key (which response issued a call)', () => {
+    // Tool frames carry no message id. The key decides whether two
+    // delegate_agent calls are one fan-out (one batch card) or two responses.
+    const started = (id: string, timestamp: number): ReducerAction => ({
+        type: 'tool_started', toolUseId: id, tool: 'delegate_agent', args: {}, timestamp,
+    });
+    const completed = (id: string, timestamp: number): ReducerAction => ({
+        type: 'tool_completed', toolUseId: id, result: 'report', timestamp,
+    });
+    const keys = (state: ConversationState) =>
+        activeTurn(state).events.filter(isToolCall).map((e) => e.messageKey);
+
+    it('gives the calls announced together one key', () => {
+        // The loop announces every call of a response before any result.
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 0},
+            started('d1', 10), started('d2', 11), started('d3', 12),
+        ]);
+        expect(new Set(keys(state)).size).toBe(1);
+    });
+
+    it('starts a new key once the previous calls have returned', () => {
+        // The model is asked again only after every result is in, so a call
+        // after a completed one belongs to the next response.
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 0},
+            started('d1', 10), started('d2', 11),
+            completed('d1', 50), completed('d2', 51),
+            started('d3', 60), started('d4', 61),
+        ]);
+        const [k1, k2, k3, k4] = keys(state);
+        expect(k1).toBe(k2);
+        expect(k3).toBe(k4);
+        expect(k3).not.toBe(k1);
+        expect(groupEvents(activeTurn(state).events).map((g) => g.kind))
+            .toEqual(['delegate_batch', 'delegate_batch']);
+    });
+
+    it('starts a new key after a thought', () => {
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 0},
+            started('d1', 10),
+            {type: 'thinking', content: 'next', timestamp: 20},
+            started('d2', 30),
+        ]);
+        const [k1, k2] = keys(state);
+        expect(k1).not.toBe(k2);
+    });
+
+    it('keeps the key of a supervised batch through approval and start', () => {
+        // permission.request_batch announces all calls as pending first; the
+        // key is set there and survives the promotion to running.
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 0},
+            {type: 'permission_request', toolUseId: 'd1', tool: 'delegate_agent', args: {}, timestamp: 10},
+            {type: 'permission_request', toolUseId: 'd2', tool: 'delegate_agent', args: {}, timestamp: 11},
+            {type: 'permission_decision', toolUseId: 'd1', decision: 'approved', timestamp: 20},
+            {type: 'permission_decision', toolUseId: 'd2', decision: 'denied', timestamp: 21},
+            started('d1', 30),
+        ]);
+        const [k1, k2] = keys(state);
+        expect(k1).toBeTruthy();
+        expect(k1).toBe(k2);
+    });
+
+    it('keeps the history row id when a cold reattach replays part of a fan-out', () => {
+        const historical: AssistantTurn = {
+            kind: 'assistant',
+            id: 'row-1',
+            turnNumber: 7,
+            historical: true,
+            status: 'done',
+            startedAt: 500,
+            events: ['d1', 'd2'].map((id) => ({
+                kind: 'tool_call' as const,
+                id,
+                tool: 'delegate_agent',
+                args: {},
+                status: 'completed' as const,
+                startedAt: 500,
+                messageKey: 'row-1',
+            })),
+        };
+        let state = reduce(EMPTY_CONVERSATION, {type: 'load_history', threadId: 'th', turns: [historical]});
+        // Replay resumes after d1's frame: d2's start lands in a recovered
+        // suffix with a synthetic key of its own.
+        state = reduce(state, started('d2', 800));
+        state = reduce(state, {type: 'reattach_turn', turnId: '7', timestamp: 900});
+
+        const turn = state.turns.filter(isAssistantTurn)[0];
+        expect(turn.events.filter(isToolCall).map((e) => e.messageKey)).toEqual(['row-1', 'row-1']);
+        expect(groupEvents(turn.events).map((g) => g.kind)).toEqual(['delegate_batch']);
     });
 });
 

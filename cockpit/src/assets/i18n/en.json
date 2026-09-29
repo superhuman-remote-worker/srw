@@ -101,6 +101,17 @@
       "review": "{{count}} awaiting review",
       "notCreated": "Job was not created"
     },
+    "delegateBatch": {
+      "title": "{{count}} subagents",
+      "finished": "{{done}}/{{total}} finished",
+      "failed": "{{count}} failed",
+      "status": {
+        "pending": "Awaiting approval",
+        "denied": "Denied",
+        "expired": "Not run",
+        "notStarted": "Not started"
+      }
+    },
     "view": {
       "rendered": "Rendered",
       "raw": "Raw"

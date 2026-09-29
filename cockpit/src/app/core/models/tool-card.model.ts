@@ -126,6 +126,14 @@ export const SLEEP_TOOL = 'sleep';
  */
 export const JOB_TOOL = 'create_job';
 
+/**
+ * The session tool that runs a roster subagent. Two or more calls carried by
+ * one assistant message are a fan-out and group into a `delegate_batch` — see
+ * `groupEvents` in `core/models/turn.model.ts`. A lone call keeps the ordinary
+ * card and folds like any other finished tool call.
+ */
+export const DELEGATE_TOOL = 'delegate_agent';
+
 export type NotifyUrgency = 'log' | 'digest' | 'page';
 
 /**

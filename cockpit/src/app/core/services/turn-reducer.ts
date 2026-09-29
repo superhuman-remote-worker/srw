@@ -424,6 +424,7 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                     category: action.category,
                     status: 'running',
                     startedAt: action.timestamp,
+                    messageKey: liveMessageKey(closed, action.toolUseId),
                 };
                 return {...turn, events: [...closed, newCall]};
             });
@@ -480,6 +481,7 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                     args: action.args,
                     status: 'pending',
                     startedAt: action.timestamp,
+                    messageKey: liveMessageKey(turn.events, action.toolUseId),
                 };
                 return {...turn, events: [...turn.events, newCall]};
             });
@@ -681,6 +683,15 @@ function mergeReattachedEvents(base: TurnEvent[], suffix: TurnEvent[]): TurnEven
             merged[existingIndex] = existing.content.includes(event.content)
                 ? existing
                 : {...event, content: existing.content + event.content};
+        } else if (existing.kind === 'tool_call' && event.kind === 'tool_call') {
+            // The history row's message id is the durable truth; a replayed
+            // frame only carries the reducer's synthetic key. Keeping the
+            // history key keeps a half-replayed fan-out in one batch.
+            merged[existingIndex] = {
+                ...existing,
+                ...event,
+                messageKey: existing.messageKey ?? event.messageKey,
+            };
         } else {
             merged[existingIndex] = {...existing, ...event} as TurnEvent;
         }
@@ -691,6 +702,32 @@ function mergeReattachedEvents(base: TurnEvent[], suffix: TurnEvent[]): TurnEven
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * The `messageKey` for a tool call first seen on the live stream.
+ *
+ * Tool frames carry no message id, so the key is inferred from order: the
+ * persistent loop announces every call of one model response (permission
+ * requests, then `tool.started`) before it reports any of their results, and it
+ * asks the model again only after every result is in. So a new call whose
+ * predecessor in the turn is a call still in flight was issued in the same
+ * response and inherits its key; anything else (a finished call, a thought,
+ * text, nothing) means a new response and a fresh key.
+ *
+ * This matters for delegate fan-out: two consecutive delegate-only responses
+ * with no text between them would otherwise merge into one batch.
+ */
+function liveMessageKey(events: TurnEvent[], toolUseId: string): string {
+    const last = events[events.length - 1];
+    if (
+        last?.kind === 'tool_call' &&
+        (last.status === 'pending' || last.status === 'running') &&
+        last.messageKey
+    ) {
+        return last.messageKey;
+    }
+    return `live:${toolUseId}`;
+}
 
 function closeOpenEvents(events: TurnEvent[], timestamp: number): TurnEvent[] {
     return events.map((e) => {

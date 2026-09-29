@@ -42,6 +42,7 @@ import {
     FoldedSummary,
     groupEvents,
     isAssistantTurn,
+    isFollowedByAnswer,
     isSessionBoundary,
     isSystemTurn,
     isUserTurn,
@@ -61,6 +62,7 @@ import {
     UserTurn,
 } from '../../core/models/turn.model';
 import {ToolCardView} from '../../core/models/tool-card.model';
+import {buildDelegateBatchMembers, DelegateBatchMember} from '../../core/models/delegate-batch.model';
 import {toolCardViewFromEvent} from '../../core/tools/tool-card-adapters';
 import {ApiService, IdeSessionStatus} from '../../core/services/api.service';
 import {workspaceLifecycleReasonKey} from '../../core/util/vm-lifecycle';
@@ -90,6 +92,7 @@ import {AppIconComponent} from '../../ui/icon';
 import {AppDialogComponent} from '../../ui/dialog';
 import {AppToolCardComponent} from '../../ui/tool-card';
 import {JobBatchCardComponent} from '../../ui/tool-card/job-batch-card.component';
+import {DelegateBatchCardComponent} from '../../ui/tool-card/delegate-batch-card.component';
 import {AppReadAloudComponent} from '../../ui/read-aloud';
 import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {AppToastService} from '../../ui/toast';
@@ -531,23 +534,25 @@ export function pickCurrentStartupStep<T extends {state: string}>(steps: readonl
 }
 
 /**
- * The running-command card to surface on (re)attach, or null. Suppressed when
- * the in-flight tool call is already rendered inside a visible turn (warm
- * reconnect) so it isn't double-shown; surfaced when it isn't (cold reload
- * mid-turn, where the in-flight turn isn't in REST history yet).
+ * The running-command cards to surface on (re)attach: one per in-flight tool
+ * call that is not already rendered inside a visible turn. A call shown in a
+ * turn (warm reconnect) is suppressed so it isn't double-shown; one that isn't
+ * (cold reload mid-turn, where the in-flight turn isn't in REST history yet)
+ * gets a card. Several at once for a parallel batch, e.g. a subagent fan-out.
  */
-export function pickRunningCommandCard(
-    runningTool: RunningToolInfo | null,
+export function pickRunningCommandCards(
+    runningTools: readonly RunningToolInfo[],
     turns: readonly Turn[],
-): RunningToolInfo | null {
-    if (!runningTool) return null;
+): RunningToolInfo[] {
+    if (runningTools.length === 0) return [];
+    const rendered = new Set<string>();
     for (const turn of turns) {
         if (!isAssistantTurn(turn)) continue;
         for (const ev of turn.events) {
-            if (ev.kind === 'tool_call' && ev.id === runningTool.id) return null;
+            if (ev.kind === 'tool_call') rendered.add(ev.id);
         }
     }
-    return runningTool;
+    return runningTools.filter((rt) => !rendered.has(rt.id));
 }
 
 /**
@@ -946,6 +951,7 @@ export function clearDraft(threadId: string | null): void {
         AppDialogComponent,
         AppToolCardComponent,
         JobBatchCardComponent,
+        DelegateBatchCardComponent,
         AppReadAloudComponent,
         AppInlineEditableTextComponent,
         CitationsPanelComponent,
@@ -1687,6 +1693,15 @@ export function clearDraft(threadId: string | null): void {
                           <app-job-batch-card [views]="jobBatchViews(group)"
                                               (diffRequested)="openJobDiff($event)" />
                         </div>
+                      } @else if (group.kind === 'delegate_batch') {
+                        <!-- A subagent fan-out: the delegate_agent calls of one
+                             message, one card with a row per child. A single
+                             delegation stays an ordinary card. -->
+                        <div class="event-tool">
+                          <app-delegate-batch-card [members]="delegateBatchMembers(group)"
+                                                   [parentThreadId]="chat.threadId()"
+                                                   [superseded]="delegateBatchSuperseded(turn, group)" />
+                        </div>
                       } @else {
                         @switch (group.event.kind) {
                           @case ('tool_call') {
@@ -1902,11 +1917,12 @@ export function clearDraft(threadId: string | null): void {
           </div>
         }
 
-        <!-- Running-command card — shown on (re)attach when the agent is
-             blocked in a tool call that isn't already rendered in a visible
+        <!-- Running-command cards — shown on (re)attach when the agent is
+             blocked in tool calls that aren't already rendered in a visible
              turn (cold reload mid-turn: the in-flight turn isn't in REST
-             history yet). Reuses the .mile marker styles (no new SCSS). -->
-        @if (runningCommandCard(); as rc) {
+             history yet). One per call. Reuses the .mile marker styles (no
+             new SCSS). -->
+        @for (rc of runningCommandCards(); track $index) {
           <div class="mile">
             <div class="mile-label">{{ 'chat.stream.running' | transloco:{ tool: rc.tool } }}</div>
             <div class="mile-detail">
@@ -2565,12 +2581,12 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private readonly destroyRef = inject(DestroyRef);
 
     /**
-     * The running-command card to show on (re)attach (or null). Surfaces the
-     * agent's in-flight tool call when it isn't already visible in a turn — see
-     * pickRunningCommandCard.
+     * The running-command cards to show on (re)attach. Surfaces the agent's
+     * in-flight tool calls that aren't already visible in a turn — see
+     * pickRunningCommandCards.
      */
-    readonly runningCommandCard = computed(() =>
-        pickRunningCommandCard(this.chat.runningTool(), this.chat.turns()),
+    readonly runningCommandCards = computed(() =>
+        pickRunningCommandCards(this.chat.runningTools(), this.chat.turns()),
     );
 
     /** The workspace-upgrade offer/provisioning card, or null. */
@@ -4559,6 +4575,44 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         const views = group.events.map((e) => this.toolView(e));
         this.jobBatchViewsCache.set(group, views);
         return views;
+    }
+
+    /** Members of a subagent fan-out, memoized per group object like {@link jobBatchViews}. */
+    private readonly delegateBatchMembersCache = new WeakMap<object, DelegateBatchMember[]>();
+
+    delegateBatchMembers(group: EventGroup & {kind: 'delegate_batch'}): DelegateBatchMember[] {
+        const cached = this.delegateBatchMembersCache.get(group);
+        if (cached) return cached;
+        const members = buildDelegateBatchMembers(group.events, (e) => this.toolView(e));
+        this.delegateBatchMembersCache.set(group, members);
+        return members;
+    }
+
+    /**
+     * Whether assistant prose follows a fan-out in the transcript, so a call
+     * still without a result is abandoned, not running, and must not be polled.
+     *
+     * Kept apart from {@link delegateBatchMembers}: that memo is keyed on the
+     * group, and a group of an older turn keeps its object identity when a later
+     * turn arrives. This one is rebuilt whenever the transcript changes.
+     */
+    private delegateSupersededCache: {
+        turns: readonly Turn[];
+        byGroup: WeakMap<object, boolean>;
+    } | null = null;
+
+    delegateBatchSuperseded(turn: AssistantTurn, group: EventGroup & {kind: 'delegate_batch'}): boolean {
+        const turns = this.chat.turns();
+        if (this.delegateSupersededCache?.turns !== turns) {
+            this.delegateSupersededCache = {turns, byGroup: new WeakMap()};
+        }
+        const cache = this.delegateSupersededCache.byGroup;
+        let superseded = cache.get(group);
+        if (superseded === undefined) {
+            superseded = isFollowedByAnswer(turns, turn, group.events[group.events.length - 1].id);
+            cache.set(group, superseded);
+        }
+        return superseded;
     }
 
     /**

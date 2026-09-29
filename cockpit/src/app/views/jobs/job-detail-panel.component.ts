@@ -27,6 +27,7 @@ import {AppBadgeComponent, BadgeTone} from '../../ui/badge';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {isTerminalJobStatus, jobStatusTone} from '../../core/util/job-status';
 import {workspaceLifecycleReasonKey} from '../../core/util/vm-lifecycle';
+import {subagentStatusTone} from '../../core/util/subagent-status';
 
 /** Own spend, or the whole subtree beneath the job. */
 export type UsageScope = 'job' | 'subtree';
@@ -195,18 +196,8 @@ export function subagentElapsedSeconds(sub: JobSubagent, now: number): number | 
   return Math.floor((ended - started) / 1000);
 }
 
-export function subagentStatusTone(status: JobSubagentStatus): BadgeTone {
-  switch (status) {
-    case 'completed': return 'success';
-    case 'running': return 'accent';
-    case 'queued': return 'info';
-    case 'error':
-    case 'cancelled': return 'danger';
-    case 'parked':
-    case 'interrupted':
-    case 'capped': return 'warning';
-  }
-}
+/** Moved to `core/util/subagent-status.ts`; re-exported for existing callers. */
+export {subagentStatusTone};
 
 /** Subjobs still capable of moving on their own. */
 export function liveSubjobCount(subjobs: readonly JobSubjob[]): number {
