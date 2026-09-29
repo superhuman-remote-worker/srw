@@ -2564,7 +2564,7 @@ class UniversalAgent:
     ) -> Optional[Dict[str, Any]]:
         """Poll the orchestrator for a running job's upgraded-workspace readiness.
 
-        The worker analogue of ``persistent_app._poll_workspace_ready`` (sandbox
+        The worker analogue of ``session_workspace.poll_workspace_ready`` (sandbox
         only — the worker MVP upgrades ``virtual → sandbox``; ``vm`` is the
         operator-gated re-dispatch path). Returns the
         ``{"backend":"sandbox","remote":{...}}`` block, or None on

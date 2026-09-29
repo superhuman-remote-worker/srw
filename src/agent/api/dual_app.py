@@ -1947,7 +1947,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 logger.exception(f"Session setup failed for thread {thread_id}")
                 import agent.api.persistent_app as pa
 
-                # _attach_session binds the thread before it can fail;
+                # The attach binds the thread before it can fail;
                 # _detach_session short-circuits when _session is None and
                 # never unbinds it, so we have to do it explicitly -- but only
                 # this attach's own thread.

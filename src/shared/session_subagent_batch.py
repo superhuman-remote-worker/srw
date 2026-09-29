@@ -28,7 +28,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 # Advertised as ``{KEY: 1}`` in the pinned ``/session/attach`` body, the
 # pinned workspace payload, and at the top level of the stateless claim
 # bundle, beside ``attach`` and never inside it (``attach`` is splatted into
-# the agent's ``_attach_session``). An agent may create a delegation batch
+# the agent's attach). An agent may create a delegation batch
 # wider than one child only against an orchestrator that advertises it (§12).
 SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY = "session_subagent_batch_settle_contract"
 SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT = 1

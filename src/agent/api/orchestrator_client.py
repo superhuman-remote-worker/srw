@@ -1837,7 +1837,7 @@ class OrchestratorClient:
         (``X-Internal-Key`` attached by :meth:`connect`). The 200 body carries
         ``unit_id``/``thread_id``/``unit_kind``/``execution_lane``, the
         ``watermarks`` pair, and the ``attach`` object — the existing
-        ``/session/attach`` body, fed to ``_attach_session`` unchanged.
+        ``/session/attach`` body, fed to the attach coordinator unchanged.
 
         Raises :class:`ClaimBundleError` on any non-200; network errors
         propagate as httpx exceptions (the caller treats both as bundle

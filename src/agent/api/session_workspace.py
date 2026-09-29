@@ -603,7 +603,7 @@ async def poll_workspace_ready(
                 "cloud_sync": ws.get("cloud_sync"),
                 "cloud_mount": ws.get("cloud_mount"),
                 "cloud_sync_degraded": ws.get("cloud_sync_degraded"),
-                # F-C1: carried through so _attach_session can fail-close the
+                # F-C1: carried through so the attach can fail-close the
                 # legacy nc_session_folder sync shim for protected threads.
                 "protected_cloud": ws.get("protected_cloud"),
                 "protected_cloud_state": ws.get("protected_cloud_state"),
@@ -668,7 +668,7 @@ async def poll_workspace_ready(
                 # attach fail closed before its first model call.
                 "workspace_provisioner": ws.get("workspace_provisioner"),
                 # Preserve the authoritative protected-ready tuple through
-                # normalization.  `_attach_session_inner` revalidates the
+                # normalization.  the attach coordinator revalidates the
                 # normalized response immediately before constructing
                 # PersistentSession; dropping status/pod coordinates here
                 # would turn a valid protected answer into an ambiguous one.

@@ -876,7 +876,7 @@ class SessionAttachCoordinator:
         attached_workspace_generation = ""
         # Every ready workspace response this attach reads, oldest first: a
         # pinned pod that attaches itself takes the fan-out advertisement from
-        # the newest one (_session_subagent_advertisement).
+        # the newest one (session_subagent_advertisement).
         subagent_workspace_responses: List[Any] = []
         if _rc is None and _co is None and self._client and self._identity.thread_id:
             try:
@@ -887,7 +887,7 @@ class SessionAttachCoordinator:
                     # credential-free, including the runtime generation.  It is a
                     # poll instruction, not an attach payload: validating ready
                     # identity here would make the dedicated path fail before
-                    # `_poll_workspace_ready` can observe engage -> ready.
+                    # the readiness poll can observe engage -> ready.
                     if peek_delivery != "engaging":
                         assert_attach_workspace_payload(
                             expected_workspace_identity,
@@ -2242,7 +2242,7 @@ class SessionAttachCoordinator:
     ) -> None:
         """Finish one synchronously claimed pool attach in the background.
 
-        ``_attach_session`` owns rollback of every process-global/session resource.
+        ``attach`` owns rollback of every process-global/session resource.
         This wrapper owns only the admission claim and the exact orchestrator
         thread↔agent reservation.  A failed attach releases that reservation once;
         a successful attach leaves it in place for the live session.

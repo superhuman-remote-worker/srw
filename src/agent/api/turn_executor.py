@@ -631,9 +631,9 @@ CLAIM_ADVERTISEMENT_KEYS: frozenset[str] = frozenset(
 
 
 def claim_bundle_attach(bundle: Mapping[str, Any]) -> Dict[str, Any]:
-    """The ``_attach_session`` keywords of a stateless claim bundle.
+    """The ``SessionAttachCoordinator.attach`` keywords of a stateless claim bundle.
 
-    ``attach`` is splatted into ``_attach_session``, so the orchestrator puts
+    ``attach`` is splatted into the coordinator's ``attach``, so the orchestrator puts
     each per-claim advertisement beside it, never inside it: an agent image
     without the keyword would refuse every claim. Both are folded in here as
     keywords, which reach the session, its tool context and the fan-out gate
@@ -5971,7 +5971,7 @@ class StatelessTurnExecutor:
         across sequential tenants:
 
         * memory-embedding env keys + singleton, KB profile keys + singleton
-          (also scrubbed pop-first inside _attach_session's
+          (also scrubbed pop-first inside the attach's
           apply_session_embedding_env — this claim-time pass covers claims
           whose attach then fails before reaching that block);
         * the dual-mode guidance/reply inboxes (worker-plane; a stateless pod
