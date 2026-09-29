@@ -52,6 +52,48 @@ rejects fails its Job with the cluster's message. A rejected volume claim (a PVC
 quota or `LimitRange`) fails the Job with a generic error; the reason is in the
 orchestrator log.
 
+## Built-in templates
+
+Every installation ships these templates in the shared Catalog:
+
+| Name | Workspace |
+| --- | --- |
+| `virtual` | No container and no VM. |
+| `container-minimal` | The `srw-workspace-minimal` image. |
+| `container-full` | The `srw-workspace` image, which is the installation image. |
+| `vm-full` | The installation's VM image with 8 CPU, 16Gi memory and a 30Gi disk. Present only when VMs are enabled. |
+
+The two container templates state 2 CPU and 4Gi as the maximum, and reserve
+0.5 CPU and 1Gi. That equals a workspace created without a template.
+
+`vm-full` has a larger disk than a VM created without a template, which gets the
+controller's disk size (20Gi by default). CPU and memory are the same.
+
+Select one by name and scope. The scope is required; SRW doesn't search other
+scopes for the name.
+
+```yaml
+workspace:
+  template:
+    ref:
+      name: container-minimal
+      scope: {kind: Catalog, name: shared}
+```
+
+- **They are read-only.** An edit or a delete is refused, for administrators too.
+  To change one, save a copy under your own name and edit the copy.
+- **Every release updates them.** A new release points the container templates
+  at its own images. Work that is already admitted keeps the image it was
+  admitted with, like any template.
+- **A Project copies a template when the Project is applied.** A Project whose
+  workspace refers to a built-in keeps that copy, image included, until the
+  Project is applied again.
+- **Operators** size the container templates with
+  `workspace.builtinTemplates.containerResources` and `vm-full` with
+  `workspace.builtinTemplates.vmResources`. They turn the set off with
+  `workspace.builtinTemplates.enabled: false`. The VM controller never makes a
+  disk smaller than `vmController.vmDiskSize`.
+
 ## Images
 
 Any image may be used. It must implement the SRW workspace contract. The simplest
@@ -295,6 +337,8 @@ the full profile.
   lacks your image's tools. Sessions run code-server inside the workspace, which
   your image must provide.
 - A virtual Session upgraded to a container gets the installation defaults.
+- A workspace created from a built-in template keeps its image across releases.
+  A workspace created without a template follows the installation image.
 
 ## Recovery after a running workspace becomes unavailable
 

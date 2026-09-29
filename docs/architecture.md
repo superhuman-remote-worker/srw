@@ -117,9 +117,13 @@ upgrade paths; moving back to a lower tier requires a new session.
 
 Container and VM workspaces are shaped by WorkspaceTemplates, and admission
 freezes the selected template into the execution. For containers, the
-provisioner applies it to every pod it creates for that Job or Session. See
+provisioner applies it to every pod it creates for that Job or Session.
+Every installation ships read-only built-in templates in the shared Catalog
+(`virtual`, `container-minimal`, `container-full` and, with VMs enabled,
+`vm-full`), and SRW publishes a minimal and a full workspace image to build your
+own on. See
 [container workspace templates](../examples/manifests/container-workspace-templates.md)
-for images, resources and the privilege rules.
+for the built-ins, images, resources and the privilege rules.
 
 ## Experts, skills, and tools
 

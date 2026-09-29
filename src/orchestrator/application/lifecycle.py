@@ -156,6 +156,11 @@ async def open_stores(resources: ApplicationResources) -> tuple[bool, Any]:
     await seed_bundled_expert_manifests(
         resources.postgres_db, catalogue_composition.get_config_dir()
     )
+    from orchestrator.services.builtin_workspace_templates import (
+        reconcile_builtin_workspace_templates_at_startup,
+    )
+
+    await reconcile_builtin_workspace_templates_at_startup(resources.postgres_db)
     from orchestrator.services.manifest_projects import migrate_projects
 
     await migrate_projects(resources.postgres_db)
