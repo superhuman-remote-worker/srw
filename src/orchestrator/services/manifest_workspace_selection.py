@@ -156,17 +156,12 @@ async def select_execution_workspace(
     account_defaults: dict | None = None,
     request: Any = None,
 ) -> tuple[dict, dict | None]:
-    """Explicit selection > Project default > account/role fallback.
+    """Explicit selection > the workspace defaults chain (Slice A2b).
 
     The returned receipt carries frozen workspace and Project revisions into
     the insertion transaction. A recommendation never enters this function.
     Legacy config_override.workspace remains an explicit execution input.
     """
-    from orchestrator.services.manifest_projects import (
-        active_project_resource,
-        source_recipe,
-    )
-
     fallback = execution_workspace_config(account_defaults, config_override, role=role)
     legacy = (config_override or {}).get("workspace") or {}
     if supplied and "backend" in legacy:
@@ -181,34 +176,26 @@ async def select_execution_workspace(
     scope = {"kind": "Project", "name": project_id} if project_id else authority.account
     dependencies: list[dict] = []
     project_revision = None
-    if not supplied and project_id:
-        project = await active_project_resource(db, project_id)
-        if project:
-            defaults = project["resolved"]["spec"].get("defaults", {})
-            if "workspace" in defaults:
-                alias = defaults["workspace"]
-                workspace = (
-                    {
-                        "template": deepcopy(
-                            project["resolved"]["spec"]["resources"]["workspaces"][
-                                alias
-                            ]
-                        )
-                    }
-                    if alias is not None
-                    else None
-                )
-            else:
-                # A versioned legacy Project source is already frozen. Its old
-                # workspace default belongs to the Project, not to its Experts.
-                shared = (source_recipe(project) or {}).get("sharedConfig", {})
-                backend = (shared.get("workspace") or {}).get("backend")
-                if backend is None:
-                    return fallback, None
-                workspace = (
-                    None
-                    if backend == "none"
-                    else {"template": {"inline": {"backend": backend}}}
+    resolution = None
+    sources = {"tier": "explicit", "template": "explicit"}
+    if not supplied:
+        from orchestrator.services.manifest_projects import active_project_resource
+        from orchestrator.services.workspace_defaults_resolution import (
+            MISSING_REFERENCE,
+            missing_template_message,
+            resolve_workspace_defaults,
+        )
+
+        resolution = await resolve_workspace_defaults(
+            db, role=role, project_id=project_id
+        )
+        workspace = resolution.binding()
+        sources = resolution.sources()
+        if resolution.project_revision:
+            project = await active_project_resource(db, project_id)
+            if project is None or project["revision"] != resolution.project_revision:
+                raise HTTPException(
+                    409, "The Project changed during workspace selection; submit again."
                 )
             await authority.resource(project)
             await resolver.authorize_dependencies(project["dependencies"])
@@ -217,9 +204,6 @@ async def select_execution_workspace(
                 {"uid": str(project["id"]), "revision": project["revision"]}
             )
             project_revision = project["revision"]
-            supplied = True
-    if not supplied:
-        return fallback, None
     # A caller's malformed binding or unsupported template is a client error on
     # every admission route and form preview, never an internal one.
     try:
@@ -232,6 +216,15 @@ async def select_execution_workspace(
             resolved["template"] = await resolver.selection(
                 "WorkspaceTemplate", resolved["template"], scope, dependencies
             )
+        except HTTPException as exc:
+            if (
+                resolution is not None
+                and resolution.template_name() is not None
+                and exc.status_code == 422
+                and exc.detail == MISSING_REFERENCE
+            ):
+                raise HTTPException(409, missing_template_message(resolution)) from None
+            raise
         except ManifestError as exc:
             raise HTTPException(422, str(exc)) from None
     instance_recipe = None
@@ -273,6 +266,8 @@ async def select_execution_workspace(
         "dependencies": dependencies,
         "project_id": project_id if project_revision else None,
         "project_revision": project_revision,
+        "sources": sources,
+        "template_name": resolution.template_name() if resolution else None,
     }
 
 
@@ -312,15 +307,8 @@ async def verify_workspace_selection(
 
 
 async def select_project_workspace_default(db, owner_id, project_id, config_override):
-    """Unattended callers choose the workspace before selecting connectors/grants."""
-    if (
-        not owner_id
-        or not project_id
-        or "backend" in ((config_override or {}).get("workspace") or {})
-    ):
-        return config_override, None
-    project = await db.get_project(str(project_id))
-    if not project or project.get("manifest_composed") is not True:
+    """Unattended callers resolve the workspace chain before connectors/grants."""
+    if not owner_id or "backend" in ((config_override or {}).get("workspace") or {}):
         return config_override, None
     user = await db.get_user(str(owner_id))
     if not user:
@@ -328,7 +316,7 @@ async def select_project_workspace_default(db, owner_id, project_id, config_over
     config, selection = await select_execution_workspace(
         db,
         user,
-        project_id=str(project_id),
+        project_id=str(project_id) if project_id else None,
         role="worker",
         config_override=config_override,
     )

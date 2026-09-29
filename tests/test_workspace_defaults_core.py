@@ -215,3 +215,15 @@ def test_backend_and_mode_names():
     assert backend_mode("remote") == "vm"
     assert next_mode("virtual") == "container"
     assert next_mode("container") == "vm"
+
+
+def test_the_contract_floor_follows_the_installation(monkeypatch):
+    from shared.workspace_contract import build_workspace_contract
+    from shared.runtime.core.workspace_selection import execution_workspace_config
+
+    monkeypatch.setenv(
+        "WORKSPACE_DEFAULTS", json.dumps({"jobs": "vm", "sessions": "none"})
+    )
+    assert build_workspace_contract({}).assigned_backend == "vm"
+    assert execution_workspace_config(role="session") == {"backend": "none"}
+    assert execution_workspace_config(role="worker") == {"backend": "vm"}

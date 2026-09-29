@@ -4203,6 +4203,13 @@ class PostgresDB:
         # connector fails the whole data contract instead of becoming a
         # silently reduced selection. Always stamp new jobs, including [].
         context = _strip_managed_repository_authority(dict(context or {}))
+        from orchestrator.services.workspace_defaults_resolution import (
+            workspace_sources_record,
+        )
+
+        sources_record = workspace_sources_record(workspace_selection)
+        if sources_record is not None:
+            context["workspace_sources"] = sources_record
         config_override = _strip_managed_repository_authority(config_override)
         # Repository identity is server-owned. Every legitimate root/subjob
         # path now binds it through ``bind_job_managed_repository`` only after
@@ -34409,6 +34416,13 @@ class PostgresDB:
             if not isinstance(metadata, dict):
                 raise ValueError("initial thread metadata must be an object")
         metadata = _strip_managed_repository_authority(metadata)
+        from orchestrator.services.workspace_defaults_resolution import (
+            workspace_sources_record,
+        )
+
+        sources_record = workspace_sources_record(workspace_selection)
+        if sources_record is not None:
+            metadata["workspace_sources"] = sources_record
         created_runtime_generation = uuid4()
         initial_workspace = metadata.get("workspace_container")
         if isinstance(initial_workspace, dict):

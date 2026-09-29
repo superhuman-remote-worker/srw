@@ -49,6 +49,8 @@ def _db():
     # Keep the optional resolution paths inert regardless of EXPERTS_DB_ENABLED.
     db.list_experts_visible = AsyncMock(return_value=[])
     db.list_project_datasources = AsyncMock(return_value=[])
+    # No project_workspace_defaults row: the installation decides the tier.
+    db.fetchrow = AsyncMock(return_value=None)
     return db
 
 

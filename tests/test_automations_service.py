@@ -41,6 +41,10 @@ def _mock_db_returning_job(
 ):
     db = MagicMock()
     db.create_job = AsyncMock(return_value={"id": job_id, "status": "created"})
+    # Every owned fire resolves the workspace defaults chain (Slice A2b): the
+    # owner exists and the Project has no project_workspace_defaults row.
+    db.get_user = AsyncMock(return_value={"id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"})
+    db.fetchrow = AsyncMock(return_value=None)
     # An automation with a project_id is now gated on that project's lifecycle
     # state (a fire against an archived project is skipped, not created).
     db.get_project = AsyncMock(
@@ -161,11 +165,12 @@ class TestCreateJobFromAutomation:
 
         await create_job_from_automation(db, row, trigger_kind="manual")
 
+        # Slice A2b: the defaults chain decides the tier before connectors.
         _empty_datasource_selection.assert_awaited_once_with(
             db,
             row["owner_id"],
             [project_id],
-            None,
+            "sandbox",
         )
         kwargs = db.create_job.await_args.kwargs
         assert kwargs["datasource_ids"] == selected

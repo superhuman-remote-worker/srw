@@ -339,9 +339,9 @@ async def prepare_job_admission_config(
             422,
             "Child jobs inherit their parent workspace; select it on the root execution.",
         )
-    if root_creation and (
-        workspace_supplied or (project or {}).get("manifest_composed")
-    ):
+    # Every root Job with an owner resolves the workspace defaults chain; a
+    # supplied workspace without an owner still gets the 422 below.
+    if root_creation and (workspace_supplied or effective_user_id):
         from orchestrator.services.manifest_workspace_selection import (
             select_execution_workspace,
         )

@@ -177,6 +177,8 @@ def _make_mock_db(due_row: dict | None) -> MagicMock:
     # state before the fire (see TestArchivedProjectSkipsTheFire). None reads
     # as "no such project", which is not archived.
     db.get_project = AsyncMock(return_value=None)
+    # No project_workspace_defaults row: the installation decides the tier.
+    db.fetchrow = AsyncMock(return_value=None)
     return db
 
 
