@@ -129,6 +129,7 @@ def test_clear_with_an_expected_identity_never_clears_a_successor():
 
     assert owner.clear(expected_generation=G1, expected_attach_token=T1) is False
     assert owner.clear(expected_generation=G2, expected_attach_token=T1) is False
+    assert owner.clear(expected_generation=G1, expected_attach_token=T2) is False
     assert (owner.session_generation, owner.attach_token) == (G2, T2)
     assert state.client.cleared == [] and state.replaced == []
 
