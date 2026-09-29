@@ -6,7 +6,13 @@ of a Job's or Session's container. See [the example](srw-container-workspace.yam
 ```yaml
 spec:
   backend: sandbox
-  resources: {cpu: 2, memory: 4Gi, storage: 30Gi}
+  resources:
+    cpu: 2            # maximum
+    memory: 4Gi       # maximum
+    storage: 30Gi
+    requests:         # reserved, optional
+      cpu: 0.5
+      memory: 1Gi
   environment:
     image: registry.example/team/workspace@sha256:<digest>
     pullPolicy: IfNotPresent
@@ -23,10 +29,16 @@ installation defaults. A stateless Session can't change its tier at all.
 
 | Field | Pod |
 | --- | --- |
-| `memory` | request = limit = the value. Memory is reserved, never overcommitted. |
-| `cpu` | limit = the value; request = a quarter of it (for example `cpu: 2` → `500m` request, `2000m` limit). |
+| `memory` | limit = the value. The request is `requests.memory` if you give one, otherwise the same value. |
+| `cpu` | limit = the value. The request is `requests.cpu` if you give one, otherwise a quarter of the limit (for example `cpu: 2` → `500m` request, `2000m` limit). |
+| `requests` | What Kubernetes reserves on the node. Each request needs its maximum in the same template and can't exceed it. Containers only. |
 | `storage` | With PVC workspaces, the claim size. Otherwise the emptyDir `sizeLimit` plus an `ephemeral-storage` request of the same size. |
 | `pullPolicy` | The container's `imagePullPolicy`. Resolution fills in `IfNotPresent` when you give an image. |
+
+A request below its maximum means the workspace is overcommitted. For memory,
+Kubernetes may evict such a workspace when the node runs short. The installation
+default runs that way too: it reserves 1Gi and allows 4Gi. Leave `requests.memory`
+out if the workspace must never be evicted for memory.
 
 A field you leave out keeps the installation default: 500m/1Gi requested,
 2 CPU/4Gi limit, and the installation's storage size. An existing workspace

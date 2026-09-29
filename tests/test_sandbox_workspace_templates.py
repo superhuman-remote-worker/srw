@@ -168,3 +168,30 @@ def test_selected_sandbox_settings_survive_binding(role):
         capture=capture,
     )
     assert capture["merged_fragment"]["workspace"]["sandbox"] == sandbox
+
+
+def test_sandbox_template_renders_its_requests():
+    assert render(
+        {
+            "backend": "sandbox",
+            "resources": {
+                "cpu": 2,
+                "memory": "4Gi",
+                "requests": {"cpu": 0.5, "memory": "1Gi"},
+            },
+        }
+    ) == {
+        "backend": "sandbox",
+        "sandbox": {
+            "cpu": 2,
+            "memory": "4Gi",
+            "requests": {"cpu": 0.5, "memory": "1Gi"},
+        },
+    }
+
+
+def test_empty_requests_are_not_rendered():
+    assert render({"backend": "sandbox", "resources": {"cpu": 2, "requests": {}}}) == {
+        "backend": "sandbox",
+        "sandbox": {"cpu": 2},
+    }

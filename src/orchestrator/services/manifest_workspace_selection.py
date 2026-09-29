@@ -49,6 +49,8 @@ def _sandbox_workspace_config(recipe: dict) -> dict:
     for field in ("cpu", "memory", "storage"):
         if field in resources:
             sandbox[field] = resources[field]
+    if resources.get("requests"):
+        sandbox["requests"] = dict(resources["requests"])
     return {"sandbox": sandbox} if sandbox else {}
 
 
@@ -123,6 +125,10 @@ def srw_workspace_config(
             raise HTTPException(422, "VM image must be a registry image reference.")
         vm["image"] = image
     resources = recipe.get("resources", {})
+    if resources.get("requests"):
+        raise HTTPException(
+            422, "Only container workspaces support resources.requests."
+        )
     if "cpu" in resources:
         cpu = resources["cpu"]
         if int(cpu) != cpu:

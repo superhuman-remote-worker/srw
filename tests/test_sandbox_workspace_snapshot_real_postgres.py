@@ -136,3 +136,48 @@ async def test_virtual_session_upgrade_binds_only_the_backend(database, actor):
     _, policy = srw_snapshot_config(prepared)
     assert policy["workspace"]["backend"] == "sandbox"
     assert "sandbox" not in policy["workspace"]
+
+
+@pytest.mark.asyncio
+async def test_requests_are_frozen_and_cannot_be_patched(database, actor):
+    spec = {
+        "backend": "sandbox",
+        "resources": {
+            "cpu": 2,
+            "memory": "4Gi",
+            "requests": {"cpu": 0.5, "memory": "1Gi"},
+        },
+    }
+    workspace, receipt = await select_execution_workspace(
+        database,
+        actor,
+        role="session",
+        project_id=None,
+        supplied=True,
+        workspace={"template": {"inline": spec}},
+    )
+    thread_id = await database.create_thread(
+        user_id=str(actor["id"]),
+        datasource_ids=[],
+        initial_metadata={"config_override": {"workspace": workspace}},
+        workspace_selection=receipt,
+    )
+    current = await read_execution(database, "Session", thread_id)
+    _, policy = srw_snapshot_config(current)
+    assert policy["workspace"]["sandbox"] == {
+        "cpu": 2,
+        "memory": "4Gi",
+        "requests": {"cpu": 0.5, "memory": "1Gi"},
+    }
+    thread = await database.get_thread(thread_id)
+    metadata = json.loads(thread["metadata"])
+    with pytest.raises(HTTPException) as denied:
+        await prepare_srw_session_patch(
+            database,
+            current,
+            thread,
+            metadata,
+            [],
+            {"workspace": {"sandbox": {"requests": {"memory": "4Gi"}}}},
+        )
+    assert denied.value.status_code == 422

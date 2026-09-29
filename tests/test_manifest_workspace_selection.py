@@ -320,6 +320,17 @@ async def test_other_account_template_and_unsupported_recipes_fail_before_creati
             "Virtual workspaces do not support OS images",
         ),
         (
+            {
+                "template": {
+                    "inline": {
+                        "backend": "sandbox",
+                        "resources": {"memory": "1Gi", "requests": {"memory": "2Gi"}},
+                    }
+                }
+            },
+            "Resource request exceeds its limit.",
+        ),
+        (
             {"template": {"inline": {"backend": "none", "resources": {"cpu": 1}}}},
             "workspace must be null or a manifest template/instanceRef binding",
         ),

@@ -201,3 +201,65 @@ async def test_non_uuid_owner_has_no_snapshot():
     assert await resolve_sandbox_settings(object(), "job", "not-a-uuid") == (
         SandboxSettings()
     )
+
+
+def test_requests_replace_the_default_reservation():
+    profile = sandbox_pod_profile(
+        SandboxSettings(cpu=2, memory="4Gi", request_cpu=0.5, request_memory="1Gi"),
+        policy(),
+    )
+    assert (profile.cpu, profile.cpu_limit) == ("500m", "2000m")
+    assert (profile.memory, profile.memory_limit) == ("1Gi", "4Gi")
+
+
+def test_todays_default_pod_can_be_written_as_a_template():
+    written = sandbox_pod_profile(
+        SandboxSettings(cpu=2, memory="4Gi", request_cpu=0.5, request_memory="1Gi"),
+        policy(),
+    )
+    default = sandbox_pod_profile(SandboxSettings(), policy())
+    assert (written.cpu, written.memory, written.cpu_limit, written.memory_limit) == (
+        default.cpu,
+        default.memory,
+        default.cpu_limit,
+        default.memory_limit,
+    )
+
+
+def test_one_request_leaves_the_other_on_the_default_rule():
+    cpu_only = sandbox_pod_profile(
+        SandboxSettings(cpu=2, memory="4Gi", request_cpu=1), policy()
+    )
+    assert (cpu_only.cpu, cpu_only.memory) == ("1000m", "4Gi")
+    memory_only = sandbox_pod_profile(
+        SandboxSettings(cpu=2, memory="4Gi", request_memory="2Gi"), policy()
+    )
+    assert (memory_only.cpu, memory_only.memory) == ("500m", "2Gi")
+
+
+def test_a_request_without_its_maximum_is_ignored():
+    # Validation refuses this shape; a frozen snapshot must still never produce
+    # a request above the default limit.
+    profile = sandbox_pod_profile(
+        SandboxSettings(request_cpu=3, request_memory="8Gi"), policy()
+    )
+    assert (profile.cpu, profile.cpu_limit) == ("500m", "2000m")
+    assert (profile.memory, profile.memory_limit) == ("1Gi", "4Gi")
+
+
+def test_settings_read_requests_from_the_frozen_policy():
+    settings = SandboxSettings.from_policy(
+        {
+            "workspace": {
+                "sandbox": {
+                    "cpu": 2,
+                    "memory": "4Gi",
+                    "requests": {"cpu": 0.5, "memory": "1Gi"},
+                }
+            }
+        }
+    )
+    assert (settings.request_cpu, settings.request_memory) == (0.5, "1Gi")
+    assert SandboxSettings.from_policy({"workspace": {"sandbox": {"cpu": 2}}}) == (
+        SandboxSettings(cpu=2)
+    )

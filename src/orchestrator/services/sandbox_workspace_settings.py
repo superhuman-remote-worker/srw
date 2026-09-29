@@ -56,16 +56,21 @@ class SandboxSettings:
     cpu: float | None = None
     memory: str | None = None
     storage: str | None = None
+    request_cpu: float | None = None
+    request_memory: str | None = None
 
     @classmethod
     def from_policy(cls, policy: dict) -> "SandboxSettings":
         sandbox = object_value(object_value(policy.get("workspace")).get("sandbox"))
+        requests = object_value(sandbox.get("requests"))
         return cls(
             image=sandbox.get("image"),
             pull_policy=sandbox.get("pull_policy"),
             cpu=sandbox.get("cpu"),
             memory=sandbox.get("memory"),
             storage=sandbox.get("storage"),
+            request_cpu=requests.get("cpu"),
+            request_memory=requests.get("memory"),
         )
 
     def is_empty(self) -> bool:
@@ -198,13 +203,18 @@ def sandbox_pod_profile(
     keep the caller's defaults, which are today's values. A custom image (one
     outside the trusted repositories) runs without FUSE or privilege unless the
     operator allows it, and never with more than the installation grants.
+    A template's ``requests`` replace either reservation.
     """
     effective_image = settings.image or image or policy.default_image
+    # A request counts only next to its maximum; validation guarantees that.
     if settings.cpu is not None:
         cpu_limit = _millicores(settings.cpu)
-        cpu = _millicores(settings.cpu / 4)
+        cpu = _millicores(
+            settings.cpu / 4 if settings.request_cpu is None else settings.request_cpu
+        )
     if settings.memory is not None:
-        memory = memory_limit = settings.memory
+        memory_limit = settings.memory
+        memory = settings.request_memory or settings.memory
     full_profile = policy.trusts(effective_image) or policy.custom_images_privileged
     return SandboxPodProfile(
         image=effective_image,
