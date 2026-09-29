@@ -197,10 +197,19 @@ async def _cron_automation(db, actor, name, *, project_id=None, minutes_ago):
 async def test_a_refused_cron_fire_is_recorded_and_the_next_automation_still_fires(
     database, actor, monkeypatch
 ):
-    from orchestrator.services.cron_dispatcher import _tick
+    from datetime import datetime, timedelta, timezone
+
+    from orchestrator.services import cron_dispatcher
 
     # The bundled worker_base, so the fire needs no Expert catalogue.
     monkeypatch.setenv("EXPERTS_DB_ENABLED", "false")
+    # Clock-independent: every advance lands a day ahead, so no row can
+    # become due again within this drain whatever the wall clock says.
+    monkeypatch.setattr(
+        cron_dispatcher,
+        "compute_next_run_after",
+        lambda *_args: datetime.now(timezone.utc) + timedelta(days=1),
+    )
 
     project_id = await _project(database)
     await save_settings_defaults(
@@ -215,7 +224,7 @@ async def test_a_refused_cron_fire_is_recorded_and_the_next_automation_still_fir
     )
     fires = await _cron_automation(database, actor, "fires", minutes_ago=1)
 
-    assert await _tick(database) == 2
+    assert await cron_dispatcher._tick(database) == 2
 
     row = await database.fetchrow(
         "SELECT last_status, next_run_at > now() AS advanced, run_count FROM automations WHERE id=$1",

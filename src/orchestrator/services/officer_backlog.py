@@ -718,9 +718,8 @@ def pool_status_lines(
         entry = refusals.get(pool)
         if isinstance(entry, dict) and entry.get("reason"):
             lines.append(
-                f"Pool {pool}: CANNOT DISPATCH — {entry['reason']} "
-                "Nothing ran; tell the Legate so the Project's workspace "
-                "defaults get fixed."
+                f"Pool {pool}: CANNOT DISPATCH until the workspace defaults "
+                f"are fixed: {entry['reason']}"
             )
 
     stalled = officer_state.get("backlog_stale_claims") or []
@@ -933,6 +932,7 @@ async def _dispatch_one(
         str(owner_user_id) if owner_user_id else None
     )
     from orchestrator.services.manifest_workspace_selection import (
+        WorkspaceSelectionRace,
         select_project_workspace_default,
     )
 
@@ -946,6 +946,8 @@ async def _dispatch_one(
             project_id,
             prepared_config,
         )
+    except WorkspaceSelectionRace:
+        raise  # transient: logged as dispatch-failed, retried next tick
     except HTTPException as exc:
         raise WorkspaceRefused(str(exc.detail)) from exc
     if workspace_selection is not None:

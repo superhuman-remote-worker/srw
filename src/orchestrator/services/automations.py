@@ -297,6 +297,7 @@ async def create_job_from_automation(
     owner_id = str(automation["owner_id"])
     target_project_ids = [str(project_id)] if project_id else []
     from orchestrator.services.manifest_workspace_selection import (
+        WorkspaceSelectionRace,
         select_project_workspace_default,
     )
 
@@ -310,6 +311,8 @@ async def create_job_from_automation(
             project_id,
             config_override,
         )
+    except WorkspaceSelectionRace:
+        raise  # transient: the tick rolls back and re-claims the row
     except HTTPException as exc:
         raise AutomationWorkspaceRefused(exc.status_code, exc.detail) from exc
     workspace_backend = _workspace_backend(config_override)

@@ -813,3 +813,30 @@ async def test_a_refused_workspace_default_stops_the_loop_with_its_message(
     stopped = db.update_project_loop.call_args.kwargs
     assert stopped["status"] == "failed"
     assert stopped["last_error"] == f"spawn failed: {message}"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_loop_job_stays_an_http_refusal(monkeypatch):
+    """Completion handlers that re-raise HTTPException keep answering 409."""
+    from fastapi import HTTPException
+
+    message = "This Project's container template 'gone' no longer exists."
+    monkeypatch.setattr(
+        "orchestrator.services.manifest_workspace_selection."
+        "select_project_workspace_default",
+        AsyncMock(side_effect=HTTPException(409, message)),
+    )
+    db = _db()
+    with pytest.raises(HTTPException) as refused:
+        await create_loop_job(
+            db,
+            _loop(
+                project_id="22222222-2222-2222-2222-222222222222",
+                owner_id="33333333-3333-3333-3333-333333333333",
+            ),
+            role="scholar",
+            iteration=1,
+        )
+    assert (refused.value.status_code, refused.value.detail) == (409, message)
+    assert str(refused.value) == message
+    db.create_job.assert_not_awaited()

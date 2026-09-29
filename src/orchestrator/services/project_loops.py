@@ -25,6 +25,8 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
+from fastapi import HTTPException
+
 from orchestrator.security.access import project_is_archived
 
 # The legacy name remains the loop path's import surface while the safe
@@ -58,12 +60,16 @@ class TerminalMergeReconciliationError(RuntimeError):
     """A durable PR merge could not be reconciled without guessing."""
 
 
-class LoopWorkspaceRefused(RuntimeError):
+class LoopWorkspaceRefused(HTTPException):
     """The workspace defaults chain refused a loop job (Slice A2b, spec §7).
 
-    Carries only the refusal text, so the spawn paths that stop the loop put
-    exactly that message in ``last_error``.
+    Still an HTTPException with the refusal's status, so completion handlers
+    keep answering it as before. ``str()`` is the refusal text alone, so the
+    spawn paths that stop the loop put exactly that message in ``last_error``.
     """
+
+    def __str__(self) -> str:
+        return str(self.detail)
 
 
 # Every loop role gets an isolated job repository seeded from the project cloud
@@ -1201,10 +1207,9 @@ async def create_loop_job(
     target_project_ids = [project_id] if project_id else []
 
     from orchestrator.services.manifest_workspace_selection import (
+        WorkspaceSelectionRace,
         select_project_workspace_default,
     )
-
-    from fastapi import HTTPException
 
     try:
         (
@@ -1216,8 +1221,10 @@ async def create_loop_job(
             project_id,
             config_override,
         )
+    except WorkspaceSelectionRace:
+        raise  # transient: propagates unchanged, as before
     except HTTPException as exc:
-        raise LoopWorkspaceRefused(str(exc.detail)) from exc
+        raise LoopWorkspaceRefused(exc.status_code, exc.detail) from exc
     if workspace_selection is not None:
         workspace_backend = config_override["workspace"]["backend"]
 

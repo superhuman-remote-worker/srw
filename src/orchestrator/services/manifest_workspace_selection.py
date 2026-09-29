@@ -20,6 +20,18 @@ _BUILD_YOUR_OWN_IMAGE = (
     "environment.image (see examples/manifests/container-workspace-templates.md)."
 )
 _IMAGE_REFERENCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]*")
+PROJECT_CHANGED = "The Project changed during workspace selection; submit again."
+
+
+class WorkspaceSelectionRace(HTTPException):
+    """A Project activation raced this selection; submitting again resolves it.
+
+    Unattended callers let it propagate unchanged (retry on the next pass)
+    instead of recording it as a workspace refusal.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(409, PROJECT_CHANGED)
 
 
 def _sandbox_workspace_config(recipe: dict) -> dict:
@@ -196,9 +208,7 @@ async def select_execution_workspace(
         if resolution.project_revision:
             project = await active_project_resource(db, project_id)
             if project is None or project["revision"] != resolution.project_revision:
-                raise HTTPException(
-                    409, "The Project changed during workspace selection; submit again."
-                )
+                raise WorkspaceSelectionRace()
             await authority.resource(project)
             await resolver.authorize_dependencies(project["dependencies"])
             dependencies = deepcopy(project["dependencies"])
@@ -288,9 +298,7 @@ async def verify_workspace_selection(
     if selection.get("project_revision"):
         project = await active_project_resource(db, selection["project_id"])
         if project is None or project["revision"] != selection["project_revision"]:
-            raise HTTPException(
-                409, "The Project changed during workspace selection; submit again."
-            )
+            raise WorkspaceSelectionRace()
     if selection.get("instance_recipe") is not None:
         from orchestrator.services.retained_vm_workspaces import read_instance
 
