@@ -1,4 +1,5 @@
 import {ChatAttachment, ToolCallInfo} from '../services/persistent-chat.service';
+import {SubagentRecoveryContinuation, SubagentRecoveryResult} from './subagent-recovery.model';
 import {DELEGATE_TOOL, JOB_TOOL, NOTIFY_USER_TOOL, SLEEP_TOOL} from './tool-card.model';
 
 /**
@@ -66,6 +67,12 @@ export interface ToolCallEvent extends ToolCallInfo {
      * back to contiguity.
      */
     messageKey?: string;
+    /**
+     * What a delegation-batch recovery found for this call, read from the
+     * structured marker on the result row it wrote (history only). Absent for
+     * every result the agent wrote itself.
+     */
+    recovery?: SubagentRecoveryResult;
 }
 
 /**
@@ -134,6 +141,13 @@ export interface SystemTurn {
     id: string;
     content: string;
     timestamp: number;
+    /**
+     * Set on the continuation a delegation-batch recovery wrote (history
+     * only): the turn's call counts, from the row's structured marker. The
+     * line then states them in the viewer's language; `content` is the text
+     * the model was given.
+     */
+    subagentRecovery?: SubagentRecoveryContinuation;
 }
 
 /**

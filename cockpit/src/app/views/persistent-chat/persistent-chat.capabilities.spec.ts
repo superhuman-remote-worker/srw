@@ -486,3 +486,55 @@ describe('rewind affordances follow the declared controls', () => {
     }
   });
 });
+
+describe('the continuation a delegation-batch recovery wrote', () => {
+  beforeAll(async () => {
+    HTMLElement.prototype.scrollTo = vi.fn();
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  const api = {
+    getThreadIdeStatus: () => of(null),
+    getMyCapabilities: () => of(null),
+    getSshHostKeys: () => of({hostname: 'ssh.example.test', host_keys: []}),
+  };
+  const MODEL_TEXT = '[subagent recovery] This turn was resumed after the process running it was replaced.';
+
+  // The muted line every injected event gets, stating the counts from the
+  // row's marker in the viewer's language; the model's text stays on hover.
+  // The test pipe renders keys, so the assertion reads which parts show.
+  it('states the turn counts it carries, and only the non-zero ones', async () => {
+    const chat = sessionState() as any;
+    chat.visibleTurns.set([
+      {kind: 'system', id: 'continuation', content: MODEL_TEXT, timestamp: 0,
+        subagentRecovery: {calls: 4, finished: 1, interrupted: 1, notStarted: 2, declined: 0, retired: 0}},
+    ]);
+    const fixture = await mountChat(chat, api, false);
+    try {
+      const line = fixture.nativeElement.querySelector('[data-testid="subagent-recovery-notice"]') as HTMLElement;
+      expect(line.getAttribute('title')).toBe(MODEL_TEXT);
+      expect(line.textContent!.replace(/\s+/g, ' ').trim()).toBe(
+        'info chat.system.subagentRecovery.resumed: chat.system.subagentRecovery.finished' +
+          ' · chat.system.subagentRecovery.interrupted · chat.system.subagentRecovery.notStarted',
+      );
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it('leaves an event without the marker as the plain line it always was', async () => {
+    const chat = sessionState() as any;
+    chat.visibleTurns.set([{kind: 'system', id: 'legacy', content: 'report of the orphaned child', timestamp: 0}]);
+    const fixture = await mountChat(chat, api, false);
+    try {
+      expect(fixture.nativeElement.querySelector('[data-testid="subagent-recovery-notice"]')).toBeNull();
+      const line = fixture.nativeElement.querySelector('.message-system .system-message') as HTMLElement;
+      expect(line.textContent!.replace(/\s+/g, ' ').trim()).toBe('info report of the orphaned child');
+      expect(line.hasAttribute('title')).toBe(false);
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+});

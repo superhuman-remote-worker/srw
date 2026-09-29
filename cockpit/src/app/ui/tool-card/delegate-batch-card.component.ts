@@ -57,6 +57,12 @@ interface DelegateBatchRow {
  *
  * Each row expands to the ordinary tool card for the full brief and report.
  *
+ * A batch whose executor died is settled by a recovery that writes a result
+ * for every open call. Each row then shows what the marker on that result
+ * says (interrupted, not started, declined, cancelled — see
+ * `delegateMemberStatus`), and the header gives the interrupted and the
+ * never-started calls a chip each.
+ *
  * Design: knowledge-base/knowledge/features/parallel_subagents.md §6.5.
  */
 @Component({
@@ -74,6 +80,12 @@ interface DelegateBatchRow {
         <span class="db__meta">{{ 'toolCard.delegateBatch.finished' | transloco:{done: summary().finished, total: summary().total} }}</span>
         @if (summary().failed; as n) {
           <span class="db__chip db__failedChip">{{ 'toolCard.delegateBatch.failed' | transloco:{count: n} }}</span>
+        }
+        @if (summary().interrupted; as n) {
+          <span class="db__chip db__interruptedChip">{{ 'toolCard.delegateBatch.interrupted' | transloco:{count: n} }}</span>
+        }
+        @if (summary().notStarted; as n) {
+          <span class="db__chip db__notStartedChip">{{ 'toolCard.delegateBatch.notStarted' | transloco:{count: n} }}</span>
         }
       </button>
 
@@ -115,8 +127,10 @@ interface DelegateBatchRow {
       border: 1px solid var(--border-color);
       border-radius: var(--radius-surface); overflow: hidden;
     }
+    /* Wraps: a recovered batch can carry three chips, too many for one
+       line at 375 px. */
     .db__head {
-      display: flex; align-items: center; gap: 6px; width: 100%;
+      display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; width: 100%;
       padding: 6px 8px; background: transparent; border: 0; color: inherit;
       font: inherit; font-size: 12px; text-align: left; cursor: pointer;
     }
@@ -131,6 +145,15 @@ interface DelegateBatchRow {
       border-radius: var(--radius-pill); white-space: nowrap;
     }
     .db__failedChip { background: var(--danger-tint); color: var(--danger); }
+    /* A recovered batch: children a restart stopped short, and calls it
+       settled before they ran. Tinted like the row badges they count. */
+    .db__interruptedChip { background: var(--warning-tint); color: var(--warning); }
+    /* Neutral: --surface-0 as the neutral badge, but --text-secondary, not the
+       badge's --text-muted — 3.3:1 on travertine, below AA at this size;
+       --text-secondary is 7.1:1 (8.9:1 on senate). The row badges below get
+       the same text so chip and badge match. */
+    .db__notStartedChip { background: var(--surface-0); color: var(--text-secondary); }
+    .db__status[data-tone='neutral'][data-appearance='subtle'] { color: var(--text-secondary); }
     .db__rows { display: flex; flex-direction: column; }
     .db__row { border-top: 1px solid var(--border-color); }
     /* One line per child: type, brief, status. The brief takes what is left

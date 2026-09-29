@@ -105,6 +105,8 @@
       "title": "{{count}} subagents",
       "finished": "{{done}}/{{total}} finished",
       "failed": "{{count}} failed",
+      "interrupted": "{{count}} interrupted",
+      "notStarted": "{{count}} not started",
       "status": {
         "pending": "Awaiting approval",
         "denied": "Denied",
@@ -2039,7 +2041,15 @@
       "sessionResumed": "Session resumed",
       "resumeSession": "Resume Session",
       "resuming": "Resuming...",
-      "resumeFailed": "Failed to resume session"
+      "resumeFailed": "Failed to resume session",
+      "subagentRecovery": {
+        "resumed": "Resumed after the agent process was replaced",
+        "finished": "{{done}} of {{total}} subagents finished",
+        "interrupted": "{{count}} interrupted",
+        "notStarted": "{{count}} not started",
+        "declined": "{{count}} declined",
+        "retired": "{{count}} cancelled"
+      }
     },
     "compaction": {
       "banner": "Context summarized",

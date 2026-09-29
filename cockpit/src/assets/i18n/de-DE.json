@@ -105,6 +105,8 @@
       "title": "{{count}} Subagenten",
       "finished": "{{done}}/{{total}} beendet",
       "failed": "{{count}} fehlgeschlagen",
+      "interrupted": "{{count}} unterbrochen",
+      "notStarted": "{{count}} nicht gestartet",
       "status": {
         "pending": "Wartet auf Freigabe",
         "denied": "Abgelehnt",
@@ -2039,7 +2041,15 @@
       "sessionResumed": "Sitzung fortgesetzt",
       "resumeSession": "Sitzung fortsetzen",
       "resuming": "Wird fortgesetzt...",
-      "resumeFailed": "Sitzung konnte nicht fortgesetzt werden"
+      "resumeFailed": "Sitzung konnte nicht fortgesetzt werden",
+      "subagentRecovery": {
+        "resumed": "Fortgesetzt, nachdem der Agentenprozess ersetzt wurde",
+        "finished": "{{done}} von {{total}} Subagenten beendet",
+        "interrupted": "{{count}} unterbrochen",
+        "notStarted": "{{count}} nicht gestartet",
+        "declined": "{{count}} abgelehnt",
+        "retired": "{{count}} abgebrochen"
+      }
     },
     "compaction": {
       "banner": "Kontext zusammengefasst",

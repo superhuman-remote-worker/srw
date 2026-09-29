@@ -4,9 +4,17 @@ import {provideRouter} from '@angular/router';
 import {TranslocoTestingModule} from '@jsverse/transloco';
 import {afterEach, beforeAll, describe, expect, it, vi} from 'vitest';
 import {JobSubagent} from '../../core/models/api.model';
-import {DelegateBatchMember, QUEUED_AFTER_MS, SubagentRosterSnapshot} from '../../core/models/delegate-batch.model';
+import {
+    buildDelegateBatchMembers,
+    DelegateBatchMember,
+    QUEUED_AFTER_MS,
+    SubagentRosterSnapshot,
+} from '../../core/models/delegate-batch.model';
 import {ToolCardStatus, ToolCardView} from '../../core/models/tool-card.model';
+import {AssistantTurn, groupEvents, isAssistantTurn, ToolCallEvent} from '../../core/models/turn.model';
+import {historyToTurns} from '../../core/services/persistent-chat.service';
 import {SubagentWatchService} from '../../core/services/subagent-watch.service';
+import {toolCardViewFromEvent} from '../../core/tools/tool-card-adapters';
 import {DelegateBatchCardComponent} from './delegate-batch-card.component';
 
 /**
@@ -110,6 +118,8 @@ describe('DelegateBatchCardComponent', () => {
                                     title: '{{count}} subagents',
                                     finished: '{{done}}/{{total}} finished',
                                     failed: '{{count}} failed',
+                                    interrupted: '{{count}} interrupted',
+                                    notStarted: '{{count}} not started',
                                     status: {
                                         pending: 'Awaiting approval',
                                         denied: 'Denied',
@@ -269,6 +279,84 @@ describe('DelegateBatchCardComponent', () => {
             expect(rows().map(statusOf)).toEqual(['Completed', 'Completed']);
             expect(text('.db__meta')).toBe('2/2 finished');
             for (const [, , live] of watcher.watch.mock.calls) expect(live).toBe(false);
+        });
+    });
+
+    describe('a batch a recovery settled, loaded from history (§6.5 step 3)', () => {
+        // The executor died mid-batch; its successor wrote a result per open
+        // call with a structured marker (metrics.subagent_recovery) and one
+        // continuation. Rows as the history endpoint returns them, run through
+        // the same pipeline the chat component uses.
+        const call = (id: string) => ({
+            name: 'delegate_agent',
+            args: {subagent_type: 'explorer', description: `brief ${id}`},
+            id,
+        });
+        const result = (callId: string, cls: string, subagentStatus: string | null) => ({
+            id: `r-${callId}`, role: 'tool', content: `text for ${callId}`, tool_calls: null,
+            tool_call_id: callId, turn_number: 3, created_at: '2026-09-29T10:05:00+00:00',
+            metrics: {subagent_recovery: {
+                version: 1, kind: 'result', class: cls, tool_call_id: callId,
+                thread_id: subagentStatus ? `child-${callId}` : null, handle: null,
+                subagent_type: 'explorer', subagent_status: subagentStatus,
+                report_path: null, delivery_id: 'batch-delivery',
+            }},
+        });
+        function membersFromHistory(rows: unknown[]): DelegateBatchMember[] {
+            const turns = historyToTurns(rows as never);
+            const turn = turns.find(isAssistantTurn) as AssistantTurn;
+            const [group] = groupEvents(turn.events);
+            expect(group.kind).toBe('delegate_batch');
+            return buildDelegateBatchMembers(
+                (group as {events: ToolCallEvent[]}).events,
+                toolCardViewFromEvent,
+            );
+        }
+        const aiRow = (calls: string[]) => ({
+            id: 'm1', role: 'ai', content: null, tool_calls: calls.map(call), turn_number: 3,
+            metrics: null, created_at: '2026-09-29T10:00:00+00:00',
+        });
+        const typed = {
+            id: 'typed', role: 'human', content: 'also check the tests', tool_calls: null,
+            turn_number: 4, metrics: null, created_at: '2026-09-29T10:01:00+00:00',
+        };
+
+        it('shows completed, interrupted and not started, and counts them in the header', async () => {
+            await render(membersFromHistory([
+                aiRow(['d1', 'd2', 'd3', 'd4']),
+                // Typed during the batch: sorts between the call and the settle.
+                typed,
+                result('d1', 'completed', 'completed'),
+                result('d2', 'interrupted', 'interrupted'),
+                result('d3', 'not_started', null),
+                result('d4', 'not_started', null),
+            ]), 'parent', true);
+            // The one read a finished batch gets: two children exist.
+            watcher.put('parent', [child('d1', 'completed'), child('d2', 'interrupted')]);
+            await settle();
+
+            expect(rows().map(statusOf)).toEqual(['Completed', 'Interrupted', 'Not started', 'Not started']);
+            expect(text('.db__title')).toBe('4 subagents');
+            expect(text('.db__meta')).toBe('4/4 finished');
+            expect(text('.db__interruptedChip')).toBe('1 interrupted');
+            expect(text('.db__notStartedChip')).toBe('2 not started');
+            expect(root().querySelector('.db__failedChip')).toBeNull();
+            // Never a child that ran: no facts line to link from.
+            expect(rows()[2].querySelector('.db__facts')).toBeNull();
+            for (const [, , live] of watcher.watch.mock.calls) expect(live).toBe(false);
+        });
+
+        it('shows a declined call as denied and a retired child as cancelled', async () => {
+            await render(membersFromHistory([
+                aiRow(['d1', 'd2']),
+                result('d1', 'declined', null),
+                result('d2', 'retired', 'cancelled'),
+            ]));
+            expect(rows().map(statusOf)).toEqual(['Denied', 'Cancelled']);
+            expect(text('.db__meta')).toBe('2/2 finished');
+            expect(text('.db__failedChip')).toBe('2 failed');
+            expect(root().querySelector('.db__interruptedChip')).toBeNull();
+            expect(root().querySelector('.db__notStartedChip')).toBeNull();
         });
     });
 

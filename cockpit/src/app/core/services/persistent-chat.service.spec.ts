@@ -29,6 +29,12 @@ import {
   UserTurn,
 } from '../models/turn.model';
 import { ThreadCloudDiffSummary } from '../models/api.model';
+import {
+  buildDelegateBatchMembers,
+  delegateMemberStatus,
+  summarizeDelegateBatch,
+} from '../models/delegate-batch.model';
+import { toolCardViewFromEvent } from '../tools/tool-card-adapters';
 import { UploadStatus } from '../models/file.model';
 import { PersistentThreadTransportBridge } from './persistent-thread-transport-bridge.service';
 import { CanvasService } from './canvas.service';
@@ -10319,6 +10325,299 @@ describe('PersistentChatService — usage.updated telemetry', () => {
       expect(groups.map((g) => g.kind)).toEqual(['delegate_batch', 'delegate_batch']);
       expect(groups.map((g) => (g.kind === 'single' ? [g.event.id] : g.events.map((e) => e.id))))
         .toEqual([['d1', 'd2'], ['d3', 'd4']]);
+    });
+  });
+
+  describe('historyToTurns — a delegation batch a recovery settled (§6.5 step 3)', () => {
+    // The executor died mid-batch. Its successor wrote one tool row per open
+    // call and one continuation event, each stamped with a structured marker
+    // in `metrics.subagent_recovery` (src/shared/session_subagent_batch.py).
+    // All of them carry the abandoned turn's number but are created at settle
+    // time, so the history endpoint (created_at order) lists them after
+    // anything the user typed during the batch.
+    const SETTLED = '2026-09-29T10:05:00+00:00';
+    const ai = (id: string, calls: string[], turn = 3) => ({
+      id,
+      role: 'ai',
+      content: null,
+      tool_calls: calls.map((callId) => ({
+        name: 'delegate_agent',
+        args: { subagent_type: 'explorer', description: `brief ${callId}` },
+        id: callId,
+      })),
+      turn_number: turn,
+      metrics: null,
+      created_at: '2026-09-29T10:00:00+00:00',
+    });
+    const recoveredResult = (
+      callId: string,
+      cls: string,
+      content: string,
+      subagentStatus: string | null = null,
+    ) => ({
+      id: `r-${callId}`,
+      role: 'tool',
+      content,
+      tool_calls: null,
+      tool_call_id: callId,
+      turn_number: 3,
+      metrics: {
+        subagent_recovery: {
+          version: 1,
+          kind: 'result',
+          class: cls,
+          tool_call_id: callId,
+          thread_id: subagentStatus ? `child-${callId}` : null,
+          handle: subagentStatus ? `explorer-${callId}` : null,
+          subagent_type: 'explorer',
+          subagent_status: subagentStatus,
+          report_path: null,
+          delivery_id: 'batch-delivery',
+        },
+      },
+      created_at: SETTLED,
+    });
+    const continuation = (counts: {
+      calls: number;
+      interrupted?: number;
+      not_started?: number;
+      declined?: number;
+      retired?: number;
+    }) => {
+      const { calls, interrupted = 0, not_started = 0, declined = 0, retired = 0 } = counts;
+      return {
+        id: 'continuation',
+        role: 'event',
+        content: '[subagent recovery] This turn was resumed after the process running it was replaced.',
+        tool_calls: null,
+        turn_number: 3,
+        metrics: {
+          subagent_recovery: {
+            version: 1,
+            kind: 'continuation',
+            supersedes_input_seq: 40,
+            calls,
+            finished: calls - interrupted - not_started - declined - retired,
+            interrupted,
+            not_started,
+            declined,
+            retired,
+          },
+        },
+        created_at: SETTLED,
+      };
+    };
+    const typed = {
+      id: 'typed',
+      role: 'human',
+      content: 'also check the tests',
+      tool_calls: null,
+      turn_number: 4,
+      metrics: null,
+      created_at: '2026-09-29T10:01:00+00:00',
+    };
+
+    /** The batch card's rows as the chat component builds them. */
+    function batchOf(turns: ReturnType<typeof historyToTurns>) {
+      const turn = turns.find(isAssistantTurn) as AssistantTurn;
+      const groups = groupEvents(turn.events);
+      expect(groups.map((g) => g.kind)).toEqual(['delegate_batch']);
+      const group = groups[0] as { kind: 'delegate_batch'; events: ToolCallEvent[] };
+      const members = buildDelegateBatchMembers(group.events, toolCardViewFromEvent);
+      const statuses = members.map((m) => delegateMemberStatus(m, null, null));
+      return { events: group.events, statuses, summary: summarizeDelegateBatch(statuses) };
+    }
+
+    it('shows each call as the marker says, and the continuation with its counts', () => {
+      const turns = historyToTurns([
+        ai('m1', ['d1', 'd2', 'd3', 'd4']),
+        recoveredResult('d1', 'completed', 'report of d1', 'completed'),
+        recoveredResult('d2', 'interrupted', '[delegate_agent: INTERRUPTED - no final report]', 'interrupted'),
+        recoveredResult('d3', 'not_started', '[delegate_agent: NOT STARTED]'),
+        recoveredResult('d4', 'not_started', '[delegate_agent: NOT STARTED]'),
+        continuation({ calls: 4, interrupted: 1, not_started: 2 }),
+      ] as never);
+
+      const { events, statuses, summary } = batchOf(turns);
+      expect(statuses).toEqual(['completed', 'interrupted', 'not_started', 'not_started']);
+      expect(summary).toEqual({ total: 4, finished: 4, failed: 0, interrupted: 1, notStarted: 2 });
+      // The text is the model's; the card reads the marker.
+      expect(events.map((e) => e.result)).toEqual([
+        'report of d1',
+        '[delegate_agent: INTERRUPTED - no final report]',
+        '[delegate_agent: NOT STARTED]',
+        '[delegate_agent: NOT STARTED]',
+      ]);
+
+      const notice = turns.find(isSystemTurn)!;
+      expect(notice.content).toContain('[subagent recovery]');
+      expect(notice.subagentRecovery).toEqual({
+        calls: 4,
+        finished: 1,
+        interrupted: 1,
+        notStarted: 2,
+        declined: 0,
+        retired: 0,
+      });
+    });
+
+    it('lands results on their batch card across input typed during the batch', () => {
+      // Server order: call, the typed message (created before the settle),
+      // then the settle's rows — the continuation first, as ids can order
+      // rows that share one created_at either way.
+      const turns = historyToTurns([
+        ai('m1', ['d1', 'd2']),
+        typed,
+        continuation({ calls: 2, interrupted: 1 }),
+        recoveredResult('d2', 'interrupted', 'interrupted d2', 'interrupted'),
+        recoveredResult('d1', 'completed', 'report of d1', 'completed'),
+      ] as never);
+
+      expect(turns.map((t) => t.kind)).toEqual(['assistant', 'user', 'system']);
+      expect((turns[1] as UserTurn).content).toBe('also check the tests');
+      const { events, statuses } = batchOf(turns);
+      expect(events.map((e) => e.result)).toEqual(['report of d1', 'interrupted d2']);
+      expect(statuses).toEqual(['completed', 'interrupted']);
+    });
+
+    it('shows a declined call as denied and a retired child as cancelled', () => {
+      const turns = historyToTurns([
+        ai('m1', ['d1', 'd2', 'd3']),
+        recoveredResult('d1', 'declined', 'User declined this tool call.'),
+        recoveredResult('d2', 'retired', '[delegate_agent: CANCELLED - session stopped]', 'cancelled'),
+        recoveredResult('d3', 'completed', 'partial report', 'capped'),
+        continuation({ calls: 3, declined: 1, retired: 1 }),
+      ] as never);
+
+      const { events, statuses, summary } = batchOf(turns);
+      expect(statuses).toEqual(['denied', 'cancelled', 'capped']);
+      expect(summary).toEqual({ total: 3, finished: 3, failed: 2, interrupted: 0, notStarted: 0 });
+      // A declined call is the refusal an AI-row decision would have recorded,
+      // so its own card reads denied as well.
+      expect(events[0].status).toBe('denied');
+      expect(events[1].status).toBe('completed');
+      expect(turns.find(isSystemTurn)!.subagentRecovery).toMatchObject({ declined: 1, retired: 1, finished: 1 });
+    });
+
+    it('renders a single call the per-child path recovered exactly as before', () => {
+      // No marker anywhere: the old path writes no tool row for an orphaned
+      // call, or leaves a durable one alone, and adds an event of its own.
+      const legacyEvent = {
+        id: 'legacy-event',
+        role: 'event',
+        content: 'report of the orphaned child',
+        tool_calls: null,
+        turn_number: 3,
+        metrics: null,
+        created_at: SETTLED,
+      };
+      const orphaned = historyToTurns([ai('m1', ['d1']), legacyEvent] as never);
+      const durable = historyToTurns([
+        ai('m1', ['d1']),
+        { ...recoveredResult('d1', 'completed', 'durable report'), metrics: { usage: { tokens: 12 } } },
+        { ...legacyEvent, content: '[subagent recovery] The original delegate_agent ToolMessage is already durable.' },
+      ] as never);
+
+      for (const turns of [orphaned, durable]) {
+        const turn = turns.find(isAssistantTurn) as AssistantTurn;
+        const groups = groupEvents(turn.events);
+        expect(groups.map((g) => g.kind)).toEqual(['single']);
+        const call = turn.events.find(isToolCall)!;
+        expect('recovery' in call).toBe(false);
+        expect(call.status).toBe('completed');
+        const notice = turns.find(isSystemTurn)!;
+        expect(Object.keys(notice).sort()).toEqual(['content', 'id', 'kind', 'timestamp']);
+      }
+      expect(orphaned.find(isAssistantTurn)!.events.find(isToolCall)!.result).toBeUndefined();
+      expect(durable.find(isAssistantTurn)!.events.find(isToolCall)!.result).toBe('durable report');
+      // Its ordinary card says what it always said.
+      const lone = durable.find(isAssistantTurn)!.events.find(isToolCall)!;
+      expect(toolCardViewFromEvent(lone).outcome).toBeUndefined();
+      expect(toolCardViewFromEvent(lone).status).toBe('ok');
+    });
+
+    it('marks a lone call of the settled turn on its ordinary card', () => {
+      // One settle covers every message of the turn (§5.1): message 1 fanned
+      // out and both results were delivered; message 2 issued one call, which
+      // renders as an ordinary card, and the executor died before it ran.
+      const delivered = (callId: string) => ({
+        id: `r-${callId}`,
+        role: 'tool',
+        content: `report of ${callId}`,
+        tool_calls: null,
+        tool_call_id: callId,
+        turn_number: 3,
+        metrics: null,
+        created_at: '2026-09-29T10:02:00+00:00',
+      });
+      const turns = historyToTurns([
+        ai('m1', ['d1', 'd2']),
+        delivered('d1'),
+        delivered('d2'),
+        ai('m2', ['d3']),
+        recoveredResult('d3', 'not_started', '[delegate_agent: NOT STARTED]'),
+        continuation({ calls: 3, not_started: 1 }),
+      ] as never);
+
+      const turn = turns.find(isAssistantTurn) as AssistantTurn;
+      const groups = groupEvents(turn.events);
+      expect(groups.map((g) => g.kind)).toEqual(['delegate_batch', 'single']);
+      const batch = groups[0] as { kind: 'delegate_batch'; events: ToolCallEvent[] };
+      const lone = (groups[1] as { kind: 'single'; event: ToolCallEvent }).event;
+
+      const loneView = toolCardViewFromEvent(lone);
+      expect(loneView.status).toBe('ok');
+      expect(loneView.outcome).toEqual({
+        labelKey: 'toolCard.delegateBatch.status.notStarted',
+        tone: 'neutral',
+      });
+      // The delivered fan-out carries no marker and no outcome.
+      expect(batch.events.map((e) => toolCardViewFromEvent(e).outcome)).toEqual([undefined, undefined]);
+    });
+
+    it('gives a lone interrupted or retired call the batch row label and tone', () => {
+      const viewOf = (cls: string, subagentStatus: string | null) => {
+        const turns = historyToTurns([
+          ai('m1', ['d1']),
+          recoveredResult('d1', cls, 'text for the model', subagentStatus),
+        ] as never);
+        return toolCardViewFromEvent(turns.find(isAssistantTurn)!.events.find(isToolCall)!);
+      };
+      expect(viewOf('interrupted', 'interrupted').outcome).toEqual({
+        labelKey: 'jobs.detail.subagentsStatuses.interrupted',
+        tone: 'warning',
+      });
+      expect(viewOf('retired', 'cancelled').outcome).toEqual({
+        labelKey: 'jobs.detail.subagentsStatuses.cancelled',
+        tone: 'danger',
+      });
+      // Already said by the card itself: OK for a completed child, Denied for
+      // a declined call.
+      expect(viewOf('completed', 'completed').outcome).toBeUndefined();
+      const declined = viewOf('declined', null);
+      expect(declined.outcome).toBeUndefined();
+      expect(declined.status).toBe('denied');
+    });
+
+    it('drops a marker when a later unmarked result for the same call arrives', () => {
+      const unmarked = {
+        ...recoveredResult('d1', 'completed', 'the later result'),
+        id: 'later',
+        metrics: null,
+        created_at: '2026-09-29T10:09:00+00:00',
+      };
+      for (const cls of ['not_started', 'declined']) {
+        const turns = historyToTurns([
+          ai('m1', ['d1']),
+          recoveredResult('d1', cls, 'settled text'),
+          unmarked,
+        ] as never);
+        const call = turns.find(isAssistantTurn)!.events.find(isToolCall)!;
+        expect('recovery' in call).toBe(false);
+        expect(call.result).toBe('the later result');
+        expect(call.status).toBe('completed');
+        expect(toolCardViewFromEvent(call).outcome).toBeUndefined();
+      }
     });
   });
 

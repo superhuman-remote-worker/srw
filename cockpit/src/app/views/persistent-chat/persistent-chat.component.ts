@@ -1425,10 +1425,35 @@ export function clearDraft(threadId: string | null): void {
           @switch (turn.kind) {
             @case ('system') {
               <div class="message message-system">
-                <div class="system-message">
-                  <app-icon size="sm" class="system-icon">info</app-icon>
-                  {{ turn.content }}
-                </div>
+                @if (turn.subagentRecovery; as r) {
+                  <!-- The continuation a delegation-batch recovery wrote: the
+                       call counts from its marker, in the viewer's language.
+                       The text the model was given stays on hover. -->
+                  <div class="system-message" data-testid="subagent-recovery-notice" [attr.title]="turn.content">
+                    <app-icon size="sm" class="system-icon">info</app-icon>
+                    <span>
+                      {{ 'chat.system.subagentRecovery.resumed' | transloco }}:
+                      {{ 'chat.system.subagentRecovery.finished' | transloco:{done: r.finished, total: r.calls} }}
+                      @if (r.interrupted) {
+                        · {{ 'chat.system.subagentRecovery.interrupted' | transloco:{count: r.interrupted} }}
+                      }
+                      @if (r.notStarted) {
+                        · {{ 'chat.system.subagentRecovery.notStarted' | transloco:{count: r.notStarted} }}
+                      }
+                      @if (r.declined) {
+                        · {{ 'chat.system.subagentRecovery.declined' | transloco:{count: r.declined} }}
+                      }
+                      @if (r.retired) {
+                        · {{ 'chat.system.subagentRecovery.retired' | transloco:{count: r.retired} }}
+                      }
+                    </span>
+                  </div>
+                } @else {
+                  <div class="system-message">
+                    <app-icon size="sm" class="system-icon">info</app-icon>
+                    {{ turn.content }}
+                  </div>
+                }
               </div>
             }
             @case ('compaction') {

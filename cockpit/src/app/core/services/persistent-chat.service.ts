@@ -32,6 +32,10 @@ import {
   Turn,
   UserTurn,
 } from '../models/turn.model';
+import {
+  parseSubagentRecoveryContinuation,
+  parseSubagentRecoveryResult,
+} from '../models/subagent-recovery.model';
 import { TranslocoService } from '@jsverse/transloco';
 import { ApiService } from './api.service';
 import type { SessionQueueState } from '../models/api.model';
@@ -8639,12 +8643,19 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
     // the model was told something, but the user never said it, and a
     // transcript that claims otherwise is a lie the user cannot audit.
     // Joins 'summary' and 'error' as the third non-conversational role.
+    //
+    // A delegation-batch recovery's continuation is one of these too: the
+    // line the per-child recovery event has always had. Its structured
+    // marker carries the turn's call counts, so the line can state them in
+    // the viewer's language instead of the text written for the model.
     if (m.role === 'event') {
+      const subagentRecovery = parseSubagentRecoveryContinuation(m.metrics);
       turns.push({
         kind: 'system',
         id: m.id,
         content: m.content || '',
         timestamp: ts,
+        ...(subagentRecovery ? { subagentRecovery } : {}),
       });
       continue;
     }
@@ -8680,14 +8691,28 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
       // Match result back to the originating call. Rows missing
       // tool_call_id (pre-migration 0011 data) can't be linked and
       // are silently dropped — same as the prior behavior.
+      //
+      // By id, not by position, and across the whole transcript: a result
+      // a delegation-batch recovery wrote is created when the successor
+      // settles the turn, so it sorts after anything typed during the batch,
+      // yet still lands on its call.
       const callId = m.tool_call_id;
       if (!callId) continue;
       const tc = toolCallById.get(callId);
       if (!tc) continue;
       tc.result = m.content ?? '';
       tc.resultStatus = 'ok';
-      // Don't clobber a 'denied' decision recorded on the AI side.
-      if (tc.status !== 'denied') tc.status = 'completed';
+      // That recovery's marker says what became of the child; the result
+      // text is for the model and is never parsed. Each result row decides
+      // afresh, like the text it carries: a later unmarked result for the
+      // same call leaves no marker behind.
+      const recovery = parseSubagentRecoveryResult(m.metrics, callId);
+      if (recovery) tc.recovery = recovery;
+      else delete tc.recovery;
+      // Don't clobber a 'denied' decision recorded on the AI side. A
+      // recovered declined call is that same refusal.
+      const refused = tc.decision === 'denied' || recovery?.class === 'declined';
+      tc.status = refused ? 'denied' : 'completed';
       continue;
     }
 
@@ -8802,5 +8827,10 @@ interface HistoryMessage {
   tool_call_id?: string | null;
   /** Set only on role='ai' rows that carry reasoning content. */
   thinking?: string | null;
+  /**
+   * The row's `metrics` JSON. Read here only for the delegation-batch
+   * recovery marker (`subagent_recovery`, see subagent-recovery.model.ts).
+   */
+  metrics?: Record<string, unknown> | null;
   created_at: string | null;
 }

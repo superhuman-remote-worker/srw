@@ -1,5 +1,6 @@
 import {ToolCallEvent} from '../models/turn.model';
 import {AuditEntry} from '../models/audit.model';
+import {recoveredDelegateCallOutcome} from '../models/delegate-batch.model';
 import {NormalizedToolCall, ToolCardStatus, ToolCardView} from '../models/tool-card.model';
 import {buildToolCardView} from './tool-descriptors';
 
@@ -40,7 +41,10 @@ export function toolCardViewFromEvent(tc: ToolCallEvent): ToolCardView {
         durationMs: tc.durationMs,
         exitCode: tc.exitCode,
     };
-    return buildToolCardView(normalized);
+    const view = buildToolCardView(normalized);
+    // A delegation a recovery settled says what became of the child.
+    const outcome = recoveredDelegateCallOutcome(tc);
+    return outcome ? {...view, outcome} : view;
 }
 
 /** Workbench MongoDB audit `AuditEntry` (a tool step) → unified view-model. */

@@ -13,6 +13,7 @@ import {
     QUEUED_AFTER_MS,
     summarizeDelegateBatch,
 } from './delegate-batch.model';
+import {SubagentRecoveryClass} from './subagent-recovery.model';
 import {ToolCardStatus, ToolCardView} from './tool-card.model';
 import {ToolCallEvent} from './turn.model';
 
@@ -39,6 +40,19 @@ function unanswered(startedAt = T0) {
     return {callStatus: 'ok' as const, answered: false, startedAt};
 }
 
+/**
+ * A call whose result a delegation-batch recovery wrote. History marks it
+ * `completed` (`denied` for a declined one) with a result behind it.
+ */
+function recovered(cls: SubagentRecoveryClass, subagentStatus: string | null = null) {
+    return {
+        callStatus: (cls === 'declined' ? 'denied' : 'ok') as ToolCardStatus,
+        answered: true,
+        startedAt: T0,
+        recovery: {class: cls, subagentStatus},
+    };
+}
+
 describe('buildDelegateBatchMembers', () => {
     it('takes type and brief from the call args and status from its card', () => {
         const event: ToolCallEvent = {
@@ -61,6 +75,17 @@ describe('buildDelegateBatchMembers', () => {
                 view,
             },
         ]);
+    });
+
+    it('carries a recovery marker from the event', () => {
+        const event: ToolCallEvent = {
+            kind: 'tool_call', id: 'call-1', tool: 'delegate_agent', args: {}, status: 'completed',
+            result: '[delegate_agent: NOT STARTED]', startedAt: T0,
+            recovery: {class: 'not_started', subagentStatus: null},
+        };
+        const [m] = buildDelegateBatchMembers([event], () => ({status: 'ok'}) as ToolCardView);
+        expect(m.recovery).toEqual({class: 'not_started', subagentStatus: null});
+        expect(m.answered).toBe(true);
     });
 
     it('counts a call answered once any result is in, even an empty one', () => {
@@ -164,6 +189,42 @@ describe('delegateMemberStatus', () => {
         });
     });
 
+    describe('a call whose result a recovery wrote (§6.5 step 3)', () => {
+        // The executor died mid-batch; its successor wrote one result per open
+        // call, each with a marker that says what became of the child.
+        it('shows what the marker says, not the call\'s "completed"', () => {
+            expect(delegateMemberStatus(recovered('interrupted', 'interrupted'), null, T0)).toBe('interrupted');
+            expect(delegateMemberStatus(recovered('not_started'), null, T0)).toBe('not_started');
+            expect(delegateMemberStatus(recovered('declined'), null, T0)).toBe('denied');
+            expect(delegateMemberStatus(recovered('retired', 'cancelled'), null, T0)).toBe('cancelled');
+            expect(delegateMemberStatus(recovered('completed', 'completed'), null, T0)).toBe('completed');
+        });
+
+        it('decides before the child row: the settle is the later fact', () => {
+            // A roster read from before the settle still has the child running.
+            expect(delegateMemberStatus(recovered('interrupted'), child('running'), T0)).toBe('interrupted');
+            expect(delegateMemberStatus(recovered('retired'), child('running'), T0)).toBe('cancelled');
+            expect(delegateMemberStatus(recovered('not_started'), null, T0 + 60_000)).toBe('not_started');
+        });
+
+        it('decides for an abandoned call too, which without it keeps its own status', () => {
+            // Step 2 left a superseded call with no child row on "completed";
+            // the recovered row now says what happened.
+            expect(delegateMemberStatus(unanswered(), null, T0 + 60_000, true)).toBe('completed');
+            expect(delegateMemberStatus(recovered('not_started'), null, T0 + 60_000, true)).toBe('not_started');
+        });
+
+        it('lets a finished child\'s terminal status say more than "completed"', () => {
+            expect(delegateMemberStatus(recovered('completed', 'capped'), null, T0)).toBe('capped');
+            expect(delegateMemberStatus(recovered('completed', 'error'), null, T0)).toBe('error');
+            // Nothing recorded: the child row's terminal status, else completed.
+            expect(delegateMemberStatus(recovered('completed'), child('capped'), T0)).toBe('capped');
+            expect(delegateMemberStatus(recovered('completed'), child('running'), T0)).toBe('completed');
+            // A status this build does not know says nothing.
+            expect(delegateMemberStatus(recovered('completed', 'rebooting'), null, T0)).toBe('completed');
+        });
+    });
+
     it('ignores a child status this build does not know', () => {
         const unknown = child('rebooting' as JobSubagentStatus);
         expect(delegateMemberStatus(member('running'), unknown, T0 + QUEUED_AFTER_MS)).toBe('running');
@@ -207,7 +268,7 @@ describe('summarizeDelegateBatch', () => {
     it('counts finished whatever the outcome, and names failures separately', () => {
         expect(
             summarizeDelegateBatch(['completed', 'error', 'cancelled', 'denied', 'running', 'queued', 'pending']),
-        ).toEqual({total: 7, finished: 4, failed: 3});
+        ).toEqual({total: 7, finished: 4, failed: 3, interrupted: 0, notStarted: 0});
     });
 
     it('does not count a capped or interrupted child as failed', () => {
@@ -216,6 +277,16 @@ describe('summarizeDelegateBatch', () => {
             total: 3,
             finished: 3,
             failed: 0,
+            interrupted: 1,
+            notStarted: 1,
         });
+    });
+
+    it('counts a recovered batch\'s interrupted and never-started calls apart', () => {
+        // One finished, one interrupted, two settled before they ran, one
+        // declined, one retired when the session was stopped.
+        expect(
+            summarizeDelegateBatch(['completed', 'interrupted', 'not_started', 'not_started', 'denied', 'cancelled']),
+        ).toEqual({total: 6, finished: 6, failed: 2, interrupted: 1, notStarted: 2});
     });
 });
