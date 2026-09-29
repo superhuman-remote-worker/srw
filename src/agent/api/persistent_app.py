@@ -83,7 +83,11 @@ from agent.api.persistent_session import (
 )
 from agent.tools.registry import TOOL_REGISTRY
 from agent.core.archiver import inflight_tool_call
-from agent.core.context import extract_summary_text, repair_tool_pairing
+from agent.core.context import (
+    extract_summary_text,
+    repair_tool_pairing,
+    repair_tool_result_adjacency,
+)
 from shared.runtime.core.message_markers import is_compaction_view, turn_membership
 from shared.runtime.core.skill_resolution import (
     APP_GUIDE_LOADER_TOOL,
@@ -12540,15 +12544,57 @@ def _sanitize_restored_history(restored: list) -> list:
     return sanitize_history_for_provider_boundary(restored, model)
 
 
+def _row_turn(db_msg: dict) -> Optional[int]:
+    """The turn that consumed a transcript row, or ``None`` when unknown.
+
+    An admitted input delivery records the turn that actually ran it. The
+    row's own ``turn_number`` is only a hint for pinned input: two messages
+    typed during one turn both carry the next number.
+    """
+    for key in ("admitted_turn_number", "turn_number"):
+        value = db_msg.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _conversation_order(db_messages: list) -> list:
+    """Order chronological transcript rows the way the model saw them.
+
+    ``seq`` is write order, not conversation order. Input is persisted when
+    it is accepted, so a message typed while a tool runs gets a ``seq``
+    between the tool call and its result, and a recovery row for an abandoned
+    turn is written after input that arrived later. The loop reads input only
+    between turns, so the live history is ordered by turn: this is a stable
+    sort by the turn that consumed each row, keeping ``seq`` order inside a
+    turn. A row without a turn keeps its place behind the row before it.
+    See knowledge-base/knowledge/features/parallel_subagents.md §10.2 (F19).
+    """
+    keyed = []
+    turn = 0
+    for db_msg in db_messages:
+        row_turn = _row_turn(db_msg)
+        if row_turn is not None:
+            turn = row_turn
+        keyed.append((turn, db_msg))
+    return [db_msg for _, db_msg in sorted(keyed, key=lambda item: item[0])]
+
+
 def _db_rows_to_lc_messages(db_messages: list) -> list:
     """Convert ``thread_messages`` rows to LangChain messages with stable ids.
 
     Shared by the restore paths (Path A checkpoint+tail, Path B full load).
-    Falls back to positional pairing of tool results for legacy rows whose
-    ``tool_call_id`` column is NULL (predates the column); current rows carry
-    it explicitly. Skips system rows — the loop adds a fresh system from the
-    current config. ``role='summary'`` rows are already excluded by the DB
-    query.
+    Takes rows in ``seq`` order and returns them in conversation order
+    (``_conversation_order``) with every tool result directly behind its call
+    (``repair_tool_result_adjacency``). Falls back to positional pairing of
+    tool results for legacy rows whose ``tool_call_id`` column is NULL
+    (predates the column); current rows carry it explicitly. Skips system
+    rows — the loop adds a fresh system from the current config.
+    ``role='summary'`` rows are already excluded by the DB query.
     """
     import uuid as _uuid
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -12556,7 +12602,7 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
     restored: list = []
     pending_tool_call_ids: list[str] = []
 
-    for db_msg in db_messages:
+    for db_msg in _conversation_order(db_messages):
         role = db_msg["role"]
         content = db_msg["content"] or ""
         tool_calls = db_msg.get("tool_calls")
@@ -12616,7 +12662,7 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
 
         # Skip system rows — the loop adds a fresh one from current config
 
-    return restored
+    return repair_tool_result_adjacency(restored)
 
 
 async def _restore_session_messages() -> None:

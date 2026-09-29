@@ -508,7 +508,7 @@ def fingerprint_diff_paths(
 def strip_restored_pending_humans(
     messages: List[Any], pending_rows: List[Dict[str, Any]]
 ) -> int:
-    """Drop restored copies of not-yet-consumed human rows from the tail.
+    """Drop restored copies of not-yet-consumed human rows.
 
     ``_restore_session_messages`` loads ALL live rows — including pending
     unanswered ones (rows whose ``seq`` is past the consumed watermark).
@@ -516,44 +516,53 @@ def strip_restored_pending_humans(
     DB write idempotent); without this strip the turn would see the pending
     message twice (once as restored history, once as the injected input).
 
-    Matching strategy: **by message id when the restored message carries the
-    DB row id** (future-proof — today's restore deliberately mints fresh
-    uuid4 ids and does not even select the id column, so id matches never
-    occur), **else by exact content equality matched tail-to-tail** (the
-    pending rows are the newest rows, so their restored copies are the last
-    messages; both sequences are seq-ordered and compared from the end).
+    Matching strategy: **by message id wherever the copy sits** — restore
+    keeps the DB row id, and an id match is the row itself, so position does
+    not matter (restore orders by turn, which puts pending input at the tail,
+    but a row without a turn number can still follow it). **Else by exact
+    content equality matched tail-to-tail**, for a copy restored without its
+    row id: the pending rows are the newest rows, so their restored copies
+    are the last messages; both sequences are seq-ordered and compared from
+    the end.
 
-    Stops at the first trailing message that is not a matching HumanMessage:
-    a non-trailing human is history and stays; an unanswered ``role='event'``
-    row (never enqueued by the orchestrator, so never in ``pending_rows``)
-    legitimately remains in context as history — matching today's documented
-    behavior for accepted-but-unconsumed notices.
+    The content match stops at the first trailing message that is not a
+    matching HumanMessage: a non-trailing human is history and stays; an
+    unanswered ``role='event'`` row (never enqueued by the orchestrator, so
+    never in ``pending_rows``) legitimately remains in context as history —
+    matching today's documented behavior for accepted-but-unconsumed notices.
 
     Mutates ``messages`` in place; returns the number of messages removed.
     """
     if not messages or not pending_rows:
         return 0
-    pending_ids = {
-        str(row["id"]): row for row in pending_rows if row.get("id") is not None
-    }
     # Event deliveries are deliberately excluded by transcript restore until
     # provider admission. Keep only rows that restore actually loaded, or an
     # event after a human row would stop the tail matcher and duplicate the
     # human on a fresh attach.
     remaining = [row for row in pending_rows if row.get("role", "human") == "human"]
+    pending_ids = {
+        str(row["id"]): row for row in remaining if row.get("id") is not None
+    }
     removed = 0
+    if pending_ids:
+        kept = []
+        for msg in messages:
+            msg_id = getattr(msg, "id", None)
+            row = pending_ids.get(str(msg_id)) if msg_id is not None else None
+            if row is not None and getattr(msg, "type", None) == "human":
+                del pending_ids[str(msg_id)]
+                remaining.remove(row)
+                removed += 1
+                continue
+            kept.append(msg)
+        messages[:] = kept
     while messages and remaining:
         msg = messages[-1]
         if getattr(msg, "type", None) != "human":
             break
-        msg_id = getattr(msg, "id", None)
-        row = pending_ids.get(str(msg_id)) if msg_id is not None else None
-        if row is not None and row in remaining:
-            remaining.remove(row)
-        elif _message_text(msg) == (remaining[-1].get("content") or ""):
-            remaining.pop()
-        else:
+        if _message_text(msg) != (remaining[-1].get("content") or ""):
             break
+        remaining.pop()
         messages.pop()
         removed += 1
     return removed

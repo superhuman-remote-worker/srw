@@ -2500,6 +2500,35 @@ class TestStripRestoredPending:
         assert removed == 1
         assert msgs == []
 
+    def test_removes_a_pending_copy_by_id_wherever_it_sits(self):
+        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+        # A row restored behind the pending input (one without a turn number)
+        # must not hide it from the strip.
+        msgs = [
+            HumanMessage(content="q1", id="a"),
+            AIMessage(
+                content="",
+                id="b",
+                tool_calls=[{"id": "c1", "name": "t", "args": {}}],
+            ),
+            ToolMessage(content="r1", tool_call_id="c1", id="c"),
+            HumanMessage(content="typed", id="row-1"),
+            HumanMessage(content="[notice]", id="event-row"),
+        ]
+        pending = [{"id": "row-1", "seq": 10, "content": "typed"}]
+        removed = te.strip_restored_pending_humans(msgs, pending)
+        assert removed == 1
+        assert [m.id for m in msgs] == ["a", "b", "c", "event-row"]
+
+    def test_an_id_match_on_a_non_human_message_is_kept(self):
+        from langchain_core.messages import AIMessage
+
+        msgs = [AIMessage(content="answer", id="row-1")]
+        pending = [{"id": "row-1", "seq": 10, "content": "answer"}]
+        assert te.strip_restored_pending_humans(msgs, pending) == 0
+        assert len(msgs) == 1
+
     def test_non_trailing_human_untouched(self):
         from langchain_core.messages import AIMessage, HumanMessage
 

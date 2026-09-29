@@ -375,6 +375,56 @@ def repair_tool_pairing(messages: List[BaseMessage]) -> List[BaseMessage]:
     return repaired
 
 
+def repair_tool_result_adjacency(messages: List[BaseMessage]) -> List[BaseMessage]:
+    """Place every tool result directly behind the message that carries its call.
+
+    Anthropic and OpenAI both reject a history in which anything stands
+    between an assistant tool call and its results. ``repair_tool_pairing``
+    matches ids and leaves positions alone, so it cannot see this. A restored
+    transcript can break the rule when a row was written after the turn it
+    belongs to, or when a message was appended between two results of one
+    parallel batch.
+
+    Results keep their relative order and follow their call. Messages that
+    stood between a call and its results move behind the last result, in
+    their own order. A result whose call is absent stays where it is for
+    ``repair_tool_pairing`` to drop. Returns a new list and never mutates the
+    input; a second pass is a no-op.
+    """
+    owner: Dict[str, int] = {}
+    for index, m in enumerate(messages):
+        if isinstance(m, AIMessage):
+            for tc in getattr(m, "tool_calls", None) or []:
+                tc_id = tc.get("id")
+                if tc_id and tc_id not in owner:
+                    owner[tc_id] = index
+
+    results: Dict[int, List[BaseMessage]] = {}
+    for m in messages:
+        if isinstance(m, ToolMessage):
+            index = owner.get(getattr(m, "tool_call_id", "") or "")
+            if index is not None:
+                results.setdefault(index, []).append(m)
+
+    repaired: List[BaseMessage] = []
+    for index, m in enumerate(messages):
+        if isinstance(m, ToolMessage) and (
+            owner.get(getattr(m, "tool_call_id", "") or "") is not None
+        ):
+            continue  # emitted behind its call
+        repaired.append(m)
+        repaired.extend(results.get(index, ()))
+
+    moved = sum(1 for before, after in zip(messages, repaired) if before is not after)
+    if moved:
+        logger.warning(
+            "repair_tool_result_adjacency: reordered %d message(s) so every "
+            "tool result follows its call",
+            moved,
+        )
+    return repaired
+
+
 # --- Provider-boundary history sanitizer (live_session_settings.md Slice D) ---
 
 # Reasoning/thinking content-block types that must never be replayed to a

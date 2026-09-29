@@ -1321,12 +1321,16 @@ class PostgresDB:
         history that the summary row already covers (see
         ``get_latest_compaction_checkpoint``).
 
-        Pass ``seq_gt=S`` to load only rows with ``seq > S``, ordered by ``seq``
-        (exact insertion order). This is the message-granular resume cursor: a
-        compaction records ``boundary_seq`` = the seq of the last message its
-        summary covers, and resume loads ``summary + (seq > boundary_seq)`` — the
-        agent's real live tail — instead of whole post-boundary turns. Preferred
-        over ``since_turn`` when the checkpoint carries a ``boundary_seq``.
+        Pass ``seq_gt=S`` to load only the rows after row ``S``, ordered by
+        ``seq`` (exact insertion order). This is the message-granular resume
+        cursor: a compaction records ``boundary_seq`` = the seq of the last
+        message its summary covers, and resume loads the summary plus the rows
+        after that message — the agent's real live tail — instead of whole
+        post-boundary turns. "After" is ``seq > S`` or a later turn than row
+        ``S``'s: input typed during a tool call has a lower ``seq`` than the rest
+        of its turn and belongs to the next one, so the summary may never have
+        seen it. Preferred over ``since_turn`` when the checkpoint carries a
+        ``boundary_seq``.
 
         Pass ``newest_first=True`` (with a ``limit``) for the resume backstop:
         the rows are selected ``seq DESC LIMIT N`` (the **newest** N, not the
@@ -1336,34 +1340,64 @@ class PostgresDB:
         mechanism. The caller logs when ``len(result) == limit`` (trimmed).
         """
         # HF-7 thread-read diet: the resume consumers read only
-        # role/content/tool_calls/tool_call_id (_db_rows_to_lc_messages) and
-        # turn_number (the turn_count restore in _restore_session_messages). The
+        # role/content/tool_calls/tool_call_id (_db_rows_to_lc_messages),
+        # turn_number (the turn_count restore in _restore_session_messages) and
+        # admitted_turn_number (conversation order, _conversation_order). The
         # other 10 columns — including the large JSONB reasoning/tool_results/
         # provider_raw/response_metadata/additional_kwargs — were fetched on
         # every resume and never read (the rebuilt AIMessage doesn't carry them).
         # Select only what resume consumes. The seq / turn_number / created_at
         # ORDER BYs below don't require the column in the projection.
         provider_projection = ", message.provider_raw" if include_provider_raw else ""
+        params: List[Any] = [thread_id]
+        # The turn that consumed a row: an admitted delivery records it, the
+        # row's own number is a hint for pinned input (restore orders by it,
+        # agent.api.persistent_app._conversation_order).
+        row_turn = "COALESCE(delivery.admitted_turn_number, message.turn_number)"
+        boundary_join = ""
+        seq_cursor = ""
+        if seq_gt is not None:
+            params.append(seq_gt)
+            boundary = f"${len(params)}"
+            # The summary covers a prefix of the conversation, which is ordered
+            # by turn and then seq. Input typed during a tool call has a lower
+            # seq than the rest of that turn, so a bare `seq > S` cursor drops
+            # it when the summary did not cover it. Load every row written
+            # after the boundary row, as before, plus every row of a later turn
+            # than the boundary row's.
+            boundary_join = f"""
+            LEFT JOIN (
+                SELECT COALESCE(
+                           boundary_delivery.admitted_turn_number,
+                           boundary_message.turn_number
+                       ) AS turn
+                FROM thread_messages AS boundary_message
+                LEFT JOIN thread_input_deliveries AS boundary_delivery
+                  ON boundary_delivery.message_id = boundary_message.id
+                WHERE boundary_message.thread_id = $1
+                  AND boundary_message.seq = {boundary}
+                LIMIT 1
+            ) AS boundary ON TRUE"""
+            seq_cursor = f"""
+              AND (seq > {boundary} OR {row_turn} > boundary.turn)"""
         query = f"""
             SELECT message.id, message.role, message.content,
                    message.tool_calls, message.tool_call_id,
-                   message.turn_number{provider_projection}
+                   message.turn_number,
+                   delivery.admitted_turn_number{provider_projection}
             FROM thread_messages AS message
+            LEFT JOIN thread_input_deliveries AS delivery
+              ON delivery.message_id = message.id{boundary_join}
             WHERE message.thread_id = $1
               AND message.role NOT IN ('summary', 'error')
               AND message.rewound_at IS NULL
-              AND NOT EXISTS (
-                    SELECT 1 FROM thread_input_deliveries AS delivery
-                     WHERE delivery.message_id = message.id
-                       AND delivery.state IN (
-                           'persisted', 'owned', 'queued', 'deferred', 'cancelled'
-                       )
-                  )
+              AND (
+                    delivery.state IS NULL
+                    OR delivery.state NOT IN (
+                        'persisted', 'owned', 'queued', 'deferred', 'cancelled'
+                    )
+                  ){seq_cursor}
         """
-        params: List[Any] = [thread_id]
-        if seq_gt is not None:
-            params.append(seq_gt)
-            query += f"\n              AND seq > ${len(params)}"
         if since_turn is not None:
             params.append(since_turn)
             query += f"\n              AND turn_number > ${len(params)}"
@@ -1397,6 +1431,7 @@ class PostgresDB:
                     "tool_calls": _j(row["tool_calls"]) if row["tool_calls"] else None,
                     "tool_call_id": row["tool_call_id"],
                     "turn_number": row["turn_number"],
+                    "admitted_turn_number": row.get("admitted_turn_number"),
                     **(
                         {"provider_raw": _j(row["provider_raw"])}
                         if include_provider_raw

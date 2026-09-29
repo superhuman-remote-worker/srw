@@ -46,7 +46,8 @@ async def test_agent_db_terminal_status_closes_control_admission():
 @pytest.mark.asyncio
 async def test_history_projects_only_resume_fields():
     """HF-7 thread-read diet: the resume reader returns exactly what the resume
-    consumers use — id/role/content/tool_calls/tool_call_id/turn_number — and does
+    consumers use — id/role/content/tool_calls/tool_call_id/turn_number, plus
+    the delivery's admitted_turn_number that orders the conversation — and does
     NOT fetch the resume-unused component columns (thinking/reasoning/
     tool_results/provider*/response_metadata/additional_kwargs/metrics/
     created_at). Those are never read on resume; the rebuilt AIMessage doesn't
@@ -73,6 +74,7 @@ async def test_history_projects_only_resume_fields():
         "tool_calls": None,
         "tool_call_id": "call_1",
         "turn_number": 2,
+        "admitted_turn_number": None,
     }
     # The tool-result link survives (so _db_rows_to_lc_messages need not fall
     # back to positional pairing).
@@ -219,6 +221,21 @@ async def test_history_seq_gt_filters_and_orders_by_seq():
     assert "ORDER BY seq ASC" in sql, "seq cursor must order by seq, not turn"
     assert "role NOT IN ('summary', 'error')" in sql, "summary exclusion preserved"
     assert 42 in db.fetch.call_args[0][1:], "boundary seq must be a bound param"
+
+
+@pytest.mark.asyncio
+async def test_history_seq_gt_follows_the_conversation_order_of_the_boundary():
+    """Input typed during a tool call has a lower seq than the rest of its turn
+    and belongs to the next one, so a summary that covered that turn never saw
+    it. The cursor keeps every row written after the boundary row and adds
+    every row of a later turn than the boundary row's."""
+    db = PostgresDB.__new__(PostgresDB)
+    db.fetch = AsyncMock(return_value=[])
+    await db.get_thread_messages_history("t1", limit=None, seq_gt=42)
+    sql = " ".join(db.fetch.call_args[0][0].split())
+    row_turn = "COALESCE(delivery.admitted_turn_number, message.turn_number)"
+    assert "boundary_message.seq = $2" in sql
+    assert f"AND (seq > $2 OR {row_turn} > boundary.turn)" in sql
 
 
 @pytest.mark.asyncio

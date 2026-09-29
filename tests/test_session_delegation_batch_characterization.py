@@ -11,8 +11,8 @@ and not on a reading of the code.
 
 Every assertion marked ``HAZARD`` records unwanted behaviour. WP1 replaces it
 with the invariants of §9: exactly one recovery continuation per superseded
-input, every report delivered to the parent exactly once, tool results
-adjacent to their calls.
+input, every report delivered to the parent exactly once. Tool results
+adjacent to their calls hold since WP0b (§10.2).
 """
 
 from __future__ import annotations
@@ -382,17 +382,14 @@ async def test_a_sibling_recovered_after_the_first_answer_loses_its_report(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model", ["claude-opus-5-5", "gpt-5.5"])
-async def test_input_typed_during_a_batch_restores_between_calls_and_results(
+async def test_input_typed_during_a_batch_restores_behind_the_results(
     pg_dsn: str, model: str
 ) -> None:
-    """Restore orders the transcript by ``seq``. Input the user sent while the
-    batch ran has a lower ``seq`` than the tool results, whether the live loop
-    wrote them or a recovery does (§5.4): every result row lands at the tail.
-
-    Providers require a tool result to follow its call directly. Nothing in
-    the restore path restores that adjacency, and the pending input is not
-    stripped because it is not the last message — so the same text would also
-    be injected again as the next turn's input."""
+    """Input the user sent while the batch ran has a lower ``seq`` than the
+    tool results, whether the live loop wrote them or a recovery does (§5.4).
+    Restore orders the transcript by turn, so the results follow their calls
+    and the input, which belongs to the next turn, is last. The executor then
+    strips it before injecting it as that turn's input (F19, WP0b)."""
 
     pool = await _fresh_pool(pg_dsn)
     try:
@@ -420,16 +417,17 @@ async def test_input_typed_during_a_batch_restores_between_calls_and_results(
         restored = repair_tool_pairing(restored)
         restored = sanitize_history_for_provider_boundary(restored, model)
 
-        # HAZARD: the typed input sits between the calls and their results.
         assert [message.type for message in restored] == [
             "human",
             "ai",
+            "tool",
+            "tool",
             "human",
-            "tool",
-            "tool",
         ]
-        assert restored[2].content == TYPED_DURING_THE_BATCH
-        assert len(restored[1].tool_calls) == 2
+        assert {call["id"] for call in restored[1].tool_calls} == {
+            message.tool_call_id for message in restored[2:4]
+        }
+        assert restored[4].content == TYPED_DURING_THE_BATCH
 
         pending = [
             {
@@ -438,8 +436,7 @@ async def test_input_typed_during_a_batch_restores_between_calls_and_results(
                 "content": TYPED_DURING_THE_BATCH,
             }
         ]
-        # HAZARD: not stripped, so it is both history and the next input.
-        assert strip_restored_pending_humans(restored, pending) == 0
-        assert [message.type for message in restored][2] == "human"
+        assert strip_restored_pending_humans(restored, pending) == 1
+        assert [message.type for message in restored] == ["human", "ai", "tool", "tool"]
     finally:
         await pool.close()
