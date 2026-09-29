@@ -25,10 +25,11 @@ def workspace_defaults_chain(preview):
     """The frozen baseline with the workspace defaults chain applied.
 
     Recorded behaviour change within srw/v1alpha1 (Slice A2b, owner decision
-    2026-09-29): a Job that omits ``execution.workspace`` keeps it omitted in
-    the preview. For an SRW harness Job the Project's ``defaults.workspace`` (or
-    the installation's defaults) decides it at admission; a generic-image Job
-    runs without one. Either way the preview no longer copies the default.
+    2026-09-29): the preview no longer copies a Project's ``defaults.workspace``
+    into a Job that omits ``execution.workspace``; admission decides it. The
+    fixture's generic Job still gets ``portable-team``'s container template when
+    it is admitted (see examples/manifests/compatibility.md); only the preview
+    loses the copied default, its dependency entry and the resolved key.
     """
     expected = deepcopy(preview)
     omitted = {

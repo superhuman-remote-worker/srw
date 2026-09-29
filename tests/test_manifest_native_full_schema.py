@@ -641,14 +641,15 @@ def stored(value):
 
 
 @pytest.fixture
-def shipped_workspace_defaults(monkeypatch):
+def builtins_off(monkeypatch):
+    """No Helm workspace.defaults (Jobs container) and no declared built-ins."""
     monkeypatch.delenv("WORKSPACE_DEFAULTS", raising=False)
     monkeypatch.delenv("WORKSPACE_BUILTIN_TEMPLATES", raising=False)
 
 
 @pytest.mark.asyncio
 async def test_manifest_job_without_workspace_uses_the_project_row(
-    database, actor, shipped_workspace_defaults
+    database, actor, builtins_off
 ):
     project_id = await workspace_defaults_project(
         database, actor, {"jobs": "vm", "vm": "box"}
@@ -666,12 +667,19 @@ async def test_manifest_job_without_workspace_uses_the_project_row(
         "template_name": None,
     }
     assert stored(job["config_override"])["workspace"]["backend"] == "vm"
+    # The manifest-owned row pins the Project generation it came from.
+    project = await database.fetchrow(
+        "SELECT id, active_revision FROM srw_resources WHERE kind='Project' AND linked_id=$1",
+        UUID(project_id),
+    )
+    assert {
+        "uid": str(project["id"]),
+        "revision": project["active_revision"],
+    } in snapshot["dependencies"]
 
 
 @pytest.mark.asyncio
-async def test_manifest_null_beats_a_project_default(
-    database, actor, shipped_workspace_defaults
-):
+async def test_manifest_null_beats_a_project_default(database, actor, builtins_off):
     project_id = await workspace_defaults_project(
         database, actor, {"jobs": "vm", "vm": "box"}
     )
@@ -689,7 +697,7 @@ async def test_manifest_null_beats_a_project_default(
 
 @pytest.mark.asyncio
 async def test_manifest_job_without_a_project_default_gets_a_container(
-    database, actor, shipped_workspace_defaults
+    database, actor, builtins_off
 ):
     project_id = await workspace_defaults_project(database, actor)
     *_, work_id, _ = await admit(database, actor, project_assignment(project_id))
@@ -704,3 +712,58 @@ async def test_manifest_job_without_a_project_default_gets_a_container(
         "template": "builtin",
         "template_name": None,
     }
+
+
+CONTAINER_FULL = {
+    "apiVersion": "srw/v1alpha1",
+    "kind": "WorkspaceTemplate",
+    "metadata": {
+        "name": "container-full",
+        "scope": {"kind": "Catalog", "name": "shared"},
+    },
+    "spec": {
+        "backend": "sandbox",
+        "environment": {"image": "ghcr.io/superhuman-remote-worker/srw-workspace:t"},
+        "resources": {
+            "cpu": 2,
+            "memory": "4Gi",
+            "requests": {"cpu": 0.5, "memory": "1Gi"},
+        },
+    },
+}
+
+
+@pytest.mark.asyncio
+async def test_manifest_job_without_workspace_gets_the_builtin_container(
+    database, actor, monkeypatch
+):
+    from orchestrator.services.builtin_workspace_templates import (
+        reconcile_builtin_workspace_templates,
+    )
+
+    # Seeded the way the chart does it: the startup reconcile plus the env.
+    await reconcile_builtin_workspace_templates(database, [CONTAINER_FULL])
+    monkeypatch.setenv("WORKSPACE_BUILTIN_TEMPLATES", json.dumps([CONTAINER_FULL]))
+    monkeypatch.delenv("WORKSPACE_DEFAULTS", raising=False)
+    document = assignment(adapter="srw/v1", mode="Reported")
+    del document["spec"]["execution"]["workspace"]
+    *_, work_id, snapshot = await admit(database, actor, document)
+    inline = snapshot["resolved"]["spec"]["execution"]["workspace"]["template"][
+        "inline"
+    ]
+    assert (
+        inline["environment"]["image"] == CONTAINER_FULL["spec"]["environment"]["image"]
+    )
+    job = await database.get_job(work_id)
+    assert stored(job["context"])["workspace_sources"] == {
+        "tier": "installation",
+        "template": "builtin",
+        "template_name": "container-full",
+    }
+    workspace = stored(job["config_override"])["workspace"]
+    assert workspace["backend"] == "sandbox"
+    assert workspace["sandbox"]["image"] == inline["environment"]["image"]
+    assert any(
+        dependency.get("key") == "WorkspaceTemplate/Catalog/shared/container-full"
+        for dependency in snapshot["dependencies"]
+    )

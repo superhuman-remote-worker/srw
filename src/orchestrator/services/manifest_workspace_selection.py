@@ -156,6 +156,22 @@ def srw_workspace_config(
     return result
 
 
+async def _pin_active_project(
+    db: Any, authority: Any, resolver: Any, project_id: str, revision: str
+) -> list[dict]:
+    """A manifest-owned defaults row holds only while its Project revision is active."""
+    from orchestrator.services.manifest_projects import active_project_resource
+
+    project = await active_project_resource(db, project_id)
+    if project is None or project["revision"] != revision:
+        raise WorkspaceSelectionRace()
+    await authority.resource(project)
+    await resolver.authorize_dependencies(project["dependencies"])
+    dependencies = deepcopy(project["dependencies"])
+    dependencies.append({"uid": str(project["id"]), "revision": project["revision"]})
+    return dependencies
+
+
 async def select_execution_workspace(
     db: Any,
     user: dict,
@@ -191,7 +207,6 @@ async def select_execution_workspace(
     resolution = None
     sources = {"tier": "explicit", "template": "explicit"}
     if not supplied:
-        from orchestrator.services.manifest_projects import active_project_resource
         from orchestrator.services.workspace_defaults_resolution import (
             MISSING_REFERENCE,
             WRONG_TIER_TEMPLATE,
@@ -206,16 +221,10 @@ async def select_execution_workspace(
         workspace = resolution.binding()
         sources = resolution.sources()
         if resolution.project_revision:
-            project = await active_project_resource(db, project_id)
-            if project is None or project["revision"] != resolution.project_revision:
-                raise WorkspaceSelectionRace()
-            await authority.resource(project)
-            await resolver.authorize_dependencies(project["dependencies"])
-            dependencies = deepcopy(project["dependencies"])
-            dependencies.append(
-                {"uid": str(project["id"]), "revision": project["revision"]}
+            dependencies = await _pin_active_project(
+                db, authority, resolver, project_id, resolution.project_revision
             )
-            project_revision = project["revision"]
+            project_revision = resolution.project_revision
     # A caller's malformed binding or unsupported template is a client error on
     # every admission route and form preview, never an internal one.
     try:
@@ -286,6 +295,71 @@ async def select_execution_workspace(
         "project_revision": project_revision,
         "sources": sources,
         "template_name": resolution.template_name() if resolution else None,
+    }
+
+
+async def select_generic_project_workspace(
+    db: Any, user: dict, *, project_id: str | None, request: Any = None
+) -> dict | None:
+    """The workspace a generic-image Job that omits one gets; None means none.
+
+    The defaults chain picks SRW agent workspaces. A generic image gets only
+    its Project's container template, and only when the Project's Jobs mode is
+    container (what the shorthand to a sandbox template sets): it can't use a
+    virtual or VM tier, and the installation and built-in layers never apply.
+    The template is resolved like an authored binding, so a Settings row's
+    reference and a manifest row's pinned content both become inline content.
+    """
+    if not project_id:
+        return None
+    from orchestrator.services.project_workspace_defaults import (
+        read_project_defaults,
+    )
+    from orchestrator.services.workspace_defaults_resolution import (
+        MISSING_PROJECT_TEMPLATE,
+        MISSING_REFERENCE,
+        WRONG_TIER_TEMPLATE,
+    )
+
+    defaults = await read_project_defaults(db, project_id)
+    if defaults is None or defaults.jobs != "container" or defaults.container is None:
+        return None
+    authority = ManifestAuthority(db, user, request=request)
+    resolver = LiveManifestResolver(ManifestStore(db), authority)
+    dependencies: list[dict] = []
+    if defaults.source == "manifest":
+        dependencies = await _pin_active_project(
+            db, authority, resolver, project_id, defaults.manifest_revision
+        )
+    ref = defaults.container.get("ref")
+    name = ref.get("name") if isinstance(ref, dict) else None
+    try:
+        template = await resolver.selection(
+            "WorkspaceTemplate",
+            deepcopy(defaults.container),
+            {"kind": "Project", "name": project_id},
+            dependencies,
+        )
+    except HTTPException as exc:
+        if (
+            name is not None
+            and exc.status_code == 422
+            and exc.detail == MISSING_REFERENCE
+        ):
+            raise HTTPException(
+                409, MISSING_PROJECT_TEMPLATE.format(tier="container", name=name)
+            ) from None
+        raise
+    except ManifestError as exc:
+        raise HTTPException(422, str(exc)) from None
+    if template["inline"]["backend"] != "sandbox":
+        raise HTTPException(409, WRONG_TIER_TEMPLATE.format(tier="container"))
+    return {
+        "document": {"template": deepcopy(defaults.container)},
+        "resolved": {"template": template},
+        "dependencies": dependencies,
+        "sources": {"tier": "project", "template": "project"},
+        "template_name": name,
     }
 
 

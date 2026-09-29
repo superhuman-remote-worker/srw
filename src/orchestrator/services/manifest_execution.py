@@ -120,31 +120,35 @@ class ManifestExecutionService:
                     raise HTTPException(
                         422, "Datasource connectors require config.datasourceId."
                     ) from None
-        # An omitted workspace resolves the defaults chain as the executing
-        # account; `null` (no workspace) and a binding are explicit choices.
-        # The chain picks SRW agent workspaces only: a generic image keeps
-        # "omitted means none", since it can't use a virtual or VM default.
+        # `null` (no workspace) and a binding are explicit choices. An omitted
+        # workspace is decided here, as the executing account: an SRW harness
+        # Job resolves the defaults chain; a generic image gets only its
+        # Project's container template when the Project's Jobs mode is
+        # container, otherwise no workspace (never an installation default).
         if "workspace" in execution:
             workspace_receipt = {
                 "sources": {"tier": "explicit", "template": "explicit"},
                 "template_name": None,
             }
-        elif adapter != "srw/v1":
-            workspace_receipt = None
-            execution["workspace"] = None
         else:
             from orchestrator.services.manifest_workspace_selection import (
                 select_execution_workspace,
+                select_generic_project_workspace,
             )
 
-            _, workspace_receipt = await select_execution_workspace(
-                self.db,
-                user,
-                project_id=project_id,
-                role="worker",
-                request=request,
-            )
-            execution["workspace"] = workspace_receipt["resolved"]
+            if adapter == "srw/v1":
+                _, workspace_receipt = await select_execution_workspace(
+                    self.db,
+                    user,
+                    project_id=project_id,
+                    role="worker",
+                    request=request,
+                )
+            else:
+                workspace_receipt = await select_generic_project_workspace(
+                    self.db, user, project_id=project_id, request=request
+                )
+            execution["workspace"] = (workspace_receipt or {}).get("resolved")
         workspace = execution["workspace"]
         instance_recipe = None
         if adapter == "srw/v1" and workspace and "instanceRef" in workspace:
