@@ -16,7 +16,9 @@ from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.services.manifest_resources import ManifestResourceService
-from orchestrator.services.manifest_store import resource_key
+from orchestrator.services.manifest_store import resource_key, ManifestStore
+from orchestrator.services.project_workspace_defaults import read_project_defaults
+from shared.workspace_defaults import ProjectDefaults
 
 
 @pytest.fixture(scope="module")
@@ -132,6 +134,9 @@ async def database(pg_url, monkeypatch):
     await db.execute(migration.read_text())
     await db.execute(
         migration.with_name("0307_installation_managed_resources.sql").read_text()
+    )
+    await db.execute(
+        migration.with_name("0308_project_workspace_defaults.sql").read_text()
     )
     yield db
     await db.disconnect()
@@ -329,6 +334,57 @@ async def test_project_activation_is_atomic_and_defaults_use_pinned_content(
         },
     )
     assert all(item["resourceVersion"] == 2 for item in upgraded["resources"])
+
+
+@pytest.mark.asyncio
+async def test_project_manifest_owns_and_releases_workspace_defaults(database, actor):
+    service = ManifestResourceService(database)
+    # A standalone, Account-scoped WorkspaceTemplate referenced by alias: an
+    # inline alias would become a managed child of the Project, and a managed
+    # child can only be removed by re-applying its owning Project (never by
+    # deleting the Project itself), which would confuse this test's own
+    # store-delete release path with the activation release path.
+    workspace = {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "WorkspaceTemplate",
+        "metadata": {"name": "box"},
+        "spec": {"backend": "vm"},
+    }
+    await apply(service, workspace, actor)
+    project = {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "Project",
+        "metadata": {"name": "team"},
+        "spec": {
+            "resources": {
+                "workspaces": {
+                    "box": {
+                        "ref": {
+                            "name": "box",
+                            "scope": {"kind": "Account", "name": str(actor["id"])},
+                        }
+                    }
+                }
+            },
+            "defaults": {"workspace": {"jobs": "vm", "vm": "box"}},
+        },
+    }
+    initial = await apply(service, project, actor)
+    project_row = next(
+        item for item in initial["resources"] if item["resource"]["kind"] == "Project"
+    )
+    project_id = await database.fetchval(
+        "SELECT linked_id FROM srw_resources WHERE id=$1", UUID(project_row["uid"])
+    )
+    row = await read_project_defaults(database, project_id)
+    assert row.jobs == "vm"
+    assert row.source == "manifest"
+    assert row.manifest_revision == project_row["revision"]
+
+    store = ManifestStore(database)
+    resource = await store.by_link("Project", project_id)
+    await store.delete(resource, expected_version=resource["resource_version"])
+    assert await read_project_defaults(database, project_id) == ProjectDefaults()
 
 
 @pytest.mark.asyncio

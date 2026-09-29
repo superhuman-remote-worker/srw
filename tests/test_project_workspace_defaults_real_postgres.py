@@ -9,6 +9,7 @@ from orchestrator.services.project_workspace_defaults import (
     read_project_defaults,
     release_manifest_defaults,
     save_settings_defaults,
+    sync_manifest_defaults,
     write_manifest_defaults,
 )
 from tests import test_manifest_native_full_schema as full_schema
@@ -115,3 +116,65 @@ async def test_deleting_the_project_deletes_its_row(database, actor):
     )
     await database.execute("DELETE FROM projects WHERE id=$1::uuid", project_id)
     assert await read_project_defaults(database, project_id) is None
+
+
+SITE = {"inline": {"backend": "sandbox", "environment": {"image": "r.example/site:1"}}}
+
+
+def resource(project_id, workspace=..., revision="sha256:r1"):
+    defaults = {} if workspace is ... else {"workspace": workspace}
+    return {
+        "kind": "Project",
+        "linked_id": project_id,
+        "revision": revision,
+        "resolved": {
+            "spec": {"resources": {"workspaces": {"site": SITE}}, "defaults": defaults}
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_activation_writes_a_manifest_row(database):
+    project_id = await _project(database)
+    await sync_manifest_defaults(
+        database, resource(project_id, {"jobs": "container", "container": "site"})
+    )
+    row = await read_project_defaults(database, project_id)
+    assert (row.jobs, row.container, row.source, row.manifest_revision) == (
+        "container",
+        SITE,
+        "manifest",
+        "sha256:r1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_dropping_the_field_releases_the_row(database, actor):
+    project_id = await _project(database)
+    await sync_manifest_defaults(database, resource(project_id, "site"))
+    await sync_manifest_defaults(database, resource(project_id, revision="sha256:r2"))
+    assert await read_project_defaults(database, project_id) == ProjectDefaults()
+    await save_settings_defaults(
+        database, project_id, ProjectDefaults(jobs="vm"), actor_id=str(actor["id"])
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_manifest_without_the_field_leaves_settings_alone(database, actor):
+    project_id = await _project(database)
+    await save_settings_defaults(
+        database,
+        project_id,
+        ProjectDefaults(sessions="container"),
+        actor_id=str(actor["id"]),
+    )
+    await sync_manifest_defaults(database, resource(project_id))
+    assert (await read_project_defaults(database, project_id)).sessions == "container"
+
+
+@pytest.mark.asyncio
+async def test_non_projects_and_unlinked_projects_are_ignored(database):
+    await sync_manifest_defaults(database, {"kind": "Expert", "linked_id": None})
+    await sync_manifest_defaults(
+        database, {**resource(None, "site"), "linked_id": None}
+    )

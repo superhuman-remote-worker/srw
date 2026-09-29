@@ -109,3 +109,22 @@ async def release_manifest_defaults(db, project_id) -> None:
            WHERE project_id = $1 AND source = 'manifest'""",
         UUID(str(project_id)),
     )
+
+
+async def sync_manifest_defaults(db, resource: dict) -> None:
+    """Project activation: own the row when the manifest sets the field, else release."""
+    from shared.manifests.workspace_defaults import project_workspace_defaults
+
+    if resource.get("kind") != "Project" or not resource.get("linked_id"):
+        return
+    values = project_workspace_defaults(resource["resolved"]["spec"])
+    if values is None:
+        await release_manifest_defaults(db, resource["linked_id"])
+        return
+    await write_manifest_defaults(
+        db,
+        resource["linked_id"],
+        ProjectDefaults(
+            **values, source="manifest", manifest_revision=resource["revision"]
+        ),
+    )
