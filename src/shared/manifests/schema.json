@@ -822,6 +822,32 @@
         }
       ]
     },
+    "WorkspaceMode": {
+      "enum": [
+        "none",
+        "virtual",
+        "container",
+        "vm"
+      ]
+    },
+    "WorkspaceDefaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jobs": {
+          "$ref": "#/$defs/WorkspaceMode"
+        },
+        "sessions": {
+          "$ref": "#/$defs/WorkspaceMode"
+        },
+        "container": {
+          "$ref": "#/$defs/Name"
+        },
+        "vm": {
+          "$ref": "#/$defs/Name"
+        }
+      }
+    },
     "ProjectDefaults": {
       "type": "object",
       "additionalProperties": false,
@@ -830,7 +856,17 @@
           "$ref": "#/$defs/Name"
         },
         "workspace": {
-          "$ref": "#/$defs/NullableAlias"
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Name"
+            },
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/WorkspaceDefaults"
+            }
+          ]
         },
         "connectors": {
           "$ref": "#/$defs/AliasList"

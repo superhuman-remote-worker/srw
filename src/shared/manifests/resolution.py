@@ -13,6 +13,7 @@ import yaml
 from .errors import fail, pointer
 from .parsing import ManifestLoader
 from .validation import API_VERSION, MAX_NODES, check_json_value, validate_documents
+from .workspace_defaults import project_workspace_defaults
 
 _RESOURCE_MAPS = {
     "experts": "Expert",
@@ -309,6 +310,15 @@ class _Bundle:
         policy = spec.get("team", {}).get("jobPolicy")
         if policy is not None:
             policy.setdefault("retry", {"maxAttempts": 1})
+        try:
+            project_workspace_defaults(spec)
+        except ValueError as exc:
+            fail(
+                "WorkspaceDefaultBackendMismatch",
+                str(exc),
+                document=number,
+                path=pointer((*path, "defaults", "workspace")),
+            )
 
     def _job(self, spec, scope, number, path):
         execution = spec["execution"]
