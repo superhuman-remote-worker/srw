@@ -24268,6 +24268,7 @@ CREATE TABLE public.srw_resources (
     deleted_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    installation_managed boolean DEFAULT false NOT NULL,
     CONSTRAINT srw_resources_document_check CHECK ((jsonb_typeof(document) = 'object'::text)),
     CONSTRAINT srw_resources_kind_check CHECK ((kind = ANY (ARRAY['Expert'::text, 'WorkspaceTemplate'::text, 'Connector'::text, 'Project'::text, 'Job'::text]))),
     CONSTRAINT srw_resources_resolved_check CHECK ((jsonb_typeof(resolved) = 'object'::text)),
@@ -24281,6 +24282,13 @@ CREATE TABLE public.srw_resources (
 --
 
 COMMENT ON TABLE public.srw_resources IS 'Canonical SRW authored resources; definition changes never replay an existing Job execution.';
+
+
+--
+-- Name: COLUMN srw_resources.installation_managed; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.srw_resources.installation_managed IS 'TRUE for resources the installation owns. Only the startup reconciler writes them; the API refuses edits and deletes.';
 
 
 --

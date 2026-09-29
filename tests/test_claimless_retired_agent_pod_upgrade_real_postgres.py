@@ -306,7 +306,12 @@ def _variant_capture_sql():
 def _stage_upstream(tmp_path):
     """origin/develop 13c904ea6: the published chain without this reconciliation."""
 
-    staged = _stage(tmp_path, "upstream", through="9999", exclude=RECONCILED_MIGRATIONS)
+    staged = _stage(
+        tmp_path,
+        "upstream",
+        through=UPSTREAM_HEAD.split("_", 1)[0],
+        exclude=RECONCILED_MIGRATIONS,
+    )
     assert max(path.name for path in staged.iterdir()) == UPSTREAM_HEAD
     return staged
 
@@ -833,9 +838,15 @@ async def test_upgrade_from_upstream_0305_adds_only_the_reconciled_files(
         upgraded = await _ledger(history)
         names_before = {row["filename"] for row in before}
         assert [row for row in upgraded if row["filename"] in names_before] == before
+        # Migrations published after the capture are applied by the same run.
+        published_later = {
+            path.name
+            for path in migrate.discover(MIGRATIONS)
+            if path.name > CAPTURE_MIGRATION
+        }
         assert {row["filename"] for row in upgraded} - {
             row["filename"] for row in before
-        } == RECONCILED_MIGRATIONS
+        } == RECONCILED_MIGRATIONS | published_later
         assert all(row["success"] for row in upgraded)
         # 0300z found 0301's extension and did nothing; 0306 installed the
         # claim-less capture in place.

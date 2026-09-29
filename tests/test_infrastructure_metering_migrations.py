@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0306_capture_claimless_retired_agent_pod.sql"
+    / "src/orchestrator/database/migrations/app/0307_installation_managed_resources.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

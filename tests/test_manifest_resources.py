@@ -130,6 +130,9 @@ async def database(pg_url, monkeypatch):
         / "src/orchestrator/database/migrations/app/0234_manifest_resources.sql"
     )
     await db.execute(migration.read_text())
+    await db.execute(
+        migration.with_name("0307_installation_managed_resources.sql").read_text()
+    )
     yield db
     await db.disconnect()
 
