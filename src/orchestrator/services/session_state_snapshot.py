@@ -50,6 +50,11 @@ _TURN_TERMINAL_KINDS = (
 
 _TOOL_CLEAR_KINDS = (*_TURN_TERMINAL_KINDS, "turn.started")
 
+# How many unmatched ``tool.started`` frames one snapshot reports. A turn's
+# widest parallel batch is bounded by the per-turn delegation maximum (at most
+# 64 calls, ``shared.runtime.core.delegation_settings``); the newest win.
+_RUNNING_TOOLS_LIMIT = 64
+
 
 def _json_object(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
@@ -257,7 +262,10 @@ async def build_session_state_snapshot(
                 epoch,
                 list(_TURN_LIFECYCLE_KINDS),
             )
-            running_row = await conn.fetchrow(
+            # Every call still running, not only the latest: a session
+            # delegation batch runs several at once (parallel_subagents.md
+            # F17). Newest first here; reported in journal order below.
+            running_rows = await conn.fetch(
                 """
                 SELECT started.payload
                 FROM thread_events AS started
@@ -279,11 +287,12 @@ async def build_session_state_snapshot(
                         )
                   )
                 ORDER BY started.seq DESC
-                LIMIT 1
+                LIMIT $4
                 """,
                 thread_id,
                 epoch,
                 list(_TOOL_CLEAR_KINDS),
+                _RUNNING_TOOLS_LIMIT,
             )
             permission_rows = await conn.fetch(
                 """
@@ -402,15 +411,22 @@ async def build_session_state_snapshot(
     }
     runtime_proves_idle = queue_proves_idle or status_proves_idle
 
-    running_tool: dict[str, Any] | None = None
-    if running_row is not None and not runtime_proves_idle:
-        payload = _json_object(running_row["payload"])
-        if payload.get("tool"):
-            running_tool = {
-                "id": str(payload.get("id") or ""),
-                "tool": str(payload["tool"]),
-                "args": _json_object(payload.get("args")),
-            }
+    # ``running_tools`` lists every unmatched call in journal order, for the
+    # Cockpit's ``parseRunningTools``; ``running_tool`` keeps its meaning for
+    # older Cockpits: the latest unmatched ``tool.started``.
+    running_tools: list[dict[str, Any]] = []
+    if not runtime_proves_idle:
+        for row in reversed(list(running_rows)):
+            payload = _json_object(row["payload"])
+            if payload.get("tool"):
+                running_tools.append(
+                    {
+                        "id": str(payload.get("id") or ""),
+                        "tool": str(payload["tool"]),
+                        "args": _json_object(payload.get("args")),
+                    }
+                )
+    running_tool: dict[str, Any] | None = running_tools[-1] if running_tools else None
 
     pending_permissions: list[dict[str, Any]] = []
     for row in permission_rows:
@@ -486,6 +502,7 @@ async def build_session_state_snapshot(
         "model": str(model) if model is not None else None,
         "temperature": temperature,
         "running_tool": running_tool,
+        "running_tools": running_tools,
         "pending_permissions": pending_permissions,
         "tasks": [_session_task(row) for row in task_rows],
         # Presence-authoritative, including an explicit null: a thread that has

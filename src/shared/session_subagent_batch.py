@@ -33,6 +33,17 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY = "session_subagent_batch_settle_contract"
 SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT = 1
 
+# The operator's fan-out switch (§12, D5), a plain boolean in the same three
+# places and under the same rule as the capability. The orchestrator
+# evaluates its deployment setting for the session's lane at every stateless
+# claim and every pinned attach or workspace pull; it is never part of a
+# session's frozen config, so turning it off reaches every stateless session
+# at its next claim. A session parent fans out only when the capability is
+# exactly ``1`` AND this is ``true``. An agent that predates the key ignores
+# it. Recovery never reads it: a batch in flight when it flips is settled
+# either way.
+SESSION_SUBAGENT_FANOUT_KEY = "session_subagent_fanout"
+
 # The class of one delegate_agent call of the turn, decided from durable facts.
 CALL_DELIVERED = "delivered"  # the parent transcript already has its result
 CALL_ENDED = "ended"  # the child finished; its result never reached the parent
@@ -296,6 +307,7 @@ __all__ = [
     "RESULT_RETIRED",
     "SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT",
     "SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY",
+    "SESSION_SUBAGENT_FANOUT_KEY",
     "batch_continuation_text",
     "continuation_metrics",
     "not_started_result_text",

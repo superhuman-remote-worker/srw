@@ -1547,12 +1547,33 @@ class TestSendSessionAttachPayload:
         assert call["json"]["runtime_actor"]["access_credential"].startswith("sra_")
 
     @pytest.mark.asyncio
-    async def test_payload_advertises_the_batch_settle_contract(self):
+    @pytest.mark.parametrize(
+        ("lanes", "fanout"),
+        [
+            (frozenset(), False),
+            (frozenset({"stateless"}), False),
+            (frozenset({"stateless", "pinned"}), True),
+        ],
+    )
+    async def test_payload_advertises_the_batch_settle_contract(self, lanes, fanout):
         """The agent learns at attach that this orchestrator settles an
-        abandoned delegation turn as one batch (parallel_subagents.md §12)."""
+        abandoned delegation turn as one batch (parallel_subagents.md §12),
+        and whether the operator lets the pinned lane fan out: the deployment
+        setting read at this attach (WP3c), a named field the pinned handlers
+        of older images ignore."""
+        import dataclasses
+
         _FakeAsyncClient.response_status = 500
         thread = self._thread()
+        resources = orch_main.app.state.resources
         with (
+            patch.object(
+                resources,
+                "settings",
+                dataclasses.replace(
+                    resources.settings, session_subagent_fanout_lanes=lanes
+                ),
+            ),
             patch.object(
                 orch_main.app.state.resources.postgres_db,
                 "get_thread",
@@ -1581,6 +1602,7 @@ class TestSendSessionAttachPayload:
             )
         (call,) = _FakeAsyncClient.calls
         assert call["json"]["session_subagent_batch_settle_contract"] == 1
+        assert call["json"]["session_subagent_fanout"] is fanout
 
     @pytest.mark.asyncio
     async def test_attach_refuses_revoked_persisted_datasource_before_http(self):

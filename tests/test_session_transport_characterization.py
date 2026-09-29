@@ -929,6 +929,7 @@ class TestWelcomeFrame:
                 "model": "model-x",
                 "temperature": 0.4,
                 "running_tool": None,
+                "running_tools": [],
                 "pending_permissions": pending,
                 "tasks": [{"id": "task-1", "status": "running"}],
             },
@@ -939,6 +940,7 @@ class TestWelcomeFrame:
             params = ws.welcome["params"]
         assert params["turn_in_flight"] is False
         assert params["running_tool"] is None
+        assert params["running_tools"] == []
         assert params["pending_permissions"] == []
         assert params["tasks"] == []
         assert params["message_count"] == 0
@@ -960,6 +962,34 @@ class TestWelcomeFrame:
                 "tool": "run_command",
                 "args": {"cmd": "ls"},
             }
+            assert ws.welcome["params"]["running_tools"] == [
+                {"id": "call-1", "tool": "run_command", "args": {"cmd": "ls"}}
+            ]
+
+    def test_running_tools_names_every_call_of_a_parallel_batch(
+        self, client, ws_path, rt
+    ):
+        """parallel_subagents.md F17: a reattaching Cockpit sees every running
+        child of a delegation batch, not one card of N."""
+        rt.session.messages = [
+            HumanMessage(content="research"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"id": "d1", "name": "delegate_agent", "args": {"brief": "a"}},
+                    {"id": "d2", "name": "delegate_agent", "args": {"brief": "b"}},
+                ],
+            ),
+        ]
+        rt.set("_tool_inflight", True)
+        rt.set("_tool_inflight_calls", {"d1", "d2"})
+        with _session_ws(client, ws_path) as ws:
+            params = ws.welcome["params"]
+        assert params["running_tools"] == [
+            {"id": "d1", "tool": "delegate_agent", "args": {"brief": "a"}},
+            {"id": "d2", "tool": "delegate_agent", "args": {"brief": "b"}},
+        ]
+        assert params["running_tool"] == params["running_tools"][0]
 
     def test_loop_started_for_the_subscriber_after_welcome(
         self, client, ws_path, rt, pa

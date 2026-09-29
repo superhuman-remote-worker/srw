@@ -82,7 +82,7 @@ from agent.api.persistent_session import (
     resolve_memory_extraction_prompt,
 )
 from agent.tools.registry import TOOL_REGISTRY
-from agent.core.archiver import inflight_tool_call
+from agent.core.archiver import inflight_tool_calls
 from agent.core.context import (
     extract_summary_text,
     repair_tool_pairing,
@@ -118,6 +118,7 @@ from shared.session_retirement import update_stateless_claim_status
 from shared.session_subagent_batch import (
     SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT,
     SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
+    SESSION_SUBAGENT_FANOUT_KEY,
 )
 from shared.runtime_actor import RuntimeActorContext
 from agent.agent import UniversalAgent
@@ -246,6 +247,78 @@ def _pinned_runtime_generation_advertised(payload: Any) -> bool:
         isinstance(payload, dict)
         and type(payload.get("pinned_runtime_generation_contract")) is int
         and payload["pinned_runtime_generation_contract"] == 1
+    )
+
+
+def _subagent_batch_settle_advertised(value: Any) -> bool:
+    """Accept only the exact numeric v1 batch-settle capability (§12)."""
+
+    return bool(type(value) is int and value == SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT)
+
+
+def _subagent_fanout_advertised(value: Any) -> bool:
+    """The orchestrator's fan-out switch counts only as a literal ``true``."""
+
+    return value is True
+
+
+def _session_subagent_advertisement(
+    batch_settle_contract: Any,
+    fanout: Any,
+    workspace_responses: Tuple[Any, ...],
+    *,
+    from_workspace: bool,
+) -> Tuple[bool, bool]:
+    """The fan-out advertisement a session attach runs with (§12).
+
+    The pushed pinned ``/session/attach`` body and the stateless claim bundle
+    pass both values as keywords. A pinned pod that attaches itself receives
+    neither: it reads them from the newest ready workspace response it
+    fetched (``workspace_responses``, newest first), exactly like
+    ``pinned_status_identity_contract``. The initial VM wait payload carries
+    neither key; the ready payload that follows it does. A stateless attach
+    never falls back: its claim bundle is the only per-claim authority, and a
+    warm session is re-applied from the next bundle.
+    """
+
+    if from_workspace:
+        newest = next(
+            (
+                response
+                for response in workspace_responses
+                if isinstance(response, dict)
+            ),
+            None,
+        )
+        if newest is not None:
+            if batch_settle_contract is None:
+                batch_settle_contract = newest.get(
+                    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY
+                )
+            if fanout is None:
+                fanout = newest.get(SESSION_SUBAGENT_FANOUT_KEY)
+    return (
+        _subagent_batch_settle_advertised(batch_settle_contract),
+        _subagent_fanout_advertised(fanout),
+    )
+
+
+def _apply_session_subagent_advertisement(
+    batch_settle_contract: Any, fanout: Any
+) -> bool:
+    """Re-apply one claim's fan-out advertisement to the attached session.
+
+    The stateless executor calls this at every claim: a warm session skips
+    attach, and the orchestrator's operator switch must still reach it at
+    once (parallel_subagents.md §12). Returns True when a value changed.
+    """
+
+    session = _session
+    if session is None:
+        return False
+    return session.apply_subagent_fanout_advertisement(
+        batch_settle_contract=_subagent_batch_settle_advertised(batch_settle_contract),
+        fanout=_subagent_fanout_advertised(fanout),
     )
 
 
@@ -697,8 +770,15 @@ async def _quiesce_session_side_tasks() -> None:
 # True while a tool call is mid-`ainvoke`. Read by POST /api/interrupt to
 # pick hard vs graceful mode. Latched only after the final execution-admission
 # callback succeeds, immediately before `tool.ainvoke`; cleared in
-# _loop_on_tool_result.
+# _loop_on_tool_result once no call is left in flight.
 _tool_inflight: bool = False
+# The ids of the calls behind ``_tool_inflight``. A session delegation batch
+# runs several calls at once, so the first ``tool.completed`` must not clear
+# the flag while its siblings still run, and a reattaching client is told
+# every running call (parallel_subagents.md F17). The flag stays the
+# authority on whether anything runs: cleared wherever the flag is reset, and
+# ids found beside a false flag are stale.
+_tool_inflight_calls: set[str] = set()
 
 # Exact stateless claim/turn identity after a bound, approved tool reaches the
 # pre-ainvoke external-effect boundary. Unlike _tool_inflight this survives the
@@ -3741,6 +3821,7 @@ async def _cleanup_failed_event_journal_attach(
     _events_epoch = 0
     _next_seq = 0
     _tool_inflight = False
+    _tool_inflight_calls.clear()
     _turn_tool_execution_identity = None
     _turn_tool_execution_external_hook = None
     _turn_event_open = False
@@ -3957,6 +4038,7 @@ async def _attach_session_inner(
     workspace_generation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
     workspace_runtime_incarnation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
     session_subagent_batch_settle_contract: Any = None,
+    session_subagent_fanout: Any = None,
 ) -> None:
     """Create and attach a PersistentSession for the given thread.
 
@@ -4081,6 +4163,10 @@ async def _attach_session_inner(
     # for lite threads, so the session can build its backend without a pod.
     _rc, _co = resolved_config, config_override
     attached_workspace_generation = ""
+    # Every ready workspace response this attach reads, oldest first: a
+    # pinned pod that attaches itself takes the fan-out advertisement from
+    # the newest one (_session_subagent_advertisement).
+    subagent_workspace_responses: List[Any] = []
     if _rc is None and _co is None and _orchestrator_client and _thread_id:
         try:
             _peek = await _orchestrator_client.get_thread_workspace(_thread_id)
@@ -4103,6 +4189,7 @@ async def _attach_session_inner(
                     _pinned_status_identity_enabled = (
                         _pinned_status_identity_advertised(_peek)
                     )
+                    subagent_workspace_responses.append(_peek)
                     attached_workspace_generation = str(
                         _peek.get("workspace_generation") or ""
                     )
@@ -4153,6 +4240,7 @@ async def _attach_session_inner(
             _pinned_status_identity_enabled = _pinned_status_identity_advertised(
                 workspace_override
             )
+            subagent_workspace_responses.append(workspace_override)
             logger.info(
                 f"Workspace ready ({workspace_override.get('backend')}): "
                 f"{workspace_override['remote']['host']}"
@@ -4243,6 +4331,7 @@ async def _attach_session_inner(
                 _pinned_status_identity_enabled = _pinned_status_identity_advertised(
                     ws_info
                 )
+                subagent_workspace_responses.append(ws_info)
                 fresh_delivery = _protected_workspace_delivery(ws_info)
                 if fresh_delivery == "engaging":
                     raise ProtectedCloudUnavailable(
@@ -4604,6 +4693,15 @@ async def _attach_session_inner(
             )
         shell_owner_token = live_lease.lease_token
 
+    # parallel_subagents.md §12: fan-out needs an orchestrator that can settle
+    # an interrupted batch (exact int 1, like the other contracts) and its
+    # operator switch for this lane (a literal true).
+    subagent_batch_settle, subagent_fanout = _session_subagent_advertisement(
+        session_subagent_batch_settle_contract,
+        session_subagent_fanout,
+        tuple(reversed(subagent_workspace_responses)),
+        from_workspace=not _stateless_mode(),
+    )
     _session = PersistentSession(
         thread_id=_thread_id,
         config=effective_config,
@@ -4618,13 +4716,8 @@ async def _attach_session_inner(
         subagent_effect_authority=_loop_runtime_effect_authority_current,
         subagent_settlement_authority=(_loop_runtime_settlement_authority_current),
         subagent_event_callback=_session_subagent_event_available,
-        # parallel_subagents.md §12: fan-out needs an orchestrator that can
-        # settle an interrupted batch. Exact int 1, like the other contracts.
-        subagent_batch_settle_contract=bool(
-            type(session_subagent_batch_settle_contract) is int
-            and session_subagent_batch_settle_contract
-            == SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT
-        ),
+        subagent_batch_settle_contract=subagent_batch_settle,
+        subagent_fanout=subagent_fanout,
         project_ids=project_ids or [],
         datasources=datasources_dict,
         knowledge_bindings=knowledge_bindings,
@@ -4732,6 +4825,7 @@ async def _attach_session_inner(
     # pre-bump generation uses the existing mid-stream epoch-change
     # reconciliation path.
     _tool_inflight = False
+    _tool_inflight_calls.clear()
     _turn_tool_execution_identity = None
     _turn_tool_execution_external_hook = None
     _turn_event_open = False
@@ -5127,6 +5221,7 @@ async def _attach_session(
     workspace_generation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
     workspace_runtime_incarnation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
     session_subagent_batch_settle_contract: Any = None,
+    session_subagent_fanout: Any = None,
 ) -> None:
     """Exception-safe attach transaction around the full construction tail."""
 
@@ -5151,6 +5246,7 @@ async def _attach_session(
             session_subagent_batch_settle_contract=(
                 session_subagent_batch_settle_contract
             ),
+            session_subagent_fanout=session_subagent_fanout,
         )
     except BaseException:
         # Covers every post-construction await, including event-journal setup,
@@ -5832,6 +5928,7 @@ async def _terminate_session_inner(
     _events_epoch = 0
     _next_seq = 0
     _tool_inflight = False
+    _tool_inflight_calls.clear()
     _turn_tool_execution_identity = None
     _turn_tool_execution_external_hook = None
     _turn_event_open = False
@@ -6056,6 +6153,7 @@ async def _admit_pool_session_attach(request: Dict[str, Any]) -> JSONResponse:
             "session_subagent_batch_settle_contract": request.get(
                 SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY
             ),
+            "session_subagent_fanout": request.get(SESSION_SUBAGENT_FANOUT_KEY),
             "session_runtime_generation": runtime_generation,
             "session_runtime_attach_token": attach_token,
         }
@@ -6106,17 +6204,39 @@ def _attached_session_thread_id() -> str:
     return str(getattr(session, "thread_id", "") or "")
 
 
-def _welcome_running_tool(session: Any) -> Optional[Dict[str, Any]]:
-    """The tool call this session's loop is blocked in right now, if any."""
+def _welcome_running_tools(session: Any) -> List[Dict[str, Any]]:
+    """Every tool call this session's loop is blocked in right now.
 
-    running_tool = inflight_tool_call(session.messages) if _tool_inflight else None
-    if running_tool is None:
-        return None
-    return {
-        "id": running_tool["id"],
-        "tool": running_tool["tool"],
-        "args": _safe_serialize(running_tool["args"]),
-    }
+    The unanswered calls of the in-flight assistant message that are
+    mid-``ainvoke``: the whole batch of a parallel delegation, only the
+    running call of a sequential one. The Cockpit's ``parseRunningTools``
+    reads the list; ``running_tool`` (its first entry) stays for older
+    Cockpits. Without per-call ids behind the latch (a flag set directly)
+    the first unanswered call is the running one, as before the list.
+    """
+
+    if not _tool_inflight:
+        return []
+    unanswered = inflight_tool_calls(session.messages)
+    running_ids = set(_tool_inflight_calls)
+    running = [call for call in unanswered if call["id"] in running_ids]
+    if not running:
+        running = unanswered[:1]
+    return [
+        {
+            "id": call["id"],
+            "tool": call["tool"],
+            "args": _safe_serialize(call["args"]),
+        }
+        for call in running
+    ]
+
+
+def _welcome_running_tool(session: Any) -> Optional[Dict[str, Any]]:
+    """The first tool call this session's loop is blocked in, if any."""
+
+    running = _welcome_running_tools(session)
+    return running[0] if running else None
 
 
 def session_transport_bindings() -> SessionTransportBindings:
@@ -6177,6 +6297,7 @@ def session_transport_bindings() -> SessionTransportBindings:
                 durable_control_modes=lambda: _durable_session_control_modes(),
                 pending_permissions=lambda: _pending_permission_requests(),
                 running_tool=lambda session: _welcome_running_tool(session),
+                running_tools=lambda session: _welcome_running_tools(session),
             ),
             commands=SessionSocketCommands(
                 config_update=lambda *args, **kwargs: _handle_config_update(
@@ -9819,7 +9940,7 @@ async def _loop_on_tool_execution_start(tool_name: str, tool_call_id: str) -> No
     """Latch the exact claim/turn crossing a real tool's effect boundary."""
 
     global _tool_inflight
-    del tool_name, tool_call_id
+    del tool_name
     if not await _loop_runtime_effect_authority_current():
         if not _protected_cloud_runtime_ready():
             _session_input.schedule_protected_reclaim()
@@ -9849,6 +9970,9 @@ async def _loop_on_tool_execution_start(tool_name: str, tool_call_id: str) -> No
     # This callback returns directly into `tool.ainvoke`. No earlier UI or
     # permission callback may set the latch: if this final health/identity
     # gate raises, no result callback runs to clear it.
+    if not _tool_inflight:
+        _tool_inflight_calls.clear()
+    _tool_inflight_calls.add(str(tool_call_id or ""))
     _tool_inflight = True
 
 
@@ -9859,7 +9983,12 @@ async def _loop_on_tool_result(
     is_error: bool = False,
 ) -> None:
     global _tool_inflight
-    _tool_inflight = False
+    # Only this call ended: siblings of a parallel batch are still running.
+    if _tool_inflight:
+        _tool_inflight_calls.discard(str(tool_call_id or ""))
+    else:
+        _tool_inflight_calls.clear()
+    _tool_inflight = bool(_tool_inflight_calls)
     # Truncate large results for transport (full result is in message history)
     display_result = result[:2000] + "..." if len(result) > 2000 else result
     _broadcast(
@@ -11678,7 +11807,13 @@ async def _retry_cloud_sync_start(turn_id: int) -> None:
 
 
 async def _loop_on_turn_start(turn_id: int) -> None:
-    global _turn_event_open, _turn_tool_execution_identity
+    global _turn_event_open, _turn_tool_execution_identity, _tool_inflight
+    # No call crosses a turn boundary: a call whose result callback never ran
+    # (a tool that raised WorkspaceUnavailableError, a failed persist) must
+    # not keep the per-call latch set, or Stop, drain and preStop would treat
+    # this session as mid-tool from now on.
+    _tool_inflight = False
+    _tool_inflight_calls.clear()
     if _session is None:
         _turn_event_open = False
         _turn_tool_execution_identity = None
@@ -15433,6 +15568,12 @@ async def _poll_workspace_ready(
                 "pinned_runtime_generation_contract": ws.get(
                     "pinned_runtime_generation_contract"
                 ),
+                # A self-attaching pinned pod takes its fan-out advertisement
+                # from this ready payload (the VM wait payload has none).
+                SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: ws.get(
+                    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY
+                ),
+                SESSION_SUBAGENT_FANOUT_KEY: ws.get(SESSION_SUBAGENT_FANOUT_KEY),
                 "session_runtime_generation": ws.get("session_runtime_generation"),
                 # Server-derived provisioner authority must survive this
                 # normalization boundary. PersistentSession deliberately does
@@ -15549,6 +15690,11 @@ async def _poll_workspace_ready(
                 "pinned_runtime_generation_contract": ws.get(
                     "pinned_runtime_generation_contract"
                 ),
+                # Same fan-out advertisement as the vm branch above.
+                SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: ws.get(
+                    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY
+                ),
+                SESSION_SUBAGENT_FANOUT_KEY: ws.get(SESSION_SUBAGENT_FANOUT_KEY),
                 "session_runtime_generation": ws.get("session_runtime_generation"),
                 "workspace_generation": workspace_generation,
                 "workspace_runtime_incarnation": workspace_runtime_incarnation,

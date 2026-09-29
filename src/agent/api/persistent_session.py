@@ -216,10 +216,15 @@ class PersistentSession:
     subagent_effect_authority: Optional[Callable[[], Any]] = None
     subagent_settlement_authority: Optional[Callable[[], Any]] = None
     subagent_event_callback: Optional[Callable[[str], Any]] = None
-    # The attach payload advertised the orchestrator's batch settle
-    # (session_subagent_batch_settle_contract == 1). Fixed per attach; a
-    # changed advertisement changes the stateless attach fingerprint.
+    # The orchestrator's per-claim advertisement (parallel_subagents.md §12):
+    # it can settle an interrupted delegation batch
+    # (``session_subagent_batch_settle_contract`` == 1), and its operator
+    # switch lets this session's lane fan out (``session_subagent_fanout``).
+    # Set at attach; a warm stateless session gets both again at every claim
+    # through ``apply_subagent_fanout_advertisement``, never through a fresh
+    # attach.
     subagent_batch_settle_contract: bool = False
+    subagent_fanout: bool = False
 
     # Permission mode (switchable at runtime)
     permission_mode: str = "supervised"
@@ -2007,6 +2012,47 @@ class PersistentSession:
         for key in [key for key in current if key not in fresh]:
             del current[key]
 
+    def apply_subagent_fanout_advertisement(
+        self, *, batch_settle_contract: bool, fanout: bool
+    ) -> bool:
+        """Apply one claim's fan-out advertisement in place. Returns True when
+        either value changed.
+
+        The stateless executor calls this at every claim, warm reuse
+        included, so the orchestrator's operator switch reaches the next claim
+        of a warm session without a detach and re-attach
+        (parallel_subagents.md §12). A change republishes both flags on the
+        tool context and rebuilds the ``delegate_agent`` description when its
+        text moved. Only a literal ``True`` sets either flag.
+
+        A failed rebuild never fails the claim: the flags just published are
+        what the gate and the runtime read, so only the description could be
+        stale, and the next change rebuilds it again.
+        """
+        settle = batch_settle_contract is True
+        switch = fanout is True
+        changed = (
+            self.subagent_batch_settle_contract is not settle
+            or self.subagent_fanout is not switch
+        )
+        self.subagent_batch_settle_contract = settle
+        self.subagent_fanout = switch
+        if self.tool_context is not None:
+            self.tool_context._session_subagent_batch_settle_contract = settle
+            self.tool_context._session_subagent_fanout = switch
+        if changed:
+            try:
+                self.refresh_delegation_description()
+            except Exception:  # noqa: BLE001 - the flags already govern
+                logger.warning(
+                    "delegate_agent description rebuild failed after a fan-out "
+                    "advertisement change (settle=%s fanout=%s)",
+                    settle,
+                    switch,
+                    exc_info=True,
+                )
+        return changed
+
     def refresh_delegation_description(self) -> bool:
         """Rebuild the tools when the bound ``delegate_agent`` description no
         longer matches the live config. Returns True when it rebuilt.
@@ -2088,12 +2134,13 @@ class PersistentSession:
         self.tool_context._subagent_execution_lane = (
             "stateless" if self.shell_owner_token is not None else "pinned"
         )
-        # Third input of the fan-out gate (agent.tools.delegation.fanout),
+        # The orchestrator's two fan-out inputs (agent.tools.delegation.fanout),
         # published with the kind and lane so the delegate_agent description
-        # and the runtime cap see it from the first tool build.
+        # and the runtime cap see them from the first tool build.
         self.tool_context._session_subagent_batch_settle_contract = (
             self.subagent_batch_settle_contract is True
         )
+        self.tool_context._session_subagent_fanout = self.subagent_fanout is True
         self.tool_context._session_parent_authority_provider = (
             self.session_parent_authority_provider
         )

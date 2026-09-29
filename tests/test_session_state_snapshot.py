@@ -30,7 +30,7 @@ class _SnapshotConn:
         *,
         thread: dict | None,
         lifecycle: dict | None = None,
-        running: dict | None = None,
+        running: dict | list[dict] | None = None,
         permissions: list[dict] | None = None,
         tasks: list[dict] | None = None,
         control_receipts: list[dict] | None = None,
@@ -40,7 +40,9 @@ class _SnapshotConn:
     ) -> None:
         self.thread = thread
         self.lifecycle = lifecycle
-        self.running = running
+        # Rows of the unmatched ``tool.started`` SELECT, newest first (its
+        # ORDER BY seq DESC). A single dict is one running call.
+        self.running = [running] if isinstance(running, dict) else running or []
         self.permissions = permissions or []
         self.tasks = tasks or []
         self.control_receipts = control_receipts or []
@@ -63,8 +65,6 @@ class _SnapshotConn:
             return self.thread
         if "AS latest_kind" in sql:
             return self.lifecycle
-        if "SELECT started.payload" in sql:
-            return self.running
         raise AssertionError(f"unexpected fetchrow query: {sql}")
 
     async def fetchval(self, sql: str, *args):
@@ -77,6 +77,9 @@ class _SnapshotConn:
 
     async def fetch(self, sql: str, *args):
         self.calls.append((sql, args))
+        if "SELECT started.payload" in sql:
+            assert "ORDER BY started.seq DESC" in sql
+            return self.running[: args[3]]
         if "FROM thread_permission_requests" in sql:
             return self.permissions
         if "FROM thread_session_tasks" in sql:
@@ -242,6 +245,13 @@ async def test_snapshot_has_full_lane_free_shape_and_normalizes_durable_rows():
             "tool": "run_command",
             "args": {"cmd": "ls"},
         },
+        "running_tools": [
+            {
+                "id": "tool-7",
+                "tool": "run_command",
+                "args": {"cmd": "ls"},
+            }
+        ],
         "pending_permissions": [
             {
                 "id": "tool-8",
@@ -657,6 +667,70 @@ async def test_stale_queue_row_never_clears_a_pinned_runtime_snapshot():
         "tool": "run_command",
         "args": {},
     }
+
+
+@pytest.mark.asyncio
+async def test_every_running_call_of_a_parallel_batch_is_reported():
+    """parallel_subagents.md F17: a session delegation batch journals one
+    ``tool.started`` per call. ``running_tools`` lists every unmatched one in
+    journal order (the Cockpit's ``parseRunningTools`` prefers it);
+    ``running_tool`` keeps its old meaning, the latest unmatched call."""
+    conn = _SnapshotConn(
+        thread=_thread(execution_lane="stateless", queue_state="leased"),
+        lifecycle={
+            "latest_kind": "turn.started",
+            "latest_turn_id": "4",
+            "latest_turn_start_seq": 30,
+        },
+        # Newest first, as the SELECT returns them.
+        running=[
+            {
+                "payload": json.dumps(
+                    {"id": "d2", "tool": "delegate_agent", "args": {"brief": "b"}}
+                )
+            },
+            {"payload": {"id": "d1", "tool": "delegate_agent", "args": {"brief": "a"}}},
+        ],
+        live_turn_count=4,
+    )
+
+    result = await build_session_state_snapshot(_SnapshotDB(conn), "thread-1")
+
+    assert result is not None
+    assert result["running_tools"] == [
+        {"id": "d1", "tool": "delegate_agent", "args": {"brief": "a"}},
+        {"id": "d2", "tool": "delegate_agent", "args": {"brief": "b"}},
+    ]
+    assert result["running_tool"] == {
+        "id": "d2",
+        "tool": "delegate_agent",
+        "args": {"brief": "b"},
+    }
+    (running_call,) = [c for c in conn.calls if "SELECT started.payload" in c[0]]
+    assert running_call[1][3] == 64  # bounded by the widest possible batch
+
+
+@pytest.mark.asyncio
+async def test_an_idle_runtime_reports_no_running_calls():
+    conn = _SnapshotConn(
+        thread=_thread(execution_lane="stateless", queue_state="done"),
+        lifecycle={
+            "latest_kind": "turn.started",
+            "latest_turn_id": "4",
+            "latest_turn_start_seq": 30,
+        },
+        running=[
+            {"payload": {"id": "d2", "tool": "delegate_agent", "args": {}}},
+            {"payload": {"id": "d1", "tool": "delegate_agent", "args": {}}},
+        ],
+        live_turn_count=4,
+    )
+
+    result = await build_session_state_snapshot(_SnapshotDB(conn), "thread-1")
+
+    assert result is not None
+    assert result["running_tools"] == []
+    assert result["running_tool"] is None
 
 
 @pytest.mark.asyncio

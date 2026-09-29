@@ -117,7 +117,10 @@ from shared.run_queue import (
     transient_release_backoff_seconds,
 )
 from shared.session_permission_retirement import retire_stale_stateless_permissions
-from shared.session_subagent_batch import SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY
+from shared.session_subagent_batch import (
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
+    SESSION_SUBAGENT_FANOUT_KEY,
+)
 from shared.session_retirement import (
     acknowledge_session_claim_quiesced,
     active_claim_authority,
@@ -414,6 +417,11 @@ def attach_fingerprint(attach: Dict[str, Any]) -> str:
       convergence, but a warm owner applies their ordered pending request in
       place. Hashing them forced a full detach/attach before that drain (9–11s
       measured on k3d for a scalar whose journal write took ~10ms).
+    * The per-claim fan-out advertisement (``CLAIM_ADVERTISEMENT_KEYS``): the
+      executor re-applies it to a warm session at every claim
+      (``PersistentSession.apply_subagent_fanout_advertisement``), so the
+      operator's switch reaches every warm session at its next claim without
+      forcing all of them through a fresh attach at once.
 
     Every other config-content change (model, prompts, tools, datasources and
     other interactive settings) still changes the hash and forces the attach
@@ -438,6 +446,11 @@ def attach_fingerprint(attach: Dict[str, Any]) -> str:
             result.pop("interactive", None)
         return result
 
+    attach = {
+        key: value
+        for key, value in attach.items()
+        if key not in CLAIM_ADVERTISEMENT_KEYS
+    }
     rc = attach.get("resolved_config")
     override = attach.get("config_override")
     if isinstance(rc, dict):
@@ -511,27 +524,50 @@ def fingerprint_diff_paths(
     return paths
 
 
+#: The per-claim advertisements the orchestrator puts beside ``attach``
+#: (parallel_subagents.md §12): its batch-settle capability and its operator
+#: fan-out switch for the stateless lane. Folded into the attach keywords for
+#: a fresh attach and re-applied in place to a warm session at every claim,
+#: so they stay out of the attach fingerprint.
+CLAIM_ADVERTISEMENT_KEYS: frozenset[str] = frozenset(
+    {SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY, SESSION_SUBAGENT_FANOUT_KEY}
+)
+
+
 def claim_bundle_attach(bundle: Mapping[str, Any]) -> Dict[str, Any]:
     """The ``_attach_session`` keywords of a stateless claim bundle.
 
     ``attach`` is splatted into ``_attach_session``, so the orchestrator puts
-    a capability beside it, never inside it: an agent image without the
-    keyword would refuse every claim. The batch-settle advertisement
-    (parallel_subagents.md §12) is folded in here as the keyword, which
-    reaches the session, its tool context, the fan-out gate and subagent
-    recovery. A bundle from an orchestrator that still carried it inside
-    ``attach`` supplies it the same way; the top-level value wins. The value
-    is part of the attach fingerprint, so a changed advertisement re-attaches
-    a warm session instead of reusing its stale flag.
+    each per-claim advertisement beside it, never inside it: an agent image
+    without the keyword would refuse every claim. Both are folded in here as
+    keywords, which reach the session, its tool context and the fan-out gate
+    at a fresh attach. A bundle from an orchestrator that still carried the
+    capability inside ``attach`` supplies it the same way; the top-level value
+    wins. Neither is part of the attach fingerprint: a warm session gets them
+    from ``claim_bundle_advertisement`` at every claim instead.
     """
 
     attach = dict(bundle.get("attach") or {})
-    key = SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY
-    nested = attach.pop(key, None)
-    value = bundle.get(key, nested)
-    if value is not None:
-        attach[key] = value
+    for key in sorted(CLAIM_ADVERTISEMENT_KEYS):
+        nested = attach.pop(key, None)
+        value = bundle.get(key, nested)
+        if value is not None:
+            attach[key] = value
     return attach
+
+
+def claim_bundle_advertisement(attach: Mapping[str, Any]) -> Tuple[Any, Any]:
+    """This claim's raw ``(batch-settle capability, fan-out switch)``.
+
+    Read from the folded attach keywords (``claim_bundle_attach``). An absent
+    value is ``None``, which the session treats as off: an orchestrator that
+    no longer advertises either value turns fan-out off at the next claim.
+    """
+
+    return (
+        attach.get(SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY),
+        attach.get(SESSION_SUBAGENT_FANOUT_KEY),
+    )
 
 
 def completed_input_checkpoint(
@@ -3960,6 +3996,13 @@ class StatelessTurnExecutor:
         # the first lazy shell initialization.
         if pa._session is not None:
             pa._session.set_shell_owner_token(token)
+            # This claim's fan-out advertisement (parallel_subagents.md §12).
+            # A warm session skipped attach, so the operator's switch reaches
+            # it only here; a fresh attach already built with the same values,
+            # which makes this a no-op for it. Before any input is injected.
+            pa._apply_session_subagent_advertisement(
+                *claim_bundle_advertisement(attach)
+            )
 
         # A claim may beat the reaper's post-steal journal transaction. Close
         # that abandoned generation and settle its exact interrupted input

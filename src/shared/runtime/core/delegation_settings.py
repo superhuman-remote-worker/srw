@@ -1,9 +1,10 @@
-"""Session fan-out settings of the ``delegation`` block (parallel_subagents.md §6.4).
+"""Session delegation settings of the ``delegation`` block (parallel_subagents.md §6.4).
 
 A session parent has its own concurrency cap, because ``delegation.max_concurrent``
 is the worker cap and an expert's worker-oriented value overrides the role
-overlay (F14). The session cap resolves in this order, and the result is
-clamped to ``SESSION_MAX_CONCURRENT_MIN..SESSION_MAX_CONCURRENT_MAX``:
+overlay (F14). Every session parent runs its children under it. The session
+cap resolves in this order, and the result is clamped to
+``SESSION_MAX_CONCURRENT_MIN..SESSION_MAX_CONCURRENT_MAX``:
 
 1. the code default, ``SESSION_MAX_CONCURRENT_DEFAULT``;
 2. the parent's model-family value — ``settings.session_max_concurrent`` in
@@ -17,11 +18,11 @@ The cap limits concurrency, not the number of calls: calls above it queue and
 run in waves. ``delegation.session_max_calls_per_turn`` bounds the calls of
 one parent turn across all its batches (enforced by the live loop, WP3b).
 
-Fan-out itself is gated (§12, D5): ``delegation.session_fanout`` enables the
-stateless lane; the pinned lane additionally needs
-``delegation.session_fanout_pinned``. Both default to off. The orchestrator's
-batch-settle capability is the third condition; the agent checks it
-(``agent.tools.delegation.fanout``).
+Whether a session may fan out at all is not configuration: the orchestrator
+advertises its batch-settle capability and its operator switch per claim or
+attach (§12, D5), and ``agent.tools.delegation.fanout`` combines them. No key
+of this block opens fan-out, so a rollback never waits for a session's frozen
+config.
 
 Pure functions over the plain ``delegation`` mapping, so the loader's parser,
 the tool description and the runtime semaphore read one resolution.
@@ -50,12 +51,6 @@ SESSION_MAX_CALLS_PER_TURN_MIN = 1
 # (``shared.session_subagent_batch.BATCH_MAX_MEMBERS``); a turn is never allowed
 # more calls than one settle can report.
 SESSION_MAX_CALLS_PER_TURN_MAX = 64
-
-SESSION_FANOUT_KEY = "session_fanout"
-SESSION_FANOUT_PINNED_KEY = "session_fanout_pinned"
-
-LANE_STATELESS = "stateless"
-LANE_PINNED = "pinned"
 
 
 def _as_int(raw: Any) -> Optional[int]:
@@ -114,30 +109,9 @@ def session_max_calls_per_turn(delegation: Any) -> int:
     return SESSION_MAX_CALLS_PER_TURN_DEFAULT if value is None else value
 
 
-def session_fanout_configured(delegation: Any, lane: Optional[str]) -> bool:
-    """The configuration half of the fan-out gate for a session on ``lane``.
-
-    Stateless needs ``session_fanout``; pinned needs ``session_fanout`` and
-    ``session_fanout_pinned`` (D5: enabled only after R3.3c). Only a literal
-    ``True`` opens either key.
-    """
-    block = _mapping(delegation)
-    if block.get(SESSION_FANOUT_KEY) is not True:
-        return False
-    if lane == LANE_STATELESS:
-        return True
-    if lane == LANE_PINNED:
-        return block.get(SESSION_FANOUT_PINNED_KEY) is True
-    return False
-
-
 __all__ = [
     "FAMILY_SESSION_MAX_CONCURRENT_KEY",
-    "LANE_PINNED",
-    "LANE_STATELESS",
     "MATRIX_SESSION_MAX_CONCURRENT_KEY",
-    "SESSION_FANOUT_KEY",
-    "SESSION_FANOUT_PINNED_KEY",
     "SESSION_MAX_CALLS_PER_TURN_DEFAULT",
     "SESSION_MAX_CALLS_PER_TURN_KEY",
     "SESSION_MAX_CALLS_PER_TURN_MAX",
@@ -148,7 +122,6 @@ __all__ = [
     "SESSION_MAX_CONCURRENT_MIN",
     "clamp_session_max_calls_per_turn",
     "clamp_session_max_concurrent",
-    "session_fanout_configured",
     "session_max_calls_per_turn",
     "session_max_concurrent",
 ]

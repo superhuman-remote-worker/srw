@@ -1582,6 +1582,11 @@
         "manifestContractCutoverEnabled": {
           "type": "boolean"
         },
+        "sessionSubagentFanoutLanes": {
+          "type": "string",
+          "enum": ["", "stateless", "stateless,pinned"],
+          "description": "Session lanes whose parents may fan out delegate_agent calls. Pinned is enabled only together with stateless (parallel_subagents D5)."
+        },
         "workspaceCleanupReconciliationEnabled": {
           "type": "boolean"
         },

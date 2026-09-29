@@ -72,7 +72,7 @@ default:
     # formulas: knowledge-history/done/context_token_accounting.md §4 + appendix.
     image_tokens: { mode: flat, flat: 1600 }
     # Session delegation cap for a PARENT of this family: how many
-    # delegate_agent children a session with fan-out runs at once (1..20).
+    # delegate_agent children a session runs at once (1..20).
     # Routed to delegation.family_session_max_concurrent, not llm; an expert or
     # session delegation.session_max_concurrent beats it. Unset everywhere, so
     # every family uses the code default 6 until the live measurements set

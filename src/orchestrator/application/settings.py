@@ -11,12 +11,44 @@ its own application's settings.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
+
+from shared.run_queue import LANE_PINNED, LANE_STATELESS
+
+logger = logging.getLogger(__name__)
+
+#: The session lanes whose parents may fan out (parallel_subagents.md §12).
+SESSION_SUBAGENT_FANOUT_LANES_ENV = "SESSION_SUBAGENT_FANOUT_LANES"
+_SESSION_SUBAGENT_FANOUT_LANE_NAMES = frozenset({LANE_STATELESS, LANE_PINNED})
 
 
 def _enabled(name: str, default: str = "false") -> bool:
     return os.environ.get(name, default).lower() in ("true", "1", "yes")
+
+
+def parse_session_subagent_fanout_lanes(raw: str | None) -> frozenset[str]:
+    """The lanes named by ``SESSION_SUBAGENT_FANOUT_LANES``.
+
+    A comma-separated subset of ``stateless`` and ``pinned``, case and
+    whitespace insensitive; unset or empty is off. An unknown name is ignored
+    with a warning and never widens the set, so a typo fails closed.
+    """
+    lanes: set[str] = set()
+    for token in (raw or "").split(","):
+        name = token.strip().lower()
+        if not name:
+            continue
+        if name in _SESSION_SUBAGENT_FANOUT_LANE_NAMES:
+            lanes.add(name)
+        else:
+            logger.warning(
+                "%s names unknown lane %r; ignoring it",
+                SESSION_SUBAGENT_FANOUT_LANES_ENV,
+                name,
+            )
+    return frozenset(lanes)
 
 
 @dataclass
@@ -61,6 +93,18 @@ class DeploymentSettings:
     #: this at zero; a positive value makes the accept -> force-delete window
     #: deterministic.
     completion_finalizer_inline_delay_seconds: float
+    #: Session lanes whose parents may run several ``delegate_agent`` calls
+    #: from one response (parallel_subagents.md §12, D5; default none). The
+    #: orchestrator evaluates it for the session's lane at every stateless
+    #: claim and pinned attach and advertises the boolean beside the
+    #: batch-settle capability, so it is never frozen into a session: turning
+    #: a lane off reaches every stateless session at its next claim, while
+    #: batches already in flight are still settled by the recovery path.
+    session_subagent_fanout_lanes: frozenset[str] = frozenset()
+
+    def session_subagent_fanout(self, lane: str | None) -> bool:
+        """Whether a session on ``lane`` may fan out right now."""
+        return lane in self.session_subagent_fanout_lanes
 
     @classmethod
     def from_environment(cls) -> DeploymentSettings:
@@ -88,7 +132,14 @@ class DeploymentSettings:
                 0.0,
                 float(os.environ.get("COMPLETION_FINALIZER_INLINE_DELAY_SECONDS", "0")),
             ),
+            session_subagent_fanout_lanes=parse_session_subagent_fanout_lanes(
+                os.environ.get(SESSION_SUBAGENT_FANOUT_LANES_ENV)
+            ),
         )
 
 
-__all__ = ["DeploymentSettings"]
+__all__ = [
+    "SESSION_SUBAGENT_FANOUT_LANES_ENV",
+    "DeploymentSettings",
+    "parse_session_subagent_fanout_lanes",
+]

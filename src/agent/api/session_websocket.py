@@ -81,6 +81,10 @@ class SessionWelcomePorts:
     durable_control_modes: Callable[[], Awaitable[tuple[str, str]]]
     pending_permissions: Callable[[], Awaitable[list[dict[str, Any]]]]
     running_tool: Callable[[Any], Optional[dict[str, Any]]]
+    #: Every call in flight (a parallel batch, e.g. a subagent fan-out), for
+    #: the Cockpit's ``parseRunningTools``; ``running_tool`` stays for older
+    #: Cockpits. Unset: the list holds ``running_tool`` alone.
+    running_tools: Optional[Callable[[Any], list[dict[str, Any]]]] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +238,11 @@ async def serve_session_websocket(ws: WebSocket, ports: SessionSocketPorts) -> N
     # the approval card unrenderable and the gate unanswerable — the failure
     # in knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md.
     running_tool = ports.welcome.running_tool(validated_session)
+    running_tools = (
+        ports.welcome.running_tools(validated_session)
+        if ports.welcome.running_tools is not None
+        else ([running_tool] if running_tool is not None else [])
+    )
     (
         durable_permission_mode,
         durable_narration_mode,
@@ -264,6 +273,7 @@ async def serve_session_websocket(ws: WebSocket, ports: SessionSocketPorts) -> N
             "model": validated_session.config.llm.model,
             "temperature": validated_session.config.llm.temperature,
             "running_tool": running_tool,
+            "running_tools": running_tools,
             "pending_permissions": pending_permissions,
             "tasks": session_tasks,
         },

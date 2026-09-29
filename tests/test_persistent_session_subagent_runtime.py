@@ -193,6 +193,7 @@ def test_tool_setup_publishes_the_session_lane_before_tools_load(
         seen["kind"] = session.tool_context._subagent_parent_kind
         seen["lane"] = session.tool_context._subagent_execution_lane
         seen["settle"] = session.tool_context._session_subagent_batch_settle_contract
+        seen["fanout"] = session.tool_context._session_subagent_fanout
 
     with (
         patch.object(session, "_load_tools_for_backend", side_effect=_capture),
@@ -200,22 +201,26 @@ def test_tool_setup_publishes_the_session_lane_before_tools_load(
     ):
         session._setup_tools(None)
 
-    assert seen == {"kind": "session", "lane": lane, "settle": False}
+    assert seen == {"kind": "session", "lane": lane, "settle": False, "fanout": False}
 
 
 @pytest.mark.parametrize("advertised", [False, True])
 def test_tool_setup_publishes_the_batch_settle_capability_before_tools_load(
     advertised,
 ):
-    """The third input of the fan-out gate (parallel_subagents.md §12): the
-    attach payload's ``session_subagent_batch_settle_contract``, on the
-    context before any factory builds the delegate_agent description."""
+    """The orchestrator's two fan-out inputs (parallel_subagents.md §12): the
+    attach payload's ``session_subagent_batch_settle_contract`` and its
+    operator switch ``session_subagent_fanout``, on the context before any
+    factory builds the delegate_agent description."""
 
-    session = _make_session(subagent_batch_settle_contract=advertised)
+    session = _make_session(
+        subagent_batch_settle_contract=advertised, subagent_fanout=advertised
+    )
     seen: dict = {}
 
     def _capture() -> None:
         seen["settle"] = session.tool_context._session_subagent_batch_settle_contract
+        seen["fanout"] = session.tool_context._session_subagent_fanout
 
     with (
         patch.object(session, "_load_tools_for_backend", side_effect=_capture),
@@ -223,7 +228,7 @@ def test_tool_setup_publishes_the_batch_settle_capability_before_tools_load(
     ):
         session._setup_tools(None)
 
-    assert seen == {"settle": advertised}
+    assert seen == {"settle": advertised, "fanout": advertised}
     # The tool config carries the parent's parallel-tool-call ability live.
     assert session.tool_context.config["parallel_tool_calls"] is (
         session.config.llm.parallel_tool_calls

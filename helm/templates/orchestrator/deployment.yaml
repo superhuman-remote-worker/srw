@@ -43,6 +43,10 @@ spec:
         # controlled enable/disable therefore deterministically converges every
         # replica before operators rely on the new policy.
         checksum/officer-auto-pull-release: {{ dict "officerAutoPullReleaseEnabled" (.Values.orchestrator.officerAutoPullReleaseEnabled | default false) | toJson | sha256sum | quote }}
+        # The session subagent fan-out switch is read once at startup and is
+        # the rollback lever (parallel_subagents.md §12): clearing it must
+        # replace every replica even when the optional Reloader is disabled.
+        checksum/session-subagent-fanout-lanes: {{ dict "sessionSubagentFanoutLanes" (.Values.orchestrator.sessionSubagentFanoutLanes | default "") | toJson | sha256sum | quote }}
         # Completion/control policy is read once at process startup. Hash the
         # exact ConfigMap inputs so mode and finalizer changes replace every
         # orchestrator replica without relying on the optional Reloader.
@@ -1533,6 +1537,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: OFFICER_AUTO_PULL_RELEASE_ENABLED
+            - name: SESSION_SUBAGENT_FANOUT_LANES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: SESSION_SUBAGENT_FANOUT_LANES
             {{- if eq (include "srw.vmMode" .) "external" }}
             # Agent tailscale sidecar gate (consumed by AgentProvisioner)
             - name: AGENT_TAILSCALE_ENABLED

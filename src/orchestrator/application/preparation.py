@@ -604,4 +604,7 @@ def thread_workspace_delivery_dependencies(
         vm_workspaces_on_pod_network=access.vm_workspaces_on_pod_network,
         require_internal=access.require_internal,
         capture_session_config=functools.partial(capture_session_delivery, resources),
+        session_subagent_fanout=lambda lane: (
+            resources.settings.session_subagent_fanout(lane)
+        ),
     )

@@ -91,9 +91,11 @@ from orchestrator.services.session_runtime_identity import (
     expected_agent_shas,
     thread_uses_pinned_execution,
 )
+from shared.run_queue import LANE_PINNED
 from shared.session_subagent_batch import (
     SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT,
     SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
+    SESSION_SUBAGENT_FANOUT_KEY,
 )
 
 logger = logging.getLogger(__name__)
@@ -144,6 +146,9 @@ class SessionAttachBindingDependencies:
     * ``reserve_session_attach_binding`` / ``release_session_attach_binding``
       / ``send_session_attach_locked`` — this module's own functions, reached
       through main's bridges so a patch there steers the sequencer.
+    * ``session_subagent_fanout`` — ``(lane) -> bool``, the operator's session
+      fan-out switch (``DeploymentSettings.session_subagent_fanout``), read at
+      every attach; off when a composition does not wire it.
     """
 
     store: Any
@@ -163,6 +168,7 @@ class SessionAttachBindingDependencies:
         ..., Awaitable[SessionAttachReleaseOutcome]
     ]
     send_session_attach_locked: Callable[..., Awaitable[bool]]
+    session_subagent_fanout: Callable[[str], bool] = lambda _lane: False
 
 
 async def bind_registered_persistent_agent(
@@ -911,6 +917,11 @@ async def send_session_attach_locked(
     # ``_attach_session`` (the claim bundle advertises it beside ``attach``).
     payload[SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY] = (
         SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT
+    )
+    # The operator's fan-out switch for the pinned lane (§12, D5), read at
+    # this attach; handlers that predate it ignore the named field.
+    payload[SESSION_SUBAGENT_FANOUT_KEY] = bool(
+        dependencies.session_subagent_fanout(LANE_PINNED)
     )
 
     current = await store.get_thread(thread_id)

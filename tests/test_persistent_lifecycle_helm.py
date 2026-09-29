@@ -30,6 +30,89 @@ def test_automatic_persistent_reconciliation_defaults_false() -> None:
     assert values["agent"]["requirePinnedStatusIdentity"] == "true"
 
 
+def test_session_subagent_fanout_lanes_reach_the_orchestrator_and_roll_it() -> None:
+    """parallel_subagents.md §12: the lane switch is the rollback lever. It
+    reaches the orchestrator from the ConfigMap, and a change replaces the
+    orchestrator even without Reloader, because it is read once at startup."""
+    if shutil.which("helm") is None:
+        pytest.skip("helm is not installed")
+    values = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
+    assert values["orchestrator"]["sessionSubagentFanoutLanes"] == ""
+
+    def _render(*extra: str):
+        output = subprocess.run(
+            [
+                "helm",
+                "template",
+                "fanout-lanes-proof",
+                str(CHART),
+                "-f",
+                str(CHART / "ci" / "test-values.yaml"),
+                *extra,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        documents = [doc for doc in yaml.safe_load_all(output) if doc]
+        configmap = next(
+            doc
+            for doc in documents
+            if doc.get("kind") == "ConfigMap"
+            and "SESSION_SUBAGENT_FANOUT_LANES" in (doc.get("data") or {})
+        )
+        deployment = next(
+            doc
+            for doc in documents
+            if doc.get("kind") == "Deployment"
+            and any(
+                container.get("name") == "orchestrator"
+                for container in doc["spec"]["template"]["spec"]["containers"]
+            )
+        )
+        orchestrator = next(
+            container
+            for container in deployment["spec"]["template"]["spec"]["containers"]
+            if container.get("name") == "orchestrator"
+        )
+        env = {entry["name"]: entry for entry in orchestrator.get("env") or []}
+        return (
+            configmap["data"]["SESSION_SUBAGENT_FANOUT_LANES"],
+            env["SESSION_SUBAGENT_FANOUT_LANES"]["valueFrom"]["configMapKeyRef"],
+            deployment["spec"]["template"]["metadata"]["annotations"],
+        )
+
+    off, ref, off_annotations = _render()
+    assert off == ""
+    assert ref["key"] == "SESSION_SUBAGENT_FANOUT_LANES"
+    on, _, on_annotations = _render(
+        "--set", "orchestrator.sessionSubagentFanoutLanes=stateless"
+    )
+    assert on == "stateless"
+    checksum_key = "checksum/session-subagent-fanout-lanes"
+    assert off_annotations[checksum_key] != on_annotations[checksum_key]
+    _, _, without_reloader = _render("--set", "reloader.enabled=false")
+    assert without_reloader[checksum_key] == off_annotations[checksum_key]
+
+    # D5: pinned opens only together with stateless.
+    refused = subprocess.run(
+        [
+            "helm",
+            "template",
+            "fanout-lanes-proof",
+            str(CHART),
+            "-f",
+            str(CHART / "ci" / "test-values.yaml"),
+            "--set",
+            "orchestrator.sessionSubagentFanoutLanes=pinned",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert refused.returncode != 0
+    assert "sessionSubagentFanoutLanes" in refused.stderr
+
+
 def _render_orchestrator(*extra_args: str) -> dict:
     if shutil.which("helm") is None:
         pytest.skip("helm is not installed")

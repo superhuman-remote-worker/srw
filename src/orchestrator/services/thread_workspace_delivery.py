@@ -80,6 +80,7 @@ from shared.backend_kinds import LITE_BACKENDS
 from shared.session_subagent_batch import (
     SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT,
     SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
+    SESSION_SUBAGENT_FANOUT_KEY,
 )
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,10 @@ class ThreadWorkspaceDeliveryDependencies:
     require_internal: Any = _require_internal
     capture_session_config: Any = None
     vm_provisioner: Any = None
+    # ``(lane) -> bool``: the operator's session fan-out switch
+    # (``DeploymentSettings.session_subagent_fanout``), read per payload. Off
+    # when a composition does not wire it.
+    session_subagent_fanout: Any = lambda _lane: False
 
 
 def agent_canvas_workspace_capabilities(
@@ -1287,10 +1292,18 @@ async def agent_get_thread_workspace_locked(
         "status": ws.get("status", "none"),
         "pinned_status_identity_contract": 1,
         "pinned_runtime_generation_contract": 1,
-        # Same advertisement as the pushed attach payload
-        # (session_attach_payload): batch settle of a delegation turn.
+        # Same advertisements as the pushed pinned attach body
+        # (session_attach_binding): batch settle of a delegation turn, and
+        # the operator's fan-out switch for this thread's lane. A pinned pod
+        # that attaches itself reads both here (the VM wait payloads carry
+        # neither; this ready payload does).
         SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: (
             SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT
+        ),
+        SESSION_SUBAGENT_FANOUT_KEY: bool(
+            dependencies.session_subagent_fanout(
+                str(final_thread.get("execution_lane") or "")
+            )
         ),
         "session_runtime_generation": (
             final_runtime_authority.generation

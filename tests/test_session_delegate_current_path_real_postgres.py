@@ -239,6 +239,9 @@ async def _children(parent):
 
 def _runtime(parent, tmp_path, *, cap):
     ctx, _ = make_parent(tmp_path, max_concurrent=cap)
+    # A session parent's own cap; the worker cap above stays for the gate-off
+    # path of older code. Both name the same number here.
+    ctx.config["delegation"]["session_max_concurrent"] = cap
     ctx._subagent_parent_kind = "session"
     ctx._thread_id = parent.thread_id
     ctx._job_id = parent.thread_id

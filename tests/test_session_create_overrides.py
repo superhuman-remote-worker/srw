@@ -212,7 +212,10 @@ class TestDelegationOverride:
             validate_delegation_override({"session_max_concurrent": cap})
 
     @pytest.mark.parametrize("gate", ["session_fanout", "session_fanout_pinned"])
-    def test_the_fanout_gates_stay_operator_configuration(self, gate):
+    def test_no_session_key_opens_fanout(self, gate):
+        """Fan-out is the orchestrator's deployment setting, advertised per
+        claim (parallel_subagents.md §12, WP3c); the WP3a config gate names
+        are plain unknown keys."""
         from orchestrator.services.session_create_overrides import (
             validate_delegation_override,
         )

@@ -4,19 +4,26 @@ One place answers "may this session parent fan out" and "how many children
 run at once", so the ``delegate_agent`` description and the runtime semaphore
 read the same values. Every function reads the parent's context LIVE: a
 session's ``tool_context.config`` is refreshed in place by a live config
-update, and the runtime's limiter re-reads the cap at every admission.
+update, the executor re-applies the orchestrator's advertisement at every
+stateless claim, and the runtime's limiter re-reads the cap at every
+admission.
 
 A session parent may fan out only when all three hold:
 
-1. the configuration gate is on for its lane (``delegation.session_fanout``;
-   the pinned lane also needs ``delegation.session_fanout_pinned``, D5);
-2. the orchestrator advertised ``session_subagent_batch_settle_contract: 1``
-   in the attach payload (published on the context as
-   ``_session_subagent_batch_settle_contract`` before tools load), so an
-   interrupted batch can be settled once;
-3. the parent is a session (``_subagent_parent_kind``) on a known lane
-   (``_subagent_execution_lane``).
+1. the orchestrator advertised ``session_subagent_batch_settle_contract: 1``
+   (published on the context as ``_session_subagent_batch_settle_contract``,
+   already reduced to ``True`` for exactly the int 1), so an interrupted
+   batch can be settled once;
+2. the orchestrator's operator switch for the session's lane is on
+   (``session_subagent_fanout: true``, published as
+   ``_session_subagent_fanout``). The orchestrator evaluates the lane; it is
+   a deployment setting, never part of the session's frozen config, so
+   turning it off reaches the next claim of every stateless session;
+3. the parent is a session (``_subagent_parent_kind``).
 
+Every session parent runs its children under the session cap
+(``delegation.session_max_concurrent``), fan-out or not: one call per
+response still leaves background children and queued calls under it.
 Workers are unaffected: their cap stays ``delegation.max_concurrent``.
 
 Light on purpose (shared imports only): the tool module and
@@ -28,7 +35,6 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from shared.runtime.core.delegation_settings import (
-    session_fanout_configured,
     session_max_calls_per_turn,
     session_max_concurrent,
 )
@@ -50,29 +56,28 @@ def is_session_parent(context: Any) -> bool:
 def session_fanout_allowed(context: Any) -> bool:
     """True when this session parent may run several delegate calls per response.
 
-    Gate on for its lane AND the orchestrator can settle a batch AND the
-    parent is a session. False for every worker.
+    The orchestrator can settle a batch AND its operator switch is on for
+    this session's lane AND the parent is a session. Only a literal ``True``
+    counts for either flag. False for every worker.
     """
     if not is_session_parent(context):
         return False
     if getattr(context, "_session_subagent_batch_settle_contract", False) is not True:
         return False
-    return session_fanout_configured(
-        _delegation(context), getattr(context, "_subagent_execution_lane", None)
-    )
+    return getattr(context, "_session_subagent_fanout", False) is True
 
 
 def delegation_max_concurrent(context: Any) -> int:
     """How many children this parent runs at once — the description's cap and
     the semaphore's size.
 
-    A session allowed to fan out uses its own cap (explicit value, else the
-    parent family's, else 6; 1..20). Every other parent keeps the worker cap
-    ``delegation.max_concurrent`` (default 4, floor 1), so a session with the
-    gate off behaves exactly as before.
+    Every session parent uses its own cap (explicit value, else the parent
+    family's, else 6; 1..20), whether or not it may fan out. Every other
+    parent keeps the worker cap ``delegation.max_concurrent`` (default 4,
+    floor 1).
     """
     delegation = _delegation(context)
-    if session_fanout_allowed(context):
+    if is_session_parent(context):
         return session_max_concurrent(delegation)
     raw = delegation.get("max_concurrent")
     try:

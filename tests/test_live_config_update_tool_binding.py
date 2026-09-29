@@ -304,7 +304,7 @@ class TestLiveConfigUpdateBoundSet:
         config = _config(
             override={
                 "tools": {"delegation": ["delegate_agent"]},
-                "delegation": {"enabled": True, "session_fanout": True},
+                "delegation": {"enabled": True},
             }
         )
         assert config.llm.parallel_tool_calls is False  # boot family
@@ -313,6 +313,7 @@ class TestLiveConfigUpdateBoundSet:
             config=config,
             shell_owner_token=7,  # stateless lane
             subagent_batch_settle_contract=True,
+            subagent_fanout=True,
         )
         session.workspace_manager = _Workspace()
         session.shell_manager = MagicMock()
@@ -343,3 +344,140 @@ class TestLiveConfigUpdateBoundSet:
         assert "Up to 6 subagents run at once" in text
         # Nothing left to rebuild once the description matches.
         assert session.refresh_delegation_description() is False
+
+
+class TestClaimAdvertisementReachesAWarmSession:
+    """parallel_subagents.md §12 (WP3c): the orchestrator's fan-out switch is
+    re-applied to a warm stateless session at every claim, in place. The
+    ``delegate_agent`` description follows it without a fresh attach."""
+
+    def _session(self):
+        config = _config(
+            override={
+                "tools": {"delegation": ["delegate_agent"]},
+                "delegation": {"enabled": True, "session_max_concurrent": 5},
+            }
+        )
+        # A family that can send parallel calls, so the fan-out text states
+        # the cap (the boot family of session_base cannot).
+        config.llm = dataclasses.replace(config.llm, parallel_tool_calls=True)
+        session = PersistentSession(
+            thread_id=str(uuid.uuid4()),
+            config=config,
+            shell_owner_token=7,  # stateless lane
+            subagent_batch_settle_contract=True,
+        )
+        session.workspace_manager = _Workspace()
+        session.shell_manager = MagicMock()
+        session._llm = MagicMock()
+        return session
+
+    def test_a_flip_on_then_off_rebuilds_only_the_description(self):
+        session = self._session()
+        with (
+            _binding_patches(),
+            patch.object(session, "_install_session_subagent_runtime"),
+        ):
+            session._setup_tools(None)
+            context = session.tool_context
+
+            def described():
+                (tool,) = [t for t in session.tools if t.name == "delegate_agent"]
+                return tool.description
+
+            single = "issue exactly ONE delegate_agent call per response"
+            fanout = "send one delegate_agent call per brief in a single response"
+            assert single in described()
+            assert context._session_subagent_fanout is False
+
+            with patch.object(
+                session,
+                "resetup_tools_for_backend",
+                wraps=session.resetup_tools_for_backend,
+            ) as rebuild:
+                # Switch on at the next claim.
+                assert (
+                    session.apply_subagent_fanout_advertisement(
+                        batch_settle_contract=True, fanout=True
+                    )
+                    is True
+                )
+                assert rebuild.call_count == 1
+                assert session.tool_context is context  # same session, in place
+                assert context._session_subagent_fanout is True
+                assert fanout in described()
+                assert "Up to 5 subagents run at once" in described()
+
+                # The same advertisement again: nothing to rebuild.
+                assert (
+                    session.apply_subagent_fanout_advertisement(
+                        batch_settle_contract=True, fanout=True
+                    )
+                    is False
+                )
+                assert rebuild.call_count == 1
+
+                # Rollback: the operator turned the lane off.
+                assert (
+                    session.apply_subagent_fanout_advertisement(
+                        batch_settle_contract=True, fanout=False
+                    )
+                    is True
+                )
+                assert rebuild.call_count == 2
+                assert context._session_subagent_fanout is False
+                assert single in described() and fanout not in described()
+
+                # An orchestrator that stops advertising the settle: off too.
+                session.apply_subagent_fanout_advertisement(
+                    batch_settle_contract=True, fanout=True
+                )
+                session.apply_subagent_fanout_advertisement(
+                    batch_settle_contract=False, fanout=True
+                )
+                assert context._session_subagent_batch_settle_contract is False
+                assert single in described()
+
+    def test_before_tools_exist_the_flags_wait_for_the_first_build(self):
+        session = self._session()
+        assert (
+            session.apply_subagent_fanout_advertisement(
+                batch_settle_contract=True, fanout=True
+            )
+            is True
+        )
+        assert session.subagent_fanout is True
+        with (
+            _binding_patches(),
+            patch.object(session, "_install_session_subagent_runtime"),
+        ):
+            session._setup_tools(None)
+        assert session.tool_context._session_subagent_fanout is True
+        (tool,) = [t for t in session.tools if t.name == "delegate_agent"]
+        assert "send one delegate_agent call per brief" in tool.description
+
+    @pytest.mark.parametrize("value", [1, "true", None])
+    def test_only_a_literal_true_is_applied(self, value):
+        session = self._session()
+        session.apply_subagent_fanout_advertisement(
+            batch_settle_contract=value, fanout=value
+        )
+        assert session.subagent_batch_settle_contract is False
+        assert session.subagent_fanout is False
+
+    def test_a_failed_rebuild_never_fails_the_claim(self):
+        """The flags govern the gate and the runtime; a description rebuild
+        that raises is logged, and the claim goes on."""
+        session = self._session()
+        session.tool_context = SimpleNamespace()
+        with patch.object(
+            session, "refresh_delegation_description", side_effect=RuntimeError("x")
+        ):
+            assert (
+                session.apply_subagent_fanout_advertisement(
+                    batch_settle_contract=True, fanout=True
+                )
+                is True
+            )
+        assert session.tool_context._session_subagent_fanout is True
+        assert session.tool_context._session_subagent_batch_settle_contract is True

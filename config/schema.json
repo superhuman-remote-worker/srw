@@ -2272,21 +2272,11 @@
           "default": false,
           "description": "Roster runtime: the `run_in_background` value used only when a `delegate_agent` call omits the argument. false = wait for the report as this tool result; true = return a durable receipt and push the child's completion automatically. An explicit false always wins."
         },
-        "session_fanout": {
-          "type": "boolean",
-          "default": false,
-          "description": "Session fan-out gate (parallel_subagents.md §12): a stateless session parent may run several `delegate_agent` calls from one response, when the orchestrator also advertises the batch settle. Off = one call per response."
-        },
-        "session_fanout_pinned": {
-          "type": "boolean",
-          "default": false,
-          "description": "Opens fan-out for the pinned session lane too (requires `session_fanout`)."
-        },
         "session_max_concurrent": {
           "type": "integer",
           "minimum": 1,
           "maximum": 20,
-          "description": "A session parent's own cap on concurrently running children when it may fan out; calls above it queue and run in waves. Unset = the parent model family's `session_max_concurrent` from config/model_config_matrix.yaml, else 6. Out-of-range values are clamped by the loader. `max_concurrent` stays the worker cap."
+          "description": "A session parent's own cap on concurrently running children (a fan-out batch, queued calls and background children alike); calls above it queue and run in waves. Unset = the parent model family's `session_max_concurrent` from config/model_config_matrix.yaml, else 6. Out-of-range values are clamped by the loader. `max_concurrent` stays the worker cap. Whether a session may fan out at all is the orchestrator's deployment setting (`orchestrator.sessionSubagentFanoutLanes`), not configuration."
         },
         "family_session_max_concurrent": {
           "type": "integer",

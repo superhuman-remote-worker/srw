@@ -68,6 +68,7 @@ from shared.session_retirement import STATELESS_STOP_KEYS, stateless_stop_marker
 from shared.session_subagent_batch import (
     SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT,
     SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
+    SESSION_SUBAGENT_FANOUT_KEY,
 )
 from shared.workspace_contract import (
     WorkspaceContractError,
@@ -110,6 +111,10 @@ class UnitClaimBundleDependencies:
     #: Injected so routes/services stay testable without a cluster. ``None``
     #: is unknown authority (503), never success.
     attest_stateless_claimant: Callable[[str, str], Awaitable[None]] | None = None
+    #: The operator's session fan-out switch for a lane
+    #: (``DeploymentSettings.session_subagent_fanout``), read at every claim.
+    #: The default keeps fan-out off for a composition that does not wire it.
+    session_subagent_fanout: Callable[[str], bool] = lambda _lane: False
 
 
 class _WorkspaceRecoveryRefusal(HTTPException):
@@ -1072,6 +1077,12 @@ async def _assemble_claim_bundle(
         # turn as one batch (parallel_subagents.md §12).
         SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: (
             SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT
+        ),
+        # The operator's fan-out switch for this lane, read now: the agent
+        # applies it to a warm session at every claim, so turning the setting
+        # off reaches the next claim of every stateless session (§12).
+        SESSION_SUBAGENT_FANOUT_KEY: bool(
+            dependencies.session_subagent_fanout(LANE_STATELESS)
         ),
         "attach": attach,
     }

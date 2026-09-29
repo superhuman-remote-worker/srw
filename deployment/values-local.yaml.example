@@ -271,6 +271,9 @@ orchestrator:
   # leader-election noise. This now MATCHES the chart default (1) — kept
   # explicit so a future default change cannot silently double the footprint.
   replicas: 1
+  # Session subagent fan-out (several delegate_agent calls per response):
+  # "" (off, the chart default), "stateless" or "stateless,pinned".
+  # sessionSubagentFanoutLanes: "stateless"
   resources:
     requests:
       memory: "256Mi"

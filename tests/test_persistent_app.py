@@ -152,6 +152,155 @@ class TestGetAgentMetrics:
 # ---------------------------------------------------------------------------
 
 
+def _batch_messages(*answered: str) -> list:
+    """A delegation batch of three calls; ``answered`` already have results."""
+    messages = [
+        HumanMessage(content="research three things"),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"id": f"d{i}", "name": "delegate_agent", "args": {"brief": b}}
+                for i, b in enumerate(("a", "b", "c"), start=1)
+            ],
+        ),
+    ]
+    messages += [
+        ToolMessage(content="report", tool_call_id=call_id) for call_id in answered
+    ]
+    return messages
+
+
+class TestParallelToolCallsInFlight:
+    """parallel_subagents.md F17: a session delegation batch runs several calls
+    at once. The in-flight latch tracks every call, and the welcome frame
+    reports every running one as ``running_tools`` (the Cockpit's
+    ``parseRunningTools`` shape: ``{id, tool, args}``), keeping
+    ``running_tool`` for older Cockpits."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated(self, monkeypatch):
+        import agent.api.persistent_app as pa
+
+        monkeypatch.setattr(pa, "_tool_inflight", False)
+        monkeypatch.setattr(pa, "_tool_inflight_calls", set())
+        monkeypatch.setattr(
+            pa, "_loop_runtime_effect_authority_current", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr(pa, "_broadcast", MagicMock())
+        return pa
+
+    def test_inflight_tool_calls_lists_every_unanswered_call(self):
+        from agent.core.archiver import inflight_tool_call, inflight_tool_calls
+
+        assert [c["id"] for c in inflight_tool_calls(_batch_messages())] == [
+            "d1",
+            "d2",
+            "d3",
+        ]
+        assert [c["id"] for c in inflight_tool_calls(_batch_messages("d2"))] == [
+            "d1",
+            "d3",
+        ]
+        assert inflight_tool_calls(_batch_messages("d1", "d2", "d3")) == []
+        assert inflight_tool_call(_batch_messages("d1"))["id"] == "d2"
+
+    @pytest.mark.asyncio
+    async def test_the_first_result_does_not_clear_a_running_sibling(self, _isolated):
+        pa = _isolated
+        for call_id in ("d1", "d2"):
+            await pa._loop_on_tool_execution_start("delegate_agent", call_id)
+        assert pa._tool_inflight is True
+        assert pa._tool_inflight_calls == {"d1", "d2"}
+
+        await pa._loop_on_tool_result("delegate_agent", "report", "d1")
+        assert pa._tool_inflight is True  # d2 still runs
+        await pa._loop_on_tool_result("delegate_agent", "report", "d2")
+        assert pa._tool_inflight is False
+        assert pa._tool_inflight_calls == set()
+
+    @pytest.mark.asyncio
+    async def test_a_cleared_latch_drops_stale_ids(self, _isolated):
+        """The flag stays the authority: ids beside a false flag (a reset that
+        cleared only the flag) never keep it latched."""
+        pa = _isolated
+        pa._tool_inflight_calls.add("stale")
+        await pa._loop_on_tool_execution_start("run_command", "c1")
+        assert pa._tool_inflight_calls == {"c1"}
+        await pa._loop_on_tool_result("run_command", "ok", "c1")
+        assert pa._tool_inflight is False
+
+        pa._tool_inflight_calls.add("stale")
+        await pa._loop_on_tool_result("run_command", "ok", "other")
+        assert pa._tool_inflight is False and pa._tool_inflight_calls == set()
+
+    @pytest.mark.asyncio
+    async def test_a_new_turn_drops_a_call_whose_result_never_ran(
+        self, _isolated, monkeypatch
+    ):
+        """A call that raised past its result callback (WorkspaceUnavailableError)
+        leaves its id behind. The next turn's calls must still release the
+        latch, or Stop, drain and preStop see a tool in flight forever."""
+        pa = _isolated
+        monkeypatch.setattr(
+            pa, "_session", SimpleNamespace(turn_count=0, workspace_sync=None)
+        )
+        monkeypatch.setattr(pa, "_thread_id", None)
+        monkeypatch.setattr(pa, "_turn_event_open", False)
+        monkeypatch.setattr(pa, "_turn_tool_execution_identity", None)
+        monkeypatch.setattr(pa, "_turn_start_external_hook", None)
+        monkeypatch.setattr(pa, "_cloud_sync_retry_pending", False)
+        await pa._loop_on_tool_execution_start("run_command", "c1")  # never answered
+
+        await pa._loop_on_turn_start(2)
+        assert pa._tool_inflight is False and pa._tool_inflight_calls == set()
+        await pa._loop_on_tool_execution_start("run_command", "c2")
+        await pa._loop_on_tool_result("run_command", "ok", "c2")
+        assert pa._tool_inflight is False
+
+    @pytest.mark.asyncio
+    async def test_welcome_reports_every_running_call_of_a_batch(self, _isolated):
+        pa = _isolated
+        session = SimpleNamespace(messages=_batch_messages())
+        for call_id in ("d1", "d2", "d3"):
+            await pa._loop_on_tool_execution_start("delegate_agent", call_id)
+
+        assert pa._welcome_running_tools(session) == [
+            {"id": "d1", "tool": "delegate_agent", "args": {"brief": "a"}},
+            {"id": "d2", "tool": "delegate_agent", "args": {"brief": "b"}},
+            {"id": "d3", "tool": "delegate_agent", "args": {"brief": "c"}},
+        ]
+        assert pa._welcome_running_tool(session) == {
+            "id": "d1",
+            "tool": "delegate_agent",
+            "args": {"brief": "a"},
+        }
+
+        # d1 finished: its result is in the transcript and its latch released.
+        session.messages = _batch_messages("d1")
+        await pa._loop_on_tool_result("delegate_agent", "report", "d1")
+        assert [c["id"] for c in pa._welcome_running_tools(session)] == ["d2", "d3"]
+        assert pa._welcome_running_tool(session)["id"] == "d2"
+
+    @pytest.mark.asyncio
+    async def test_a_sequential_batch_reports_only_the_running_call(self, _isolated):
+        """Sequential execution leaves later calls unanswered but not started;
+        they are not running."""
+        pa = _isolated
+        session = SimpleNamespace(messages=_batch_messages())
+        await pa._loop_on_tool_execution_start("delegate_agent", "d1")
+        assert [c["id"] for c in pa._welcome_running_tools(session)] == ["d1"]
+
+    def test_idle_and_legacy_latch(self, _isolated):
+        pa = _isolated
+        session = SimpleNamespace(messages=_batch_messages())
+        assert pa._welcome_running_tools(session) == []
+        assert pa._welcome_running_tool(session) is None
+        # A latch without ids (set directly, as older paths did): the first
+        # unanswered call is the running one, exactly as before the list.
+        pa._tool_inflight = True
+        assert [c["id"] for c in pa._welcome_running_tools(session)] == ["d1"]
+
+
 class TestInflightToolCall:
     """inflight_tool_call() identifies the command a (re)attaching client should
     surface as 'running' from the agent's in-memory messages (which aren't yet

@@ -278,6 +278,14 @@ orchestrator:
   # unattended-operation deployment gates are complete; false always permits
   # disabling an already configured century and suppresses new tick admission.
   officerAutoPullReleaseEnabled: false
+  # -- Session lanes whose parents may run several delegate_agent calls from
+  # one response (subagent fan-out): "" (off), "stateless" or
+  # "stateless,pinned". Advertised per claim/attach, never frozen into a
+  # session: clearing it gives every stateless session single-call delegation
+  # again at its next claim (a pinned session at its next attach), while a
+  # batch already in flight is still settled by recovery. Needs agent images
+  # that understand the batch settle; enable pinned only after R3.3c.
+  sessionSubagentFanoutLanes: ""
   # -- Additional exact Git host or host:port endpoints trusted for external
   # OKF KB datasources. The built-in public-provider set remains enabled.
   # Wildcards, IP literals, and localhost are rejected. Example:

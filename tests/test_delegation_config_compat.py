@@ -106,15 +106,14 @@ def test_one_deprecation_warning_per_source_and_layer(caplog):
     assert "max_concurrent" in warnings[0].message  # names the surviving shape
 
 
-def test_delegation_config_is_the_three_keys_plus_session_fanout():
+def test_delegation_config_is_the_three_keys_plus_the_session_cap():
     assert {f.name for f in DelegationConfig.__dataclass_fields__.values()} == {
         "enabled",
         "max_concurrent",
         "run_in_background_default",
-        # parallel_subagents.md §6.4: the session fan-out gate, cap and
-        # per-turn maximum (shared.runtime.core.delegation_settings).
-        "session_fanout",
-        "session_fanout_pinned",
+        # parallel_subagents.md §6.4: the session cap and per-turn maximum
+        # (shared.runtime.core.delegation_settings). No key gates fan-out: that
+        # is the orchestrator's per-claim advertisement (§12, WP3c).
         "session_max_concurrent",
         "family_session_max_concurrent",
         "session_max_calls_per_turn",
@@ -446,11 +445,9 @@ def test_resolve_config_resolves_a_stored_critic_fragment_canonically():
     agent = blob["agent"]
     assert agent["tools"]["delegation"] == ["delegate_agent"]
     # The frozen blob is the typed config: the authored keys, plus the session
-    # fan-out keys at their defaults (no model family sets a cap yet).
+    # cap keys at their defaults (no model family sets a cap yet).
     assert agent["delegation"] == {
         **merged["delegation"],
-        "session_fanout": False,
-        "session_fanout_pinned": False,
         "session_max_concurrent": None,
         "family_session_max_concurrent": None,
         "session_max_calls_per_turn": 20,

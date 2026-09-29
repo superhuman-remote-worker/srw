@@ -16,7 +16,7 @@ import contextlib
 import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from uuid import uuid4
 
@@ -291,11 +291,20 @@ class FakeSession:
         self.stateless_warm_reuse_safe = stateless_warm_reuse_safe
         self.turn_count = 0
         self.tool_context = SimpleNamespace(_stateless_subagent_recovery_active=False)
+        # (batch_settle_contract, fanout) as each claim applied them.
+        self.advertisements: List[Tuple[bool, bool]] = []
 
     def set_shell_owner_token(self, token: int) -> None:
         self.shell_owner_tokens.append(token)
         if self._shell_owner_tokens is not None:
             self._shell_owner_tokens.append(token)
+
+    def apply_subagent_fanout_advertisement(
+        self, *, batch_settle_contract: bool, fanout: bool
+    ) -> bool:
+        before = self.advertisements[-1] if self.advertisements else (False, False)
+        self.advertisements.append((batch_settle_contract, fanout))
+        return before != (batch_settle_contract, fanout)
 
 
 class Harness:
@@ -1073,22 +1082,96 @@ class TestHappyPath:
 
     def test_claim_bundle_attach_folds_the_capability_in(self):
         key = "session_subagent_batch_settle_contract"
+        switch = "session_subagent_fanout"
         base = {"thread_id": "t", "config_name": "session_base"}
         plain = te.claim_bundle_attach({"attach": base})
         assert plain == base and plain is not base
-        beside = te.claim_bundle_attach({"attach": base, key: 1})
-        assert beside == {**base, key: 1}
+        beside = te.claim_bundle_attach({"attach": base, key: 1, switch: True})
+        assert beside == {**base, key: 1, switch: True}
+        assert te.claim_bundle_advertisement(beside) == (1, True)
+        assert te.claim_bundle_advertisement(plain) == (None, None)
         # The top-level advertisement wins over a nested one.
         both = te.claim_bundle_attach({"attach": {**base, key: 0}, key: 1})
         assert both == {**base, key: 1}
-        # A changed advertisement changes the fingerprint: no warm reuse of a
-        # session built with the old flag.
-        assert te.attach_fingerprint(plain) != te.attach_fingerprint(beside)
+        # WP3c: neither value is part of the fingerprint. A warm session gets
+        # them in place at every claim, so a flip of the operator's switch
+        # never sends every warm session through a fresh attach.
+        assert te.attach_fingerprint(plain) == te.attach_fingerprint(beside)
+        off = te.claim_bundle_attach({"attach": base, key: 1, switch: False})
+        assert te.attach_fingerprint(off) == te.attach_fingerprint(beside)
         assert te.claim_bundle_attach({}) == {}
-        # The real attach accepts the keyword (it has no ``**kwargs``).
+        # The real attach accepts both keywords (it has no ``**kwargs``).
         import inspect
 
-        assert key in inspect.signature(pa._attach_session).parameters
+        parameters = inspect.signature(pa._attach_session).parameters
+        assert key in parameters and switch in parameters
+
+    @pytest.mark.asyncio
+    async def test_a_warm_session_follows_the_fanout_switch_without_reattach(
+        self, harness
+    ):
+        """parallel_subagents.md §12 (WP3c): rollback is "flip the setting".
+        The orchestrator's switch reaches a warm session at its next claim,
+        in place: one attach for three claims, the advertisement applied at
+        each (the session rebuilds its delegate_agent description when a
+        value changed), before any input is injected."""
+
+        unit = uuid4()
+        fetch = pa._orchestrator_client.get_claim_bundle
+        switches = iter([True, False, None])
+
+        async def bundle(unit_id, lease_token):
+            data = await fetch(unit_id, lease_token)
+            data["session_subagent_batch_settle_contract"] = 1
+            switch = next(switches)
+            if switch is not None:  # an orchestrator that no longer sends it
+                data["session_subagent_fanout"] = switch
+            return data
+
+        pa._orchestrator_client.get_claim_bundle = bundle
+        for token, seq in ((1, 1), (2, 2), (3, 3)):
+            harness.db.pending_rows = [
+                {"id": str(uuid4()), "seq": seq, "content": f"turn {seq}"}
+            ]
+            await harness.executor._serve_claim(
+                make_claim(unit_id=unit, token=token, input_seq=seq)
+            )
+        await _finish(harness)
+
+        (attached,) = harness.calls["attach"]
+        assert attached["session_subagent_fanout"] is True
+        assert not harness.calls["terminate"]
+        (session,) = harness.sessions
+        assert session.advertisements == [(True, True), (True, False), (True, False)]
+        assert len(harness.calls["complete"]) == 3
+
+    @pytest.mark.asyncio
+    async def test_the_advertisement_is_applied_before_input_is_injected(
+        self, harness, monkeypatch
+    ):
+        order: List[str] = []
+        real_apply = pa._apply_session_subagent_advertisement
+
+        def apply(*args):
+            order.append("advertisement")
+            return real_apply(*args)
+
+        monkeypatch.setattr(pa, "_apply_session_subagent_advertisement", apply)
+        real_reconcile = pa._reconcile_stale_thread_interrupts
+
+        async def reconcile(**kwargs):
+            order.append("interrupt_recovery")
+            return await real_reconcile(**kwargs)
+
+        monkeypatch.setattr(pa, "_reconcile_stale_thread_interrupts", reconcile)
+        harness.db.pending_rows = [{"id": str(uuid4()), "seq": 1, "content": "hi"}]
+        await harness.executor._serve_claim(
+            make_claim(unit_id=uuid4(), token=1, input_seq=1)
+        )
+        await _finish(harness)
+
+        assert order[:2] == ["advertisement", "interrupt_recovery"]
+        assert len(harness.consumed) == 1
 
     @pytest.mark.asyncio
     async def test_recovered_interrupted_input_is_never_injected(self, harness):

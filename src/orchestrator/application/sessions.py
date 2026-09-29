@@ -139,6 +139,9 @@ def session_attach_binding_dependencies(
             session_attach_binding_dependencies,
             resources,
         ),
+        session_subagent_fanout=lambda lane: (
+            resources.settings.session_subagent_fanout(lane)
+        ),
     )
 
 
@@ -710,6 +713,9 @@ def unit_claim_bundle_dependencies(
             resources.postgres_db
         ),
         attest_stateless_claimant=stateless_claimant_attestation.build_claimant_attestor(),
+        session_subagent_fanout=lambda lane: (
+            resources.settings.session_subagent_fanout(lane)
+        ),
     )
 
 

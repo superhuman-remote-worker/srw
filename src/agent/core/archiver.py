@@ -175,19 +175,20 @@ def _message_to_dict(msg: BaseMessage) -> Dict[str, Any]:
     return result
 
 
-def inflight_tool_call(messages: Sequence[BaseMessage]) -> Optional[Dict[str, Any]]:
-    """Return the assistant tool call that is currently executing, or None.
+def inflight_tool_calls(messages: Sequence[BaseMessage]) -> List[Dict[str, Any]]:
+    """Every unanswered tool call of the last tool-calling assistant message.
 
     The persistent turn loop appends the ``AIMessage`` carrying ``tool_calls`` to
     history *before* running the tools, then appends one ``ToolMessage`` per call
     as each finishes. So a tool_call on the most recent tool-calling ``AIMessage``
-    that has no matching ``ToolMessage`` is one still in flight — exactly the
-    command a (re)attaching client should surface as "running" while the turn is
-    blocked, since that in-memory message is not persisted to the DB until the
-    turn ends (so REST history can't show it).
+    that has no matching ``ToolMessage`` has not finished — the commands a
+    (re)attaching client should surface as "running" while the turn is blocked,
+    since that in-memory message is not persisted to the DB until the turn ends
+    (so REST history can't show it). A parallel batch (a session subagent
+    fan-out) has several.
 
-    Returns ``{"id", "tool", "args"}`` for the first unanswered call on the last
-    tool-calling assistant message, or None when nothing is in flight.
+    Returns ``{"id", "tool", "args"}`` per unanswered call in provider order;
+    empty when nothing is outstanding.
     """
     answered: set = set()
     last_calls: Optional[List[Dict[str, Any]]] = None
@@ -199,16 +200,28 @@ def inflight_tool_call(messages: Sequence[BaseMessage]) -> Optional[Dict[str, An
         elif isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
             last_calls = msg.tool_calls
     if not last_calls:
-        return None
-    for tc in last_calls:
-        tool_call_id = tc.get("id", "")
-        if tool_call_id not in answered:
-            return {
-                "id": tool_call_id,
-                "tool": tc.get("name", ""),
-                "args": tc.get("args", {}),
-            }
-    return None
+        return []
+    return [
+        {
+            "id": tc.get("id", ""),
+            "tool": tc.get("name", ""),
+            "args": tc.get("args", {}),
+        }
+        for tc in last_calls
+        if tc.get("id", "") not in answered
+    ]
+
+
+def inflight_tool_call(messages: Sequence[BaseMessage]) -> Optional[Dict[str, Any]]:
+    """Return the assistant tool call that is currently executing, or None.
+
+    The first of :func:`inflight_tool_calls`: in the sequential tool path the
+    first unanswered call of the last tool-calling ``AIMessage`` is the one
+    running. Returns ``{"id", "tool", "args"}`` or None when nothing is in
+    flight.
+    """
+    calls = inflight_tool_calls(messages)
+    return calls[0] if calls else None
 
 
 class LLMArchiver:

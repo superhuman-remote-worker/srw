@@ -1,4 +1,4 @@
-"""Session fan-out: configuration, cap, gate and tool description (WP3a).
+"""Session fan-out: cap, gate and tool description (WP3a, WP3c).
 
 Design: knowledge-base/knowledge/features/parallel_subagents.md §6.4, §12,
 §13 D2/D5. What this file pins:
@@ -8,8 +8,10 @@ Design: knowledge-base/knowledge/features/parallel_subagents.md §6.4, §12,
   defaults to 20 (clamped to 1..64);
 * the settings matrix routes a family's ``session_max_concurrent`` to its own
   delegation slot and re-derives it on every pass (a model switch replaces it);
-* ``session_fanout_allowed`` = gate on for the lane AND the orchestrator's
-  batch-settle capability AND a session parent (pinned needs its own key);
+* ``session_fanout_allowed`` = the orchestrator's batch-settle capability AND
+  its per-claim operator switch AND a session parent. No config key opens it
+  (WP3c: the gate is a deployment setting the orchestrator evaluates per lane);
+* every session parent runs under the session cap, fan-out or not;
 * the ``delegate_agent`` description tells each parent the truth: the WP0
   text when fan-out is not allowed, the effective cap / one-child-per-response
   / writer rule / recovery markers when it is, workers unchanged;
@@ -47,7 +49,6 @@ from shared.runtime.core.delegation_settings import (
     FAMILY_SESSION_MAX_CONCURRENT_KEY,
     SESSION_MAX_CALLS_PER_TURN_DEFAULT,
     SESSION_MAX_CONCURRENT_DEFAULT,
-    session_fanout_configured,
     session_max_calls_per_turn,
     session_max_concurrent,
 )
@@ -60,6 +61,7 @@ from shared.runtime.core.model_registry import family_of
 from shared.runtime.core.session_config_patch import patch_frozen_session
 from shared.session_subagent_batch import (
     SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
+    SESSION_SUBAGENT_FANOUT_KEY,
     not_started_result_text,
 )
 from tests.test_delegate_agent_tool import (
@@ -82,20 +84,22 @@ def session_parent(
     tmp_path,
     *,
     lane: str = "stateless",
-    gate: bool = True,
-    pinned_gate: bool = False,
+    switch: bool = True,
     contract: bool = True,
     parallel_tool_calls: bool = True,
     **delegation,
 ):
-    """A session-marked parent whose fan-out inputs are all set explicitly."""
+    """A session-marked parent whose fan-out inputs are all set explicitly.
+
+    ``contract`` and ``switch`` are what the session publishes from the
+    orchestrator's advertisement (the capability, reduced to ``True`` for
+    exactly the int 1, and the operator switch for its lane)."""
     ctx, root = make_parent(tmp_path, max_concurrent=delegation.pop("max", 2))
     ctx._subagent_parent_kind = "session"
     ctx._subagent_execution_lane = lane
     ctx._session_subagent_batch_settle_contract = contract
-    ctx.config["delegation"].update(
-        {"session_fanout": gate, "session_fanout_pinned": pinned_gate, **delegation}
-    )
+    ctx._session_subagent_fanout = switch
+    ctx.config["delegation"].update(delegation)
     ctx.config["parallel_tool_calls"] = parallel_tool_calls
     return ctx, root
 
@@ -157,14 +161,13 @@ class TestCapResolution:
                         "session_max_concurrent": 50,
                         FAMILY_SESSION_MAX_CONCURRENT_KEY: 7,
                         "session_max_calls_per_turn": 0,
-                        "session_fanout": "yes",  # only a literal true opens it
-                        "session_fanout_pinned": True,
+                        # WP3c: no config key opens fan-out any more; a
+                        # stored layer that still names one keeps loading.
+                        "session_fanout": True,
                     },
                 }
             )
         assert cfg.delegation == DelegationConfig(
-            session_fanout=False,
-            session_fanout_pinned=True,
             session_max_concurrent=20,
             family_session_max_concurrent=7,
             session_max_calls_per_turn=1,
@@ -175,8 +178,8 @@ class TestCapResolution:
 
     def test_defaults_when_nothing_is_authored(self):
         cfg = load_agent_config_from_dict({"agent_id": "a", "display_name": "A"})
-        assert cfg.delegation.session_fanout is False
-        assert cfg.delegation.session_fanout_pinned is False
+        assert not hasattr(cfg.delegation, "session_fanout")
+        assert not hasattr(cfg.delegation, "session_fanout_pinned")
         assert cfg.delegation.session_max_concurrent is None
         assert cfg.delegation.session_max_calls_per_turn == 20
 
@@ -285,42 +288,32 @@ class TestMatrixRoute:
 
 class TestGate:
     @pytest.mark.parametrize(
-        ("gate", "pinned_gate", "contract", "lane"),
-        list(
-            itertools.product(
-                [False, True],
-                [False, True],
-                [False, True],
-                ["stateless", "pinned", None],
-            )
-        ),
+        ("contract", "switch", "kind"),
+        list(itertools.product([False, True], [False, True], ["session", None])),
     )
-    def test_truth_table(self, tmp_path, gate, pinned_gate, contract, lane):
-        ctx, _ = session_parent(
-            tmp_path, lane=lane, gate=gate, pinned_gate=pinned_gate, contract=contract
-        )
-        expected = (
-            gate
-            and contract
-            and (lane == "stateless" or (lane == "pinned" and pinned_gate))
-        )
-        assert session_fanout_allowed(ctx) is expected
-        assert session_fanout_configured(ctx.config["delegation"], lane) is (
-            gate and (lane == "stateless" or (lane == "pinned" and pinned_gate))
-        )
+    def test_truth_table(self, tmp_path, contract, switch, kind):
+        """Capability x per-claim switch x parent kind. The lane is not an
+        input: the orchestrator evaluated it before advertising the switch."""
+        for lane in ("stateless", "pinned"):
+            ctx, _ = session_parent(
+                tmp_path / lane, lane=lane, switch=switch, contract=contract
+            )
+            ctx._subagent_parent_kind = kind
+            assert session_fanout_allowed(ctx) is (
+                contract and switch and kind == "session"
+            )
 
     @pytest.mark.parametrize("truthy", [1, "true", "yes", {"on": True}, [True]])
-    def test_only_a_literal_true_opens_either_gate_key(self, tmp_path, truthy):
-        """A hand-edited or stored layer may carry a truthy non-bool; the
-        resolver must not read it as on (the parser coerces it the same way)."""
-        ctx, _ = session_parent(tmp_path / "gate", gate=truthy)
-        assert session_fanout_configured(ctx.config["delegation"], "stateless") is False
+    def test_only_a_literal_true_switch_counts(self, tmp_path, truthy):
+        ctx, _ = session_parent(tmp_path, switch=truthy)
         assert session_fanout_allowed(ctx) is False
 
+    def test_no_config_key_opens_fanout(self, tmp_path):
+        """The WP3a gate keys are gone: authored config can no longer turn
+        fan-out on, so a rollback never waits for a frozen config."""
         ctx, _ = session_parent(
-            tmp_path / "pinned", lane="pinned", gate=True, pinned_gate=truthy
+            tmp_path, switch=False, session_fanout=True, session_fanout_pinned=True
         )
-        assert session_fanout_configured(ctx.config["delegation"], "pinned") is False
         assert session_fanout_allowed(ctx) is False
 
     def test_a_worker_never_fans_out_through_the_session_gate(self, tmp_path):
@@ -334,12 +327,24 @@ class TestGate:
         ctx._session_subagent_batch_settle_contract = value
         assert session_fanout_allowed(ctx) is False
 
-    def test_the_cap_follows_the_gate(self, tmp_path):
-        ctx, _ = session_parent(tmp_path, max=2, session_max_concurrent=9)
+    @pytest.mark.parametrize(
+        ("contract", "switch"), [(True, True), (True, False), (False, False)]
+    )
+    def test_every_session_uses_the_session_cap(self, tmp_path, contract, switch):
+        """WP3c: the session cap does not follow the gate. With fan-out off a
+        session still runs background children and queued calls, and the
+        cockpit's per-session "Subagents at once" must bound them."""
+        ctx, _ = session_parent(
+            tmp_path, max=2, contract=contract, switch=switch, session_max_concurrent=9
+        )
         assert delegation_max_concurrent(ctx) == 9
-        ctx._session_subagent_batch_settle_contract = False
-        # Not allowed: exactly the pre-WP3 cap (behaviour-neutral gate off).
-        assert delegation_max_concurrent(ctx) == 2
+        # The runtime's semaphore reads the same function: background
+        # children and queued calls of a session without fan-out included.
+        runtime = install(ctx, factory=lambda cfg, lim: EchoModel())
+        assert runtime.max_concurrent == 9
+        del ctx.config["delegation"]["session_max_concurrent"]
+        assert delegation_max_concurrent(ctx) == SESSION_MAX_CONCURRENT_DEFAULT
+        assert runtime.max_concurrent == SESSION_MAX_CONCURRENT_DEFAULT
 
     def test_the_worker_cap(self, tmp_path):
         ctx, _ = make_parent(tmp_path, max_concurrent=3)
@@ -386,12 +391,12 @@ class TestDescription:
         assert INTERRUPTED_MARKER == batch_recovery.INTERRUPTED_HEADER
 
     def test_not_allowed_keeps_the_wp0_text_exactly(self, tmp_path):
-        """Gate off, capability missing, or pinned without its key: the WP0
-        single-child text, byte for byte."""
+        """Switch off, capability missing, or a pinned lane the operator did
+        not open: the WP0 single-child text, byte for byte."""
         cases = [
-            dict(gate=False),
+            dict(switch=False),
             dict(contract=False),
-            dict(lane="pinned"),  # gate on, pinned key off
+            dict(lane="pinned", switch=False),
         ]
         for i, case in enumerate(cases):
             ctx, _ = session_parent(tmp_path / str(i), **case)
@@ -454,21 +459,20 @@ class TestDescription:
         # The writer rule and the markers still hold.
         assert _WRITER_RULE in text and NOT_STARTED_MARKER in text
 
-    def test_a_pinned_session_with_its_key_fans_out_and_keeps_background(
+    def test_a_pinned_session_with_its_switch_fans_out_and_keeps_background(
         self, tmp_path
     ):
-        ctx, _ = session_parent(tmp_path, lane="pinned", pinned_gate=True)
+        ctx, _ = session_parent(tmp_path, lane="pinned", switch=True)
         text = the_tool(ctx).description
         assert _FANOUT in text
         assert "run_in_background=true returns an immediate durable receipt" in text
 
     def test_worker_descriptions_are_unchanged(self, tmp_path):
         ctx, _ = make_parent(tmp_path, max_concurrent=3)
-        # Session knobs and the capability mean nothing to a worker.
-        ctx.config["delegation"].update(
-            {"session_fanout": True, "session_max_concurrent": 9}
-        )
+        # Session knobs and the advertisement mean nothing to a worker.
+        ctx.config["delegation"].update({"session_max_concurrent": 9})
         ctx._session_subagent_batch_settle_contract = True
+        ctx._session_subagent_fanout = True
         ctx._subagent_execution_lane = "stateless"
         assert the_tool(ctx).description == build_description(
             ctx.config["subagents"]["roster"], default="explorer", max_concurrent=3
@@ -509,9 +513,10 @@ class TestLiveConfigChange:
         assert all(f"echo: brief {i}" in out for i, out in enumerate(outs))
         assert _max_overlap(spans) == 3
 
-        # Gate off again: back to the pre-WP3 cap and the WP0 text, both sides.
-        ctx.config["delegation"]["session_fanout"] = False
-        assert runtime.max_concurrent == 2
+        # Switch off (the next claim's advertisement): the WP0 text, while
+        # the semaphore keeps the session cap (WP3c), not the worker cap.
+        ctx._session_subagent_fanout = False
+        assert runtime.max_concurrent == 3
         assert _WP0_SINGLE in the_tool(ctx).description
 
     @pytest.mark.asyncio
@@ -652,17 +657,19 @@ class TestLiveConcurrencyLimit:
 # ---------------------------------------------------------------------------
 
 
-def test_every_attach_entry_point_accepts_the_capability():
-    """Pinned attach passes the body's advertisement as this keyword; the
-    stateless executor folds the claim bundle's top-level one in
+def test_every_attach_entry_point_accepts_the_advertisement():
+    """Pinned attach passes the body's advertisement as these keywords; the
+    stateless executor folds the claim bundle's top-level ones in
     (``turn_executor.claim_bundle_attach``)."""
     import agent.api.persistent_app as pa
 
     for fn in (pa._attach_session, pa._attach_session_inner):
-        assert (
-            SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY
-            in inspect.signature(fn).parameters
-        ), fn.__name__
+        parameters = inspect.signature(fn).parameters
+        for key in (
+            SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
+            SESSION_SUBAGENT_FANOUT_KEY,
+        ):
+            assert key in parameters, (fn.__name__, key)
 
 
 class _StopAttach(Exception):
@@ -722,3 +729,193 @@ async def test_attach_accepts_only_the_exact_int_1(advertised, expected):
                 session_subagent_batch_settle_contract=advertised,
             )
     assert seen["subagent_batch_settle_contract"] is expected
+
+
+async def _attach_until_construction(workspace, **keywords) -> dict:
+    """Run ``_attach_session_inner`` up to the PersistentSession construction
+    and return the keywords it would build the session with."""
+    import agent.api.persistent_app as papp
+
+    seen: dict = {}
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            seen.update(kwargs)
+            raise _StopAttach
+
+    agent = SimpleNamespace(
+        config=SimpleNamespace(workspace=SimpleNamespace(backend="none")),
+        _tactical_llm=None,
+        _llm=object(),
+        _auxiliary_llm=None,
+        postgres_conn=MagicMock(),
+        vector_conn=None,
+    )
+    client = SimpleNamespace(
+        get_thread_workspace=AsyncMock(return_value=workspace), agent_id=None
+    )
+    with (
+        patch.object(papp, "_session", None),
+        patch.object(papp, "_thread_id", None),
+        patch.object(papp, "_event_writer", None),
+        patch.object(papp, "_agent", agent),
+        patch.object(papp, "_orchestrator_client", client),
+        patch.object(papp, "PersistentSession", FakeSession),
+        patch.object(papp, "_session_backend_is_lite", return_value=True),
+        patch.object(papp, "_officer_cfg", return_value=None),
+        patch.object(papp, "_apply_session_embedding_env"),
+    ):
+        with pytest.raises(_StopAttach):
+            await papp._attach_session_inner(
+                "11111111-1111-4111-8111-111111111111",
+                config_override={},
+                **keywords,
+            )
+    return seen
+
+
+def _lite_workspace(**advertisement) -> dict:
+    return {
+        "cloud_mount": None,
+        "cloud_sync": None,
+        "protected_cloud": False,
+        "project_ids": [],
+        "datasources": None,
+        **advertisement,
+    }
+
+
+@pytest.mark.parametrize(
+    ("switch", "expected"),
+    [(True, True), (False, False), (1, False), ("true", False), (None, False)],
+)
+@pytest.mark.asyncio
+async def test_attach_accepts_only_a_literal_true_switch(switch, expected):
+    seen = await _attach_until_construction(
+        _lite_workspace(),
+        session_subagent_batch_settle_contract=1,
+        session_subagent_fanout=switch,
+    )
+    assert seen["subagent_batch_settle_contract"] is True
+    assert seen["subagent_fanout"] is expected
+
+
+@pytest.mark.parametrize("fanout", [True, False])
+@pytest.mark.asyncio
+async def test_a_self_attaching_pinned_pod_reads_its_workspace_advertisement(
+    monkeypatch, fanout
+):
+    """WP3c item 2: a dedicated pinned pod attaches itself (no pushed body),
+    so the capability and the switch come from the workspace pull, the same
+    way ``pinned_status_identity_contract`` does. Before WP3c the session was
+    built with neither."""
+    import agent.api.persistent_app as papp
+
+    monkeypatch.setattr(papp, "_stateless_mode", lambda: False)
+    seen = await _attach_until_construction(
+        _lite_workspace(
+            **{
+                SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: 1,
+                SESSION_SUBAGENT_FANOUT_KEY: fanout,
+            }
+        )
+    )
+    assert seen["subagent_batch_settle_contract"] is True
+    assert seen["subagent_fanout"] is fanout
+
+
+@pytest.mark.asyncio
+async def test_a_pushed_advertisement_wins_over_the_workspace(monkeypatch):
+    import agent.api.persistent_app as papp
+
+    monkeypatch.setattr(papp, "_stateless_mode", lambda: False)
+    seen = await _attach_until_construction(
+        _lite_workspace(
+            **{
+                SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: 1,
+                SESSION_SUBAGENT_FANOUT_KEY: True,
+            }
+        ),
+        session_subagent_batch_settle_contract=1,
+        session_subagent_fanout=False,
+    )
+    assert seen["subagent_fanout"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_stateless_attach_takes_the_advertisement_from_its_claim_only(
+    monkeypatch,
+):
+    """The claim bundle is the stateless lane's per-claim authority: an
+    absent value is off, whatever a workspace response says."""
+    import agent.api.persistent_app as papp
+
+    monkeypatch.setattr(papp, "_stateless_mode", lambda: True)
+    seen = await _attach_until_construction(
+        _lite_workspace(
+            **{
+                SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: 1,
+                SESSION_SUBAGENT_FANOUT_KEY: True,
+            }
+        )
+    )
+    assert seen["subagent_batch_settle_contract"] is False
+    assert seen["subagent_fanout"] is False
+
+
+def test_the_advertisement_resolution_reads_the_newest_ready_response():
+    import agent.api.persistent_app as papp
+
+    resolve = papp._session_subagent_advertisement
+    ready = {
+        SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: 1,
+        SESSION_SUBAGENT_FANOUT_KEY: True,
+    }
+    older = {SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: 1}
+    assert resolve(None, None, (ready, older), from_workspace=True) == (True, True)
+    # The newest response decides, even when it lacks the switch (an older
+    # orchestrator replica answered last): off, never an older "on".
+    assert resolve(None, None, (older, ready), from_workspace=True) == (True, False)
+    assert resolve(None, None, (None, ready), from_workspace=True) == (True, True)
+    assert resolve(None, None, (), from_workspace=True) == (False, False)
+    assert resolve(None, None, (ready,), from_workspace=False) == (False, False)
+    assert resolve(True, True, (), from_workspace=False) == (False, True)
+
+
+@pytest.mark.asyncio
+async def test_the_pool_attach_handler_forwards_the_switch(monkeypatch):
+    """The pushed pinned ``/session/attach`` body reaches ``_attach_session``
+    with both advertisement keywords (persistent app; the dual app forwards
+    the same named field)."""
+    import agent.api.dual_app as dual_app
+    import agent.api.persistent_app as papp
+
+    captured: dict = {}
+
+    async def transaction(thread_id, attach, generation, token):
+        captured.update(attach)
+
+    monkeypatch.delenv("POD_UID", raising=False)
+    monkeypatch.setattr(papp, "_session", None)
+    monkeypatch.setattr(papp, "_pool_attach_claim", None)
+    monkeypatch.setattr(papp, "_pool_attach_task", None)
+    monkeypatch.setattr(papp, "_pool_attach_runtime_generation", None)
+    monkeypatch.setattr(papp, "_pool_attach_token", None)
+    monkeypatch.setattr(papp, "_pending_drain_suspend", None)
+    monkeypatch.setattr(papp, "_run_pool_attach_transaction", transaction)
+    monkeypatch.setattr(papp, "_adopt_attached_runtime_identity", MagicMock())
+
+    response = await papp._admit_pool_session_attach(
+        {
+            "thread_id": "11111111-1111-4111-8111-111111111111",
+            SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: 1,
+            SESSION_SUBAGENT_FANOUT_KEY: True,
+        }
+    )
+    assert response.status_code == 200
+    await papp._pool_attach_task
+    assert captured["session_subagent_batch_settle_contract"] == 1
+    assert captured["session_subagent_fanout"] is True
+    assert 'session_subagent_fanout=request.get("session_subagent_fanout")' in (
+        inspect.getsource(dual_app)
+    )

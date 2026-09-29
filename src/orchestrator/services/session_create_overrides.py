@@ -109,10 +109,10 @@ def bridge_nested_llm_override(
 
 
 #: The ``delegation`` keys a session request may set: the live keys after U3
-#: (loader.normalize_delegation_block) plus the session's own fan-out cap
-#: (parallel_subagents.md D2: overridable per expert and per session). The
-#: fan-out gates ``session_fanout`` / ``session_fanout_pinned`` are operator
-#: and expert configuration and stay refused here.
+#: (loader.normalize_delegation_block) plus the session's own cap
+#: (parallel_subagents.md D2: overridable per expert and per session). No key
+#: opens fan-out: that is the orchestrator's deployment setting
+#: (``DeploymentSettings.session_subagent_fanout_lanes``), advertised per claim.
 DELEGATION_KEYS: frozenset[str] = frozenset(
     {
         "enabled",

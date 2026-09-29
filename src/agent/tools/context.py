@@ -404,6 +404,11 @@ class ToolContext:
         # conditions of session fan-out (``agent.tools.delegation.fanout``);
         # published with the parent kind and lane, before tools load.
     )
+    _session_subagent_fanout: bool = (
+        False  # The orchestrator's operator switch for this session's lane
+        # (``session_subagent_fanout: true``), re-applied at every stateless
+        # claim. Another of the fan-out conditions (``fanout.py``).
+    )
     _session_parent_authority_provider: Optional[Callable[[], Any]] = (
         None  # Fresh pinned/stateless SessionParentAuthority for every child
         # persistence operation.  Stateless warm sessions repoint leases

@@ -226,6 +226,28 @@ def test_importing_the_package_has_no_side_effects():
             "completion_finalizer_inline_delay_seconds",
             2.5,
         ),
+        ({}, "session_subagent_fanout_lanes", frozenset()),
+        (
+            {"SESSION_SUBAGENT_FANOUT_LANES": ""},
+            "session_subagent_fanout_lanes",
+            frozenset(),
+        ),
+        (
+            {"SESSION_SUBAGENT_FANOUT_LANES": "stateless"},
+            "session_subagent_fanout_lanes",
+            frozenset({"stateless"}),
+        ),
+        (
+            {"SESSION_SUBAGENT_FANOUT_LANES": " Stateless , PINNED ,"},
+            "session_subagent_fanout_lanes",
+            frozenset({"stateless", "pinned"}),
+        ),
+        (
+            # A typo fails closed: an unknown lane never widens the set.
+            {"SESSION_SUBAGENT_FANOUT_LANES": "all,true"},
+            "session_subagent_fanout_lanes",
+            frozenset(),
+        ),
     ],
 )
 def test_deployment_settings_keep_their_environment_contract(
@@ -242,11 +264,40 @@ def test_deployment_settings_keep_their_environment_contract(
         "OFFICER_RUNTIME_VERIFICATION_ENABLED",
         "OFFICER_AUTO_PULL_RELEASE_ENABLED",
         "COMPLETION_FINALIZER_INLINE_DELAY_SECONDS",
+        "SESSION_SUBAGENT_FANOUT_LANES",
     ):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     assert getattr(DeploymentSettings.from_environment(), field) == expected
+
+
+def test_session_subagent_fanout_is_read_per_lane_and_at_call_time(monkeypatch):
+    """parallel_subagents.md §12 (WP3c): the three advertising compositions
+    (stateless claim bundle, pinned attach body, workspace pull payload) read
+    the application's settings when they run, so a replaced settings object is
+    seen by the next claim or attach without rebuilding any dependency."""
+    from orchestrator.application import preparation, sessions
+
+    monkeypatch.delenv("SESSION_SUBAGENT_FANOUT_LANES", raising=False)
+    settings = DeploymentSettings.from_environment()
+    assert settings.session_subagent_fanout("stateless") is False
+    assert settings.session_subagent_fanout(None) is False
+
+    resources = build_application_resources()
+    readers = [
+        sessions.unit_claim_bundle_dependencies(resources).session_subagent_fanout,
+        sessions.session_attach_binding_dependencies(resources).session_subagent_fanout,
+        preparation.thread_workspace_delivery_dependencies(
+            resources
+        ).session_subagent_fanout,
+    ]
+    assert [read("stateless") for read in readers] == [False] * 3
+    resources.settings = dataclasses.replace(
+        resources.settings, session_subagent_fanout_lanes=frozenset({"stateless"})
+    )
+    assert [read("stateless") for read in readers] == [True] * 3
+    assert [read("pinned") for read in readers] == [False] * 3
 
 
 def test_create_app_uses_explicit_settings():

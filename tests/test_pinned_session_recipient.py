@@ -548,8 +548,10 @@ async def test_attach_wrapper_sends_server_recipient_and_postchecks(monkeypatch)
             "session_runtime_generation": GENERATION,
             "session_runtime_attach_token": ATTACH_TOKEN,
             # The pinned handlers read named fields, so the pushed body may
-            # advertise the batch settle (parallel_subagents.md §12).
+            # advertise the batch settle and the operator's fan-out switch for
+            # the pinned lane, off by default (parallel_subagents.md §12).
             "session_subagent_batch_settle_contract": 1,
+            "session_subagent_fanout": False,
             "_recipient": _recipient(),
         },
     }

@@ -2800,13 +2800,9 @@ class DelegationConfig:
     # Default for a `delegate_agent` call that does not say run_in_background
     # (background children arrive with the U4 control plane).
     run_in_background_default: bool = False
-    # --- Session fan-out (parallel_subagents.md §6.4, D2/D5). Resolution and
-    # the gate live in shared.runtime.core.delegation_settings. ---
-    # Gate: several delegate_agent calls per response for a STATELESS session
-    # parent (the orchestrator must also advertise the batch settle).
-    session_fanout: bool = False
-    # Gate for the PINNED lane, on top of session_fanout (after R3.3c).
-    session_fanout_pinned: bool = False
+    # --- Session delegation (parallel_subagents.md §6.4, D2). Resolution
+    # lives in shared.runtime.core.delegation_settings. Whether a session may
+    # fan out is the orchestrator's per-claim advertisement, not a key here. ---
     # A session's own cap (the worker cap above does not apply to it): the
     # explicit expert/session value, clamped to 1..20. None = not set.
     session_max_concurrent: Optional[int] = None
@@ -3018,9 +3014,6 @@ def _parse_delegation_config(delegation_data: Any) -> DelegationConfig:
         run_in_background_default=bool(
             delegation_data.get("run_in_background_default", False)
         ),
-        # Only a literal true opens a gate.
-        session_fanout=delegation_data.get("session_fanout") is True,
-        session_fanout_pinned=delegation_data.get("session_fanout_pinned") is True,
         session_max_concurrent=session_cap,
         family_session_max_concurrent=family_cap,
         session_max_calls_per_turn=(

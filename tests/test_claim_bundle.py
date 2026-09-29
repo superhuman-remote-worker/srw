@@ -476,6 +476,49 @@ async def test_session_bundle_advertises_batch_settle_beside_attach(monkeypatch)
 
     assert out["session_subagent_batch_settle_contract"] == 1
     assert "session_subagent_batch_settle_contract" not in out["attach"]
+    # The operator's fan-out switch rides beside it too, off by default.
+    assert out["session_subagent_fanout"] is False
+    assert "session_subagent_fanout" not in out["attach"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lanes", "expected"),
+    [
+        (frozenset(), False),
+        (frozenset({"pinned"}), False),
+        (frozenset({"stateless"}), True),
+        (frozenset({"stateless", "pinned"}), True),
+    ],
+)
+async def test_session_bundle_reads_the_fanout_switch_at_every_claim(
+    monkeypatch, lanes, expected
+):
+    """parallel_subagents.md §12 (WP3c): the switch is the deployment setting
+    evaluated for the stateless lane when the bundle is built, never a value
+    frozen into the session, so flipping it reaches the next claim. It stays
+    beside ``attach``: a deployed ``_attach_session`` has no such keyword."""
+    from orchestrator import main as orch_main
+
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
+    _patch(monkeypatch, orch_main, db)
+    resources = orch_main.app.state.resources
+    monkeypatch.setattr(
+        resources,
+        "settings",
+        dataclasses.replace(resources.settings, session_subagent_fanout_lanes=lanes),
+    )
+
+    out = await unit_claim_bundle.claim_bundle_for_unit(
+        UNIT_ID,
+        lease_token=7,
+        pod_name=POD_NAME,
+        pod_uid=POD_UID,
+        dependencies=sessions_composition.unit_claim_bundle_dependencies(resources),
+    )
+
+    assert out["session_subagent_fanout"] is expected
+    assert "session_subagent_fanout" not in out["attach"]
 
 
 @pytest.mark.asyncio

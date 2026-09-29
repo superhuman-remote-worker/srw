@@ -391,6 +391,9 @@ data:
   # BP-01 owner control ships dark until the unattended-release scorecard is
   # complete. This gates new pulls even if unsupported JSON already says true.
   OFFICER_AUTO_PULL_RELEASE_ENABLED: {{ .Values.orchestrator.officerAutoPullReleaseEnabled | default false | quote }}
+  # Session subagent fan-out lanes. Consumed only by the orchestrator, which
+  # advertises the per-lane switch at every claim/attach; empty is off.
+  SESSION_SUBAGENT_FANOUT_LANES: {{ .Values.orchestrator.sessionSubagentFanoutLanes | default "" | quote }}
   WORKER_BATCH_MIN_WALL_SECONDS: {{ .Values.agent.stateless.worker.batchMinWallSeconds | default 300 | quote }}
 
   # Reject pickle fallback in LangGraph checkpoint serialization. This is

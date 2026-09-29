@@ -184,6 +184,55 @@ async def test_attested_vm_delivery_reaches_real_remote_backend(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("lanes", "fanout"),
+    [(set(), False), ({"stateless"}, False), ({"stateless", "pinned"}, True)],
+)
+async def test_vm_ready_payload_carries_the_fanout_advertisement(
+    vm_delivery, lanes, fanout
+):
+    """parallel_subagents.md §12 (WP3c): a pinned pod that attaches itself
+    learns the batch-settle capability and the operator's switch for its lane
+    only from this pull. The ready payload carries both and the agent's
+    normalization keeps them; the initial VM wait payload carries neither, so
+    the agent reads them once the VM is ready."""
+    from orchestrator.services.vm_thread_initial import initial_vm_wait_payload
+
+    vm_delivery.dependencies = replace(
+        vm_delivery.dependencies,
+        session_subagent_fanout=lambda lane: lane in lanes,
+    )
+    payload = await _deliver(vm_delivery)
+    assert payload["session_subagent_batch_settle_contract"] == 1
+    assert payload["session_subagent_fanout"] is fanout
+
+    waiting = initial_vm_wait_payload(
+        {**vm_delivery.thread, "metadata": {"vm": {"status": "provisioning"}}}
+    )
+    assert "session_subagent_batch_settle_contract" not in waiting
+    assert "session_subagent_fanout" not in waiting
+    client = SimpleNamespace(
+        get_thread_workspace=AsyncMock(side_effect=[waiting, payload])
+    )
+    normalized = await persistent_app._poll_workspace_ready(
+        client, THREAD, timeout=5, poll_interval=0, require_vm=True
+    )
+    assert client.get_thread_workspace.await_count == 2
+    assert normalized["session_subagent_batch_settle_contract"] == 1
+    assert normalized["session_subagent_fanout"] is fanout
+    assert persistent_app._session_subagent_advertisement(
+        None, None, (normalized,), from_workspace=True
+    ) == (True, fanout)
+
+
+@pytest.mark.asyncio
+async def test_an_unwired_delivery_advertises_fanout_off(vm_delivery):
+    """A composition that does not wire the switch fails closed."""
+    payload = await _deliver(vm_delivery)
+    assert payload["session_subagent_fanout"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "field",
     [
         "provision_generation",
