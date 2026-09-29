@@ -115,6 +115,10 @@ from shared.thread_presence import (
     mark_stateless_natural_pause,
 )
 from shared.session_retirement import update_stateless_claim_status
+from shared.session_subagent_batch import (
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT,
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
+)
 from shared.runtime_actor import RuntimeActorContext
 from agent.agent import UniversalAgent
 
@@ -3952,6 +3956,7 @@ async def _attach_session_inner(
     events_epoch: Any = None,
     workspace_generation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
     workspace_runtime_incarnation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
+    session_subagent_batch_settle_contract: Any = None,
 ) -> None:
     """Create and attach a PersistentSession for the given thread.
 
@@ -4613,6 +4618,13 @@ async def _attach_session_inner(
         subagent_effect_authority=_loop_runtime_effect_authority_current,
         subagent_settlement_authority=(_loop_runtime_settlement_authority_current),
         subagent_event_callback=_session_subagent_event_available,
+        # parallel_subagents.md §12: fan-out needs an orchestrator that can
+        # settle an interrupted batch. Exact int 1, like the other contracts.
+        subagent_batch_settle_contract=bool(
+            type(session_subagent_batch_settle_contract) is int
+            and session_subagent_batch_settle_contract
+            == SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT
+        ),
         project_ids=project_ids or [],
         datasources=datasources_dict,
         knowledge_bindings=knowledge_bindings,
@@ -5108,6 +5120,7 @@ async def _attach_session(
     events_epoch: Any = None,
     workspace_generation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
     workspace_runtime_incarnation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
+    session_subagent_batch_settle_contract: Any = None,
 ) -> None:
     """Exception-safe attach transaction around the full construction tail."""
 
@@ -5129,6 +5142,9 @@ async def _attach_session(
             events_epoch=events_epoch,
             workspace_generation=workspace_generation,
             workspace_runtime_incarnation=workspace_runtime_incarnation,
+            session_subagent_batch_settle_contract=(
+                session_subagent_batch_settle_contract
+            ),
         )
     except BaseException:
         # Covers every post-construction await, including event-journal setup,
@@ -6030,6 +6046,9 @@ async def _admit_pool_session_attach(request: Dict[str, Any]) -> JSONResponse:
             ),
             "pinned_runtime_generation_contract": request.get(
                 "pinned_runtime_generation_contract"
+            ),
+            "session_subagent_batch_settle_contract": request.get(
+                SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY
             ),
             "session_runtime_generation": runtime_generation,
             "session_runtime_attach_token": attach_token,
@@ -14259,6 +14278,9 @@ async def _handle_config_update(
         # Same for what tools read at call time (multimodal, the model window,
         # delegation settings): an llm-only update rebinds without a reload.
         _session.refresh_tool_context_config()
+        # Except the delegate_agent description, which states the live cap and
+        # fan-out mode the runtime enforces: reload when it changed.
+        _session.refresh_delegation_description()
 
         # Rebuild auxiliary LLM if auxiliary settings changed. Symmetric to
         # the chat-side rebuild — the boot-time singleton on _agent doesn't

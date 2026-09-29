@@ -216,6 +216,10 @@ class PersistentSession:
     subagent_effect_authority: Optional[Callable[[], Any]] = None
     subagent_settlement_authority: Optional[Callable[[], Any]] = None
     subagent_event_callback: Optional[Callable[[str], Any]] = None
+    # The attach payload advertised the orchestrator's batch settle
+    # (session_subagent_batch_settle_contract == 1). Fixed per attach; a
+    # changed advertisement changes the stateless attach fingerprint.
+    subagent_batch_settle_contract: bool = False
 
     # Permission mode (switchable at runtime)
     permission_mode: str = "supervised"
@@ -526,6 +530,9 @@ class PersistentSession:
             model=self.config.llm.model or "",
             tool_names=[t.name for t in self.tools] if self.tools else None,
             prompt_type="interactive",
+            # A stateless session cannot run a background child; the
+            # delegation floor must not offer one (same test as the lane).
+            delegation_background_available=self.shell_owner_token is None,
         )
         _steps["prompt"] = time.perf_counter() - _t
         _t = time.perf_counter()
@@ -1945,6 +1952,10 @@ class PersistentSession:
             ),
             "agent_id": self.config.agent_id,
             "multimodal": self.config.llm.multimodal,
+            # Whether the parent model may send several tool calls per message
+            # (matrix `parallel_tool_calls`): the delegate_agent description
+            # offers session fan-out only to a model that can issue it.
+            "parallel_tool_calls": self.config.llm.parallel_tool_calls,
             # Lets bulk readers cap a single tool result relative to the main
             # model's window (session_silent_failure_audit.md #5).
             "model_max_context_tokens": self.config.limits.model_max_context_tokens,
@@ -1996,6 +2007,46 @@ class PersistentSession:
         for key in [key for key in current if key not in fresh]:
             del current[key]
 
+    def refresh_delegation_description(self) -> bool:
+        """Rebuild the tools when the bound ``delegate_agent`` description no
+        longer matches the live config. Returns True when it rebuilt.
+
+        The description states the cap, the fan-out mode and whether the
+        model can send parallel calls; the runtime re-reads the same cap at
+        every admission (``agent.tools.delegation.fanout``). An llm-only or a
+        delegation-only live update reloads no tools, so without this the two
+        would disagree after a model switch (parallel_subagents.md §6.4).
+        Call after ``refresh_tool_context_config``.
+
+        It also hands a raised cap to children already queued behind the
+        runtime's limit, which would otherwise wait for a running child to
+        finish.
+        """
+        if self.tool_context is None:
+            return False
+        refresh_concurrency = getattr(
+            getattr(self.tool_context, "subagent_runtime", None),
+            "refresh_concurrency",
+            None,
+        )
+        if callable(refresh_concurrency):
+            refresh_concurrency()
+        if not self.tools:
+            return False
+        bound = next(
+            (t for t in self.tools if getattr(t, "name", None) == "delegate_agent"),
+            None,
+        )
+        if bound is None:
+            return False
+        from agent.tools.delegation.delegate_agent import create_delegate_agent_tools
+
+        fresh = create_delegate_agent_tools(self.tool_context)
+        if fresh and fresh[0].description == getattr(bound, "description", None):
+            return False
+        self.resetup_tools_for_backend()
+        return True
+
     def _setup_tools(self, postgres_conn: Optional[Any]) -> None:
         """Load tools from config, excluding phase-specific ones."""
         tool_config = self._tool_config()
@@ -2036,6 +2087,12 @@ class PersistentSession:
         self.tool_context._subagent_parent_kind = "session"
         self.tool_context._subagent_execution_lane = (
             "stateless" if self.shell_owner_token is not None else "pinned"
+        )
+        # Third input of the fan-out gate (agent.tools.delegation.fanout),
+        # published with the kind and lane so the delegate_agent description
+        # and the runtime cap see it from the first tool build.
+        self.tool_context._session_subagent_batch_settle_contract = (
+            self.subagent_batch_settle_contract is True
         )
         self.tool_context._session_parent_authority_provider = (
             self.session_parent_authority_provider
@@ -2806,6 +2863,7 @@ class PersistentSession:
                 model=self.config.llm.model or "",
                 tool_names=[tool.name for tool in self.tools],
                 prompt_type="interactive",
+                delegation_background_available=self.shell_owner_token is None,
             )
         backend_name = type(getattr(self.workspace_manager, "backend", None)).__name__
         logger.info(

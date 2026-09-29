@@ -397,6 +397,13 @@ class ToolContext:
         # life of the session object. The delegate_agent description reads it
         # at tool-build time, where no lease or authority may exist yet.
     )
+    _session_subagent_batch_settle_contract: bool = (
+        False  # The attach payload advertised
+        # ``session_subagent_batch_settle_contract: 1``: the orchestrator can
+        # settle an interrupted delegation batch once. One of the three
+        # conditions of session fan-out (``agent.tools.delegation.fanout``);
+        # published with the parent kind and lane, before tools load.
+    )
     _session_parent_authority_provider: Optional[Callable[[], Any]] = (
         None  # Fresh pinned/stateless SessionParentAuthority for every child
         # persistence operation.  Stateless warm sessions repoint leases

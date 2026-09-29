@@ -1942,6 +1942,9 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     pinned_runtime_generation_contract=request.get(
                         "pinned_runtime_generation_contract"
                     ),
+                    session_subagent_batch_settle_contract=request.get(
+                        "session_subagent_batch_settle_contract"
+                    ),
                     session_runtime_generation=runtime_generation,
                     session_runtime_attach_token=runtime_attach_token,
                     workspace_generation=workspace_generation,

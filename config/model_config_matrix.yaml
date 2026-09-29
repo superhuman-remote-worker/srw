@@ -71,6 +71,13 @@ default:
     # multimodal families below override with a dimension-aware mode. Verified
     # formulas: knowledge-history/done/context_token_accounting.md §4 + appendix.
     image_tokens: { mode: flat, flat: 1600 }
+    # Session delegation cap for a PARENT of this family: how many
+    # delegate_agent children a session with fan-out runs at once (1..20).
+    # Routed to delegation.family_session_max_concurrent, not llm; an expert or
+    # session delegation.session_max_concurrent beats it. Unset everywhere, so
+    # every family uses the code default 6 until the live measurements set
+    # per-family values (parallel_subagents.md §6.4, §13 D2, WP5/WP6).
+    # session_max_concurrent: 6
 
 minimax:
   # M2.7 reasoning is not a level we drive (no effort param); rely on endpoint

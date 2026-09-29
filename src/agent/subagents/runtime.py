@@ -8,7 +8,8 @@ What the runtime owns, and the ``delegate_agent`` tool only calls:
   runtime (B.1);
 - the worktree index counter (``.worktrees/<handle>`` is handle-named; the
   index keeps ``reader_env``'s port block allocation distinct per child);
-- the per-parent ``asyncio.Semaphore(delegation.max_concurrent)`` — N calls
+- the per-parent concurrency limit (``LiveConcurrencyLimit`` over
+  ``fanout.delegation_max_concurrent``, re-read at every admission) — N calls
   in one batch run concurrently up to the cap and in waves above it;
 - ``begin_batch(n)`` — the tool node stamps how many delegate calls the
   current batch carries so every envelope shares the parent's headroom by N
@@ -48,6 +49,7 @@ from agent.subagents.driver import SubagentDriver, SubagentResult
 from agent.subagents.envelope import build_envelope, build_replay_envelope, report_path
 from agent.subagents.fork import seed_fork_history
 from agent.subagents.host import ParentHost, ParentRef
+from agent.subagents.limiter import LiveConcurrencyLimit
 from agent.subagents.ledger import (
     SUBAGENT_STATUSES,
     NullLedger,
@@ -169,7 +171,7 @@ class SubagentRuntime:
         *,
         roster: Optional[Mapping[str, Mapping[str, Any]]] = None,
         default: Optional[str] = None,
-        max_concurrent: int = 4,
+        max_concurrent: int | Callable[[], int] = 4,
         ledger: Optional[SubagentLedger] = None,
         llm_factory: Optional[Callable[[Any, Any], Any]] = None,
         clock: Callable[[], float] = time.monotonic,
@@ -184,18 +186,25 @@ class SubagentRuntime:
             if isinstance(entry, Mapping)
         }
         self.default = str(default) if default else None
-        try:
-            cap = int(max_concurrent)
-        except (TypeError, ValueError):
-            cap = 4
-        self.max_concurrent = max(1, cap)
+        # The cap is either fixed or a zero-argument callable over the
+        # parent's LIVE context (from_context): the limiter re-reads it at
+        # every admission, so a live config update reaches the semaphore as
+        # well as the tool description (parallel_subagents.md §6.4).
+        cap_source: int | Callable[[], int]
+        if callable(max_concurrent):
+            cap_source = max_concurrent
+        else:
+            try:
+                cap_source = max(1, int(max_concurrent))
+            except (TypeError, ValueError):
+                cap_source = 4
         self.ledger: SubagentLedger = ledger if ledger is not None else NullLedger()
         self._llm_factory = llm_factory
         self.clock = clock
         self._hex_source = hex_source or (lambda: secrets.token_hex(2))
         self._driver_kwargs = dict(driver_kwargs or {})
 
-        self._semaphore = asyncio.Semaphore(self.max_concurrent)
+        self._semaphore = LiveConcurrencyLimit(cap_source, fallback=4)
         self._writer_guard = SharedWriterGuard()
         self._handles: set[str] = set()
         self._worktree_index = 0
@@ -230,19 +239,33 @@ class SubagentRuntime:
         cls, context: Any, host: ParentHost, **kwargs: Any
     ) -> "SubagentRuntime":
         """The runtime of a parent ``ToolContext``: roster / default from
-        ``config["subagents"]``, the cap from ``config["delegation"]``."""
+        ``config["subagents"]``, the cap read live through
+        ``fanout.delegation_max_concurrent`` — the function the
+        ``delegate_agent`` description reads, so both state one cap."""
+        from agent.tools.delegation.fanout import delegation_max_concurrent
+
         config = getattr(context, "config", None) or {}
         subagents = config.get("subagents") or {}
         if not isinstance(subagents, Mapping):
             subagents = {}
-        delegation = config.get("delegation") or {}
-        if not isinstance(delegation, Mapping):
-            delegation = {}
         kwargs.setdefault("roster", subagents.get("roster") or {})
         kwargs.setdefault("default", subagents.get("default"))
-        raw_cap = delegation.get("max_concurrent")
-        kwargs.setdefault("max_concurrent", 4 if raw_cap is None else raw_cap)
+        kwargs.setdefault("max_concurrent", lambda: delegation_max_concurrent(context))
         return cls(context, host, **kwargs)
+
+    @property
+    def max_concurrent(self) -> int:
+        """This parent's current cap on concurrently running children."""
+        return self._semaphore.limit
+
+    def refresh_concurrency(self) -> int:
+        """Apply a changed cap to calls already queued behind the limit.
+
+        The cap is re-read at every admission and release; a live config
+        update calls this so a raised cap starts queued children at once
+        instead of when the next child finishes. Returns how many started.
+        """
+        return self._semaphore.wake()
 
     # ------------------------------------------------------------------
     # Roster / handles / counters / batch

@@ -810,6 +810,7 @@ def rebase_context(
     ctx._parent_host = None
     ctx._subagent_parent_kind = None
     ctx._subagent_execution_lane = None
+    ctx._session_subagent_batch_settle_contract = False
     ctx._session_parent_authority_provider = None
     ctx._session_parent_authority = None
     ctx.parent_context_probe = None

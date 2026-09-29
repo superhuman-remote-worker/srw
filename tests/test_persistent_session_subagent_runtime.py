@@ -192,6 +192,7 @@ def test_tool_setup_publishes_the_session_lane_before_tools_load(
     def _capture() -> None:
         seen["kind"] = session.tool_context._subagent_parent_kind
         seen["lane"] = session.tool_context._subagent_execution_lane
+        seen["settle"] = session.tool_context._session_subagent_batch_settle_contract
 
     with (
         patch.object(session, "_load_tools_for_backend", side_effect=_capture),
@@ -199,4 +200,73 @@ def test_tool_setup_publishes_the_session_lane_before_tools_load(
     ):
         session._setup_tools(None)
 
-    assert seen == {"kind": "session", "lane": lane}
+    assert seen == {"kind": "session", "lane": lane, "settle": False}
+
+
+@pytest.mark.parametrize("advertised", [False, True])
+def test_tool_setup_publishes_the_batch_settle_capability_before_tools_load(
+    advertised,
+):
+    """The third input of the fan-out gate (parallel_subagents.md §12): the
+    attach payload's ``session_subagent_batch_settle_contract``, on the
+    context before any factory builds the delegate_agent description."""
+
+    session = _make_session(subagent_batch_settle_contract=advertised)
+    seen: dict = {}
+
+    def _capture() -> None:
+        seen["settle"] = session.tool_context._session_subagent_batch_settle_contract
+
+    with (
+        patch.object(session, "_load_tools_for_backend", side_effect=_capture),
+        patch.object(session, "_install_session_subagent_runtime"),
+    ):
+        session._setup_tools(None)
+
+    assert seen == {"settle": advertised}
+    # The tool config carries the parent's parallel-tool-call ability live.
+    assert session.tool_context.config["parallel_tool_calls"] is (
+        session.config.llm.parallel_tool_calls
+    )
+
+
+def test_live_config_refresh_hands_a_raised_cap_to_queued_children():
+    """``refresh_delegation_description`` runs on every live config update; it
+    wakes the runtime's limiter even when no delegate_agent tool is bound (the
+    hidden lifecycle runtime still holds queued children)."""
+
+    session = _make_session()
+    runtime = SimpleNamespace(refresh_concurrency=MagicMock(return_value=2))
+    session.tool_context = SimpleNamespace(subagent_runtime=runtime)
+    session.tools = None
+
+    assert session.refresh_delegation_description() is False
+    runtime.refresh_concurrency.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("shell_owner_token", "background"), [(None, True), (7, False)]
+)
+@pytest.mark.asyncio
+async def test_the_prompt_floor_offers_background_only_where_the_lane_has_it(
+    shell_owner_token, background
+):
+    """A stateless session cannot run a background child, so its delegation
+    floor must not offer one (the tool description says the same since WP0)."""
+
+    session = _make_session(shell_owner_token=shell_owner_token)
+    with (
+        patch.object(session, "_setup_workspace", new_callable=AsyncMock),
+        patch.object(session, "_setup_tools"),
+        patch.object(session, "_bind_tools"),
+        patch.object(session, "_setup_context_manager"),
+        patch.object(session, "_setup_shell_manager"),
+        patch.object(session, "_setup_memory"),
+        patch(
+            "agent.api.persistent_session.get_phase_system_prompt",
+            return_value="prompt",
+        ) as build,
+    ):
+        await session.setup(llm=MagicMock())
+
+    assert build.call_args.kwargs["delegation_background_available"] is background

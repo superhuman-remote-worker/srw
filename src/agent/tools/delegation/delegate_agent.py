@@ -12,8 +12,10 @@ returns either the foreground envelope or a durable background receipt. The
 description is REBUILT per factory call from the expert's resolved roster, so
 the model sees the types it can actually delegate to, its concurrency cap and
 the expert's background default. It also states what THIS parent may do: a
-session is told it delegates one child per response, and a stateless session is
-not offered background mode — the runtime refuses both, so advertising them
+session is told it delegates one child per response unless it may fan out
+(``fanout.session_fanout_allowed``: then its own cap, the one-shared-writer rule
+and the two recovery markers), and a stateless session is not offered
+background mode — the runtime refuses what is not offered, so advertising it
 costs the model a turn.
 
 Import rule: ``agent.subagents`` is imported lazily inside the factory and the
@@ -27,6 +29,12 @@ import logging
 from typing import Any, Dict, List, Literal, Mapping, Optional
 
 from agent.tools.context import ToolContext
+from agent.tools.delegation.fanout import (
+    delegation_max_concurrent,
+    is_session_parent,
+    parent_parallel_tool_calls,
+    session_fanout_allowed,
+)
 
 from shared.tool_catalog.definitions import (
     DELEGATE_AGENT_METADATA as DELEGATE_AGENT_METADATA,
@@ -75,6 +83,54 @@ def _roster_lines(roster: Mapping[str, Any], default: Optional[str]) -> List[str
     return lines
 
 
+#: Recovery markers a session parent may meet as a delegate_agent result after
+#: its executor was replaced mid-batch (parallel_subagents.md §5.5). The
+#: NOT STARTED text is server-rendered
+#: (``shared.session_subagent_batch.not_started_result_text``).
+INTERRUPTED_MARKER = "[delegate_agent: INTERRUPTED - no final report]"
+NOT_STARTED_MARKER = "[delegate_agent: NOT STARTED]"
+
+_TURN_OF_ITS_OWN = (
+    "Delegation runs in a turn of its own — any other tool batched with "
+    "delegate_agent is not executed and must be re-issued in the next turn. "
+    "Subagents cannot delegate: you cannot nest."
+)
+
+
+def _session_fanout_lines(cap: int, *, parallel_tool_calls: bool) -> List[str]:
+    """The concurrency, writer and recovery lines of a session allowed to fan out."""
+    if parallel_tool_calls:
+        concurrency = (
+            "To run briefs in parallel, send one delegate_agent call per brief "
+            f"in a single response. Up to {cap} "
+            f"{'subagent runs' if cap == 1 else 'subagents run'} at once; more "
+            "calls queue and run in waves."
+        )
+    else:
+        # The family sends one tool call per message: offering fan-out would
+        # be untrue whatever the cap says.
+        concurrency = (
+            "One subagent at a time: you send one tool call per response, so "
+            "delegate one brief, wait for its report, then delegate the next."
+        )
+    return [
+        f"{concurrency} {_TURN_OF_ITS_OWN}",
+        'By default a child works in your working tree (isolation="shared"), '
+        "and at most one child with write tools may work there at a time — a "
+        "second is refused, not queued. Give a writing child `owned_paths` "
+        "(the globs it may write; required when its type's write_policy is "
+        "owned_paths). To run writers in parallel, give each "
+        'isolation="worktree": its own git worktree on a branch.',
+        f"A result starting {INTERRUPTED_MARKER} means the process running "
+        "this conversation was replaced while that child worked: it may have "
+        "changed files, so check the workspace, then delegate only what is "
+        "still missing.",
+        f"A result starting {NOT_STARTED_MARKER} means that child never ran "
+        "and changed nothing: call delegate_agent again if the task is still "
+        "needed.",
+    ]
+
+
 def build_description(
     roster: Mapping[str, Any],
     *,
@@ -83,13 +139,20 @@ def build_description(
     run_in_background_default: bool = False,
     single_child_per_response: bool = False,
     background_available: bool = True,
+    session_fanout: bool = False,
+    parallel_tool_calls: bool = True,
 ) -> str:
     """The model-facing description for THIS parent's roster and cap.
 
     ``single_child_per_response`` replaces the fan-out sentence for a parent
     whose batches wider than one child are refused (sessions);
     ``background_available=False`` drops the background offer for a parent
-    whose lane cannot run one (stateless sessions)."""
+    whose lane cannot run one (stateless sessions). ``session_fanout`` is a
+    session allowed to fan out (``fanout.session_fanout_allowed``): it states
+    the effective cap, the one-shared-writer rule and the two recovery
+    markers, and wins over ``single_child_per_response``;
+    ``parallel_tool_calls=False`` (the parent family sends one tool call per
+    message) turns its cap sentence into one child at a time."""
     cap = max(1, int(max_concurrent or 1))
     names = [n for n, e in roster.items() if isinstance(e, Mapping)]
     returns = (
@@ -113,25 +176,26 @@ def build_description(
             "No subagent types are configured for this expert — a call will "
             "return an error until the roster is set."
         )
-    if single_child_per_response:
+    fanout_lines = (
+        _session_fanout_lines(cap, parallel_tool_calls=parallel_tool_calls)
+        if session_fanout
+        else []
+    )
+    if fanout_lines:
+        lines.append(fanout_lines[0])
+    elif single_child_per_response:
         lines.append(
             "One subagent at a time: issue exactly ONE delegate_agent call per "
             "response. A response that carries several delegate_agent calls is "
             "refused and none of them runs — delegate the next brief after "
-            "this one returns. Delegation runs in a turn of its own — any "
-            "other tool batched with delegate_agent is not executed and must "
-            "be re-issued in the next turn. Subagents cannot delegate: you "
-            "cannot nest."
+            f"this one returns. {_TURN_OF_ITS_OWN}"
         )
     else:
         plural = "subagent runs" if cap == 1 else "subagents run"
         lines.append(
             f"Up to {cap} {plural} at once: to fan out, call this tool N times "
             "in ONE turn (one call per brief; calls above the cap queue and "
-            "run in waves). Delegation runs in a turn of its own — any other "
-            "tool batched with delegate_agent is not executed and must be "
-            "re-issued in the next turn. Subagents cannot delegate: you cannot "
-            "nest."
+            f"run in waves). {_TURN_OF_ITS_OWN}"
         )
     if background_available:
         background_default = "true" if run_in_background_default else "false"
@@ -151,14 +215,17 @@ def build_description(
             "available in this session: leave it unset — a call that sets it "
             "to true is refused."
         )
-    lines.append(
-        "All agents share the working tree — partition writes or sequence "
-        "waves: give a writing child `owned_paths` (the globs it may write; "
-        "required when its type's write_policy is owned_paths), never run two "
-        'writers on the same files at once, and use isolation="worktree" for '
-        "a child that needs its own git worktree branch instead of the shared "
-        "tree."
-    )
+    if fanout_lines:
+        lines.append(fanout_lines[1])
+    else:
+        lines.append(
+            "All agents share the working tree — partition writes or sequence "
+            "waves: give a writing child `owned_paths` (the globs it may write; "
+            "required when its type's write_policy is owned_paths), never run two "
+            'writers on the same files at once, and use isolation="worktree" for '
+            "a child that needs its own git worktree branch instead of the shared "
+            "tree."
+        )
     lines.append(
         "fork=true seeds the child with your conversation so far — it re-sends "
         "your whole prefix on every child call; use it only when the child "
@@ -173,6 +240,7 @@ def build_description(
         "finish in a handful of tool calls, and do not use subagents to "
         "double-check your own work."
     )
+    lines.extend(fanout_lines[2:])
     return "\n".join(lines)
 
 
@@ -243,15 +311,17 @@ def create_delegate_agent_tools(context: ToolContext) -> List[Any]:
     from typing import Annotated
 
     roster, default = _roster_settings(context)
-    try:
-        max_concurrent = int(settings.get("max_concurrent") or 4)
-    except (TypeError, ValueError):
-        max_concurrent = 4
+    # The same reads the runtime's semaphore makes (fanout.py), so the cap
+    # stated here is the cap enforced; a live config update rebuilds this
+    # tool and the runtime re-reads the cap at its next admission.
+    max_concurrent = delegation_max_concurrent(context)
+    session_fanout = session_fanout_allowed(context)
+    parallel_tool_calls = parent_parallel_tool_calls(context)
     run_in_background_default = bool(settings.get("run_in_background_default", False))
     type_names = ", ".join(n for n, e in roster.items() if isinstance(e, Mapping))
-    # What this parent may actually do. Both are decided when the tool is
-    # built: the parent kind and the lane never change under a session object.
-    session_parent = getattr(context, "_subagent_parent_kind", None) == "session"
+    # What this parent may actually do. The parent kind and the lane never
+    # change under a session object; the fan-out gate follows the live config.
+    session_parent = is_session_parent(context)
     background_available = not (
         session_parent
         and getattr(context, "_subagent_execution_lane", None) == "stateless"
@@ -387,8 +457,10 @@ def create_delegate_agent_tools(context: ToolContext) -> List[Any]:
             default=default,
             max_concurrent=max_concurrent,
             run_in_background_default=run_in_background_default,
-            single_child_per_response=session_parent,
+            single_child_per_response=session_parent and not session_fanout,
             background_available=background_available,
+            session_fanout=session_fanout,
+            parallel_tool_calls=parallel_tool_calls,
         ),
         args_schema=DelegateAgentInput,
     )
@@ -397,6 +469,8 @@ def create_delegate_agent_tools(context: ToolContext) -> List[Any]:
 
 __all__ = [
     "DELEGATE_AGENT_METADATA",
+    "INTERRUPTED_MARKER",
+    "NOT_STARTED_MARKER",
     "build_description",
     "create_delegate_agent_tools",
     "ensure_runtime",

@@ -293,3 +293,53 @@ class TestLiveConfigUpdateBoundSet:
         assert config["shell"]["mode"] == "persistent"
         # Runtime-derived keys ride the asdict round trip and must survive.
         assert config["_resolved_skills"] == before["_resolved_skills"]
+
+    async def test_llm_only_update_rebuilds_a_stale_delegate_description(
+        self, monkeypatch
+    ):
+        """parallel_subagents.md §6.4: the delegate_agent description states
+        the cap and fan-out mode the runtime enforces live. An llm-only frame
+        reloads no tools, so a switch onto a family that can send parallel
+        calls must still rebuild that one description."""
+        config = _config(
+            override={
+                "tools": {"delegation": ["delegate_agent"]},
+                "delegation": {"enabled": True, "session_fanout": True},
+            }
+        )
+        assert config.llm.parallel_tool_calls is False  # boot family
+        session = PersistentSession(
+            thread_id=str(uuid.uuid4()),
+            config=config,
+            shell_owner_token=7,  # stateless lane
+            subagent_batch_settle_contract=True,
+        )
+        session.workspace_manager = _Workspace()
+        session.shell_manager = MagicMock()
+        session._llm = MagicMock()
+        with (
+            _binding_patches(),
+            patch.object(session, "_install_session_subagent_runtime"),
+        ):
+            session._setup_tools(None)
+
+        def described():
+            (tool,) = [t for t in session.tools if t.name == "delegate_agent"]
+            return tool.description
+
+        assert "One subagent at a time: you send one tool call per" in described()
+        mod, broadcast, send = _handler_patches(monkeypatch, session)
+
+        with _binding_patches():
+            await mod._handle_config_update(
+                MagicMock(), {"llm": {"model": "gpt-5.6-sol"}}
+            )
+
+        send.assert_not_awaited()
+        assert session.config.llm.parallel_tool_calls is True
+        assert session.tool_context.config["parallel_tool_calls"] is True
+        text = described()
+        assert "send one delegate_agent call per brief in a single response" in text
+        assert "Up to 6 subagents run at once" in text
+        # Nothing left to rebuild once the description matches.
+        assert session.refresh_delegation_description() is False
