@@ -1,0 +1,107 @@
+{
+  "date": "2026-09-29",
+  "commit": "e24263a4d6c629a1e667d4aad10abc130032bb45",
+  "stack": "local k3d (context k3d-srw, namespace srw), Tilt-built images (tilt-* tags, no sha- tags), vm.mode off",
+  "minimalImage": "srw-registry:5000/srw-workspace-minimal:a2a (sha256:02ce2b3f2bc54ae9113129da27588eec9d7f3d91ca15701bcf48b06f74b97a4c)",
+  "checks": [
+    {
+      "check": 1,
+      "name": "Catalog lists the built-ins with installationManaged",
+      "result": "pass",
+      "observed": {
+        "templates": ["virtual", "container-minimal", "container-full"],
+        "installationManaged": [true, true, true],
+        "vm-full": "absent (vm.mode off)",
+        "container-minimal.image": "srw-registry:5000/srw-workspace-minimal:a2a",
+        "container-full.image": "srw-registry:5000/srw-workspace:tilt-2a3ac37580fd6eec",
+        "reconcilerAfterImageChange": "updated [container-minimal], unchanged [virtual, container-full]; all three were created by an earlier start at 07:24Z"
+      }
+    },
+    {
+      "check": 2,
+      "name": "Job on container-minimal reaches job_complete with FUSE profile and a working browser tool",
+      "result": "pass",
+      "observed": {
+        "podImage": "srw-registry:5000/srw-workspace-minimal:a2a",
+        "requests": {"cpu": "500m", "memory": "1Gi"},
+        "limits": {"cpu": "2", "memory": "4Gi"},
+        "fuse": "dev-fuse hostPath volume, privileged, SYS_ADMIN, same as the default pod",
+        "srw/build-sha": "absent",
+        "jobStatus": "job_complete called, job pending_review",
+        "browserCalls": ["browser_navigate https://example.com", "browser_snapshot"],
+        "browserToolTitle": "example.com",
+        "chromeTargetTitle": "Example Domain",
+        "note": "browser-exec reports the title 'example.com' on the full (installation) image too; the chat has 'Example Domain' only in the agent's reasoning"
+      }
+    },
+    {
+      "check": 3,
+      "name": "Session on container-minimal becomes Ready, IDE answers, End removes the pod",
+      "result": "pass",
+      "observed": {
+        "podImage": "srw-registry:5000/srw-workspace-minimal:a2a",
+        "workspaceStatus": "ready",
+        "ideEndpoint": "200 {status: active, source: live_workspace}",
+        "codeServerHealthz": 200,
+        "afterEnd": "thread ended, pod gone; PVC removed by the permanent delete"
+      }
+    },
+    {
+      "check": 4,
+      "name": "container-full pod equals the default pod",
+      "result": "pass",
+      "observed": {
+        "image": "srw-registry:5000/srw-workspace:tilt-2a3ac37580fd6eec (both)",
+        "requests": {"cpu": "500m", "memory": "1Gi"},
+        "limits": {"cpu": "2", "memory": "4Gi"},
+        "securityContext": "identical",
+        "imagePullPolicy": "IfNotPresent (both)",
+        "srw/build-sha": "absent on both (tilt tags)",
+        "specDiff": "only the per-job HASHED_PASSWORD value and the creation-reservation annotation"
+      }
+    },
+    {
+      "check": 5,
+      "name": "Template requests reach the pod; request above limit is refused",
+      "result": "pass",
+      "observed": {
+        "inline": {"requests": {"cpu": "200m", "memory": "512Mi"}, "limits": {"cpu": "1", "memory": "2Gi"}},
+        "requestAboveLimit": "422 Resource request exceeds its limit."
+      }
+    },
+    {
+      "check": 6,
+      "name": "Edit and delete of a built-in return 409; an Account copy is allowed",
+      "result": "pass",
+      "observed": {
+        "apply": "409 This template is managed by the installation. Duplicate it to change it.",
+        "delete": "409 This template is managed by the installation. Duplicate it to change it.",
+        "accountCopy": "200, installationManaged false (deleted afterwards)"
+      }
+    },
+    {
+      "check": 7,
+      "name": "containerResources change gives the container built-ins a new revision",
+      "result": "pass",
+      "observed": {
+        "reconciler": "updated [container-minimal, container-full], unchanged [virtual]",
+        "resourceVersion": {"container-full": "1 -> 2", "container-minimal": "2 -> 3", "virtual": "1 -> 1"},
+        "cpu": 3
+      }
+    },
+    {
+      "check": 8,
+      "name": "Switch off retires the built-ins; switch back restores them with the same uids",
+      "result": "pass",
+      "observed": {
+        "off": "Catalog empty; reconciler retired [container-full, container-minimal, virtual]",
+        "on": "reconciler restored [virtual, container-minimal, container-full]; uids unchanged",
+        "uids": {
+          "container-full": "7c213677-5cd5-4387-89e2-ce6ea7ea24d6",
+          "container-minimal": "ab8bb40a-2f2d-4f74-ad22-36acb3f68eef",
+          "virtual": "2006a495-1538-4345-b1f5-f54d30239426"
+        }
+      }
+    }
+  ]
+}
