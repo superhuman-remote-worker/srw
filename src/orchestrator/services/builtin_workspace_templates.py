@@ -99,6 +99,7 @@ async def reconcile_builtin_workspace_templates(
                     "Built-in workspace template %s is invalid and was skipped: %s",
                     name,
                     getattr(error, "detail", error),
+                    exc_info=isinstance(error, (KeyError, TypeError)),
                 )
                 summary["invalid"].append(name)
                 continue

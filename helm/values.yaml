@@ -2726,6 +2726,9 @@ workspace:
     # container-minimal, container-full and, when VMs are on, vm-full. The
     # orchestrator reconciles them at every start. They are read-only in the
     # application; users duplicate one to change it. false retires them.
+    # Changing this block changes the orchestrator's ConfigMap; with
+    # reloader.enabled (on by default), Reloader restarts the orchestrator so
+    # the new start picks it up. With Reloader off, restart it by hand.
     enabled: true
     # -- Sizes of the two built-in container templates. cpu and memory are the
     # maximum; requests is what Kubernetes reserves on the node. The defaults

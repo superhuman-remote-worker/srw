@@ -93,6 +93,14 @@ workspace:
   `workspace.builtinTemplates.vmResources`. They turn the set off with
   `workspace.builtinTemplates.enabled: false`. The VM controller never makes a
   disk smaller than `vmController.vmDiskSize`.
+- **A name conflict skips that built-in.** If the shared Catalog already holds
+  a template with a built-in's name that the installation doesn't manage — an
+  administrator created it, for example — the orchestrator skips the built-in
+  and logs an error at startup. Rename or delete the existing template to get
+  the built-in.
+- **A built-in a Project still references stays.** It stays, read-only, after
+  it stops being declared or after `workspace.builtinTemplates.enabled: false`,
+  and is retired at a later start once nothing references it.
 
 ## Images
 

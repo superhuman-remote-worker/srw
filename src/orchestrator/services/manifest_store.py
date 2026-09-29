@@ -145,6 +145,19 @@ class ManifestStore:
         metadata = document["metadata"]
         old = await self.by_name(document["kind"], metadata["scope"], metadata["name"])
         if old:
+            if bool(old.get("installation_managed")) != installation_managed:
+                # The installation's rows and everyone else's never change
+                # hands, in either direction. Check this before the version
+                # comparison below: an admin applying a stale version against a
+                # built-in must see the managed refusal, not a version-changed
+                # retry that only leads back here.
+                raise HTTPException(
+                    409,
+                    INSTALLATION_MANAGED_MESSAGE
+                    if old.get("installation_managed")
+                    else "A resource with this name exists and isn't managed "
+                    "by the installation.",
+                )
             if (
                 expected_version is not None
                 and old["resource_version"] != expected_version
@@ -152,16 +165,6 @@ class ManifestStore:
                 raise HTTPException(
                     409,
                     "Resource version changed; read the current resource and retry.",
-                )
-            if bool(old.get("installation_managed")) != installation_managed:
-                # The installation's rows and everyone else's never change
-                # hands, in either direction.
-                raise HTTPException(
-                    409,
-                    INSTALLATION_MANAGED_MESSAGE
-                    if old.get("installation_managed")
-                    else "A resource with this name exists and isn't managed "
-                    "by the installation.",
                 )
             if (
                 old["document"] == document

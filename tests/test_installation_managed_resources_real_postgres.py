@@ -99,6 +99,28 @@ async def test_an_admin_cannot_edit_a_marked_row(database, actor):
 
 
 @pytest.mark.asyncio
+async def test_a_stale_version_still_gets_the_managed_refusal(database, actor):
+    # The managed check must run before the version-changed check: a stale
+    # expected_version against a built-in should not surface "read and
+    # retry" only to hit the managed refusal on the very next attempt.
+    assert actor["is_admin"] is True
+    marked = await builtin(database)
+    changed = template("container-full", CATALOG, resources={"cpu": 8})
+    with pytest.raises(HTTPException) as refused:
+        await ManifestResourceService(database).apply(
+            json.dumps(changed),
+            actor,
+            format="json",
+            expected_versions={key(changed): marked["resource_version"] + 1},
+        )
+    assert refused.value.status_code == 409
+    assert refused.value.detail == INSTALLATION_MANAGED_MESSAGE
+    current = await ManifestStore(database).by_id(marked["id"])
+    assert current["resource_version"] == marked["resource_version"]
+    assert current["revision"] == marked["revision"]
+
+
+@pytest.mark.asyncio
 async def test_applying_even_identical_content_is_refused(database, actor):
     # One rule for every API write keeps the answer independent of how the
     # live resolver spells a resolved spec.
