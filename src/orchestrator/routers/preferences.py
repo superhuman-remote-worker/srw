@@ -10,7 +10,6 @@ from pydantic import BaseModel, field_validator
 
 from orchestrator.security.auth import require_approved_user
 from orchestrator.services.preference_defaults import resolve_preference_defaults
-from orchestrator.services.session_workspace_policy import SESSION_WORKSPACE_BACKENDS
 
 router = APIRouter(prefix="/api/settings/preferences")
 
@@ -96,19 +95,17 @@ class UserSettingsUpdate(BaseModel):
     def _validate_persistent_agent(
         cls, v: dict[str, Any] | None
     ) -> dict[str, Any] | None:
-        """Guard the persistent_agent sub-object: workspace_backend must be a
-        create-time-selectable tier — a typo here would otherwise misconfigure
-        every future session created from the user's defaults. Other keys stay
-        free-form (Phase 6 contract)."""
+        """Guard the persistent_agent sub-object. ``workspace_backend`` is a
+        retired preference (Slice A2b: a Session's tier now comes only from
+        the workspace defaults chain) — accepted from a stale cockpit and
+        silently dropped, rather than 422ing, so an old client's PATCH still
+        succeeds for its other fields. Other keys stay free-form (Phase 6
+        contract)."""
         if v is None:
             return v
         if not isinstance(v, dict):
             raise ValueError("persistent_agent must be an object")
-        backend = v.get("workspace_backend")
-        if backend is not None and backend not in SESSION_WORKSPACE_BACKENDS:
-            raise ValueError(
-                f"workspace_backend must be one of {list(SESSION_WORKSPACE_BACKENDS)}"
-            )
+        v = {key: value for key, value in v.items() if key != "workspace_backend"}
         return v
 
     @field_validator("read_aloud")
@@ -233,6 +230,15 @@ async def get_user_preferences(
     """
     user = await dependencies.require_approved_user(request, dependencies.db)
     prefs = await dependencies.db.get_user_settings(str(user["id"]))
+    # persistent_agent.workspace_backend is a retired preference (Slice A2b):
+    # hide it on read even though a stored row may still carry it (the
+    # backfill in Task 9 clears it on the next write).
+    if isinstance(prefs.get("persistent_agent"), dict):
+        prefs["persistent_agent"] = {
+            key: value
+            for key, value in prefs["persistent_agent"].items()
+            if key != "workspace_backend"
+        }
     prefs["_resolved"] = await resolve_preference_defaults(
         dependencies.db, role_base=dependencies.role_base, environ=dependencies.environ
     )

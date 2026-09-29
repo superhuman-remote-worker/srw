@@ -378,3 +378,19 @@ async def test_the_shipped_configuration_with_the_chart_builtins(database, monke
     assert refused.value.detail == (
         "The built-in container template 'container-full' is missing; see the orchestrator's startup log."
     )
+
+
+@pytest.mark.asyncio
+async def test_the_personal_project_row_decides_a_session(database, actor):
+    project_id = await _project(database)
+    await save_settings_defaults(
+        database,
+        project_id,
+        ProjectDefaults(sessions="container"),
+        actor_id=str(actor["id"]),
+    )
+    config, receipt = await select_execution_workspace(
+        database, actor, project_id=project_id, role="session"
+    )
+    assert config["backend"] == "sandbox"
+    assert receipt["sources"] == {"tier": "project", "template": "builtin"}

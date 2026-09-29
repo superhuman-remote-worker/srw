@@ -37,7 +37,6 @@ EXPECTED_DEFAULTS = {
         "model": "registry-chat",
         "permission_mode": "supervised",
         "idle_timeout_minutes": 30,
-        "workspace_backend": "virtual",
     },
 }
 
@@ -154,6 +153,18 @@ async def test_get_preserves_saved_preferences_and_registry_defaults(preferences
 
 
 @pytest.mark.asyncio
+async def test_get_hides_the_retired_workspace_backend(preferences_api):
+    api = preferences_api
+    api.db.get_user_settings.side_effect = None
+    api.db.get_user_settings.return_value = {
+        "persistent_agent": {"model": "p", "workspace_backend": "sandbox"}
+    }
+    response = await request(api, "GET")
+    assert response.json()["persistent_agent"] == {"model": "p"}
+    assert "workspace_backend" not in response.json()["_resolved"]["persistent_agent"]
+
+
+@pytest.mark.asyncio
 async def test_get_overwrites_stored_resolved_but_does_not_persist_it(preferences_api):
     api = preferences_api
     api.db.get_user_settings.side_effect = None
@@ -233,11 +244,14 @@ async def test_empty_role_defaults_preserve_none_and_platform_fallbacks(
             },
             {
                 "persistent_agent": {
-                    "workspace_backend": "none",
                     "greeting": "legacy",
                     "future": 7,
                 }
             },
+        ),
+        (
+            {"persistent_agent": {"model": "p", "workspace_backend": "sandbox"}},
+            {"persistent_agent": {"model": "p"}},
         ),
         (
             {"communication": {"channels": {"email": False}, "future": 7}},
@@ -309,8 +323,6 @@ async def test_empty_or_only_unknown_patch_remains_400_after_auth(
 @pytest.mark.parametrize(
     "body,field",
     [
-        ({"persistent_agent": {"workspace_backend": "vm"}}, "persistent_agent"),
-        ({"persistent_agent": {"workspace_backend": "bogus"}}, "persistent_agent"),
         ({"read_aloud": {"reasoning_level": "ultra"}}, "read_aloud"),
         ({"read_aloud": {"custom_prompt": "x" * 1001}}, "read_aloud"),
         ({"communication": {"channels": {"email": "false"}}}, "communication"),

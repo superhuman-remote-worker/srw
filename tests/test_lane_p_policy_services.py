@@ -55,9 +55,6 @@ from orchestrator.services import (
     session_create_overrides as session_create_overrides_module,
 )
 from orchestrator.services import session_tool_policy as session_tool_policy_module
-from orchestrator.services import (
-    session_workspace_policy as session_workspace_policy_module,
-)
 from orchestrator.services import virtual_workspace as virtual_workspace_module
 from orchestrator.services import vm_workspace_policy as vm_workspace_policy_module
 from orchestrator.services import workspace_tier_policy as workspace_tier_policy_module
@@ -401,24 +398,6 @@ class TestSessionWorkspacePolicy:
     def test_vm_is_creatable_but_never_a_saved_default(self):
         assert "vm" in wspolicy.SESSION_CREATE_WORKSPACE_BACKENDS
         assert "vm" not in wspolicy.SESSION_WORKSPACE_BACKENDS
-        assert wspolicy.default_session_workspace_backend(
-            {"workspace_backend": "vm"}
-        ) == (wspolicy.SESSION_DEFAULT_WORKSPACE_BACKEND)
-
-    @pytest.mark.parametrize(
-        ("settings", "expected"),
-        [
-            ({"workspace_backend": "sandbox"}, "sandbox"),
-            ({"workspace_backend": "bogus"}, "virtual"),
-            ({}, "virtual"),
-            (None, "virtual"),
-        ],
-    )
-    def test_default_backend_chain(self, settings, expected):
-        assert wspolicy.default_session_workspace_backend(settings) == expected
-        assert wspolicy.default_session_workspace_backend(
-            settings
-        ) == session_workspace_policy_module.default_session_workspace_backend(settings)
 
     def test_workspace_override_accepts_vm_and_rejects_unknown(self):
         assert wspolicy.validated_session_workspace_override(
@@ -1710,7 +1689,13 @@ class TestSessionConfigResolution:
             dependencies=deps,
         )
         assert seen["called"] is True
-        assert seen["base_defaults"] == {"llm": {"model": "sentinel-account-model"}}
+        # Slice A2b: the snapshot-less path folds in the chain's tier
+        # (installation default "virtual", from the fake store's fetchrow
+        # returning no project row) on top of the stubbed account layer.
+        assert seen["base_defaults"] == {
+            "llm": {"model": "sentinel-account-model"},
+            "workspace": {"backend": "virtual"},
+        }
 
     @pytest.mark.asyncio
     async def test_a_project_scoped_thread_skips_the_mount_lookup(self):
@@ -1904,7 +1889,7 @@ class TestAccountDefaults:
         assert "workspace" not in worker
 
     @pytest.mark.asyncio
-    async def test_session_layer_carries_the_workspace_backend(self):
+    async def test_the_session_layer_no_longer_carries_a_workspace(self):
         store = MagicMock()
         store.get_user_settings = AsyncMock(
             return_value={
@@ -1923,7 +1908,7 @@ class TestAccountDefaults:
         layer = await sessioncfg.account_defaults_layer(
             "u", "session", dependencies=deps
         )
-        assert layer["workspace"] == {"backend": "sandbox"}
+        assert "workspace" not in layer
         assert layer["llm"]["model"] == "p", (
             "persistent_agent.model wins over default_model"
         )
