@@ -38,8 +38,15 @@ from shared.session_subagent_authority import (
     coerce_session_parent_authority,
     session_subagent_delivery_id,
 )
+from shared.session_subagent_batch import session_subagent_batch_delivery_id
 
 logger = logging.getLogger(__name__)
+
+# The verdicts of a batch settle that are successes (orchestrator
+# ``agent_settle_session_subagent_batch``); a ``stale`` verdict is a 409.
+_BATCH_SETTLE_RESULTS = frozenset(
+    {"applied", "idempotent", "already_delivered", "nothing_to_recover"}
+)
 
 _COMPLETION_REPORT_PAYLOAD_FIELDS = (
     "should_stop",
@@ -1185,6 +1192,26 @@ class OrchestratorClient:
     ) -> list[dict[str, Any]]:
         """Return generation-bearing session child recovery candidates."""
 
+        listed = await self.list_live_session_subagent_recovery(
+            parent_thread_id, parent_authority=parent_authority
+        )
+        return listed["subagents"]
+
+    async def list_live_session_subagent_recovery(
+        self,
+        parent_thread_id: str,
+        *,
+        parent_authority: SessionParentAuthority,
+    ) -> dict[str, Any]:
+        """The recovery candidates and the orchestrator's per-turn plans.
+
+        ``subagents`` are the validated candidate rows. ``recovery_turns`` is
+        the list of per-turn plans (one per parent turn of a candidate, every
+        ``delegate_agent`` call of the turn with its class), or ``None`` from
+        an orchestrator that predates batch settle, and for a malformed list:
+        plans never fail the listing.
+        """
+
         parsed = _session_subagent_authority_for_thread(
             parent_authority, parent_thread_id
         )
@@ -1203,7 +1230,8 @@ class OrchestratorClient:
                 raise SubagentPersistenceError(
                     "session-live-list", int(response.status_code)
                 )
-            rows = response.json().get("subagents")
+            data = response.json()
+            rows = data.get("subagents")
             if not isinstance(rows, list) or not all(
                 isinstance(row, dict) for row in rows
             ):
@@ -1216,11 +1244,106 @@ class OrchestratorClient:
             ]
             if len({row["thread_id"] for row in normalized}) != len(normalized):
                 raise SubagentPersistenceError("session-live-list-payload")
-            return normalized
+            plans = data.get("recovery_turns")
+            if plans is not None and (
+                not isinstance(plans, list)
+                or not all(isinstance(plan, dict) for plan in plans)
+            ):
+                # Plans are additive. A malformed list never fails the
+                # candidates: every child then recovers on its own.
+                logger.warning(
+                    "Ignoring malformed session recovery plans for thread %s",
+                    parent_thread_id,
+                )
+                plans = None
+            return {
+                "subagents": normalized,
+                "recovery_turns": (
+                    [dict(plan) for plan in plans] if plans is not None else None
+                ),
+            }
         except (SessionParentAuthorityRefused, SubagentPersistenceError):
             raise
         except Exception as exc:
             raise SubagentPersistenceError("session-live-list") from exc
+
+    async def settle_session_subagent_batch(
+        self,
+        parent_thread_id: str,
+        *,
+        parent_authority: SessionParentAuthority,
+        parent_input_message_id: str,
+        parent_iteration: int,
+        members: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Settle one abandoned delegation turn in one orchestrator transaction.
+
+        Returns the verdict: ``applied``, ``idempotent``, ``already_delivered``
+        or ``nothing_to_recover``, or the server's view with ``result: stale``
+        when the members differ from the ones it would settle (nothing was
+        written). The id of a continuation written now is recomputed here and
+        a mismatch is refused, as for the single-child delivery id. An
+        ``idempotent`` verdict names whichever continuation already supersedes
+        the input: this settle's own from an earlier attempt, or one a
+        single-child recovery wrote.
+        """
+
+        parsed = _session_subagent_authority_for_thread(
+            parent_authority, parent_thread_id
+        )
+        input_id = str(UUID(str(parent_input_message_id)))
+        if (
+            isinstance(parent_iteration, bool)
+            or not isinstance(parent_iteration, int)
+            or parent_iteration <= 0
+        ):
+            raise ValueError("a batch settle needs the exact parent turn")
+        expected_delivery = str(
+            session_subagent_batch_delivery_id(parent_thread_id, input_id)
+        )
+        if not self._client:
+            await self.connect()
+        url = (
+            f"{self.orchestrator_url}/api/agents/threads/"
+            f"{parent_thread_id}/subagents/settle-batch"
+        )
+        payload = {
+            "parent_authority": parsed.to_wire(),
+            "parent_input_message_id": input_id,
+            "parent_iteration": parent_iteration,
+            "members": [dict(member) for member in members],
+        }
+        try:
+            response = await self._client.post(url, json=payload)
+            _raise_session_subagent_authority_refusal(response)
+            data = response.json()
+            if response.status_code == 409:
+                detail = data.get("detail") if isinstance(data, dict) else None
+                if isinstance(detail, dict) and detail.get("result") == "stale":
+                    return dict(detail)
+                raise SubagentPersistenceError("session-batch-settle", 409)
+            if response.status_code != 200:
+                raise SubagentPersistenceError(
+                    "session-batch-settle", int(response.status_code)
+                )
+            result = data.get("result")
+            if (
+                result not in _BATCH_SETTLE_RESULTS
+                or str(UUID(str(data.get("parent_input_message_id")))) != input_id
+                or data.get("parent_iteration") != parent_iteration
+            ):
+                raise SubagentPersistenceError("session-batch-settle-payload")
+            if result in {"applied", "idempotent"}:
+                delivery_id = str(UUID(str(data.get("delivery_id"))))
+                if (
+                    result == "applied" and delivery_id != expected_delivery
+                ) or not str(data.get("delivery_state") or "").strip():
+                    raise SubagentPersistenceError("session-batch-settle-payload")
+            return dict(data)
+        except (SessionParentAuthorityRefused, SubagentPersistenceError):
+            raise
+        except Exception as exc:
+            raise SubagentPersistenceError("session-batch-settle") from exc
 
     async def get_session_subagent_thread(
         self,

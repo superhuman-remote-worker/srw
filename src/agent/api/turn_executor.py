@@ -74,6 +74,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    Mapping,
     Optional,
     Tuple,
 )
@@ -116,6 +117,7 @@ from shared.run_queue import (
     transient_release_backoff_seconds,
 )
 from shared.session_permission_retirement import retire_stale_stateless_permissions
+from shared.session_subagent_batch import SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY
 from shared.session_retirement import (
     acknowledge_session_claim_quiesced,
     active_claim_authority,
@@ -229,11 +231,15 @@ def _enabled_env(name: str, default: bool = False) -> bool:
 # means nothing was ever answered, so the oldest human row qualifies.
 _PENDING_INPUT_SQL = """
     SELECT message.id, message.seq, message.content, message.turn_number,
-           message.role, delivery.delivery_id, delivery.supersedes_input_seq
+           message.role, delivery.delivery_id, delivery.supersedes_input_seq,
+           superseded.role AS supersedes_input_role
     FROM thread_messages AS message
     LEFT JOIN thread_input_deliveries AS delivery
       ON delivery.message_id = message.id
      AND delivery.thread_id = message.thread_id
+    LEFT JOIN thread_messages AS superseded
+      ON superseded.thread_id = message.thread_id
+     AND superseded.seq = delivery.supersedes_input_seq
     WHERE message.thread_id = $1
       AND message.rewound_at IS NULL
       AND (
@@ -503,6 +509,58 @@ def fingerprint_diff_paths(
 
     _walk(old, new, "", 0)
     return paths
+
+
+def claim_bundle_attach(bundle: Mapping[str, Any]) -> Dict[str, Any]:
+    """The ``_attach_session`` keywords of a stateless claim bundle.
+
+    ``attach`` is splatted into ``_attach_session``, so the orchestrator puts
+    a capability beside it, never inside it: an agent image without the
+    keyword would refuse every claim. The batch-settle advertisement
+    (parallel_subagents.md §12) is folded in here as the keyword, which
+    reaches the session, its tool context, the fan-out gate and subagent
+    recovery. A bundle from an orchestrator that still carried it inside
+    ``attach`` supplies it the same way; the top-level value wins. The value
+    is part of the attach fingerprint, so a changed advertisement re-attaches
+    a warm session instead of reusing its stale flag.
+    """
+
+    attach = dict(bundle.get("attach") or {})
+    key = SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY
+    nested = attach.pop(key, None)
+    value = bundle.get(key, nested)
+    if value is not None:
+        attach[key] = value
+    return attach
+
+
+def completed_input_checkpoint(
+    target: Mapping[str, Any], *, claim_consumed_seq: Optional[int]
+) -> Optional[int]:
+    """The human watermark a finished turn checkpoints when it closes.
+
+    An ordinary turn consumed its own input row. A subagent recovery turn
+    answered the input its continuation supersedes: a human row is consumed
+    there (the recovery already advanced the watermark to it, so this is a
+    repeat the close accepts).
+
+    ``None`` when the superseded input is not a human row: a wake, a job
+    completion, or the continuation of an earlier recovery whose turn
+    delegated again (parallel_subagents.md D3). The recovery settled that
+    event's own delivery, and the human watermark is not this turn's to move.
+    The close would refuse a checkpoint at the event's seq, because it
+    requires the event's delivery to be owned by the current lease and after
+    a crash it never is; and accepted, it would skip human input typed below
+    that seq.
+    """
+
+    superseded = target.get("supersedes_input_seq")
+    if superseded is not None and target.get("supersedes_input_role") != "human":
+        return None
+    return max(
+        int(superseded if superseded is not None else target["seq"]),
+        int(claim_consumed_seq) if claim_consumed_seq is not None else -1,
+    )
 
 
 def strip_restored_pending_humans(
@@ -995,7 +1053,7 @@ class StatelessTurnExecutor:
         # Full-settle close evidence survives cancellation into the claim's
         # finally block. Cleanup must never downgrade an atomic
         # close+checkpoint retry into a gate-only close.
-        self._pending_settled_close: tuple[str, int, int, int] | None = None
+        self._pending_settled_close: tuple[str, int, int, int | None] | None = None
         # Monotonic executor-owned copy of the exact external-effect seam.
         # PersistentApp session globals are intentionally cleared by a
         # physical detach, which can precede the queue completion CAS.
@@ -3804,7 +3862,7 @@ class StatelessTurnExecutor:
             return
 
         timing["bundle"] = time.perf_counter() - t0
-        attach = bundle.get("attach") or {}
+        attach = claim_bundle_attach(bundle)
         # Watermarks: the claim's values were read atomically inside the claim
         # statement — they are the authority; the bundle's copy is diagnostics.
         consumed_seq = claim.consumed_seq
@@ -4217,14 +4275,15 @@ class StatelessTurnExecutor:
             t0 = time.perf_counter()
             await self._await_cloud_push_staged(pa)
             timing["stage"] = time.perf_counter() - t0
-            superseded_input_seq = target.get("supersedes_input_seq")
-            completed_input_seq = max(
-                int(
-                    superseded_input_seq
-                    if superseded_input_seq is not None
-                    else target["seq"]
-                ),
-                int(claim.consumed_seq) if claim.consumed_seq is not None else -1,
+            completed_input_seq = completed_input_checkpoint(
+                target, claim_consumed_seq=claim.consumed_seq
+            )
+            # Without a checkpoint, completion keeps the watermark this claim
+            # observed after attach: nothing the turn did consumes human input.
+            completion_consumed_seq = (
+                completed_input_seq
+                if completed_input_seq is not None
+                else (consumed_seq if consumed_seq >= 0 else None)
             )
             self._pending_settled_close = (
                 str(claim.unit_id),
@@ -4298,7 +4357,7 @@ class StatelessTurnExecutor:
             timing["detach_final"] = time.perf_counter() - t0
             t0 = time.perf_counter()
             state = await self._complete_with_retry(
-                claim, consumed_seq=completed_input_seq
+                claim, consumed_seq=completion_consumed_seq
             )
             timing["complete"] = time.perf_counter() - t0
             if state is None:
@@ -4326,9 +4385,9 @@ class StatelessTurnExecutor:
                 self.request_stop()
                 return
             logger.info(
-                "run_queue complete: unit=%s consumed_seq=%d state=%s",
+                "run_queue complete: unit=%s consumed_seq=%s state=%s",
                 unit_id,
-                completed_input_seq,
+                completion_consumed_seq,
                 state,
             )
             logger.info(
@@ -4534,12 +4593,15 @@ class StatelessTurnExecutor:
 
         token = claim.lease_token
         pending_close = self._pending_settled_close
-        if (
-            completed_input_seq is None
-            and pending_close is not None
-            and pending_close[:3]
-            == (str(claim.unit_id), int(token), int(target_turn_id))
-        ):
+        # The close of a fully settled turn. Without a checkpoint (a recovery
+        # turn whose superseded input was an event, completed_input_checkpoint)
+        # it is just as idempotent, so it is retried just the same.
+        settled_close = pending_close is not None and pending_close[:3] == (
+            str(claim.unit_id),
+            int(token),
+            int(target_turn_id),
+        )
+        if completed_input_seq is None and settled_close:
             completed_input_seq = pending_close[3]
         attempts = 0
         try:
@@ -4556,7 +4618,7 @@ class StatelessTurnExecutor:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    if completed_input_seq is None:
+                    if completed_input_seq is None and not settled_close:
                         raise
                     attempts += 1
                     logger.warning(
@@ -4579,11 +4641,7 @@ class StatelessTurnExecutor:
             with contextlib.suppress(BaseException):
                 await pa._stop_thread_interrupt_watcher()
             raise
-        if pending_close is not None and pending_close[:3] == (
-            str(claim.unit_id),
-            int(token),
-            int(target_turn_id),
-        ):
+        if settled_close:
             self._pending_settled_close = None
         await pa._stop_thread_interrupt_watcher()
         if not closed:
@@ -4660,6 +4718,11 @@ class StatelessTurnExecutor:
                 "supersedes_input_seq": (
                     int(r.get("supersedes_input_seq"))
                     if r.get("supersedes_input_seq") is not None
+                    else None
+                ),
+                "supersedes_input_role": (
+                    str(r.get("supersedes_input_role"))
+                    if r.get("supersedes_input_role") is not None
                     else None
                 ),
             }
@@ -5177,7 +5240,7 @@ class StatelessTurnExecutor:
         )
 
     async def _complete_with_retry(
-        self, claim: ClaimedUnit, *, consumed_seq: int
+        self, claim: ClaimedUnit, *, consumed_seq: int | None
     ) -> Optional[str]:
         """complete_unit with bounded retries. Returns the resulting state,
         None when fenced out, or the sentinel 'error' after exhausted retries.

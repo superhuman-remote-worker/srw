@@ -5010,11 +5010,6 @@ async def _attach_session_inner(
         )
         _cloud_sync_retry_pending = True
 
-    # Restore message history from DB (for session resume)
-    _t_step = time.perf_counter()
-    await _restore_session_messages()
-    logger.info("attach step: message restore %.2fs", time.perf_counter() - _t_step)
-
     # Mark thread as active. Stateless attach is an authorization boundary:
     # End may have fenced the queue after claim-bundle returned, so a failed
     # exact-lease CAS must abort before loop/tool admission.
@@ -5035,6 +5030,17 @@ async def _attach_session_inner(
     # under this exact authority before any provider can become ready;
     # recovered background evidence joins the durable-input reclaim below.
     await _session.recover_subagents()
+
+    # Restore message history from DB (for session resume). After recovery:
+    # settling an interrupted delegation turn writes one tool result per call
+    # into the transcript (parallel_subagents.md §5.4, F15), and restore must
+    # load them beside their calls — its tool-pairing repair and any resume
+    # compaction then see complete pairs, never calls whose results land in
+    # the database a moment later. The queue is still closed here, so input
+    # admission keeps waiting for recovery and restore alike.
+    _t_step = time.perf_counter()
+    await _restore_session_messages()
+    logger.info("attach step: message restore %.2fs", time.perf_counter() - _t_step)
     _session_input.open_queue()
 
     # Publish mount state only after the authoritative active CAS and queue

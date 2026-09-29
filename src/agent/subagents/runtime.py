@@ -43,6 +43,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from agent.core.context import sanitize_history_for_provider_boundary
 
+from agent.subagents.batch_recovery import SessionTurnRecovery
 from agent.subagents.budgets import ChildBudgets
 from agent.subagents.child import SharedWriterGuard, SpawnRefused, build_child
 from agent.subagents.driver import SubagentDriver, SubagentResult
@@ -1773,7 +1774,10 @@ class SubagentRuntime:
         deterministic interrupted evidence envelope through the normal atomic
         Lane-B transaction. A session foreground predecessor also receives one
         durable event because its synchronous tool-return channel died with
-        the prior process; worker foreground calls retain graph replay.
+        the prior process; worker foreground calls retain graph replay. A
+        session turn with more than one delegation call is settled as one
+        batch instead (``batch_recovery``): one tool result per call and one
+        continuation, when the orchestrator lists recovery plans.
         """
         async with self._recovery_lock:
             if self._recovery_complete:
@@ -1789,9 +1793,33 @@ class SubagentRuntime:
                 raise RuntimeError(
                     f"subagent orphan recovery has no parent {parent.kind} id"
                 )
-            rows = await asyncio.wait_for(lister(parent_id), timeout=_LEDGER_TIMEOUT_S)
+            # A session parent also gets the orchestrator's per-turn plans
+            # with the candidates (parallel_subagents.md §6.2). Plans are the
+            # proof that the orchestrator can settle a turn as one batch; one
+            # that predates them lists none, and every child then recovers on
+            # its own. Every other parent lists rows only.
+            plans: Optional[List[Any]] = None
+            recovery_lister = getattr(self.ledger, "list_live_recovery", None)
+            session_parent = (
+                str(getattr(self.host, "delivery_channel", "lane_b") or "") == "event"
+            )
+            if session_parent and callable(recovery_lister):
+                listed = await asyncio.wait_for(
+                    recovery_lister(parent_id), timeout=_LEDGER_TIMEOUT_S
+                )
+                if not isinstance(listed, Mapping):
+                    raise RuntimeError(
+                        "subagent orphan recovery returned no durable list"
+                    )
+                rows = listed.get("subagents")
+                plans = listed.get("recovery_turns")
+            else:
+                rows = await asyncio.wait_for(
+                    lister(parent_id), timeout=_LEDGER_TIMEOUT_S
+                )
             if not isinstance(rows, list):
                 raise RuntimeError("subagent orphan recovery returned no durable list")
+            batch = SessionTurnRecovery.for_runtime(self, rows, plans)
 
             recovered: List[Dict[str, Any]] = []
             adopter = getattr(self.ledger, "adopt_live", None)
@@ -1828,6 +1856,13 @@ class SubagentRuntime:
                         getattr(self.host, "delivery_channel", "lane_b") or "lane_b"
                     )
                     if delivery_channel == "event":
+                        if batch is not None:
+                            # A turn with more than one delegation call is
+                            # settled once, at its first listed child.
+                            settled, handled = await batch.recover(row)
+                            recovered.extend(settled)
+                            if handled:
+                                continue
                         loader = getattr(self.ledger, "load_messages", None)
                         terminalize = getattr(
                             self.ledger,

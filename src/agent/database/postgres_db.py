@@ -2025,6 +2025,13 @@ class PostgresDB:
     # Shared by the single-row upsert (RETURNING id, seq) and the turn-complete
     # reconcile batch (same statement minus RETURNING — executemany discards
     # results). Keep the column set in lockstep with the orchestrator's writer.
+    #
+    # ``metrics`` belongs to the writer that owns it. The agent writes turn
+    # metrics on AI rows only, so an AI row takes what the upsert brings. A
+    # non-AI row keeps metrics it already has when the upsert brings none: the
+    # loop re-saves its input row at turn start, and a recovery continuation
+    # carries ``metrics.subagent_recovery`` written by the orchestrator
+    # (parallel_subagents.md §6.5), which that re-save must not erase.
     _THREAD_MESSAGE_UPSERT_SQL = """
         INSERT INTO thread_messages
             (id, thread_id, role, content, tool_calls, turn_number,
@@ -2037,7 +2044,10 @@ class PostgresDB:
             content           = EXCLUDED.content,
             tool_calls        = EXCLUDED.tool_calls,
             turn_number       = EXCLUDED.turn_number,
-            metrics           = EXCLUDED.metrics,
+            metrics           = CASE
+                WHEN thread_messages.role = 'ai' THEN EXCLUDED.metrics
+                ELSE COALESCE(EXCLUDED.metrics, thread_messages.metrics)
+            END,
             tool_call_id      = EXCLUDED.tool_call_id,
             thinking          = EXCLUDED.thinking,
             reasoning         = EXCLUDED.reasoning,

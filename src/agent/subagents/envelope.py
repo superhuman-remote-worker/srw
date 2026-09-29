@@ -131,11 +131,18 @@ def _cut_at_line(text: str, chars: int, *, from_end: bool) -> str:
 
 
 def trim_head_tail(
-    text: str, budget_tokens: int, *, handle: str, model: Optional[str] = None
+    text: str,
+    budget_tokens: int,
+    *,
+    handle: str,
+    model: Optional[str] = None,
+    spilled: bool = True,
 ) -> tuple[str, int]:
     """Keep the head (60 %) and tail (40 %) of an over-budget text.
 
     Returns ``(body, elided_tokens)``; ``elided_tokens`` is 0 when the text fit.
+    ``spilled=False`` leaves the spill file out of the elision notice, for a
+    text that does not come from it.
     """
     total = count_tokens(text, model)
     budget = max(1, int(budget_tokens))
@@ -147,7 +154,8 @@ def trim_head_tail(
     head = _cut_at_line(text, head_chars, from_end=False)
     tail = _cut_at_line(text, tail_chars, from_end=True)
     elided = max(1, total - count_tokens(head, model) - count_tokens(tail, model))
-    notice = f"\n[… {elided} tokens elided — full report at {report_path(handle)} …]\n"
+    where = f" — full report at {report_path(handle)}" if spilled else ""
+    notice = f"\n[… {elided} tokens elided{where} …]\n"
     return head.rstrip("\n") + "\n" + notice + tail.lstrip("\n"), elided
 
 
@@ -274,6 +282,96 @@ def _seconds_between(start: Any, end: Any) -> float:
         return 0.0
 
 
+def read_spilled_report(
+    row: Mapping[str, Any], workspace_manager: Any
+) -> Optional[str]:
+    """The spilled report of a ledger row, or ``None`` when it cannot be read.
+
+    Missing, unreadable (any backend error) and empty all read as ``None``.
+    """
+    handle = str(row.get("subagent_handle") or "subagent")
+    path = str(row.get("report_path") or report_path(handle))
+    if workspace_manager is None or not row.get("report_path"):
+        return None
+    try:
+        if workspace_manager.exists(path):
+            text = workspace_manager.read_file(path)
+            return text if isinstance(text, str) and text.strip() else None
+    except Exception as e:
+        logger.warning(
+            "subagent %s: stored report %s unreadable on replay: %s",
+            handle,
+            path,
+            e,
+        )
+    return None
+
+
+#: Where the text of a replayed report came from.
+REPORT_FROM_SPILL = "spill"
+REPORT_FROM_TRANSCRIPT = "transcript"
+
+
+def render_replay_envelope(
+    row: Mapping[str, Any],
+    *,
+    tool_call_id: str,
+    text: Optional[str],
+    source: str = REPORT_FROM_SPILL,
+    entry_budget: int,
+    probe: Optional[ContextProbe] = None,
+    n_in_batch: int = 1,
+    model: Optional[str] = None,
+) -> str:
+    """The replay envelope of a ledger row around an already obtained text.
+
+    ``source`` says where ``text`` came from: the spill file, or the child's
+    stored transcript when the spill could not be read (its last assistant
+    message). The caller cleans the text before this cuts it. No text at all
+    yields the short :data:`REPLAY_UNAVAILABLE` body.
+    """
+    handle = str(row.get("subagent_handle") or "subagent")
+    subagent_type = str(row.get("subagent_type") or "unknown")
+    status = str(row.get("subagent_outcome") or row.get("subagent_status") or "?")
+    turns = int(row.get("total_turns") or 0)
+    tokens = int(row.get("total_tokens") or 0)
+    duration = _seconds_between(row.get("created_at"), row.get("ended_at"))
+    path = str(row.get("report_path") or report_path(handle))
+    spilled = source == REPORT_FROM_SPILL
+
+    lines = [render_header(handle, subagent_type, status, turns, tokens, duration)]
+    if text is not None and text.strip():
+        body = neutralise_control_markers(text)
+        budget = return_budget(entry_budget, probe, n_in_batch)
+        trimmed, elided = trim_head_tail(
+            body, budget, handle=handle, model=model, spilled=spilled
+        )
+        lines.append(wrap_report(handle, trimmed))
+        if spilled:
+            note = (
+                "read_file it for the elided part"
+                if elided
+                else "read_file it if you need it"
+            )
+            lines.append(f"Full report: {path} ({note}).")
+        else:
+            lines.append(
+                f"Report source: the child's stored transcript (its last "
+                f"message), because {path} could not be read after the "
+                "restart."
+            )
+    else:
+        lines.append(wrap_report(handle, REPLAY_UNAVAILABLE.format(path=path)))
+    lines.append(
+        f"Replayed: this child already ran for tool call {tool_call_id} before "
+        "a restart; no new child was spawned and nothing was spent."
+    )
+    error = row.get("subagent_error")
+    if error:
+        lines.append(f"Error: {error}")
+    return "\n".join(lines)
+
+
 def build_replay_envelope(
     row: Mapping[str, Any],
     *,
@@ -295,50 +393,15 @@ def build_replay_envelope(
     original return). A missing spill yields the short
     :data:`REPLAY_UNAVAILABLE` body instead of a silently empty report.
     """
-    handle = str(row.get("subagent_handle") or "subagent")
-    subagent_type = str(row.get("subagent_type") or "unknown")
-    status = str(row.get("subagent_outcome") or row.get("subagent_status") or "?")
-    turns = int(row.get("total_turns") or 0)
-    tokens = int(row.get("total_tokens") or 0)
-    duration = _seconds_between(row.get("created_at"), row.get("ended_at"))
-    path = str(row.get("report_path") or report_path(handle))
-
-    text: Optional[str] = None
-    if workspace_manager is not None and row.get("report_path"):
-        try:
-            if workspace_manager.exists(path):
-                text = workspace_manager.read_file(path)
-        except Exception as e:
-            logger.warning(
-                "subagent %s: stored report %s unreadable on replay: %s",
-                handle,
-                path,
-                e,
-            )
-            text = None
-
-    lines = [render_header(handle, subagent_type, status, turns, tokens, duration)]
-    if text is not None and text.strip():
-        body = neutralise_control_markers(text)
-        budget = return_budget(entry_budget, probe, n_in_batch)
-        trimmed, elided = trim_head_tail(body, budget, handle=handle, model=model)
-        lines.append(wrap_report(handle, trimmed))
-        note = (
-            "read_file it for the elided part"
-            if elided
-            else "read_file it if you need it"
-        )
-        lines.append(f"Full report: {path} ({note}).")
-    else:
-        lines.append(wrap_report(handle, REPLAY_UNAVAILABLE.format(path=path)))
-    lines.append(
-        f"Replayed: this child already ran for tool call {tool_call_id} before "
-        "a restart; no new child was spawned and nothing was spent."
+    return render_replay_envelope(
+        row,
+        tool_call_id=tool_call_id,
+        text=read_spilled_report(row, workspace_manager),
+        entry_budget=entry_budget,
+        probe=probe,
+        n_in_batch=n_in_batch,
+        model=model,
     )
-    error = row.get("subagent_error")
-    if error:
-        lines.append(f"Error: {error}")
-    return "\n".join(lines)
 
 
 __all__ = [
@@ -348,11 +411,15 @@ __all__ = [
     "MIN_RETURN_TOKENS",
     "REPLAY_UNAVAILABLE",
     "REPORT_DIR",
+    "REPORT_FROM_SPILL",
+    "REPORT_FROM_TRANSCRIPT",
     "REPORT_NAME",
     "build_envelope",
     "build_replay_envelope",
     "count_tokens",
     "neutralise_control_markers",
+    "read_spilled_report",
+    "render_replay_envelope",
     "render_header",
     "report_path",
     "return_budget",

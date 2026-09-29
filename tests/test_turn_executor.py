@@ -918,6 +918,179 @@ class TestHappyPath:
         ]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("superseded_role", "checkpoint"), [("human", 5), ("event", None)]
+    )
+    async def test_recovery_turn_checkpoints_only_a_superseded_human_input(
+        self, harness, superseded_role, checkpoint
+    ):
+        """parallel_subagents WP2: a recovery turn whose superseded input was an
+        event (a wake, a job completion, or an earlier continuation whose turn
+        delegated again) closes without a checkpoint. At the event's seq the
+        close requires a delivery the dead executor owned, and would skip
+        human input typed below it. Completion keeps the observed watermark."""
+
+        unit = uuid4()
+        row_id = str(uuid4())
+        harness.db.pending_rows = [
+            {
+                "id": row_id,
+                "seq": 9,
+                "content": "[subagent recovery] continue",
+                "turn_number": 3,
+                "role": "event",
+                "delivery_id": str(uuid4()),
+                "supersedes_input_seq": 5,
+                "supersedes_input_role": superseded_role,
+            }
+        ]
+        harness.restored_turn_count = 4
+        harness.db.claim_stateless_input_delivery = AsyncMock(
+            return_value={"message_id": row_id, "seq": 9, "claim_generation": 4}
+        )
+
+        await harness.executor._serve_claim(
+            make_claim(unit_id=unit, token=12, input_seq=11, consumed_seq=3)
+        )
+        await _finish(harness)
+
+        (close,) = harness.calls["interrupt_close"]
+        assert close["completed_input_seq"] == checkpoint
+        # The human case consumes the superseded row; the event case keeps
+        # the watermark the claim observed (3), so input 4..11 stays owed.
+        assert harness.calls["complete"] == [
+            {"unit_id": unit, "lease_token": 12, "consumed_seq": checkpoint or 3}
+        ]
+        assert not harness.calls["park"]
+
+    @pytest.mark.asyncio
+    async def test_a_settled_close_without_checkpoint_is_retried(
+        self, harness, monkeypatch
+    ):
+        """The close of a settled recovery turn whose superseded input was an
+        event carries no checkpoint. It is as idempotent as one that does, so
+        a transient DB error is retried, not turned into a park."""
+
+        unit = uuid4()
+        row_id = str(uuid4())
+        harness.db.pending_rows = [
+            {
+                "id": row_id,
+                "seq": 9,
+                "content": "[subagent recovery] continue",
+                "turn_number": 3,
+                "role": "event",
+                "delivery_id": str(uuid4()),
+                "supersedes_input_seq": 5,
+                "supersedes_input_role": "event",
+            }
+        ]
+        harness.restored_turn_count = 4
+        harness.loop_behavior = "settled_effect"  # a tool ran in this turn
+        harness.db.claim_stateless_input_delivery = AsyncMock(
+            return_value={"message_id": row_id, "seq": 9, "claim_generation": 4}
+        )
+        close = te.close_interrupt_admission
+        failures = [ConnectionResetError("transient")]
+
+        async def flaky_close(db, **kwargs):
+            if kwargs.get("completed_input_seq") is None and failures:
+                harness.calls["interrupt_close"].append({"failed": True, **kwargs})
+                raise failures.pop()
+            return await close(db, **kwargs)
+
+        monkeypatch.setattr(te, "close_interrupt_admission", flaky_close)
+
+        await harness.executor._serve_claim(
+            make_claim(unit_id=unit, token=12, input_seq=11, consumed_seq=3)
+        )
+        await _finish(harness)
+
+        closes = harness.calls["interrupt_close"]
+        assert [c.get("failed", False) for c in closes] == [True, False]
+        assert all(c["completed_input_seq"] is None for c in closes)
+        assert not harness.calls["park"]
+        assert harness.calls["complete"] == [
+            {"unit_id": unit, "lease_token": 12, "consumed_seq": 3}
+        ]
+
+    def test_completed_input_checkpoint(self):
+        checkpoint = te.completed_input_checkpoint
+        assert checkpoint({"seq": 9}, claim_consumed_seq=None) == 9
+        assert checkpoint({"seq": 9}, claim_consumed_seq=12) == 12
+        recovery = {"seq": 9, "supersedes_input_seq": 5}
+        assert (
+            checkpoint(
+                {**recovery, "supersedes_input_role": "human"}, claim_consumed_seq=5
+            )
+            == 5
+        )
+        for role in ("event", None):
+            assert (
+                checkpoint(
+                    {**recovery, "supersedes_input_role": role}, claim_consumed_seq=5
+                )
+                is None
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("where", ["beside_attach", "inside_attach", "absent"])
+    async def test_batch_settle_capability_reaches_attach_as_one_keyword(
+        self, harness, where
+    ):
+        """The claim bundle advertises the batch settle beside ``attach``
+        (never inside it: ``attach`` is splatted into ``_attach_session``).
+        The executor passes it as one keyword, which the session publishes on
+        its tool context for the fan-out gate and subagent recovery. A bundle
+        from an orchestrator that still nested it is read the same way."""
+
+        key = "session_subagent_batch_settle_contract"
+        unit = uuid4()
+        harness.db.pending_rows = [{"id": str(uuid4()), "seq": 5, "content": "hi"}]
+        fetch = pa._orchestrator_client.get_claim_bundle
+
+        async def bundle(unit_id, lease_token):
+            data = await fetch(unit_id, lease_token)
+            data["attach"] = dict(data["attach"])
+            if where == "beside_attach":
+                data[key] = 1
+            elif where == "inside_attach":
+                data["attach"][key] = 1
+            return data
+
+        pa._orchestrator_client.get_claim_bundle = bundle
+
+        await harness.executor._serve_claim(
+            make_claim(unit_id=unit, token=7, input_seq=5, consumed_seq=None)
+        )
+        await _finish(harness)
+
+        (attached,) = harness.calls["attach"]
+        if where == "absent":
+            assert key not in attached
+        else:
+            assert attached[key] == 1
+
+    def test_claim_bundle_attach_folds_the_capability_in(self):
+        key = "session_subagent_batch_settle_contract"
+        base = {"thread_id": "t", "config_name": "session_base"}
+        plain = te.claim_bundle_attach({"attach": base})
+        assert plain == base and plain is not base
+        beside = te.claim_bundle_attach({"attach": base, key: 1})
+        assert beside == {**base, key: 1}
+        # The top-level advertisement wins over a nested one.
+        both = te.claim_bundle_attach({"attach": {**base, key: 0}, key: 1})
+        assert both == {**base, key: 1}
+        # A changed advertisement changes the fingerprint: no warm reuse of a
+        # session built with the old flag.
+        assert te.attach_fingerprint(plain) != te.attach_fingerprint(beside)
+        assert te.claim_bundle_attach({}) == {}
+        # The real attach accepts the keyword (it has no ``**kwargs``).
+        import inspect
+
+        assert key in inspect.signature(pa._attach_session).parameters
+
+    @pytest.mark.asyncio
     async def test_recovered_interrupted_input_is_never_injected(self, harness):
         unit = uuid4()
         stopped_id = str(uuid4())
