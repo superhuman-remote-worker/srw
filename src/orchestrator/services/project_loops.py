@@ -58,6 +58,14 @@ class TerminalMergeReconciliationError(RuntimeError):
     """A durable PR merge could not be reconciled without guessing."""
 
 
+class LoopWorkspaceRefused(RuntimeError):
+    """The workspace defaults chain refused a loop job (Slice A2b, spec §7).
+
+    Carries only the refusal text, so the spawn paths that stop the loop put
+    exactly that message in ``last_error``.
+    """
+
+
 # Every loop role gets an isolated job repository seeded from the project cloud
 # folder. On completion, conflict-free changes under ``projects/<slug>/`` are
 # applied back to cloud. Execution roles are expected to produce such a diff;
@@ -1196,12 +1204,20 @@ async def create_loop_job(
         select_project_workspace_default,
     )
 
-    config_override, workspace_selection = await select_project_workspace_default(
-        db,
-        owner_id,
-        project_id,
-        config_override,
-    )
+    from fastapi import HTTPException
+
+    try:
+        (
+            config_override,
+            workspace_selection,
+        ) = await select_project_workspace_default(
+            db,
+            owner_id,
+            project_id,
+            config_override,
+        )
+    except HTTPException as exc:
+        raise LoopWorkspaceRefused(str(exc.detail)) from exc
     if workspace_selection is not None:
         workspace_backend = config_override["workspace"]["backend"]
 

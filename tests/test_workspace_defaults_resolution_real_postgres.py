@@ -1,6 +1,7 @@
 """select_execution_workspace consults the defaults chain (Slice A2b)."""
 
 import json
+from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
@@ -167,3 +168,204 @@ async def test_a_session_records_the_layers_that_supplied_its_workspace(
         "template": None,
         "template_name": None,
     }
+
+
+GONE = {"ref": {"name": "gone", "scope": {"kind": "Catalog", "name": "shared"}}}
+GONE_MESSAGE = "This Project's container template 'gone' no longer exists."
+
+
+async def _cron_automation(db, actor, name, *, project_id=None, minutes_ago):
+    return str(
+        await db.fetchval(
+            """
+            INSERT INTO automations
+                (owner_id, project_id, name, trigger_type, cron_expr, expert,
+                 prompt, next_run_at)
+            VALUES ($1, $2, $3, 'cron', '*/5 * * * *', 'worker_base', 'Do it',
+                    now() - make_interval(mins => $4))
+            RETURNING id
+            """,
+            actor["id"],
+            UUID(project_id) if project_id else None,
+            name,
+            minutes_ago,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_refused_cron_fire_is_recorded_and_the_next_automation_still_fires(
+    database, actor, monkeypatch
+):
+    from orchestrator.services.cron_dispatcher import _tick
+
+    # The bundled worker_base, so the fire needs no Expert catalogue.
+    monkeypatch.setenv("EXPERTS_DB_ENABLED", "false")
+
+    project_id = await _project(database)
+    await save_settings_defaults(
+        database,
+        project_id,
+        ProjectDefaults(jobs="container", container=GONE),
+        actor_id=str(actor["id"]),
+    )
+    # The refused row is due first, so it is claimed first on every tick.
+    refused = await _cron_automation(
+        database, actor, "refused", project_id=project_id, minutes_ago=2
+    )
+    fires = await _cron_automation(database, actor, "fires", minutes_ago=1)
+
+    assert await _tick(database) == 2
+
+    row = await database.fetchrow(
+        "SELECT last_status, next_run_at > now() AS advanced, run_count FROM automations WHERE id=$1",
+        UUID(refused),
+    )
+    assert row["last_status"] == GONE_MESSAGE
+    assert row["advanced"] and row["run_count"] == 0
+    assert (
+        await database.fetchval(
+            "SELECT count(*) FROM jobs WHERE context->>'automation_id' = $1", refused
+        )
+        == 0
+    )
+    fired = await database.fetchrow(
+        "SELECT last_status, run_count, last_job_id FROM automations WHERE id=$1",
+        UUID(fires),
+    )
+    assert fired["run_count"] == 1 and fired["last_status"] is None
+    job = await database.get_job(str(fired["last_job_id"]))
+    assert _json(job["context"])["automation_id"] == fires
+
+
+@pytest.mark.asyncio
+async def test_a_default_template_of_another_tier_fails_closed(database, actor):
+    from orchestrator.services.manifest_resources import ManifestResourceService
+
+    template = {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "WorkspaceTemplate",
+        "metadata": {"name": "edited", "scope": {"kind": "Catalog", "name": "shared"}},
+        "spec": {"backend": "vm"},
+    }
+    await ManifestResourceService(database).apply(
+        json.dumps(template), actor, format="json"
+    )
+    project_id = await _project(database)
+    edited = {"ref": {"name": "edited", "scope": {"kind": "Catalog", "name": "shared"}}}
+    await save_settings_defaults(
+        database,
+        project_id,
+        ProjectDefaults(jobs="container", container=edited),
+        actor_id=str(actor["id"]),
+    )
+    with pytest.raises(HTTPException) as refused:
+        await select_execution_workspace(
+            database, actor, project_id=project_id, role="worker"
+        )
+    assert refused.value.status_code == 409
+    assert (
+        refused.value.detail == "The container template must be a container workspace."
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_caller_cannot_supply_the_workspace_sources(database, actor):
+    forged = {"tier": "project", "template": "project", "template_name": "forged"}
+    job = await database.create_job(
+        "forged",
+        user_id=str(actor["id"]),
+        context={"workspace_sources": forged, "keep": 1},
+    )
+    context = _json((await database.get_job(str(job["id"])))["context"])
+    assert "workspace_sources" not in context and context["keep"] == 1
+    thread_id = await database.create_thread(
+        user_id=str(actor["id"]),
+        datasource_ids=[],
+        initial_metadata={"workspace_sources": forged},
+    )
+    metadata = _json((await database.get_thread(thread_id))["metadata"])
+    assert "workspace_sources" not in metadata
+
+
+CHART_IMAGE = "ghcr.io/superhuman-remote-worker/srw-workspace:1.4.0"
+CHART_SIZES = {"cpu": 2, "memory": "4Gi", "requests": {"cpu": 0.5, "memory": "1Gi"}}
+
+
+def _chart_builtins() -> list[dict]:
+    """What helm/templates/_helpers.tpl renders with the shipped values."""
+    scope = {"kind": "Catalog", "name": "shared"}
+
+    def template(name, spec):
+        return {
+            "apiVersion": "srw/v1alpha1",
+            "kind": "WorkspaceTemplate",
+            "metadata": {"name": name, "scope": scope},
+            "spec": spec,
+        }
+
+    return [
+        template("virtual", {"backend": "virtual"}),
+        template(
+            "container-minimal",
+            {
+                "backend": "sandbox",
+                "environment": {
+                    "image": CHART_IMAGE.replace(
+                        "srw-workspace", "srw-workspace-minimal"
+                    )
+                },
+                "resources": CHART_SIZES,
+            },
+        ),
+        template(
+            "container-full",
+            {
+                "backend": "sandbox",
+                "environment": {"image": CHART_IMAGE},
+                "resources": CHART_SIZES,
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_shipped_configuration_with_the_chart_builtins(database, monkeypatch):
+    from orchestrator.services.builtin_workspace_templates import (
+        reconcile_builtin_workspace_templates,
+    )
+
+    declared = _chart_builtins()
+    await reconcile_builtin_workspace_templates(database, declared)
+    monkeypatch.setenv("WORKSPACE_BUILTIN_TEMPLATES", json.dumps(declared))
+    user = dict(
+        await database.fetchrow(
+            "INSERT INTO users(display_name,is_approved,is_admin) VALUES('Member',TRUE,FALSE) RETURNING *"
+        )
+    )
+
+    config, receipt = await select_execution_workspace(
+        database, user, project_id=None, role="worker"
+    )
+    assert config["backend"] == "sandbox"
+    assert config["sandbox"]["image"] == CHART_IMAGE
+    assert {key: config["sandbox"][key] for key in CHART_SIZES} == CHART_SIZES
+    assert receipt["sources"] == {"tier": "installation", "template": "builtin"}
+    assert receipt["template_name"] == "container-full"
+
+    session, _ = await select_execution_workspace(
+        database, user, project_id=None, role="session"
+    )
+    assert session == {"backend": "virtual"}
+
+    # container-full retired (soft-deleted) while the chart still declares it.
+    await reconcile_builtin_workspace_templates(
+        database,
+        [doc for doc in declared if doc["metadata"]["name"] != "container-full"],
+    )
+    with pytest.raises(HTTPException) as refused:
+        await select_execution_workspace(database, user, project_id=None, role="worker")
+    assert refused.value.status_code == 409
+    assert refused.value.detail == (
+        "The built-in container template 'container-full' is missing; see the orchestrator's startup log."
+    )

@@ -26,6 +26,7 @@ MISSING_BUILTIN_TEMPLATE = "The built-in {tier} template '{name}' is missing; se
 MISSING_REFERENCE = (
     "Referenced resource or requested immutable revision does not exist."
 )
+WRONG_TIER_TEMPLATE = "The {tier} template must be a {tier} workspace."
 _MISSING = {
     "project": MISSING_PROJECT_TEMPLATE,
     "installation": MISSING_INSTALLATION_TEMPLATE,

@@ -4207,6 +4207,9 @@ class PostgresDB:
             workspace_sources_record,
         )
 
+        # Server-owned: only the selection receipt may say which layer
+        # supplied the workspace, never a caller's context.
+        context.pop("workspace_sources", None)
         sources_record = workspace_sources_record(workspace_selection)
         if sources_record is not None:
             context["workspace_sources"] = sources_record
@@ -34420,6 +34423,9 @@ class PostgresDB:
             workspace_sources_record,
         )
 
+        # Server-owned: only the selection receipt may say which layer
+        # supplied the workspace, never a caller's metadata.
+        metadata.pop("workspace_sources", None)
         sources_record = workspace_sources_record(workspace_selection)
         if sources_record is not None:
             metadata["workspace_sources"] = sources_record
@@ -61332,6 +61338,7 @@ class PostgresDB:
                 last_dispatched_at = now(),
                 last_fired_at = now(),
                 last_job_id = $3,
+                last_status = NULL,
                 run_count = run_count + 1,
                 fires_today_count = CASE
                     WHEN fires_today_date = CURRENT_DATE
@@ -61369,6 +61376,34 @@ class PostgresDB:
             WHERE id = $2
             """,
             next_run_at,
+            UUID(automation_id),
+        )
+
+    async def refuse_automation_fire(
+        self,
+        conn,
+        automation_id: str,
+        *,
+        next_run_at: datetime,
+        reason: str,
+    ) -> None:
+        """Advance ``next_run_at`` for a fire the workspace defaults refused.
+
+        Like ``skip_automation_fire``, but the refusal is the owner's to fix,
+        so it becomes the automation's ``last_status``. The next successful
+        fire clears it.
+        """
+        await conn.execute(
+            """
+            UPDATE automations
+            SET next_run_at = $1,
+                last_dispatched_at = now(),
+                last_status = $2,
+                updated_at = now()
+            WHERE id = $3
+            """,
+            next_run_at,
+            reason,
             UUID(automation_id),
         )
 

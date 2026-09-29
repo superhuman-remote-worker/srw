@@ -39,6 +39,8 @@ from datetime import datetime, timedelta, timezone
 from time import perf_counter
 from typing import Any, Awaitable, Callable, Optional, Sequence
 
+from fastapi import HTTPException
+
 from orchestrator.security.access import project_is_archived
 from orchestrator.services.datasource_policy import (
     DatasourceUnavailableError,
@@ -91,6 +93,16 @@ PENDING_REVIEW_PAGE_HOURS = float(os.getenv("OFFICER_PENDING_REVIEW_PAGE_HOURS",
 # Distinct because two failures on one ticket are one problem, not a pattern.
 BREAKER_FAILURES = 2
 BREAKER_OPEN_MINUTES = float(os.getenv("OFFICER_POOL_BREAKER_MINUTES", "30"))
+
+
+class WorkspaceRefused(Exception):
+    """The workspace defaults chain refused a dispatch (Slice A2b, spec §7).
+
+    Configuration the owner must fix, not an outage and not a job failure: the
+    tick records it on the post as ``backlog_workspace_refusals`` (sitrep and
+    post card) and retries the pool on the next tick.
+    """
+
 
 # A floor breach wakes the officer at most this often per pool. Event-driven
 # replenishment beats a passive number on a card, but a queue that is short
@@ -701,6 +713,16 @@ def pool_status_lines(
                 "Read those failures before re-readying anything in this pool."
             )
 
+    refusals = officer_state.get("backlog_workspace_refusals") or {}
+    for pool in sorted(pools):
+        entry = refusals.get(pool)
+        if isinstance(entry, dict) and entry.get("reason"):
+            lines.append(
+                f"Pool {pool}: CANNOT DISPATCH — {entry['reason']} "
+                "Nothing ran; tell the Legate so the Project's workspace "
+                "defaults get fixed."
+            )
+
     stalled = officer_state.get("backlog_stale_claims") or []
     if stalled:
         rendered = "; ".join(
@@ -914,12 +936,18 @@ async def _dispatch_one(
         select_project_workspace_default,
     )
 
-    prepared_config, workspace_selection = await select_project_workspace_default(
-        db,
-        effective_owner_user_id,
-        project_id,
-        prepared_config,
-    )
+    try:
+        (
+            prepared_config,
+            workspace_selection,
+        ) = await select_project_workspace_default(
+            db,
+            effective_owner_user_id,
+            project_id,
+            prepared_config,
+        )
+    except HTTPException as exc:
+        raise WorkspaceRefused(str(exc.detail)) from exc
     if workspace_selection is not None:
         config_override = prepared_config
     if enforce_grants is not None:
@@ -1175,6 +1203,7 @@ async def tick_officer(
 
     state_patch: dict[str, Any] = {}
     breakers = dict(state.get("backlog_breakers") or {})
+    refusals = dict(state.get("backlog_workspace_refusals") or {})
 
     # Stale claims: computed once for the whole post, recorded for the sitrep.
     open_claims = await db.list_stale_officer_claims(
@@ -1342,6 +1371,24 @@ async def tick_officer(
                 trigger_dispatch=trigger_dispatch,
                 enforce_grants=enforce_grants,
             )
+        except WorkspaceRefused as exc:
+            # The Project's or installation's workspace defaults can't be
+            # resolved. Nothing ran; record why for the sitrep and the post.
+            logger.warning(
+                "officer=%s pool=%s skip=workspace-refused ticket=%s: %s",
+                thread_id[:8],
+                pool,
+                ticket.get("note_id"),
+                exc,
+            )
+            refusals[pool] = {
+                "reason": str(exc),
+                "ticket": ticket.get("note_id"),
+                "at": now.isoformat(),
+            }
+            state_patch["backlog_workspace_refusals"] = refusals
+            counts["skipped"] += 1
+            continue
         except Exception:
             # Includes the unique-index refusal of a racing double-claim. Not a
             # job failure: nothing ran, so the breaker stays shut.
@@ -1358,6 +1405,8 @@ async def tick_officer(
         if job is None:
             counts["skipped"] += 1
             continue
+        if refusals.pop(pool, None) is not None:
+            state_patch["backlog_workspace_refusals"] = refusals
         counts["dispatched"] += 1
         logger.info(
             "officer=%s pool=%s dispatched=%s/%s",

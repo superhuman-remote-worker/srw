@@ -182,9 +182,11 @@ async def select_execution_workspace(
         from orchestrator.services.manifest_projects import active_project_resource
         from orchestrator.services.workspace_defaults_resolution import (
             MISSING_REFERENCE,
+            WRONG_TIER_TEMPLATE,
             missing_template_message,
             resolve_workspace_defaults,
         )
+        from shared.workspace_defaults import backend_mode
 
         resolution = await resolve_workspace_defaults(
             db, role=role, project_id=project_id
@@ -227,6 +229,12 @@ async def select_execution_workspace(
             raise
         except ManifestError as exc:
             raise HTTPException(422, str(exc)) from None
+        # A default template edited to another backend after it was chosen
+        # must never move work to a different tier: fail closed.
+        if resolution is not None and (
+            backend_mode(resolved["template"]["inline"]["backend"]) != resolution.mode
+        ):
+            raise HTTPException(409, WRONG_TIER_TEMPLATE.format(tier=resolution.mode))
     instance_recipe = None
     instance_generation = None
     if resolved and "instanceRef" in resolved:

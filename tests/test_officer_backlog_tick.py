@@ -1417,3 +1417,42 @@ class TestExecutorSerialization:
         ]
         counts = await tick_officer(db, _vector_db(rows), row, now=NOW)
         assert counts["dispatched"] == 1
+
+
+class TestWorkspaceRefusal:
+    """Slice A2b, spec §7: a refused workspace default reaches the post."""
+
+    @pytest.mark.asyncio
+    async def test_a_refused_workspace_default_is_recorded_on_the_post(
+        self, monkeypatch
+    ):
+        from fastapi import HTTPException
+
+        from orchestrator.services.officer_backlog import (
+            _officer_meta,
+            pool_status_lines,
+        )
+
+        message = "This Project's container template 'gone' no longer exists."
+        monkeypatch.setattr(
+            "orchestrator.services.manifest_workspace_selection."
+            "select_project_workspace_default",
+            AsyncMock(side_effect=HTTPException(409, message)),
+        )
+        db = _db()
+        rows = [_row("feature-a", tags=["ready", "category:researcher"], ready_at=NOW)]
+        officer = _officer_row(user_id=OWNER_ID)
+        counts = await tick_officer(db, _vector_db(rows), officer, now=NOW)
+
+        assert counts["dispatched"] == 0 and counts["skipped"] == 1
+        db.create_job.assert_not_awaited()
+        patch_ = db.merge_thread_officer_state.await_args.args[1]
+        assert patch_["backlog_workspace_refusals"] == {
+            "researchers": {
+                "reason": message,
+                "ticket": "feature-a",
+                "at": NOW.isoformat(),
+            }
+        }
+        lines = pool_status_lines(_officer_meta(officer), patch_, NOW)
+        assert any(message in line for line in lines)
