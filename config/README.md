@@ -782,6 +782,28 @@ native API accepts images only as base64 or `ms://` file IDs, not public URLs.
 The family is detected automatically, including `openrouter/` and `moonshotai/`
 prefixes. Adding the family does not register a catalog row.
 
+## Qwen3.8-27B
+
+The `qwen3.8-27b` family is settings-only (default prompts): image and video
+input, a 262,144-token native context, and the model card's thinking-mode
+sampling (temperature 1.0, top_p 0.95, top_k 20). Only the 27B is matched. The
+API-only Qwen3.8 Max/Flash rows take a different effort ladder and a 1M window,
+and `qwen3-8b` is the older Qwen3 8B.
+
+Reasoning effort is `low`, `medium`, or `xhigh` (default, Qwen's recommendation
+for multi-turn agent work). The official chat template raises an error on any
+other value, so a requested `high` is sent as `medium` and `max` as `xhigh`. The
+template also rejects a system message anywhere but first. The family therefore
+sets `single_system_message: true`, which folds each request to one leading
+system message before it is sent (later system messages become user messages).
+Families without the setting are unchanged.
+
+Self-host with vLLM using `--reasoning-parser qwen3 --enable-auto-tool-choice
+--tool-call-parser qwen3_xml` ([recipe](https://recipes.vllm.ai/Qwen/Qwen3.8-27B)),
+then add the served model in **Admin → Models** on an OpenAI-compatible endpoint.
+Via OpenRouter, add `qwen/qwen3.8-27b`. The family is detected automatically;
+pick it by hand if the served model name does not contain `qwen3.8-27b`.
+
 ## Schema Validation
 
 Add the schema comment at the top of your YAML file for IDE autocompletion:

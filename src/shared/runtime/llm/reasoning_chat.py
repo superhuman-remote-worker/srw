@@ -915,6 +915,44 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
         return await super().send(request, **kwargs)
 
 
+def _content_parts(content: Any) -> list:
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content else []
+    return list(content or [])
+
+
+def fold_system_messages(messages: list) -> list:
+    """Leave at most one system message, and only as the first message.
+
+    For chat templates that accept a single leading system turn — Qwen3.x
+    raises ``System message must be at the beginning.`` on any other — while
+    SRW places the compaction summary as a second system message and may add
+    system nudges mid-history. The leading run of system messages merges into
+    one; each later system message becomes a user turn where it stands, so the
+    messages before it (and the provider's cached prefix) are unchanged.
+    Returns a new list; the input dicts are not mutated.
+    """
+    lead = 0
+    while lead < len(messages) and messages[lead].get("role") == "system":
+        lead += 1
+    out = []
+    if lead:
+        contents = [m.get("content") for m in messages[:lead]]
+        if all(isinstance(c, str) for c in contents):
+            merged: Any = "\n\n".join(c for c in contents if c)
+        else:
+            merged = []
+            for c in contents:
+                parts = _content_parts(c)
+                if merged and parts:
+                    merged.append({"type": "text", "text": "\n\n"})
+                merged.extend(parts)
+        out.append({**messages[0], "content": merged})
+    for m in messages[lead:]:
+        out.append({**m, "role": "user"} if m.get("role") == "system" else m)
+    return out
+
+
 class ReasoningChatOpenAI(ChatOpenAI):
     """ChatOpenAI that captures reasoning_content and validates context limits.
 
@@ -937,6 +975,10 @@ class ReasoningChatOpenAI(ChatOpenAI):
         response = llm.invoke("Solve this problem step by step...")
         reasoning = response.additional_kwargs.get("reasoning_content")
     """
+
+    # Family setting `single_system_message` (model_config_matrix.yaml): fold
+    # the request down to one leading system message before it is sent.
+    single_system_message: bool = False
 
     # Use PrivateAttr for Pydantic compatibility
     _reasoning_client: ReasoningCapturingClient = PrivateAttr(default=None)
@@ -972,6 +1014,12 @@ class ReasoningChatOpenAI(ChatOpenAI):
         # Store after init
         self._reasoning_client = reasoning_client
         self._async_reasoning_client = async_reasoning_client
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        if self.single_system_message and isinstance(payload.get("messages"), list):
+            payload["messages"] = fold_system_messages(payload["messages"])
+        return payload
 
     def _post_process_result(self, result):
         """Post-process LLM result: capture reasoning and debug output.

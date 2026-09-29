@@ -396,6 +396,10 @@ def family_of(model_id: str, default: str = "default") -> str:
         # (mistral-large-latest, codestral-latest); the openrouter/ prefix is
         # stripped above. All share the `mistral` matrix family.
         return "mistral"
+    # Qwen3.8-27B only (the API Max/Flash rows take another effort ladder).
+    # The dot keeps the older Qwen3 8B (qwen3-8b) on the generic rule.
+    if re.search(r"(?:^|/)qwen3\.8-27b(?![\w.])", name):
+        return "qwen3.8-27b"
     if "qwen" in name or "qwq" in name:
         return "qwen"
     if "llama" in name:

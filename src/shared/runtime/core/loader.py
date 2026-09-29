@@ -4430,6 +4430,11 @@ def _create_openai_llm(
     # Pass KeyRing for automatic key rotation
     llm_kwargs["key_ring"] = key_ring
 
+    # Family setting for chat templates that accept one leading system turn
+    # only (Qwen3.8 raises on any other) — see fold_system_messages.
+    if resolve_model_settings(config.model).get("single_system_message") is True:
+        llm_kwargs["single_system_message"] = True
+
     llm = ReasoningChatOpenAI(**llm_kwargs)
 
     key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
@@ -4796,6 +4801,11 @@ def _create_openrouter_llm(
 
     # Pass KeyRing for automatic key rotation
     llm_kwargs["key_ring"] = key_ring
+
+    # Family setting for chat templates that accept one leading system turn
+    # only (Qwen3.8 raises on any other) — see fold_system_messages.
+    if resolve_model_settings(config.model).get("single_system_message") is True:
+        llm_kwargs["single_system_message"] = True
 
     llm = ReasoningChatOpenAI(**llm_kwargs)
 

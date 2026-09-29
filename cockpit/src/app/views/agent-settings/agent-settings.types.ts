@@ -217,6 +217,8 @@ export function detectModelFamily(model: string): string {
     name.startsWith('ministral') || name.startsWith('devstral') || name.startsWith('pixtral') ||
     name.startsWith('voxtral')
   ) return 'mistral';
+  // Qwen3.8-27B only — mirrors family_of(); the dot keeps qwen3-8b generic.
+  if (/(?:^|\/)qwen3\.8-27b(?![\w.])/.test(name)) return 'qwen3.8-27b';
   if (name.includes('qwen') || name.includes('qwq')) return 'qwen';
   if (name.includes('llama')) return 'llama';
   if (name.startsWith('gemini')) return 'gemini';

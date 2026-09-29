@@ -104,6 +104,8 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
     # Kimi K3 before the generic kimi rule; K2.x keeps default prompts.
     (re.compile(r"(?:^|/)kimi-k3(?![\w.])", re.IGNORECASE), "kimi-k3"),
     (re.compile(r"kimi", re.IGNORECASE), "default"),
+    # Qwen3.8-27B only; the dot keeps Qwen3 8B (qwen3-8b) off it.
+    (re.compile(r"(?:^|/)qwen3\.8-27b(?![\w.])", re.IGNORECASE), "qwen3.8-27b"),
     # Embeddings
     (re.compile(r"text-embedding", re.IGNORECASE), "openai-embedding"),
 ]

@@ -65,6 +65,7 @@ _FAMILY_MODELS = {
     "glm-5.3-flash": "glm-5.3-flash",
     "muse-spark-1.3": "meta/muse-spark-1.3",
     "kimi-k3": "moonshotai/kimi-k3",
+    "qwen3.8-27b": "Qwen/Qwen3.8-27B",  # -> the base systemprompt.txt
     "gpt-5": "gpt-5.5",
     "codex-spark": "gpt-5.3-codex-spark",
     "gpt-oss": "gpt-oss-120b",

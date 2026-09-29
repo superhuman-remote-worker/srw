@@ -391,6 +391,62 @@ kimi-k3:
     # estimate-tokens API) — calibrate from usage.
     image_tokens: { mode: flat, flat: 1600 }
 
+# Qwen3.8-27B (open weights 2026-08-14, Apache 2.0): dense vision-language model
+# (image + video), 262,144-token native context (1M only with YaRN, which Qwen
+# says costs quality on short inputs). Served OpenAI-compatible — self-hosted
+# vLLM/SGLang (`--reasoning-parser qwen3 --tool-call-parser qwen3_xml`),
+# OpenRouter `qwen/qwen3.8-27b`, Qwen Cloud. Only the 27B is matched: the API
+# Qwen3.8 Max/Flash rows take a different effort ladder and a 1M window, and
+# older Qwen rows stay on `default`.
+# Verified 2026-09-29:
+# https://huggingface.co/Qwen/Qwen3.8-27B (model card + chat_template.jinja)
+# https://recipes.vllm.ai/Qwen/Qwen3.8-27B
+# https://openrouter.ai/api/v1/models
+#
+# Reasoning: thinking is on by default; `reasoning_effort` takes exactly
+# xhigh (default) | medium | low. The official chat template RAISES on any
+# other value — `high` is a hard error — so the ladder here must never grow
+# a level the template lacks (the factory clamp maps high -> medium,
+# max -> xhigh). Qwen: lower effort "does not always reduce overall task
+# completion time" on multi-turn agent work, hence the xhigh default. The
+# `enable_thinking` off-switch is not exposed (one reasoning method per
+# family). vLLM's recipe passes effort in chat_template_kwargs, while the
+# model card shows the top-level field on "most frameworks" — if a vLLM build
+# ignores the top-level field, the template default (xhigh) applies.
+#
+# The template also RAISES on a system message that is not first ("System
+# message must be at the beginning.") — and SRW sends the compaction summary
+# as a second system message. `single_system_message` folds the request to
+# one leading system turn (later system messages become user turns).
+#
+# Sampling is the model card's thinking-mode set (temperature 1.0, top_p 0.95,
+# top_k 20; min_p / penalties at their defaults, so not sent).
+qwen3.8-27b:
+  reasoning:
+    method: effort_enum
+    delivery: native
+    default: &qwen38_default_effort xhigh
+    options: [low, medium, xhigh]
+  guardrails:
+    file: default.yaml
+  settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
+    structured_output_method: json_schema
+    single_system_message: true  # template rejects any system message but the first
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 20
+    # Override inherited expert-base high (which the template rejects) with
+    # the model default; explicit expert/user/catalog settings still win.
+    reasoning_level: *qwen38_default_effort
+    multimodal: true
+    parallel_tool_calls: false  # new family — start safe, flip once validated
+    model_max_context_tokens: 262144
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
+    # 16px patches merged 2x2 -> one token per 32x32 px, at most 16,777,216 px
+    # (16,384 tokens) per image (preprocessor_config.json). ceil() biases high.
+    image_tokens: { mode: openai_patches, patch_px: 32, budget: 16384, flat: 16384 }
+
 gemini:
   # Phase 2 → token_budget (thinkingConfig.thinkingBudget; 2.5 Pro is always_on).
   # v1: no control wired; output capture via include_thoughts stays in the factory.

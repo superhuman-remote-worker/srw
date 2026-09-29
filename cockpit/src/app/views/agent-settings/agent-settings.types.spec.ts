@@ -35,6 +35,17 @@ describe('detectModelFamily — Kimi K3', () => {
   );
 });
 
+describe('detectModelFamily — Qwen3.8-27B', () => {
+  it('claims the 27B but not Qwen3 8B or the Qwen3.8 API rows', () => {
+    for (const id of ['Qwen/Qwen3.8-27B', 'Qwen/Qwen3.8-27B-FP8', 'qwen/qwen3.8-27b:free', 'openrouter/qwen/qwen3.8-27b']) {
+      expect(detectModelFamily(id)).toBe('qwen3.8-27b');
+    }
+    expect(detectModelFamily('qwen/qwen3-8b')).toBe('qwen');
+    expect(detectModelFamily('qwen/qwen3.8-max-0902')).toBe('qwen');
+    expect(detectModelFamily('qwen3.8-270b')).toBe('qwen');
+  });
+});
+
 describe('detectModelFamily — GLM', () => {
   it.each(['', 'z-ai/', 'openrouter/z-ai/', 'zai-org/'])(
     'distinguishes GLM-5.3 Flash vision settings with prefix %s', (prefix) => {
