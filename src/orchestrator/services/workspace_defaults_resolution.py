@@ -83,3 +83,51 @@ def workspace_sources_record(selection: Mapping | None) -> dict | None:
     if not sources:
         return None
     return {**sources, "template_name": (selection or {}).get("template_name")}
+
+
+VMS_UNAVAILABLE = "VM workspaces are not available on this installation."
+_PROBLEMS: list[str] = []
+
+
+def installation_problems() -> list[str]:
+    return list(_PROBLEMS)
+
+
+async def check_installation_workspace_defaults(db: Any) -> list[str]:
+    """Log and remember what's wrong with the chart's values; never raise."""
+    import logging
+
+    from orchestrator.services.manifest_store import ManifestStore
+    from shared.workspace_contract import vm_mode_from_env
+    from shared.workspace_defaults import CATALOG_SHARED, TEMPLATE_TIERS, backend_mode
+
+    problems: list[str] = []
+    try:
+        installation = installation_defaults()
+    except InvalidWorkspaceDefaults as exc:
+        problems.append(INVALID_INSTALLATION.format(reason=exc))
+        installation = None
+    if installation is not None:
+        vms_off = vm_mode_from_env() == "off"
+        for field in ("jobs", "sessions", "vm"):
+            value = getattr(installation, field)
+            if vms_off and (value == "vm" or (field == "vm" and value)):
+                problems.append(f"{VMS_UNAVAILABLE} (Helm workspace.defaults.{field})")
+        store = ManifestStore(db)
+        for tier in TEMPLATE_TIERS:
+            name = getattr(installation, tier)
+            if not name:
+                continue
+            row = await store.by_name("WorkspaceTemplate", dict(CATALOG_SHARED), name)
+            if row is None:
+                problems.append(
+                    MISSING_INSTALLATION_TEMPLATE.format(tier=tier, name=name)
+                )
+            elif backend_mode(row["resolved"]["spec"]["backend"]) != tier:
+                problems.append(
+                    f"The {tier} template must be a {tier} workspace. (Helm workspace.defaults.{tier})"
+                )
+    for problem in problems:
+        logging.getLogger(__name__).error("Workspace defaults: %s", problem)
+    _PROBLEMS[:] = problems
+    return problems

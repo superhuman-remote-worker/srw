@@ -533,8 +533,11 @@ async def test_external_vm_lane_override_keeps_permission_and_merged_grant_order
     workspace_wire, monkeypatch, caplog
 ):
     wire = workspace_wire
+    # Slice A2b: a legacy Project's stored workspace backend no longer
+    # selects a workspace (the defaults chain does); request an explicit VM
+    # the way `config_override.workspace` still supports (see
+    # test_explicit_stateless_refusals_keep_exact_http_and_no_later_effects).
     wire.db.get_project.return_value["default_config_override"] = {
-        "workspace": {"backend": "vm"},
         "autonomy": "review",
     }
     caplog.set_level(logging.DEBUG)
@@ -565,7 +568,7 @@ async def test_external_vm_lane_override_keeps_permission_and_merged_grant_order
         wire,
         body(
             execution_lane="stateless",
-            config_override={"autonomy": "partial"},
+            config_override={"workspace": {"backend": "vm"}, "autonomy": "partial"},
             datasource_ids=[],
         ),
     )

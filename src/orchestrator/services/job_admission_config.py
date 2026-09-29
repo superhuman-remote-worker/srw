@@ -243,6 +243,18 @@ async def prepare_job_admission_config(
             # asyncpg may return JSONB as a string — parse it
             if isinstance(project_default_override, str):
                 project_default_override = json.loads(project_default_override)
+            if (
+                isinstance(project_default_override, dict)
+                and "workspace" in project_default_override
+            ):
+                # Slice A2b: the workspace defaults chain reads
+                # project_workspace_defaults for the Project layer; a legacy
+                # Project's stored backend no longer leaks through here.
+                project_default_override = {
+                    key: value
+                    for key, value in project_default_override.items()
+                    if key != "workspace"
+                }
 
     config_override = project_default_override
     resolved_expert_id = explicit_expert_id

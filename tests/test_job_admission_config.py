@@ -307,12 +307,14 @@ async def test_legacy_project_default_only_applies_in_disabled_db_root_mode(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("as_json", [False, True])
-async def test_override_precedence_null_removal_and_workspace_request_are_preserved(
-    deps, scope, as_json
-):
+async def test_override_precedence_and_null_removal_are_preserved(deps, scope, as_json):
     project_override = {
         "llm": {"model": "project", "temperature": 0.2},
         "extra": {"keep": True, "remove": 1},
+        # Slice A2b: a legacy Project's stored workspace backend no longer
+        # leaks through this merge; the workspace defaults chain resolves it
+        # instead (here: the shipped installation default, since this
+        # fixture's store never returns a project_workspace_defaults row).
         "workspace": {"backend": "vm"},
         "items": [1, 2],
     }
@@ -337,7 +339,7 @@ async def test_override_precedence_null_removal_and_workspace_request_are_preser
     assert result.config_override == {
         "llm": {"model": "request", "temperature": 0.2},
         "extra": {"keep": True, "request": True},
-        "workspace": {"backend": "vm"},
+        "workspace": {"backend": "sandbox"},
         "items": [4],
     }
     assert result.requested_workspace_backend is None
