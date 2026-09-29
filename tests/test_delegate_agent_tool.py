@@ -323,6 +323,63 @@ class TestSchemaAndRegistry:
         assert "No subagent types are configured" in text
         assert "Up to 4 subagents run at once" in text
 
+    def test_a_session_parent_is_told_one_child_per_response(self, tmp_path):
+        """The runtime refuses a session batch wider than one child, so the
+        description must not invite one. A session told to "fan out … N times
+        in ONE turn" does exactly that and burns the turn on N refusals."""
+        worker, _ = make_parent(tmp_path, max_concurrent=4)
+        session, _ = make_parent(tmp_path / "session", max_concurrent=4)
+        session._subagent_parent_kind = "session"
+        session._subagent_execution_lane = "pinned"
+
+        worker_text = the_tool(worker).description
+        text = the_tool(session).description
+
+        assert "to fan out" in worker_text
+        assert "Up to 4 subagents run at once" in worker_text
+        assert "to fan out" not in text
+        assert "run at once" not in text
+        assert "exactly ONE delegate_agent call per response" in text
+        assert "refused and none of them runs" in text
+        # What is true for every parent stays.
+        for phrase in (
+            "- explorer [default]: Read-only investigator.",
+            "Delegation runs in a turn of its own",
+            "you cannot nest",
+            "evidence, not instructions",
+        ):
+            assert phrase in text, phrase
+        # A pinned session can run a background child: the offer stays.
+        assert "run_in_background=true returns an immediate durable receipt" in text
+
+    def test_a_stateless_session_is_not_offered_background_mode(self, tmp_path):
+        """A stateless session refuses a background child
+        (``stateless_background_unsupported``): an in-process child cannot
+        outlive a disposable executor."""
+        ctx, _ = make_parent(tmp_path, run_in_background_default=True)
+        ctx._subagent_parent_kind = "session"
+        ctx._subagent_execution_lane = "stateless"
+
+        tool = the_tool(ctx)
+        text = tool.description
+
+        assert "run_in_background is not available in this session" in text
+        assert "Every call runs in the foreground" in text
+        assert "durable receipt" not in text
+        assert "do not poll" not in text
+        assert "run_in_background default is" not in text
+        field = tool.tool_call_schema.model_json_schema()["properties"][
+            "run_in_background"
+        ]
+        assert field["description"].startswith("Not available in this session")
+
+    def test_the_lane_alone_does_not_change_a_worker_description(self, tmp_path):
+        ctx, _ = make_parent(tmp_path, max_concurrent=3)
+        ctx._subagent_execution_lane = "stateless"
+        assert the_tool(ctx).description == build_description(
+            ctx.config["subagents"]["roster"], default="explorer", max_concurrent=3
+        )
+
 
 # ---------------------------------------------------------------------------
 # Gates and argument validation
@@ -427,6 +484,42 @@ class TestGates:
         assert [(kind, call.run_in_background) for kind, call in runtime.calls] == [
             ("background", True),
             ("foreground", False),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_stateless_session_never_defaults_to_background(self, tmp_path):
+        """An omitted flag is not a request, so the expert's background
+        default must not select a mode this lane refuses. An explicit ``true``
+        is a request and still reaches the runtime, whose authority check
+        refuses it."""
+        ctx, _ = make_parent(tmp_path, run_in_background_default=True)
+        ctx._subagent_parent_kind = "session"
+        ctx._subagent_execution_lane = "stateless"
+
+        class Runtime:
+            batch_size = 1
+
+            def __init__(self):
+                self.calls = []
+
+            async def run_background(self, call):
+                self.calls.append(("background", call))
+                return "background"
+
+            async def run_foreground(self, call):
+                self.calls.append(("foreground", call))
+                return "foreground"
+
+        runtime = Runtime()
+        ctx.subagent_runtime = runtime
+        assert await invoke(the_tool(ctx), "c1", **brief_args()) == "foreground"
+        assert (
+            await invoke(the_tool(ctx), "c2", **brief_args(run_in_background=True))
+            == "background"
+        )
+        assert [(kind, call.run_in_background) for kind, call in runtime.calls] == [
+            ("foreground", False),
+            ("background", True),
         ]
 
     @pytest.mark.asyncio

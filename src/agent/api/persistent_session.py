@@ -2034,6 +2034,9 @@ class PersistentSession:
         # ensure_runtime must fail closed instead of constructing WorkerHost
         # from the session's legacy `_job_id = thread_id` alias.
         self.tool_context._subagent_parent_kind = "session"
+        self.tool_context._subagent_execution_lane = (
+            "stateless" if self.shell_owner_token is not None else "pinned"
+        )
         self.tool_context._session_parent_authority_provider = (
             self.session_parent_authority_provider
         )

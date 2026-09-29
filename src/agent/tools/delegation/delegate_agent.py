@@ -11,7 +11,10 @@ semaphore, handle, build, driver, envelope, ledger, idempotent replay) and
 returns either the foreground envelope or a durable background receipt. The
 description is REBUILT per factory call from the expert's resolved roster, so
 the model sees the types it can actually delegate to, its concurrency cap and
-the expert's background default.
+the expert's background default. It also states what THIS parent may do: a
+session is told it delegates one child per response, and a stateless session is
+not offered background mode — the runtime refuses both, so advertising them
+costs the model a turn.
 
 Import rule: ``agent.subagents`` is imported lazily inside the factory and the
 coroutine (registry → delegation → subagents → persistent_graph would cycle
@@ -78,18 +81,29 @@ def build_description(
     default: Optional[str] = None,
     max_concurrent: int = 4,
     run_in_background_default: bool = False,
+    single_child_per_response: bool = False,
+    background_available: bool = True,
 ) -> str:
-    """The model-facing description for THIS parent's roster and cap."""
+    """The model-facing description for THIS parent's roster and cap.
+
+    ``single_child_per_response`` replaces the fan-out sentence for a parent
+    whose batches wider than one child are refused (sessions);
+    ``background_available=False`` drops the background offer for a parent
+    whose lane cannot run one (stateless sessions)."""
     cap = max(1, int(max_concurrent or 1))
     names = [n for n, e in roster.items() if isinstance(e, Mapping)]
+    returns = (
+        "A foreground call returns the report as this tool's result; a "
+        "background call returns a durable receipt and pushes the report later."
+        if background_available
+        else "The call waits and returns the report as this tool's result."
+    )
     lines = [
-        "Delegate ONE bounded brief to a subagent. A foreground call returns "
-        "the report as this tool's result; a background call returns a durable "
-        "receipt and pushes the report later. The child runs in-process on your "
-        "workspace with a fresh context: it sees ONLY `prompt`, so write the "
-        "brief self-contained — objective, expected output, context and how it "
-        "fits the plan, key questions, sources/tools to use, scope boundaries, "
-        "what to report.",
+        f"Delegate ONE bounded brief to a subagent. {returns} The child runs "
+        "in-process on your workspace with a fresh context: it sees ONLY "
+        "`prompt`, so write the brief self-contained — objective, expected "
+        "output, context and how it fits the plan, key questions, sources/tools "
+        "to use, scope boundaries, what to report.",
     ]
     if names:
         lines.append("Subagent types available to you (`subagent_type`):")
@@ -99,25 +113,44 @@ def build_description(
             "No subagent types are configured for this expert — a call will "
             "return an error until the roster is set."
         )
-    plural = "subagent runs" if cap == 1 else "subagents run"
-    lines.append(
-        f"Up to {cap} {plural} at once: to fan out, call this tool N times in "
-        "ONE turn (one call per brief; calls above the cap queue and run in "
-        "waves). Delegation runs in a turn of its own — any other tool batched "
-        "with delegate_agent is not executed and must be re-issued in the next "
-        "turn. Subagents cannot delegate: you cannot nest."
-    )
-    background_default = "true" if run_in_background_default else "false"
-    lines.append(
-        "run_in_background=true returns an immediate durable receipt only "
-        "after the child row is created, then the child runs while you "
-        "continue. Its completion "
-        "report is pushed into a later turn automatically — do not poll with "
-        "wait_agent or list_agents. Use wait_agent once only when the result "
-        "is immediately blocking your next step. Foreground (false) waits and "
-        "returns the report as this tool result. If omitted, this expert's "
-        f"run_in_background default is {background_default}."
-    )
+    if single_child_per_response:
+        lines.append(
+            "One subagent at a time: issue exactly ONE delegate_agent call per "
+            "response. A response that carries several delegate_agent calls is "
+            "refused and none of them runs — delegate the next brief after "
+            "this one returns. Delegation runs in a turn of its own — any "
+            "other tool batched with delegate_agent is not executed and must "
+            "be re-issued in the next turn. Subagents cannot delegate: you "
+            "cannot nest."
+        )
+    else:
+        plural = "subagent runs" if cap == 1 else "subagents run"
+        lines.append(
+            f"Up to {cap} {plural} at once: to fan out, call this tool N times "
+            "in ONE turn (one call per brief; calls above the cap queue and "
+            "run in waves). Delegation runs in a turn of its own — any other "
+            "tool batched with delegate_agent is not executed and must be "
+            "re-issued in the next turn. Subagents cannot delegate: you cannot "
+            "nest."
+        )
+    if background_available:
+        background_default = "true" if run_in_background_default else "false"
+        lines.append(
+            "run_in_background=true returns an immediate durable receipt only "
+            "after the child row is created, then the child runs while you "
+            "continue. Its completion "
+            "report is pushed into a later turn automatically — do not poll "
+            "with wait_agent or list_agents. Use wait_agent once only when the "
+            "result is immediately blocking your next step. Foreground (false) "
+            "waits and returns the report as this tool result. If omitted, "
+            f"this expert's run_in_background default is {background_default}."
+        )
+    else:
+        lines.append(
+            "Every call runs in the foreground. run_in_background is not "
+            "available in this session: leave it unset — a call that sets it "
+            "to true is refused."
+        )
     lines.append(
         "All agents share the working tree — partition writes or sequence "
         "waves: give a writing child `owned_paths` (the globs it may write; "
@@ -216,6 +249,31 @@ def create_delegate_agent_tools(context: ToolContext) -> List[Any]:
         max_concurrent = 4
     run_in_background_default = bool(settings.get("run_in_background_default", False))
     type_names = ", ".join(n for n, e in roster.items() if isinstance(e, Mapping))
+    # What this parent may actually do. Both are decided when the tool is
+    # built: the parent kind and the lane never change under a session object.
+    session_parent = getattr(context, "_subagent_parent_kind", None) == "session"
+    background_available = not (
+        session_parent
+        and getattr(context, "_subagent_execution_lane", None) == "stateless"
+    )
+    if not background_available:
+        # An omitted flag is not a request: it must not select a mode this
+        # lane refuses. An explicit true still reaches the authority refusal.
+        run_in_background_default = False
+    background_field_description = (
+        (
+            "true = return an immediate durable receipt and let the "
+            "completion report push into a later turn automatically; "
+            "false = wait and return the report now. Omit to use this "
+            f"expert's configured default ({run_in_background_default}). "
+            "Never poll for a background completion."
+        )
+        if background_available
+        else (
+            "Not available in this session: every call runs in the "
+            "foreground. Leave it unset; true is refused."
+        )
+    )
 
     class DelegateAgentInput(BaseModel):
         description: str = Field(
@@ -241,13 +299,7 @@ def create_delegate_agent_tools(context: ToolContext) -> List[Any]:
         )
         run_in_background: Optional[bool] = Field(
             default=None,
-            description=(
-                "true = return an immediate durable receipt and let the "
-                "completion report push into a later turn automatically; "
-                "false = wait and return the report now. Omit to use this "
-                f"expert's configured default ({run_in_background_default}). "
-                "Never poll for a background completion."
-            ),
+            description=background_field_description,
         )
         isolation: Literal["shared", "worktree"] = Field(
             default="shared",
@@ -335,6 +387,8 @@ def create_delegate_agent_tools(context: ToolContext) -> List[Any]:
             default=default,
             max_concurrent=max_concurrent,
             run_in_background_default=run_in_background_default,
+            single_child_per_response=session_parent,
+            background_available=background_available,
         ),
         args_schema=DelegateAgentInput,
     )

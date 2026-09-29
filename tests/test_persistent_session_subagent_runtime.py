@@ -173,3 +173,30 @@ def test_context_probe_reads_live_manager_state_each_time():
     assert second.current_token_count == 654
     assert second.compaction_threshold_tokens == 789
     assert second.model_max_context_tokens == 1000
+
+
+@pytest.mark.parametrize(
+    ("shell_owner_token", "lane"),
+    [(None, "pinned"), (7, "stateless")],
+)
+def test_tool_setup_publishes_the_session_lane_before_tools_load(
+    shell_owner_token, lane
+):
+    """``delegate_agent`` builds its description when the tool is created, so
+    the parent kind and the lane must be on the context before any factory
+    runs. Only the stateless executor sets ``shell_owner_token``."""
+
+    session = _make_session(shell_owner_token=shell_owner_token)
+    seen: dict = {}
+
+    def _capture() -> None:
+        seen["kind"] = session.tool_context._subagent_parent_kind
+        seen["lane"] = session.tool_context._subagent_execution_lane
+
+    with (
+        patch.object(session, "_load_tools_for_backend", side_effect=_capture),
+        patch.object(session, "_install_session_subagent_runtime"),
+    ):
+        session._setup_tools(None)
+
+    assert seen == {"kind": "session", "lane": lane}

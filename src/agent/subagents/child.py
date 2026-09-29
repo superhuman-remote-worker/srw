@@ -809,6 +809,7 @@ def rebase_context(
     ctx.subagent_runtime = None
     ctx._parent_host = None
     ctx._subagent_parent_kind = None
+    ctx._subagent_execution_lane = None
     ctx._session_parent_authority_provider = None
     ctx._session_parent_authority = None
     ctx.parent_context_probe = None

@@ -392,6 +392,11 @@ class ToolContext:
         # set this before tool loading so lazy runtime construction can never
         # mistake their thread UUID for the legacy ``_job_id`` alias.
     )
+    _subagent_execution_lane: Optional[str] = (
+        None  # ``pinned``/``stateless`` for a session parent, fixed for the
+        # life of the session object. The delegate_agent description reads it
+        # at tool-build time, where no lease or authority may exist yet.
+    )
     _session_parent_authority_provider: Optional[Callable[[], Any]] = (
         None  # Fresh pinned/stateless SessionParentAuthority for every child
         # persistence operation.  Stateless warm sessions repoint leases
