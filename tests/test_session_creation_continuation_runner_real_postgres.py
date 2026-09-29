@@ -5,15 +5,19 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
 import asyncpg
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 from orchestrator.database.postgres import PostgresDB
-from orchestrator.services import session_provisioner
+from orchestrator.services import container_provisioner as provider_module
+from orchestrator.services import session_provisioner, ssh_helpers
 from tests import test_workspace_pull_failure_real_postgres as pull
 from tests.test_active_session_creator_end_real_postgres import (
     metadata,
@@ -187,6 +191,25 @@ async def test_v1_unscheduled_session_keeps_same_uid_until_later_ready(db, monke
     scheduled = datetime.now(timezone.utc)
     pod.spec.node_name = "node8"
     ready_external_runtime(case, monkeypatch)
+    # The staged waiter requires a verified pinned host key before SSH. Model
+    # the key scan as accepted by the external verifier for this exact Pod.
+    public_key = (
+        Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+        .public_key()
+        .public_bytes(Encoding.OpenSSH, PublicFormat.OpenSSH)
+        .decode("ascii")
+    )
+    fingerprint = ssh_helpers._fingerprint_host_key(public_key.split()[1])
+    monkeypatch.setattr(
+        provider_module, "workspace_private_key_fingerprint", lambda _: fingerprint
+    )
+    monkeypatch.setattr(
+        provider_module,
+        "_isolated_pod_exec",
+        lambda *args, **kwargs: f"256 {fingerprint} workspace (ED25519)",
+    )
+    scan = AsyncMock(return_value=(f"{pod.status.pod_ip} {public_key}", b""))
+    monkeypatch.setattr(ssh_helpers, "_scan_pinned_host_key", scan)
     pod.status.conditions = [
         SimpleNamespace(
             type="PodScheduled", status="True", last_transition_time=scheduled
@@ -195,6 +218,7 @@ async def test_v1_unscheduled_session_keeps_same_uid_until_later_ready(db, monke
     ]
     (candidate,) = (await db.list_current_session_creation_candidates()).candidates
     assert await runner._continue(candidate)
+    assert scan.await_args.args == (pod.status.pod_ip, 30022, fingerprint)
     settled = await exact_source(db, case, "stateless")
     assert settled["id"] == source["id"]
     assert settled["pod_uid"] == source["pod_uid"]
