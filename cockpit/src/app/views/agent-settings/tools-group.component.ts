@@ -26,6 +26,9 @@ import {
     type ResolvedToolRow,
 } from './resolved-toolset';
 
+/** Source of per-instance ids for the cap field's label and hint. */
+let nextCapInputId = 0;
+
 /** True when every selectable category key is enabled (none in the disabled set). */
 export function allToolCategoriesSelected(
   selectableKeys: string[],
@@ -49,16 +52,94 @@ export function disabledToolCategoriesFromConfig(
   return disabled;
 }
 
-/** The only live delegation knobs after the U3 runtime replacement. */
+/**
+ * Which delegation cap the Delegation row's number field edits.
+ *
+ * - `worker`: `delegation.max_concurrent` — jobs and the expert editor.
+ * - `session`: `delegation.session_max_concurrent` — a session thread (the
+ *   create form and the live pane). A session allowed to fan out ignores
+ *   `max_concurrent` (parallel_subagents.md §6.4, D2), so a session that wrote
+ *   it asked for 2 and got 6.
+ */
+export type DelegationCapScope = 'worker' | 'session';
+
+/**
+ * The cap scope for a settings surface's mode. `session` and `live` are both a
+ * session THREAD (the create form and the running session's pane); `job` is a
+ * worker. The expert editor does not go through this: it edits an expert, and
+ * keeps the worker cap.
+ */
+export function delegationCapScopeForMode(mode: SettingsMode): DelegationCapScope {
+  return mode === 'job' ? 'worker' : 'session';
+}
+
+/** The key under `delegation` each scope writes. */
+export type DelegationCapKey = 'max_concurrent' | 'session_max_concurrent';
+
+/**
+ * The session cap's contract, mirrored from
+ * `src/shared/runtime/core/delegation_settings.py` (default and clamp range)
+ * and the orchestrator's `validate_delegation_override` (what a write may
+ * carry: an integer from 1 to 20, booleans refused).
+ */
+export const SESSION_DELEGATION_CAP = {
+  path: 'delegation.session_max_concurrent',
+  familyPath: 'delegation.family_session_max_concurrent',
+  min: 1,
+  max: 20,
+  default: 6,
+} as const;
+
+/**
+ * A session cap as a value the orchestrator accepts, else null.
+ *
+ * Never clamps: a value the boundary would refuse is not silently turned into
+ * a different number the user did not type.
+ */
+export function sessionDelegationCapValue(raw: unknown): number | null {
+  if (typeof raw !== 'number' || !Number.isInteger(raw)) return null;
+  return raw >= SESSION_DELEGATION_CAP.min && raw <= SESSION_DELEGATION_CAP.max ? raw : null;
+}
+
+/** A stored session cap as the runtime reads it (`clamp_session_max_concurrent`):
+ *  a number, truncated and clamped into range; anything else is unset. */
+function clampedSessionDelegationCap(raw: unknown): number | null {
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return null;
+  const {min, max} = SESSION_DELEGATION_CAP;
+  return Math.max(min, Math.min(max, Math.trunc(raw)));
+}
+
+/**
+ * The session cap a config layer carries.
+ *
+ * `explicit` is `delegation.session_max_concurrent` on this layer (null =
+ * unset). `inherited` is what applies when it is unset: the parent model
+ * family's value when the layer carries one, else the code default 6.
+ */
+export function resolveSessionDelegationCap(
+  config: Record<string, unknown>,
+): {explicit: number | null; inherited: number} {
+  return {
+    explicit: clampedSessionDelegationCap(readConfigPath(config, SESSION_DELEGATION_CAP.path)),
+    inherited:
+      clampedSessionDelegationCap(readConfigPath(config, SESSION_DELEGATION_CAP.familyPath))
+      ?? SESSION_DELEGATION_CAP.default,
+  };
+}
+
+/** The only live delegation knobs after the U3 runtime replacement. `capKey`
+ *  is the cap the scope writes; `cap` null = the user set none, so nothing is
+ *  written and the value stays inherited. */
 export function delegationOverride(
   enabled: boolean,
   baselineEnabled: boolean,
-  maxConcurrent: number | null,
+  cap: number | null,
+  capKey: DelegationCapKey = 'max_concurrent',
 ): Record<string, unknown> | null {
-  if (enabled === baselineEnabled && maxConcurrent === null) return null;
+  if (enabled === baselineEnabled && cap === null) return null;
   const result: Record<string, unknown> = {};
   if (enabled !== baselineEnabled) result['enabled'] = enabled;
-  if (maxConcurrent !== null) result['max_concurrent'] = maxConcurrent;
+  if (cap !== null) result[capKey] = cap;
   return result;
 }
 
@@ -202,18 +283,61 @@ export function delegationOverride(
             }
           }
           @if (row.key === 'delegation' && rowState(row) === 'on') {
-            <div class="inline-params">
-              <div class="inline-field" [class.modified]="delegationMaxConcurrent() !== null">
-                <label class="inline-label">{{ 'agentSettings.tools.maxConcurrent' | transloco }}</label>
-                <input type="number" class="inline-input number-input" min="1" step="1"
-                  [ngModel]="delegationMaxConcurrent() ?? resolvedDelegationMaxConcurrent()"
-                  (ngModelChange)="onDelegationMaxConcurrentChange($event)"
-                  [disabled]="disabled()">
-                @if (delegationMaxConcurrent() !== null) {
-                  <button type="button" class="reset-btn" (click)="delegationMaxConcurrent.set(null); change.emit()">close</button>
+            @if (delegationCapScope() === 'session') {
+              <!-- A session's own cap. Unset renders EMPTY with the inherited
+                   value as placeholder: showing 6 as a typed value would make
+                   an untouched form look like a choice, and nothing is written
+                   until the user types one. A set cap is the placeholder too:
+                   ngModel does not rewrite a field the user emptied when the
+                   bound value is unchanged (typed 5 over a held 5), and the
+                   empty field must then show 5, not the default. -->
+              <div class="inline-params inline-params-stacked">
+                <div class="inline-field" [class.modified]="delegationCap() !== null">
+                  <label class="inline-label" [attr.for]="capInputId">{{ 'agentSettings.tools.sessionCap.label' | transloco }}</label>
+                  <input type="number" class="inline-input number-input"
+                    [id]="capInputId"
+                    [attr.min]="sessionCapMin" [attr.max]="sessionCapMax" step="1"
+                    [attr.placeholder]="sessionCap().explicit ?? sessionCap().inherited"
+                    [ngModel]="delegationCap() ?? sessionCap().explicit"
+                    (ngModelChange)="onDelegationCapChange($event)"
+                    [attr.aria-invalid]="delegationCapInvalid()"
+                    [attr.aria-describedby]="capInputId + '-hint'"
+                    [disabled]="disabled()">
+                  <!-- Live mode is pin-only: the protocol has no clear op, so
+                       a reset here would show "inherited" over a session that
+                       still holds the pin. -->
+                  @if (delegationCap() !== null && mode() !== 'live') {
+                    <button type="button" class="reset-btn"
+                      [title]="'agentSettings.common.resetToDefault' | transloco"
+                      [attr.aria-label]="'agentSettings.common.resetToDefault' | transloco"
+                      (click)="resetDelegationCap()"><app-icon size="xs">close</app-icon></button>
+                  }
+                </div>
+                <span class="inline-hint" [id]="capInputId + '-hint'">{{ 'agentSettings.tools.sessionCap.hint' | transloco }}</span>
+                @if (delegationCapInvalid()) {
+                  <span class="tool-toggle-reason" role="alert">{{
+                    'agentSettings.tools.sessionCap.invalid' | transloco:{ min: sessionCapMin, max: sessionCapMax }
+                  }}</span>
+                } @else if (delegationCap() === null && sessionCap().explicit === null) {
+                  <span class="inline-hint">{{
+                    'agentSettings.tools.sessionCap.inherited' | transloco:{ n: sessionCap().inherited }
+                  }}</span>
                 }
               </div>
-            </div>
+            } @else {
+              <div class="inline-params">
+                <div class="inline-field" [class.modified]="delegationCap() !== null">
+                  <label class="inline-label">{{ 'agentSettings.tools.maxConcurrent' | transloco }}</label>
+                  <input type="number" class="inline-input number-input" min="1" step="1"
+                    [ngModel]="delegationCap() ?? resolvedDelegationMaxConcurrent()"
+                    (ngModelChange)="onDelegationCapChange($event)"
+                    [disabled]="disabled()">
+                  @if (delegationCap() !== null) {
+                    <button type="button" class="reset-btn" (click)="resetDelegationCap()"><app-icon size="xs">close</app-icon></button>
+                  }
+                </div>
+              </div>
+            }
           }
         }
       </div>
@@ -378,6 +502,15 @@ export function delegationOverride(
       display: flex;
       gap: 12px;
       padding: 6px 10px 6px 42px;
+    }
+    .inline-params-stacked {
+      flex-direction: column;
+      gap: 3px;
+    }
+    .inline-hint {
+      font-size: 11px;
+      line-height: 1.4;
+      color: var(--text-muted);
     }
     .roster-list {
       list-style: none;
@@ -551,8 +684,45 @@ export class ToolsGroupComponent {
   /** The baseline the diff is taken against, same fallback rule. */
   private readonly anchoredBaseline = signal<Set<string> | null>(null);
 
-  /** Delegation inline params. */
-  readonly delegationMaxConcurrent = signal<number | null>(null);
+  /**
+   * Which cap the Delegation row's number field edits — see
+   * {@link DelegationCapScope}. The default is the worker cap, so a host that
+   * does not say (the expert editor, job creation) keeps writing
+   * `delegation.max_concurrent` exactly as before.
+   */
+  delegationCapScope = input<DelegationCapScope>('worker');
+
+  /** Delegation inline param: what the user typed into the cap field, or null
+   *  while they have typed nothing (the value then stays inherited). */
+  readonly delegationCap = signal<number | null>(null);
+
+  /** The session cap the config carries, and what applies when it carries none. */
+  readonly sessionCap = computed(() => resolveSessionDelegationCap(this.config()));
+  readonly sessionCapMin = SESSION_DELEGATION_CAP.min;
+  readonly sessionCapMax = SESSION_DELEGATION_CAP.max;
+  /** Ties the field's label and hint to its input; unique per instance. */
+  readonly capInputId = `delegation-cap-${nextCapInputId++}`;
+
+  /** True when the session cap field holds a value the orchestrator would
+   *  refuse (not a whole number from 1 to 20). Such a value is never written;
+   *  the create form blocks on it via {@link delegationCapValid}. Only while
+   *  the field is shown: switching Delegation off hides the field and its
+   *  error, and a hidden error must not keep the create form's submit blocked. */
+  readonly delegationCapInvalid = computed(
+    () =>
+      this.delegationCapScope() === 'session'
+      && this.delegationCap() !== null
+      && sessionDelegationCapValue(this.delegationCap()) === null
+      && this.rows().some((row) => row.key === 'delegation' && this.rowState(row) === 'on'),
+  );
+
+  /** The cap to write: the typed value, validated for a session, passed
+   *  through unchanged for the worker cap (its behaviour predates this). */
+  private readonly writableDelegationCap = computed<number | null>(() =>
+    this.delegationCapScope() === 'session'
+      ? sessionDelegationCapValue(this.delegationCap())
+      : this.delegationCap(),
+  );
 
   /** The categories from the server's answer, or null when there is none. */
   private readonly serverCategories = computed<Record<string, SessionToolCategory> | null>(
@@ -814,7 +984,7 @@ export class ToolsGroupComponent {
     // a pending addition is invisible to the line above and would otherwise
     // not be counted as the edit it is.
     count += this.requestedAdditions().size;
-    if (this.delegationMaxConcurrent() !== null) count++;
+    if (this.delegationCap() !== null) count++;
     return count;
   });
 
@@ -822,9 +992,13 @@ export class ToolsGroupComponent {
    *  parent uses this to decide whether a late-arriving read may re-anchor the
    *  baseline or would clobber a click. A pending addition counts: re-anchoring
    *  clears it (see `anchor`), so it is exactly the kind of edit a late read
-   *  must not silently discard. */
+   *  must not silently discard. A typed delegation cap counts for the same
+   *  reason: the creation forms re-read the preview on every change, so
+   *  without it the preview answering the cap edit re-anchored and wiped it. */
   hasToolEdits(): boolean {
-    return this.requestedAdditions().size > 0 || this.rows().some((row) => !row.pristine);
+    return this.requestedAdditions().size > 0
+      || this.delegationCap() !== null
+      || this.rows().some((row) => !row.pristine);
   }
 
   // --- Resolved defaults ---
@@ -879,14 +1053,27 @@ export class ToolsGroupComponent {
     else next.delete(key);
     this.userDisabled.set(next);
     if (key === 'delegation') {
-      this.delegationMaxConcurrent.set(null);
+      this.delegationCap.set(null);
     }
     this.change.emit();
   }
 
-  onDelegationMaxConcurrentChange(v: number): void {
-    this.delegationMaxConcurrent.set(v);
+  /** The cap field changed. An emptied field is "no edit" (null), which in a
+   *  creation form means inherit; an invalid session value is kept for the
+   *  field to show beside its error, and is never written. */
+  onDelegationCapChange(v: number | null): void {
+    this.delegationCap.set(typeof v === 'number' ? v : null);
     this.change.emit();
+  }
+
+  resetDelegationCap(): void {
+    this.delegationCap.set(null);
+    this.change.emit();
+  }
+
+  /** False while the session cap field holds a value that would be refused. */
+  delegationCapValid(): boolean {
+    return !this.delegationCapInvalid();
   }
 
   /**
@@ -930,7 +1117,8 @@ export class ToolsGroupComponent {
     const delegation = delegationOverride(
       delegationEnabled,
       wasEnabledByExpert,
-      this.delegationMaxConcurrent(),
+      this.writableDelegationCap(),
+      this.delegationCapScope() === 'session' ? 'session_max_concurrent' : 'max_concurrent',
     );
     if (delegation) result['delegation'] = delegation;
 
@@ -968,7 +1156,7 @@ export class ToolsGroupComponent {
     this.anchoredBaseline.set(new Set(disabled));
 
     // Reset delegation inline params on expert change
-    this.delegationMaxConcurrent.set(null);
+    this.delegationCap.set(null);
     // A re-anchor is a new baseline, so a request made against the old one is
     // no longer meaningful. Hosts guard this with `hasToolEdits()`.
     this.requestedAdditions.set(new Set());
@@ -976,7 +1164,7 @@ export class ToolsGroupComponent {
 
   resetAll(): void {
     this.userDisabled.set(new Set(this.expertDisabledCategories()));
-    this.delegationMaxConcurrent.set(null);
+    this.delegationCap.set(null);
     this.requestedAdditions.set(new Set());
   }
 }

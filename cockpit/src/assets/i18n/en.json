@@ -3462,6 +3462,12 @@
       "rosterTitle": "Subagents this expert can delegate to",
       "rosterDefault": "(default)",
       "rosterEmpty": "This expert has no subagent roster, so delegate_agent has nothing to run — every call will return an error. Add a roster to the expert under Subagents.",
+      "sessionCap": {
+        "label": "Subagents at once",
+        "hint": "How many subagents run at the same time. More calls wait their turn.",
+        "inherited": "Inherited (default {{n}})",
+        "invalid": "Enter a whole number from {{min}} to {{max}}."
+      },
       "unknownCategory": "This cockpit build has no description for this category."
     },
     "toolCategories": {

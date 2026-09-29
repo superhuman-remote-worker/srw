@@ -20,6 +20,10 @@ import {
 } from '../agent-settings/resolved-toolset';
 import {deepMergeConfig} from '../agent-settings/config-merge';
 import {
+    SESSION_DELEGATION_CAP,
+    sessionDelegationCapValue,
+} from '../agent-settings/tools-group.component';
+import {
     ConfigUpdateOutcome,
     PersistentChatService,
     NarrationMode,
@@ -567,9 +571,13 @@ export class SettingsPaneComponent {
         // The delegation concurrency knob rides beside the Delegation row and
         // is the only non-tools key the tools group writes (besides the gate,
         // which is derived at dispatch from the row's own switch position).
-        state['delegation.max_concurrent'] =
-            readConfigPath(overrides, 'delegation.max_concurrent')
-            ?? readConfigPath(config, 'delegation.max_concurrent')
+        // A session reads its OWN cap, `delegation.session_max_concurrent`
+        // (parallel_subagents.md §6.4, D2): a session allowed to fan out
+        // ignores `max_concurrent`, so writing that key asked for 2 and got 6.
+        // Unset stays null — the pane never writes the inherited value.
+        state[SESSION_DELEGATION_CAP.path] =
+            readConfigPath(overrides, SESSION_DELEGATION_CAP.path)
+            ?? readConfigPath(config, SESSION_DELEGATION_CAP.path)
             ?? null;
         // Canonical joined form so the diff is a plain string compare. The
         // picker's untouched default IS the attached set, so this holds the
@@ -641,14 +649,16 @@ export class SettingsPaneComponent {
         if ('delegation' in tools) {
             fragment['delegation'] = {enabled: !!desired['tools.delegation']};
         }
-        const maxConcurrent = desired['delegation.max_concurrent'];
+        // Only a value the orchestrator accepts (a whole number from 1 to
+        // 20) is ever sent; the tools group withholds anything else already.
+        const sessionCap = sessionDelegationCapValue(desired[SESSION_DELEGATION_CAP.path]);
         if (
-            maxConcurrent !== previous['delegation.max_concurrent']
-            && typeof maxConcurrent === 'number'
+            desired[SESSION_DELEGATION_CAP.path] !== previous[SESSION_DELEGATION_CAP.path]
+            && sessionCap !== null
         ) {
             fragment['delegation'] = {
                 ...((fragment['delegation'] as Record<string, unknown>) ?? {}),
-                max_concurrent: maxConcurrent,
+                session_max_concurrent: sessionCap,
             };
         }
 
@@ -718,6 +728,18 @@ export class SettingsPaneComponent {
                 this.threadOverride.update((current) =>
                     deepMergeConfig(current, outcome.applied),
                 );
+            } else if (outcome.transport === 'websocket') {
+                // The socket ack moves the live signals, but the session cap
+                // has none: fold the confirmed value in, or an emptied field
+                // would read "inherited" over a session that holds the value.
+                const cap = sessionDelegationCapValue(
+                    readConfigPath(outcome.applied, SESSION_DELEGATION_CAP.path),
+                );
+                if (cap !== null) {
+                    this.threadOverride.update((current) =>
+                        deepMergeConfig(current, {delegation: {session_max_concurrent: cap}}),
+                    );
+                }
             }
             return;
         }

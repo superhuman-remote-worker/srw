@@ -273,6 +273,23 @@ describe('SessionCreateComponent submit flow', () => {
     expect(component.creating()).toBe(false);
   });
 
+  it('does not create a session while the subagent cap is out of range', async () => {
+    // The orchestrator refuses delegation.session_max_concurrent outside 1..20;
+    // submitting would silently drop the typed value, so the form holds.
+    const {fixture, http, navigate} = setup();
+    const component = fixture.componentInstance;
+    component.agentSettings = {
+      vmSizingValid: () => true,
+      delegationCapValid: () => false,
+    } as unknown as SessionCreateComponent['agentSettings'];
+
+    await component.createSession();
+
+    http.expectNone((request) => request.url.endsWith('/persistent/threads'));
+    expect(navigate).not.toHaveBeenCalled();
+    expect(component.creating()).toBe(false);
+  });
+
   it('stays on the form with the error when the server rejects the config', async () => {
     const {fixture, http, navigate} = setup();
     const component = fixture.componentInstance;

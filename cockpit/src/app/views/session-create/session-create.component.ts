@@ -270,7 +270,7 @@ interface ExpertDetail extends Expert {
           <app-button
             variant="primary"
             [loading]="creating()"
-            [disabled]="loadingDatasources() || datasourceLoadError() || loadingExpert() || loadingWorkspacePreview() || !vmSizingValid()"
+            [disabled]="loadingDatasources() || datasourceLoadError() || loadingExpert() || loadingWorkspacePreview() || !vmSizingValid() || !delegationCapValid()"
             (clicked)="createSession()"
           >
             {{ creating() ? ('sessions.create.creating' | transloco) : ('sessions.create.createSession' | transloco) }}
@@ -997,8 +997,13 @@ export class SessionCreateComponent implements OnInit {
     return this.agentSettings?.vmSizingValid() ?? true;
   }
 
+  /** The session delegation cap field holds nothing the orchestrator refuses. */
+  delegationCapValid(): boolean {
+    return this.agentSettings?.delegationCapValid() ?? true;
+  }
+
   async createSession(): Promise<void> {
-    if (this.loadingDatasources() || this.datasourceLoadError() || this.loadingExpert() || this.loadingWorkspacePreview() || !this.vmSizingValid()) return;
+    if (this.loadingDatasources() || this.datasourceLoadError() || this.loadingExpert() || this.loadingWorkspacePreview() || !this.vmSizingValid() || !this.delegationCapValid()) return;
     this.creating.set(true);
 
     const expert = this.selectedExpert();

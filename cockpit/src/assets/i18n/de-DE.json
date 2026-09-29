@@ -3453,6 +3453,12 @@
       "rosterTitle": "Subagenten, an die dieser Experte delegieren kann",
       "rosterDefault": "(Standard)",
       "rosterEmpty": "Dieser Experte hat keine Subagenten-Riege, delegate_agent hat also nichts auszuführen — jeder Aufruf liefert einen Fehler. Riege beim Experten unter Subagenten hinzufügen.",
+      "sessionCap": {
+        "label": "Subagenten gleichzeitig",
+        "hint": "Wie viele Subagenten gleichzeitig laufen. Weitere Aufrufe warten, bis sie an der Reihe sind.",
+        "inherited": "Geerbt (Standard {{n}})",
+        "invalid": "Geben Sie eine ganze Zahl von {{min}} bis {{max}} ein."
+      },
       "unknownCategory": "Dieser Cockpit-Build hat keine Beschreibung für diese Kategorie."
     },
     "toolCategories": {

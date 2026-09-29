@@ -9,7 +9,7 @@ import type {
 import {SettingsMode, TierReachability} from './agent-settings.types';
 import {ExecutionGroupComponent} from './execution-group.component';
 import {ModelGroupComponent} from './model-group.component';
-import {ToolsGroupComponent} from './tools-group.component';
+import {delegationCapScopeForMode, ToolsGroupComponent} from './tools-group.component';
 import {DatasourcesGroupComponent} from './datasources-group.component';
 import {InstructionsTabComponent} from './instructions-tab.component';
 import {AdvancedAccordionComponent} from './advanced-accordion.component';
@@ -96,6 +96,7 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
           <app-tools-group
             [config]="config()"
             [mode]="mode()"
+            [delegationCapScope]="delegationCapScope()"
             [disabled]="disabled()"
             [resolved]="resolvedToolset()"
             [readsResolvedToolset]="readsResolvedToolset()"
@@ -252,6 +253,9 @@ export class AgentSettingsComponent {
    * Delegation controls), so collapse to horizontal tabs with full-width content.
    */
   readonly useVerticalTabs = computed(() => this.mode() === 'job' && !this.viewport.isMobile());
+  /** Which delegation cap the Delegation row edits: a session thread's own
+   *  cap in the create form and the live pane, the worker cap for a job. */
+  readonly delegationCapScope = computed(() => delegationCapScopeForMode(this.mode()));
   /** Whether the selected project has shared memory. */
   showProjectMemory = input(false);
   /** Inherited tool lists from the selected expert's mode base. */
@@ -391,6 +395,12 @@ export class AgentSettingsComponent {
 
   vmSizingValid(): boolean {
     return this.advancedAccordion?.vmSizingValid() ?? true;
+  }
+
+  /** False while the session delegation cap field holds a value the
+   *  orchestrator would refuse (a creation form blocks submit on it). */
+  delegationCapValid(): boolean {
+    return this.toolsGroup?.delegationCapValid() ?? true;
   }
 
   /** Return selected datasource IDs (not part of config_override). */

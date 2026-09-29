@@ -1121,17 +1121,126 @@ describe('SettingsPaneComponent delegation gate', () => {
     const {component, chat, fakeSettings} = createPane({
       toolGroups: toolsetAnswer({delegation: 'on', canvas: 'on'}, {enumerate_only: {delegation: NAMES}}),
     });
-    fakeSettings.getOverrides.mockReturnValue({delegation: {max_concurrent: 2}});
+    fakeSettings.getOverrides.mockReturnValue({delegation: {session_max_concurrent: 2}});
     component.onSettingsChange();
     vi.runAllTimers();
     expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({
-      delegation: {max_concurrent: 2},
+      delegation: {session_max_concurrent: 2},
     });
 
     // A later, unrelated edit (canvas off) does not re-send the knob.
-    fakeSettings.getOverrides.mockReturnValue({delegation: {max_concurrent: 2}, tools: {canvas: []}});
+    fakeSettings.getOverrides.mockReturnValue({
+      delegation: {session_max_concurrent: 2},
+      tools: {canvas: []},
+    });
     component.onSettingsChange();
     vi.runAllTimers();
     expect(chat.updateConfig).toHaveBeenLastCalledWith({tools: {canvas: []}});
+  });
+});
+
+describe('SettingsPaneComponent session delegation cap', () => {
+  // parallel_subagents.md §6.4 / D2. A session allowed to fan out reads its
+  // own cap, `delegation.session_max_concurrent`, and ignores the worker cap
+  // `delegation.max_concurrent` — so the pane writing the worker key meant a
+  // user who set 2 got 6. The pane is only ever a session, so it reads and
+  // writes the session key and nothing else.
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    TestBed.resetTestingModule();
+  });
+  const NAMES = ['delegate_agent', 'list_agents', 'message_agent', 'stop_agent', 'wait_agent'];
+  const delegationOn = () =>
+    toolsetAnswer({delegation: 'on', canvas: 'on'}, {enumerate_only: {delegation: NAMES}});
+
+  async function flushOutcome() {
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  it('a worker-cap edit is never dispatched from a session', () => {
+    const {component, chat, fakeSettings} = createPane({toolGroups: delegationOn()});
+    fakeSettings.getOverrides.mockReturnValue({delegation: {max_concurrent: 2}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).not.toHaveBeenCalled();
+  });
+
+  it('an unset cap is never written: unrelated edits carry no inherited value', () => {
+    const {component, chat, fakeSettings} = createPane({toolGroups: delegationOn()});
+    fakeSettings.getOverrides.mockReturnValue({tools: {canvas: []}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({tools: {canvas: []}});
+  });
+
+  it('the stored session cap is the baseline: re-pinning the same value sends nothing', () => {
+    const {component, chat, fakeSettings} = createPane({
+      toolGroups: delegationOn(),
+      override: {delegation: {session_max_concurrent: 3}},
+    });
+    fakeSettings.getOverrides.mockReturnValue({delegation: {session_max_concurrent: 3}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).not.toHaveBeenCalled();
+
+    fakeSettings.getOverrides.mockReturnValue({delegation: {session_max_concurrent: 5}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({
+      delegation: {session_max_concurrent: 5},
+    });
+  });
+
+  it('a value the orchestrator would refuse is never dispatched', () => {
+    const {component, chat, fakeSettings} = createPane({toolGroups: delegationOn()});
+    for (const refused of [0, 21, 2.5]) {
+      fakeSettings.getOverrides.mockReturnValue({delegation: {session_max_concurrent: refused}});
+      component.onSettingsChange();
+      vi.runAllTimers();
+    }
+    expect(chat.updateConfig).not.toHaveBeenCalled();
+  });
+
+  it('with the real tools group: typing a cap sends session_max_concurrent only', () => {
+    const {component, chat, toolsGroup} = createPaneWithRealToolsGroup(delegationOn());
+    Object.defineProperty(toolsGroup, 'delegationCapScope', {value: () => 'session'});
+
+    toolsGroup.onDelegationCapChange(25); // out of range: flagged, not sent
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).not.toHaveBeenCalled();
+
+    toolsGroup.onDelegationCapChange(2);
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({
+      delegation: {session_max_concurrent: 2},
+    });
+  });
+
+  it('a socket-confirmed cap is folded into the overlay, so the field keeps showing it', async () => {
+    const {component, chat, fakeSettings} = createPane({toolGroups: delegationOn()});
+    chat.updateConfig.mockResolvedValue({
+      ok: true,
+      requestId: 'req-cap',
+      transport: 'websocket',
+      applied: {delegation: {session_max_concurrent: 2}},
+      effective: 'now',
+    });
+    fakeSettings.getOverrides.mockReturnValue({delegation: {session_max_concurrent: 2}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    await flushOutcome();
+
+    expect(
+      (component.liveConfig()['delegation'] as Record<string, unknown>)['session_max_concurrent'],
+    ).toBe(2);
+    // Emptying the field afterwards is not a change: the session holds 2.
+    fakeSettings.getOverrides.mockReturnValue({});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenCalledTimes(1);
   });
 });

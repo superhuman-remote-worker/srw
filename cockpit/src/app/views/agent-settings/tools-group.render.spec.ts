@@ -1,5 +1,5 @@
 import {beforeAll, describe, expect, it} from 'vitest';
-import {ɵresolveComponentResources} from '@angular/core';
+import {signal, ɵresolveComponentResources} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
 import {TranslocoTestingModule} from '@jsverse/transloco';
 import en from '../../../assets/i18n/en.json';
@@ -54,6 +54,8 @@ function mount(options: {
   gatedCapabilities?: Record<string, unknown> | null;
   readsResolvedToolset?: boolean;
   enumerateOnly?: Record<string, string[]> | null;
+  config?: Record<string, unknown> | (() => Record<string, unknown>);
+  delegationCapScope?: 'worker' | 'session';
 } = {}) {
   TestBed.configureTestingModule({
     imports: [
@@ -77,6 +79,17 @@ function mount(options: {
   Object.defineProperty(instance, 'enumerateOnly', {
     value: () => options.enumerateOnly ?? null,
   });
+  if (options.config) {
+    const config = options.config;
+    Object.defineProperty(instance, 'config', {
+      value: typeof config === 'function' ? config : () => config,
+    });
+  }
+  if (options.delegationCapScope) {
+    Object.defineProperty(instance, 'delegationCapScope', {
+      value: () => options.delegationCapScope,
+    });
+  }
   fixture.detectChanges();
   return fixture;
 }
@@ -668,5 +681,181 @@ describe('ToolsGroupComponent delegation roster', () => {
     const host = fixture.nativeElement as HTMLElement;
     expect(host.querySelector('.roster-list')).toBeNull();
     expect(host.querySelector('.roster-empty')).toBeNull();
+  });
+});
+
+describe('ToolsGroupComponent session delegation cap', () => {
+  // parallel_subagents.md §6.4 / D2: a session's own cap. The field says what
+  // it does, shows an unset cap as inherited instead of as a typed value, and
+  // refuses what the orchestrator would refuse.
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  const delegationOn = () => response({
+    categories: {delegation: cat({state: 'on', tools: ['delegate_agent']})},
+  });
+
+  function capInput(fixture: {nativeElement: unknown}): HTMLInputElement {
+    const input = (fixture.nativeElement as HTMLElement).querySelector<HTMLInputElement>(
+      '.inline-params input[type="number"]',
+    );
+    if (!input) throw new Error(`no cap field; saw: ${text(fixture)}`);
+    return input;
+  }
+
+  function type(
+    fixture: {nativeElement: unknown; detectChanges: () => void},
+    value: string,
+  ): void {
+    const input = capInput(fixture);
+    input.value = value;
+    input.dispatchEvent(new Event('input'));
+    fixture.detectChanges();
+  }
+
+  it('unset: labelled in plain words, empty, and shown as inherited (default 6)', async () => {
+    const fixture = mount({mode: 'live', delegationCapScope: 'session', resolved: delegationOn()});
+    await fixture.whenStable();
+    const input = capInput(fixture);
+    expect(text(fixture)).toContain('Subagents at once');
+    expect(text(fixture)).toContain('How many subagents run at the same time. More calls wait their turn.');
+    expect(text(fixture)).toContain('Inherited (default 6)');
+    expect(text(fixture)).not.toContain('Max concurrent');
+    expect(input.value).toBe('');
+    expect(input.getAttribute('placeholder')).toBe('6');
+    expect(input.getAttribute('min')).toBe('1');
+    expect(input.getAttribute('max')).toBe('20');
+    expect(fixture.componentInstance.getOverrides()).toEqual({});
+  });
+
+  it('inherits the model family value when the config carries one', async () => {
+    const fixture = mount({
+      mode: 'session',
+      delegationCapScope: 'session',
+      resolved: delegationOn(),
+      config: {delegation: {family_session_max_concurrent: 4}},
+    });
+    await fixture.whenStable();
+    expect(text(fixture)).toContain('Inherited (default 4)');
+    expect(capInput(fixture).getAttribute('placeholder')).toBe('4');
+  });
+
+  it('a set cap shows as its value, not as inherited, and is not re-written', async () => {
+    const fixture = mount({
+      mode: 'live',
+      delegationCapScope: 'session',
+      resolved: delegationOn(),
+      config: {delegation: {session_max_concurrent: 3}},
+    });
+    await fixture.whenStable();
+    expect(capInput(fixture).value).toBe('3');
+    expect(text(fixture)).not.toContain('Inherited');
+    expect(fixture.componentInstance.getOverrides()).toEqual({});
+  });
+
+  it('typing a value writes session_max_concurrent and clears the inherited note', async () => {
+    const fixture = mount({mode: 'live', delegationCapScope: 'session', resolved: delegationOn()});
+    await fixture.whenStable();
+    type(fixture, '2');
+    expect(fixture.componentInstance.getOverrides()).toEqual({
+      delegation: {session_max_concurrent: 2},
+    });
+    expect(text(fixture)).not.toContain('Inherited');
+  });
+
+  it('an out-of-range value shows the rule and is not written', async () => {
+    const fixture = mount({mode: 'live', delegationCapScope: 'session', resolved: delegationOn()});
+    await fixture.whenStable();
+    type(fixture, '25');
+    const alert = (fixture.nativeElement as HTMLElement).querySelector('[role="alert"]');
+    expect(alert?.textContent).toContain('Enter a whole number from 1 to 20.');
+    expect(capInput(fixture).getAttribute('aria-invalid')).toBe('true');
+    expect(fixture.componentInstance.getOverrides()).toEqual({});
+
+    type(fixture, '20');
+    expect((fixture.nativeElement as HTMLElement).querySelector('[role="alert"]')).toBeNull();
+    expect(fixture.componentInstance.getOverrides()).toEqual({
+      delegation: {session_max_concurrent: 20},
+    });
+  });
+
+  it('the live pane offers no reset (pin-only); the create form resets to inherited', async () => {
+    const live = mount({mode: 'live', delegationCapScope: 'session', resolved: delegationOn()});
+    await live.whenStable();
+    type(live, '2');
+    expect((live.nativeElement as HTMLElement).querySelector('.inline-params .reset-btn')).toBeNull();
+    TestBed.resetTestingModule();
+
+    const create = mount({mode: 'session', delegationCapScope: 'session', resolved: delegationOn()});
+    await create.whenStable();
+    type(create, '2');
+    const reset = (create.nativeElement as HTMLElement).querySelector<HTMLButtonElement>(
+      '.inline-params .reset-btn',
+    );
+    expect(reset).not.toBeNull();
+    reset!.click();
+    create.detectChanges();
+    expect(create.componentInstance.getOverrides()).toEqual({});
+    expect(text(create)).toContain('Inherited (default 6)');
+  });
+
+  it('switching Delegation off drops a hidden invalid cap from validity', async () => {
+    // The field and its error render only while the row is on. An invalid
+    // value left behind a switched-off row must not keep Create disabled with
+    // nothing on screen saying why.
+    const fixture = mount({mode: 'session', delegationCapScope: 'session', resolved: delegationOn()});
+    await fixture.whenStable();
+    type(fixture, '25');
+    expect(fixture.componentInstance.delegationCapValid()).toBe(false);
+
+    const box = (fixture.nativeElement as HTMLElement).querySelector<HTMLInputElement>(
+      '.tool-toggle input[type="checkbox"]',
+    )!;
+    box.dispatchEvent(new Event('change'));
+    fixture.detectChanges();
+    expect((fixture.nativeElement as HTMLElement).querySelector('.inline-params')).toBeNull();
+    expect(fixture.componentInstance.delegationCapValid()).toBe(true);
+    expect(fixture.componentInstance.getOverrides()).toEqual({
+      tools: {delegation: []},
+      delegation: {enabled: false},
+    });
+
+    // Back on: the value and its error return together.
+    box.dispatchEvent(new Event('change'));
+    fixture.detectChanges();
+    expect(fixture.componentInstance.delegationCapValid()).toBe(false);
+    expect((fixture.nativeElement as HTMLElement).querySelector('[role="alert"]')).not.toBeNull();
+  });
+
+  it('an emptied field over a held cap shows the held value, not the default', async () => {
+    // Typing 5, the socket confirming 5 into the config, then emptying the
+    // field: the bound value stays 5, so ngModel leaves the field empty. Its
+    // placeholder is then all it shows, and it must be what the session holds.
+    const config = signal<Record<string, unknown>>({});
+    const fixture = mount({
+      mode: 'live',
+      delegationCapScope: 'session',
+      resolved: delegationOn(),
+      config,
+    });
+    await fixture.whenStable();
+    type(fixture, '5');
+    config.set({delegation: {session_max_concurrent: 5}});
+    fixture.detectChanges();
+    type(fixture, '');
+    expect(capInput(fixture).getAttribute('placeholder')).toBe('5');
+    expect(text(fixture)).not.toContain('Inherited');
+    expect(fixture.componentInstance.getOverrides()).toEqual({});
+  });
+
+  it('a job keeps the worker field: max_concurrent, default 4, no inherited note', async () => {
+    const fixture = mount({mode: 'job', resolved: delegationOn()});
+    await fixture.whenStable();
+    expect(text(fixture)).toContain('Max concurrent');
+    expect(text(fixture)).not.toContain('Subagents at once');
+    expect(capInput(fixture).value).toBe('4');
+    type(fixture, '2');
+    expect(fixture.componentInstance.getOverrides()).toEqual({delegation: {max_concurrent: 2}});
   });
 });
