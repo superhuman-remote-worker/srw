@@ -614,12 +614,21 @@ class SessionAttachCoordinator:
         session = self._session
         if session is None:
             return False
-        return session.apply_subagent_fanout_advertisement(
-            batch_settle_contract=subagent_batch_settle_advertised(
-                batch_settle_contract
-            ),
-            fanout=subagent_fanout_advertised(fanout),
+        batch_settle = subagent_batch_settle_advertised(batch_settle_contract)
+        fanout_allowed = subagent_fanout_advertised(fanout)
+        changed = session.apply_subagent_fanout_advertisement(
+            batch_settle_contract=batch_settle,
+            fanout=fanout_allowed,
         )
+        if changed:
+            self._logger.info(
+                "Session delegation advertisement re-applied: thread=%s "
+                "batch_settle=%s fanout=%s",
+                self._identity.thread_id,
+                batch_settle,
+                fanout_allowed,
+            )
+        return changed
 
     def runtime_actor_for_attach(
         self,
@@ -1410,6 +1419,14 @@ class SessionAttachCoordinator:
             session_subagent_fanout,
             tuple(reversed(subagent_workspace_responses)),
             from_workspace=not self._ports.stateless_mode(),
+        )
+        self._logger.info(
+            "Session delegation advertisement: thread=%s batch_settle=%s "
+            "fanout=%s source=%s",
+            self._identity.thread_id,
+            subagent_batch_settle,
+            subagent_fanout,
+            "claim" if self._ports.stateless_mode() else "attach",
         )
         session = self._ports.session_factory(
             thread_id=self._identity.thread_id,
