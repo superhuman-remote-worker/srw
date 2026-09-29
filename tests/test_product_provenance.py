@@ -515,8 +515,10 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
 
     assert _count_full_revision(main, "SRW_SOURCE_REVISION") >= 7
     assert _count_full_revision(develop, "SRW_SOURCE_REVISION") >= 7
-    assert _count_full_revision(main, "org.opencontainers.image.revision") == 7
-    assert _count_full_revision(develop, "org.opencontainers.image.revision") == 7
+    # Seven build identities, and the workspace job labels two images: the
+    # full one and the minimal one it is built on.
+    assert _count_full_revision(main, "org.opencontainers.image.revision") == 8
+    assert _count_full_revision(develop, "org.opencontainers.image.revision") == 8
     for component in (
         "agent",
         "orchestrator",

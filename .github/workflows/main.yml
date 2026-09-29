@@ -914,7 +914,7 @@ jobs:
       needs.test-cockpit.result == 'success' &&
       (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 50
     permissions:
       contents: read
       packages: write
@@ -942,14 +942,49 @@ jobs:
             type=sha,format=short,prefix=sha-
             type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
             type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
+      - name: Extract metadata (minimal)
+        id: meta-minimal
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-workspace-minimal
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
       - name: Read Playwright version
         id: pw
         run: echo "version=$(tr -d '[:space:]' < .playwright-version)" >> "$GITHUB_OUTPUT"
-      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+      - name: Build minimal${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.workspace
+          target: minimal
+          build-args: |
+            PLAYWRIGHT_VERSION=${{ steps.pw.outputs.version }}
+            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
+            SRW_RELEASE_VERSION=${{ needs.resolve-version.outputs.version }}
+            SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta-minimal.outputs.tags }}
+          labels: |
+            ${{ steps.meta-minimal.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.resolve-version.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=workspace
+            io.srw.workspace.variant=minimal
+          provenance: false
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-workspace:buildcache-main
+      # Same builder, so every minimal layer above is reused here.
+      - name: Build full${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.workspace
+          target: full
           build-args: |
             PLAYWRIGHT_VERSION=${{ steps.pw.outputs.version }}
             SRW_SOURCE_REVISION=${{ github.sha }}
@@ -965,6 +1000,7 @@ jobs:
             org.opencontainers.image.version=${{ needs.resolve-version.outputs.version }}
             org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
             io.srw.component=workspace
+            io.srw.workspace.variant=full
           provenance: false
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-workspace:buildcache-main
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-workspace:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
@@ -1488,6 +1524,7 @@ jobs:
           yq -i '
             .provenance.releaseVersion = strenv(RELEASE_VERSION) |
             .image.mcp.digest = strenv(MCP_DIGEST) |
+            .image.workspaceMinimal.tag = strenv(IMAGE_TAG) |
             .vmController.image.tag = strenv(IMAGE_TAG) |
             .vmController.preparation.image.tag = strenv(IMAGE_TAG) |
             .vmController.preparation.image.digest = strenv(VM_PREPARER_DIGEST) |

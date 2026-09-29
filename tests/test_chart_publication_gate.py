@@ -50,7 +50,7 @@ def test_verified_unchanged_images_may_be_reused():
         return "sha256:" + "b" * 64
 
     verified = gate.verify_images(refs, inspect)
-    assert set(verified) == set(gate.COMPONENTS)
+    assert set(verified) == set(gate.COMPONENTS) | set(gate.COBUILT)
     assert observed == list(refs.values())
     assert all(ref.endswith(":sha-aaaaaaa") for ref in observed)
 
@@ -112,7 +112,7 @@ def test_cli_writes_no_partial_outputs_when_the_last_registry_image_is_missing(
 
     def inspect(args, **kwargs):
         observed.append(args[4])
-        if len(observed) == len(gate.COMPONENTS):
+        if len(observed) == len(gate.COMPONENTS) + len(gate.COBUILT):
             raise subprocess.CalledProcessError(1, args)
         return subprocess.CompletedProcess(args, 0, "sha256:" + "b" * 64 + "\n")
 
@@ -121,7 +121,7 @@ def test_cli_writes_no_partial_outputs_when_the_last_registry_image_is_missing(
         ["--repository", "ghcr.io/example/srw", "--inventory", str(inventory)]
     )
     assert result == 1
-    assert len(observed) == len(gate.COMPONENTS)
+    assert len(observed) == len(gate.COMPONENTS) + len(gate.COBUILT)
     assert output.read_text() == "EXISTING=value\n"
     assert not inventory.exists()
 
@@ -170,3 +170,80 @@ def test_architecture_and_verified_images_gate_publication_on_the_tested_revisio
     assert all(
         step.get("if", "") != "always()" for step in steps[verification_index + 1 :]
     )
+
+
+def test_the_minimal_workspace_image_shares_the_workspace_identity():
+    state = needs(changed="false", result="skipped")
+    state["changes"]["outputs"]["workspace-sha"] = "d" * 40
+    refs = gate.expected_images(state, "ghcr.io/example/srw")
+    assert refs["workspace"] == "ghcr.io/example/srw-workspace:sha-ddddddd"
+    assert refs["workspace-minimal"] == (
+        "ghcr.io/example/srw-workspace-minimal:sha-ddddddd"
+    )
+
+
+def test_a_missing_minimal_image_refuses_publication():
+    refs = gate.expected_images(needs(), "ghcr.io/example/srw")
+
+    def inspect(ref):
+        if "workspace-minimal" in ref:
+            raise subprocess.CalledProcessError(1, ["inspect", ref])
+        return "sha256:" + "b" * 64
+
+    with pytest.raises(subprocess.CalledProcessError):
+        gate.verify_images(refs, inspect)
+
+
+def test_a_cobuilt_image_never_needs_its_own_job():
+    assert set(gate.COBUILT) == {"workspace-minimal"}
+    assert set(gate.COBUILT.values()) <= set(gate.COMPONENTS)
+    assert not set(gate.COBUILT) & set(gate.COMPONENTS)
+
+
+def workflow(name):
+    path = SCRIPT.parents[1] / ".github" / "workflows" / f"{name}.yml"
+    return path.read_text(), yaml.safe_load(path.read_text())["jobs"]
+
+
+@pytest.mark.parametrize("name", ["develop", "main"])
+def test_one_job_builds_both_workspace_targets_with_the_same_tags(name):
+    _, jobs = workflow(name)
+    steps = jobs["build-workspace"]["steps"]
+    metadata = {
+        step["id"]: step["with"]
+        for step in steps
+        if step.get("uses", "").startswith("docker/metadata-action@")
+    }
+    assert metadata["meta-minimal"]["images"].endswith("-workspace-minimal")
+    assert metadata["meta"]["images"].endswith("-workspace")
+    assert metadata["meta-minimal"]["tags"] == metadata["meta"]["tags"]
+
+    builds = [
+        step["with"]
+        for step in steps
+        if step.get("uses", "").startswith("docker/build-push-action@")
+    ]
+    assert [build["target"] for build in builds] == ["minimal", "full"]
+    minimal, full = builds
+    assert minimal["tags"] == "${{ steps.meta-minimal.outputs.tags }}"
+    assert full["tags"] == "${{ steps.meta.outputs.tags }}"
+    for key in ("context", "file", "build-args", "push", "provenance", "cache-from"):
+        assert minimal[key] == full[key], key
+    # Only the last build exports the cache; it covers both stages.
+    assert "cache-to" not in minimal and "mode=max" in full["cache-to"]
+
+
+@pytest.mark.parametrize(
+    ("name", "publication"),
+    [("develop", "deploy-experimental"), ("main", "release-chart")],
+)
+def test_the_chart_is_stamped_with_the_minimal_image(name, publication):
+    _, jobs = workflow(name)
+    scripts = "\n".join(step.get("run", "") for step in jobs[publication]["steps"])
+    assert ".image.workspaceMinimal.tag" in scripts
+
+
+def test_develop_rebuilds_when_either_workspace_image_is_missing():
+    text, _ = workflow("develop")
+    assert "docker/assert-workspace-contract.sh" in text
+    assert 'image_missing workspace-minimal "$WORKSPACE_SHA"' in text
