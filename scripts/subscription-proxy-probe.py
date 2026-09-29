@@ -333,6 +333,19 @@ CASES = {
     "opus-5-noheader": (thinking_case("claude-opus-5", "high", False), "claude-opus-5"),
     "opus-5-tools": (tool_loop_case("claude-opus-5", "high"), "claude-opus-5"),
     "codex": (codex_case("gpt-5.6-sol", "low"), "gpt-5.6-sol"),
+    # Sonnet 5.5: the family default first, then the two levels 4.x lacks.
+    "sonnet-5-5-tools": (
+        tool_loop_case("claude-sonnet-5-5", "high"),
+        "claude-sonnet-5-5",
+    ),
+    "sonnet-5-5-xhigh": (
+        thinking_case("claude-sonnet-5-5", "xhigh", True),
+        "claude-sonnet-5-5",
+    ),
+    "sonnet-5-5-max": (
+        thinking_case("claude-sonnet-5-5", "max", True),
+        "claude-sonnet-5-5",
+    ),
 }
 DEFAULT = [
     "opus-5-5",
