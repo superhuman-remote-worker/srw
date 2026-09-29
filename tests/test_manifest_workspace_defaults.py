@@ -107,3 +107,36 @@ def test_resolution_rejects_a_backend_mismatch():
     with pytest.raises(ManifestError) as error:
         preview_documents([project({"vm": "site"})])
     assert error.value.issue.code == "WorkspaceDefaultBackendMismatch"
+
+
+def job(scope, workspace=...):
+    execution = {"expert": {"inline": {"runtime": {"image": "r.example/agent:1"}}}}
+    if workspace is not ...:
+        execution["workspace"] = workspace
+    return {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "Job",
+        "metadata": {"name": "build", "scope": scope},
+        "spec": {"task": {"text": "Build it."}, "execution": execution},
+    }
+
+
+def resolved_job(documents):
+    return next(
+        d for d in preview_documents(documents)["resolved"] if d["kind"] == "Job"
+    )
+
+
+def test_an_omitted_workspace_stays_absent_after_resolution():
+    account = {"kind": "Account", "name": "personal"}
+    assert "workspace" not in resolved_job([job(account)])["spec"]["execution"]
+
+
+def test_a_project_default_is_no_longer_copied_into_a_job():
+    documents = [project("site"), job({"kind": "Project", "name": "website"})]
+    assert "workspace" not in resolved_job(documents)["spec"]["execution"]
+
+
+def test_null_survives_resolution():
+    account = {"kind": "Account", "name": "personal"}
+    assert resolved_job([job(account, None)])["spec"]["execution"]["workspace"] is None

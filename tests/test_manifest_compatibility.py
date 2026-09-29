@@ -21,13 +21,41 @@ FIXTURE = (
 )
 
 
+def workspace_defaults_chain(preview):
+    """The frozen baseline with the workspace defaults chain applied.
+
+    Recorded behaviour change within srw/v1alpha1 (Slice A2b, owner decision
+    2026-09-29): a Job that omits ``execution.workspace`` keeps it omitted in
+    the preview. The Project's ``defaults.workspace`` (or the installation's
+    defaults) decides it at admission, so the preview no longer copies it.
+    """
+    expected = deepcopy(preview)
+    omitted = {
+        number
+        for number, document in enumerate(expected["documents"], start=1)
+        if document["kind"] == "Job"
+        and "workspace" not in document["spec"]["execution"]
+    }
+
+    def copied(entry):
+        return entry["document"] in omitted and entry["path"].startswith(
+            "/spec/execution/workspace"
+        )
+
+    expected["defaults"] = [e for e in expected["defaults"] if not copied(e)]
+    expected["dependencies"] = [e for e in expected["dependencies"] if not copied(e)]
+    for number in omitted:
+        expected["resolved"][number - 1]["spec"]["execution"].pop("workspace")
+    return expected
+
+
 def test_published_alpha_fixture_preserves_resolution_defaults_and_json_values():
     baseline = json.loads((FIXTURE / "baseline.json").read_text())
     documents = parse_documents((FIXTURE / "portable.yaml").read_text())
     before = deepcopy(documents)
     assert API_VERSION == baseline["apiVersion"]
     assert load_schema()["properties"]["apiVersion"]["const"] == API_VERSION
-    assert preview_documents(documents) == baseline["preview"]
+    assert preview_documents(documents) == workspace_defaults_chain(baseline["preview"])
     assert documents == before
     for format in ("json", "yaml"):
         exported = export_documents(documents, format=format)

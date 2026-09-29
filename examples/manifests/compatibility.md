@@ -144,3 +144,12 @@ version/migration decision for a behavior change; do not regenerate the expected
 answer merely to make a changed resolver pass. These parser/resolver checks are
 one layer of acceptance. They do not replace admission/authorization tests, real
 runtime tests, migration replay or a deployment-specific upgrade/rollback exercise.
+
+Recorded behaviour changes within `srw/v1alpha1`, applied to the frozen answer by
+the test rather than regenerated into it:
+
+- **Workspace defaults chain.** A Job that omits `execution.workspace` keeps it
+  omitted in the preview. The Project's `defaults.workspace`, otherwise the
+  installation's workspace defaults, decide it when the Job is admitted, and the
+  admitted execution snapshot records the result. `workspace: null` still means
+  no workspace.

@@ -491,7 +491,8 @@ async def native_execution(database, actor, *, max_attempts=1, mode="ProcessExit
         database, runtime=process, namespace="test", native_hosting_enabled=True
     )
     resources = ManifestResourceService(database, admit_job=execution.admit)
-    assignment = job(expert={"inline": expert()["spec"]})
+    # These Jobs run without a workspace; an omitted one resolves the chain.
+    assignment = job(expert={"inline": expert()["spec"]}, workspace=None)
     assignment["spec"]["retry"] = {"maxAttempts": max_attempts}
     assignment["spec"]["completion"] = {"mode": mode}
     assignment["spec"]["timeoutSeconds"] = 60
@@ -810,7 +811,7 @@ async def test_reapply_job_keeps_original_referenced_generation(database, actor)
         database, runtime=process, namespace="test", native_hosting_enabled=True
     )
     resources = ManifestResourceService(database, admit_job=execution.admit)
-    authored = [expert(), job()]
+    authored = [expert(), job(workspace=None)]
     first = await apply(resources, authored, actor)
     original = await database.fetchval("SELECT resolved::text FROM srw_execution_specs")
     change = expert(image="example/worker:v2")
@@ -820,13 +821,13 @@ async def test_reapply_job_keeps_original_referenced_generation(database, actor)
         if key.startswith("Expert/")
     }
     await apply(resources, change, actor, expected_versions=versions)
-    repeated = await apply(resources, job(), actor)
+    repeated = await apply(resources, job(workspace=None), actor)
     assert repeated["executions"] == first["executions"]
     assert (
         await database.fetchval("SELECT resolved::text FROM srw_execution_specs")
         == original
     )
-    classified = job()
+    classified = job(workspace=None)
     classified["metadata"]["tags"] = ["reviewed"]
     job_versions = {
         key: value for key, value in expected(first).items() if key.startswith("Job/")

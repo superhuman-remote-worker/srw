@@ -120,6 +120,26 @@ class ManifestExecutionService:
                     raise HTTPException(
                         422, "Datasource connectors require config.datasourceId."
                     ) from None
+        # An omitted workspace resolves the defaults chain as the executing
+        # account; `null` (no workspace) and a binding are explicit choices.
+        if "workspace" in execution:
+            workspace_receipt = {
+                "sources": {"tier": "explicit", "template": "explicit"},
+                "template_name": None,
+            }
+        else:
+            from orchestrator.services.manifest_workspace_selection import (
+                select_execution_workspace,
+            )
+
+            _, workspace_receipt = await select_execution_workspace(
+                self.db,
+                user,
+                project_id=project_id,
+                role="worker",
+                request=request,
+            )
+            execution["workspace"] = workspace_receipt["resolved"]
         workspace = execution["workspace"]
         instance_recipe = None
         if adapter == "srw/v1" and workspace and "instanceRef" in workspace:
@@ -169,6 +189,10 @@ class ManifestExecutionService:
             key: deepcopy(prepared[key])
             for key in ("document", "resolved", "revision", "dependencies")
         }
+        # A default template is pinned like any referenced resource.
+        for dependency in workspace_receipt.get("dependencies", []):
+            if dependency not in snapshot["dependencies"]:
+                snapshot["dependencies"].append(deepcopy(dependency))
         if adapter == "srw/v1":
             from orchestrator.services.manifest_execution_snapshot import (
                 prepare_srw_snapshot,
@@ -272,6 +296,9 @@ class ManifestExecutionService:
             authority_user_id=str(user["id"]),
             authority_project_ids=[project_id] if project_id else [],
             execution_manifest=snapshot,
+            # With execution_manifest given, create_job reads the receipt only
+            # to record which layers supplied the workspace.
+            workspace_selection=workspace_receipt,
         )
         if workspace and adapter == "generic":
             await self.workspace.reserve(str(job["id"]), workspace, user)

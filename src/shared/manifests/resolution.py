@@ -328,31 +328,24 @@ class _Bundle:
         if (
             scope["kind"] == "Project"
             and project is None
-            and any(
-                field not in execution
-                for field in ("expert", "workspace", "connectors")
-            )
+            and any(field not in execution for field in ("expert", "connectors"))
         ):
             fail(
                 "UnresolvedProjectDefaults",
-                "Supply the Project definition or explicitly select expert, workspace and connectors.",
+                "Supply the Project definition or explicitly select expert and connectors.",
                 document=number,
                 path=pointer((*path, "execution")),
             )
         defaults = project["spec"].get("defaults", {}) if project else {}
         resources = project["spec"]["resources"] if project else {}
-        for field in ("expert", "workspace", "connectors"):
+        # An omitted workspace stays omitted: admission resolves the workspace
+        # defaults chain (Project row, installation, built-in) for it.
+        for field in ("expert", "connectors"):
             if field in execution or field not in defaults:
                 continue
             value = defaults[field]
             if field == "expert":
                 execution[field] = resources["experts"][value]
-            elif field == "workspace":
-                execution[field] = (
-                    None
-                    if value is None
-                    else {"template": resources["workspaces"][value]}
-                )
             else:
                 execution[field] = {
                     alias: resources["connectors"][alias] for alias in value
@@ -374,8 +367,7 @@ class _Bundle:
         execution["expert"] = self._selection(
             "Expert", execution["expert"], scope, number, (*path, "execution", "expert")
         )
-        execution.setdefault("workspace", None)
-        workspace = execution["workspace"]
+        workspace = execution.get("workspace")
         if workspace is not None and "template" in workspace:
             workspace["template"] = self._selection(
                 "WorkspaceTemplate",
