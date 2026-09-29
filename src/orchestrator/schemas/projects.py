@@ -1,7 +1,14 @@
 """Project, membership, repository and promotion request contracts."""
 
 from typing import Any, Literal
-from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 
 
 class ExternalKnowledgeBase(BaseModel):
@@ -108,6 +115,28 @@ class ProjectUpdate(BaseModel):
     cloud_storage_read_only: bool | None = None
     # Workspace egress tier. Admin-only — see PATCH /api/projects/{id}.
     network_tier: str | None = None
+
+
+WorkspaceMode = Literal["none", "virtual", "container", "vm"]
+
+
+class WorkspaceTemplateRef(BaseModel):
+    """A template by name and scope, e.g. {kind: Catalog, name: shared}."""
+
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=63)
+    scope: dict[str, str]
+
+
+class ProjectWorkspaceDefaultsUpdate(BaseModel):
+    """Body for PUT /api/projects/{id}/workspace-defaults. A null field falls
+    through to the installation."""
+
+    model_config = ConfigDict(extra="forbid")
+    jobs: WorkspaceMode | None = None
+    sessions: WorkspaceMode | None = None
+    container: WorkspaceTemplateRef | None = None
+    vm: WorkspaceTemplateRef | None = None
 
 
 class ProjectMemberAdd(BaseModel):
