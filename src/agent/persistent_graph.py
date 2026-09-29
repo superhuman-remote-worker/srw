@@ -17,7 +17,7 @@ import inspect
 import logging
 import time
 import uuid as _uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Union
 
@@ -991,6 +991,218 @@ async def _await_or_hard_interrupt(
     return None, True
 
 
+# ---------------------------------------------------------------------------
+# Session delegation batch (parallel_subagents.md §6.3, §6.4, §8)
+# ---------------------------------------------------------------------------
+
+#: How often a running delegation batch polls ``check_interrupt``. A Stop that
+#: lands while a tool runs is "graceful", which sets no event to wait on.
+_DELEGATION_INTERRUPT_POLL_S = 0.25
+#: Strict persistence of one delegation result. The write is an upsert by the
+#: message id, so a retry can never produce a second row.
+_DELEGATION_RESULT_PERSIST_ATTEMPTS = 3
+_DELEGATION_RESULT_PERSIST_RETRY_S = 0.5
+
+#: First line of a call cancelled because its batch could not go on.
+DELEGATION_CANCELLED_HEADER = "[delegate_agent: CANCELLED - no final report]"
+_WORKSPACE_UNAVAILABLE_REASON = "the workspace became unavailable"
+
+
+class DelegationResultNotDurable(RuntimeError):
+    """A delegation result could not be saved to the parent transcript.
+
+    The result is the delivery fact of its child. The turn stops before any
+    further provider call, so no final answer can make the batch look
+    delivered; the turn-end reconcile retries the same rows (by id), and a
+    successor's settle writes whatever is still missing.
+    """
+
+
+def _session_fanout_allowed(tool_context: Optional[Any]) -> bool:
+    """``fanout.session_fanout_allowed``, read live and never fatal."""
+    if tool_context is None:
+        return False
+    from agent.tools.delegation import fanout
+
+    try:
+        return fanout.session_fanout_allowed(tool_context) is True
+    except Exception:
+        logger.warning(
+            "Session fan-out gate unreadable; treating as off", exc_info=True
+        )
+        return False
+
+
+def _delegation_max_calls_per_turn(tool_context: Any) -> int:
+    from agent.tools.delegation import fanout
+
+    return max(1, int(fanout.delegation_max_calls_per_turn(tool_context)))
+
+
+def _delegation_over_limit_text(limit: int) -> str:
+    """Result of a call above the per-turn maximum (§6.4). Not retryable."""
+    return (
+        "Error: delegate_agent call refused: this turn has reached its maximum "
+        f"of {limit} delegate_agent calls. This subagent did not run. Do not "
+        "retry it in this turn: work with the reports you have, or do the rest "
+        "yourself."
+    )
+
+
+def _delegation_not_started_text(exc: BaseException) -> str:
+    """Result of a call whose effect boundary refused to start it."""
+    return (
+        "Error: delegate_agent did not start this subagent "
+        f"({type(exc).__name__}: {exc}). It did no work and changed nothing."
+    )
+
+
+def _delegation_cancelled_text(reason: str) -> str:
+    """Result of a call the batch cancelled because it could not go on."""
+    return "\n".join(
+        [
+            DELEGATION_CANCELLED_HEADER,
+            f"This subagent was cancelled before it finished, because {reason}. "
+            "It produced no final report. If it had already started, anything "
+            "it changed in the workspace is still there and may be incomplete.",
+            "If this work is still needed, first check the workspace for what "
+            "it already produced, then delegate only what is still missing.",
+        ]
+    )
+
+
+@dataclass
+class _DelegationSlot:
+    """One ``delegate_agent`` call of a batch, in provider order."""
+
+    tool: Any
+    args: Dict[str, Any]
+    tool_call_id: str
+    #: ``approved`` | ``declined`` | ``over_limit``
+    decision: str
+    #: Crossed ``on_tool_execution_start`` (the child may have started).
+    started: bool = False
+    content: str = ""
+    is_error: bool = False
+    #: The result written before any child started (declined, over limit).
+    message: Optional[ToolMessage] = None
+
+
+@dataclass
+class _DelegationBatchOutcome:
+    stopped: bool = False
+    fatal: Optional[BaseException] = None
+    cancelled_by_batch: set = field(default_factory=set)
+
+
+async def _await_turn_interrupt(
+    check_interrupt: Callable[[], Any], hard_event: Optional[asyncio.Event]
+) -> str:
+    """Poll the turn's one-shot interrupt flag; return its mode once set."""
+    while True:
+        mode = check_interrupt()
+        if mode:
+            return mode if isinstance(mode, str) else "graceful"
+        if hard_event is not None and not hard_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    hard_event.wait(), timeout=_DELEGATION_INTERRUPT_POLL_S
+                )
+            except asyncio.TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(_DELEGATION_INTERRUPT_POLL_S)
+
+
+async def _supervise_delegation_batch(
+    tasks: Sequence["asyncio.Task[Any]"],
+    *,
+    check_interrupt: Callable[[], Any],
+    hard_interrupt_event: Optional[asyncio.Event],
+    stop_children: Callable[[], Awaitable[Any]],
+) -> _DelegationBatchOutcome:
+    """Wait until every call task of a delegation batch has ended.
+
+    - Stop (the turn's interrupt flag) is raced against the batch (D4):
+      ``stop_children`` runs once and the batch keeps waiting, so every call
+      still ends with its own result.
+    - A call that fails on its own is its own outcome; the siblings keep
+      running. A ``WorkspaceUnavailableError`` is the exception: the siblings
+      share the dead workspace, so they are cancelled and each is reported
+      as cancelled. The failure the turn ends with is returned as ``fatal``:
+      a ``WorkspaceUnavailableError`` whenever one occurred (its message
+      tells the user how to recover), else the first failure.
+    - A cancellation — of the turn task (shutdown, drain) or of a call task
+      by itself — is never an outcome: every task is cancelled and joined,
+      nothing is reported, and ``CancelledError`` propagates. The successor
+      settles the batch (§5.3).
+    """
+    outcome = _DelegationBatchOutcome()
+    pending = set(tasks)
+    watcher = asyncio.ensure_future(
+        _await_turn_interrupt(check_interrupt, hard_interrupt_event)
+    )
+    try:
+        while pending:
+            waiting = set(pending)
+            if not watcher.done():
+                waiting.add(watcher)
+            done, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+            if watcher in done:
+                done.discard(watcher)
+                if watcher.cancelled():
+                    pass
+                elif watcher.exception() is not None:
+                    logger.warning(
+                        "Interrupt poll failed during a delegation batch: %s",
+                        watcher.exception(),
+                    )
+                else:
+                    outcome.stopped = True
+                    logger.info(
+                        "Interrupt received during a delegation batch — "
+                        "stopping its children"
+                    )
+                    try:
+                        await stop_children()
+                    except Exception:
+                        logger.warning(
+                            "Stopping the delegation batch failed", exc_info=True
+                        )
+            for task in done:
+                pending.discard(task)
+                if task.cancelled():
+                    if task in outcome.cancelled_by_batch:
+                        continue
+                    raise asyncio.CancelledError()
+                exc = task.exception()
+                if exc is None:
+                    continue
+                if not isinstance(exc, Exception):
+                    raise exc
+                workspace_lost = isinstance(exc, WorkspaceUnavailableError)
+                if outcome.fatal is None or (
+                    workspace_lost
+                    and not isinstance(outcome.fatal, WorkspaceUnavailableError)
+                ):
+                    outcome.fatal = exc
+                if workspace_lost:
+                    for sibling in pending:
+                        outcome.cancelled_by_batch.add(sibling)
+                        sibling.cancel()
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        watcher.cancel()
+        await asyncio.gather(*tasks, watcher, return_exceptions=True)
+        raise
+    if not watcher.done():
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+    return outcome
+
+
 async def run_persistent_loop(
     llm_with_tools: BaseChatModel,
     tools: List[Any],
@@ -1470,11 +1682,17 @@ async def run_persistent_loop(
                 # stamp.  This is process-local context only; the session
                 # transcript remains the durable source of the turn number.
                 tool_context._current_turn_count = turn_id
+                # A recovery turn's input is its continuation event: children
+                # it delegates name the event as their parent input, and a
+                # crash in this turn is settled against it (§7).
                 tool_context._current_input_message_id = str(user_msg.id)
                 tool_context._current_ai_message_id = None
+                # D3: a session allowed to fan out may delegate again in its
+                # recovery turn. Otherwise the ban stays as it was.
                 tool_context._stateless_subagent_recovery_active = bool(
                     input_delivery_source == "subagent"
                     and input_supersedes_seq is not None
+                    and not _session_fanout_allowed(tool_context)
                 )
             try:
                 result = await _execute_turn(
@@ -1929,6 +2147,9 @@ async def _execute_turn(
     tool_calls_made = 0
     messages_added = 0
     first_provider_admitted = False
+    # delegate_agent calls of this turn within the per-turn maximum, across
+    # all its batches (enforced only for a session allowed to fan out).
+    delegate_calls_admitted = 0
 
     def _adopt(msg: Any) -> Any:
         """Stamp a message this turn appends with the turn's membership."""
@@ -1985,6 +2206,44 @@ async def _execute_turn(
         if callbacks.persist_message is not None:
             return await callbacks.persist_message(msg)
         return None
+
+    async def _persist_delegation_result(msg: Any) -> None:
+        """Persist one delegation result strictly: it is the delivery fact.
+
+        Only a transport that promises durable acknowledgements
+        (``require_delegation_persistence``) is held to it; a bounded retry
+        rewrites the same row. A result that stays unsaved raises
+        :class:`DelegationResultNotDurable`. A cancellation propagates.
+        """
+        if (
+            not callbacks.require_delegation_persistence
+            or callbacks.persist_message is None
+        ):
+            await _persist(msg)
+            return
+        last_error: Optional[BaseException] = None
+        for attempt in range(1, _DELEGATION_RESULT_PERSIST_ATTEMPTS + 1):
+            try:
+                if await callbacks.persist_message(msg) is True:
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = exc
+            logger.warning(
+                "delegate_agent result %s not saved (attempt %d/%d)",
+                getattr(msg, "tool_call_id", "?"),
+                attempt,
+                _DELEGATION_RESULT_PERSIST_ATTEMPTS,
+            )
+            if attempt < _DELEGATION_RESULT_PERSIST_ATTEMPTS:
+                await asyncio.sleep(_DELEGATION_RESULT_PERSIST_RETRY_S * attempt)
+        raise DelegationResultNotDurable(
+            "A subagent result could not be saved to the conversation, so this "
+            "turn stopped before continuing. The subagents have ended and their "
+            "reports are kept under .subagents/ in the workspace. Send a "
+            "message to continue."
+        ) from last_error
 
     async def _record_unexecuted_tool_batch(
         tool_calls: Sequence[dict[str, Any]], *, reason: str
@@ -3390,36 +3649,49 @@ async def _execute_turn(
                 await _persist(rejected)
             continue
 
+        # A delegation-only batch runs as one fan-out (below). A session
+        # allowed to fan out is held to its per-turn maximum across all the
+        # batches of this turn (§6.4): the calls above it are refused before
+        # they are announced or gated, and do not run.
+        _execute_delegation_batch = (
+            _delegation_only_batch and "delegate_agent" in tool_map
+        )
+        _delegation_limit: Optional[int] = None
+        _delegation_room = len(response.tool_calls)
+        if _execute_delegation_batch and _session_fanout_allowed(tool_context):
+            _delegation_limit = _delegation_max_calls_per_turn(tool_context)
+            _delegation_room = max(0, _delegation_limit - delegate_calls_admitted)
+
         # Announce the whole batch up front so the client can show every
         # pending call at once. Names that resolve to no tool are filtered out:
         # they are rejected below without ever reaching the gate, so announcing
         # one would raise an approval card asking the user to authorize a tool
-        # that cannot run whatever they answer. Soft-fail: if this breaks, the
-        # per-call gate path below still inserts and prompts exactly as before.
-        # Still called when the filtered list is empty: the announce hook also
-        # retires any previous batch's pending rows, and skipping it outright
-        # would leave those behind.
+        # that cannot run whatever they answer. Delegation calls above the
+        # per-turn maximum are filtered out for the same reason. Soft-fail: if
+        # this breaks, the per-call gate path below still inserts and prompts
+        # exactly as before. Still called when the filtered list is empty: the
+        # announce hook also retires any previous batch's pending rows, and
+        # skipping it outright would leave those behind.
         if callbacks.announce_permission_batch is not None:
-            gateable = [tc for tc in response.tool_calls if tc.get("name") in tool_map]
+            gateable = [
+                tc
+                for index, tc in enumerate(response.tool_calls)
+                if tc.get("name") in tool_map
+                and not (_execute_delegation_batch and index >= _delegation_room)
+            ]
             try:
                 await callbacks.announce_permission_batch(gateable)
             except Exception as e:
                 logger.warning("Permission batch announce failed: %s", e)
 
-        _execute_delegation_batch = (
-            _delegation_only_batch and "delegate_agent" in tool_map
-        )
         if _execute_delegation_batch:
             # Permission decisions stay serial (the transport owns their
             # durable/card lifecycle), but no child starts until the whole
             # batch has been admitted.  Once admitted, invoke every child in
             # its own task; the runtime semaphore applies the configured cap
-            # and turns a wider fan-out into waves.  asyncio.gather preserves
-            # input order, so ToolMessages remain paired in provider order
-            # even when a later child finishes first.
-            _delegation_decisions: list[
-                tuple[Any, dict[str, Any], str, PermissionOutcome]
-            ] = []
+            # and turns a wider fan-out into waves.  Results are emitted in
+            # provider order, even when a later child finishes first.
+            _slots: list[_DelegationSlot] = []
             for i, tool_call in enumerate(response.tool_calls):
                 if callbacks.check_interrupt():
                     logger.info("Interrupt received before delegation batch")
@@ -3449,6 +3721,11 @@ async def _execute_turn(
                         ", ".join(_repaired),
                     )
                 tool_call_id = str(tool_call.get("id") or "")
+                if i >= _delegation_room:
+                    _slots.append(
+                        _DelegationSlot(tool, tool_args, tool_call_id, "over_limit")
+                    )
+                    continue
                 outcome = PermissionOutcome.coerce(
                     await callbacks.permission_check(
                         "delegate_agent", tool_args, tool_call_id
@@ -3465,7 +3742,16 @@ async def _execute_turn(
                         messages_added=messages_added,
                         tool_calls_made=tool_calls_made,
                     )
-                _delegation_decisions.append((tool, tool_args, tool_call_id, outcome))
+                _slots.append(
+                    _DelegationSlot(
+                        tool,
+                        tool_args,
+                        tool_call_id,
+                        "approved"
+                        if outcome is PermissionOutcome.APPROVED
+                        else "declined",
+                    )
+                )
 
             # The last supervised decision may take minutes.  Close the final
             # approval→effect race before constructing the runtime or any task:
@@ -3484,17 +3770,63 @@ async def _execute_turn(
                     interrupted=True,
                 )
 
-            _approved_delegations = [
-                (tool, tool_args, tool_call_id)
-                for tool, tool_args, tool_call_id, outcome in _delegation_decisions
-                if outcome is PermissionOutcome.APPROVED
-            ]
+            delegate_calls_admitted += min(len(_slots), _delegation_room)
+            _approved_slots = [slot for slot in _slots if slot.decision == "approved"]
 
-            if _approved_delegations:
+            # Every decision is known. Write the result of each call that will
+            # not run before any child starts: a crash during the batch must
+            # not turn a decline into "not started" (§5.2).
+            try:
+                for slot in _slots:
+                    if slot.decision == "approved":
+                        continue
+                    if slot.decision == "declined":
+                        slot.content = "User declined this tool call."
+                    else:
+                        slot.content = _delegation_over_limit_text(
+                            _delegation_limit or 0
+                        )
+                        slot.is_error = True
+                        await callbacks.on_tool_start(
+                            "delegate_agent", slot.args, slot.tool_call_id
+                        )
+                    slot.message = _adopt(
+                        _ensure_msg_id(
+                            ToolMessage(
+                                content=slot.content, tool_call_id=slot.tool_call_id
+                            )
+                        )
+                    )
+                    await _persist_delegation_result(slot.message)
+                    if slot.decision == "over_limit":
+                        await callbacks.on_tool_result(
+                            "delegate_agent",
+                            slot.content,
+                            slot.tool_call_id,
+                            is_error=True,
+                        )
+            except DelegationResultNotDurable as unsaved:
+                # No child has started. Keep what exists for the turn-end
+                # reconcile and stop before any further provider call. The
+                # shared message says the subagents ended; here none started.
+                for slot in _slots:
+                    if slot.message is not None:
+                        messages.append(slot.message)
+                        messages_added += 1
+                raise DelegationResultNotDurable(
+                    "A delegate_agent result could not be saved to the "
+                    "conversation, so this turn stopped before any subagent "
+                    "started. No subagent ran. Send a message to continue."
+                ) from unsaved.__cause__
+
+            _batch = _DelegationBatchOutcome()
+            _delegation_tasks: list[asyncio.Task[Any]] = []
+            if _approved_slots:
                 # The fork source must be the durable parent list, including
                 # this assistant tool-call turn.  Install/resolve the runtime
                 # once before concurrent StructuredTool invocations so two
                 # first calls cannot race through lazy runtime construction.
+                runtime = None
                 if tool_context is not None:
                     tool_context._fork_source = messages
                     runtime = getattr(tool_context, "subagent_runtime", None)
@@ -3506,29 +3838,28 @@ async def _execute_turn(
                         runtime = _ensure_subagent_runtime(tool_context)
                     begin_batch = getattr(runtime, "begin_batch", None)
                     if callable(begin_batch):
-                        begin_batch(len(_approved_delegations))
+                        begin_batch(len(_approved_slots))
 
-                async def _invoke_delegation(
-                    tool: Any, tool_args: dict[str, Any], tool_call_id: str
-                ) -> tuple[str, bool]:
+                async def _invoke_delegation(slot: _DelegationSlot) -> tuple[str, bool]:
                     await callbacks.on_tool_start(
-                        "delegate_agent", tool_args, tool_call_id
+                        "delegate_agent", slot.args, slot.tool_call_id
                     )
                     if callbacks.on_tool_execution_start is not None:
                         await callbacks.on_tool_execution_start(
-                            "delegate_agent", tool_call_id
+                            "delegate_agent", slot.tool_call_id
                         )
+                    slot.started = True
                     try:
                         # InjectedToolCallId is populated only when a
                         # StructuredTool receives the full model ToolCall.
                         # Ordinary session tools intentionally retain the old
                         # args-only invocation path below.
-                        result = await tool.ainvoke(
+                        result = await slot.tool.ainvoke(
                             {
                                 "type": "tool_call",
                                 "name": "delegate_agent",
-                                "args": tool_args,
-                                "id": tool_call_id,
+                                "args": slot.args,
+                                "id": slot.tool_call_id,
                             }
                         )
                         if isinstance(result, ToolMessage):
@@ -3540,56 +3871,68 @@ async def _execute_turn(
                         logger.warning("Tool delegate_agent failed: %s", exc)
                         return (f"Tool execution error: {exc}", True)
 
+                async def _stop_delegation_children() -> None:
+                    # D4: Stop reaches the children. Running ones get
+                    # graceful_stop and return STOPPED; queued ones return
+                    # NOT STARTED. Every call still returns its result.
+                    stop = getattr(runtime, "stop_foreground_batch", None)
+                    if callable(stop):
+                        stopping = stop()
+                        if inspect.isawaitable(stopping):
+                            await stopping
+
                 _delegation_tasks = [
                     asyncio.create_task(
-                        _invoke_delegation(tool, tool_args, tool_call_id),
+                        _invoke_delegation(slot),
                         name=f"session-delegate-{index}",
                     )
-                    for index, (tool, tool_args, tool_call_id) in enumerate(
-                        _approved_delegations
-                    )
+                    for index, slot in enumerate(_approved_slots)
                 ]
-                try:
-                    _delegation_results = await asyncio.gather(*_delegation_tasks)
-                except BaseException:
-                    # gather propagates the first WorkspaceUnavailableError or
-                    # CancelledError without joining siblings.  No failed turn
-                    # may return while another child can still spend or mutate.
-                    for task in _delegation_tasks:
-                        if not task.done():
-                            task.cancel()
-                    await asyncio.gather(
-                        *_delegation_tasks,
-                        return_exceptions=True,
-                    )
-                    raise
-            else:
-                _delegation_results = []
+                # A cancellation of this turn (shutdown, drain) propagates from
+                # here after every child task is cancelled and joined, and no
+                # result is written: the successor settles the batch.
+                _batch = await _supervise_delegation_batch(
+                    _delegation_tasks,
+                    check_interrupt=callbacks.check_interrupt,
+                    hard_interrupt_event=callbacks.hard_interrupt_event,
+                    stop_children=_stop_delegation_children,
+                )
+                for slot, task in zip(_approved_slots, _delegation_tasks):
+                    if task.cancelled():
+                        # Only a sibling the batch cancelled itself gets here.
+                        slot.content = _delegation_cancelled_text(
+                            _WORKSPACE_UNAVAILABLE_REASON
+                        )
+                        slot.is_error = True
+                        continue
+                    exc = task.exception()
+                    if exc is None:
+                        slot.content, slot.is_error = task.result()
+                    elif slot.started:
+                        slot.content = f"Tool execution error: {exc}"
+                        slot.is_error = True
+                    else:
+                        slot.content = _delegation_not_started_text(exc)
+                        slot.is_error = True
 
             # Emit results in the provider's exact tool-call order, not task
             # completion order (and not "declines first" when a supervised
-            # batch contains both approved and declined calls).
-            _approved_results = iter(_delegation_results)
-            for _tool, tool_args, tool_call_id, outcome in _delegation_decisions:
-                if outcome is PermissionOutcome.DECLINED:
-                    declined = _ensure_msg_id(
-                        ToolMessage(
-                            content="User declined this tool call.",
-                            tool_call_id=tool_call_id,
-                        )
-                    )
-                    messages.append(_adopt(declined))
+            # batch contains both approved and declined calls). Every call has
+            # exactly one result; the ones written before the children started
+            # are only placed here.
+            _persist_failure: Optional[DelegationResultNotDurable] = None
+            for slot in _slots:
+                if slot.message is not None:
+                    messages.append(slot.message)
                     messages_added += 1
-                    await _persist(declined)
                     continue
 
-                result_str, is_error = next(_approved_results)
-                cleaned_str, extracted_images = extract_image_tags(result_str)
+                cleaned_str, extracted_images = extract_image_tags(slot.content)
                 cleaned_str = redact_tool_result(cleaned_str, tool_context)
                 tool_message = _ensure_msg_id(
                     ToolMessage(
                         content=cleaned_str,
-                        tool_call_id=tool_call_id,
+                        tool_call_id=slot.tool_call_id,
                     )
                 )
                 messages.append(_adopt(tool_message))
@@ -3597,31 +3940,39 @@ async def _execute_turn(
                 tool_calls_made += 1
                 if officer_max_actions:
                     try:
-                        fingerprint = ("delegate_agent", repr(tool_args))
+                        fingerprint = ("delegate_agent", repr(slot.args))
                     except Exception:
                         fingerprint = ("delegate_agent", "<unrepresentable>")
                     guard_fingerprints[fingerprint] = (
                         guard_fingerprints.get(fingerprint, 0) + 1
                     )
-                await _persist(tool_message)
+                # The result is the child's delivery fact (F5). Once one could
+                # not be saved, the rest stay in memory for the turn-end
+                # reconcile, which retries every row of the turn by its id.
+                if _persist_failure is None:
+                    try:
+                        await _persist_delegation_result(tool_message)
+                    except DelegationResultNotDurable as exc:
+                        _persist_failure = exc
 
                 if extracted_images:
                     image_message = _ensure_msg_id(
                         make_multimodal_user_message(
-                            text=f"Image content from tool call {tool_call_id}:",
+                            text=f"Image content from tool call {slot.tool_call_id}:",
                             images=extracted_images,
                             max_edge=resolve_image_max_edge(config),
                         )
                     )
                     messages.append(_adopt(image_message))
                     messages_added += 1
-                    await _persist(image_message)
+                    if _persist_failure is None:
+                        await _persist(image_message)
 
                 await callbacks.on_tool_result(
                     "delegate_agent",
                     cleaned_str,
-                    tool_call_id,
-                    is_error=is_error,
+                    slot.tool_call_id,
+                    is_error=slot.is_error,
                 )
 
                 if tool_context and callbacks.on_workspace_upgrade_needed:
@@ -3632,9 +3983,27 @@ async def _execute_turn(
                     ):
                         await callbacks.on_workspace_upgrade_needed(freeze_req)
 
-            # All calls were either executed or paired with explicit declines.
-            # Skip the ordinary sequential executor below and proceed to the
-            # shared post-batch sleep/guard checks.
+            # Every call now has its result. A batch that could not go on ends
+            # the turn with its error, and an unsaved result ends it before any
+            # further provider call; neither leaves a call without a result.
+            if _batch.fatal is not None:
+                raise _batch.fatal
+            if _persist_failure is not None:
+                raise _persist_failure
+            if _batch.stopped:
+                # Stop reached the batch: the turn ends here, without a final
+                # answer (§8). The next turn sees one result per call.
+                logger.info("Delegation batch stopped — ending the turn")
+                return TurnResult(
+                    turn_id=0,
+                    messages_added=messages_added,
+                    tool_calls_made=tool_calls_made,
+                    interrupted=True,
+                )
+
+            # All calls have their results. Skip the ordinary sequential
+            # executor below and proceed to the shared post-batch sleep/guard
+            # checks.
 
         # --- Execute tool calls ---
         for i, tool_call in enumerate(

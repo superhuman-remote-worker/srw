@@ -385,19 +385,27 @@ def repair_tool_result_adjacency(messages: List[BaseMessage]) -> List[BaseMessag
     belongs to, or when a message was appended between two results of one
     parallel batch.
 
-    Results keep their relative order and follow their call. Messages that
-    stood between a call and its results move behind the last result, in
-    their own order. A result whose call is absent stays where it is for
+    Results follow their call in the order of that message's ``tool_calls``,
+    whatever order they were stored in: a stable sort by call position. The
+    stored order can differ from it — a session delegation batch saves the
+    results of declined and refused calls before any child starts, and a
+    recovery settle writes only the results still missing — while some
+    providers pair results by position or name, and every call of a
+    delegation batch has the same name (parallel_subagents §7). Messages
+    that stood between a call and its results move behind the last result,
+    in their own order. A result whose call is absent stays where it is for
     ``repair_tool_pairing`` to drop. Returns a new list and never mutates the
     input; a second pass is a no-op.
     """
     owner: Dict[str, int] = {}
+    position: Dict[str, int] = {}
     for index, m in enumerate(messages):
         if isinstance(m, AIMessage):
-            for tc in getattr(m, "tool_calls", None) or []:
+            for call_position, tc in enumerate(getattr(m, "tool_calls", None) or []):
                 tc_id = tc.get("id")
                 if tc_id and tc_id not in owner:
                     owner[tc_id] = index
+                    position[tc_id] = call_position
 
     results: Dict[int, List[BaseMessage]] = {}
     for m in messages:
@@ -405,6 +413,8 @@ def repair_tool_result_adjacency(messages: List[BaseMessage]) -> List[BaseMessag
             index = owner.get(getattr(m, "tool_call_id", "") or "")
             if index is not None:
                 results.setdefault(index, []).append(m)
+    for group in results.values():
+        group.sort(key=lambda m: position[getattr(m, "tool_call_id", "") or ""])
 
     repaired: List[BaseMessage] = []
     for index, m in enumerate(messages):

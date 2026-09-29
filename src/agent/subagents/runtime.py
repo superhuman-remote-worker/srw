@@ -14,6 +14,10 @@ What the runtime owns, and the ``delegate_agent`` tool only calls:
 - ``begin_batch(n)`` — the tool node stamps how many delegate calls the
   current batch carries so every envelope shares the parent's headroom by N
   (B.5);
+- ``stop_foreground_batch()`` — Stop reaches the batch (parallel_subagents
+  D4): every running foreground child gets ``graceful_stop`` and returns a
+  ``STOPPED`` result, and every call still queued behind the cap returns
+  ``NOT STARTED`` without a child row;
 - ``run_foreground(call)`` — build the child (``build_child``), run the
   driver on the brief, render the envelope, record through the
   ``SubagentLedger`` (the DB ledger in production, WP3), remember the result;
@@ -63,6 +67,66 @@ logger = logging.getLogger(__name__)
 #: How long a ledger write may block the parent (non-fatal past it).
 _LEDGER_TIMEOUT_S = 5.0
 _ORPHAN_PARTIAL_MAX_CHARS = 4000
+
+#: First line of the result of a foreground child stopped because its parent's
+#: turn was stopped (D4). Styled like the recovery markers a session parent
+#: already knows (``batch_recovery.INTERRUPTED_HEADER`` and NOT STARTED).
+STOPPED_HEADER = "[delegate_agent: STOPPED - did not finish]"
+#: The marker of a call that never started. The description explains it; the
+#: settle renders the same first line (``shared.session_subagent_batch``).
+NOT_STARTED_HEADER = "[delegate_agent: NOT STARTED]"
+#: The reason a stopped child's one tool-less synthesis turn is given
+#: (``driver.SYNTH_PROMPT``: "You have reached your stop request. ...").
+BATCH_STOP_REASON = "stop request"
+#: How long each stopped child may take for that synthesis turn, as for a
+#: retirement (``quiesce``); a stuck provider or tool is then hard-stopped.
+BATCH_STOP_GRACE_S = 10.0
+
+
+def stopped_not_started_text() -> str:
+    """The result of a call still queued behind the cap when its turn stopped."""
+
+    return (
+        f"{NOT_STARTED_HEADER}\n"
+        "This subagent never started: this turn was stopped while the call was "
+        "still queued. It did no work and changed nothing.\n"
+        "If the task is still needed, call delegate_agent again with the same "
+        "task."
+    )
+
+
+def stopped_envelope(envelope: str, *, has_text: bool) -> str:
+    """The result of a child stopped by its turn's Stop, around its envelope.
+
+    Only what is known: the child was stopped and did not finish, its text is
+    partial, and the workspace may hold its incomplete changes. The envelope
+    keeps the provenance header (handle, type, turns, tokens) and the report.
+    """
+
+    if has_text:
+        cause = (
+            "This subagent was stopped before it finished, because this turn "
+            "was stopped. The report below is what it wrote when it was "
+            "stopped: partial and unverified, not a finished answer."
+        )
+    else:
+        cause = (
+            "This subagent was stopped before it finished, because this turn "
+            "was stopped. It left no report."
+        )
+    return "\n".join(
+        [
+            STOPPED_HEADER,
+            cause,
+            envelope,
+            "Anything it changed in the workspace is still there and may be "
+            "incomplete.",
+            "If this work is still needed, first check the workspace for what "
+            "it already produced. Then either finish the remainder yourself or "
+            "call delegate_agent again with a task limited to what is still "
+            "missing.",
+        ]
+    )
 
 
 def _orphan_row_counter(row: Mapping[str, Any], name: str) -> int:
@@ -210,6 +274,9 @@ class SubagentRuntime:
         self._handles: set[str] = set()
         self._worktree_index = 0
         self._batch_size = 1
+        # Set by ``stop_foreground_batch`` for the current batch only;
+        # ``begin_batch`` clears it.
+        self._foreground_stop: Optional[str] = None
         self._active: Dict[str, SubagentDriver] = {}
         self._records: Dict[Tuple[str, str], SubagentRecord] = {}
         self._inflight: Dict[Tuple[str, str], asyncio.Future] = {}
@@ -320,10 +387,47 @@ class SubagentRuntime:
         except (TypeError, ValueError):
             size = 1
         self._batch_size = max(1, size)
+        # A new batch starts unstopped: a Stop belongs to the batch it hit.
+        self._foreground_stop = None
 
     @property
     def batch_size(self) -> int:
         return self._batch_size
+
+    @property
+    def foreground_batch_stopped(self) -> bool:
+        """Whether the current foreground batch was stopped (D4)."""
+        return self._foreground_stop is not None
+
+    async def stop_foreground_batch(
+        self, *, grace_s: float = BATCH_STOP_GRACE_S
+    ) -> int:
+        """Stop the current foreground batch (parallel_subagents D4).
+
+        Every running foreground child gets ``graceful_stop``: one bounded
+        tool-less turn for a partial answer, then a hard stop; its call then
+        returns a ``STOPPED`` result. A call still queued behind the cap, or
+        still being built, returns ``NOT STARTED`` and opens no child row. A
+        child whose row opens after this call is stopped before its first
+        provider call. Background children are not touched. Returns how many
+        running children were asked to stop.
+        """
+
+        self._foreground_stop = BATCH_STOP_REASON
+        drivers = [
+            driver
+            for handle, driver in list(self._active.items())
+            if handle not in self._background
+        ]
+        if drivers:
+            await asyncio.gather(
+                *(
+                    driver.graceful_stop(BATCH_STOP_REASON, timeout=grace_s)
+                    for driver in drivers
+                ),
+                return_exceptions=True,
+            )
+        return len(drivers)
 
     @property
     def active(self) -> Dict[str, SubagentDriver]:
@@ -439,11 +543,16 @@ class SubagentRuntime:
     ) -> str:
         if not self._accepting:
             return "Error: subagent runtime is quiescing; no new work accepted"
+        if self._foreground_stop is not None:
+            return stopped_not_started_text()
         isolation = str(call.isolation or entry.get("isolation") or "shared")
         handle = self.mint_handle(name)
         subagent_id = str(uuid.uuid4())
 
         async with self._semaphore:
+            if self._foreground_stop is not None:
+                # Queued behind the cap when the turn was stopped.
+                return stopped_not_started_text()
             budgets = ChildBudgets.from_entry(entry, name)
             try:
                 build = await build_child(
@@ -482,6 +591,10 @@ class SubagentRuntime:
             if not self._accepting:
                 await build.release()
                 return "Error: subagent runtime is quiescing; child was not started"
+            if self._foreground_stop is not None:
+                # Stopped while its environment was being built: no row yet.
+                await build.release()
+                return stopped_not_started_text()
 
             messages = None
             if call.fork:
@@ -538,6 +651,10 @@ class SubagentRuntime:
                 call.fork,
             )
             try:
+                if self._foreground_stop is not None:
+                    # The Stop landed while the row was being opened: the
+                    # child ends stopped before its first provider call.
+                    await driver.graceful_stop(self._foreground_stop, timeout=0.0)
                 result = await driver.run(call.prompt)
             except asyncio.CancelledError:
                 await self._commit_foreground_terminal(
@@ -576,6 +693,8 @@ class SubagentRuntime:
             n_in_batch=self._batch_size,
             model=self._parent_model(),
         )
+        if self._foreground_stop is not None and result.status == "interrupted:stopped":
+            envelope = stopped_envelope(envelope, has_text=bool(result.text.strip()))
         status = result.kind if result.kind in SUBAGENT_STATUSES else "error"
         spilled = report_path(handle) if self._report_exists(handle) else None
         await self._commit_foreground_terminal(
@@ -2496,7 +2615,13 @@ class SubagentRuntime:
 
 
 __all__ = [
+    "BATCH_STOP_GRACE_S",
+    "BATCH_STOP_REASON",
+    "NOT_STARTED_HEADER",
+    "STOPPED_HEADER",
     "SubagentCall",
     "SubagentRecord",
     "SubagentRuntime",
+    "stopped_envelope",
+    "stopped_not_started_text",
 ]

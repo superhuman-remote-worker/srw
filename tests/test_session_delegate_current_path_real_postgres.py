@@ -1,4 +1,11 @@
-"""Characterize current session fan-out policy through real tool and ledger paths."""
+"""Session delegation through the real tool, runtime, ledger, HTTP and Postgres.
+
+With fan-out not allowed a session delegates one child per response and a
+wider batch is refused (``REFUSAL``). With fan-out allowed
+(parallel_subagents §6.3) a batch of any width runs under the session cap in
+waves, and a recovery turn delegates under its continuation event (D3). The
+fan-out decision is pinned with ``tests._fanout_gate``.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +28,8 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from testcontainers.postgres import PostgresContainer
 
 from agent.api.orchestrator_client import OrchestratorClient
+from agent.api.persistent_app import _db_rows_to_lc_messages
+from agent.core.context import repair_tool_pairing
 from agent.core.thread_messages import _serialize_message_row
 from agent.database.postgres_db import PostgresDB as AgentDB
 from agent.persistent_graph import PermissionOutcome, _execute_turn
@@ -33,7 +42,9 @@ from shared.session_subagent_authority import (
     SessionParentAuthority,
     SessionParentAuthorityRefused,
 )
+from shared.runtime.core.message_markers import PERSIST_ROLE_EVENT, PERSIST_ROLE_KEY
 from tests._fake_chat_model import FakeChatModel, text_turn
+from tests._fanout_gate import set_session_fanout
 from tests.test_delegate_agent_tool import make_parent
 from tests.test_persistent_delegation_batch import _callbacks, _config, _context_manager
 
@@ -237,7 +248,26 @@ async def _children(parent):
         )
 
 
-def _runtime(parent, tmp_path, *, cap):
+class _TrackedChild(FakeChatModel):
+    """A child model that stays in its provider call for a moment and counts
+    how many children are inside one at the same time."""
+
+    def __init__(self, script, tracker):
+        super().__init__(script)
+        self.tracker = tracker
+
+    async def astream(self, messages, **kw):
+        self.tracker["active"] += 1
+        self.tracker["peak"] = max(self.tracker["peak"], self.tracker["active"])
+        try:
+            await asyncio.sleep(self.tracker["delay"])
+            async for chunk in super().astream(messages, **kw):
+                yield chunk
+        finally:
+            self.tracker["active"] -= 1
+
+
+def _runtime(parent, tmp_path, *, cap, tracker=None):
     ctx, _ = make_parent(tmp_path, max_concurrent=cap)
     # A session parent's own cap; the worker cap above stays for the gate-off
     # path of older code. Both name the same number here.
@@ -254,7 +284,10 @@ def _runtime(parent, tmp_path, *, cap):
     models = []
 
     def child_model(_config, _limits):
-        model = FakeChatModel([text_turn("child evidence")])
+        script = [text_turn("child evidence")]
+        model = (
+            FakeChatModel(script) if tracker is None else _TrackedChild(script, tracker)
+        )
         models.append(model)
         return model
 
@@ -289,15 +322,52 @@ def _runtime(parent, tmp_path, *, cap):
     return ctx, runtime, ledger, tool, models, exact_authority
 
 
-async def _run(parent, tmp_path, *, cap, count, batch_sizes=None, permissions=None):
+async def _admitted_pinned_event_input(parent, message_id):
+    """A continuation's delivery as the pinned lane admits it: the server
+    accepts an event as a parent input only through its admitted delivery."""
+    async with parent.db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO thread_input_deliveries "
+            "(delivery_id, thread_id, message_id, source, state, admitted_at, "
+            "admitted_turn_number, execution_lane) "
+            "VALUES ($1, $2, $3, 'subagent', 'admitted', now(), 1, 'pinned')",
+            uuid4(),
+            UUID(parent.thread_id),
+            UUID(message_id),
+        )
+
+
+async def _run(
+    parent,
+    tmp_path,
+    *,
+    cap,
+    count,
+    batch_sizes=None,
+    permissions=None,
+    tracker=None,
+    continuation=False,
+):
     ctx, runtime, ledger, tool, models, exact_authority = _runtime(
-        parent, tmp_path, cap=cap
+        parent, tmp_path, cap=cap, tracker=tracker
     )
-    human = HumanMessage(content="Inspect two independent things.", id=str(uuid4()))
+    if continuation:
+        # The input of a recovery turn: the continuation event a settle wrote.
+        human = HumanMessage(
+            content="[delegate_agent results recovered after a restart]",
+            id=str(uuid4()),
+            additional_kwargs={PERSIST_ROLE_KEY: PERSIST_ROLE_EVENT},
+        )
+    else:
+        human = HumanMessage(content="Inspect two independent things.", id=str(uuid4()))
+    # What run_persistent_loop publishes for the turn's input (the continuation
+    # event in a recovery turn; tests/test_session_delegation_live_batch.py).
     ctx._current_input_message_id = human.id
     await parent.agent.save_thread_message(
         parent.thread_id, **_serialize_message_row(human, 1)
     )
+    if continuation:
+        await _admitted_pinned_event_input(parent, human.id)
     calls = [
         {
             "name": "delegate_agent",
@@ -448,16 +518,32 @@ async def test_partly_approved_batch_runs_only_approved_child_in_provider_order(
             "WHERE thread_id=$1 AND role='tool' ORDER BY seq",
             UUID(parent.thread_id),
         )
+    # One row per call with what the model saw. The decline is written before
+    # the child starts (§6.3), so it is the first row whatever its position
+    # in the batch; the live transcript above keeps provider order.
     assert [(row["tool_call_id"], row["content"]) for row in rows] == [
-        (message.tool_call_id, message.content) for message in outputs
+        (f"call-{1 - approved_index}", "User declined this tool call."),
+        (f"call-{approved_index}", outputs[approved_index].content),
     ]
     assert {row["turn_number"] for row in rows} == {1}
+    # A restore hands the model the results in call order again, so the
+    # restored history equals the live one (§7).
+    history = await parent.agent.get_thread_messages_history(
+        thread_id=parent.thread_id, limit=1000, newest_first=True
+    )
+    restored = repair_tool_pairing(_db_rows_to_lc_messages(history))
+    assert [
+        (message.tool_call_id, message.content)
+        for message in restored
+        if isinstance(message, ToolMessage)
+    ] == [(message.tool_call_id, message.content) for message in outputs]
 
 
 @pytest.mark.parametrize("cap", [2, 1])
-async def test_two_approved_session_calls_are_refused_before_runtime_and_durable_create(
-    parent, tmp_path, cap
+async def test_without_fan_out_two_approved_session_calls_are_refused_before_create(
+    parent, tmp_path, cap, monkeypatch
 ):
+    set_session_fanout(monkeypatch, allowed=False)
     run = await _run(parent, tmp_path, cap=cap, count=2)
     outputs = [message for message in run.messages if isinstance(message, ToolMessage)]
     assert [(message.tool_call_id, message.content) for message in outputs] == [
@@ -488,6 +574,101 @@ async def test_two_approved_session_calls_are_refused_before_runtime_and_durable
     assert [
         (row["tool_call_id"], row["content"]) for row in rows if row["role"] == "tool"
     ] == [("call-0", REFUSAL), ("call-1", REFUSAL)]
+
+
+async def test_with_fan_out_four_calls_run_under_cap_two_in_waves(
+    parent, tmp_path, monkeypatch
+):
+    """The positive fan-out proof (parallel_subagents §6.3). N = 4 with cap 2:
+    at most two children are inside a provider call at once, four child rows
+    end completed, four results follow the call in provider order, and the
+    parent answers once."""
+    set_session_fanout(monkeypatch)
+    tracker = {"active": 0, "peak": 0, "delay": 0.2}
+    run = await _run(parent, tmp_path, cap=2, count=4, tracker=tracker)
+
+    assert tracker["peak"] == 2  # waves: never more than the cap, and parallel
+    assert run.runtime.max_concurrent == 2
+    assert run.runtime.batch_size == 4
+    outputs = [message for message in run.messages if isinstance(message, ToolMessage)]
+    assert [message.tool_call_id for message in outputs] == [
+        f"call-{index}" for index in range(4)
+    ]
+    assert all("child evidence" in message.content for message in outputs)
+    assert all(not message.content.startswith("Error:") for message in outputs)
+    assert run.result.error is None and run.result.interrupted is False
+    assert run.result.tool_calls_made == 4
+    assert len(run.models) == 4
+    assert all(len(model.calls) == 1 for model in run.models)
+    # One final answer, after the four results.
+    assert len(run.parent_model.calls) == 2
+    assert isinstance(run.messages[-1], AIMessage)
+    assert run.messages[-1].content == "parent done"
+    assert not run.messages[-1].tool_calls
+
+    children = await _children(parent)
+    assert [row["parent_tool_call_id"] for row in children] == [
+        f"call-{index}" for index in range(4)
+    ]
+    assert all(row["subagent_status"] == "completed" for row in children)
+    assert all(row["status"] == "ended" for row in children)
+    ai_ids = {
+        json.loads(row["metadata"])["subagent"]["parent_ai_message_id"]
+        for row in children
+    }
+    assert len(ai_ids) == 1
+    async with parent.db.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, role, tool_calls, tool_call_id, content, turn_number "
+            "FROM thread_messages WHERE thread_id=$1 ORDER BY seq",
+            UUID(parent.thread_id),
+        )
+    assert [row["role"] for row in rows] == [
+        "human",
+        "ai",
+        "tool",
+        "tool",
+        "tool",
+        "tool",
+        "ai",
+    ]
+    assert str(rows[1]["id"]) in ai_ids
+    assert [call["id"] for call in json.loads(rows[1]["tool_calls"])] == [
+        f"call-{index}" for index in range(4)
+    ]
+    assert [(row["tool_call_id"], row["content"]) for row in rows[2:6]] == [
+        (message.tool_call_id, message.content) for message in outputs
+    ]
+    assert rows[6]["content"] == "parent done" and rows[6]["tool_calls"] is None
+    assert {row["turn_number"] for row in rows} == {1}
+    assert len(run.ledger.rows) == 4
+
+
+async def test_with_fan_out_a_recovery_turn_delegates_under_its_continuation(
+    parent, tmp_path, monkeypatch
+):
+    """D3: the recovery turn may delegate again, and its children name the
+    continuation event as their parent input. The server accepts that event
+    through its admitted delivery, so a crash in this turn is settled against
+    the continuation, never against the original input."""
+    set_session_fanout(monkeypatch)
+    run = await _run(parent, tmp_path, cap=2, count=2, continuation=True)
+
+    outputs = [message for message in run.messages if isinstance(message, ToolMessage)]
+    assert [message.tool_call_id for message in outputs] == ["call-0", "call-1"]
+    assert all("child evidence" in message.content for message in outputs)
+    children = await _children(parent)
+    assert [row["subagent_status"] for row in children] == ["completed", "completed"]
+    assert {
+        json.loads(row["metadata"])["subagent"]["parent_input_message_id"]
+        for row in children
+    } == {run.context._current_input_message_id}
+    async with parent.db.acquire() as conn:
+        role = await conn.fetchval(
+            "SELECT role FROM thread_messages WHERE id=$1",
+            UUID(run.context._current_input_message_id),
+        )
+    assert role == "event"
 
 
 async def test_single_session_delegate_reaches_real_ledger_http_and_child_provider(

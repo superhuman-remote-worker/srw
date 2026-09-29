@@ -13,10 +13,14 @@ description is REBUILT per factory call from the expert's resolved roster, so
 the model sees the types it can actually delegate to, its concurrency cap and
 the expert's background default. It also states what THIS parent may do: a
 session is told it delegates one child per response unless it may fan out
-(``fanout.session_fanout_allowed``: then its own cap, the one-shared-writer rule
-and the two recovery markers), and a stateless session is not offered
-background mode — the runtime refuses what is not offered, so advertising it
-costs the model a turn.
+(``fanout.session_fanout_allowed``: then its own cap, the per-turn maximum,
+the one-shared-writer rule and the two recovery markers), and a stateless
+session is not offered background mode — the runtime refuses what is not
+offered, so advertising it costs the model a turn. What the description
+refuses, the tool refuses: a session that may not fan out gets an error for
+a batch wider than one child and for a delegation in a stateless recovery
+turn; a session that may fan out gets neither (the live loop enforces its
+per-turn maximum).
 
 Import rule: ``agent.subagents`` is imported lazily inside the factory and the
 coroutine (registry → delegation → subagents → persistent_graph would cycle
@@ -30,10 +34,15 @@ from typing import Any, Dict, List, Literal, Mapping, Optional
 
 from agent.tools.context import ToolContext
 from agent.tools.delegation.fanout import (
+    delegation_max_calls_per_turn,
     delegation_max_concurrent,
     is_session_parent,
     parent_parallel_tool_calls,
     session_fanout_allowed,
+)
+
+from shared.runtime.core.delegation_settings import (
+    SESSION_MAX_CALLS_PER_TURN_DEFAULT,
 )
 
 from shared.tool_catalog.definitions import (
@@ -97,7 +106,9 @@ _TURN_OF_ITS_OWN = (
 )
 
 
-def _session_fanout_lines(cap: int, *, parallel_tool_calls: bool) -> List[str]:
+def _session_fanout_lines(
+    cap: int, *, parallel_tool_calls: bool, max_calls_per_turn: int
+) -> List[str]:
     """The concurrency, writer and recovery lines of a session allowed to fan out."""
     if parallel_tool_calls:
         concurrency = (
@@ -113,8 +124,14 @@ def _session_fanout_lines(cap: int, *, parallel_tool_calls: bool) -> List[str]:
             "One subagent at a time: you send one tool call per response, so "
             "delegate one brief, wait for its report, then delegate the next."
         )
+    # The per-turn maximum the live loop enforces across all batches of a turn.
+    limit = (
+        f"At most {max_calls_per_turn} delegate_agent "
+        f"{'call' if max_calls_per_turn == 1 else 'calls'} per turn; calls "
+        "beyond that are refused and do not run."
+    )
     return [
-        f"{concurrency} {_TURN_OF_ITS_OWN}",
+        f"{concurrency} {limit} {_TURN_OF_ITS_OWN}",
         'By default a child works in your working tree (isolation="shared"), '
         "and at most one child with write tools may work there at a time — a "
         "second is refused, not queued. Give a writing child `owned_paths` "
@@ -141,6 +158,7 @@ def build_description(
     background_available: bool = True,
     session_fanout: bool = False,
     parallel_tool_calls: bool = True,
+    max_calls_per_turn: int = SESSION_MAX_CALLS_PER_TURN_DEFAULT,
 ) -> str:
     """The model-facing description for THIS parent's roster and cap.
 
@@ -152,7 +170,9 @@ def build_description(
     the effective cap, the one-shared-writer rule and the two recovery
     markers, and wins over ``single_child_per_response``;
     ``parallel_tool_calls=False`` (the parent family sends one tool call per
-    message) turns its cap sentence into one child at a time."""
+    message) turns its cap sentence into one child at a time;
+    ``max_calls_per_turn`` is the per-turn maximum the live loop enforces
+    for such a session."""
     cap = max(1, int(max_concurrent or 1))
     names = [n for n, e in roster.items() if isinstance(e, Mapping)]
     returns = (
@@ -177,7 +197,11 @@ def build_description(
             "return an error until the roster is set."
         )
     fanout_lines = (
-        _session_fanout_lines(cap, parallel_tool_calls=parallel_tool_calls)
+        _session_fanout_lines(
+            cap,
+            parallel_tool_calls=parallel_tool_calls,
+            max_calls_per_turn=max(1, int(max_calls_per_turn or 1)),
+        )
         if session_fanout
         else []
     )
@@ -317,6 +341,7 @@ def create_delegate_agent_tools(context: ToolContext) -> List[Any]:
     max_concurrent = delegation_max_concurrent(context)
     session_fanout = session_fanout_allowed(context)
     parallel_tool_calls = parent_parallel_tool_calls(context)
+    max_calls_per_turn = delegation_max_calls_per_turn(context)
     run_in_background_default = bool(settings.get("run_in_background_default", False))
     type_names = ", ".join(n for n, e in roster.items() if isinstance(e, Mapping))
     # What this parent may actually do. The parent kind and the lane never
@@ -421,14 +446,21 @@ def create_delegate_agent_tools(context: ToolContext) -> List[Any]:
             else bool(run_in_background)
         )
         runtime = ensure_runtime(context)
-        if getattr(context, "_stateless_subagent_recovery_active", False):
+        # A session allowed to fan out has neither ban (parallel_subagents
+        # D3 and §6.3): the recovery turn may delegate again, and a batch of
+        # any width runs under the cap. Otherwise both stay exactly as before.
+        fanout = session_fanout_allowed(context)
+        if not fanout and getattr(
+            context, "_stateless_subagent_recovery_active", False
+        ):
             return (
                 "Error: delegate_agent is disabled while a stateless parent "
                 "is recovering an orphaned foreground child result. Use the "
                 "recovered evidence to answer the abandoned turn directly."
             )
         if (
-            getattr(context, "_subagent_parent_kind", None) == "session"
+            not fanout
+            and getattr(context, "_subagent_parent_kind", None) == "session"
             and runtime.batch_size > 1
         ):
             return (
@@ -461,6 +493,7 @@ def create_delegate_agent_tools(context: ToolContext) -> List[Any]:
             background_available=background_available,
             session_fanout=session_fanout,
             parallel_tool_calls=parallel_tool_calls,
+            max_calls_per_turn=max_calls_per_turn,
         ),
         args_schema=DelegateAgentInput,
     )

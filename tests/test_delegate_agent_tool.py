@@ -46,6 +46,7 @@ from agent.tools.delegation.delegate_agent import (
 )
 from agent.tools.registry import TOOL_REGISTRY, load_tools
 from tests._fake_chat_model import FakeChatModel, text_turn, tool_turn
+from tests._fanout_gate import set_session_fanout
 from tests._fs_backend import FilesystemTestBackend
 
 _PARENT_LLM = {
@@ -380,6 +381,36 @@ class TestSchemaAndRegistry:
             ctx.config["subagents"]["roster"], default="explorer", max_concurrent=3
         )
 
+    def test_a_session_allowed_to_fan_out_is_told_the_per_turn_maximum(
+        self, tmp_path, monkeypatch
+    ):
+        """The live loop refuses the calls of a turn above
+        ``delegation.session_max_calls_per_turn``; the description says so in
+        one sentence, and only where it applies."""
+        limit = (
+            "At most 7 delegate_agent calls per turn; calls beyond that are "
+            "refused and do not run."
+        )
+        ctx, _ = make_parent(tmp_path)
+        ctx._subagent_parent_kind = "session"
+        ctx._subagent_execution_lane = "stateless"
+        ctx.config["delegation"]["session_max_calls_per_turn"] = 7
+        ctx.config["parallel_tool_calls"] = True
+
+        assert "At most" not in the_tool(ctx).description
+        set_session_fanout(monkeypatch)
+        text = the_tool(ctx).description
+        assert limit in text
+        assert text.index("more calls queue and run in waves.") < text.index(limit)
+
+        ctx.config["parallel_tool_calls"] = False
+        assert limit in the_tool(ctx).description
+        worker, _ = make_parent(tmp_path / "worker")
+        assert "At most" not in the_tool(worker).description
+        assert "call per turn" in build_description(
+            {}, session_fanout=True, max_calls_per_turn=1
+        )
+
 
 # ---------------------------------------------------------------------------
 # Gates and argument validation
@@ -457,6 +488,49 @@ class TestGates:
         recovery = await invoke(the_tool(ctx), "c2", **brief_args())
         assert recovery.startswith("Error: delegate_agent is disabled")
         assert runtime.calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_session_allowed_to_fan_out_has_neither_refusal(
+        self, tmp_path, monkeypatch
+    ):
+        """parallel_subagents §6.3 and D3: with fan-out allowed, a batch wider
+        than one child runs (under the cap) and a recovery turn may delegate
+        again. The gate is live: turning it off restores both refusals."""
+        set_session_fanout(monkeypatch)
+        ctx, _ = make_parent(tmp_path)
+
+        class Runtime:
+            batch_size = 2
+
+            def __init__(self):
+                self.calls = []
+
+            async def run_background(self, call):
+                self.calls.append(("background", call.tool_call_id))
+                return "unexpected"
+
+            async def run_foreground(self, call):
+                self.calls.append(("foreground", call.tool_call_id))
+                return f"report {call.tool_call_id}"
+
+        runtime = Runtime()
+        ctx.subagent_runtime = runtime
+        ctx._subagent_parent_kind = "session"
+        ctx._subagent_execution_lane = "stateless"
+        tool = the_tool(ctx)
+
+        assert await invoke(tool, "c1", **brief_args()) == "report c1"
+        ctx._stateless_subagent_recovery_active = True
+        assert await invoke(tool, "c2", **brief_args()) == "report c2"
+        assert runtime.calls == [("foreground", "c1"), ("foreground", "c2")]
+
+        set_session_fanout(monkeypatch, allowed=False)
+        refused = await invoke(tool, "c3", **brief_args())
+        assert refused.startswith("Error: delegate_agent is disabled")
+        ctx._stateless_subagent_recovery_active = False
+        refused = await invoke(tool, "c4", **brief_args())
+        assert refused.startswith("Error: sessions may delegate only one")
+        assert len(runtime.calls) == 2
 
     @pytest.mark.asyncio
     async def test_omission_uses_config_default_but_explicit_false_wins(self, tmp_path):

@@ -422,7 +422,10 @@ class ToolContext:
         False  # True only while a stateless executor is feeding an orphaned
         # foreground child's evidence back through the abandoned parent turn.
         # delegate_agent fails closed for that turn: recovery evidence must
-        # not recursively create replacement child work.
+        # not recursively create replacement child work. A session allowed to
+        # fan out never sets or honours it (parallel_subagents D3): its
+        # recovery turn may delegate, and those children name the
+        # continuation event as their parent input.
     )
     parent_context_probe: Optional[Callable[[], Any]] = (
         None  # () -> ContextProbe of the parent's live ContextManager, stashed

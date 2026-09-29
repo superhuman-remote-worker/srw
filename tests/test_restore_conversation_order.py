@@ -5,7 +5,9 @@ finding F19). Rows arrive in ``seq`` order, which is write order. Input is
 persisted when it is accepted, so text typed while a tool runs sits between
 the tool call and its result, and a recovery row for an abandoned turn is
 written after input that arrived later. Restore sorts rows by the turn that
-consumed them and then places every tool result directly behind its call.
+consumed them and then places every tool result directly behind its call, in
+the order of the calls (parallel_subagents §7): a delegation batch stores a
+declined call's result before any child starts, so stored order can differ.
 """
 
 from __future__ import annotations
@@ -46,14 +48,15 @@ def _ids(messages: list) -> list[str]:
 
 def _assert_results_follow_calls(messages: list) -> None:
     """The provider rule: an assistant message with tool calls is followed
-    directly by one result per call, before anything else."""
+    directly by one result per call, before anything else, in the order of
+    its calls (some providers pair results by position)."""
 
     for index, message in enumerate(messages):
         if isinstance(message, AIMessage) and message.tool_calls:
-            wanted = {call["id"] for call in message.tool_calls}
+            wanted = [call["id"] for call in message.tool_calls]
             following = messages[index + 1 : index + 1 + len(wanted)]
             assert all(isinstance(m, ToolMessage) for m in following), _ids(messages)
-            assert {m.tool_call_id for m in following} == wanted, _ids(messages)
+            assert [m.tool_call_id for m in following] == wanted, _ids(messages)
 
 
 class TestConversationOrder:
@@ -274,6 +277,22 @@ class TestConversationOrder:
         assert _ids(restored) == ["q1", "batch", "r-c1", "r-c2", "image-c1", "a1"]
         _assert_results_follow_calls(restored)
 
+    def test_restored_results_follow_the_call_order_of_their_batch(self) -> None:
+        # Rows as a supervised delegation batch stores them: the decline of
+        # c2 is written before c1's child starts, so its seq is lower.
+        rows = [
+            _row("q1", "human", 1),
+            _row("batch", "ai", 1, calls=("c1", "c2")),
+            _row("r-c2", "tool", 1, call_id="c2"),
+            _row("r-c1", "tool", 1, call_id="c1"),
+            _row("a1", "ai", 1),
+        ]
+
+        restored = _db_rows_to_lc_messages(rows)
+
+        assert _ids(restored) == ["q1", "batch", "r-c1", "r-c2", "a1"]
+        _assert_results_follow_calls(restored)
+
 
 class TestRepairToolResultAdjacency:
     def _history(self) -> list:
@@ -328,6 +347,72 @@ class TestRepairToolResultAdjacency:
         ]
 
         assert _ids(repair_tool_result_adjacency(history)) == ["q1", "stray", "a1"]
+
+    def test_results_follow_the_order_of_their_calls_not_the_stored_order(
+        self,
+    ) -> None:
+        # A delegation batch saves a declined call's result before any child
+        # starts, and a recovery settle writes only the missing results, so
+        # the stored order of one batch's results can differ from its calls.
+        history = [
+            HumanMessage(content="q1", id="q1"),
+            AIMessage(
+                content="",
+                id="batch",
+                tool_calls=[
+                    {"id": f"c{n}", "name": "delegate_agent", "args": {}}
+                    for n in (1, 2, 3, 4)
+                ],
+            ),
+            ToolMessage(content="declined", tool_call_id="c3", id="r-c3"),
+            ToolMessage(content="r1", tool_call_id="c1", id="r-c1"),
+            HumanMessage(content="typed", id="typed"),
+            ToolMessage(content="r4", tool_call_id="c4", id="r-c4"),
+            ToolMessage(content="r2", tool_call_id="c2", id="r-c2"),
+            AIMessage(content="a1", id="a1"),
+        ]
+
+        once = repair_tool_result_adjacency(history)
+
+        assert _ids(once) == [
+            "q1",
+            "batch",
+            "r-c1",
+            "r-c2",
+            "r-c3",
+            "r-c4",
+            "typed",
+            "a1",
+        ]
+        assert _ids(repair_tool_result_adjacency(once)) == _ids(once)
+
+    def test_each_batch_keeps_its_own_call_order(self) -> None:
+        def batch(message_id: str, *calls: str) -> AIMessage:
+            return AIMessage(
+                content="",
+                id=message_id,
+                tool_calls=[{"id": c, "name": "t", "args": {}} for c in calls],
+            )
+
+        history = [
+            HumanMessage(content="q1", id="q1"),
+            batch("b1", "a", "b"),
+            ToolMessage(content="rb", tool_call_id="b", id="r-b"),
+            ToolMessage(content="ra", tool_call_id="a", id="r-a"),
+            batch("b2", "c", "d"),
+            ToolMessage(content="rd", tool_call_id="d", id="r-d"),
+            ToolMessage(content="rc", tool_call_id="c", id="r-c"),
+        ]
+
+        assert _ids(repair_tool_result_adjacency(history)) == [
+            "q1",
+            "b1",
+            "r-a",
+            "r-b",
+            "b2",
+            "r-c",
+            "r-d",
+        ]
 
     def test_a_valid_history_is_returned_unchanged(self) -> None:
         history = [
