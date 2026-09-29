@@ -714,14 +714,14 @@ async def test_job_ready_waiting_on_owner_lock_uses_fresh_deadline_clock(db):
 
 
 @pytest.mark.asyncio
-async def test_populated_0305_to_0307_upgrade_preserves_legacy_creation(tmp_path):
+async def test_populated_pre_startup_upgrade_preserves_legacy_creation(tmp_path):
     migrations = (
         Path(__file__).resolve().parents[1] / "src/orchestrator/database/migrations/app"
     )
     stage = tmp_path / "migrations"
     stage.mkdir()
     for path in migrations.glob("*.sql"):
-        if path.name.split("_", 1)[0] <= "0305":
+        if path.name.split("_", 1)[0] < "0309":
             (stage / path.name).write_bytes(path.read_bytes())
     with PostgresContainer("postgres:15") as container:
         dsn = container.get_connection_url().replace(
@@ -744,8 +744,8 @@ async def test_populated_0305_to_0307_upgrade_preserves_legacy_creation(tmp_path
                 "SELECT filename,checksum FROM schema_migrations ORDER BY filename"
             )
             for name in (
-                "0306_container_startup_stage_authority.sql",
-                "0307_validate_container_startup_stage_authority.sql",
+                "0309_container_startup_stage_authority.sql",
+                "0310_validate_container_startup_stage_authority.sql",
             ):
                 migration = migrations / name
                 (stage / migration.name).write_bytes(migration.read_bytes())

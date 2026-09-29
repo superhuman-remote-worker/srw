@@ -1,6 +1,6 @@
--- migration:     0307_validate_container_startup_stage_authority.sql
+-- migration:     0310_validate_container_startup_stage_authority.sql
 -- description:   Validate the nullable container startup protocol shape after expansion.
--- depends-on:    0306_container_startup_stage_authority.sql
+-- depends-on:    0309_container_startup_stage_authority.sql
 -- transactional: yes
 
 BEGIN;

@@ -1,4 +1,4 @@
--- migration:     0306_container_startup_stage_authority.sql
+-- migration:     0309_container_startup_stage_authority.sql
 -- description:   Freeze exact container startup stages on current creation receipts.
 -- depends-on:    0305_validate_pinned_permanent_warm_release.sql
 -- expected:      < 5s. Nullable columns, checks and scoped guards; no backfill.
