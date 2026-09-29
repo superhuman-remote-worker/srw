@@ -73,8 +73,9 @@ weaker adversarial boundary than a restricted container. Disable FUSE or its
 privileged mode where possible, isolate workspace nodes, and use the VM tier for
 work that needs a stronger boundary.
 
-That FUSE profile applies only to the installation workspace image and to
-repositories listed in `workspace.images.trustedRepositories`. A WorkspaceTemplate
+That FUSE profile applies only to SRW's own workspace images (`image.workspace`
+and `image.workspaceMinimal`) and to repositories listed in
+`workspace.images.trustedRepositories`. A WorkspaceTemplate
 may name any other image. Such a custom image runs unprivileged: no `/dev/fuse`,
 no `SYS_ADMIN` and seccomp `RuntimeDefault`. It therefore gets no cloud mount.
 `workspace.customImages.privileged: true` gives custom images the full profile.

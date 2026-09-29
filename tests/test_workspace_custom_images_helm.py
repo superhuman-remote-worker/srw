@@ -1,5 +1,6 @@
 """Custom workspace image policy reaches the orchestrator."""
 
+import json
 import shutil
 import subprocess
 
@@ -14,7 +15,9 @@ pytestmark = pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is ab
 def test_defaults_keep_custom_images_unprivileged():
     documents = render()
     env = _env(documents, _orchestrator(documents))
-    assert env["WORKSPACE_TRUSTED_IMAGE_REPOSITORIES"] == "[]"
+    assert json.loads(env["WORKSPACE_TRUSTED_IMAGE_REPOSITORIES"]) == [
+        "ghcr.io/superhuman-remote-worker/srw-workspace-minimal:latest"
+    ]
     assert env["WORKSPACE_CUSTOM_IMAGES_PRIVILEGED"] == "false"
     assert env["WORKSPACE_IMAGE_PULL_TIMEOUT_SECONDS"] == "600"
 
@@ -26,9 +29,10 @@ def test_operator_settings_are_rendered():
         "workspace.imagePullTimeoutSeconds=900",
     )
     env = _env(documents, _orchestrator(documents))
-    assert env["WORKSPACE_TRUSTED_IMAGE_REPOSITORIES"] == (
-        '["ghcr.io/org/srw-workspace-minimal"]'
-    )
+    assert json.loads(env["WORKSPACE_TRUSTED_IMAGE_REPOSITORIES"]) == [
+        "ghcr.io/org/srw-workspace-minimal",
+        "ghcr.io/superhuman-remote-worker/srw-workspace-minimal:latest",
+    ]
     assert env["WORKSPACE_CUSTOM_IMAGES_PRIVILEGED"] == "true"
     assert env["WORKSPACE_IMAGE_PULL_TIMEOUT_SECONDS"] == "900"
 

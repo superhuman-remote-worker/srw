@@ -416,7 +416,11 @@ def test_host_key_env_is_appended_after_the_existing_orchestrator_env(
     end leaves every pre-existing index where it was.
     """
     names = [entry["name"] for entry in _container(orchestrator, "orchestrator")["env"]]
-    assert names[-2:] == ["SSH_GATEWAY_PUBLIC_HOST_KEYS", "SSH_GATEWAY_HOSTNAME"]
+    assert names[-3:] == [
+        "SSH_GATEWAY_PUBLIC_HOST_KEYS",
+        "SSH_GATEWAY_HOSTNAME",
+        "WORKSPACE_BUILTIN_TEMPLATES",
+    ]
 
 
 # ---------------------------------------------------------------------------

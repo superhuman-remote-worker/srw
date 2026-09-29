@@ -120,6 +120,72 @@ Usage: {{ include "srw.imageRef" (dict "image" .Values.image.agent) }}
 {{- end }}
 
 {{/*
+Default VM image. The VM controller and the vm-full built-in template both use
+this, so they always name the same image.
+*/}}
+{{- define "srw.defaultVmImage" -}}
+{{- .Values.vmController.defaultVmImage | default (printf "ghcr.io/superhuman-remote-worker/srw-agent-vm-base:v%s" .Chart.AppVersion) -}}
+{{- end }}
+
+{{/*
+Built-in Catalog WorkspaceTemplates as a JSON list of manifest documents. The
+orchestrator reconciles its Catalog against this list at startup; an empty list
+retires the built-ins. container-full uses the very reference WORKSPACE_IMAGE
+uses, so a workspace on it is the installation image in every respect.
+*/}}
+{{- define "srw.builtinWorkspaceTemplatesJson" -}}
+{{- $templates := list -}}
+{{- if .Values.workspace.builtinTemplates.enabled -}}
+{{- $scope := dict "kind" "Catalog" "name" "shared" -}}
+{{- $sizes := .Values.workspace.builtinTemplates.containerResources -}}
+{{- $vmSizes := .Values.workspace.builtinTemplates.vmResources -}}
+{{- $templates = append $templates (dict
+    "apiVersion" "srw/v1alpha1"
+    "kind" "WorkspaceTemplate"
+    "metadata" (dict "name" "virtual" "scope" $scope "annotations" (dict
+      "srw.io/display-name" "Virtual"
+      "srw.io/description" "A workspace without a container or a VM."))
+    "spec" (dict "backend" "virtual")) -}}
+{{- $templates = append $templates (dict
+    "apiVersion" "srw/v1alpha1"
+    "kind" "WorkspaceTemplate"
+    "metadata" (dict "name" "container-minimal" "scope" $scope "annotations" (dict
+      "srw.io/display-name" "Container (minimal)"
+      "srw.io/description" "SRW tools, a browser and the IDE. The base for your own image."))
+    "spec" (dict
+      "backend" "sandbox"
+      "environment" (dict "image" (include "srw.imageRef" (dict "image" .Values.image.workspaceMinimal)))
+      "resources" $sizes)) -}}
+{{- $templates = append $templates (dict
+    "apiVersion" "srw/v1alpha1"
+    "kind" "WorkspaceTemplate"
+    "metadata" (dict "name" "container-full" "scope" $scope "annotations" (dict
+      "srw.io/display-name" "Container (full)"
+      "srw.io/description" "Minimal plus Node.js, compilers, database clients and document tools."))
+    "spec" (dict
+      "backend" "sandbox"
+      "environment" (dict "image" (include "srw.imageRef" (dict "image" .Values.image.workspace)))
+      "resources" $sizes)) -}}
+{{- if ne (include "srw.vmMode" .) "off" -}}
+{{- $templates = append $templates (dict
+    "apiVersion" "srw/v1alpha1"
+    "kind" "WorkspaceTemplate"
+    "metadata" (dict "name" "vm-full" "scope" $scope "annotations" (dict
+      "srw.io/display-name" "Virtual machine (full)"
+      "srw.io/description" "A full virtual machine with sudo, Docker and Kubernetes tooling."))
+    "spec" (dict
+      "backend" "vm"
+      "environment" (dict "image" (include "srw.defaultVmImage" .))
+      "resources" (dict
+        "cpu" (int $vmSizes.cpu)
+        "memory" $vmSizes.memory
+        "storage" $vmSizes.storage))) -}}
+{{- end -}}
+{{- end -}}
+{{- $templates | toJson -}}
+{{- end }}
+
+{{/*
 Bounded public deployment provenance consumed by the orchestrator and
 dynamically provisioned agents. The image digest comes only from the same
 value that srw.imageRef uses, so a tag can never be reported as an artifact

@@ -276,10 +276,11 @@ cleans up after itself; a Session doesn't (see below).
 
 ## Privilege
 
-Workspaces from the installation image, and from repositories listed in
-`workspace.images.trustedRepositories`, keep the privileged FUSE profile used for
-the cloud-storage mount. An entry matches its repository with any tag or digest;
-a tag or digest written in the entry is ignored.
+Workspaces from SRW's own images (`srw-workspace` and `srw-workspace-minimal`),
+and from repositories listed in `workspace.images.trustedRepositories`, keep the
+privileged FUSE profile used for the cloud-storage mount. An entry matches its
+repository with any tag or digest; a tag or digest written in the entry is
+ignored.
 
 Any other image runs unprivileged: no `/dev/fuse`, no `SYS_ADMIN` and seccomp
 `RuntimeDefault`. It therefore gets no rclone cloud mount. Protected cloud

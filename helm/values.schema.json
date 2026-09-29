@@ -303,6 +303,9 @@
         },
         "workspace": {
           "$ref": "#/definitions/firstPartyImage"
+        },
+        "workspaceMinimal": {
+          "$ref": "#/definitions/firstPartyImage"
         }
       }
     },
@@ -2462,6 +2465,41 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {"privileged": {"type": "boolean"}}
+        },
+        "builtinTemplates": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "containerResources": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu": {"type": "number", "exclusiveMinimum": 0},
+                "memory": {"type": "string", "pattern": "^[1-9][0-9]*(Mi|Gi|Ti)$"},
+                "requests": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "cpu": {"type": "number", "exclusiveMinimum": 0},
+                    "memory": {
+                      "type": "string",
+                      "pattern": "^[1-9][0-9]*(Mi|Gi|Ti)$"
+                    }
+                  }
+                }
+              }
+            },
+            "vmResources": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu": {"type": "integer", "minimum": 1},
+                "memory": {"type": "string", "pattern": "^[1-9][0-9]*(Mi|Gi|Ti)$"},
+                "storage": {"type": "string", "pattern": "^[1-9][0-9]*(Mi|Gi|Ti)$"}
+              }
+            }
+          }
         },
         "imagePullTimeoutSeconds": {"type": "integer", "minimum": 60, "maximum": 3600}
       }

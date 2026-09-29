@@ -823,7 +823,10 @@ data:
   WORKSPACE_NAMESPACE: {{ .Release.Namespace | quote }}
   WORKSPACE_FUSE_ENABLED: {{ ternary "true" "false" .Values.workspace.fuse.enabled | quote }}
   WORKSPACE_FUSE_PRIVILEGED: {{ ternary "true" "false" .Values.workspace.fuse.privileged | quote }}
-  WORKSPACE_TRUSTED_IMAGE_REPOSITORIES: {{ (.Values.workspace.images.trustedRepositories | default (list)) | toJson | quote }}
+  # The minimal image is SRW's own, like image.workspace, so it keeps the FUSE
+  # profile. The orchestrator reduces every entry to its repository.
+  WORKSPACE_TRUSTED_IMAGE_REPOSITORIES: {{ append (.Values.workspace.images.trustedRepositories | default (list)) (include "srw.imageRef" (dict "image" .Values.image.workspaceMinimal)) | toJson | quote }}
+  WORKSPACE_BUILTIN_TEMPLATES: {{ include "srw.builtinWorkspaceTemplatesJson" . | quote }}
   WORKSPACE_CUSTOM_IMAGES_PRIVILEGED: {{ ternary "true" "false" .Values.workspace.customImages.privileged | quote }}
   WORKSPACE_IMAGE_PULL_TIMEOUT_SECONDS: {{ .Values.workspace.imagePullTimeoutSeconds | int | quote }}
 

@@ -91,6 +91,14 @@ image:
     tag: latest
     digest: ""
     pullPolicy: Always
+  # -- The minimal workspace image: the SRW workspace contract, the browser
+  # stack and a small CLI set. image.workspace is built on top of it. Its
+  # repository is always trusted, like image.workspace. Built and tagged
+  # together with image.workspace, so both always carry the same tag.
+  workspaceMinimal:
+    repository: ghcr.io/superhuman-remote-worker/srw-workspace-minimal
+    tag: latest
+    digest: ""
 
 # Public, declarative component identity. Source revisions are full commit IDs,
 # never display tags. Artifact digests remain empty unless the corresponding
@@ -2704,7 +2712,8 @@ workspace:
   images:
     # -- Image repositories (host/path, any tag or digest) whose workspaces keep
     # the privileged FUSE profile. The repository of image.workspace is always
-    # trusted. Every other image is a custom image; see customImages.
+    # trusted, and so is the repository of image.workspaceMinimal. Every other
+    # image is a custom image; see customImages.
     trustedRepositories: []
   customImages:
     # -- Give custom workspace images the same privileged FUSE profile as
@@ -2712,6 +2721,34 @@ workspace:
     # its container, and privileged is one step from root on the node. Enable
     # only when you trust everyone who can author workspace templates.
     privileged: false
+  builtinTemplates:
+    # -- Ship the built-in workspace templates in the shared Catalog: virtual,
+    # container-minimal, container-full and, when VMs are on, vm-full. The
+    # orchestrator reconciles them at every start. They are read-only in the
+    # application; users duplicate one to change it. false retires them.
+    enabled: true
+    # -- Sizes of the two built-in container templates. cpu and memory are the
+    # maximum; requests is what Kubernetes reserves on the node. The defaults
+    # equal the pod a workspace gets when no template is selected. They don't
+    # change that pod.
+    containerResources:
+      cpu: 2
+      memory: 4Gi
+      requests:
+        cpu: 0.5
+        memory: 1Gi
+    # -- Sizes of the built-in vm-full template. cpu must be a whole number.
+    # cpu and memory equal what a VM gets today when nothing states sizes. They
+    # are not vmController.defaultCpu and defaultMemory, which apply only to a
+    # request without sizes; the orchestrator always sends sizes. storage is
+    # larger than vmController.vmDiskSize on purpose: a VM is usually chosen to
+    # install software, and 20Gi fills quickly. The VM controller never makes a
+    # disk smaller than vmController.vmDiskSize, so a larger vmDiskSize wins.
+    # These values don't change a VM that is selected without a template.
+    vmResources:
+      cpu: 8
+      memory: 16Gi
+      storage: 30Gi
   # -- How long a custom workspace image may take to pull before a Job fails
   # with the pull error. The installation image is prewarmed and unaffected.
   # Job containers are dispatched one at a time, so while a custom image is

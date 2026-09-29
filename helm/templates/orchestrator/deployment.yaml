@@ -1901,6 +1901,13 @@ spec:
             - name: SSH_GATEWAY_HOSTNAME
               value: {{ .Values.sshGateway.hostname | quote }}
             {{- end }}
+            # Appended at the end on purpose; see the note above.
+            - name: WORKSPACE_BUILTIN_TEMPLATES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_BUILTIN_TEMPLATES
+                  optional: true
           volumeMounts:
             - name: workspace
               mountPath: /workspace
