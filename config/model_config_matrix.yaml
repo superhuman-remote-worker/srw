@@ -395,9 +395,9 @@ kimi-k3:
 # (image + video), 262,144-token native context (1M only with YaRN, which Qwen
 # says costs quality on short inputs). Served OpenAI-compatible — self-hosted
 # vLLM/SGLang (`--reasoning-parser qwen3 --tool-call-parser qwen3_xml`),
-# OpenRouter `qwen/qwen3.8-27b`, Qwen Cloud. Only the 27B is matched: the API
-# Qwen3.8 Max/Flash rows take a different effort ladder and a 1M window, and
-# older Qwen rows stay on `default`.
+# OpenRouter `qwen/qwen3.8-27b`, Qwen Cloud. Only the 27B is matched: Qwen3.8
+# Max has its own family (1M window), and Flash and older Qwen rows stay on
+# `default`.
 # Verified 2026-09-29:
 # https://huggingface.co/Qwen/Qwen3.8-27B (model card + chat_template.jinja)
 # https://recipes.vllm.ai/Qwen/Qwen3.8-27B
@@ -446,6 +446,95 @@ qwen3.8-27b:
     # 16px patches merged 2x2 -> one token per 32x32 px, at most 16,777,216 px
     # (16,384 tokens) per image (preprocessor_config.json). ceil() biases high.
     image_tokens: { mode: openai_patches, patch_px: 32, budget: 16384, flat: 16384 }
+
+# Qwen3.8 Max (2.4T MoE; text, image and video in) and Max Prime (the same
+# model on a higher-throughput SKU). API only: Alibaba Model Studio (DashScope,
+# OpenAI-compatible) or OpenRouter `qwen/qwen3.8-max-0902` /
+# `qwen/qwen3.8-max-prime`. The open-weight Qwen3.8-2.4T-A95B is not matched:
+# it is text-only, and its chat template raises on images.
+# Verified 2026-09-29:
+# https://www.alibabacloud.com/help/en/model-studio/qwen3-8-max
+# https://www.alibabacloud.com/help/en/model-studio/deep-thinking
+# https://www.alibabacloud.com/help/en/model-studio/qwen-function-calling
+# https://openrouter.ai/api/v1/models
+#
+# Reasoning: top-level `reasoning_effort`, valid xhigh (default) | medium |
+# low; effort sets the thinking budget (4,096 / 16,384 / 262,144). Unlike the
+# open-weight template the API does not raise on `high`, it maps high and max
+# to xhigh, so the ladder lists only the levels that differ. `thinking_budget`
+# alongside an effort is a 400; SRW never sends it.
+#
+# Forced tool use is unsupported in thinking mode (no `required`, no named
+# tool), so structured output stays on json_schema. Alibaba documents no rule
+# for system messages after the first; the open variant's template raises on
+# them, so fold them (see qwen3.8-27b). `preserve_thinking` is on and asks for
+# prior reasoning_content, which SRW never replays (all families). Very verbose:
+# Artificial Analysis measured about twice the median output tokens.
+#
+# Sampling: Alibaba publishes no thinking-mode set for Max; this is Qwen's set
+# for the open 2.4T variant and for Flash (1.0 / 0.95 / 20).
+qwen3.8-max:
+  reasoning:
+    method: effort_enum
+    delivery: native
+    default: &qwen38max_default_effort xhigh
+    options: [low, medium, xhigh]
+  settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
+    structured_output_method: json_schema  # forced tool use is unsupported in thinking mode
+    single_system_message: true  # undocumented on the API; the open variant's template raises
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 20
+    # Override inherited expert-base high with the API default; explicit
+    # expert/user/catalog settings still win.
+    reasoning_level: *qwen38max_default_effort
+    multimodal: true
+    parallel_tool_calls: false  # new family — start safe, flip once validated
+    model_max_context_tokens: 1000000
+    max_output_tokens: 131072  # API max (reasoning is budgeted separately)
+    # One token per 32x32 px; the API downsizes to its default max_pixels
+    # (2,621,440 px = 2,560 tokens), which SRW does not raise. ceil() biases high.
+    image_tokens: { mode: openai_patches, patch_px: 32, budget: 2560, flat: 2560 }
+
+# xAI Grok 4.7 (2026-09-16). Reached over the xAI API (OpenAI-compatible Chat
+# Completions), OpenRouter `x-ai/grok-4.7`, or the Grok Build subscription
+# lane on the proxy. Only 4.7 is matched: older 4.x rows differ (4.3 defaults
+# to low and takes `none`, 4.5's docs disagree on xhigh, 4.20 has a 2M window).
+# Verified 2026-09-29:
+# https://docs.x.ai/developers/models/grok-4.7.md
+# https://docs.x.ai/developers/model-capabilities/text/reasoning.md
+# https://docs.x.ai/developers/tools/function-calling.md
+# https://openrouter.ai/api/v1/models
+#
+# Reasoning is always on: `reasoning_effort` low | medium | high | xhigh,
+# default high ("Reasoning cannot be disabled"). That is the `default` ladder;
+# this block exists for the rest: a 500K window (`default` is 128K), vision,
+# and sampling (0.7 / 0.95, as in xAI's Grok Build config and on OpenRouter).
+#
+# The API returns an error for presence_penalty, frequency_penalty and stop on
+# reasoning models. SRW sends none of them; keep it that way.
+#
+# Cost: once a prompt reaches 200K tokens xAI bills EVERY token in the request
+# at double rate. The window below is the true max (matrix convention), so
+# compaction starts at 400K and long jobs pay double for most late turns. To
+# stay under the tier, give the model a 250K `context_window` in Admin -> Models.
+# xAI also calls omitted reasoning_content "the top cause of cache misses";
+# SRW never replays it (all families), so expect fewer cache hits.
+grok-4.7:
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high, xhigh] }
+  settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
+    structured_output_method: json_schema
+    temperature: 0.7
+    top_p: 0.95
+    multimodal: true
+    parallel_tool_calls: false  # documented and on by default upstream; start safe, flip once validated
+    model_max_context_tokens: 500000
+    max_output_tokens: 128000  # xAI's default when unset (resolver clamps to ctx backstop)
+    # Current docs don't say how images are counted. The last published formula
+    # (448px tiles, 256 tokens each plus one, at most 6 tiles) caps at 1,792.
+    image_tokens: { mode: flat, flat: 1792 }
 
 gemini:
   # Phase 2 → token_budget (thinkingConfig.thinkingBudget; 2.5 Pro is always_on).
@@ -563,6 +652,39 @@ claude-sonnet:
     # this key on a family ⇒ renderer default (150). Tune with calibration data
     # (multimodal_image_cost_optimization.md §1) before lowering other families.
     pdf_render_dpi: 130
+
+# Claude Sonnet 5 / 5.5 (2026-06-30 / 2026-09-28). ONE family for both, split
+# off `claude-sonnet` for the effort ladder: both accept all five levels, default
+# `high`, while 4.x Sonnet takes low|medium|high (the generic block still serves
+# those rows). 5.5 recalibrated what each level does, but the knobs this matrix
+# carries are the same for both: 1M context, 128K output, high-res vision.
+#
+# 5.5 rejects the same two things Opus 5.5 does, both upstream 400s (which on
+# the subscription proxy bench the Claude credential for ~60s):
+#   - disabling thinking (`disabled`, or `enabled` with a budget). SRW sends
+#     neither; effort is the only reasoning control it drives.
+#   - forced tool use (`tool_choice` any/tool). Structured output goes through
+#     `json_schema` (default block); never set `function_calling` here.
+# A non-default temperature/top_p/top_k is also a 400. 1.0 IS the default, and
+# the key must stay: without it the family falls through to `default`'s 0.0.
+# Unverified live: 5.5 rejects a thinking block when earlier history changed,
+# and compaction changes history. SRW's OpenAI-shaped paths never send thinking
+# back, so it should not apply there.
+# Verified 2026-09-29:
+# https://platform.claude.com/docs/en/build-with-claude/effort
+# https://platform.claude.com/docs/en/models/sonnet-5-5/whats-new-sonnet-5-5
+# https://openrouter.ai/api/v1/models
+claude-sonnet-5:
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high, xhigh, max] }
+  settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
+    temperature: 1.0  # the API default; anything else is a 400
+    multimodal: true
+    parallel_tool_calls: true
+    model_max_context_tokens: 1000000  # Sonnet 5/5.5: 1M context, 128K max output
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
+    # 28px patches, Opus 4.7+/Fable5 high-res cap (2576px edge / 4784 tok max).
+    image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 2576, max_tokens: 4784, flat: 4784 }
 
 claude-haiku:
   # Effort-driven adaptive thinking — see the claude-opus note above.

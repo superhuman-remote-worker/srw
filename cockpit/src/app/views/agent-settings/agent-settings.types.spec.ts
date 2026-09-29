@@ -41,8 +41,30 @@ describe('detectModelFamily — Qwen3.8-27B', () => {
       expect(detectModelFamily(id)).toBe('qwen3.8-27b');
     }
     expect(detectModelFamily('qwen/qwen3-8b')).toBe('qwen');
-    expect(detectModelFamily('qwen/qwen3.8-max-0902')).toBe('qwen');
+    expect(detectModelFamily('qwen/qwen3.8-max-0902')).toBe('qwen3.8-max');
     expect(detectModelFamily('qwen3.8-270b')).toBe('qwen');
+  });
+});
+
+describe('detectModelFamily — Qwen3.8 Max', () => {
+  it('claims Max and Max Prime but not the text-only open 2.4T or Flash', () => {
+    for (const id of ['qwen3.8-max', 'qwen/qwen3.8-max-0902', 'openrouter/qwen/qwen3.8-max-prime']) {
+      expect(detectModelFamily(id)).toBe('qwen3.8-max');
+    }
+    expect(detectModelFamily('qwen/qwen3.8-2.4t-a95b')).toBe('qwen');
+    expect(detectModelFamily('qwen/qwen3.8-flash')).toBe('qwen');
+    expect(detectModelFamily('qwen3.8-maximal')).toBe('qwen');
+  });
+});
+
+describe('detectModelFamily — Grok 4.7', () => {
+  it('claims 4.7 but leaves older Grok rows on default', () => {
+    for (const id of ['grok-4.7', 'x-ai/grok-4.7-20260916', 'openrouter/x-ai/grok-4.7', 'grok-4.7-fast']) {
+      expect(detectModelFamily(id)).toBe('grok-4.7');
+    }
+    for (const id of ['grok-4.6', 'grok-4.3', 'grok-build-0.1', 'grok-4.70', 'grok-4.7.1']) {
+      expect(detectModelFamily(id)).toBe('default');
+    }
   });
 });
 
@@ -90,6 +112,17 @@ describe('detectModelFamily — Claude Opus 5.5', () => {
 
   it('keeps dated Opus 5 snapshots on claude-opus-5', () => {
     expect(detectModelFamily('claude-opus-5-20260401')).toBe('claude-opus-5');
+  });
+});
+
+describe('detectModelFamily — Claude Sonnet 5', () => {
+  it('maps Sonnet 5 and 5.5 to one family and keeps 4.x generic', () => {
+    expect(detectModelFamily('claude-sonnet-5')).toBe('claude-sonnet-5');
+    expect(detectModelFamily('claude-sonnet-5-5')).toBe('claude-sonnet-5');
+    expect(detectModelFamily('claude-sonnet-5-5-20260928')).toBe('claude-sonnet-5');
+    expect(detectModelFamily('openrouter/anthropic/claude-sonnet-5.5')).toBe('claude-sonnet-5');
+    expect(detectModelFamily('claude-sonnet-4-6')).toBe('claude-sonnet');
+    expect(detectModelFamily('claude-sonnet-4-5-20250929')).toBe('claude-sonnet');
   });
 });
 

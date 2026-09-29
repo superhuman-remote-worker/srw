@@ -50,6 +50,8 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
     (re.compile(r"claude-opus-5[.-]5(?!\d)", re.IGNORECASE), "claude-opus-5-5"),
     (re.compile(r"claude-opus-5", re.IGNORECASE), "claude-opus-5"),
     (re.compile(r"claude-opus", re.IGNORECASE), "claude-opus"),
+    # Sonnet 5 and 5.5 before generic Sonnet: only 5.x takes the full ladder.
+    (re.compile(r"claude-sonnet-5", re.IGNORECASE), "claude-sonnet-5"),
     (re.compile(r"claude-sonnet", re.IGNORECASE), "claude-sonnet"),
     (re.compile(r"claude-haiku", re.IGNORECASE), "claude-haiku"),
     # Fable 5 and 5.1 share one family (identical matrix knobs).
@@ -106,6 +108,10 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
     (re.compile(r"kimi", re.IGNORECASE), "default"),
     # Qwen3.8-27B only; the dot keeps Qwen3 8B (qwen3-8b) off it.
     (re.compile(r"(?:^|/)qwen3\.8-27b(?![\w.])", re.IGNORECASE), "qwen3.8-27b"),
+    # Qwen3.8 Max and Max Prime; the open 2.4T-A95B is text-only and stays off.
+    (re.compile(r"(?:^|/)qwen3\.8-max(?![\w.])", re.IGNORECASE), "qwen3.8-max"),
+    # Grok 4.7 only; older 4.x rows keep default.
+    (re.compile(r"(?:^|/)grok-4\.7(?![\w.])", re.IGNORECASE), "grok-4.7"),
     # Embeddings
     (re.compile(r"text-embedding", re.IGNORECASE), "openai-embedding"),
 ]

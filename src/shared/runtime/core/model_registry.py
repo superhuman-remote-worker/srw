@@ -337,6 +337,10 @@ def family_of(model_id: str, default: str = "default") -> str:
         return "claude-opus-5"
     if name.startswith("claude-opus"):
         return "claude-opus"
+    # Sonnet 5 and 5.5 share one family: both take the full effort ladder,
+    # which 4.x Sonnet does not.
+    if name.startswith("claude-sonnet-5"):
+        return "claude-sonnet-5"
     if name.startswith("claude-sonnet"):
         return "claude-sonnet"
     if name.startswith("claude-haiku"):
@@ -381,6 +385,10 @@ def family_of(model_id: str, default: str = "default") -> str:
     # moonshotai/kimi-k3, kimi-k3:batch and Claude Code's kimi-k3[1m].
     if re.search(r"(?:^|/)kimi-k3(?![\w.])", name):
         return "kimi-k3"
+    # Grok 4.7 only; older 4.x rows take other effort ladders and windows. The
+    # guard rejects grok-4.70 / grok-4.7.1 but keeps x-ai/grok-4.7 and dated ids.
+    if re.search(r"(?:^|/)grok-4\.7(?![\w.])", name):
+        return "grok-4.7"
     if name.startswith(
         (
             "mistral",
@@ -400,6 +408,9 @@ def family_of(model_id: str, default: str = "default") -> str:
     # The dot keeps the older Qwen3 8B (qwen3-8b) on the generic rule.
     if re.search(r"(?:^|/)qwen3\.8-27b(?![\w.])", name):
         return "qwen3.8-27b"
+    # Max and Max Prime (and dated Max snapshots); not the open 2.4T-A95B.
+    if re.search(r"(?:^|/)qwen3\.8-max(?![\w.])", name):
+        return "qwen3.8-max"
     if "qwen" in name or "qwq" in name:
         return "qwen"
     if "llama" in name:
