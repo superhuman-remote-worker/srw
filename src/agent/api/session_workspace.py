@@ -466,6 +466,7 @@ async def poll_workspace_ready(
     raise_on_denied: bool = False,
     vm_timeout: int = VM_WORKSPACE_POLL_TIMEOUT_S,
     require_vm: bool = False,
+    raise_on_ending: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Poll orchestrator for workspace container readiness.
 
@@ -475,6 +476,11 @@ async def poll_workspace_ready(
     the sandbox-container ``timeout`` default, so the deadline self-extends
     rather than declaring a still-booting VM "not ready"
     (knowledge-base/knowledge/features/session_create_on_vm.md).
+
+    ``raise_on_ending`` makes a 409 ``session_ending`` terminal
+    (:class:`~agent.api.orchestrator_client.SessionEnding`) instead of a
+    transient "unavailable": an attaching life whose retirement began can
+    never become ready.
 
     ``require_vm`` makes the VM the ONLY acceptable answer: a ready sandbox
     container is refused (and logged as a provisioning leak) instead of being
@@ -496,9 +502,11 @@ async def poll_workspace_ready(
     _vm_budget_applied = False
 
     while time.monotonic() < deadline:
-        ws = await client.get_thread_workspace(
-            thread_id, raise_on_denied=raise_on_denied
-        )
+        fetch_options: Dict[str, Any] = {"raise_on_denied": raise_on_denied}
+        if raise_on_ending:
+            # An attach must stop once its life's retirement has begun.
+            fetch_options["raise_on_ending"] = True
+        ws = await client.get_thread_workspace(thread_id, **fetch_options)
         if not ws:
             # The client collapses every non-200 to None. For a vm-tier
             # session that includes a transient 5xx from the orchestrator

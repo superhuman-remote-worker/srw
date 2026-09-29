@@ -91,6 +91,27 @@ class SessionEnded(Exception):
     """Typed terminal response from the workspace credential boundary."""
 
 
+class SessionEnding(SessionEnded):
+    """The session life's retirement has begun (409 ``session_ending``).
+
+    Raised only to callers that opt in (an attach waiting for its workspace):
+    the life can no longer become ready, and the retirement that settles it
+    waits for this runtime to leave. ``runtime_generation`` is the generation
+    the refusal names, if any.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        runtime_generation: Any = None,
+        retirement_disposition: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.runtime_generation = runtime_generation
+        self.retirement_disposition = retirement_disposition
+
+
 class ThreadConfigUpdateDenied(Exception):
     """The orchestrator rejected a live thread config update (4xx).
 
@@ -1728,7 +1749,11 @@ class OrchestratorClient:
             return False
 
     async def get_thread_workspace(
-        self, thread_id: str, *, raise_on_denied: bool = False
+        self,
+        thread_id: str,
+        *,
+        raise_on_denied: bool = False,
+        raise_on_ending: bool = False,
     ) -> dict | None:
         """Poll workspace container status for a thread.
 
@@ -1742,6 +1767,11 @@ class OrchestratorClient:
         to ``None``, so the attach path can fail with the real reason rather than
         the misleading 'No workspace container provisioned'. Other failures stay
         ``None`` (transient — keep polling).
+
+        A 409 ``session_ended`` always raises :class:`SessionEnded`. With
+        ``raise_on_ending=True``, a 409 ``session_ending`` (the life's
+        retirement has begun) raises :class:`SessionEnding` instead of
+        collapsing to ``None``.
         """
         if not self._client:
             await self.connect()
@@ -1780,6 +1810,16 @@ class OrchestratorClient:
                     detail = None
                 if isinstance(detail, dict) and detail.get("code") == "session_ended":
                     raise SessionEnded("session ended before workspace attach")
+                if (
+                    raise_on_ending
+                    and isinstance(detail, dict)
+                    and detail.get("code") == "session_ending"
+                ):
+                    raise SessionEnding(
+                        "session retirement began before workspace attach",
+                        runtime_generation=detail.get("session_runtime_generation"),
+                        retirement_disposition=detail.get("retirement_disposition"),
+                    )
             return None
         except (SessionGrantDenied, SessionEnded):
             raise

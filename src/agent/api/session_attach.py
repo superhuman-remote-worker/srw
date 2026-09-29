@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from agent.api.lease_context import LeaseHandle, LeaseLostError
-from agent.api.orchestrator_client import SessionEnded
+from agent.api.orchestrator_client import SessionEnded, SessionEnding
 from agent.api.session_contract import (
     EventJournalUnavailable,
     ProtectedCloudUnavailable,
@@ -513,6 +513,65 @@ class SessionAttachCoordinator:
     def cleanup_context(self) -> Optional[dict[str, Any]]:
         return self._cleanup_context
 
+    # --- Workspace reads of one attach -----------------------------------------
+
+    def _ending_fence(self) -> dict[str, Any]:
+        """A pinned attach stops at its life's first ending refusal.
+
+        Stateless attaches keep the historical reads: their claim's lease is
+        the authority the End fences.
+        """
+
+        return {} if self._ports.stateless_mode() else {"raise_on_ending": True}
+
+    def _ending_outcome(self, ending: SessionEnding) -> BaseException:
+        """Classify an ending refusal against this attach's own generation."""
+
+        own = self._identity.session_generation
+        named = canonical_runtime_generation(ending.runtime_generation)
+        if named is not None and own is not None and named != own:
+            self._logger.warning(
+                "Attach superseded while waiting for its workspace "
+                "(thread=%s): another session life is ending",
+                self._identity.thread_id,
+            )
+            return WorkspaceNotReady(
+                "Workspace runtime generation changed during attach"
+            )
+        self._logger.info(
+            "Session life retirement began before the attach completed "
+            "(thread=%s disposition=%s) — stopping the attach",
+            self._identity.thread_id,
+            ending.retirement_disposition,
+        )
+        return ending
+
+    async def _read_workspace(self, thread_id: str) -> Any:
+        """One workspace read of this attach, fenced by the ending refusal."""
+
+        try:
+            return await self._client.get_thread_workspace(
+                thread_id, **self._ending_fence()
+            )
+        except SessionEnding as ending:
+            outcome = self._ending_outcome(ending)
+            if outcome is ending:
+                raise
+            raise outcome from ending
+
+    async def _poll_workspace(self, thread_id: str, **kwargs: Any) -> Any:
+        """The readiness poll of this attach, fenced by the ending refusal."""
+
+        try:
+            return await self._ports.poll_workspace_ready(
+                self._client, thread_id, **kwargs, **self._ending_fence()
+            )
+        except SessionEnding as ending:
+            outcome = self._ending_outcome(ending)
+            if outcome is ending:
+                raise
+            raise outcome from ending
+
     def retain_release_receipt(self, receipt: dict[str, Any]) -> bool:
         """Install one immutable attach-abort proof without replacing a claimant.
 
@@ -812,9 +871,7 @@ class SessionAttachCoordinator:
         subagent_workspace_responses: List[Any] = []
         if _rc is None and _co is None and self._client and self._identity.thread_id:
             try:
-                _peek = await self._client.get_thread_workspace(
-                    self._identity.thread_id
-                )
+                _peek = await self._read_workspace(self._identity.thread_id)
                 if isinstance(_peek, dict):
                     peek_delivery = protected_workspace_delivery(_peek)
                     # A valid engaging response is intentionally coordinate- and
@@ -866,8 +923,7 @@ class SessionAttachCoordinator:
         # object-store backend from the injected mounts (persistent_session.py).
         workspace_override = None
         if not is_lite_session and self._client and self._identity.thread_id:
-            workspace_override = await self._ports.poll_workspace_ready(
-                self._client,
+            workspace_override = await self._poll_workspace(
                 self._identity.thread_id,
                 timeout=120,
                 raise_on_denied=True,
@@ -965,9 +1021,7 @@ class SessionAttachCoordinator:
             )
         if self._client and self._identity.thread_id:
             try:
-                ws_info = await self._client.get_thread_workspace(
-                    self._identity.thread_id
-                )
+                ws_info = await self._read_workspace(self._identity.thread_id)
                 if ws_info:
                     assert_attach_workspace_payload(
                         expected_workspace_identity,
@@ -1418,9 +1472,7 @@ class SessionAttachCoordinator:
                     raise ProtectedCloudUnavailable(
                         "protected-cloud workspace cannot be revalidated"
                     )
-                final_workspace = await self._client.get_thread_workspace(
-                    self._identity.thread_id
-                )
+                final_workspace = await self._read_workspace(self._identity.thread_id)
                 if not isinstance(final_workspace, dict):
                     raise ProtectedCloudUnavailable(
                         "protected-cloud workspace authority is unavailable"
@@ -1582,9 +1634,7 @@ class SessionAttachCoordinator:
             and self._identity.thread_id
         ):
             try:
-                ws_info = await self._client.get_thread_workspace(
-                    self._identity.thread_id
-                )
+                ws_info = await self._read_workspace(self._identity.thread_id)
                 if ws_info:
                     assert_attach_workspace_payload(
                         expected_workspace_identity,
