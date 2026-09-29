@@ -1,6 +1,6 @@
 {
   "date": "2026-09-29",
-  "commit": "e24263a4d6c629a1e667d4aad10abc130032bb45",
+  "commit": "4f91cbe738ded04e7de595d7d1ebc4d43e80cc04",
   "stack": "local k3d (context k3d-srw, namespace srw), Tilt-built images (tilt-* tags, no sha- tags), vm.mode off",
   "minimalImage": "srw-registry:5000/srw-workspace-minimal:a2a (sha256:02ce2b3f2bc54ae9113129da27588eec9d7f3d91ca15701bcf48b06f74b97a4c)",
   "checks": [
