@@ -376,6 +376,11 @@ def family_of(model_id: str, default: str = "default") -> str:
     # Version-specific: older Muse releases must not inherit 1.3 capabilities.
     if re.search(r"(?:^|/)muse-spark-1\.3(?:$|[-:])", name):
         return "muse-spark-1.3"
+    # K3 only: K2.x rows take a `thinking` toggle and no effort field, so they
+    # stay on default. The guard rejects kimi-k30 / kimi-k3.5 but keeps
+    # moonshotai/kimi-k3, kimi-k3:batch and Claude Code's kimi-k3[1m].
+    if re.search(r"(?:^|/)kimi-k3(?![\w.])", name):
+        return "kimi-k3"
     if name.startswith(
         (
             "mistral",

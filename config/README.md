@@ -173,7 +173,10 @@ config/
 │   ├── persona_glm_5_3.txt                 # GLM-5.3 / Flash persona
 │   ├── systemprompt_muse_spark_1_3.txt     # Muse Spark 1.3 worker prompt
 │   ├── systemprompt_interactive_muse_spark_1_3.txt # Muse Spark 1.3 chat prompt
-│   └── persona_muse_spark_1_3.txt          # Muse Spark 1.3 persona
+│   ├── persona_muse_spark_1_3.txt          # Muse Spark 1.3 persona
+│   ├── systemprompt_kimi_k3.txt            # Kimi K3 worker prompt
+│   ├── systemprompt_interactive_kimi_k3.txt # Kimi K3 chat prompt
+│   └── persona_kimi_k3.txt                 # Kimi K3 persona
 └── templates/                   # Instruction templates (non-prompt files)
     ├── instructions.md                  # Default agent instructions
     ├── instructions_minimax.md          # MiniMax M2.7-optimized instructions
@@ -750,6 +753,34 @@ The separately selected `meta/muse-spark-1.3-contributor` also uses this family;
 family detection preserves the selected model ID and tier. Adding the family
 does not register a catalog row. Audio/video input transport is outside this
 family configuration change.
+
+## Moonshot Kimi K3
+
+The `kimi-k3` family supplies worker/chat/persona prompts, image input, a
+1,048,576-token context window, and a 131,072-token response budget including
+reasoning (Moonshot's own `max_completion_tokens` default). Only K3 is matched:
+K2.x rows keep the `default` family, since they take a `thinking` toggle instead
+of an effort field and have a 256K window.
+
+Reasoning is always on and cannot be disabled. `reasoning_effort` accepts `low`,
+`high`, and `max`; the family defaults to `max`, the
+[provider default](https://platform.kimi.ai/docs/guide/use-reasoning-effort).
+Moonshot warns that changing the level mid-conversation invalidates prefix-cache
+hits. The native API
+[fixes the sampling parameters](https://platform.kimi.ai/docs/api/models-overview):
+temperature 1.0 (the family's value), top_p 0.95 (left unset), and both penalties at 0.
+
+Structured output uses `json_schema`. Do not switch the family to
+`function_calling`: forcing a named tool returns HTTP 400 while thinking is on.
+Moonshot also asks for each assistant message's `reasoning_content` to be sent
+back on later turns. SRW's OpenAI-compatible transport does not do that, so the
+K3 prompts ask the model for a one-line visible intent before each tool call.
+
+In **Admin → Models**, add `moonshotai/kimi-k3` with your OpenRouter provider, or
+`kimi-k3` on an OpenAI-compatible endpoint at `https://api.moonshot.ai/v1`. The
+native API accepts images only as base64 or `ms://` file IDs, not public URLs.
+The family is detected automatically, including `openrouter/` and `moonshotai/`
+prefixes. Adding the family does not register a catalog row.
 
 ## Schema Validation
 

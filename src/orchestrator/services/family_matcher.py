@@ -101,6 +101,8 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
         re.compile(r"(?:^|/)muse-spark-1\.3(?:$|[-:])", re.IGNORECASE),
         "muse-spark-1.3",
     ),
+    # Kimi K3 before the generic kimi rule; K2.x keeps default prompts.
+    (re.compile(r"(?:^|/)kimi-k3(?![\w.])", re.IGNORECASE), "kimi-k3"),
     (re.compile(r"kimi", re.IGNORECASE), "default"),
     # Embeddings
     (re.compile(r"text-embedding", re.IGNORECASE), "openai-embedding"),

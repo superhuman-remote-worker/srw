@@ -20,6 +20,21 @@ describe('detectModelFamily — Muse Spark 1.3', () => {
   );
 });
 
+describe('detectModelFamily — Kimi K3', () => {
+  it.each(['', 'moonshotai/', 'openrouter/moonshotai/'])(
+    'claims K3 but leaves K2.x on default with prefix %s', (prefix) => {
+      expect(detectModelFamily(`${prefix}kimi-k3`)).toBe('kimi-k3');
+      expect(detectModelFamily(`${prefix}Kimi-K3`)).toBe('kimi-k3');
+      expect(detectModelFamily(`${prefix}kimi-k3:batch`)).toBe('kimi-k3');
+      expect(detectModelFamily(`${prefix}kimi-k3[1m]`)).toBe('kimi-k3');
+      expect(detectModelFamily(`${prefix}kimi-k2.6`)).toBe('default');
+      expect(detectModelFamily(`${prefix}kimi-k2.7-code`)).toBe('default');
+      expect(detectModelFamily(`${prefix}kimi-k30`)).toBe('default');
+      expect(detectModelFamily(`${prefix}kimi-k3.5`)).toBe('default');
+    },
+  );
+});
+
 describe('detectModelFamily — GLM', () => {
   it.each(['', 'z-ai/', 'openrouter/z-ai/', 'zai-org/'])(
     'distinguishes GLM-5.3 Flash vision settings with prefix %s', (prefix) => {

@@ -328,6 +328,69 @@ muse-spark-1.3:
     max_output_tokens: 131072
     image_tokens: { mode: flat, flat: 1600 }  # no verified per-image formula
 
+# Moonshot Kimi K3 (API 2026-07-16, open weights 2026-07-27): 2.8T MoE / 104B
+# active, 1,048,576-token context, native image + video input, served
+# OpenAI-compatible (api.moonshot.ai/v1 as `kimi-k3`, OpenRouter as
+# `moonshotai/kimi-k3`). Standard parens-form tool wire, so `default.yaml`
+# guardrails apply. Older Kimi rows (K2.x: 256K, `thinking` toggle, no effort
+# field) stay on `default` — the resolvers match K3 only.
+# Verified 2026-09-29:
+# https://platform.kimi.ai/docs/guide/kimi-k3-quickstart
+# https://platform.kimi.ai/docs/api/models-overview
+# https://openrouter.ai/api/v1/models
+#
+# Reasoning is always on and cannot be disabled; the only control is the
+# top-level `reasoning_effort` (low|high|max, provider default max). The K2.x
+# `thinking` param is gone — never send it. Moonshot warns that changing the
+# level mid-conversation invalidates prefix-cache hits.
+#
+# The native API rejects any temperature other than 1.0, and fixes top_p at 0.95,
+# n at 1 and both penalties at 0 (other values return an error; Moonshot's advice is to
+# omit them). The factories always send `temperature`, so it stays at the one
+# accepted value; top_p is left unset so each provider applies its own default.
+#
+# Structured output MUST stay `json_schema` (strict supported). A forced
+# named tool — what `function_calling` does — returns HTTP 400 with thinking on
+# ("tool_choice 'specified' is incompatible with thinking enabled"), and K3
+# always thinks. `tool_choice: required` is accepted.
+#
+# Moonshot asks for the complete assistant message, `reasoning_content`
+# included, to be sent back on every turn (Preserved Thinking). The
+# OpenAI-compatible transport does not serialize reasoning back, so K3
+# loses its prior reasoning between calls. No 400 is documented for that, but
+# it is a quality gap; the K3 prompts ask for a one-line visible intent before
+# each tool call so the thread survives.
+kimi-k3:
+  reasoning:
+    method: effort_enum
+    delivery: native
+    default: &kimik3_default_effort max
+    options: [low, high, max]
+  prompts:
+    systemprompt: systemprompt_kimi_k3.txt
+    systemprompt_interactive: systemprompt_interactive_kimi_k3.txt
+    persona: persona_kimi_k3.txt
+  guardrails:
+    file: default.yaml
+  settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
+    structured_output_method: json_schema  # function_calling forces a named tool -> 400 (see above)
+    temperature: 1.0  # the only value the native API accepts
+    # Override inherited expert-base high with the provider default; explicit
+    # expert/user/catalog settings still win.
+    reasoning_level: *kimik3_default_effort
+    multimodal: true  # images as base64 data URLs; native API rejects public image URLs
+    # Moonshot documents parallel tool calls, but OpenRouter does not list the
+    # param for K3 — start safe like every new family, flip once validated.
+    parallel_tool_calls: false
+    model_max_context_tokens: 1048576
+    # Moonshot's own max_completion_tokens default (reasoning included); the
+    # provider allows up to the full window.
+    max_output_tokens: 131072
+    # MoonViT-V2 token cost is dynamic and unpublished (Moonshot points to its
+    # estimate-tokens API) — calibrate from usage.
+    image_tokens: { mode: flat, flat: 1600 }
+
 gemini:
   # Phase 2 → token_budget (thinkingConfig.thinkingBudget; 2.5 Pro is always_on).
   # v1: no control wired; output capture via include_thoughts stays in the factory.

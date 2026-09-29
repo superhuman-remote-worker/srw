@@ -210,6 +210,8 @@ export function detectModelFamily(model: string): string {
   if (name.includes('glm-5.3')) return 'glm-5.3';
   if (name.includes('glm')) return 'glm';
   if (/(?:^|\/)muse-spark-1\.3(?:$|[-:])/.test(name)) return 'muse-spark-1.3';
+  // K3 only; K2.x stays on default — mirrors family_of() on the server.
+  if (/(?:^|\/)kimi-k3(?![\w.])/.test(name)) return 'kimi-k3';
   if (
     name.startsWith('mistral') || name.startsWith('codestral') || name.startsWith('magistral') ||
     name.startsWith('ministral') || name.startsWith('devstral') || name.startsWith('pixtral') ||
