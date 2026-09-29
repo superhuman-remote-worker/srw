@@ -105,7 +105,8 @@ CGROUP = "/sys/fs/cgroup"
 
 # ---------------------------------------------------------------------------
 # OPERATOR SWITCH (WP3c, commit 7d25b7cbf). Precondition; adjust HERE only.
-#   Enable on k3d: deployment/values-local.yaml ->
+#   On by default in the chart since WP6 (helm/values.yaml); on k3d make sure
+#   deployment/values-local.yaml does not turn it off:
 #       orchestrator:
 #         sessionSubagentFanoutLanes: "stateless"
 #   Tilt re-applies the chart on that edit (never `helm upgrade` under Tilt);

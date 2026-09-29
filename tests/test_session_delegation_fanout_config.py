@@ -8,6 +8,8 @@ Design: knowledge-base/knowledge/features/parallel_subagents.md §6.4, §12,
   defaults to 20 (clamped to 1..64);
 * the settings matrix routes a family's ``session_max_concurrent`` to its own
   delegation slot and re-derives it on every pass (a model switch replaces it);
+* the bundled matrix sets 10 for every Claude and both MiniMax families and
+  nothing for any other family (WP6);
 * ``session_fanout_allowed`` = the orchestrator's batch-settle capability AND
   its per-claim operator switch AND a session parent. No config key opens it
   (WP3c: the gate is a deployment setting the orchestrator evaluates per lane);
@@ -207,19 +209,92 @@ def family_caps(monkeypatch):
     return matrix
 
 
-class TestMatrixRoute:
-    def test_the_bundled_matrix_sets_no_family_cap_yet(self):
-        loader._model_config_matrix_cache.clear()
-        for family, settings in loader._load_settings_matrix().items():
-            assert "session_max_concurrent" not in settings, family
-        data = {"llm": {"model": _CLAUDE}}
-        _apply_settings_matrix(data, set())
-        assert FAMILY_SESSION_MAX_CONCURRENT_KEY not in (data.get("delegation") or {})
-        cfg = load_agent_config_from_dict(
-            {"agent_id": "a", "display_name": "A", **data}
-        )
-        assert session_max_concurrent(dataclasses.asdict(cfg.delegation)) == 6
+#: WP6 (parallel_subagents.md §13 D2): the bundled matrix raises the session
+#: cap to 10 for every Claude and both MiniMax families, one model id each.
+#: Families do not inherit from each other, so each block names the key.
+_BUNDLED_TEN = {
+    "claude-opus": "claude-opus-4-6",
+    "claude-opus-5": "claude-opus-5",
+    "claude-opus-5-5": "openrouter/anthropic/claude-opus-5.5",
+    "claude-sonnet": "claude-sonnet-4-5",
+    "claude-sonnet-5": "claude-sonnet-5-5",
+    "claude-haiku": "claude-haiku-4-5",
+    "claude-fable": "claude-fable-5",
+    "minimax": "MiniMax-M2.7",
+    "minimax-m3": "MiniMax-M3",
+}
+#: Every other family keeps the code default; GPT and Codex were trained
+#: around 6 or fewer (§13), gemma is the bundled experts' default model.
+_BUNDLED_DEFAULT = {
+    "gpt-5": "gpt-5.5",
+    "codex": "gpt-5.3-codex",
+    "gemma": "RedHatAI/gemma-4-31B-it-FP8-Dynamic",
+}
 
+
+@pytest.fixture
+def bundled_matrix(monkeypatch):
+    """The committed matrix file, without any DB settings override."""
+    loader._model_config_matrix_cache.clear()
+    monkeypatch.setattr(loader, "_settings_override_for", lambda family: {})
+    yield loader._load_settings_matrix()
+    loader._model_config_matrix_cache.clear()
+
+
+def _resolved_cap(model: str, delegation: dict | None = None) -> tuple[dict, int]:
+    """The matrix pass and the parsed config, as a real dispatch runs them."""
+    data: dict = {"llm": {"model": model}}
+    if delegation is not None:
+        data["delegation"] = dict(delegation)
+    _apply_settings_matrix(data, set())
+    cfg = load_agent_config_from_dict({"agent_id": "a", "display_name": "A", **data})
+    return data, session_max_concurrent(dataclasses.asdict(cfg.delegation))
+
+
+class TestBundledFamilyCaps:
+    def test_only_the_claude_and_minimax_families_name_a_cap(self, bundled_matrix):
+        named = {
+            family: settings["session_max_concurrent"]
+            for family, settings in bundled_matrix.items()
+            if "session_max_concurrent" in settings
+        }
+        assert named == dict.fromkeys(_BUNDLED_TEN, 10)
+        assert "session_max_concurrent" not in bundled_matrix["default"]
+
+    @pytest.mark.parametrize(("family", "model"), sorted(_BUNDLED_TEN.items()))
+    def test_a_claude_or_minimax_parent_resolves_to_ten(
+        self, bundled_matrix, family, model
+    ):
+        assert family_of(model) == family
+        data, cap = _resolved_cap(model)
+        assert data["delegation"] == {FAMILY_SESSION_MAX_CONCURRENT_KEY: 10}
+        assert "session_max_concurrent" not in data["llm"]
+        assert cap == 10
+
+    @pytest.mark.parametrize(("family", "model"), sorted(_BUNDLED_DEFAULT.items()))
+    def test_every_other_family_keeps_the_code_default(
+        self, bundled_matrix, family, model
+    ):
+        assert family_of(model) == family
+        data, cap = _resolved_cap(model)
+        assert FAMILY_SESSION_MAX_CONCURRENT_KEY not in (data.get("delegation") or {})
+        assert cap == SESSION_MAX_CONCURRENT_DEFAULT == 6
+
+    @pytest.mark.parametrize("explicit", [3, 12])
+    @pytest.mark.parametrize("model", ["claude-opus-5-5", "MiniMax-M3"])
+    def test_an_explicit_value_beats_the_bundled_family_value(
+        self, bundled_matrix, model, explicit
+    ):
+        """An expert's or a session's own cap wins over the family's 10, both
+        below and above it."""
+        data, cap = _resolved_cap(
+            model, {"enabled": True, "session_max_concurrent": explicit}
+        )
+        assert data["delegation"][FAMILY_SESSION_MAX_CONCURRENT_KEY] == 10
+        assert cap == explicit
+
+
+class TestMatrixRoute:
     def test_a_family_value_lands_in_the_delegation_slot_not_llm(self, family_caps):
         data = {"llm": {"model": _CLAUDE}}
         _apply_settings_matrix(data, set())

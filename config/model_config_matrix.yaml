@@ -74,9 +74,11 @@ default:
     # Session delegation cap for a PARENT of this family: how many
     # delegate_agent children a session runs at once (1..20).
     # Routed to delegation.family_session_max_concurrent, not llm; an expert or
-    # session delegation.session_max_concurrent beats it. Unset everywhere, so
-    # every family uses the code default 6 until the live measurements set
-    # per-family values (parallel_subagents.md §6.4, §13 D2, WP5/WP6).
+    # session delegation.session_max_concurrent beats it. Values are set per
+    # family below (the Claude and MiniMax families: 10); a family without the
+    # key uses the code default 6. Families do not inherit from each other, so
+    # every family that raises it names it (parallel_subagents.md §6.4, §13 D2,
+    # WP5/WP6).
     # session_max_concurrent: 6
 
 minimax:
@@ -100,6 +102,8 @@ minimax:
     parallel_tool_calls: true
     model_max_context_tokens: 204800  # M2.7: 204,800 context, 131K max output
     max_output_tokens: 49152  # reasoning headroom (resolver clamps to ctx backstop)
+    # Measured to 20 on k3d 2026-09-29 without 429s, with trivial children.
+    session_max_concurrent: 10
     # MiniMax's OpenAI-compatible API defaults to thinking inside `content`
     # wrapped in <think> tags (+ a stray extra `</think>` on tool-call turns).
     # reasoning_split moves it to reasoning_content/reasoning_details — fields
@@ -155,6 +159,7 @@ minimax-m3:
     model_max_context_tokens: 1000000  # M3: up to 1M context (>=512K guaranteed) via MSA
     max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
     image_tokens: { mode: flat, flat: 1600 }  # no public per-image formula — calibrate via usage
+    session_max_concurrent: 10
     # Same as the `minimax` family: without reasoning_split MiniMax's direct
     # API returns thinking as <think> tags inside `content` (leaky titles,
     # duplicated streaming text, stray double closer on tool-call turns).
@@ -578,6 +583,9 @@ claude-opus:
     temperature: 1.0  # Anthropic: just use temperature, leave top_p/top_k at defaults
     multimodal: true  # Claude Opus 4.6 supports vision
     parallel_tool_calls: true
+    # Trained around 20 concurrent subagents (Claude Code); raised from 6 after
+    # the 2026-09-29 k3d gate; real-load provider limits not yet measured.
+    session_max_concurrent: 10
     model_max_context_tokens: 1000000  # Opus 4.6: 1M context, 128K max output
     max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
     # 28px patches, Opus 4.7+/Fable5 high-res cap (2576px edge / 4784 tok max).
@@ -606,6 +614,7 @@ claude-opus-5:
     temperature: 1.0  # Anthropic: just use temperature, leave top_p/top_k at defaults
     multimodal: true
     parallel_tool_calls: true
+    session_max_concurrent: 10
     model_max_context_tokens: 1000000  # Opus 5: 1M context, 128K max output
     max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
     # 28px patches, Opus 4.7+/Fable5 high-res cap (2576px edge / 4784 tok max).
@@ -634,6 +643,7 @@ claude-opus-5-5:
     temperature: 1.0  # Anthropic: just use temperature, leave top_p/top_k at defaults
     multimodal: true
     parallel_tool_calls: true
+    session_max_concurrent: 10
     model_max_context_tokens: 1000000  # Opus 5.5: 1M context, 128K max output
     max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
     # 28px patches, Opus 4.7+/Fable5 high-res cap (2576px edge / 4784 tok max).
@@ -651,6 +661,7 @@ claude-sonnet:
     temperature: 1.0
     multimodal: true
     parallel_tool_calls: true
+    session_max_concurrent: 10
     model_max_context_tokens: 1000000  # Sonnet 4.x: up to 1M context
     max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
     image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 1568, max_tokens: 1568, flat: 1568 }
@@ -688,6 +699,7 @@ claude-sonnet-5:
     temperature: 1.0  # the API default; anything else is a 400
     multimodal: true
     parallel_tool_calls: true
+    session_max_concurrent: 10
     model_max_context_tokens: 1000000  # Sonnet 5/5.5: 1M context, 128K max output
     max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
     # 28px patches, Opus 4.7+/Fable5 high-res cap (2576px edge / 4784 tok max).
@@ -701,6 +713,7 @@ claude-haiku:
     temperature: 1.0
     multimodal: true
     parallel_tool_calls: true
+    session_max_concurrent: 10
     model_max_context_tokens: 200000  # Haiku 4.5: 200K context
     image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 1568, max_tokens: 1568, flat: 1568 }
     pdf_render_dpi: 130  # legacy 1568px cap — see claude-sonnet note
@@ -730,6 +743,7 @@ claude-fable:
     temperature: 1.0
     multimodal: true
     parallel_tool_calls: true
+    session_max_concurrent: 10
     model_max_context_tokens: 1000000  # Fable 5/5.1: 1M context, 128K max output
     max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
     # 28px patches, Opus 4.7+/Fable5 high-res cap (2576px edge / 4784 tok max).

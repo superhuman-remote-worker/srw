@@ -272,8 +272,9 @@ orchestrator:
   # explicit so a future default change cannot silently double the footprint.
   replicas: 1
   # Session subagent fan-out (several delegate_agent calls per response):
-  # "" (off, the chart default), "stateless" or "stateless,pinned".
-  # sessionSubagentFanoutLanes: "stateless"
+  # "" (off), "stateless" (the chart default) or "stateless,pinned".
+  # Uncomment to turn it off for this cluster:
+  # sessionSubagentFanoutLanes: ""
   resources:
     requests:
       memory: "256Mi"

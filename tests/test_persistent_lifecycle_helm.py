@@ -33,11 +33,14 @@ def test_automatic_persistent_reconciliation_defaults_false() -> None:
 def test_session_subagent_fanout_lanes_reach_the_orchestrator_and_roll_it() -> None:
     """parallel_subagents.md §12: the lane switch is the rollback lever. It
     reaches the orchestrator from the ConfigMap, and a change replaces the
-    orchestrator even without Reloader, because it is read once at startup."""
+    orchestrator even without Reloader, because it is read once at startup.
+
+    WP6: the chart enables the stateless lane by default; an empty value is
+    the rollback. Pinned stays off until R3.3c (D5)."""
     if shutil.which("helm") is None:
         pytest.skip("helm is not installed")
     values = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
-    assert values["orchestrator"]["sessionSubagentFanoutLanes"] == ""
+    assert values["orchestrator"]["sessionSubagentFanoutLanes"] == "stateless"
 
     def _render(*extra: str):
         output = subprocess.run(
@@ -82,17 +85,18 @@ def test_session_subagent_fanout_lanes_reach_the_orchestrator_and_roll_it() -> N
             deployment["spec"]["template"]["metadata"]["annotations"],
         )
 
-    off, ref, off_annotations = _render()
-    assert off == ""
-    assert ref["key"] == "SESSION_SUBAGENT_FANOUT_LANES"
-    on, _, on_annotations = _render(
-        "--set", "orchestrator.sessionSubagentFanoutLanes=stateless"
-    )
+    on, ref, on_annotations = _render()
     assert on == "stateless"
+    assert ref["key"] == "SESSION_SUBAGENT_FANOUT_LANES"
+    # The rollback: an operator override of "" turns every lane off.
+    off, _, off_annotations = _render(
+        "--set-string", "orchestrator.sessionSubagentFanoutLanes="
+    )
+    assert off == ""
     checksum_key = "checksum/session-subagent-fanout-lanes"
     assert off_annotations[checksum_key] != on_annotations[checksum_key]
     _, _, without_reloader = _render("--set", "reloader.enabled=false")
-    assert without_reloader[checksum_key] == off_annotations[checksum_key]
+    assert without_reloader[checksum_key] == on_annotations[checksum_key]
 
     # D5: pinned opens only together with stateless.
     refused = subprocess.run(

@@ -445,7 +445,8 @@ def test_resolve_config_resolves_a_stored_critic_fragment_canonically():
     agent = blob["agent"]
     assert agent["tools"]["delegation"] == ["delegate_agent"]
     # The frozen blob is the typed config: the authored keys, plus the session
-    # cap keys at their defaults (no model family sets a cap yet).
+    # cap keys at their defaults (the critic's model is in no family that sets
+    # a cap).
     assert agent["delegation"] == {
         **merged["delegation"],
         "session_max_concurrent": None,

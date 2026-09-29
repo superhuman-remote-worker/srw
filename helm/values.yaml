@@ -280,12 +280,14 @@ orchestrator:
   officerAutoPullReleaseEnabled: false
   # -- Session lanes whose parents may run several delegate_agent calls from
   # one response (subagent fan-out): "" (off), "stateless" or
-  # "stateless,pinned". Advertised per claim/attach, never frozen into a
-  # session: clearing it gives every stateless session single-call delegation
-  # again at its next claim (a pinned session at its next attach), while a
-  # batch already in flight is still settled by recovery. Needs agent images
-  # that understand the batch settle; enable pinned only after R3.3c.
-  sessionSubagentFanoutLanes: ""
+  # "stateless,pinned". Enabled by default for stateless sessions. Advertised
+  # per claim/attach, never frozen into a session: set "" to roll back, and
+  # every stateless session returns to single-call delegation at its next
+  # claim (a pinned session at its next attach), while a batch already in
+  # flight is still settled by recovery. Pinned stays off until R3.3c. The
+  # orchestrator's own code default (SESSION_SUBAGENT_FANOUT_LANES unset) is
+  # off, so a run outside this chart stays opt-in.
+  sessionSubagentFanoutLanes: "stateless"
   # -- Additional exact Git host or host:port endpoints trusted for external
   # OKF KB datasources. The built-in public-provider set remains enabled.
   # Wildcards, IP literals, and localhost are rejected. Example:
