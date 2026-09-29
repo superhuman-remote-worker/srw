@@ -215,7 +215,7 @@ async def test_cloud_only_handler_resumes_files_and_checkpoints_before_ack(
     attach = AsyncMock(
         side_effect=AssertionError("background work cannot attach a session")
     )
-    monkeypatch.setattr(pa, "_attach_session", attach)
+    monkeypatch.setattr(pa._session_attach, "attach", attach)
     abandon = AsyncMock()
     monkeypatch.setattr(cloud_push_task, "abandon_bg_push", abandon)
     await cloud_push_task.run_adopted_cloud_push(

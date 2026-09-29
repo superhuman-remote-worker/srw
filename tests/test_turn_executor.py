@@ -22,6 +22,7 @@ from uuid import uuid4
 
 import pytest
 
+from agent.api import session_attach
 import agent.api.persistent_app as pa
 import agent.api.turn_executor as te
 from agent.api.lease_context import (
@@ -605,7 +606,7 @@ class Harness:
             harness.calls["interrupt_stale"].append({"lease_token": lease_token})
             return harness.stale_result
 
-        monkeypatch.setattr(pa, "_attach_session", fake_attach)
+        monkeypatch.setattr(pa._session_attach, "attach", fake_attach)
         monkeypatch.setattr(pa, "_terminate_session", fake_terminate)
         monkeypatch.setattr(pa, "_ensure_persistent_loop_started", fake_ensure)
         monkeypatch.setattr(
@@ -1240,7 +1241,7 @@ class TestHappyPath:
         # The real attach accepts both keywords (it has no ``**kwargs``).
         import inspect
 
-        parameters = inspect.signature(pa._attach_session).parameters
+        parameters = inspect.signature(pa._session_attach.attach).parameters
         assert key in parameters and switch in parameters
 
     @pytest.mark.asyncio
@@ -1287,13 +1288,13 @@ class TestHappyPath:
         self, harness, monkeypatch
     ):
         order: List[str] = []
-        real_apply = pa._apply_session_subagent_advertisement
+        real_apply = pa._session_attach.apply_subagent_advertisement
 
         def apply(*args):
             order.append("advertisement")
             return real_apply(*args)
 
-        monkeypatch.setattr(pa, "_apply_session_subagent_advertisement", apply)
+        monkeypatch.setattr(pa._session_attach, "apply_subagent_advertisement", apply)
         real_reconcile = pa._reconcile_stale_thread_interrupts
 
         async def reconcile(**kwargs):
@@ -3031,7 +3032,7 @@ class TestScrubOnClaim:
         from shared.runtime.services import embedding_service as emb
 
         # Tenant A attach: env keys land, singleton would be rebuilt lazily.
-        pa._apply_session_embedding_env(
+        session_attach.apply_session_embedding_env(
             {
                 "EMBEDDING_PROVIDER": "openai",
                 "EMBEDDING_MODEL": "tenant-a-model",
@@ -3051,8 +3052,8 @@ class TestScrubOnClaim:
 
         # Tenant B attach with env_keys ABSENT: no A values anywhere,
         # singleton None.
-        pa._apply_session_embedding_env(None)
-        for key in pa.MEMORY_EMBEDDING_ENV_KEYS:
+        session_attach.apply_session_embedding_env(None)
+        for key in session_attach.MEMORY_EMBEDDING_ENV_KEYS:
             assert key not in os.environ, key
         for key in emb.KB_EMBEDDING_ENV_KEYS:
             assert key not in os.environ, key
@@ -3064,15 +3065,15 @@ class TestScrubOnClaim:
     def test_partial_override_replaces_not_merges(self, monkeypatch):
         from shared.runtime.services import embedding_service as emb
 
-        pa._apply_session_embedding_env(
+        session_attach.apply_session_embedding_env(
             {"EMBEDDING_MODEL": "a-model", "EMBEDDING_API_KEY": "sk-a"}
         )
         # Tenant B supplies only a model: A's key must NOT survive.
-        pa._apply_session_embedding_env({"EMBEDDING_MODEL": "b-model"})
+        session_attach.apply_session_embedding_env({"EMBEDDING_MODEL": "b-model"})
         assert os.environ.get("EMBEDDING_MODEL") == "b-model"
         assert "EMBEDDING_API_KEY" not in os.environ
         assert emb._embedding_service is None
-        pa._apply_session_embedding_env(None)  # cleanup
+        session_attach.apply_session_embedding_env(None)  # cleanup
 
     def test_executor_scrub_clears_dual_inboxes(self, harness):
         import agent.api.dual_app as dual_app

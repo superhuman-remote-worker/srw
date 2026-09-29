@@ -402,7 +402,8 @@ def test_every_override_seam_calls_the_strip():
     (The functional tests above prove the helper; this pins where it runs.)"""
     expected = {
         "src/agent/agent.py": 1,
-        "src/agent/api/persistent_app.py": 3,
+        "src/agent/api/persistent_app.py": 2,
+        "src/agent/api/session_attach.py": 1,
         "src/shared/runtime/core/expert_resolution.py": 1,
         "src/shared/runtime/core/subagent_roster.py": 1,
         "src/orchestrator/services/config_resolver.py": 2,

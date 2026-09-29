@@ -270,13 +270,13 @@ async def test_persistent_attach_wrong_process_refuses_before_pool_claim(monkeyp
     monkeypatch.setenv("POD_UID", "pod-a")
     monkeypatch.setattr(mod, "_orchestrator_client", client)
     monkeypatch.setattr(mod, "_session", None)
-    monkeypatch.setattr(mod, "_pool_attach_claim", None)
-    monkeypatch.setattr(mod, "_pool_attach_runtime_generation", None)
-    monkeypatch.setattr(mod, "_pool_attach_token", None)
-    monkeypatch.setattr(mod, "_pool_attach_task", None)
+    monkeypatch.setattr(mod._session_attach, "_pool_claim", None)
+    monkeypatch.setattr(mod._session_attach, "_pool_claim_generation", None)
+    monkeypatch.setattr(mod._session_attach, "_pool_claim_token", None)
+    monkeypatch.setattr(mod._session_attach, "_pool_task", None)
     monkeypatch.setattr(mod._session_identity, "adopt", adopt)
 
-    response = await mod._admit_pool_session_attach(
+    response = await mod._pool_session_attach_response(
         {
             "thread_id": THREAD_ID,
             "pinned_runtime_generation_contract": 1,
@@ -288,8 +288,8 @@ async def test_persistent_attach_wrong_process_refuses_before_pool_claim(monkeyp
 
     assert response.status_code == 503
     assert json.loads(response.body)["error"] == "recipient_authority_mismatch"
-    assert mod._pool_attach_claim is None
-    assert mod._pool_attach_task is None
+    assert mod._session_attach._pool_claim is None
+    assert mod._session_attach._pool_task is None
     adopt.assert_not_called()
 
 

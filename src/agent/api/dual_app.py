@@ -279,13 +279,13 @@ async def _release_unstarted_session_attach(claim: dict[str, Any]) -> bool:
         "workspace_runtime_incarnation": claim.get("workspace_runtime_incarnation"),
     }
     pa._orchestrator_client = _orchestrator_client
-    if not pa._retain_failed_attach_release_receipt(receipt):
+    if not pa._session_attach.retain_release_receipt(receipt):
         logger.error(
             "Pre-setup attach abort for thread %s conflicts with a retained proof",
             claim["thread_id"],
         )
         return False
-    confirmed = await pa._release_failed_attach_receipt_until_confirmed(
+    confirmed = await pa._session_attach.release_receipt_until_confirmed(
         claim["thread_id"],
         runtime_generation=claim["session_runtime_generation"],
         runtime_attach_token=claim["session_runtime_attach_token"],
@@ -590,7 +590,7 @@ async def _handle_heartbeat_intents(response: Dict[str, Any]) -> None:
         os._exit(0)
     elif _pod_state == PodState.SESSION:
         # Dual pods host adopted sessions on persistent_app's module state
-        # (/session/attach seeds pa.* and calls pa._attach_session), so the
+        # (/session/attach seeds pa.* and calls pa._session_attach.attach), so the
         # drain semantics are delegated, not re-implemented.
         import agent.api.persistent_app as pa
 
@@ -1916,7 +1916,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 pa._config_path = _config_path
                 pa._started_at = _started_at
 
-                await pa._attach_session(
+                await pa._session_attach.attach(
                     thread_id=thread_id,
                     config_override=request.get("config_override"),
                     resolved_config=request.get("resolved_config"),
@@ -1962,7 +1962,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 if _orchestrator_client:
                     try:
                         release_confirmed = (
-                            await pa._release_failed_attach_receipt_until_confirmed(
+                            await pa._session_attach.release_receipt_until_confirmed(
                                 thread_id,
                                 runtime_generation=runtime_generation,
                                 runtime_attach_token=runtime_attach_token,

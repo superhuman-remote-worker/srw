@@ -138,3 +138,7 @@ class SessionOperations:
     accept_input: Callable[..., Awaitable[AcceptedInput]]
     signal_interrupt: Callable[[int], Optional[str]]
     resolve_permission: Callable[..., Awaitable[Optional[dict[str, Any]]]]
+
+
+class EventJournalUnavailable(RuntimeError):
+    """The persistent event generation could not be resolved authoritatively."""

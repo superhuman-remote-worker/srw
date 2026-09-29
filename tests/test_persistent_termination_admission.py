@@ -13,6 +13,7 @@ from fastapi import WebSocketDisconnect
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from orchestrator.services import session_lifecycle, session_wake, sitrep
+from agent.api import session_contract
 from agent.api import (
     persistent_app,
     persistent_termination,
@@ -703,7 +704,7 @@ async def test_protected_mount_loss_rejects_before_persist_and_recovers(
     persistent_app._session.protected_cloud_required = True
     persistent_app._session.protected_cloud_ready = lambda: state["ready"]
 
-    with pytest.raises(persistent_app.ProtectedCloudUnavailable):
+    with pytest.raises(session_contract.ProtectedCloudUnavailable):
         await persistent_app._session_input.accept("do not persist yet")
     assert db.rows == []
     assert queue.empty()
@@ -754,7 +755,7 @@ async def test_partial_protected_mount_join_blocks_ready_input_provider_and_tool
 
     assert persistent_app._session_ready() is False
     assert persistent_app._loop_provider_admission_open() is False
-    with pytest.raises(persistent_app.ProtectedCloudUnavailable):
+    with pytest.raises(session_contract.ProtectedCloudUnavailable):
         await persistent_app._session_input.accept("must not cross a partial mount")
     assert db.rows == []
     with pytest.raises(WorkspaceUnavailableError, match="protected cloud"):

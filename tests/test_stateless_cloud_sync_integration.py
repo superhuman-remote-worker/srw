@@ -8,6 +8,8 @@ push.
 
 from __future__ import annotations
 
+from agent.api import session_attach
+from agent.api import session_workspace
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 import asyncio
 from types import SimpleNamespace
@@ -473,7 +475,7 @@ async def test_workspace_poll_preserves_generation(
         get_thread_workspace=AsyncMock(return_value=workspace_response)
     )
 
-    result = await papp._poll_workspace_ready(client, THREAD_ID, timeout=1)
+    result = await session_workspace.poll_workspace_ready(client, THREAD_ID, timeout=1)
 
     assert result is not None
     assert result["backend"] == expected_backend
@@ -1363,7 +1365,7 @@ async def test_none_agent_cloud_suppression_is_stateless_only(
         patch.object(papp, "_agent", agent),
         patch.object(papp, "_orchestrator_client", client),
         patch.object(papp, "PersistentSession", FakeSession),
-        patch.object(papp, "_session_backend_is_lite", return_value=True),
+        patch.object(session_attach, "session_backend_is_lite", return_value=True),
         patch.object(
             papp, "_build_sync_coordinator", return_value=workspace_sync
         ) as build_sync,
@@ -1380,13 +1382,13 @@ async def test_none_agent_cloud_suppression_is_stateless_only(
         patch.object(papp, "_update_thread_status", AsyncMock()),
         patch.object(papp, "_start_watchdogs"),
         patch.object(papp, "_officer_cfg", return_value=None),
-        patch.object(papp, "_apply_session_embedding_env"),
+        patch.object(session_attach, "apply_session_embedding_env"),
     ):
         lease_reset = None
         try:
             if stateless:
                 _, lease_reset = _install_lease()
-            await papp._attach_session(THREAD_ID, config_override={})
+            await papp._session_attach.attach(THREAD_ID, config_override={})
         finally:
             if lease_reset is not None:
                 current_lease.reset(lease_reset)
@@ -1472,15 +1474,17 @@ async def test_late_workspace_fetch_retains_generation_without_coordinator():
         patch.object(papp, "_agent", agent),
         patch.object(papp, "_orchestrator_client", client),
         patch.object(papp, "PersistentSession", FakeSession),
-        patch.object(papp, "_poll_workspace_ready", AsyncMock(return_value=readiness)),
+        patch.object(
+            session_workspace, "poll_workspace_ready", AsyncMock(return_value=readiness)
+        ),
         patch.object(papp, "_build_sync_coordinator") as build_sync,
         patch.object(papp, "_restore_session_messages", AsyncMock()),
         patch.object(papp, "_update_thread_status", AsyncMock()),
         patch.object(papp, "_start_watchdogs"),
         patch.object(papp, "_officer_cfg", return_value=None),
-        patch.object(papp, "_apply_session_embedding_env"),
+        patch.object(session_attach, "apply_session_embedding_env"),
     ):
-        await papp._attach_session(THREAD_ID, config_override={})
+        await papp._session_attach.attach(THREAD_ID, config_override={})
 
     assert client.get_thread_workspace.await_count == 2
     assert len(instances) == 1

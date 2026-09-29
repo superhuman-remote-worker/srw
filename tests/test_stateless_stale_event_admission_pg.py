@@ -155,7 +155,7 @@ class _Executor:
         monkeypatch.setattr(
             te, "close_interrupt_admission", run_queue.close_interrupt_admission
         )
-        monkeypatch.setattr(pa, "_attach_session", self._attach)
+        monkeypatch.setattr(pa._session_attach, "attach", self._attach)
         monkeypatch.setattr(harness, "_fake_loop", self._loop)
         harness.executor = te.StatelessTurnExecutor(
             pod_name=pod,

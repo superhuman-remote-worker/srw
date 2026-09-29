@@ -35,6 +35,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import shared.runtime.core.loader as loader
+from agent.api import session_attach
 from agent.subagents.limiter import LiveConcurrencyLimit
 from agent.tools.delegation.delegate_agent import (
     INTERRUPTED_MARKER,
@@ -738,7 +739,7 @@ def test_every_attach_entry_point_accepts_the_advertisement():
     (``turn_executor.claim_bundle_attach``)."""
     import agent.api.persistent_app as pa
 
-    for fn in (pa._attach_session, pa._attach_session_inner):
+    for fn in (pa._session_attach.attach, pa._session_attach._attach_inner):
         parameters = inspect.signature(fn).parameters
         for key in (
             SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
@@ -793,12 +794,12 @@ async def test_attach_accepts_only_the_exact_int_1(advertised, expected):
         patch.object(papp, "_agent", agent),
         patch.object(papp, "_orchestrator_client", client),
         patch.object(papp, "PersistentSession", FakeSession),
-        patch.object(papp, "_session_backend_is_lite", return_value=True),
+        patch.object(session_attach, "session_backend_is_lite", return_value=True),
         patch.object(papp, "_officer_cfg", return_value=None),
-        patch.object(papp, "_apply_session_embedding_env"),
+        patch.object(session_attach, "apply_session_embedding_env"),
     ):
         with pytest.raises(_StopAttach):
-            await papp._attach_session_inner(
+            await papp._session_attach._attach_inner(
                 "11111111-1111-4111-8111-111111111111",
                 config_override={},
                 session_subagent_batch_settle_contract=advertised,
@@ -836,12 +837,12 @@ async def _attach_until_construction(workspace, **keywords) -> dict:
         patch.object(papp, "_agent", agent),
         patch.object(papp, "_orchestrator_client", client),
         patch.object(papp, "PersistentSession", FakeSession),
-        patch.object(papp, "_session_backend_is_lite", return_value=True),
+        patch.object(session_attach, "session_backend_is_lite", return_value=True),
         patch.object(papp, "_officer_cfg", return_value=None),
-        patch.object(papp, "_apply_session_embedding_env"),
+        patch.object(session_attach, "apply_session_embedding_env"),
     ):
         with pytest.raises(_StopAttach):
-            await papp._attach_session_inner(
+            await papp._session_attach._attach_inner(
                 "11111111-1111-4111-8111-111111111111",
                 config_override={},
                 **keywords,
@@ -939,9 +940,7 @@ async def test_a_stateless_attach_takes_the_advertisement_from_its_claim_only(
 
 
 def test_the_advertisement_resolution_reads_the_newest_ready_response():
-    import agent.api.persistent_app as papp
-
-    resolve = papp._session_subagent_advertisement
+    resolve = session_attach.session_subagent_advertisement
     ready = {
         SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: 1,
         SESSION_SUBAGENT_FANOUT_KEY: True,
@@ -972,15 +971,17 @@ async def test_the_pool_attach_handler_forwards_the_switch(monkeypatch):
 
     monkeypatch.delenv("POD_UID", raising=False)
     monkeypatch.setattr(papp, "_session", None)
-    monkeypatch.setattr(papp, "_pool_attach_claim", None)
-    monkeypatch.setattr(papp, "_pool_attach_task", None)
-    monkeypatch.setattr(papp, "_pool_attach_runtime_generation", None)
-    monkeypatch.setattr(papp, "_pool_attach_token", None)
+    monkeypatch.setattr(papp._session_attach, "_pool_claim", None)
+    monkeypatch.setattr(papp._session_attach, "_pool_task", None)
+    monkeypatch.setattr(papp._session_attach, "_pool_claim_generation", None)
+    monkeypatch.setattr(papp._session_attach, "_pool_claim_token", None)
     monkeypatch.setattr(papp, "_pending_drain_suspend", None)
-    monkeypatch.setattr(papp, "_run_pool_attach_transaction", transaction)
+    monkeypatch.setattr(
+        papp._session_attach, "_run_pool_attach_transaction", transaction
+    )
     monkeypatch.setattr(papp._session_identity, "adopt", MagicMock())
 
-    response = await papp._admit_pool_session_attach(
+    response = await papp._pool_session_attach_response(
         {
             "thread_id": "11111111-1111-4111-8111-111111111111",
             SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: 1,
@@ -988,7 +989,7 @@ async def test_the_pool_attach_handler_forwards_the_switch(monkeypatch):
         }
     )
     assert response.status_code == 200
-    await papp._pool_attach_task
+    await papp._session_attach._pool_task
     assert captured["session_subagent_batch_settle_contract"] == 1
     assert captured["session_subagent_fanout"] is True
     assert 'session_subagent_fanout=request.get("session_subagent_fanout")' in (

@@ -510,7 +510,9 @@ def test_attach_shares_one_rotatable_actor_with_the_maintenance_client(monkeypat
     client, _http = _client(_actor(expires_in=timedelta(hours=5)))
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
 
-    attached = persistent_app._runtime_actor_context_for_attach(actor.to_payload())
+    attached = persistent_app._session_attach.runtime_actor_for_attach(
+        actor.to_payload()
+    )
 
     assert attached is client.runtime_actor
     assert attached is not actor
@@ -528,7 +530,7 @@ def test_attach_shares_one_rotatable_actor_with_the_maintenance_client(monkeypat
     )
     assert attached.refresh_credential == "srr_" + "F" * 43
 
-    persistent_app._clear_attached_runtime_actor()
+    persistent_app._session_attach.clear_runtime_actor()
     assert client.runtime_actor is None
 
 

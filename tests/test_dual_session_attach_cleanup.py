@@ -82,7 +82,7 @@ def _restore_globals(monkeypatch):
         "agent": dual_app._agent,
         "client": dual_app._orchestrator_client,
         "thread": persistent_app._session_identity.thread_id,
-        "receipt": persistent_app._failed_attach_release_receipt,
+        "receipt": persistent_app._session_attach._release_receipt,
         "pa_client": persistent_app._orchestrator_client,
     }
     monkeypatch.setenv("POD_UID", POD_UID)
@@ -92,7 +92,7 @@ def _restore_globals(monkeypatch):
     dual_app._agent = MagicMock()
     dual_app._orchestrator_client = None
     persistent_app._session_identity._thread_id = None
-    persistent_app._failed_attach_release_receipt = None
+    persistent_app._session_attach._release_receipt = None
     yield
     task = dual_app._session_attach_task
     if task is not None and not isinstance(task, MagicMock) and not task.done():
@@ -103,7 +103,7 @@ def _restore_globals(monkeypatch):
     dual_app._agent = saved["agent"]
     dual_app._orchestrator_client = saved["client"]
     persistent_app._session_identity._thread_id = saved["thread"]
-    persistent_app._failed_attach_release_receipt = saved["receipt"]
+    persistent_app._session_attach._release_receipt = saved["receipt"]
     persistent_app._orchestrator_client = saved["pa_client"]
 
 
@@ -166,7 +166,7 @@ async def _attach_failure(error: BaseException, *, workspace: bool = False) -> N
     # The one-way proof boundary must already have flipped before production
     # can enter even the first line of PersistentSession attach.
     assert dual_app._session_attach_claim["setup_started"] is True
-    assert persistent_app._retain_failed_attach_release_receipt(
+    assert persistent_app._session_attach.retain_release_receipt(
         _receipt(workspace=workspace)
     )
     raise error
@@ -184,7 +184,7 @@ async def test_actor_refusal_uses_only_monotonic_pre_setup_proof():
     client = _client(bound=False, release=True)
     dual_app._orchestrator_client = client
 
-    with patch.object(persistent_app, "_attach_session", AsyncMock()) as setup:
+    with patch.object(persistent_app._session_attach, "attach", AsyncMock()) as setup:
         response = await _attach_endpoint()(_request(workspace=True))
         assert response.status_code == 409
         task = dual_app._session_attach_task
@@ -211,7 +211,7 @@ async def test_setup_forwards_canonical_workspace_identity_to_shared_attach():
     client = _client()
     dual_app._orchestrator_client = client
 
-    with patch.object(persistent_app, "_attach_session", AsyncMock()) as setup:
+    with patch.object(persistent_app._session_attach, "attach", AsyncMock()) as setup:
         response = await _attach_endpoint()(_request(workspace=True))
         assert response.status_code == 200
         await dual_app._session_attach_task
@@ -249,8 +249,8 @@ async def test_setup_started_failure_cannot_emit_pre_setup_protocol():
     dual_app._orchestrator_client = client
 
     with patch.object(
-        persistent_app,
-        "_attach_session",
+        persistent_app._session_attach,
+        "attach",
         side_effect=_failing_attach(
             RuntimeError("failed before manager construction"), workspace=True
         ),
@@ -274,7 +274,7 @@ async def test_task_creation_failure_releases_and_scrubs_bound_actor(monkeypatch
         raise RuntimeError("event loop refused task")
 
     monkeypatch.setattr(dual_app.asyncio, "create_task", fail_task_creation)
-    with patch.object(persistent_app, "_attach_session", AsyncMock()) as setup:
+    with patch.object(persistent_app._session_attach, "attach", AsyncMock()) as setup:
         response = await _attach_endpoint()(_request(workspace=True))
 
     assert response.status_code == 500
@@ -300,8 +300,8 @@ async def test_unconfirmed_partial_setup_release_stays_session_and_nonready():
     dual_app._orchestrator_client = client
     with (
         patch.object(
-            persistent_app,
-            "_attach_session",
+            persistent_app._session_attach,
+            "attach",
             side_effect=_failing_attach(RuntimeError("overlay refused")),
         ),
         patch.object(
@@ -319,7 +319,7 @@ async def test_unconfirmed_partial_setup_release_stays_session_and_nonready():
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    assert persistent_app._failed_attach_release_receipt == _receipt()
+    assert persistent_app._session_attach._release_receipt == _receipt()
     assert dual_app._pod_state is dual_app.PodState.SESSION
 
 
@@ -328,8 +328,8 @@ async def test_cancelled_setup_uses_process_zero_before_propagating():
     client = _client(release=True)
     dual_app._orchestrator_client = client
     with patch.object(
-        persistent_app,
-        "_attach_session",
+        persistent_app._session_attach,
+        "attach",
         side_effect=_failing_attach(asyncio.CancelledError()),
     ):
         response = await _attach_endpoint()(_request())

@@ -323,7 +323,7 @@ class TestApplyDatasourceEnrichmentToResolved:
     (dedicated-pod parity with warm-pool, live_session_settings.md P0.2)."""
 
     def test_folds_categories_and_cli_types_into_agent_dict(self):
-        from agent.api.persistent_app import _apply_datasource_enrichment_to_resolved
+        from agent.api.session_attach import apply_datasource_enrichment_to_resolved
 
         resolved = {
             "agent": {
@@ -333,7 +333,7 @@ class TestApplyDatasourceEnrichmentToResolved:
             "prompts": {},
         }
         cats = {"sql": ["sql_query", "sql_schema"], "graph": []}
-        _apply_datasource_enrichment_to_resolved(resolved, cats, ["postgresql"])
+        apply_datasource_enrichment_to_resolved(resolved, cats, ["postgresql"])
 
         agent = resolved["agent"]
         # Categories merged; unrelated categories preserved; stale replaced.
@@ -352,7 +352,7 @@ class TestApplyDatasourceEnrichmentToResolved:
         _apply_datasource_enrichment_to_resolved must surface as
         config.extra['_cli_datasources'] and config.tools.sql after
         load_config_from_resolved."""
-        from agent.api.persistent_app import _apply_datasource_enrichment_to_resolved
+        from agent.api.session_attach import apply_datasource_enrichment_to_resolved
         from shared.runtime.core.loader import load_config_from_resolved
 
         resolved = {
@@ -360,7 +360,7 @@ class TestApplyDatasourceEnrichmentToResolved:
             "prompts": {},
             "instructions": {},
         }
-        _apply_datasource_enrichment_to_resolved(
+        apply_datasource_enrichment_to_resolved(
             resolved, {"sql": ["sql_query", "sql_schema"]}, ["postgresql"]
         )
         config = load_config_from_resolved(resolved)
@@ -368,21 +368,21 @@ class TestApplyDatasourceEnrichmentToResolved:
         assert config.tools.sql == ["sql_query", "sql_schema"]
 
     def test_noop_on_missing_or_malformed_blob(self):
-        from agent.api.persistent_app import _apply_datasource_enrichment_to_resolved
+        from agent.api.session_attach import apply_datasource_enrichment_to_resolved
 
         # None blob: nothing to do, must not raise.
-        _apply_datasource_enrichment_to_resolved(None, {"sql": []}, ["postgresql"])
+        apply_datasource_enrichment_to_resolved(None, {"sql": []}, ["postgresql"])
 
         # Malformed agent key: left untouched.
         resolved = {"agent": "not-a-dict"}
-        _apply_datasource_enrichment_to_resolved(resolved, {"sql": []}, ["x"])
+        apply_datasource_enrichment_to_resolved(resolved, {"sql": []}, ["x"])
         assert resolved == {"agent": "not-a-dict"}
 
     def test_no_cli_types_leaves_top_level_unset(self):
-        from agent.api.persistent_app import _apply_datasource_enrichment_to_resolved
+        from agent.api.session_attach import apply_datasource_enrichment_to_resolved
 
         resolved = {"agent": {"agent_id": "a", "tools": {}}}
-        _apply_datasource_enrichment_to_resolved(resolved, {"sql": []}, [])
+        apply_datasource_enrichment_to_resolved(resolved, {"sql": []}, [])
         assert "_cli_datasources" not in resolved["agent"]
 
 

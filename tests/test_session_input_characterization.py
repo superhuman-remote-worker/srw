@@ -23,6 +23,7 @@ from uuid import UUID, uuid4
 import pytest
 import pytest_asyncio
 
+from agent.api import session_workspace
 import agent.api.persistent_app as pa
 from agent.api.lease_context import LeaseHandle, current_lease
 from agent.api.session_contract import DurableInputUnavailable
@@ -720,14 +721,16 @@ async def _attach(monkeypatch, thread_id: str) -> _AttachSession:
         ),
     )
     monkeypatch.setattr(pa, "PersistentSession", _AttachSession)
-    monkeypatch.setattr(pa, "_poll_workspace_ready", AsyncMock(return_value=workspace))
+    monkeypatch.setattr(
+        session_workspace, "poll_workspace_ready", AsyncMock(return_value=workspace)
+    )
     monkeypatch.setattr(pa, "_restore_session_messages", AsyncMock())
     monkeypatch.setattr(pa, "_update_thread_status", AsyncMock(return_value=True))
     monkeypatch.setattr(pa, "_start_watchdogs", MagicMock())
     monkeypatch.setattr(pa, "_build_sync_coordinator", MagicMock())
     monkeypatch.setattr(pa, "_session", None)
     monkeypatch.setattr(pa._session_identity, "_thread_id", None)
-    await pa._attach_session(thread_id)
+    await pa._session_attach.attach(thread_id)
     return pa._session
 
 

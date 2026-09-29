@@ -4081,7 +4081,7 @@ class StatelessTurnExecutor:
                 return
             t0 = time.perf_counter()
             try:
-                await pa._attach_session(**attach)
+                await pa._session_attach.attach(**attach)
             except Exception as e:
                 logger.warning(
                     "attach failed for unit %s: %s", unit_id, e, exc_info=True
@@ -4129,7 +4129,7 @@ class StatelessTurnExecutor:
             # A warm session skipped attach, so the operator's switch reaches
             # it only here; a fresh attach already built with the same values,
             # which makes this a no-op for it. Before any input is injected.
-            pa._apply_session_subagent_advertisement(
+            pa._session_attach.apply_subagent_advertisement(
                 *claim_bundle_advertisement(attach)
             )
 
@@ -5972,14 +5972,15 @@ class StatelessTurnExecutor:
 
         * memory-embedding env keys + singleton, KB profile keys + singleton
           (also scrubbed pop-first inside _attach_session's
-          _apply_session_embedding_env — this claim-time pass covers claims
+          apply_session_embedding_env — this claim-time pass covers claims
           whose attach then fails before reaching that block);
         * the dual-mode guidance/reply inboxes (worker-plane; a stateless pod
           never runs jobs, but they are process-global dicts, so clear them).
         """
         try:
-            pa = _pa()
-            pa._apply_session_embedding_env(None)
+            from agent.api.session_attach import apply_session_embedding_env
+
+            apply_session_embedding_env(None)
         except Exception:
             logger.warning("embedding scrub failed (non-fatal)", exc_info=True)
         try:

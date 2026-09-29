@@ -31,7 +31,7 @@ from typing import (
     Set,
     Tuple,
 )
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, Request, WebSocket
@@ -40,8 +40,13 @@ from fastapi.responses import JSONResponse
 from agent.api import session_transport as _session_transport
 from agent.api._session_auth import SessionAuthBindings
 from agent.api.session_canvas_control import CanvasControlChannel
+from agent.api import session_workspace as _session_workspace
+from agent.api.session_attach import (
+    SessionAttachCoordinator,
+    SessionAttachPorts,
+)
 from agent.api.session_contract import (
-    ProtectedCloudUnavailable,
+    EventJournalUnavailable,
     SessionOperations,
     SessionRuntimeView,
     TerminationAdmissionClosed,
@@ -53,8 +58,6 @@ from agent.api.session_identity import (
     SessionIdentityRuntime,
     canonical_runtime_generation,
     environment_pod_uid,
-    pinned_runtime_generation_advertised,
-    pinned_status_identity_advertised,
 )
 from agent.api.session_input import (
     InputWaitPlan,
@@ -119,12 +122,6 @@ from shared.thread_presence import (
     mark_stateless_natural_pause,
 )
 from shared.session_retirement import update_stateless_claim_status
-from shared.session_subagent_batch import (
-    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT,
-    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
-    SESSION_SUBAGENT_FANOUT_KEY,
-)
-from shared.runtime_actor import RuntimeActorContext
 from agent.agent import UniversalAgent
 
 # Re-exported: tests/test_persistent_app.py and tests/test_session_wake_event_role.py
@@ -201,216 +198,6 @@ _session_identity = SessionIdentityRuntime(
         identity_replaced=lambda: _reset_retirement_admission_mirror(),
     )
 )
-
-# Pool-mode attach admission is deliberately split from the heavy attach
-# transaction.  The orchestrator holds its datasource-selection advisory lock
-# while POSTing /session/attach.  A synchronous attach polls the workspace
-# endpoint, which takes that same lock, so the two processes deadlock.  Claim
-# the empty process synchronously, return ``attaching``, then let the fully
-# exception-safe attach transaction run after the orchestrator has released
-# its lock.  The claim is process-local and set before the 200 response: a
-# second POST can never slip into the setup window.
-_pool_attach_lock = asyncio.Lock()
-_pool_attach_claim: Optional[str] = None
-_pool_attach_runtime_generation: Optional[str] = None
-_pool_attach_token: Optional[str] = None
-_pool_attach_task: Optional[asyncio.Task[None]] = None
-# Exact proof retained between exception-safe attach rollback and the
-# orchestrator's generation-rotating release CAS. Never infer it from a
-# swallowed cleanup error or from an absent session after globals were reset.
-_failed_attach_release_receipt: Optional[dict[str, Any]] = None
-# Mutable only while one exact delivered attach is constructing. It records
-# the one-way setup boundary plus the attested workspace coordinates needed to
-# prove a partial sandbox runtime writer-free even when PersistentSession was
-# not constructed yet. Never log this mapping: it contains transport paths.
-_failed_attach_workspace_cleanup_context: Optional[dict[str, Any]] = None
-
-
-def _retain_failed_attach_release_receipt(receipt: dict[str, Any]) -> bool:
-    """Install one immutable attach-abort proof without replacing a claimant.
-
-    Dual mode can prove that actor binding failed before its one-way setup latch
-    flipped; the normal attach rollback installs a stronger process-zero proof.
-    In both cases a delayed failure from G1 must never replace G2's retained
-    proof, so equality is benign/idempotent and every other incumbent wins.
-    """
-
-    global _failed_attach_release_receipt
-
-    if not isinstance(receipt, dict):
-        return False
-    incumbent = _failed_attach_release_receipt
-    if incumbent is not None:
-        return incumbent == receipt
-    _failed_attach_release_receipt = dict(receipt)
-    return True
-
-
-def _pool_heartbeat_status() -> str:
-    """Advertise a synchronous pool claim before ``_session`` exists."""
-
-    return (
-        "ready"
-        if _session is None
-        and _pool_attach_claim is None
-        and _pending_drain_suspend is None
-        and _failed_attach_release_receipt is None
-        else "session"
-    )
-
-
-def _subagent_batch_settle_advertised(value: Any) -> bool:
-    """Accept only the exact numeric v1 batch-settle capability (§12)."""
-
-    return bool(type(value) is int and value == SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT)
-
-
-def _subagent_fanout_advertised(value: Any) -> bool:
-    """The orchestrator's fan-out switch counts only as a literal ``true``."""
-
-    return value is True
-
-
-def _session_subagent_advertisement(
-    batch_settle_contract: Any,
-    fanout: Any,
-    workspace_responses: Tuple[Any, ...],
-    *,
-    from_workspace: bool,
-) -> Tuple[bool, bool]:
-    """The fan-out advertisement a session attach runs with (§12).
-
-    The pushed pinned ``/session/attach`` body and the stateless claim bundle
-    pass both values as keywords. A pinned pod that attaches itself receives
-    neither: it reads them from the newest ready workspace response it
-    fetched (``workspace_responses``, newest first), exactly like
-    ``pinned_status_identity_contract``. The initial VM wait payload carries
-    neither key; the ready payload that follows it does. A stateless attach
-    never falls back: its claim bundle is the only per-claim authority, and a
-    warm session is re-applied from the next bundle.
-    """
-
-    if from_workspace:
-        newest = next(
-            (
-                response
-                for response in workspace_responses
-                if isinstance(response, dict)
-            ),
-            None,
-        )
-        if newest is not None:
-            if batch_settle_contract is None:
-                batch_settle_contract = newest.get(
-                    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY
-                )
-            if fanout is None:
-                fanout = newest.get(SESSION_SUBAGENT_FANOUT_KEY)
-    return (
-        _subagent_batch_settle_advertised(batch_settle_contract),
-        _subagent_fanout_advertised(fanout),
-    )
-
-
-def _apply_session_subagent_advertisement(
-    batch_settle_contract: Any, fanout: Any
-) -> bool:
-    """Re-apply one claim's fan-out advertisement to the attached session.
-
-    The stateless executor calls this at every claim: a warm session skips
-    attach, and the orchestrator's operator switch must still reach it at
-    once (parallel_subagents.md §12). Returns True when a value changed.
-    """
-
-    session = _session
-    if session is None:
-        return False
-    return session.apply_subagent_fanout_advertisement(
-        batch_settle_contract=_subagent_batch_settle_advertised(batch_settle_contract),
-        fanout=_subagent_fanout_advertised(fanout),
-    )
-
-
-_ATTACH_WORKSPACE_IDENTITY_UNSET = object()
-
-
-def _canonical_attach_workspace_identity(
-    workspace_generation: Any,
-    workspace_runtime_incarnation: Any,
-) -> Optional[Tuple[Optional[str], Optional[str]]]:
-    """Canonicalize an explicitly delivered workspace-authority pair.
-
-    ``None`` as the return value means the caller omitted the contract (the
-    dedicated startup path). ``(None, None)`` means the claim bundle captured
-    no physical identity yet; shared attach may still poll a workspace whose
-    session-runtime generation is authoritative. Keeping those states distinct
-    prevents a compatibility default from weakening a delivered exact pair.
-    """
-
-    generation_omitted = workspace_generation is _ATTACH_WORKSPACE_IDENTITY_UNSET
-    incarnation_omitted = (
-        workspace_runtime_incarnation is _ATTACH_WORKSPACE_IDENTITY_UNSET
-    )
-    if generation_omitted or incarnation_omitted:
-        if generation_omitted and incarnation_omitted:
-            return None
-        raise WorkspaceNotReady(
-            "Attach workspace identity must be delivered as an exact pair"
-        )
-    if workspace_generation is None and workspace_runtime_incarnation is None:
-        return (None, None)
-
-    canonical_generation = canonical_runtime_generation(workspace_generation)
-    canonical_incarnation = canonical_runtime_generation(workspace_runtime_incarnation)
-    if canonical_generation is None or canonical_incarnation is None:
-        raise WorkspaceNotReady("Attach workspace identity is malformed or incomplete")
-    return canonical_generation, canonical_incarnation
-
-
-def _assert_attach_workspace_tier(
-    expected: Optional[Tuple[Optional[str], Optional[str]]],
-    *,
-    is_lite_session: bool,
-) -> None:
-    """Reject an exact physical claim for a resolved no-workspace tier."""
-
-    if expected is None or expected == (None, None):
-        return
-    if is_lite_session:
-        raise WorkspaceNotReady(
-            "Attach workspace identity does not match the resolved workspace tier"
-        )
-
-
-def _assert_attach_workspace_payload(
-    expected: Optional[Tuple[Optional[str], Optional[str]]],
-    payload: Any,
-) -> None:
-    """Fence an observed workspace response to the delivered claim identity."""
-
-    if expected is None or expected == (None, None):
-        return
-    raw_generation = (
-        payload.get("workspace_generation") if isinstance(payload, dict) else None
-    )
-    raw_incarnation = (
-        payload.get("workspace_runtime_incarnation")
-        if isinstance(payload, dict)
-        else None
-    )
-    if raw_generation is None and raw_incarnation is None:
-        observed: Tuple[Optional[str], Optional[str]] = (None, None)
-    else:
-        canonical_generation = canonical_runtime_generation(raw_generation)
-        canonical_incarnation = canonical_runtime_generation(raw_incarnation)
-        if canonical_generation is None or canonical_incarnation is None:
-            raise WorkspaceNotReady(
-                "Observed workspace identity is malformed or incomplete"
-            )
-        observed = canonical_generation, canonical_incarnation
-    if observed != expected:
-        raise WorkspaceNotReady("Workspace identity changed during attach")
-
 
 # Pool mode: agent can be reused across sessions (Docker Compose mode)
 _sessions_served: int = 0
@@ -566,6 +353,174 @@ _session_input = SessionInputRuntime(
         track_side_task=lambda task: _track_session_side_task(task),
         human_input_accepted=lambda content: _schedule_early_title(content),
         begin_input_wait=lambda: _begin_loop_input_wait(),
+    ),
+    logger=logger,
+)
+
+
+def _publish_session(session: Any) -> None:
+    """Install (or clear) the attached session slot."""
+
+    global _session
+    _session = session
+
+
+def _reset_turn_state() -> None:
+    """Clear the per-turn tool/turn flags an attach or rollback starts from."""
+
+    global _tool_inflight, _turn_event_open
+    global _turn_tool_execution_identity, _turn_tool_execution_external_hook
+    _tool_inflight = False
+    _tool_inflight_calls.clear()
+    _turn_tool_execution_identity = None
+    _turn_tool_execution_external_hook = None
+    _turn_event_open = False
+
+
+def _reset_event_journal_cursor() -> None:
+    global _events_epoch, _next_seq
+    _events_epoch = 0
+    _next_seq = 0
+
+
+def _discard_event_writer() -> None:
+    global _event_writer
+    _event_writer = None
+
+
+def _reset_draft_title() -> None:
+    global _draft_title_value
+    _draft_title_value = None
+
+
+def _set_cloud_sync_retry_pending(pending: bool) -> None:
+    global _cloud_sync_retry_pending
+    _cloud_sync_retry_pending = pending
+
+
+def _close_runtime_authorization() -> None:
+    global _runtime_authorization_admission_open
+    _runtime_authorization_admission_open = False
+
+
+def _register_session_mcp_tools(manager: Any) -> None:
+    """Replace (or clear) the process-global MCP entries of the tool registry."""
+
+    from agent.tools.registry import register_mcp_tools
+
+    register_mcp_tools(manager)
+
+
+async def _open_event_journal() -> None:
+    """Resolve this attach's generation and seq seed, then start its writer.
+
+    Clean reattaches reuse the thread's current epoch with the seq counter
+    seeded above every previously served frame (see
+    ``_resolve_event_journal_epoch``). A stateless attach fences every flush
+    on the live claim; a pinned attach fences it on its exact runtime identity
+    and starts the durable control consumer it owns for the whole attach.
+    """
+
+    global _events_epoch, _next_seq, _event_writer
+    session = _session
+    _events_epoch, _next_seq = await _resolve_event_journal_epoch(
+        session.postgres_conn, _session_identity.thread_id
+    )
+    live_lease = _current_lease_var.get()
+    pinned_agent_id = _registered_pinned_agent_id() if live_lease is None else None
+    writer = _OrderedPersistentEventWriter(
+        postgres_conn=session.postgres_conn,
+        thread_id=_session_identity.thread_id,
+        epoch=_events_epoch,
+        on_terminal_failure=_event_persistence_failed,
+        # Stateless executor attach: fence every flush on the live claim (the
+        # executor set the LeaseHandle before attaching). Pinned lane:
+        # ContextVar default None -> today's statement.
+        lease=live_lease,
+        pinned_agent_id=pinned_agent_id,
+        pinned_runtime_generation=(
+            _session_identity.session_generation if live_lease is None else None
+        ),
+        pinned_runtime_attach_token=(
+            _session_identity.attach_token if live_lease is None else None
+        ),
+    )
+    writer.start()
+    _event_writer = writer
+    if live_lease is None and pinned_agent_id is not None:
+        await _start_thread_control_watcher(agent_id=pinned_agent_id)
+
+
+# Session attachment: the attach sequence, failed-attach cleanup and release
+# receipts, and the pool admission claim. One owner per process; every
+# collaborator it names is read at call time.
+_session_attach = SessionAttachCoordinator(
+    SessionAttachPorts(
+        identity=lambda: _session_identity,
+        input_runtime=lambda: _session_input,
+        agent=lambda: _agent,
+        orchestrator_client=lambda: _orchestrator_client,
+        stateless_mode=lambda: _stateless_mode(),
+        lease=lambda: _current_lease_var.get(),
+        session=lambda: _session,
+        publish_session=lambda session: _publish_session(session),
+        session_factory=lambda **kwargs: PersistentSession(**kwargs),
+        provider_admission=lambda *args, **kwargs: _loop_provider_admission_open(
+            *args, **kwargs
+        ),
+        effect_authority=lambda *args, **kwargs: (
+            _loop_runtime_effect_authority_current(*args, **kwargs)
+        ),
+        settlement_authority=lambda *args, **kwargs: (
+            _loop_runtime_settlement_authority_current(*args, **kwargs)
+        ),
+        subagent_event_available=lambda *args, **kwargs: (
+            _session_subagent_event_available(*args, **kwargs)
+        ),
+        reset_turn_state=lambda: _reset_turn_state(),
+        reset_draft_title=lambda: _reset_draft_title(),
+        set_cloud_sync_retry_pending=lambda pending: _set_cloud_sync_retry_pending(
+            pending
+        ),
+        close_runtime_authorization=lambda: _close_runtime_authorization(),
+        clear_canvas=lambda: _canvas_control.clear_all(),
+        clear_subscribers=lambda: _subscribers.clear(),
+        side_tasks_active=lambda: any(not task.done() for task in _session_side_tasks),
+        quiesce_side_tasks=lambda: _quiesce_session_side_tasks(),
+        pending_drain_suspend=lambda: _pending_drain_suspend,
+        event_writer=lambda: _event_writer,
+        discard_event_writer=lambda: _discard_event_writer(),
+        reset_journal_cursor=lambda: _reset_event_journal_cursor(),
+        open_event_journal=lambda: _open_event_journal(),
+        events_epoch=lambda: _events_epoch,
+        stop_interrupt_watcher=lambda: _stop_thread_interrupt_watcher(),
+        stop_control_watcher=lambda: _stop_thread_control_watcher(),
+        stop_and_join_watchdogs=lambda: _stop_and_join_watchdogs(),
+        start_watchdogs=lambda: _start_watchdogs(),
+        update_thread_status=lambda *args, **kwargs: _update_thread_status(
+            *args, **kwargs
+        ),
+        restore_messages=lambda: _restore_session_messages(),
+        broadcast=lambda method, params: _broadcast(method, params),
+        officer_config=lambda: _officer_cfg(),
+        loop_running=lambda: _loop_task is not None and not _loop_task.done(),
+        ensure_loop_started=lambda source: _ensure_persistent_loop_started(source),
+        wire_aux_archiver=lambda: _wire_session_aux_archiver(),
+        emit_citation_verdict=lambda *args, **kwargs: _emit_citation_verdict(
+            *args, **kwargs
+        ),
+        emit_canvas_event=lambda *args, **kwargs: _emit_canvas_event(*args, **kwargs),
+        poll_workspace_ready=lambda *args, **kwargs: (
+            _session_workspace.poll_workspace_ready(*args, **kwargs)
+        ),
+        load_expert_config=lambda name: _load_expert_config(name),
+        apply_session_tool_group_markers=lambda *args, **kwargs: (
+            _apply_session_tool_group_markers(*args, **kwargs)
+        ),
+        llm_config_with_cache_key=lambda llm_cfg: _llm_config_with_cache_key(llm_cfg),
+        build_sync_coordinator=lambda **kwargs: _build_sync_coordinator(**kwargs),
+        legacy_nc_cloud_cfg=lambda nc_folder: _legacy_nc_cloud_cfg(nc_folder),
+        register_mcp_tools=lambda manager: _register_session_mcp_tools(manager),
     ),
     logger=logger,
 )
@@ -935,347 +890,6 @@ async def _safe_mark_stateless_natural_pause(*, require_untethered: bool) -> boo
         return False
 
 
-_PROTECTED_CLOUD_SAFE_ERROR_CODES = frozenset(
-    {
-        "feature_disabled",
-        "malformed_protected_marker",
-        "unsupported_workspace_tier",
-        "no_protected_mount",
-        "engage_refused",
-        "engage_failed",
-    }
-)
-
-
-def _protected_workspace_marker(payload: Dict[str, Any]) -> str:
-    """Classify the additive workspace marker without truthiness coercion."""
-
-    if "protected_cloud" not in payload or payload.get("protected_cloud") is False:
-        return "off"
-    if payload.get("protected_cloud") is True:
-        return "on"
-    raise ProtectedCloudUnavailable("malformed protected-cloud workspace marker")
-
-
-def _validate_protected_cloud_mount(payload: Any) -> Dict[str, Any]:
-    """Return an exact protected lower+overlay payload or fail closed."""
-
-    if not isinstance(payload, dict):
-        raise ProtectedCloudUnavailable("protected-cloud mount payload is missing")
-    overlay = payload.get("overlay")
-    mounts = payload.get("mounts")
-    if (
-        type(payload.get("version")) is not int
-        or payload.get("version") != 1
-        or payload.get("driver") != "rclone"
-        or payload.get("protected") is not True
-        or payload.get("skip_workspace_links") is not True
-        or payload.get("fallback") is not False
-        or not isinstance(overlay, dict)
-        or overlay.get("lower") != "/cloud/lower"
-        or overlay.get("merged") != "/cloud/merged"
-        or overlay.get("upper") != "/home/agent-host/.overlay/upper"
-        or overlay.get("work") != "/home/agent-host/.overlay/work"
-        or not isinstance(overlay.get("quota_bytes"), int)
-        or isinstance(overlay.get("quota_bytes"), bool)
-        or overlay.get("quota_bytes") <= 0
-        or not isinstance(mounts, list)
-        or len(mounts) != 1
-    ):
-        raise ProtectedCloudUnavailable("protected-cloud mount payload is malformed")
-
-    lowers = [
-        mount
-        for mount in mounts
-        if isinstance(mount, dict) and mount.get("mount_kind") == "protected_lower"
-    ]
-    if len(lowers) != 1:
-        raise ProtectedCloudUnavailable(
-            "protected-cloud payload must contain exactly one protected lower"
-        )
-    lower = lowers[0]
-    source = lower.get("source")
-    source_config = source.get("config") if isinstance(source, dict) else None
-    auth = lower.get("auth")
-    if (
-        not isinstance(lower.get("mount_id"), str)
-        or not lower.get("mount_id")
-        or lower.get("backend") != "nextcloud"
-        or lower.get("target_path") != "/cloud/lower"
-        or lower.get("workspace_name") != "lower"
-        or lower.get("access") != "read_only"
-        or not isinstance(source, dict)
-        or source.get("type") != "webdav"
-        or not isinstance(source_config, dict)
-        or source_config.get("vendor") != "nextcloud"
-        or not isinstance(source_config.get("url"), str)
-        or not source_config.get("url")
-        or not isinstance(source_config.get("user"), str)
-        or not source_config.get("user")
-        or not isinstance(auth, dict)
-        or auth.get("type") != "basic"
-        or not isinstance(auth.get("password"), str)
-        or not auth.get("password")
-    ):
-        raise ProtectedCloudUnavailable("protected-cloud lower mount is malformed")
-    return payload
-
-
-def _protected_workspace_delivery(payload: Dict[str, Any]) -> str:
-    """Return ``off``, ``engaging`` or ``ready`` for a workspace response."""
-
-    if _protected_workspace_marker(payload) == "off":
-        mount = payload.get("cloud_mount")
-        protected_mount_shape = False
-        if isinstance(mount, dict):
-            mounts = mount.get("mounts")
-            protected_mount_shape = (
-                ("protected" in mount and mount.get("protected") is not False)
-                or "overlay" in mount
-                or (
-                    isinstance(mounts, list)
-                    and any(
-                        isinstance(candidate, dict)
-                        and candidate.get("mount_kind") == "protected_lower"
-                        for candidate in mounts
-                    )
-                )
-            )
-        if (
-            payload.get("protected_cloud_state") is not None
-            or payload.get("protected_cloud_error_code") is not None
-            or protected_mount_shape
-        ):
-            raise ProtectedCloudUnavailable(
-                "protected-cloud payload has no authoritative marker"
-            )
-        return "off"
-    state = payload.get("protected_cloud_state")
-    status = payload.get("status")
-    if state in {"engaging", "failed"}:
-        # Pending/refused responses are a deliberately tiny, coordinate-free
-        # projection.  Use an allowlist rather than chasing aliases: attach
-        # consumes ``remote.host`` directly, and one forgotten transport key
-        # would otherwise bypass a blacklist without ever being inspected.
-        allowed_non_ready = {
-            "status",
-            "protected_cloud",
-            "protected_cloud_state",
-            "protected_cloud_error_code",
-            "pod_ip",
-            "pod_name",
-            "pod_port",
-            "namespace",
-            "vm_status",
-            "vm_ssh_host",
-            "vm_ssh_port",
-            "vm_name",
-            "ssh_key_path",
-            "workspace_generation",
-            "workspace_runtime_incarnation",
-            "workspace_ssh_host_key_fingerprint",
-            "git_remote_url",
-            "managed_repository_credentials",
-            "repositories",
-            "resolved_config",
-            "config_override",
-            "project_ids",
-            "datasources",
-            "nc_session_folder",
-            "cloud_sync",
-            "cloud_mount",
-            "cloud_sync_degraded",
-            "canvas_presentation_available",
-            "canvas_live_apps_available",
-            "canvas_shared_browser_available",
-        }
-        neutral_none = allowed_non_ready - {
-            "status",
-            "protected_cloud",
-            "protected_cloud_state",
-            "protected_cloud_error_code",
-            "project_ids",
-            "cloud_sync_degraded",
-            "canvas_presentation_available",
-            "canvas_live_apps_available",
-            "canvas_shared_browser_available",
-        }
-        if (
-            any(key not in allowed_non_ready for key in payload)
-            or any(payload.get(key) is not None for key in neutral_none)
-            or ("project_ids" in payload and payload.get("project_ids") != [])
-            or any(
-                payload.get(key) is not False
-                for key in (
-                    "cloud_sync_degraded",
-                    "canvas_presentation_available",
-                    "canvas_live_apps_available",
-                    "canvas_shared_browser_available",
-                )
-                if key in payload
-            )
-        ):
-            raise ProtectedCloudUnavailable(
-                "protected-cloud non-ready payload exposed runtime coordinates"
-            )
-    if state == "engaging" and status == "creating":
-        return "engaging"
-    if state == "failed" and status == "failed":
-        code = payload.get("protected_cloud_error_code")
-        safe_code = (
-            code
-            if isinstance(code, str) and code in _PROTECTED_CLOUD_SAFE_ERROR_CODES
-            else "engage_failed"
-        )
-        raise ProtectedCloudUnavailable(
-            f"protected-cloud engage was refused ({safe_code})"
-        )
-    if state != "ready" or status != "ready":
-        raise ProtectedCloudUnavailable(
-            "protected-cloud workspace has no authoritative ready state"
-        )
-    declared_backends: list[str] = []
-    if "backend" in payload:
-        direct_backend = payload.get("backend")
-        if not isinstance(direct_backend, str):
-            raise ProtectedCloudUnavailable(
-                "protected cloud workspace backend declaration is malformed"
-            )
-        declared_backends.append(direct_backend)
-    override = payload.get("config_override")
-    if override is not None:
-        if not isinstance(override, dict):
-            raise ProtectedCloudUnavailable(
-                "protected cloud workspace override is malformed"
-            )
-        workspace = override.get("workspace")
-        if workspace is not None:
-            if not isinstance(workspace, dict) or not isinstance(
-                workspace.get("backend"), str
-            ):
-                raise ProtectedCloudUnavailable(
-                    "protected cloud workspace override is malformed"
-                )
-            declared_backends.append(workspace["backend"])
-    resolved = payload.get("resolved_config")
-    if resolved is not None:
-        if not isinstance(resolved, dict):
-            raise ProtectedCloudUnavailable(
-                "protected cloud resolved config is malformed"
-            )
-        agent = resolved.get("agent")
-        if agent is not None and not isinstance(agent, dict):
-            raise ProtectedCloudUnavailable(
-                "protected cloud resolved agent config is malformed"
-            )
-        workspace = agent.get("workspace") if isinstance(agent, dict) else None
-        if workspace is not None:
-            if not isinstance(workspace, dict) or not isinstance(
-                workspace.get("backend"), str
-            ):
-                raise ProtectedCloudUnavailable(
-                    "protected cloud resolved workspace config is malformed"
-                )
-            declared_backends.append(workspace["backend"])
-    if (
-        not declared_backends
-        or any(backend != "sandbox" for backend in declared_backends)
-        or not isinstance(payload.get("pod_ip"), str)
-        or not payload.get("pod_ip")
-        or (
-            payload.get("pod_port") is not None
-            and (
-                type(payload.get("pod_port")) is not int
-                or not 1 <= payload.get("pod_port") <= 65535
-            )
-        )
-        or payload.get("vm_status") not in (None, "none")
-        or payload.get("vm_ssh_host") is not None
-        or payload.get("vm_ssh_port") is not None
-        or payload.get("vm_name") is not None
-        or canonical_runtime_generation(payload.get("workspace_generation")) is None
-        or canonical_runtime_generation(payload.get("workspace_runtime_incarnation"))
-        is None
-        or not isinstance(payload.get("workspace_ssh_host_key_fingerprint"), str)
-        or not payload.get("workspace_ssh_host_key_fingerprint")
-        or not pinned_runtime_generation_advertised(payload)
-        or canonical_runtime_generation(payload.get("session_runtime_generation"))
-        is None
-    ):
-        raise ProtectedCloudUnavailable(
-            "protected cloud requires an exact sandbox workspace"
-        )
-    remote = payload.get("remote")
-    if remote is not None:
-        expected_port = payload.get("pod_port") or 30022
-        expected_key = payload.get("ssh_key_path") or "/run/secrets/vm-ssh-key"
-        if (
-            not isinstance(remote, dict)
-            or set(remote)
-            - {
-                "host",
-                "port",
-                "username",
-                "key_path",
-                "workspace_path",
-            }
-            or remote.get("host") != payload.get("pod_ip")
-            or remote.get("port") != expected_port
-            or remote.get("username") != "agent-host"
-            or remote.get("key_path") != expected_key
-            or remote.get("workspace_path") != "/home/agent-host/workspace"
-        ):
-            raise ProtectedCloudUnavailable(
-                "protected cloud remote endpoint does not match its attestation"
-            )
-    if (
-        payload.get("cloud_sync") is not None
-        or payload.get("nc_session_folder") is not None
-    ):
-        raise ProtectedCloudUnavailable(
-            "protected-cloud payload exposed a legacy live-write surface"
-        )
-    _validate_protected_cloud_mount(payload.get("cloud_mount"))
-    return "ready"
-
-
-@dataclass(frozen=True, slots=True)
-class _ProtectedWorkspaceIdentity:
-    """Exact protected workspace + mount bytes authorized for one attach."""
-
-    pod_ip: str
-    pod_port: int
-    workspace_generation: str
-    runtime_incarnation: str
-    host_fingerprint: str
-    session_runtime_generation: str
-    cloud_mount_json: str
-
-
-def _protected_workspace_identity(
-    payload: Dict[str, Any],
-) -> _ProtectedWorkspaceIdentity:
-    if _protected_workspace_delivery(payload) != "ready":
-        raise ProtectedCloudUnavailable("protected workspace is not ready")
-    return _ProtectedWorkspaceIdentity(
-        pod_ip=payload["pod_ip"],
-        pod_port=payload.get("pod_port") or 30022,
-        workspace_generation=str(UUID(payload["workspace_generation"])),
-        runtime_incarnation=str(UUID(payload["workspace_runtime_incarnation"])),
-        host_fingerprint=payload["workspace_ssh_host_key_fingerprint"],
-        session_runtime_generation=str(UUID(payload["session_runtime_generation"])),
-        cloud_mount_json=json.dumps(
-            payload["cloud_mount"],
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
-    )
-
-
-class EventJournalUnavailable(RuntimeError):
-    """The persistent event generation could not be resolved authoritatively."""
-
-
 class ControlInboxBlocked(EventJournalUnavailable):
     """The oldest control cannot be safely consumed by this runtime owner."""
 
@@ -1561,7 +1175,7 @@ def _session_ready() -> bool:
 
     Three-way check: ``_session.llm_with_tools`` is set near the end of
     ``PersistentSession.setup()``, but the input queue is published
-    later in ``_attach_session`` (after repo clone, cloud sync pull, message
+    later by the attach coordinator (after repo clone, cloud sync pull, message
     restore, and the ``thread_status='active'`` DB update). Anything that
     gates session readiness — the readiness probes (``/ready``,
     ``/session/status``) and the session WebSocket transport — must call
@@ -2425,27 +2039,6 @@ def _aux_health_for_heartbeat() -> Optional[Dict[str, Any]]:
         return None
 
 
-async def _release_delivered_attach_before_dedicated_exit(thread_id: str) -> None:
-    """Rotate a failed dedicated attach only from its exact zero proof."""
-
-    receipt = _failed_attach_release_receipt
-    if receipt is None:
-        return
-    if not isinstance(receipt, dict) or receipt.get("thread_id") != thread_id:
-        raise EventJournalUnavailable(
-            "failed attach release receipt belongs to a different runtime"
-        )
-    confirmed = await _release_failed_attach_receipt_until_confirmed(
-        thread_id,
-        runtime_generation=receipt.get("session_runtime_generation"),
-        runtime_attach_token=receipt.get("session_runtime_attach_token"),
-    )
-    if not confirmed:
-        raise EventJournalUnavailable(
-            "failed attach release remains unconfirmed; exit suppressed"
-        )
-
-
 async def _exit_workspace_not_ready(thread_id: str, exc: Exception) -> NoReturn:
     """Handle an unrecoverable workspace error during lifespan startup
     (WorkspaceNotReady — never provisioned/wedged; or WorkspaceUnavailableError
@@ -2461,7 +2054,7 @@ async def _exit_workspace_not_ready(thread_id: str, exc: Exception) -> NoReturn:
         thread_id,
         exc,
     )
-    await _release_delivered_attach_before_dedicated_exit(thread_id)
+    await _session_attach.release_before_dedicated_exit(thread_id)
     if _orchestrator_client:
         try:
             _orchestrator_client.stop_heartbeat()
@@ -2492,7 +2085,7 @@ async def _exit_grant_denied(thread_id: str, exc: Exception) -> NoReturn:
         thread_id,
         exc,
     )
-    await _release_delivered_attach_before_dedicated_exit(thread_id)
+    await _session_attach.release_before_dedicated_exit(thread_id)
     if _orchestrator_client:
         try:
             _orchestrator_client.stop_heartbeat()
@@ -2525,7 +2118,7 @@ async def _exit_memory_unavailable(thread_id: str, exc: Exception) -> NoReturn:
         thread_id,
         exc,
     )
-    await _release_delivered_attach_before_dedicated_exit(thread_id)
+    await _session_attach.release_before_dedicated_exit(thread_id)
     if _orchestrator_client:
         try:
             _orchestrator_client.stop_heartbeat()
@@ -2705,7 +2298,7 @@ async def lifespan(app: FastAPI):
                 # Advertising ready in that window would overwrite the
                 # reservation's agents.status='session', make exact failure
                 # cleanup impossible, and let dispatch double-claim the pod.
-                return _pool_heartbeat_status()
+                return _session_attach.pool_heartbeat_status()
 
             _heartbeat_task = asyncio.create_task(
                 _orchestrator_client.run_heartbeat_loop(
@@ -2741,7 +2334,7 @@ async def lifespan(app: FastAPI):
             _session_identity.bind_thread(str(uuid.uuid4()))
 
         try:
-            await _attach_session(_session_identity.thread_id)
+            await _session_attach.attach(_session_identity.thread_id)
         except SessionEnded:
             await _exit_session_ended(_session_identity.thread_id)
         except SessionGrantDenied as e:
@@ -2792,7 +2385,7 @@ async def lifespan(app: FastAPI):
     # A pool attach is admitted synchronously but finishes in the background.
     # Own that task through shutdown so workspace/setup code cannot continue
     # after the client is deregistered and lose its exact release fence.
-    attach_task = _pool_attach_task
+    attach_task = _session_attach.pool_task
     if attach_task is not None and not attach_task.done():
         attach_task.cancel()
         try:
@@ -3017,46 +2610,6 @@ def _load_expert_config(config_name: str):
     )
 
 
-def _session_backend_is_lite(config: Optional[Dict[str, Any]]) -> bool:
-    """True if a resolved session config / override selects a lite tier
-    (``virtual``/``none``).
-
-    Lite tiers run with no workspace pod, so the session attach must skip the
-    workspace-readiness poll (which would otherwise raise ``WorkspaceNotReady``
-    for a pod that never exists) and let ``PersistentSession._setup_workspace``
-    build the object-store backend from the injected mounts (the lite tiers
-    have no SSH workspace pod — no_workspace_agent_mode.md §4).
-    """
-    if not isinstance(config, dict):
-        return False
-    from agent.core.backends.factory import LITE_BACKENDS
-
-    # config_override is flat ({workspace: ...}); a resolved_config blob nests
-    # the agent config under "agent".
-    ws = config.get("workspace") or (config.get("agent") or {}).get("workspace") or {}
-    return ws.get("backend") in LITE_BACKENDS
-
-
-def _session_backend_is_vm(config: Optional[Dict[str, Any]]) -> bool:
-    """True if a resolved session config / override selects the VM tier
-    (``vm``, or its legacy ``remote`` alias).
-
-    A vm-tier session's workspace is a KubeVirt VM, and its readiness poll must
-    accept ONLY that VM: a sandbox container is ready in seconds while a cold VM
-    boot takes minutes, so a container that exists for any reason would always
-    win the race and silently attach the session to the wrong tier
-    (knowledge-base/knowledge/issues/session_vm_backend_never_attaches.md Defect 2).
-
-    Same dual-shape contract as :func:`_session_backend_is_lite`.
-    """
-    if not isinstance(config, dict):
-        return False
-    from agent.core.backends.factory import VM_BACKENDS
-
-    ws = config.get("workspace") or (config.get("agent") or {}).get("workspace") or {}
-    return ws.get("backend") in VM_BACKENDS
-
-
 _FLEET_MANAGEMENT_DISABLED_KEY = "_fleet_management_disabled"
 _JOB_CONTROL_DISABLED_KEY = "_job_control_disabled"
 _JOB_INSPECTION_DISABLED_KEY = "_job_inspection_disabled"
@@ -3088,38 +2641,6 @@ def _apply_session_tool_group_markers(
             merged_config[marker] = True
         else:
             merged_config.pop(marker, None)
-
-
-def _apply_datasource_enrichment_to_resolved(
-    resolved_config: Optional[Dict[str, Any]],
-    ds_tool_categories: Dict[str, List[str]],
-    cli_ds_types: List[str],
-) -> None:
-    """Fold datasource-derived config into an orchestrator-resolved blob.
-
-    Hydration (``load_config_from_resolved``) deliberately skips the
-    config_override merge, so the datasource tool categories and
-    ``_cli_datasources`` applied to config_override during attach never reach
-    a hydrated session. Mutate the blob's ``agent`` dict in place instead:
-    tool categories merge into ``agent["tools"]``; ``_cli_datasources`` goes
-    at the TOP level, because ``serialize_resolved_config`` flattens
-    ``extra`` keys there and ``load_agent_config_from_dict`` folds unknown
-    top-level keys back into ``config.extra``.
-
-    No-op when ``resolved_config`` is absent or malformed.
-    """
-    if not resolved_config:
-        return
-    agent_dict = resolved_config.get("agent")
-    if not isinstance(agent_dict, dict):
-        return
-    if ds_tool_categories:
-        agent_tools = agent_dict.get("tools")
-        agent_tools = dict(agent_tools) if isinstance(agent_tools, dict) else {}
-        agent_tools.update(ds_tool_categories)
-        agent_dict["tools"] = agent_tools
-    if cli_ds_types:
-        agent_dict["_cli_datasources"] = cli_ds_types
 
 
 def _sanitize_live_session_config_override(
@@ -3357,477 +2878,6 @@ async def _bump_event_journal_epoch(postgres_conn: Any, thread_id: str) -> int:
     return new_epoch
 
 
-async def _strict_cleanup_partial_attach_local_resources(
-    context: dict[str, Any],
-) -> None:
-    """Close every datasource/MCP owner created before session construction."""
-
-    resources: list[Any] = []
-    seen: set[int] = set()
-    for registry_name in ("datasources", "datasource_clients"):
-        registry = context.get(registry_name)
-        if not isinstance(registry, dict):
-            continue
-        for resource in registry.values():
-            if resource is None or id(resource) in seen:
-                continue
-            seen.add(id(resource))
-            resources.append(resource)
-    for resource in resources:
-        try:
-            aclose = getattr(resource, "aclose", None)
-            if callable(aclose):
-                result = aclose()
-                if inspect.isawaitable(result):
-                    await result
-                continue
-            close = getattr(resource, "close", None)
-            if callable(close):
-                result = close()
-                if inspect.isawaitable(result):
-                    await result
-        except Exception as exc:
-            raise EventJournalUnavailable(
-                "partial attach local datasource owner did not quiesce"
-            ) from exc
-    context["datasources"] = {}
-    context["datasource_clients"] = {}
-
-
-async def _strict_cleanup_partial_sandbox_workspace(
-    context: dict[str, Any],
-) -> str:
-    """Prove all writers zero on an attested sandbox before G rotation."""
-
-    remote = context.get("remote")
-    generation = canonical_runtime_generation(context.get("workspace_generation"))
-    incarnation = canonical_runtime_generation(
-        context.get("workspace_runtime_incarnation")
-    )
-    fingerprint = context.get("workspace_ssh_host_key_fingerprint")
-    thread_id = context.get("thread_id")
-    if not (
-        isinstance(remote, dict)
-        and isinstance(remote.get("host"), str)
-        and remote["host"].strip()
-        and type(remote.get("port", 22)) is int
-        and 1 <= remote.get("port", 22) <= 65535
-        and isinstance(thread_id, str)
-        and thread_id
-        and generation is not None
-        and incarnation is not None
-        and isinstance(fingerprint, str)
-        and fingerprint.strip()
-    ):
-        raise EventJournalUnavailable(
-            "partial sandbox attach lacks exact workspace cleanup authority"
-        )
-
-    from shared.runtime.core.backends.remote import RemoteBackend
-
-    try:
-        backend = RemoteBackend(
-            host=remote["host"],
-            port=remote.get("port", 22),
-            username=remote.get("username", "agent-host"),
-            key_path=remote.get("key_path", "/run/secrets/vm-ssh-key"),
-            workspace_path=remote.get("workspace_path", "/home/agent-host/workspace"),
-            job_id=thread_id,
-            connect_timeout=remote.get("connect_timeout", 30),
-            max_retries=remote.get("max_retries", 5),
-            retry_timeouts_as_booting=remote.get("retry_timeouts_as_booting", False),
-            sudo_action="freeze",
-            workspace_generation=generation,
-            runtime_incarnation=incarnation,
-            expected_host_key_fingerprint=fingerprint,
-            workspace_tier="sandbox",
-        )
-    except Exception as exc:
-        raise EventJournalUnavailable(
-            "partial sandbox cleanup authority is malformed"
-        ) from exc
-
-    loop = asyncio.get_running_loop()
-    try:
-        await loop.run_in_executor(None, backend.connect)
-        protocol = await loop.run_in_executor(
-            None, backend.protected_workspace_zero_cleanup_strict
-        )
-        if protocol != "workspace_process_zero_v1":
-            raise EventJournalUnavailable(
-                "partial sandbox workspace process-zero proof is unavailable"
-            )
-        return protocol
-    except EventJournalUnavailable:
-        raise
-    except Exception as exc:
-        raise EventJournalUnavailable(
-            "partial sandbox workspace did not quiesce"
-        ) from exc
-    finally:
-        try:
-            await loop.run_in_executor(None, backend.disconnect)
-        except Exception:
-            logger.warning(
-                "Partial sandbox cleanup transport did not disconnect",
-                exc_info=True,
-            )
-
-
-async def _cleanup_failed_event_journal_attach(
-    thread_id: str, *, restore_thread_id: str | None = None
-) -> dict[str, Any] | None:
-    """Quiesce a partial attach and return its exact release proof.
-
-    A delivered pinned attach owns a real G/attach reservation. Rotating that
-    generation is safe only after every local/remote writer is proven zero;
-    preserving the shell or swallowing writer/cleanup uncertainty would let
-    old work cross into the replacement. Legacy/stateless cleanup retains its
-    historical handoff behavior and returns no release receipt.
-    """
-
-    global _session, _event_writer
-    global _events_epoch, _next_seq, _tool_inflight, _turn_event_open
-    global _turn_tool_execution_identity, _turn_tool_execution_external_hook
-    global _runtime_authorization_admission_open
-    global _failed_attach_workspace_cleanup_context
-    global _failed_attach_release_receipt
-
-    exact_generation = _session_identity.session_generation
-    exact_attach_token = _session_identity.attach_token
-    exact_pinned_attach = bool(
-        _session_identity.runtime_contract
-        and exact_generation is not None
-        and exact_attach_token is not None
-    )
-    release_receipt: dict[str, Any] | None = None
-    cleanup_context = _failed_attach_workspace_cleanup_context
-
-    await _stop_thread_interrupt_watcher()
-    await _stop_thread_control_watcher()
-    if exact_pinned_attach:
-        await _stop_and_join_watchdogs()
-        await _quiesce_session_side_tasks()
-
-    writer = _event_writer
-    if writer is not None:
-        try:
-            await writer.close()
-        except Exception as exc:
-            if exact_pinned_attach:
-                raise EventJournalUnavailable(
-                    "partial attach event writer did not quiesce"
-                ) from exc
-            logger.warning(
-                "Failed to close event writer after attach failure (thread=%s): %s",
-                thread_id,
-                exc,
-            )
-        else:
-            _event_writer = None
-
-    failed_session = _session
-    if failed_session is not None:
-        tool_context = getattr(failed_session, "tool_context", None)
-        if tool_context is not None:
-            tool_context.citation_verdict_callback = None
-            tool_context.canvas_event_callback = None
-        try:
-            # An exact delivered attach is about to rotate its G and therefore
-            # must destructively retire/prove its shell and workspace writers.
-            # Legacy/stateless handoff keeps the historical preserve behavior.
-            await failed_session.cleanup(
-                preserve_shell=not exact_pinned_attach,
-                preserve_workspace_daemons=(
-                    not exact_pinned_attach
-                    and getattr(failed_session, "shell_owner_token", None) is not None
-                    and getattr(
-                        failed_session,
-                        "stateless_warm_reuse_safe",
-                        True,
-                    )
-                    is False
-                ),
-            )
-        except Exception as exc:
-            if exact_pinned_attach:
-                raise EventJournalUnavailable(
-                    "partial attach runtime did not quiesce"
-                ) from exc
-            logger.warning(
-                "Failed to clean partial session after event-journal error "
-                "(thread=%s): %s",
-                thread_id,
-                exc,
-            )
-    elif exact_pinned_attach:
-        if not (
-            isinstance(cleanup_context, dict)
-            and cleanup_context.get("thread_id") == thread_id
-        ):
-            raise EventJournalUnavailable(
-                "partial attach lacks an exact local cleanup boundary"
-            )
-        if cleanup_context.get("setup_started") is True:
-            await _strict_cleanup_partial_attach_local_resources(cleanup_context)
-            tier = cleanup_context.get("workspace_tier")
-            if tier == "sandbox":
-                protocol = await _strict_cleanup_partial_sandbox_workspace(
-                    cleanup_context
-                )
-                cleanup_context["local_quiescence_protocol"] = protocol
-            elif tier in {"virtual", "none"}:
-                cleanup_context["local_quiescence_protocol"] = "agent_runtime_zero_v1"
-            else:
-                # VM/remote requires the orchestrator's exact actuator proof.
-                # An agent process can close only its local producers and must
-                # retain the delivered attach fence until that authority acts.
-                raise EventJournalUnavailable(
-                    "partial physical attach requires actuator quiescence"
-                )
-        else:
-            # This monotonic branch is possible only before datasource,
-            # session, backend or workspace setup begins. The server repeats
-            # the zero-input/control and exact workspace-tuple predicates
-            # before rotating G.
-            cleanup_context["local_quiescence_protocol"] = "agent_attach_not_started_v1"
-
-    if exact_pinned_attach:
-        protocol = str(
-            (
-                getattr(failed_session, "local_quiescence_protocol", "")
-                if failed_session is not None
-                else (cleanup_context or {}).get("local_quiescence_protocol")
-            )
-            or ""
-        )
-        workspace_generation = (
-            str(getattr(failed_session, "workspace_generation", "") or "")
-            if failed_session is not None
-            else str((cleanup_context or {}).get("workspace_generation") or "")
-        )
-        workspace_runtime_incarnation = (
-            str(getattr(failed_session, "workspace_runtime_incarnation", "") or "")
-            if failed_session is not None
-            else str((cleanup_context or {}).get("workspace_runtime_incarnation") or "")
-        )
-        pod_uid = str(os.environ.get("POD_UID") or "").strip()
-        if (
-            not pod_uid
-            or protocol
-            not in {
-                "workspace_process_zero_v1",
-                "agent_runtime_zero_v1",
-                "agent_attach_not_started_v1",
-            }
-            or bool(workspace_generation) != bool(workspace_runtime_incarnation)
-            or (protocol == "workspace_process_zero_v1" and not workspace_generation)
-            or (protocol == "agent_runtime_zero_v1" and workspace_generation)
-        ):
-            raise EventJournalUnavailable(
-                "partial attach produced no trusted local quiescence receipt"
-            )
-        release_receipt = {
-            "thread_id": thread_id,
-            "session_runtime_generation": exact_generation,
-            "session_runtime_attach_token": exact_attach_token,
-            "agent_pod_uid": pod_uid,
-            "local_runtime_quiesced": True,
-            "local_quiescence_protocol": protocol,
-            "workspace_generation": workspace_generation or None,
-            "workspace_runtime_incarnation": (workspace_runtime_incarnation or None),
-        }
-
-    _session = None
-    _session_identity.bind_thread(restore_thread_id)
-    _failed_attach_workspace_cleanup_context = None
-    _events_epoch = 0
-    _next_seq = 0
-    _tool_inflight = False
-    _tool_inflight_calls.clear()
-    _turn_tool_execution_identity = None
-    _turn_tool_execution_external_hook = None
-    _turn_event_open = False
-    _session_input.teardown()
-    _session_identity.clear_process_generation()
-    _runtime_authorization_admission_open = False
-    _session_identity.set_status_contract(False)
-    _session_identity.clear()
-    _clear_attached_runtime_actor()
-    _canvas_control.clear_all()
-    _subscribers.clear()
-    from agent.tools.registry import register_mcp_tools
-
-    register_mcp_tools(None)
-    _apply_session_embedding_env(None)
-    if release_receipt is not None and not _retain_failed_attach_release_receipt(
-        release_receipt
-    ):
-        raise EventJournalUnavailable(
-            "partial attach release proof conflicts with another runtime"
-        )
-    return release_receipt
-
-
-async def _cleanup_failed_attach_until_proven(
-    thread_id: str,
-    *,
-    restore_thread_id: str | None = None,
-) -> dict[str, Any] | None:
-    """Keep one delivered exact attach nonclaimable until cleanup is proven."""
-
-    expected_session = _session
-    expected_identity = (
-        _session_identity.session_generation,
-        _session_identity.attach_token,
-    )
-    exact = bool(_session_identity.runtime_contract and all(expected_identity))
-    attempt = 0
-    while True:
-        try:
-            return await _cleanup_failed_event_journal_attach(
-                thread_id,
-                restore_thread_id=restore_thread_id,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            still_exact_owner = bool(
-                exact
-                and _session is expected_session
-                and _session_identity.session_generation == expected_identity[0]
-                and _session_identity.attach_token == expected_identity[1]
-            )
-            if not still_exact_owner:
-                raise
-            delay = _EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS[
-                min(
-                    attempt + 1,
-                    len(_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS) - 1,
-                )
-            ]
-            attempt += 1
-            logger.warning(
-                "Exact failed-attach cleanup remains unproven; retaining "
-                "the nonclaimable owner and retrying (thread=%s type=%s)",
-                thread_id,
-                type(exc).__name__,
-            )
-            if delay:
-                await asyncio.sleep(delay)
-
-
-async def _release_failed_attach_receipt_until_confirmed(
-    thread_id: str,
-    *,
-    runtime_generation: str | None,
-    runtime_attach_token: str | None,
-) -> bool:
-    """Retry one proven delivered-attach abort without weakening its fence."""
-
-    global _failed_attach_release_receipt
-
-    receipt = _failed_attach_release_receipt
-    if not (
-        isinstance(receipt, dict)
-        and receipt.get("thread_id") == thread_id
-        and receipt.get("session_runtime_generation") == runtime_generation
-        and receipt.get("session_runtime_attach_token") == runtime_attach_token
-    ):
-        return False
-    client = _orchestrator_client
-    if client is None:
-        return False
-    attempt = 0
-    while _failed_attach_release_receipt is receipt:
-        try:
-            confirmed = await client.release_thread_agent(
-                thread_id,
-                session_runtime_generation=runtime_generation,
-                session_runtime_attach_token=runtime_attach_token,
-                agent_pod_uid=receipt["agent_pod_uid"],
-                local_runtime_quiesced=True,
-                local_quiescence_protocol=receipt["local_quiescence_protocol"],
-                workspace_generation=receipt.get("workspace_generation"),
-                workspace_runtime_incarnation=receipt.get(
-                    "workspace_runtime_incarnation"
-                ),
-            )
-        except Exception as exc:
-            logger.warning(
-                "Exact failed-attach release attempt failed (thread=%s type=%s)",
-                thread_id,
-                type(exc).__name__,
-            )
-            confirmed = False
-        if confirmed:
-            if _failed_attach_release_receipt is receipt:
-                _failed_attach_release_receipt = None
-            return True
-        delay = _EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS[
-            min(attempt + 1, len(_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS) - 1)
-        ]
-        attempt += 1
-        await asyncio.sleep(delay)
-    return False
-
-
-# Memory-path embedding routing keys. EmbeddingService is a process-wide
-# singleton built from these EMBEDDING_* env vars at first call. The memory
-# reranker's RERANK_* transport (the `rerank` catalog slot) rides along under
-# the same scrub-on-claim contract: the scorer reads them at bind time, so a
-# following tenant must never inherit the previous tenant's rerank host/key.
-MEMORY_EMBEDDING_ENV_KEYS = (
-    "EMBEDDING_PROVIDER",
-    "EMBEDDING_MODEL",
-    "EMBEDDING_BASE_URL",
-    "EMBEDDING_API_KEY",
-    "RERANK_MODEL",
-    "RERANK_BASE_URL",
-    "RERANK_API_KEY",
-)
-
-
-def _apply_session_embedding_env(env_keys: Optional[Dict[str, Any]]) -> None:
-    """Replace the process embedding profile with this attach's snapshot.
-
-    Scrub-on-claim (stateless_agents.md §5.6 — M3 deliverable D, and a live
-    pinned-lane pod-reuse leak): the KB path (``apply_kb_embedding_env``) was
-    deliberately hardened pop-first for pod reuse; the memory path was not —
-    it pushed ``EMBEDDING_API_KEY`` into process-global ``os.environ`` and
-    never popped it, so a following tenant whose config omitted ``env_keys``
-    skipped the block and inherited the prior tenant's key + un-reset
-    singleton. Symmetric now: at EVERY attach, unconditionally pop all
-    memory-embedding keys and null the memory-embedding singleton BEFORE
-    applying the new ``env_keys`` (which then re-set them only if provided).
-
-    Acceptance (tests/test_turn_executor.py scrub matrix): after an attach
-    with tenant-A env_keys followed by an attach with tenant-B env_keys
-    absent, ``os.environ`` carries no A values and the singleton is None.
-    """
-    for k in MEMORY_EMBEDDING_ENV_KEYS:
-        os.environ.pop(k, None)
-    from shared.runtime.services import embedding_service as _embedding_module
-
-    _embedding_module._embedding_service = None
-    # KB path: already a complete pop-first attach-time snapshot.
-    _embedding_module.apply_kb_embedding_env(env_keys)
-    if env_keys:
-        for k in MEMORY_EMBEDDING_ENV_KEYS:
-            value = env_keys.get(k)
-            if value is not None:
-                os.environ[k] = str(value)
-        if any(
-            k in env_keys
-            for k in MEMORY_EMBEDDING_ENV_KEYS + _embedding_module.KB_EMBEDDING_ENV_KEYS
-        ):
-            logger.info(
-                "Embedding overrides applied: memory_model=%s, kb_model=%s",
-                os.environ.get("EMBEDDING_MODEL"),
-                os.environ.get("KB_EMBEDDING_MODEL"),
-            )
-
-
 def _llm_config_with_cache_key(llm_cfg: Any) -> Any:
     """Copy ``llm_cfg`` with the per-thread OpenAI cache-routing key.
 
@@ -3842,1261 +2892,6 @@ def _llm_config_with_cache_key(llm_cfg: Any) -> Any:
     import dataclasses
 
     return dataclasses.replace(llm_cfg, prompt_cache_key=f"srw-thread-{_session_identity.thread_id}")
-
-
-async def _attach_session_inner(
-    thread_id: str,
-    config_override: Optional[Dict[str, Any]] = None,
-    resolved_config: Optional[Dict[str, Any]] = None,
-    project_ids: Optional[List[str]] = None,
-    datasources: Optional[List[Dict[str, Any]]] = None,
-    config_name: Optional[str] = None,
-    runtime_actor: Optional[Dict[str, Any]] = None,
-    pinned_status_identity_contract: Any = None,
-    pinned_runtime_generation_contract: Any = None,
-    session_runtime_generation: Any = None,
-    session_runtime_attach_token: Any = None,
-    conversation_revision: Any = None,
-    events_epoch: Any = None,
-    workspace_generation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
-    workspace_runtime_incarnation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
-    session_subagent_batch_settle_contract: Any = None,
-    session_subagent_fanout: Any = None,
-) -> None:
-    """Create and attach a PersistentSession for the given thread.
-
-    This is the core session setup logic, extracted from the lifespan so it
-    can be reused by both dedicated mode (lifespan startup) and pool mode
-    (POST /session/attach).
-
-    ``config_name`` (pool mode): the thread's config, used as the session
-    base instead of the pod's boot config when provided.
-    """
-    global _session, _events_epoch, _next_seq, _tool_inflight
-    global _turn_tool_execution_identity, _turn_tool_execution_external_hook
-    global _turn_event_open, _draft_title_value
-    global _event_writer, _cloud_sync_retry_pending
-    global _runtime_authorization_admission_open
-    global _failed_attach_workspace_cleanup_context
-
-    expected_workspace_identity = _canonical_attach_workspace_identity(
-        workspace_generation,
-        workspace_runtime_incarnation,
-    )
-    prior_thread_id = _session_identity.thread_id
-
-    _cloud_sync_retry_pending = False
-    # A pooled process must never carry a prior Officer's successful
-    # maintenance result into the next attachment. Ordinary sessions bypass
-    # this latch through ``_officer_cfg() is None`` below.
-    _runtime_authorization_admission_open = False
-    _session_identity.set_status_contract(
-        type(pinned_status_identity_contract) is int
-        and pinned_status_identity_contract == 1
-    )
-    runtime_contract_advertised = bool(
-        type(pinned_runtime_generation_contract) is int
-        and pinned_runtime_generation_contract == 1
-    )
-    client_generation = (
-        getattr(_orchestrator_client, "session_runtime_generation", None)
-        if _orchestrator_client is not None
-        else None
-    )
-    if not isinstance(client_generation, str):
-        client_generation = None
-    client_attach_token = (
-        getattr(_orchestrator_client, "session_runtime_attach_token", None)
-        if _orchestrator_client is not None
-        else None
-    )
-    if not isinstance(client_attach_token, str):
-        client_attach_token = None
-    _session_identity.adopt(
-        session_runtime_generation
-        if session_runtime_generation is not None
-        else client_generation,
-        session_runtime_attach_token
-        if session_runtime_attach_token is not None
-        else client_attach_token,
-        contract_advertised=(
-            runtime_contract_advertised
-            or (
-                getattr(
-                    _orchestrator_client,
-                    "pinned_runtime_generation_contract",
-                    False,
-                )
-                is True
-            )
-        ),
-    )
-    _canvas_control.clear_all()
-
-    if _session is not None:
-        raise RuntimeError(
-            f"Cannot attach thread {thread_id}: already attached to {_session_identity.thread_id}"
-        )
-    if _failed_attach_workspace_cleanup_context is not None:
-        raise RuntimeError(
-            "Cannot attach while a prior runtime cleanup proof remains pending"
-        )
-
-    stale_side_tasks = {task for task in _session_side_tasks if not task.done()}
-    if stale_side_tasks:
-        raise RuntimeError(
-            "Cannot attach a new thread while prior session tasks remain active"
-        )
-    _session_identity.begin_attach()
-    _draft_title_value = None
-
-    # A normal detach always closes and clears the prior writer. Recover from a
-    # stale writer defensively before a pool-mode reattach so no event can land
-    # under the previous thread/pool identity.
-    if _event_writer is not None:
-        logger.warning(
-            "Closing stale thread_events writer before attaching thread %s",
-            thread_id,
-        )
-        await _event_writer.close()
-        _event_writer = None
-
-    _session_identity.bind_thread(thread_id)
-    if _session_identity.runtime_contract and not _stateless_mode():
-        _failed_attach_workspace_cleanup_context = {
-            "thread_id": thread_id,
-            "setup_started": False,
-            "workspace_tier": None,
-            "workspace_generation": None,
-            "workspace_runtime_incarnation": None,
-            "workspace_ssh_host_key_fingerprint": None,
-            "remote": None,
-            "datasources": {},
-            "datasource_clients": {},
-        }
-
-    runtime_actor_context = _runtime_actor_context_for_attach(runtime_actor)
-
-    # Determine the backend before polling: a lite (virtual/none) session has
-    # NO workspace pod, so polling for one would always fail (WorkspaceNotReady).
-    # The pool path passes config_override; a dedicated agent fetches it here.
-    # The orchestrator attaches the lite object-store mounts to this response
-    # for lite threads, so the session can build its backend without a pod.
-    _rc, _co = resolved_config, config_override
-    attached_workspace_generation = ""
-    # Every ready workspace response this attach reads, oldest first: a
-    # pinned pod that attaches itself takes the fan-out advertisement from
-    # the newest one (_session_subagent_advertisement).
-    subagent_workspace_responses: List[Any] = []
-    if _rc is None and _co is None and _orchestrator_client and _session_identity.thread_id:
-        try:
-            _peek = await _orchestrator_client.get_thread_workspace(_session_identity.thread_id)
-            if isinstance(_peek, dict):
-                peek_delivery = _protected_workspace_delivery(_peek)
-                # A valid engaging response is intentionally coordinate- and
-                # credential-free, including the runtime generation.  It is a
-                # poll instruction, not an attach payload: validating ready
-                # identity here would make the dedicated path fail before
-                # `_poll_workspace_ready` can observe engage -> ready.
-                if peek_delivery != "engaging":
-                    _assert_attach_workspace_payload(
-                        expected_workspace_identity,
-                        _peek,
-                    )
-                    _session_identity.adopt_workspace_payload(
-                        _peek,
-                        protected_required=(_protected_workspace_marker(_peek) == "on"),
-                    )
-                    _session_identity.set_status_contract(
-                        pinned_status_identity_advertised(_peek)
-                    )
-                    subagent_workspace_responses.append(_peek)
-                    attached_workspace_generation = str(
-                        _peek.get("workspace_generation") or ""
-                    )
-                _rc = _peek.get("resolved_config")
-                _co = _peek.get("config_override")
-        except (ProtectedCloudUnavailable, SessionEnded, WorkspaceNotReady):
-            raise
-        except Exception:
-            pass
-    # Check BOTH blobs: the resolved config is the agent's preferred hydration
-    # source, the override is the authoritative tier — either may carry it.
-    is_lite_session = _session_backend_is_lite(_rc) or _session_backend_is_lite(_co)
-    # Same dual-blob read for the VM tier: a vm-tier session must attach to its
-    # VM and never to a container that happens to be ready (Defect 2).
-    is_vm_session = _session_backend_is_vm(_rc) or _session_backend_is_vm(_co)
-    _assert_attach_workspace_tier(
-        expected_workspace_identity,
-        is_lite_session=is_lite_session,
-    )
-    if _failed_attach_workspace_cleanup_context is not None:
-        _failed_attach_workspace_cleanup_context["workspace_tier"] = (
-            "vm" if is_vm_session else "virtual" if is_lite_session else "sandbox"
-        )
-
-    # Wait for workspace container (if orchestrator is provisioning one).
-    # Skipped for lite tiers, which run with no pod — the session builds its
-    # object-store backend from the injected mounts (persistent_session.py).
-    workspace_override = None
-    if not is_lite_session and _orchestrator_client and _session_identity.thread_id:
-        workspace_override = await _poll_workspace_ready(
-            _orchestrator_client,
-            _session_identity.thread_id,
-            timeout=120,
-            raise_on_denied=True,
-            require_vm=is_vm_session,
-        )
-        if workspace_override:
-            _assert_attach_workspace_payload(
-                expected_workspace_identity,
-                workspace_override,
-            )
-            _session_identity.adopt_workspace_payload(
-                workspace_override,
-                protected_required=(
-                    _protected_workspace_marker(workspace_override) == "on"
-                ),
-            )
-            _session_identity.set_status_contract(
-                pinned_status_identity_advertised(workspace_override)
-            )
-            subagent_workspace_responses.append(workspace_override)
-            logger.info(
-                f"Workspace ready ({workspace_override.get('backend')}): "
-                f"{workspace_override['remote']['host']}"
-            )
-            if _failed_attach_workspace_cleanup_context is not None:
-                remote = workspace_override.get("remote")
-                _failed_attach_workspace_cleanup_context.update(
-                    {
-                        "workspace_tier": workspace_override.get("backend"),
-                        "workspace_generation": workspace_override.get(
-                            "workspace_generation"
-                        ),
-                        "workspace_runtime_incarnation": workspace_override.get(
-                            "workspace_runtime_incarnation"
-                        ),
-                        "workspace_ssh_host_key_fingerprint": workspace_override.get(
-                            "workspace_ssh_host_key_fingerprint"
-                        ),
-                        "remote": dict(remote) if isinstance(remote, dict) else None,
-                    }
-                )
-        elif is_vm_session:
-            # Never silently downgrade a vm-tier session to a container. Say what
-            # actually failed so the pod log names the real cause instead of
-            # blaming a container this session was never supposed to have.
-            raise WorkspaceNotReady(
-                "VM workspace never became ready for this vm-tier session "
-                "(metadata.vm did not reach status='ready' with an ssh_host "
-                "within the VM budget). Not falling back to a sandbox container."
-            )
-        else:
-            raise WorkspaceNotReady(
-                "No workspace container provisioned for thread. "
-                "Cannot attach session without an isolated workspace."
-            )
-    elif is_lite_session:
-        logger.info(
-            "Lite (no-pod) session for thread %s — skipping workspace poll",
-            _session_identity.thread_id,
-        )
-
-    attached_workspace_generation = str(
-        (workspace_override or {}).get("workspace_generation")
-        or attached_workspace_generation
-        or ""
-    )
-
-    # Apply config overrides, project_ids, and datasources from thread metadata
-    if not config_override:
-        config_override = (workspace_override or {}).get("config_override")
-    if resolved_config is None:
-        resolved_config = (workspace_override or {}).get("resolved_config")
-    if not project_ids:
-        project_ids = (workspace_override or {}).get("project_ids") or []
-    cloud_mount_cfg = (
-        workspace_override.get("cloud_mount") if workspace_override else None
-    )
-    # Protected state is an exact three-way contract.  Always perform a fresh
-    # fetch before constructing PersistentSession: an engage can be revoked or
-    # fail after the readiness poll, and stale credentials must not win merely
-    # because the first response already populated every optional field.
-    initial_delivery = _protected_workspace_delivery(workspace_override or {})
-    protected_cloud = initial_delivery == "ready"
-    protected_workspace_identity = (
-        _protected_workspace_identity(workspace_override)
-        if protected_cloud and workspace_override is not None
-        else None
-    )
-    if protected_cloud:
-        _session_identity.adopt_workspace_payload(
-            workspace_override,
-            protected_required=True,
-        )
-    if _orchestrator_client and _session_identity.thread_id:
-        try:
-            ws_info = await _orchestrator_client.get_thread_workspace(_session_identity.thread_id)
-            if ws_info:
-                _assert_attach_workspace_payload(
-                    expected_workspace_identity,
-                    ws_info,
-                )
-                _session_identity.adopt_workspace_payload(
-                    ws_info,
-                    protected_required=(
-                        protected_cloud or _protected_workspace_marker(ws_info) == "on"
-                    ),
-                )
-                _session_identity.set_status_contract(
-                    pinned_status_identity_advertised(ws_info)
-                )
-                subagent_workspace_responses.append(ws_info)
-                fresh_delivery = _protected_workspace_delivery(ws_info)
-                if fresh_delivery == "engaging":
-                    raise ProtectedCloudUnavailable(
-                        "protected-cloud engage changed while attaching"
-                    )
-                if protected_cloud and fresh_delivery != "ready":
-                    raise ProtectedCloudUnavailable(
-                        "protected-cloud authority disappeared while attaching"
-                    )
-                protected_cloud = fresh_delivery == "ready"
-                attached_workspace_generation = attached_workspace_generation or str(
-                    ws_info.get("workspace_generation") or ""
-                )
-                if not config_override:
-                    config_override = ws_info.get("config_override")
-                if resolved_config is None:
-                    resolved_config = ws_info.get("resolved_config")
-                if not project_ids:
-                    project_ids = ws_info.get("project_ids") or []
-                if not datasources:
-                    datasources = ws_info.get("datasources")
-                if protected_cloud:
-                    # Latest authoritative bytes replace, rather than fill, an
-                    # earlier mount so a revoked/rotated reader cannot be used.
-                    cloud_mount_cfg = ws_info.get("cloud_mount")
-                    _validate_protected_cloud_mount(cloud_mount_cfg)
-                    fresh_identity = _protected_workspace_identity(ws_info)
-                    if fresh_identity != protected_workspace_identity:
-                        raise ProtectedCloudUnavailable(
-                            "protected workspace identity changed before setup"
-                        )
-                elif not cloud_mount_cfg:
-                    cloud_mount_cfg = ws_info.get("cloud_mount")
-            elif protected_cloud:
-                raise ProtectedCloudUnavailable(
-                    "protected-cloud workspace authority is unavailable"
-                )
-        except (ProtectedCloudUnavailable, SessionEnded, WorkspaceNotReady):
-            raise
-        except Exception:
-            if protected_cloud:
-                raise ProtectedCloudUnavailable(
-                    "protected-cloud workspace revalidation failed"
-                )
-
-    # config_override is final here (request > workspace_override > ws_info)
-    # and caller-authored on every one of those routes. Strip loader-owned
-    # keys ONCE, before the runtime decorates it (``extra._cli_datasources``
-    # below) and before the deep-merge onto config.extra further down: a
-    # thread override carrying ``_db_prompt_keys: []`` must not unfence the
-    # expert's DB prompts (security audit 2026-08-27, finding #2).
-    if isinstance(config_override, dict):
-        from shared.runtime.core.loader import strip_loader_owned_keys
-
-        config_override = strip_loader_owned_keys(config_override)
-
-    # Crossing this one-way boundary means config/datasource/session setup may
-    # have created local or remote actors. Any later delivered-attach abort
-    # must prove actual agent/workspace process zero; it can never downgrade
-    # to `agent_attach_not_started_v1` even if construction fails before
-    # PersistentSession is assigned.
-    if _failed_attach_workspace_cleanup_context is not None:
-        _failed_attach_workspace_cleanup_context["setup_started"] = True
-
-    # Process datasources: create connections, inject env vars, apply tool overrides
-    # Note: repository cloning is deferred until AFTER the workspace is
-    # initialized, then runs on the workspace backend (repos/<name> on the
-    # workspace container) — never on the agent pod.
-    datasources_dict: Dict[str, Any] = {}
-    datasource_clients: Dict[str, Any] = {}
-    repo_datasources: List[Dict[str, Any]] = []
-    kb_datasources: List[Dict[str, Any]] = []
-    mcp_manager = None
-    if datasources:
-        from agent.core.datasource_setup import (
-            datasource_tool_categories,
-            process_datasources,
-        )
-
-        # Separate repos (cloned later) from other datasources
-        repo_datasources = [ds for ds in datasources if ds.get("type") == "repository"]
-        kb_datasources = [ds for ds in datasources if ds.get("type") == "kb"]
-        non_repo_datasources = [
-            ds for ds in datasources if ds.get("type") not in ("repository", "kb")
-        ]
-        datasources_dict, datasource_clients, cli_ds_types = process_datasources(
-            non_repo_datasources
-        )
-        if _failed_attach_workspace_cleanup_context is not None:
-            _failed_attach_workspace_cleanup_context["datasources"] = datasources_dict
-            _failed_attach_workspace_cleanup_context["datasource_clients"] = (
-                datasource_clients
-            )
-        mcp_manager = datasources_dict.get("mcp")
-        if mcp_manager is not None:
-            _t_step = time.perf_counter()
-            try:
-                await mcp_manager.connect_all()
-            except Exception as e:
-                logger.warning(
-                    "Unexpected session MCP discovery failure (%s); continuing",
-                    type(e).__name__,
-                )
-            mcp_manager.annotate_configs()
-            logger.info(
-                "attach step: mcp connect_all %.2fs", time.perf_counter() - _t_step
-            )
-
-        # Inject datasource tool categories so the correct tools are loaded
-        # when config is resolved below. Shared map with the orchestrator's
-        # _build_datasource_tool_override — the two previously disagreed on
-        # read-write managed connectors (write-tools vs CLI-only).
-        ds_tool_categories = datasource_tool_categories(datasources)
-        config_override = dict(config_override or {})
-        tools_override = dict(config_override.get("tools", {}))
-        tools_override.update(ds_tool_categories)
-        if tools_override:
-            config_override["tools"] = tools_override
-
-        if cli_ds_types:
-            config_override.setdefault("extra", {})["_cli_datasources"] = cli_ds_types
-
-        # Hydrated attaches load the orchestrator-resolved blob below and
-        # never touch config_override — fold the same enrichment into the
-        # blob's agent dict, or a hydrated attach silently drops read-only
-        # connector tools and the CLI prompt block. The warm-pool path
-        # compensated orchestrator-side; the dedicated-pod path did not
-        # (live_session_settings.md P0.2).
-        _apply_datasource_enrichment_to_resolved(
-            resolved_config, ds_tool_categories, cli_ds_types
-        )
-
-        logger.info(
-            "Processed %d datasource(s) for session: %d connections, %d CLI",
-            len(datasources),
-            len(datasources_dict),
-            len(cli_ds_types),
-        )
-
-    # Pool-mode agents serve sequential sessions. Replace (or clear) the
-    # process-global dynamic entries before config hydration/tool loading.
-    from agent.tools.registry import register_mcp_tools
-
-    register_mcp_tools(mcp_manager)
-
-    effective_config = _agent.config
-    _hydrated = False
-    if resolved_config:
-        # Orchestrator-resolved config: the blob is the full, frozen,
-        # credential-injected session config (base + expert + overrides). Hydrate
-        # it directly — no config_name load, no config_override flat-merge (which
-        # would degrade the resolved layers). This is the warm-pool / cold-attach
-        # expert delivery channel — the fix for the 3-minute stall.
-        from shared.runtime.core.loader import create_llm, load_config_from_resolved
-
-        effective_config = load_config_from_resolved(resolved_config)
-        _hydrated = True
-        logger.info(
-            "Attach: hydrated orchestrator-resolved config for thread %s "
-            "(model=%s, persona_source=%s)",
-            thread_id,
-            effective_config.llm.model,
-            effective_config.extra.get("_persona_source"),
-        )
-    elif config_name:
-        # The thread's config beats the pod's boot config — idle-pool pods
-        # boot as workers, and a session served from the worker YAML loses
-        # its persistent memory pipeline (no teardown_extractor) among the
-        # rest of the session profile. Fail-loud on unknown names.
-        effective_config = _load_expert_config(config_name)
-        logger.info(
-            "Attach: session base config '%s' (overrides pod boot config)",
-            config_name,
-        )
-
-    llm = _agent._llm
-    if _hydrated:
-        # The resolved llm carries the final model + injected transport.
-        llm = create_llm(
-            _llm_config_with_cache_key(effective_config.llm),
-            effective_config.limits,
-        )
-        logger.info(
-            "Attach: built session LLM from resolved config: model=%s",
-            effective_config.llm.model,
-        )
-    elif config_override:
-        import dataclasses
-
-        from shared.runtime.core.loader import (
-            _apply_settings_matrix,
-            create_llm,
-            deep_merge,
-            load_agent_config_from_dict,
-        )
-
-        # The legacy (experts-off) attach path reads the RAW request override
-        # rather than the orchestrator's merged fragment, so it needs its own
-        # normalisation — otherwise `canvas: false` never becomes the `[]` that
-        # _apply_session_tool_group_markers matches on, and the group stays on.
-        # Same seam for a legacy llm.strategic/tactical/subagent block.
-        config_override = normalize_delegation_block(
-            normalize_llm_tiers(
-                normalize_tool_policy(config_override, source="thread-override"),
-                source="thread-override",
-            ),
-            source="thread-override",
-        )
-        base_dict = dataclasses.asdict(effective_config)
-        merged = deep_merge(base_dict, config_override)
-        _apply_session_tool_group_markers(merged, config_override)
-
-        # If the override changes the model, re-apply settings_matrix for the
-        # new model family so temperature/top_p/limits get correct defaults.
-        # Override LLM keys are treated as "explicitly set" so the matrix
-        # won't overwrite them.
-        if config_override.get("llm"):
-            override_llm_keys = set(config_override["llm"].keys())
-            _apply_settings_matrix(
-                merged, override_llm_keys, effective_config._deployment_dir
-            )
-
-        effective_config = load_agent_config_from_dict(
-            merged, deployment_dir=effective_config._deployment_dir
-        )
-        if config_override.get("llm"):
-            llm = create_llm(
-                _llm_config_with_cache_key(effective_config.llm),
-                effective_config.limits,
-            )
-            logger.info(
-                f"Config override applied: model={effective_config.llm.model}, "
-                f"temperature={effective_config.llm.temperature}"
-            )
-
-    # Task 15: thread protected_cloud into config.extra via the same channel
-    # _cli_datasources uses (loader.py reads config.extra["_protected_cloud"]
-    # at render time — loader.py:3913-3915), so the interactive prompt's
-    # honesty block renders for this session. Applied once, after
-    # effective_config is fully resolved (hydrated / config_override-merged /
-    # config_name-loaded / plain boot config) rather than folded into the
-    # config_override merge above — pushing it through config_override would
-    # make an otherwise-empty override truthy and force every protected
-    # thread through the `elif config_override:` deep-merge/rebuild branch
-    # even when no other override exists.
-    #
-    # NEVER mutate effective_config in place here: on the plain-boot path
-    # (no resolved_config / config_name / config_override) effective_config
-    # IS the module-singleton _agent.config, which pool-mode pods reuse
-    # across sequential session attaches — an in-place write would leak
-    # _protected_cloud into every later NON-protected session on the pod
-    # (whose live cloud files really are saved, making the honesty block a
-    # lie). Clone via dataclasses.replace with a copied extra dict instead;
-    # the new object is assigned back to the local, so all downstream use
-    # in this function picks it up. The guards skip test stubs that aren't
-    # real AgentConfig dataclasses.
-    import dataclasses
-
-    if (
-        protected_cloud
-        and hasattr(effective_config, "extra")
-        and dataclasses.is_dataclass(effective_config)
-    ):
-        effective_config = dataclasses.replace(
-            effective_config,
-            extra={**effective_config.extra, "_protected_cloud": True},
-        )
-
-    # Auxiliary LLM rebuild. The boot-time _agent._auxiliary_llm is built from
-    # config.auxiliary.model in the YAML default — for persistent sessions
-    # without an override that's RedHatAI/... with no transport, which routes
-    # title-generation/memory-extraction calls to api.openai.com with
-    # not-needed and 401s. When the orchestrator's create_thread injection
-    # (or a runtime config.update) supplies an auxiliary section, build a
-    # session-scoped AuxiliaryLLM and pass it in instead of the singleton.
-    auxiliary_llm = _agent._auxiliary_llm
-    if (config_override and config_override.get("auxiliary", {}).get("model")) or (
-        _hydrated and effective_config.auxiliary and effective_config.auxiliary.model
-    ):
-        from shared.runtime.core.loader import (
-            LLMConfig,
-            create_llm,
-            resolve_model_settings,
-        )
-        from shared.runtime.services.auxiliary import AuxiliaryLLM
-
-        aux_cfg = effective_config.auxiliary
-        model_settings = resolve_model_settings(
-            aux_cfg.model, effective_config._deployment_dir
-        )
-        aux_llm_config = LLMConfig(
-            model=aux_cfg.model,
-            base_url=aux_cfg.base_url,
-            api_key=aux_cfg.api_key,
-            provider=aux_cfg.provider,
-            extra_headers=aux_cfg.extra_headers,
-            temperature=aux_cfg.temperature,
-            top_p=model_settings.get("top_p"),
-            top_k=model_settings.get("top_k"),
-            model_max_context_tokens=model_settings.get("model_max_context_tokens"),
-            extra_body=model_settings.get("extra_body"),
-            max_retries=1,
-        )
-        aux_structured_output_method = model_settings.get(
-            "structured_output_method", "json_schema"
-        )
-        fallback_model = effective_config.llm.model
-        fallback_settings = resolve_model_settings(
-            fallback_model, effective_config._deployment_dir
-        )
-        aux_inner = create_llm(aux_llm_config, effective_config.limits)
-        auxiliary_llm = AuxiliaryLLM(
-            llm=aux_inner,
-            max_iterations=aux_cfg.max_iterations,
-            timeout=aux_cfg.timeout,
-            max_context_tokens=model_settings.get("model_max_context_tokens"),
-            structured_output_method=aux_structured_output_method,
-            # Drop-in fallback to the main session model when the dedicated aux
-            # model is unreachable — keeps compaction/memory/titles alive instead
-            # of crashing the session. See
-            # knowledge-base/knowledge/issues/openrouter_auxiliary_misrouted_to_openai.md.
-            fallback_llm=llm,
-            fallback_structured_output_method=fallback_settings.get(
-                "structured_output_method", "json_schema"
-            ),
-        )
-        logger.info(
-            "Auxiliary override applied: model=%s, base_url=%s",
-            aux_cfg.model,
-            aux_cfg.base_url or "default",
-        )
-
-    # Embedding override + scrub-on-claim (§5.6): replace the process-wide
-    # embedding profile (memory + KB) with this attach's snapshot — pop-first
-    # on BOTH paths, singleton nulled unconditionally. Extracted to a helper
-    # so the tenant-A→tenant-B residue acceptance is unit-testable.
-    _env_keys_src = (
-        (effective_config.extra or {}).get("env_keys")
-        if _hydrated
-        else (config_override.get("env_keys") if config_override else None)
-    )
-    _apply_session_embedding_env(_env_keys_src)
-
-    from agent.services.knowledge.bindings import build_knowledge_bindings
-
-    knowledge_bindings = build_knowledge_bindings(
-        project_ids=project_ids or [],
-        datasources=kb_datasources,
-        runtime_actor=runtime_actor_context,
-    )
-
-    # Create PersistentSession
-    live_lease = _current_lease_var.get()
-    shell_owner_token = None
-    if live_lease is not None and live_lease.active:
-        if str(live_lease.unit_id) != str(_session_identity.thread_id):
-            raise RuntimeError(
-                "Stateless lease identity does not match the session being attached"
-            )
-        shell_owner_token = live_lease.lease_token
-
-    # parallel_subagents.md §12: fan-out needs an orchestrator that can settle
-    # an interrupted batch (exact int 1, like the other contracts) and its
-    # operator switch for this lane (a literal true).
-    subagent_batch_settle, subagent_fanout = _session_subagent_advertisement(
-        session_subagent_batch_settle_contract,
-        session_subagent_fanout,
-        tuple(reversed(subagent_workspace_responses)),
-        from_workspace=not _stateless_mode(),
-    )
-    _session = PersistentSession(
-        thread_id=_session_identity.thread_id,
-        config=effective_config,
-        shell_owner_token=shell_owner_token,
-        protected_cloud_required=protected_cloud,
-        pinned_runtime_identity_required=bool(
-            _session_identity.runtime_contract and shell_owner_token is None
-        ),
-        orchestrator_client=_orchestrator_client,
-        session_parent_authority_provider=_session_identity.parent_authority,
-        subagent_provider_admission=_loop_provider_admission_open,
-        subagent_effect_authority=_loop_runtime_effect_authority_current,
-        subagent_settlement_authority=(_loop_runtime_settlement_authority_current),
-        subagent_event_callback=_session_subagent_event_available,
-        subagent_batch_settle_contract=subagent_batch_settle,
-        subagent_fanout=subagent_fanout,
-        project_ids=project_ids or [],
-        datasources=datasources_dict,
-        knowledge_bindings=knowledge_bindings,
-        runtime_actor=runtime_actor_context,
-        _datasource_clients=datasource_clients,
-        # Raw payload kept as the live-change diff baseline (Slice B).
-        datasource_configs=list(datasources or []),
-    )
-    _session.execution_snapshot = (resolved_config or {}).get("execution_snapshot")
-    # PersistentSession now owns every local/remote cleanup handle. The
-    # construction-only context must not survive into pool reuse.
-    _failed_attach_workspace_cleanup_context = None
-    if protected_workspace_identity is not None:
-        _session.protected_workspace_generation = (
-            protected_workspace_identity.workspace_generation
-        )
-        _session.protected_workspace_runtime_incarnation = (
-            protected_workspace_identity.runtime_incarnation
-        )
-    if project_ids:
-        logger.info(f"Session scoped to {len(project_ids)} project(s): {project_ids}")
-    git_remote_url = (
-        workspace_override.get("git_remote_url") if workspace_override else None
-    )
-    _t_step = time.perf_counter()
-    try:
-        await _session.setup(
-            llm=llm,
-            auxiliary_llm=auxiliary_llm,
-            postgres_conn=_agent.postgres_conn,
-            vector_conn=getattr(_agent, "vector_conn", None),
-            workspace_override=workspace_override,
-            git_remote_url=git_remote_url,
-            cloud_mount_cfg=cloud_mount_cfg,
-        )
-        if protected_cloud:
-            if _orchestrator_client is None or _session_identity.thread_id is None:
-                raise ProtectedCloudUnavailable(
-                    "protected-cloud workspace cannot be revalidated"
-                )
-            final_workspace = await _orchestrator_client.get_thread_workspace(
-                _session_identity.thread_id
-            )
-            if not isinstance(final_workspace, dict):
-                raise ProtectedCloudUnavailable(
-                    "protected-cloud workspace authority is unavailable"
-                )
-            _assert_attach_workspace_payload(
-                expected_workspace_identity,
-                final_workspace,
-            )
-            _session_identity.adopt_workspace_payload(
-                final_workspace,
-                protected_required=True,
-            )
-            if _protected_workspace_delivery(final_workspace) != "ready":
-                raise ProtectedCloudUnavailable(
-                    "protected-cloud workspace is no longer ready"
-                )
-            final_mount = final_workspace.get("cloud_mount")
-            _validate_protected_cloud_mount(final_mount)
-            final_identity = _protected_workspace_identity(final_workspace)
-            if (
-                final_identity != protected_workspace_identity
-                or final_mount != cloud_mount_cfg
-                or not _session.protected_cloud_ready()
-            ):
-                raise ProtectedCloudUnavailable(
-                    "protected-cloud mount authority changed during setup"
-                )
-    except BaseException as exc:
-        if not isinstance(exc, asyncio.CancelledError):
-            # Cleanup can replace this error or wait indefinitely for proof.
-            # Retain only its class; messages/tracebacks can carry credentials.
-            logger.warning(
-                "Session attach failed before cleanup "
-                "(thread=%s stage=session_setup type=%s)",
-                thread_id,
-                type(exc).__name__,
-            )
-        await _cleanup_failed_event_journal_attach(
-            thread_id, restore_thread_id=prior_thread_id
-        )
-        raise
-    logger.info("attach step: session.setup %.2fs", time.perf_counter() - _t_step)
-    # Install the lifecycle provider fence before restore/attach can invoke
-    # compaction or any other auxiliary model. Turn-complete and hot-swap paths
-    # call the same idempotent wiring helper again for rebuilt instances.
-    _wire_session_aux_archiver()
-
-    # Live citation-verdict push: let the engine's background verifier broadcast
-    # pending→verified/failed so the cockpit citations panel updates in place
-    # rather than only at the next per-turn refresh. Set before the first turn
-    # (so it's wired before the lazily-built CitationEngine is first used).
-    if _session is not None and _session.tool_context is not None:
-        _session.tool_context.citation_verdict_callback = _emit_citation_verdict
-        _session.tool_context.canvas_event_callback = _emit_canvas_event
-
-    # Resolve the authoritative (generation, seq seed) before the first
-    # broadcast. Clean reattaches REUSE the thread's current epoch with the
-    # seq counter seeded above every previously served frame, so cached client
-    # cursors stay valid and no cache-wipe cascade fires; the epoch bumps only
-    # when the previous session life is terminal (see
-    # _resolve_event_journal_epoch). A provisioning SSE opened against a
-    # pre-bump generation uses the existing mid-stream epoch-change
-    # reconciliation path.
-    _tool_inflight = False
-    _tool_inflight_calls.clear()
-    _turn_tool_execution_identity = None
-    _turn_tool_execution_external_hook = None
-    _turn_event_open = False
-    _events_epoch = 0
-    _next_seq = 0
-    if _session is not None and _session.postgres_conn is not None:
-        try:
-            _events_epoch, _next_seq = await _resolve_event_journal_epoch(
-                _session.postgres_conn, _session_identity.thread_id
-            )
-            live_lease = _current_lease_var.get()
-            pinned_agent_id = (
-                _registered_pinned_agent_id() if live_lease is None else None
-            )
-            writer = _OrderedPersistentEventWriter(
-                postgres_conn=_session.postgres_conn,
-                thread_id=_session_identity.thread_id,
-                epoch=_events_epoch,
-                on_terminal_failure=_event_persistence_failed,
-                # Stateless executor attach: fence every flush on the live
-                # claim (the executor set the LeaseHandle before attaching).
-                # Pinned lane: ContextVar default None → today's statement.
-                lease=live_lease,
-                pinned_agent_id=pinned_agent_id,
-                pinned_runtime_generation=(
-                    _session_identity.session_generation if live_lease is None else None
-                ),
-                pinned_runtime_attach_token=(
-                    _session_identity.attach_token if live_lease is None else None
-                ),
-            )
-            writer.start()
-            _event_writer = writer
-            if live_lease is None and pinned_agent_id is not None:
-                await _start_thread_control_watcher(agent_id=pinned_agent_id)
-        except Exception as exc:
-            logger.error(
-                "Event journal initialization failed; aborting session attach "
-                "(thread=%s): %s",
-                _session_identity.thread_id,
-                exc,
-                exc_info=True,
-            )
-            await _cleanup_failed_event_journal_attach(thread_id)
-            if isinstance(exc, EventJournalUnavailable):
-                raise
-            raise EventJournalUnavailable(
-                "Persistent event journal initialization failed"
-            ) from exc
-
-    cloud_mount_active = bool(
-        _session.cloud_mount_manager and _session.cloud_mount_manager.active
-    )
-
-    from agent.core.datasource_setup import install_workspace_credentials
-
-    await asyncio.to_thread(
-        install_workspace_credentials, datasources or [], _session.workspace_manager
-    )
-
-    # Clone repository datasources into the workspace (deferred from above).
-    # All clone/auth operations run on the workspace backend — there is no
-    # agent-local clone path (knowledge-base/knowledge/features/no_workspace_agent_mode.md §9.4).
-    if repo_datasources and _session.workspace_manager:
-        from agent.core.datasource_setup import clone_repository_datasources
-
-        clone_repository_datasources(repo_datasources, _session.workspace_manager)
-
-    # README.md workspace-facts block (connectors, materials, layout) — after
-    # the workspace is initialized and repositories are cloned. Written even
-    # without connectors so the file states the explicit "none" case.
-    if _session.workspace_manager:
-        from agent.core.datasource_setup import inject_workspace_facts
-
-        try:
-            inject_workspace_facts(
-                datasources or [],
-                _session.workspace_manager,
-                expert=getattr(_session.config, "display_name", None),
-            )
-        except Exception as e:
-            logger.warning(f"Failed to write workspace facts: {e}")
-
-    # Initialize cloud workspace sync if the orchestrator gave us a config.
-    # F-C1: a protected thread NEVER adopts cloud_sync or nc_session_folder
-    # from either fetch site — protected mode's only sanctioned live-write
-    # surface is the capture overlay (already reflected in
-    # cloud_mount_active above); letting either field through here would
-    # rebuild a live agent-service WebDAV sync in every degraded-protected
-    # scenario (refused engage, flag off, VM tier, overlay-failure teardown).
-    suppress_disposable_cloud = bool(
-        _stateless_mode()
-        and getattr(getattr(effective_config, "workspace", None), "backend", None)
-        == "none"
-    )
-    cloud_cfg = (
-        None
-        if cloud_mount_active or protected_cloud or suppress_disposable_cloud
-        else workspace_override.get("cloud_sync")
-        if workspace_override
-        else None
-    )
-    nc_folder = (
-        None
-        if protected_cloud or suppress_disposable_cloud
-        else workspace_override.get("nc_session_folder")
-        if workspace_override
-        else None
-    )
-    cloud_degraded_hint = False
-    if not suppress_disposable_cloud and (
-        not cloud_mount_active
-        and (not cloud_cfg or not nc_folder)
-        and _orchestrator_client
-        and _session_identity.thread_id
-    ):
-        try:
-            ws_info = await _orchestrator_client.get_thread_workspace(_session_identity.thread_id)
-            if ws_info:
-                _assert_attach_workspace_payload(
-                    expected_workspace_identity,
-                    ws_info,
-                )
-                _session_identity.adopt_workspace_payload(
-                    ws_info,
-                    protected_required=(
-                        protected_cloud or _protected_workspace_marker(ws_info) == "on"
-                    ),
-                )
-                fresh_delivery = _protected_workspace_delivery(ws_info)
-                if protected_cloud:
-                    if fresh_delivery != "ready":
-                        raise ProtectedCloudUnavailable(
-                            "protected-cloud authority changed during attach"
-                        )
-                    fresh_mount = ws_info.get("cloud_mount")
-                    _validate_protected_cloud_mount(fresh_mount)
-                    if (
-                        fresh_mount != cloud_mount_cfg
-                        or _protected_workspace_identity(ws_info)
-                        != protected_workspace_identity
-                    ):
-                        raise ProtectedCloudUnavailable(
-                            "protected-cloud mount authority changed during attach"
-                        )
-                elif fresh_delivery == "ready":
-                    raise ProtectedCloudUnavailable(
-                        "protected-cloud mode was enabled during attach"
-                    )
-                attached_workspace_generation = attached_workspace_generation or str(
-                    ws_info.get("workspace_generation") or ""
-                )
-                if not protected_cloud:
-                    cloud_cfg = cloud_cfg or ws_info.get("cloud_sync")
-                    nc_folder = nc_folder or ws_info.get("nc_session_folder")
-                cloud_degraded_hint = bool(ws_info.get("cloud_sync_degraded"))
-        except (ProtectedCloudUnavailable, SessionEnded, WorkspaceNotReady):
-            raise
-        except Exception:
-            # A stateless turn cannot distinguish "no cloud configured" from
-            # "the credential/config boundary was unreachable" and must not
-            # execute unsynced on that ambiguity. Pinned keeps the historical
-            # degraded behavior and retries on its next boundary.
-            if _stateless_mode():
-                _cloud_sync_retry_pending = True
-            if protected_cloud:
-                raise ProtectedCloudUnavailable(
-                    "protected-cloud workspace revalidation failed"
-                )
-    if suppress_disposable_cloud:
-        # backend=none is an intentionally disposable ScratchBackend with no
-        # user file tools. The orchestrator may still provision a generic
-        # session cloud folder; mirroring internal scratch scaffolding into it
-        # would both violate the stateless tier contract and lack a durable
-        # workspace generation. Suppress both structured and legacy sync paths
-        # only for stateless claims; pinned keeps its historical behavior.
-        cloud_cfg = None
-        nc_folder = None
-        _cloud_sync_retry_pending = False
-    # The late credential/config fetch above is often the first place a lite
-    # attach receives its binding generation. Retain the final value even when
-    # no coordinator is built, so an omitted/degraded payload cannot hide a
-    # pending generation row from the turn-start fail-closed check.
-    _session.cloud_sync_workspace_generation = attached_workspace_generation
-    # Back-compat: translate a bare nc_session_folder into the new schema.
-    # F-C1: gated on `not protected_cloud` too (defense-in-depth — nc_folder
-    # is already forced None above for a protected thread, but this keeps
-    # the invariant explicit at the point the shim actually fires).
-    if not cloud_mount_active and not protected_cloud and not cloud_cfg and nc_folder:
-        cloud_cfg = _legacy_nc_cloud_cfg(nc_folder)
-    if cloud_cfg:
-        try:
-            _session.workspace_sync = _build_sync_coordinator(
-                workspace_path=_session.workspace_manager.path,
-                workspace_backend=_session.workspace_manager.backend,
-                cloud_cfg=cloud_cfg,
-                thread_id=str(_session_identity.thread_id or ""),
-                workspace_generation=attached_workspace_generation,
-            )
-            if _session.workspace_sync is None:
-                raise RuntimeError("cloud sync payload resolved no usable mounts")
-            if _session.workspace_sync:
-                # Phase 1 of cloud_collaboration_model.md: turn-boundary sync,
-                # not background polling. Do one blocking initial pull to
-                # seed the workspace with current cloud-side contents before
-                # the agent starts its first turn — and raise immediately if
-                # any mount is broken, so the operator sees it before any
-                # actual work is committed.
-                #
-                # Stateless executor: SKIP this pull. Every claimed turn runs
-                # the same full pull at turn start (_run_persistent_turn's
-                # turn-boundary sync) seconds after this attach, so the
-                # attach-time pull is a duplicate full-mount walk on the
-                # claim's critical path (measured 41s of the 49s attach,
-                # 2026-08-08 baseline). Broken-mount surfacing moves to the
-                # turn's _resilient_cloud_sync path, which broadcasts
-                # workspace_sync.error and flags degradation — same operator
-                # visibility, one walk instead of two.
-                if _stateless_mode():
-                    logger.info(
-                        "attach step: initial cloud pull_all skipped "
-                        "(stateless — turn-start pull covers seeding)"
-                    )
-                else:
-                    _t_step = time.perf_counter()
-                    await _session.workspace_sync.pull_all()
-                    logger.info(
-                        "attach step: initial cloud pull_all %.2fs",
-                        time.perf_counter() - _t_step,
-                    )
-                logger.info(
-                    "Cloud workspace sync coordinator started (%d mount(s))",
-                    len(_session.workspace_sync),
-                )
-        except Exception as e:
-            # The coordinator build or initial pull failed. Historically this
-            # was swallowed to a warning and the session then ran unsynced for
-            # its entire life with no signal — the exact mechanism behind the
-            # prod-private "files didn't clone, but I saw no error" incident
-            # (knowledge-base/knowledge/issues/main_cloud.md Issue 13). Surface it to the cockpit
-            # over the same workspace_sync.error channel the turn-loop uses
-            # (_resilient_cloud_sync), so the operator sees a degraded-sync
-            # state instead of silence.
-            logger.warning(f"Failed to start cloud workspace sync: {e}")
-            _broadcast(
-                "workspace_sync.error",
-                {
-                    "op": "initial_pull",
-                    "turn_id": 0,
-                    "message": str(e),
-                    "degraded": True,
-                },
-            )
-            _session.workspace_sync = None
-            _cloud_sync_retry_pending = True
-    elif cloud_degraded_hint:
-        # Cloud is up but the orchestrator resolved no sync target for this
-        # thread (session-folder provisioning failed upstream, so nc_session_folder
-        # and the project mounts are all empty). Surface the same degraded-sync
-        # state the failed-initial-pull path uses, instead of running silently
-        # unsynced for the session's whole life (knowledge-base/knowledge/issues/main_cloud.md Issue 13).
-        logger.warning(
-            "Thread %s: main cloud is up but no sync target resolved — "
-            "session will run unsynced.",
-            _session_identity.thread_id,
-        )
-        _broadcast(
-            "workspace_sync.error",
-            {
-                "op": "provision",
-                "turn_id": 0,
-                "message": "Cloud sync could not be set up for this session "
-                "(no sync target was provisioned).",
-                "degraded": True,
-            },
-        )
-        _cloud_sync_retry_pending = True
-
-    # Mark thread as active. Stateless attach is an authorization boundary:
-    # End may have fenced the queue after claim-bundle returned, so a failed
-    # exact-lease CAS must abort before loop/tool admission.
-    if not await _update_thread_status("active"):
-        raise LeaseLostError("stateless attach lost lifecycle authority")
-
-    # Initialize headless loop input. It survives WS reconnect so that the
-    # loop can keep reading input / responding to interrupts across transport
-    # churn. Cleared in _terminate_session.
-    # Keep readiness closed until durable child recovery has completely
-    # converged.  Publishing the queue earlier lets a concurrent status/input
-    # request start the provider between two orphan reconciliations.
-    _session_input.begin_attach()
-    _session_identity.mint_process_generation()
-
-    # Child generations survive their parent process. Reconcile predecessors
-    # under this exact authority before any provider can become ready;
-    # recovered background evidence joins the durable-input reclaim below.
-    await _session.recover_subagents()
-
-    # Restore message history from DB (for session resume). After recovery:
-    # settling an interrupted delegation turn writes one tool result per call
-    # into the transcript (parallel_subagents.md §5.4, F15), and restore must
-    # load them beside their calls — its tool-pairing repair and any resume
-    # compaction then see complete pairs, never calls whose results land in
-    # the database a moment later. The queue is still closed here, so input
-    # admission keeps waiting for recovery and restore alike.
-    _t_step = time.perf_counter()
-    await _restore_session_messages()
-    logger.info("attach step: message restore %.2fs", time.perf_counter() - _t_step)
-    _session_input.open_queue()
-
-    # Publish mount state only after the authoritative active CAS and queue
-    # barrier.  An End racing message/repository restore must not observe a
-    # misleading ready event from a runtime that is about to roll back.
-    if cloud_mount_active:
-        _broadcast(
-            "cloud_mount.ready",
-            {
-                "mounts": [
-                    {
-                        "mount_id": m.mount_id,
-                        "mount_kind": m.mount_kind,
-                        "target_path": m.target_path,
-                        "workspace_name": m.workspace_name,
-                    }
-                    for m in _session.cloud_mount_manager.mounts
-                ]
-            },
-        )
-    elif _session.cloud_mount_error:
-        _broadcast(
-            "cloud_mount.error",
-            {"message": _session.cloud_mount_error, "degraded": True},
-        )
-
-    # Restore deliberately excludes persisted-but-unadmitted delivery rows:
-    # they are executable inbox work, not passive conversation context. Claim
-    # and queue them after the exact reciprocal binding is active.
-    # Pinned input deliveries are owned by the reciprocal thread/agent/pod
-    # binding.  A stateless turn is instead owned by its run_queue lease and
-    # deliberately has no registered agent row; trying to enter the pinned
-    # reclaimer here makes every pooled attach fail after all of its durable
-    # setup has already completed.  The turn executor reads the stateless
-    # inbox through input_seq/consumed_seq after this attach returns.
-    if not _stateless_mode():
-        await _session_input.reclaim_pending()
-
-    # Start self-cleanup watchdogs (PR 2): exit on boot-WS timeout or
-    # out-of-band thread.status='ended'. Cancelled by _terminate_session.
-    _start_watchdogs()
-
-    # Officer boot self-wake (centurion.md §4): the loop starts LAZILY on
-    # first input / WS attach, so a freshly booted or respawned officer would
-    # otherwise park forever with restored history and no running loop. This
-    # wake IS the bootstrap, and it makes any durable notices restored above
-    # readable in the very first turn. Gated on the loop not already running:
-    # a re-attach (e.g. a retried /session/attach POST) must not inject a
-    # second boot wake — the k3d smoke produced exactly that duplicate.
-    # Stateless executor pods never self-wake: turns run only under a
-    # run_queue lease (officer threads stay on the pinned lane in S1).
-    if (
-        _officer_cfg() is not None
-        and not _stateless_mode()
-        and (_loop_task is None or _loop_task.done())
-    ):
-        _ensure_persistent_loop_started("officer_boot")
-        await _session_input.accept(
-            "[wake: session started/restarted] You are the project officer "
-            "coming back online after a start or restart. Reorient from your "
-            "charter and knowledge base; recent orchestrator notices (if any) "
-            "are in your history above. A fresh sitrep arrives with the next "
-            "orchestrator wake. If nothing needs you now, file a sleep.",
-            role="event",
-        )
-
-    logger.info(f"Session attached: thread={_session_identity.thread_id} events_epoch={_events_epoch}")
-
-
-async def _attach_session(
-    thread_id: str,
-    config_override: Optional[Dict[str, Any]] = None,
-    resolved_config: Optional[Dict[str, Any]] = None,
-    project_ids: Optional[List[str]] = None,
-    datasources: Optional[List[Dict[str, Any]]] = None,
-    config_name: Optional[str] = None,
-    runtime_actor: Optional[Dict[str, Any]] = None,
-    pinned_status_identity_contract: Any = None,
-    pinned_runtime_generation_contract: Any = None,
-    session_runtime_generation: Any = None,
-    session_runtime_attach_token: Any = None,
-    conversation_revision: Any = None,
-    events_epoch: Any = None,
-    workspace_generation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
-    workspace_runtime_incarnation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
-    session_subagent_batch_settle_contract: Any = None,
-    session_subagent_fanout: Any = None,
-) -> None:
-    """Exception-safe attach transaction around the full construction tail."""
-
-    previous_thread_id = _session_identity.thread_id
-    try:
-        await _attach_session_inner(
-            thread_id=thread_id,
-            config_override=config_override,
-            resolved_config=resolved_config,
-            project_ids=project_ids,
-            datasources=datasources,
-            config_name=config_name,
-            runtime_actor=runtime_actor,
-            pinned_status_identity_contract=pinned_status_identity_contract,
-            pinned_runtime_generation_contract=pinned_runtime_generation_contract,
-            session_runtime_generation=session_runtime_generation,
-            session_runtime_attach_token=session_runtime_attach_token,
-            conversation_revision=conversation_revision,
-            events_epoch=events_epoch,
-            workspace_generation=workspace_generation,
-            workspace_runtime_incarnation=workspace_runtime_incarnation,
-            session_subagent_batch_settle_contract=(
-                session_subagent_batch_settle_contract
-            ),
-            session_subagent_fanout=session_subagent_fanout,
-        )
-    except BaseException:
-        # Covers every post-construction await, including event-journal setup,
-        # repository/message restore, lifecycle CAS, and input reclamation.
-        # The helper is idempotent when the inner setup guard already ran.
-        exact_identity = (
-            _session_identity.session_generation,
-            _session_identity.attach_token,
-        )
-        retained_receipt = _failed_attach_release_receipt
-        exact_receipt_exists = bool(
-            isinstance(retained_receipt, dict)
-            and retained_receipt.get("thread_id") == thread_id
-            and retained_receipt.get("session_runtime_generation") == exact_identity[0]
-            and retained_receipt.get("session_runtime_attach_token")
-            == exact_identity[1]
-        )
-        if (
-            _session is not None
-            or _session_identity.thread_id != previous_thread_id
-            or (
-                _session_identity.runtime_contract
-                and all(exact_identity)
-                and not exact_receipt_exists
-            )
-        ):
-            await _cleanup_failed_attach_until_proven(
-                thread_id, restore_thread_id=previous_thread_id
-            )
-        raise
 
 
 async def _terminate_session(
@@ -5722,7 +3517,7 @@ async def _terminate_session_inner(
     # Clear session state
     _session = None
     _session_identity.release_thread()
-    _clear_attached_runtime_actor()
+    _session_attach.clear_runtime_actor()
 
     # Clear headless input state + subscriber registry. The pump tasks owned by
     # each subscriber are cancelled by their socket handlers' finally blocks
@@ -5782,132 +3577,9 @@ async def _detach_session() -> None:
     await _terminate_session("legacy")
 
 
-def _runtime_actor_context_for_attach(
-    payload: Optional[Dict[str, Any]],
-) -> RuntimeActorContext | None:
-    """Resolve one actor object shared by maintenance and every session tool."""
 
-    actor = RuntimeActorContext.from_payload(payload)
-    if payload is not None and actor is None:
-        raise RuntimeError("Malformed server-derived runtime actor context")
-    client = _orchestrator_client
-    if actor is None and client is not None:
-        # Dedicated runtime clients receive the actor during registration.
-        actor = getattr(client, "runtime_actor", None)
-    elif actor is not None and client is not None:
-        # Pool/stateless attach receives its actor in the server payload. The
-        # heartbeat maintenance channel and the session/tool bindings must
-        # share this exact mutable object so a rotation cannot leave tools on
-        # the predecessor bearer.
-        adopt = getattr(client, "adopt_runtime_actor", None)
-        if callable(adopt):
-            adopt(actor)
-        else:  # deliberately tiny dry-run/test adapters
-            client.runtime_actor = actor
-    return actor
-
-
-def _clear_attached_runtime_actor() -> None:
-    """Drop project authority at the common session teardown boundary."""
-
-    client = _orchestrator_client
-    clear = getattr(client, "clear_runtime_actor", None) if client else None
-    if callable(clear):
-        clear()
-
-
-async def _run_pool_attach_transaction(
-    thread_id: str,
-    attach: Dict[str, Any],
-    runtime_generation: str | None,
-    attach_token: str | None,
-) -> None:
-    """Finish one synchronously claimed pool attach in the background.
-
-    ``_attach_session`` owns rollback of every process-global/session resource.
-    This wrapper owns only the admission claim and the exact orchestrator
-    thread↔agent reservation.  A failed attach releases that reservation once;
-    a successful attach leaves it in place for the live session.
-    """
-
-    global _pool_attach_claim, _pool_attach_task
-    global _pool_attach_runtime_generation, _pool_attach_token
-
-    succeeded = False
-    release_confirmed = False
-    try:
-        await _attach_session(thread_id=thread_id, **attach)
-        succeeded = True
-        logger.info("Pool session setup complete for thread %s", thread_id)
-    except asyncio.CancelledError:
-        logger.info("Pool session setup cancelled for thread %s", thread_id)
-        raise
-    except BaseException as exc:
-        # Do not echo an arbitrary workspace/config exception: internal
-        # payloads may carry credential material.  The attach transaction logs
-        # its own bounded diagnostics at the failing boundary.
-        logger.error(
-            "Pool session setup failed for thread %s (%s)",
-            thread_id,
-            type(exc).__name__,
-        )
-    finally:
-        if not succeeded and _orchestrator_client is not None:
-            try:
-                # The server rotates G only after this exact delivered attach
-                # proves every local/workspace writer zero.  Missing or stale
-                # receipts deliberately retain the process-local claim.
-                release_confirmed = (
-                    await _release_failed_attach_receipt_until_confirmed(
-                        thread_id,
-                        runtime_generation=runtime_generation,
-                        runtime_attach_token=attach_token,
-                    )
-                )
-            except BaseException as exc:
-                logger.warning(
-                    "Failed to release exact pool binding for thread %s (%s)",
-                    thread_id,
-                    type(exc).__name__,
-                )
-        async with _pool_attach_lock:
-            if succeeded or release_confirmed:
-                if (
-                    _pool_attach_claim == thread_id
-                    and _pool_attach_runtime_generation == runtime_generation
-                    and _pool_attach_token == attach_token
-                ):
-                    _pool_attach_claim = None
-                    _pool_attach_runtime_generation = None
-                    _pool_attach_token = None
-                if _pool_attach_task is asyncio.current_task():
-                    _pool_attach_task = None
-            elif (
-                _pool_attach_claim == thread_id
-                and _pool_attach_runtime_generation == runtime_generation
-                and _pool_attach_token == attach_token
-            ):
-                # Deliberately retain the claim.  The exact reservation could
-                # not be proven released, so this process must remain
-                # non-ready/nonclaimable until lifecycle reconciliation or
-                # shutdown removes it.
-                logger.error(
-                    "Pool attach failure for thread %s retained its local "
-                    "ownership fence after unconfirmed DB release",
-                    thread_id,
-                )
-
-
-async def _admit_pool_session_attach(request: Dict[str, Any]) -> JSONResponse:
-    """Claim an idle persistent process and schedule its heavy attach.
-
-    The claim and task are installed before returning 200.  This is the
-    persistent-pool equivalent of dual mode's ``PodState.SESSION`` latch and
-    is the narrow callback-deadlock break for protected workspace polling.
-    """
-
-    global _pool_attach_claim, _pool_attach_task
-    global _pool_attach_runtime_generation, _pool_attach_token
+async def _pool_session_attach_response(request: Dict[str, Any]) -> JSONResponse:
+    """``POST /session/attach`` for a pool process: validate, then admit."""
 
     thread_id = request.get("thread_id")
     if not isinstance(thread_id, str) or not thread_id:
@@ -5918,90 +3590,8 @@ async def _admit_pool_session_attach(request: Dict[str, Any]) -> JSONResponse:
     )
     if recipient_refusal is not None:
         return recipient_refusal
-    runtime_contract = pinned_runtime_generation_advertised(request)
-    generation_raw = request.get("session_runtime_generation")
-    attach_token_raw = request.get("session_runtime_attach_token")
-    runtime_generation = canonical_runtime_generation(generation_raw)
-    attach_token = canonical_runtime_generation(attach_token_raw)
-    if (
-        (generation_raw is not None and runtime_generation is None)
-        or (attach_token_raw is not None and attach_token is None)
-        or (runtime_contract and (runtime_generation is None or attach_token is None))
-    ):
-        return JSONResponse(
-            {"error": "exact session runtime identity is required"},
-            status_code=409,
-        )
-
-    async with _pool_attach_lock:
-        if (
-            _session is not None
-            or _pool_attach_claim is not None
-            or _pending_drain_suspend is not None
-        ):
-            owner = (
-                _session_identity.thread_id
-                or _pool_attach_claim
-                or _pending_drain_suspend.get("thread_id")
-            )
-            return JSONResponse(
-                {
-                    "error": f"Already attached to thread {owner}",
-                    "current_thread_id": owner,
-                },
-                status_code=409,
-            )
-
-        _pool_attach_claim = thread_id
-        _pool_attach_runtime_generation = runtime_generation
-        _pool_attach_token = attach_token
-        attach = {
-            "config_override": request.get("config_override"),
-            "resolved_config": request.get("resolved_config"),
-            "project_ids": request.get("project_ids"),
-            "datasources": request.get("datasources"),
-            "config_name": request.get("config_name"),
-            "runtime_actor": request.get("runtime_actor"),
-            "pinned_status_identity_contract": request.get(
-                "pinned_status_identity_contract"
-            ),
-            "pinned_runtime_generation_contract": request.get(
-                "pinned_runtime_generation_contract"
-            ),
-            "session_subagent_batch_settle_contract": request.get(
-                SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY
-            ),
-            "session_subagent_fanout": request.get(SESSION_SUBAGENT_FANOUT_KEY),
-            "session_runtime_generation": runtime_generation,
-            "session_runtime_attach_token": attach_token,
-        }
-        try:
-            _session_identity.adopt(
-                runtime_generation,
-                attach_token,
-                contract_advertised=runtime_contract,
-            )
-            _pool_attach_task = asyncio.create_task(
-                _run_pool_attach_transaction(
-                    thread_id,
-                    attach,
-                    runtime_generation,
-                    attach_token,
-                ),
-                name=f"pool-session-attach:{thread_id}",
-            )
-        except BaseException:
-            _pool_attach_claim = None
-            _pool_attach_runtime_generation = None
-            _pool_attach_token = None
-            _pool_attach_task = None
-            _session_identity.clear(
-                expected_generation=runtime_generation,
-                expected_attach_token=attach_token,
-            )
-            raise
-
-    return JSONResponse({"status": "attaching", "thread_id": thread_id})
+    admission = await _session_attach.admit_pool_attach(thread_id, request)
+    return JSONResponse(admission.body, status_code=admission.status_code)
 
 
 @dataclass(frozen=True, slots=True)
@@ -6340,7 +3930,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             # The executor owns attach/detach on this pod — an out-of-band
             # attach would corrupt its session cache and run outside a lease.
             return stateless_rejection()
-        return await _admit_pool_session_attach(request)
+        return await _pool_session_attach_response(request)
 
     @app.post("/session/detach")
     async def session_detach(request: dict = {}):
@@ -15227,295 +12817,6 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
         logger.warning(f"Idle archive failed: {e}")
 
 
-async def _poll_workspace_ready(
-    client: Any,
-    thread_id: str,
-    timeout: int = 120,
-    poll_interval: float = 2.0,
-    *,
-    raise_on_denied: bool = False,
-    vm_timeout: int = _vm_upgrade_poll_timeout,
-    require_vm: bool = False,
-) -> Optional[Dict[str, Any]]:
-    """Poll orchestrator for workspace container readiness.
-
-    ``vm_timeout`` is the extended budget applied automatically once the poll
-    observes a VM-backed thread in flight (``vm_status`` provisioning/created):
-    a cold KubeVirt boot (CDI import + guest boot) routinely runs minutes past
-    the sandbox-container ``timeout`` default, so the deadline self-extends
-    rather than declaring a still-booting VM "not ready"
-    (knowledge-base/knowledge/features/session_create_on_vm.md).
-
-    ``require_vm`` makes the VM the ONLY acceptable answer: a ready sandbox
-    container is refused (and logged as a provisioning leak) instead of being
-    returned. Checking ``vm_status`` first is not sufficient on its own — within
-    a single iteration a not-yet-ready VM falls through to the container branch,
-    and since a container is ready in ~8 s against a multi-minute VM boot it wins
-    that race every time. Callers pass this when the thread's resolved tier is
-    ``vm``; the sandbox-upgrade caller deliberately does not
-    (knowledge-base/knowledge/issues/session_vm_backend_never_attaches.md Defect 2).
-
-    Returns:
-        Workspace config dict {"backend": "remote", "remote": {host, port, ...}}
-        or None if timeout, unavailable, or no workspace provisioned.
-    """
-    import time
-
-    start = time.monotonic()
-    deadline = start + timeout
-    _vm_budget_applied = False
-
-    while time.monotonic() < deadline:
-        ws = await client.get_thread_workspace(
-            thread_id, raise_on_denied=raise_on_denied
-        )
-        if not ws:
-            # The client collapses every non-200 to None. For a vm-tier
-            # session that includes a transient 5xx from the orchestrator
-            # (a restart, or a repository authority that is briefly
-            # unavailable) and bailing here mis-reports a booting VM as
-            # "never became ready" while releasing the pinned agent — the
-            # VM budget bounds the retry instead.
-            if require_vm:
-                logger.warning(
-                    "Thread %s: workspace status unavailable — retrying within "
-                    "the VM budget.",
-                    thread_id,
-                )
-                await asyncio.sleep(poll_interval)
-                continue
-            return None
-
-        protected_delivery = _protected_workspace_delivery(ws)
-        if protected_delivery == "engaging":
-            await asyncio.sleep(poll_interval)
-            continue
-
-        # SSH key: orchestrator sends the path it resolved (dev compose
-        # key or K8s secret mount); fall back to the K8s default.
-        ssh_key = ws.get("ssh_key_path") or "/run/secrets/vm-ssh-key"
-
-        # Check VM workspace first (takes precedence over container)
-        vm_status = ws.get("vm_status")
-
-        # A VM-backed thread pays a cold KubeVirt boot far beyond the
-        # sandbox-container default. Extend the poll deadline ONCE the moment we
-        # observe the VM is in flight so a legitimate cold boot isn't declared
-        # "not ready" — self-adjusting, no caller signal needed.
-        if not _vm_budget_applied and vm_status in ("provisioning", "created"):
-            deadline = start + max(timeout, vm_timeout)
-            _vm_budget_applied = True
-            logger.info(
-                "Thread %s: VM workspace provisioning detected — extending "
-                "workspace readiness budget to %ss.",
-                thread_id,
-                max(timeout, vm_timeout),
-            )
-        if vm_status == "ready" and ws.get("vm_ssh_host"):
-            return {
-                "backend": "vm",
-                # The attach verifier consumes the same server-issued runtime
-                # contract for both backends; normalization must preserve it.
-                "pinned_status_identity_contract": ws.get(
-                    "pinned_status_identity_contract"
-                ),
-                "pinned_runtime_generation_contract": ws.get(
-                    "pinned_runtime_generation_contract"
-                ),
-                # A self-attaching pinned pod takes its fan-out advertisement
-                # from this ready payload (the VM wait payload has none).
-                SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: ws.get(
-                    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY
-                ),
-                SESSION_SUBAGENT_FANOUT_KEY: ws.get(SESSION_SUBAGENT_FANOUT_KEY),
-                "session_runtime_generation": ws.get("session_runtime_generation"),
-                # Server-derived provisioner authority must survive this
-                # normalization boundary. PersistentSession deliberately does
-                # not trust the provisioner from agent config.
-                "workspace_provisioner": ws.get("workspace_provisioner"),
-                "workspace_generation": ws.get("workspace_generation"),
-                "workspace_runtime_incarnation": ws.get(
-                    "workspace_runtime_incarnation"
-                ),
-                # The VM controller and provisioner attest the same physical
-                # tuple consumed by exact pinned-session SSH setup.
-                "workspace_ssh_host_key_fingerprint": ws.get(
-                    "workspace_ssh_host_key_fingerprint"
-                ),
-                # VM physical attestation does not grant Canvas presentation.
-                "canvas_presentation_available": False,
-                "canvas_live_apps_available": False,
-                "canvas_shared_browser_available": False,
-                "remote": {
-                    "host": ws["vm_ssh_host"],
-                    "port": ws.get("vm_ssh_port", 22),
-                    "username": "agent-host",
-                    "key_path": ssh_key,
-                    "workspace_path": "/home/agent-host/workspace",
-                },
-                "git_remote_url": ws.get("git_remote_url"),
-                "managed_repository_credentials": ws.get(
-                    "managed_repository_credentials"
-                ),
-                "repositories": ws.get("repositories"),
-                "config_override": ws.get("config_override"),
-                "project_ids": ws.get("project_ids") or [],
-                "datasources": ws.get("datasources"),
-                "nc_session_folder": ws.get("nc_session_folder"),
-                "cloud_sync": ws.get("cloud_sync"),
-                "cloud_mount": ws.get("cloud_mount"),
-                "cloud_sync_degraded": ws.get("cloud_sync_degraded"),
-                # F-C1: carried through so _attach_session can fail-close the
-                # legacy nc_session_folder sync shim for protected threads.
-                "protected_cloud": ws.get("protected_cloud"),
-                "protected_cloud_state": ws.get("protected_cloud_state"),
-                "protected_cloud_error_code": ws.get("protected_cloud_error_code"),
-            }
-
-        # A vm-tier thread accepts no substitute. Bail on a terminal VM instead
-        # of burning the full VM budget — the pre-existing 'failed' bail below
-        # also requires the CONTAINER to have failed, which never happens on a
-        # thread that (correctly) has no container.
-        if require_vm:
-            if not vm_status:
-                # No VM context at all on a vm-tier thread — provisioning was
-                # never requested (create_thread sets vm.status='provisioning'
-                # synchronously before the agent can poll, and it persists across
-                # resume). Terminal, so fail fast rather than sitting out the
-                # budget; mirrors the container branch's status=='none' bail.
-                logger.warning(
-                    "Thread %s: vm-tier session has no VM context — no VM was "
-                    "ever provisioned for it.",
-                    thread_id,
-                )
-                return None
-            if vm_status == "failed":
-                logger.warning(
-                    "Thread %s: VM provisioning failed — not falling back to a "
-                    "container (vm-tier session).",
-                    thread_id,
-                )
-                return None
-            if ws.get("status") == "ready" and ws.get("pod_ip"):
-                # A container exists for a vm-tier thread: a provisioning leak
-                # (see Defect 1). Refuse it — attaching here is precisely the
-                # silent wrong-tier downgrade this guard exists to prevent.
-                logger.warning(
-                    "Thread %s: ignoring a ready workspace container on a vm-tier "
-                    "session (pod %s) — this container should not exist; waiting "
-                    "for the VM instead.",
-                    thread_id,
-                    ws.get("pod_ip"),
-                )
-            await asyncio.sleep(poll_interval)
-            continue
-
-        # Check container workspace
-        status = ws.get("status", "none")
-
-        if status == "ready" and ws.get("pod_ip"):
-            workspace_generation = ws.get("workspace_generation")
-            workspace_runtime_incarnation = ws.get("workspace_runtime_incarnation")
-            workspace_ssh_host_key_fingerprint = ws.get(
-                "workspace_ssh_host_key_fingerprint"
-            )
-            if not workspace_generation or not workspace_runtime_incarnation:
-                # Never let a detached fingerprint look like independently
-                # usable authority. Stateless setup consumes one triplet.
-                workspace_ssh_host_key_fingerprint = None
-            return {
-                "backend": "sandbox",
-                # This is orchestrator authority, not an inference from the
-                # normalized backend label. Dropping it makes every sandbox
-                # attach fail closed before its first model call.
-                "workspace_provisioner": ws.get("workspace_provisioner"),
-                # Preserve the authoritative protected-ready tuple through
-                # normalization.  `_attach_session_inner` revalidates the
-                # normalized response immediately before constructing
-                # PersistentSession; dropping status/pod coordinates here
-                # would turn a valid protected answer into an ambiguous one.
-                "status": "ready",
-                "pod_ip": ws["pod_ip"],
-                "pod_port": ws.get("pod_port") or 30022,
-                "ssh_key_path": ssh_key,
-                "pinned_status_identity_contract": ws.get(
-                    "pinned_status_identity_contract"
-                ),
-                "pinned_runtime_generation_contract": ws.get(
-                    "pinned_runtime_generation_contract"
-                ),
-                # Same fan-out advertisement as the vm branch above.
-                SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: ws.get(
-                    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY
-                ),
-                SESSION_SUBAGENT_FANOUT_KEY: ws.get(SESSION_SUBAGENT_FANOUT_KEY),
-                "session_runtime_generation": ws.get("session_runtime_generation"),
-                "workspace_generation": workspace_generation,
-                "workspace_runtime_incarnation": workspace_runtime_incarnation,
-                "workspace_ssh_host_key_fingerprint": (
-                    workspace_ssh_host_key_fingerprint
-                ),
-                # This is an orchestrator-attested capability, not a property
-                # inferred from the backend label or endpoint reachability.
-                "canvas_presentation_available": (
-                    ws.get("canvas_presentation_available") is True
-                ),
-                "canvas_live_apps_available": (
-                    ws.get("canvas_live_apps_available") is True
-                ),
-                "canvas_shared_browser_available": (
-                    ws.get("canvas_shared_browser_available") is True
-                ),
-                "remote": {
-                    "host": ws["pod_ip"],
-                    "port": ws.get("pod_port") or 30022,
-                    "username": "agent-host",
-                    "key_path": ssh_key,
-                    "workspace_path": "/home/agent-host/workspace",
-                },
-                "git_remote_url": ws.get("git_remote_url"),
-                "managed_repository_credentials": ws.get(
-                    "managed_repository_credentials"
-                ),
-                "repositories": ws.get("repositories"),
-                "config_override": ws.get("config_override"),
-                "project_ids": ws.get("project_ids") or [],
-                "datasources": ws.get("datasources"),
-                "nc_session_folder": ws.get("nc_session_folder"),
-                "cloud_sync": ws.get("cloud_sync"),
-                "cloud_mount": ws.get("cloud_mount"),
-                "cloud_sync_degraded": ws.get("cloud_sync_degraded"),
-                # F-C1: see comment above (vm branch).
-                "protected_cloud": ws.get("protected_cloud"),
-                "protected_cloud_state": ws.get("protected_cloud_state"),
-                "protected_cloud_error_code": ws.get("protected_cloud_error_code"),
-            }
-        if status == "failed" and (not vm_status or vm_status == "failed"):
-            # The internal readiness response can carry the one-shot managed
-            # repository authority bundle once a runtime is ready.  Never log
-            # the response object on a terminal/error branch: a mixed-version
-            # or racing response could otherwise put encrypted-handoff
-            # plaintext in pod logs.  Status fields are sufficient to diagnose
-            # the provisioning failure.
-            logger.warning(
-                "Workspace provisioning failed for thread %s "
-                "(container_status=%s, vm_status=%s)",
-                thread_id,
-                status,
-                vm_status or "none",
-            )
-            return None
-        if status == "none" and not vm_status:
-            # No workspace provisioned for this thread (no K8s)
-            return None
-
-        # Still creating — wait and poll again
-        await asyncio.sleep(poll_interval)
-
-    logger.warning(f"Workspace polling timed out after {timeout}s")
-    return None
-
-
 def _upgrade_already_satisfied(src_backend: Any, target_tier: str) -> bool:
     """True when the live backend already provides ``target_tier`` — the
     workspace upgrade is then a no-op.
@@ -15654,7 +12955,7 @@ async def _handle_workspace_upgrade(
         # 2. Poll for readiness, then normalize to a {"backend", "remote"} block.
         #    A vm provisions through metadata.vm (vm_status), which _poll_vm_ready
         #    tolerates through the async provisioning window and bails promptly on
-        #    'failed'; _poll_workspace_ready would mis-bail on the still-empty
+        #    'failed'; poll_workspace_ready would mis-bail on the still-empty
         #    container status. Sandbox keeps the container poller (returns the
         #    block directly).
         if target_tier == "vm":
@@ -15695,7 +12996,7 @@ async def _handle_workspace_upgrade(
                 else None
             )
         else:
-            ws_config = await _poll_workspace_ready(
+            ws_config = await _session_workspace.poll_workspace_ready(
                 _orchestrator_client, _session_identity.thread_id, timeout=300
             )
         if not ws_config or not ws_config.get("remote"):

@@ -40,14 +40,26 @@ _IDENTITY_FIELDS = {
     "process_generation": "_process_generation",
     "attach_generation": "_attach_generation",
 }
-_ATTACH_STATE_GLOBALS = (
-    "_pool_attach_claim",
-    "_pool_attach_runtime_generation",
-    "_pool_attach_token",
-    "_pool_attach_task",
-    "_failed_attach_release_receipt",
-    "_failed_attach_workspace_cleanup_context",
+_ATTACH_STATE_FIELDS = (
+    "_pool_claim",
+    "_pool_claim_generation",
+    "_pool_claim_token",
+    "_pool_task",
+    "_release_receipt",
+    "_cleanup_context",
 )
+# Collaborators that moved to a pure owner module with the coordinator.
+_MOVED_COLLABORATORS = {
+    "_poll_workspace_ready": ("agent.api.session_workspace", "poll_workspace_ready"),
+    "_apply_session_embedding_env": (
+        "agent.api.session_attach",
+        "apply_session_embedding_env",
+    ),
+    "_strict_cleanup_partial_sandbox_workspace": (
+        "agent.api.session_attach",
+        "strict_cleanup_partial_sandbox_workspace",
+    ),
+}
 
 
 def identity() -> dict[str, Any]:
@@ -69,75 +81,81 @@ def fingerprint() -> str | None:
 
 
 def attach(**kwargs: Any):
-    return pa._attach_session(**kwargs)
+    return pa._session_attach.attach(**kwargs)
 
 
 def pool_admit(request: dict[str, Any]):
-    return pa._admit_pool_session_attach(request)
+    return pa._pool_session_attach_response(request)
 
 
 def pool_claim() -> tuple[Any, Any, Any]:
-    return (
-        pa._pool_attach_claim,
-        pa._pool_attach_runtime_generation,
-        pa._pool_attach_token,
-    )
+    return pa._session_attach.pool_claim
 
 
 def pool_task():
-    return pa._pool_attach_task
+    return pa._session_attach.pool_task
 
 
 def heartbeat_status() -> str:
-    return pa._pool_heartbeat_status()
+    return pa._session_attach.pool_heartbeat_status()
 
 
 def release_receipt():
-    return pa._failed_attach_release_receipt
+    return pa._session_attach.release_receipt
 
 
 def set_release_receipt(receipt) -> None:
-    pa._failed_attach_release_receipt = receipt
+    pa._session_attach._release_receipt = receipt
 
 
 def retain_receipt(receipt) -> bool:
-    return pa._retain_failed_attach_release_receipt(receipt)
+    return pa._session_attach.retain_release_receipt(receipt)
 
 
 def release_until_confirmed(thread_id, generation, token):
-    return pa._release_failed_attach_receipt_until_confirmed(
+    return pa._session_attach.release_receipt_until_confirmed(
         thread_id, runtime_generation=generation, runtime_attach_token=token
     )
 
 
 def cleanup_until_proven(thread_id, restore_thread_id=None):
-    return pa._cleanup_failed_attach_until_proven(
+    return pa._session_attach.cleanup_failed_attach_until_proven(
         thread_id, restore_thread_id=restore_thread_id
     )
 
 
 def cleanup_context():
-    return pa._failed_attach_workspace_cleanup_context
+    return pa._session_attach.cleanup_context
 
 
 def patch_cleanup_step(monkeypatch, fake) -> None:
     """Replace the single failed-attach cleanup attempt."""
 
-    monkeypatch.setattr(pa, "_cleanup_failed_event_journal_attach", fake)
+    monkeypatch.setattr(pa._session_attach, "cleanup_failed_attach", fake)
 
 
 def patch_retry_delays(monkeypatch, delays) -> None:
-    monkeypatch.setattr(pa, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", delays)
+    import agent.api.session_attach as session_attach
+
+    monkeypatch.setattr(session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", delays)
 
 
 def apply_advertisement(batch_settle_contract, fanout) -> bool:
-    return pa._apply_session_subagent_advertisement(batch_settle_contract, fanout)
+    return pa._session_attach.apply_subagent_advertisement(
+        batch_settle_contract, fanout
+    )
 
 
 def patch_collaborator(monkeypatch, name: str, value: Any) -> None:
     """Collaborators that stay with the runtime (session factory, workspace
     poll, lifecycle CAS, restore, watchdogs, ...)."""
 
+    moved = _MOVED_COLLABORATORS.get(name)
+    if moved is not None:
+        import importlib
+
+        monkeypatch.setattr(importlib.import_module(moved[0]), moved[1], value)
+        return
     monkeypatch.setattr(pa, name, value)
 
 
@@ -147,15 +165,15 @@ def reset_attach_state() -> None:
     for name in _IDENTITY_FIELDS.values():
         if name != "_attach_generation":
             setattr(owner, name, False if name.endswith("_contract") else None)
-    for name in _ATTACH_STATE_GLOBALS:
-        setattr(pa, name, None)
+    for name in _ATTACH_STATE_FIELDS:
+        setattr(pa._session_attach, name, None)
 
 
 def saved_attach_state() -> tuple[Any, ...]:
     owner = pa._session_identity
     return (
         tuple(getattr(owner, name) for name in _IDENTITY_FIELDS.values()),
-        tuple(getattr(pa, name) for name in _ATTACH_STATE_GLOBALS),
+        tuple(getattr(pa._session_attach, name) for name in _ATTACH_STATE_FIELDS),
     )
 
 
@@ -163,8 +181,8 @@ def restore_attach_state(saved) -> None:
     identity_values, attach_values = saved
     for name, value in zip(_IDENTITY_FIELDS.values(), identity_values):
         setattr(pa._session_identity, name, value)
-    for name, value in zip(_ATTACH_STATE_GLOBALS, attach_values):
-        setattr(pa, name, value)
+    for name, value in zip(_ATTACH_STATE_FIELDS, attach_values):
+        setattr(pa._session_attach, name, value)
 
 
 # ---------------------------------------------------------------------------

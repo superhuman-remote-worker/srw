@@ -1,5 +1,7 @@
 """VM physical identity survives delivery, polling, and persistent SSH setup."""
 
+from agent.api import session_attach
+from agent.api import session_workspace
 import asyncio
 import logging
 from copy import deepcopy
@@ -133,7 +135,7 @@ async def _deliver(fixture):
 
 
 async def _normalize(payload):
-    return await persistent_app._poll_workspace_ready(
+    return await session_workspace.poll_workspace_ready(
         SimpleNamespace(get_thread_workspace=AsyncMock(return_value=payload)),
         THREAD,
         timeout=1,
@@ -217,13 +219,13 @@ async def test_vm_ready_payload_carries_the_fanout_advertisement(
     client = SimpleNamespace(
         get_thread_workspace=AsyncMock(side_effect=[waiting, payload])
     )
-    normalized = await persistent_app._poll_workspace_ready(
+    normalized = await session_workspace.poll_workspace_ready(
         client, THREAD, timeout=5, poll_interval=0, require_vm=True
     )
     assert client.get_thread_workspace.await_count == 2
     assert normalized["session_subagent_batch_settle_contract"] == 1
     assert normalized["session_subagent_fanout"] is fanout
-    assert persistent_app._session_subagent_advertisement(
+    assert session_attach.session_subagent_advertisement(
         None, None, (normalized,), from_workspace=True
     ) == (True, fanout)
 
@@ -424,9 +426,7 @@ async def vm_attach_setup(vm_delivery, monkeypatch):
     monkeypatch.setattr(persistent_app, "_session", None)
     monkeypatch.setattr(persistent_app._session_identity, "_thread_id", None)
     monkeypatch.setattr(persistent_app, "_event_writer", None)
-    monkeypatch.setattr(
-        persistent_app, "_failed_attach_workspace_cleanup_context", None
-    )
+    monkeypatch.setattr(persistent_app._session_attach, "_cleanup_context", None)
     monkeypatch.setattr(persistent_app, "_session_side_tasks", set())
     monkeypatch.setattr(persistent_app._session_identity, "_session_generation", None)
     monkeypatch.setattr(persistent_app._session_identity, "_attach_token", None)
@@ -475,10 +475,10 @@ async def test_vm_attach_setup_materializes_repository_bundle(
         stop_after_workspace,
     )
     monkeypatch.setattr(
-        persistent_app, "_cleanup_failed_event_journal_attach", AsyncMock()
+        persistent_app._session_attach, "cleanup_failed_attach", AsyncMock()
     )
     with pytest.raises(WorkspaceSetupComplete):
-        await persistent_app._attach_session(
+        await persistent_app._session_attach.attach(
             THREAD,
             pinned_status_identity_contract=1,
             pinned_runtime_generation_contract=1,
@@ -523,13 +523,15 @@ async def test_vm_setup_failure_is_logged_before_cleanup_settles(
     monkeypatch.setattr(
         persistent_session.PersistentSession, "_setup_workspace", fail_workspace
     )
-    monkeypatch.setattr(persistent_app, "_cleanup_failed_event_journal_attach", cleanup)
+    monkeypatch.setattr(
+        persistent_app._session_attach, "cleanup_failed_attach", cleanup
+    )
     monkeypatch.setattr(
         persistent_app, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)
     )
     caplog.set_level(logging.WARNING, logger=persistent_app.__name__)
     task = asyncio.create_task(
-        persistent_app._attach_session(
+        persistent_app._session_attach.attach(
             THREAD,
             pinned_status_identity_contract=1,
             pinned_runtime_generation_contract=1,
@@ -562,7 +564,7 @@ async def test_vm_setup_failure_is_logged_before_cleanup_settles(
         assert persistent_app._session_identity.thread_id == THREAD
         assert persistent_app._session_identity.session_generation == RUNTIME
         assert persistent_app._session_identity.attach_token == ATTACH
-        assert persistent_app._pool_heartbeat_status() == "session"
+        assert persistent_app._session_attach.pool_heartbeat_status() == "session"
         if cleanup_fails:
             assert cleanup_calls == 3
             assert "cleanup remains unproven" in caplog.text
@@ -590,10 +592,10 @@ async def test_cancelled_vm_setup_keeps_cancellation_without_failure_warning(
         persistent_session.PersistentSession, "_setup_workspace", blocked_workspace
     )
     monkeypatch.setattr(
-        persistent_app, "_cleanup_failed_event_journal_attach", AsyncMock()
+        persistent_app._session_attach, "cleanup_failed_attach", AsyncMock()
     )
     task = asyncio.create_task(
-        persistent_app._attach_session(
+        persistent_app._session_attach.attach(
             THREAD,
             pinned_status_identity_contract=1,
             pinned_runtime_generation_contract=1,

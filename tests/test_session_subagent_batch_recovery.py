@@ -16,6 +16,7 @@ from uuid import uuid4
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+from agent.api import session_workspace
 import agent.subagents.batch_recovery as batch_mod
 from agent.subagents import ContextProbe
 from agent.subagents.batch_recovery import (
@@ -943,7 +944,9 @@ async def test_attach_recovers_children_before_it_restores_the_transcript():
         patch.object(mod, "_orchestrator_client", fake_orchestrator),
         patch.object(mod, "PersistentSession", FakeSession),
         patch.object(
-            mod, "_poll_workspace_ready", new=AsyncMock(return_value=workspace_override)
+            session_workspace,
+            "poll_workspace_ready",
+            new=AsyncMock(return_value=workspace_override),
         ),
         patch.object(mod, "_build_sync_coordinator"),
         patch.object(mod, "_restore_session_messages", new=restore),
@@ -953,7 +956,7 @@ async def test_attach_recovers_children_before_it_restores_the_transcript():
         try:
             # The capability as the stateless executor passes it from the
             # claim bundle (``turn_executor.claim_bundle_attach``).
-            await mod._attach_session(
+            await mod._session_attach.attach(
                 "thread-1", session_subagent_batch_settle_contract=1
             )
             queue_after_attach = mod._session_input.queue

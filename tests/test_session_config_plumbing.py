@@ -2462,11 +2462,12 @@ class TestAttachRoutesForwardConfigName:
         import inspect
 
         import agent.api.dual_app as dual_app
-        import agent.api.persistent_app as papp
 
         assert 'config_name=request.get("config_name")' in inspect.getsource(dual_app)
+        from agent.api.session_attach import SessionAttachCoordinator
+
         assert '"config_name": request.get("config_name")' in inspect.getsource(
-            papp._admit_pool_session_attach
+            SessionAttachCoordinator.admit_pool_attach
         )
 
     def test_dual_detach_uses_rest_detach_reason(self):

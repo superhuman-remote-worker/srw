@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from agent.api import session_attach
+from agent.api import session_workspace
 import asyncio
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -67,16 +69,16 @@ def _partial_cleanup_patchers(context):
         patch.object(app._session_identity, "_session_generation", GENERATION),
         patch.object(app._session_identity, "_attach_token", ATTACH_TOKEN),
         patch.object(app._session_identity, "_runtime_contract", True),
-        patch.object(app, "_failed_attach_workspace_cleanup_context", context),
-        patch.object(app, "_failed_attach_release_receipt", None),
+        patch.object(app._session_attach, "_cleanup_context", context),
+        patch.object(app._session_attach, "_release_receipt", None),
         patch.object(app, "_event_writer", None),
         patch.object(app, "_stop_thread_interrupt_watcher", new=AsyncMock()),
         patch.object(app, "_stop_thread_control_watcher", new=AsyncMock()),
         patch.object(app, "_stop_and_join_watchdogs", new=AsyncMock()),
         patch.object(app, "_quiesce_session_side_tasks", new=AsyncMock()),
         patch.object(app._session_identity, "clear", return_value=True),
-        patch.object(app, "_clear_attached_runtime_actor"),
-        patch.object(app, "_apply_session_embedding_env"),
+        patch.object(app._session_attach, "clear_runtime_actor"),
+        patch.object(session_attach, "apply_session_embedding_env"),
         patch("agent.tools.registry.register_mcp_tools"),
         patch.dict(app.os.environ, {"POD_UID": "pod-uid-a"}),
     ]
@@ -88,12 +90,12 @@ def _restore_pool_globals():
     saved = (
         app._session,
         app._session_identity.thread_id,
-        app._pool_attach_claim,
-        app._pool_attach_runtime_generation,
-        app._pool_attach_token,
-        app._pool_attach_task,
-        app._failed_attach_release_receipt,
-        app._failed_attach_workspace_cleanup_context,
+        app._session_attach._pool_claim,
+        app._session_attach._pool_claim_generation,
+        app._session_attach._pool_claim_token,
+        app._session_attach._pool_task,
+        app._session_attach._release_receipt,
+        app._session_attach._cleanup_context,
         app._orchestrator_client,
         app._heartbeat_task,
         app._session_identity.session_generation,
@@ -109,23 +111,23 @@ def _restore_pool_globals():
     )
     app._session = None
     app._session_identity._thread_id = None
-    app._pool_attach_claim = None
-    app._pool_attach_runtime_generation = None
-    app._pool_attach_token = None
-    app._pool_attach_task = None
-    app._failed_attach_release_receipt = None
-    app._failed_attach_workspace_cleanup_context = None
+    app._session_attach._pool_claim = None
+    app._session_attach._pool_claim_generation = None
+    app._session_attach._pool_claim_token = None
+    app._session_attach._pool_task = None
+    app._session_attach._release_receipt = None
+    app._session_attach._cleanup_context = None
     app._heartbeat_task = None
     yield
     (
         app._session,
         app._session_identity._thread_id,
-        app._pool_attach_claim,
-        app._pool_attach_runtime_generation,
-        app._pool_attach_token,
-        app._pool_attach_task,
-        app._failed_attach_release_receipt,
-        app._failed_attach_workspace_cleanup_context,
+        app._session_attach._pool_claim,
+        app._session_attach._pool_claim_generation,
+        app._session_attach._pool_claim_token,
+        app._session_attach._pool_task,
+        app._session_attach._release_receipt,
+        app._session_attach._cleanup_context,
         app._orchestrator_client,
         app._heartbeat_task,
         app._session_identity._session_generation,
@@ -142,20 +144,20 @@ def _restore_pool_globals():
 
 
 def test_pool_claim_is_non_ready_before_session_construction():
-    assert app._pool_heartbeat_status() == "ready"
-    app._pool_attach_claim = "thread-a"
-    app._pool_attach_runtime_generation = GENERATION
-    app._pool_attach_token = ATTACH_TOKEN
-    app._failed_attach_release_receipt = _release_receipt()
+    assert app._session_attach.pool_heartbeat_status() == "ready"
+    app._session_attach._pool_claim = "thread-a"
+    app._session_attach._pool_claim_generation = GENERATION
+    app._session_attach._pool_claim_token = ATTACH_TOKEN
+    app._session_attach._release_receipt = _release_receipt()
     assert app._session is None
-    assert app._pool_heartbeat_status() == "session"
+    assert app._session_attach.pool_heartbeat_status() == "session"
 
 
 @pytest.mark.asyncio
 async def test_real_attach_boundary_forwards_workspace_identity_pair():
     inner = AsyncMock()
-    with patch.object(app, "_attach_session_inner", inner):
-        await app._attach_session(
+    with patch.object(app._session_attach, "_attach_inner", inner):
+        await app._session_attach.attach(
             thread_id="thread-a",
             workspace_generation=WORKSPACE_GENERATION,
             workspace_runtime_incarnation=WORKSPACE_INCARNATION,
@@ -178,17 +180,17 @@ def test_attach_workspace_identity_requires_canonical_pair(
     workspace_generation, workspace_runtime_incarnation
 ):
     with pytest.raises(app.WorkspaceNotReady, match="malformed or incomplete"):
-        app._canonical_attach_workspace_identity(
+        session_workspace.canonical_attach_workspace_identity(
             workspace_generation,
             workspace_runtime_incarnation,
         )
 
 
 def test_null_workspace_pair_allows_attach_to_poll_later_physical_identity():
-    expected = app._canonical_attach_workspace_identity(None, None)
+    expected = session_workspace.canonical_attach_workspace_identity(None, None)
 
-    app._assert_attach_workspace_tier(expected, is_lite_session=False)
-    app._assert_attach_workspace_payload(
+    session_workspace.assert_attach_workspace_tier(expected, is_lite_session=False)
+    session_workspace.assert_attach_workspace_payload(
         expected,
         {
             "workspace_generation": WORKSPACE_GENERATION,
@@ -202,12 +204,14 @@ async def test_pre_setup_attach_abort_uses_only_monotonic_not_started_proof():
     context = _partial_cleanup_context(setup_started=False)
     sandbox_zero = AsyncMock()
     patchers = _partial_cleanup_patchers(context) + [
-        patch.object(app, "_strict_cleanup_partial_sandbox_workspace", sandbox_zero)
+        patch.object(
+            session_attach, "strict_cleanup_partial_sandbox_workspace", sandbox_zero
+        )
     ]
     with ExitStack() as stack:
         for patcher in patchers:
             stack.enter_context(patcher)
-        receipt = await app._cleanup_failed_event_journal_attach("thread-a")
+        receipt = await app._session_attach.cleanup_failed_attach("thread-a")
 
     assert receipt == {
         "thread_id": "thread-a",
@@ -228,13 +232,17 @@ async def test_partial_sandbox_setup_requires_actual_workspace_process_zero():
     local_zero = AsyncMock()
     sandbox_zero = AsyncMock(return_value="workspace_process_zero_v1")
     patchers = _partial_cleanup_patchers(context) + [
-        patch.object(app, "_strict_cleanup_partial_attach_local_resources", local_zero),
-        patch.object(app, "_strict_cleanup_partial_sandbox_workspace", sandbox_zero),
+        patch.object(
+            session_attach, "strict_cleanup_partial_attach_local_resources", local_zero
+        ),
+        patch.object(
+            session_attach, "strict_cleanup_partial_sandbox_workspace", sandbox_zero
+        ),
     ]
     with ExitStack() as stack:
         for patcher in patchers:
             stack.enter_context(patcher)
-        receipt = await app._cleanup_failed_event_journal_attach("thread-a")
+        receipt = await app._session_attach.cleanup_failed_attach("thread-a")
 
     local_zero.assert_awaited_once_with(context)
     sandbox_zero.assert_awaited_once_with(context)
@@ -257,7 +265,7 @@ async def test_partial_sandbox_zero_uses_attested_remote_identity():
         "shared.runtime.core.backends.remote.RemoteBackend", return_value=backend
     ) as cls:
         assert (
-            await app._strict_cleanup_partial_sandbox_workspace(context)
+            await session_attach.strict_cleanup_partial_sandbox_workspace(context)
             == "workspace_process_zero_v1"
         )
 
@@ -336,14 +344,16 @@ async def test_real_attach_crosses_one_way_setup_boundary_before_constructor():
         patch.object(app, "_session", None),
         patch.object(app._session_identity, "_thread_id", None),
         patch.object(app, "_event_writer", None),
-        patch.object(app, "_failed_attach_workspace_cleanup_context", None),
-        patch.object(app, "_poll_workspace_ready", AsyncMock(return_value=workspace)),
+        patch.object(app._session_attach, "_cleanup_context", None),
+        patch.object(
+            session_workspace, "poll_workspace_ready", AsyncMock(return_value=workspace)
+        ),
         patch.object(app, "PersistentSession", side_effect=constructor_failure),
-        patch.object(app, "_apply_session_embedding_env"),
+        patch.object(session_attach, "apply_session_embedding_env"),
         patch("agent.tools.registry.register_mcp_tools"),
     ):
         with pytest.raises(RuntimeError, match="constructor refused"):
-            await app._attach_session_inner(
+            await app._session_attach._attach_inner(
                 thread_id="thread-a",
                 pinned_runtime_generation_contract=1,
                 session_runtime_generation=GENERATION,
@@ -352,7 +362,7 @@ async def test_real_attach_crosses_one_way_setup_boundary_before_constructor():
                 workspace_runtime_incarnation=WORKSPACE_INCARNATION,
             )
 
-        context = app._failed_attach_workspace_cleanup_context
+        context = app._session_attach._cleanup_context
         assert isinstance(context, dict)
         assert context["setup_started"] is True
         assert context["workspace_tier"] == "sandbox"
@@ -397,7 +407,7 @@ async def test_real_attach_rejects_workspace_identity_drift_before_constructor()
         patch.object(app, "_session", None),
         patch.object(app._session_identity, "_thread_id", None),
         patch.object(app, "_event_writer", None),
-        patch.object(app, "_failed_attach_workspace_cleanup_context", None),
+        patch.object(app._session_attach, "_cleanup_context", None),
         patch.object(app._session_identity, "_session_generation", None),
         patch.object(app._session_identity, "_attach_token", None),
         patch.object(app._session_identity, "_runtime_contract", False),
@@ -408,7 +418,7 @@ async def test_real_attach_rejects_workspace_identity_drift_before_constructor()
         patch.object(app, "PersistentSession", constructor),
     ):
         with pytest.raises(app.WorkspaceNotReady, match="identity changed"):
-            await app._attach_session_inner(
+            await app._session_attach._attach_inner(
                 thread_id="thread-a",
                 pinned_runtime_generation_contract=1,
                 session_runtime_generation=GENERATION,
@@ -418,7 +428,7 @@ async def test_real_attach_rejects_workspace_identity_drift_before_constructor()
             )
 
         constructor.assert_not_called()
-        context = app._failed_attach_workspace_cleanup_context
+        context = app._session_attach._cleanup_context
         assert isinstance(context, dict)
         assert context["setup_started"] is False
         assert context["workspace_generation"] is None
@@ -438,11 +448,14 @@ async def test_partial_cleanup_failure_keeps_exact_retry_owner_until_proven():
         patch.object(app._session_identity, "_session_generation", GENERATION),
         patch.object(app._session_identity, "_attach_token", ATTACH_TOKEN),
         patch.object(app._session_identity, "_runtime_contract", True),
-        patch.object(app, "_failed_attach_workspace_cleanup_context", context),
-        patch.object(app, "_cleanup_failed_event_journal_attach", cleanup),
+        patch.object(app._session_attach, "_cleanup_context", context),
+        patch.object(app._session_attach, "cleanup_failed_attach", cleanup),
         patch.object(app, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)),
     ):
-        assert await app._cleanup_failed_attach_until_proven("thread-a") == receipt
+        assert (
+            await app._session_attach.cleanup_failed_attach_until_proven("thread-a")
+            == receipt
+        )
 
     assert cleanup.await_count == 2
 
@@ -452,27 +465,29 @@ async def test_unconfirmed_failure_retains_claim_and_non_ready_fence():
     client = MagicMock()
     client.release_thread_agent = AsyncMock(return_value=False)
     app._orchestrator_client = client
-    app._pool_attach_claim = "thread-a"
-    app._pool_attach_runtime_generation = GENERATION
-    app._pool_attach_token = ATTACH_TOKEN
-    app._failed_attach_release_receipt = _release_receipt()
+    app._session_attach._pool_claim = "thread-a"
+    app._session_attach._pool_claim_generation = GENERATION
+    app._session_attach._pool_claim_token = ATTACH_TOKEN
+    app._session_attach._release_receipt = _release_receipt()
 
     with (
         patch.object(
-            app,
-            "_attach_session",
+            app._session_attach,
+            "attach",
             AsyncMock(side_effect=RuntimeError("overlay refused")),
         ),
         patch.object(app, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0, 0.01)),
     ):
         task = asyncio.create_task(
-            app._run_pool_attach_transaction("thread-a", {}, GENERATION, ATTACH_TOKEN)
+            app._session_attach._run_pool_attach_transaction(
+                "thread-a", {}, GENERATION, ATTACH_TOKEN
+            )
         )
-        app._pool_attach_task = task
+        app._session_attach._pool_task = task
         while client.release_thread_agent.await_count < 1:
             await asyncio.sleep(0)
-        assert app._pool_attach_claim == "thread-a"
-        assert app._pool_heartbeat_status() == "session"
+        assert app._session_attach._pool_claim == "thread-a"
+        assert app._session_attach.pool_heartbeat_status() == "session"
         task.cancel()
         await task
 
@@ -486,9 +501,9 @@ async def test_unconfirmed_failure_retains_claim_and_non_ready_fence():
         workspace_generation=None,
         workspace_runtime_incarnation=None,
     )
-    assert app._pool_attach_claim == "thread-a"
-    assert app._pool_attach_task is task
-    assert app._pool_heartbeat_status() == "session"
+    assert app._session_attach._pool_claim == "thread-a"
+    assert app._session_attach._pool_task is task
+    assert app._session_attach.pool_heartbeat_status() == "session"
 
 
 @pytest.mark.asyncio
@@ -496,23 +511,27 @@ async def test_confirmed_failure_release_reopens_pool_once():
     client = MagicMock()
     client.release_thread_agent = AsyncMock(return_value=True)
     app._orchestrator_client = client
-    app._pool_attach_claim = "thread-a"
-    app._pool_attach_runtime_generation = GENERATION
-    app._pool_attach_token = ATTACH_TOKEN
-    app._failed_attach_release_receipt = _release_receipt()
+    app._session_attach._pool_claim = "thread-a"
+    app._session_attach._pool_claim_generation = GENERATION
+    app._session_attach._pool_claim_token = ATTACH_TOKEN
+    app._session_attach._release_receipt = _release_receipt()
 
     with patch.object(
-        app, "_attach_session", AsyncMock(side_effect=RuntimeError("lower refused"))
+        app._session_attach,
+        "attach",
+        AsyncMock(side_effect=RuntimeError("lower refused")),
     ):
         task = asyncio.create_task(
-            app._run_pool_attach_transaction("thread-a", {}, GENERATION, ATTACH_TOKEN)
+            app._session_attach._run_pool_attach_transaction(
+                "thread-a", {}, GENERATION, ATTACH_TOKEN
+            )
         )
-        app._pool_attach_task = task
+        app._session_attach._pool_task = task
         await task
 
-    assert app._pool_attach_claim is None
-    assert app._pool_attach_task is None
-    assert app._pool_heartbeat_status() == "ready"
+    assert app._session_attach._pool_claim is None
+    assert app._session_attach._pool_task is None
+    assert app._session_attach.pool_heartbeat_status() == "ready"
 
 
 @pytest.mark.asyncio
@@ -530,28 +549,30 @@ async def test_lost_release_responses_replay_identical_proof_until_confirmed():
     client = MagicMock()
 
     async def release(*args, **kwargs):
-        observations.append((app._pool_attach_claim, dict(kwargs)))
+        observations.append((app._session_attach._pool_claim, dict(kwargs)))
         return len(observations) >= 3
 
     client.release_thread_agent = AsyncMock(side_effect=release)
     app._orchestrator_client = client
-    app._pool_attach_claim = "thread-a"
-    app._pool_attach_runtime_generation = GENERATION
-    app._pool_attach_token = ATTACH_TOKEN
-    app._failed_attach_release_receipt = _release_receipt()
+    app._session_attach._pool_claim = "thread-a"
+    app._session_attach._pool_claim_generation = GENERATION
+    app._session_attach._pool_claim_token = ATTACH_TOKEN
+    app._session_attach._release_receipt = _release_receipt()
 
     with (
         patch.object(
-            app,
-            "_attach_session",
+            app._session_attach,
+            "attach",
             AsyncMock(side_effect=RuntimeError("delivered attach failed")),
         ),
         patch.object(app, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)),
     ):
         task = asyncio.create_task(
-            app._run_pool_attach_transaction("thread-a", {}, GENERATION, ATTACH_TOKEN)
+            app._session_attach._run_pool_attach_transaction(
+                "thread-a", {}, GENERATION, ATTACH_TOKEN
+            )
         )
-        app._pool_attach_task = task
+        app._session_attach._pool_task = task
         await task
 
     assert len(observations) == 3
@@ -566,10 +587,10 @@ async def test_lost_release_responses_replay_identical_proof_until_confirmed():
         "workspace_generation": None,
         "workspace_runtime_incarnation": None,
     }
-    assert app._failed_attach_release_receipt is None
-    assert app._pool_attach_claim is None
-    assert app._pool_attach_task is None
-    assert app._pool_heartbeat_status() == "ready"
+    assert app._session_attach._release_receipt is None
+    assert app._session_attach._pool_claim is None
+    assert app._session_attach._pool_task is None
+    assert app._session_attach.pool_heartbeat_status() == "ready"
 
 
 @pytest.mark.asyncio
@@ -579,33 +600,35 @@ async def test_late_generation_one_cleanup_cannot_clear_generation_two_claim():
     client = MagicMock()
 
     async def release_and_rebind(*_args, **_kwargs):
-        app._pool_attach_claim = "thread-a"
-        app._pool_attach_runtime_generation = generation_two
-        app._pool_attach_token = token_two
+        app._session_attach._pool_claim = "thread-a"
+        app._session_attach._pool_claim_generation = generation_two
+        app._session_attach._pool_claim_token = token_two
         return True
 
     client.release_thread_agent = AsyncMock(side_effect=release_and_rebind)
     app._orchestrator_client = client
-    app._pool_attach_claim = "thread-a"
-    app._pool_attach_runtime_generation = GENERATION
-    app._pool_attach_token = ATTACH_TOKEN
-    app._failed_attach_release_receipt = _release_receipt()
+    app._session_attach._pool_claim = "thread-a"
+    app._session_attach._pool_claim_generation = GENERATION
+    app._session_attach._pool_claim_token = ATTACH_TOKEN
+    app._session_attach._release_receipt = _release_receipt()
 
     with patch.object(
-        app,
-        "_attach_session",
+        app._session_attach,
+        "attach",
         AsyncMock(side_effect=RuntimeError("generation one attach failed")),
     ):
         task = asyncio.create_task(
-            app._run_pool_attach_transaction("thread-a", {}, GENERATION, ATTACH_TOKEN)
+            app._session_attach._run_pool_attach_transaction(
+                "thread-a", {}, GENERATION, ATTACH_TOKEN
+            )
         )
-        app._pool_attach_task = task
+        app._session_attach._pool_task = task
         await task
 
-    assert app._pool_attach_claim == "thread-a"
-    assert app._pool_attach_runtime_generation == generation_two
-    assert app._pool_attach_token == token_two
-    assert app._pool_heartbeat_status() == "session"
+    assert app._session_attach._pool_claim == "thread-a"
+    assert app._session_attach._pool_claim_generation == generation_two
+    assert app._session_attach._pool_claim_token == token_two
+    assert app._session_attach.pool_heartbeat_status() == "session"
 
 
 @pytest.mark.asyncio
@@ -620,24 +643,24 @@ async def test_admission_claims_before_blocking_setup_and_rejects_second_attach(
         entered.set()
         await blocker.wait()
 
-    with patch.object(app, "_attach_session", side_effect=blocked_attach):
-        first = await app._admit_pool_session_attach(_request())
+    with patch.object(app._session_attach, "attach", side_effect=blocked_attach):
+        first = await app._pool_session_attach_response(_request())
         assert first.status_code == 200
-        assert app._pool_attach_claim == "thread-a"
-        assert app._pool_heartbeat_status() == "session"
+        assert app._session_attach._pool_claim == "thread-a"
+        assert app._session_attach.pool_heartbeat_status() == "session"
         await entered.wait()
 
-        second = await app._admit_pool_session_attach(_request("thread-b"))
+        second = await app._pool_session_attach_response(_request("thread-b"))
         assert second.status_code == 409
 
-        task = app._pool_attach_task
+        task = app._session_attach._pool_task
         assert task is not None
-        app._failed_attach_release_receipt = _release_receipt()
+        app._session_attach._release_receipt = _release_receipt()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    assert app._pool_attach_claim is None
+    assert app._session_attach._pool_claim is None
     client.release_thread_agent.assert_awaited_once_with(
         "thread-a",
         session_runtime_generation=GENERATION,
@@ -655,25 +678,27 @@ async def test_stale_release_receipt_never_clears_current_claim():
     client = MagicMock()
     client.release_thread_agent = AsyncMock(return_value=True)
     app._orchestrator_client = client
-    app._pool_attach_claim = "thread-a"
-    app._pool_attach_runtime_generation = GENERATION
-    app._pool_attach_token = ATTACH_TOKEN
-    app._failed_attach_release_receipt = _release_receipt(
+    app._session_attach._pool_claim = "thread-a"
+    app._session_attach._pool_claim_generation = GENERATION
+    app._session_attach._pool_claim_token = ATTACH_TOKEN
+    app._session_attach._release_receipt = _release_receipt(
         generation="cccccccc-cccc-4ccc-8ccc-cccccccccccc"
     )
 
     with patch.object(
-        app, "_attach_session", AsyncMock(side_effect=RuntimeError("failed"))
+        app._session_attach, "attach", AsyncMock(side_effect=RuntimeError("failed"))
     ):
         task = asyncio.create_task(
-            app._run_pool_attach_transaction("thread-a", {}, GENERATION, ATTACH_TOKEN)
+            app._session_attach._run_pool_attach_transaction(
+                "thread-a", {}, GENERATION, ATTACH_TOKEN
+            )
         )
-        app._pool_attach_task = task
+        app._session_attach._pool_task = task
         await task
 
     client.release_thread_agent.assert_not_awaited()
-    assert app._pool_attach_claim == "thread-a"
-    assert app._pool_heartbeat_status() == "session"
+    assert app._session_attach._pool_claim == "thread-a"
+    assert app._session_attach.pool_heartbeat_status() == "session"
 
 
 @pytest.mark.asyncio
@@ -706,7 +731,7 @@ async def test_dedicated_attach_failure_releases_receipt_before_exit(
     client.close = AsyncMock(side_effect=close)
     client.stop_heartbeat = MagicMock()
     app._orchestrator_client = client
-    app._failed_attach_release_receipt = _release_receipt()
+    app._session_attach._release_receipt = _release_receipt()
 
     def exit_process(code):
         order.append(f"exit:{code}")
@@ -717,7 +742,7 @@ async def test_dedicated_attach_failure_releases_receipt_before_exit(
         await getattr(app, exit_helper_name)("thread-a", RuntimeError("attach failed"))
 
     assert order == ["release", "deregister", "close", "exit:0"]
-    assert app._failed_attach_release_receipt is None
+    assert app._session_attach._release_receipt is None
 
 
 @pytest.mark.asyncio
@@ -733,7 +758,7 @@ async def test_dedicated_exit_stays_nonready_while_release_is_unconfirmed(monkey
     client.deregister = AsyncMock()
     client.close = AsyncMock()
     app._orchestrator_client = client
-    app._failed_attach_release_receipt = _release_receipt()
+    app._session_attach._release_receipt = _release_receipt()
     exit_process = MagicMock()
     monkeypatch.setattr(app.os, "_exit", exit_process)
 
@@ -742,12 +767,12 @@ async def test_dedicated_exit_stays_nonready_while_release_is_unconfirmed(monkey
             app._exit_workspace_not_ready("thread-a", RuntimeError("attach failed"))
         )
         await release_seen.wait()
-        assert app._pool_heartbeat_status() == "session"
+        assert app._session_attach.pool_heartbeat_status() == "session"
         client.deregister.assert_not_awaited()
         exit_process.assert_not_called()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    assert app._failed_attach_release_receipt == _release_receipt()
-    assert app._pool_heartbeat_status() == "session"
+    assert app._session_attach._release_receipt == _release_receipt()
+    assert app._session_attach.pool_heartbeat_status() == "session"

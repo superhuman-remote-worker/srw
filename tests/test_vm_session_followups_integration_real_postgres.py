@@ -16,7 +16,7 @@ from orchestrator.services import agent_provisioner as agent_module
 from orchestrator.services import stale_agent_detector as detector
 from orchestrator.services import vm_provisioner as vm_module
 from orchestrator.services import thread_workspace_delivery as delivery
-from agent.api import persistent_app
+from agent.api import session_workspace
 from agent.api.orchestrator_client import OrchestratorClient
 from orchestrator.routers.agent_thread_status import router
 from orchestrator.security import access
@@ -133,7 +133,7 @@ async def end_by_handoff(db, monkeypatch, vm_delivery):
         presented_attach_token=str(current["runtime_attach_token"]),
         dependencies=replace(vm_delivery.dependencies, store=db),
     )
-    workspace = await persistent_app._poll_workspace_ready(
+    workspace = await session_workspace.poll_workspace_ready(
         NS(get_thread_workspace=AsyncMock(return_value=payload)),
         thread_id,
         timeout=1,

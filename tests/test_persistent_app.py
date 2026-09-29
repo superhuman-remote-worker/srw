@@ -1,12 +1,14 @@
 """Tests for src/api/persistent_app.py — persistent agent FastAPI application.
 
 Covers: _get_agent_metrics, _safe_serialize, _save_message,
-_save_turn_ai_messages, _generate_title, _poll_workspace_ready,
+_save_turn_ai_messages, _generate_title, poll_workspace_ready,
 _poll_vm_ready, _handle_compact, _handle_archive, permission_check,
 on_tool_result truncation, check_interrupt closure, WS message routing,
 health endpoints, _ws_send, create_persistent_app, on_turn callbacks.
 """
 
+from agent.api import session_contract
+from agent.api import session_workspace
 import asyncio
 import json
 from contextlib import ExitStack, contextmanager
@@ -39,17 +41,16 @@ from agent.api.persistent_app import (
     _loop_persist_message,
     _persist_one_message,
     _poll_vm_ready,
-    _poll_workspace_ready,
     _repair_tool_pairing,
     _safe_serialize,
     _save_message,
     _save_turn_ai_messages,
-    _session_backend_is_lite,
-    _session_backend_is_vm,
     _upgrade_already_satisfied,
     _ws_send,
     create_persistent_app,
 )
+from agent.api.session_attach import session_backend_is_lite, session_backend_is_vm
+from agent.api.session_workspace import poll_workspace_ready
 
 
 async def _handle_api_interrupt(request):
@@ -2545,7 +2546,7 @@ class TestAutoTitleAfterFirstTurn:
 
 
 # ---------------------------------------------------------------------------
-# 3.6 _poll_workspace_ready()
+# 3.6 poll_workspace_ready()
 # ---------------------------------------------------------------------------
 
 
@@ -2581,7 +2582,7 @@ class TestPollWorkspaceReady:
         client = AsyncMock()
         client.get_thread_workspace.return_value = workspace
 
-        result = await app._poll_workspace_ready(
+        result = await session_workspace.poll_workspace_ready(
             client, "tid", timeout=5, require_vm=backend == "vm"
         )
 
@@ -2605,7 +2606,7 @@ class TestPollWorkspaceReady:
         client = AsyncMock()
         client.get_thread_workspace.return_value = None
 
-        result = await _poll_workspace_ready(client, "tid", timeout=5)
+        result = await poll_workspace_ready(client, "tid", timeout=5)
         assert result is None
         # Should have been called only once (no retry)
         assert client.get_thread_workspace.call_count == 1
@@ -2626,7 +2627,7 @@ class TestPollWorkspaceReady:
             )
         )
         with pytest.raises(SessionGrantDenied):
-            await _poll_workspace_ready(client, "tid", timeout=5, raise_on_denied=True)
+            await poll_workspace_ready(client, "tid", timeout=5, raise_on_denied=True)
         client.get_thread_workspace.assert_called_once_with("tid", raise_on_denied=True)
 
     @pytest.mark.asyncio
@@ -2644,7 +2645,7 @@ class TestPollWorkspaceReady:
             "canvas_shared_browser_available": True,
         }
 
-        result = await _poll_workspace_ready(client, "tid", timeout=5)
+        result = await poll_workspace_ready(client, "tid", timeout=5)
 
         assert result is not None
         assert result["backend"] == "vm"
@@ -2673,7 +2674,7 @@ class TestPollWorkspaceReady:
             "canvas_shared_browser_available": True,
         }
 
-        result = await _poll_workspace_ready(client, "tid", timeout=5)
+        result = await poll_workspace_ready(client, "tid", timeout=5)
 
         assert result is not None
         assert result["backend"] == "sandbox"
@@ -2699,7 +2700,7 @@ class TestPollWorkspaceReady:
             "workspace_ssh_host_key_fingerprint": "SHA256:orphaned",
         }
 
-        result = await _poll_workspace_ready(client, "tid", timeout=5)
+        result = await poll_workspace_ready(client, "tid", timeout=5)
 
         assert result is not None
         assert result["backend"] == "sandbox"
@@ -2714,7 +2715,7 @@ class TestPollWorkspaceReady:
         client = AsyncMock()
         client.get_thread_workspace.return_value = {"status": "none"}
 
-        result = await _poll_workspace_ready(client, "tid", timeout=5)
+        result = await poll_workspace_ready(client, "tid", timeout=5)
         assert result is None
 
     @pytest.mark.asyncio
@@ -2727,7 +2728,7 @@ class TestPollWorkspaceReady:
             "managed_repository_credentials": [{"private_key": private_material}],
         }
 
-        result = await _poll_workspace_ready(client, "tid", timeout=5)
+        result = await poll_workspace_ready(client, "tid", timeout=5)
         assert result is None
         assert private_material not in caplog.text
 
@@ -2747,7 +2748,7 @@ class TestPollWorkspaceReady:
         client.get_thread_workspace = _get_workspace
 
         with patch("agent.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
-            result = await _poll_workspace_ready(
+            result = await poll_workspace_ready(
                 client, "tid", timeout=30, poll_interval=0.01
             )
 
@@ -2763,7 +2764,7 @@ class TestPollWorkspaceReady:
         with patch("agent.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
             # Use a very short timeout and mock time.monotonic to expire immediately
             with patch("time.monotonic", side_effect=[0, 100]):
-                result = await _poll_workspace_ready(
+                result = await poll_workspace_ready(
                     client, "tid", timeout=5, poll_interval=0.01
                 )
 
@@ -2780,7 +2781,7 @@ class TestPollWorkspaceReady:
             "pod_ip": "pod-ip",
         }
 
-        result = await _poll_workspace_ready(client, "tid", timeout=5)
+        result = await poll_workspace_ready(client, "tid", timeout=5)
         assert result["remote"]["host"] == "vm-host"
 
     @pytest.mark.asyncio
@@ -2807,7 +2808,7 @@ class TestPollWorkspaceReady:
             # to 2, past the base deadline); the vm-detected extend to 1000 keeps
             # polling so the second poll returns the ready VM.
             with patch("time.monotonic", side_effect=[0, 0.5, 2, 2]):
-                result = await _poll_workspace_ready(
+                result = await poll_workspace_ready(
                     client, "tid", timeout=1, vm_timeout=1000, poll_interval=0.01
                 )
 
@@ -2833,7 +2834,7 @@ class TestPollWorkspaceReady:
 
         with patch("agent.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
             with patch("time.monotonic", side_effect=[0, 0.5, 2]):
-                result = await _poll_workspace_ready(
+                result = await poll_workspace_ready(
                     client,
                     "tid",
                     timeout=1,
@@ -2854,7 +2855,7 @@ class TestPollWorkspaceReady:
             "vm_ssh_port": 22,
         }
 
-        result = await _poll_workspace_ready(client, "tid", timeout=5, require_vm=True)
+        result = await poll_workspace_ready(client, "tid", timeout=5, require_vm=True)
 
         assert result is not None
         assert result["backend"] == "vm"
@@ -2868,7 +2869,7 @@ class TestPollWorkspaceReady:
         client = AsyncMock()
         client.get_thread_workspace.return_value = {"vm_status": "failed"}
 
-        result = await _poll_workspace_ready(client, "tid", timeout=5, require_vm=True)
+        result = await poll_workspace_ready(client, "tid", timeout=5, require_vm=True)
 
         assert result is None
         assert client.get_thread_workspace.call_count == 1  # no retry
@@ -2881,7 +2882,7 @@ class TestPollWorkspaceReady:
         client = AsyncMock()
         client.get_thread_workspace.return_value = {"status": "none"}
 
-        result = await _poll_workspace_ready(client, "tid", timeout=5, require_vm=True)
+        result = await poll_workspace_ready(client, "tid", timeout=5, require_vm=True)
 
         assert result is None
         assert client.get_thread_workspace.call_count == 1  # no retry
@@ -2898,7 +2899,7 @@ class TestPollWorkspaceReady:
             "pod_ip": "10.42.2.32",
         }
 
-        result = await _poll_workspace_ready(client, "tid", timeout=5)
+        result = await poll_workspace_ready(client, "tid", timeout=5)
 
         assert result is not None
         assert result["backend"] == "sandbox"
@@ -4678,7 +4679,7 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
             patch("agent.api.persistent_app._orchestrator_client", client),
             patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch(
-                "agent.api.persistent_app._poll_workspace_ready",
+                "agent.api.session_workspace.poll_workspace_ready",
                 new_callable=AsyncMock,
                 return_value=workspace,
             ),
@@ -4784,7 +4785,7 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
             patch("agent.api.persistent_app._orchestrator_client", client),
             patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch(
-                "agent.api.persistent_app._poll_workspace_ready",
+                "agent.api.session_workspace.poll_workspace_ready",
                 new_callable=AsyncMock,
                 return_value=workspace,
             ),
@@ -4824,7 +4825,7 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
             patch("agent.api.persistent_app._orchestrator_client", client),
             patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch(
-                "agent.api.persistent_app._poll_workspace_ready",
+                "agent.api.session_workspace.poll_workspace_ready",
                 new_callable=AsyncMock,
             ) as poll,
         ):
@@ -5695,7 +5696,7 @@ class TestAttachSessionEventJournalFailure:
         mod._subscribers.clear()
 
         with patch.object(mod, "_stop_thread_control_watcher", new=AsyncMock()):
-            await mod._cleanup_failed_event_journal_attach(mod._session_identity.thread_id)
+            await mod._session_attach.cleanup_failed_attach(mod._session_identity.thread_id)
 
         session.cleanup.assert_awaited_once_with(
             preserve_shell=True,
@@ -5749,9 +5750,7 @@ class TestAttachSessionEventJournalFailure:
             patch.object(mod, "_agent", fake_agent),
             patch.object(mod, "_orchestrator_client", fake_orchestrator),
             patch.object(mod, "PersistentSession", FakeSession),
-            patch.object(
-                mod,
-                "_poll_workspace_ready",
+            patch.object(session_workspace, "poll_workspace_ready",
                 new=AsyncMock(return_value=workspace_override),
             ),
             patch.object(
@@ -5767,7 +5766,7 @@ class TestAttachSessionEventJournalFailure:
             patch.object(mod, "_broadcast") as broadcast,
         ):
             with pytest.raises(mod.EventJournalUnavailable):
-                await mod._attach_session("thread-journal-failure")
+                await mod._session_attach.attach("thread-journal-failure")
 
         assert len(instances) == 1
         instances[0].cleanup.assert_awaited_once_with(
@@ -5846,9 +5845,7 @@ class TestAttachSessionCloudMount:
             patch.object(mod, "_agent", fake_agent),
             patch.object(mod, "_orchestrator_client", fake_orchestrator),
             patch.object(mod, "PersistentSession", FakeSession),
-            patch.object(
-                mod,
-                "_poll_workspace_ready",
+            patch.object(session_workspace, "poll_workspace_ready",
                 new=AsyncMock(return_value=workspace_override),
             ),
             patch.object(mod, "_build_sync_coordinator") as build_sync,
@@ -5857,7 +5854,7 @@ class TestAttachSessionCloudMount:
             patch.object(mod, "_start_watchdogs"),
         ):
             try:
-                await mod._attach_session("thread-1")
+                await mod._session_attach.attach("thread-1")
                 queue_after_recovery = mod._session_input.queue
             finally:
                 mod._session = None
@@ -5931,9 +5928,7 @@ class TestAttachSessionProtectedCloudFailClose:
             patch.object(mod, "_agent", fake_agent),
             patch.object(mod, "_orchestrator_client", fake_orchestrator),
             patch.object(mod, "PersistentSession", self._fake_session_cls()),
-            patch.object(
-                mod,
-                "_poll_workspace_ready",
+            patch.object(session_workspace, "poll_workspace_ready",
                 new=AsyncMock(return_value=workspace_override),
             ),
             patch.object(mod, "_build_sync_coordinator") as build_sync,
@@ -5943,10 +5938,10 @@ class TestAttachSessionProtectedCloudFailClose:
         ):
             try:
                 with pytest.raises(
-                    mod.ProtectedCloudUnavailable,
+                    session_contract.ProtectedCloudUnavailable,
                     match="no authoritative ready state",
                 ):
-                    await mod._attach_session("thread-1")
+                    await mod._session_attach.attach("thread-1")
             finally:
                 mod._session = None
                 mod._session_identity._thread_id = None
@@ -5989,9 +5984,7 @@ class TestAttachSessionProtectedCloudFailClose:
             patch.object(mod, "_agent", fake_agent),
             patch.object(mod, "_orchestrator_client", fake_orchestrator),
             patch.object(mod, "PersistentSession", self._fake_session_cls()),
-            patch.object(
-                mod,
-                "_poll_workspace_ready",
+            patch.object(session_workspace, "poll_workspace_ready",
                 new=AsyncMock(return_value=workspace_override),
             ),
             patch.object(mod, "_build_sync_coordinator") as build_sync,
@@ -6000,7 +5993,7 @@ class TestAttachSessionProtectedCloudFailClose:
             patch.object(mod, "_start_watchdogs"),
         ):
             try:
-                await mod._attach_session("thread-1")
+                await mod._session_attach.attach("thread-1")
             finally:
                 mod._session = None
                 mod._session_identity._thread_id = None
@@ -6154,9 +6147,7 @@ class TestAttachSessionProtectedCloudSingletonIsolation:
             patch.object(mod, "_agent", fake_agent),
             patch.object(mod, "_orchestrator_client", fake_orchestrator),
             patch.object(mod, "PersistentSession", self._fake_session_cls(captured)),
-            patch.object(
-                mod,
-                "_poll_workspace_ready",
+            patch.object(session_workspace, "poll_workspace_ready",
                 new=AsyncMock(return_value=workspace_override),
             ),
             patch.object(mod, "_build_sync_coordinator"),
@@ -6165,7 +6156,7 @@ class TestAttachSessionProtectedCloudSingletonIsolation:
             patch.object(mod, "_start_watchdogs"),
         ):
             try:
-                await mod._attach_session(
+                await mod._session_attach.attach(
                     "thread-1",
                     pinned_runtime_generation_contract=workspace_override.get(
                         "pinned_runtime_generation_contract"
@@ -7760,9 +7751,9 @@ class TestAttachSessionRebinds:
 
     def test_attach_rebuilds_auxiliary_when_override_present(self):
         from inspect import getsource
-        from agent.api.persistent_app import _attach_session_inner
+        from agent.api.session_attach import SessionAttachCoordinator
 
-        src = getsource(_attach_session_inner)
+        src = getsource(SessionAttachCoordinator._attach_inner)
         # Auxiliary rebuild branch
         assert 'config_override.get("auxiliary", {}).get("model")' in src
         assert "AuxiliaryLLM(" in src
@@ -7775,16 +7766,16 @@ class TestAttachSessionRebinds:
         must still route through it, and the helper must reset the singleton
         and own every memory transport key (embedding + the rerank slot)."""
         from inspect import getsource
-        from agent.api.persistent_app import (
+        from agent.api.session_attach import (
             MEMORY_EMBEDDING_ENV_KEYS,
-            _apply_session_embedding_env,
-            _attach_session_inner,
+            SessionAttachCoordinator,
+            apply_session_embedding_env,
         )
 
-        attach_src = getsource(_attach_session_inner)
-        assert "_apply_session_embedding_env(_env_keys_src)" in attach_src
+        attach_src = getsource(SessionAttachCoordinator._attach_inner)
+        assert "apply_session_embedding_env(_env_keys_src)" in attach_src
 
-        helper_src = getsource(_apply_session_embedding_env)
+        helper_src = getsource(apply_session_embedding_env)
         assert "_embedding_module._embedding_service = None" in helper_src
         assert set(MEMORY_EMBEDDING_ENV_KEYS) == {
             "EMBEDDING_PROVIDER",
@@ -8171,7 +8162,7 @@ class TestWorkspaceNotReadyException:
 
 
 class TestAttachSessionRaisesWorkspaceNotReady:
-    """_attach_session raises WorkspaceNotReady when _poll_workspace_ready returns None."""
+    """_attach_session raises WorkspaceNotReady when poll_workspace_ready returns None."""
 
     @pytest.mark.asyncio
     async def test_raises_workspace_not_ready_when_poll_returns_none(self):
@@ -8182,11 +8173,10 @@ class TestAttachSessionRaisesWorkspaceNotReady:
 
         with patch.object(pa, "_session", None):
             with patch.object(pa, "_orchestrator_client", mock_client):
-                with patch.object(
-                    pa, "_poll_workspace_ready", new=AsyncMock(return_value=None)
+                with patch.object(session_workspace, "poll_workspace_ready", new=AsyncMock(return_value=None)
                 ):
                     with pytest.raises(WorkspaceNotReady):
-                        await pa._attach_session("t1")
+                        await pa._session_attach.attach("t1")
 
     @pytest.mark.asyncio
     async def test_raises_contains_descriptive_message(self):
@@ -8197,11 +8187,10 @@ class TestAttachSessionRaisesWorkspaceNotReady:
 
         with patch.object(pa, "_session", None):
             with patch.object(pa, "_orchestrator_client", mock_client):
-                with patch.object(
-                    pa, "_poll_workspace_ready", new=AsyncMock(return_value=None)
+                with patch.object(session_workspace, "poll_workspace_ready", new=AsyncMock(return_value=None)
                 ):
                     with pytest.raises(WorkspaceNotReady, match="workspace"):
-                        await pa._attach_session("t1")
+                        await pa._session_attach.attach("t1")
 
     @pytest.mark.asyncio
     async def test_double_attach_guard_still_raises_plain_runtime_error(self):
@@ -8213,7 +8202,7 @@ class TestAttachSessionRaisesWorkspaceNotReady:
 
         with patch.object(pa, "_session", mock_session):
             with pytest.raises(RuntimeError) as exc_info:
-                await pa._attach_session("t1")
+                await pa._session_attach.attach("t1")
         # It must NOT be WorkspaceNotReady
         assert not isinstance(exc_info.value, WorkspaceNotReady)
         assert "already attached" in str(exc_info.value)
@@ -8456,7 +8445,7 @@ class TestScheduleExitDeregisters:
 
 
 # ---------------------------------------------------------------------------
-# _session_backend_is_lite() — lite-session boot detection
+# session_backend_is_lite() — lite-session boot detection
 # (no_workspace_agent_mode session boot gap; workspace_tier_upgrade.md smoke test)
 # ---------------------------------------------------------------------------
 
@@ -8467,73 +8456,73 @@ class TestSessionBackendIsLite:
     ({workspace: ...}) and the NESTED resolved_config shape (agent.workspace)."""
 
     def test_flat_virtual_is_lite(self):
-        assert _session_backend_is_lite({"workspace": {"backend": "virtual"}}) is True
+        assert session_backend_is_lite({"workspace": {"backend": "virtual"}}) is True
 
     def test_flat_none_is_lite(self):
-        assert _session_backend_is_lite({"workspace": {"backend": "none"}}) is True
+        assert session_backend_is_lite({"workspace": {"backend": "none"}}) is True
 
     def test_nested_virtual_is_lite(self):
         # A resolved_config blob nests the agent config under "agent".
         assert (
-            _session_backend_is_lite({"agent": {"workspace": {"backend": "virtual"}}})
+            session_backend_is_lite({"agent": {"workspace": {"backend": "virtual"}}})
             is True
         )
 
     def test_flat_sandbox_is_not_lite(self):
-        assert _session_backend_is_lite({"workspace": {"backend": "sandbox"}}) is False
+        assert session_backend_is_lite({"workspace": {"backend": "sandbox"}}) is False
 
     def test_nested_vm_is_not_lite(self):
         assert (
-            _session_backend_is_lite({"agent": {"workspace": {"backend": "vm"}}})
+            session_backend_is_lite({"agent": {"workspace": {"backend": "vm"}}})
             is False
         )
 
     def test_missing_backend_is_not_lite(self):
-        assert _session_backend_is_lite({"workspace": {}}) is False
-        assert _session_backend_is_lite({}) is False
+        assert session_backend_is_lite({"workspace": {}}) is False
+        assert session_backend_is_lite({}) is False
 
     def test_non_dict_is_not_lite(self):
-        assert _session_backend_is_lite(None) is False
-        assert _session_backend_is_lite("virtual") is False
+        assert session_backend_is_lite(None) is False
+        assert session_backend_is_lite("virtual") is False
 
 
 # ---------------------------------------------------------------------------
-# _session_backend_is_vm() — VM-tier boot detection
+# session_backend_is_vm() — VM-tier boot detection
 # (knowledge-base/knowledge/issues/session_vm_backend_never_attaches.md Defect 2)
 # ---------------------------------------------------------------------------
 
 
 class TestSessionBackendIsVm:
     """_attach_session uses this to require a VM (never a container) for a
-    vm-tier session. Same dual-shape contract as _session_backend_is_lite:
+    vm-tier session. Same dual-shape contract as session_backend_is_lite:
     FLAT config_override ({workspace: ...}) and NESTED resolved_config
     (agent.workspace)."""
 
     def test_flat_vm_is_vm(self):
-        assert _session_backend_is_vm({"workspace": {"backend": "vm"}}) is True
+        assert session_backend_is_vm({"workspace": {"backend": "vm"}}) is True
 
     def test_flat_remote_alias_is_vm(self):
         # "remote" is the legacy alias for "vm"; stored overrides still carry it.
-        assert _session_backend_is_vm({"workspace": {"backend": "remote"}}) is True
+        assert session_backend_is_vm({"workspace": {"backend": "remote"}}) is True
 
     def test_nested_vm_is_vm(self):
         assert (
-            _session_backend_is_vm({"agent": {"workspace": {"backend": "vm"}}}) is True
+            session_backend_is_vm({"agent": {"workspace": {"backend": "vm"}}}) is True
         )
 
     def test_flat_sandbox_is_not_vm(self):
-        assert _session_backend_is_vm({"workspace": {"backend": "sandbox"}}) is False
+        assert session_backend_is_vm({"workspace": {"backend": "sandbox"}}) is False
 
     def test_lite_is_not_vm(self):
-        assert _session_backend_is_vm({"workspace": {"backend": "virtual"}}) is False
+        assert session_backend_is_vm({"workspace": {"backend": "virtual"}}) is False
 
     def test_missing_backend_is_not_vm(self):
-        assert _session_backend_is_vm({"workspace": {}}) is False
-        assert _session_backend_is_vm({}) is False
+        assert session_backend_is_vm({"workspace": {}}) is False
+        assert session_backend_is_vm({}) is False
 
     def test_non_dict_is_not_vm(self):
-        assert _session_backend_is_vm(None) is False
-        assert _session_backend_is_vm("vm") is False
+        assert session_backend_is_vm(None) is False
+        assert session_backend_is_vm("vm") is False
 
 
 @pytest.mark.asyncio
@@ -8543,7 +8532,7 @@ async def test_vm_tier_poll_rides_out_a_transient_workspace_failure():
     orchestrator restart, or a briefly unavailable repository authority)."""
     from unittest.mock import AsyncMock
 
-    from agent.api.persistent_app import _poll_workspace_ready
+    from agent.api.session_workspace import poll_workspace_ready
 
     client = AsyncMock()
     client.get_thread_workspace = AsyncMock(
@@ -8554,7 +8543,7 @@ async def test_vm_tier_poll_rides_out_a_transient_workspace_failure():
         ]
     )
 
-    result = await _poll_workspace_ready(
+    result = await poll_workspace_ready(
         client, "tid", timeout=10, poll_interval=0.01, require_vm=True
     )
 
