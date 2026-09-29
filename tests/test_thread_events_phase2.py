@@ -235,7 +235,7 @@ class TestBroadcastCursor:
         fake_session.postgres_conn = fake_conn
 
         mod._session = fake_session
-        mod._thread_id = "thread-xyz"
+        mod._session_identity._thread_id = "thread-xyz"
         mod._subscribe("c1")
         writer = mod._OrderedPersistentEventWriter(
             postgres_conn=fake_conn,
@@ -300,13 +300,13 @@ class TestBroadcastCursor:
         request_id = "77777777-7777-4777-8777-777777777777"
         agent_id = "88888888-8888-4888-8888-888888888888"
         mod._session = session
-        mod._thread_id = "99999999-9999-4999-8999-999999999999"
+        mod._session_identity._thread_id = "99999999-9999-4999-8999-999999999999"
         mod._events_epoch = 3
         mod._next_seq = 10
         live = mod._subscribe("durable-control")
         writer = mod._OrderedPersistentEventWriter(
             postgres_conn=pool,
-            thread_id=mod._thread_id,
+            thread_id=mod._session_identity.thread_id,
             epoch=3,
             on_terminal_failure=lambda _events, _reason: None,
             pinned_agent_id=agent_id,
@@ -1156,12 +1156,12 @@ class TestAgentRestInputEndpointsNoSession:
                 self.row["state"] = "queued"
                 return True
 
-        mod._thread_id = "thread-rest"
+        mod._session_identity._thread_id = "thread-rest"
         mod._loop_task = None
         mod._session_input._queue = asyncio.Queue()
         mod._session_input._hard_interrupt_event = asyncio.Event()
-        mod._input_runtime_generation = str(uuid4())
-        mod._session_runtime_attach_token = str(uuid4())
+        mod._session_identity._process_generation = str(uuid4())
+        mod._session_identity._attach_token = str(uuid4())
         mod._session_input._queued_claims.clear()
         mod._session = SimpleNamespace(
             llm_with_tools=object(),
@@ -1198,8 +1198,8 @@ class TestAgentRestInputEndpointsNoSession:
                 patch.object(mod, "_loop_completion_handler", new=AsyncMock()),
                 patch.object(mod, "_early_title_from_prompt", new=AsyncMock()),
                 patch.object(
-                    mod,
-                    "_current_pinned_session_identity_fingerprint",
+                    mod._session_identity,
+                    "fingerprint",
                     return_value=exact_session_fingerprint,
                 ),
                 patch.object(
@@ -1226,12 +1226,12 @@ class TestAgentRestInputEndpointsNoSession:
             assert all(i["claim_generation"] == 1 for i in seen_inputs)
         finally:
             mod._session = None
-            mod._thread_id = None
+            mod._session_identity._thread_id = None
             mod._loop_task = None
             mod._session_input._queue = None
             mod._session_input._hard_interrupt_event = None
-            mod._input_runtime_generation = None
-            mod._session_runtime_attach_token = None
+            mod._session_identity._process_generation = None
+            mod._session_identity._attach_token = None
             mod._session_input._queued_claims.clear()
 
 

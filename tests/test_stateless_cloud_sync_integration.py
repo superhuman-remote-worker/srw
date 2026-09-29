@@ -163,7 +163,7 @@ async def test_stateless_start_recovers_then_strict_pulls_then_arms(monkeypatch)
     try:
         with (
             patch.object(papp, "_session", session),
-            patch.object(papp, "_thread_id", THREAD_ID),
+            patch.object(papp._session_identity, "_thread_id", THREAD_ID),
             patch(
                 "shared.cloud_sync_generations.cloud_sync_lease_is_current",
                 AsyncMock(return_value=True),
@@ -222,7 +222,7 @@ async def test_stateless_pull_failure_blocks_arm_and_turn_start(monkeypatch):
     try:
         with (
             patch.object(papp, "_session", session),
-            patch.object(papp, "_thread_id", THREAD_ID),
+            patch.object(papp._session_identity, "_thread_id", THREAD_ID),
             patch(
                 "shared.cloud_sync_generations.cloud_sync_lease_is_current",
                 AsyncMock(return_value=True),
@@ -259,7 +259,7 @@ async def test_stateless_turn_refuses_unrecovered_cloud_setup(monkeypatch):
 
     with (
         patch.object(papp, "_session", session),
-        patch.object(papp, "_thread_id", THREAD_ID),
+        patch.object(papp._session_identity, "_thread_id", THREAD_ID),
         patch.object(papp, "_cloud_sync_retry_pending", True),
         patch.object(papp, "_retry_cloud_sync_start", retry),
         patch.object(papp, "_broadcast"),
@@ -349,7 +349,7 @@ async def test_turn_end_task_captures_token_and_requirement_snapshot(monkeypatch
     try:
         with (
             patch.object(papp, "_session", session),
-            patch.object(papp, "_thread_id", THREAD_ID),
+            patch.object(papp._session_identity, "_thread_id", THREAD_ID),
             patch.object(papp, "_retire_announced_permission_rows", AsyncMock()),
             patch.object(papp, "_wire_session_aux_archiver"),
             patch.object(papp, "_save_turn_ai_messages", AsyncMock()),
@@ -422,7 +422,7 @@ async def test_teardown_skips_raw_sync_only_for_stateless(stateless: bool):
 
     with (
         patch.object(papp, "_session", session),
-        patch.object(papp, "_thread_id", THREAD_ID),
+        patch.object(papp._session_identity, "_thread_id", THREAD_ID),
         patch.object(papp, "_loop_task", None),
         patch.object(papp, "_event_writer", None),
         patch.object(papp, "_control_owner_agent_id", None),
@@ -1358,7 +1358,7 @@ async def test_none_agent_cloud_suppression_is_stateless_only(
 
     with (
         patch.object(papp, "_session", None),
-        patch.object(papp, "_thread_id", None),
+        patch.object(papp._session_identity, "_thread_id", None),
         patch.object(papp, "_event_writer", None),
         patch.object(papp, "_agent", agent),
         patch.object(papp, "_orchestrator_client", client),
@@ -1391,7 +1391,7 @@ async def test_none_agent_cloud_suppression_is_stateless_only(
             if lease_reset is not None:
                 current_lease.reset(lease_reset)
             papp._session = None
-            papp._thread_id = None
+            papp._session_identity._thread_id = None
 
     if expects_sync:
         build_sync.assert_called_once()
@@ -1467,7 +1467,7 @@ async def test_late_workspace_fetch_retains_generation_without_coordinator():
 
     with (
         patch.object(papp, "_session", None),
-        patch.object(papp, "_thread_id", None),
+        patch.object(papp._session_identity, "_thread_id", None),
         patch.object(papp, "_event_writer", None),
         patch.object(papp, "_agent", agent),
         patch.object(papp, "_orchestrator_client", client),

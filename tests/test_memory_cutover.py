@@ -1278,7 +1278,7 @@ class TestTeardownWiring:
 
         with (
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch(
                 "agent.api.persistent_app._update_thread_status",
                 new=AsyncMock(return_value=True),
@@ -1310,7 +1310,7 @@ class TestTeardownWiring:
 
         with (
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch(
                 "agent.api.persistent_app._update_thread_status",
                 new=AsyncMock(return_value=True),
@@ -1341,7 +1341,7 @@ class TestTeardownWiring:
         session.quiesce_subagents = AsyncMock()
         session.resume_subagents = AsyncMock()
         persistent_app._session = session
-        persistent_app._thread_id = "tid-b11-1"
+        persistent_app._session_identity._thread_id = "tid-b11-1"
         persistent_app._terminating = False
         persistent_app._loop_task = None
         persistent_app._max_sessions_per_process = 0
@@ -1368,7 +1368,7 @@ class TestTeardownWiring:
         ws = AsyncMock()
 
         persistent_app._session = session
-        persistent_app._thread_id = "tid-b11-2"
+        persistent_app._session_identity._thread_id = "tid-b11-2"
         persistent_app._terminating = False
         persistent_app._loop_task = None
         persistent_app._max_sessions_per_process = 0
@@ -1378,7 +1378,9 @@ class TestTeardownWiring:
             patch.object(persistent_app, "_stop_watchdogs"),
         ):
             # _handle_archive reads the patched-in module globals directly
-            with patch("agent.api.persistent_app._thread_id", "tid-b11-2"):
+            with patch(
+                "agent.api.persistent_app._session_identity._thread_id", "tid-b11-2"
+            ):
                 await _handle_archive(ws)
             await persistent_app._terminate_session("loop_complete")
 

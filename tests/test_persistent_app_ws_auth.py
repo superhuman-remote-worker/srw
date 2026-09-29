@@ -38,9 +38,9 @@ def configure_pod_env(monkeypatch):
 
     import agent.api.persistent_app as pa
 
-    monkeypatch.setattr(pa, "_thread_id", THREAD_ID)
-    monkeypatch.setattr(pa, "_session_runtime_generation", RUNTIME_GENERATION)
-    monkeypatch.setattr(pa, "_session_runtime_attach_token", ATTACH_TOKEN)
+    monkeypatch.setattr(pa._session_identity, "_thread_id", THREAD_ID)
+    monkeypatch.setattr(pa._session_identity, "_session_generation", RUNTIME_GENERATION)
+    monkeypatch.setattr(pa._session_identity, "_attach_token", ATTACH_TOKEN)
     monkeypatch.setattr(
         pa,
         "_orchestrator_client",

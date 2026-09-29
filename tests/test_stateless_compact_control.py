@@ -77,7 +77,7 @@ def stateless_owner(monkeypatch):
         context_manager=SimpleNamespace(_last_summarization_stats=None),
     )
     monkeypatch.setattr(pa, "_session", session)
-    monkeypatch.setattr(pa, "_thread_id", str(THREAD_ID))
+    monkeypatch.setattr(pa._session_identity, "_thread_id", str(THREAD_ID))
     monkeypatch.setattr(pa, "_resume_compaction_receipt", None)
     handle = LeaseHandle()
     handle.update(str(THREAD_ID), LEASE)

@@ -12,7 +12,7 @@ a call-time provider. Runtime identity in particular is read through
 never cached across an await the operation re-reads over — so a renewed or
 replaced lease, a rotated attach token or a successor session is observed
 exactly where the runtime always observed it. The identity values themselves
-stay with their owners; this module only defines what it reads.
+stay with their owner (``agent.api.session_identity``).
 
 This module does not import the runtime that composes it, an application
 factory, the loop or the worker graph (import contract and boundary guard).
@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 from uuid import UUID, uuid4
 
-from agent.api.lease_context import LeaseHandle
+from agent.api.session_identity import SessionRuntimeIdentity
 from agent.api.session_contract import (
     AcceptedInput,
     DurableInputUnavailable,
@@ -52,27 +52,6 @@ INTERRUPT_CAUSE_LEASE_LOST = "lease_lost"
 INTERRUPT_CAUSES = frozenset(
     {INTERRUPT_CAUSE_USER, INTERRUPT_CAUSE_SHUTDOWN, INTERRUPT_CAUSE_LEASE_LOST}
 )
-
-
-@dataclass(frozen=True, slots=True)
-class SessionRuntimeIdentity:
-    """One synchronous read of the attached runtime's identity.
-
-    ``process_generation`` is this process incarnation's input generation
-    (minted per attach); ``session_generation`` is the durable session runtime
-    generation; ``attach_generation`` is the local attach counter that scopes
-    session side tasks. ``lease`` is the *current* stateless lease handle, or
-    ``None`` on the pinned lane.
-    """
-
-    thread_id: Optional[str]
-    process_generation: Optional[str]
-    session_generation: Optional[str]
-    attach_token: Optional[str]
-    agent_id: Optional[str]
-    pod_uid: Optional[str]
-    lease: Optional[LeaseHandle]
-    attach_generation: int
 
 
 @dataclass(frozen=True, slots=True)

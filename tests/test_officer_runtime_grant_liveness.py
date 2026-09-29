@@ -426,7 +426,7 @@ async def test_no_spend_callback_survives_real_live_config_rebuild(monkeypatch):
         maintain_runtime_actor=AsyncMock(),
     )
     monkeypatch.setattr(persistent_app, "_session", session)
-    monkeypatch.setattr(persistent_app, "_thread_id", THREAD_ID)
+    monkeypatch.setattr(persistent_app._session_identity, "_thread_id", THREAD_ID)
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
     monkeypatch.setattr(persistent_app, "_broadcast", MagicMock())
     monkeypatch.setattr(persistent_app, "_runtime_authorization_admission_open", True)

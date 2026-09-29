@@ -179,7 +179,7 @@ async def test_managed_patch_failure_precedes_any_local_mutation(monkeypatch, fr
     client = SimpleNamespace(update_thread_config=AsyncMock(return_value=None))
     monkeypatch.setattr(mod, "_session", session)
     monkeypatch.setattr(mod, "_orchestrator_client", client)
-    monkeypatch.setattr(mod, "_thread_id", WORK)
+    monkeypatch.setattr(mod._session_identity, "_thread_id", WORK)
     send = AsyncMock()
     monkeypatch.setattr(mod, "_ws_send", send)
     await mod._handle_config_update(MagicMock(), deepcopy(fragment))

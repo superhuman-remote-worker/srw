@@ -1218,7 +1218,10 @@ class TestAgentToolsetRoute:
     def test_reports_nothing_to_measure_when_unattached(self):
         import agent.api.persistent_app as pa
 
-        with patch.object(pa, "_session", None), patch.object(pa, "_thread_id", "t9"):
+        with (
+            patch.object(pa, "_session", None),
+            patch.object(pa._session_identity, "_thread_id", "t9"),
+        ):
             payload = pa._session_toolset_report()
         assert payload["attached"] is False
         assert payload["report"] is None
@@ -1235,7 +1238,7 @@ class TestAgentToolsetRoute:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "t9"),
+            patch.object(pa._session_identity, "_thread_id", "t9"),
         ):
             payload = pa._session_toolset_report()
 
@@ -1257,7 +1260,7 @@ class TestAgentToolsetRoute:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "t9"),
+            patch.object(pa._session_identity, "_thread_id", "t9"),
         ):
             payload = pa._session_toolset_report()
 
@@ -1277,7 +1280,7 @@ class TestAgentToolsetRoute:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "t9"),
+            patch.object(pa._session_identity, "_thread_id", "t9"),
         ):
             payload = pa._session_toolset_report()
 

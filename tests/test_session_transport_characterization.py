@@ -258,6 +258,19 @@ _INPUT_OWNER_NAMES = {
     "_accept_user_input": "accept",
 }
 
+# Runtime identity names now owned by ``persistent_app._session_identity``
+# (R3.3b), mapped to its attribute.
+_IDENTITY_OWNER_NAMES = {
+    "_thread_id": "_thread_id",
+    "_session_runtime_generation": "_session_generation",
+    "_session_runtime_attach_token": "_attach_token",
+    "_pinned_runtime_generation_enabled": "_runtime_contract",
+    "_pinned_status_identity_enabled": "_status_contract",
+    "_input_runtime_generation": "_process_generation",
+    "_session_generation": "_attach_generation",
+    "_current_pinned_session_identity_fingerprint": "fingerprint",
+}
+
 
 class _Runtime:
     """Test-owned view of the persistent runtime seams."""
@@ -271,6 +284,9 @@ class _Runtime:
         moved = _INPUT_OWNER_NAMES.get(name)
         if moved is not None:
             return self.pa._session_input, moved
+        moved = _IDENTITY_OWNER_NAMES.get(name)
+        if moved is not None:
+            return self.pa._session_identity, moved
         return self.pa, name
 
     def set(self, name: str, value) -> None:

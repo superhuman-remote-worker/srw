@@ -41,7 +41,7 @@ def test_loop_on_workspace_commit_records_via_conn(monkeypatch):
     session = MagicMock()
     session.postgres_conn = conn
     monkeypatch.setattr(app_mod, "_session", session)
-    monkeypatch.setattr(app_mod, "_thread_id", "tid-1")
+    monkeypatch.setattr(app_mod._session_identity, "_thread_id", "tid-1")
 
     asyncio.run(app_mod._loop_on_workspace_commit("sha42"))
     conn.record_turn_commit.assert_awaited_once_with("tid-1", "sha42")
@@ -92,7 +92,7 @@ def _patched_app(monkeypatch, session, *, turn_open=False):
     from agent.api import persistent_app as app_mod
 
     monkeypatch.setattr(app_mod, "_session", session)
-    monkeypatch.setattr(app_mod, "_thread_id", "tid-1")
+    monkeypatch.setattr(app_mod._session_identity, "_thread_id", "tid-1")
     monkeypatch.setattr(app_mod, "_turn_event_open", turn_open)
     monkeypatch.setattr(app_mod, "_tool_inflight", False)
     monkeypatch.setattr(app_mod._session_input, "_queue", asyncio.Queue())

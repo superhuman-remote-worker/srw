@@ -48,11 +48,18 @@ from agent.api.session_contract import (
     WorkspaceNotReady,
     canonical_session_identity_fingerprint,
 )
+from agent.api.session_identity import (
+    SessionIdentityPorts,
+    SessionIdentityRuntime,
+    canonical_runtime_generation,
+    environment_pod_uid,
+    pinned_runtime_generation_advertised,
+    pinned_status_identity_advertised,
+)
 from agent.api.session_input import (
     InputWaitPlan,
     SessionInputPorts,
     SessionInputRuntime,
-    SessionRuntimeIdentity,
 )
 from agent.api.session_http import (
     SessionHttpPorts,
@@ -106,10 +113,7 @@ from agent.services.workspace_undo import (
 from agent.api.lease_context import LeaseLostError
 from agent.api.lease_context import current_lease as _current_lease_var
 from shared import event_journal as _event_journal
-from shared.pinned_session_identity import (
-    PINNED_SESSION_READY_IDENTITY_CONTRACT,
-    pinned_session_ready_identity_fingerprint,
-)
+from shared.pinned_session_identity import PINNED_SESSION_READY_IDENTITY_CONTRACT
 from shared.thread_presence import (
     expire_permission_if_untethered,
     mark_stateless_natural_pause,
@@ -152,11 +156,9 @@ _started_at: Optional[datetime] = None
 
 # Session layer (created/destroyed per thread assignment):
 _session: Optional[PersistentSession] = None
-_thread_id: Optional[str] = None
-_pinned_status_identity_enabled = False
-_pinned_runtime_generation_enabled = False
-_session_runtime_generation: Optional[str] = None
-_session_runtime_attach_token: Optional[str] = None
+# The bound thread, the durable runtime generation and attach token, the
+# advertised contracts, the per-attach input generation and the local attach
+# generation live in one owner, ``_session_identity`` (composed below).
 # Process-local mirror of the orchestrator's exact ``ending`` authority. It is
 # scoped to the complete attached runtime identity, not the process: pool/dual
 # agents may safely serve a successor after exact cleanup clears this tuple.
@@ -172,6 +174,33 @@ _retirement_admission_permanent: Optional[bool] = None
 # never downgrade it to a broad End.
 _pending_drain_suspend: Optional[dict[str, Any]] = None
 _pending_drain_suspend_retry_task: Optional[asyncio.Task[None]] = None
+
+
+def _reset_retirement_admission_mirror() -> None:
+    """Drop the local ``ending`` mirror when the attached identity changes."""
+
+    global _retirement_admission_identity, _retirement_admission_disposition
+    global _retirement_admission_token, _retirement_admission_permanent
+    _retirement_admission_identity = None
+    _retirement_admission_disposition = None
+    _retirement_admission_token = None
+    _retirement_admission_permanent = None
+
+
+# The attached session's identity: bound thread, durable runtime generation and
+# attach token, advertised contracts, per-attach input generation and local
+# attach generation. One owner per process; every other owner reads it through
+# ``snapshot()``/``fingerprint()`` at call time.
+_session_identity = SessionIdentityRuntime(
+    SessionIdentityPorts(
+        agent_id=lambda: _registered_pinned_agent_id(),
+        pod_uid=environment_pod_uid,
+        lease=lambda: _current_lease_var.get(),
+        stateless_mode=lambda: _stateless_mode(),
+        orchestrator_client=lambda: _orchestrator_client,
+        identity_replaced=lambda: _reset_retirement_admission_mirror(),
+    )
+)
 
 # Pool-mode attach admission is deliberately split from the heavy attach
 # transaction.  The orchestrator holds its datasource-selection advisory lock
@@ -227,26 +256,6 @@ def _pool_heartbeat_status() -> str:
         and _pending_drain_suspend is None
         and _failed_attach_release_receipt is None
         else "session"
-    )
-
-
-def _pinned_status_identity_advertised(payload: Any) -> bool:
-    """Accept only the exact numeric v1 additive lifecycle capability."""
-
-    return bool(
-        isinstance(payload, dict)
-        and type(payload.get("pinned_status_identity_contract")) is int
-        and payload["pinned_status_identity_contract"] == 1
-    )
-
-
-def _pinned_runtime_generation_advertised(payload: Any) -> bool:
-    """Accept only the exact numeric v1 runtime-generation capability."""
-
-    return bool(
-        isinstance(payload, dict)
-        and type(payload.get("pinned_runtime_generation_contract")) is int
-        and payload["pinned_runtime_generation_contract"] == 1
     )
 
 
@@ -322,15 +331,6 @@ def _apply_session_subagent_advertisement(
     )
 
 
-def _canonical_runtime_generation(value: Any) -> str | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        return str(UUID(value.strip()))
-    except (TypeError, ValueError):
-        return None
-
-
 _ATTACH_WORKSPACE_IDENTITY_UNSET = object()
 
 
@@ -360,8 +360,8 @@ def _canonical_attach_workspace_identity(
     if workspace_generation is None and workspace_runtime_incarnation is None:
         return (None, None)
 
-    canonical_generation = _canonical_runtime_generation(workspace_generation)
-    canonical_incarnation = _canonical_runtime_generation(workspace_runtime_incarnation)
+    canonical_generation = canonical_runtime_generation(workspace_generation)
+    canonical_incarnation = canonical_runtime_generation(workspace_runtime_incarnation)
     if canonical_generation is None or canonical_incarnation is None:
         raise WorkspaceNotReady("Attach workspace identity is malformed or incomplete")
     return canonical_generation, canonical_incarnation
@@ -401,8 +401,8 @@ def _assert_attach_workspace_payload(
     if raw_generation is None and raw_incarnation is None:
         observed: Tuple[Optional[str], Optional[str]] = (None, None)
     else:
-        canonical_generation = _canonical_runtime_generation(raw_generation)
-        canonical_incarnation = _canonical_runtime_generation(raw_incarnation)
+        canonical_generation = canonical_runtime_generation(raw_generation)
+        canonical_incarnation = canonical_runtime_generation(raw_incarnation)
         if canonical_generation is None or canonical_incarnation is None:
             raise WorkspaceNotReady(
                 "Observed workspace identity is malformed or incomplete"
@@ -410,137 +410,6 @@ def _assert_attach_workspace_payload(
         observed = canonical_generation, canonical_incarnation
     if observed != expected:
         raise WorkspaceNotReady("Workspace identity changed during attach")
-
-
-def _adopt_attached_runtime_identity(
-    generation: Any,
-    attach_token: Any = None,
-    *,
-    contract_advertised: bool,
-) -> None:
-    """Install one exact runtime identity before any attach-side await."""
-
-    global _session_runtime_generation, _session_runtime_attach_token
-    global _pinned_runtime_generation_enabled
-    global _retirement_admission_identity, _retirement_admission_disposition
-    global _retirement_admission_token
-    global _retirement_admission_permanent
-
-    canonical_generation = _canonical_runtime_generation(generation)
-    canonical_token = (
-        _canonical_runtime_generation(attach_token)
-        if attach_token is not None
-        else None
-    )
-    if contract_advertised and (
-        canonical_generation is None
-        or (not _stateless_mode() and canonical_token is None)
-    ):
-        raise WorkspaceNotReady(
-            "Pinned runtime generation contract omitted its exact generation "
-            "or attach token"
-        )
-    if generation is not None and canonical_generation is None:
-        raise WorkspaceNotReady("Pinned runtime generation is malformed")
-    if attach_token is not None and canonical_token is None:
-        raise WorkspaceNotReady("Pinned runtime attach token is malformed")
-    _session_runtime_generation = canonical_generation
-    _session_runtime_attach_token = canonical_token
-    _pinned_runtime_generation_enabled = contract_advertised
-    _retirement_admission_identity = None
-    _retirement_admission_disposition = None
-    _retirement_admission_token = None
-    _retirement_admission_permanent = None
-    client = _orchestrator_client
-    if client is not None and canonical_generation is not None:
-        adopt = getattr(client, "adopt_session_runtime_identity", None)
-        if not callable(adopt) or not adopt(
-            canonical_generation,
-            canonical_token,
-            contract_advertised=contract_advertised,
-        ):
-            raise WorkspaceNotReady("Pinned runtime identity could not be adopted")
-
-
-def _clear_attached_runtime_identity(
-    *,
-    expected_generation: str | None = None,
-    expected_attach_token: str | None = None,
-) -> bool:
-    """Clear only a captured generation, never a successor's authority."""
-
-    global _session_runtime_generation, _session_runtime_attach_token
-    global _pinned_runtime_generation_enabled
-    global _retirement_admission_identity, _retirement_admission_disposition
-    global _retirement_admission_token
-    global _retirement_admission_permanent
-
-    if (
-        expected_generation is not None
-        and _session_runtime_generation != expected_generation
-    ):
-        return False
-    if (
-        expected_attach_token is not None
-        and _session_runtime_attach_token != expected_attach_token
-    ):
-        return False
-    client = _orchestrator_client
-    if client is not None:
-        clear = getattr(client, "clear_session_runtime_identity", None)
-        if callable(clear) and not inspect.iscoroutinefunction(clear):
-            clear(
-                expected_generation=expected_generation,
-                expected_attach_token=expected_attach_token,
-            )
-    _session_runtime_generation = None
-    _session_runtime_attach_token = None
-    _pinned_runtime_generation_enabled = False
-    _retirement_admission_identity = None
-    _retirement_admission_disposition = None
-    _retirement_admission_token = None
-    _retirement_admission_permanent = None
-    return True
-
-
-def _bind_attached_runtime_payload(
-    payload: Any,
-    *,
-    protected_required: bool,
-) -> str | None:
-    """Fence a workspace response to this attach's exact runtime life."""
-
-    if not isinstance(payload, dict):
-        raise WorkspaceNotReady("Workspace runtime identity is unavailable")
-    advertised = _pinned_runtime_generation_advertised(payload)
-    raw_generation = payload.get("session_runtime_generation")
-    generation = _canonical_runtime_generation(raw_generation)
-    if raw_generation is not None and generation is None:
-        raise WorkspaceNotReady("Workspace runtime generation is malformed")
-    if advertised and generation is None:
-        raise WorkspaceNotReady(
-            "Workspace runtime generation contract omitted its generation"
-        )
-    if _pinned_runtime_generation_enabled and not advertised:
-        raise WorkspaceNotReady("Workspace runtime generation contract disappeared")
-    if (
-        _session_runtime_generation is not None
-        and generation != _session_runtime_generation
-    ):
-        raise WorkspaceNotReady("Workspace runtime generation changed during attach")
-    if _session_runtime_generation is None and generation is not None:
-        _adopt_attached_runtime_identity(
-            generation,
-            _session_runtime_attach_token,
-            contract_advertised=advertised,
-        )
-    if protected_required and (
-        not advertised or generation is None or _session_runtime_generation is None
-    ):
-        raise ProtectedCloudUnavailable(
-            "Protected workspace has no exact runtime generation"
-        )
-    return generation
 
 
 # Pool mode: agent can be reused across sessions (Docker Compose mode)
@@ -582,11 +451,6 @@ _TERMINATION_QUEUE_SENTINEL = INTERRUPT_SENTINEL
 # actual provider boundary, including work queued before the failure.
 _runtime_authorization_admission_open: bool = False
 
-# One process incarnation inside one pod. Kubernetes may restart a container
-# without changing the pod UID; this value lets the successor reclaim work
-# that existed only in the predecessor's RAM queue. The separate session
-# generation fences the durable thread binding. Reset on every attach.
-_input_runtime_generation: Optional[str] = None
 _INPUT_CANCELLATION_ENABLED_ENV = "PERSISTENT_INPUT_CANCELLATION_ENABLED"
 
 
@@ -676,7 +540,7 @@ _subscribers: Dict[str, asyncio.Queue] = {}
 _canvas_control = CanvasControlChannel(
     load_state=lambda: _current_canvas_for_control(),
     invalidate_recent_read=lambda path: _invalidate_session_recent_read(path),
-    identity_fingerprint=lambda: _current_pinned_session_identity_fingerprint(),
+    identity_fingerprint=lambda: _session_identity.fingerprint(),
     broadcast=lambda method, params: _broadcast(method, params),
     fan_out_live=lambda frame: _fan_out_live_frame(frame),
 )
@@ -690,11 +554,11 @@ _canvas_control = CanvasControlChannel(
 _session_input = SessionInputRuntime(
     SessionInputPorts(
         session=lambda: _session,
-        identity=lambda: _current_input_runtime_identity(),
+        identity=lambda: _session_identity.snapshot(),
         stateless_mode=lambda: _stateless_mode(),
         runtime_admission_closed=lambda: _runtime_admission_closed(),
         protected_cloud_ready=lambda: _protected_cloud_runtime_ready(),
-        identity_fingerprint=lambda: _current_pinned_session_identity_fingerprint(),
+        identity_fingerprint=lambda: _session_identity.fingerprint(),
         cancellation_enabled=lambda: _persistent_input_cancellation_enabled(),
         turn_open=lambda: _turn_event_open,
         tool_inflight=lambda: _tool_inflight,
@@ -718,9 +582,9 @@ _rewind_lock: asyncio.Lock = asyncio.Lock()
 # fine title — not worth a DB column.
 _draft_title_value: Optional[str] = None
 # Session-local fire-and-forget work must not survive pool reuse.  Every task
-# captures an immutable attach generation and is terminally joined during
-# teardown before the event writer or claimant lease is released.
-_session_generation: int = 0
+# captures an immutable attach generation (``_session_identity``) and is
+# terminally joined during teardown before the event writer or claimant lease
+# is released.
 _session_side_tasks: set[asyncio.Task[Any]] = set()
 
 
@@ -737,8 +601,8 @@ def _session_identity_matches(
 ) -> bool:
     return bool(
         _session is session
-        and _thread_id == thread_id
-        and _session_generation == generation
+        and _session_identity.thread_id == thread_id
+        and _session_identity.attach_generation == generation
     )
 
 
@@ -799,8 +663,8 @@ def _record_turn_tool_execution_identity() -> Optional[Tuple[str, int, int]]:
         handle is None
         or handle.unit_id is None
         or int(handle.lease_token) <= 0
-        or _thread_id is None
-        or str(_thread_id) != str(handle.unit_id)
+        or _session_identity.thread_id is None
+        or str(_session_identity.thread_id) != str(handle.unit_id)
         or _session is None
     ):
         # Pinned sessions have no queue claim and need no shutdown replay
@@ -1040,38 +904,22 @@ def _stateless_mode() -> bool:
     return os.environ.get("STATELESS_EXECUTOR", "").strip() == "1"
 
 
-def _current_stateless_lease_token() -> Optional[int]:
-    """Return the exact live claim token for this attached stateless thread."""
-
-    if not _stateless_mode() or _thread_id is None:
-        return None
-    handle = _current_lease_var.get()
-    if (
-        handle is None
-        or not handle.active
-        or handle.lost.is_set()
-        or str(handle.unit_id) != str(_thread_id)
-    ):
-        return None
-    return int(handle.lease_token)
-
-
 async def _safe_mark_stateless_natural_pause(*, require_untethered: bool) -> bool:
     """Best-effort durable presence oracle for stateless natural pauses."""
 
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
         return False
-    lease_token = _current_stateless_lease_token()
+    lease_token = _session_identity.stateless_lease_token()
     if lease_token is None:
         logger.warning(
             "Skipped stateless natural pause without exact lease (thread=%s)",
-            _thread_id,
+            _session_identity.thread_id,
         )
         return False
     try:
         return await mark_stateless_natural_pause(
             _session.postgres_conn,
-            thread_id=_thread_id,
+            thread_id=_session_identity.thread_id,
             lease_token=lease_token,
             require_untethered=require_untethered,
         )
@@ -1081,7 +929,7 @@ async def _safe_mark_stateless_natural_pause(*, require_untethered: bool) -> boo
         # this advisory status write.
         logger.warning(
             "Failed stateless natural-pause presence check (thread=%s): %s",
-            _thread_id,
+            _session_identity.thread_id,
             exc,
         )
         return False
@@ -1345,13 +1193,13 @@ def _protected_workspace_delivery(payload: Dict[str, Any]) -> str:
         or payload.get("vm_ssh_host") is not None
         or payload.get("vm_ssh_port") is not None
         or payload.get("vm_name") is not None
-        or _canonical_runtime_generation(payload.get("workspace_generation")) is None
-        or _canonical_runtime_generation(payload.get("workspace_runtime_incarnation"))
+        or canonical_runtime_generation(payload.get("workspace_generation")) is None
+        or canonical_runtime_generation(payload.get("workspace_runtime_incarnation"))
         is None
         or not isinstance(payload.get("workspace_ssh_host_key_fingerprint"), str)
         or not payload.get("workspace_ssh_host_key_fingerprint")
-        or not _pinned_runtime_generation_advertised(payload)
-        or _canonical_runtime_generation(payload.get("session_runtime_generation"))
+        or not pinned_runtime_generation_advertised(payload)
+        or canonical_runtime_generation(payload.get("session_runtime_generation"))
         is None
     ):
         raise ProtectedCloudUnavailable(
@@ -1474,7 +1322,7 @@ def _officer_cfg():
 def _terminal_retirement_disposition() -> str:
     """Choose the immutable outcome before beginning pinned retirement."""
 
-    identity = _attached_retirement_identity()
+    identity = _session_identity.retirement_identity()
     if (
         identity is not None
         and _retirement_admission_identity == identity
@@ -1568,7 +1416,7 @@ def _session_toolset_report() -> dict:
     if session is None:
         return {
             "attached": False,
-            "thread_id": _thread_id,
+            "thread_id": _session_identity.thread_id,
             "report": None,
         }
     names = [
@@ -1578,7 +1426,7 @@ def _session_toolset_report() -> dict:
     ]
     backend = getattr(getattr(session, "workspace_manager", None), "backend", None)
     report = build_agent_toolset_report(
-        thread_id=getattr(session, "thread_id", None) or _thread_id,
+        thread_id=getattr(session, "thread_id", None) or _session_identity.thread_id,
         tool_names=names,
         backend=backend,
     )
@@ -1614,20 +1462,10 @@ def _termination_admission_closed() -> bool:
         return True
 
 
-def _attached_retirement_identity() -> tuple[str, Optional[str], Optional[str]] | None:
-    if _thread_id is None:
-        return None
-    return (
-        str(_thread_id),
-        _session_runtime_generation,
-        _session_runtime_attach_token,
-    )
-
-
 def _retirement_admission_closed() -> bool:
     """True only for the exact attached life whose End has begun."""
 
-    identity = _attached_retirement_identity()
+    identity = _session_identity.retirement_identity()
     return identity is not None and _retirement_admission_identity == identity
 
 
@@ -1717,18 +1555,6 @@ def _runtime_input_admission_open() -> bool:
     return not _runtime_admission_closed() and _protected_cloud_runtime_ready()
 
 
-def _current_pinned_session_identity_fingerprint() -> str | None:
-    """Return the exact local identity used by readiness and effect gates."""
-
-    return pinned_session_ready_identity_fingerprint(
-        thread_id=_thread_id,
-        runtime_generation=_session_runtime_generation,
-        agent_id=_registered_pinned_agent_id(),
-        runtime_attach_token=_session_runtime_attach_token,
-        pod_uid=os.environ.get("POD_UID"),
-    )
-
-
 def _session_ready() -> bool:
     """True when the persistent session is fully attached and the loop
     primitives are ready to accept a WS subscriber.
@@ -1812,7 +1638,7 @@ def _ensure_persistent_loop_started(
         # context at creation — with thread_id for log correlation.
         from agent.core.logging_config import bind_log_context, reset_log_context
 
-        _ctx_token = bind_log_context(thread_id=_thread_id)
+        _ctx_token = bind_log_context(thread_id=_session_identity.thread_id)
         _loop_task = asyncio.create_task(
             run_persistent_loop(
                 llm_with_tools=_session.llm_with_tools,
@@ -1864,7 +1690,7 @@ def _ensure_persistent_loop_started(
         )
         logger.info(
             "Persistent loop started: thread=%s source=%s",
-            _thread_id,
+            _session_identity.thread_id,
             source,
         )
         reset_log_context(_ctx_token)
@@ -1878,7 +1704,7 @@ def _ensure_persistent_loop_started(
     else:
         logger.info(
             "Persistent loop already running: thread=%s source=%s",
-            _thread_id,
+            _session_identity.thread_id,
             source,
         )
     return True
@@ -1978,10 +1804,10 @@ async def _drain_suspend_session() -> None:
     """
     global _drain_intent_handled, _pending_drain_suspend
 
-    thread_id = _thread_id
+    thread_id = _session_identity.thread_id
     runtime_agent_id = _registered_pinned_agent_id()
-    runtime_generation = _session_runtime_generation
-    runtime_attach_token = _session_runtime_attach_token
+    runtime_generation = _session_identity.session_generation
+    runtime_attach_token = _session_identity.attach_token
     runtime_session = _session
 
     # Suspend is a terminal retirement disposition too. Close/drain durable
@@ -2280,7 +2106,7 @@ async def _boot_ws_watchdog(timeout_s: int) -> None:
             "No WebSocket connection within %ds for thread %s — "
             "exiting (likely abandoned during creation).",
             timeout_s,
-            _thread_id,
+            _session_identity.thread_id,
         )
     try:
         await _terminate_session("boot_ws_timeout")
@@ -2317,10 +2143,10 @@ async def _thread_status_watchdog(poll_s: int) -> None:
     global _retirement_admission_token
     global _retirement_admission_permanent
 
-    bound_thread_id = _thread_id
-    bound_runtime_generation = _session_runtime_generation
-    bound_runtime_attach_token = _session_runtime_attach_token
-    runtime_generation_required = _pinned_runtime_generation_enabled
+    bound_thread_id = _session_identity.thread_id
+    bound_runtime_generation = _session_identity.session_generation
+    bound_runtime_attach_token = _session_identity.attach_token
+    runtime_generation_required = _session_identity.runtime_contract
     while True:
         try:
             await asyncio.sleep(poll_s)
@@ -2329,9 +2155,9 @@ async def _thread_status_watchdog(poll_s: int) -> None:
         if not _orchestrator_client or not bound_thread_id:
             continue
         if (
-            _thread_id != bound_thread_id
-            or _session_runtime_generation != bound_runtime_generation
-            or _session_runtime_attach_token != bound_runtime_attach_token
+            _session_identity.thread_id != bound_thread_id
+            or _session_identity.session_generation != bound_runtime_generation
+            or _session_identity.attach_token != bound_runtime_attach_token
         ):
             return
         try:
@@ -2342,13 +2168,13 @@ async def _thread_status_watchdog(poll_s: int) -> None:
         if not lifecycle:
             continue
         if (
-            _thread_id != bound_thread_id
-            or _session_runtime_generation != bound_runtime_generation
-            or _session_runtime_attach_token != bound_runtime_attach_token
+            _session_identity.thread_id != bound_thread_id
+            or _session_identity.session_generation != bound_runtime_generation
+            or _session_identity.attach_token != bound_runtime_attach_token
         ):
             return
         status = lifecycle.get("status")
-        observed_generation = _canonical_runtime_generation(
+        observed_generation = canonical_runtime_generation(
             lifecycle.get("session_runtime_generation")
         )
         generation_moved = bool(
@@ -2358,7 +2184,7 @@ async def _thread_status_watchdog(poll_s: int) -> None:
         generation_missing = bool(
             runtime_generation_required and observed_generation is None
         )
-        observed_attach_token = _canonical_runtime_generation(
+        observed_attach_token = canonical_runtime_generation(
             lifecycle.get("session_runtime_attach_token")
         )
         attach_token_moved = observed_attach_token != bound_runtime_attach_token
@@ -2378,7 +2204,7 @@ async def _thread_status_watchdog(poll_s: int) -> None:
         ):
             disposition = lifecycle.get("retirement_disposition")
             permanent = lifecycle.get("retirement_permanent")
-            retirement_token = _canonical_runtime_generation(
+            retirement_token = canonical_runtime_generation(
                 lifecycle.get("session_runtime_retirement_token")
             )
             if disposition not in {"ended", "suspended"}:
@@ -2395,7 +2221,7 @@ async def _thread_status_watchdog(poll_s: int) -> None:
                     bound_thread_id,
                 )
                 continue
-            identity = _attached_retirement_identity()
+            identity = _session_identity.retirement_identity()
             if identity is None:
                 return
             _retirement_admission_identity = identity
@@ -2773,12 +2599,11 @@ async def lifespan(app: FastAPI):
         _session, \
         _orchestrator_client, \
         _heartbeat_task, \
-        _started_at, \
-        _thread_id
+        _started_at
 
     _started_at = datetime.now()
     stateless = _stateless_mode()
-    pool_mode = _thread_id is None
+    pool_mode = _session_identity.thread_id is None
     if stateless:
         logger.info(
             f"Starting stateless turn executor agent: config={_config_path} "
@@ -2788,7 +2613,7 @@ async def lifespan(app: FastAPI):
     else:
         logger.info(
             f"Starting persistent agent: config={_config_path}, "
-            f"thread={_thread_id or '(pool mode — waiting for assignment)'}"
+            f"thread={_session_identity.thread_id or '(pool mode — waiting for assignment)'}"
         )
 
     # 1. Create and initialize UniversalAgent (singleton layer)
@@ -2834,24 +2659,24 @@ async def lifespan(app: FastAPI):
                 )
             else:
                 # Dedicated mode: auto-create thread if needed (backwards compatible)
-                if _thread_id is None:
+                if _session_identity.thread_id is None:
                     created_id = await _orchestrator_client.create_thread(
                         config_name=_config_path or "session_base",
                         permission_mode=_agent.config.interactive.permission_mode,
                         title=f"Local Session ({_config_path or 'session_base'})",
                     )
                     if created_id:
-                        _thread_id = created_id
-                        logger.info(f"Auto-created thread: {_thread_id}")
+                        _session_identity.bind_thread(created_id)
+                        logger.info(f"Auto-created thread: {_session_identity.thread_id}")
                     else:
                         logger.warning(
                             "Failed to create thread — generating local UUID"
                         )
 
-                if _thread_id is None:
+                if _session_identity.thread_id is None:
                     import uuid
 
-                    _thread_id = str(uuid.uuid4())
+                    _session_identity.bind_thread(str(uuid.uuid4()))
 
                 # A thread-bound registration that loses the provisioning race
                 # raises DuplicateThreadBinding (orchestrator 409); the except
@@ -2863,14 +2688,14 @@ async def lifespan(app: FastAPI):
                 # (network / 5xx): keep the pod up but session-less.
                 dedicated_register_ok = await _orchestrator_client.register(
                     agent_mode="persistent",
-                    thread_id=_thread_id,
+                    thread_id=_session_identity.thread_id,
                 )
                 if not dedicated_register_ok:
                     logger.error(
                         "Persistent registration for thread %s failed "
                         "(transient / non-409) — pod will stay up but will NOT "
                         "attach a session.",
-                        _thread_id,
+                        _session_identity.thread_id,
                     )
 
             # Start heartbeat
@@ -2896,9 +2721,9 @@ async def lifespan(app: FastAPI):
             # Exit cleanly so this orphan pod leaves the per-session Service
             # endpoints; the winning agent keeps serving and the orchestrator
             # does not rebind (the binding already exists). Does not return.
-            await _exit_duplicate_provision(_thread_id)
+            await _exit_duplicate_provision(_session_identity.thread_id)
         except SessionEnded:
-            await _exit_session_ended(_thread_id)
+            await _exit_session_ended(_session_identity.thread_id)
         except Exception as e:
             logger.warning(f"Failed to register with orchestrator (non-fatal): {e}")
             _orchestrator_client = None
@@ -2908,17 +2733,17 @@ async def lifespan(app: FastAPI):
     # If we have a thread_id (dedicated mode) and registration succeeded, set
     # up the session immediately. If register was refused (409), skip the
     # attach — the legitimate owner already holds this thread.
-    if _thread_id and dedicated_register_ok:
+    if _session_identity.thread_id and dedicated_register_ok:
         # Fallback: generate UUID if still None (standalone mode)
-        if _thread_id is None:
+        if _session_identity.thread_id is None:
             import uuid
 
-            _thread_id = str(uuid.uuid4())
+            _session_identity.bind_thread(str(uuid.uuid4()))
 
         try:
-            await _attach_session(_thread_id)
+            await _attach_session(_session_identity.thread_id)
         except SessionEnded:
-            await _exit_session_ended(_thread_id)
+            await _exit_session_ended(_session_identity.thread_id)
         except SessionGrantDenied as e:
             # The session's resolved config exceeds the owner's capability grants
             # (workspace endpoint returned 403) — e.g. a grant revoked between the
@@ -2926,7 +2751,7 @@ async def lifespan(app: FastAPI):
             # attach. Permanent: exit with the REAL reason instead of the
             # misleading 'workspace not provisioned' rebind path; the cockpit
             # re-surfaces it on its next create/prepare grant pre-flight.
-            await _exit_grant_denied(_thread_id, e)
+            await _exit_grant_denied(_session_identity.thread_id, e)
         except MemoryUnavailableError as e:
             # A configured/required memory component couldn't be set up (store
             # init or a plugin transport that won't resolve — e.g. the reranker
@@ -2934,7 +2759,7 @@ async def lifespan(app: FastAPI):
             # reason instead of crashing (which triggered a workspace-release +
             # crash-loop retry). The cockpit re-surfaces it via the orchestrator
             # endpoint pre-flight.
-            await _exit_memory_unavailable(_thread_id, e)
+            await _exit_memory_unavailable(_session_identity.thread_id, e)
         except (WorkspaceNotReady, WorkspaceUnavailableError) as e:
             # Workspace raced us / is wedged (WorkspaceNotReady) or its pod is
             # dead/unreachable (WorkspaceUnavailableError — SSH connect exhausted
@@ -2942,12 +2767,12 @@ async def lifespan(app: FastAPI):
             # crashing, so K8s doesn't restart-loop. The orchestrator's session
             # reconcile (ensure_workspace drift probe) recreates the pod and
             # rebinds a fresh agent. See _exit_workspace_not_ready.
-            await _exit_workspace_not_ready(_thread_id, e)
-    elif _thread_id and not dedicated_register_ok:
+            await _exit_workspace_not_ready(_session_identity.thread_id, e)
+    elif _session_identity.thread_id and not dedicated_register_ok:
         logger.info(
             "Skipping session attach for thread %s — orchestrator refused "
             "registration.",
-            _thread_id,
+            _session_identity.thread_id,
         )
     elif stateless:
         logger.info(
@@ -3575,8 +3400,8 @@ async def _strict_cleanup_partial_sandbox_workspace(
     """Prove all writers zero on an attested sandbox before G rotation."""
 
     remote = context.get("remote")
-    generation = _canonical_runtime_generation(context.get("workspace_generation"))
-    incarnation = _canonical_runtime_generation(
+    generation = canonical_runtime_generation(context.get("workspace_generation"))
+    incarnation = canonical_runtime_generation(
         context.get("workspace_runtime_incarnation")
     )
     fingerprint = context.get("workspace_ssh_host_key_fingerprint")
@@ -3661,20 +3486,17 @@ async def _cleanup_failed_event_journal_attach(
     historical handoff behavior and returns no release receipt.
     """
 
-    global _session, _thread_id, _event_writer
+    global _session, _event_writer
     global _events_epoch, _next_seq, _tool_inflight, _turn_event_open
     global _turn_tool_execution_identity, _turn_tool_execution_external_hook
-    global _input_runtime_generation
     global _runtime_authorization_admission_open
-    global _pinned_status_identity_enabled
-    global _pinned_runtime_generation_enabled
     global _failed_attach_workspace_cleanup_context
     global _failed_attach_release_receipt
 
-    exact_generation = _session_runtime_generation
-    exact_attach_token = _session_runtime_attach_token
+    exact_generation = _session_identity.session_generation
+    exact_attach_token = _session_identity.attach_token
     exact_pinned_attach = bool(
-        _pinned_runtime_generation_enabled
+        _session_identity.runtime_contract
         and exact_generation is not None
         and exact_attach_token is not None
     )
@@ -3817,7 +3639,7 @@ async def _cleanup_failed_event_journal_attach(
         }
 
     _session = None
-    _thread_id = restore_thread_id
+    _session_identity.bind_thread(restore_thread_id)
     _failed_attach_workspace_cleanup_context = None
     _events_epoch = 0
     _next_seq = 0
@@ -3827,10 +3649,10 @@ async def _cleanup_failed_event_journal_attach(
     _turn_tool_execution_external_hook = None
     _turn_event_open = False
     _session_input.teardown()
-    _input_runtime_generation = None
+    _session_identity.clear_process_generation()
     _runtime_authorization_admission_open = False
-    _pinned_status_identity_enabled = False
-    _clear_attached_runtime_identity()
+    _session_identity.set_status_contract(False)
+    _session_identity.clear()
     _clear_attached_runtime_actor()
     _canvas_control.clear_all()
     _subscribers.clear()
@@ -3856,10 +3678,10 @@ async def _cleanup_failed_attach_until_proven(
 
     expected_session = _session
     expected_identity = (
-        _session_runtime_generation,
-        _session_runtime_attach_token,
+        _session_identity.session_generation,
+        _session_identity.attach_token,
     )
-    exact = bool(_pinned_runtime_generation_enabled and all(expected_identity))
+    exact = bool(_session_identity.runtime_contract and all(expected_identity))
     attempt = 0
     while True:
         try:
@@ -3873,8 +3695,8 @@ async def _cleanup_failed_attach_until_proven(
             still_exact_owner = bool(
                 exact
                 and _session is expected_session
-                and _session_runtime_generation == expected_identity[0]
-                and _session_runtime_attach_token == expected_identity[1]
+                and _session_identity.session_generation == expected_identity[0]
+                and _session_identity.attach_token == expected_identity[1]
             )
             if not still_exact_owner:
                 raise
@@ -4015,11 +3837,11 @@ def _llm_config_with_cache_key(llm_cfg: Any) -> Any:
     transmits it to first-party OpenAI only; every other provider/endpoint
     ignores the field, so setting it unconditionally here is safe.
     """
-    if not _thread_id:
+    if not _session_identity.thread_id:
         return llm_cfg
     import dataclasses
 
-    return dataclasses.replace(llm_cfg, prompt_cache_key=f"srw-thread-{_thread_id}")
+    return dataclasses.replace(llm_cfg, prompt_cache_key=f"srw-thread-{_session_identity.thread_id}")
 
 
 async def _attach_session_inner(
@@ -4050,27 +3872,25 @@ async def _attach_session_inner(
     ``config_name`` (pool mode): the thread's config, used as the session
     base instead of the pod's boot config when provided.
     """
-    global _session, _thread_id, _events_epoch, _next_seq, _tool_inflight
+    global _session, _events_epoch, _next_seq, _tool_inflight
     global _turn_tool_execution_identity, _turn_tool_execution_external_hook
-    global _turn_event_open, _session_generation, _draft_title_value
+    global _turn_event_open, _draft_title_value
     global _event_writer, _cloud_sync_retry_pending
     global _runtime_authorization_admission_open
-    global _pinned_status_identity_enabled
-    global _pinned_runtime_generation_enabled
     global _failed_attach_workspace_cleanup_context
 
     expected_workspace_identity = _canonical_attach_workspace_identity(
         workspace_generation,
         workspace_runtime_incarnation,
     )
-    prior_thread_id = _thread_id
+    prior_thread_id = _session_identity.thread_id
 
     _cloud_sync_retry_pending = False
     # A pooled process must never carry a prior Officer's successful
     # maintenance result into the next attachment. Ordinary sessions bypass
     # this latch through ``_officer_cfg() is None`` below.
     _runtime_authorization_admission_open = False
-    _pinned_status_identity_enabled = bool(
+    _session_identity.set_status_contract(
         type(pinned_status_identity_contract) is int
         and pinned_status_identity_contract == 1
     )
@@ -4092,7 +3912,7 @@ async def _attach_session_inner(
     )
     if not isinstance(client_attach_token, str):
         client_attach_token = None
-    _adopt_attached_runtime_identity(
+    _session_identity.adopt(
         session_runtime_generation
         if session_runtime_generation is not None
         else client_generation,
@@ -4115,7 +3935,7 @@ async def _attach_session_inner(
 
     if _session is not None:
         raise RuntimeError(
-            f"Cannot attach thread {thread_id}: already attached to {_thread_id}"
+            f"Cannot attach thread {thread_id}: already attached to {_session_identity.thread_id}"
         )
     if _failed_attach_workspace_cleanup_context is not None:
         raise RuntimeError(
@@ -4127,7 +3947,7 @@ async def _attach_session_inner(
         raise RuntimeError(
             "Cannot attach a new thread while prior session tasks remain active"
         )
-    _session_generation += 1
+    _session_identity.begin_attach()
     _draft_title_value = None
 
     # A normal detach always closes and clears the prior writer. Recover from a
@@ -4141,8 +3961,8 @@ async def _attach_session_inner(
         await _event_writer.close()
         _event_writer = None
 
-    _thread_id = thread_id
-    if _pinned_runtime_generation_enabled and not _stateless_mode():
+    _session_identity.bind_thread(thread_id)
+    if _session_identity.runtime_contract and not _stateless_mode():
         _failed_attach_workspace_cleanup_context = {
             "thread_id": thread_id,
             "setup_started": False,
@@ -4168,9 +3988,9 @@ async def _attach_session_inner(
     # pinned pod that attaches itself takes the fan-out advertisement from
     # the newest one (_session_subagent_advertisement).
     subagent_workspace_responses: List[Any] = []
-    if _rc is None and _co is None and _orchestrator_client and _thread_id:
+    if _rc is None and _co is None and _orchestrator_client and _session_identity.thread_id:
         try:
-            _peek = await _orchestrator_client.get_thread_workspace(_thread_id)
+            _peek = await _orchestrator_client.get_thread_workspace(_session_identity.thread_id)
             if isinstance(_peek, dict):
                 peek_delivery = _protected_workspace_delivery(_peek)
                 # A valid engaging response is intentionally coordinate- and
@@ -4183,12 +4003,12 @@ async def _attach_session_inner(
                         expected_workspace_identity,
                         _peek,
                     )
-                    _bind_attached_runtime_payload(
+                    _session_identity.adopt_workspace_payload(
                         _peek,
                         protected_required=(_protected_workspace_marker(_peek) == "on"),
                     )
-                    _pinned_status_identity_enabled = (
-                        _pinned_status_identity_advertised(_peek)
+                    _session_identity.set_status_contract(
+                        pinned_status_identity_advertised(_peek)
                     )
                     subagent_workspace_responses.append(_peek)
                     attached_workspace_generation = str(
@@ -4219,10 +4039,10 @@ async def _attach_session_inner(
     # Skipped for lite tiers, which run with no pod — the session builds its
     # object-store backend from the injected mounts (persistent_session.py).
     workspace_override = None
-    if not is_lite_session and _orchestrator_client and _thread_id:
+    if not is_lite_session and _orchestrator_client and _session_identity.thread_id:
         workspace_override = await _poll_workspace_ready(
             _orchestrator_client,
-            _thread_id,
+            _session_identity.thread_id,
             timeout=120,
             raise_on_denied=True,
             require_vm=is_vm_session,
@@ -4232,14 +4052,14 @@ async def _attach_session_inner(
                 expected_workspace_identity,
                 workspace_override,
             )
-            _bind_attached_runtime_payload(
+            _session_identity.adopt_workspace_payload(
                 workspace_override,
                 protected_required=(
                     _protected_workspace_marker(workspace_override) == "on"
                 ),
             )
-            _pinned_status_identity_enabled = _pinned_status_identity_advertised(
-                workspace_override
+            _session_identity.set_status_contract(
+                pinned_status_identity_advertised(workspace_override)
             )
             subagent_workspace_responses.append(workspace_override)
             logger.info(
@@ -4280,7 +4100,7 @@ async def _attach_session_inner(
     elif is_lite_session:
         logger.info(
             "Lite (no-pod) session for thread %s — skipping workspace poll",
-            _thread_id,
+            _session_identity.thread_id,
         )
 
     attached_workspace_generation = str(
@@ -4311,26 +4131,26 @@ async def _attach_session_inner(
         else None
     )
     if protected_cloud:
-        _bind_attached_runtime_payload(
+        _session_identity.adopt_workspace_payload(
             workspace_override,
             protected_required=True,
         )
-    if _orchestrator_client and _thread_id:
+    if _orchestrator_client and _session_identity.thread_id:
         try:
-            ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
+            ws_info = await _orchestrator_client.get_thread_workspace(_session_identity.thread_id)
             if ws_info:
                 _assert_attach_workspace_payload(
                     expected_workspace_identity,
                     ws_info,
                 )
-                _bind_attached_runtime_payload(
+                _session_identity.adopt_workspace_payload(
                     ws_info,
                     protected_required=(
                         protected_cloud or _protected_workspace_marker(ws_info) == "on"
                     ),
                 )
-                _pinned_status_identity_enabled = _pinned_status_identity_advertised(
-                    ws_info
+                _session_identity.set_status_contract(
+                    pinned_status_identity_advertised(ws_info)
                 )
                 subagent_workspace_responses.append(ws_info)
                 fresh_delivery = _protected_workspace_delivery(ws_info)
@@ -4688,7 +4508,7 @@ async def _attach_session_inner(
     live_lease = _current_lease_var.get()
     shell_owner_token = None
     if live_lease is not None and live_lease.active:
-        if str(live_lease.unit_id) != str(_thread_id):
+        if str(live_lease.unit_id) != str(_session_identity.thread_id):
             raise RuntimeError(
                 "Stateless lease identity does not match the session being attached"
             )
@@ -4704,15 +4524,15 @@ async def _attach_session_inner(
         from_workspace=not _stateless_mode(),
     )
     _session = PersistentSession(
-        thread_id=_thread_id,
+        thread_id=_session_identity.thread_id,
         config=effective_config,
         shell_owner_token=shell_owner_token,
         protected_cloud_required=protected_cloud,
         pinned_runtime_identity_required=bool(
-            _pinned_runtime_generation_enabled and shell_owner_token is None
+            _session_identity.runtime_contract and shell_owner_token is None
         ),
         orchestrator_client=_orchestrator_client,
-        session_parent_authority_provider=_session_subagent_parent_authority,
+        session_parent_authority_provider=_session_identity.parent_authority,
         subagent_provider_admission=_loop_provider_admission_open,
         subagent_effect_authority=_loop_runtime_effect_authority_current,
         subagent_settlement_authority=(_loop_runtime_settlement_authority_current),
@@ -4755,12 +4575,12 @@ async def _attach_session_inner(
             cloud_mount_cfg=cloud_mount_cfg,
         )
         if protected_cloud:
-            if _orchestrator_client is None or _thread_id is None:
+            if _orchestrator_client is None or _session_identity.thread_id is None:
                 raise ProtectedCloudUnavailable(
                     "protected-cloud workspace cannot be revalidated"
                 )
             final_workspace = await _orchestrator_client.get_thread_workspace(
-                _thread_id
+                _session_identity.thread_id
             )
             if not isinstance(final_workspace, dict):
                 raise ProtectedCloudUnavailable(
@@ -4770,7 +4590,7 @@ async def _attach_session_inner(
                 expected_workspace_identity,
                 final_workspace,
             )
-            _bind_attached_runtime_payload(
+            _session_identity.adopt_workspace_payload(
                 final_workspace,
                 protected_required=True,
             )
@@ -4835,7 +4655,7 @@ async def _attach_session_inner(
     if _session is not None and _session.postgres_conn is not None:
         try:
             _events_epoch, _next_seq = await _resolve_event_journal_epoch(
-                _session.postgres_conn, _thread_id
+                _session.postgres_conn, _session_identity.thread_id
             )
             live_lease = _current_lease_var.get()
             pinned_agent_id = (
@@ -4843,7 +4663,7 @@ async def _attach_session_inner(
             )
             writer = _OrderedPersistentEventWriter(
                 postgres_conn=_session.postgres_conn,
-                thread_id=_thread_id,
+                thread_id=_session_identity.thread_id,
                 epoch=_events_epoch,
                 on_terminal_failure=_event_persistence_failed,
                 # Stateless executor attach: fence every flush on the live
@@ -4852,10 +4672,10 @@ async def _attach_session_inner(
                 lease=live_lease,
                 pinned_agent_id=pinned_agent_id,
                 pinned_runtime_generation=(
-                    _session_runtime_generation if live_lease is None else None
+                    _session_identity.session_generation if live_lease is None else None
                 ),
                 pinned_runtime_attach_token=(
-                    _session_runtime_attach_token if live_lease is None else None
+                    _session_identity.attach_token if live_lease is None else None
                 ),
             )
             writer.start()
@@ -4866,7 +4686,7 @@ async def _attach_session_inner(
             logger.error(
                 "Event journal initialization failed; aborting session attach "
                 "(thread=%s): %s",
-                _thread_id,
+                _session_identity.thread_id,
                 exc,
                 exc_info=True,
             )
@@ -4941,16 +4761,16 @@ async def _attach_session_inner(
         not cloud_mount_active
         and (not cloud_cfg or not nc_folder)
         and _orchestrator_client
-        and _thread_id
+        and _session_identity.thread_id
     ):
         try:
-            ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
+            ws_info = await _orchestrator_client.get_thread_workspace(_session_identity.thread_id)
             if ws_info:
                 _assert_attach_workspace_payload(
                     expected_workspace_identity,
                     ws_info,
                 )
-                _bind_attached_runtime_payload(
+                _session_identity.adopt_workspace_payload(
                     ws_info,
                     protected_required=(
                         protected_cloud or _protected_workspace_marker(ws_info) == "on"
@@ -5023,7 +4843,7 @@ async def _attach_session_inner(
                 workspace_path=_session.workspace_manager.path,
                 workspace_backend=_session.workspace_manager.backend,
                 cloud_cfg=cloud_cfg,
-                thread_id=str(_thread_id or ""),
+                thread_id=str(_session_identity.thread_id or ""),
                 workspace_generation=attached_workspace_generation,
             )
             if _session.workspace_sync is None:
@@ -5091,7 +4911,7 @@ async def _attach_session_inner(
         logger.warning(
             "Thread %s: main cloud is up but no sync target resolved — "
             "session will run unsynced.",
-            _thread_id,
+            _session_identity.thread_id,
         )
         _broadcast(
             "workspace_sync.error",
@@ -5114,12 +4934,11 @@ async def _attach_session_inner(
     # Initialize headless loop input. It survives WS reconnect so that the
     # loop can keep reading input / responding to interrupts across transport
     # churn. Cleared in _terminate_session.
-    global _input_runtime_generation
     # Keep readiness closed until durable child recovery has completely
     # converged.  Publishing the queue earlier lets a concurrent status/input
     # request start the provider between two orphan reconciliations.
     _session_input.begin_attach()
-    _input_runtime_generation = str(uuid4())
+    _session_identity.mint_process_generation()
 
     # Child generations survive their parent process. Reconcile predecessors
     # under this exact authority before any provider can become ready;
@@ -5202,7 +5021,7 @@ async def _attach_session_inner(
             role="event",
         )
 
-    logger.info(f"Session attached: thread={_thread_id} events_epoch={_events_epoch}")
+    logger.info(f"Session attached: thread={_session_identity.thread_id} events_epoch={_events_epoch}")
 
 
 async def _attach_session(
@@ -5226,7 +5045,7 @@ async def _attach_session(
 ) -> None:
     """Exception-safe attach transaction around the full construction tail."""
 
-    previous_thread_id = _thread_id
+    previous_thread_id = _session_identity.thread_id
     try:
         await _attach_session_inner(
             thread_id=thread_id,
@@ -5254,8 +5073,8 @@ async def _attach_session(
         # repository/message restore, lifecycle CAS, and input reclamation.
         # The helper is idempotent when the inner setup guard already ran.
         exact_identity = (
-            _session_runtime_generation,
-            _session_runtime_attach_token,
+            _session_identity.session_generation,
+            _session_identity.attach_token,
         )
         retained_receipt = _failed_attach_release_receipt
         exact_receipt_exists = bool(
@@ -5267,9 +5086,9 @@ async def _attach_session(
         )
         if (
             _session is not None
-            or _thread_id != previous_thread_id
+            or _session_identity.thread_id != previous_thread_id
             or (
-                _pinned_runtime_generation_enabled
+                _session_identity.runtime_contract
                 and all(exact_identity)
                 and not exact_receipt_exists
             )
@@ -5340,8 +5159,8 @@ async def _terminate_session(
     if not _session:
         return
     termination_session = _session
-    termination_identity = _attached_retirement_identity()
-    termination_thread_id = _thread_id
+    termination_identity = _session_identity.retirement_identity()
+    termination_thread_id = _session_identity.thread_id
 
     async def _run() -> str | None:
         global _terminating, _termination_task
@@ -5378,10 +5197,10 @@ async def _terminate_session(
                 except Exception as exc:
                     retry_identity = _retirement_admission_identity
                     retryable_exact_retirement = bool(
-                        _pinned_runtime_generation_enabled
+                        _session_identity.runtime_contract
                         and termination_identity is not None
                         and _session is termination_session
-                        and _attached_retirement_identity() == termination_identity
+                        and _session_identity.retirement_identity() == termination_identity
                         and (
                             retry_identity == termination_identity
                             or (mark_thread and retry_identity is None)
@@ -5411,7 +5230,7 @@ async def _terminate_session(
 
     task = asyncio.create_task(
         _run(),
-        name=f"session-terminate-{str(_thread_id or 'detached')[:12]}",
+        name=f"session-terminate-{str(_session_identity.thread_id or 'detached')[:12]}",
     )
     _termination_task = task
     try:
@@ -5456,7 +5275,7 @@ async def _request_vm_retirement_actuator(
 ) -> str:
     """Retry only the frozen drain handoff; acceptance leaves End pending."""
     session = _session
-    identity = _attached_retirement_identity()
+    identity = _session_identity.retirement_identity()
     if (
         not isinstance(session, PersistentSession)
         or not session.terminal_vm_drain_complete
@@ -5486,7 +5305,7 @@ async def _request_vm_retirement_actuator(
             "workspace_runtime_incarnation": session.workspace_runtime_incarnation,
         }
     attempt = 0
-    while _session is session and _attached_retirement_identity() == identity:
+    while _session is session and _session_identity.retirement_identity() == identity:
         try:
             response = await _orchestrator_client.request_thread_retirement_actuator(
                 identity[0], **session.terminal_actuator_request,
@@ -5529,7 +5348,7 @@ async def _settle_exact_retirement_after_quiescence(
     exact_attach_token = expected_identity[2] if expected_identity else None
     exact_retirement_token = _retirement_admission_token
     exact_contract = bool(
-        _pinned_runtime_generation_enabled
+        _session_identity.runtime_contract
         and pinned_agent_id
         and exact_generation
         and exact_attach_token
@@ -5542,7 +5361,7 @@ async def _settle_exact_retirement_after_quiescence(
         ]
         if delay:
             await asyncio.sleep(delay)
-        if _attached_retirement_identity() != expected_identity:
+        if _session_identity.retirement_identity() != expected_identity:
             return False
         try:
             settled = await _update_thread_status(
@@ -5554,7 +5373,7 @@ async def _settle_exact_retirement_after_quiescence(
         except Exception as exc:
             logger.warning(
                 "Exact retirement settlement attempt failed (thread=%s type=%s)",
-                expected_identity[0] if expected_identity else _thread_id,
+                expected_identity[0] if expected_identity else _session_identity.thread_id,
                 type(exc).__name__,
             )
             settled = False
@@ -5603,25 +5422,23 @@ async def _terminate_session_inner(
     preserve_workspace_daemons: bool = False,
 ) -> str | None:
     """Body of _terminate_session — only reached holding the _terminating guard."""
-    global _session, _thread_id, _sessions_served, _loop_task
+    global _session, _sessions_served, _loop_task
     global _events_epoch, _next_seq, _tool_inflight, _turn_event_open
     global _turn_tool_execution_identity, _turn_tool_execution_external_hook
     global _event_writer, _cloud_sync_retry_pending, _draft_title_value
     global _active_permission_request_id
-    global _input_runtime_generation
     global _runtime_authorization_admission_open
-    global _pinned_status_identity_enabled
 
     if not _session:
         return
 
-    thread_id = _thread_id
-    runtime_generation = _session_runtime_generation
-    runtime_attach_token = _session_runtime_attach_token
+    thread_id = _session_identity.thread_id
+    runtime_generation = _session_identity.session_generation
+    runtime_attach_token = _session_identity.attach_token
     retirement_disposition = _terminal_retirement_disposition()
     retirement_permanent = (
         _retirement_admission_permanent
-        if _retirement_admission_identity == _attached_retirement_identity()
+        if _retirement_admission_identity == _session_identity.retirement_identity()
         and _retirement_admission_permanent is not None
         else False
     )
@@ -5661,10 +5478,10 @@ async def _terminate_session_inner(
         mark_thread
         and not preserve_remote_shell
         and not preserve_workspace_daemons
-        and _pinned_runtime_generation_enabled
+        and _session_identity.runtime_contract
         and pinned_control_owner
         and retirement_disposition == "ended"
-        and _retirement_admission_identity == _attached_retirement_identity()
+        and _retirement_admission_identity == _session_identity.retirement_identity()
         and _retirement_admission_token
         and _session.workspace_backend_tier in {"vm", "remote"}
     )
@@ -5904,7 +5721,7 @@ async def _terminate_session_inner(
 
     # Clear session state
     _session = None
-    _thread_id = None
+    _session_identity.release_thread()
     _clear_attached_runtime_actor()
 
     # Clear headless input state + subscriber registry. The pump tasks owned by
@@ -5912,10 +5729,10 @@ async def _terminate_session_inner(
     # when those handlers notice the WS close; dropping the registry here
     # ensures stale entries don't accumulate across sessions.
     _session_input.teardown()
-    _input_runtime_generation = None
+    _session_identity.clear_process_generation()
     _runtime_authorization_admission_open = False
-    _pinned_status_identity_enabled = False
-    _clear_attached_runtime_identity(
+    _session_identity.set_status_contract(False)
+    _session_identity.clear(
         expected_generation=runtime_generation,
         expected_attach_token=runtime_attach_token,
     )
@@ -6101,11 +5918,11 @@ async def _admit_pool_session_attach(request: Dict[str, Any]) -> JSONResponse:
     )
     if recipient_refusal is not None:
         return recipient_refusal
-    runtime_contract = _pinned_runtime_generation_advertised(request)
+    runtime_contract = pinned_runtime_generation_advertised(request)
     generation_raw = request.get("session_runtime_generation")
     attach_token_raw = request.get("session_runtime_attach_token")
-    runtime_generation = _canonical_runtime_generation(generation_raw)
-    attach_token = _canonical_runtime_generation(attach_token_raw)
+    runtime_generation = canonical_runtime_generation(generation_raw)
+    attach_token = canonical_runtime_generation(attach_token_raw)
     if (
         (generation_raw is not None and runtime_generation is None)
         or (attach_token_raw is not None and attach_token is None)
@@ -6123,7 +5940,7 @@ async def _admit_pool_session_attach(request: Dict[str, Any]) -> JSONResponse:
             or _pending_drain_suspend is not None
         ):
             owner = (
-                _thread_id
+                _session_identity.thread_id
                 or _pool_attach_claim
                 or _pending_drain_suspend.get("thread_id")
             )
@@ -6159,7 +5976,7 @@ async def _admit_pool_session_attach(request: Dict[str, Any]) -> JSONResponse:
             "session_runtime_attach_token": attach_token,
         }
         try:
-            _adopt_attached_runtime_identity(
+            _session_identity.adopt(
                 runtime_generation,
                 attach_token,
                 contract_advertised=runtime_contract,
@@ -6178,7 +5995,7 @@ async def _admit_pool_session_attach(request: Dict[str, Any]) -> JSONResponse:
             _pool_attach_runtime_generation = None
             _pool_attach_token = None
             _pool_attach_task = None
-            _clear_attached_runtime_identity(
+            _session_identity.clear(
                 expected_generation=runtime_generation,
                 expected_attach_token=attach_token,
             )
@@ -6257,8 +6074,8 @@ def session_transport_bindings() -> SessionTransportBindings:
     runtime = SessionRuntimeView(
         stateless_mode=lambda: _stateless_mode(),
         session=lambda: _session,
-        thread_id=lambda: _thread_id,
-        identity_fingerprint=lambda: _current_pinned_session_identity_fingerprint(),
+        thread_id=lambda: _session_identity.thread_id,
+        identity_fingerprint=lambda: _session_identity.fingerprint(),
         runtime_admission_closed=lambda: _runtime_admission_closed(),
         retirement_admission_closed=lambda: _retirement_admission_closed(),
         protected_cloud_ready=lambda: _protected_cloud_runtime_ready(),
@@ -6282,7 +6099,7 @@ def session_transport_bindings() -> SessionTransportBindings:
     return SessionTransportBindings(
         auth=SessionAuthBindings(
             attached_thread_id=lambda: _attached_session_thread_id(),
-            identity_fingerprint=lambda: _current_pinned_session_identity_fingerprint(),
+            identity_fingerprint=lambda: _session_identity.fingerprint(),
         ),
         http=SessionHttpPorts(runtime=runtime, operations=operations),
         socket=SessionSocketPorts(
@@ -6327,9 +6144,9 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
     Returns:
         FastAPI app with WebSocket and health endpoints
     """
-    global _config_path, _thread_id
+    global _config_path
     _config_path = config_path
-    _thread_id = thread_id
+    _session_identity.bind_thread(thread_id)
 
     app = FastAPI(
         title="Persistent Agent API",
@@ -6349,7 +6166,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                     "healthy" if app_guide.get("state") == "ready" else "degraded"
                 ),
                 "mode": "stateless" if _stateless_mode() else "persistent",
-                "thread_id": _thread_id,
+                "thread_id": _session_identity.thread_id,
                 "uptime_seconds": (datetime.now() - _started_at).total_seconds()
                 if _started_at
                 else 0,
@@ -6401,7 +6218,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 {
                     "ready": is_ready,
                     "mode": "stateless",
-                    "thread_id": _thread_id,
+                    "thread_id": _session_identity.thread_id,
                     "capabilities": {"durable_input_delivery": False},
                 },
                 status_code=200 if is_ready else 503,
@@ -6413,7 +6230,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             and _session.protected_cloud_required
             and _session.protected_cloud_ready()
         )
-        session_identity_fingerprint = _current_pinned_session_identity_fingerprint()
+        session_identity_fingerprint = _session_identity.fingerprint()
         capabilities: dict[str, Any] = {
             "durable_input_delivery": True,
             "pinned_session_identity_contract": (
@@ -6430,7 +6247,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             {
                 "ready": is_ready,
                 "mode": "persistent",
-                "thread_id": _thread_id,
+                "thread_id": _session_identity.thread_id,
                 "session_identity_fingerprint": session_identity_fingerprint,
                 "capabilities": capabilities,
             },
@@ -6447,7 +6264,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         return JSONResponse(
             {
                 "mode": "persistent",
-                "thread_id": _thread_id,
+                "thread_id": _session_identity.thread_id,
                 "turn_in_flight": _turn_in_flight(),
                 "config": _config_path,
                 "permission_mode": _session.permission_mode if _session else None,
@@ -6475,7 +6292,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         )
         if (
             expected is None
-            or _current_pinned_session_identity_fingerprint() != expected
+            or _session_identity.fingerprint() != expected
         ):
             return JSONResponse(
                 {"error": "session_identity_mismatch", "retryable": True},
@@ -6484,7 +6301,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         return JSONResponse(
             {
                 "ready": _session_ready(),
-                "thread_id": _thread_id,
+                "thread_id": _session_identity.thread_id,
                 "state": "session" if _session is not None else "idle",
                 "turn_in_flight": _turn_in_flight(),
                 "recipient_verified": True,
@@ -6543,7 +6360,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         )
         if (
             expected is None
-            or _current_pinned_session_identity_fingerprint() != expected
+            or _session_identity.fingerprint() != expected
         ):
             return JSONResponse(
                 {"error": "session_identity_mismatch", "retryable": True},
@@ -6552,7 +6369,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         if _session is None:
             return JSONResponse({"status": "already_idle", "thread_id": None})
 
-        thread_id = _thread_id
+        thread_id = _session_identity.thread_id
         try:
             result = await _terminate_session("rest_detach")
             if result == "actuator_requested":
@@ -6595,8 +6412,8 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         except Exception:
             body = None
         expected_agent_id = _registered_pinned_agent_id()
-        expected_generation = _session_runtime_generation
-        expected_attach_token = _session_runtime_attach_token
+        expected_generation = _session_identity.session_generation
+        expected_attach_token = _session_identity.attach_token
         expected_workspace_generation = getattr(
             _session, "protected_workspace_generation", ""
         )
@@ -6616,7 +6433,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             != expected_generation
             or request.headers.get("x-session-runtime-attach-token")
             != expected_attach_token
-            or body.get("thread_id") != _thread_id
+            or body.get("thread_id") != _session_identity.thread_id
             or body.get("workspace_generation") != expected_workspace_generation
             or body.get("workspace_runtime_incarnation") != expected_runtime_incarnation
         ):
@@ -6633,7 +6450,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             error_ref = uuid4().hex[:12]
             logger.exception(
                 "Cloud overlay unavailable for thread %s (error_ref=%s)",
-                _thread_id,
+                _session_identity.thread_id,
                 error_ref,
             )
             return JSONResponse(
@@ -6649,7 +6466,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             error_ref = uuid4().hex[:12]
             logger.exception(
                 "Failed to reset cloud overlay for thread %s (error_ref=%s)",
-                _thread_id,
+                _session_identity.thread_id,
                 error_ref,
             )
             return JSONResponse(
@@ -6666,55 +6483,6 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
     register_session_websocket_routes(app, auth=transport.auth, ports=transport.socket)
 
     return app
-
-
-def _session_subagent_parent_authority():
-    """Snapshot the exact current pinned life or stateless turn lease."""
-
-    from shared.session_subagent_authority import (
-        SessionParentAuthority,
-        SessionParentAuthorityRefused,
-    )
-
-    thread_id = str(_thread_id or "").strip()
-    if not thread_id:
-        raise SessionParentAuthorityRefused("parent_missing")
-    lease = _current_lease_var.get()
-    if lease is not None:
-        if (
-            not lease.active
-            or lease.lost.is_set()
-            or str(lease.unit_id or "") != thread_id
-            or type(lease.lease_token) is not int
-            or lease.lease_token <= 0
-            or not isinstance(lease.executor_id, str)
-            or not lease.executor_id
-            or not isinstance(lease.pod_uid, str)
-            or not lease.pod_uid
-        ):
-            raise SessionParentAuthorityRefused("stateless_parent_not_current")
-        return SessionParentAuthority(
-            execution_lane="stateless",
-            parent_thread_id=thread_id,
-            lease_token=lease.lease_token,
-            executor_id=lease.executor_id,
-            executor_pod_uid=lease.pod_uid,
-        )
-
-    agent_id = _registered_pinned_agent_id()
-    pod_uid = str(os.environ.get("POD_UID") or "").strip()
-    generation = str(_session_runtime_generation or "").strip()
-    attach_token = str(_session_runtime_attach_token or "").strip()
-    if not agent_id or not pod_uid or not generation or not attach_token:
-        raise SessionParentAuthorityRefused("pinned_parent_not_current")
-    return SessionParentAuthority(
-        execution_lane="pinned",
-        parent_thread_id=thread_id,
-        agent_id=agent_id,
-        pod_uid=pod_uid,
-        session_runtime_generation=generation,
-        runtime_attach_token=attach_token,
-    )
 
 
 async def _session_subagent_event_available(_message: str) -> None:
@@ -6752,7 +6520,7 @@ async def _loop_runtime_authority_current(
             return False
         authority = None
         try:
-            authority = _session_subagent_parent_authority()
+            authority = _session_identity.parent_authority()
             if authority.execution_lane != "stateless":
                 return False
             current = await session.postgres_conn.session_parent_authority_current(
@@ -6765,14 +6533,14 @@ async def _loop_runtime_authority_current(
             )
             current = False
         try:
-            authority_after = _session_subagent_parent_authority()
+            authority_after = _session_identity.parent_authority()
         except Exception:
             authority_after = None
         same_local_life = bool(
             session is _session
             and authority is not None
             and authority_after == authority
-            and str(authority.parent_thread_id) == str(_thread_id or "")
+            and str(authority.parent_thread_id) == str(_session_identity.thread_id or "")
         )
         if current is not True and same_local_life:
             # Wake the executor immediately when the DB rejects a lease whose
@@ -6787,19 +6555,19 @@ async def _loop_runtime_authority_current(
             and local_authority_open()
             and _protected_cloud_runtime_ready()
         )
-    if not _pinned_runtime_generation_enabled:
+    if not _session_identity.runtime_contract:
         # Compatibility phase for old orchestrators. Strict mode/new attaches
         # advertise the additive contract and always take the exact DB fence.
         return True
     session = _session
-    thread_id = _thread_id
+    thread_id = _session_identity.thread_id
     if session is None or session.postgres_conn is None or thread_id is None:
         return False
     try:
         agent_id, pod_uid, _process_generation, attach_token = (
             _session_input.pinned_identity()
         )
-        session_generation = str(_session_runtime_generation or "").strip()
+        session_generation = str(_session_identity.session_generation or "").strip()
         if not session_generation:
             return False
         current = await session.postgres_conn.verify_pinned_runtime_effect_authority(
@@ -6818,9 +6586,9 @@ async def _loop_runtime_authority_current(
     return bool(
         current is True
         and session is _session
-        and str(thread_id) == str(_thread_id)
-        and _process_generation == _input_runtime_generation
-        and attach_token == _session_runtime_attach_token
+        and str(thread_id) == str(_session_identity.thread_id)
+        and _process_generation == _session_identity.process_generation
+        and attach_token == _session_identity.attach_token
         and local_authority_open()
         and _protected_cloud_runtime_ready()
     )
@@ -6838,21 +6606,6 @@ async def _loop_runtime_settlement_authority_current() -> bool:
     return await _loop_runtime_authority_current(allow_retirement_settlement=True)
 
 
-def _current_input_runtime_identity() -> SessionRuntimeIdentity:
-    """The attached runtime identity, read now in one synchronous step."""
-
-    return SessionRuntimeIdentity(
-        thread_id=_thread_id,
-        process_generation=_input_runtime_generation,
-        session_generation=_session_runtime_generation,
-        attach_token=_session_runtime_attach_token,
-        agent_id=_registered_pinned_agent_id(),
-        pod_uid=os.environ.get("POD_UID"),
-        lease=_current_lease_var.get(),
-        attach_generation=_session_generation,
-    )
-
-
 def _schedule_early_title(content: str) -> None:
     """Title the thread from an accepted opening prompt.
 
@@ -6865,8 +6618,8 @@ def _schedule_early_title(content: str) -> None:
 
     if _session is not None and _session.turn_count <= 2:
         title_session = _session
-        title_thread_id = str(_thread_id or "")
-        title_generation = _session_generation
+        title_thread_id = str(_session_identity.thread_id or "")
+        title_generation = _session_identity.attach_generation
         _track_session_side_task(
             asyncio.create_task(
                 _early_title_from_prompt(
@@ -6904,7 +6657,7 @@ def _subscribe(client_id: str) -> asyncio.Queue:
     queue = _session_transport.subscribe(
         _subscribers, client_id, maxsize=_SUBSCRIBER_QUEUE_MAXSIZE
     )
-    if was_empty and _orchestrator_client is not None and _thread_id is not None:
+    if was_empty and _orchestrator_client is not None and _session_identity.thread_id is not None:
         _track_session_side_task(
             asyncio.create_task(
                 _safe_set_thread_status("active"), name="phase5-revert-active"
@@ -6930,14 +6683,14 @@ async def _file_officer_wake(minutes: int, reason: str) -> None:
     (centurion.md §4).
     """
     try:
-        if _orchestrator_client is None or _thread_id is None:
+        if _orchestrator_client is None or _session_identity.thread_id is None:
             return
-        ok = await _orchestrator_client.file_officer_wake(_thread_id, minutes, reason)
+        ok = await _orchestrator_client.file_officer_wake(_session_identity.thread_id, minutes, reason)
         if not ok:
             logger.warning(
                 "Officer wake filing rejected for thread %s "
                 "(watchdog will file sleep_max)",
-                _thread_id,
+                _session_identity.thread_id,
             )
     except Exception as e:
         logger.warning(
@@ -7894,10 +7647,10 @@ def _broadcast_frame(
             receipt=receipt,
         )
         writer = _event_writer
-        if writer is None or writer.thread_id != _thread_id:
+        if writer is None or writer.thread_id != _session_identity.thread_id:
             logger.error(
                 "thread_events writer unavailable (thread=%s epoch=%d seq=%d kind=%s)",
-                _thread_id,
+                _session_identity.thread_id,
                 epoch,
                 seq,
                 method,
@@ -8005,7 +7758,7 @@ async def _durable_session_control_modes() -> tuple[str, str]:
     if _session is None:
         return "supervised", "auto"
     fallback = (_session.permission_mode, _session.narration_mode)
-    if _session.postgres_conn is None or _thread_id is None:
+    if _session.postgres_conn is None or _session_identity.thread_id is None:
         return fallback
 
     from shared.thread_controls import applied_control_scalar
@@ -8016,7 +7769,7 @@ async def _durable_session_control_modes() -> tuple[str, str]:
                 row = await conn.fetchrow(
                     "SELECT permission_mode, narration_mode FROM threads "
                     "WHERE id = $1::uuid",
-                    _thread_id,
+                    _session_identity.thread_id,
                 )
                 if row is None:
                     return fallback
@@ -8038,7 +7791,7 @@ async def _durable_session_control_modes() -> tuple[str, str]:
                     "WHERE request.thread_id = $1::uuid "
                     "AND request.outcome IS NULL "
                     "ORDER BY request.request_seq",
-                    _thread_id,
+                    _session_identity.thread_id,
                 )
         for receipt in receipts:
             scalar = applied_control_scalar(
@@ -8220,10 +7973,10 @@ async def _finalize_durable_control(
                 lease_token=lease_token,
                 agent_id=agent_id,
                 runtime_generation=(
-                    _session_runtime_generation if agent_id is not None else None
+                    _session_identity.session_generation if agent_id is not None else None
                 ),
                 runtime_attach_token=(
-                    _session_runtime_attach_token if agent_id is not None else None
+                    _session_identity.attach_token if agent_id is not None else None
                 ),
                 outcome=outcome,
                 error_code=error_code,
@@ -8247,21 +8000,21 @@ async def _reconcile_durable_control_scalars(
 
     if (lease_token is None) == (agent_id is None):
         raise ValueError("exactly one control owner credential is required")
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
         raise EventJournalUnavailable("control scalar reconciliation lost session")
 
     async with _session.postgres_conn.acquire() as conn:
         async with conn.transaction():
             fenced = await owner_fence_current(
                 conn,
-                thread_id=_thread_id,
+                thread_id=_session_identity.thread_id,
                 lease_token=lease_token,
                 agent_id=agent_id,
                 runtime_generation=(
-                    _session_runtime_generation if agent_id is not None else None
+                    _session_identity.session_generation if agent_id is not None else None
                 ),
                 runtime_attach_token=(
-                    _session_runtime_attach_token if agent_id is not None else None
+                    _session_identity.attach_token if agent_id is not None else None
                 ),
             )
             if not fenced:
@@ -8271,7 +8024,7 @@ async def _reconcile_durable_control_scalars(
             row = await conn.fetchrow(
                 "SELECT permission_mode, narration_mode FROM threads "
                 "WHERE id = $1::uuid",
-                _thread_id,
+                _session_identity.thread_id,
             )
     if row is None or _session is None:
         raise ControlInboxBlocked("control scalar reconciliation lost thread")
@@ -8294,10 +8047,10 @@ async def _set_pinned_control_admission(
     the binding; database failures raise and must not be treated as closure.
     """
 
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
         raise EventJournalUnavailable("control admission gate lost session")
-    runtime_generation = _session_runtime_generation
-    runtime_attach_token = _session_runtime_attach_token
+    runtime_generation = _session_identity.session_generation
+    runtime_attach_token = _session_identity.attach_token
     if runtime_generation is None:
         return False
     async with _session.postgres_conn.acquire() as conn:
@@ -8306,7 +8059,7 @@ async def _set_pinned_control_admission(
                 "SELECT agent_id, execution_lane, status, runtime_generation, "
                 "runtime_attach_token, runtime_retirement_token FROM threads "
                 "WHERE id = $1::uuid FOR UPDATE",
-                _thread_id,
+                _session_identity.thread_id,
             )
             if (
                 thread is None
@@ -8326,7 +8079,7 @@ async def _set_pinned_control_admission(
                 "SELECT 1 FROM agents WHERE id = $1::uuid "
                 "AND thread_id = $2::uuid FOR SHARE",
                 agent_id,
-                _thread_id,
+                _session_identity.thread_id,
             )
             if reciprocal is None:
                 return False
@@ -8337,7 +8090,7 @@ async def _set_pinned_control_admission(
                 "AND runtime_generation = $4::uuid "
                 "AND runtime_attach_token IS NOT DISTINCT FROM $5::uuid "
                 "AND runtime_retirement_token IS NULL RETURNING id",
-                _thread_id,
+                _session_identity.thread_id,
                 agent_id,
                 bool(open_for_admission),
                 runtime_generation,
@@ -8371,7 +8124,7 @@ async def _close_pinned_control_inbox(*, agent_id: str) -> bool:
             raise
         logger.info(
             "Pinned control owner moved during final drain (thread=%s agent=%s)",
-            _thread_id,
+            _session_identity.thread_id,
             agent_id,
         )
         return False
@@ -8430,9 +8183,9 @@ async def _drain_thread_controls(
     if (lease_token is None) == (agent_id is None):
         raise ValueError("exactly one control owner credential is required")
 
-    runtime_generation = _session_runtime_generation if agent_id is not None else None
+    runtime_generation = _session_identity.session_generation if agent_id is not None else None
     runtime_attach_token = (
-        _session_runtime_attach_token if agent_id is not None else None
+        _session_identity.attach_token if agent_id is not None else None
     )
     if agent_id is not None and runtime_generation is None:
         raise ControlInboxBlocked("pinned control owner lacks runtime generation")
@@ -8440,13 +8193,13 @@ async def _drain_thread_controls(
     applied = 0
     async with _control_drain_lock:
         while True:
-            if _session is None or _session.postgres_conn is None or _thread_id is None:
+            if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
                 return applied
             if lease_token is not None:
                 handle = _current_lease_var.get()
                 if (
                     handle is None
-                    or handle.unit_id != str(_thread_id)
+                    or handle.unit_id != str(_session_identity.thread_id)
                     or handle.lease_token != int(lease_token)
                     or handle.lost.is_set()
                 ):
@@ -8459,7 +8212,7 @@ async def _drain_thread_controls(
                 async with conn.transaction():
                     owns_thread = await owner_fence_current(
                         conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         lease_token=lease_token,
                         agent_id=agent_id,
                         runtime_generation=runtime_generation,
@@ -8476,14 +8229,14 @@ async def _drain_thread_controls(
                     if agent_id is not None:
                         await adopt_next_pinned_control_request(
                             conn,
-                            thread_id=_thread_id,
+                            thread_id=_session_identity.thread_id,
                             agent_id=agent_id,
                             runtime_generation=runtime_generation,
                             runtime_attach_token=runtime_attach_token,
                         )
                     request = await fetch_next_control_request(
                         conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         lease_token=lease_token,
                         agent_id=agent_id,
                         runtime_generation=runtime_generation,
@@ -8500,7 +8253,7 @@ async def _drain_thread_controls(
                         )
                     receipt = await fetch_control_receipt(
                         conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         request_id=request.id,
                     )
 
@@ -8547,7 +8300,7 @@ async def _drain_thread_controls(
                 logger.info(
                     "session-control timing: thread=%s verb=%s seq=%d "
                     "recovered_receipt=true total=%.3fs",
-                    _thread_id,
+                    _session_identity.thread_id,
                     request.verb,
                     request.request_seq,
                     time.perf_counter() - started,
@@ -8650,7 +8403,7 @@ async def _drain_thread_controls(
             logger.info(
                 "session-control timing: thread=%s verb=%s seq=%d "
                 "recovered_receipt=false journal=%.3fs total=%.3fs",
-                _thread_id,
+                _session_identity.thread_id,
                 request.verb,
                 request.request_seq,
                 journal_seconds,
@@ -8799,7 +8552,7 @@ async def _start_thread_control_watcher(
             open_for_admission=False,
         )
     await _stop_thread_control_watcher()
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
         raise EventJournalUnavailable("cannot start control owner without a session")
 
     _control_owner_lease_token = int(lease_token) if lease_token is not None else None
@@ -8837,12 +8590,12 @@ async def _start_thread_control_watcher(
     _control_watcher_task = asyncio.create_task(
         _control_watcher_loop(
             postgres_conn=_session.postgres_conn,
-            thread_id=str(_thread_id),
+            thread_id=str(_session_identity.thread_id),
             stop=stop,
             lease_token=_control_owner_lease_token,
             agent_id=_control_owner_agent_id,
         ),
-        name=f"thread-control-watcher-{str(_thread_id)[:8]}",
+        name=f"thread-control-watcher-{str(_session_identity.thread_id)[:8]}",
     )
     return drained
 
@@ -8899,14 +8652,14 @@ async def _finalize_durable_interrupt(
 
     from shared.thread_interrupts import finalize_interrupt_request
 
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
         return "lost_owner"
     async with _session.postgres_conn.acquire() as conn:
         async with conn.transaction():
             return await finalize_interrupt_request(
                 conn,
                 request_id=request.id,
-                thread_id=_thread_id,
+                thread_id=_session_identity.thread_id,
                 lease_token=int(lease_token),
                 target_turn_id=int(request.target_turn_id),
                 outcome=outcome,
@@ -8937,12 +8690,12 @@ async def _drain_thread_interrupts(*, lease_token: int, target_turn_id: int) -> 
     applied_count = 0
     async with _interrupt_drain_lock:
         while True:
-            if _session is None or _session.postgres_conn is None or _thread_id is None:
+            if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
                 return applied_count
             handle = _current_lease_var.get()
             if (
                 handle is None
-                or handle.unit_id != str(_thread_id)
+                or handle.unit_id != str(_session_identity.thread_id)
                 or handle.lease_token != int(lease_token)
                 or handle.lost.is_set()
             ):
@@ -8955,7 +8708,7 @@ async def _drain_thread_interrupts(*, lease_token: int, target_turn_id: int) -> 
                 async with conn.transaction():
                     owns_thread = await owner_fence_current(
                         conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         lease_token=int(lease_token),
                     )
                     if not owns_thread:
@@ -8965,7 +8718,7 @@ async def _drain_thread_interrupts(*, lease_token: int, target_turn_id: int) -> 
                         )
                     request = await fetch_next_interrupt_request(
                         conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         lease_token=int(lease_token),
                         target_turn_id=int(target_turn_id),
                     )
@@ -8973,7 +8726,7 @@ async def _drain_thread_interrupts(*, lease_token: int, target_turn_id: int) -> 
                         return applied_count
                     receipt = await fetch_interrupt_receipt(
                         conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         request_id=request.id,
                     )
 
@@ -9009,7 +8762,7 @@ async def _drain_thread_interrupts(*, lease_token: int, target_turn_id: int) -> 
                 logger.info(
                     "session-interrupt timing: thread=%s turn=%d "
                     "recovered_receipt=true total=%.3fs",
-                    _thread_id,
+                    _session_identity.thread_id,
                     request.target_turn_id,
                     time.perf_counter() - started,
                 )
@@ -9060,7 +8813,7 @@ async def _drain_thread_interrupts(*, lease_token: int, target_turn_id: int) -> 
             logger.info(
                 "session-interrupt timing: thread=%s turn=%d applied=%s "
                 "recovered_receipt=false journal=%.3fs total=%.3fs",
-                _thread_id,
+                _session_identity.thread_id,
                 request.target_turn_id,
                 outcome == "applied",
                 journal_seconds,
@@ -9081,19 +8834,19 @@ async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
 
     global _event_writer, _events_epoch, _next_seq
 
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
         raise EventJournalUnavailable("interrupt epoch recovery lost its session")
     handle = _current_lease_var.get()
     if (
         handle is None
-        or handle.unit_id != str(_thread_id)
+        or handle.unit_id != str(_session_identity.thread_id)
         or handle.lease_token != int(lease_token)
         or handle.lost.is_set()
     ):
         raise InterruptInboxBlocked("interrupt epoch recovery lost local lease")
 
     old_writer = _event_writer
-    if old_writer is None or old_writer.thread_id != str(_thread_id):
+    if old_writer is None or old_writer.thread_id != str(_session_identity.thread_id):
         raise EventJournalUnavailable("interrupt epoch recovery has no writer")
     _event_writer = None
     await old_writer.close()
@@ -9108,7 +8861,7 @@ async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
                     "SELECT 1 FROM threads WHERE id = $1::uuid "
                     "AND execution_lane = 'stateless' AND agent_id IS NULL "
                     "FOR UPDATE",
-                    _thread_id,
+                    _session_identity.thread_id,
                 )
                 if thread is None:
                     handle.lost.set()
@@ -9120,7 +8873,7 @@ async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
                     "WHERE unit_id = $1::uuid AND unit_kind = 'session_turn' "
                     "AND state = 'leased' AND lease_token = $2::bigint "
                     "FOR UPDATE",
-                    _thread_id,
+                    _session_identity.thread_id,
                     int(lease_token),
                 )
                 if queue is None:
@@ -9134,7 +8887,7 @@ async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
 
                 permission_retirement = await retire_stale_stateless_permissions(
                     conn,
-                    thread_id=str(_thread_id),
+                    thread_id=str(_session_identity.thread_id),
                     retired_lease_token=int(lease_token) - 1,
                     successor_lease_token=int(lease_token),
                     reason="lease_expired",
@@ -9153,7 +8906,7 @@ async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
                 else:
                     new_epoch = await _event_journal.bump_epoch(
                         conn,
-                        thread_id=str(_thread_id),
+                        thread_id=str(_session_identity.thread_id),
                     )
                     recovered_hwm = 0
     except BaseException:
@@ -9168,7 +8921,7 @@ async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
     try:
         new_writer = _OrderedPersistentEventWriter(
             postgres_conn=_session.postgres_conn,
-            thread_id=str(_thread_id),
+            thread_id=str(_session_identity.thread_id),
             epoch=_events_epoch,
             on_terminal_failure=_event_persistence_failed,
             lease=handle,
@@ -9180,7 +8933,7 @@ async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
     _event_writer = new_writer
     logger.info(
         "session-owner recovery epoch: thread=%s token=%d old=%d new=%d permissions=%d",
-        _thread_id,
+        _session_identity.thread_id,
         lease_token,
         old_epoch,
         _events_epoch,
@@ -9212,13 +8965,13 @@ async def _reconcile_stale_thread_interrupts(
 
     reconciled = 0
     async with _interrupt_drain_lock:
-        if _session is None or _session.postgres_conn is None or _thread_id is None:
+        if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
             return reconciled, None
         while True:
             handle = _current_lease_var.get()
             if (
                 handle is None
-                or handle.unit_id != str(_thread_id)
+                or handle.unit_id != str(_session_identity.thread_id)
                 or handle.lease_token != int(lease_token)
                 or handle.lost.is_set()
             ):
@@ -9232,7 +8985,7 @@ async def _reconcile_stale_thread_interrupts(
                 async with conn.transaction():
                     owns_thread = await owner_fence_current_for_update(
                         conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         lease_token=int(lease_token),
                     )
                     if not owns_thread:
@@ -9242,13 +8995,13 @@ async def _reconcile_stale_thread_interrupts(
                         )
                     requests = await fetch_stale_interrupt_requests(
                         conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         current_lease_token=int(lease_token),
                     )
                     stale_permissions = bool(
                         await conn.fetchval(
                             _STALE_PERMISSION_EXISTS_SQL,
-                            _thread_id,
+                            _session_identity.thread_id,
                             int(lease_token),
                         )
                     )
@@ -9258,7 +9011,7 @@ async def _reconcile_stale_thread_interrupts(
                             "SELECT consumed_seq FROM run_queue "
                             "WHERE unit_id = $1::uuid AND state = 'leased' "
                             "AND lease_token = $2::bigint",
-                            _thread_id,
+                            _session_identity.thread_id,
                             int(lease_token),
                         )
                         result = (
@@ -9274,7 +9027,7 @@ async def _reconcile_stale_thread_interrupts(
                         receipts = {
                             request.id: await fetch_interrupt_receipt(
                                 conn,
-                                thread_id=_thread_id,
+                                thread_id=_session_identity.thread_id,
                                 request_id=request.id,
                             )
                             for request in requests
@@ -9385,7 +9138,7 @@ async def _reconcile_stale_thread_interrupts(
                         async with conn.transaction():
                             if not await owner_fence_current_for_update(
                                 conn,
-                                thread_id=_thread_id,
+                                thread_id=_session_identity.thread_id,
                                 lease_token=int(lease_token),
                             ):
                                 handle.lost.set()
@@ -9394,7 +9147,7 @@ async def _reconcile_stale_thread_interrupts(
                                 )
                             consumed = await consume_applied_interrupt_input_live(
                                 conn,
-                                thread_id=_thread_id,
+                                thread_id=_session_identity.thread_id,
                                 current_lease_token=int(lease_token),
                                 accepted_lease_token=int(request.accepted_lease_token),
                                 target_turn_id=int(request.target_turn_id),
@@ -9432,7 +9185,7 @@ async def _reconcile_stale_thread_interrupts(
                 logger.info(
                     "session-interrupt stale recovery: thread=%s request=%s "
                     "accepted_token=%d current_token=%d receipt=%s",
-                    _thread_id,
+                    _session_identity.thread_id,
                     request.id,
                     request.accepted_lease_token,
                     lease_token,
@@ -9443,7 +9196,7 @@ async def _reconcile_stale_thread_interrupts(
                 async with conn.transaction():
                     if not await owner_fence_current_for_update(
                         conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         lease_token=int(lease_token),
                     ):
                         handle.lost.set()
@@ -9454,7 +9207,7 @@ async def _reconcile_stale_thread_interrupts(
                         "SELECT consumed_seq FROM run_queue "
                         "WHERE unit_id = $1::uuid AND state = 'leased' "
                         "AND lease_token = $2::bigint",
-                        _thread_id,
+                        _session_identity.thread_id,
                         int(lease_token),
                     )
                     return (
@@ -9574,7 +9327,7 @@ async def _start_thread_interrupt_watcher_locked(
     global _interrupt_owner_lease_token, _interrupt_owner_turn_id
 
     await _stop_thread_interrupt_watcher_locked()
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
         raise EventJournalUnavailable("cannot start interrupt owner without a session")
     _interrupt_owner_lease_token = int(lease_token)
     _interrupt_owner_turn_id = int(target_turn_id)
@@ -9593,12 +9346,12 @@ async def _start_thread_interrupt_watcher_locked(
     _interrupt_watcher_task = asyncio.create_task(
         _interrupt_watcher_loop(
             postgres_conn=_session.postgres_conn,
-            thread_id=str(_thread_id),
+            thread_id=str(_session_identity.thread_id),
             stop=stop,
             lease_token=_interrupt_owner_lease_token,
             target_turn_id=_interrupt_owner_turn_id,
         ),
-        name=f"thread-interrupt-watcher-{str(_thread_id)[:8]}",
+        name=f"thread-interrupt-watcher-{str(_session_identity.thread_id)[:8]}",
     )
     return drained
 
@@ -9696,7 +9449,7 @@ def _invalidate_session_recent_read(path: str) -> None:
 async def _current_canvas_for_control() -> dict[str, Any] | None:
     """Load authoritative Canvas state with the attached delegated owner."""
 
-    if _session is None or _thread_id is None or _session.tool_context is None:
+    if _session is None or _session_identity.thread_id is None or _session.tool_context is None:
         return None
     context = _session.tool_context
     user_id = str(context.user_id or "").strip()
@@ -9705,7 +9458,7 @@ async def _current_canvas_for_control() -> dict[str, Any] | None:
     config_name = str(context.config.get("agent_id") or _config_path or "persistent")
     client = create_orchestrator_client_from_env(config_name, user_id=user_id)
     try:
-        return await client.get_thread_canvas(_thread_id)
+        return await client.get_thread_canvas(_session_identity.thread_id)
     finally:
         await client.close()
 
@@ -9715,7 +9468,7 @@ async def _current_canvas_for_control() -> dict[str, Any] | None:
 #
 # These used to be closures inside ws_chat. They've been hoisted so the loop
 # can outlive any single WebSocket connection: callbacks reference module
-# globals (_session, _orchestrator_client, _thread_id) and emit via
+# globals (_session, _orchestrator_client, _session_identity) and emit via
 # _broadcast() rather than writing to one ws. The input and interrupt
 # callbacks are the input owner's (``_session_input``).
 # ---------------------------------------------------------------------------
@@ -9805,7 +9558,7 @@ async def _begin_loop_input_wait() -> InputWaitPlan:
         and _session is not None
         and _session.turn_count > 0
         and _orchestrator_client is not None
-        and _thread_id is not None
+        and _session_identity.thread_id is not None
     )
     if should_consider_flip:
         if _stateless_mode():
@@ -9853,7 +9606,7 @@ async def _begin_loop_input_wait() -> InputWaitPlan:
             logger.warning(
                 "Officer backstop wake fired for thread %s — the "
                 "orchestrator's durable timer never delivered",
-                _thread_id,
+                _session_identity.thread_id,
             )
             return {
                 "content": (
@@ -9879,7 +9632,7 @@ async def _begin_loop_input_wait() -> InputWaitPlan:
             logger.info(
                 "Idle timeout (%dmin) for thread %s",
                 idle_timeout_minutes,
-                _thread_id,
+                _session_identity.thread_id,
             )
             raise IdleTimeoutError(f"Idle timeout after {idle_timeout_seconds}s")
 
@@ -10048,7 +9801,7 @@ async def _insert_permission_request(
     tool_call_id: str, tool_name: str, tool_args: Dict[str, Any]
 ) -> Optional[str]:
     """INSERT a pending row and return its UUID. None on failure."""
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
         return None
     try:
         async with _session.postgres_conn.acquire() as conn:
@@ -10064,7 +9817,7 @@ async def _insert_permission_request(
                     handle is None
                     or not handle.active
                     or handle.lost.is_set()
-                    or str(handle.unit_id) != str(_thread_id)
+                    or str(handle.unit_id) != str(_session_identity.thread_id)
                     or int(handle.lease_token) <= 0
                 ):
                     if handle is not None:
@@ -10079,7 +9832,7 @@ async def _insert_permission_request(
                         "AND NOT (COALESCE(metadata, '{}'::jsonb) "
                         "         ? '_stateless_workspace_retirement_pending') "
                         "FOR UPDATE",
-                        _thread_id,
+                        _session_identity.thread_id,
                     )
                     queue_live = None
                     if thread_live is not None:
@@ -10090,7 +9843,7 @@ async def _insert_permission_request(
                             "AND state = 'leased' "
                             "AND lease_token = $2::bigint "
                             "FOR SHARE",
-                            _thread_id,
+                            _session_identity.thread_id,
                             int(handle.lease_token),
                         )
                     if queue_live is None:
@@ -10102,7 +9855,7 @@ async def _insert_permission_request(
                         " accepted_lease_token) "
                         "VALUES ($1, $2, $3, $4::jsonb, $5::bigint) "
                         "RETURNING id",
-                        _thread_id,
+                        _session_identity.thread_id,
                         tool_call_id,
                         tool_name,
                         json.dumps(_safe_serialize(tool_args)),
@@ -10117,7 +9870,7 @@ async def _insert_permission_request(
                 "(thread_id, tool_call_id, tool_name, tool_args) "
                 "VALUES ($1, $2, $3, $4::jsonb) "
                 "RETURNING id",
-                _thread_id,
+                _session_identity.thread_id,
                 tool_call_id,
                 tool_name,
                 json.dumps(_safe_serialize(tool_args)),
@@ -10166,7 +9919,7 @@ async def _has_terminal_permission_decision(tool_call_id: str) -> bool:
     the pre-batch behavior — the per-call gate path still inserts and gates
     — rather than blocking the announce.
     """
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
         return False
     try:
         async with _session.postgres_conn.acquire() as conn:
@@ -10175,7 +9928,7 @@ async def _has_terminal_permission_decision(tool_call_id: str) -> bool:
                 "WHERE thread_id = $1 AND tool_call_id = $2 "
                 "  AND status IN ('approved', 'denied') "
                 "LIMIT 1",
-                _thread_id,
+                _session_identity.thread_id,
                 tool_call_id,
             )
         return found is not None
@@ -10193,7 +9946,7 @@ async def _has_terminal_permission_decision(tool_call_id: str) -> bool:
 # announced by the turn currently running. Mutated in place (never rebound) so
 # tests and concurrent readers see one dict.
 #
-# The thread id is carried per entry, not read from the ambient `_thread_id`,
+# The thread id is carried per entry, not read from the ambient bound thread,
 # because this module is process-global and a pool agent serves many threads in
 # sequence: an entry that outlived its session (see _terminate_session_inner)
 # must never be swept — and broadcast as resolved — by the NEXT thread, whose
@@ -10220,7 +9973,7 @@ def _permission_retirement_authority() -> Optional[Tuple[str, int | str]]:
     """Capture the exact credential allowed to retire permission rows."""
 
     if _stateless_mode():
-        lease_token = _current_stateless_lease_token()
+        lease_token = _session_identity.stateless_lease_token()
         return ("stateless", lease_token) if lease_token is not None else None
     agent_id = _control_owner_agent_id or _registered_pinned_agent_id()
     return ("pinned", agent_id) if agent_id is not None else None
@@ -10323,7 +10076,7 @@ async def _retire_announced_permission_rows(
     if _session is None or _session.postgres_conn is None:
         return
     authority = _permission_retirement_authority()
-    if authority is None or _thread_id is None:
+    if authority is None or _session_identity.thread_id is None:
         logger.info(
             "Skipped permission-row retirement without exact owner (%s)", reason
         )
@@ -10336,7 +10089,7 @@ async def _retire_announced_permission_rows(
         tool_call_id: entry
         for tool_call_id, entry in _announced_permission_rows.items()
         if (mode is None or not _gate_needed(mode, entry[1]))
-        and entry[2] == _thread_id
+        and entry[2] == _session_identity.thread_id
         and tool_call_id not in _gates_in_flight
         and entry[0] != _active_permission_request_id
     }
@@ -10354,7 +10107,7 @@ async def _retire_announced_permission_rows(
                     if authority_kind == "stateless"
                     else _RETIRE_PINNED_PERMISSION_SQL,
                     request_id,
-                    _thread_id,
+                    _session_identity.thread_id,
                     authority_credential,
                 )
                 doomed.pop(tool_call_id, None)
@@ -10394,7 +10147,7 @@ async def _loop_announce_permission_batch(tool_calls: List[Dict[str, Any]]) -> N
     finished tool. The per-call gate path then *claims* these rows rather
     than inserting its own — see ``_loop_permission_check``.
     """
-    if _session is None or _thread_id is None:
+    if _session is None or _session_identity.thread_id is None:
         return
     # A mode control can commit while the LLM is producing its tool batch.
     # Drain under the exact current owner immediately before deciding which
@@ -10434,7 +10187,7 @@ async def _loop_announce_permission_batch(tool_calls: List[Dict[str, Any]]) -> N
         # ledger nothing can tell a row that was answered from one the turn
         # walked away from. Stamped with the announcing thread so a later
         # session in this same process can never sweep it.
-        _announced_permission_rows[tool_call_id] = (request_id, tool_name, _thread_id)
+        _announced_permission_rows[tool_call_id] = (request_id, tool_name, _session_identity.thread_id)
         requests.append(
             {
                 "id": tool_call_id,
@@ -10461,7 +10214,7 @@ async def _pending_permission_requests() -> List[Dict[str, Any]]:
     Soft-fails to ``[]``: a welcome frame must still go out if this lookup
     breaks.
     """
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
         return []
     try:
         async with _session.postgres_conn.acquire() as conn:
@@ -10470,7 +10223,7 @@ async def _pending_permission_requests() -> List[Dict[str, Any]]:
                 "FROM thread_permission_requests "
                 "WHERE thread_id = $1 AND status = 'pending' "
                 "ORDER BY requested_at ASC",
-                _thread_id,
+                _session_identity.thread_id,
             )
     except Exception as e:
         logger.warning("Pending permission lookup failed: %s", e)
@@ -10623,7 +10376,7 @@ async def _wait_for_permission_resolution(
                     return str(current)
 
             if _stateless_mode():
-                lease_token = _current_stateless_lease_token()
+                lease_token = _session_identity.stateless_lease_token()
                 if lease_token is None:
                     # Lease loss is not a user decision. Leave the row pending
                     # for the successor/retirement path.
@@ -10648,7 +10401,7 @@ async def _wait_for_permission_resolution(
                     async with postgres_conn.acquire() as conn:
                         expiry = await expire_permission_if_untethered(
                             conn,
-                            thread_id=str(_thread_id),
+                            thread_id=str(_session_identity.thread_id),
                             request_id=request_id,
                             lease_token=lease_token,
                         )
@@ -10766,7 +10519,7 @@ async def _resolve_pending_permission(
     """UPDATE a pending permission row by id, or the most-recent-pending if
     no id given. Returns the resolved row dict or None if not found / no
     pending request matched."""
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
         return None
     if decision not in ("approved", "denied"):
         return None
@@ -10792,7 +10545,7 @@ async def _resolve_pending_permission(
                     "  ORDER BY requested_at DESC LIMIT 1"
                     ") "
                     "RETURNING id, status, tool_call_id, thread_id",
-                    _thread_id,
+                    _session_identity.thread_id,
                     decision,
                     decided_by,
                 )
@@ -10879,7 +10632,7 @@ async def _loop_permission_check(
         # claim that row instead of inserting a second one for the same
         # tool_call_id (there is no unique constraint to stop a duplicate).
         claimed_request_id: Optional[str] = None
-        if _session.postgres_conn is not None and _thread_id is not None:
+        if _session.postgres_conn is not None and _session_identity.thread_id is not None:
             try:
                 async with _session.postgres_conn.acquire() as conn:
                     existing = await conn.fetchrow(
@@ -10888,7 +10641,7 @@ async def _loop_permission_check(
                         "  AND status IN ('approved', 'denied', 'pending') "
                         "ORDER BY decided_at DESC NULLS LAST, requested_at DESC "
                         "LIMIT 1",
-                        _thread_id,
+                        _session_identity.thread_id,
                         tool_call_id,
                     )
                 if existing is not None and existing["status"] != "pending":
@@ -10964,7 +10717,7 @@ async def _loop_permission_check(
         if (
             _officer_cfg() is None
             and _orchestrator_client is not None
-            and _thread_id is not None
+            and _session_identity.thread_id is not None
         ):
             if _stateless_mode():
                 await _safe_mark_stateless_natural_pause(require_untethered=True)
@@ -11122,8 +10875,8 @@ def _capture_cloud_generation_claim(sync: Any) -> _CloudGenerationClaim:
     if (
         handle is None
         or not handle.active
-        or not _thread_id
-        or str(handle.unit_id) != str(_thread_id)
+        or not _session_identity.thread_id
+        or str(handle.unit_id) != str(_session_identity.thread_id)
         or _session is None
         or _session.postgres_conn is None
         or not str(getattr(sync, "workspace_generation", ""))
@@ -11132,7 +10885,7 @@ def _capture_cloud_generation_claim(sync: Any) -> _CloudGenerationClaim:
             "stateless cloud sync lacks an exact queue/workspace generation"
         )
     return _CloudGenerationClaim(
-        thread_id=str(_thread_id),
+        thread_id=str(_session_identity.thread_id),
         lease_token=int(handle.lease_token),
         workspace_generation=str(sync.workspace_generation),
         postgres=_session.postgres_conn,
@@ -11320,13 +11073,13 @@ async def _assert_no_pending_stateless_cloud_generation() -> None:
     if (
         handle is None
         or not handle.active
-        or not _thread_id
-        or str(handle.unit_id) != str(_thread_id)
+        or not _session_identity.thread_id
+        or str(handle.unit_id) != str(_session_identity.thread_id)
         or _session.postgres_conn is None
     ):
         raise LeaseLostError("stateless no-cloud check lacks an exact lease")
     claim = _CloudGenerationClaim(
-        thread_id=str(_thread_id),
+        thread_id=str(_session_identity.thread_id),
         lease_token=int(handle.lease_token),
         workspace_generation=_session.cloud_sync_workspace_generation,
         postgres=_session.postgres_conn,
@@ -11743,7 +11496,7 @@ async def _retry_cloud_sync_start(turn_id: int) -> None:
     """
     global _cloud_sync_retry_pending
 
-    if _session is None or not _orchestrator_client or not _thread_id:
+    if _session is None or not _orchestrator_client or not _session_identity.thread_id:
         return
     if (
         _session.workspace_manager is None
@@ -11752,7 +11505,7 @@ async def _retry_cloud_sync_start(turn_id: int) -> None:
         _cloud_sync_retry_pending = False
         return
     try:
-        ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
+        ws_info = await _orchestrator_client.get_thread_workspace(_session_identity.thread_id)
     except Exception:
         return
     if not ws_info:
@@ -11781,7 +11534,7 @@ async def _retry_cloud_sync_start(turn_id: int) -> None:
             workspace_path=_session.workspace_manager.path,
             workspace_backend=_session.workspace_manager.backend,
             cloud_cfg=cloud_cfg,
-            thread_id=str(_thread_id),
+            thread_id=str(_session_identity.thread_id),
             workspace_generation=str(ws_info.get("workspace_generation") or ""),
         )
         if not coordinator:
@@ -11857,10 +11610,10 @@ async def _loop_on_turn_start(turn_id: int) -> None:
     # ordering (and the pull's remote listing reflects the last turn's
     # writes). This is where a too-fast reply pays the push cost: inside a
     # started turn, visibly, instead of in an invisible pre-turn queue.
-    if _stateless_mode() and _thread_id:
+    if _stateless_mode() and _session_identity.thread_id:
         # Step 4a: a push this pod handed off for THIS thread is superseded by
         # the new claim — cancel it and let generation recovery adopt+resume.
-        await _cancel_background_cloud_push(str(_thread_id))
+        await _cancel_background_cloud_push(str(_session_identity.thread_id))
     await _await_pending_cloud_push()
 
     # Phase 1 of cloud_collaboration_model.md §9: pull cloud-side edits
@@ -11905,7 +11658,7 @@ def _wire_session_aux_archiver() -> None:
     is the same object), so wiring it once keeps every aux path archived.
 
     Idempotent and cheap (just assigns three fields); fire-and-forget. Uses
-    ``job_id=_thread_id`` + ``agent_type="persistent"`` to match the session
+    ``job_id=<bound thread>`` + ``agent_type="persistent"`` to match the session
     main-call archiving in ``_loop_archive_llm_call``. See
     knowledge-base/knowledge/issues/surface_silent_aux_failures.md (Phase 1.6).
     """
@@ -11917,7 +11670,7 @@ def _wire_session_aux_archiver() -> None:
         # converges through this function. A hot swap must not detach either
         # observability or the termination no-spend fence.
         gate_setter(_loop_auxiliary_provider_admission_open)
-    if not _thread_id:
+    if not _session_identity.thread_id:
         return
     try:
         from agent.core.archiver import get_archiver
@@ -11925,7 +11678,7 @@ def _wire_session_aux_archiver() -> None:
         archiver = get_archiver()
         if archiver is not None:
             _session.auxiliary_llm.set_job_context(
-                archiver=archiver, job_id=_thread_id, agent_type="persistent"
+                archiver=archiver, job_id=_session_identity.thread_id, agent_type="persistent"
             )
     except Exception as e:
         logger.debug(f"Could not wire session aux archiver (non-fatal): {e}")
@@ -11960,15 +11713,15 @@ async def _notify_cloud_stage(
     internal_key = os.getenv("MCP_INTERNAL_KEY", "")
     if internal_key:
         headers["X-Internal-Key"] = internal_key
-    target_thread_id = str(thread_id or _thread_id or "")
+    target_thread_id = str(thread_id or _session_identity.thread_id or "")
     target_agent_id = str(
         agent_id or getattr(_orchestrator_client, "agent_id", None) or ""
     )
-    target_generation = _canonical_runtime_generation(
-        session_runtime_generation or _session_runtime_generation
+    target_generation = canonical_runtime_generation(
+        session_runtime_generation or _session_identity.session_generation
     )
-    target_attach_token = _canonical_runtime_generation(
-        session_runtime_attach_token or _session_runtime_attach_token
+    target_attach_token = canonical_runtime_generation(
+        session_runtime_attach_token or _session_identity.attach_token
     )
     if not target_thread_id or not target_agent_id or target_generation is None:
         return
@@ -11991,10 +11744,10 @@ async def _loop_on_workspace_commit(sha: str) -> None:
     Best-effort: a miss only degrades rewind code-restore granularity for
     this turn (the resolver falls back to the previous mapped commit).
     """
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
         return
     try:
-        await _session.postgres_conn.record_turn_commit(_thread_id, sha)
+        await _session.postgres_conn.record_turn_commit(_session_identity.thread_id, sha)
     except Exception:
         logger.warning("record_turn_commit failed (non-fatal)", exc_info=True)
 
@@ -12107,7 +11860,7 @@ async def _reconcile_turn_with_retry(
             await asyncio.wait_for(
                 _save_turn_ai_messages(
                     _session.postgres_conn,
-                    _thread_id,
+                    _session_identity.thread_id,
                     _session.messages,
                     turn_id,
                     metrics=metrics,
@@ -12265,10 +12018,10 @@ async def _loop_on_turn_complete_body(
             # malformed stateless row must fail closed rather than leave an
             # unfenced SSH/tar task running after claimant handoff.
             raise LeaseLostError("protected-cloud staging requires pinned execution")
-        stage_thread_id = str(_thread_id or "")
+        stage_thread_id = str(_session_identity.thread_id or "")
         stage_agent_id = str(getattr(_orchestrator_client, "agent_id", None) or "")
-        stage_runtime_generation = _session_runtime_generation
-        stage_attach_token = _session_runtime_attach_token
+        stage_runtime_generation = _session_identity.session_generation
+        stage_attach_token = _session_identity.attach_token
         _track_session_side_task(
             asyncio.create_task(
                 _notify_cloud_stage(
@@ -12290,9 +12043,9 @@ def _loop_archive_llm_call(prepared: Any, response: Any, metrics: dict) -> None:
     The Mongo insert is synchronous, so it runs in a thread; failures are
     non-fatal by audit-trail contract.
     """
-    if _session is None or _thread_id is None:
+    if _session is None or _session_identity.thread_id is None:
         return
-    thread_id = _thread_id
+    thread_id = _session_identity.thread_id
     turn = _session.turn_count
     model = metrics.get("model") or getattr(
         getattr(_session.config, "llm", None), "model", "unknown"
@@ -12338,13 +12091,13 @@ async def _loop_persist_message(msg: Any) -> bool:
     ``_session.turn_count`` for the turn number — the loop callback carries no
     turn id (same convention as ``_record_compaction``).
     """
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
         return False
     try:
         await asyncio.wait_for(
             _persist_one_message(
                 _session.postgres_conn,
-                _thread_id,
+                _session_identity.thread_id,
                 msg,
                 _session.turn_count,
                 tool_decisions=dict(_session.tool_decisions),
@@ -12392,12 +12145,12 @@ async def _loop_on_error(message: str, turn_id: Optional[int] = None) -> None:
     if (
         _session is not None
         and _session.postgres_conn is not None
-        and _thread_id is not None
+        and _session_identity.thread_id is not None
     ):
         try:
             await asyncio.wait_for(
                 _session.postgres_conn.save_thread_message(
-                    thread_id=_thread_id,
+                    thread_id=_session_identity.thread_id,
                     role="error",
                     content=message,
                     turn_number=(
@@ -12489,7 +12242,7 @@ async def _persist_compaction_checkpoint(
     or thread). On the stateless lane the row is fenced by the current lease
     (``save_thread_message``), so a lost lease raises ``LeaseLostError``.
     """
-    if not (summary_text and _session and _session.postgres_conn and _thread_id):
+    if not (summary_text and _session and _session.postgres_conn and _session_identity.thread_id):
         return False
     turn = _session.turn_count
     # Type-guard: defensive against an unexpected turn_count type so an
@@ -12510,7 +12263,7 @@ async def _persist_compaction_checkpoint(
     if boundary_id:
         try:
             boundary_seq = await _session.postgres_conn.get_seq_for_message_id(
-                _thread_id, boundary_id
+                _session_identity.thread_id, boundary_id
             )
         except Exception as e:
             logger.debug(f"boundary_seq lookup failed (non-fatal): {e}")
@@ -12524,7 +12277,7 @@ async def _persist_compaction_checkpoint(
     if control_request_id is not None:
         metrics["control_request_id"] = control_request_id
     await _session.postgres_conn.save_thread_message(
-        thread_id=_thread_id,
+        thread_id=_session_identity.thread_id,
         role="summary",
         content=summary_text,
         turn_number=turn,
@@ -12585,7 +12338,7 @@ async def _record_compaction(
         logger.warning(f"Failed to persist compaction marker (non-fatal): {e}")
         return
     if persisted and trigger == "resume":
-        lease_token = _current_stateless_lease_token()
+        lease_token = _session_identity.stateless_lease_token()
         if lease_token is not None:
             _resume_compaction_receipt = (lease_token, dict(params))
 
@@ -12858,7 +12611,7 @@ async def _restore_session_messages() -> None:
     view (cockpit reads it via a separate orchestrator-side query); only the
     in-memory LLM context is bounded.
     """
-    if not _session or not _agent or not _agent.postgres_conn or not _thread_id:
+    if not _session or not _agent or not _agent.postgres_conn or not _session_identity.thread_id:
         return
 
     try:
@@ -12873,7 +12626,7 @@ async def _restore_session_messages() -> None:
             _session.config.context_management, "max_summary_length", 10000
         )
 
-        ckpt = await _agent.postgres_conn.get_latest_compaction_checkpoint(_thread_id)
+        ckpt = await _agent.postgres_conn.get_latest_compaction_checkpoint(_session_identity.thread_id)
         boundary_turn = ckpt.get("boundary_turn") if ckpt else None
         boundary_seq = ckpt.get("boundary_seq") if ckpt else None
 
@@ -12886,7 +12639,7 @@ async def _restore_session_messages() -> None:
                 # not cover (seq > boundary_seq), independent of turn size — the
                 # fix for the 793-message-turn OOM. Capped by the resume floor.
                 db_messages = await _agent.postgres_conn.get_thread_messages_history(
-                    thread_id=_thread_id,
+                    thread_id=_session_identity.thread_id,
                     limit=_resume_message_limit,
                     seq_gt=boundary_seq,
                     newest_first=True,
@@ -12895,14 +12648,14 @@ async def _restore_session_messages() -> None:
                 # Back-compat: summary rows written before boundary_seq shipped
                 # carry only boundary_turn — fall back to the turn cursor.
                 db_messages = await _agent.postgres_conn.get_thread_messages_history(
-                    thread_id=_thread_id,
+                    thread_id=_session_identity.thread_id,
                     limit=_resume_message_limit,
                     since_turn=boundary_turn,
                     newest_first=True,
                 )
             if len(db_messages) >= _resume_message_limit:
                 logger.warning(
-                    f"Resume floor hit on thread {_thread_id}: post-boundary tail "
+                    f"Resume floor hit on thread {_session_identity.thread_id}: post-boundary tail "
                     f"trimmed to newest {_resume_message_limit} messages (stale "
                     f"boundary or a runaway tail) — bounded, but old context may drop"
                 )
@@ -12958,7 +12711,7 @@ async def _restore_session_messages() -> None:
                 )
                 logger.info(
                     f"Restored from checkpoint ({cursor}) for "
-                    f"thread {_thread_id} ({len(restored)} msgs in context; "
+                    f"thread {_session_identity.thread_id} ({len(restored)} msgs in context; "
                     f"tail of {len(db_messages)} raw rows; "
                     f"turn_count={_session.turn_count})"
                 )
@@ -12998,13 +12751,13 @@ async def _restore_session_messages() -> None:
         # exit-137 OOM). ensure_within_limits then summarizes them and Path B
         # writes a checkpoint so the next resume hits Path A.
         db_messages = await _agent.postgres_conn.get_thread_messages_history(
-            thread_id=_thread_id,
+            thread_id=_session_identity.thread_id,
             limit=_resume_message_limit,
             newest_first=True,
         )
         if len(db_messages) >= _resume_message_limit:
             logger.warning(
-                f"Resume floor hit on thread {_thread_id} (no checkpoint): loaded "
+                f"Resume floor hit on thread {_session_identity.thread_id} (no checkpoint): loaded "
                 f"newest {_resume_message_limit} of a larger log — bounded to avoid OOM"
             )
 
@@ -13051,7 +12804,7 @@ async def _restore_session_messages() -> None:
             last_turn = max((m.get("turn_number") or 0 for m in db_messages), default=0)
             _session.turn_count = last_turn
             logger.info(
-                f"Restored {len(restored)} messages for thread {_thread_id} "
+                f"Restored {len(restored)} messages for thread {_session_identity.thread_id} "
                 f"(from {len(db_messages)} stored; last turn: {last_turn})"
             )
 
@@ -13293,7 +13046,7 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
     async def _err(message: str) -> None:
         await _ws_send(ws, "error", {"message": message, "request_id": request_id})
 
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
         await _err("Session no longer active")
         return
     mode = data.get("mode", "conversation")
@@ -13315,7 +13068,7 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
         #    not kill the in-flight turn or discard queued inputs — cheap to do
         #    ahead of the interrupt since the rewind lock excludes the only
         #    writer that could tombstone this row concurrently.
-        row = await conn.get_live_message(_thread_id, message_id)
+        row = await conn.get_live_message(_session_identity.thread_id, message_id)
         if row is None:
             await _err("Message not found (it may already be rewound)")
             return
@@ -13344,7 +13097,7 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
         # out-of-band teardown (drain, watchdog, REST detach) to tear the
         # session down underneath us. Re-validate before touching anything
         # that assumes it's still alive.
-        if _session is None or _session.postgres_conn is None or _thread_id is None:
+        if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
             await _err("Session no longer active")
             return
 
@@ -13366,7 +13119,7 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                     "unavailable (conversation-only rewind still works)"
                 )
                 return
-            restored_to_sha = await conn.resolve_restore_commit(_thread_id, from_seq)
+            restored_to_sha = await conn.resolve_restore_commit(_session_identity.thread_id, from_seq)
             if not restored_to_sha:
                 await _err(
                     "No workspace checkpoint exists before this message — "
@@ -13402,7 +13155,7 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                 # would resolve to the abandoned tree instead of the one we
                 # just restored to.
                 try:
-                    await conn.record_turn_commit(_thread_id, restore_commit_sha)
+                    await conn.record_turn_commit(_session_identity.thread_id, restore_commit_sha)
                 except Exception:
                     logger.warning(
                         "record_turn_commit failed after rewind restore (non-fatal)",
@@ -13415,7 +13168,7 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
         try:
             # 5. Sweep + ledger (one transaction). mode='code' ledgers only.
             result = await conn.apply_rewind(
-                _thread_id,
+                _session_identity.thread_id,
                 from_seq=from_seq,
                 mode=mode,
                 actor="ws_client",
@@ -13468,13 +13221,13 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                 #     normal run with no stragglers sweeps 0 rows. Not a
                 #     second apply_rewind: that would append a duplicate
                 #     thread_rewinds ledger row for the same rewind.
-                stray_count = await conn.resweep_rewind(_thread_id, from_seq)
+                stray_count = await conn.resweep_rewind(_session_identity.thread_id, from_seq)
                 if stray_count > 0:
                     logger.warning(
                         "Rewind resweep caught %d stray row(s) written during "
                         "the interrupt wait (thread=%s from_seq=%s)",
                         stray_count,
-                        _thread_id,
+                        _session_identity.thread_id,
                         from_seq,
                     )
 
@@ -13498,16 +13251,16 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                     if old_writer is not None:
                         _event_writer = None
                         await old_writer.close()
-                    _events_epoch = await _bump_event_journal_epoch(conn, _thread_id)
+                    _events_epoch = await _bump_event_journal_epoch(conn, _session_identity.thread_id)
                     _next_seq = 0
                     new_writer = _OrderedPersistentEventWriter(
                         postgres_conn=conn,
-                        thread_id=_thread_id,
+                        thread_id=_session_identity.thread_id,
                         epoch=_events_epoch,
                         on_terminal_failure=_event_persistence_failed,
                         pinned_agent_id=_registered_pinned_agent_id(),
-                        pinned_runtime_generation=_session_runtime_generation,
-                        pinned_runtime_attach_token=_session_runtime_attach_token,
+                        pinned_runtime_generation=_session_identity.session_generation,
+                        pinned_runtime_attach_token=_session_identity.attach_token,
                     )
                     new_writer.start()
                     _event_writer = new_writer
@@ -13516,20 +13269,20 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                         "Rewind epoch bump failed — viewers repaint on next attach",
                         exc_info=True,
                     )
-                    if _event_writer is None and _thread_id is not None:
+                    if _event_writer is None and _session_identity.thread_id is not None:
                         # Keep journaling alive under the still-current epoch
                         # rather than leaving the rest of the session
                         # unjournaled because the bump failed.
                         try:
                             recovery_writer = _OrderedPersistentEventWriter(
                                 postgres_conn=conn,
-                                thread_id=_thread_id,
+                                thread_id=_session_identity.thread_id,
                                 epoch=_events_epoch,
                                 on_terminal_failure=_event_persistence_failed,
                                 pinned_agent_id=_registered_pinned_agent_id(),
-                                pinned_runtime_generation=(_session_runtime_generation),
+                                pinned_runtime_generation=(_session_identity.session_generation),
                                 pinned_runtime_attach_token=(
-                                    _session_runtime_attach_token
+                                    _session_identity.attach_token
                                 ),
                             )
                             recovery_writer.start()
@@ -13551,7 +13304,7 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                     logger.warning(
                         "Rewind rehydrate came back empty after sweep "
                         "(thread=%s from_seq=%s surviving_turn=%s)",
-                        _thread_id,
+                        _session_identity.thread_id,
                         from_seq,
                         result["surviving_turn"],
                     )
@@ -13584,14 +13337,14 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
         except Exception as e:
             logger.exception(
                 "Rewind failed after the sweep gate: thread=%s from_seq=%s",
-                _thread_id,
+                _session_identity.thread_id,
                 from_seq,
             )
             await _err(f"Rewind failed: {e}")
             return
         logger.info(
             "Rewind applied: thread=%s mode=%s from_seq=%s swept=%s",
-            _thread_id,
+            _session_identity.thread_id,
             mode,
             from_seq,
             result["swept"],
@@ -13859,7 +13612,7 @@ async def _apply_compact_control(
     if lease_token is None:
         # Admission keeps compact off the pinned inbox (it has a socket verb).
         return "control.rejected", "rejected", "unsupported_control", {}
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
+    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
         raise ControlInboxBlocked(f"compaction lost its session: {request.id}")
 
     request_id = str(request.id)
@@ -13869,7 +13622,7 @@ async def _apply_compact_control(
     # committed (crash between the two): answer from it, fold nothing twice.
     try:
         checkpoint = await _session.postgres_conn.get_latest_compaction_checkpoint(
-            _thread_id
+            _session_identity.thread_id
         )
     except Exception as exc:
         raise ControlInboxBlocked(
@@ -14162,7 +13915,7 @@ async def _handle_config_update(
     and on every error frame this handler emits, so a client with several
     in-flight updates can correlate outcomes (live_session_settings.md P0.3).
     """
-    global _session, _orchestrator_client, _thread_id
+    global _session, _orchestrator_client
 
     saved_snapshot = None
 
@@ -14239,11 +13992,11 @@ async def _handle_config_update(
         tools_update = bool(config_override.get("tools"))
         authorization_update = tools_update or ds_update or security_runtime_update
         effective_override = config_override
-        if _orchestrator_client and _thread_id:
+        if _orchestrator_client and _session_identity.thread_id:
             try:
                 execution_snapshot = getattr(_session, "execution_snapshot", None)
                 enriched = await _orchestrator_client.update_thread_config(
-                    _thread_id,
+                    _session_identity.thread_id,
                     config_override,
                     datasource_ids=datasource_ids,
                     snapshot_generation=(
@@ -14298,7 +14051,7 @@ async def _handle_config_update(
         # internal endpoint re-injects them per fetch.
         new_ds_payload: Optional[List[Dict[str, Any]]] = None
         if ds_update:
-            ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
+            ws_info = await _orchestrator_client.get_thread_workspace(_session_identity.thread_id)
             if not isinstance(ws_info, dict):
                 await _send_error(
                     "Session connector update could not be applied",
@@ -14566,8 +14319,8 @@ async def _handle_archive(ws: WebSocket) -> None:
             await _ws_send(ws, "error", {"message": "Session not ready"})
             return
 
-        archived_thread_id = _thread_id
-        archived_runtime_generation = _session_runtime_generation
+        archived_thread_id = _session_identity.thread_id
+        archived_runtime_generation = _session_identity.session_generation
         archived_disposition = _terminal_retirement_disposition()
         # Close durable input/control/Resume admission before the first
         # teardown-side await. Memory, title, cloud sync and Git finalization
@@ -14629,7 +14382,7 @@ async def _handle_archive(ws: WebSocket) -> None:
         # 2. Generate title if untitled
         if _session.postgres_conn:
             try:
-                thread = await _session.postgres_conn.get_thread(_thread_id)
+                thread = await _session.postgres_conn.get_thread(_session_identity.thread_id)
                 current = thread.get("title", "") if thread else ""
                 if (
                     not current
@@ -14643,7 +14396,7 @@ async def _handle_archive(ws: WebSocket) -> None:
                         async with _session.postgres_conn.acquire() as conn:
                             await conn.execute(
                                 "UPDATE threads SET title = $2 WHERE id = $1",
-                                _thread_id,
+                                _session_identity.thread_id,
                                 title,
                             )
             except Exception as e:
@@ -14691,27 +14444,27 @@ async def _update_thread_status(
     retirement_permanent: Optional[bool] = None,
 ) -> bool:
     """Durably update status via REST, falling back when REST says ``False``."""
-    runtime_generation = _session_runtime_generation
-    runtime_attach_token = _session_runtime_attach_token
+    runtime_generation = _session_identity.session_generation
+    runtime_attach_token = _session_identity.attach_token
     runtime_retirement_token = _retirement_admission_token
-    if not _stateless_mode() and _pinned_runtime_generation_enabled:
+    if not _stateless_mode() and _session_identity.runtime_contract:
         if runtime_generation is None:
             logger.warning(
                 "Pinned runtime generation was advertised but no exact "
                 "generation is attached (thread=%s status=%s)",
-                _thread_id,
+                _session_identity.thread_id,
                 status,
             )
             return False
     if not _stateless_mode() and (
-        _pinned_status_identity_enabled or _pinned_runtime_generation_enabled
+        _session_identity.status_contract or _session_identity.runtime_contract
     ):
         exact_agent_id = pinned_agent_id or _registered_pinned_agent_id()
         if exact_agent_id is None:
             logger.warning(
                 "Pinned status identity was advertised but no registered "
                 "agent id is available (thread=%s status=%s)",
-                _thread_id,
+                _session_identity.thread_id,
                 status,
             )
             return False
@@ -14722,16 +14475,16 @@ async def _update_thread_status(
             or status not in {"active", "awaiting_user"}
             or _session is None
             or _session.postgres_conn is None
-            or _thread_id is None
+            or _session_identity.thread_id is None
         ):
             return False
-        lease_token = _current_stateless_lease_token()
+        lease_token = _session_identity.stateless_lease_token()
         if lease_token is None:
             return False
         try:
             return await update_stateless_claim_status(
                 _session.postgres_conn,
-                thread_id=_thread_id,
+                thread_id=_session_identity.thread_id,
                 lease_token=lease_token,
                 status=status,
             )
@@ -14739,19 +14492,19 @@ async def _update_thread_status(
             logger.warning(
                 "Exact-lease stateless status update failed "
                 "(thread=%s status=%s token=%s): %s",
-                _thread_id,
+                _session_identity.thread_id,
                 status,
                 lease_token,
                 exc,
             )
             return False
-    if _orchestrator_client and _thread_id:
+    if _orchestrator_client and _session_identity.thread_id:
         try:
             if pinned_agent_id is None:
                 if retirement_disposition is not None:
                     return False
                 updated = await _orchestrator_client.update_thread_status(
-                    _thread_id,
+                    _session_identity.thread_id,
                     status,
                 )
             else:
@@ -14768,8 +14521,8 @@ async def _update_thread_status(
                     if status not in {"ending", "ended"}:
                         return False
                     status_kwargs["retirement_permanent"] = retirement_permanent
-                if status == "ended" and _pinned_runtime_generation_enabled:
-                    identity = _attached_retirement_identity()
+                if status == "ended" and _session_identity.runtime_contract:
+                    identity = _session_identity.retirement_identity()
                     if (
                         identity is None
                         or _retirement_admission_identity != identity
@@ -14815,7 +14568,7 @@ async def _update_thread_status(
                             workspace_runtime_incarnation
                         )
                 updated = await _orchestrator_client.update_thread_status(
-                    _thread_id,
+                    _session_identity.thread_id,
                     status,
                     **status_kwargs,
                 )
@@ -14831,7 +14584,7 @@ async def _update_thread_status(
         return False
 
     # Fallback to direct DB
-    if _session and _session.postgres_conn and _thread_id:
+    if _session and _session.postgres_conn and _session_identity.thread_id:
         try:
             if pinned_agent_id is not None:
                 async with _session.postgres_conn.acquire() as conn:
@@ -14841,7 +14594,7 @@ async def _update_thread_status(
                             "runtime_attach_token "
                             "FROM threads "
                             "WHERE id = $1::uuid FOR UPDATE",
-                            _thread_id,
+                            _session_identity.thread_id,
                         )
                         if (
                             thread is None
@@ -14863,7 +14616,7 @@ async def _update_thread_status(
                             "SELECT 1 FROM agents WHERE id = $1::uuid "
                             "AND thread_id = $2::uuid FOR SHARE",
                             pinned_agent_id,
-                            _thread_id,
+                            _session_identity.thread_id,
                         )
                         if reciprocal is None:
                             return False
@@ -14900,7 +14653,7 @@ async def _update_thread_status(
                                 )
                                 + "AND status <> 'ended' RETURNING id"
                             )
-                            params = [_thread_id, pinned_agent_id]
+                            params = [_session_identity.thread_id, pinned_agent_id]
                             if runtime_generation is not None:
                                 params.append(runtime_generation)
                                 params.append(runtime_attach_token)
@@ -14926,7 +14679,7 @@ async def _update_thread_status(
                                 )
                                 + "AND status <> 'ended' RETURNING id"
                             )
-                            params = [_thread_id, pinned_agent_id]
+                            params = [_session_identity.thread_id, pinned_agent_id]
                             if runtime_generation is not None:
                                 params.append(runtime_generation)
                                 params.append(runtime_attach_token)
@@ -14935,12 +14688,12 @@ async def _update_thread_status(
                             return False
                         return updated is not None
             if status == "ended":
-                await _session.postgres_conn.end_thread(_thread_id)
+                await _session.postgres_conn.end_thread(_session_identity.thread_id)
                 return True
             else:
                 return bool(
                     await _session.postgres_conn.update_thread_status(
-                        _thread_id, status
+                        _session_identity.thread_id, status
                     )
                 )
         except Exception as e:
@@ -14969,7 +14722,7 @@ async def _reconcile_retirement_begin_or_reopen_controls(
     global _retirement_admission_identity, _retirement_admission_disposition
     global _retirement_admission_token, _retirement_admission_permanent
 
-    if _attached_retirement_identity() != identity:
+    if _session_identity.retirement_identity() != identity:
         return False
 
     async def reopen_exact_runtime() -> bool | None:
@@ -14985,7 +14738,7 @@ async def _reconcile_retirement_begin_or_reopen_controls(
         global _retirement_admission_identity, _retirement_admission_disposition
         global _retirement_admission_token, _retirement_admission_permanent
 
-        if _attached_retirement_identity() != identity:
+        if _session_identity.retirement_identity() != identity:
             return None
         if (
             _retirement_admission_identity == identity
@@ -15012,7 +14765,7 @@ async def _reconcile_retirement_begin_or_reopen_controls(
             if session is None or not callable(resume):
                 raise RuntimeError("session has no child-runtime resume boundary")
             await resume()
-            if _session is not session or _attached_retirement_identity() != identity:
+            if _session is not session or _session_identity.retirement_identity() != identity:
                 raise RuntimeError("session identity moved during child-runtime resume")
             return True
         except Exception:
@@ -15024,7 +14777,7 @@ async def _reconcile_retirement_begin_or_reopen_controls(
                 exc_info=True,
             )
             try:
-                if _attached_retirement_identity() == identity:
+                if _session_identity.retirement_identity() == identity:
                     await _set_pinned_control_admission(
                         agent_id=exact_agent_id,
                         open_for_admission=False,
@@ -15037,7 +14790,7 @@ async def _reconcile_retirement_begin_or_reopen_controls(
                     exact_agent_id,
                     exc_info=True,
                 )
-            if _attached_retirement_identity() == identity:
+            if _session_identity.retirement_identity() == identity:
                 _retirement_admission_identity = identity
                 _retirement_admission_disposition = retirement_disposition
                 _retirement_admission_token = None
@@ -15069,7 +14822,7 @@ async def _reconcile_retirement_begin_or_reopen_controls(
         return False
 
     attempt = 0
-    while _attached_retirement_identity() == identity:
+    while _session_identity.retirement_identity() == identity:
         try:
             lifecycle = await lifecycle_reader(identity[0])
         except Exception as exc:
@@ -15081,10 +14834,10 @@ async def _reconcile_retirement_begin_or_reopen_controls(
             return False
         if not isinstance(lifecycle, dict):
             return False
-        observed_generation = _canonical_runtime_generation(
+        observed_generation = canonical_runtime_generation(
             lifecycle.get("session_runtime_generation")
         )
-        observed_attach = _canonical_runtime_generation(
+        observed_attach = canonical_runtime_generation(
             lifecycle.get("session_runtime_attach_token")
         )
         exact_life = bool(
@@ -15097,7 +14850,7 @@ async def _reconcile_retirement_begin_or_reopen_controls(
         preflight = lifecycle.get("runtime_retirement_preflight") is True
         authorized = lifecycle.get("runtime_retirement_authorized") is True
         if pending and authorized and lifecycle.get("status") == "ending":
-            token = _canonical_runtime_generation(
+            token = canonical_runtime_generation(
                 lifecycle.get("session_runtime_retirement_token")
             )
             if (
@@ -15174,7 +14927,7 @@ async def _begin_exact_session_retirement(
         return False
     if type(retirement_permanent) is not bool:
         return False
-    identity = _attached_retirement_identity()
+    identity = _session_identity.retirement_identity()
     if identity is None:
         return False
     # Close the whole parent admission surface before child quiescence. A
@@ -15198,7 +14951,7 @@ async def _begin_exact_session_retirement(
         logger.warning(
             "Session child runtime did not quiesce before retirement "
             "(thread=%s disposition=%s)",
-            _thread_id,
+            _session_identity.thread_id,
             retirement_disposition,
             exc_info=True,
         )
@@ -15225,7 +14978,7 @@ async def _begin_exact_session_retirement(
         # further consumption; never move this drain after the status call.
         try:
             if not await _close_pinned_control_inbox(agent_id=exact_agent_id):
-                if _pinned_runtime_generation_enabled:
+                if _session_identity.runtime_contract:
                     return await _reconcile_retirement_begin_or_reopen_controls(
                         identity=identity,
                         exact_agent_id=exact_agent_id,
@@ -15238,11 +14991,11 @@ async def _begin_exact_session_retirement(
         except Exception:
             logger.warning(
                 "Exact control preflight failed before retirement (thread=%s agent=%s)",
-                _thread_id,
+                _session_identity.thread_id,
                 exact_agent_id,
                 exc_info=True,
             )
-            if _pinned_runtime_generation_enabled:
+            if _session_identity.runtime_contract:
                 return await _reconcile_retirement_begin_or_reopen_controls(
                     identity=identity,
                     exact_agent_id=exact_agent_id,
@@ -15253,11 +15006,11 @@ async def _begin_exact_session_retirement(
                 )
             return False
     retirement_token: str | None = None
-    if _pinned_runtime_generation_enabled:
+    if _session_identity.runtime_contract:
         if (
             exact_agent_id is None
-            or _session_runtime_generation is None
-            or _session_runtime_attach_token is None
+            or _session_identity.session_generation is None
+            or _session_identity.attach_token is None
             or _orchestrator_client is None
         ):
             if exact_agent_id is not None:
@@ -15283,10 +15036,10 @@ async def _begin_exact_session_retirement(
             return False
         try:
             response = await begin(
-                str(_thread_id),
+                str(_session_identity.thread_id),
                 pinned_agent_id=exact_agent_id,
-                session_runtime_generation=_session_runtime_generation,
-                session_runtime_attach_token=_session_runtime_attach_token,
+                session_runtime_generation=_session_identity.session_generation,
+                session_runtime_attach_token=_session_identity.attach_token,
                 retirement_disposition=retirement_disposition,
                 retirement_permanent=retirement_permanent,
             )
@@ -15327,7 +15080,7 @@ async def _begin_exact_session_retirement(
                 begin_was_sent=True,
                 reopen_if_uncommitted=reopen_controls_if_uncommitted,
             )
-        retirement_token = _canonical_runtime_generation(
+        retirement_token = canonical_runtime_generation(
             response.get("session_runtime_retirement_token")
         )
         if retirement_token is None:
@@ -15358,7 +15111,7 @@ async def _begin_exact_session_retirement(
             return False
     # The server fenced the captured G/token. Never mirror that fence onto a
     # successor attached while the request was in flight.
-    if _session is None or _attached_retirement_identity() != identity:
+    if _session is None or _session_identity.retirement_identity() != identity:
         return False
     _retirement_admission_identity = identity
     _retirement_admission_disposition = retirement_disposition
@@ -15377,7 +15130,7 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
         if not _session:
             return
 
-        idle_thread_id = _thread_id
+        idle_thread_id = _session_identity.thread_id
         # Idle exit is just as terminal as an explicit /done. Close exact
         # runtime admission before memory/title/Git awaits so a late control
         # or user input cannot enter behind the decision to retire.
@@ -15438,7 +15191,7 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
         # 1. Generate title if untitled
         if _session.postgres_conn:
             try:
-                thread = await _session.postgres_conn.get_thread(_thread_id)
+                thread = await _session.postgres_conn.get_thread(_session_identity.thread_id)
                 current = thread.get("title", "") if thread else ""
                 if (
                     not current
@@ -15452,7 +15205,7 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
                         async with _session.postgres_conn.acquire() as conn:
                             await conn.execute(
                                 "UPDATE threads SET title = $2 WHERE id = $1",
-                                _thread_id,
+                                _session_identity.thread_id,
                                 title,
                             )
             except Exception as e:
@@ -15822,7 +15575,7 @@ async def _handle_workspace_upgrade(
     swaps as usual, and re-opens the shell-layer sudo gate after the swap. (The
     pre-existing ``_handle_vm_upgrade`` stays the sandbox→vm sudo-escalation path.)
     """
-    if not _session or not _orchestrator_client or not _thread_id:
+    if not _session or not _orchestrator_client or not _session_identity.thread_id:
         await _ws_send(ws, "workspace_upgrade.failed", {"reason": "Session not ready"})
         return
 
@@ -15862,7 +15615,7 @@ async def _handle_workspace_upgrade(
     await _ws_send(
         ws,
         "workspace_upgrade.started",
-        {"thread_id": _thread_id, "target_tier": target_tier},
+        {"thread_id": _session_identity.thread_id, "target_tier": target_tier},
     )
 
     try:
@@ -15879,7 +15632,7 @@ async def _handle_workspace_upgrade(
                 ws,
                 "workspace_upgrade.complete",
                 {
-                    "thread_id": _thread_id,
+                    "thread_id": _session_identity.thread_id,
                     "target_tier": target_tier,
                     "message": f"Workspace already provides the {target_tier} tier",
                 },
@@ -15888,7 +15641,7 @@ async def _handle_workspace_upgrade(
 
         # 1. Request provisioning via orchestrator (S2).
         ok = await _orchestrator_client.request_thread_workspace_upgrade(
-            _thread_id, target_tier=target_tier
+            _session_identity.thread_id, target_tier=target_tier
         )
         if not ok:
             await _ws_send(
@@ -15913,7 +15666,7 @@ async def _handle_workspace_upgrade(
                     ws,
                     "workspace_upgrade.progress",
                     {
-                        "thread_id": _thread_id,
+                        "thread_id": _session_identity.thread_id,
                         "target_tier": "vm",
                         "elapsed_s": elapsed_s,
                         "timeout_s": _vm_upgrade_poll_timeout,
@@ -15922,7 +15675,7 @@ async def _handle_workspace_upgrade(
 
             vm_cfg = await _poll_vm_ready(
                 _orchestrator_client,
-                _thread_id,
+                _session_identity.thread_id,
                 timeout=_vm_upgrade_poll_timeout,
                 progress_cb=_emit_vm_progress,
             )
@@ -15943,7 +15696,7 @@ async def _handle_workspace_upgrade(
             )
         else:
             ws_config = await _poll_workspace_ready(
-                _orchestrator_client, _thread_id, timeout=300
+                _orchestrator_client, _session_identity.thread_id, timeout=300
             )
         if not ws_config or not ws_config.get("remote"):
             # A vm that never came ready (usually the cold ~2.8GB CDI import
@@ -15953,10 +15706,10 @@ async def _handle_workspace_upgrade(
             # `kubectl delete` (workspace_tier_upgrade.md Q7). Best-effort.
             if target_tier == "vm":
                 try:
-                    await _orchestrator_client.abort_thread_vm_upgrade(_thread_id)
+                    await _orchestrator_client.abort_thread_vm_upgrade(_session_identity.thread_id)
                 except Exception as e:
                     logger.warning(
-                        f"VM abort/teardown after failed upgrade ({_thread_id}): {e}"
+                        f"VM abort/teardown after failed upgrade ({_session_identity.thread_id}): {e}"
                     )
             await _ws_send(
                 ws,
@@ -15996,7 +15749,7 @@ async def _handle_workspace_upgrade(
             username=remote.get("username", "agent-host"),
             key_path=remote.get("key_path"),
             workspace_path=remote.get("workspace_path", "/home/agent-host/workspace"),
-            job_id=_thread_id,
+            job_id=_session_identity.thread_id,
             default_timeout=shell_config.get("default_timeout", 120),
             max_tabs=shell_config.get("max_tabs", 15),
             connect_timeout=remote.get("connect_timeout", 30),
@@ -16052,7 +15805,7 @@ async def _handle_workspace_upgrade(
 
             seeded = await asyncio.to_thread(seed_workspace, src_backend, new_backend)
             logger.info(
-                f"Seeded {seeded} file(s) into upgraded workspace for {_thread_id}"
+                f"Seeded {seeded} file(s) into upgraded workspace for {_session_identity.thread_id}"
             )
 
         # 6. Hot-swap + re-derive the toolset (S1) so shell/git/file tools
@@ -16069,7 +15822,7 @@ async def _handle_workspace_upgrade(
         #     a remount failure must not abort the otherwise-successful upgrade.
         #     See knowledge-base/knowledge/issues/workspace_upgrade_drops_cloud_mount.md.
         try:
-            _ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
+            _ws_info = await _orchestrator_client.get_thread_workspace(_session_identity.thread_id)
             _fresh_cloud_mount = _ws_info.get("cloud_mount") if _ws_info else None
             if _fresh_cloud_mount:
                 if _session.cloud_mount_manager is not None:
@@ -16083,12 +15836,12 @@ async def _handle_workspace_upgrade(
                         ws,
                         "workspace_upgrade.cloud_mount_degraded",
                         {
-                            "thread_id": _thread_id,
+                            "thread_id": _session_identity.thread_id,
                             "reason": _session.cloud_mount_error or "mount inactive",
                         },
                     )
         except Exception as e:
-            logger.warning(f"Cloud remount after upgrade failed ({_thread_id}): {e}")
+            logger.warning(f"Cloud remount after upgrade failed ({_session_identity.thread_id}): {e}")
 
         _session.resetup_tools_for_backend()
 
@@ -16110,7 +15863,7 @@ async def _handle_workspace_upgrade(
         #    not a virtual. Deep-merged into metadata.config_override; non-fatal.
         try:
             await _orchestrator_client.update_thread_config(
-                _thread_id, {"workspace": {"backend": backend_tier}}
+                _session_identity.thread_id, {"workspace": {"backend": backend_tier}}
             )
         except Exception as e:
             logger.warning(f"Persisting upgraded tier failed (non-fatal): {e}")
@@ -16119,17 +15872,17 @@ async def _handle_workspace_upgrade(
             ws,
             "workspace_upgrade.complete",
             {
-                "thread_id": _thread_id,
+                "thread_id": _session_identity.thread_id,
                 "target_tier": backend_tier,
                 "seeded_files": seeded,
             },
         )
         logger.info(
-            f"Workspace upgrade ({backend_tier}) complete for thread {_thread_id}"
+            f"Workspace upgrade ({backend_tier}) complete for thread {_session_identity.thread_id}"
         )
 
     except Exception as e:
-        logger.exception(f"Workspace upgrade failed for thread {_thread_id}")
+        logger.exception(f"Workspace upgrade failed for thread {_session_identity.thread_id}")
         # A failure AFTER the vm was provisioned (e.g. the seed or swap step,
         # once vm_status was already ready) would otherwise leak the running VM —
         # only the poll-timeout path tore it down before. Tear it down here too
@@ -16137,10 +15890,10 @@ async def _handle_workspace_upgrade(
         # ready VM (workspace_tier_upgrade.md Q7).
         if target_tier == "vm" and _orchestrator_client is not None:
             try:
-                await _orchestrator_client.abort_thread_vm_upgrade(_thread_id)
+                await _orchestrator_client.abort_thread_vm_upgrade(_session_identity.thread_id)
             except Exception as ee:
                 logger.warning(
-                    f"VM teardown after upgrade failure ({_thread_id}): {ee}"
+                    f"VM teardown after upgrade failure ({_session_identity.thread_id}): {ee}"
                 )
         await _ws_send(ws, "workspace_upgrade.failed", {"reason": str(e)})
 
@@ -16422,9 +16175,9 @@ async def _write_title_if_placeholder(
     untouched. Returns True iff the title was written.
     """
     session = expected_session if expected_session is not None else _session
-    thread_id = expected_thread_id if expected_thread_id is not None else _thread_id
+    thread_id = expected_thread_id if expected_thread_id is not None else _session_identity.thread_id
     generation = (
-        expected_generation if expected_generation is not None else _session_generation
+        expected_generation if expected_generation is not None else _session_identity.attach_generation
     )
     if not title or not session or not session.postgres_conn or not thread_id:
         return False
@@ -16496,11 +16249,11 @@ async def _early_title_from_prompt(
     global _draft_title_value
     try:
         session = expected_session if expected_session is not None else _session
-        thread_id = expected_thread_id if expected_thread_id is not None else _thread_id
+        thread_id = expected_thread_id if expected_thread_id is not None else _session_identity.thread_id
         generation = (
             expected_generation
             if expected_generation is not None
-            else _session_generation
+            else _session_identity.attach_generation
         )
         if not session or not session.postgres_conn or not thread_id:
             return
@@ -16541,9 +16294,9 @@ async def _auto_title_after_first_turn() -> None:
     """
     global _draft_title_value
     try:
-        if not _session or not _session.postgres_conn or not _thread_id:
+        if not _session or not _session.postgres_conn or not _session_identity.thread_id:
             return
-        thread = await _session.postgres_conn.get_thread(_thread_id)
+        thread = await _session.postgres_conn.get_thread(_session_identity.thread_id)
         current = thread.get("title", "") if thread else ""
         # Overwrite a placeholder or our own draft — never a manual rename.
         if not _title_is_placeholder(current) and current != _draft_title_value:

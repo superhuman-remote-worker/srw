@@ -34,12 +34,9 @@ _PERSISTENT_GLOBALS = (
     "_drain_intent_handled",
     "_drain_deferred_logged",
     "_session",
-    "_thread_id",
     "_tool_inflight",
     "_loop_task",
     "_orchestrator_client",
-    "_session_runtime_generation",
-    "_session_runtime_attach_token",
     "_retirement_admission_identity",
     "_retirement_admission_disposition",
     "_retirement_admission_token",
@@ -50,6 +47,8 @@ _PERSISTENT_GLOBALS = (
     "_max_sessions_per_process",
 )
 
+_PERSISTENT_IDENTITY_FIELDS = ("_thread_id", "_session_generation", "_attach_token")
+
 
 class TestPersistentDrainHandler:
     @pytest.fixture(autouse=True)
@@ -58,6 +57,10 @@ class TestPersistentDrainHandler:
         from agent.api import persistent_app
 
         saved = {name: getattr(persistent_app, name) for name in _PERSISTENT_GLOBALS}
+        saved_identity = {
+            name: getattr(persistent_app._session_identity, name)
+            for name in _PERSISTENT_IDENTITY_FIELDS
+        }
         saved_input = (
             persistent_app._session_input._awaiting_input,
             persistent_app._session_input._queue,
@@ -65,13 +68,13 @@ class TestPersistentDrainHandler:
         persistent_app._drain_intent_handled = False
         persistent_app._drain_deferred_logged = False
         persistent_app._session = None
-        persistent_app._thread_id = None
+        persistent_app._session_identity._thread_id = None
         persistent_app._session_input._awaiting_input = False
         persistent_app._tool_inflight = False
         persistent_app._session_input._queue = None
         persistent_app._orchestrator_client = None
-        persistent_app._session_runtime_generation = None
-        persistent_app._session_runtime_attach_token = None
+        persistent_app._session_identity._session_generation = None
+        persistent_app._session_identity._attach_token = None
         persistent_app._retirement_admission_identity = None
         persistent_app._retirement_admission_disposition = None
         persistent_app._retirement_admission_token = None
@@ -81,6 +84,8 @@ class TestPersistentDrainHandler:
         yield
         for name, value in saved.items():
             setattr(persistent_app, name, value)
+        for name, value in saved_identity.items():
+            setattr(persistent_app._session_identity, name, value)
         (
             persistent_app._session_input._awaiting_input,
             persistent_app._session_input._queue,
@@ -92,7 +97,7 @@ class TestPersistentDrainHandler:
         persistent_app._session.workspace_generation = None
         persistent_app._session.workspace_runtime_incarnation = None
         persistent_app._session.local_quiescence_protocol = "agent_runtime_zero_v1"
-        persistent_app._thread_id = "tid-drain-1"
+        persistent_app._session_identity._thread_id = "tid-drain-1"
         persistent_app._session_input._awaiting_input = True
         persistent_app._tool_inflight = False
         persistent_app._session_input._queue = None
@@ -125,8 +130,8 @@ class TestPersistentDrainHandler:
         client = self._attach_parked_session(persistent_app)
         runtime_generation = "55555555-5555-4555-8555-555555555555"
         runtime_attach_token = "77777777-7777-4777-8777-777777777777"
-        persistent_app._session_runtime_generation = runtime_generation
-        persistent_app._session_runtime_attach_token = runtime_attach_token
+        persistent_app._session_identity._session_generation = runtime_generation
+        persistent_app._session_identity._attach_token = runtime_attach_token
         order = []
 
         async def terminate(*_args, **_kwargs):
@@ -232,8 +237,8 @@ class TestPersistentDrainHandler:
         client = self._attach_parked_session(persistent_app)
         generation = "55555555-5555-4555-8555-555555555555"
         attach_token = "77777777-7777-4777-8777-777777777777"
-        persistent_app._session_runtime_generation = generation
-        persistent_app._session_runtime_attach_token = attach_token
+        persistent_app._session_identity._session_generation = generation
+        persistent_app._session_identity._attach_token = attach_token
         client.suspend_thread = AsyncMock(side_effect=[False, True])
 
         async def begin(*_args, **_kwargs):
@@ -270,10 +275,10 @@ class TestPersistentDrainHandler:
         from agent.api import persistent_app
 
         client = self._attach_parked_session(persistent_app)
-        persistent_app._session_runtime_generation = (
+        persistent_app._session_identity._session_generation = (
             "55555555-5555-4555-8555-555555555555"
         )
-        persistent_app._session_runtime_attach_token = (
+        persistent_app._session_identity._attach_token = (
             "77777777-7777-4777-8777-777777777777"
         )
         original_session = persistent_app._session
@@ -463,7 +468,7 @@ class TestPersistentDrainHandler:
         session.workspace_manager = None
         session.cleanup = AsyncMock()
         persistent_app._session = session
-        persistent_app._thread_id = "tid-reentry-1"
+        persistent_app._session_identity._thread_id = "tid-reentry-1"
         persistent_app._terminating = False
         persistent_app._max_sessions_per_process = 0
 

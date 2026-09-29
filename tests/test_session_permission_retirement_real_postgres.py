@@ -399,7 +399,7 @@ async def test_successor_recovery_releases_discovery_locks_and_seeds_next_seq(
         "_session",
         SimpleNamespace(postgres_conn=pg, turn_count=4),
     )
-    monkeypatch.setattr(persistent_app, "_thread_id", str(thread_id))
+    monkeypatch.setattr(persistent_app._session_identity, "_thread_id", str(thread_id))
     monkeypatch.setattr(persistent_app, "_event_writer", old_writer)
     monkeypatch.setattr(persistent_app, "_events_epoch", 3)
     monkeypatch.setattr(persistent_app, "_next_seq", 99)

@@ -81,7 +81,7 @@ def _restore_globals(monkeypatch):
         "task": dual_app._session_attach_task,
         "agent": dual_app._agent,
         "client": dual_app._orchestrator_client,
-        "thread": persistent_app._thread_id,
+        "thread": persistent_app._session_identity.thread_id,
         "receipt": persistent_app._failed_attach_release_receipt,
         "pa_client": persistent_app._orchestrator_client,
     }
@@ -91,7 +91,7 @@ def _restore_globals(monkeypatch):
     dual_app._session_attach_task = None
     dual_app._agent = MagicMock()
     dual_app._orchestrator_client = None
-    persistent_app._thread_id = None
+    persistent_app._session_identity._thread_id = None
     persistent_app._failed_attach_release_receipt = None
     yield
     task = dual_app._session_attach_task
@@ -102,7 +102,7 @@ def _restore_globals(monkeypatch):
     dual_app._session_attach_task = saved["task"]
     dual_app._agent = saved["agent"]
     dual_app._orchestrator_client = saved["client"]
-    persistent_app._thread_id = saved["thread"]
+    persistent_app._session_identity._thread_id = saved["thread"]
     persistent_app._failed_attach_release_receipt = saved["receipt"]
     persistent_app._orchestrator_client = saved["pa_client"]
 
@@ -134,9 +134,11 @@ async def test_dual_ready_reports_exact_non_secret_session_identity(monkeypatch)
         "initialized": True,
         "connections": {"postgres": True},
     }
-    monkeypatch.setattr(persistent_app, "_thread_id", thread_id)
-    monkeypatch.setattr(persistent_app, "_session_runtime_generation", GENERATION)
-    monkeypatch.setattr(persistent_app, "_session_runtime_attach_token", ATTACH_TOKEN)
+    monkeypatch.setattr(persistent_app._session_identity, "_thread_id", thread_id)
+    monkeypatch.setattr(
+        persistent_app._session_identity, "_session_generation", GENERATION
+    )
+    monkeypatch.setattr(persistent_app._session_identity, "_attach_token", ATTACH_TOKEN)
     monkeypatch.setattr(
         persistent_app, "_orchestrator_client", MagicMock(agent_id=agent_id)
     )

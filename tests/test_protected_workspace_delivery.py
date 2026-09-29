@@ -488,7 +488,7 @@ async def test_mixed_off_marker_aborts_before_session_or_manager_construction(
     monkeypatch.setattr(persistent_app, "_agent", fake_agent)
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
     monkeypatch.setattr(persistent_app, "_session", None)
-    monkeypatch.setattr(persistent_app, "_thread_id", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_thread_id", None)
 
     with (
         patch.object(
@@ -506,7 +506,7 @@ async def test_mixed_off_marker_aborts_before_session_or_manager_construction(
 
     session_constructor.assert_not_called()
     assert persistent_app._session is None
-    assert persistent_app._thread_id is None
+    assert persistent_app._session_identity.thread_id is None
 
 
 def _runtime_client(workspace_responses: list[dict]):
@@ -569,14 +569,17 @@ async def test_dedicated_attach_initial_engaging_polls_to_ready(monkeypatch):
         ("_agent", fake_agent),
         ("_orchestrator_client", client),
         ("_session", None),
-        ("_thread_id", None),
         ("_event_writer", None),
-        ("_input_runtime_generation", None),
-        ("_session_runtime_generation", None),
-        ("_session_runtime_attach_token", None),
         ("_session_side_tasks", set()),
     ):
         monkeypatch.setattr(persistent_app, name, value)
+    for name in (
+        "_thread_id",
+        "_process_generation",
+        "_session_generation",
+        "_attach_token",
+    ):
+        monkeypatch.setattr(persistent_app._session_identity, name, None)
     for name in (
         "_queue",
         "_interrupt_mode",
@@ -624,8 +627,11 @@ async def test_dedicated_attach_initial_engaging_polls_to_ready(monkeypatch):
     )
     update_status.assert_awaited_once_with("active")
     assert persistent_app._session is session
-    assert UUID(str(persistent_app._input_runtime_generation))
-    assert persistent_app._input_runtime_generation != client.session_runtime_generation
+    assert UUID(str(persistent_app._session_identity.process_generation))
+    assert (
+        persistent_app._session_identity.process_generation
+        != client.session_runtime_generation
+    )
 
     # This is a successful live attach, so invoking the delivered-attach abort
     # protocol here would now (correctly) require a real workspace process-zero
@@ -636,20 +642,20 @@ async def test_dedicated_attach_initial_engaging_polls_to_ready(monkeypatch):
 def test_strict_pinned_input_identity_keeps_process_generation_separate(monkeypatch):
     client = _runtime_client([])
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
-    monkeypatch.setattr(persistent_app, "_pinned_runtime_generation_enabled", True)
+    monkeypatch.setattr(persistent_app._session_identity, "_runtime_contract", True)
     monkeypatch.setattr(
-        persistent_app,
-        "_session_runtime_generation",
+        persistent_app._session_identity,
+        "_session_generation",
         client.session_runtime_generation,
     )
     monkeypatch.setattr(
-        persistent_app,
-        "_session_runtime_attach_token",
+        persistent_app._session_identity,
+        "_attach_token",
         client.session_runtime_attach_token,
     )
     monkeypatch.setattr(
-        persistent_app,
-        "_input_runtime_generation",
+        persistent_app._session_identity,
+        "_process_generation",
         "ffffffff-ffff-4fff-8fff-ffffffffffff",
     )
     monkeypatch.setenv("POD_UID", "pod-uid")
@@ -676,10 +682,10 @@ async def test_dedicated_attach_initial_engaging_timeout_fails_closed(monkeypatc
     poll = AsyncMock(return_value=None)
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
     monkeypatch.setattr(persistent_app, "_session", None)
-    monkeypatch.setattr(persistent_app, "_thread_id", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_thread_id", None)
     monkeypatch.setattr(persistent_app, "_event_writer", None)
-    monkeypatch.setattr(persistent_app, "_session_runtime_generation", None)
-    monkeypatch.setattr(persistent_app, "_session_runtime_attach_token", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_session_generation", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_attach_token", None)
     monkeypatch.setattr(persistent_app, "_failed_attach_release_receipt", None)
     monkeypatch.setattr(
         persistent_app, "_failed_attach_workspace_cleanup_context", None
@@ -707,7 +713,7 @@ async def test_dedicated_attach_initial_engaging_timeout_fails_closed(monkeypatc
     poll.assert_awaited_once()
     constructor.assert_not_called()
     assert persistent_app._session is None
-    assert persistent_app._thread_id is None
+    assert persistent_app._session_identity.thread_id is None
 
 
 def test_advertised_pinned_runtime_contract_requires_exact_attach_token(monkeypatch):
@@ -715,21 +721,21 @@ def test_advertised_pinned_runtime_contract_requires_exact_attach_token(monkeypa
     client = _runtime_client([])
     client.session_runtime_attach_token = None
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
-    monkeypatch.setattr(persistent_app, "_session_runtime_generation", None)
-    monkeypatch.setattr(persistent_app, "_session_runtime_attach_token", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_session_generation", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_attach_token", None)
 
     with pytest.raises(
         persistent_app.WorkspaceNotReady,
         match="generation or attach token",
     ):
-        persistent_app._adopt_attached_runtime_identity(
+        persistent_app._session_identity.adopt(
             client.session_runtime_generation,
             None,
             contract_advertised=True,
         )
 
-    assert persistent_app._session_runtime_generation is None
-    assert persistent_app._session_runtime_attach_token is None
+    assert persistent_app._session_identity.session_generation is None
+    assert persistent_app._session_identity.attach_token is None
 
 
 def test_stateless_claim_uses_generation_without_pinned_attach_token(monkeypatch):
@@ -737,19 +743,20 @@ def test_stateless_claim_uses_generation_without_pinned_attach_token(monkeypatch
     client = _runtime_client([])
     client.session_runtime_attach_token = None
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
-    monkeypatch.setattr(persistent_app, "_session_runtime_generation", None)
-    monkeypatch.setattr(persistent_app, "_session_runtime_attach_token", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_session_generation", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_attach_token", None)
 
-    persistent_app._adopt_attached_runtime_identity(
+    persistent_app._session_identity.adopt(
         client.session_runtime_generation,
         None,
         contract_advertised=True,
     )
 
     assert (
-        persistent_app._session_runtime_generation == client.session_runtime_generation
+        persistent_app._session_identity.session_generation
+        == client.session_runtime_generation
     )
-    assert persistent_app._session_runtime_attach_token is None
+    assert persistent_app._session_identity.attach_token is None
 
 
 @pytest.mark.asyncio
@@ -773,7 +780,7 @@ async def test_workspace_identity_change_before_constructor_fails_closed(monkeyp
     monkeypatch.setattr(persistent_app, "_agent", fake_agent)
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
     monkeypatch.setattr(persistent_app, "_session", None)
-    monkeypatch.setattr(persistent_app, "_thread_id", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_thread_id", None)
     monkeypatch.setattr(persistent_app, "_failed_attach_release_receipt", None)
     monkeypatch.setattr(
         persistent_app, "_failed_attach_workspace_cleanup_context", None
@@ -838,7 +845,7 @@ async def test_workspace_identity_change_during_setup_rolls_back(monkeypatch):
     monkeypatch.setattr(persistent_app, "_agent", fake_agent)
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
     monkeypatch.setattr(persistent_app, "_session", None)
-    monkeypatch.setattr(persistent_app, "_thread_id", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_thread_id", None)
     monkeypatch.setattr(persistent_app, "_failed_attach_release_receipt", None)
     monkeypatch.setattr(
         persistent_app, "_failed_attach_workspace_cleanup_context", None

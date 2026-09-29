@@ -1230,10 +1230,10 @@ def worker_runtime(monkeypatch):
         "agent": pa._agent,
         "client": pa._orchestrator_client,
         "session": pa._session,
-        "thread_id": pa._thread_id,
+        "thread_id": pa._session_identity.thread_id,
     }
     pa._session = None
-    pa._thread_id = None
+    pa._session_identity._thread_id = None
     monkeypatch.setattr(
         turn_executor.StatelessTurnExecutor,
         "_scrub_process_residue",
@@ -1245,7 +1245,7 @@ def worker_runtime(monkeypatch):
         pa._agent = saved["agent"]
         pa._orchestrator_client = saved["client"]
         pa._session = saved["session"]
-        pa._thread_id = saved["thread_id"]
+        pa._session_identity._thread_id = saved["thread_id"]
 
 
 def _install(

@@ -464,7 +464,7 @@ async def test_a_graceful_shutdown_during_a_batch_is_settled_by_the_successor(
                 pa, "_agent", SimpleNamespace(postgres_conn=dying.agent_db)
             )
             monkeypatch.setattr(pa, "_session", SimpleNamespace(tool_context=context))
-            monkeypatch.setattr(pa, "_thread_id", str(seed.session))
+            monkeypatch.setattr(pa._session_identity, "_thread_id", str(seed.session))
             monkeypatch.setattr(pa, "_interrupt_owner_lease_token", claim.lease_token)
             monkeypatch.setattr(pa, "_interrupt_owner_turn_id", 1)
             monkeypatch.setattr(pa, "_session_input", owner)

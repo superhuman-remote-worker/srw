@@ -529,7 +529,7 @@ class TestTeardownExtraction:
             ),
             patch("agent.api.persistent_app._stateless_mode", return_value=False),
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch(
                 "agent.api.persistent_app._update_thread_status",
                 new=AsyncMock(return_value=True),
@@ -562,7 +562,7 @@ class TestTeardownExtraction:
             ),
             patch("agent.api.persistent_app._stateless_mode", return_value=False),
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch("agent.api.persistent_app._broadcast"),
             patch(
                 "agent.api.persistent_app._update_thread_status",
@@ -593,7 +593,7 @@ class TestTeardownExtraction:
         ws = AsyncMock()
         with (
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch("agent.api.persistent_app._broadcast"),
             patch("agent.api.persistent_app._terminate_session", AsyncMock()),
             patch(
@@ -626,7 +626,7 @@ class TestTeardownExtraction:
         session.retire_shell_owner = MagicMock()
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_loop_task", None),
             patch.object(pa, "_event_writer", None),
             patch.object(pa, "_stop_watchdogs"),

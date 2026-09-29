@@ -31,14 +31,14 @@ from shared.pinned_session_identity import pinned_session_ready_identity_fingerp
 # Arrangement adapter -- the only part R3.3b may edit.
 # ---------------------------------------------------------------------------
 
-_IDENTITY_GLOBALS = {
+_IDENTITY_FIELDS = {
     "thread_id": "_thread_id",
-    "generation": "_session_runtime_generation",
-    "attach_token": "_session_runtime_attach_token",
-    "runtime_contract": "_pinned_runtime_generation_enabled",
-    "status_contract": "_pinned_status_identity_enabled",
-    "process_generation": "_input_runtime_generation",
-    "attach_generation": "_session_generation",
+    "generation": "_session_generation",
+    "attach_token": "_attach_token",
+    "runtime_contract": "_runtime_contract",
+    "status_contract": "_status_contract",
+    "process_generation": "_process_generation",
+    "attach_generation": "_attach_generation",
 }
 _ATTACH_STATE_GLOBALS = (
     "_pool_attach_claim",
@@ -51,20 +51,21 @@ _ATTACH_STATE_GLOBALS = (
 
 
 def identity() -> dict[str, Any]:
-    return {key: getattr(pa, name) for key, name in _IDENTITY_GLOBALS.items()}
+    owner = pa._session_identity
+    return {key: getattr(owner, name) for key, name in _IDENTITY_FIELDS.items()}
 
 
 def seed_identity(monkeypatch, **values: Any) -> None:
     for key, value in values.items():
-        monkeypatch.setattr(pa, _IDENTITY_GLOBALS[key], value)
+        monkeypatch.setattr(pa._session_identity, _IDENTITY_FIELDS[key], value)
 
 
 def identity_snapshot():
-    return pa._current_input_runtime_identity()
+    return pa._session_identity.snapshot()
 
 
 def fingerprint() -> str | None:
-    return pa._current_pinned_session_identity_fingerprint()
+    return pa._session_identity.fingerprint()
 
 
 def attach(**kwargs: Any):
@@ -142,24 +143,27 @@ def patch_collaborator(monkeypatch, name: str, value: Any) -> None:
 
 def reset_attach_state() -> None:
     pa._session = None
-    pa._thread_id = None
-    pa._session_runtime_generation = None
-    pa._session_runtime_attach_token = None
-    pa._pinned_runtime_generation_enabled = False
-    pa._pinned_status_identity_enabled = False
-    pa._input_runtime_generation = None
+    owner = pa._session_identity
+    for name in _IDENTITY_FIELDS.values():
+        if name != "_attach_generation":
+            setattr(owner, name, False if name.endswith("_contract") else None)
     for name in _ATTACH_STATE_GLOBALS:
         setattr(pa, name, None)
 
 
 def saved_attach_state() -> tuple[Any, ...]:
-    names = tuple(_IDENTITY_GLOBALS.values()) + _ATTACH_STATE_GLOBALS
-    return names, tuple(getattr(pa, name) for name in names)
+    owner = pa._session_identity
+    return (
+        tuple(getattr(owner, name) for name in _IDENTITY_FIELDS.values()),
+        tuple(getattr(pa, name) for name in _ATTACH_STATE_GLOBALS),
+    )
 
 
 def restore_attach_state(saved) -> None:
-    names, values = saved
-    for name, value in zip(names, values):
+    identity_values, attach_values = saved
+    for name, value in zip(_IDENTITY_FIELDS.values(), identity_values):
+        setattr(pa._session_identity, name, value)
+    for name, value in zip(_ATTACH_STATE_GLOBALS, attach_values):
         setattr(pa, name, value)
 
 

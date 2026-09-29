@@ -63,10 +63,10 @@ def _partial_cleanup_context(*, setup_started: bool):
 def _partial_cleanup_patchers(context):
     return [
         patch.object(app, "_session", None),
-        patch.object(app, "_thread_id", "thread-a"),
-        patch.object(app, "_session_runtime_generation", GENERATION),
-        patch.object(app, "_session_runtime_attach_token", ATTACH_TOKEN),
-        patch.object(app, "_pinned_runtime_generation_enabled", True),
+        patch.object(app._session_identity, "_thread_id", "thread-a"),
+        patch.object(app._session_identity, "_session_generation", GENERATION),
+        patch.object(app._session_identity, "_attach_token", ATTACH_TOKEN),
+        patch.object(app._session_identity, "_runtime_contract", True),
         patch.object(app, "_failed_attach_workspace_cleanup_context", context),
         patch.object(app, "_failed_attach_release_receipt", None),
         patch.object(app, "_event_writer", None),
@@ -74,7 +74,7 @@ def _partial_cleanup_patchers(context):
         patch.object(app, "_stop_thread_control_watcher", new=AsyncMock()),
         patch.object(app, "_stop_and_join_watchdogs", new=AsyncMock()),
         patch.object(app, "_quiesce_session_side_tasks", new=AsyncMock()),
-        patch.object(app, "_clear_attached_runtime_identity", return_value=True),
+        patch.object(app._session_identity, "clear", return_value=True),
         patch.object(app, "_clear_attached_runtime_actor"),
         patch.object(app, "_apply_session_embedding_env"),
         patch("agent.tools.registry.register_mcp_tools"),
@@ -87,7 +87,7 @@ def _restore_pool_globals():
     # Real attach tests adopt lifecycle identity before session construction.
     saved = (
         app._session,
-        app._thread_id,
+        app._session_identity.thread_id,
         app._pool_attach_claim,
         app._pool_attach_runtime_generation,
         app._pool_attach_token,
@@ -96,19 +96,19 @@ def _restore_pool_globals():
         app._failed_attach_workspace_cleanup_context,
         app._orchestrator_client,
         app._heartbeat_task,
-        app._session_runtime_generation,
-        app._session_runtime_attach_token,
-        app._pinned_runtime_generation_enabled,
-        app._pinned_status_identity_enabled,
+        app._session_identity.session_generation,
+        app._session_identity.attach_token,
+        app._session_identity.runtime_contract,
+        app._session_identity.status_contract,
         app._retirement_admission_identity,
         app._retirement_admission_disposition,
         app._retirement_admission_token,
         app._retirement_admission_permanent,
         app._runtime_authorization_admission_open,
-        app._session_generation,
+        app._session_identity.attach_generation,
     )
     app._session = None
-    app._thread_id = None
+    app._session_identity._thread_id = None
     app._pool_attach_claim = None
     app._pool_attach_runtime_generation = None
     app._pool_attach_token = None
@@ -119,7 +119,7 @@ def _restore_pool_globals():
     yield
     (
         app._session,
-        app._thread_id,
+        app._session_identity._thread_id,
         app._pool_attach_claim,
         app._pool_attach_runtime_generation,
         app._pool_attach_token,
@@ -128,16 +128,16 @@ def _restore_pool_globals():
         app._failed_attach_workspace_cleanup_context,
         app._orchestrator_client,
         app._heartbeat_task,
-        app._session_runtime_generation,
-        app._session_runtime_attach_token,
-        app._pinned_runtime_generation_enabled,
-        app._pinned_status_identity_enabled,
+        app._session_identity._session_generation,
+        app._session_identity._attach_token,
+        app._session_identity._runtime_contract,
+        app._session_identity._status_contract,
         app._retirement_admission_identity,
         app._retirement_admission_disposition,
         app._retirement_admission_token,
         app._retirement_admission_permanent,
         app._runtime_authorization_admission_open,
-        app._session_generation,
+        app._session_identity._attach_generation,
     ) = saved
 
 
@@ -334,7 +334,7 @@ async def test_real_attach_crosses_one_way_setup_boundary_before_constructor():
         patch.object(app, "_agent", agent),
         patch.object(app, "_orchestrator_client", client),
         patch.object(app, "_session", None),
-        patch.object(app, "_thread_id", None),
+        patch.object(app._session_identity, "_thread_id", None),
         patch.object(app, "_event_writer", None),
         patch.object(app, "_failed_attach_workspace_cleanup_context", None),
         patch.object(app, "_poll_workspace_ready", AsyncMock(return_value=workspace)),
@@ -395,12 +395,12 @@ async def test_real_attach_rejects_workspace_identity_drift_before_constructor()
     with (
         patch.object(app, "_orchestrator_client", client),
         patch.object(app, "_session", None),
-        patch.object(app, "_thread_id", None),
+        patch.object(app._session_identity, "_thread_id", None),
         patch.object(app, "_event_writer", None),
         patch.object(app, "_failed_attach_workspace_cleanup_context", None),
-        patch.object(app, "_session_runtime_generation", None),
-        patch.object(app, "_session_runtime_attach_token", None),
-        patch.object(app, "_pinned_runtime_generation_enabled", False),
+        patch.object(app._session_identity, "_session_generation", None),
+        patch.object(app._session_identity, "_attach_token", None),
+        patch.object(app._session_identity, "_runtime_contract", False),
         patch.object(app, "_retirement_admission_identity", None),
         patch.object(app, "_retirement_admission_disposition", None),
         patch.object(app, "_retirement_admission_token", None),
@@ -434,10 +434,10 @@ async def test_partial_cleanup_failure_keeps_exact_retry_owner_until_proven():
     )
     with (
         patch.object(app, "_session", None),
-        patch.object(app, "_thread_id", "thread-a"),
-        patch.object(app, "_session_runtime_generation", GENERATION),
-        patch.object(app, "_session_runtime_attach_token", ATTACH_TOKEN),
-        patch.object(app, "_pinned_runtime_generation_enabled", True),
+        patch.object(app._session_identity, "_thread_id", "thread-a"),
+        patch.object(app._session_identity, "_session_generation", GENERATION),
+        patch.object(app._session_identity, "_attach_token", ATTACH_TOKEN),
+        patch.object(app._session_identity, "_runtime_contract", True),
         patch.object(app, "_failed_attach_workspace_cleanup_context", context),
         patch.object(app, "_cleanup_failed_event_journal_attach", cleanup),
         patch.object(app, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)),

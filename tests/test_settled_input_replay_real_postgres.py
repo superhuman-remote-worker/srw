@@ -69,9 +69,7 @@ def _event(delivery_id: str, content: str = WAKE) -> dict:
         "content": content,
         "role": "event",
         "delivery_id": delivery_id,
-        "session_identity_fingerprint": (
-            pa._current_pinned_session_identity_fingerprint()
-        ),
+        "session_identity_fingerprint": (pa._session_identity.fingerprint()),
     }
 
 

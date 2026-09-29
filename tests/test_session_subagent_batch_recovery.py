@@ -937,7 +937,7 @@ async def test_attach_recovers_children_before_it_restores_the_transcript():
         get_thread_workspace=AsyncMock(return_value=workspace_override)
     )
     mod._session = None
-    mod._thread_id = None
+    mod._session_identity._thread_id = None
     with (
         patch.object(mod, "_agent", fake_agent),
         patch.object(mod, "_orchestrator_client", fake_orchestrator),
@@ -959,7 +959,7 @@ async def test_attach_recovers_children_before_it_restores_the_transcript():
             queue_after_attach = mod._session_input.queue
         finally:
             mod._session = None
-            mod._thread_id = None
+            mod._session_identity._thread_id = None
             mod._session_input.teardown()
 
     assert order == [("recover", None), ("restore", None)]

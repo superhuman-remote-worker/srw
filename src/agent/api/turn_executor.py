@@ -4037,7 +4037,7 @@ class StatelessTurnExecutor:
         fresh_attach = False
         reuse = (
             pa._session is not None
-            and pa._thread_id == unit_id
+            and pa._session_identity.thread_id == unit_id
             and self._attached_fingerprint == fingerprint
             and pa._session.stateless_warm_reuse_safe
         )
@@ -4060,7 +4060,7 @@ class StatelessTurnExecutor:
         else:
             if (
                 pa._session is not None
-                and pa._thread_id == unit_id
+                and pa._session_identity.thread_id == unit_id
                 and self._attached_bundle is not None
             ):
                 # Same thread, changed fingerprint: name WHICH bundle paths
@@ -5098,7 +5098,7 @@ class StatelessTurnExecutor:
         target_turn_id = getattr(pa, "_interrupt_owner_turn_id", None)
         if (
             not unit_id
-            or str(getattr(pa, "_thread_id", "") or "") != str(unit_id)
+            or str(pa._session_identity.thread_id or "") != str(unit_id)
             or getattr(pa, "_interrupt_owner_lease_token", None) != lease_token
             or isinstance(target_turn_id, bool)
             or not isinstance(target_turn_id, int)
@@ -5487,7 +5487,7 @@ class StatelessTurnExecutor:
         """
 
         if getattr(pa, "_session", None) is None or str(
-            getattr(pa, "_thread_id", "") or ""
+            pa._session_identity.thread_id or ""
         ) != str(claim.unit_id):
             return False
         fetchval = getattr(self._db, "fetchval", None)
@@ -5892,7 +5892,10 @@ class StatelessTurnExecutor:
         """
 
         pa = _pa()
-        if pa._thread_id == str(claim.unit_id) and pa._session is not None:
+        if (
+            pa._session_identity.thread_id == str(claim.unit_id)
+            and pa._session is not None
+        ):
             await self._detach_cached_session("terminal_claim_fenced")
         try:
             acknowledged = await acknowledge_session_claim_quiesced(
@@ -5939,7 +5942,7 @@ class StatelessTurnExecutor:
         if pa._session is None:
             # A failed attach can leave _thread_id set with no session
             # (dual_app precedent) — clear it so the next claim starts clean.
-            pa._thread_id = None
+            pa._session_identity.release_thread()
             return
         # Queue-claim detach retires only this Python/SFTP owner. Workspace
         # rclone/overlay residents are durable handoff state and may still be

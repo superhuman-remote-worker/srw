@@ -130,7 +130,7 @@ def stateless_owner(monkeypatch):
         undo_turn=AsyncMock(),
     )
     monkeypatch.setattr(pa, "_session", session)
-    monkeypatch.setattr(pa, "_thread_id", str(THREAD_ID))
+    monkeypatch.setattr(pa._session_identity, "_thread_id", str(THREAD_ID))
     handle = LeaseHandle()
     handle.update(str(THREAD_ID), 9)
     token = current_lease.set(handle)
@@ -576,8 +576,10 @@ async def test_pinned_drain_adopts_then_passes_immutable_agent_owner(
     apply_request = MagicMock(return_value=("narration.changed", "applied", None))
 
     with (
-        patch.object(pa, "_session_runtime_generation", str(RUNTIME_GENERATION)),
-        patch.object(pa, "_session_runtime_attach_token", str(RUNTIME_ATTACH_TOKEN)),
+        patch.object(
+            pa._session_identity, "_session_generation", str(RUNTIME_GENERATION)
+        ),
+        patch.object(pa._session_identity, "_attach_token", str(RUNTIME_ATTACH_TOKEN)),
         patch("shared.thread_controls.owner_fence_current", owner_fence),
         patch("shared.thread_controls.adopt_next_pinned_control_request", adopt),
         patch("shared.thread_controls.fetch_next_control_request", fetch_next),
@@ -782,7 +784,7 @@ async def test_pinned_watcher_closes_gate_before_stop_and_after_first_drain_fail
 ):
     order: list[str] = []
     monkeypatch.setattr(pa, "_session", SimpleNamespace(postgres_conn=object()))
-    monkeypatch.setattr(pa, "_thread_id", str(THREAD_ID))
+    monkeypatch.setattr(pa._session_identity, "_thread_id", str(THREAD_ID))
     monkeypatch.setattr(pa, "_control_owner_lease_token", None)
     monkeypatch.setattr(pa, "_control_owner_agent_id", "prior-owner")
 
@@ -819,7 +821,7 @@ async def test_pinned_watcher_closes_gate_before_stop_and_after_first_drain_fail
 async def test_pinned_watcher_cancellation_after_open_recloses_capability(monkeypatch):
     order: list[str] = []
     monkeypatch.setattr(pa, "_session", SimpleNamespace(postgres_conn=object()))
-    monkeypatch.setattr(pa, "_thread_id", str(THREAD_ID))
+    monkeypatch.setattr(pa._session_identity, "_thread_id", str(THREAD_ID))
     monkeypatch.setattr(pa, "_control_owner_lease_token", None)
     monkeypatch.setattr(pa, "_control_owner_agent_id", None)
 
@@ -996,7 +998,7 @@ async def test_exact_pinned_ended_status_rest_false_never_bypasses_retirement(
     conn = _PinnedStatusConn()
     client = SimpleNamespace(update_thread_status=AsyncMock(return_value=False))
     monkeypatch.setattr(pa, "_orchestrator_client", client)
-    monkeypatch.setattr(pa, "_thread_id", str(THREAD_ID))
+    monkeypatch.setattr(pa._session_identity, "_thread_id", str(THREAD_ID))
     monkeypatch.setattr(
         pa,
         "_session",
@@ -1023,7 +1025,7 @@ async def test_exact_pinned_status_refuses_moved_binding_without_update(monkeypa
         "_orchestrator_client",
         SimpleNamespace(update_thread_status=AsyncMock(return_value=False)),
     )
-    monkeypatch.setattr(pa, "_thread_id", str(THREAD_ID))
+    monkeypatch.setattr(pa._session_identity, "_thread_id", str(THREAD_ID))
     monkeypatch.setattr(
         pa,
         "_session",
@@ -1046,9 +1048,9 @@ async def test_advertised_pinned_identity_fences_every_status_write(
         agent_id=str(PINNED_AGENT_ID),
         update_thread_status=AsyncMock(return_value=False),
     )
-    monkeypatch.setattr(pa, "_pinned_status_identity_enabled", True)
+    monkeypatch.setattr(pa._session_identity, "_status_contract", True)
     monkeypatch.setattr(pa, "_orchestrator_client", client)
-    monkeypatch.setattr(pa, "_thread_id", str(THREAD_ID))
+    monkeypatch.setattr(pa._session_identity, "_thread_id", str(THREAD_ID))
     monkeypatch.setattr(
         pa,
         "_session",
@@ -1073,9 +1075,9 @@ async def test_old_server_compatibility_omits_identity_until_advertised(monkeypa
         agent_id=str(PINNED_AGENT_ID),
         update_thread_status=AsyncMock(return_value=True),
     )
-    monkeypatch.setattr(pa, "_pinned_status_identity_enabled", False)
+    monkeypatch.setattr(pa._session_identity, "_status_contract", False)
     monkeypatch.setattr(pa, "_orchestrator_client", client)
-    monkeypatch.setattr(pa, "_thread_id", str(THREAD_ID))
+    monkeypatch.setattr(pa._session_identity, "_thread_id", str(THREAD_ID))
     monkeypatch.setattr(pa, "_session", None)
 
     assert await pa._update_thread_status("active")
@@ -1096,12 +1098,12 @@ async def test_runtime_generation_fences_rest_and_direct_database_status_write(
         agent_id=str(PINNED_AGENT_ID),
         update_thread_status=AsyncMock(return_value=False),
     )
-    monkeypatch.setattr(pa, "_pinned_status_identity_enabled", True)
-    monkeypatch.setattr(pa, "_pinned_runtime_generation_enabled", True)
-    monkeypatch.setattr(pa, "_session_runtime_generation", generation)
-    monkeypatch.setattr(pa, "_session_runtime_attach_token", attach_token)
+    monkeypatch.setattr(pa._session_identity, "_status_contract", True)
+    monkeypatch.setattr(pa._session_identity, "_runtime_contract", True)
+    monkeypatch.setattr(pa._session_identity, "_session_generation", generation)
+    monkeypatch.setattr(pa._session_identity, "_attach_token", attach_token)
     monkeypatch.setattr(pa, "_orchestrator_client", client)
-    monkeypatch.setattr(pa, "_thread_id", str(THREAD_ID))
+    monkeypatch.setattr(pa._session_identity, "_thread_id", str(THREAD_ID))
     monkeypatch.setattr(
         pa,
         "_session",
@@ -1140,11 +1142,11 @@ async def test_stale_runtime_generation_cannot_use_direct_database_fallback(
         agent_id=str(PINNED_AGENT_ID),
         update_thread_status=AsyncMock(return_value=False),
     )
-    monkeypatch.setattr(pa, "_pinned_status_identity_enabled", True)
-    monkeypatch.setattr(pa, "_pinned_runtime_generation_enabled", True)
-    monkeypatch.setattr(pa, "_session_runtime_generation", generation_a)
+    monkeypatch.setattr(pa._session_identity, "_status_contract", True)
+    monkeypatch.setattr(pa._session_identity, "_runtime_contract", True)
+    monkeypatch.setattr(pa._session_identity, "_session_generation", generation_a)
     monkeypatch.setattr(pa, "_orchestrator_client", client)
-    monkeypatch.setattr(pa, "_thread_id", str(THREAD_ID))
+    monkeypatch.setattr(pa._session_identity, "_thread_id", str(THREAD_ID))
     monkeypatch.setattr(
         pa,
         "_session",

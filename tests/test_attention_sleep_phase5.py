@@ -83,11 +83,11 @@ def _reset_agent_globals():
     import agent.api.persistent_app as mod
 
     mod._session = None
-    mod._thread_id = None
-    mod._pinned_status_identity_enabled = False
-    mod._pinned_runtime_generation_enabled = False
-    mod._session_runtime_generation = None
-    mod._session_runtime_attach_token = None
+    mod._session_identity._thread_id = None
+    mod._session_identity._status_contract = False
+    mod._session_identity._runtime_contract = False
+    mod._session_identity._session_generation = None
+    mod._session_identity._attach_token = None
     mod._orchestrator_client = None
     mod._subscribers.clear()
     mod._session_input._queue = None
@@ -105,7 +105,7 @@ def _install_agent_session(*, turn_count: int = 0):
     session.config = MagicMock()
     session.config.interactive.idle_timeout_minutes = 0
     mod._session = session
-    mod._thread_id = "thread-test-uuid"
+    mod._session_identity._thread_id = "thread-test-uuid"
     client = AsyncMock()
     client.update_thread_status = AsyncMock(return_value=True)
     mod._orchestrator_client = client

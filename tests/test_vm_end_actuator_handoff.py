@@ -122,11 +122,6 @@ def attach_native_session(monkeypatch, session, events, *, lose_response=False):
 
     values = {
         "_session": session,
-        "_thread_id": session.thread_id,
-        "_session_runtime_generation": generation,
-        "_session_runtime_attach_token": attach,
-        "_pinned_runtime_generation_enabled": True,
-        "_pinned_status_identity_enabled": True,
         "_control_owner_agent_id": owner,
         "_orchestrator_client": Client(),
         # Begin has already returned this immutable authority. The terminal
@@ -145,6 +140,14 @@ def attach_native_session(monkeypatch, session, events, *, lose_response=False):
     }
     for name, value in values.items():
         monkeypatch.setattr(app, name, value)
+    for name, value in {
+        "_thread_id": session.thread_id,
+        "_session_generation": generation,
+        "_attach_token": attach,
+        "_runtime_contract": True,
+        "_status_contract": True,
+    }.items():
+        monkeypatch.setattr(app._session_identity, name, value)
     monkeypatch.setattr(app, "_stateless_mode", lambda: False)
     monkeypatch.setenv("POD_UID", str(uuid4()))
     return accepted
@@ -347,7 +350,7 @@ async def test_rest_detach_reports_pending_after_native_vm_drain(monkeypatch):
     attach_native_session(monkeypatch, session, events)
     api = app.create_persistent_app("session_base", thread_id=session.thread_id)
     endpoint = next(route.endpoint for route in api.routes if route.path == "/session/detach")
-    fingerprint = app._current_pinned_session_identity_fingerprint()
+    fingerprint = app._session_identity.fingerprint()
     assert fingerprint
     response = await endpoint({"session_identity_fingerprint": fingerprint})
     assert response.status_code == 202

@@ -86,11 +86,11 @@ def _reset_agent_globals():
     import agent.api.persistent_app as mod
 
     mod._session = None
-    mod._thread_id = None
-    mod._pinned_status_identity_enabled = False
-    mod._pinned_runtime_generation_enabled = False
-    mod._session_runtime_generation = None
-    mod._session_runtime_attach_token = None
+    mod._session_identity._thread_id = None
+    mod._session_identity._status_contract = False
+    mod._session_identity._runtime_contract = False
+    mod._session_identity._session_generation = None
+    mod._session_identity._attach_token = None
     mod._orchestrator_client = None
     mod._subscribers.clear()
     mod._session_input._queue = None
@@ -109,7 +109,7 @@ def _install_session(*, turn_count: int, headless_mode: str = "eager"):
     session.config.interactive.idle_timeout_minutes = 0
     session.config.headless = HeadlessConfig(mode=headless_mode)
     mod._session = session
-    mod._thread_id = "thread-phase6"
+    mod._session_identity._thread_id = "thread-phase6"
     client = AsyncMock()
     client.update_thread_status = AsyncMock(return_value=True)
     mod._orchestrator_client = client
@@ -120,17 +120,17 @@ def _install_session(*, turn_count: int, headless_mode: str = "eager"):
 def test_reset_agent_globals_clears_pinned_identity_protocol() -> None:
     import agent.api.persistent_app as mod
 
-    mod._pinned_status_identity_enabled = True
-    mod._pinned_runtime_generation_enabled = True
-    mod._session_runtime_generation = "leaked-generation"
-    mod._session_runtime_attach_token = "leaked-attach"
+    mod._session_identity._status_contract = True
+    mod._session_identity._runtime_contract = True
+    mod._session_identity._session_generation = "leaked-generation"
+    mod._session_identity._attach_token = "leaked-attach"
 
     _reset_agent_globals()
 
-    assert mod._pinned_status_identity_enabled is False
-    assert mod._pinned_runtime_generation_enabled is False
-    assert mod._session_runtime_generation is None
-    assert mod._session_runtime_attach_token is None
+    assert mod._session_identity.status_contract is False
+    assert mod._session_identity.runtime_contract is False
+    assert mod._session_identity.session_generation is None
+    assert mod._session_identity.attach_token is None
 
 
 class TestPoliteModeFlip:

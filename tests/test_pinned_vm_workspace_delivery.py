@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+from agent.api.session_identity import pinned_status_identity_advertised
 import pytest_asyncio
 from fastapi import HTTPException
 
@@ -146,15 +148,17 @@ async def test_attested_vm_delivery_reaches_real_remote_backend(
     """Dropping any physical field must break SSH setup for the server contract."""
     payload = await _deliver(vm_delivery)
     normalized = await _normalize(payload)
-    monkeypatch.setattr(persistent_app, "_session_runtime_generation", RUNTIME)
-    monkeypatch.setattr(persistent_app, "_pinned_runtime_generation_enabled", True)
+    monkeypatch.setattr(
+        persistent_app._session_identity, "_session_generation", RUNTIME
+    )
+    monkeypatch.setattr(persistent_app._session_identity, "_runtime_contract", True)
     assert (
-        persistent_app._bind_attached_runtime_payload(
+        persistent_app._session_identity.adopt_workspace_payload(
             normalized, protected_required=False
         )
         == RUNTIME
     )
-    assert persistent_app._pinned_status_identity_advertised(normalized)
+    assert pinned_status_identity_advertised(normalized)
     session = persistent_session.PersistentSession(
         thread_id=THREAD,
         config=_make_config(ws_backend="vm"),
@@ -418,15 +422,15 @@ async def vm_attach_setup(vm_delivery, monkeypatch):
     monkeypatch.setattr(persistent_app, "_agent", agent)
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
     monkeypatch.setattr(persistent_app, "_session", None)
-    monkeypatch.setattr(persistent_app, "_thread_id", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_thread_id", None)
     monkeypatch.setattr(persistent_app, "_event_writer", None)
     monkeypatch.setattr(
         persistent_app, "_failed_attach_workspace_cleanup_context", None
     )
     monkeypatch.setattr(persistent_app, "_session_side_tasks", set())
-    monkeypatch.setattr(persistent_app, "_session_runtime_generation", None)
-    monkeypatch.setattr(persistent_app, "_session_runtime_attach_token", None)
-    monkeypatch.setattr(persistent_app, "_pinned_runtime_generation_enabled", False)
+    monkeypatch.setattr(persistent_app._session_identity, "_session_generation", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_attach_token", None)
+    monkeypatch.setattr(persistent_app._session_identity, "_runtime_contract", False)
     return credential
 
 
@@ -555,9 +559,9 @@ async def test_vm_setup_failure_is_logged_before_cleanup_settles(
             assert secret not in caplog.text
         assert not task.done()
         assert persistent_app._session is not None
-        assert persistent_app._thread_id == THREAD
-        assert persistent_app._session_runtime_generation == RUNTIME
-        assert persistent_app._session_runtime_attach_token == ATTACH
+        assert persistent_app._session_identity.thread_id == THREAD
+        assert persistent_app._session_identity.session_generation == RUNTIME
+        assert persistent_app._session_identity.attach_token == ATTACH
         assert persistent_app._pool_heartbeat_status() == "session"
         if cleanup_fails:
             assert cleanup_calls == 3

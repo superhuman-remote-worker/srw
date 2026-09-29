@@ -175,7 +175,7 @@ def _wire_input_runtime(monkeypatch, tmp_path, db, *, turn_count: int = 5):
     monkeypatch.setattr(persistent_app, "_tool_inflight", False)
     monkeypatch.setattr(persistent_app._session_input, "_queue", queue)
     monkeypatch.setattr(persistent_app._session_input, "_reclaim_lock", asyncio.Lock())
-    monkeypatch.setattr(persistent_app, "_thread_id", str(uuid4()))
+    monkeypatch.setattr(persistent_app._session_identity, "_thread_id", str(uuid4()))
     monkeypatch.setenv("POD_UID", "pod-uid-test")
     monkeypatch.setattr(
         persistent_app,
@@ -184,12 +184,14 @@ def _wire_input_runtime(monkeypatch, tmp_path, db, *, turn_count: int = 5):
     )
     process_generation = str(uuid4())
     session_generation = str(uuid4())
-    monkeypatch.setattr(persistent_app, "_input_runtime_generation", process_generation)
     monkeypatch.setattr(
-        persistent_app, "_session_runtime_generation", session_generation
+        persistent_app._session_identity, "_process_generation", process_generation
     )
-    monkeypatch.setattr(persistent_app, "_session_runtime_attach_token", str(uuid4()))
-    monkeypatch.setattr(persistent_app, "_pinned_runtime_generation_enabled", False)
+    monkeypatch.setattr(
+        persistent_app._session_identity, "_session_generation", session_generation
+    )
+    monkeypatch.setattr(persistent_app._session_identity, "_attach_token", str(uuid4()))
+    monkeypatch.setattr(persistent_app._session_identity, "_runtime_contract", False)
     persistent_app._session_input._queued_claims.clear()
     monkeypatch.setattr(
         persistent_app,
@@ -213,7 +215,7 @@ async def _handle_api_input(request):
 
 
 def _current_session_identity_fingerprint() -> str:
-    value = persistent_app._current_pinned_session_identity_fingerprint()
+    value = persistent_app._session_identity.fingerprint()
     assert value is not None
     return value
 
@@ -859,7 +861,7 @@ async def test_existing_websocket_rejects_successor_generation_before_persist(
     queue = _wire_input_runtime(monkeypatch, tmp_path, db)
 
     def _rotate_generation():
-        persistent_app._session_runtime_generation = str(uuid4())
+        persistent_app._session_identity._session_generation = str(uuid4())
 
     ws = await _run_websocket_input(
         monkeypatch,
@@ -919,16 +921,16 @@ async def test_authorized_retirement_fences_provider_and_tool_before_effect(
 
     db = _InsertOnceDB()
     _wire_input_runtime(monkeypatch, tmp_path, db)
-    monkeypatch.setattr(persistent_app, "_pinned_runtime_generation_enabled", True)
+    monkeypatch.setattr(persistent_app._session_identity, "_runtime_contract", True)
     db.verify_pinned_runtime_effect_authority = AsyncMock(return_value=False)
 
     assert await persistent_app._loop_runtime_effect_authority_current() is False
     db.verify_pinned_runtime_effect_authority.assert_awaited_once_with(
-        thread_id=persistent_app._thread_id,
+        thread_id=persistent_app._session_identity.thread_id,
         agent_id=persistent_app._orchestrator_client.agent_id,
         pod_uid="pod-uid-test",
-        session_runtime_generation=persistent_app._session_runtime_generation,
-        runtime_attach_token=persistent_app._session_runtime_attach_token,
+        session_runtime_generation=persistent_app._session_identity.session_generation,
+        runtime_attach_token=persistent_app._session_identity.attach_token,
     )
 
     with pytest.raises(
@@ -955,7 +957,7 @@ async def test_stateless_effect_boundary_awaits_exact_queue_lease(monkeypatch):
     token = current_lease.set(lease)
     try:
         monkeypatch.setenv("STATELESS_EXECUTOR", "1")
-        monkeypatch.setattr(persistent_app, "_thread_id", thread_id)
+        monkeypatch.setattr(persistent_app._session_identity, "_thread_id", thread_id)
         monkeypatch.setattr(
             persistent_app,
             "_session",
@@ -1012,7 +1014,7 @@ async def test_stateless_effect_boundary_rechecks_local_life_after_db_await(
     token = current_lease.set(lease)
     try:
         monkeypatch.setenv("STATELESS_EXECUTOR", "1")
-        monkeypatch.setattr(persistent_app, "_thread_id", thread_id)
+        monkeypatch.setattr(persistent_app._session_identity, "_thread_id", thread_id)
         monkeypatch.setattr(
             persistent_app,
             "_session",
@@ -1040,7 +1042,7 @@ async def test_force_end_after_provider_response_blocks_real_tool_effect(
 
     db = _InsertOnceDB()
     _wire_input_runtime(monkeypatch, tmp_path, db)
-    monkeypatch.setattr(persistent_app, "_pinned_runtime_generation_enabled", True)
+    monkeypatch.setattr(persistent_app._session_identity, "_runtime_contract", True)
     monkeypatch.setattr(persistent_app, "_retirement_admission_identity", None)
 
     provider_calls = 0
@@ -1135,7 +1137,7 @@ async def test_websocket_post_persist_fence_acknowledges_and_successor_reclaims_
     # publishes exactly that one input to its queue.
     db.after_persist = None
     persistent_app._termination_admission_fenced = False
-    persistent_app._input_runtime_generation = str(uuid4())
+    persistent_app._session_identity._process_generation = str(uuid4())
     persistent_app._session_input._queued_claims.clear()
     reclaimed = await persistent_app._session_input.reclaim_pending()
     assert reclaimed == {(params["delivery_id"], 2)}
@@ -1213,7 +1215,7 @@ async def test_committed_insert_before_queue_is_reclaimed_by_new_process(
     assert queue.empty()
 
     monkeypatch.setattr(persistent_app._session_input, "queue_claimed", original_queue)
-    persistent_app._input_runtime_generation = str(uuid4())
+    persistent_app._session_identity._process_generation = str(uuid4())
     persistent_app._session_input._queued_claims.clear()
     assert await persistent_app._session_input.reclaim_pending() == {(delivery_id, 2)}
     item = queue.get_nowait()
@@ -1241,7 +1243,7 @@ async def test_cancelled_direct_human_delivery_is_terminal_and_not_reclaimed(
     )
     assert db.deliveries[accepted.delivery_id]["state"] == "cancelled"
 
-    persistent_app._input_runtime_generation = str(uuid4())
+    persistent_app._session_identity._process_generation = str(uuid4())
     persistent_app._session_input._queued_claims.clear()
     assert await persistent_app._session_input.reclaim_pending() == set()
     assert queue.empty()
@@ -1293,7 +1295,7 @@ async def test_interrupted_event_defers_and_successor_reclaims_exactly_once(
         "turn_interrupted_before_provider",
     )
 
-    persistent_app._input_runtime_generation = str(uuid4())
+    persistent_app._session_identity._process_generation = str(uuid4())
     persistent_app._session_input._queued_claims.clear()
     assert await persistent_app._session_input.reclaim_pending() == {(delivery_id, 2)}
     assert await persistent_app._session_input.reclaim_pending() == set()
@@ -2508,7 +2510,7 @@ async def test_auxiliary_gate_survives_rebuild_and_quiescence_tracks_inflight(
         persistent_app, "_TERMINATION_SENTINEL_PATH", tmp_path / "terminating"
     )
     monkeypatch.setattr(persistent_app, "_termination_admission_fenced", False)
-    monkeypatch.setattr(persistent_app, "_thread_id", str(uuid4()))
+    monkeypatch.setattr(persistent_app._session_identity, "_thread_id", str(uuid4()))
     monkeypatch.setattr(persistent_app, "_tool_inflight", False)
     monkeypatch.setattr(persistent_app, "_turn_event_open", False)
     monkeypatch.setattr(persistent_app, "_loop_task", None)

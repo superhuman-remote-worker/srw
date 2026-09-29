@@ -127,7 +127,7 @@ def stateless_owner(monkeypatch):
         turn_count=4,
     )
     monkeypatch.setattr(pa, "_session", session)
-    monkeypatch.setattr(pa, "_thread_id", str(THREAD_ID))
+    monkeypatch.setattr(pa._session_identity, "_thread_id", str(THREAD_ID))
     monkeypatch.setattr(pa, "_turn_event_open", True)
     monkeypatch.setattr(pa._session_input, "_interrupt_mode", None)
     monkeypatch.setattr(pa._session_input, "_hard_interrupt_event", asyncio.Event())

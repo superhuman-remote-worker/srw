@@ -361,7 +361,7 @@ class Harness:
 
         pa._agent = SimpleNamespace(postgres_conn=self.db)
         pa._session = None
-        pa._thread_id = None
+        pa._session_identity._thread_id = None
         pa._session_input._queue = None
         pa._loop_task = None
         pa._turn_start_external_hook = None
@@ -530,7 +530,7 @@ class Harness:
             pa._turn_tool_execution_identity = None
             pa._turn_tool_execution_external_hook = None
             harness.sessions.append(pa._session)
-            pa._thread_id = kwargs.get("thread_id")
+            pa._session_identity._thread_id = kwargs.get("thread_id")
             pa._session_input._queue = asyncio.Queue()
 
         async def fake_terminate(
@@ -556,7 +556,7 @@ class Harness:
                     await task
             pa._loop_task = None
             pa._session = None
-            pa._thread_id = None
+            pa._session_identity._thread_id = None
             pa._session_input._queue = None
             pa._turn_tool_execution_identity = None
             pa._turn_tool_execution_external_hook = None
@@ -653,7 +653,7 @@ class Harness:
 
     def mark_tool_effect(self, turn_id: int) -> None:
         identity = (
-            str(pa._thread_id),
+            str(pa._session_identity.thread_id),
             int(self.executor._lease.lease_token),
             int(turn_id),
         )
@@ -747,7 +747,6 @@ class Harness:
 
 _PA_SAVED_ATTRS = (
     "_session",
-    "_thread_id",
     "_loop_task",
     "_turn_start_external_hook",
     "_turn_complete_external_hook",
@@ -768,6 +767,9 @@ _PA_SAVED_ATTRS = (
     "_background_cloud_pushes",
 )
 
+# The identity owner's state the harness rebinds per test.
+_IDENTITY_SAVED_ATTRS = ("_thread_id",)
+
 # The input owner's state the harness rebinds per test.
 _INPUT_SAVED_ATTRS = (
     "_queue",
@@ -784,6 +786,9 @@ def harness(monkeypatch):
     saved_input = {
         name: getattr(pa._session_input, name) for name in _INPUT_SAVED_ATTRS
     }
+    saved_identity = {
+        name: getattr(pa._session_identity, name) for name in _IDENTITY_SAVED_ATTRS
+    }
     h = Harness(monkeypatch)
     try:
         yield h
@@ -792,6 +797,8 @@ def harness(monkeypatch):
             setattr(pa, name, value)
         for name, value in saved_input.items():
             setattr(pa._session_input, name, value)
+        for name, value in saved_identity.items():
+            setattr(pa._session_identity, name, value)
 
 
 async def _finish(h: Harness):
@@ -1608,7 +1615,7 @@ class TestBundleFailures:
     async def test_bundle_error_retires_warm_loop_before_release(self, harness):
         harness.bundle_error = ConnectionError("orchestrator down")
         pa._session = FakeSession(stateless_warm_reuse_safe=True)
-        pa._thread_id = "previous-warm-thread"
+        pa._session_identity._thread_id = "previous-warm-thread"
         pa._session_input._queue = asyncio.Queue()
         pa._loop_task = asyncio.create_task(asyncio.sleep(3600))
         harness._fake_loop_tasks.append(pa._loop_task)
@@ -1680,7 +1687,7 @@ class TestTurnError:
             _unwrapped_backend=MagicMock(return_value=backend),
         )
         pa._session = session
-        pa._thread_id = "physical-thread"
+        pa._session_identity._thread_id = "physical-thread"
 
         with patch.object(
             pa,
@@ -1694,7 +1701,7 @@ class TestTurnError:
         session.retire_shell_owner.assert_not_called()
         backend.retire.assert_not_called()
         assert pa._session is session
-        assert pa._thread_id == "physical-thread"
+        assert pa._session_identity.thread_id == "physical-thread"
 
     @pytest.mark.asyncio
     async def test_loop_death_releases_with_error(self, harness):
@@ -2454,7 +2461,7 @@ class TestShutdownCancellation:
         async def _unexpected_crash(served_claim):
             assert served_claim is claim
             harness.executor._lease.update(claim.unit_id, claim.lease_token)
-            pa._thread_id = str(claim.unit_id)
+            pa._session_identity._thread_id = str(claim.unit_id)
             pa._session = FakeSession()
             pa._session_input._queue = asyncio.Queue()
             if tool_effect:
@@ -2494,7 +2501,7 @@ class TestShutdownCancellation:
     def test_shutdown_abort_target_requires_thread_and_lease_owner(self, harness):
         unit = uuid4()
         harness.executor._lease.update(unit, 9)
-        pa._thread_id = str(unit)
+        pa._session_identity._thread_id = str(unit)
         pa._interrupt_owner_lease_token = 9
         pa._interrupt_owner_turn_id = 3
 
@@ -2502,7 +2509,7 @@ class TestShutdownCancellation:
         pa._interrupt_owner_lease_token = 10
         assert harness.executor._owned_abort_target(pa) is None
         pa._interrupt_owner_lease_token = 9
-        pa._thread_id = str(uuid4())
+        pa._session_identity._thread_id = str(uuid4())
         assert harness.executor._owned_abort_target(pa) is None
 
     def test_stale_tool_effect_handoff_fails_closed_and_new_claim_resets(self, harness):
@@ -2544,7 +2551,7 @@ class TestShutdownCancellation:
 
         claim = make_claim(token=41)
         pa._session = FakeSession(stateless_warm_reuse_safe=True)
-        pa._thread_id = "prior-warm-thread"
+        pa._session_identity._thread_id = "prior-warm-thread"
         pa._session_input._queue = asyncio.Queue()
         pa._loop_task = asyncio.create_task(asyncio.sleep(3600))
         harness._fake_loop_tasks.append(pa._loop_task)
@@ -2637,7 +2644,7 @@ class TestShutdownCancellation:
             claim.attempts_since_completion
         )
         assert not harness.calls["journal"]  # re-queued: nothing to tell the user
-        assert pa._thread_id is None
+        assert pa._session_identity.thread_id is None
         assert not harness.calls["complete"]
 
     @pytest.mark.asyncio
@@ -2671,7 +2678,7 @@ class TestShutdownCancellation:
         ]
         # The park and its frame share the thread-locked release transaction.
         assert harness.db.transactions == 1
-        assert pa._thread_id is None
+        assert pa._session_identity.thread_id is None
 
     @pytest.mark.asyncio
     async def test_bundle_refusal_release_carries_the_retry_budget(self, harness):
@@ -3516,7 +3523,7 @@ class TestFencedPersistence:
         db = SimpleNamespace(transition_stateless_input_delivery=transition)
         thread_id = str(uuid4())
         monkeypatch.setattr(pa, "_session", SimpleNamespace(postgres_conn=db))
-        monkeypatch.setattr(pa, "_thread_id", thread_id)
+        monkeypatch.setattr(pa._session_identity, "_thread_id", thread_id)
         handle = LeaseHandle()
         handle.update(
             thread_id,
@@ -3954,9 +3961,9 @@ class TestCommitThenEffects:
         pa._session = None
         assert await harness.executor._delegation_batch_recoverable(pa, claim) is False
         pa._session = FakeSession()
-        pa._thread_id = str(uuid4())  # another thread's session
+        pa._session_identity._thread_id = str(uuid4())  # another thread's session
         assert await harness.executor._delegation_batch_recoverable(pa, claim) is False
-        pa._thread_id = str(claim.unit_id)
+        pa._session_identity._thread_id = str(claim.unit_id)
         assert await harness.executor._delegation_batch_recoverable(pa, claim) is True
         assert not any(
             sql == te._DELEGATION_BATCH_RECOVERABLE_SQL and args[2]

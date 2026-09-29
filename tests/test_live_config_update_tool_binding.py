@@ -214,7 +214,7 @@ def _handler_patches(monkeypatch, session):
     send = AsyncMock()
     monkeypatch.setattr(mod, "_session", session)
     monkeypatch.setattr(mod, "_orchestrator_client", client)
-    monkeypatch.setattr(mod, "_thread_id", session.thread_id)
+    monkeypatch.setattr(mod._session_identity, "_thread_id", session.thread_id)
     monkeypatch.setattr(mod, "_ws_send", send)
     monkeypatch.setattr(mod, "_broadcast", broadcast)
     monkeypatch.setattr(mod, "_wire_session_aux_archiver", lambda: None)

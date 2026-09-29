@@ -17,6 +17,8 @@ from unittest.mock import AsyncMock, MagicMock, call as mock_call, patch
 from uuid import uuid4
 
 import pytest
+
+from agent.api.session_identity import pinned_status_identity_advertised
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from agent.api.persistent_app import (
@@ -244,7 +246,7 @@ class TestParallelToolCallsInFlight:
         monkeypatch.setattr(
             pa, "_session", SimpleNamespace(turn_count=0, workspace_sync=None)
         )
-        monkeypatch.setattr(pa, "_thread_id", None)
+        monkeypatch.setattr(pa._session_identity, "_thread_id", None)
         monkeypatch.setattr(pa, "_turn_event_open", False)
         monkeypatch.setattr(pa, "_turn_tool_execution_identity", None)
         monkeypatch.setattr(pa, "_turn_start_external_hook", None)
@@ -497,7 +499,7 @@ class TestRestoreSessionMessageIds:
         with (
             patch.object(pa, "_session", mock_session),
             patch.object(pa, "_agent", mock_agent),
-            patch.object(pa, "_thread_id", "thread-abc"),
+            patch.object(pa._session_identity, "_thread_id", "thread-abc"),
         ):
             await pa._restore_session_messages()
 
@@ -547,7 +549,7 @@ class TestRestoreSessionToolPairing:
         with (
             patch.object(pa, "_session", mock_session),
             patch.object(pa, "_agent", mock_agent),
-            patch.object(pa, "_thread_id", "thread-full"),
+            patch.object(pa._session_identity, "_thread_id", "thread-full"),
         ):
             await pa._restore_session_messages()
 
@@ -623,7 +625,7 @@ class TestRestoreSessionToolPairing:
         with (
             patch.object(pa, "_session", mock_session),
             patch.object(pa, "_agent", mock_agent),
-            patch.object(pa, "_thread_id", "thread-orphan"),
+            patch.object(pa._session_identity, "_thread_id", "thread-orphan"),
         ):
             await pa._restore_session_messages()
 
@@ -722,7 +724,7 @@ class TestRestoreFromCheckpoint:
         with (
             patch.object(pa, "_session", mock_session),
             patch.object(pa, "_agent", mock_agent),
-            patch.object(pa, "_thread_id", "thread-ckpt"),
+            patch.object(pa._session_identity, "_thread_id", "thread-ckpt"),
         ):
             await pa._restore_session_messages()
 
@@ -774,7 +776,7 @@ class TestRestoreFromCheckpoint:
         with (
             patch.object(pa, "_session", mock_session),
             patch.object(pa, "_agent", mock_agent),
-            patch.object(pa, "_thread_id", "thread-no-ckpt"),
+            patch.object(pa._session_identity, "_thread_id", "thread-no-ckpt"),
         ):
             await pa._restore_session_messages()
 
@@ -809,7 +811,7 @@ class TestRestoreFromCheckpoint:
         with (
             patch.object(pa, "_session", mock_session),
             patch.object(pa, "_agent", mock_agent),
-            patch.object(pa, "_thread_id", "thread-old-summary"),
+            patch.object(pa._session_identity, "_thread_id", "thread-old-summary"),
         ):
             await pa._restore_session_messages()
 
@@ -881,7 +883,7 @@ class TestRestoreFromCheckpoint:
         with (
             patch.object(pa, "_session", mock_session),
             patch.object(pa, "_agent", mock_agent),
-            patch.object(pa, "_thread_id", "thread-resume-compact"),
+            patch.object(pa._session_identity, "_thread_id", "thread-resume-compact"),
         ):
             await pa._restore_session_messages()
 
@@ -969,7 +971,7 @@ class TestRestoreFromCheckpoint:
         with (
             patch.object(pa, "_session", mock_session),
             patch.object(pa, "_agent", mock_agent),
-            patch.object(pa, "_thread_id", "thread-path-a-compact"),
+            patch.object(pa._session_identity, "_thread_id", "thread-path-a-compact"),
         ):
             await pa._restore_session_messages()
 
@@ -994,7 +996,7 @@ class TestRestoreFromCheckpoint:
         with (
             patch.object(pa, "_session", mock_session),
             patch.object(pa, "_agent", mock_agent),
-            patch.object(pa, "_thread_id", "thread-path-a-clean"),
+            patch.object(pa._session_identity, "_thread_id", "thread-path-a-clean"),
         ):
             await pa._restore_session_messages()
 
@@ -1366,7 +1368,7 @@ class TestReconcileTurnWithRetry:
         session.messages = []
         session.tool_decisions = {}
         monkeypatch.setattr(pa, "_session", session)
-        monkeypatch.setattr(pa, "_thread_id", "tid")
+        monkeypatch.setattr(pa._session_identity, "_thread_id", "tid")
         monkeypatch.setattr(pa, "_save_turn_ai_messages", save)
         return pa
 
@@ -1554,7 +1556,7 @@ class TestAuthoritativeTurnPersist:
         broadcast = MagicMock()
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_retire_announced_permission_rows", AsyncMock()),
             patch.object(pa, "_wire_session_aux_archiver"),
             patch.object(pa, "_broadcast", broadcast),
@@ -1579,7 +1581,7 @@ class TestAuthoritativeTurnPersist:
         session = self._session()
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_retire_announced_permission_rows", AsyncMock()),
             patch.object(pa, "_wire_session_aux_archiver"),
             patch.object(pa, "_broadcast"),
@@ -1614,7 +1616,7 @@ class TestAuthoritativeTurnPersist:
         should_stage = MagicMock(return_value=True)
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_retire_announced_permission_rows", AsyncMock()),
             patch.object(pa, "_wire_session_aux_archiver", wire_aux),
             patch.object(pa, "_broadcast"),
@@ -1646,7 +1648,7 @@ class TestAuthoritativeTurnPersist:
         session = self._session()
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_retire_announced_permission_rows", AsyncMock()),
             patch.object(pa, "_wire_session_aux_archiver"),
         ):
@@ -1674,7 +1676,7 @@ class TestAuthoritativeTurnPersist:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_retire_announced_permission_rows", AsyncMock()),
             patch.object(pa, "_wire_session_aux_archiver"),
             patch.object(pa, "_broadcast", side_effect=broadcast),
@@ -1694,7 +1696,7 @@ class TestAuthoritativeTurnPersist:
         broadcast = MagicMock()
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_retire_announced_permission_rows", AsyncMock()),
             patch.object(pa, "_wire_session_aux_archiver"),
             patch.object(pa, "_broadcast", broadcast),
@@ -1729,7 +1731,7 @@ class TestPersistentLoopMemoryOutboxWiring:
         session.thread_id = "tid"
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             patch.object(pa, "_loop_task", None),
             patch.object(pa, "_session_ready", return_value=True),
             patch.object(pa, "run_persistent_loop", new=fake_run),
@@ -1794,7 +1796,7 @@ class TestLoopPersistMessage:
         )
         with (
             patch.object(pa, "_session", mock_session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
         ):
             persisted = await _loop_persist_message(AIMessage(content="hi", id="msg_1"))
         assert persisted is True
@@ -1811,7 +1813,7 @@ class TestLoopPersistMessage:
         mock_session.postgres_conn = None
         with (
             patch.object(pa, "_session", mock_session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
         ):
             persisted = await _loop_persist_message(
                 AIMessage(content="hi")
@@ -1830,7 +1832,7 @@ class TestLoopPersistMessage:
         )
         with (
             patch.object(pa, "_session", mock_session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
         ):
             persisted = await _loop_persist_message(
                 AIMessage(content="hi", id="x")
@@ -1859,7 +1861,7 @@ class TestRecordCompactionBoundarySeq:
         )
         with (
             patch.object(pa, "_session", mock_session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
         ):
             await pa._record_compaction(
                 "summary text", 100, 11, trigger="auto", ws=None
@@ -1887,7 +1889,7 @@ class TestRecordCompactionBoundarySeq:
         )
         with (
             patch.object(pa, "_session", mock_session),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
         ):
             await pa._record_compaction("summary", 50, 8, trigger="manual", ws=None)
 
@@ -1927,7 +1929,7 @@ class TestRestorePathACursor:
         with (
             patch.object(pa, "_session", mock_session),
             patch.object(pa, "_agent", mock_agent),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
         ):
             await pa._restore_session_messages()
         kwargs = mock_agent.postgres_conn.get_thread_messages_history.call_args.kwargs
@@ -1946,7 +1948,7 @@ class TestRestorePathACursor:
         with (
             patch.object(pa, "_session", mock_session),
             patch.object(pa, "_agent", mock_agent),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
         ):
             await pa._restore_session_messages()
         kwargs = mock_agent.postgres_conn.get_thread_messages_history.call_args.kwargs
@@ -1966,7 +1968,7 @@ class TestRestorePathACursor:
         with (
             patch.object(pa, "_session", mock_session),
             patch.object(pa, "_agent", mock_agent),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
         ):
             await pa._restore_session_messages()
         kwargs = mock_agent.postgres_conn.get_thread_messages_history.call_args.kwargs
@@ -1996,7 +1998,7 @@ class TestRestorePathACursor:
         with (
             patch.object(pa, "_session", mock_session),
             patch.object(pa, "_agent", mock_agent),
-            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
             caplog.at_level(logging.WARNING),
         ):
             await pa._restore_session_messages()
@@ -2336,7 +2338,7 @@ class TestEarlyTitleFromPrompt:
         mock_session, mock_conn, mock_conn_ctx = self._mock_session()
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch("agent.api.persistent_app._draft_title_value", None),
             patch("agent.api.persistent_app._generate_title", AsyncMock()) as gen,
             patch("agent.api.persistent_app._broadcast") as bcast,
@@ -2355,7 +2357,7 @@ class TestEarlyTitleFromPrompt:
         mock_session, mock_conn, mock_conn_ctx = self._mock_session()
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch("agent.api.persistent_app._draft_title_value", None),
             patch("agent.api.persistent_app._broadcast") as bcast,
         ):
@@ -2372,7 +2374,7 @@ class TestEarlyTitleFromPrompt:
         )
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch("agent.api.persistent_app._draft_title_value", None),
             patch("agent.api.persistent_app._broadcast") as bcast,
         ):
@@ -2389,7 +2391,7 @@ class TestEarlyTitleFromPrompt:
         mock_conn.get_thread = AsyncMock(side_effect=RuntimeError("db down"))
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch("agent.api.persistent_app._draft_title_value", None),
         ):
             await _early_title_from_prompt("a perfectly good titleable prompt")
@@ -2413,8 +2415,8 @@ class TestEarlyTitleFromPrompt:
         old_conn.get_thread = AsyncMock(side_effect=blocked_get)
         with (
             patch.object(papp, "_session", old_session),
-            patch.object(papp, "_thread_id", "thread-a"),
-            patch.object(papp, "_session_generation", 41),
+            patch.object(papp._session_identity, "_thread_id", "thread-a"),
+            patch.object(papp._session_identity, "_attach_generation", 41),
             patch.object(papp, "_draft_title_value", None),
             patch.object(papp, "_broadcast") as broadcast,
         ):
@@ -2428,8 +2430,8 @@ class TestEarlyTitleFromPrompt:
             )
             await started.wait()
             papp._session = new_session
-            papp._thread_id = "thread-b"
-            papp._session_generation = 42
+            papp._session_identity._thread_id = "thread-b"
+            papp._session_identity._attach_generation = 42
             release.set()
             await task
 
@@ -2486,7 +2488,7 @@ class TestAutoTitleAfterFirstTurn:
         mock_session, _, mock_conn_ctx = self._mock_session("Untitled Session")
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch("agent.api.persistent_app._draft_title_value", None),
             patch(
                 "agent.api.persistent_app._generate_title",
@@ -2509,7 +2511,7 @@ class TestAutoTitleAfterFirstTurn:
         mock_session, _, mock_conn_ctx = self._mock_session("why can't external")
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch("agent.api.persistent_app._draft_title_value", "why can't external"),
             patch(
                 "agent.api.persistent_app._generate_title",
@@ -2530,7 +2532,7 @@ class TestAutoTitleAfterFirstTurn:
         mock_session, _, mock_conn_ctx = self._mock_session("My hand-picked title")
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch("agent.api.persistent_app._draft_title_value", "some old draft"),
             patch("agent.api.persistent_app._generate_title", AsyncMock()) as gen,
             patch("agent.api.persistent_app._broadcast") as bcast,
@@ -2558,8 +2560,8 @@ class TestPollWorkspaceReady:
         import agent.api.persistent_app as app
 
         generation = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-        monkeypatch.setattr(app, "_session_runtime_generation", generation)
-        monkeypatch.setattr(app, "_pinned_runtime_generation_enabled", True)
+        monkeypatch.setattr(app._session_identity, "_session_generation", generation)
+        monkeypatch.setattr(app._session_identity, "_runtime_contract", True)
         workspace = {
             "workspace_provisioner": "k8s",
             "pinned_status_identity_contract": 1,
@@ -2584,10 +2586,10 @@ class TestPollWorkspaceReady:
         )
 
         if identity == "exact":
-            assert app._bind_attached_runtime_payload(
+            assert app._session_identity.adopt_workspace_payload(
                 result, protected_required=False
             ) == generation
-            assert app._pinned_status_identity_advertised(result)
+            assert pinned_status_identity_advertised(result)
         else:
             message = (
                 "contract omitted its generation"
@@ -2595,7 +2597,7 @@ class TestPollWorkspaceReady:
                 else "generation changed during attach"
             )
             with pytest.raises(app.WorkspaceNotReady, match=message):
-                app._bind_attached_runtime_payload(result, protected_required=False)
+                app._session_identity.adopt_workspace_payload(result, protected_required=False)
 
     @pytest.mark.asyncio
     async def test_returns_none_when_workspace_not_found(self):
@@ -3088,7 +3090,7 @@ class TestHandleCompact:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "tid-1"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid-1"),
         ):
             await _handle_compact(ws, "")
 
@@ -3128,7 +3130,7 @@ class TestHandleCompact:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "tid-1"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid-1"),
         ):
             await _handle_compact(ws, "")
 
@@ -3159,7 +3161,7 @@ class TestHandleCompact:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "tid-1"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid-1"),
         ):
             await _handle_compact(ws, "")
 
@@ -3198,7 +3200,7 @@ class TestHandleCompact:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "tid-1"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid-1"),
         ):
             await _handle_compact(ws, "")
 
@@ -3233,7 +3235,7 @@ class TestHandleCompact:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "tid-1"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid-1"),
         ):
             await _handle_compact(ws, "")
 
@@ -3336,7 +3338,7 @@ class TestHandleArchive:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
         ):
             await _handle_archive(ws)
 
@@ -3363,7 +3365,7 @@ class TestHandleArchive:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
         ):
             await _handle_archive(ws)
 
@@ -3383,7 +3385,7 @@ class TestHandleArchive:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch(
                 "agent.api.persistent_app.extract_and_store_memories",
                 side_effect=RuntimeError("extraction failed"),
@@ -3421,7 +3423,7 @@ class TestHandleArchive:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch(
                 "agent.api.persistent_app._generate_title",
                 return_value="Generated Title",
@@ -3445,7 +3447,7 @@ class TestHandleArchive:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
         ):
             await _handle_archive(ws)
 
@@ -3470,7 +3472,7 @@ class TestHandleArchive:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "test-thread-id"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "test-thread-id"),
         ):
             await _handle_archive(ws)
 
@@ -3503,9 +3505,9 @@ class TestHandleArchive:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "test-thread-id"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "test-thread-id"),
             patch(
-                "agent.api.persistent_app._session_runtime_generation",
+                "agent.api.persistent_app._session_identity._session_generation",
                 "55555555-5555-4555-8555-555555555555",
             ),
         ):
@@ -3536,9 +3538,9 @@ class TestHandleArchive:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "officer-thread"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "officer-thread"),
             patch(
-                "agent.api.persistent_app._session_runtime_generation",
+                "agent.api.persistent_app._session_identity._session_generation",
                 "55555555-5555-4555-8555-555555555555",
             ),
         ):
@@ -3574,7 +3576,7 @@ class TestHandleArchive:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "test-thread-id"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "test-thread-id"),
         ):
             await _handle_archive(ws)
 
@@ -3596,7 +3598,7 @@ class TestHandleArchive:
 
         with (
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._thread_id", "test-thread-id"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "test-thread-id"),
         ):
             await _handle_archive(ws)
 
@@ -3619,7 +3621,7 @@ class TestHandleArchive:
 
         with (
             patch("agent.api.persistent_app._session", mock_session),
-            patch("agent.api.persistent_app._thread_id", "test-thread-id"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "test-thread-id"),
         ):
             await _handle_archive(ws)
 
@@ -3666,7 +3668,7 @@ class TestHandleIdleArchive:
 
         with (
             patch.object(mod, "_session", self._session()),
-            patch.object(mod, "_thread_id", "idle-thread"),
+            patch.object(mod._session_identity, "_thread_id", "idle-thread"),
             patch.object(mod, "_update_thread_status", update),
             patch.object(mod, "_terminate_session", settle),
             patch.object(mod, "_broadcast", broadcast),
@@ -3691,7 +3693,7 @@ class TestHandleIdleArchive:
         broadcast = MagicMock()
         with (
             patch.object(mod, "_session", self._session()),
-            patch.object(mod, "_thread_id", "idle-thread"),
+            patch.object(mod._session_identity, "_thread_id", "idle-thread"),
             patch.object(
                 mod,
                 "_update_thread_status",
@@ -3720,11 +3722,11 @@ async def test_pinned_terminal_status_never_uses_direct_db_fallback(status):
 
     with (
         patch.object(mod, "_session", session),
-        patch.object(mod, "_thread_id", "terminal-thread"),
+        patch.object(mod._session_identity, "_thread_id", "terminal-thread"),
         patch.object(mod, "_orchestrator_client", client),
         patch.object(mod, "_stateless_mode", return_value=False),
-        patch.object(mod, "_pinned_status_identity_enabled", False),
-        patch.object(mod, "_pinned_runtime_generation_enabled", False),
+        patch.object(mod._session_identity, "_status_contract", False),
+        patch.object(mod._session_identity, "_runtime_contract", False),
     ):
         assert await mod._update_thread_status(status) is False
 
@@ -3751,9 +3753,9 @@ async def test_begun_retirement_closes_local_input_and_readiness_before_finaliza
 
     with (
         patch.object(mod, "_session", session),
-        patch.object(mod, "_thread_id", "retiring-thread"),
-        patch.object(mod, "_session_runtime_generation", generation),
-        patch.object(mod, "_session_runtime_attach_token", attach_token),
+        patch.object(mod._session_identity, "_thread_id", "retiring-thread"),
+        patch.object(mod._session_identity, "_session_generation", generation),
+        patch.object(mod._session_identity, "_attach_token", attach_token),
         patch.object(mod, "_retirement_admission_identity", None),
         patch.object(mod, "_stateless_mode", return_value=False),
         patch.object(mod, "_registered_pinned_agent_id", return_value="agent-a"),
@@ -3796,22 +3798,18 @@ async def test_child_quiescence_precedes_retirement_authority_revocation():
 
     with (
         patch.object(mod, "_session", session),
-        patch.object(mod, "_thread_id", "retirement-order-thread"),
-        patch.object(
-            mod,
-            "_session_runtime_generation",
+        patch.object(mod._session_identity, "_thread_id", "retirement-order-thread"),
+        patch.object(mod._session_identity, "_session_generation",
             "88888888-8888-4888-8888-888888888888",
         ),
-        patch.object(
-            mod,
-            "_session_runtime_attach_token",
+        patch.object(mod._session_identity, "_attach_token",
             "99999999-9999-4999-8999-999999999999",
         ),
         patch.object(mod, "_retirement_admission_identity", None),
         patch.object(mod, "_retirement_admission_disposition", None),
         patch.object(mod, "_retirement_admission_token", None),
         patch.object(mod, "_retirement_admission_permanent", None),
-        patch.object(mod, "_pinned_runtime_generation_enabled", False),
+        patch.object(mod._session_identity, "_runtime_contract", False),
         patch.object(mod, "_stateless_mode", return_value=False),
         patch.object(mod, "_registered_pinned_agent_id", return_value="agent-a"),
         patch.object(mod, "_close_pinned_control_inbox", close_controls),
@@ -3836,22 +3834,18 @@ async def test_child_quiescence_failure_refuses_retirement_begin():
 
     with (
         patch.object(mod, "_session", session),
-        patch.object(mod, "_thread_id", "retirement-quiesce-failure"),
-        patch.object(
-            mod,
-            "_session_runtime_generation",
+        patch.object(mod._session_identity, "_thread_id", "retirement-quiesce-failure"),
+        patch.object(mod._session_identity, "_session_generation",
             "88888888-8888-4888-8888-888888888888",
         ),
-        patch.object(
-            mod,
-            "_session_runtime_attach_token",
+        patch.object(mod._session_identity, "_attach_token",
             "99999999-9999-4999-8999-999999999999",
         ),
         patch.object(mod, "_retirement_admission_identity", None),
         patch.object(mod, "_retirement_admission_disposition", None),
         patch.object(mod, "_retirement_admission_token", None),
         patch.object(mod, "_retirement_admission_permanent", None),
-        patch.object(mod, "_pinned_runtime_generation_enabled", False),
+        patch.object(mod._session_identity, "_runtime_contract", False),
         patch.object(mod, "_stateless_mode", return_value=False),
         patch.object(mod, "_registered_pinned_agent_id", return_value="agent-a"),
         patch.object(mod, "_close_pinned_control_inbox", close_controls),
@@ -3881,10 +3875,10 @@ class TestExactRetirementBeginReconciliation:
         session = _retirement_session_mock()
         patchers = (
             patch.object(mod, "_session", session),
-            patch.object(mod, "_thread_id", self.thread_id),
-            patch.object(mod, "_session_runtime_generation", self.generation),
-            patch.object(mod, "_session_runtime_attach_token", self.attach_token),
-            patch.object(mod, "_pinned_runtime_generation_enabled", True),
+            patch.object(mod._session_identity, "_thread_id", self.thread_id),
+            patch.object(mod._session_identity, "_session_generation", self.generation),
+            patch.object(mod._session_identity, "_attach_token", self.attach_token),
+            patch.object(mod._session_identity, "_runtime_contract", True),
             patch.object(mod, "_retirement_admission_identity", None),
             patch.object(mod, "_retirement_admission_disposition", None),
             patch.object(mod, "_retirement_admission_token", None),
@@ -4090,10 +4084,10 @@ async def test_loop_gone_terminal_begin_retries_without_reopening_controls():
 
     patchers = [
         patch.object(mod, "_session", session),
-        patch.object(mod, "_thread_id", "loop-gone-thread"),
-        patch.object(mod, "_session_runtime_generation", generation),
-        patch.object(mod, "_session_runtime_attach_token", attach_token),
-        patch.object(mod, "_pinned_runtime_generation_enabled", True),
+        patch.object(mod._session_identity, "_thread_id", "loop-gone-thread"),
+        patch.object(mod._session_identity, "_session_generation", generation),
+        patch.object(mod._session_identity, "_attach_token", attach_token),
+        patch.object(mod._session_identity, "_runtime_contract", True),
         patch.object(mod, "_retirement_admission_identity", None),
         patch.object(mod, "_retirement_admission_token", None),
         patch.object(mod, "_retirement_admission_permanent", None),
@@ -4145,10 +4139,10 @@ async def test_authorized_retirement_transient_local_failure_keeps_exact_retry_o
 
     with (
         patch.object(mod, "_session", session),
-        patch.object(mod, "_thread_id", identity[0]),
-        patch.object(mod, "_session_runtime_generation", generation),
-        patch.object(mod, "_session_runtime_attach_token", attach_token),
-        patch.object(mod, "_pinned_runtime_generation_enabled", True),
+        patch.object(mod._session_identity, "_thread_id", identity[0]),
+        patch.object(mod._session_identity, "_session_generation", generation),
+        patch.object(mod._session_identity, "_attach_token", attach_token),
+        patch.object(mod._session_identity, "_runtime_contract", True),
         patch.object(mod, "_retirement_admission_identity", identity),
         patch.object(mod, "_retirement_admission_token", retirement_token),
         patch.object(mod, "_termination_task", None),
@@ -4170,16 +4164,16 @@ async def test_authorized_retirement_retry_never_crosses_successor_identity():
     identity = ("stale-retry-thread", generation, attach_token)
 
     async def move_then_fail(*_args, **_kwargs):
-        mod._session_runtime_generation = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        mod._session_identity._session_generation = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         raise mod.EventJournalUnavailable("old runtime cleanup failed")
 
     inner = AsyncMock(side_effect=move_then_fail)
     with (
         patch.object(mod, "_session", MagicMock()),
-        patch.object(mod, "_thread_id", identity[0]),
-        patch.object(mod, "_session_runtime_generation", generation),
-        patch.object(mod, "_session_runtime_attach_token", attach_token),
-        patch.object(mod, "_pinned_runtime_generation_enabled", True),
+        patch.object(mod._session_identity, "_thread_id", identity[0]),
+        patch.object(mod._session_identity, "_session_generation", generation),
+        patch.object(mod._session_identity, "_attach_token", attach_token),
+        patch.object(mod._session_identity, "_runtime_contract", True),
         patch.object(mod, "_retirement_admission_identity", identity),
         patch.object(
             mod,
@@ -4481,7 +4475,7 @@ class TestHandleWorkspaceUpgradeVm:
                 self._session_with_backend(backend),
             ),
             patch("agent.api.persistent_app._orchestrator_client", client),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
         ):
             await _handle_workspace_upgrade(ws, target_tier="vm")
 
@@ -4508,7 +4502,7 @@ class TestHandleWorkspaceUpgradeVm:
                 self._session_with_backend(sandbox),
             ),
             patch("agent.api.persistent_app._orchestrator_client", client),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch(
                 "agent.api.persistent_app._poll_vm_ready",
                 new_callable=AsyncMock,
@@ -4549,7 +4543,7 @@ class TestHandleWorkspaceUpgradeVm:
                 self._session_with_backend(sandbox),
             ),
             patch("agent.api.persistent_app._orchestrator_client", client),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch(
                 "agent.api.persistent_app._poll_vm_ready",
                 new_callable=AsyncMock,
@@ -4606,7 +4600,7 @@ class TestHandleWorkspaceUpgradeVm:
         with (
             patch("agent.api.persistent_app._session", sess),
             patch("agent.api.persistent_app._orchestrator_client", client),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch(
                 "agent.api.persistent_app._poll_vm_ready",
                 new_callable=AsyncMock,
@@ -4682,7 +4676,7 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
         with (
             patch("agent.api.persistent_app._session", session),
             patch("agent.api.persistent_app._orchestrator_client", client),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch(
                 "agent.api.persistent_app._poll_workspace_ready",
                 new_callable=AsyncMock,
@@ -4740,7 +4734,7 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
         with (
             patch("agent.api.persistent_app._session", session),
             patch("agent.api.persistent_app._orchestrator_client", client),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch(
                 "agent.api.persistent_app._poll_vm_ready",
                 new_callable=AsyncMock,
@@ -4788,7 +4782,7 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
         with (
             patch("agent.api.persistent_app._session", session),
             patch("agent.api.persistent_app._orchestrator_client", client),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch(
                 "agent.api.persistent_app._poll_workspace_ready",
                 new_callable=AsyncMock,
@@ -4828,7 +4822,7 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
         with (
             patch("agent.api.persistent_app._session", session),
             patch("agent.api.persistent_app._orchestrator_client", client),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch(
                 "agent.api.persistent_app._poll_workspace_ready",
                 new_callable=AsyncMock,
@@ -5072,7 +5066,7 @@ class TestTerminateSession:
         )
 
         mod._session = session
-        mod._thread_id = f"thread-{reason}"
+        mod._session_identity._thread_id = f"thread-{reason}"
         mod._loop_task = loop_task
         mod._event_writer = writer
         mod._terminating = False
@@ -5151,7 +5145,7 @@ class TestTerminateSession:
         update = AsyncMock(return_value=True)
 
         mod._session = session
-        mod._thread_id = "thread-officer-shutdown"
+        mod._session_identity._thread_id = "thread-officer-shutdown"
         mod._loop_task = None
         mod._watchdog_tasks = []
         mod._event_writer = None
@@ -5205,7 +5199,7 @@ class TestTerminateSession:
         session.cleanup = AsyncMock()
 
         mod._session = session
-        mod._thread_id = "thread-late-side-task"
+        mod._session_identity._thread_id = "thread-late-side-task"
         mod._loop_task = None
         mod._event_writer = None
         mod._terminating = False
@@ -5264,7 +5258,7 @@ class TestTerminateSession:
         session.cleanup = AsyncMock()
 
         mod._session = session
-        mod._thread_id = "thread-watchdog-barrier"
+        mod._session_identity._thread_id = "thread-watchdog-barrier"
         mod._loop_task = None
         mod._watchdog_tasks = [watchdog]
         mod._event_writer = None
@@ -5314,7 +5308,7 @@ class TestTerminateSession:
         update = AsyncMock(return_value=True)
 
         mod._session = session
-        mod._thread_id = f"thread-{failure}-uncertain"
+        mod._session_identity._thread_id = f"thread-{failure}-uncertain"
         mod._loop_task = None
         mod._watchdog_tasks = []
         mod._event_writer = writer
@@ -5356,7 +5350,7 @@ class TestTerminateSession:
         update = AsyncMock(side_effect=[True, False])
 
         mod._session = session
-        mod._thread_id = "thread-unsettled"
+        mod._session_identity._thread_id = "thread-unsettled"
         mod._loop_task = None
         mod._event_writer = None
         mod._terminating = False
@@ -5375,7 +5369,7 @@ class TestTerminateSession:
                 await mod._terminate_session("shutdown")
 
             assert mod._session is session
-            assert mod._thread_id == "thread-unsettled"
+            assert mod._session_identity.thread_id == "thread-unsettled"
             assert mod._retirement_admission_closed() is True
             assert mod._runtime_admission_closed() is True
             assert mod._runtime_input_admission_open() is False
@@ -5416,10 +5410,10 @@ class TestTerminateSession:
         update = AsyncMock(return_value=False)
 
         with (
-            patch.object(mod, "_thread_id", identity[0]),
-            patch.object(mod, "_session_runtime_generation", generation),
-            patch.object(mod, "_session_runtime_attach_token", attach_token),
-            patch.object(mod, "_pinned_runtime_generation_enabled", True),
+            patch.object(mod._session_identity, "_thread_id", identity[0]),
+            patch.object(mod._session_identity, "_session_generation", generation),
+            patch.object(mod._session_identity, "_attach_token", attach_token),
+            patch.object(mod._session_identity, "_runtime_contract", True),
             patch.object(mod, "_retirement_admission_identity", identity),
             patch.object(mod, "_retirement_admission_token", retirement_token),
             patch.object(mod, "_orchestrator_client", client),
@@ -5473,7 +5467,7 @@ class TestTerminateSession:
         # except handler, and our ordering assertion would be vacuous.
         await loop_started.wait()
         mod._loop_task = loop_task
-        mod._thread_id = "t1"
+        mod._session_identity._thread_id = "t1"
 
         # Minimal _session double that records when it's torn down.
         fake_session = _retirement_session_mock()
@@ -5496,7 +5490,7 @@ class TestTerminateSession:
             # The writer must drain while both captured identities are still
             # authoritative; pool-mode reuse clears them immediately after.
             assert mod._session is fake_session
-            assert mod._thread_id == "t1"
+            assert mod._session_identity.thread_id == "t1"
             order.append("writer_closed")
 
         fake_writer = MagicMock()
@@ -5541,7 +5535,7 @@ class TestTerminateSession:
         import agent.api.persistent_app as mod
 
         mod._loop_task = None
-        mod._thread_id = "t-handoff"
+        mod._session_identity._thread_id = "t-handoff"
         mod._event_writer = None
         mod._terminating = False
         mod._max_sessions_per_process = 0
@@ -5573,7 +5567,7 @@ class TestTerminateSession:
         import agent.api.persistent_app as mod
 
         mod._loop_task = None
-        mod._thread_id = "t-physical-handoff"
+        mod._session_identity._thread_id = "t-physical-handoff"
         mod._event_writer = None
         mod._terminating = False
         mod._max_sessions_per_process = 0
@@ -5604,7 +5598,7 @@ class TestTerminateSession:
         import agent.api.persistent_app as mod
 
         mod._loop_task = None
-        mod._thread_id = "t-binding-moved"
+        mod._session_identity._thread_id = "t-binding-moved"
         mod._event_writer = None
         mod._terminating = False
         mod._max_sessions_per_process = 0
@@ -5646,7 +5640,7 @@ class TestTerminateSession:
         import agent.api.persistent_app as mod
 
         mod._loop_task = None  # nothing to cancel
-        mod._thread_id = "t2"
+        mod._session_identity._thread_id = "t2"
         mod._subscribers["ghost"] = _asyncio.Queue()
         mod._session_input._queue = _asyncio.Queue()
         mod._session_input._interrupt_mode = "hard"
@@ -5696,19 +5690,19 @@ class TestAttachSessionEventJournalFailure:
             cleanup=AsyncMock(),
         )
         mod._session = session
-        mod._thread_id = "thread-failed-physical-attach"
+        mod._session_identity._thread_id = "thread-failed-physical-attach"
         mod._event_writer = None
         mod._subscribers.clear()
 
         with patch.object(mod, "_stop_thread_control_watcher", new=AsyncMock()):
-            await mod._cleanup_failed_event_journal_attach(mod._thread_id)
+            await mod._cleanup_failed_event_journal_attach(mod._session_identity.thread_id)
 
         session.cleanup.assert_awaited_once_with(
             preserve_shell=True,
             preserve_workspace_daemons=True,
         )
         assert mod._session is None
-        assert mod._thread_id is None
+        assert mod._session_identity.thread_id is None
 
     @pytest.mark.asyncio
     async def test_aborts_and_cleans_partial_session_before_any_broadcast(self):
@@ -5746,7 +5740,7 @@ class TestAttachSessionEventJournalFailure:
         )
 
         mod._session = None
-        mod._thread_id = None
+        mod._session_identity._thread_id = None
         mod._event_writer = None
         mod._events_epoch = 0
         mod._next_seq = 0
@@ -5784,7 +5778,7 @@ class TestAttachSessionEventJournalFailure:
         writer_cls.assert_not_called()
         broadcast.assert_not_called()
         assert mod._session is None
-        assert mod._thread_id is None
+        assert mod._session_identity.thread_id is None
         assert mod._event_writer is None
         assert mod._events_epoch == 0
         assert mod._next_seq == 0
@@ -5847,7 +5841,7 @@ class TestAttachSessionCloudMount:
         )
 
         mod._session = None
-        mod._thread_id = None
+        mod._session_identity._thread_id = None
         with (
             patch.object(mod, "_agent", fake_agent),
             patch.object(mod, "_orchestrator_client", fake_orchestrator),
@@ -5867,7 +5861,7 @@ class TestAttachSessionCloudMount:
                 queue_after_recovery = mod._session_input.queue
             finally:
                 mod._session = None
-                mod._thread_id = None
+                mod._session_identity._thread_id = None
 
         build_sync.assert_not_called()
         assert recovery_queue_states == [None]
@@ -5932,7 +5926,7 @@ class TestAttachSessionProtectedCloudFailClose:
         )
 
         mod._session = None
-        mod._thread_id = None
+        mod._session_identity._thread_id = None
         with (
             patch.object(mod, "_agent", fake_agent),
             patch.object(mod, "_orchestrator_client", fake_orchestrator),
@@ -5955,7 +5949,7 @@ class TestAttachSessionProtectedCloudFailClose:
                     await mod._attach_session("thread-1")
             finally:
                 mod._session = None
-                mod._thread_id = None
+                mod._session_identity._thread_id = None
 
         # The legacy shim (_legacy_nc_cloud_cfg -> _build_sync_coordinator)
         # must never fire for a protected thread, regardless of a stale/
@@ -5990,7 +5984,7 @@ class TestAttachSessionProtectedCloudFailClose:
         )
 
         mod._session = None
-        mod._thread_id = None
+        mod._session_identity._thread_id = None
         with (
             patch.object(mod, "_agent", fake_agent),
             patch.object(mod, "_orchestrator_client", fake_orchestrator),
@@ -6009,7 +6003,7 @@ class TestAttachSessionProtectedCloudFailClose:
                 await mod._attach_session("thread-1")
             finally:
                 mod._session = None
-                mod._thread_id = None
+                mod._session_identity._thread_id = None
 
         build_sync.assert_called_once()
         # The legacy translation ran (webdav_url built from nc_folder).
@@ -6155,7 +6149,7 @@ class TestAttachSessionProtectedCloudSingletonIsolation:
             clear_session_runtime_identity=MagicMock(return_value=True),
         )
         mod._session = None
-        mod._thread_id = None
+        mod._session_identity._thread_id = None
         with (
             patch.object(mod, "_agent", fake_agent),
             patch.object(mod, "_orchestrator_client", fake_orchestrator),
@@ -6185,7 +6179,7 @@ class TestAttachSessionProtectedCloudSingletonIsolation:
                 )
             finally:
                 mod._session = None
-                mod._thread_id = None
+                mod._session_identity._thread_id = None
 
     @pytest.mark.asyncio
     async def test_sequential_pool_reuse_does_not_leak_protected_flag(self):
@@ -6287,7 +6281,7 @@ class TestHandlePersistentWebsocketReadiness:
             patch("agent.api.persistent_app._loop_task", None),
             patch("agent.api.persistent_app._ws_connected_event", None),
             patch(
-                "agent.api.persistent_app._current_pinned_session_identity_fingerprint",
+                "agent.api.persistent_app._session_identity.fingerprint",
                 return_value=self.fingerprint,
             ),
         ):
@@ -6315,7 +6309,7 @@ class TestHandlePersistentWebsocketReadiness:
             patch("agent.api.persistent_app._loop_task", None),
             patch("agent.api.persistent_app._ws_connected_event", None),
             patch(
-                "agent.api.persistent_app._current_pinned_session_identity_fingerprint",
+                "agent.api.persistent_app._session_identity.fingerprint",
                 return_value=self.fingerprint,
             ),
         ):
@@ -6339,7 +6333,7 @@ class TestHandlePersistentWebsocketReadiness:
             patch("agent.api.persistent_app._loop_task", None),
             patch("agent.api.persistent_app._ws_connected_event", None),
             patch(
-                "agent.api.persistent_app._current_pinned_session_identity_fingerprint",
+                "agent.api.persistent_app._session_identity.fingerprint",
                 return_value=self.fingerprint,
             ),
         ):
@@ -6368,7 +6362,7 @@ class TestHandlePersistentWebsocketReadiness:
             patch("agent.api.persistent_app._loop_task", None),
             patch("agent.api.persistent_app._ws_connected_event", connected),
             patch(
-                "agent.api.persistent_app._current_pinned_session_identity_fingerprint",
+                "agent.api.persistent_app._session_identity.fingerprint",
                 return_value=self.fingerprint,
             ),
         ):
@@ -6409,7 +6403,7 @@ class TestHandlePersistentWebsocketReadiness:
 
         with (
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._thread_id", "thread-1"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "thread-1"),
             patch("agent.api.persistent_app._session_input._queue", asyncio.Queue()),
             patch("agent.api.persistent_app._session_ready", return_value=True),
             patch("agent.api.persistent_app._turn_event_open", True),
@@ -6421,7 +6415,7 @@ class TestHandlePersistentWebsocketReadiness:
             patch("agent.api.persistent_app._orchestrator_client", None),
             patch("agent.api.persistent_app._ws_connected_event", None),
             patch(
-                "agent.api.persistent_app._current_pinned_session_identity_fingerprint",
+                "agent.api.persistent_app._session_identity.fingerprint",
                 return_value=self.fingerprint,
             ),
         ):
@@ -6472,7 +6466,7 @@ class TestHandlePersistentWebsocketReadiness:
 
         with (
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._thread_id", "thread-1"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "thread-1"),
             patch("agent.api.persistent_app._session_input._queue", asyncio.Queue()),
             patch("agent.api.persistent_app._session_ready", return_value=True),
             patch("agent.api.persistent_app._turn_event_open", True),
@@ -6494,7 +6488,7 @@ class TestHandlePersistentWebsocketReadiness:
             patch("agent.api.persistent_app._orchestrator_client", None),
             patch("agent.api.persistent_app._ws_connected_event", None),
             patch(
-                "agent.api.persistent_app._current_pinned_session_identity_fingerprint",
+                "agent.api.persistent_app._session_identity.fingerprint",
                 return_value=self.fingerprint,
             ),
         ):
@@ -6531,7 +6525,7 @@ class TestHandlePersistentWebsocketReadiness:
         try:
             with (
                 patch("agent.api.persistent_app._session", session),
-                patch("agent.api.persistent_app._thread_id", thread_id),
+                patch("agent.api.persistent_app._session_identity._thread_id", thread_id),
                 patch("agent.api.persistent_app._turn_event_open", False),
                 patch(
                     "agent.api.persistent_app._turn_tool_execution_identity",
@@ -6589,7 +6583,7 @@ class TestHandlePersistentWebsocketReadiness:
                     "agent.api.persistent_app._session",
                     SimpleNamespace(turn_count=4),
                 ),
-                patch("agent.api.persistent_app._thread_id", "wrong-thread"),
+                patch("agent.api.persistent_app._session_identity._thread_id", "wrong-thread"),
                 patch(
                     "agent.api.persistent_app._turn_tool_execution_identity",
                     None,
@@ -6620,7 +6614,7 @@ class TestHandlePersistentWebsocketReadiness:
                     "agent.api.persistent_app._session",
                     SimpleNamespace(turn_count=2),
                 ),
-                patch("agent.api.persistent_app._thread_id", "pinned-thread"),
+                patch("agent.api.persistent_app._session_identity._thread_id", "pinned-thread"),
                 patch(
                     "agent.api.persistent_app._turn_tool_execution_identity",
                     None,
@@ -6644,7 +6638,7 @@ class TestHandlePersistentWebsocketReadiness:
         session = SimpleNamespace(turn_count=5, postgres_conn=None)
         with (
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._thread_id", thread_id),
+            patch("agent.api.persistent_app._session_identity._thread_id", thread_id),
             patch("agent.api.persistent_app._turn_event_open", True),
             patch("agent.api.persistent_app._turn_tool_execution_identity", identity),
             patch("agent.api.persistent_app._turn_complete_external_hook", None),
@@ -6887,9 +6881,7 @@ class TestHandleApiInterruptHardEvent:
         mod._tool_inflight = False  # no tool in flight ⇒ hard
         mod._session_input._hard_interrupt_event = _asyncio.Event()
 
-        with patch.object(
-            mod,
-            "_current_pinned_session_identity_fingerprint",
+        with patch.object(mod._session_identity, "fingerprint",
             return_value=self.fingerprint,
         ):
             await _handle_api_interrupt(self._request())
@@ -6909,9 +6901,7 @@ class TestHandleApiInterruptHardEvent:
         mod._tool_inflight = True  # tool mid-ainvoke ⇒ graceful (never cancel)
         mod._session_input._hard_interrupt_event = _asyncio.Event()
 
-        with patch.object(
-            mod,
-            "_current_pinned_session_identity_fingerprint",
+        with patch.object(mod._session_identity, "fingerprint",
             return_value=self.fingerprint,
         ):
             await _handle_api_interrupt(self._request())
@@ -6933,9 +6923,7 @@ class TestHandleApiInterruptHardEvent:
         mod._session_input._hard_interrupt_event = asyncio.Event()
         request = self._request(client_request_id="client-1", target_turn_id=7)
 
-        with patch.object(
-            mod,
-            "_current_pinned_session_identity_fingerprint",
+        with patch.object(mod._session_identity, "fingerprint",
             return_value=self.fingerprint,
         ):
             response = await _handle_api_interrupt(request)
@@ -6965,9 +6953,7 @@ class TestHandleApiInterruptHardEvent:
         mod._session_input._hard_interrupt_event = asyncio.Event()
         request = self._request(client_request_id="client-1", target_turn_id=7)
 
-        with patch.object(
-            mod,
-            "_current_pinned_session_identity_fingerprint",
+        with patch.object(mod._session_identity, "fingerprint",
             return_value=self.fingerprint,
         ):
             response = await _handle_api_interrupt(request)
@@ -6994,9 +6980,7 @@ class TestHandleApiInterruptHardEvent:
         mod._turn_event_open = False
         mod._session_input._hard_interrupt_event = asyncio.Event()
 
-        with patch.object(
-            mod,
-            "_current_pinned_session_identity_fingerprint",
+        with patch.object(mod._session_identity, "fingerprint",
             return_value=self.fingerprint,
         ):
             response = await _handle_api_interrupt(self._request())
@@ -7016,9 +7000,7 @@ class TestHandleApiInterruptHardEvent:
         mod._session = SimpleNamespace(turn_count=7)
         request = self._request(client_request_id="client-1", target_turn_id=True)
 
-        with patch.object(
-            mod,
-            "_current_pinned_session_identity_fingerprint",
+        with patch.object(mod._session_identity, "fingerprint",
             return_value=self.fingerprint,
         ):
             response = await _handle_api_interrupt(request)
@@ -7034,9 +7016,7 @@ class TestHandleApiInterruptHardEvent:
         mod._turn_event_open = True
         mod._session_input._hard_interrupt_event = asyncio.Event()
 
-        with patch.object(
-            mod,
-            "_current_pinned_session_identity_fingerprint",
+        with patch.object(mod._session_identity, "fingerprint",
             return_value="sha256:" + ("b" * 64),
         ):
             response = await _handle_api_interrupt(self._request())
@@ -7064,7 +7044,7 @@ class TestCreatePersistentApp:
         create_persistent_app("my_config", "thread-123")
 
         assert mod._config_path == "my_config"
-        assert mod._thread_id == "thread-123"
+        assert mod._session_identity.thread_id == "thread-123"
 
     def test_returns_fastapi_instance(self):
         from fastapi import FastAPI
@@ -7077,7 +7057,7 @@ class TestCreatePersistentApp:
         import agent.api.persistent_app as mod
 
         create_persistent_app("config")
-        assert mod._thread_id is None
+        assert mod._session_identity.thread_id is None
 
     @pytest.mark.asyncio
     async def test_health_reports_ready_app_guide_without_changing_liveness(
@@ -7158,8 +7138,8 @@ class TestCreatePersistentApp:
         pod_uid = "50000000-0000-4000-8000-000000000005"
         app = create_persistent_app("config", thread_id)
         monkeypatch.setattr(mod, "_session_ready", lambda: True)
-        monkeypatch.setattr(mod, "_session_runtime_generation", generation)
-        monkeypatch.setattr(mod, "_session_runtime_attach_token", attach_token)
+        monkeypatch.setattr(mod._session_identity, "_session_generation", generation)
+        monkeypatch.setattr(mod._session_identity, "_attach_token", attach_token)
         monkeypatch.setattr(
             mod, "_orchestrator_client", SimpleNamespace(agent_id=agent_id)
         )
@@ -7243,9 +7223,7 @@ class TestRuntimeCanvasControlBinding:
         monkeypatch.setattr(mod, "_broadcast", broadcast)
         frames = []
         monkeypatch.setattr(mod, "_fan_out_live_frame", frames.append)
-        monkeypatch.setattr(
-            mod,
-            "_current_pinned_session_identity_fingerprint",
+        monkeypatch.setattr(mod._session_identity, "fingerprint",
             lambda: self.fingerprint,
         )
         monkeypatch.setattr(mod._canvas_control, "validation_min_interval_s", 0)
@@ -7327,7 +7305,7 @@ class TestHandleConfigUpdateEnrichmentGate:
         from agent.api.persistent_app import _handle_config_update
 
         src = getsource(_handle_config_update)
-        assert "if _orchestrator_client and _thread_id:" in src, (
+        assert "if _orchestrator_client and _session_identity.thread_id:" in src, (
             "Auxiliary model changes must trigger the orchestrator-PATCH "
             "enrichment gate."
         )
@@ -7354,7 +7332,7 @@ class TestHandleConfigUpdateEnrichmentGate:
         from agent.api.persistent_app import _handle_config_update
 
         src = getsource(_handle_config_update)
-        assert "if _orchestrator_client and _thread_id:" in src
+        assert "if _orchestrator_client and _session_identity.thread_id:" in src
         assert src.index("update_thread_config(") < src.index(
             "resetup_tools_for_backend()"
         )
@@ -7399,7 +7377,7 @@ class TestHandleConfigUpdateEnrichmentGate:
         send = AsyncMock()
         monkeypatch.setattr(mod, "_session", session)
         monkeypatch.setattr(mod, "_orchestrator_client", orchestrator_client)
-        monkeypatch.setattr(mod, "_thread_id", "thread-1")
+        monkeypatch.setattr(mod._session_identity, "_thread_id", "thread-1")
         monkeypatch.setattr(mod, "_ws_send", send)
 
         await mod._handle_config_update(
@@ -7443,7 +7421,7 @@ class TestHandleConfigUpdateEnrichmentGate:
         send = AsyncMock()
         monkeypatch.setattr(mod, "_session", session)
         monkeypatch.setattr(mod, "_orchestrator_client", client)
-        monkeypatch.setattr(mod, "_thread_id", "thread-1")
+        monkeypatch.setattr(mod._session_identity, "_thread_id", "thread-1")
         monkeypatch.setattr(mod, "_ws_send", send)
 
         await mod._handle_config_update(MagicMock(), fragment, request_id="fixed-1")
@@ -7480,7 +7458,7 @@ class TestHandleConfigUpdateEnrichmentGate:
         send = AsyncMock()
         monkeypatch.setattr(mod, "_session", session)
         monkeypatch.setattr(mod, "_orchestrator_client", client)
-        monkeypatch.setattr(mod, "_thread_id", "thread-1")
+        monkeypatch.setattr(mod._session_identity, "_thread_id", "thread-1")
         monkeypatch.setattr(mod, "_ws_send", send)
 
         await mod._handle_config_update(MagicMock(), {"workspace": {"backend": "vm"}})
@@ -7537,7 +7515,7 @@ class TestHandleConfigUpdateAckProtocol:
         send = AsyncMock()
         monkeypatch.setattr(mod, "_session", session)
         monkeypatch.setattr(mod, "_orchestrator_client", orchestrator_client)
-        monkeypatch.setattr(mod, "_thread_id", "thread-1")
+        monkeypatch.setattr(mod._session_identity, "_thread_id", "thread-1")
         monkeypatch.setattr(mod, "_ws_send", send)
 
         await mod._handle_config_update(
@@ -7563,7 +7541,7 @@ class TestHandleConfigUpdateAckProtocol:
         send = AsyncMock()
         monkeypatch.setattr(mod, "_session", session)
         monkeypatch.setattr(mod, "_orchestrator_client", None)
-        monkeypatch.setattr(mod, "_thread_id", "thread-1")
+        monkeypatch.setattr(mod._session_identity, "_thread_id", "thread-1")
         monkeypatch.setattr(mod, "_ws_send", send)
 
         await mod._handle_config_update(
@@ -7638,7 +7616,7 @@ class TestHandleConfigUpdateDatasources:
         send = AsyncMock()
         monkeypatch.setattr(mod, "_session", session)
         monkeypatch.setattr(mod, "_orchestrator_client", None)
-        monkeypatch.setattr(mod, "_thread_id", "thread-1")
+        monkeypatch.setattr(mod._session_identity, "_thread_id", "thread-1")
         monkeypatch.setattr(mod, "_ws_send", send)
 
         await mod._handle_config_update(
@@ -7670,7 +7648,7 @@ class TestHandleConfigUpdateDatasources:
         send = AsyncMock()
         monkeypatch.setattr(mod, "_session", session)
         monkeypatch.setattr(mod, "_orchestrator_client", orchestrator_client)
-        monkeypatch.setattr(mod, "_thread_id", "thread-1")
+        monkeypatch.setattr(mod._session_identity, "_thread_id", "thread-1")
         monkeypatch.setattr(mod, "_ws_send", send)
 
         await mod._handle_config_update(MagicMock(), {}, datasource_ids=[])
@@ -7702,7 +7680,7 @@ class TestHandleConfigUpdateDatasources:
         send = AsyncMock()
         monkeypatch.setattr(mod, "_session", session)
         monkeypatch.setattr(mod, "_orchestrator_client", orchestrator_client)
-        monkeypatch.setattr(mod, "_thread_id", "thread-1")
+        monkeypatch.setattr(mod._session_identity, "_thread_id", "thread-1")
         monkeypatch.setattr(mod, "_ws_send", send)
 
         await mod._handle_config_update(
@@ -7870,7 +7848,7 @@ class TestBootWsWatchdog:
 
         event = asyncio.Event()  # Never set
         with patch.object(pa, "_ws_connected_event", event):
-            with patch.object(pa, "_thread_id", "thread-xyz"):
+            with patch.object(pa._session_identity, "_thread_id", "thread-xyz"):
                 with patch.object(pa, "_terminate_session", new=AsyncMock()) as detach:
                     with patch.object(pa, "_schedule_exit") as exit_fn:
                         # Tiny timeout so the test doesn't actually wait 10 min
@@ -7886,7 +7864,7 @@ class TestBootWsWatchdog:
 
         event = asyncio.Event()  # Never set
         with patch.object(pa, "_ws_connected_event", event):
-            with patch.object(pa, "_thread_id", "thread-xyz"):
+            with patch.object(pa._session_identity, "_thread_id", "thread-xyz"):
                 with patch.object(
                     pa,
                     "_terminate_session",
@@ -7909,7 +7887,7 @@ class TestThreadStatusWatchdog:
             return_value={"status": "ended", "agent_id": None, "ended_at": "now"}
         )
         with patch.object(pa, "_orchestrator_client", client):
-            with patch.object(pa, "_thread_id", "thread-xyz"):
+            with patch.object(pa._session_identity, "_thread_id", "thread-xyz"):
                 with patch.object(pa, "_terminate_session", new=AsyncMock()) as detach:
                     with patch.object(pa, "_schedule_exit") as exit_fn:
                         # Tiny poll interval so test runs quickly
@@ -7925,7 +7903,7 @@ class TestThreadStatusWatchdog:
         client.get_thread_lifecycle = AsyncMock(return_value={"status": "ended"})
         with (
             patch.object(pa, "_orchestrator_client", client),
-            patch.object(pa, "_thread_id", "thread-unproven"),
+            patch.object(pa._session_identity, "_thread_id", "thread-unproven"),
             patch.object(
                 pa,
                 "_terminate_session",
@@ -7949,7 +7927,7 @@ class TestThreadStatusWatchdog:
             return_value={"status": "active", "agent_id": "a-1", "ended_at": None}
         )
         with patch.object(pa, "_orchestrator_client", client):
-            with patch.object(pa, "_thread_id", "thread-xyz"):
+            with patch.object(pa._session_identity, "_thread_id", "thread-xyz"):
                 with patch.object(pa, "_terminate_session", new=AsyncMock()) as detach:
                     with patch.object(pa, "_schedule_exit") as exit_fn:
                         # Run the watchdog briefly then cancel — it must not
@@ -7981,9 +7959,9 @@ class TestThreadStatusWatchdog:
         )
         with (
             patch.object(pa, "_orchestrator_client", client),
-            patch.object(pa, "_thread_id", "thread-xyz"),
-            patch.object(pa, "_session_runtime_generation", generation_a),
-            patch.object(pa, "_pinned_runtime_generation_enabled", True),
+            patch.object(pa._session_identity, "_thread_id", "thread-xyz"),
+            patch.object(pa._session_identity, "_session_generation", generation_a),
+            patch.object(pa._session_identity, "_runtime_contract", True),
             patch.object(pa, "_terminate_session", new=AsyncMock()) as detach,
             patch.object(pa, "_schedule_exit") as exit_fn,
         ):
@@ -8013,10 +7991,10 @@ class TestThreadStatusWatchdog:
         )
         with (
             patch.object(pa, "_orchestrator_client", client),
-            patch.object(pa, "_thread_id", "thread-xyz"),
-            patch.object(pa, "_session_runtime_generation", generation),
-            patch.object(pa, "_session_runtime_attach_token", token_a),
-            patch.object(pa, "_pinned_runtime_generation_enabled", True),
+            patch.object(pa._session_identity, "_thread_id", "thread-xyz"),
+            patch.object(pa._session_identity, "_session_generation", generation),
+            patch.object(pa._session_identity, "_attach_token", token_a),
+            patch.object(pa._session_identity, "_runtime_contract", True),
             patch.object(pa, "_terminate_session", new=AsyncMock()) as detach,
             patch.object(pa, "_schedule_exit") as exit_fn,
         ):
@@ -8034,7 +8012,7 @@ class TestThreadStatusWatchdog:
         client = AsyncMock()
         client.get_thread_lifecycle = AsyncMock(side_effect=RuntimeError("network"))
         with patch.object(pa, "_orchestrator_client", client):
-            with patch.object(pa, "_thread_id", "thread-xyz"):
+            with patch.object(pa._session_identity, "_thread_id", "thread-xyz"):
                 with patch.object(pa, "_terminate_session", new=AsyncMock()) as detach:
                     with patch.object(pa, "_schedule_exit") as exit_fn:
                         task = asyncio.create_task(pa._thread_status_watchdog(poll_s=0))
@@ -8069,7 +8047,7 @@ class TestThreadStatusWatchdog:
             }
         )
         with patch.object(pa, "_orchestrator_client", client):
-            with patch.object(pa, "_thread_id", "thread-xyz"):
+            with patch.object(pa._session_identity, "_thread_id", "thread-xyz"):
                 with patch.object(pa, "_terminate_session", new=AsyncMock()) as detach:
                     with patch.object(pa, "_schedule_exit") as exit_fn:
                         task = asyncio.create_task(pa._thread_status_watchdog(poll_s=0))
@@ -8098,7 +8076,7 @@ class TestThreadStatusWatchdog:
             }
         )
         with patch.object(pa, "_orchestrator_client", client):
-            with patch.object(pa, "_thread_id", "thread-xyz"):
+            with patch.object(pa._session_identity, "_thread_id", "thread-xyz"):
                 with patch.object(pa, "_terminate_session", new=AsyncMock()) as detach:
                     with patch.object(pa, "_schedule_exit") as exit_fn:
                         await pa._thread_status_watchdog(poll_s=0)

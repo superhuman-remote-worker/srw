@@ -59,7 +59,7 @@ def _restart_input_process(monkeypatch) -> str:
 
     _arrange_input_state(monkeypatch)
     generation = str(uuid4())
-    monkeypatch.setattr(pa, "_input_runtime_generation", generation)
+    monkeypatch.setattr(pa._session_identity, "_process_generation", generation)
     return generation
 
 
@@ -256,18 +256,18 @@ async def pinned_runtime(db, pg_dsn, monkeypatch, tmp_path):  # noqa: F811 - fix
     _open_admission(monkeypatch, tmp_path)
     _arrange_input_state(monkeypatch)
     monkeypatch.setenv("POD_UID", "pod-pinned")
-    monkeypatch.setattr(pa, "_thread_id", str(thread_id))
+    monkeypatch.setattr(pa._session_identity, "_thread_id", str(thread_id))
     monkeypatch.setattr(
         pa, "_orchestrator_client", SimpleNamespace(agent_id=str(agent_id))
     )
     monkeypatch.setattr(
-        pa, "_session_runtime_generation", str(thread["runtime_generation"])
+        pa._session_identity, "_session_generation", str(thread["runtime_generation"])
     )
     monkeypatch.setattr(
-        pa, "_session_runtime_attach_token", str(thread["runtime_attach_token"])
+        pa._session_identity, "_attach_token", str(thread["runtime_attach_token"])
     )
-    monkeypatch.setattr(pa, "_input_runtime_generation", str(uuid4()))
-    monkeypatch.setattr(pa, "_pinned_runtime_generation_enabled", False)
+    monkeypatch.setattr(pa._session_identity, "_process_generation", str(uuid4()))
+    monkeypatch.setattr(pa._session_identity, "_runtime_contract", False)
     monkeypatch.setattr(
         pa,
         "_session",
@@ -417,9 +417,9 @@ async def test_concurrent_publication_of_one_live_claim_queues_it_once(
         thread_id=str(pinned_runtime.thread_id),
         agent_id=pa._orchestrator_client.agent_id,
         pod_uid="pod-pinned",
-        runtime_generation=pa._input_runtime_generation,
-        session_runtime_generation=pa._session_runtime_generation,
-        runtime_attach_token=pa._session_runtime_attach_token,
+        runtime_generation=pa._session_identity.process_generation,
+        session_runtime_generation=pa._session_identity.session_generation,
+        runtime_attach_token=pa._session_identity.attach_token,
     )
     row = dict(rows[0])
     assert row["claim_generation"] == accepted.claim_generation + 1
@@ -478,7 +478,7 @@ async def test_replaced_attach_token_is_read_at_admission_and_refused(
     try:
         # Identity changes after construction and after the claim; the admit
         # reads the current one and the database refuses the stale claim.
-        monkeypatch.setattr(pa, "_session_runtime_attach_token", str(uuid4()))
+        monkeypatch.setattr(pa._session_identity, "_attach_token", str(uuid4()))
         assert (
             await callbacks.admit_input_delivery(
                 delivery_id, accepted.claim_generation, 1
@@ -486,7 +486,7 @@ async def test_replaced_attach_token_is_read_at_admission_and_refused(
             is False
         )
         assert (await _delivery(pinned_runtime.db, delivery_id))["state"] == "queued"
-        monkeypatch.setattr(pa, "_input_runtime_generation", None)
+        monkeypatch.setattr(pa._session_identity, "_process_generation", None)
         with pytest.raises(DurableInputUnavailable):
             await _operations().accept_input("no identity", delivery_id=str(uuid4()))
     finally:
@@ -521,7 +521,7 @@ async def test_stateless_transitions_follow_lease_renewal_and_replacement(
     _arrange_input_state(monkeypatch)
     recording = _LeaseRecordingDB()
     thread_id = str(uuid4())
-    monkeypatch.setattr(pa, "_thread_id", thread_id)
+    monkeypatch.setattr(pa._session_identity, "_thread_id", thread_id)
     monkeypatch.setattr(
         pa,
         "_session",
@@ -726,7 +726,7 @@ async def _attach(monkeypatch, thread_id: str) -> _AttachSession:
     monkeypatch.setattr(pa, "_start_watchdogs", MagicMock())
     monkeypatch.setattr(pa, "_build_sync_coordinator", MagicMock())
     monkeypatch.setattr(pa, "_session", None)
-    monkeypatch.setattr(pa, "_thread_id", None)
+    monkeypatch.setattr(pa._session_identity, "_thread_id", None)
     await pa._attach_session(thread_id)
     return pa._session
 
@@ -746,7 +746,7 @@ async def test_attach_teardown_attach_never_carries_input_state(monkeypatch, tmp
     recovery = first.recovery_views[0]
     assert recovery.queue is None  # published only after subagent recovery
     one = _input_view()
-    first_generation = pa._input_runtime_generation
+    first_generation = pa._session_identity.process_generation
     assert first_generation
     assert isinstance(one.queue, asyncio.Queue)
     assert one.claims == frozenset()
@@ -764,7 +764,7 @@ async def test_attach_teardown_attach_never_carries_input_state(monkeypatch, tmp
 
     await pa._terminate_session("characterization", mark_thread=False)
     gone = _input_view()
-    assert pa._input_runtime_generation is None
+    assert pa._session_identity.process_generation is None
     assert gone.queue is None
     assert gone.claims == frozenset()
     assert (gone.mode, gone.target, gone.hard_event) == (None, None, None)
@@ -773,7 +773,7 @@ async def test_attach_teardown_attach_never_carries_input_state(monkeypatch, tmp
 
     await _attach(monkeypatch, "thread-two")
     two = _input_view()
-    assert pa._input_runtime_generation not in (None, first_generation)
+    assert pa._session_identity.process_generation not in (None, first_generation)
     assert two.queue is not one.queue and two.queue.empty()
     assert two.claims == frozenset()
     assert (two.mode, two.target) == (None, None)
@@ -852,7 +852,7 @@ async def test_protected_reclaim_is_single_flight_and_joined_with_side_tasks(
         protected_cloud_ready=lambda: ready["value"],
     )
     monkeypatch.setattr(pa, "_session", session)
-    monkeypatch.setattr(pa, "_thread_id", "thread-protected")
+    monkeypatch.setattr(pa._session_identity, "_thread_id", "thread-protected")
     monkeypatch.setattr(pa, "_session_side_tasks", set())
     reclaims = AsyncMock(return_value=set())
     _replace_reclaim(monkeypatch, reclaims)
@@ -884,7 +884,7 @@ async def test_protected_reclaim_runs_once_when_the_same_life_heals(
         protected_cloud_ready=lambda: ready["value"],
     )
     monkeypatch.setattr(pa, "_session", session)
-    monkeypatch.setattr(pa, "_thread_id", "thread-heals")
+    monkeypatch.setattr(pa._session_identity, "_thread_id", "thread-heals")
     monkeypatch.setattr(pa, "_session_side_tasks", set())
     reclaim = AsyncMock(return_value=set())
     _replace_reclaim(monkeypatch, reclaim)

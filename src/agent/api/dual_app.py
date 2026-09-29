@@ -59,10 +59,7 @@ from shared.workspace_contract import (
 from shared.subagent_lifecycle import (
     SubagentLifecycleError,
 )
-from shared.pinned_session_identity import (
-    PINNED_SESSION_READY_IDENTITY_CONTRACT,
-    pinned_session_ready_identity_fingerprint,
-)
+from shared.pinned_session_identity import PINNED_SESSION_READY_IDENTITY_CONTRACT
 
 logger = logging.getLogger(__name__)
 
@@ -1269,13 +1266,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 and pa._session is not None
                 and pa._session.protected_cloud_ready() is True
             )
-            session_identity_fingerprint = pinned_session_ready_identity_fingerprint(
-                thread_id=pa._thread_id,
-                runtime_generation=pa._session_runtime_generation,
-                agent_id=pa._registered_pinned_agent_id(),
-                runtime_attach_token=pa._session_runtime_attach_token,
-                pod_uid=os.environ.get("POD_UID"),
-            )
+            session_identity_fingerprint = pa._session_identity.fingerprint()
             capabilities: dict[str, bool | int] = {
                 "durable_input_delivery": True,
                 "pinned_session_identity_contract": (
@@ -1956,10 +1947,11 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 logger.exception(f"Session setup failed for thread {thread_id}")
                 import agent.api.persistent_app as pa
 
-                # _attach_session sets pa._thread_id before it can fail;
+                # _attach_session binds the thread before it can fail;
                 # _detach_session short-circuits when _session is None and
-                # never clears _thread_id, so we have to do it explicitly.
-                pa._thread_id = None
+                # never unbinds it, so we have to do it explicitly -- but only
+                # this attach's own thread.
+                pa._session_identity.release_thread(expected=thread_id)
                 # Release the exact reciprocal DB reservation before this pod
                 # advertises itself idle.  The endpoint treats an already-
                 # replaced binding as a successful/benign no-op, so ``True``
@@ -2054,7 +2046,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         return JSONResponse(
             {
                 "ready": pa._session_ready(),
-                "thread_id": pa._thread_id,
+                "thread_id": pa._session_identity.thread_id,
                 "state": "session",
                 "turn_in_flight": pa._turn_in_flight(),
             }
@@ -2073,7 +2065,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         )
         if (
             expected is None
-            or pa._current_pinned_session_identity_fingerprint() != expected
+            or pa._session_identity.fingerprint() != expected
         ):
             return JSONResponse(
                 {"error": "session_identity_mismatch", "retryable": True},
@@ -2087,7 +2079,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         return JSONResponse(
             {
                 "ready": pa._session_ready(),
-                "thread_id": pa._thread_id,
+                "thread_id": pa._session_identity.thread_id,
                 "state": "session",
                 "turn_in_flight": pa._turn_in_flight(),
                 "recipient_verified": True,
@@ -2122,7 +2114,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         )
         if (
             expected is None
-            or pa._current_pinned_session_identity_fingerprint() != expected
+            or pa._session_identity.fingerprint() != expected
         ):
             return JSONResponse(
                 {"error": "session_identity_mismatch", "retryable": True},
@@ -2133,7 +2125,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             return JSONResponse({"status": "not_in_session"}, status_code=404)
 
         try:
-            thread_id = pa._thread_id
+            thread_id = pa._session_identity.thread_id
             # Same reason string as persistent_app's /session/detach so the
             # documented "Terminate(rest_detach)" signal greps identically
             # on dual pool pods (was the "legacy" back-compat shim).

@@ -788,7 +788,7 @@ async def test_attach_accepts_only_the_exact_int_1(advertised, expected):
     )
     with (
         patch.object(papp, "_session", None),
-        patch.object(papp, "_thread_id", None),
+        patch.object(papp._session_identity, "_thread_id", None),
         patch.object(papp, "_event_writer", None),
         patch.object(papp, "_agent", agent),
         patch.object(papp, "_orchestrator_client", client),
@@ -831,7 +831,7 @@ async def _attach_until_construction(workspace, **keywords) -> dict:
     )
     with (
         patch.object(papp, "_session", None),
-        patch.object(papp, "_thread_id", None),
+        patch.object(papp._session_identity, "_thread_id", None),
         patch.object(papp, "_event_writer", None),
         patch.object(papp, "_agent", agent),
         patch.object(papp, "_orchestrator_client", client),
@@ -978,7 +978,7 @@ async def test_the_pool_attach_handler_forwards_the_switch(monkeypatch):
     monkeypatch.setattr(papp, "_pool_attach_token", None)
     monkeypatch.setattr(papp, "_pending_drain_suspend", None)
     monkeypatch.setattr(papp, "_run_pool_attach_transaction", transaction)
-    monkeypatch.setattr(papp, "_adopt_attached_runtime_identity", MagicMock())
+    monkeypatch.setattr(papp._session_identity, "adopt", MagicMock())
 
     response = await papp._admit_pool_session_attach(
         {

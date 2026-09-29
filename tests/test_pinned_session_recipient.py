@@ -103,8 +103,8 @@ async def test_status_wrong_fingerprint_returns_no_turn_state():
     route = _route(app, "/session/status")
     with (
         patch.object(
-            mod,
-            "_current_pinned_session_identity_fingerprint",
+            mod._session_identity,
+            "fingerprint",
             return_value=FINGERPRINT,
         ),
         patch.object(mod, "_turn_in_flight") as turn_state,
@@ -127,13 +127,13 @@ async def test_status_exact_fingerprint_is_recipient_verified():
     route = _route(app, "/session/status")
     with (
         patch.object(
-            mod,
-            "_current_pinned_session_identity_fingerprint",
+            mod._session_identity,
+            "fingerprint",
             return_value=FINGERPRINT,
         ),
         patch.object(mod, "_session_ready", return_value=True),
         patch.object(mod, "_turn_in_flight", return_value=False),
-        patch.object(mod, "_thread_id", THREAD_ID),
+        patch.object(mod._session_identity, "_thread_id", THREAD_ID),
     ):
         response = await route.endpoint({"session_identity_fingerprint": FINGERPRINT})
 
@@ -153,8 +153,8 @@ async def test_detach_wrong_fingerprint_has_zero_effect():
     terminate = AsyncMock()
     with (
         patch.object(
-            mod,
-            "_current_pinned_session_identity_fingerprint",
+            mod._session_identity,
+            "fingerprint",
             return_value=FINGERPRINT,
         ),
         patch.object(mod, "_terminate_session", terminate),
@@ -274,7 +274,7 @@ async def test_persistent_attach_wrong_process_refuses_before_pool_claim(monkeyp
     monkeypatch.setattr(mod, "_pool_attach_runtime_generation", None)
     monkeypatch.setattr(mod, "_pool_attach_token", None)
     monkeypatch.setattr(mod, "_pool_attach_task", None)
-    monkeypatch.setattr(mod, "_adopt_attached_runtime_identity", adopt)
+    monkeypatch.setattr(mod._session_identity, "adopt", adopt)
 
     response = await mod._admit_pool_session_attach(
         {

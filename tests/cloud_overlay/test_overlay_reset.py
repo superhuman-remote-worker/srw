@@ -227,11 +227,11 @@ def post_reset(monkeypatch):
     from fastapi.testclient import TestClient
 
     app = app_mod.create_persistent_app("dummy_config", _RESET_THREAD_ID)
-    monkeypatch.setattr(app_mod, "_thread_id", _RESET_THREAD_ID)
+    monkeypatch.setattr(app_mod._session_identity, "_thread_id", _RESET_THREAD_ID)
     monkeypatch.setattr(
-        app_mod, "_session_runtime_generation", _RESET_RUNTIME_GENERATION
+        app_mod._session_identity, "_session_generation", _RESET_RUNTIME_GENERATION
     )
-    monkeypatch.setattr(app_mod, "_session_runtime_attach_token", _RESET_ATTACH_TOKEN)
+    monkeypatch.setattr(app_mod._session_identity, "_attach_token", _RESET_ATTACH_TOKEN)
     monkeypatch.setattr(app_mod, "_registered_pinned_agent_id", lambda: _RESET_AGENT_ID)
 
     def _post(session, *, headers=None, body=None):

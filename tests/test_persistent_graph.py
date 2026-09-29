@@ -3544,14 +3544,14 @@ class TestToolExecutionLoop:
 
         with (
             patch.object(pa, "_session", session),
-            patch.object(pa, "_thread_id", "thread-a"),
+            patch.object(pa._session_identity, "_thread_id", "thread-a"),
             patch.object(
                 pa, "_orchestrator_client", SimpleNamespace(agent_id=agent_id)
             ),
-            patch.object(pa, "_pinned_runtime_generation_enabled", True),
-            patch.object(pa, "_input_runtime_generation", generation),
-            patch.object(pa, "_session_runtime_generation", generation),
-            patch.object(pa, "_session_runtime_attach_token", attach_token),
+            patch.object(pa._session_identity, "_runtime_contract", True),
+            patch.object(pa._session_identity, "_process_generation", generation),
+            patch.object(pa._session_identity, "_session_generation", generation),
+            patch.object(pa._session_identity, "_attach_token", attach_token),
             patch.object(pa, "_retirement_admission_identity", None),
             patch.object(pa, "_termination_admission_fenced", False),
             patch.object(pa, "_tool_inflight", False),
@@ -3693,7 +3693,7 @@ class TestToolExecutionLoop:
         try:
             with (
                 patch.object(pa, "_session", SimpleNamespace(turn_count=1)),
-                patch.object(pa, "_thread_id", "wrong-thread"),
+                patch.object(pa._session_identity, "_thread_id", "wrong-thread"),
                 patch.object(pa, "_turn_tool_execution_identity", None),
                 patch.object(
                     pa,
@@ -3746,7 +3746,7 @@ class TestToolExecutionLoop:
         try:
             with (
                 patch.object(pa, "_session", SimpleNamespace(turn_count=1)),
-                patch.object(pa, "_thread_id", "claimed-thread"),
+                patch.object(pa._session_identity, "_thread_id", "claimed-thread"),
                 patch.object(pa, "_turn_tool_execution_identity", None),
                 patch.object(pa, "_turn_tool_execution_external_hook", None),
             ):

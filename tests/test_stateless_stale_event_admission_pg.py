@@ -77,6 +77,7 @@ from tests.test_subagent_thread_migration import (  # noqa: F401  (scratch_pg_ds
     scratch_pg_dsn,
 )
 from tests.test_turn_executor import (
+    _IDENTITY_SAVED_ATTRS,
     _INPUT_SAVED_ATTRS,
     _PA_SAVED_ATTRS,
     FakeSession,
@@ -96,6 +97,9 @@ def harness(monkeypatch):
     saved_input = {
         name: getattr(pa._session_input, name) for name in _INPUT_SAVED_ATTRS
     }
+    saved_identity = {
+        name: getattr(pa._session_identity, name) for name in _IDENTITY_SAVED_ATTRS
+    }
     h = Harness(monkeypatch)
     try:
         yield h
@@ -104,6 +108,8 @@ def harness(monkeypatch):
             setattr(pa, name, value)
         for name, value in saved_input.items():
             setattr(pa._session_input, name, value)
+        for name, value in saved_identity.items():
+            setattr(pa._session_identity, name, value)
 
 
 ANSWER = "The comparison: Austria keeps 41,200 EUR of 60,000 EUR gross."
@@ -173,7 +179,7 @@ class _Executor:
         session.turn_count = max((int(r["turn_number"] or 0) for r in rows), default=0)
         self.h.sessions.append(session)
         pa._session = session
-        pa._thread_id = thread_id
+        pa._session_identity._thread_id = thread_id
         pa._session_input._queue = asyncio.Queue()
         pa._turn_tool_execution_identity = None
 
@@ -190,7 +196,7 @@ class _Executor:
                 }
             )
             await pa._turn_start_external_hook(turn_id)
-            thread_id = pa._thread_id
+            thread_id = pa._session_identity.thread_id
             token = self.h.executor._lease.lease_token
             delivery = item.get("delivery_id")
             if delivery is not None:
