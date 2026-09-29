@@ -127,7 +127,7 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     # 28 since R1.B12 closed the entrypoint and the composition boundary;
     # 29 since R3.2 fenced the session client transport off the runtime;
     # 30 since R3.3a fenced the session input owner off the runtime and loop.
-    assert "Contracts: 30 kept, 0 broken" in result.stdout
+    assert "Contracts: 31 kept, 0 broken" in result.stdout
 
 
 @pytest.mark.parametrize(
