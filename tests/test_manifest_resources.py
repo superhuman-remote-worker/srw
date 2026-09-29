@@ -388,6 +388,61 @@ async def test_project_manifest_owns_and_releases_workspace_defaults(database, a
 
 
 @pytest.mark.asyncio
+async def test_generic_job_without_workspace_ignores_a_project_vm_default(
+    database, actor, monkeypatch
+):
+    from orchestrator.services.manifest_execution import ManifestExecutionService
+    from orchestrator.services.manifest_execution_snapshot import read_execution
+
+    project = {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "Project",
+        "metadata": {"name": "team"},
+        "spec": {
+            "resources": {"workspaces": {"box": {"inline": {"backend": "vm"}}}},
+            "defaults": {"workspace": {"jobs": "vm", "vm": "box"}},
+        },
+    }
+    initial = await apply(ManifestResourceService(database), project, actor)
+    project_row = next(
+        item for item in initial["resources"] if item["resource"]["kind"] == "Project"
+    )
+    project_id = await database.fetchval(
+        "SELECT linked_id FROM srw_resources WHERE id=$1", UUID(project_row["uid"])
+    )
+    assert (await read_project_defaults(database, project_id)).jobs == "vm"
+
+    created = []
+    create_job = database.create_job
+
+    async def recording_create_job(**kwargs):
+        created.append(kwargs)
+        return await create_job(**kwargs)
+
+    monkeypatch.setattr(database, "create_job", recording_create_job)
+    execution = ManifestExecutionService(
+        database,
+        runtime=ProcessRuntime(),
+        namespace="test",
+        native_hosting_enabled=True,
+    )
+    resources = ManifestResourceService(database, admit_job=execution.admit)
+    assignment = job(expert={"inline": expert()["spec"]})
+    assignment["metadata"]["scope"] = {"kind": "Project", "name": str(project_id)}
+    result = await apply(resources, assignment, actor)
+    work_id = next(iter(result["executions"].values()))
+
+    # The defaults chain picks SRW agent workspaces; a generic image keeps
+    # "omitted means no workspace", whatever the Project's Jobs mode says.
+    snapshot = await read_execution(database, "Job", work_id)
+    assert snapshot["resolved"]["spec"]["execution"]["workspace"] is None
+    assert "workspace" not in snapshot["document"]["spec"]["execution"]
+    assert created[0]["config_override"] == {"workspace": {"backend": "none"}}
+    assert created[0]["requested_workspace_backend"] == "none"
+    assert created[0]["workspace_selection"] is None
+
+
+@pytest.mark.asyncio
 async def test_secrets_are_encrypted_and_plans_never_deliver_them(database, actor):
     service = ManifestResourceService(database)
     secret = await service.put_secret(
@@ -491,8 +546,7 @@ async def native_execution(database, actor, *, max_attempts=1, mode="ProcessExit
         database, runtime=process, namespace="test", native_hosting_enabled=True
     )
     resources = ManifestResourceService(database, admit_job=execution.admit)
-    # These Jobs run without a workspace; an omitted one resolves the chain.
-    assignment = job(expert={"inline": expert()["spec"]}, workspace=None)
+    assignment = job(expert={"inline": expert()["spec"]})
     assignment["spec"]["retry"] = {"maxAttempts": max_attempts}
     assignment["spec"]["completion"] = {"mode": mode}
     assignment["spec"]["timeoutSeconds"] = 60
@@ -811,7 +865,7 @@ async def test_reapply_job_keeps_original_referenced_generation(database, actor)
         database, runtime=process, namespace="test", native_hosting_enabled=True
     )
     resources = ManifestResourceService(database, admit_job=execution.admit)
-    authored = [expert(), job(workspace=None)]
+    authored = [expert(), job()]
     first = await apply(resources, authored, actor)
     original = await database.fetchval("SELECT resolved::text FROM srw_execution_specs")
     change = expert(image="example/worker:v2")
@@ -821,13 +875,13 @@ async def test_reapply_job_keeps_original_referenced_generation(database, actor)
         if key.startswith("Expert/")
     }
     await apply(resources, change, actor, expected_versions=versions)
-    repeated = await apply(resources, job(workspace=None), actor)
+    repeated = await apply(resources, job(), actor)
     assert repeated["executions"] == first["executions"]
     assert (
         await database.fetchval("SELECT resolved::text FROM srw_execution_specs")
         == original
     )
-    classified = job(workspace=None)
+    classified = job()
     classified["metadata"]["tags"] = ["reviewed"]
     job_versions = {
         key: value for key, value in expected(first).items() if key.startswith("Job/")

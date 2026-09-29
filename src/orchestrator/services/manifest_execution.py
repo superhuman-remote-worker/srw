@@ -122,11 +122,16 @@ class ManifestExecutionService:
                     ) from None
         # An omitted workspace resolves the defaults chain as the executing
         # account; `null` (no workspace) and a binding are explicit choices.
+        # The chain picks SRW agent workspaces only: a generic image keeps
+        # "omitted means none", since it can't use a virtual or VM default.
         if "workspace" in execution:
             workspace_receipt = {
                 "sources": {"tier": "explicit", "template": "explicit"},
                 "template_name": None,
             }
+        elif adapter != "srw/v1":
+            workspace_receipt = None
+            execution["workspace"] = None
         else:
             from orchestrator.services.manifest_workspace_selection import (
                 select_execution_workspace,
@@ -190,7 +195,7 @@ class ManifestExecutionService:
             for key in ("document", "resolved", "revision", "dependencies")
         }
         # A default template is pinned like any referenced resource.
-        for dependency in workspace_receipt.get("dependencies", []):
+        for dependency in (workspace_receipt or {}).get("dependencies", []):
             if dependency not in snapshot["dependencies"]:
                 snapshot["dependencies"].append(deepcopy(dependency))
         if adapter == "srw/v1":

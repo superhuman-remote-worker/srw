@@ -149,7 +149,8 @@ Recorded behaviour changes within `srw/v1alpha1`, applied to the frozen answer b
 the test rather than regenerated into it:
 
 - **Workspace defaults chain.** A Job that omits `execution.workspace` keeps it
-  omitted in the preview. The Project's `defaults.workspace`, otherwise the
-  installation's workspace defaults, decide it when the Job is admitted, and the
-  admitted execution snapshot records the result. `workspace: null` still means
-  no workspace.
+  omitted in the preview. For an SRW harness Job (`adapter: srw/v1`), the
+  Project's `defaults.workspace`, otherwise the installation's workspace
+  defaults, decide it when the Job is admitted, and the admitted execution
+  snapshot records the result. A generic-image Job that omits it still runs
+  without a workspace. `workspace: null` still means no workspace.
