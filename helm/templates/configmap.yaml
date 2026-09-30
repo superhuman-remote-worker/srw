@@ -447,6 +447,7 @@ data:
   # Explicit operations and generations already admitted by the database can
   # still converge while this is false.
   WORKSPACE_CLEANUP_RECONCILIATION_ENABLED: {{ .Values.orchestrator.workspaceCleanupReconciliationEnabled | default false | quote }}
+  CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED: {{ get (.Values.orchestrator.containerStartupStageAuthority | default dict) "enabled" | default false | quote }}
   # Reclaim-on-idle (Task 7, opt-in, fail-safe): drop a session's workspace
   # PVC on idle-suspend once its S3 snapshot verifies restorable. Default off
   # keeps today's retain-on-idle behavior. See workspace_suspension.py and

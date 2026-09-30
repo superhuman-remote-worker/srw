@@ -1,4 +1,4 @@
-import type { VMCreationView, WorkspaceContractProjection, WorkspaceLifecycleView, WorkspaceRecoveryView } from './api.model';
+import type { VMCreationView, WorkspaceContractProjection, WorkspaceCreationView, WorkspaceLifecycleView, WorkspaceRecoveryView } from './api.model';
 
 /**
  * Audit step types from MongoDB agent_audit collection.
@@ -171,6 +171,7 @@ export interface JobSummary {
   workspace_recovery?: WorkspaceRecoveryView | null;
   workspace_lifecycle?: WorkspaceLifecycleView | null;
   vm_creation?: VMCreationView | null;
+  workspace_creation?: WorkspaceCreationView | null;
 }
 
 /**

@@ -172,14 +172,16 @@ class TestAccountDefaultsLayer:
         assert detail["config"]["llm"]["model"] == "account-pinned-model"
 
     @pytest.mark.asyncio
-    async def test_saved_session_tier_preference_wins_over_platform_default(
-        self, monkeypatch, account_user
+    @pytest.mark.parametrize("legacy_backend", ["sandbox", "vm", "none"])
+    async def test_legacy_session_tier_preference_does_not_override_execution_default(
+        self, monkeypatch, account_user, legacy_backend
     ):
+        monkeypatch.delenv("WORKSPACE_DEFAULTS", raising=False)
         monkeypatch.setattr(
             orchestrator_main.app.state.resources.postgres_db,
             "get_user_settings",
             AsyncMock(
-                return_value={"persistent_agent": {"workspace_backend": "sandbox"}}
+                return_value={"persistent_agent": {"workspace_backend": legacy_backend}}
             ),
         )
 
@@ -190,7 +192,9 @@ class TestAccountDefaultsLayer:
             include_account_defaults=True,
         )
 
-        assert detail["config"]["workspace"]["backend"] == "sandbox"
+        # Legacy preferences migrate into Project defaults at startup; they no
+        # longer contribute a workspace tier to the Expert's account layer.
+        assert detail["config"]["workspace"]["backend"] == "virtual"
 
     @pytest.mark.asyncio
     async def test_worker_detail_gets_the_model_floor_but_no_session_tier(

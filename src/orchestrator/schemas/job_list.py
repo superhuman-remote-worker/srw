@@ -47,6 +47,15 @@ class WorkspaceLifecycleView(BaseModel):
     next_retry_at: datetime | None = None
 
 
+class WorkspaceCreationView(BaseModel):
+    """Read-only container startup stage for the current exact receipt."""
+
+    stage: str
+    state: str
+    reason_code: str
+    readiness_deadline_at: datetime | None
+
+
 class PublicJobListItem(BaseModel):
     """Current list-row projection; additional public fields remain compatible."""
 
@@ -92,6 +101,9 @@ class PublicJobListItem(BaseModel):
     )
     workspace_lifecycle: WorkspaceLifecycleView | None = Field(
         description="Safe VM compute state; no runtime identities, coordinates or other users' leases."
+    )
+    workspace_creation: WorkspaceCreationView | None = Field(
+        description="Current container startup stage; null without an exact active receipt."
     )
     audit_count: int | None = Field(
         description="Null when the optional audit service is unavailable; zero when available with no entries."

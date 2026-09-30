@@ -463,6 +463,193 @@ class TestKubernetesIdeProxyAuthority:
         service.connect(db, provisioner)
         return service, core_api
 
+    def _terminal_service(self, monkeypatch, owner_status="completed"):
+        from orchestrator.services.ide_credentials import (
+            IDE_CREDENTIAL_ENV,
+            ide_credential,
+        )
+        from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+
+        monkeypatch.setenv("IDE_CREDENTIAL_KEY", "test-root-key")
+        owner = WorkspaceOwner.job(self._JOB_ID)
+        runtime = {
+            **self._runtime(scope="ide", entity_id=self._JOB_ID),
+            "source": "gitea",
+            "_creation_reservation_id": "55555555-5555-4555-8555-555555555555",
+            "_creation_claim_token": "7",
+        }
+        row = {
+            "id": self._JOB_ID,
+            "status": owner_status,
+            "repo_name": "owned-repo",
+            "context": {"ide_session": runtime},
+        }
+        pod = self._pod(owner_kind="job", entity_id=self._JOB_ID, scope="ide")
+        expected_credential = ide_credential(
+            namespace="agent-workspaces",
+            owner_kind=owner.kind,
+            owner_id=owner.id,
+            pod_name=f"ide-{self._JOB_ID[:12]}",
+        )
+        pod.spec = SimpleNamespace(
+            containers=[
+                SimpleNamespace(
+                    env=[
+                        SimpleNamespace(
+                            name=IDE_CREDENTIAL_ENV, value=expected_credential
+                        )
+                    ]
+                )
+            ]
+        )
+        service, _ = self._service(job=row, pod=pod)
+        service._db.get_current_managed_repository_workspace_creation_result = (
+            AsyncMock(
+                return_value={
+                    "id": runtime["_creation_reservation_id"],
+                    "owner_kind": "job",
+                    "owner_id": self._JOB_ID,
+                    "scope": "ide",
+                    "operation_kind": "restore",
+                    "claim_token": 7,
+                    "runtime_incarnation": self._RUNTIME_A,
+                    "pod_uid": self._RUNTIME_A,
+                    "phase": "settled",
+                    "result_kind": "settled",
+                    "settled_at": object(),
+                    "cancel_requested_at": None,
+                    "restore_work_completed_at": object(),
+                    "restore_work_result_kind": "active",
+                }
+            )
+        )
+        service._db.fetchval = AsyncMock(return_value=False)
+        return service, row, pod, expected_credential
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owner_status", ["completed", "failed", "cancelled"])
+    async def test_terminal_job_current_restored_ide_is_served_and_advertised(
+        self, monkeypatch, owner_status
+    ):
+        import orchestrator.services.ide_proxy as ide_proxy
+
+        service, _, _, expected_credential = self._terminal_service(
+            monkeypatch, owner_status
+        )
+
+        target = await service.resolve_target(self._JOB_ID)
+        assert target is not None
+        assert target.scope == "ide" and target.backend == "k8s"
+        assert target.credential == expected_credential
+        assert await service.revalidate_target(target)
+
+        status = {
+            "status": "active",
+            "code_server_url": f"/api/jobs/{self._JOB_ID}/ide/proxy/",
+        }
+        with patch.object(ide_proxy, "ide_proxy_service", service):
+            assert (
+                await ide_proxy.contain_ide_status_for(self._JOB_ID, status) is status
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            "no_receipt",
+            "receipt_read_error",
+            "unsettled",
+            "wrong_reservation",
+            "wrong_runtime",
+            "incomplete_work",
+            "cancel_requested",
+            "open_cleanup",
+            "cleanup_read_error",
+            "foreign_pod",
+            "missing_credential",
+        ],
+    )
+    async def test_terminal_job_ide_refuses_missing_or_stale_authority(
+        self, monkeypatch, mutation
+    ):
+        import orchestrator.services.ide_proxy as ide_proxy
+
+        service, _, pod, _ = self._terminal_service(monkeypatch)
+        receipt_read = (
+            service._db.get_current_managed_repository_workspace_creation_result
+        )
+        receipt = receipt_read.return_value
+        if mutation == "no_receipt":
+            receipt_read.return_value = None
+        elif mutation == "receipt_read_error":
+            receipt_read.side_effect = RuntimeError("read unavailable")
+        elif mutation == "unsettled":
+            receipt["settled_at"] = None
+        elif mutation == "wrong_reservation":
+            receipt["id"] = self._RUNTIME_B
+        elif mutation == "wrong_runtime":
+            receipt["runtime_incarnation"] = self._RUNTIME_B
+        elif mutation == "incomplete_work":
+            receipt["restore_work_completed_at"] = None
+        elif mutation == "cancel_requested":
+            receipt["cancel_requested_at"] = object()
+        elif mutation == "open_cleanup":
+            service._db.fetchval.return_value = True
+        elif mutation == "cleanup_read_error":
+            service._db.fetchval.side_effect = RuntimeError("read unavailable")
+        elif mutation == "foreign_pod":
+            pod.metadata.labels["srw/job-id"] = self._RUNTIME_B
+        else:
+            pod.spec.containers[0].env = []
+
+        target = await service.resolve_target(self._JOB_ID)
+        if mutation == "missing_credential":
+            assert target is not None and target.credential is None
+        else:
+            assert target is None
+        status = {"status": "active", "code_server_url": "/api/jobs/ide/proxy/"}
+        with patch.object(ide_proxy, "ide_proxy_service", service):
+            result = await ide_proxy.contain_ide_status_for(self._JOB_ID, status)
+        assert result["status"] == "unavailable"
+        assert result["code_server_url"] is None
+
+    @pytest.mark.asyncio
+    async def test_terminal_job_replaced_during_pod_read_cannot_be_served(
+        self, monkeypatch
+    ):
+        service, row, _, _ = self._terminal_service(monkeypatch)
+        original_pod = (
+            service._container_provisioner._core_api.read_namespaced_pod.return_value
+        )
+
+        def replace_during_read(**kwargs):
+            row["context"]["ide_session"]["_runtime_incarnation"] = self._RUNTIME_B
+            return original_pod
+
+        service._container_provisioner._core_api.read_namespaced_pod.side_effect = (
+            replace_during_read
+        )
+        assert await service.resolve_target(self._JOB_ID) is None
+
+    @pytest.mark.asyncio
+    async def test_terminal_job_successor_revokes_existing_target(self, monkeypatch):
+        service, row, _, _ = self._terminal_service(monkeypatch)
+        target = await service.resolve_target(self._JOB_ID)
+        assert target is not None
+        row["context"]["ide_session"]["_runtime_incarnation"] = self._RUNTIME_B
+        assert not await service.revalidate_target(target)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("restore_type", ["container", "vm"])
+    async def test_terminal_job_other_ide_backends_remain_refused(
+        self, monkeypatch, restore_type
+    ):
+        service, row, _, _ = self._terminal_service(monkeypatch)
+        runtime = row["context"]["ide_session"]
+        runtime["restore_type"] = restore_type
+        assert await service.resolve_target(self._JOB_ID) is None
+        service._db.get_current_managed_repository_workspace_creation_result.assert_not_awaited()
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("owner_kind", "scope"),
@@ -827,7 +1014,8 @@ class TestVmIdeProxyAuthority:
             launcher_pod_uid=str(__import__("uuid").uuid4()),
             rootdisk_pvc_uid=str(__import__("uuid").uuid4()),
             ssh_host_key_fingerprint="SHA256:" + "a" * 43,
-            host=self._POD_IP, port=22,
+            host=self._POD_IP,
+            port=22,
         )
         db = SimpleNamespace(
             get_job=AsyncMock(return_value=self._job()),
@@ -840,7 +1028,9 @@ class TestVmIdeProxyAuthority:
         assert target.backend == "vm"
         assert target.host == self._POD_IP and target.port == 22
         assert target.identity[1:5] == (
-            proof.vm_uid, proof.vmi_uid, proof.launcher_pod_uid,
+            proof.vm_uid,
+            proof.vmi_uid,
+            proof.launcher_pod_uid,
             proof.rootdisk_pvc_uid,
         )
         assert await service.resolve_pod_ip(self._JOB_ID) is None

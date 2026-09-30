@@ -64,6 +64,10 @@ orchestrator:
   kbGitAllowedHosts: "git.internal.example.com"
   kbExternalReindexConcurrency: 2
   kbReindexSweepSeconds: 900
+  # First deploy the capable bridge with this off. Enable only after proving
+  # all pre-bridge processes/creators are gone; existing v1 work continues off.
+  containerStartupStageAuthority:
+    enabled: false
   vmProvisioning:
     creationRetryEnabled: false
     rootdiskStallTimeoutSeconds: 2700

@@ -16,6 +16,7 @@ The read-only preview added for quick chat shares the creation admission plan.
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 from fastapi import APIRouter, Request
 
@@ -106,6 +107,15 @@ async def list_threads(
     )
     for thread in result["threads"]:
         thread["workspace_lifecycle"] = states.get(str(thread["id"]))
+    creations = await dependencies.store.container_workspace_creation_views(
+        "thread", [str(thread["id"]) for thread in result["threads"]]
+    )
+    for thread in result["threads"]:
+        thread["workspace_creation"] = (
+            None
+            if thread.get("status") in {"ended", "suspended"}
+            else creations.get(UUID(str(thread["id"])))
+        )
     return result
 
 

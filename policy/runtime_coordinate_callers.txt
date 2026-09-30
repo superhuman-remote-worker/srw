@@ -32,6 +32,7 @@ src/orchestrator/services/cloud_staging/stage.py  _stream_authorized_tar  ssh  b
 src/orchestrator/services/cloud_staging/stage.py  _stream_authorized_tar  ssh  build_agent_ssh_cmd  ad317ba9f7ed  #1  vm-authority
 src/orchestrator/services/container_provisioner.py  ContainerProvisioner._create_ide_pod_legacy  remote-effect  self._seed_workspace_state  cd45bd21d0c8  #1  fresh-k8s-attestation
 src/orchestrator/services/container_provisioner.py  ContainerProvisioner._create_pinned_workspace_legacy  remote-effect  self._seed_workspace_state  cd45bd21d0c8  #1  fresh-k8s-attestation
+src/orchestrator/services/container_provisioner.py  ContainerProvisioner._observe_container_startup_stage  ssh  wait_for_agent_ssh  7d63e924597b  #1  pinned-host-key
 src/orchestrator/services/container_provisioner.py  ContainerProvisioner._release_captured_workspace  remote-effect  self._snapshot_service.capture_vm_snapshot  8fbdf2e3ec4d  #1  fresh-k8s-attestation
 src/orchestrator/services/container_provisioner.py  ContainerProvisioner._release_captured_workspace  remote-effect  self._snapshot_service.reconcile_terminal_snapshot_generation  5dedc83040e5  #1  fresh-k8s-attestation
 src/orchestrator/services/container_provisioner.py  ContainerProvisioner._release_pinned_retirement_workspace  remote-effect  self._snapshot_service.capture_vm_snapshot  295d0c16a879  #1  pinned-host-key

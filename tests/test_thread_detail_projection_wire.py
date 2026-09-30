@@ -14,9 +14,11 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
+from uuid import UUID
 
 import pytest
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from orchestrator.routers import thread_session
@@ -29,6 +31,7 @@ PROJECT_ID = "22222222-3333-4444-8555-666666666666"
 
 class _Store:
     def __init__(self) -> None:
+        self.container_workspace_creation_views = AsyncMock(return_value={})
         self.ensure_thread_ssh_handle = AsyncMock(return_value="s-minted")
         self.list_thread_mounts = AsyncMock(
             return_value=[
@@ -66,10 +69,14 @@ def _raw_row() -> dict:
     }
 
 
-def _client(store: _Store, row: dict | None = None) -> TestClient:
+def _client(
+    store: _Store, row: dict | None = None, *, denied: bool = False
+) -> TestClient:
     async def gate(request, gate_store, thread_id):
         del request
         assert gate_store is store and thread_id == THREAD_ID
+        if denied:
+            raise HTTPException(status_code=403, detail="not owner")
         return {
             "id": "owner-1",
             "is_admin": False,
@@ -136,6 +143,29 @@ def test_detail_route_mints_a_missing_handle_and_projects_mounts() -> None:
             "backend_id": None,
         }
     ]
+
+
+def test_detail_route_reads_one_allowlisted_startup_view_after_owner_gate() -> None:
+    store = _Store()
+    view = {
+        "stage": "scheduling",
+        "state": "observing",
+        "reason_code": "observation_pending",
+        "readiness_deadline_at": None,
+    }
+    store.container_workspace_creation_views.return_value = {UUID(THREAD_ID): view}
+    body = _client(store).get(f"/api/persistent/threads/{THREAD_ID}").json()
+    assert body["workspace_creation"] == view
+    store.container_workspace_creation_views.assert_awaited_once_with(
+        "thread", [THREAD_ID]
+    )
+
+
+def test_detail_denial_precedes_startup_receipt_read() -> None:
+    store = _Store()
+    response = _client(store, denied=True).get(f"/api/persistent/threads/{THREAD_ID}")
+    assert response.status_code == 403
+    store.container_workspace_creation_views.assert_not_awaited()
 
 
 @pytest.mark.parametrize("permanent", [False, True])

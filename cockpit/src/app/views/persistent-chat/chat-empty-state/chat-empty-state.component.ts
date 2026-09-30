@@ -5,6 +5,8 @@ import {AppIconComponent} from '../../../ui/icon';
 import {VexillumComponent} from '../../../ui/vexillum';
 import {AppSelectComponent} from '../../../ui/select';
 import {AppButtonComponent} from '../../../ui/button';
+import type {WorkspaceCreationView} from '../../../core/models/api.model';
+import {workspaceCreationMessageKey} from '../../../core/util/workspace-creation';
 
 /** One suggestion chip, already resolved to the active language. */
 export interface DisplayedSuggestion {
@@ -114,6 +116,7 @@ export class ChatEmptyStateComponent {
   connectorsEnabled = input<boolean>(false);
   datasourceCount = input<number>(0);
   workspaceBackend = input<string>('');
+  workspaceCreation = input<WorkspaceCreationView | null>(null);
 
   suggestionPicked = output<DisplayedSuggestion>();
   connectorsToggled = output<boolean>();
@@ -122,10 +125,12 @@ export class ChatEmptyStateComponent {
   sendRetried = output<void>();
 
   protected readonly titleKey = computed(() =>
+    this.workspaceCreation() && this.variant() === 'ready' ? 'workspaceCreation.title' :
     this.variant() === 'recovery' ? 'chat.draft.recoveryTitle' :
       this.variant() === 'draft' ? 'chat.draft.title' : 'chat.empty.title',
   );
   protected readonly subtitleKey = computed(() =>
+    this.workspaceCreation() && this.variant() === 'ready' ? workspaceCreationMessageKey(this.workspaceCreation()!) :
     this.variant() === 'recovery' ? 'chat.draft.recoveryBody' :
       this.variant() === 'draft' ? 'chat.draft.subtitle' : 'chat.empty.subtitle',
   );

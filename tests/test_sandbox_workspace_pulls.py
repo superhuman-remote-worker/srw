@@ -82,6 +82,47 @@ def test_backoff_is_pulling_until_the_budget_then_fails():
     assert verdict(pod("ErrImagePull", age_seconds=601)).state == "failed"
 
 
+def test_late_scheduled_pod_gets_its_full_pull_budget_from_scheduled_clock():
+    old_pod = pod("ImagePullBackOff", age_seconds=900)
+    assert (
+        classify_image_pull(
+            old_pod,
+            image=IMAGE,
+            now=NOW,
+            pull_timeout_seconds=600,
+            started_at=NOW - timedelta(seconds=30),
+        ).state
+        == "pulling"
+    )
+    expired = classify_image_pull(
+        old_pod,
+        image=IMAGE,
+        now=NOW,
+        pull_timeout_seconds=600,
+        started_at=NOW - timedelta(seconds=601),
+    )
+    assert expired.state == "failed"
+    assert expired.failure_reason_code == "pull_deadline"
+    invalid = classify_image_pull(
+        pod("InvalidImageName", age_seconds=900),
+        image=IMAGE,
+        now=NOW,
+        pull_timeout_seconds=600,
+        started_at=NOW - timedelta(seconds=30),
+    )
+    assert invalid.state == "failed"
+    assert invalid.failure_reason_code == "invalid_image"
+    bad_config = classify_image_pull(
+        pod("CreateContainerConfigError", age_seconds=900),
+        image=IMAGE,
+        now=NOW,
+        pull_timeout_seconds=600,
+        started_at=NOW - timedelta(seconds=30),
+    )
+    assert bad_config.state == "failed"
+    assert bad_config.failure_reason_code == "invalid_configuration"
+
+
 def test_container_creating_never_fails_on_its_own():
     assert verdict(pod("ContainerCreating", age_seconds=9999)).state == "pulling"
 
@@ -274,6 +315,38 @@ def failing_pull(body):
 class _TemplatedJobDB(_PinnedSessionContainerDB):
     async def fetchrow(self, *args):
         return None
+
+    async def begin_managed_repository_workspace_creation_effect(
+        self, owner_id, **kwargs
+    ):
+        if not self._creation_claim_matches(kwargs):
+            return None
+        receipt = self._creation_reservation
+        if receipt["phase"] == "reserved":
+            receipt["phase"] = "mutating"
+        receipt["external_mutation_started_at"] = "now"
+        receipt["external_effects"][kwargs["resource_kind"]] = {
+            "issued_at": "now",
+            "observed_uid": None,
+        }
+        return dict(receipt)
+
+    async def get_current_managed_repository_workspace_creation_result(
+        self, owner_id, *, owner_kind, scope, operation_kind
+    ):
+        receipt = self._creation_reservation
+        if (
+            receipt is None
+            or receipt["owner_id"] != owner_id
+            or receipt["owner_kind"] != owner_kind
+            or receipt["scope"] != scope
+            or receipt["operation_kind"] != operation_kind
+            or receipt["phase"] != "runtime_bound"
+            or receipt["settled_at"] is not None
+            or receipt["cancel_requested_at"] is not None
+        ):
+            return None
+        return dict(receipt)
 
 
 def job_provisioner(monkeypatch, settings):

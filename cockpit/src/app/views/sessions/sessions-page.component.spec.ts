@@ -15,6 +15,7 @@ import {HttpClient, HttpErrorResponse} from '@angular/common/http';
 import {Router} from '@angular/router';
 import {Observable, of, Subject, throwError} from 'rxjs';
 import {SessionsPageComponent} from './sessions-page.component';
+import en from '../../../assets/i18n/en.json';
 import {SessionListService} from '../../core/services/session-list.service';
 import {TranslocoService} from '@jsverse/transloco';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
@@ -1014,6 +1015,9 @@ describe('SessionsPageComponent', () => {
 @Pipe({name: 'transloco', standalone: true})
 class TranslocoStubPipe implements PipeTransform {
     transform(key: string): string {
+        if (key.startsWith('workspaceCreation.')) {
+            return (en.workspaceCreation as Record<string, string>)[key.split('.')[1]] ?? key;
+        }
         return key;
     }
 }
@@ -1075,6 +1079,21 @@ describe('SessionsPageComponent (rendered): a fenced permanent delete', () => {
     function deleteButton(host: HTMLElement, id: string): IconButton {
         return card(host, id).querySelector('app-icon-button[variant="danger"]') as IconButton;
     }
+
+    it('shows typed scheduling status while keeping the session action controls', async () => {
+        serveThreadLists(mocks.mockHttp, [makeThread({
+            id: 't-startup', status: 'created',
+            workspace_creation: {stage: 'scheduling', state: 'waiting_capacity',
+                reason_code: 'scheduler_unschedulable', readiness_deadline_at: null},
+        })]);
+        const fixture = TestBed.createComponent(SessionsPageComponent);
+        fixture.detectChanges();
+        await settle(fixture);
+        const sessionCard = card(fixture.nativeElement as HTMLElement, 't-startup');
+        expect(sessionCard.textContent).toContain('Waiting for scheduling');
+        expect(sessionCard.querySelectorAll('app-icon-button').length).toBeGreaterThanOrEqual(2);
+        expect(deleteButton(fixture.nativeElement as HTMLElement, 't-startup').disabled).not.toBe(true);
+    });
 
     it('keeps Delete enabled as a retry on the ending card, re-sends it on click, and drops the retry on a 200', async () => {
         const live = makeThread({id: 't-del', status: 'active'});

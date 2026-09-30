@@ -966,6 +966,29 @@ Two Secrets must exist in the release namespace:
 Pin `vmController.defaultVmImage` to a published tag. The default points at the tag that
 matches the chart's `appVersion`, which exists only for released charts.
 
+### Container startup stage rollout
+
+`orchestrator.containerStartupStageAuthority.enabled` defaults to `false`
+(`CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED`). It admits version-1 container
+startup receipts for Jobs and stateless Sessions. Scheduling waits do not spend
+readiness, image-pull or SSH budgets. The exact Pod's scheduling transition starts
+immutable budgets; authenticated Ready settles the receipt. An expired budget
+leaves an attention state with normal Cancel/End controls. A Job's execution
+deadline remains independent and can cancel it while it waits for capacity.
+
+Deploy the capable application and migrations `0309`/`0310` with this value off
+first. Before enabling it in a separate rollout, verify that every pre-bridge
+orchestrator Pod UID and process is gone, including detached Job workspace
+creators and Session creation callbacks. Ready replica counts, dispatcher drain
+and lease expiry alone do not prove those older writers have stopped. The chart
+replaces orchestrator Pods on either switch transition even without Reloader;
+that checksum does not replace the pre-activation absence check.
+
+Turning the switch off stops new adoption while existing version-1 receipts
+continue. After activation, roll back only to a version-1-capable bridge image.
+Existing settled receipts with an unfinished Job remain held for normal Cancel;
+the new observer does not reopen them or issue a second Pod create.
+
 ### Durable VM workspace recovery rollout
 
 VM startup uses separate clocks for disk preparation, placement and guest boot.

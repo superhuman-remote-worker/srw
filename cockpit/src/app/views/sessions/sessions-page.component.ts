@@ -15,6 +15,7 @@ import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
 import {Thread} from '../../core/models/api.model';
 import {VMCreationWaitComponent} from '../../core/components/vm-creation-wait.component';
+import {workspaceCreationMessageKey} from '../../core/util/workspace-creation';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AppButtonComponent} from '../../ui/button';
@@ -211,6 +212,11 @@ const ENDING_POLL_MAX_MS = 15_000;
               </div>
               @if (thread.vm_creation; as creation) {
                 @if (creation.wait) { <app-vm-creation-wait [creation]="creation" /> }
+              }
+              @if (thread.workspace_creation; as creation) {
+                <div class="session-workspace-creation" [class.attention]="creation.state === 'attention'" role="status">
+                  {{ workspaceCreationMessageKey(creation) | transloco }}
+                </div>
               }
               <div class="session-actions">
                 @if (canTalk(thread)) {
@@ -455,6 +461,8 @@ const ENDING_POLL_MAX_MS = 15_000;
     .session-status-dot.active, .session-status-dot.created { background: var(--success); }
     .session-status-dot.ending { background: var(--warning, #f59e0b); }
     .session-status-dot.ended { background: var(--surface-2); }
+    .session-workspace-creation { margin-top: 4px; color: var(--text-secondary); font-size: 12px; }
+    .session-workspace-creation.attention { color: var(--warning); }
 
     .session-title {
       font-size: 13px;
@@ -576,6 +584,7 @@ const ENDING_POLL_MAX_MS = 15_000;
   `],
 })
 export class SessionsPageComponent implements OnInit {
+    readonly workspaceCreationMessageKey = workspaceCreationMessageKey;
     private readonly http = inject(HttpClient);
     private readonly router = inject(Router);
     private readonly toast = inject(AppToastService);

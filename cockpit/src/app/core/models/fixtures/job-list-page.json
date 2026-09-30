@@ -36,7 +36,8 @@
       "audit_count": null,
       "cloud_review_mode": "open_folder",
       "exported_folder_url": null,
-      "workspace_lifecycle": null
+      "workspace_lifecycle": null,
+      "workspace_creation": null
     },
     {
       "id": "33333333-3333-4333-8333-333333333334",
@@ -74,7 +75,8 @@
       "audit_count": null,
       "cloud_review_mode": "open_folder",
       "exported_folder_url": null,
-      "workspace_lifecycle": null
+      "workspace_lifecycle": null,
+      "workspace_creation": null
     }
   ],
   "total": 10000,

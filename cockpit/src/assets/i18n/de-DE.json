@@ -649,6 +649,20 @@
       "countSuffix": " (×{{count}})"
     }
   },
+  "workspaceCreation": {
+    "title": "Arbeitsbereichsstatus",
+    "unknown": "Der Status des Arbeitsbereichs wird geprüft.",
+    "observing": "Die Einplanung des Arbeitsbereichs wird geprüft; das Ergebnis ist noch nicht bestätigt.",
+    "waitingScheduling": "Warten auf Einplanung. Der Scheduler hat diesen Arbeitsbereich noch nicht platziert.",
+    "insufficientCapacity": "Für den angeforderten Arbeitsbereich ist derzeit nicht genug Kapazität vorhanden.",
+    "starting": "Der eingeplante Arbeitsbereich wird gestartet.",
+    "invalidImage": "Arbeitsbereich benötigt Aufmerksamkeit: Das Image ist ungültig.",
+    "invalidConfiguration": "Arbeitsbereich benötigt Aufmerksamkeit: Die Konfiguration ist ungültig.",
+    "pullDeadline": "Arbeitsbereich benötigt Aufmerksamkeit: Das Laden des Images hat die Startgrenze überschritten.",
+    "readinessDeadline": "Arbeitsbereich benötigt Aufmerksamkeit: Die Bereitschaft hat die Startgrenze überschritten.",
+    "sshDeadline": "Arbeitsbereich benötigt Aufmerksamkeit: Die Frist für die SSH-Authentifizierung ist abgelaufen.",
+    "legacyHeld": "Eine ältere Arbeitsbereichserstellung wird geprüft; ein Abschlussnachweis fehlt."
+  },
   "jobs": {
     "pagination": {
       "label": "Seitennavigation",

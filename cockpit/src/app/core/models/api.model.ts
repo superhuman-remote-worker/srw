@@ -1988,6 +1988,7 @@ export interface Thread {
   workspace_lifecycle?: WorkspaceLifecycleView | null;
   /** Bounded progress for this exact pinned VM creation source. */
   vm_creation?: VMCreationView | null;
+  workspace_creation?: WorkspaceCreationView | null;
   total_turns: number;
   total_tokens: number;
   nc_session_folder?: string | null;
@@ -2287,6 +2288,19 @@ export interface VMCreationView {
   resumable: boolean;
 }
 
+/** Safe owner projection of container workspace startup. No scheduler text or authority lives here. */
+export interface WorkspaceCreationView {
+  stage: 'scheduling' | 'readiness';
+  state: 'observing' | 'waiting_capacity' | 'starting' | 'attention';
+  reason_code:
+    | 'observation_pending' | 'scheduler_unschedulable' | 'scheduling_other'
+    | 'scheduled' | 'invalid_image' | 'invalid_configuration'
+    | 'pull_deadline' | 'readiness_deadline' | 'ssh_deadline'
+    | 'legacy_receipt_held' | 'insufficient_capacity';
+  /** Frozen boot/pull hard boundary. SSH authentication has a separate grace. */
+  readiness_deadline_at: string | null;
+}
+
 /** VM compute state beside the human wait or Job/session status. */
 export interface WorkspaceLifecycleView {
   state: 'warm' | 'releasing' | 'release_held' | 'suspended' | 'waking' | 'wake_held' | 'ready' | 'unsupported';
@@ -2374,6 +2388,7 @@ export interface Job {
   /** Safe recovery state; controller coordinates and raw diagnostics are never included. */
   workspace_recovery?: WorkspaceRecoveryView | null;
   vm_creation?: VMCreationView | null;
+  workspace_creation?: WorkspaceCreationView | null;
   workspace_lifecycle?: WorkspaceLifecycleView | null;
 }
 

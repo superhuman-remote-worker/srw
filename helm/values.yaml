@@ -174,6 +174,12 @@ orchestrator:
   # generation admitted before the flag closes may finish without stranding
   # its process-zero/maintenance fence.
   workspaceCleanupReconciliationEnabled: false
+  # -- Admit container startup v1 receipts only after the capable bridge and
+  # migrations 0306/0307 are deployed and all pre-bridge orchestrator processes
+  # and their in-flight creators are gone. Disable to stop new adoption;
+  # existing v1 work continues. Roll back only to a v1-capable image.
+  containerStartupStageAuthority:
+    enabled: false
   # -- One-release coordinated cutover for the 0197/0198 workspace lifecycle
   # authority epoch. Keep true while advancing the ServiceAccount generation:
   # the namespace RoleBinding revokes the predecessor account and Recreate

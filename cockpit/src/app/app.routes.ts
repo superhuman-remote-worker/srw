@@ -12,7 +12,6 @@ import {CanvasPopoutPageComponent} from './views/canvas/canvas-popout-page.compo
 import {SessionsPageComponent} from './views/sessions/sessions-page.component';
 import {SessionCreateComponent} from './views/session-create/session-create.component';
 import {ExpertsPageComponent} from './views/experts/experts-page.component';
-import {ExpertEditorComponent} from './views/experts/expert-editor.component';
 import {SkillsPageComponent} from './views/skills/skills-page.component';
 import {SkillEditorComponent} from './views/skills/skill-editor.component';
 import {authGuard} from './core/guards/auth.guard';
@@ -21,6 +20,10 @@ import {projectAccessGuard} from './core/guards/project-access.guard';
 
 const loadSettings = () =>
   import('./views/settings/settings.component').then((m) => m.SettingsComponent);
+
+// Expert authoring is only needed when creating or editing an Expert.
+const loadExpertEditor = () =>
+  import('./views/experts/expert-editor.component').then((m) => m.ExpertEditorComponent);
 
 export const routes: Routes = [
   // Instant landing (knowledge-base/knowledge/features/instant_landing_session.md): the root is a
@@ -62,8 +65,8 @@ export const routes: Routes = [
     canActivate: [authGuard],
   },
   { path: 'experts', component: ExpertsPageComponent, canActivate: [authGuard] },
-  { path: 'experts/new', component: ExpertEditorComponent, canActivate: [authGuard] },
-  { path: 'experts/:id/edit', component: ExpertEditorComponent, canActivate: [authGuard] },
+  { path: 'experts/new', loadComponent: loadExpertEditor, canActivate: [authGuard] },
+  { path: 'experts/:id/edit', loadComponent: loadExpertEditor, canActivate: [authGuard] },
   { path: 'skills', component: SkillsPageComponent, canActivate: [authGuard] },
   { path: 'skills/new', component: SkillEditorComponent, canActivate: [authGuard] },
   { path: 'skills/:id/edit', component: SkillEditorComponent, canActivate: [authGuard] },

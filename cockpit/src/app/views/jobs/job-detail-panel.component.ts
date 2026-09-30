@@ -28,6 +28,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 import {isTerminalJobStatus, jobStatusTone} from '../../core/util/job-status';
 import {workspaceLifecycleReasonKey} from '../../core/util/vm-lifecycle';
 import {subagentStatusTone} from '../../core/util/subagent-status';
+import {workspaceCreationMessageKey} from '../../core/util/workspace-creation';
 
 /** Own spend, or the whole subtree beneath the job. */
 export type UsageScope = 'job' | 'subtree';
@@ -347,6 +348,11 @@ export function heldForReviewReason(
           @if (lifecycle.next_retry_at) {
             <span>{{ 'jobs.lifecycle.nextRetry' | transloco }}: {{ lifecycle.next_retry_at | date:'mediumTime' }}</span>
           }
+        </section>
+      }
+      @if (workspaceCreation(); as creation) {
+        <section class="recovery-detail" [class.attention]="creation.state === 'attention'" role="status">
+          <strong>{{ workspaceCreationMessageKey(creation) | transloco }}</strong>
         </section>
       }
       @if (heldForReviewReason(job()); as held) {
@@ -903,9 +909,17 @@ export function heldForReviewReason(
 })
 export class JobDetailPanelComponent {
   readonly lifecycleReasonKey = workspaceLifecycleReasonKey;
+  readonly workspaceCreationMessageKey = workspaceCreationMessageKey;
   readonly job = input.required<JobSummary>();
   /** Null until the lazy load for this job has been kicked off. */
   readonly data = input<JobDetailState | null>(null);
+  /** A returned detail object supersedes the list snapshot, including a null projection. */
+  readonly workspaceCreation = computed(() => {
+    const data = this.data();
+    return data === null || data.loading || !data.detail
+      ? this.job().workspace_creation
+      : data.detail?.workspace_creation;
+  });
   /**
    * Children the SERVER returned for this root — i.e. the ones matching the
    * current filter, not every child that exists. The copy says so; a bare count

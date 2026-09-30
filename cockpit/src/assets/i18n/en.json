@@ -649,6 +649,20 @@
       "countSuffix": " (×{{count}})"
     }
   },
+  "workspaceCreation": {
+    "title": "Workspace status",
+    "unknown": "Workspace status is being checked.",
+    "observing": "Checking workspace scheduling; the result is not yet confirmed.",
+    "waitingScheduling": "Waiting for scheduling. The scheduler has not placed this workspace yet.",
+    "insufficientCapacity": "The requested workspace currently has insufficient capacity.",
+    "starting": "Starting the scheduled workspace.",
+    "invalidImage": "Workspace needs attention: its image is invalid.",
+    "invalidConfiguration": "Workspace needs attention: its configuration is invalid.",
+    "pullDeadline": "Workspace needs attention: image pull exceeded its startup boundary.",
+    "readinessDeadline": "Workspace needs attention: readiness exceeded its startup boundary.",
+    "sshDeadline": "Workspace needs attention: SSH authentication grace expired.",
+    "legacyHeld": "Checking an older workspace creation; completion evidence is unavailable."
+  },
   "jobs": {
     "pagination": {
       "label": "Pagination",

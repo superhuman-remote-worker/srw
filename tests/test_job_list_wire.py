@@ -89,7 +89,8 @@ def wire(monkeypatch):
         jobs=[row()], total=1, total_is_capped=False, has_more=False
     )
     db = SimpleNamespace(
-        query_jobs=AsyncMock(side_effect=lambda **kw: copy.deepcopy(result))
+        query_jobs=AsyncMock(side_effect=lambda **kw: copy.deepcopy(result)),
+        container_workspace_creation_views=AsyncMock(return_value={}),
     )
     visible = AsyncMock(return_value=[UUID(PROJECT), UUID(OTHER_PROJECT)])
     audit = SimpleNamespace(
@@ -172,6 +173,44 @@ async def test_shared_cockpit_fixture_is_actual_serialized_list_json(wire):
         "offset": 2,
         "include_total": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_job_list_reads_one_authorized_startup_batch(wire):
+    view = {
+        "stage": "scheduling",
+        "state": "waiting_capacity",
+        "reason_code": "scheduler_unschedulable",
+        "readiness_deadline_at": None,
+    }
+    wire.result.jobs[0]["status"] = "processing"
+    wire.result.jobs.append(row(id=UUID(CHILD), is_display_root=False))
+    wire.db.container_workspace_creation_views.return_value = {UUID(JOB): view}
+    response = await get(wire)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["jobs"][0]["workspace_creation"] == view
+    assert body["jobs"][1]["workspace_creation"] is None
+    wire.db.container_workspace_creation_views.assert_awaited_once_with(
+        "job", [JOB, CHILD]
+    )
+    wire.db.container_workspace_creation_views.reset_mock()
+    denied = await get(wire, authenticated=False)
+    assert denied.status_code == 401
+    wire.db.container_workspace_creation_views.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_terminal_job_cannot_render_a_stale_startup_view(wire):
+    wire.db.container_workspace_creation_views.return_value = {
+        UUID(JOB): {
+            "stage": "readiness",
+            "state": "starting",
+            "reason_code": "scheduled",
+            "readiness_deadline_at": STAMP,
+        }
+    }
+    assert (await get(wire)).json()["jobs"][0]["workspace_creation"] is None
 
 
 @pytest.mark.asyncio

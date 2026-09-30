@@ -12,7 +12,7 @@ import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { HttpClient } from '@angular/common/http';
 import { filter, firstValueFrom, map, Observable, Subscription, tap, timeout } from 'rxjs';
 import { environment } from '../environment';
-import { Project, ThreadCloudDiffSummary, ThreadMount, ThreadStatus, WorkspaceLifecycleView } from '../models/api.model';
+import { Project, ThreadCloudDiffSummary, ThreadMount, ThreadStatus, WorkspaceCreationView, WorkspaceLifecycleView } from '../models/api.model';
 // Type + pure derivation only — importing them from the review component
 // would pull it (and Monaco's loader) back into the eager bundle graph and
 // defeat the @defer that keeps the review surface lazy.
@@ -1283,6 +1283,7 @@ export class PersistentChatService {
       !this.retirementPermanent(),
   );
   readonly workspaceLifecycle = signal<WorkspaceLifecycleView | null>(null);
+  readonly workspaceCreation = signal<WorkspaceCreationView | null>(null);
 
   /** Bind an IDE response to this view, including same-thread Resume. A late
    *  ready response cannot restore the idle view of a terminal retirement. */
@@ -2402,6 +2403,7 @@ export class PersistentChatService {
       this.ncSessionFolder.set(null);
       this.cloudSessionUrl.set(null);
       this.sshHandle.set(null);
+      this.workspaceCreation.set(null);
       this.tasks.set([]);
       this.undoAvailable.set(false);
       this.rewindInFlight.set(false);
@@ -3016,6 +3018,7 @@ export class PersistentChatService {
           : null,
       );
       this.workspaceLifecycle.set(thread.workspace_lifecycle ?? null);
+      this.workspaceCreation.set(thread.workspace_creation ?? null);
       if (!lifecycleOnly) {
         this.threadMounts.set(Array.isArray(thread.mounts) ? thread.mounts : []);
         this._protectedCloud.set(!!thread.metadata?.protected_cloud);
@@ -5193,6 +5196,7 @@ export class PersistentChatService {
     this.sshHandle.set(null);
     this.threadStatus.set(null);
     this.workspaceLifecycle.set(null);
+    this.workspaceCreation.set(null);
     this.endedAt.set(null);
     this.retirementDisposition.set(null);
     this.retirementPermanent.set(false);

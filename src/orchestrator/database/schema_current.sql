@@ -2421,6 +2421,235 @@ $_$;
 
 
 --
+-- Name: enforce_container_startup_owner_ready(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_container_startup_owner_ready() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    receipt public.managed_repository_workspace_creation_reservations%ROWTYPE;
+    projection jsonb;
+    prior_status text;
+    hard_deadline timestamptz;
+BEGIN
+    IF TG_TABLE_NAME = 'jobs' THEN
+        projection := NEW.context->'workspace_container';
+        prior_status := OLD.context #>> '{workspace_container,status}';
+        SELECT * INTO receipt
+          FROM public.managed_repository_workspace_creation_reservations
+         WHERE owner_kind = 'job' AND owner_id = NEW.id
+           AND scope = 'workspace_container' AND startup_protocol_version = 1
+           AND settled_at IS NULL
+         LIMIT 1;
+    ELSE
+        projection := NEW.metadata->'workspace_container';
+        prior_status := OLD.metadata #>> '{workspace_container,status}';
+        SELECT * INTO receipt
+          FROM public.managed_repository_workspace_creation_reservations
+         WHERE owner_kind = 'thread' AND owner_id = NEW.id
+           AND scope = 'workspace_container' AND startup_protocol_version = 1
+           AND settled_at IS NULL
+         LIMIT 1;
+    END IF;
+    IF receipt.id IS NULL OR projection->>'status' IS DISTINCT FROM 'ready'
+       OR prior_status = 'ready' THEN
+        RETURN NEW;
+    END IF;
+    hard_deadline := receipt.scheduled_at + make_interval(
+        secs => GREATEST(receipt.ready_budget_seconds,
+                         COALESCE(receipt.pull_budget_seconds, 0)));
+    IF current_setting('srw.container_startup_ready_receipt', true)
+          IS DISTINCT FROM receipt.id::text
+       OR receipt.operation_kind <> 'create'
+       OR receipt.phase <> 'runtime_bound' OR receipt.cancel_requested_at IS NOT NULL
+       OR receipt.expires_at <= clock_timestamp()
+       OR receipt.startup_stage IS DISTINCT FROM 'readiness'
+       OR receipt.startup_state IS DISTINCT FROM 'starting'
+       OR receipt.startup_first_ready_at IS NULL
+       OR clock_timestamp() >= LEAST(
+           receipt.startup_first_ready_at + make_interval(secs => receipt.ssh_budget_seconds),
+           hard_deadline + make_interval(secs => receipt.ssh_budget_seconds))
+       OR projection->>'_runtime_incarnation' IS DISTINCT FROM receipt.pod_uid::text
+       OR projection->>'_creation_reservation_id' IS DISTINCT FROM receipt.id::text
+       OR projection->>'_creation_claim_token' IS DISTINCT FROM receipt.claim_token::text THEN
+        RAISE EXCEPTION 'container startup Ready lacks current stage authority'
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'managed_workspace_startup_owner_ready';
+    END IF;
+    IF TG_TABLE_NAME = 'threads' THEN
+        IF NEW.runtime_generation IS DISTINCT FROM
+           receipt.thread_runtime_generation THEN
+            RAISE EXCEPTION 'container startup Ready generation changed'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'managed_workspace_startup_owner_ready';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: enforce_container_startup_stage_receipt(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_container_startup_stage_receipt() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    owner_runtime jsonb;
+    owner_status text;
+    owner_generation uuid;
+    hard_deadline timestamptz;
+    ssh_deadline timestamptz;
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        IF OLD.startup_protocol_version = 1 AND (
+            NEW.startup_protocol_version IS DISTINCT FROM 1
+            OR NEW.scheduled_at IS DISTINCT FROM OLD.scheduled_at
+               AND OLD.scheduled_at IS NOT NULL
+            OR NEW.startup_first_ready_at IS DISTINCT FROM OLD.startup_first_ready_at
+               AND OLD.startup_first_ready_at IS NOT NULL
+            OR NEW.ready_budget_seconds IS DISTINCT FROM OLD.ready_budget_seconds
+               AND OLD.ready_budget_seconds IS NOT NULL
+            OR NEW.pull_budget_seconds IS DISTINCT FROM OLD.pull_budget_seconds
+               AND OLD.scheduled_at IS NOT NULL
+            OR NEW.ssh_budget_seconds IS DISTINCT FROM OLD.ssh_budget_seconds
+               AND OLD.ssh_budget_seconds IS NOT NULL
+            OR OLD.startup_state = 'attention' AND
+               (NEW.startup_state IS DISTINCT FROM OLD.startup_state
+                OR NEW.startup_reason_code IS DISTINCT FROM OLD.startup_reason_code
+                OR NEW.startup_attention_at IS DISTINCT FROM OLD.startup_attention_at)
+            OR NEW.scope IS DISTINCT FROM OLD.scope
+            OR NEW.operation_kind IS DISTINCT FROM OLD.operation_kind
+            OR NEW.pod_uid IS DISTINCT FROM OLD.pod_uid
+            OR NEW.runtime_incarnation IS DISTINCT FROM OLD.runtime_incarnation
+        ) THEN
+            RAISE EXCEPTION 'container startup authority is immutable'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'managed_workspace_startup_stage_authority';
+        END IF;
+    END IF;
+    IF NEW.startup_protocol_version IS DISTINCT FROM 1 THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.phase NOT IN ('runtime_bound', 'settled', 'aborted')
+       OR (TG_OP = 'INSERT' OR OLD.startup_protocol_version IS DISTINCT FROM 1)
+          AND (NEW.phase <> 'runtime_bound' OR NEW.settled_at IS NOT NULL
+               OR NEW.cancel_requested_at IS NOT NULL) THEN
+        RAISE EXCEPTION 'container startup requires an open bound receipt'
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'managed_workspace_startup_stage_authority';
+    END IF;
+    IF NEW.cancel_requested_at IS NOT NULL THEN
+        -- Native Cancel rotates the claim, then updates the owner projection
+        -- in its owner-ordered transaction. Its physical cleanup/abort path
+        -- must retain the receipt and does not grant a later Ready or a
+        -- successful creation settlement. Do not let this branch bypass the
+        -- Ready marker check below by writing settled after cancellation.
+        IF NEW.phase = 'settled' OR NEW.result_kind = 'settled' THEN
+            RAISE EXCEPTION 'cancelled container startup cannot settle Ready'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'managed_workspace_startup_stage_authority';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF TG_OP = 'UPDATE' AND OLD.startup_protocol_version = 1
+       AND NEW.startup_stage IS NOT DISTINCT FROM OLD.startup_stage
+       AND NEW.startup_state IS NOT DISTINCT FROM OLD.startup_state
+       AND NEW.startup_reason_code IS NOT DISTINCT FROM OLD.startup_reason_code
+       AND NEW.scheduled_at IS NOT DISTINCT FROM OLD.scheduled_at
+       AND NEW.startup_first_ready_at IS NOT DISTINCT FROM OLD.startup_first_ready_at
+       AND NEW.ready_budget_seconds IS NOT DISTINCT FROM OLD.ready_budget_seconds
+       AND NEW.pull_budget_seconds IS NOT DISTINCT FROM OLD.pull_budget_seconds
+       AND NEW.ssh_budget_seconds IS NOT DISTINCT FROM OLD.ssh_budget_seconds
+       AND NEW.startup_attention_at IS NOT DISTINCT FROM OLD.startup_attention_at
+       AND NEW.phase = 'runtime_bound' THEN
+        -- An existing same-generation claim rotates the receipt token before
+        -- updating the owner's token. Check the final pair at commit instead.
+        RETURN NEW;
+    END IF;
+
+    IF NEW.owner_kind = 'job' THEN
+        SELECT context->'workspace_container', status::text
+          INTO owner_runtime, owner_status
+          FROM public.jobs WHERE id = NEW.owner_id;
+        IF owner_status IN ('completed', 'failed', 'cancelled') THEN
+            RAISE EXCEPTION 'container startup owner is terminal'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'managed_workspace_startup_stage_authority';
+        END IF;
+    ELSE
+        SELECT metadata->'workspace_container', status::text, runtime_generation
+          INTO owner_runtime, owner_status, owner_generation
+          FROM public.threads WHERE id = NEW.owner_id;
+        IF owner_status = 'ended'
+           OR owner_generation IS DISTINCT FROM NEW.thread_runtime_generation THEN
+            RAISE EXCEPTION 'container startup owner generation changed'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'managed_workspace_startup_stage_authority';
+        END IF;
+    END IF;
+    IF owner_runtime IS NULL
+       OR owner_runtime->>'_runtime_incarnation' IS DISTINCT FROM NEW.pod_uid::text
+       OR owner_runtime->>'_creation_reservation_id' IS DISTINCT FROM NEW.id::text
+       OR owner_runtime->>'_creation_claim_token' IS DISTINCT FROM NEW.claim_token::text THEN
+        RAISE EXCEPTION 'container startup owner binding changed'
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'managed_workspace_startup_stage_authority';
+    END IF;
+    IF NEW.startup_state = 'attention' AND
+       NEW.startup_reason_code IN ('pull_deadline', 'readiness_deadline') THEN
+        hard_deadline := NEW.scheduled_at + make_interval(
+            secs => GREATEST(NEW.ready_budget_seconds,
+                             COALESCE(NEW.pull_budget_seconds, 0)));
+        IF clock_timestamp() <= hard_deadline THEN
+            RAISE EXCEPTION 'startup deadline has not elapsed'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'managed_workspace_startup_stage_authority';
+        END IF;
+    ELSIF NEW.startup_state = 'attention'
+          AND NEW.startup_reason_code = 'ssh_deadline' THEN
+        hard_deadline := NEW.scheduled_at + make_interval(
+            secs => GREATEST(NEW.ready_budget_seconds,
+                             COALESCE(NEW.pull_budget_seconds, 0)));
+        ssh_deadline := LEAST(
+            NEW.startup_first_ready_at + make_interval(secs => NEW.ssh_budget_seconds),
+            hard_deadline + make_interval(secs => NEW.ssh_budget_seconds));
+        IF NEW.startup_first_ready_at IS NULL
+           OR clock_timestamp() <= ssh_deadline THEN
+            RAISE EXCEPTION 'startup SSH deadline has not elapsed'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'managed_workspace_startup_stage_authority';
+        END IF;
+    END IF;
+    IF NEW.phase = 'settled' AND OLD.phase IS DISTINCT FROM 'settled' THEN
+        hard_deadline := NEW.scheduled_at + make_interval(
+            secs => GREATEST(NEW.ready_budget_seconds,
+                             COALESCE(NEW.pull_budget_seconds, 0)));
+        ssh_deadline := LEAST(
+            NEW.startup_first_ready_at + make_interval(secs => NEW.ssh_budget_seconds),
+            hard_deadline + make_interval(secs => NEW.ssh_budget_seconds));
+        IF current_setting('srw.container_startup_ready_receipt', true)
+              IS DISTINCT FROM NEW.id::text
+           OR NEW.result_kind IS DISTINCT FROM 'settled'
+           OR NEW.startup_stage IS DISTINCT FROM 'readiness'
+           OR NEW.startup_state IS DISTINCT FROM 'starting'
+           OR NEW.startup_first_ready_at IS NULL
+           OR clock_timestamp() >= ssh_deadline
+           OR owner_runtime->>'status' IS DISTINCT FROM 'ready' THEN
+            RAISE EXCEPTION 'container startup cannot settle before authenticated Ready'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'managed_workspace_startup_stage_authority';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: enforce_docker_workspace_reuse_process_zero(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -18485,6 +18714,57 @@ $$;
 
 
 --
+-- Name: validate_container_startup_current_binding(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_container_startup_current_binding() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    current_receipt public.managed_repository_workspace_creation_reservations%ROWTYPE;
+    owner_runtime jsonb;
+    owner_generation uuid;
+BEGIN
+    SELECT * INTO current_receipt
+      FROM public.managed_repository_workspace_creation_reservations
+     WHERE id = NEW.id;
+    IF current_receipt.startup_protocol_version IS DISTINCT FROM 1
+       OR current_receipt.phase <> 'runtime_bound'
+       OR current_receipt.cancel_requested_at IS NOT NULL
+       OR current_receipt.settled_at IS NOT NULL THEN
+        RETURN NULL;
+    END IF;
+    IF current_receipt.owner_kind = 'job' THEN
+        SELECT context->'workspace_container' INTO owner_runtime
+          FROM public.jobs WHERE id = current_receipt.owner_id;
+    ELSE
+        SELECT metadata->'workspace_container', runtime_generation
+          INTO owner_runtime, owner_generation
+          FROM public.threads WHERE id = current_receipt.owner_id;
+        IF owner_generation IS DISTINCT FROM
+           current_receipt.thread_runtime_generation THEN
+            RAISE EXCEPTION 'startup thread generation changed at commit'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'managed_workspace_startup_current_binding';
+        END IF;
+    END IF;
+    IF owner_runtime IS NULL
+       OR owner_runtime->>'_runtime_incarnation' IS DISTINCT FROM
+          current_receipt.pod_uid::text
+       OR owner_runtime->>'_creation_reservation_id' IS DISTINCT FROM
+          current_receipt.id::text
+       OR owner_runtime->>'_creation_claim_token' IS DISTINCT FROM
+          current_receipt.claim_token::text THEN
+        RAISE EXCEPTION 'container startup owner binding changed at commit'
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'managed_workspace_startup_current_binding';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+--
 -- Name: validate_inventory_epoch_last_complete_snapshot(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -22567,6 +22847,16 @@ CREATE TABLE public.managed_repository_workspace_creation_reservations (
     restore_work_completed_at timestamp with time zone,
     restore_work_result_kind text,
     restore_work_projection_transaction_id bigint,
+    startup_protocol_version smallint,
+    startup_stage text,
+    startup_state text,
+    startup_reason_code text,
+    scheduled_at timestamp with time zone,
+    startup_first_ready_at timestamp with time zone,
+    ready_budget_seconds double precision,
+    pull_budget_seconds double precision,
+    ssh_budget_seconds double precision,
+    startup_attention_at timestamp with time zone,
     CONSTRAINT managed_repository_workspace_creation_cancel_shape_check CHECK ((((cancel_requested_at IS NULL) AND (cancel_claim_projection_transaction_id IS NULL) AND (cancel_target_disposition IS NULL) AND (cancel_resource_policy IS NULL) AND (cancel_suspended_at IS NULL) AND (cancel_snapshot_restore_required IS NULL)) OR ((cancel_requested_at IS NOT NULL) AND (cancel_claim_projection_transaction_id IS NOT NULL) AND (cancel_target_disposition IS NOT NULL) AND (cancel_resource_policy = ANY (ARRAY['preserve'::text, 'terminal_reclaim'::text])) AND (cancel_snapshot_restore_required IS NOT NULL) AND ((cancel_target_disposition = 'suspended'::text) OR (cancel_suspended_at IS NULL))))),
     CONSTRAINT managed_repository_workspace_creation_cleanup_shape_check CHECK ((((cancel_cleanup_completed_at IS NULL) AND (cancel_projection_transaction_id IS NULL)) OR ((cancel_cleanup_completed_at IS NOT NULL) AND (cancel_projection_transaction_id IS NOT NULL) AND (cancel_requested_at IS NOT NULL) AND (settled_at IS NOT NULL) AND (result_kind = 'aborted'::text) AND (phase = 'aborted'::text)))),
     CONSTRAINT managed_repository_workspace_creation_effects_check CHECK ((jsonb_typeof(external_effects) = 'object'::text)),
@@ -22579,7 +22869,8 @@ CREATE TABLE public.managed_repository_workspace_creation_reservations (
     CONSTRAINT managed_repository_workspace_creation_runtime_shape_check CHECK ((((runtime_incarnation IS NULL) AND (pod_uid IS NULL)) OR ((runtime_incarnation IS NOT NULL) AND (pod_uid = runtime_incarnation)))),
     CONSTRAINT managed_repository_workspace_creation_scope_check CHECK ((scope = ANY (ARRAY['workspace_container'::text, 'ide'::text]))),
     CONSTRAINT managed_repository_workspace_creation_thread_generation_shape CHECK ((((owner_kind = 'job'::text) AND (thread_runtime_generation IS NULL)) OR ((owner_kind = 'thread'::text) AND (thread_runtime_generation IS NOT NULL)))),
-    CONSTRAINT managed_repository_workspace_restore_work_shape_check CHECK (((restore_work_claim_token >= 0) AND (((restore_work_claimed_by IS NULL) AND (restore_work_claim_expires_at IS NULL)) OR ((restore_work_claimed_by IS NOT NULL) AND (restore_work_claim_expires_at IS NOT NULL) AND (restore_work_claim_token > 0))) AND (((restore_work_result_kind IS NULL) AND (restore_work_projection_transaction_id IS NULL)) OR ((operation_kind = 'restore'::text) AND (result_kind = 'settled'::text) AND (restore_work_completed_at IS NOT NULL) AND (restore_work_projection_transaction_id IS NOT NULL) AND (((scope = 'ide'::text) AND (restore_work_result_kind = ANY (ARRAY['active'::text, 'failed'::text]))) OR ((scope = 'workspace_container'::text) AND (restore_work_result_kind = ANY (ARRAY['ready'::text, 'failed'::text])))))) AND ((restore_work_completed_at IS NULL) OR (restore_work_result_kind IS NOT NULL))))
+    CONSTRAINT managed_repository_workspace_restore_work_shape_check CHECK (((restore_work_claim_token >= 0) AND (((restore_work_claimed_by IS NULL) AND (restore_work_claim_expires_at IS NULL)) OR ((restore_work_claimed_by IS NOT NULL) AND (restore_work_claim_expires_at IS NOT NULL) AND (restore_work_claim_token > 0))) AND (((restore_work_result_kind IS NULL) AND (restore_work_projection_transaction_id IS NULL)) OR ((operation_kind = 'restore'::text) AND (result_kind = 'settled'::text) AND (restore_work_completed_at IS NOT NULL) AND (restore_work_projection_transaction_id IS NOT NULL) AND (((scope = 'ide'::text) AND (restore_work_result_kind = ANY (ARRAY['active'::text, 'failed'::text]))) OR ((scope = 'workspace_container'::text) AND (restore_work_result_kind = ANY (ARRAY['ready'::text, 'failed'::text])))))) AND ((restore_work_completed_at IS NULL) OR (restore_work_result_kind IS NOT NULL)))),
+    CONSTRAINT managed_workspace_startup_stage_shape_check CHECK (COALESCE((((startup_protocol_version IS NULL) AND (startup_stage IS NULL) AND (startup_state IS NULL) AND (startup_reason_code IS NULL) AND (scheduled_at IS NULL) AND (startup_first_ready_at IS NULL) AND (ready_budget_seconds IS NULL) AND (pull_budget_seconds IS NULL) AND (ssh_budget_seconds IS NULL) AND (startup_attention_at IS NULL)) OR ((startup_protocol_version = 1) AND (owner_kind = ANY (ARRAY['job'::text, 'thread'::text])) AND (scope = 'workspace_container'::text) AND (operation_kind = 'create'::text) AND (runtime_incarnation IS NOT NULL) AND (pod_uid = runtime_incarnation) AND (((startup_stage = 'scheduling'::text) AND (startup_state = ANY (ARRAY['observing'::text, 'waiting_capacity'::text])) AND (((startup_state = 'observing'::text) AND (startup_reason_code = ANY (ARRAY['observation_pending'::text, 'scheduling_other'::text]))) OR ((startup_state = 'waiting_capacity'::text) AND (startup_reason_code = ANY (ARRAY['scheduler_unschedulable'::text, 'insufficient_capacity'::text])))) AND (scheduled_at IS NULL) AND (startup_first_ready_at IS NULL) AND (ready_budget_seconds IS NULL) AND (pull_budget_seconds IS NULL) AND (ssh_budget_seconds IS NULL) AND (startup_attention_at IS NULL)) OR ((startup_stage = 'readiness'::text) AND (((startup_state = 'starting'::text) AND (startup_reason_code = 'scheduled'::text) AND (startup_attention_at IS NULL)) OR ((startup_state = 'attention'::text) AND (startup_reason_code = ANY (ARRAY['invalid_image'::text, 'invalid_configuration'::text, 'pull_deadline'::text, 'readiness_deadline'::text, 'ssh_deadline'::text])) AND (startup_attention_at IS NOT NULL))) AND (scheduled_at IS NOT NULL) AND (ready_budget_seconds >= (0.000001)::double precision) AND (ready_budget_seconds < (31536000)::double precision) AND ((pull_budget_seconds IS NULL) OR ((pull_budget_seconds >= (0.000001)::double precision) AND (pull_budget_seconds < (31536000)::double precision))) AND (ssh_budget_seconds >= (0.000001)::double precision) AND (ssh_budget_seconds < (31536000)::double precision) AND ((startup_first_ready_at IS NULL) OR ((startup_first_ready_at >= scheduled_at) AND (startup_first_ready_at <= (scheduled_at + make_interval(secs => GREATEST(ready_budget_seconds, COALESCE(pull_budget_seconds, (0)::double precision))))))))))), false))
 );
 
 
@@ -33429,6 +33720,20 @@ CREATE TRIGGER trg_capture_job_deliverable_contract AFTER INSERT ON public.jobs 
 
 
 --
+-- Name: managed_repository_workspace_creation_reservations trg_container_startup_current_binding; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER trg_container_startup_current_binding AFTER INSERT OR UPDATE ON public.managed_repository_workspace_creation_reservations DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.validate_container_startup_current_binding();
+
+
+--
+-- Name: managed_repository_workspace_creation_reservations trg_container_startup_stage_receipt; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_container_startup_stage_receipt BEFORE INSERT OR UPDATE ON public.managed_repository_workspace_creation_reservations FOR EACH ROW EXECUTE FUNCTION public.enforce_container_startup_stage_receipt();
+
+
+--
 -- Name: docker_workspace_leases trg_docker_workspace_reuse_requires_process_zero; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -33510,6 +33815,13 @@ CREATE TRIGGER trg_jobs_c_require_workspace_cleanup_before_delete BEFORE DELETE 
 --
 
 CREATE TRIGGER trg_jobs_cancel_workspace_creation_on_terminal_status BEFORE UPDATE OF status ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.cancel_workspace_creation_on_terminal_owner_transition();
+
+
+--
+-- Name: jobs trg_jobs_container_startup_ready; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_jobs_container_startup_ready BEFORE UPDATE OF context ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.enforce_container_startup_owner_ready();
 
 
 --
@@ -33692,6 +34004,13 @@ CREATE TRIGGER trg_threads_c_require_workspace_cleanup_before_delete BEFORE DELE
 --
 
 CREATE TRIGGER trg_threads_cancel_workspace_creation_on_terminal_status BEFORE UPDATE OF status ON public.threads FOR EACH ROW EXECUTE FUNCTION public.cancel_workspace_creation_on_terminal_owner_transition();
+
+
+--
+-- Name: threads trg_threads_container_startup_ready; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_threads_container_startup_ready BEFORE UPDATE OF metadata ON public.threads FOR EACH ROW EXECUTE FUNCTION public.enforce_container_startup_owner_ready();
 
 
 --

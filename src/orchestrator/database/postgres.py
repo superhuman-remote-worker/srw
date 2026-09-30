@@ -61,6 +61,17 @@ from orchestrator.database.session_subagent_recovery import (
     settle_session_subagent_batch as _settle_session_subagent_batch,
     stamp_recovered_child,
 )
+from orchestrator.database.container_startup_stage import (
+    BoundPodObserved,
+    ReadyObservedAt,
+    ScheduledAt,
+    StageBudgets,
+    StartupAttention,
+    Unknown,
+    Unscheduled,
+    WorkspaceCreationView,
+    public_workspace_creation_view,
+)
 
 from orchestrator.services.datasource_policy_errors import (
     DatasourcePolicyError as DatasourcePolicyError,
@@ -17022,6 +17033,80 @@ class PostgresDB:
                 )
                 return dict(row) if row is not None else None
 
+    async def container_workspace_creation_views(
+        self, owner_kind: str, owner_ids: Sequence[str | UUID]
+    ) -> dict[UUID, WorkspaceCreationView]:
+        """Read public startup state for exact current receipts in one snapshot.
+
+        Callers first apply their normal owner visibility gate. This read does
+        not claim, renew, adopt or change a creation receipt.
+        """
+
+        if owner_kind not in {"job", "thread"} or not owner_ids:
+            return {}
+        try:
+            ids = list(dict.fromkeys(UUID(str(value)) for value in owner_ids))
+        except (TypeError, ValueError):
+            return {}
+        if owner_kind == "job":
+            owner_table, owner_json = "jobs", "context"
+            owner_guard = "j.status NOT IN ('completed','failed','cancelled')"
+            initial_guard = "j.context #>> '{workspace_container,provisioner}'='k8s'"
+        else:
+            owner_table, owner_json = "threads", "metadata"
+            owner_guard = (
+                "j.status IN ('created','active','awaiting_user') "
+                "AND j.execution_lane='stateless' "
+                "AND j.runtime_generation=r.thread_runtime_generation"
+            )
+            initial_guard = (
+                "j.metadata #>> '{workspace_container,provisioner}'='k8s' "
+                "AND j.metadata #> '{workspace_container,_runtime_creation}'="
+                "jsonb_build_object('generation',j.runtime_generation::text,"
+                "'mode','create','attempted',true,'replaces_uid',NULL) "
+                "AND COALESCE(j.metadata #> '{workspace_container,_snapshot_restore_required}',"
+                "'false'::jsonb)='false'::jsonb "
+                "AND COALESCE(j.metadata->'protected_cloud','false'::jsonb)='false'::jsonb "
+                "AND NOT (j.metadata ?| ARRAY["
+                "'_stateless_workspace_retirement_pending','_stateless_claim_retirement',"
+                "'_stateless_claim_loss_hold','_stateless_claim_losses'])"
+            )
+        query = (
+            "SELECT r.owner_id,r.phase,r.result_kind,r.settled_at,"
+            "r.cancel_requested_at,r.startup_protocol_version,r.startup_stage,"
+            "r.startup_state,r.startup_reason_code,r.scheduled_at,"
+            "r.ready_budget_seconds,r.pull_budget_seconds,r.ssh_budget_seconds,"
+            f"j.{owner_json} #>> '{{workspace_container,status}}' AS workspace_status "
+            f"FROM {owner_table} j JOIN "
+            "managed_repository_workspace_creation_reservations r "
+            "ON r.owner_kind=$2 AND r.owner_id=j.id "
+            "AND r.scope='workspace_container' AND r.operation_kind='create' "
+            f"AND r.id::text=j.{owner_json} #>> "
+            "'{workspace_container,_creation_reservation_id}' "
+            f"AND r.claim_token::text=j.{owner_json} #>> "
+            "'{workspace_container,_creation_claim_token}' "
+            f"AND r.runtime_incarnation::text=j.{owner_json} #>> "
+            "'{workspace_container,_runtime_incarnation}' "
+            "AND r.pod_uid=r.runtime_incarnation "
+            "WHERE j.id=ANY($1::uuid[]) "
+            "AND (r.settled_at IS NULL OR $2='job') "
+            f"AND {owner_guard} AND {initial_guard} "
+            f"AND j.{owner_json} #>> '{{workspace_container,status}}' "
+            "IN ('creating','pending','created') "
+            "AND NOT EXISTS (SELECT 1 FROM "
+            "managed_repository_workspace_cleanup_intents c "
+            "WHERE c.owner_kind=$2 AND c.owner_id=j.id "
+            "AND c.scope='workspace_container' AND c.settled_at IS NULL)"
+        )
+        async with self.acquire() as conn:
+            rows = await conn.fetch(query, ids, owner_kind)
+        views: dict[UUID, WorkspaceCreationView] = {}
+        for row in rows:
+            view = public_workspace_creation_view(row)
+            if view is not None:
+                views[row["owner_id"]] = view
+        return views
+
     async def get_managed_repository_workspace_creation_result(
         self,
         owner_id: str,
@@ -18704,6 +18789,12 @@ class PostgresDB:
                     or str(reservation.get("runtime_incarnation") or "") != runtime
                     or reservation.get("settled_at") is not None
                 ):
+                    return False
+                if reservation.get("startup_protocol_version") == 1:
+                    # Version-1 Ready must close in the same transaction as
+                    # its owner projection. The generic legacy setter cannot
+                    # establish that shared commit even if its caller raced
+                    # an otherwise valid observation.
                     return False
                 try:
                     state = _strict_json_object(owner.get("state"), label=json_column)
@@ -22157,6 +22248,496 @@ class PostgresDB:
                 )
                 return result == "UPDATE 1"
 
+    async def observe_container_startup(
+        self,
+        owner_kind: str,
+        owner_id: str,
+        reservation_id: str,
+        claim_token: int,
+        pod_uid: str,
+        observation: (
+            Unknown | BoundPodObserved | Unscheduled | ScheduledAt
+            | ReadyObservedAt | StartupAttention
+        ),
+        *,
+        budgets: StageBudgets | None = None,
+        adopt_if_unmarked: bool = False,
+    ) -> bool:
+        """Freeze one exact bound Pod's startup evidence under owner authority.
+
+        The caller authenticates the physical Pod before entry. The DB rechecks
+        the current owner, reservation, claim and UID after taking owner then
+        reservation locks; no external work is performed under those locks.
+        """
+
+        try:
+            owner_uuid = UUID(str(owner_id))
+            receipt_uuid = UUID(str(reservation_id))
+            runtime_uuid = UUID(str(pod_uid))
+        except (TypeError, ValueError):
+            return False
+        if (
+            owner_kind not in {"job", "thread"}
+            or type(claim_token) is not int
+            or claim_token <= 0
+            or type(adopt_if_unmarked) is not bool
+            or isinstance(observation, Unknown)
+        ):
+            return False
+        if isinstance(observation, BoundPodObserved):
+            if budgets is not None:
+                return False
+        elif isinstance(observation, Unscheduled):
+            if observation.reason_code not in {
+                "scheduler_unschedulable",
+                "scheduling_other",
+            } or budgets is not None:
+                return False
+        elif isinstance(observation, ScheduledAt):
+            if budgets is not None and not isinstance(budgets, StageBudgets):
+                return False
+        elif isinstance(observation, ReadyObservedAt):
+            if budgets is not None:
+                return False
+        elif isinstance(observation, StartupAttention):
+            if observation.reason_code not in {
+                "invalid_image",
+                "invalid_configuration",
+                "pull_deadline",
+                "readiness_deadline",
+                "ssh_deadline",
+            } or budgets is not None:
+                return False
+        else:
+            return False
+
+        table = "jobs" if owner_kind == "job" else "threads"
+        state_column = "context" if owner_kind == "job" else "metadata"
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                owner = await conn.fetchrow(
+                    f"SELECT status::text AS status, {state_column} AS state, "
+                    + (
+                        "NULL::uuid AS runtime_generation, "
+                        "NULL::text AS execution_lane "
+                        if owner_kind == "job"
+                        else "runtime_generation, execution_lane "
+                    )
+                    + f"FROM {table} WHERE id=$1 FOR UPDATE",
+                    owner_uuid,
+                )
+                if owner is None or str(owner["status"]) in {
+                    "ended",
+                    "suspended",
+                    "completed",
+                    "failed",
+                    "cancelled",
+                }:
+                    return False
+                try:
+                    owner_state = _strict_json_object(
+                        owner["state"], label=state_column
+                    )
+                except RuntimeError:
+                    return False
+                workspace = owner_state.get("workspace_container")
+                if not isinstance(workspace, dict):
+                    return False
+                if owner_kind == "thread":
+                    try:
+                        _, checked_workspace, checked_runtime, marker = (
+                            _stateless_runtime_creation_context(
+                                {
+                                    "status": owner["status"],
+                                    "execution_lane": owner["execution_lane"],
+                                    "runtime_generation": owner["runtime_generation"],
+                                    "metadata": owner["state"],
+                                }
+                            )
+                        )
+                    except RuntimeError:
+                        return False
+                    if (
+                        marker is None
+                        or marker["mode"] != "create"
+                        or marker["attempted"] is not True
+                        or checked_runtime != str(runtime_uuid)
+                    ):
+                        return False
+                    workspace = checked_workspace
+                receipt = await conn.fetchrow(
+                    "SELECT * FROM managed_repository_workspace_creation_reservations "
+                    "WHERE id=$1 AND owner_kind=$2 AND owner_id=$3 "
+                    "AND scope='workspace_container' AND operation_kind='create' "
+                    "FOR UPDATE",
+                    receipt_uuid,
+                    owner_kind,
+                    owner_uuid,
+                )
+                if receipt is None:
+                    return False
+                now = await conn.fetchval("SELECT clock_timestamp()")
+                if (
+                    receipt["phase"] != "runtime_bound"
+                    or receipt["settled_at"] is not None
+                    or receipt["cancel_requested_at"] is not None
+                    or receipt["expires_at"] <= now
+                    or receipt["claim_token"] != claim_token
+                    or receipt["runtime_incarnation"] != runtime_uuid
+                    or receipt["pod_uid"] != runtime_uuid
+                    or owner["runtime_generation"]
+                    != receipt["thread_runtime_generation"]
+                    or workspace.get("_runtime_incarnation") != str(runtime_uuid)
+                    or workspace.get("_creation_reservation_id") != str(receipt_uuid)
+                    or workspace.get("_creation_claim_token") != str(claim_token)
+                    or workspace.get("status") not in {"creating", "pending", "created"}
+                    or await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM "
+                        "managed_repository_workspace_cleanup_intents "
+                        "WHERE owner_kind=$1 AND owner_id=$2 "
+                        "AND scope='workspace_container' AND settled_at IS NULL)",
+                        owner_kind,
+                        owner_uuid,
+                    )
+                ):
+                    return False
+                version = receipt["startup_protocol_version"]
+                if version is None and not adopt_if_unmarked:
+                    return False
+                if version not in (None, 1):
+                    return False
+                if isinstance(observation, BoundPodObserved):
+                    if version == 1:
+                        # Attesting the same bound Pod a second time cannot
+                        # reset a clock, attention, or a later stage.
+                        return True
+                    result = await conn.execute(
+                        "UPDATE managed_repository_workspace_creation_reservations "
+                        "SET startup_protocol_version=1, startup_stage='scheduling', "
+                        "startup_state='observing', "
+                        "startup_reason_code='observation_pending' "
+                        "WHERE id=$1 AND claim_token=$2 AND phase='runtime_bound' "
+                        "AND settled_at IS NULL AND cancel_requested_at IS NULL "
+                        "AND expires_at > clock_timestamp()",
+                        receipt_uuid,
+                        claim_token,
+                    )
+                    return result == "UPDATE 1"
+                if receipt["startup_state"] == "attention":
+                    return False
+                stage = receipt["startup_stage"]
+                state = receipt["startup_state"]
+                reason = receipt["startup_reason_code"]
+                scheduled_at = receipt["scheduled_at"]
+                first_ready_at = receipt["startup_first_ready_at"]
+                ready_seconds = receipt["ready_budget_seconds"]
+                pull_seconds = receipt["pull_budget_seconds"]
+                ssh_seconds = receipt["ssh_budget_seconds"]
+                attention_at = None
+
+                if isinstance(observation, Unscheduled):
+                    if scheduled_at is not None:
+                        return False
+                    stage = "scheduling"
+                    state = (
+                        "waiting_capacity"
+                        if observation.reason_code == "scheduler_unschedulable"
+                        else "observing"
+                    )
+                    reason = observation.reason_code
+                elif isinstance(observation, ScheduledAt):
+                    proposed = observation.scheduled_at
+                    if (
+                        proposed.tzinfo is None
+                        or proposed.utcoffset() is None
+                        or proposed.astimezone(timezone.utc) < receipt["created_at"]
+                        or proposed.astimezone(timezone.utc) > now
+                    ):
+                        return False
+                    proposed = proposed.astimezone(timezone.utc)
+                    if scheduled_at is not None:
+                        if scheduled_at != proposed or (
+                            budgets is not None
+                            and (
+                                ready_seconds != budgets.ready_seconds
+                                or pull_seconds != budgets.pull_seconds
+                                or ssh_seconds != budgets.ssh_seconds
+                            )
+                        ):
+                            return False
+                    else:
+                        if budgets is None:
+                            return False
+                        scheduled_at = proposed
+                        ready_seconds = budgets.ready_seconds
+                        pull_seconds = budgets.pull_seconds
+                        ssh_seconds = budgets.ssh_seconds
+                    stage, state, reason = "readiness", "starting", "scheduled"
+                elif isinstance(observation, ReadyObservedAt):
+                    proposed = observation.ready_at
+                    if (
+                        scheduled_at is None
+                        or proposed.tzinfo is None
+                        or proposed.utcoffset() is None
+                    ):
+                        return False
+                    proposed = proposed.astimezone(timezone.utc)
+                    hard_bound = scheduled_at + timedelta(
+                        seconds=max(ready_seconds, pull_seconds or 0)
+                    )
+                    if proposed < scheduled_at or proposed > now:
+                        return False
+                    if first_ready_at is not None:
+                        return first_ready_at == proposed
+                    if proposed > hard_bound:
+                        stage, state, reason = (
+                            "readiness",
+                            "attention",
+                            "readiness_deadline",
+                        )
+                        attention_at = now
+                    else:
+                        first_ready_at = proposed
+                        if now >= min(
+                            proposed + timedelta(seconds=ssh_seconds),
+                            hard_bound + timedelta(seconds=ssh_seconds),
+                        ):
+                            stage, state, reason = (
+                                "readiness",
+                                "attention",
+                                "ssh_deadline",
+                            )
+                            attention_at = now
+                else:
+                    assert isinstance(observation, StartupAttention)
+                    if scheduled_at is None:
+                        return False
+                    hard_bound = scheduled_at + timedelta(
+                        seconds=max(ready_seconds, pull_seconds or 0)
+                    )
+                    reason = observation.reason_code
+                    if reason in {"pull_deadline", "readiness_deadline"}:
+                        if now <= hard_bound or first_ready_at is not None:
+                            return False
+                    elif reason == "ssh_deadline":
+                        if first_ready_at is None or now <= min(
+                            first_ready_at + timedelta(seconds=ssh_seconds),
+                            hard_bound + timedelta(seconds=ssh_seconds),
+                        ):
+                            return False
+                    stage, state, attention_at = "readiness", "attention", now
+
+                result = await conn.execute(
+                    "UPDATE managed_repository_workspace_creation_reservations "
+                    "SET startup_protocol_version=1, startup_stage=$2, "
+                    "startup_state=$3, startup_reason_code=$4, scheduled_at=$5, "
+                    "startup_first_ready_at=$6, ready_budget_seconds=$7, "
+                    "pull_budget_seconds=$8, ssh_budget_seconds=$9, "
+                    "startup_attention_at=$10 WHERE id=$1 "
+                    "AND claim_token=$11 AND phase='runtime_bound' "
+                    "AND settled_at IS NULL AND cancel_requested_at IS NULL "
+                    "AND expires_at > clock_timestamp()",
+                    receipt_uuid,
+                    stage,
+                    state,
+                    reason,
+                    scheduled_at,
+                    first_ready_at,
+                    ready_seconds,
+                    pull_seconds,
+                    ssh_seconds,
+                    attention_at,
+                    claim_token,
+                )
+                return result == "UPDATE 1"
+
+    async def complete_job_workspace_creation(
+        self,
+        job_id: str,
+        *,
+        runtime_incarnation: str,
+        backing_id: str,
+        ssh_host_key_fingerprint: str,
+        pod_ip: str,
+        port: int,
+        creation_reservation_id: str,
+        creation_claim_token: int,
+        host: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Publish authenticated Job Ready and close its v1 receipt atomically."""
+
+        try:
+            job_uuid = UUID(str(job_id))
+            runtime_uuid = UUID(str(runtime_incarnation))
+            receipt_uuid = UUID(str(creation_reservation_id))
+        except (TypeError, ValueError):
+            return None
+        if (
+            type(creation_claim_token) is not int
+            or creation_claim_token <= 0
+            or not isinstance(backing_id, str)
+            or not backing_id.strip()
+            or len(backing_id) > 512
+            or "\x00" in backing_id
+            or not isinstance(ssh_host_key_fingerprint, str)
+            or not re.fullmatch(
+                r"SHA256:[A-Za-z0-9+/]{43}", ssh_host_key_fingerprint
+            )
+            or not isinstance(pod_ip, str)
+            or not pod_ip
+            or type(port) is not int
+            or not 1 <= port <= 65535
+            or (host is not None and (not isinstance(host, str) or not host))
+        ):
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                owner = await conn.fetchrow(
+                    "SELECT status::text AS status, context FROM jobs "
+                    "WHERE id=$1 FOR UPDATE",
+                    job_uuid,
+                )
+                if owner is None or owner["status"] not in {"created", "processing"}:
+                    return None
+                try:
+                    context = _strict_json_object(owner["context"], label="context")
+                except RuntimeError:
+                    return None
+                workspace = context.get("workspace_container")
+                if (
+                    not isinstance(workspace, dict)
+                    or workspace.get("provisioner") != "k8s"
+                    or workspace.get("status") not in {
+                        "creating", "pending", "created"
+                    }
+                    or workspace.get("_runtime_incarnation") != str(runtime_uuid)
+                    or workspace.get("_creation_reservation_id")
+                    != str(receipt_uuid)
+                    or workspace.get("_creation_claim_token")
+                    != str(creation_claim_token)
+                    or WORKER_EXECUTION_HOLD_KEY in context
+                ):
+                    return None
+                execution = await conn.fetchrow(
+                    "SELECT harness_adapter, "
+                    "created_at + (resolved->'spec'->>'timeoutSeconds')::double precision "
+                    "* interval '1 second' AS deadline_at "
+                    "FROM srw_execution_specs WHERE work_kind='Job' AND work_id=$1 "
+                    "FOR SHARE",
+                    job_uuid,
+                )
+                if execution is not None and execution["harness_adapter"] != "srw/v1":
+                    return None
+                receipt = await conn.fetchrow(
+                    "SELECT * FROM managed_repository_workspace_creation_reservations "
+                    "WHERE id=$1 AND owner_kind='job' AND owner_id=$2 "
+                    "AND scope='workspace_container' AND operation_kind='create' "
+                    "FOR UPDATE",
+                    receipt_uuid,
+                    job_uuid,
+                )
+                if (
+                    receipt is None
+                    or receipt["phase"] != "runtime_bound"
+                    or receipt["settled_at"] is not None
+                    or receipt["cancel_requested_at"] is not None
+                    or receipt["claim_token"] != creation_claim_token
+                    or receipt["runtime_incarnation"] != runtime_uuid
+                    or receipt["pod_uid"] != runtime_uuid
+                    or receipt["startup_protocol_version"] != 1
+                    or receipt["startup_stage"] != "readiness"
+                    or receipt["startup_state"] != "starting"
+                    or receipt["startup_first_ready_at"] is None
+                    or await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM "
+                        "managed_repository_workspace_cleanup_intents "
+                        "WHERE owner_kind='job' AND owner_id=$1 "
+                        "AND scope='workspace_container' AND settled_at IS NULL)",
+                        job_uuid,
+                    )
+                ):
+                    return None
+                hard_bound = receipt["scheduled_at"] + timedelta(
+                    seconds=max(
+                        receipt["ready_budget_seconds"],
+                        receipt["pull_budget_seconds"] or 0,
+                    )
+                )
+                ssh_bound = min(
+                    receipt["startup_first_ready_at"]
+                    + timedelta(seconds=receipt["ssh_budget_seconds"]),
+                    hard_bound + timedelta(seconds=receipt["ssh_budget_seconds"]),
+                )
+                workspace.update(
+                    {
+                        "status": "ready",
+                        "provisioner": "k8s",
+                        "pod_ip": pod_ip,
+                        "port": port,
+                        "_runtime_incarnation": str(runtime_uuid),
+                        "_creation_reservation_id": str(receipt_uuid),
+                        "_creation_claim_token": str(creation_claim_token),
+                    }
+                )
+                if host is None:
+                    workspace.pop("host", None)
+                else:
+                    workspace["host"] = host
+                workspace.pop("error", None)
+                context["workspace_container"] = workspace
+                context["_workspace_binding"] = {
+                    "generation": str(uuid4()),
+                    "kind": "remote",
+                    "backing_id": backing_id,
+                    "ssh_host_key_fingerprint": ssh_host_key_fingerprint,
+                }
+                now = await conn.fetchval("SELECT clock_timestamp()")
+                if (
+                    receipt["expires_at"] <= now
+                    or now >= ssh_bound
+                    or (
+                        execution is not None
+                        and execution["deadline_at"] is not None
+                        and now >= execution["deadline_at"]
+                    )
+                ):
+                    return None
+                await conn.fetchval(
+                    "SELECT set_config('srw.container_startup_ready_receipt', "
+                    "$1, true)",
+                    str(receipt_uuid),
+                )
+                published = await conn.execute(
+                    "UPDATE jobs SET context=$2::jsonb WHERE id=$1 "
+                    "AND clock_timestamp()<$3::timestamptz "
+                    "AND clock_timestamp()<$4::timestamptz "
+                    "AND ($5::timestamptz IS NULL "
+                    "OR clock_timestamp()<$5::timestamptz)",
+                    job_uuid,
+                    json.dumps(context),
+                    receipt["expires_at"],
+                    ssh_bound,
+                    execution["deadline_at"] if execution is not None else None,
+                )
+                if published != "UPDATE 1":
+                    return None
+                closed = await conn.execute(
+                    "UPDATE managed_repository_workspace_creation_reservations "
+                    "SET settled_at=clock_timestamp(), phase='settled', "
+                    "result_kind='settled' WHERE id=$1 AND claim_token=$2 "
+                    "AND phase='runtime_bound' AND settled_at IS NULL "
+                    "AND cancel_requested_at IS NULL "
+                    "AND expires_at>clock_timestamp()",
+                    receipt_uuid,
+                    creation_claim_token,
+                )
+                if closed != "UPDATE 1":
+                    raise RuntimeError("Job Ready publication lost creation receipt")
+                return {
+                    "runtime_incarnation": str(runtime_uuid),
+                    "reservation_id": str(receipt_uuid),
+                }
+
     async def complete_stateless_thread_workspace_creation(
         self,
         thread_id: str,
@@ -22268,6 +22849,30 @@ class PostgresDB:
                 )
                 if reservation is None:
                     return None
+                if reservation["startup_protocol_version"] == 1:
+                    now = await conn.fetchval("SELECT clock_timestamp()")
+                    if (
+                        reservation["startup_stage"] != "readiness"
+                        or reservation["startup_state"] != "starting"
+                        or reservation["startup_first_ready_at"] is None
+                        or reservation["expires_at"] <= now
+                        or reservation["pod_uid"] != UUID(runtime_incarnation)
+                    ):
+                        return None
+                    hard_bound = reservation["scheduled_at"] + timedelta(
+                        seconds=max(
+                            reservation["ready_budget_seconds"],
+                            reservation["pull_budget_seconds"] or 0,
+                        )
+                    )
+                    ssh_bound = min(
+                        reservation["startup_first_ready_at"]
+                        + timedelta(seconds=reservation["ssh_budget_seconds"]),
+                        hard_bound
+                        + timedelta(seconds=reservation["ssh_budget_seconds"]),
+                    )
+                    if now >= ssh_bound:
+                        return None
 
                 binding = metadata.get("_workspace_binding")
                 if binding is not None and not isinstance(binding, dict):
@@ -22315,6 +22920,12 @@ class PostgresDB:
                 workspace.pop(_STATELESS_RUNTIME_CREATION_KEY, None)
                 workspace.pop("error", None)
                 metadata["workspace_container"] = workspace
+                if reservation["startup_protocol_version"] == 1:
+                    await conn.fetchval(
+                        "SELECT set_config('srw.container_startup_ready_receipt', "
+                        "$1, true)",
+                        reservation_id,
+                    )
                 result = await conn.execute(
                     "UPDATE threads SET metadata = $2::jsonb, "
                     "last_activity = CURRENT_TIMESTAMP WHERE id = $1",
@@ -22328,7 +22939,8 @@ class PostgresDB:
                     "SET settled_at = now(), phase = 'settled', result_kind = 'settled' "
                     "WHERE id = $1 AND claim_token = $2 "
                     "AND phase = 'runtime_bound' AND settled_at IS NULL "
-                    "AND cancel_requested_at IS NULL AND expires_at > now()",
+                    "AND cancel_requested_at IS NULL "
+                    "AND expires_at > clock_timestamp()",
                     reservation["id"],
                     creation_claim_token,
                 )
@@ -36997,6 +37609,47 @@ class PostgresDB:
             cursor=cursor,
             exhausted=len(rows) < bounded_limit,
         )
+
+    async def list_current_job_creation_candidates(self, *, after=None, limit=32):
+        """Page open v1 Job receipts; each row is only an observation hint."""
+
+        bounded_limit = max(1, min(int(limit), 64))
+        after_created, after_id = after if after is not None else (None, None)
+        rows = await self.fetch(
+            "SELECT r.created_at, r.id AS reservation_id, r.owner_id AS job_id, "
+            "r.claim_token, r.pod_uid "
+            "FROM managed_repository_workspace_creation_reservations r "
+            "JOIN jobs j ON j.id=r.owner_id "
+            "WHERE r.owner_kind='job' AND r.scope='workspace_container' "
+            "AND r.operation_kind='create' AND r.phase='runtime_bound' "
+            "AND r.startup_protocol_version=1 AND r.settled_at IS NULL "
+            "AND r.cancel_requested_at IS NULL "
+            "AND r.startup_state IN ('observing','waiting_capacity','starting') "
+            "AND r.runtime_incarnation=r.pod_uid AND r.pod_uid IS NOT NULL "
+            "AND j.status IN ('created','processing') "
+            "AND NOT (j.context ? '_worker_execution_hold') "
+            "AND j.context->'workspace_container'->>'provisioner'='k8s' "
+            "AND j.context->'workspace_container'->>'status' "
+            "IN ('created','creating','pending') "
+            "AND j.context->'workspace_container'->>'_creation_reservation_id'=r.id::text "
+            "AND j.context->'workspace_container'->>'_creation_claim_token'=r.claim_token::text "
+            "AND j.context->'workspace_container'->>'_runtime_incarnation'=r.pod_uid::text "
+            "AND NOT EXISTS (SELECT 1 FROM managed_repository_workspace_cleanup_intents c "
+            "WHERE c.owner_kind='job' AND c.owner_id=j.id "
+            "AND c.scope='workspace_container' AND c.settled_at IS NULL) "
+            "AND ($1::timestamptz IS NULL OR (r.created_at,r.id)>($1,$2::uuid)) "
+            "ORDER BY r.created_at,r.id LIMIT $3",
+            after_created,
+            UUID(str(after_id)) if after_id is not None else None,
+            bounded_limit,
+        )
+        return {
+            "candidates": tuple(dict(row) for row in rows),
+            "cursor": (rows[-1]["created_at"], str(rows[-1]["reservation_id"]))
+            if rows
+            else after,
+            "exhausted": len(rows) < bounded_limit,
+        }
 
     async def current_session_creation_candidate_is_exact(self, candidate) -> bool:
         """Recheck the immutable source and current owner under a caller's guard."""
