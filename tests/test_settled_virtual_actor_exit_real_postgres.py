@@ -291,10 +291,13 @@ async def test_process_generation_difference_never_turns_used_life_into_zero_adm
         assert receipt["partial_admission_count"] == int(input_state == "admitted")
     assert str(thread["runtime_retirement_token"]) == retirement["token"]
     assert thread["status"] == status
-    assert await db.fetchval(
-        "SELECT state FROM thread_input_deliveries WHERE delivery_id=$1::uuid",
-        ids["delivery_id"],
-    ) == input_state
+    assert (
+        await db.fetchval(
+            "SELECT state FROM thread_input_deliveries WHERE delivery_id=$1::uuid",
+            ids["delivery_id"],
+        )
+        == input_state
+    )
 
 
 @pytest.mark.asyncio

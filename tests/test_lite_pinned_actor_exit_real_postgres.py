@@ -261,10 +261,13 @@ async def test_used_lite_actor_with_unfinished_input_stays_pending(
     assert receipt["partial_admission_count"] == int(input_state == "admitted")
     assert str(thread["runtime_retirement_token"]) == retirement["token"]
     assert thread["status"] == "active"
-    assert await db.fetchval(
-        "SELECT state FROM thread_input_deliveries WHERE delivery_id=$1::uuid",
-        ids["delivery_id"],
-    ) == input_state
+    assert (
+        await db.fetchval(
+            "SELECT state FROM thread_input_deliveries WHERE delivery_id=$1::uuid",
+            ids["delivery_id"],
+        )
+        == input_state
+    )
 
 
 @pytest.mark.asyncio

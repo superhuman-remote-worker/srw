@@ -320,14 +320,17 @@ async def test_killed_agent_pod_cannot_certify_ambiguous_remote_writers(
     # Even truthful terminal agent-Pod evidence says nothing about a separate
     # workspace process namespace. Neither the API owner nor SQL may borrow
     # the lite/virtual shortcut without that namespace's exact proof.
-    assert await db.acknowledge_abrupt_pinned_actor_exit(
-        ids["thread"],
-        runtime_generation=retirement["generation"],
-        retirement_token=retirement["token"],
-        agent_id=ids["agent"],
-        attach_token=ids["attach_token"],
-        stopped_pod_uid=ids["pod_uid"],
-    ) is None
+    assert (
+        await db.acknowledge_abrupt_pinned_actor_exit(
+            ids["thread"],
+            runtime_generation=retirement["generation"],
+            retirement_token=retirement["token"],
+            agent_id=ids["agent"],
+            attach_token=ids["attach_token"],
+            stopped_pod_uid=ids["pod_uid"],
+        )
+        is None
+    )
     assert not await controls.pinned_retirement_operations(
         main.app.state.resources
     ).recover_captured_process_zero(retirement)
