@@ -4676,18 +4676,19 @@ describe('PersistentChatService — control commands', () => {
     expect(ctx.mockHttp.post).toHaveBeenCalledTimes(3);
   });
 
-  it('/upgrade-workspace defaults to the sandbox tier', async () => {
+  it.each([
+    ['/upgrade-workspace', { method: 'upgrade-to-workspace' }],
+    ['/upgrade-workspace vm', { method: 'upgrade-to-workspace', target_tier: 'vm' }],
+    ['/upgrade-workspace container', { method: 'upgrade-to-workspace', target_tier: 'sandbox' }],
+    [
+      '/upgrade-workspace website-builder',
+      { method: 'upgrade-to-workspace', template: 'website-builder' },
+    ],
+  ])('%s sends %o', async (input: string, control: Record<string, unknown>) => {
     const ctx = await readySession();
-    await ctx.service.sendMessage('/upgrade-workspace');
+    await ctx.service.sendMessage(input);
     const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
-    expect(sent).toContainEqual({ method: 'upgrade-to-workspace', target_tier: 'sandbox' });
-  });
-
-  it('/upgrade-workspace vm requests the vm tier (Phase 2, server-gated)', async () => {
-    const ctx = await readySession();
-    await ctx.service.sendMessage('/upgrade-workspace vm');
-    const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
-    expect(sent).toContainEqual({ method: 'upgrade-to-workspace', target_tier: 'vm' });
+    expect(sent).toContainEqual(control);
   });
 
   it('setMode uses the lane-agnostic REST inbox and never the control WS', async () => {

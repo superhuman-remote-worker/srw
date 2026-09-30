@@ -2285,7 +2285,8 @@
       "supervised": "Switch to supervised mode (approve all writes)",
       "autonomous": "Switch to autonomous mode (approve nothing)",
       "silent": "Hide reasoning and minimize tool detail",
-      "verbose": "Show full reasoning and tool detail"
+      "verbose": "Show full reasoning and tool detail",
+      "upgradeWorkspace": "Upgrade the workspace: no argument for the next tier, \"vm\", or a template name"
     },
     "toolLabels": {
       "read_file": "Reading",
@@ -3370,6 +3371,7 @@
       "workspaceRecommendation": "This Expert recommends {{tier}}. You can choose another workspace.",
       "autonomyDefaultHint": "Controls when the agent pauses for human review",
       "tierCurrent": "current",
+      "tierNext": "the next tier",
       "tierHint": "Upgrades carry your files over and cannot be reversed within the session.",
       "tierUpgrading": "Provisioning {{tier}}…",
       "tierUnreachable": {

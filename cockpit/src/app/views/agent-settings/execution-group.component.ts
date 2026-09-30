@@ -484,11 +484,15 @@ export class ExecutionGroupComponent {
   readonly workspaceBackend = signal<string | null>(null);
   readonly workspaceBackends = WORKSPACE_BACKENDS;
 
-  /** Label for a tier, from the shared `advanced.options.*` vocabulary. An
-   *  unrecognised tier renders its raw value rather than vanishing — better a
-   *  bare string than silently re-labelling the session as something else. */
+  /** Label for a tier, from the shared `advanced.options.*` vocabulary. `next`
+   *  is not a real backend (it means "whatever tier the server picks"), so it
+   *  gets its own label rather than a `WORKSPACE_BACKENDS` lookup. An
+   *  otherwise-unrecognised tier renders its raw value rather than vanishing —
+   *  better a bare string than silently re-labelling the session as something
+   *  else. */
   tierLabel(tier: string): string {
     this.activeLang();
+    if (tier === 'next') return this.transloco.translate('agentSettings.execution.tierNext');
     const known = WORKSPACE_BACKENDS.find((b) => b.value === tier);
     return known ? this.transloco.translate(`advanced.options.${known.i18nKey}`) : tier;
   }

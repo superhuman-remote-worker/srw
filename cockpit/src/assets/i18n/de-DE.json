@@ -2285,7 +2285,8 @@
       "supervised": "Zu Beaufsichtigt wechseln (alle Schreibvorgänge genehmigen)",
       "autonomous": "Zu Autonom wechseln (nichts genehmigen)",
       "silent": "Reasoning ausblenden und Werkzeug-Details minimieren",
-      "verbose": "Vollständiges Reasoning und Werkzeug-Details anzeigen"
+      "verbose": "Vollständiges Reasoning und Werkzeug-Details anzeigen",
+      "upgradeWorkspace": "Arbeitsbereich aufwerten: ohne Angabe die nächste Stufe, \"vm\" oder ein Vorlagenname"
     },
     "toolLabels": {
       "read_file": "Liest",
@@ -3370,6 +3371,7 @@
       "autonomyDefaultHint": "Legt fest, wann der Agent für eine manuelle Prüfung pausiert",
       "narration": "Erzählmodus",
       "tierCurrent": "aktuell",
+      "tierNext": "die nächste Stufe",
       "tierHint": "Beim Upgrade werden deine Dateien übernommen; innerhalb der Sitzung ist es nicht umkehrbar.",
       "tierUpgrading": "{{tier}} wird bereitgestellt…",
       "tierUnreachable": {

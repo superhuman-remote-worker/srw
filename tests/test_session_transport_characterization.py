@@ -1786,14 +1786,20 @@ COMMANDS = [
     pytest.param(
         {"method": "upgrade-to-workspace", "target_tier": "vm"},
         "_handle_workspace_upgrade",
-        {"target_tier": "vm"},
+        {"target_tier": "vm", "template": None},
         id="upgrade-to-workspace",
     ),
     pytest.param(
         {"method": "upgrade-to-workspace"},
         "_handle_workspace_upgrade",
-        {"target_tier": "sandbox"},
-        id="upgrade-to-workspace-default",
+        {"target_tier": None, "template": None},
+        id="upgrade-to-workspace-no-tier",
+    ),
+    pytest.param(
+        {"method": "upgrade-to-workspace", "template": "site"},
+        "_handle_workspace_upgrade",
+        {"target_tier": None, "template": "site"},
+        id="upgrade-to-workspace-template",
     ),
     pytest.param(
         {"method": "rewind", "message_id": "msg-3", "request_id": "req-2"},
