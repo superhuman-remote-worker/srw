@@ -5,7 +5,13 @@ import {TranslocoService} from '@jsverse/transloco';
 import {of, Subject, throwError} from 'rxjs';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 
-import {Datasource, Job, ProjectDatasource} from '../../core/models/api.model';
+import {
+  Datasource,
+  Job,
+  ProjectDatasource,
+  ProjectMemberRole,
+  ProjectWorkspaceDefaults,
+} from '../../core/models/api.model';
 import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {ErrorMessageService} from '../../core/services/error-message.service';
@@ -41,7 +47,32 @@ function linkedDatasource(id: string): ProjectDatasource {
   };
 }
 
-function createComponent(policyAvailable = true) {
+/** The GET's shape for a bare installation, no Project row, VMs on: what a
+ *  freshly-created project's "Workspace defaults" section renders. */
+const WORKSPACE_DEFAULTS: ProjectWorkspaceDefaults = {
+  stored: {jobs: null, sessions: null, container: null, vm: null},
+  managed_by_manifest: false,
+  effective: {
+    jobs: {mode: 'container', source: 'installation'},
+    sessions: {mode: 'virtual', source: 'installation'},
+    container: {template_name: 'container-full', source: 'builtin'},
+    vm: {template_name: 'vm-full', source: 'builtin'},
+  },
+  installation: {jobs: 'container', sessions: 'virtual', container: 'container-full', vm: 'vm-full'},
+  template_problems: {},
+  installation_problems: [],
+  vm_available: true,
+};
+
+/** `createComponent(false)` (a bare boolean) keeps its old meaning:
+ *  `datasourceScopeAutoAttachAvailable`. An options object adds `userRole`,
+ *  which also switches the stubbed project from the suite's default
+ *  (archived, no role — see the "archived read-only settings" describe below)
+ *  to an active one carrying that role, since a role only matters for a
+ *  Project that isn't already read-only for every member. */
+function createComponent(options: boolean | {policyAvailable?: boolean; userRole?: ProjectMemberRole} = true) {
+  const opts = typeof options === 'boolean' ? {policyAvailable: options} : options;
+  const policyAvailable = opts.policyAvailable ?? true;
   const api = {
     getProjectDatasources: vi.fn().mockReturnValue(of([])),
     getLinkableProjectDatasources: vi.fn().mockReturnValue(
@@ -53,13 +84,22 @@ function createComponent(policyAvailable = true) {
     getProjectRepositories: vi.fn().mockReturnValue(of([])),
     attachProjectKnowledgeRepository: vi.fn().mockReturnValue(of({status: 'attached'})),
     getKnowledgeSummary: vi.fn().mockReturnValue(of(null)),
-    getProject: vi.fn().mockReturnValue(of({id: 'project-a', status: 'archived'})),
+    getProject: vi.fn().mockReturnValue(
+      of(
+        opts.userRole
+          ? {id: 'project-a', status: 'active', is_default: false, user_role: opts.userRole}
+          : {id: 'project-a', status: 'archived'},
+      ),
+    ),
     setProjectStatus: vi.fn().mockReturnValue(of({archived: true})),
     updateProject: vi.fn().mockReturnValue(of({status: 'updated'})),
     updateProjectFields: vi.fn().mockReturnValue(of({status: 'updated'})),
     getProjectJobs: vi.fn().mockReturnValue(of([])),
     getProjectMembers: vi.fn().mockReturnValue(of([])),
     getProjectExperts: vi.fn().mockReturnValue(of([])),
+    getProjectWorkspaceDefaults: vi.fn().mockReturnValue(of(WORKSPACE_DEFAULTS)),
+    putProjectWorkspaceDefaults: vi.fn().mockReturnValue(of(WORKSPACE_DEFAULTS)),
+    listWorkspaceTemplates: vi.fn().mockReturnValue(of({resources: []})),
   };
   const currentUser = signal({id: 'user-1', is_admin: false});
   const injector = Injector.create({
@@ -588,5 +628,46 @@ describe('ProjectDetailPageComponent project-memory toggle', () => {
         memory: {project_scoped: false, recall_limit: 5},
       },
     });
+  });
+});
+
+describe('ProjectDetailPageComponent workspace defaults', () => {
+  it('loads the defaults with the project', () => {
+    const {api, component} = createComponent();
+    component.loadAll();
+    expect(api.getProjectWorkspaceDefaults).toHaveBeenCalledWith('project-a');
+    expect(component.workspaceDefaults()?.installation.jobs).toBe('container');
+    expect(component.wdJobs()).toBeNull();
+  });
+
+  it('lets an owner save template references', () => {
+    const {api, component} = createComponent({userRole: 'owner'});
+    component.loadAll();
+    component.wdJobs.set('container');
+    component.wdContainer.set('Catalog/shared/container-minimal');
+    component.saveWorkspaceDefaults();
+    expect(api.putProjectWorkspaceDefaults).toHaveBeenCalledWith('project-a', {
+      jobs: 'container',
+      sessions: null,
+      container: {name: 'container-minimal', scope: {kind: 'Catalog', name: 'shared'}},
+      vm: null,
+    });
+  });
+
+  it('is read-only for viewers, archived projects and manifest-owned defaults', () => {
+    const viewer = createComponent({userRole: 'viewer'});
+    viewer.component.loadAll();
+    expect(viewer.component.canEditWorkspaceDefaults()).toBe(false);
+    const managed = createComponent({userRole: 'owner'});
+    managed.api.getProjectWorkspaceDefaults.mockReturnValue(of({...WORKSPACE_DEFAULTS, managed_by_manifest: true}));
+    managed.component.loadAll();
+    expect(managed.component.canEditWorkspaceDefaults()).toBe(false);
+  });
+
+  it('hides VM choices when VMs are unavailable', () => {
+    const {api, component} = createComponent({userRole: 'owner'});
+    api.getProjectWorkspaceDefaults.mockReturnValue(of({...WORKSPACE_DEFAULTS, vm_available: false}));
+    component.loadAll();
+    expect(component.workspaceModes()).toEqual(['none', 'virtual', 'container']);
   });
 });

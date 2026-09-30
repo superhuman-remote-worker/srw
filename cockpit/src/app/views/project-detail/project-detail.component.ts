@@ -1,5 +1,6 @@
 import {ChangeDetectionStrategy, Component, computed, DestroyRef, inject, OnDestroy, OnInit, signal} from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
+import {forkJoin} from 'rxjs';
 import {ActivatedRoute, Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {MarkdownComponent} from 'ngx-markdown';
@@ -42,8 +43,29 @@ import {
     ProjectRepoRole,
     ProjectRepository,
     ProjectStatus,
+    ProjectWorkspaceDefaults,
     User,
+    WorkspaceMode,
+    WorkspaceTemplateRef,
 } from '../../core/models/api.model';
+
+/** A stored template selection (`ProjectWorkspaceDefaults.stored.container`
+ *  or `.vm`) is `{"ref": {...}}` for a Settings row or `{"inline": {...}}`
+ *  for one the manifest owns; only a `ref` maps to one of this tab's own
+ *  `<option>` values. */
+function templateKey(selection: Record<string, unknown> | null): string | null {
+  const ref = selection?.['ref'] as WorkspaceTemplateRef | undefined;
+  return ref ? `${ref.scope.kind}/${ref.scope.name}/${ref.name}` : null;
+}
+
+/** Inverse of the option `key` built in `loadWorkspaceDefaults`
+ *  (`${scope.kind}/${scope.name}/${name}`) — split on the first two slashes
+ *  only, since a template name may itself contain one. */
+function templateRef(key: string | null): WorkspaceTemplateRef | null {
+  if (!key) return null;
+  const [kind, name, ...rest] = key.split('/');
+  return {name: rest.join('/'), scope: {kind, name}};
+}
 
 type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'experts' | 'members' | 'loop' | 'centurion' | 'settings';
 
@@ -989,6 +1011,111 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   <p class="text-muted setting-desc">
                     {{ 'projectDetail.settings.networkTierDesc' | transloco }}
                   </p>
+                </div>
+              }
+
+              <!-- Workspace defaults: what Jobs and Sessions in this Project
+                   get when they don't pick a workspace (spec §6). Read-only
+                   while archived, manifest-owned, or the caller isn't an
+                   owner/admin — canEditWorkspaceDefaults() covers all three,
+                   the fields stay visible either way. -->
+              @if (workspaceDefaults(); as wd) {
+                <div class="settings-group">
+                  <h3 class="settings-heading">{{ 'projectDetail.settings.workspaceDefaults' | transloco }}</h3>
+                  <p class="text-muted setting-desc">
+                    {{ 'projectDetail.settings.workspaceDefaultsHint' | transloco }}
+                  </p>
+                  @if (wd.managed_by_manifest) {
+                    <p class="archived-note" role="note">
+                      {{ 'projectDetail.settings.workspaceDefaultsManaged' | transloco }}
+                    </p>
+                  }
+                  @for (problem of wd.installation_problems; track problem) {
+                    <p class="edit-error" role="alert">{{ problem }}</p>
+                  }
+                  <app-form-field [label]="'projectDetail.settings.workspaceJobs' | transloco">
+                    <app-select
+                      [value]="wdJobs() ?? ''"
+                      [disabled]="!canEditWorkspaceDefaults()"
+                      (changed)="wdJobs.set($any($event) || null)"
+                    >
+                      <option value="">{{
+                        'projectDetail.settings.installationDefault' | transloco: { value: modeLabel(wd.installation.jobs) }
+                      }}</option>
+                      @for (mode of workspaceModes(); track mode) {
+                        <option [value]="mode">{{ modeLabel(mode) }}</option>
+                      }
+                    </app-select>
+                  </app-form-field>
+                  <app-form-field [label]="'projectDetail.settings.workspaceSessions' | transloco">
+                    <app-select
+                      [value]="wdSessions() ?? ''"
+                      [disabled]="!canEditWorkspaceDefaults()"
+                      (changed)="wdSessions.set($any($event) || null)"
+                    >
+                      <option value="">{{
+                        'projectDetail.settings.installationDefault' | transloco: { value: modeLabel(wd.installation.sessions) }
+                      }}</option>
+                      @for (mode of workspaceModes(); track mode) {
+                        <option [value]="mode">{{ modeLabel(mode) }}</option>
+                      }
+                    </app-select>
+                  </app-form-field>
+                  <app-form-field
+                    [label]="'projectDetail.settings.workspaceContainerTemplate' | transloco"
+                    [hint]="wd.template_problems.container ?? ''"
+                  >
+                    <app-select
+                      [value]="wd.managed_by_manifest && wd.stored.container ? 'manifest' : (wdContainer() ?? '')"
+                      [disabled]="!canEditWorkspaceDefaults()"
+                      (changed)="wdContainer.set($event || null)"
+                    >
+                      <option value="">{{
+                        'projectDetail.settings.installationDefault' | transloco: { value: wd.installation.container ?? modeLabel('container') }
+                      }}</option>
+                      @if (wd.managed_by_manifest && wd.stored.container) {
+                        <option value="manifest">{{ 'projectDetail.settings.fromManifest' | transloco }}</option>
+                      }
+                      @for (t of containerTemplates(); track t.key) {
+                        <option [value]="t.key">{{ t.label }}</option>
+                      }
+                    </app-select>
+                  </app-form-field>
+                  @if (wd.vm_available) {
+                    <app-form-field
+                      [label]="'projectDetail.settings.workspaceVmTemplate' | transloco"
+                      [hint]="wd.template_problems.vm ?? ''"
+                    >
+                      <app-select
+                        [value]="wd.managed_by_manifest && wd.stored.vm ? 'manifest' : (wdVm() ?? '')"
+                        [disabled]="!canEditWorkspaceDefaults()"
+                        (changed)="wdVm.set($event || null)"
+                      >
+                        <option value="">{{
+                          'projectDetail.settings.installationDefault' | transloco: { value: wd.installation.vm ?? modeLabel('vm') }
+                        }}</option>
+                        @if (wd.managed_by_manifest && wd.stored.vm) {
+                          <option value="manifest">{{ 'projectDetail.settings.fromManifest' | transloco }}</option>
+                        }
+                        @for (t of vmTemplates(); track t.key) {
+                          <option [value]="t.key">{{ t.label }}</option>
+                        }
+                      </app-select>
+                    </app-form-field>
+                  }
+                  @if (canEditWorkspaceDefaults()) {
+                    <div class="settings-actions">
+                      <app-button
+                        variant="primary"
+                        size="sm"
+                        [loading]="isSavingWorkspaceDefaults()"
+                        [disabled]="isSavingWorkspaceDefaults()"
+                        (clicked)="saveWorkspaceDefaults()"
+                      >
+                        {{ 'projectDetail.settings.save' | transloco }}
+                      </app-button>
+                    </div>
+                  }
                 </div>
               }
 
@@ -2016,6 +2143,31 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     return typeof defaultVal === 'boolean' ? defaultVal : true;
   });
 
+  // Settings tab: workspace defaults
+  readonly workspaceDefaults = signal<ProjectWorkspaceDefaults | null>(null);
+  readonly wdJobs = signal<WorkspaceMode | null>(null);
+  readonly wdSessions = signal<WorkspaceMode | null>(null);
+  readonly wdContainer = signal<string | null>(null);
+  readonly wdVm = signal<string | null>(null);
+  readonly isSavingWorkspaceDefaults = signal(false);
+  readonly workspaceTemplates = signal<{key: string; label: string; backend: string}[]>([]);
+  readonly containerTemplates = computed(() => this.workspaceTemplates().filter((t) => t.backend === 'sandbox'));
+  readonly vmTemplates = computed(() => this.workspaceTemplates().filter((t) => t.backend === 'vm'));
+  /** Manifest-owned rows, archived Projects and non-owner/non-admin members
+   *  all render the same read-only fields (spec §6, Project page Settings
+   *  tab) — one gate for the template and the save button alike. */
+  readonly canEditWorkspaceDefaults = computed(
+    () =>
+      !this.isArchived() &&
+      !this.workspaceDefaults()?.managed_by_manifest &&
+      (this.isAdmin() || this.project()?.user_role === 'owner'),
+  );
+  readonly workspaceModes = computed<WorkspaceMode[]>(() =>
+    this.workspaceDefaults()?.vm_available === false
+      ? ['none', 'virtual', 'container']
+      : ['none', 'virtual', 'container', 'vm'],
+  );
+
   // Knowledge tab
   readonly kbSummary = signal<KnowledgeSummary | null>(null);
   readonly kbNotes = signal<KnowledgeNote[]>([]);
@@ -2114,6 +2266,8 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
         this.settingsCloudReadOnly.set(p.cloud_storage_read_only ?? false);
         this.settingsNetworkTier.set(p.network_tier ?? 'internet-only');
       }
+      // Reads this.project(), just set above, to decide the template scopes.
+      this.loadWorkspaceDefaults();
     });
     this.loadJobs();
     this.loadRepos();
@@ -2558,6 +2712,79 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
         this.reportEditFailure(err);
       },
     });
+  }
+
+  /** Workspace defaults: the Project's row in the chain (spec §6, Project
+   *  page Settings tab). Loads the stored/effective/installation view plus
+   *  the templates this Project may pick from, in the Catalog, Project and
+   *  (for the personal project) Account scopes. */
+  loadWorkspaceDefaults(): void {
+    this.api.getProjectWorkspaceDefaults(this.projectId).subscribe({
+      next: (wd) => this.applyWorkspaceDefaults(wd),
+      error: () => this.workspaceDefaults.set(null),
+    });
+    const scopes: [string, string][] = [
+      ['Catalog', 'shared'],
+      ['Project', this.projectId],
+    ];
+    if (this.project()?.is_default) scopes.push(['Account', 'me']);
+    const me = this.userService.currentUser()?.id ?? 'me';
+    forkJoin(scopes.map(([kind, name]) => this.api.listWorkspaceTemplates(kind, name))).subscribe((lists) =>
+      this.workspaceTemplates.set(
+        lists.flatMap((list) =>
+          list.resources.map(({resource}) => {
+            const scope = resource.metadata.scope;
+            // The option list keys an Account scope to the caller's own id,
+            // not the literal 'me' sent in the query, so a stored personal-
+            // project Account ref (normalized to the caller's id server-side)
+            // matches an option here — see templateKey above.
+            const scopeName = scope.kind === 'Account' ? me : scope.name;
+            return {
+              key: `${scope.kind}/${scopeName}/${resource.metadata.name}`,
+              label: resource.metadata.annotations?.['srw.io/display-name'] ?? resource.metadata.name,
+              backend: resource.spec.backend ?? '',
+            };
+          }),
+        ),
+      ),
+    );
+  }
+
+  private applyWorkspaceDefaults(wd: ProjectWorkspaceDefaults): void {
+    this.workspaceDefaults.set(wd);
+    this.wdJobs.set(wd.stored.jobs);
+    this.wdSessions.set(wd.stored.sessions);
+    this.wdContainer.set(templateKey(wd.stored.container));
+    this.wdVm.set(templateKey(wd.stored.vm));
+  }
+
+  saveWorkspaceDefaults(): void {
+    if (!this.canEditWorkspaceDefaults()) return;
+    this.isSavingWorkspaceDefaults.set(true);
+    this.editError.set(null);
+    this.api
+      .putProjectWorkspaceDefaults(this.projectId, {
+        jobs: this.wdJobs(),
+        sessions: this.wdSessions(),
+        container: templateRef(this.wdContainer()),
+        vm: templateRef(this.wdVm()),
+      })
+      .subscribe({
+        next: (wd) => {
+          this.applyWorkspaceDefaults(wd);
+          this.isSavingWorkspaceDefaults.set(false);
+        },
+        error: (err: unknown) => {
+          this.editError.set(this.errors.translate(err, 'projectDetail.settings.workspaceDefaultsSaveFailed'));
+          this.isSavingWorkspaceDefaults.set(false);
+        },
+      });
+  }
+
+  /** Renders a `WorkspaceMode` ('none' | 'virtual' | 'container' | 'vm') as
+   *  its translated label, for the "Installation default (…)" option text. */
+  modeLabel(mode: string | null | undefined): string {
+    return mode ? this.transloco.translate(`projectDetail.settings.workspaceMode.${mode}`) : '';
   }
 
   /** One place for "the server refused this edit". The 409 an archived project
