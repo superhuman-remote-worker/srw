@@ -12182,7 +12182,11 @@ BEGIN
         IF context->>'workspace_backend' IS DISTINCT FROM 'vm'
            OR jsonb_typeof(source) IS DISTINCT FROM 'object'
            OR source->'captured_vm'->>'vm_uid' IS NOT NULL
-           OR owner_row.metadata->'vm' IS DISTINCT FROM source->'captured_vm'
+           OR (
+               owner_row.metadata->'vm' IS DISTINCT FROM source->'captured_vm'
+               AND NOT public.thread_vm_creation_never_issued_source(
+                   owner_row.id,source->>'provision_generation')
+           )
            OR NOT EXISTS (
                SELECT 1 FROM public.vm_creation_retries c
                 WHERE c.request_id::text=source->>'request_id'
