@@ -12646,6 +12646,7 @@ class PostgresDB:
         assignment_source: str,
         expected_status: str,
         upgrade_config: dict | None = None,
+        upgrade_sources: dict | None = None,
     ) -> bool:
         """Atomically authorize an intentional in-process workspace upgrade.
 
@@ -12659,9 +12660,10 @@ class PostgresDB:
         only supported in-process job transition is ``virtual|none`` to
         ``sandbox``.  VM approval has its own status/control transaction.
 
-        ``upgrade_config`` (the upgrade's rendered container template) lands
-        in ``context.workspace_container`` in the same statement as the
-        ``pending`` marker, so the provisioner never sees one without the other.
+        ``upgrade_config`` (the upgrade's rendered container settings) and
+        ``upgrade_sources`` land in ``context.workspace_container`` in the same
+        statement as the ``pending`` marker, so the provisioner never sees one
+        without the others.
         """
 
         import json as json_module
@@ -12684,6 +12686,7 @@ class PostgresDB:
         pending: dict[str, Any] = {"status": "pending"}
         if upgrade_config is not None:
             pending["upgrade_config"] = upgrade_config
+            pending["upgrade_sources"] = upgrade_sources
         normalized_config_backend = (
             "CASE lower(COALESCE(config_override->'workspace'->>'backend', "
             "'sandbox')) WHEN 'container' THEN 'sandbox' "

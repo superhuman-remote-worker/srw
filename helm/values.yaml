@@ -2757,7 +2757,10 @@ workspace:
     # larger than vmController.vmDiskSize on purpose: a VM is usually chosen to
     # install software, and 20Gi fills quickly. The VM controller never makes a
     # disk smaller than vmController.vmDiskSize, so a larger vmDiskSize wins.
-    # These values don't change a VM that is selected without a template.
+    # A VM upgrade (a Session's, or a Job frozen for sudo) that names no
+    # template gets the VM template of the workspace defaults, vm-full unless
+    # workspace.defaults.vm or the Project names another, so it gets these
+    # sizes too. They don't change a VM whose recipe states only backend: vm.
     vmResources:
       cpu: 8
       memory: 16Gi

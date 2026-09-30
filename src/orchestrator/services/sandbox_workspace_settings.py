@@ -104,7 +104,6 @@ async def resolve_sandbox_settings(
         upgrade = object_value(
             object_value(context.get("workspace_container")).get("upgrade_config")
         )
-        upgrade.pop("sources", None)
         if upgrade:
             return SandboxSettings.from_policy({"workspace": {"sandbox": upgrade}})
     return settings

@@ -138,6 +138,10 @@ CONTAINER_UPGRADE_UNAVAILABLE = (
     "Container upgrades of a running Session are unavailable; "
     "start a new Session with this template."
 )
+RETAINED_UPGRADE_UNAVAILABLE = (
+    "Upgrades can't use a template that keeps its workspace; "
+    "start new work with this template."
+)
 OWNER_UNAVAILABLE = "The execution owner is unavailable."
 
 
@@ -257,4 +261,48 @@ async def render_upgrade_workspace(
     # move work to a different tier: fail closed.
     if backend_mode(resolved["template"]["inline"]["backend"]) != mode:
         raise HTTPException(409, WRONG_TIER_TEMPLATE.format(tier=mode))
+    # The rendered settings can't carry retention: a kept workspace would be
+    # provisioned as an ordinary one and deleted when the work ends.
+    if resolved["template"]["inline"].get("retention") == "Retain":
+        raise HTTPException(409, RETAINED_UPGRADE_UNAVAILABLE)
     return mode, srw_workspace_config(resolved), sources
+
+
+async def upgrade_record(
+    db: Any,
+    user_id: Any,
+    *,
+    role: str,
+    project_id: str | None,
+    current_backend: str,
+    requested_backend: str,
+    template_name: str | None = None,
+) -> tuple[str, dict]:
+    """The tier an upgrade moves to and the record it keeps next to it.
+
+    The record is ``{"upgrade_config": <rendered settings>, "upgrade_sources":
+    <sources>}``. Templates are read as the work's owner. Ownerless work
+    (trusted internal Jobs, their subjobs, agent child threads) has nobody to
+    read them as: without a named template it keeps its bare provisioning.
+    """
+    from shared.workspace_defaults import MODE_BACKEND, backend_mode
+
+    if not user_id and not template_name:
+        return backend_mode(requested_backend), {
+            "upgrade_config": {},
+            "upgrade_sources": None,
+        }
+    owner = await work_owner(db, user_id)
+    mode, config, sources = await render_upgrade_workspace(
+        db,
+        owner,
+        role=role,
+        project_id=project_id,
+        current_backend=current_backend,
+        requested_backend=requested_backend,
+        template_name=template_name,
+    )
+    return mode, {
+        "upgrade_config": config.get(MODE_BACKEND[mode], {}),
+        "upgrade_sources": sources,
+    }

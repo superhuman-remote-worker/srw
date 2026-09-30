@@ -2422,14 +2422,12 @@ class JobControlOperations:
             #    existing vm siblings are preserved. The VM provisions the
             #    defaults chain's VM template, read as the Job's owner.
             from orchestrator.services.workspace_defaults_resolution import (
-                render_upgrade_workspace,
-                work_owner,
+                upgrade_record,
             )
 
-            owner = await work_owner(self.dependencies.store, job.get("user_id"))
-            _, upgrade_config, upgrade_sources = await render_upgrade_workspace(
+            _, upgrade = await upgrade_record(
                 self.dependencies.store,
-                owner,
+                job.get("user_id"),
                 role="worker",
                 project_id=str(job["project_id"]) if job.get("project_id") else None,
                 current_backend="sandbox",
@@ -2439,8 +2437,7 @@ class JobControlOperations:
                 "requested": True,
                 "upgrade_from": "container",
                 "upgrade_command": frozen_data.get("command", ""),
-                "upgrade_config": upgrade_config.get("vm", {}),
-                "upgrade_sources": upgrade_sources,
+                **upgrade,
             }
             upgraded_workspace_contract = {
                 "version": 1,

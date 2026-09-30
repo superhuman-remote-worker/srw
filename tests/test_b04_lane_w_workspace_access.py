@@ -590,12 +590,11 @@ class TestProvisionJobWorkspace:
             "requested_backend": "virtual",
             "assignment_source": "runtime_workspace_upgrade",
             "expected_status": "processing",
-            "upgrade_config": {
-                "sources": {
-                    "tier": "upgrade",
-                    "template": "builtin",
-                    "template_name": None,
-                }
+            "upgrade_config": {},
+            "upgrade_sources": {
+                "tier": "upgrade",
+                "template": "builtin",
+                "template_name": None,
             },
         }
         wire.holder.store.get_user.assert_awaited_once_with(USER["id"])

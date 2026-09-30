@@ -68,11 +68,8 @@ async def test_a_job_container_upgrade_uses_its_template_settings(monkeypatch):
                 "id": JOB_ID,
                 "context": {
                     "workspace_container": {
-                        "upgrade_config": {
-                            "image": "r.example/site:1",
-                            "cpu": 1,
-                            "sources": {"tier": "upgrade"},
-                        }
+                        "upgrade_config": {"image": "r.example/site:1", "cpu": 1},
+                        "upgrade_sources": {"tier": "upgrade"},
                     }
                 },
             }
