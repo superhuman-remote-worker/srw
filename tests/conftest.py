@@ -470,6 +470,8 @@ def fake_db(
         side_effect=list_datasource_projects_bulk
     )
     db.list_datasources = AsyncMock(side_effect=list_datasources)
+    # This graph has no open container workspace creation receipts.
+    db.container_workspace_creation_views = AsyncMock(return_value={})
 
     # PostgresDB.acquire() is an @asynccontextmanager, not a coroutine: the
     # owner reads (read_vm_idle_states on job/thread detail and list, and
