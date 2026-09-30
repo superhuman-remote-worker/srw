@@ -130,10 +130,15 @@ async def assert_cleared(case, database):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("adoption_enabled", [False, True])
 async def test_normal_ensure_clears_then_restores_exact_retained_volume(
-    database, actor, monkeypatch
+    database, actor, monkeypatch, adoption_enabled
 ):
     case = await suspended_case(database, actor, monkeypatch)
+    monkeypatch.setenv(
+        "CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED",
+        str(adoption_enabled).lower(),
+    )
     first = await ensure(case, database)
     assert first.outcome == EnsureOutcome.PENDING
     current = await database.get_thread(case.thread_id)
@@ -151,6 +156,11 @@ async def test_normal_ensure_clears_then_restores_exact_retained_volume(
     )
     assert restore["claimed_by"] == f"container-restore:{case.source['id']}"
     assert restore["result_kind"] == "settled"
+    # Startup stage adoption applies to fresh creation, not the retained-disk
+    # restore operation or its separate work-completion authority.
+    assert restore["startup_protocol_version"] is None
+    assert restore["startup_state"] is None
+    assert restore["scheduled_at"] is None
     assert restore["restore_work_completed_at"] is not None
     assert restore["restore_work_result_kind"] == "ready"
     assert (
