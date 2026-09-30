@@ -124,27 +124,24 @@ BEGIN
     IF backend IS DISTINCT FROM 'virtual' AND backend IS DISTINCT FROM 'none' THEN
         RETURN NULL;
     END IF;
-    -- A virtual actor owns exactly its rclone backing; a lite actor owns no
-    -- backing at all. Either way the captured binding must match what the
-    -- live row still advertises.
-    IF backend = 'virtual' AND (
-           jsonb_typeof(binding) IS DISTINCT FROM 'object'
-        OR binding->>'kind' IS DISTINCT FROM 'virtual'
-        OR COALESCE(binding->>'backing_id', '') !~ '^rclone:[0-9a-f]{64}$'
-        OR COALESCE(binding->>'generation', '') !~
-           '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-        OR binding->'ssh_host_key_fingerprint' IS DISTINCT FROM 'null'::jsonb
-        OR binding - ARRAY['generation','kind','backing_id','ssh_host_key_fingerprint']
-           IS DISTINCT FROM '{}'::jsonb
-        OR owner_row.metadata->'_workspace_binding' IS DISTINCT FROM binding
-    ) THEN
-        RETURN NULL;
-    END IF;
-    IF backend = 'none' AND (
-           COALESCE(binding, 'null'::jsonb) NOT IN ('null'::jsonb, '{}'::jsonb)
-        OR COALESCE(owner_row.metadata->'_workspace_binding', 'null'::jsonb)
-           NOT IN ('null'::jsonb, '{}'::jsonb)
-    ) THEN
+    -- Virtual without backing and none both own only their exact agent Pod.
+    -- Absence must agree in captured and current authority; a partial or
+    -- physical binding is never inferred away from a terminal agent Pod.
+    IF COALESCE(binding, 'null'::jsonb) IN ('null'::jsonb, '{}'::jsonb) THEN
+        IF COALESCE(owner_row.metadata->'_workspace_binding', 'null'::jsonb)
+           NOT IN ('null'::jsonb, '{}'::jsonb) THEN
+            RETURN NULL;
+        END IF;
+    ELSIF backend IS DISTINCT FROM 'virtual'
+       OR jsonb_typeof(binding) IS DISTINCT FROM 'object'
+       OR binding->>'kind' IS DISTINCT FROM 'virtual'
+       OR COALESCE(binding->>'backing_id', '') !~ '^rclone:[0-9a-f]{64}$'
+       OR COALESCE(binding->>'generation', '') !~
+          '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+       OR binding->'ssh_host_key_fingerprint' IS DISTINCT FROM 'null'::jsonb
+       OR binding - ARRAY['generation','kind','backing_id','ssh_host_key_fingerprint']
+          IS DISTINCT FROM '{}'::jsonb
+       OR owner_row.metadata->'_workspace_binding' IS DISTINCT FROM binding THEN
         RETURN NULL;
     END IF;
     IF context->>'generation' IS DISTINCT FROM generation_id::text

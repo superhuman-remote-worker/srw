@@ -154,12 +154,17 @@ async def _schema_applied(pg_dsn):
             "SELECT to_regclass('public.thread_agent_pod_recycle_handoffs') IS NOT NULL"
         ):
             await conn.execute(PINNED_RECYCLE_MIGRATION.read_text())
-        await conn.execute(
-            (
+        for name in (
+            "0313_pinned_abrupt_actor_exit.sql",
+            "0317_pinned_virtual_without_backing_abrupt_exit.sql",
+        ):
+            migration = (
                 Path(__file__).resolve().parents[1]
-                / "src/orchestrator/database/migrations/app/0313_pinned_abrupt_actor_exit.sql"
-            ).read_text()
-        )
+                / "src/orchestrator/database/migrations/app"
+                / name
+            )
+            if migration.exists():
+                await conn.execute(migration.read_text())
     finally:
         await conn.close()
 

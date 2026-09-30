@@ -1,5 +1,6 @@
 """Killed pinned life: truthful Pod zero, durable inbox and exact successor."""
 
+import json
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock
@@ -30,16 +31,20 @@ _base_db = fixtures.db
 @pytest_asyncio.fixture(scope="module")
 async def _schema_applied(pg_dsn):
     await fixtures._schema_applied.__wrapped__(pg_dsn)
-    migration = (
-        Path(__file__).resolve().parents[1]
-        / "src/orchestrator/database/migrations/app/0313_pinned_abrupt_actor_exit.sql"
+    migration_root = (
+        Path(__file__).resolve().parents[1] / "src/orchestrator/database/migrations/app"
     )
-    if migration.exists():
-        conn = await asyncpg.connect(pg_dsn)
-        try:
-            await conn.execute(migration.read_text())
-        finally:
-            await conn.close()
+    conn = await asyncpg.connect(pg_dsn)
+    try:
+        for name in (
+            "0313_pinned_abrupt_actor_exit.sql",
+            "0317_pinned_virtual_without_backing_abrupt_exit.sql",
+        ):
+            migration = migration_root / name
+            if migration.exists():
+                await conn.execute(migration.read_text())
+    finally:
+        await conn.close()
 
 
 @pytest_asyncio.fixture
@@ -76,7 +81,7 @@ async def killed_life(
     deliveries = []
     async with db.acquire() as conn:
         async with conn.transaction():
-            for index in range(2):
+            for index in range(3 if partial else 2):
                 row = await persist_input_delivery(
                     conn,
                     thread_id=ids["thread"],
@@ -91,7 +96,7 @@ async def killed_life(
                     session_runtime_generation=generation,
                     runtime_attach_token=ids["attach_token"],
                 )
-                if index == 0:
+                if index == 0 or (partial and index == 1):
                     assert await mark_input_delivery_queued(
                         conn,
                         delivery_id=row["delivery_id"],
@@ -102,7 +107,7 @@ async def killed_life(
                         runtime_attach_token=ids["attach_token"],
                         claim_generation=int(row["claim_generation"]),
                     )
-                    if partial:
+                    if partial and index == 0:
                         assert await transition_input_delivery(
                             conn,
                             delivery_id=row["delivery_id"],
@@ -198,11 +203,16 @@ async def test_killed_life_zero_preserves_stranded_inputs(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("with_virtual_binding", [True, False])
+@pytest.mark.parametrize("partial", [False, True])
 async def test_killed_life_end_resume_and_successor_claim_each_stranded_input_once(
-    db, monkeypatch, with_virtual_binding
+    db, monkeypatch, with_virtual_binding, partial
 ):
     ids, retirement, deliveries, _, _ = await killed_life(
-        db, monkeypatch, backend="virtual", with_virtual_binding=with_virtual_binding
+        db,
+        monkeypatch,
+        backend="virtual",
+        with_virtual_binding=with_virtual_binding,
+        partial=partial,
     )
     assert await controls.pinned_retirement_operations(
         main.app.state.resources
@@ -237,7 +247,9 @@ async def test_killed_life_end_resume_and_successor_claim_each_stranded_input_on
                 session_runtime_generation=str(successor["runtime_generation"]),
                 runtime_attach_token=str(successor["runtime_attach_token"]),
             )
-            assert [r["delivery_id"] for r in recovered] == deliveries
+            assert [r["delivery_id"] for r in recovered] == (
+                deliveries[1:] if partial else deliveries
+            )
             for row in recovered:
                 authority = dict(
                     delivery_id=row["delivery_id"],
@@ -267,6 +279,14 @@ async def test_killed_life_end_resume_and_successor_claim_each_stranded_input_on
                 )
                 == []
             )
+    if partial:
+        original = await db.fetchrow(
+            "SELECT state,admitted_turn_number,settled_at FROM thread_input_deliveries WHERE delivery_id=$1::uuid",
+            deliveries[0],
+        )
+        assert original["state"] == "admitted"
+        assert original["admitted_turn_number"] == 1
+        assert original["settled_at"] is None
 
 
 @pytest.mark.asyncio
@@ -290,7 +310,7 @@ async def test_killed_partial_turn_is_retired_without_fabricating_completion_or_
         "SELECT delivery_id,state,settled_at FROM thread_input_deliveries WHERE thread_id=$1::uuid ORDER BY persisted_at",
         ids["thread"],
     )
-    assert [r["state"] for r in rows] == ["admitted", "owned"]
+    assert [r["state"] for r in rows] == ["admitted", "queued", "owned"]
     assert rows[0]["settled_at"] is None
     assert rows[0]["delivery_id"] == deliveries[0]
 
@@ -318,13 +338,52 @@ async def test_killed_virtual_actor_without_backing_has_exact_abrupt_sql_receipt
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "binding", [{"kind": "virtual"}, {"kind": "sandbox", "host": "separate-writer"}]
+)
+async def test_virtual_absence_receipt_refuses_new_current_binding(
+    db, monkeypatch, binding
+):
+    ids, retirement, _, _, _ = await killed_life(
+        db, monkeypatch, backend="virtual", with_virtual_binding=False
+    )
+    await db.execute(
+        "UPDATE threads SET metadata=jsonb_set(metadata,'{_workspace_binding}',$2::jsonb) WHERE id=$1::uuid",
+        ids["thread"],
+        json.dumps(binding),
+    )
+    assert (
+        await db.acknowledge_abrupt_pinned_actor_exit(
+            ids["thread"],
+            runtime_generation=retirement["generation"],
+            retirement_token=retirement["token"],
+            agent_id=ids["agent"],
+            attach_token=ids["attach_token"],
+            stopped_pod_uid=ids["pod_uid"],
+        )
+        is None
+    )
+    assert not await controls.pinned_retirement_operations(
+        main.app.state.resources
+    ).recover_captured_process_zero(retirement)
+    assert (await db.get_thread(ids["thread"]))[
+        "runtime_retirement_local_quiescence"
+    ] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "backend,with_virtual_binding", [("none", True), ("virtual", False)]
+)
+@pytest.mark.parametrize(
     "defect",
     ["replacement_uid", "unavailable_proof", "stale_generation", "stale_token"],
 )
 async def test_killed_life_recovery_refuses_unproven_or_superseded_runtime(
-    db, monkeypatch, defect
+    db, monkeypatch, defect, backend, with_virtual_binding
 ):
-    ids, retirement, deliveries, api, provider = await killed_life(db, monkeypatch)
+    ids, retirement, deliveries, api, provider = await killed_life(
+        db, monkeypatch, backend=backend, with_virtual_binding=with_virtual_binding
+    )
     if defect == "replacement_uid":
         pod = next(iter(api.pods.values()))
         pod.metadata.uid = str(uuid4())

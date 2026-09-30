@@ -1649,15 +1649,14 @@ class PinnedRetirementOperations:
     ) -> bool:
         """Return whether the captured lite tier owns nothing but its agent Pod.
 
-        Officers and their conferences run here: ``workspace.backend`` is
-        ``none``, so there is no workspace container, binding, VM, or provision
-        intent — the agent runtime is the only process, and its exact Pod stop is
-        the whole zero proof (``agent_runtime_zero_v1``, which the receipt trigger
-        has accepted for this backend all along).
+        A none backend, or a virtual backend without a backing, has no
+        workspace container, binding, VM or provision intent. The agent Pod
+        is its only process namespace. SQL independently verifies the current
+        binding is also absent before accepting the exact captured Pod proof.
         """
 
         return bool(
-            str(context.get("workspace_backend") or "") == "none"
+            str(context.get("workspace_backend") or "") in {"none", "virtual"}
             and not workspace
             and not binding
             and context.get("vm") in (None, {})
