@@ -967,5 +967,10 @@ async def test_thread_vm_retry_admits_durable_source_without_resource_enforcemen
         request_id=str(source["request_id"])
     )
     assert settled == {"settled": True, "disposition": "never_issued"}
+    assert await db.pinned_vm_creation_source_settled(
+        str(thread_id),
+        runtime_generation=retirement["generation"],
+        retirement_token=retirement["token"],
+    )
     assert await VMCreationRetryStore(db).claim_due(limit=10) == []
     assert len(calls) == 1
