@@ -24,6 +24,7 @@ const CSRF_HEADERS = { 'X-CSRF': '1' };
 
 interface UserIdentity {
   id: string;
+  default_project_id?: string | null;
   email?: string | null;
   is_admin: boolean;
   is_approved: boolean;
@@ -101,6 +102,7 @@ async function bootstrapCatalogAndReadiness(
   admin: BrowserContext,
   journey: BrowserContext,
   environment: RuntimeEnvironment,
+  journeyIdentity: UserIdentity,
 ): Promise<void> {
   const keys = await requireJson<unknown[]>(
     await admin.request.get(appUrl('/api/admin/providers/keys')),
@@ -191,13 +193,64 @@ async function bootstrapCatalogAndReadiness(
   expect(experts.defaults.worker).toMatchObject({ expert_type: 'worker' });
   expect(experts.defaults.session).toMatchObject({ expert_type: 'session' });
 
+  // Workspace selection belongs to Project defaults; the retired account
+  // preference is deliberately ignored. Only the generated journey identity's
+  // personal Project may be changed, and attach mode remains read-only.
+  const projectId = journeyIdentity.default_project_id;
+  expect(typeof projectId, 'The journey user must have a personal Project.').toBe('string');
+  expect(projectId).toBeTruthy();
+  const workspaceDefaultsUrl = appUrl(
+    `/api/projects/${encodeURIComponent(projectId as string)}/workspace-defaults`,
+  );
+  type WorkspaceDefaults = {
+    can_edit: boolean;
+    managed_by_manifest: boolean;
+    account_templates: boolean;
+    stored: {
+      jobs: string | null;
+      sessions: string | null;
+      container: { ref: { name: string; scope: Record<string, string> } } | null;
+      vm: { ref: { name: string; scope: Record<string, string> } } | null;
+    };
+    effective: { sessions: { mode: string } };
+  };
+  const before = await requireJson<WorkspaceDefaults>(
+    await journey.request.get(workspaceDefaultsUrl),
+    'personal Project workspace-default inventory',
+  );
   if (!ATTACH_MODE && environment.workspaceBackend === 'sandbox') {
-    const updated = await journey.request.patch(appUrl('/api/settings/preferences'), {
-      headers: CSRF_HEADERS,
-      data: { persistent_agent: { workspace_backend: environment.workspaceBackend } },
-    });
-    await requireJson<{ status: string }>(updated, 'journey workspace-profile selection');
+    expect(before.can_edit).toBe(true);
+    expect(before.managed_by_manifest).toBe(false);
+    expect(before.account_templates, 'Only the journey user\'s personal Project may change.').toBe(true);
+    expect(Object.keys(before.stored).sort()).toEqual(['container', 'jobs', 'sessions', 'vm']);
+    for (const tier of ['container', 'vm'] as const) {
+      if (before.stored[tier] !== null) {
+        expect(before.stored[tier]).toHaveProperty('ref');
+        expect(before.stored[tier]?.ref).toBeTruthy();
+      }
+    }
+    const updated = await requireJson<WorkspaceDefaults>(
+      await journey.request.put(workspaceDefaultsUrl, {
+        headers: CSRF_HEADERS,
+        // PUT replaces the whole record; retain all other Project defaults.
+        data: {
+          jobs: before.stored.jobs,
+          sessions: 'container',
+          container: before.stored.container?.ref ?? null,
+          vm: before.stored.vm?.ref ?? null,
+        },
+      }),
+      'journey Project workspace-profile selection',
+    );
+    expect(updated.effective.sessions.mode).toBe('container');
   }
+  const workspaceDefaults = await requireJson<WorkspaceDefaults>(
+    await journey.request.get(workspaceDefaultsUrl),
+    'journey Project workspace-profile verification',
+  );
+  expect(workspaceDefaults.effective.sessions.mode).toBe(
+    environment.workspaceBackend === 'sandbox' ? 'container' : 'virtual',
+  );
 
   const preferences = await requireJson<Record<string, unknown>>(
     await journey.request.get(appUrl('/api/settings/preferences')),
@@ -206,22 +259,22 @@ async function bootstrapCatalogAndReadiness(
   const explicitPreferenceKeys = Object.keys(preferences)
     .filter((key) => key !== '_resolved')
     .sort();
-  if (environment.workspaceBackend === 'virtual') {
-    expect(explicitPreferenceKeys).toEqual([]);
-  } else {
+  // An owned browser rerun can retain the empty object written by the old
+  // bootstrap before workspace_backend was retired. It is not a preference.
+  if (OWNED_BROWSER_RERUN && explicitPreferenceKeys.includes('persistent_agent')) {
+    expect(preferences['persistent_agent']).toEqual({});
     expect(explicitPreferenceKeys).toEqual(['persistent_agent']);
-    expect(preferences['persistent_agent']).toEqual({
-      workspace_backend: environment.workspaceBackend,
-    });
+  } else {
+    expect(explicitPreferenceKeys).toEqual([]);
   }
   expect(preferences['_resolved']).toMatchObject({
     default_model: environment.chatModel,
     default_auxiliary_model: environment.chatModel,
     persistent_agent: {
       model: environment.chatModel,
-      workspace_backend: 'virtual',
     },
   });
+  expect(preferences['_resolved']).not.toHaveProperty('persistent_agent.workspace_backend');
 
   const readiness = await requireJson<Readiness>(
     await journey.request.get(appUrl('/api/system/readiness')),
@@ -325,7 +378,7 @@ setup(
       expect(journeyIdentity.is_approved).toBe(true);
       expect(journeyIdentity.is_admin).toBe(false);
 
-      await bootstrapCatalogAndReadiness(admin, journey, environment);
+      await bootstrapCatalogAndReadiness(admin, journey, environment, journeyIdentity);
       await persistAndProveJourneyState(browser, journey);
     } finally {
       await Promise.allSettled([admin.close(), journey.close()]);
