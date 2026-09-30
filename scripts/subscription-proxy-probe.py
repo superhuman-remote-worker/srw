@@ -6,9 +6,10 @@ lane for ~60s, so the probe stops at the first non-200 instead of cascading
 into a second bench, and it checks the credential is live before every call.
 
 It speaks exactly the shape SRW dispatch sends — streamed Chat Completions
-with ``reasoning_effort`` and SRW's own ``Anthropic-Beta`` header for Claude
-rows, streamed Responses with ``reasoning.summary=auto`` for Codex rows — and
-reports, per case, whether reasoning comes back readable:
+with ``reasoning_effort``, ``include_reasoning: true`` and SRW's own
+``Anthropic-Beta`` header for Claude rows, streamed Responses with
+``reasoning.summary=auto`` for Codex rows — and reports, per case, whether
+reasoning comes back readable:
 
   VISIBLE      reasoning text arrived
   REDACTED     reasoning deltas (or billed thinking tokens) arrived with no
@@ -19,8 +20,9 @@ The proxy's Chat Completions usage carries no thinking-token breakdown, so
 on the Claude lane REDACTED rests on the empty-delta signature alone.
 
 The ``*-noheader`` case drops SRW's header, which measures whether the proxy
-now produces visible thinking on its own (CLIProxyAPI v7.3.x derives
-``thinking.display`` from ``reasoning_effort``; v7.2.110 needed the header).
+produces visible thinking without it (v7.2.110 needed the header; from v7.3.17
+the ``include_reasoning`` body field decides, and without it Claude's thinking
+comes back REDACTED whatever the header says).
 
 Usage (repo root; runs inside the orchestrator pod, stdlib only):
 
@@ -171,6 +173,8 @@ def chat(model, messages, effort, headers, tools=None):
     }
     if effort:
         body["reasoning_effort"] = effort
+        # What loader._create_openai_llm adds for Claude on the proxy.
+        body["include_reasoning"] = True
     if tools:
         body["tools"] = tools
     started = time.monotonic()

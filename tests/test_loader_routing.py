@@ -684,6 +684,75 @@ class TestClaudeFableReasoning:
         assert call_kwargs["model_kwargs"]["reasoning_effort"] == "max"
 
 
+class TestClaudeProxyAsksForVisibleReasoning:
+    """From CLIProxyAPI v7.3.17 a Chat `reasoning_effort` no longer makes the
+    proxy return Claude's thinking; `include_reasoning: true` does. Measured on
+    dev (v7.3.20, 2026-09-29): without it opus-5-5 and opus-5 came back
+    REDACTED, with it VISIBLE, header or not."""
+
+    PROXY_URL = "http://srw-codex-proxy:8317/v1"
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_claude_on_the_proxy_asks_for_its_reasoning(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="claude-opus-5-5", base_url=self.PROXY_URL, reasoning_level="medium"
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "medium"
+        assert call_kwargs["extra_body"]["include_reasoning"] is True
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_no_effort_means_no_visibility_request(self, mock_chat):
+        # An explicit summary request switches thinking on by itself on the
+        # proxy, so it must never ride on a call that asked for no reasoning.
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="claude-opus-5-5", base_url=self.PROXY_URL, reasoning_level="none"
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert "reasoning_effort" not in call_kwargs.get("model_kwargs", {})
+        assert "include_reasoning" not in call_kwargs.get("extra_body", {})
+
+    @pytest.mark.parametrize(
+        "model, base_url",
+        [
+            ("gpt-6-sol", "http://srw-codex-proxy:8317/v1"),
+            ("claude-opus-5-5", "https://claude-fixture.invalid/v1"),
+        ],
+    )
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_other_models_and_endpoints_are_untouched(self, mock_chat, model, base_url):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model=model, base_url=base_url, reasoning_level="high")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert "include_reasoning" not in call_kwargs.get("extra_body", {})
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_a_declared_value_wins(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="claude-opus-5-5",
+            base_url=self.PROXY_URL,
+            reasoning_level="high",
+            extra_body={"include_reasoning": False},
+        )
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["extra_body"]["include_reasoning"] is False
+
+
 class TestFallThroughLadderIncludesXhigh:
     """The `default` family declares xhigh (2026-09-11), so a model with no
     family block of its own can be run at xhigh instead of being clamped down

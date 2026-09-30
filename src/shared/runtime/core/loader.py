@@ -4511,6 +4511,23 @@ def _create_openai_llm(
     if config.prompt_cache_key and (not base_url or "api.openai.com" in base_url):
         extra_body.setdefault("prompt_cache_key", config.prompt_cache_key)
 
+    claude_via_proxy = bool(
+        base_url
+        and _is_codex_proxy_url(base_url)
+        and family_of(config.model).startswith("claude")
+    )
+
+    # Claude through the subscription proxy asks for its reasoning explicitly.
+    # From CLIProxyAPI v7.3.17 a Chat `reasoning_effort` no longer implies a
+    # visible summary for Claude: the proxy sends `thinking.display: updates`
+    # (Opus 5.5, Fable 5.1, Sonnet 5) or keeps Anthropic's `omitted` default,
+    # and the reasoning arrives as empty deltas. Only alongside an effort,
+    # because an explicit summary request also switches thinking on by itself.
+    # Older proxies build the Claude body from known fields and drop this one.
+    # setdefault so a declared value keeps winning.
+    if claude_via_proxy and "reasoning_effort" in model_kwargs:
+        extra_body.setdefault("include_reasoning", True)
+
     # Add timeout if specified
     if config.timeout is not None:
         llm_kwargs["timeout"] = _resolve_timeout(config, limits)
@@ -4527,9 +4544,10 @@ def _create_openai_llm(
         llm_kwargs["extra_body"] = extra_body
 
     # Route-level transport headers injected at dispatch (LLMConfig.extra_headers).
-    # The subscription proxy's Claude executor decides thinking visibility from
-    # the inbound Anthropic-Beta header, so this is the difference between a
-    # readable reasoning summary and an empty thinking block.
+    # Below CLIProxyAPI v7.3.x the Claude executor decides thinking visibility
+    # from the inbound Anthropic-Beta header, so there this is the difference
+    # between a readable reasoning summary and an empty thinking block (from
+    # v7.3.17 the proxy reads `include_reasoning` above instead).
     if config.extra_headers:
         llm_kwargs["default_headers"] = dict(config.extra_headers)
     session_headers = _subscription_proxy_session_headers(config, base_url)
@@ -4568,11 +4586,7 @@ def _create_openai_llm(
     # Claude through the subscription proxy: without explicit breakpoints the
     # proxy marks the last message, which is the per-turn injection tail, and
     # the history never reads from cache (compaction refactor note, F17).
-    if (
-        base_url
-        and _is_codex_proxy_url(base_url)
-        and family_of(config.model).startswith("claude")
-    ):
+    if claude_via_proxy:
         llm_kwargs["anthropic_cache_breakpoints"] = True
 
     llm = ReasoningChatOpenAI(**llm_kwargs)

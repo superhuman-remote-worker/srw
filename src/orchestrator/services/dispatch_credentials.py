@@ -298,9 +298,9 @@ async def inject_model_credentials(
         section["provider"] = meta.provider
 
     # Transport headers the resolved route needs. Only the subscription proxy
-    # uses this today: its Claude executor decides thinking visibility from the
-    # inbound Anthropic-Beta header, so a Claude-Code-served model without it
-    # returns empty thinking blocks (billed, unreadable). Written on every
+    # uses this today: below v7.3.x its Claude executor decides thinking
+    # visibility from the inbound Anthropic-Beta header, so a Claude-Code-served
+    # model without it returns empty thinking blocks (billed, unreadable). Written on every
     # injection — including as `{}` — for the same reason `provider` is: a
     # session hot-swap deep-merges this section over the previous model's, and
     # a header left behind would describe the model that is no longer running.
