@@ -3,9 +3,9 @@
 R3.2 moves the session HTTP/WebSocket handlers (``/api/input``,
 ``/api/interrupt``, ``/api/approve``, ``/ws/chat``, ``/p/{thread_id}/ws``) out
 of ``persistent_app`` into transport modules. These tests drive nothing but the
-public routes of ``create_persistent_app`` and ``create_dual_app`` and patch
-only runtime state/functions that stay owned by ``persistent_app`` /
-``dual_app``, so they must pass unchanged before and after the move.
+public routes of ``create_persistent_app`` and ``create_dual_app``. Test-only
+adapters follow runtime state/functions to their explicit owners, so the
+transport assertions stay unchanged before and after each extraction.
 
 The production lifespan is replaced by a no-op ASGI shim (it would register
 with an orchestrator); every route is served by the composed app itself. One
@@ -36,6 +36,7 @@ from agent.services.workspace_undo import (
 )
 from orchestrator.services.session_tokens import SessionTokenService
 from shared.pinned_session_identity import pinned_session_ready_identity_fingerprint
+from tests._session_termination_adapter import termination_target
 
 
 SECRET = "r3-transport-characterization-secret-0123456789"
@@ -287,7 +288,7 @@ class _Runtime:
         moved = _IDENTITY_OWNER_NAMES.get(name)
         if moved is not None:
             return self.pa._session_identity, moved
-        return self.pa, name
+        return termination_target(self.pa, name)
 
     def set(self, name: str, value) -> None:
         owner, attribute = self._target(name)

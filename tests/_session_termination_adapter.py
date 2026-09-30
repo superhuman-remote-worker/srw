@@ -64,6 +64,6 @@ _NAMES = {
 
 
 def termination_target(module, name):
-    if name in _NAMES:
+    if name in _NAMES and hasattr(module, "_session_termination"):
         return module._session_termination, _NAMES[name]
     return module, name
