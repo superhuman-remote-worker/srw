@@ -294,6 +294,8 @@ async def test_killed_life_recovery_refuses_unproven_or_superseded_runtime(
     ).recover_captured_process_zero(retirement)
     current = await db.get_thread(ids["thread"])
     assert current["runtime_retirement_local_quiescence"] is None
+    if defect in {"stale_generation", "stale_token"}:
+        assert api.pods, "a stale request must refuse before its first Pod effect"
     rows = await db.fetch(
         "SELECT delivery_id,state FROM thread_input_deliveries WHERE thread_id=$1::uuid ORDER BY persisted_at",
         ids["thread"],
