@@ -25,6 +25,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 
 from agent.core.context import ContextConfig, ContextManager
+from agent.core.summarizer import load_summarizer_prompt
 from shared.runtime.core.loader import (
     AgentConfig,
     FileResolver,
@@ -3190,6 +3191,7 @@ class PersistentSession:
             # window must keep its ids and turn stamps, or the turn-end
             # reconcile cannot find this turn's rows after a mid-turn summary.
             preserve_message_identity=True,
+            summarization_prompt=load_summarizer_prompt(self.config),
         )
 
     def refresh_context_limits(self) -> None:

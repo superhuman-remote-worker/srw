@@ -21,7 +21,6 @@ from langchain_core.messages import (
 from agent.core.context import (
     ContextManager,
     ContextConfig,
-    ConversationSummary,
     place_pinned_after_summary,
 )
 from shared.runtime.core.message_markers import (
@@ -66,29 +65,27 @@ def context_manager(context_config):
     return ContextManager(config=context_config, model="gpt-4")
 
 
+#: What the mock summarizer writes: a Markdown checkpoint (text mode).
+SAMPLE_CHECKPOINT = """## Objective
+- Test summary of the conversation.
+
+## Work State
+### Completed
+- Task 1 completed
+- Task 2 completed"""
+
+
+def checkpoint(text: str = SAMPLE_CHECKPOINT) -> AIMessage:
+    """An aux response carrying a checkpoint, as ``llm.ainvoke`` returns it."""
+    return AIMessage(content=text, response_metadata={"finish_reason": "stop"})
+
+
 def make_mock_aux(max_context_tokens=15_000):
-    """Create a mock AuxiliaryLLM that returns structured summaries."""
+    """Create a mock AuxiliaryLLM whose model writes a Markdown checkpoint."""
     from shared.runtime.services.auxiliary import AuxiliaryLLM
 
     llm = MagicMock()
-
-    parsed_value = ConversationSummary(
-        summary="Test summary of the conversation.",
-        tasks_completed="- Task 1 completed\n- Task 2 completed",
-        key_decisions="Decision to use approach A",
-        current_state="Ready for next phase",
-        blockers="",
-    )
-    raw_response = AIMessage(content="structured output")
-    structured_llm = AsyncMock()
-    structured_llm.ainvoke = AsyncMock(
-        return_value={
-            "raw": raw_response,
-            "parsed": parsed_value,
-            "parsing_error": None,
-        }
-    )
-    llm.with_structured_output = MagicMock(return_value=structured_llm)
+    llm.ainvoke = AsyncMock(return_value=checkpoint())
 
     return AuxiliaryLLM(llm=llm, max_context_tokens=max_context_tokens)
 
@@ -361,12 +358,12 @@ class TestRollingFold:
         plan = engine.plan(["User: Hello", "Assistant: Hi"])
         result = await engine.run(plan)
 
-        assert "**Summary:**" in result
+        assert "## Objective" in result
         assert "Test summary" in result
 
     @pytest.mark.asyncio
     async def test_fold_threads_running_summary(self, mock_llm):
-        """Pass 2 must see pass 1's summary as 'Prior Summary:'."""
+        """Pass 2 must see pass 1's summary under the merge contract."""
         engine = make_engine(mock_llm)
         parts = [f"part {i}: " + "x" * 4000 for i in range(30)]
         plan = engine.plan(parts)
@@ -374,13 +371,14 @@ class TestRollingFold:
 
         await engine.run(plan)
 
-        structured = mock_llm.llm.with_structured_output.return_value
+        structured = mock_llm.llm
         assert structured.ainvoke.call_count == plan.n_passes
         # Second call's human message carries the running summary
         second_call_messages = structured.ainvoke.call_args_list[1][0][0]
         human_content = second_call_messages[1].content
-        assert "Prior Summary:" in human_content
+        assert "<prior-summary>" in human_content
         assert "Test summary" in human_content
+        assert "is discarded after this" in human_content
 
     @pytest.mark.asyncio
     async def test_seed_summary_reaches_first_pass(self, mock_llm):
@@ -388,9 +386,9 @@ class TestRollingFold:
         plan = engine.plan(["User: continue please"])
         await engine.run(plan, seed_summary="Previously: built the parser.")
 
-        structured = mock_llm.llm.with_structured_output.return_value
+        structured = mock_llm.llm
         first_call_messages = structured.ainvoke.call_args_list[0][0][0]
-        assert "Prior Summary: Previously: built the parser." in (
+        assert "<prior-summary>\nPreviously: built the parser.\n</prior-summary>" in (
             first_call_messages[1].content
         )
 
@@ -400,27 +398,18 @@ class TestRollingFold:
         plan = engine.plan(["User: lots of stuff"])
         await engine.run(plan, focus="keep the SQL schema details")
 
-        structured = mock_llm.llm.with_structured_output.return_value
+        structured = mock_llm.llm
         first_call_messages = structured.ainvoke.call_args_list[0][0][0]
         assert "keep the SQL schema details" in first_call_messages[1].content
 
     @pytest.mark.asyncio
     async def test_transient_failure_retried_then_succeeds(self, mock_llm):
-        parsed_value = ConversationSummary(
-            summary="Recovered summary.",
-            tasks_completed="",
-            key_decisions="",
-            current_state="",
-        )
-        structured = mock_llm.llm.with_structured_output.return_value
+        recovered = checkpoint("## Objective\n- Recovered summary.")
+        structured = mock_llm.llm
         structured.ainvoke = AsyncMock(
             side_effect=[
                 Exception("503 all backends unavailable"),
-                {
-                    "raw": AIMessage(content="ok"),
-                    "parsed": parsed_value,
-                    "parsing_error": None,
-                },
+                recovered,
             ]
         )
 
@@ -443,7 +432,7 @@ class TestRollingFold:
         assert exc_info.value.reason == "aux_unavailable"
         from agent.core.summarizer import MAX_ATTEMPTS
 
-        structured = aux.llm.with_structured_output.return_value
+        structured = aux.llm
         assert structured.ainvoke.call_count == MAX_ATTEMPTS
 
     @pytest.mark.asyncio
@@ -462,7 +451,7 @@ class TestRollingFold:
             await engine.run(plan)
 
         assert exc_info.value.reason == "aux_overflow"
-        structured = aux.llm.with_structured_output.return_value
+        structured = aux.llm
         assert structured.ainvoke.call_count == 1  # no retry
 
     @pytest.mark.asyncio
@@ -506,9 +495,9 @@ class TestOverflowDetection:
 
 class TestAuxPreflightGuard:
     @pytest.mark.asyncio
-    async def test_chain_rejects_oversized_input(self):
-        """Non-summarization aux tasks fail fast instead of overflowing at
-        the transport (951k memory-extraction payloads to a 131k model)."""
+    async def test_complete_rejects_oversized_input(self):
+        """Aux calls fail fast instead of overflowing at the transport
+        (951k memory-extraction payloads to a 131k model)."""
         from shared.runtime.services.auxiliary import AuxInputTooLarge, SummarizeTask
 
         aux = make_mock_aux(max_context_tokens=100)
@@ -519,14 +508,13 @@ class TestAuxPreflightGuard:
         )
 
         with pytest.raises(AuxInputTooLarge):
-            await aux.chain(task)
+            await aux.complete(task)
 
         # The LLM was never invoked
-        structured = aux.llm.with_structured_output.return_value
-        structured.ainvoke.assert_not_called()
+        aux.llm.ainvoke.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_chain_allows_fitting_input(self, mock_llm):
+    async def test_complete_allows_fitting_input(self, mock_llm):
         from shared.runtime.services.auxiliary import SummarizeTask
 
         task = SummarizeTask(
@@ -534,8 +522,8 @@ class TestAuxPreflightGuard:
             summarization_prompt="",
             max_summary_length=1000,
         )
-        result = await mock_llm.chain(task)
-        assert result.summary == "Test summary of the conversation."
+        result = await mock_llm.complete(task)
+        assert result.content == SAMPLE_CHECKPOINT
 
     @pytest.mark.asyncio
     async def test_no_guard_when_window_unknown(self):
@@ -547,7 +535,7 @@ class TestAuxPreflightGuard:
             summarization_prompt="",
             max_summary_length=1000,
         )
-        result = await aux.chain(task)  # no raise
+        result = await aux.complete(task)  # no raise
         assert result is not None
 
 
@@ -557,279 +545,155 @@ class TestAuxPreflightGuard:
 
 
 class TestFormatMessagesForSummary:
-    """Tests for the _format_messages_for_summary helper method."""
+    """The transcript the summarizer reads (compaction refactor WP2): full user
+    and assistant text, tool arguments and results capped at 2,000 chars, and
+    each assistant turn in one part with the results of its calls."""
 
-    def test_formats_human_messages(self, context_manager):
-        """Human messages should be formatted with User prefix."""
-        messages = [HumanMessage(content="Hello, world!")]
-        parts = context_manager._format_messages_for_summary(messages)
+    def test_user_text_goes_in_full(self, context_manager):
+        """Acceptance: a 3,000-character user instruction reaches the summarizer."""
+        instruction = "Use the staging database only. " + "x" * 3000
+        parts = context_manager._format_messages_for_summary(
+            [HumanMessage(content=instruction)]
+        )
 
-        assert len(parts) == 1
-        assert parts[0].startswith("User:")
-        assert "Hello, world!" in parts[0]
+        assert parts == [f"[User]: {instruction}"]
 
-    def test_formats_ai_messages(self, context_manager):
-        """AI messages should be formatted with Assistant prefix."""
-        messages = [AIMessage(content="Hello back!")]
-        parts = context_manager._format_messages_for_summary(messages)
+    def test_assistant_text_goes_in_full(self, context_manager):
+        parts = context_manager._format_messages_for_summary(
+            [AIMessage(content="y" * 5000)]
+        )
 
-        assert len(parts) == 1
-        assert parts[0].startswith("Assistant:")
+        assert parts == ["[Assistant]: " + "y" * 5000]
 
-    def test_formats_tool_calls(self, context_manager):
-        """AI messages with tool calls should show tool names."""
+    def test_tool_arguments_reach_the_summarizer(self, context_manager):
+        """Acceptance: a path present only in a tool argument is in the transcript."""
         messages = [
             AIMessage(
-                content="", tool_calls=[{"name": "read_file", "id": "1", "args": {}}]
-            )
-        ]
-        parts = context_manager._format_messages_for_summary(messages)
-
-        assert len(parts) == 1
-        assert "read_file" in parts[0]
-
-    def test_formats_tool_messages_recent(self, context_manager):
-        """Recent tool messages should include truncated content (observation masking)."""
-        messages = [ToolMessage(content="x" * 100, tool_call_id="1")]
-        parts = context_manager._format_messages_for_summary(messages)
-
-        assert len(parts) == 1
-        # Single tool message falls within the recent-10 window, so content is included
-        assert "[Tool 'unknown' result:" in parts[0]
-        assert "xxx" in parts[0]  # content preserved (under 300 char truncation)
-
-    def test_formats_tool_messages_old_masked(self, context_manager):
-        """Old tool messages beyond the 10-message window should be observation-masked."""
-        # Create 12 tool messages — first 2 should be masked, last 10 should have content
-        messages = [
-            ToolMessage(content=f"result_{i}" * 20, tool_call_id=str(i))
-            for i in range(12)
-        ]
-        parts = context_manager._format_messages_for_summary(messages)
-
-        # 12 messages + 1 recency marker = 13 parts
-        assert len(parts) == 13
-        # First 2 are beyond the recent-10 window — should be masked (placeholder only)
-        assert "omitted" in parts[0]
-        assert "omitted" in parts[1]
-        # Recency marker separates old from recent
-        assert "RECENT CONTEXT" in parts[2]
-        # Last 10 should have content
-        assert "result_2" in parts[3]
-        assert "result_11" in parts[12]
-
-    def test_recency_marker_inserted_when_enough_tool_messages(self, context_manager):
-        """Recency marker should appear when there are >10 tool messages."""
-        messages = [
-            ToolMessage(content=f"result_{i}", tool_call_id=str(i)) for i in range(15)
-        ]
-        parts = context_manager._format_messages_for_summary(messages)
-
-        marker_parts = [p for p in parts if "RECENT CONTEXT" in p]
-        assert len(marker_parts) == 1
-        assert "PRESERVE WITH HIGHEST PRIORITY" in marker_parts[0]
-
-    def test_no_recency_marker_when_few_tool_messages(self, context_manager):
-        """No recency marker when all tool messages fit in the recent window."""
-        messages = [
-            ToolMessage(content=f"result_{i}", tool_call_id=str(i)) for i in range(5)
-        ]
-        parts = context_manager._format_messages_for_summary(messages)
-
-        marker_parts = [p for p in parts if "RECENT CONTEXT" in p]
-        assert len(marker_parts) == 0
-
-    def test_atomic_grouping_preserves_sibling_results(self, context_manager):
-        """When one tool result in a group is recent, all siblings should be recent too."""
-        # 9 old standalone tool messages (fill most of the window)
-        old_msgs = [
-            ToolMessage(content=f"old_{i}" * 20, tool_call_id=f"old_{i}")
-            for i in range(9)
-        ]
-
-        # 1 AIMessage calling 3 tools — will straddle the boundary
-        ai_msg = AIMessage(
-            content="",
-            tool_calls=[
-                {"name": "read_file", "id": "group_a", "args": {}},
-                {"name": "web_search", "id": "group_b", "args": {}},
-                {"name": "sql_query", "id": "group_c", "args": {}},
-            ],
-        )
-        group_results = [
-            ToolMessage(content="file content here", tool_call_id="group_a"),
-            ToolMessage(content="search results here", tool_call_id="group_b"),
-            ToolMessage(content="query output here", tool_call_id="group_c"),
-        ]
-
-        # Total: 12 tool messages. Flat last-10 keeps old_2..old_8 + all 3 grouped.
-        # All 3 grouped are in the flat window here, but atomic grouping ensures
-        # that even at different boundary positions, they stay together.
-        messages = old_msgs + [ai_msg] + group_results
-        parts = context_manager._format_messages_for_summary(messages)
-
-        # All 3 grouped results should show content, not "omitted"
-        for label in ["file content", "search results", "query output"]:
-            matching = [p for p in parts if label in p]
-            assert len(matching) == 1
-            assert "omitted" not in matching[0], f"'{label}' should not be masked"
-
-    def test_atomic_grouping_boundary_case(self, context_manager):
-        """Group straddling the flat-10 boundary: all siblings should be preserved."""
-        # 10 standalone old tool messages
-        old_msgs = [
-            ToolMessage(content=f"standalone_{i}" * 20, tool_call_id=f"s_{i}")
-            for i in range(10)
-        ]
-
-        # AIMessage with 3 tool calls — group will straddle the flat-10 boundary
-        ai_msg = AIMessage(
-            content="",
-            tool_calls=[
-                {"name": "tool_a", "id": "g_a", "args": {}},
-                {"name": "tool_b", "id": "g_b", "args": {}},
-                {"name": "tool_c", "id": "g_c", "args": {}},
-            ],
-        )
-        group_results = [
-            ToolMessage(content="result_a data", tool_call_id="g_a"),
-            ToolMessage(content="result_b data", tool_call_id="g_b"),
-            ToolMessage(content="result_c data", tool_call_id="g_c"),
-        ]
-
-        # Total: 13 tool messages. Flat last-10 = s_3..s_9 + g_a + g_b + g_c
-        # g_a is the 11th tool message — in the flat window.
-        # But with only 7 standalone old in the window, if we add more old messages
-        # to push g_a out, atomic grouping pulls it back in.
-        # Here all 3 are already in the flat window, so just verify they stay.
-        messages = old_msgs + [ai_msg] + group_results
-        parts = context_manager._format_messages_for_summary(messages)
-
-        for label in ["result_a", "result_b", "result_c"]:
-            matching = [p for p in parts if label in p]
-            assert len(matching) == 1
-            assert "omitted" not in matching[0], f"{label} should not be masked"
-
-    def test_atomic_grouping_pulls_in_old_siblings(self, context_manager):
-        """A group member outside the flat-10 window is pulled in by a recent sibling."""
-        # AIMessage with 2 tool calls — results will be split across the boundary
-        ai_msg = AIMessage(
-            content="",
-            tool_calls=[
-                {"name": "tool_x", "id": "pair_x", "args": {}},
-                {"name": "tool_y", "id": "pair_y", "args": {}},
-            ],
-        )
-
-        # Place pair_x early (outside flat window), pair_y late (inside flat window),
-        # with 10 filler tool messages in between.
-        # Total: 12 tool messages. Flat last-10 = indices 2..11.
-        # pair_x (tool index 0) is OUTSIDE flat window.
-        # pair_y (tool index 11) is INSIDE flat window.
-        # Atomic grouping should pull pair_x into the recent set.
-        messages = (
-            [ai_msg]
-            + [ToolMessage(content="x_data value", tool_call_id="pair_x")]
-            + [
-                ToolMessage(content=f"fill_{i}" * 20, tool_call_id=f"fl_{i}")
-                for i in range(10)
-            ]
-            + [ToolMessage(content="y_data value", tool_call_id="pair_y")]
-        )
-        parts = context_manager._format_messages_for_summary(messages)
-
-        # pair_x should show content (pulled in by pair_y), not be masked
-        x_parts = [p for p in parts if "x_data" in p]
-        assert len(x_parts) == 1
-        assert "omitted" not in x_parts[0], (
-            "pair_x should be pulled into recent by sibling pair_y"
-        )
-
-        # pair_y should also show content (it's naturally in the window)
-        y_parts = [p for p in parts if "y_data" in p]
-        assert len(y_parts) == 1
-        assert "omitted" not in y_parts[0]
-
-    def test_includes_prior_summaries(self, context_manager):
-        """System messages with prior summaries should be included."""
-        messages = [
-            SystemMessage(content="[Summary of prior work]\nPrevious work summary."),
-            HumanMessage(content="Continue"),
-        ]
-        parts = context_manager._format_messages_for_summary(messages)
-
-        assert len(parts) == 2
-        assert "Prior Summary:" in parts[0]
-        assert "User:" in parts[1]
-
-    def test_excludes_regular_system_messages(self, context_manager):
-        """Regular system messages should be excluded."""
-        messages = [
-            SystemMessage(content="You are a helpful assistant."),
-            HumanMessage(content="Hello"),
-        ]
-        parts = context_manager._format_messages_for_summary(messages)
-
-        assert len(parts) == 1
-        assert parts[0].startswith("User:")
-
-    def test_truncates_long_messages(self, context_manager):
-        """Long messages should be truncated."""
-        long_content = "x" * 1000
-        messages = [HumanMessage(content=long_content)]
-        parts = context_manager._format_messages_for_summary(messages)
-
-        # Human messages truncated to 500 chars
-        assert len(parts[0]) < 600
-
-        # AI messages truncated to 800 chars
-        ai_messages = [AIMessage(content="y" * 1000)]
-        ai_parts = context_manager._format_messages_for_summary(ai_messages)
-        assert "y" * 800 in ai_parts[0]
-        assert "y" * 801 not in ai_parts[0]
-
-    def test_ai_reasoning_preserved_at_800_chars(self, context_manager):
-        """AI reasoning should be preserved up to 800 chars, not 300."""
-        # Content that's 500 chars — would be cut at 300 before, now preserved
-        content = "A" * 500
-        messages = [AIMessage(content=content)]
-        parts = context_manager._format_messages_for_summary(messages)
-
-        assert len(parts) == 1
-        assert "A" * 500 in parts[0]  # Full 500 chars preserved
-
-    def test_ai_reasoning_with_tool_calls_preserved(self, context_manager):
-        """AIMessage with both reasoning content and tool_calls should show both."""
-        messages = [
-            AIMessage(
-                content="I need to check the auth module because the JWT validation is failing",
+                content="",
                 tool_calls=[
-                    {"name": "read_file", "id": "tc1", "args": {"path": "auth.py"}},
-                    {"name": "web_search", "id": "tc2", "args": {"query": "JWT"}},
+                    {
+                        "name": "read_file",
+                        "id": "tc1",
+                        "args": {"path": "services/billing/ledger.py"},
+                    }
                 ],
             )
         ]
         parts = context_manager._format_messages_for_summary(messages)
 
-        assert len(parts) == 1
-        # Both reasoning and tool names should be present
-        assert "JWT validation" in parts[0]
-        assert "read_file" in parts[0]
-        assert "web_search" in parts[0]
+        assert parts == [
+            '[Assistant tool call]: read_file({"path": "services/billing/ledger.py"})'
+        ]
 
-    def test_ai_reasoning_with_tool_calls_empty_content(self, context_manager):
-        """AIMessage with tool_calls but empty content should only show tool names."""
+    def test_tool_arguments_are_capped(self, context_manager):
         messages = [
             AIMessage(
                 content="",
-                tool_calls=[{"name": "read_file", "id": "tc1", "args": {}}],
+                tool_calls=[
+                    {"name": "write_file", "id": "tc1", "args": {"content": "z" * 5000}}
+                ],
             )
         ]
         parts = context_manager._format_messages_for_summary(messages)
 
-        assert len(parts) == 1
-        assert "read_file" in parts[0]
-        assert parts[0] == "Assistant: [Called tools: read_file]"
+        assert "z" * 1900 in parts[0]
+        assert "z" * 2100 not in parts[0]
+        assert "[truncated," in parts[0]
+
+    def test_call_and_results_share_one_part(self, context_manager):
+        """Acceptance: tool call/result pairs stay together, so the chunk
+        planner can never split them across fold passes."""
+        messages = [
+            HumanMessage(content="check auth"),
+            AIMessage(
+                content="Reading both files.",
+                tool_calls=[
+                    {"name": "read_file", "id": "a", "args": {"path": "auth.py"}},
+                    {"name": "read_file", "id": "b", "args": {"path": "jwt.py"}},
+                ],
+            ),
+            ToolMessage(content="auth body", tool_call_id="a", name="read_file"),
+            ToolMessage(content="jwt body", tool_call_id="b", name="read_file"),
+            AIMessage(content="Both read."),
+        ]
+        parts = context_manager._format_messages_for_summary(messages)
+
+        assert len(parts) == 3
+        assert parts[1] == "\n".join(
+            [
+                "[Assistant]: Reading both files.",
+                '[Assistant tool call]: read_file({"path": "auth.py"})',
+                '[Assistant tool call]: read_file({"path": "jwt.py"})',
+                "[Tool result: read_file]: auth body",
+                "[Tool result: read_file]: jwt body",
+            ]
+        )
+        assert parts[2] == "[Assistant]: Both read."
+
+    def test_tool_results_are_capped(self, context_manager):
+        parts = context_manager._format_messages_for_summary(
+            [ToolMessage(content="r" * 5000, tool_call_id="orphan", name="grep")]
+        )
+
+        assert parts[0].startswith("[Tool result: grep]: " + "r" * 2000)
+        assert "[truncated, 3000 more chars]" in parts[0]
+
+    def test_every_result_is_kept_however_many(self, context_manager):
+        """No recency window: old results are capped, never masked."""
+        messages = [
+            ToolMessage(content=f"result_{i}", tool_call_id=str(i)) for i in range(15)
+        ]
+        parts = context_manager._format_messages_for_summary(messages)
+
+        assert len(parts) == 15
+        assert all(f"result_{i}" in parts[i] for i in range(15))
+
+    def test_error_result_keeps_head_and_tail(self, context_manager):
+        trace = "Traceback (most recent call last):\n" + "f" * 4000 + "\nKeyError: 'id'"
+        parts = context_manager._format_messages_for_summary(
+            [ToolMessage(content=trace, tool_call_id="e", name="run_command")]
+        )
+
+        assert parts[0].startswith("[Tool error: run_command]: Traceback")
+        assert parts[0].endswith("KeyError: 'id'")
+        assert "chars omitted" in parts[0]
+
+    def test_error_status_marks_an_error(self, context_manager):
+        parts = context_manager._format_messages_for_summary(
+            [
+                ToolMessage(
+                    content="permission denied",
+                    tool_call_id="e",
+                    name="write_file",
+                    status="error",
+                )
+            ]
+        )
+
+        assert parts == ["[Tool error: write_file]: permission denied"]
+
+    def test_system_messages_are_left_out(self, context_manager):
+        """The system prompt and earlier summaries (they seed the fold) are
+        not part of the transcript."""
+        messages = [
+            SystemMessage(content="You are a helpful assistant."),
+            SystemMessage(content="[Summary of prior work]\nPrevious work."),
+            HumanMessage(content="Continue"),
+        ]
+        parts = context_manager._format_messages_for_summary(messages)
+
+        assert parts == ["[User]: Continue"]
+
+    def test_tool_call_without_text_shows_only_the_call(self, context_manager):
+        messages = [
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "list_files", "id": "tc1", "args": {}}],
+            )
+        ]
+        parts = context_manager._format_messages_for_summary(messages)
+
+        assert parts == ["[Assistant tool call]: list_files({})"]
 
 
 # =============================================================================
@@ -852,9 +716,9 @@ class TestSummarizeConversation:
             auxiliary=mock_llm,
         )
 
-        assert "**Summary:**" in result
+        assert "## Objective" in result
         assert context_manager.state.total_summarizations == 1
-        structured = mock_llm.llm.with_structured_output.return_value
+        structured = mock_llm.llm
         assert structured.ainvoke.call_count == 1
 
     @pytest.mark.asyncio
@@ -885,7 +749,7 @@ class TestSummarizeConversation:
         )
 
         assert result
-        structured = mock_llm.llm.with_structured_output.return_value
+        structured = mock_llm.llm
         assert structured.ainvoke.call_count > 1
 
     @pytest.mark.asyncio
@@ -981,21 +845,12 @@ class TestProgressEvents:
 
     @pytest.mark.asyncio
     async def test_retry_bumps_attempt_in_progress(self, context_manager, mock_llm):
-        parsed_value = ConversationSummary(
-            summary="ok",
-            tasks_completed="",
-            key_decisions="",
-            current_state="",
-        )
-        structured = mock_llm.llm.with_structured_output.return_value
+        recovered = checkpoint("## Objective\n- ok")
+        structured = mock_llm.llm
         structured.ainvoke = AsyncMock(
             side_effect=[
                 Exception("503"),
-                {
-                    "raw": AIMessage(content="ok"),
-                    "parsed": parsed_value,
-                    "parsing_error": None,
-                },
+                recovered,
             ]
         )
         events = []
@@ -1495,6 +1350,11 @@ class TestOversizedMessageCompaction:
             HumanMessage(content="ok", id="h3"),
             AIMessage(content="done", id="a3"),
         ]
+        # A summary larger than the (stubbed) history it would replace sends
+        # compaction down the substitution-only path, which keeps the stub.
+        mock_llm.llm.ainvoke = AsyncMock(
+            return_value=checkpoint(SAMPLE_CHECKPOINT + "\n- more detail" * 40)
+        )
 
         result = await context_manager.summarize_and_compact(
             messages=messages,
@@ -1761,7 +1621,7 @@ class TestPinnedAfterSummary:
         await context_manager.summarize_and_compact(
             messages=messages, auxiliary=mock_llm
         )
-        structured = mock_llm.llm.with_structured_output.return_value
+        structured = mock_llm.llm
         assert structured.ainvoke.await_count >= 1
         sent = str(structured.ainvoke.call_args_list)
         assert self.BODY not in sent

@@ -519,27 +519,16 @@ def _count_text(request, text: str) -> int:
 
 
 def _mock_aux():
-    """AuxiliaryLLM whose structured summariser returns a fixed short summary."""
-    from agent.core.context import ConversationSummary
+    """AuxiliaryLLM whose summariser writes a fixed short checkpoint."""
     from shared.runtime.services.auxiliary import AuxiliaryLLM
 
-    parsed = ConversationSummary(
-        summary="Summary of the work so far.",
-        tasks_completed="- read files",
-        key_decisions="",
-        current_state="mid-phase",
-        blockers="",
-    )
-    structured = AsyncMock()
-    structured.ainvoke = AsyncMock(
-        return_value={
-            "raw": AIMessage(content="s"),
-            "parsed": parsed,
-            "parsing_error": None,
-        }
-    )
     llm = MagicMock()
-    llm.with_structured_output = MagicMock(return_value=structured)
+    llm.ainvoke = AsyncMock(
+        return_value=AIMessage(
+            content="## Objective\n- Summary of the work so far.\n\n"
+            "## Work State\n- read files"
+        )
+    )
     return AuxiliaryLLM(llm=llm, max_context_tokens=15_000)
 
 

@@ -1,8 +1,8 @@
 """Strict JSON schema compatibility checks for auxiliary outputs.
 
-This test enforces that every auxiliary output schema (including
-``ConversationSummary`` from ``src.core.context``) can be converted to
-strict JSON Schema without runtime validation errors.
+This test enforces that every auxiliary output schema can be converted to
+strict JSON Schema without runtime validation errors. (Conversation
+summarization is a text-mode task and has no output schema.)
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from typing import Any, Type
 import pytest
 from pydantic import BaseModel
 
-from agent.core.context import ConversationSummary
 from shared.runtime.services.auxiliary import AuxTask
 import shared.runtime.services.auxiliary as auxiliary
 
@@ -97,9 +96,6 @@ def _all_aux_output_schemas() -> list[Type[BaseModel]]:
         if schema not in seen:
             schemas.append(schema)
             seen.add(schema)
-    if ConversationSummary not in seen:
-        schemas.append(ConversationSummary)
-        seen.add(ConversationSummary)
     return schemas
 
 

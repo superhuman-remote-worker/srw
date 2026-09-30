@@ -6,12 +6,17 @@ Provides two execution modes for background/support LLM tasks:
   System prompt + context → Pydantic model. No tools, no loop.
   For tasks that just need reasoning over provided context.
 
+- **Text mode** (`complete()`): Single LLM call returning the model's own
+  text, for tasks whose output is prose the caller validates itself
+  (conversation summarization writes Markdown sections, not JSON).
+
 - **Agent mode** (`agent()`): Short-lived tool loop with structured output.
   The LLM can make tool calls (search KB, read files, write notes),
   then a final structured-output call produces the result.
   Capped iterations. Not a full job — no workspace, no todos, no phases.
 
-All tasks use `with_structured_output()` for reliable structured returns.
+Chain and agent tasks use `with_structured_output()` for reliable structured
+returns.
 
 See knowledge-base/knowledge/features/auxiliary.md for the full design document.
 """
@@ -258,10 +263,6 @@ class CitationVerdict(BaseModel):
     reasoning: str = Field(description="One or two sentences explaining the verdict.")
 
 
-# ConversationSummary is shared with compaction through core.summary_models;
-# auxiliary tasks do not depend on the agent context manager.
-
-
 # =============================================================================
 # Task base classes
 # =============================================================================
@@ -289,6 +290,25 @@ class AuxTask(ABC):
     @abstractmethod
     def output_schema(self) -> Type[BaseModel]:
         """Pydantic model class for structured output."""
+        ...
+
+
+class AuxTextTask(ABC):
+    """Base class for text-mode tasks: system prompt + context -> free text.
+
+    The AuxiliaryLLM returns the raw ``AIMessage``; the caller parses and
+    validates it (finish reason, required structure, repetition).
+    """
+
+    @property
+    @abstractmethod
+    def system_prompt(self) -> str:
+        """System prompt for the LLM call."""
+        ...
+
+    @abstractmethod
+    def build_context(self) -> str:
+        """Build the user message content from task inputs."""
         ...
 
 
@@ -521,14 +541,35 @@ class VerifyCitationTask(AuxTask):
         return CitationVerdict
 
 
-class SummarizeTask(AuxTask):
-    """Summarize a conversation segment into structured fields.
+#: Merge contract for a fold pass that carries a prior summary. Adapted from
+#: OpenCode's ``SUMMARY_UPDATE_INSTRUCTIONS`` (sst/opencode @ 7945de20,
+#: packages/core/src/session/compaction.ts, MIT): every harness that merges
+#: says the prior summary is discarded after the call, so the model must carry
+#: forward what still matters (compaction refactor, finding F1).
+SUMMARY_MERGE_INSTRUCTIONS = """\
+The <prior-summary> covers everything that happened before the <conversation>. \
+Write one new checkpoint that combines both. The <prior-summary> is discarded \
+after this: anything you do not carry into the new checkpoint is lost.
+- Carry forward objectives, user requests, constraints, decisions and open work \
+from the <prior-summary>, even when the <conversation> does not mention them. \
+Drop only what is finished and no longer needed.
+- The <conversation> is more recent. Where the two conflict, the conversation \
+wins: state the corrected fact and drop the old claim.
+- Move work that has since finished from Active to Completed, and mark resolved \
+blockers as resolved.
+- Keep every quote under User Requests (verbatim) unless the user withdrew it."""
 
-    Chain mode task invoked per fold pass by
-    ``agent.core.summarizer.SummarizationEngine``.
-    Prompt loaded from config/prompts/ via the prompt matrix.
 
-    The output schema is ConversationSummary from src/core/summary_models.py.
+class SummarizeTask(AuxTextTask):
+    """Write one fold pass of a conversation checkpoint (text mode).
+
+    Invoked per fold pass by ``agent.core.summarizer.SummarizationEngine``. The
+    system prompt (``config/prompts/summarization_prompt*.txt``, resolved per
+    summarizer family) holds the role, the rules and the section template.
+    The user message puts the transcript first and the instruction last
+    (finding F12): conversation, then the prior summary with the merge
+    contract, then the optional user focus, then the closing instruction that
+    repeats the no-continuation rule.
     """
 
     def __init__(
@@ -536,43 +577,73 @@ class SummarizeTask(AuxTask):
         conversation_text: str,
         summarization_prompt: str,
         max_summary_length: int = 10000,
+        *,
+        prior_summary: Optional[str] = None,
+        focus: Optional[str] = None,
     ):
         self.conversation_text = conversation_text
         self._summarization_prompt = summarization_prompt
         self.max_summary_length = max_summary_length
+        self.prior_summary = prior_summary
+        self.focus = focus
+
+    @property
+    def max_summary_tokens(self) -> int:
+        """The length asked of the model. ``max_summary_length`` is characters."""
+        return max(250, self.max_summary_length // 4)
 
     @property
     def system_prompt(self) -> str:
-        # The template has {conversation} and {max_summary_length} placeholders.
-        # Strip the conversation placeholder — it goes in build_context().
-        # Render max_summary_length into the instructions.
+        # Bundled prompts carry no placeholders. A DB-authored or older prompt
+        # may still hold {conversation} / {max_summary_length}: render them so
+        # the text stays valid (the conversation always travels in
+        # build_context()).
         from collections import defaultdict
 
         rendered = self._summarization_prompt.format_map(
             defaultdict(
                 str,
-                conversation="",  # Will be sent as HumanMessage
-                max_summary_length=str(self.max_summary_length),
+                conversation="",
+                max_summary_length=str(self.max_summary_tokens),
             )
         )
         # Clean up the empty "Conversation:" section left by the placeholder
         rendered = rendered.replace("\nConversation:\n\n\n", "\n")
         return rendered.strip()
 
-    def build_context(self) -> str:
-        return (
-            f"Summarize the following conversation. "
-            f"Keep the total summary under {self.max_summary_length} tokens. "
-            f"Weight recent messages more heavily — the end of the transcript "
-            f"is the active context.\n\n"
-            f"{self.conversation_text}"
-        )
-
     @property
-    def output_schema(self) -> Type[BaseModel]:
-        from shared.runtime.core.summary_models import ConversationSummary
+    def asks_for_sections(self) -> bool:
+        """True when the system prompt specifies Markdown section headings."""
+        return any(line.startswith("## ") for line in self.system_prompt.splitlines())
 
-        return ConversationSummary
+    def build_context(self) -> str:
+        parts = [
+            "Here is the conversation to summarize:",
+            f"<conversation>\n{self.conversation_text}\n</conversation>",
+        ]
+        if self.prior_summary:
+            parts += [
+                "Here is the summary of everything before the <conversation> above:",
+                f"<prior-summary>\n{self.prior_summary}\n</prior-summary>",
+                SUMMARY_MERGE_INSTRUCTIONS,
+            ]
+        if self.focus:
+            parts.append(
+                f"The user asked this checkpoint to focus on: {self.focus}\n"
+                "Give that topic the most detail, but keep every section."
+            )
+        shape = (
+            "only the sections the system prompt specifies, in that order, "
+            'with "(none)" for an empty section'
+            if self.asks_for_sections
+            else "in the format the system prompt specifies"
+        )
+        parts.append(
+            f"Write the checkpoint now: {shape}. Do not continue the "
+            "conversation, do not answer anything asked in it, and do not call "
+            f"tools. Keep it under about {self.max_summary_tokens} tokens."
+        )
+        return "\n\n".join(parts)
 
 
 class ConversationTitle(BaseModel):
@@ -1478,6 +1549,54 @@ class AuxiliaryLLM:
         self._archive_call(task, messages, raw_response, latency_ms)
 
         return parsed
+
+    async def complete(
+        self,
+        task: AuxTextTask,
+        timeout: Optional[float] = None,
+        retry_policy: Optional[RetryPolicy] = None,
+    ) -> AIMessage:
+        """Single LLM call: system prompt + context -> the model's own text.
+
+        Same pre-flight guard, main-model fallback and archiving as
+        :meth:`chain`, without structured output. Returns the raw message so
+        the caller can check ``finish_reason`` and validate the text.
+        """
+        messages = [
+            SystemMessage(content=task.system_prompt),
+            HumanMessage(content=task.build_context()),
+        ]
+
+        if self.max_context_tokens:
+            from shared.runtime.core.chunk_planner import count_text_tokens
+
+            input_tokens = count_text_tokens(messages[0].content) + count_text_tokens(
+                messages[1].content
+            )
+            if input_tokens > self.max_context_tokens:
+                task_name = task.__class__.__name__
+                error = AuxInputTooLarge(
+                    input_tokens, self.max_context_tokens, task_name
+                )
+                self.health.record_failure(task_name, error)
+                raise error
+
+        start = time.monotonic()
+        response = await self._invoke_aux(
+            self._ainvoke_fallback(
+                lambda llm, method: llm,
+                messages,
+                task_name=task.__class__.__name__,
+                timeout=timeout if timeout is not None else self.timeout,
+                retry_policy=retry_policy,
+            ),
+            task=task,
+            messages=messages,
+            start=start,
+        )
+        latency_ms = int((time.monotonic() - start) * 1000)
+        self._archive_call(task, messages, response, latency_ms)
+        return response
 
     async def agent(self, task: AuxAgentTask) -> BaseModel:
         """Short-lived agent loop: system prompt + tools -> structured result.

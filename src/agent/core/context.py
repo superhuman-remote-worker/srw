@@ -32,10 +32,6 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-from shared.runtime.core.summary_models import (
-    ConversationSummary as ConversationSummary,
-    IdentityAnchor as IdentityAnchor,
-)
 
 from shared.runtime.core.image_tokens import (
     content_to_summary_text,
@@ -852,6 +848,13 @@ class ContextConfig:
     message_count_min_tokens: int = 80_000
     keep_recent_messages: int = 10
     keep_window_max_tool_result_chars: int = 16000
+    # What the summarizer reads of each tool call and result (WP2 of
+    # knowledge-base/knowledge/features/compaction_refactor_fidelity_and_fork_strategy.md).
+    # User and assistant text always go in full. 2,000 characters is what
+    # OpenCode and pi send; SRW sent 300 characters of the last 10 results and
+    # nothing of the rest, and no tool arguments at all.
+    summary_tool_result_chars: int = 2000
+    summary_tool_args_chars: int = 2000
     tool_retry_count: int = 3
     tool_retry_delay_seconds: float = 1.0
     # Safety layer constant — a base=100_000 instance of the limit fractions in
@@ -1031,6 +1034,7 @@ class ContextManager:
         tactical_model: Optional[str] = None,
         summarization_call_timeout: float = 240.0,
         preserve_message_identity: bool = False,
+        summarization_prompt: Optional[str] = None,
     ):
         """Initialize context manager.
 
@@ -1052,8 +1056,12 @@ class ContextManager:
                 so its per-row upsert (``ON CONFLICT (id)``) and its turn
                 stamps survive compaction. See
                 knowledge-base/knowledge/issues/stateless_turn_settlement_crashes_after_midturn_compaction.md.
+            summarization_prompt: The summarizer's system prompt, used when a
+                compaction call passes none. Sessions and subagents never
+                passed one, so their summaries ran without the rules.
         """
         self.config = config or ContextConfig()
+        self.summarization_prompt = summarization_prompt
         self.preserve_message_identity = bool(preserve_message_identity)
         # getattr-guarded: some callers pass a non-ContextConfig (e.g. tests
         # hand the whole AgentConfig). image_tokens is an optional new field —
@@ -1584,13 +1592,19 @@ class ContextManager:
         return messages
 
     def _format_messages_for_summary(self, messages: List[BaseMessage]) -> List[str]:
-        """Format messages into text parts for summarization.
+        """Format messages into transcript parts for the summarizer.
 
-        Uses observation masking (JetBrains "Complexity Trap" pattern):
-        - Recent tool results: include truncated content (first 300 chars)
-        - AI reasoning: include up to 800 chars (reasoning traces > tool output per ACON)
-        - Old tool results: replace with placeholder noting tool name + size
-        - Reasoning/action history: always preserved in full
+        One part per user message, and one per assistant message together
+        with the results of the tool calls it made, so the chunk planner never
+        separates a call from its result. User and assistant text go in full;
+        tool arguments and results are capped (``summary_tool_*_chars``), an
+        error result keeping its head and its tail. Bracketed role tags keep
+        the summarizer from reading the transcript as a conversation to
+        continue (pi's stated reason for the same format).
+
+        System messages (the prompt, earlier summaries: those seed the fold),
+        workspace injections (re-injected after compaction) and protected
+        phase blocks (re-seated verbatim) are left out.
 
         Args:
             messages: Messages to format
@@ -1602,120 +1616,79 @@ class ContextManager:
             is_workspace_injection_message,
         )
 
-        # Count tool messages and build parent mapping for atomic grouping
-        tool_msg_indices = []
-        tool_call_parent = {}  # tool_call_id → parent AIMessage index
-        for i, msg in enumerate(messages):
-            if (
-                isinstance(msg, AIMessage)
-                and hasattr(msg, "tool_calls")
-                and msg.tool_calls
-            ):
-                for tc in msg.tool_calls:
-                    tc_id = tc.get("id")
-                    if tc_id:
-                        tool_call_parent[tc_id] = i
-            elif isinstance(msg, ToolMessage):
-                tool_msg_indices.append(i)
+        result_cap = self.config.summary_tool_result_chars
+        args_cap = self.config.summary_tool_args_chars
 
-        # Keep last 10 tool results with content (observation masking window)
-        recent_tool_indices = set(tool_msg_indices[-10:]) if tool_msg_indices else set()
+        def _cap(text: str, limit: int) -> str:
+            if len(text) <= limit:
+                return text
+            return f"{text[:limit]}\n[truncated, {len(text) - limit} more chars]"
 
-        # Atomic grouping: if any tool result sharing the same parent AIMessage
-        # is recent, include all sibling results in the recent set.
-        # (ForgeCode pattern: "never split tool call/result pairs")
-        if recent_tool_indices and tool_call_parent:
-            recent_parents = set()
-            for idx in recent_tool_indices:
-                tc_id = getattr(messages[idx], "tool_call_id", None)
-                parent_idx = tool_call_parent.get(tc_id)
-                if parent_idx is not None:
-                    recent_parents.add(parent_idx)
+        def _cap_error(text: str, limit: int) -> str:
+            # Tracebacks carry the cause at the end: keep head and tail.
+            if len(text) <= limit:
+                return text
+            half = limit // 2
+            return (
+                f"{text[:half]}\n[... {len(text) - 2 * half} chars omitted ...]\n"
+                f"{text[-half:]}"
+            )
 
-            for idx in tool_msg_indices:
-                if idx not in recent_tool_indices:
-                    tc_id = getattr(messages[idx], "tool_call_id", None)
-                    parent_idx = tool_call_parent.get(tc_id)
-                    if parent_idx in recent_parents:
-                        recent_tool_indices.add(idx)
+        def _format_call(call: Dict[str, Any]) -> str:
+            name = call.get("name") or "unknown"
+            try:
+                args = json.dumps(call.get("args") or {}, ensure_ascii=False)
+            except (TypeError, ValueError):
+                args = str(call.get("args"))
+            return f"[Assistant tool call]: {name}({_cap(args, args_cap)})"
 
-        # Determine recency boundary for the visual marker.
-        # The marker is inserted before the earliest message in the recent tool window,
-        # but only if there are enough tool messages to have an "old" section.
-        recency_boundary = None
-        if len(tool_msg_indices) > len(recent_tool_indices):
-            recency_boundary = min(recent_tool_indices)
+        def _format_result(msg: ToolMessage) -> str:
+            name = getattr(msg, "name", None) or "unknown"
+            text = content_to_summary_text(msg.content)
+            lowered = text.lstrip()[:20].lower()
+            is_error = getattr(msg, "status", None) == "error" or lowered.startswith(
+                ("error", "traceback")
+            )
+            if is_error:
+                return f"[Tool error: {name}]: {_cap_error(text, result_cap)}"
+            return f"[Tool result: {name}]: {_cap(text, result_cap)}"
 
-        formatted_parts = []
-        marker_inserted = False
-        for i, msg in enumerate(messages):
-            # Skip workspace injection messages - they're re-injected fresh after summarization
-            if is_workspace_injection_message(msg):
+        parts: List[str] = []
+        # tool_call_id -> index in ``parts`` of the assistant turn that made it
+        open_calls: Dict[str, int] = {}
+        for msg in messages:
+            if is_workspace_injection_message(msg) or is_protected_message(msg):
                 continue
-            # Skip protected messages (phase instruction blocks): they are
-            # re-seated verbatim after the summary, and their text would
-            # otherwise dominate the summary of the work.
-            if is_protected_message(msg):
-                continue
-
-            # Insert recency marker before the first message in the recent window
-            if (
-                recency_boundary is not None
-                and i >= recency_boundary
-                and not marker_inserted
-            ):
-                if formatted_parts:  # Only if there are older messages to separate from
-                    formatted_parts.append(
-                        "\n════════════════════════════════════════\n"
-                        "RECENT CONTEXT — PRESERVE WITH HIGHEST PRIORITY\n"
-                        "════════════════════════════════════════"
-                    )
-                marker_inserted = True
-
             if isinstance(msg, SystemMessage):
-                # Include prior summaries in the new summarization so context is preserved
-                # Skip other system messages (like the main system prompt)
-                if "[Summary of prior work]" in msg.content:
-                    formatted_parts.append(f"Prior Summary: {msg.content}")
                 continue
-            elif isinstance(msg, HumanMessage):
+            if isinstance(msg, HumanMessage):
                 # Image-safe: list content (a multimodal re-delivery) becomes
                 # text + "[image: ...]" markers, never stringified base64.
                 text = content_to_summary_text(msg.content)
-                formatted_parts.append(f"User: {text[:500]}")
+                if text.strip():
+                    parts.append(f"[User]: {text}")
             elif isinstance(msg, AIMessage):
-                content = content_to_summary_text(msg.content)
-                if hasattr(msg, "tool_calls") and msg.tool_calls:
-                    tool_names = [tc.get("name", "unknown") for tc in msg.tool_calls]
-                    if content:
-                        # Preserve reasoning alongside tool calls
-                        # (ACON: reasoning traces > tool output)
-                        formatted_parts.append(
-                            f"Assistant: {content[:800]}... [Called tools: {', '.join(tool_names)}]"
-                        )
-                    else:
-                        formatted_parts.append(
-                            f"Assistant: [Called tools: {', '.join(tool_names)}]"
-                        )
-                elif content:
-                    formatted_parts.append(f"Assistant: {content[:800]}...")
+                lines: List[str] = []
+                text = content_to_summary_text(msg.content)
+                if text.strip():
+                    lines.append(f"[Assistant]: {text}")
+                for call in msg.tool_calls or []:
+                    lines.append(_format_call(call))
+                if not lines:
+                    continue
+                parts.append("\n".join(lines))
+                for call in msg.tool_calls or []:
+                    if call.get("id"):
+                        open_calls[call["id"]] = len(parts) - 1
             elif isinstance(msg, ToolMessage):
-                tool_name = getattr(msg, "name", None) or "unknown"
-                content = content_to_summary_text(msg.content)
-                if i in recent_tool_indices:
-                    # Recent: include truncated content for summarization
-                    truncated = content[:300]
-                    suffix = "..." if len(content) > 300 else ""
-                    formatted_parts.append(
-                        f"[Tool '{tool_name}' result: {truncated}{suffix}]"
-                    )
+                line = _format_result(msg)
+                owner = open_calls.get(getattr(msg, "tool_call_id", None))
+                if owner is None:
+                    parts.append(line)
                 else:
-                    # Old: observation masking — placeholder only
-                    formatted_parts.append(
-                        f"[Tool '{tool_name}' result omitted ({len(content)} chars)]"
-                    )
+                    parts[owner] = f"{parts[owner]}\n{line}"
 
-        return formatted_parts
+        return parts
 
     async def summarize_conversation(
         self,
@@ -1753,8 +1726,14 @@ class ContextManager:
             must keep the original messages (never compact behind a
             placeholder).
         """
-        from agent.core.summarizer import SummarizationEngine, SummarizationFailed
+        from agent.core.summarizer import (
+            SummarizationEngine,
+            SummarizationFailed,
+            files_section,
+        )
 
+        if not summarization_prompt:
+            summarization_prompt = self.summarization_prompt
         formatted_parts = self._format_messages_for_summary(messages)
         if not formatted_parts:
             logger.info("Nothing to summarize (no formattable messages)")
@@ -1845,6 +1824,12 @@ class ContextManager:
                 },
             )
             return None
+
+        # The file list is recorded from the tool calls, not written by the
+        # model (WP2): union of the prior checkpoint's list and this span's.
+        recorded_files = files_section(seed_summary, messages)
+        if recorded_files:
+            summary = f"{summary.rstrip()}\n\n{recorded_files}"
 
         self._last_summarization_stats = {
             "n_passes": plan.n_passes,
@@ -2104,8 +2089,8 @@ class ContextManager:
         keep_window_token_savings = max(0, recent_before_tokens - recent_after_tokens)
 
         # Rolling-summary continuation: prior summaries seed the fold (the
-        # engine prepends them as "Prior Summary:" to the first pass) instead
-        # of being re-formatted as messages.
+        # first pass merges them under the merge contract) instead of being
+        # re-formatted as messages.
         seed_summary: Optional[str] = None
         if old_summaries:
             seed_summary = "\n\n".join(

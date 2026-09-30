@@ -1411,17 +1411,32 @@ _MODELLED_SCHEMAS: Final = frozenset(
         "ConversationTitle",
         "ExtractedMemories",
         "AssemblyResult",
-        "ConversationSummary",
+        "ConversationCheckpoint",
         "CurationResult",
         "KnowledgeAssemblyResult",
     }
 )
 
 
+def _is_checkpoint_request(payload: dict[str, Any]) -> bool:
+    """Context compaction (``SummarizeTask``, text mode): a transcript in
+    ``<conversation>`` tags followed by the closing checkpoint instruction."""
+    messages = payload.get("messages")
+    last = messages[-1] if isinstance(messages, list) and messages else None
+    content = last.get("content") if isinstance(last, dict) else None
+    return (
+        isinstance(content, str)
+        and "<conversation>" in content
+        and "Write the checkpoint now" in content
+    )
+
+
 def _structured_output_name(payload: dict[str, Any]) -> str | None:
     response_format = payload.get("response_format")
     if not isinstance(response_format, dict):
-        return None
+        # Compaction asks for Markdown, not JSON, but it is still an
+        # auxiliary answer this fixture models, never a scenario reply.
+        return "ConversationCheckpoint" if _is_checkpoint_request(payload) else None
     response_type = response_format.get("type")
     if response_type not in {"json_schema", "json_object"}:
         return None
@@ -1469,27 +1484,17 @@ def _structured_content(schema_name: str, run_id: str) -> str:
             },
             separators=(",", ":"),
         )
-    if schema_name == "ConversationSummary":
+    if schema_name == "ConversationCheckpoint":
         # Context compaction (`SummarizeTask`) folds a long worker conversation
-        # through this schema. A loop member that runs long enough to compact
-        # asked for it and got a 422, which the agent retried three times and
-        # then degraded to trimming — real behaviour change, and two
-        # `unexpected_schema` rejections that hide a genuine unexpected call.
-        # The deterministic answer is a valid, content-free summary.
-        return json.dumps(
-            {
-                "summary": f"E2E-{run_id} deterministic conversation summary.",
-                "tasks_completed": "",
-                "tasks_in_progress": "",
-                "key_decisions": "",
-                "current_state": "",
-                "blockers": "",
-                "critical_facts": "",
-                "state_changes": "",
-                "pinned_instructions": "",
-                "identity_anchor": "",
-            },
-            separators=(",", ":"),
+        # into a Markdown checkpoint. Answering it with a scenario reply would
+        # consume the scenario's script and fail the agent's section check,
+        # which retries three times and then keeps the history uncompacted.
+        # The deterministic answer is a valid, content-free checkpoint.
+        return (
+            "## Objective\n"
+            f"- E2E-{run_id} deterministic conversation summary.\n\n"
+            "## Work State\n"
+            "### Completed\n- (none)\n### Active\n- (none)\n### Blocked\n- (none)"
         )
     if schema_name == "CurationResult":
         return json.dumps(

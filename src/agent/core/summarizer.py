@@ -14,10 +14,16 @@ unstructured fallback that used to live in
    (``ceil(input/chunk_budget)``), so the engine scales to arbitrarily large
    inputs without recursion depth limits.
 
-Robustness comes from bounded retries with backoff on the *same* structured
-call — there is no fallback to a second, differently-shaped summarizer. On
-exhaustion the engine raises :class:`SummarizationFailed` and the caller keeps
-the original history (never a placeholder).
+Each pass asks the auxiliary model for a Markdown checkpoint in plain text
+(``SummarizeTask``, text mode) and validates what comes back: truncated,
+section-less or looping output is rejected and the pass retried. Robustness
+comes from bounded retries with backoff on the *same* call — there is no
+fallback to a second, differently-shaped summarizer. On exhaustion the engine
+raises :class:`SummarizationFailed` and the caller keeps the original history
+(never a placeholder).
+
+Design of the prompt contract and transcript: knowledge-base/knowledge/features/
+compaction_refactor_fidelity_and_fork_strategy.md (WP1, WP2).
 
 Progress is emitted through an optional async callback so the transport layer
 decides what to do with it (persistent sessions broadcast SSE frames; worker
@@ -27,7 +33,8 @@ agents log).
 import asyncio
 import logging
 import math
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+import re
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 
 from openai import BadRequestError
 from pydantic import ValidationError
@@ -41,7 +48,10 @@ from shared.runtime.core.chunk_planner import (
     SummarizationFailed,
     count_text_tokens,
 )
-from shared.runtime.core.summary_models import IdentityAnchor
+from agent.core.response_validator import (
+    _detect_line_repetition,
+    _detect_token_repetition,
+)
 from shared.runtime.core.llm_retry import NO_RETRY
 
 logger = logging.getLogger(__name__)
@@ -54,58 +64,177 @@ BACKOFF_SECONDS = (5.0, 15.0)  # sleep after attempt 1, attempt 2
 ProgressCallback = Callable[[str, Dict[str, Any]], Awaitable[None]]
 
 
-def format_structured_summary(result: Any) -> str:
-    """Render a ConversationSummary-shaped object into readable summary text.
+#: Heading of the file list the engine's caller appends from the tool calls.
+#: The model never writes it; it is stripped from model output and from the
+#: prior summary before a fold, then rebuilt deterministically.
+FILES_SECTION_HEADING = "## Files Touched (recorded from tool calls)"
 
-    Moved from ``ContextManager._single_pass_summarize``; duck-typed so the
-    engine doesn't import the schema class.
+#: Tools whose ``path`` argument names a file the agent read.
+_READ_TOOLS = frozenset({"read_file", "get_document_info"})
+#: Tools that change files, and the arguments that name them.
+_MODIFY_TOOL_ARGS: Dict[str, Tuple[str, ...]] = {
+    "write_file": ("path",),
+    "edit_file": ("path",),
+    "delete_file": ("path",),
+    "rename_file": ("path",),
+    "move_file": ("source", "dest"),
+    "copy_file": ("dest",),
+}
+#: Bound on each list so a long job cannot grow the section without limit.
+_MAX_FILES_PER_LIST = 60
+
+# Repetition thresholds for a checkpoint. Higher than the main-model response
+# validator's: every empty section legitimately repeats "- (none)".
+_MAX_SUMMARY_LINE_REPEATS = 20
+_MAX_SUMMARY_TOKEN_REPEATS = 30
+
+
+class SummaryRejected(Exception):
+    """A fold pass returned output that is not a usable checkpoint.
+
+    Retryable: sampling differs between attempts, and a loop or a truncation
+    is not a property of the input alone.
     """
-    parts: List[str] = []
 
-    def _text(attr: str) -> str:
-        value = getattr(result, attr, None)
-        return value.strip() if isinstance(value, str) else ""
+    def __init__(self, reason: str, detail: str = ""):
+        self.reason = reason
+        super().__init__(f"{reason}: {detail}" if detail else reason)
 
-    if _text("summary"):
-        parts.append(f"**Summary:**\n{_text('summary')}")
-    if _text("tasks_completed"):
-        parts.append(f"**Tasks Completed:**\n{_text('tasks_completed')}")
-    if _text("tasks_in_progress"):
-        parts.append(f"**Tasks In Progress:**\n{_text('tasks_in_progress')}")
-    if _text("key_decisions"):
-        parts.append(f"**Key Decisions:**\n{_text('key_decisions')}")
-    if _text("current_state"):
-        parts.append(f"**Current State:**\n{_text('current_state')}")
-    if _text("blockers"):
-        parts.append(f"**Blockers:**\n{_text('blockers')}")
-    if _text("critical_facts"):
-        parts.append(f"**Critical Facts:**\n{_text('critical_facts')}")
-    if _text("state_changes"):
-        parts.append(f"**State Changes:**\n{_text('state_changes')}")
-    if _text("pinned_instructions"):
-        parts.append(f"**Pinned Instructions:**\n{_text('pinned_instructions')}")
 
-    identity_anchor = getattr(result, "identity_anchor", None)
-    if identity_anchor:
-        if isinstance(identity_anchor, dict):
-            identity_anchor = IdentityAnchor(**identity_anchor)
+def _strip_wrapping(text: str) -> str:
+    """Drop ``<think>`` blocks and a code fence wrapped around the whole text."""
+    text = re.sub(r"(?is)<think>.*?</think>\s*", "", text).strip()
+    fenced = re.match(r"(?s)^```[a-zA-Z]*\n(.*)\n```$", text)
+    return fenced.group(1).strip() if fenced else text
 
-        if isinstance(identity_anchor, IdentityAnchor):
-            anchor_parts = []
-            if identity_anchor.agent_role:
-                anchor_parts.append(f"Role: {identity_anchor.agent_role}")
-            if identity_anchor.current_task:
-                anchor_parts.append(f"Task: {identity_anchor.current_task}")
-            if identity_anchor.active_constraints:
-                anchor_parts.append(
-                    "Constraints: " + "; ".join(identity_anchor.active_constraints)
-                )
-            if anchor_parts:
-                parts.append("**Identity Anchor:**\n" + "\n".join(anchor_parts))
-        elif isinstance(identity_anchor, str) and identity_anchor.strip():
-            parts.append(f"**Identity Anchor:**\n{identity_anchor.strip()}")
 
-    return "\n\n".join(parts)
+def validate_summary_message(message: Any, *, expect_sections: bool) -> str:
+    """Return the checkpoint text of an aux response, or raise SummaryRejected.
+
+    Rejects a response the provider cut off at its output limit, one with no
+    text (a tool call or an empty reply), one without any section heading
+    when the prompt asked for sections (a refusal, or an answer to the
+    transcript instead of a summary), and a repetition loop.
+    """
+    metadata = getattr(message, "response_metadata", None) or {}
+    finish = str(
+        metadata.get("finish_reason") or metadata.get("stop_reason") or ""
+    ).lower()
+    if finish in ("length", "max_tokens"):
+        raise SummaryRejected("truncated", f"finish_reason={finish}")
+
+    content = getattr(message, "content", message)
+    if isinstance(content, list):
+        content = "\n".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in content
+            if not (
+                isinstance(part, dict) and part.get("type") in ("thinking", "reasoning")
+            )
+        )
+    text = _strip_wrapping(str(content or ""))
+    if not text:
+        raise SummaryRejected("empty")
+    if expect_sections and not re.search(r"(?m)^#{1,3} \S", text):
+        raise SummaryRejected("no_sections", text[:120])
+    loop = _detect_line_repetition(
+        text, max_line_repetitions=_MAX_SUMMARY_LINE_REPEATS
+    ) or _detect_token_repetition(
+        text, max_token_repetitions=_MAX_SUMMARY_TOKEN_REPEATS
+    )
+    if loop:
+        raise SummaryRejected("repetition", loop)
+    return strip_files_section(text)
+
+
+def strip_files_section(summary: str) -> str:
+    """Remove the recorded-files section (heading to the next ``## ``/end)."""
+    idx = summary.find(FILES_SECTION_HEADING)
+    if idx < 0:
+        return summary
+    rest = summary[idx + len(FILES_SECTION_HEADING) :]
+    nxt = re.search(r"(?m)^## ", rest)
+    tail = rest[nxt.start() :] if nxt else ""
+    return (summary[:idx].rstrip() + ("\n\n" + tail if tail else "")).strip()
+
+
+def _parse_files_section(summary: str) -> Tuple[List[str], List[str]]:
+    """Read the Read/Modified lists back out of an earlier checkpoint."""
+    idx = summary.find(FILES_SECTION_HEADING)
+    if idx < 0:
+        return [], []
+    body = summary[idx + len(FILES_SECTION_HEADING) :]
+    nxt = re.search(r"(?m)^## ", body)
+    body = body[: nxt.start()] if nxt else body
+    lists: Dict[str, List[str]] = {"read": [], "modified": []}
+    for line in body.splitlines():
+        match = re.match(r"^- (Read|Modified): (.*)$", line.strip())
+        if match and match.group(2).strip() != "(none)":
+            lists[match.group(1).lower()] = [
+                p.strip() for p in match.group(2).split(", ") if p.strip()
+            ]
+    return lists["read"], lists["modified"]
+
+
+def _collect_tool_call_files(messages: Iterable[Any]) -> Tuple[List[str], List[str]]:
+    """Files read and modified, in first-seen order, from the tool calls."""
+    read: List[str] = []
+    modified: List[str] = []
+    for msg in messages:
+        for call in getattr(msg, "tool_calls", None) or []:
+            name = call.get("name")
+            args = call.get("args") or {}
+            if not isinstance(args, dict):
+                continue
+            if name in _READ_TOOLS:
+                targets, bucket = ("path",), read
+            elif name in _MODIFY_TOOL_ARGS:
+                targets, bucket = _MODIFY_TOOL_ARGS[name], modified
+            else:
+                continue
+            for key in targets:
+                value = args.get(key)
+                if isinstance(value, str) and value.strip():
+                    bucket.append(value.strip())
+    return read, modified
+
+
+def _merge_recent(older: List[str], newer: List[str], limit: int) -> List[str]:
+    """Union keeping first-seen order, but the most recent ``limit`` entries."""
+    merged: Dict[str, None] = {}
+    for path in older + newer:
+        merged.pop(path, None)
+        merged[path] = None
+    return list(merged)[-limit:]
+
+
+def files_section(prior_summary: Optional[str], messages: Iterable[Any]) -> str:
+    """Build the deterministic file list for a new checkpoint.
+
+    Unions the list recorded in the prior checkpoint with the files named by
+    this span's tool calls. A file that was modified is listed only under
+    Modified. Research: file state tracked from tool calls, not left to the
+    summarizer ("artifact trail" was the weakest dimension in Factory's
+    evaluation; pi records read and modified files the same way).
+    """
+    prior_read, prior_modified = _parse_files_section(prior_summary or "")
+    new_read, new_modified = _collect_tool_call_files(messages)
+    modified = _merge_recent(prior_modified, new_modified, _MAX_FILES_PER_LIST)
+    modified_set = set(modified)
+    read = [
+        p
+        for p in _merge_recent(prior_read, new_read, _MAX_FILES_PER_LIST * 2)
+        if p not in modified_set
+    ][-_MAX_FILES_PER_LIST:]
+    if not read and not modified:
+        return ""
+    return "\n".join(
+        [
+            FILES_SECTION_HEADING,
+            f"- Read: {', '.join(read) if read else '(none)'}",
+            f"- Modified: {', '.join(modified) if modified else '(none)'}",
+        ]
+    )
 
 
 def is_overflow_error(exc: BaseException) -> bool:
@@ -153,6 +282,35 @@ def _describe_exc(exc: Optional[BaseException]) -> str:
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
+def load_summarizer_prompt(config: Any) -> Optional[str]:
+    """The summarization prompt variant for the model that writes the summary.
+
+    That is the dedicated auxiliary model when one is configured and enabled,
+    otherwise the summarization model. (The worker used to resolve the variant
+    from ``llm.summarization`` even when a different auxiliary model wrote the
+    summary, and sessions and subagents loaded none at all.) Returns None when
+    the config cannot resolve a prompt, so a caller never fails to start over
+    it; the summarizer then runs with the task's own instructions only.
+    """
+    try:
+        from shared.runtime.core.loader import load_summarization_prompt
+
+        aux = getattr(config, "auxiliary", None)
+        aux_model = (
+            getattr(aux, "model", None) if getattr(aux, "enabled", False) else None
+        )
+        model = (
+            aux_model
+            or config.llm.get_phase_config("summarization").model
+            or config.llm.model
+        )
+        prompt = load_summarization_prompt(config, model=model or "")
+        return prompt if isinstance(prompt, str) and prompt.strip() else None
+    except Exception as e:
+        logger.warning(f"Summarization prompt could not be loaded: {e}")
+        return None
+
+
 class SummarizationEngine:
     """Plan-then-fold summarization sized for the auxiliary model's window."""
 
@@ -173,8 +331,9 @@ class SummarizationEngine:
                 (resolved from the aux model's settings at construction) is
                 the budgeting authority.
             summarization_prompt: Pre-rendered prompt template (may be None).
-            max_summary_length: Max summary length in characters (the
-                structured task's contract); also bounds the running summary.
+            max_summary_length: Max summary length in characters; the task
+                asks for about a quarter of it in tokens, and it bounds the
+                running summary.
             call_timeout: Per fold-call timeout in seconds. Replaces the old
                 single 600s blob — N passes get N bounded calls.
             progress_cb: Optional async ``(event_name, params)`` callback.
@@ -228,7 +387,13 @@ class SummarizationEngine:
         return count_text_tokens(text, self.counting_model)
 
     def _measure_overhead(self) -> int:
-        """Measure the system prompt's token cost (+ schema allowance)."""
+        """Measure the fixed prompt cost of a fold call, plus an allowance.
+
+        Counts the system prompt and the user-message scaffolding with the
+        merge contract present (the worst case). The prior summary itself is
+        covered by the planner's carry reserve; the allowance covers a
+        ``/compact`` focus and tokenizer differences.
+        """
         try:
             from shared.runtime.services.auxiliary import SummarizeTask
 
@@ -236,8 +401,11 @@ class SummarizationEngine:
                 conversation_text="",
                 summarization_prompt=self.summarization_prompt or "",
                 max_summary_length=self.max_summary_length,
+                prior_summary=" ",
             )
-            prompt_tokens = self._count(probe.system_prompt)
+            prompt_tokens = self._count(probe.system_prompt) + self._count(
+                probe.build_context()
+            )
         except Exception as e:  # pragma: no cover - defensive
             logger.debug(f"Prompt overhead probe failed, using fixed value: {e}")
             prompt_tokens = 3_000
@@ -276,9 +444,9 @@ class SummarizationEngine:
 
         Args:
             plan: Output of :meth:`plan`.
-            seed_summary: Prior summary text to incorporate (rolling-summary
-                continuation — replaces the old "prepend old summary
-                messages" pattern).
+            seed_summary: Prior summary text to merge into the first pass
+                (rolling-summary continuation). Later passes carry the
+                running summary the same way, under the merge contract.
             focus: Optional user-provided compaction focus (``/compact
                 <focus>``), honored in every fold call.
 
@@ -302,18 +470,12 @@ class SummarizationEngine:
                 n_passes=plan.n_passes,
             )
 
-        summary = seed_summary
+        summary = strip_files_section(seed_summary) if seed_summary else None
         for chunk in plan.chunks:
-            fold_segments: List[str] = []
-            if summary:
-                fold_segments.append(f"Prior Summary: {summary}")
-            if focus:
-                fold_segments.append(f"User compaction focus: {focus}")
-            fold_segments.append(chunk.text)
-            fold_text = "\n".join(fold_segments)
-
             await self._emit_progress(plan, chunk, attempt=1, out_tokens=None)
-            summary = await self._call_with_retries(fold_text, plan, chunk)
+            summary = await self._call_with_retries(
+                chunk.text, plan, chunk, prior_summary=summary, focus=focus
+            )
             await self._emit_progress(
                 plan, chunk, attempt=1, out_tokens=self._count(summary)
             )
@@ -321,12 +483,20 @@ class SummarizationEngine:
         return summary or ""
 
     async def _call_with_retries(
-        self, fold_text: str, plan: ChunkPlan, chunk: Chunk
+        self,
+        conversation_text: str,
+        plan: ChunkPlan,
+        chunk: Chunk,
+        *,
+        prior_summary: Optional[str] = None,
+        focus: Optional[str] = None,
     ) -> str:
         last_error: Optional[BaseException] = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                return await self._call_once(fold_text)
+                return await self._call_once(
+                    conversation_text, prior_summary=prior_summary, focus=focus
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -362,30 +532,42 @@ class SummarizationEngine:
             f"{MAX_ATTEMPTS} attempts: {_describe_exc(last_error)}"
         )
         raise SummarizationFailed(
-            "aux_unavailable",
+            "summary_rejected"
+            if isinstance(last_error, SummaryRejected)
+            else "aux_unavailable",
             str(last_error),
             pass_index=chunk.index,
             n_passes=plan.n_passes,
         ) from last_error
 
-    async def _call_once(self, conversation_text: str) -> str:
-        """One structured summarization call. No fallback variants."""
+    async def _call_once(
+        self,
+        conversation_text: str,
+        *,
+        prior_summary: Optional[str] = None,
+        focus: Optional[str] = None,
+    ) -> str:
+        """One summarization call, validated. No fallback variants."""
         from shared.runtime.services.auxiliary import SummarizeTask
 
         task = SummarizeTask(
             conversation_text=conversation_text,
             summarization_prompt=self.summarization_prompt or "",
             max_summary_length=self.max_summary_length,
+            prior_summary=prior_summary,
+            focus=focus,
         )
         # NO_RETRY: the fold loop above already owns the retry for this call
         # (MAX_ATTEMPTS + BACKOFF_SECONDS + the is_overflow_error gate). Letting
         # AuxiliaryLLM add its own would double the provider calls per fold and
         # hide the first failure from `_emit_progress`, so the cockpit would show
         # attempt 1 twice instead of 1 then 2.
-        result = await self.auxiliary.chain(
+        response = await self.auxiliary.complete(
             task, timeout=self.call_timeout, retry_policy=NO_RETRY
         )
-        return format_structured_summary(result)
+        return validate_summary_message(
+            response, expect_sections=task.asks_for_sections
+        )
 
     async def _emit_progress(
         self,

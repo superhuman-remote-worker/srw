@@ -931,11 +931,7 @@ class TestArchivePhaseNode:
             SystemMessage,
         )
 
-        from agent.core.context import (
-            ContextConfig,
-            ContextManager,
-            ConversationSummary,
-        )
+        from agent.core.context import ContextConfig, ContextManager
         from shared.runtime.core.message_markers import (
             PROTECTED_KEY,
             is_protected_message,
@@ -964,23 +960,12 @@ class TestArchivePhaseNode:
         )
         context_mgr.set_current_phase("tactical", phase_key="2:tactical")
 
-        parsed = ConversationSummary(
-            summary="Phase 2 work.",
-            tasks_completed="- Task 1",
-            key_decisions="",
-            current_state="phase ended",
-            blockers="",
-        )
-        structured = AsyncMock()
-        structured.ainvoke = AsyncMock(
-            return_value={
-                "raw": AIMessage(content="s"),
-                "parsed": parsed,
-                "parsing_error": None,
-            }
-        )
         aux_llm = MagicMock()
-        aux_llm.with_structured_output = MagicMock(return_value=structured)
+        aux_llm.ainvoke = AsyncMock(
+            return_value=AIMessage(
+                content="## Objective\n- Phase 2 work.\n\n## Work State\n- Task 1"
+            )
+        )
         auxiliary = AuxiliaryLLM(llm=aux_llm, max_context_tokens=15_000)
 
         block = create_phase_instruction_message(
@@ -2237,23 +2222,10 @@ class TestEnsureWithinLimits:
         from langchain_core.messages import AIMessage
 
         llm = MagicMock()
-        # with_structured_output(include_raw=True) returns dict with raw/parsed/parsing_error
-        parsed = MagicMock(
-            summary="Test summary",
-            tasks_completed="- Task 1",
-            key_decisions="- Decision 1",
-            current_state="In progress",
-            blockers="",
+        # Text mode: the model writes the Markdown checkpoint itself.
+        llm.ainvoke = AsyncMock(
+            return_value=AIMessage(content="## Objective\n- Test summary")
         )
-        structured_llm = MagicMock()
-        structured_llm.ainvoke = AsyncMock(
-            return_value={
-                "raw": AIMessage(content="structured output"),
-                "parsed": parsed,
-                "parsing_error": None,
-            }
-        )
-        llm.with_structured_output = MagicMock(return_value=structured_llm)
         return AuxiliaryLLM(llm=llm)
 
     @pytest.mark.asyncio
