@@ -3,10 +3,6 @@
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from orchestrator.services.session_workspace_policy import (
-    SESSION_DEFAULT_WORKSPACE_BACKEND,
-)
-
 
 async def resolve_preference_defaults(
     db: Any,
@@ -73,6 +69,5 @@ async def resolve_preference_defaults(
             "model": registry_chat or p_llm.get("model"),
             "permission_mode": "supervised",
             "idle_timeout_minutes": 30,
-            "workspace_backend": SESSION_DEFAULT_WORKSPACE_BACKEND,
         },
     }

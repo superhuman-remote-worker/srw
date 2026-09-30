@@ -237,6 +237,7 @@ interface ExpertDetail extends Expert {
           [config]="workspaceConfig()"
           [resolvedToolset]="toolPreview()"
           [readsResolvedToolset]="true"
+          [workspacePreview]="toolPreview()?.workspace ?? null"
           [disabled]="creating()"
           [settingsMatrix]="expertDetail()?.settings_matrix ?? frameworkSettingsMatrix()"
           [effectiveModels]="resolvedEffectiveModels()"

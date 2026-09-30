@@ -243,6 +243,18 @@ async def prepare_job_admission_config(
             # asyncpg may return JSONB as a string — parse it
             if isinstance(project_default_override, str):
                 project_default_override = json.loads(project_default_override)
+            if (
+                isinstance(project_default_override, dict)
+                and "workspace" in project_default_override
+            ):
+                # Slice A2b: the workspace defaults chain reads
+                # project_workspace_defaults for the Project layer; a legacy
+                # Project's stored backend no longer leaks through here.
+                project_default_override = {
+                    key: value
+                    for key, value in project_default_override.items()
+                    if key != "workspace"
+                }
 
     config_override = project_default_override
     resolved_expert_id = explicit_expert_id
@@ -339,9 +351,9 @@ async def prepare_job_admission_config(
             422,
             "Child jobs inherit their parent workspace; select it on the root execution.",
         )
-    if root_creation and (
-        workspace_supplied or (project or {}).get("manifest_composed")
-    ):
+    # Every root Job with an owner resolves the workspace defaults chain; a
+    # supplied workspace without an owner still gets the 422 below.
+    if root_creation and (workspace_supplied or effective_user_id):
         from orchestrator.services.manifest_workspace_selection import (
             select_execution_workspace,
         )

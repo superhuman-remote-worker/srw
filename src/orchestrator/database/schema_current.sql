@@ -23315,6 +23315,34 @@ COMMENT ON COLUMN public.project_repositories.role IS 'jobs = the per-project jo
 
 
 --
+-- Name: project_workspace_defaults; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.project_workspace_defaults (
+    project_id uuid NOT NULL,
+    jobs_mode text,
+    sessions_mode text,
+    container_template jsonb,
+    vm_template jsonb,
+    source text DEFAULT 'settings'::text NOT NULL,
+    manifest_revision text,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_by uuid,
+    CONSTRAINT project_workspace_defaults_jobs_mode_check CHECK ((jobs_mode = ANY (ARRAY['none'::text, 'virtual'::text, 'container'::text, 'vm'::text]))),
+    CONSTRAINT project_workspace_defaults_revision_follows_source CHECK (((source = 'manifest'::text) = (manifest_revision IS NOT NULL))),
+    CONSTRAINT project_workspace_defaults_sessions_mode_check CHECK ((sessions_mode = ANY (ARRAY['none'::text, 'virtual'::text, 'container'::text, 'vm'::text]))),
+    CONSTRAINT project_workspace_defaults_source_check CHECK ((source = ANY (ARRAY['settings'::text, 'manifest'::text])))
+);
+
+
+--
+-- Name: TABLE project_workspace_defaults; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.project_workspace_defaults IS 'Workspace defaults per Project: tier modes for Jobs and Sessions, and a template per tier. The resolver reads only this table for the Project layer.';
+
+
+--
 -- Name: projects; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -28211,6 +28239,14 @@ ALTER TABLE ONLY public.project_officers
 
 ALTER TABLE ONLY public.project_repositories
     ADD CONSTRAINT project_repositories_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: project_workspace_defaults project_workspace_defaults_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_workspace_defaults
+    ADD CONSTRAINT project_workspace_defaults_pkey PRIMARY KEY (project_id);
 
 
 --
@@ -34957,6 +34993,22 @@ ALTER TABLE ONLY public.project_officers
 
 ALTER TABLE ONLY public.project_repositories
     ADD CONSTRAINT project_repositories_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: project_workspace_defaults project_workspace_defaults_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_workspace_defaults
+    ADD CONSTRAINT project_workspace_defaults_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: project_workspace_defaults project_workspace_defaults_updated_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_workspace_defaults
+    ADD CONSTRAINT project_workspace_defaults_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES public.users(id) ON DELETE SET NULL;
 
 
 --

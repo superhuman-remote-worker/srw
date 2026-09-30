@@ -7,6 +7,7 @@ import type {
     SessionToolGroupsResponse,
 } from '../../core/services/api.service';
 import {SettingsMode, TierReachability} from './agent-settings.types';
+import type {WorkspacePreview} from '../../core/models/workspace.model';
 import {ExecutionGroupComponent} from './execution-group.component';
 import {ModelGroupComponent} from './model-group.component';
 import {delegationCapScopeForMode, ToolsGroupComponent} from './tools-group.component';
@@ -82,6 +83,7 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
             [liveTier]="liveTier()"
             [tierReachability]="tierReachability()"
             [upgradeInProgress]="upgradeInProgress()"
+            [workspacePreview]="workspacePreview()"
             (change)="onChange()"
             (tierChangeRequested)="tierChangeRequested.emit($event)"
           />
@@ -299,6 +301,10 @@ export class AgentSettingsComponent {
   liveTier = input<string | null>(null);
   tierReachability = input<Record<string, TierReachability>>({});
   upgradeInProgress = input<{tier: string; elapsed?: number} | null>(null);
+  /** The resolver's answer for what an unpinned workspace backend would
+   *  resolve to, forwarded to the execution group's hint (Slice A2b §6,
+   *  "Create form"). Null outside job/session creation. */
+  workspacePreview = input<WorkspacePreview | null>(null);
   /** Expert detail loading state. */
   loadingExpert = input(false);
 

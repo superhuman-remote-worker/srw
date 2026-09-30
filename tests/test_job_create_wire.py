@@ -101,6 +101,8 @@ def wire(monkeypatch):
             )
         ),
         resolve_datasources_for_thread=AsyncMock(return_value=[]),
+        # No project_workspace_defaults row: the installation decides the tier.
+        fetchrow=AsyncMock(return_value=None),
     )
     defaults = AsyncMock(return_value=([CONNECTOR], {}))
     authorize = AsyncMock(side_effect=lambda _actor, ids, **kw: (list(ids), {}))
@@ -531,8 +533,11 @@ async def test_external_vm_lane_override_keeps_permission_and_merged_grant_order
     workspace_wire, monkeypatch, caplog
 ):
     wire = workspace_wire
+    # Slice A2b: a legacy Project's stored workspace backend no longer
+    # selects a workspace (the defaults chain does); request an explicit VM
+    # the way `config_override.workspace` still supports (see
+    # test_explicit_stateless_refusals_keep_exact_http_and_no_later_effects).
     wire.db.get_project.return_value["default_config_override"] = {
-        "workspace": {"backend": "vm"},
         "autonomy": "review",
     }
     caplog.set_level(logging.DEBUG)
@@ -563,7 +568,7 @@ async def test_external_vm_lane_override_keeps_permission_and_merged_grant_order
         wire,
         body(
             execution_lane="stateless",
-            config_override={"autonomy": "partial"},
+            config_override={"workspace": {"backend": "vm"}, "autonomy": "partial"},
             datasource_ids=[],
         ),
     )
@@ -1016,7 +1021,8 @@ async def test_actual_create_json_keeps_row_nulls_extensions_and_serialization(
         "user_id": USER,
         "project_id": PROJECT,
         "context": {"expert_selection": {"source": "application", "expert_id": EXPERT}},
-        "config_override": None,
+        # Slice A2b: every root Job binds the workspace defaults chain.
+        "config_override": {"workspace": {"backend": "sandbox"}},
         "workspace_contract": {"state": "unassigned"},
         "existing_extension": {"nullable": None},
         "workspace_recovery": None,
@@ -1154,7 +1160,11 @@ async def test_public_identity_and_authority_injection_are_stripped_without_new_
         "nested": [{"keep": 1}],
         "expert_selection": {"source": "application", "expert_id": EXPERT},
     }
-    assert kwargs["config_override"] == {"extra": {}}
+    # Slice A2b: every root Job binds the workspace defaults chain.
+    assert kwargs["config_override"] == {
+        "extra": {},
+        "workspace": {"backend": "sandbox"},
+    }
 
 
 @pytest.mark.asyncio
@@ -1315,6 +1325,8 @@ async def test_project_and_expert_overrides_merge_before_request_at_real_insert(
     assert args["config_override"] == {
         "llm": {"model": "request", "temperature": 0.2},
         "extra": {"keep": True},
+        # Slice A2b: every root Job binds the workspace defaults chain.
+        "workspace": {"backend": "sandbox"},
     }
     assert args["context"]["expert_selection"] == {
         "source": "project",

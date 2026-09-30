@@ -78,12 +78,16 @@ References without a scope resolve in the selected Project, or in the Account
 for a standalone execution. The example explicitly selects an Account resource;
 Jobs can acquire a default Project even when no project ID is submitted.
 
-Omission inherits the active Project default, then account/role defaults. Explicit
-null selects no workspace. `config_override.workspace.backend` remains an
-explicit compatibility input; supplying both forms is rejected. Referenced
+Omission uses the [workspace defaults](container-workspace-templates.md#workspace-defaults):
+the Project's mode for the role and its template for that tier, then the
+installation's, then the built-in template. A generic-image Job (`adapter:
+generic`) that omits `workspace` gets only its Project's container template, when
+the Project's Jobs mode is `container` and one is set; otherwise it has no
+workspace. Explicit null selects no workspace. `config_override.workspace.backend`
+remains an explicit compatibility input; supplying both forms is rejected. Referenced
 workspace revisions are frozen in execution snapshots, including across Session
 configuration edits and End/Resume. Unattended Project loops, automations and
-Officer dispatch also resolve the Project workspace before connector selection.
+Officer dispatch also resolve the workspace defaults before connector selection.
 
 The SRW provisioner accepts backend-only templates and prebuilt VM templates
 with `Delete` retention, plus retained same-cluster VM instances for Jobs.

@@ -84,7 +84,13 @@ workspace:
   To change one, save a copy under your own name and edit the copy.
 - **Every release updates them.** A new release points the container templates
   at its own images. Work that is already admitted keeps the image it was
-  admitted with, like any template.
+  admitted with, like any template. That includes Jobs that named no workspace:
+  they get `container-full` (see [Workspace defaults](#workspace-defaults)).
+- **They pull like a pod without a pull policy.** Each container template gets
+  the policy Kubernetes would give its image: `Always` for a `latest` tag
+  without a digest (the shipped values), `IfNotPresent` for a pinned tag or a
+  digest. The chart's `image.workspace.pullPolicy` doesn't change it. To pull a
+  pinned tag every time, save a copy with its own `pullPolicy`.
 - **A Project copies a template when the Project is applied.** A Project whose
   workspace refers to a built-in keeps that copy, image included, until the
   Project is applied again.
@@ -101,6 +107,222 @@ workspace:
 - **A built-in a Project still references stays.** It stays, read-only, after
   it stops being declared or after `workspace.builtinTemplates.enabled: false`,
   and is retired at a later start once nothing references it.
+
+## Workspace defaults
+
+When a Job or Session doesn't name a workspace, SRW answers two questions. Each
+answer comes from the Project first, then the installation.
+
+1. **Which tier.** A mode per role: one for Jobs, one for Sessions.
+2. **Which template for that tier.** One template per tier (`container`, `vm`),
+   shared by both roles: the Project's, otherwise the installation's, otherwise
+   the built-in (`container-full`, `vm-full`).
+
+| Mode | Backend | Template |
+| --- | --- | --- |
+| `none` | `none`: no files, no shell | none |
+| `virtual` | `virtual` | none |
+| `container` | `sandbox` | the container template |
+| `vm` | `vm` | the VM template |
+
+Modes say `container`; a template's backend says `sandbox`. Both name the same
+tier.
+
+With nothing configured, Jobs get a container from `container-full` and Sessions
+get `virtual`. `container-full` has the installation image and the installation
+sizes, so this is what work got before defaults existed.
+
+The defaults are applied once, when the work is admitted. Changing them later
+doesn't move running work. The Job or Session records which layer gave each
+answer, in `context.workspace_sources` (Jobs) or `metadata.workspace_sources`
+(Sessions):
+
+```json
+{"tier": "project", "template": "project", "template_name": "container-minimal"}
+```
+
+The tier comes from `explicit`, `project`, `installation` or `upgrade`; the
+template from `explicit`, `project`, `installation` or `builtin`. Admission
+writes this record; a value sent by the caller is dropped. `GET /api/jobs/{id}`
+returns it inside `context`, and `GET /api/persistent/threads/{id}` inside
+`metadata`.
+
+### A Project's defaults
+
+The Project page's **Settings** tab has a **Workspace defaults** section: Jobs,
+Sessions, Container template and VM template. The VM fields are hidden while VMs
+are off. Each "Installation default (…)" entry shows what the installation
+gives. Project owners and administrators can change the values; other members
+see them read-only. The template pickers offer Catalog templates and the
+Project's own templates, which every member can read. A personal project also
+offers its owner's Account templates. A template that no longer exists is
+flagged on its field.
+
+There is no per-user workspace setting. A user's personal project stands in for
+it, and the Settings page links there. A value saved under the old personal
+"Workspace backend" setting was copied to the personal project's Sessions mode
+at the upgrade.
+
+The same values are available through the API:
+
+- `GET /api/projects/{id}/workspace-defaults` returns the stored values, the
+  effective ones with their layers, the installation's values and any problems.
+  Any member may read it.
+- `PUT /api/projects/{id}/workspace-defaults` replaces all four values. A field
+  that is left out or `null` falls through to the installation.
+
+  ```json
+  {"jobs": "container", "sessions": "virtual",
+   "container": {"name": "container-minimal", "scope": {"kind": "Catalog", "name": "shared"}},
+   "vm": null}
+  ```
+
+  It answers 403 unless the caller is a Project owner or an administrator, and
+  409 "These defaults are managed by the Project manifest." when a manifest
+  owns them. It answers 422 for:
+  - a template whose backend doesn't match its tier ("The container template
+    must be a container workspace.");
+  - a template outside the pickers' set ("Pick a Catalog template or one of this
+    Project's templates.");
+  - a VM value while VMs are off ("VM workspaces are not available on this
+    installation.").
+
+### In a Project manifest
+
+`defaults.workspace` takes an alias (the shorthand), `null`, or an object:
+
+```yaml
+spec:
+  resources:
+    workspaces:
+      development: {ref: {name: cpp-terraform-react, scope: {kind: Catalog, name: shared}}}
+      devbox: {ref: {name: vm-full, scope: {kind: Catalog, name: shared}}}
+  defaults:
+    workspace:
+      jobs: container          # none | virtual | container | vm
+      sessions: virtual
+      container: development   # alias from resources.workspaces
+      vm: devbox
+```
+
+- **Object.** All four fields are optional. `container` and `vm` must name
+  aliases in `resources.workspaces` whose backend matches (`sandbox`, `vm`), or
+  the apply fails validation.
+- **Shorthand `workspace: <alias>`.** Both modes become the alias's tier, and the
+  alias becomes the template for that tier (none for `virtual`).
+- **`workspace: null`.** Both modes become `none`.
+
+Activating a Project revision that sets `defaults.workspace` writes these values
+and makes the manifest their owner. The Settings tab then shows them read-only
+("These defaults are managed by the Project manifest"), and `PUT` answers 409. A
+revision without the field leaves values made in the Settings tab alone. A
+revision that drops the field, or deleting the Project manifest, clears the
+values and hands them back to the Settings tab. A manifest-owned template is
+copied when the revision is applied; only a new revision changes it.
+
+### Jobs and Sessions
+
+`execution.workspace` in a Job manifest, and `workspace` in `POST /api/jobs` and
+`POST /api/persistent/threads`:
+
+| Value | Workspace |
+| --- | --- |
+| omitted | the defaults for the Job or Session role |
+| `null` | none (backend `none`) |
+| a binding | used as given |
+
+A generic-image Job (`adapter: generic`) that omits `workspace` gets its
+Project's container template when the Project's Jobs mode is `container` and a
+container template is set, which is what the shorthand to a `sandbox` alias
+sets. Otherwise it gets no workspace. The installation's values and the
+built-ins never apply to generic Jobs.
+
+The Job and Session create forms show where the default comes from under the
+workspace picker, for example "Default from this Project · container-minimal".
+
+### Installation defaults (Helm)
+
+```yaml
+workspace:
+  defaults:
+    jobs: container     # none | virtual | container | vm
+    sessions: virtual
+    container: ""       # empty = the built-in; or a template name in Catalog/shared
+    vm: ""
+```
+
+The values above are the shipped ones. A named template must exist in the
+shared Catalog with the matching backend; any template there works, not only a
+built-in. With `workspace.builtinTemplates.enabled: false`, an empty name means
+the plain backend: the installation image and sizes, without a template. The
+orchestrator checks these values at startup; see the
+[Helm chart guide](../../helm/README.md#workspace-defaults).
+
+### When a default is broken
+
+Admission fails closed. There is no silent fallback, because work would run
+without its toolchain. The message names the layer:
+
+- "This Project's container template 'x' no longer exists."
+- "The installation's container template 'x' (Helm workspace.defaults.container)
+  no longer exists."
+- "The built-in container template 'container-full' is missing; see the
+  orchestrator's startup log."
+- "The installation's workspace defaults (Helm workspace.defaults) are invalid:
+  …"
+- "The container template must be a container workspace." (409): the template
+  was edited to another backend after it was chosen.
+
+Work that starts without anyone watching doesn't hold up other work:
+
+- A scheduled automation skips that run and stores the message as its last
+  status. The next successful run clears it.
+- The officer's backlog report shows "Pool …: CANNOT DISPATCH until the
+  workspace defaults are fixed: …" for that pool.
+- A project loop stops with "spawn failed: …".
+
+"The Project changed during workspace selection; submit again." is not a
+refusal. Those paths retry it.
+
+### Upgrades
+
+An upgrade moves to the tier it asks for, or to the next one up (`none` and
+`virtual` go to a container, a container goes to a VM). It gets that tier's
+default template from the lookup above, unless it names a template.
+
+| Trigger | Result |
+| --- | --- |
+| `/upgrade-workspace vm` in a Session | a VM from the default VM template |
+| `/upgrade-workspace <template name>` in a Session | that template. SRW looks for the name in the Session's Project, then in your Account, then in the shared Catalog. In a running Session it must be a VM template. |
+| `/upgrade-workspace` without an argument | the next tier (for a `virtual` Session, see below) |
+| The agent's approval request (it needs `sudo`) | a VM from the default VM template |
+| A Job frozen for a VM (`POST /api/jobs/{id}/upgrade-to-vm`) | a VM from the default VM template |
+| A running `virtual` or `none` Job that needs a container | a container from the default container template |
+
+- **Container upgrades of a running Session are unavailable.** In a `virtual`
+  Session, `/upgrade-workspace container` and `/upgrade-workspace` without an
+  argument are refused, and a container template name is refused with
+  "Container upgrades of a running Session are unavailable; start a new Session
+  with this template." Start a new Session with the container you need.
+- **Refusals.**
+  - A template that isn't a higher tier than the current one: 400 "An upgrade
+    must move to a higher tier than the current one."
+  - A template that keeps its workspace (`retention: Retain`): 409 "Upgrades
+    can't use a template that keeps its workspace; start new work with this
+    template."
+  - An unknown name: 404 "No template named 'x' is available here."
+  - As before: a VM upgrade while VMs are off, a stateless Session (409), and a
+    Session admitted from a manifest are refused, and nothing moves down a tier.
+- **Work without an owner** (internal Jobs, their subjobs, agent child threads)
+  upgrades without a template, as before. Naming a template for it answers 409
+  "The execution owner is unavailable."
+- **VM sizes.** A VM upgrade takes the template's sizes. With the shipped values
+  that is `vm-full`: its 30Gi disk is larger than the 20Gi a VM upgrade got
+  before.
+- **Recorded.** The upgrade stores the template's settings as `upgrade_config`
+  and their layers as `upgrade_sources`: in `metadata.vm` for a Session, in
+  `context.vm` for a Job's VM upgrade, and in `context.workspace_container` for
+  a Job's container upgrade.
 
 ## Images
 
@@ -344,9 +566,12 @@ the full profile.
 - A Job's separate IDE pod still runs the installation image, so its terminal
   lacks your image's tools. Sessions run code-server inside the workspace, which
   your image must provide.
-- A virtual Session upgraded to a container gets the installation defaults.
-- A workspace created from a built-in template keeps its image across releases.
-  A workspace created without a template follows the installation image.
+- A running Session can't upgrade to a container with `/upgrade-workspace`
+  (see [Upgrades](#upgrades)).
+- A workspace created from a built-in template keeps its image across releases,
+  including work that got `container-full` because it named no workspace. Only
+  the plain backend, used when the built-ins are turned off, follows the
+  installation image.
 
 ## Recovery after a running workspace becomes unavailable
 

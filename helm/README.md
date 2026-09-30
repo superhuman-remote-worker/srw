@@ -747,6 +747,68 @@ openssl rand -base64 48  # IDE_CREDENTIAL_KEY
 
 ---
 
+## Workspace defaults
+
+These values decide what a Job or Session gets when nobody names a workspace.
+[Workspace defaults](../examples/manifests/container-workspace-templates.md#workspace-defaults)
+describes the whole lookup, including each Project's own defaults, which win
+over these.
+
+```yaml
+workspace:
+  defaults:
+    jobs: container     # none | virtual | container | vm
+    sessions: virtual
+    container: ""       # empty = the built-in container-full
+    vm: ""              # empty = the built-in vm-full
+```
+
+| Key | Shipped value | Meaning |
+|---|---|---|
+| `workspace.defaults.jobs` | `container` | The tier of a Job: `none`, `virtual`, `container` or `vm` |
+| `workspace.defaults.sessions` | `virtual` | The tier of a Session, same choices |
+| `workspace.defaults.container` | `""` | The name of a `backend: sandbox` WorkspaceTemplate in Catalog `shared`; empty means `container-full` |
+| `workspace.defaults.vm` | `""` | The name of a `backend: vm` WorkspaceTemplate in Catalog `shared`; empty means `vm-full` |
+
+- **The shipped values change nothing.** Jobs get a container with the
+  installation image and sizes (through `container-full`); Sessions get
+  `virtual`. The image pulls as before too: `Always` for a `latest` tag without
+  a digest, `IfNotPresent` for a pinned tag or a digest, whatever
+  `image.workspace.pullPolicy` says.
+- **A template name must exist in the shared Catalog** with the matching
+  backend. Any template there works, not only a built-in, so you can point every
+  container at your own image without forking the chart.
+- **`vm` values need VMs.** Setting `vm` as a mode, or a `vm` template, while
+  `vm.mode` is `off` is reported as a problem.
+- **Built-ins turned off.** With `workspace.builtinTemplates.enabled: false`, an
+  empty template name means the plain backend: the installation image and the
+  installation sizes, without a template.
+- **Delivery.** The chart renders the block as `WORKSPACE_DEFAULTS` (JSON) into
+  the orchestrator's ConfigMap; `values.schema.json` checks the modes and the
+  name format. As with `workspace.builtinTemplates`, Reloader restarts the
+  orchestrator when the block changes; with Reloader off, restart it by hand.
+- **Startup check.** After it reconciles the built-in templates, the orchestrator
+  checks these values. It logs each problem as an error starting with
+  `Workspace defaults:`, for example
+  `Workspace defaults: The installation's container template 'x' (Helm workspace.defaults.container) no longer exists.`
+  Every Project's Settings tab shows the same problems. The orchestrator still
+  starts; work that needs the broken value fails with that message.
+- **Upgrade backfill.** Each start also logs
+  `Workspace defaults backfill: {'manifest': …, 'legacy_project': …, 'preference': …, 'healed': …, 'skipped': …}`,
+  the number of pre-existing workspace settings it copied into Project defaults.
+  It copies each value once; later starts log zeros. `healed` counts manifest
+  Projects whose defaults it brought back in line with the active Project
+  revision; `skipped` counts Projects it couldn't read, each logged with its
+  error and retried at the next start.
+- **Rolling back to a release before these defaults.** Older releases ignore
+  the Project defaults, with one exception: a Project manifest that uses the
+  object form of `defaults.workspace` (`{jobs: …, sessions: …, container: …}`)
+  makes the older code fail on that Project. Before you roll back, apply such
+  Projects again with the shorthand (`workspace: <alias>`) or without the
+  field.
+
+---
+
 ## VM workspaces on your cluster
 
 Agent workspaces run as containers by default. Enabling the VM tier gives an agent a full

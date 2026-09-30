@@ -49,6 +49,8 @@ def _db():
     # Keep the optional resolution paths inert regardless of EXPERTS_DB_ENABLED.
     db.list_experts_visible = AsyncMock(return_value=[])
     db.list_project_datasources = AsyncMock(return_value=[])
+    # No project_workspace_defaults row: the installation decides the tier.
+    db.fetchrow = AsyncMock(return_value=None)
     return db
 
 
@@ -755,3 +757,86 @@ class TestNextStageIndex:
         assert project_loops_service.next_stage_index(
             seq_index_completed=0, stage_count=0, turn_all_failed=False
         ) == (0, False)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_workspace_default_stops_the_loop_with_its_message(
+    monkeypatch,
+):
+    """Slice A2b, spec §7: the refusal text reaches the loop's last_error."""
+    from unittest.mock import MagicMock
+
+    from fastapi import HTTPException
+
+    from orchestrator.services.project_loop_advance import rotate_loop_to_next_stage
+    from orchestrator.services.project_loop_spawn import ProjectLoopDependencies
+
+    message = "This Project's container template 'gone' no longer exists."
+    monkeypatch.setattr(
+        "orchestrator.services.manifest_workspace_selection."
+        "select_project_workspace_default",
+        AsyncMock(side_effect=HTTPException(409, message)),
+    )
+    owner = "33333333-3333-3333-3333-333333333333"
+    db = _db()
+    db.get_user = AsyncMock(return_value={"id": owner})
+    db.user_can_run_unattended_operations = AsyncMock(return_value=True)
+    dependencies = ProjectLoopDependencies(
+        store=db,
+        vector_store=None,
+        notifier=AsyncMock(),
+        gitea_client=MagicMock(),
+        main_cloud_router=MagicMock(),
+        trigger_dispatch=MagicMock(),
+        kick_officer_event_drain=MagicMock(),
+        enforce_dispatch_grants=AsyncMock(),
+        reindex_project_kb=AsyncMock(),
+        completion_commands_enabled=lambda: False,
+        completion_sweep_router=MagicMock(),
+    )
+    actions: list[str] = []
+    await rotate_loop_to_next_stage(
+        _loop(
+            project_id="22222222-2222-2222-2222-222222222222",
+            owner_id=owner,
+            role_sequence=["scholar", "developer"],
+        ),
+        seq_index_completed=0,
+        base_total=1,
+        next_remaining=4,
+        consecutive=0,
+        last_error=None,
+        actions=actions,
+        dependencies=dependencies,
+    )
+    db.create_job.assert_not_awaited()
+    stopped = db.update_project_loop.call_args.kwargs
+    assert stopped["status"] == "failed"
+    assert stopped["last_error"] == f"spawn failed: {message}"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_loop_job_stays_an_http_refusal(monkeypatch):
+    """Completion handlers that re-raise HTTPException keep answering 409."""
+    from fastapi import HTTPException
+
+    message = "This Project's container template 'gone' no longer exists."
+    monkeypatch.setattr(
+        "orchestrator.services.manifest_workspace_selection."
+        "select_project_workspace_default",
+        AsyncMock(side_effect=HTTPException(409, message)),
+    )
+    db = _db()
+    with pytest.raises(HTTPException) as refused:
+        await create_loop_job(
+            db,
+            _loop(
+                project_id="22222222-2222-2222-2222-222222222222",
+                owner_id="33333333-3333-3333-3333-333333333333",
+            ),
+            role="scholar",
+            iteration=1,
+        )
+    assert (refused.value.status_code, refused.value.detail) == (409, message)
+    assert str(refused.value) == message
+    db.create_job.assert_not_awaited()

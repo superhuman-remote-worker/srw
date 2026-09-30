@@ -718,9 +718,11 @@ class CutoverGate:
         default_job["metadata"]["scope"] = {"kind": "Project", "name": project_id}
         default_job["spec"]["execution"] = {}
         resolved = self.preview(default_job)["resolved"][0]["spec"]["execution"]
+        # defaults.workspace is applied at admission (the Project's workspace
+        # defaults row), so the preview leaves an omitted workspace omitted.
         require(
             resolved["expert"]["inline"]["runtime"]["config"]["generation"] == 2
-            and resolved["workspace"] is None
+            and "workspace" not in resolved
             and resolved["connectors"] == {},
             "Stored default resolution did not use the active Project generation.",
         )

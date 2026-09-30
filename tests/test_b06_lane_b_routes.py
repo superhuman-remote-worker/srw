@@ -10,6 +10,7 @@ process-wide lookup.
 from __future__ import annotations
 
 import contextlib
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -33,6 +34,7 @@ USER = {"id": "55555555-5555-4555-8555-555555555555", "is_admin": False}
 def _thread(**over: Any) -> dict[str, Any]:
     row = {
         "id": THREAD,
+        "user_id": USER["id"],
         "execution_lane": "pinned",
         "status": "created",
         "metadata": {},
@@ -145,6 +147,7 @@ def _config_deps(**over: Any) -> tcu.ThreadConfigUpdateDependencies:
             return_value={"delivery_override": {"llm": {"api_key": "sk-live"}}}
         ),
         merge_thread_vm_context=AsyncMock(),
+        get_user=AsyncMock(return_value=USER),
     )
     for key, value in store_over.items():
         setattr(store, key, value)
@@ -177,6 +180,13 @@ def _config_deps(**over: Any) -> tcu.ThreadConfigUpdateDependencies:
     return tcu.ThreadConfigUpdateDependencies(
         recovery_store=SimpleNamespace(), **fields
     )
+
+
+@pytest.fixture(autouse=True)
+def shipped_chart(monkeypatch) -> None:
+    """Upgrades resolve the shipped chain: no built-ins declared."""
+    monkeypatch.delenv("WORKSPACE_DEFAULTS", raising=False)
+    monkeypatch.delenv("WORKSPACE_BUILTIN_TEMPLATES", raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -289,9 +299,17 @@ class TestCreationPreview:
 
     @pytest.mark.parametrize("backend", ["virtual", "none", "sandbox", "vm"])
     def test_defaults_follow_effective_workspace_and_scope_without_creating_work(
-        self, backend
+        self, backend, monkeypatch
     ):
-        deps, repository = self.dependencies(backend)
+        # Slice A2b: an unpinned Session's tier comes from the defaults chain
+        # (here the installation), no longer from the account preference.
+        from shared.workspace_defaults import backend_mode
+
+        monkeypatch.setenv(
+            "WORKSPACE_DEFAULTS", json.dumps({"sessions": backend_mode(backend)})
+        )
+        monkeypatch.delenv("WORKSPACE_BUILTIN_TEMPLATES", raising=False)
+        deps, repository = self.dependencies()
         response = _client(admission=deps).post(
             "/api/persistent/threads/preview", json={"use_datasource_defaults": True}
         )
@@ -336,7 +354,21 @@ class TestCreationPreview:
             "active_project_resource",
             AsyncMock(return_value=project),
         )
+        # Slice A2b: activation writes the manifest's defaults into
+        # project_workspace_defaults; selection reads only that row.
+        from shared.manifests.workspace_defaults import project_workspace_defaults
+
+        values = project_workspace_defaults(project["resolved"]["spec"])
+        row = {
+            "jobs_mode": values["jobs"],
+            "sessions_mode": values["sessions"],
+            "container_template": values["container"],
+            "vm_template": values["vm"],
+            "source": "manifest",
+            "manifest_revision": project["revision"],
+        }
         deps, repository = self.dependencies()
+        deps.store.fetchrow = AsyncMock(return_value=row)
         client = _client(admission=deps)
         body = {"project_ids": [THREAD], "use_datasource_defaults": True}
         response = client.post("/api/persistent/threads/preview", json=body)

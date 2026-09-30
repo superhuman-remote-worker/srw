@@ -601,3 +601,169 @@ async def test_srw_admission_rejects_undeliverable_connector_before_writes(
         await database.fetchval("SELECT count(*) FROM srw_resources WHERE kind='Job'")
         == 0
     )
+
+
+async def workspace_defaults_project(database, actor, workspace=...):
+    """Activate a manifest Project, with ``defaults.workspace`` unless omitted."""
+    spec = {"resources": {"workspaces": {"box": {"inline": {"backend": "vm"}}}}}
+    if workspace is not ...:
+        spec["defaults"] = {"workspace": workspace}
+    document = {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "Project",
+        "metadata": {"name": "workspace-defaults"},
+        "spec": spec,
+    }
+    result = await ManifestResourceService(database).apply(
+        json.dumps(document), actor, format="json"
+    )
+    row = next(
+        item for item in result["resources"] if item["resource"]["kind"] == "Project"
+    )
+    return str(
+        await database.fetchval(
+            "SELECT linked_id FROM srw_resources WHERE id=$1", UUID(row["uid"])
+        )
+    )
+
+
+def project_assignment(project_id, workspace=...):
+    document = assignment(adapter="srw/v1", mode="Reported")
+    document["metadata"]["scope"] = {"kind": "Project", "name": project_id}
+    del document["spec"]["execution"]["workspace"]
+    if workspace is not ...:
+        document["spec"]["execution"]["workspace"] = workspace
+    return document
+
+
+def stored(value):
+    return json.loads(value) if isinstance(value, str) else value
+
+
+@pytest.fixture
+def builtins_off(monkeypatch):
+    """No Helm workspace.defaults (Jobs container) and no declared built-ins."""
+    monkeypatch.delenv("WORKSPACE_DEFAULTS", raising=False)
+    monkeypatch.delenv("WORKSPACE_BUILTIN_TEMPLATES", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_manifest_job_without_workspace_uses_the_project_row(
+    database, actor, builtins_off
+):
+    project_id = await workspace_defaults_project(
+        database, actor, {"jobs": "vm", "vm": "box"}
+    )
+    *_, work_id, _ = await admit(database, actor, project_assignment(project_id))
+    snapshot = await read_execution(database, "Job", work_id)
+    workspace = snapshot["resolved"]["spec"]["execution"]["workspace"]
+    assert workspace["template"]["inline"]["backend"] == "vm"
+    # The authored document keeps the omission; only the admitted spec is filled.
+    assert "workspace" not in snapshot["document"]["spec"]["execution"]
+    job = await database.get_job(work_id)
+    assert stored(job["context"])["workspace_sources"] == {
+        "tier": "project",
+        "template": "project",
+        "template_name": None,
+    }
+    assert stored(job["config_override"])["workspace"]["backend"] == "vm"
+    # The manifest-owned row pins the Project generation it came from.
+    project = await database.fetchrow(
+        "SELECT id, active_revision FROM srw_resources WHERE kind='Project' AND linked_id=$1",
+        UUID(project_id),
+    )
+    assert {
+        "uid": str(project["id"]),
+        "revision": project["active_revision"],
+    } in snapshot["dependencies"]
+
+
+@pytest.mark.asyncio
+async def test_manifest_null_beats_a_project_default(database, actor, builtins_off):
+    project_id = await workspace_defaults_project(
+        database, actor, {"jobs": "vm", "vm": "box"}
+    )
+    *_, work_id, _ = await admit(database, actor, project_assignment(project_id, None))
+    snapshot = await read_execution(database, "Job", work_id)
+    assert snapshot["resolved"]["spec"]["execution"]["workspace"] is None
+    job = await database.get_job(work_id)
+    assert stored(job["config_override"])["workspace"]["backend"] == "none"
+    assert stored(job["context"])["workspace_sources"] == {
+        "tier": "explicit",
+        "template": "explicit",
+        "template_name": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_manifest_job_without_a_project_default_gets_a_container(
+    database, actor, builtins_off
+):
+    project_id = await workspace_defaults_project(database, actor)
+    *_, work_id, _ = await admit(database, actor, project_assignment(project_id))
+    snapshot = await read_execution(database, "Job", work_id)
+    workspace = snapshot["resolved"]["spec"]["execution"]["workspace"]
+    # It was backend none before Slice A2b.
+    assert workspace["template"]["inline"]["backend"] == "sandbox"
+    job = await database.get_job(work_id)
+    assert stored(job["config_override"])["workspace"]["backend"] == "sandbox"
+    assert stored(job["context"])["workspace_sources"] == {
+        "tier": "installation",
+        "template": "builtin",
+        "template_name": None,
+    }
+
+
+CONTAINER_FULL = {
+    "apiVersion": "srw/v1alpha1",
+    "kind": "WorkspaceTemplate",
+    "metadata": {
+        "name": "container-full",
+        "scope": {"kind": "Catalog", "name": "shared"},
+    },
+    "spec": {
+        "backend": "sandbox",
+        "environment": {"image": "ghcr.io/superhuman-remote-worker/srw-workspace:t"},
+        "resources": {
+            "cpu": 2,
+            "memory": "4Gi",
+            "requests": {"cpu": 0.5, "memory": "1Gi"},
+        },
+    },
+}
+
+
+@pytest.mark.asyncio
+async def test_manifest_job_without_workspace_gets_the_builtin_container(
+    database, actor, monkeypatch
+):
+    from orchestrator.services.builtin_workspace_templates import (
+        reconcile_builtin_workspace_templates,
+    )
+
+    # Seeded the way the chart does it: the startup reconcile plus the env.
+    await reconcile_builtin_workspace_templates(database, [CONTAINER_FULL])
+    monkeypatch.setenv("WORKSPACE_BUILTIN_TEMPLATES", json.dumps([CONTAINER_FULL]))
+    monkeypatch.delenv("WORKSPACE_DEFAULTS", raising=False)
+    document = assignment(adapter="srw/v1", mode="Reported")
+    del document["spec"]["execution"]["workspace"]
+    *_, work_id, snapshot = await admit(database, actor, document)
+    inline = snapshot["resolved"]["spec"]["execution"]["workspace"]["template"][
+        "inline"
+    ]
+    assert (
+        inline["environment"]["image"] == CONTAINER_FULL["spec"]["environment"]["image"]
+    )
+    job = await database.get_job(work_id)
+    assert stored(job["context"])["workspace_sources"] == {
+        "tier": "installation",
+        "template": "builtin",
+        "template_name": "container-full",
+    }
+    workspace = stored(job["config_override"])["workspace"]
+    assert workspace["backend"] == "sandbox"
+    assert workspace["sandbox"]["image"] == inline["environment"]["image"]
+    assert any(
+        dependency.get("key") == "WorkspaceTemplate/Catalog/shared/container-full"
+        for dependency in snapshot["dependencies"]
+    )

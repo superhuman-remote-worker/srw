@@ -46,6 +46,8 @@ def deps():
         store=SimpleNamespace(
             get_user=AsyncMock(return_value={"default_project_id": PROJECT}),
             get_project=AsyncMock(return_value={"id": PROJECT}),
+            # No project_workspace_defaults row: the installation decides.
+            fetchrow=AsyncMock(return_value=None),
         ),
         require_project_access=AsyncMock(),
         bundled_expert_exists=Mock(return_value=True),
@@ -305,12 +307,14 @@ async def test_legacy_project_default_only_applies_in_disabled_db_root_mode(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("as_json", [False, True])
-async def test_override_precedence_null_removal_and_workspace_request_are_preserved(
-    deps, scope, as_json
-):
+async def test_override_precedence_and_null_removal_are_preserved(deps, scope, as_json):
     project_override = {
         "llm": {"model": "project", "temperature": 0.2},
         "extra": {"keep": True, "remove": 1},
+        # Slice A2b: a legacy Project's stored workspace backend no longer
+        # leaks through this merge; the workspace defaults chain resolves it
+        # instead (here: the shipped installation default, since this
+        # fixture's store never returns a project_workspace_defaults row).
         "workspace": {"backend": "vm"},
         "items": [1, 2],
     }
@@ -335,7 +339,7 @@ async def test_override_precedence_null_removal_and_workspace_request_are_preser
     assert result.config_override == {
         "llm": {"model": "request", "temperature": 0.2},
         "extra": {"keep": True, "request": True},
-        "workspace": {"backend": "vm"},
+        "workspace": {"backend": "sandbox"},
         "items": [4],
     }
     assert result.requested_workspace_backend is None
@@ -420,7 +424,9 @@ async def test_interleaved_preparations_keep_dependency_and_context_isolation(
     second_deps = replace(
         deps,
         store=SimpleNamespace(
-            get_user=AsyncMock(), get_project=AsyncMock(return_value={"id": PARENT})
+            get_user=AsyncMock(),
+            get_project=AsyncMock(return_value={"id": PARENT}),
+            fetchrow=AsyncMock(return_value=None),
         ),
         require_project_access=AsyncMock(),
         resolve_worker_expert=AsyncMock(
@@ -472,3 +478,26 @@ async def test_two_authored_workspace_selections_remain_an_error(deps, scope):
             config_override={"workspace": {"backend": "sandbox"}},
         )
     assert denied.value.status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ["user_rest", "internal_rest"])
+async def test_a_root_job_in_a_plain_project_reaches_the_resolver(
+    deps, scope, origin, monkeypatch
+):
+    deps.store.get_project.return_value = {"id": PROJECT, "manifest_composed": False}
+    calls = []
+
+    async def fake_select(db, user, **kwargs):
+        calls.append(kwargs)
+        return {"backend": "sandbox"}, {
+            "sources": {"tier": "installation", "template": "builtin"}
+        }
+
+    monkeypatch.setattr(
+        "orchestrator.services.manifest_workspace_selection.select_execution_workspace",
+        fake_select,
+    )
+    result = await prepare(deps, scope, origin=origin)
+    assert calls and calls[0]["supplied"] is False
+    assert result.workspace_selection["sources"]["tier"] == "installation"

@@ -154,8 +154,10 @@ async def reconcile_builtin_workspace_templates(
 async def reconcile_builtin_workspace_templates_at_startup(db) -> dict | None:
     """Reconcile from the environment. Never raises.
 
-    A broken declaration or a database error must not stop the orchestrator:
-    workspaces without a template don't need the built-ins.
+    A broken declaration or a database error must not stop the orchestrator.
+    Work that needs a missing built-in (a Job that names no workspace gets
+    container-full) fails with "The built-in ... template '...' is missing",
+    and ``check_installation_workspace_defaults`` reports it at startup.
     """
     try:
         declared = declared_builtin_templates()

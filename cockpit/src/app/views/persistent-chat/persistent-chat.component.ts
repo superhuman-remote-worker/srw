@@ -134,6 +134,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
     {command: '/autonomous', descriptionKey: 'chat.slash.autonomous'},
     {command: '/silent', descriptionKey: 'chat.slash.silent'},
     {command: '/verbose', descriptionKey: 'chat.slash.verbose'},
+    {command: '/upgrade-workspace', descriptionKey: 'chat.slash.upgradeWorkspace'},
 ];
 
 const TOOL_LABELS: Record<string, string> = {

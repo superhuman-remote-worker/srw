@@ -83,12 +83,12 @@ def test_specs_carry_a_backend_an_image_and_sizes():
     assert declared["virtual"]["spec"] == {"backend": "virtual"}
     assert declared["container-full"]["spec"] == {
         "backend": "sandbox",
-        "environment": {"image": env["WORKSPACE_IMAGE"]},
+        "environment": {"image": env["WORKSPACE_IMAGE"], "pullPolicy": "Always"},
         "resources": sizes,
     }
     assert declared["container-minimal"]["spec"] == {
         "backend": "sandbox",
-        "environment": {"image": MINIMAL + ":latest"},
+        "environment": {"image": MINIMAL + ":latest", "pullPolicy": "Always"},
         "resources": sizes,
     }
     assert declared["vm-full"]["spec"]["backend"] == "vm"
@@ -186,7 +186,63 @@ def test_the_new_variable_is_the_last_orchestrator_variable():
     entries = _orchestrator(documents)["spec"]["template"]["spec"]["containers"][0][
         "env"
     ]
-    assert entries[-1]["name"] == "WORKSPACE_BUILTIN_TEMPLATES"
+    # WORKSPACE_DEFAULTS (Slice A2b, Task 8) is appended after
+    # WORKSPACE_BUILTIN_TEMPLATES, which is itself appended-at-the-end (see
+    # helm/templates/orchestrator/deployment.yaml); appending, never
+    # inserting, avoids the Kubernetes strategic-merge `env[N].valueFrom`
+    # patch bug.
+    assert entries[-2]["name"] == "WORKSPACE_BUILTIN_TEMPLATES"
+    assert entries[-1]["name"] == "WORKSPACE_DEFAULTS"
+
+
+def pull_policies(*settings) -> dict[str, str]:
+    declared = builtins(*settings)
+    assert "pullPolicy" not in declared["vm-full"]["spec"].get("environment", {})
+    return {
+        name: declared[name]["spec"]["environment"]["pullPolicy"]
+        for name in ("container-full", "container-minimal")
+    }
+
+
+# Kubernetes' own default, which the untemplated workspace pod got before the
+# built-ins existed: Always for a digest-less `latest` (or empty) tag, else
+# IfNotPresent. The chart's image.workspace.pullPolicy never decides it.
+def test_shipped_latest_tags_pull_always():
+    assert pull_policies() == {
+        "container-full": "Always",
+        "container-minimal": "Always",
+    }
+
+
+def test_pinned_tags_pull_if_not_present():
+    assert pull_policies(
+        "image.workspace.tag=1.4.0", "image.workspaceMinimal.tag=1.4.0"
+    ) == {"container-full": "IfNotPresent", "container-minimal": "IfNotPresent"}
+
+
+def test_digests_pull_if_not_present():
+    assert pull_policies(
+        f"image.workspace.digest={DIGEST}", f"image.workspaceMinimal.digest={DIGEST}"
+    ) == {"container-full": "IfNotPresent", "container-minimal": "IfNotPresent"}
+
+
+def test_each_image_decides_its_own_pull_policy():
+    assert pull_policies(f"image.workspace.digest={DIGEST}") == {
+        "container-full": "IfNotPresent",
+        "container-minimal": "Always",
+    }
+
+
+def test_the_chart_pull_policy_does_not_decide():
+    assert pull_policies(
+        "image.workspace.pullPolicy=IfNotPresent",
+        "image.workspaceMinimal.pullPolicy=IfNotPresent",
+    ) == {"container-full": "Always", "container-minimal": "Always"}
+    assert pull_policies(
+        "image.workspace.tag=1.4.0",
+        "image.workspaceMinimal.tag=1.4.0",
+        "image.workspace.pullPolicy=Always",
+    ) == {"container-full": "IfNotPresent", "container-minimal": "IfNotPresent"}
 
 
 @pytest.mark.parametrize(

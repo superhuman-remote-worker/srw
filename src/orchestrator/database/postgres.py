@@ -4214,6 +4214,16 @@ class PostgresDB:
         # connector fails the whole data contract instead of becoming a
         # silently reduced selection. Always stamp new jobs, including [].
         context = _strip_managed_repository_authority(dict(context or {}))
+        from orchestrator.services.workspace_defaults_resolution import (
+            workspace_sources_record,
+        )
+
+        # Server-owned: only the selection receipt may say which layer
+        # supplied the workspace, never a caller's context.
+        context.pop("workspace_sources", None)
+        sources_record = workspace_sources_record(workspace_selection)
+        if sources_record is not None:
+            context["workspace_sources"] = sources_record
         config_override = _strip_managed_repository_authority(config_override)
         # Repository identity is server-owned. Every legitimate root/subjob
         # path now binds it through ``bind_job_managed_repository`` only after
@@ -12646,6 +12656,8 @@ class PostgresDB:
         requested_backend: str | None,
         assignment_source: str,
         expected_status: str,
+        upgrade_config: dict | None = None,
+        upgrade_sources: dict | None = None,
     ) -> bool:
         """Atomically authorize an intentional in-process workspace upgrade.
 
@@ -12658,6 +12670,11 @@ class PostgresDB:
         This is deliberately narrower than a general JSONB patch.  Today the
         only supported in-process job transition is ``virtual|none`` to
         ``sandbox``.  VM approval has its own status/control transaction.
+
+        ``upgrade_config`` (the upgrade's rendered container settings) and
+        ``upgrade_sources`` land in ``context.workspace_container`` in the same
+        statement as the ``pending`` marker, so the provisioner never sees one
+        without the others.
         """
 
         import json as json_module
@@ -12677,6 +12694,10 @@ class PostgresDB:
             "assigned_backend": target_backend,
             "assignment_source": assignment_source,
         }
+        pending: dict[str, Any] = {"status": "pending"}
+        if upgrade_config is not None:
+            pending["upgrade_config"] = upgrade_config
+            pending["upgrade_sources"] = upgrade_sources
         normalized_config_backend = (
             "CASE lower(COALESCE(config_override->'workspace'->>'backend', "
             "'sandbox')) WHEN 'container' THEN 'sandbox' "
@@ -12693,7 +12714,7 @@ class PostgresDB:
                        ),
                        '{{workspace_container}}',
                        COALESCE(context->'workspace_container', '{{}}'::jsonb)
-                           || '{{"status":"pending"}}'::jsonb
+                           || $6::jsonb
                    ),
                    config_override = jsonb_set(
                        COALESCE(config_override, '{{}}'::jsonb),
@@ -12726,6 +12747,7 @@ class PostgresDB:
                 target_backend,
                 expected_status,
                 expected_backend,
+                json_module.dumps(pending),
             )
         return row is not None
 
@@ -35021,6 +35043,16 @@ class PostgresDB:
             if not isinstance(metadata, dict):
                 raise ValueError("initial thread metadata must be an object")
         metadata = _strip_managed_repository_authority(metadata)
+        from orchestrator.services.workspace_defaults_resolution import (
+            workspace_sources_record,
+        )
+
+        # Server-owned: only the selection receipt may say which layer
+        # supplied the workspace, never a caller's metadata.
+        metadata.pop("workspace_sources", None)
+        sources_record = workspace_sources_record(workspace_selection)
+        if sources_record is not None:
+            metadata["workspace_sources"] = sources_record
         created_runtime_generation = uuid4()
         initial_workspace = metadata.get("workspace_container")
         if isinstance(initial_workspace, dict):
@@ -61971,6 +62003,7 @@ class PostgresDB:
                 last_dispatched_at = now(),
                 last_fired_at = now(),
                 last_job_id = $3,
+                last_status = NULL,
                 run_count = run_count + 1,
                 fires_today_count = CASE
                     WHEN fires_today_date = CURRENT_DATE
@@ -62008,6 +62041,34 @@ class PostgresDB:
             WHERE id = $2
             """,
             next_run_at,
+            UUID(automation_id),
+        )
+
+    async def refuse_automation_fire(
+        self,
+        conn,
+        automation_id: str,
+        *,
+        next_run_at: datetime,
+        reason: str,
+    ) -> None:
+        """Advance ``next_run_at`` for a fire the workspace defaults refused.
+
+        Like ``skip_automation_fire``, but the refusal is the owner's to fix,
+        so it becomes the automation's ``last_status``. The next successful
+        fire clears it.
+        """
+        await conn.execute(
+            """
+            UPDATE automations
+            SET next_run_at = $1,
+                last_dispatched_at = now(),
+                last_status = $2,
+                updated_at = now()
+            WHERE id = $3
+            """,
+            next_run_at,
+            reason,
             UUID(automation_id),
         )
 

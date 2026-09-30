@@ -600,8 +600,14 @@ async def test_approve_phase_boundary_requeues_under_completion_claim(
 
 
 @pytest.mark.asyncio
-async def test_upgrade_to_vm_commits_contract_before_dispatch(tmp_path: Path) -> None:
-    job = _frozen_job()
+async def test_upgrade_to_vm_commits_contract_before_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The VM provisions the shipped chain's VM template: no built-ins declared.
+    monkeypatch.delenv("WORKSPACE_DEFAULTS", raising=False)
+    monkeypatch.delenv("WORKSPACE_BUILTIN_TEMPLATES", raising=False)
+    owner = {"id": "33333333-3333-4333-8333-333333333333"}
+    job = {**_frozen_job(), "user_id": owner["id"]}
     connection = AsyncMock()
     connection.fetchrow = AsyncMock(return_value={"id": JOB_ID})
 
@@ -617,6 +623,7 @@ async def test_upgrade_to_vm_commits_contract_before_dispatch(tmp_path: Path) ->
 
     store = MagicMock()
     store.get_job = AsyncMock(return_value=job)
+    store.get_user = AsyncMock(return_value=owner)
     store.acquire = acquire
     control = _completion_control()
     operations = _operations(tmp_path, store=store, completion_control=control)
@@ -625,6 +632,14 @@ async def test_upgrade_to_vm_commits_contract_before_dispatch(tmp_path: Path) ->
 
     result = await operations.upgrade_job_to_vm_internal(JOB_ID)
 
+    store.get_user.assert_awaited_once_with(owner["id"])
+    vm_updates = json.loads(connection.fetchrow.await_args.args[1])
+    assert vm_updates["upgrade_config"] == {}
+    assert vm_updates["upgrade_sources"] == {
+        "tier": "upgrade",
+        "template": "builtin",
+        "template_name": None,
+    }
     sql = connection.fetchrow.await_args.args[0]
     assert "assignment_source" in connection.fetchrow.await_args.args[5]
     assert "status = 'paused', freeze_data = NULL" in sql
@@ -636,6 +651,41 @@ async def test_upgrade_to_vm_commits_contract_before_dispatch(tmp_path: Path) ->
         hook="vm_upgrade",
     )
     assert result["status"] == "approved_vm_upgrade"
+
+
+@pytest.mark.asyncio
+async def test_an_ownerless_job_upgrades_to_a_bare_vm(tmp_path: Path) -> None:
+    # Trusted internal callers and their subjobs create Jobs without an owner:
+    # nobody to read templates as, so the VM is provisioned as it always was.
+    connection = AsyncMock()
+    connection.fetchrow = AsyncMock(return_value={"id": JOB_ID})
+
+    @asynccontextmanager
+    async def transaction():
+        yield
+
+    connection.transaction = transaction
+
+    @asynccontextmanager
+    async def acquire():
+        yield connection
+
+    store = MagicMock()
+    store.get_job = AsyncMock(return_value={**_frozen_job(), "user_id": None})
+    store.get_user = AsyncMock()
+    store.acquire = acquire
+    operations = _operations(
+        tmp_path, store=store, completion_control=_completion_control()
+    )
+    operations.dependencies.vm_provisioner.is_available = True
+    operations.dependencies.vm_provisioner.mode = "same-cluster"
+
+    result = await operations.upgrade_job_to_vm_internal(JOB_ID)
+
+    assert result["status"] == "approved_vm_upgrade"
+    store.get_user.assert_not_awaited()
+    vm_updates = json.loads(connection.fetchrow.await_args.args[1])
+    assert (vm_updates["upgrade_config"], vm_updates["upgrade_sources"]) == ({}, None)
 
 
 # What the provisioner and the controller actually record: SSH transport,

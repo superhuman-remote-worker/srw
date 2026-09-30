@@ -1770,6 +1770,65 @@ export interface ProjectUpdateRequest {
   network_tier?: ProjectNetworkTier;
 }
 
+/** What Jobs or Sessions get when nothing more specific picks a workspace. */
+export type WorkspaceMode = 'none' | 'virtual' | 'container' | 'vm';
+
+/** A named template, scoped to a Catalog, a Project or an Account. */
+export interface WorkspaceTemplateRef {
+  name: string;
+  scope: {kind: string; name: string};
+}
+
+/**
+ * `GET /api/projects/{id}/workspace-defaults`: the Project's stored row (if
+ * any), the effective values with where each came from, and whether the
+ * Project manifest owns the row (making it read-only in the cockpit).
+ */
+export interface ProjectWorkspaceDefaults {
+  stored: {
+    jobs: WorkspaceMode | null;
+    sessions: WorkspaceMode | null;
+    container: Record<string, unknown> | null;
+    vm: Record<string, unknown> | null;
+  };
+  managed_by_manifest: boolean;
+  /** Whether this caller may edit these defaults: admin or Project owner,
+   *  Project not archived, row not manifest-owned — computed server-side. */
+  can_edit: boolean;
+  /** Whether this caller may pick their own Account templates here: true
+   *  only when this Project is the caller's own personal project. */
+  account_templates: boolean;
+  effective: {
+    jobs: {mode: WorkspaceMode; source: string};
+    sessions: {mode: WorkspaceMode; source: string};
+    container: {template_name: string | null; source: string};
+    vm: {template_name: string | null; source: string};
+  };
+  installation: {jobs: WorkspaceMode; sessions: WorkspaceMode; container: string | null; vm: string | null};
+  template_problems: Partial<Record<'container' | 'vm', string>>;
+  installation_problems: string[];
+  vm_available: boolean;
+}
+
+/** Request body for `PUT /api/projects/{id}/workspace-defaults`. */
+export interface ProjectWorkspaceDefaultsUpdate {
+  jobs: WorkspaceMode | null;
+  sessions: WorkspaceMode | null;
+  container: WorkspaceTemplateRef | null;
+  vm: WorkspaceTemplateRef | null;
+}
+
+/** `GET /api/resources?...&kind=WorkspaceTemplate`: the visible templates for
+ *  a scope, used to populate the Settings tab's template pickers. */
+export interface WorkspaceTemplateList {
+  resources: {
+    resource: {
+      metadata: {name: string; scope: {kind: string; name: string}; annotations?: Record<string, string>};
+      spec: {backend?: string};
+    };
+  }[];
+}
+
 /**
  * Project member with user info.
  */

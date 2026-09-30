@@ -154,6 +154,8 @@ def harness(monkeypatch):
             store=SimpleNamespace(
                 get_user=AsyncMock(return_value={}),
                 get_project=AsyncMock(return_value={"id": PROJECT}),
+                # No project_workspace_defaults row: the installation decides.
+                fetchrow=AsyncMock(return_value=None),
             ),
             require_project_access=AsyncMock(),
             bundled_expert_exists=state.bundled,

@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
+from fastapi import HTTPException
+
 from orchestrator.security.access import project_is_archived
 
 from orchestrator.services.agent_pod_entrypoint import (
@@ -34,6 +36,15 @@ from orchestrator.services.default_experts import (
 from shared.runtime.core.loader import canonical_config_name, deep_merge
 
 logger = logging.getLogger(__name__)
+
+
+class AutomationWorkspaceRefused(HTTPException):
+    """The workspace defaults chain refused this fire (Slice A2b, spec §7).
+
+    Still an HTTPException, so Run now answers with the refusal. The cron tick
+    records it as the automation's last status and advances the schedule
+    instead of re-claiming the row on every tick.
+    """
 
 
 def _experts_db_enabled() -> bool:
@@ -286,15 +297,24 @@ async def create_job_from_automation(
     owner_id = str(automation["owner_id"])
     target_project_ids = [str(project_id)] if project_id else []
     from orchestrator.services.manifest_workspace_selection import (
+        WorkspaceSelectionRace,
         select_project_workspace_default,
     )
 
-    config_override, workspace_selection = await select_project_workspace_default(
-        db,
-        owner_id,
-        project_id,
-        config_override,
-    )
+    try:
+        (
+            config_override,
+            workspace_selection,
+        ) = await select_project_workspace_default(
+            db,
+            owner_id,
+            project_id,
+            config_override,
+        )
+    except WorkspaceSelectionRace:
+        raise  # transient: the tick rolls back and re-claims the row
+    except HTTPException as exc:
+        raise AutomationWorkspaceRefused(exc.status_code, exc.detail) from exc
     workspace_backend = _workspace_backend(config_override)
 
     # Automations intentionally store no connector selection in v1. Resolve
@@ -352,6 +372,7 @@ async def create_job_from_automation(
 
 
 __all__ = [
+    "AutomationWorkspaceRefused",
     "create_job_from_automation",
     "validate_automation_expert_selection",
 ]

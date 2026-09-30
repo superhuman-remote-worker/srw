@@ -20,6 +20,18 @@ _BUILD_YOUR_OWN_IMAGE = (
     "environment.image (see examples/manifests/container-workspace-templates.md)."
 )
 _IMAGE_REFERENCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]*")
+PROJECT_CHANGED = "The Project changed during workspace selection; submit again."
+
+
+class WorkspaceSelectionRace(HTTPException):
+    """A Project activation raced this selection; submitting again resolves it.
+
+    Unattended callers let it propagate unchanged (retry on the next pass)
+    instead of recording it as a workspace refusal.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(409, PROJECT_CHANGED)
 
 
 def _sandbox_workspace_config(recipe: dict) -> dict:
@@ -144,6 +156,22 @@ def srw_workspace_config(
     return result
 
 
+async def _pin_active_project(
+    db: Any, authority: Any, resolver: Any, project_id: str, revision: str
+) -> list[dict]:
+    """A manifest-owned defaults row holds only while its Project revision is active."""
+    from orchestrator.services.manifest_projects import active_project_resource
+
+    project = await active_project_resource(db, project_id)
+    if project is None or project["revision"] != revision:
+        raise WorkspaceSelectionRace()
+    await authority.resource(project)
+    await resolver.authorize_dependencies(project["dependencies"])
+    dependencies = deepcopy(project["dependencies"])
+    dependencies.append({"uid": str(project["id"]), "revision": project["revision"]})
+    return dependencies
+
+
 async def select_execution_workspace(
     db: Any,
     user: dict,
@@ -156,17 +184,12 @@ async def select_execution_workspace(
     account_defaults: dict | None = None,
     request: Any = None,
 ) -> tuple[dict, dict | None]:
-    """Explicit selection > Project default > account/role fallback.
+    """Explicit selection > the workspace defaults chain (Slice A2b).
 
     The returned receipt carries frozen workspace and Project revisions into
     the insertion transaction. A recommendation never enters this function.
     Legacy config_override.workspace remains an explicit execution input.
     """
-    from orchestrator.services.manifest_projects import (
-        active_project_resource,
-        source_recipe,
-    )
-
     fallback = execution_workspace_config(account_defaults, config_override, role=role)
     legacy = (config_override or {}).get("workspace") or {}
     if supplied and "backend" in legacy:
@@ -181,45 +204,27 @@ async def select_execution_workspace(
     scope = {"kind": "Project", "name": project_id} if project_id else authority.account
     dependencies: list[dict] = []
     project_revision = None
-    if not supplied and project_id:
-        project = await active_project_resource(db, project_id)
-        if project:
-            defaults = project["resolved"]["spec"].get("defaults", {})
-            if "workspace" in defaults:
-                alias = defaults["workspace"]
-                workspace = (
-                    {
-                        "template": deepcopy(
-                            project["resolved"]["spec"]["resources"]["workspaces"][
-                                alias
-                            ]
-                        )
-                    }
-                    if alias is not None
-                    else None
-                )
-            else:
-                # A versioned legacy Project source is already frozen. Its old
-                # workspace default belongs to the Project, not to its Experts.
-                shared = (source_recipe(project) or {}).get("sharedConfig", {})
-                backend = (shared.get("workspace") or {}).get("backend")
-                if backend is None:
-                    return fallback, None
-                workspace = (
-                    None
-                    if backend == "none"
-                    else {"template": {"inline": {"backend": backend}}}
-                )
-            await authority.resource(project)
-            await resolver.authorize_dependencies(project["dependencies"])
-            dependencies = deepcopy(project["dependencies"])
-            dependencies.append(
-                {"uid": str(project["id"]), "revision": project["revision"]}
-            )
-            project_revision = project["revision"]
-            supplied = True
+    resolution = None
+    sources = {"tier": "explicit", "template": "explicit"}
     if not supplied:
-        return fallback, None
+        from orchestrator.services.workspace_defaults_resolution import (
+            MISSING_REFERENCE,
+            WRONG_TIER_TEMPLATE,
+            missing_template_message,
+            resolve_workspace_defaults,
+        )
+        from shared.workspace_defaults import backend_mode
+
+        resolution = await resolve_workspace_defaults(
+            db, role=role, project_id=project_id
+        )
+        workspace = resolution.binding()
+        sources = resolution.sources()
+        if resolution.project_revision:
+            dependencies = await _pin_active_project(
+                db, authority, resolver, project_id, resolution.project_revision
+            )
+            project_revision = resolution.project_revision
     # A caller's malformed binding or unsupported template is a client error on
     # every admission route and form preview, never an internal one.
     try:
@@ -232,8 +237,23 @@ async def select_execution_workspace(
             resolved["template"] = await resolver.selection(
                 "WorkspaceTemplate", resolved["template"], scope, dependencies
             )
+        except HTTPException as exc:
+            if (
+                resolution is not None
+                and resolution.template_name() is not None
+                and exc.status_code == 422
+                and exc.detail == MISSING_REFERENCE
+            ):
+                raise HTTPException(409, missing_template_message(resolution)) from None
+            raise
         except ManifestError as exc:
             raise HTTPException(422, str(exc)) from None
+        # A default template edited to another backend after it was chosen
+        # must never move work to a different tier: fail closed.
+        if resolution is not None and (
+            backend_mode(resolved["template"]["inline"]["backend"]) != resolution.mode
+        ):
+            raise HTTPException(409, WRONG_TIER_TEMPLATE.format(tier=resolution.mode))
     instance_recipe = None
     instance_generation = None
     if resolved and "instanceRef" in resolved:
@@ -273,6 +293,73 @@ async def select_execution_workspace(
         "dependencies": dependencies,
         "project_id": project_id if project_revision else None,
         "project_revision": project_revision,
+        "sources": sources,
+        "template_name": resolution.template_name() if resolution else None,
+    }
+
+
+async def select_generic_project_workspace(
+    db: Any, user: dict, *, project_id: str | None, request: Any = None
+) -> dict | None:
+    """The workspace a generic-image Job that omits one gets; None means none.
+
+    The defaults chain picks SRW agent workspaces. A generic image gets only
+    its Project's container template, and only when the Project's Jobs mode is
+    container (what the shorthand to a sandbox template sets): it can't use a
+    virtual or VM tier, and the installation and built-in layers never apply.
+    The template is resolved like an authored binding, so a Settings row's
+    reference and a manifest row's pinned content both become inline content.
+    """
+    if not project_id:
+        return None
+    from orchestrator.services.project_workspace_defaults import (
+        read_current_project_defaults,
+    )
+    from orchestrator.services.workspace_defaults_resolution import (
+        MISSING_PROJECT_TEMPLATE,
+        MISSING_REFERENCE,
+        WRONG_TIER_TEMPLATE,
+    )
+
+    defaults = await read_current_project_defaults(db, project_id)
+    if defaults is None or defaults.jobs != "container" or defaults.container is None:
+        return None
+    authority = ManifestAuthority(db, user, request=request)
+    resolver = LiveManifestResolver(ManifestStore(db), authority)
+    dependencies: list[dict] = []
+    if defaults.source == "manifest":
+        dependencies = await _pin_active_project(
+            db, authority, resolver, project_id, defaults.manifest_revision
+        )
+    ref = defaults.container.get("ref")
+    name = ref.get("name") if isinstance(ref, dict) else None
+    try:
+        template = await resolver.selection(
+            "WorkspaceTemplate",
+            deepcopy(defaults.container),
+            {"kind": "Project", "name": project_id},
+            dependencies,
+        )
+    except HTTPException as exc:
+        if (
+            name is not None
+            and exc.status_code == 422
+            and exc.detail == MISSING_REFERENCE
+        ):
+            raise HTTPException(
+                409, MISSING_PROJECT_TEMPLATE.format(tier="container", name=name)
+            ) from None
+        raise
+    except ManifestError as exc:
+        raise HTTPException(422, str(exc)) from None
+    if template["inline"]["backend"] != "sandbox":
+        raise HTTPException(409, WRONG_TIER_TEMPLATE.format(tier="container"))
+    return {
+        "document": {"template": deepcopy(defaults.container)},
+        "resolved": {"template": template},
+        "dependencies": dependencies,
+        "sources": {"tier": "project", "template": "project"},
+        "template_name": name,
     }
 
 
@@ -285,9 +372,7 @@ async def verify_workspace_selection(
     if selection.get("project_revision"):
         project = await active_project_resource(db, selection["project_id"])
         if project is None or project["revision"] != selection["project_revision"]:
-            raise HTTPException(
-                409, "The Project changed during workspace selection; submit again."
-            )
+            raise WorkspaceSelectionRace()
     if selection.get("instance_recipe") is not None:
         from orchestrator.services.retained_vm_workspaces import read_instance
 
@@ -312,15 +397,8 @@ async def verify_workspace_selection(
 
 
 async def select_project_workspace_default(db, owner_id, project_id, config_override):
-    """Unattended callers choose the workspace before selecting connectors/grants."""
-    if (
-        not owner_id
-        or not project_id
-        or "backend" in ((config_override or {}).get("workspace") or {})
-    ):
-        return config_override, None
-    project = await db.get_project(str(project_id))
-    if not project or project.get("manifest_composed") is not True:
+    """Unattended callers resolve the workspace chain before connectors/grants."""
+    if not owner_id or "backend" in ((config_override or {}).get("workspace") or {}):
         return config_override, None
     user = await db.get_user(str(owner_id))
     if not user:
@@ -328,7 +406,7 @@ async def select_project_workspace_default(db, owner_id, project_id, config_over
     config, selection = await select_execution_workspace(
         db,
         user,
-        project_id=str(project_id),
+        project_id=str(project_id) if project_id else None,
         role="worker",
         config_override=config_override,
     )

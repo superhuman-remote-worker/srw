@@ -8,7 +8,7 @@ import {
   OnInit,
   signal,
 } from '@angular/core';
-import { ActivatedRoute, Router } from '@angular/router';
+import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import { environment } from '../../core/environment';
 import { McpTokenService } from '../../core/services/mcp-token.service';
 import { UserService } from '../../core/services/user.service';
@@ -105,6 +105,7 @@ const EXPIRY_OPTIONS = [
     SidebarToggleComponent,
     AppThemeToggleComponent,
     AppAccentToggleComponent,
+    RouterLink,
     TranslocoPipe,
     AppButtonComponent,
     AppInputComponent,
@@ -853,51 +854,14 @@ const EXPIRY_OPTIONS = [
                     </option>
                   </app-select>
                 </app-form-field>
-                <app-form-field
-                  [label]="'settings.persistent.workspaceBackend' | transloco"
-                  [hint]="'settings.persistent.workspaceBackendHint' | transloco"
-                >
-                  <app-select
-                    [value]="
-                      paWorkspaceBackend() ?? resolved().persistent_agent?.workspace_backend ?? ''
-                    "
-                    (changed)="
-                      onPrefChange(
-                        paWorkspaceBackend,
-                        resolved().persistent_agent?.workspace_backend,
-                        $event
-                      )
-                    "
-                  >
-                    <option value="virtual">
-                      {{ 'settings.persistent.workspaceVirtual' | transloco
-                      }}{{
-                        !paWorkspaceBackend() &&
-                        resolved().persistent_agent?.workspace_backend === 'virtual'
-                          ? ' (' + ('common.default' | transloco) + ')'
-                          : ''
-                      }}
-                    </option>
-                    <option value="sandbox">
-                      {{ 'settings.persistent.workspaceSandbox' | transloco
-                      }}{{
-                        !paWorkspaceBackend() &&
-                        resolved().persistent_agent?.workspace_backend === 'sandbox'
-                          ? ' (' + ('common.default' | transloco) + ')'
-                          : ''
-                      }}
-                    </option>
-                    <option value="none">
-                      {{ 'settings.persistent.workspaceNone' | transloco
-                      }}{{
-                        !paWorkspaceBackend() &&
-                        resolved().persistent_agent?.workspace_backend === 'none'
-                          ? ' (' + ('common.default' | transloco) + ')'
-                          : ''
-                      }}
-                    </option>
-                  </app-select>
-                </app-form-field>
+                <p class="field-hint">
+                  {{ 'settings.persistent.workspaceMoved' | transloco }}
+                  @if (userService.currentUser()?.default_project_id; as projectId) {
+                    <a [routerLink]="['/projects', projectId]">{{
+                      'settings.persistent.workspaceMovedLink' | transloco
+                    }}</a>
+                  }
+                </p>
                 <div class="form-row two-col">
                   <app-form-field [label]="'settings.persistent.idleTimeout' | transloco">
                     <app-input
@@ -2098,6 +2062,13 @@ const EXPIRY_OPTIONS = [
         line-height: 1.5;
       }
 
+      .field-hint {
+        margin: 6px 0 0;
+        color: var(--text-muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
       /* AI Subscriptions (also reused by the Cloud Storage status/provenance
          rows — these are section-agnostic status primitives, not provider UI) */
       .subs-status-card {
@@ -3053,9 +3024,6 @@ export class SettingsComponent implements OnInit, OnDestroy {
   // Persistent Agent form state — null = use resolved default
   readonly paModel = signal<string | null>(null);
   readonly paPermissionMode = signal<string | null>(null);
-  // Default session workspace tier (null = track the resolved system default,
-  // which is "virtual" — see knowledge-base/knowledge/features/instant_landing_session.md).
-  readonly paWorkspaceBackend = signal<string | null>(null);
   readonly paIdleTimeout = signal<number | null>(null);
   readonly paIdleTimeoutText = computed(() => {
     const v = this.paIdleTimeout();
@@ -3170,7 +3138,6 @@ export class SettingsComponent implements OnInit, OnDestroy {
         if (pa) {
           this.paModel.set(pa.model ?? null);
           this.paPermissionMode.set(pa.permission_mode ?? null);
-          this.paWorkspaceBackend.set(pa.workspace_backend ?? null);
           this.paIdleTimeout.set(pa.idle_timeout_minutes ?? null);
           this.paHeadlessMode.set(pa.headless_mode ?? null);
           this.paAttentionSleepMinutes.set(pa.headless_attention_sleep_minutes ?? null);
@@ -3537,7 +3504,6 @@ export class SettingsComponent implements OnInit, OnDestroy {
       persistent_agent: {
         model: this.paModel()?.trim() || null,
         permission_mode: this.paPermissionMode() || null,
-        workspace_backend: this.paWorkspaceBackend() || null,
         idle_timeout_minutes: this.paIdleTimeout() || null,
         headless_mode: this.paHeadlessMode() || null,
         headless_attention_sleep_minutes: this.paAttentionSleepMinutes(),

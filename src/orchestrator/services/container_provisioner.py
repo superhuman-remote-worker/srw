@@ -5724,7 +5724,9 @@ class ContainerProvisioner:
                 expected_network_tier=network_tier,
                 expected_pvc_name=pvc_name,
                 expected_seed_configmap=seed_configmap,
-                pull_image=settings.image,
+                pull_image=(
+                    settings.image if settings.image != self._workspace_image else None
+                ),
                 pull_started_at=getattr(pod.metadata, "creation_timestamp", None),
                 **(
                     {"readiness_started_at": self._background_pod_clock(pod)}

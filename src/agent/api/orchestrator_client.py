@@ -1686,10 +1686,14 @@ class OrchestratorClient:
             return False
 
     async def request_thread_workspace_upgrade(
-        self, thread_id: str, target_tier: str = "sandbox"
-    ) -> bool:
+        self,
+        thread_id: str,
+        target_tier: str | None = "sandbox",
+        template: str | None = None,
+    ) -> tuple[bool, str | None]:
         """Provision a real workspace container for a lite thread (upgrade from
-        ``virtual``/``none`` to the ``sandbox`` tier).
+        ``virtual``/``none`` to the ``sandbox`` tier), or hand the orchestrator
+        a ``template`` name to upgrade to whatever tier that template requires.
 
         The session-side analogue of ``request_thread_vm_upgrade``: kicks off
         container provisioning, after which the caller polls
@@ -1698,7 +1702,9 @@ class OrchestratorClient:
         operator-gated ``request_thread_vm_upgrade`` path.
 
         Returns:
-            True if accepted (or already in progress), False on failure.
+            ``(True, None)`` if accepted (or already in progress); otherwise
+            ``(False, detail)``, where ``detail`` is the orchestrator's
+            refusal text (its JSON ``{"detail": ...}`` body) when it sent one.
         """
         if not self._client:
             await self.connect()
@@ -1707,7 +1713,11 @@ class OrchestratorClient:
             f"{self.orchestrator_url}"
             f"/api/agents/threads/{thread_id}/upgrade-to-workspace"
         )
-        payload = {"target_tier": target_tier}
+        payload = {
+            key: value
+            for key, value in (("target_tier", target_tier), ("template", template))
+            if value is not None
+        }
 
         try:
             response = await self._client.post(url, json=payload)
@@ -1716,16 +1726,19 @@ class OrchestratorClient:
                     f"Workspace upgrade ({target_tier}) requested for thread "
                     f"{thread_id}"
                 )
-                return True
-            else:
-                logger.error(
-                    f"Workspace upgrade request failed: "
-                    f"{response.status_code} - {response.text}"
-                )
-                return False
+                return True, None
+            logger.error(
+                f"Workspace upgrade request failed: "
+                f"{response.status_code} - {response.text}"
+            )
+            try:
+                detail = response.json().get("detail")
+            except ValueError:
+                detail = None
+            return False, detail if isinstance(detail, str) else None
         except Exception as e:
             logger.error(f"Workspace upgrade request error: {e}")
-            return False
+            return False, None
 
     async def get_thread_workspace(
         self, thread_id: str, *, raise_on_denied: bool = False

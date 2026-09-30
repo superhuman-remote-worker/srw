@@ -1159,6 +1159,49 @@ async def test_reordered_s15_runs_only_after_exact_delivery_marker(
 
 
 @pytest.mark.asyncio
+async def test_a_refused_loop_spawn_keeps_its_409(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Slice A2b: a workspace refusal inside the atomic loop advance is still
+    an HTTPException, so the route re-raises its 409 instead of a 500."""
+    from orchestrator.services.project_loops import LoopWorkspaceRefused
+
+    message = "This Project's container template 'gone' no longer exists."
+    job = _route_job()
+    job["context"] = {"loop_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+    database = _RouteDB(job)
+    runner = _RecordingRunner()
+    _patch_normal_route_dependencies(
+        monkeypatch,
+        database=database,
+        terminal_effects=AsyncMock(return_value={"actions": []}),
+        workspace_cleanup=AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        project_loop_advance_module,
+        "prepare_atomic_project_loop_advance",
+        AsyncMock(return_value={"kind": "mutation"}),
+    )
+    monkeypatch.setattr(
+        project_loop_advance_module,
+        "materialize_prepared_project_loop_advance",
+        AsyncMock(side_effect=LoopWorkspaceRefused(409, message)),
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        await b08_helpers.complete_job_legacy(
+            MagicMock(),
+            JOB_ID,
+            _body(),
+            _authorized=True,
+            _effect_runner=runner,
+        )
+
+    assert (refused.value.status_code, refused.value.detail) == (409, message)
+    assert "project_loop_advance" in runner.transactional_names
+
+
+@pytest.mark.asyncio
 async def test_reordered_entry_authority_loss_prevents_class_b_and_delivery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

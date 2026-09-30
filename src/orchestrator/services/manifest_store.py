@@ -282,6 +282,12 @@ class ManifestStore:
                 "UPDATE srw_resources SET deleted_at=now(),updated_at=now(),resource_version=resource_version+1 WHERE id=$1",
                 row["id"],
             )
+            if current["kind"] == "Project" and current.get("linked_id"):
+                from orchestrator.services.project_workspace_defaults import (
+                    release_manifest_defaults,
+                )
+
+                await release_manifest_defaults(self.db, current["linked_id"])
 
     async def _retirement_blocker(self, row) -> str | None:
         """Why a resource can't be retired yet, or None."""

@@ -192,13 +192,12 @@ sys.meta_path.insert(0, Blocker())
 from orchestrator.routers.preferences import UserSettingsUpdate, router
 from orchestrator.services.preference_defaults import resolve_preference_defaults
 from orchestrator.services.session_workspace_policy import (
-    SESSION_WORKSPACE_BACKENDS, SESSION_DEFAULT_WORKSPACE_BACKEND,
+    SESSION_WORKSPACE_BACKENDS,
     SESSION_CREATE_WORKSPACE_BACKENDS,
 )
 
 assert UserSettingsUpdate(language="de-DE").language == "de-DE"
 assert SESSION_WORKSPACE_BACKENDS == ("sandbox", "virtual", "none")
-assert SESSION_DEFAULT_WORKSPACE_BACKEND == "virtual"
 assert SESSION_CREATE_WORKSPACE_BACKENDS == ("sandbox", "virtual", "none", "vm")
 assert len(router.routes) == 2
 assert not [name for name in sys.modules if is_forbidden(name)]
@@ -214,21 +213,13 @@ assert not [name for name in sys.modules if is_forbidden(name)]
 
 def test_workspace_policy_constants_are_consumed_from_their_owner():
     """R1.B12: ``orchestrator.main`` is only the entrypoint and re-exports
-    nothing; the preferences router and the defaults resolver must read the
-    tier constants from ``session_workspace_policy`` itself, not a copy."""
+    nothing; the tier constants must not be duplicated there. Slice A2b
+    retired the ``workspace_backend`` preference, so neither the preferences
+    router nor the defaults resolver import the tier constants any more."""
     from orchestrator import main
     from orchestrator.routers.preferences import UserSettingsUpdate
-    from orchestrator.services import preference_defaults, session_workspace_policy
 
     assert preferences_module.UserSettingsUpdate is UserSettingsUpdate
-    assert (
-        preferences_module.SESSION_WORKSPACE_BACKENDS
-        is session_workspace_policy.SESSION_WORKSPACE_BACKENDS
-    )
-    assert (
-        preference_defaults.SESSION_DEFAULT_WORKSPACE_BACKEND
-        is session_workspace_policy.SESSION_DEFAULT_WORKSPACE_BACKEND
-    )
     for name in (
         "SESSION_WORKSPACE_BACKENDS",
         "SESSION_DEFAULT_WORKSPACE_BACKEND",
