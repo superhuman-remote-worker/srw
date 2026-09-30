@@ -670,4 +670,51 @@ describe('ProjectDetailPageComponent workspace defaults', () => {
     component.loadAll();
     expect(component.workspaceModes()).toEqual(['none', 'virtual', 'container']);
   });
+
+  it('saves no VM values while VMs are unavailable', () => {
+    // A row saved while VMs were on still carries them; the fields are
+    // hidden now, and the server refuses VM values (422).
+    const {api, component} = createComponent({userRole: 'owner'});
+    api.getProjectWorkspaceDefaults.mockReturnValue(
+      of({
+        ...WORKSPACE_DEFAULTS,
+        stored: {
+          jobs: 'vm',
+          sessions: 'vm',
+          container: null,
+          vm: {ref: {name: 'vm-full', scope: {kind: 'Catalog', name: 'shared'}}},
+        },
+        vm_available: false,
+      }),
+    );
+    component.loadAll();
+    component.wdContainer.set('Catalog/shared/container-minimal');
+    component.saveWorkspaceDefaults();
+    expect(api.putProjectWorkspaceDefaults).toHaveBeenCalledWith('project-a', {
+      jobs: null,
+      sessions: null,
+      container: {name: 'container-minimal', scope: {kind: 'Catalog', name: 'shared'}},
+      vm: null,
+    });
+  });
+
+  function personalProject(userRole?: ProjectMemberRole) {
+    const created = createComponent({userRole: 'owner'});
+    created.api.getProject.mockReturnValue(
+      of({id: 'project-a', status: 'active', is_default: true, user_role: userRole}),
+    );
+    created.component.loadAll();
+    return created.api.listWorkspaceTemplates.mock.calls.map(([kind, name]) => `${kind}/${name}`);
+  }
+
+  it("lists Account templates in the viewer's own personal project", () => {
+    expect(personalProject('owner')).toEqual(['Catalog/shared', 'Project/project-a', 'Account/me']);
+  });
+
+  it("never lists the viewer's Account templates in someone else's personal project", () => {
+    // An admin (or a member) opening another user's personal project: the
+    // viewer's own Account templates aren't that project's to pick.
+    expect(personalProject(undefined)).toEqual(['Catalog/shared', 'Project/project-a']);
+    expect(personalProject('editor')).toEqual(['Catalog/shared', 'Project/project-a']);
+  });
 });

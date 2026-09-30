@@ -2717,7 +2717,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   /** Workspace defaults: the Project's row in the chain (spec §6, Project
    *  page Settings tab). Loads the stored/effective/installation view plus
    *  the templates this Project may pick from, in the Catalog, Project and
-   *  (for the personal project) Account scopes. */
+   *  (for the viewer's own personal project) Account scopes. */
   loadWorkspaceDefaults(): void {
     this.api.getProjectWorkspaceDefaults(this.projectId).subscribe({
       next: (wd) => this.applyWorkspaceDefaults(wd),
@@ -2727,7 +2727,11 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
       ['Catalog', 'shared'],
       ['Project', this.projectId],
     ];
-    if (this.project()?.is_default) scopes.push(['Account', 'me']);
+    // Only the owner's Account templates are a personal project's to pick;
+    // an admin opening someone else's personal project must not see (and
+    // offer) their own.
+    const project = this.project();
+    if (project?.is_default && project.user_role === 'owner') scopes.push(['Account', 'me']);
     const me = this.userService.currentUser()?.id ?? 'me';
     forkJoin(scopes.map(([kind, name]) => this.api.listWorkspaceTemplates(kind, name))).subscribe((lists) =>
       this.workspaceTemplates.set(
@@ -2760,14 +2764,18 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   saveWorkspaceDefaults(): void {
     if (!this.canEditWorkspaceDefaults()) return;
+    // Without VMs the VM fields are hidden and the server refuses VM values
+    // (422): a VM mode or template kept from before goes back to the default.
+    const vms = this.workspaceDefaults()?.vm_available !== false;
+    const mode = (value: WorkspaceMode | null) => (vms || value !== 'vm' ? value : null);
     this.isSavingWorkspaceDefaults.set(true);
     this.editError.set(null);
     this.api
       .putProjectWorkspaceDefaults(this.projectId, {
-        jobs: this.wdJobs(),
-        sessions: this.wdSessions(),
+        jobs: mode(this.wdJobs()),
+        sessions: mode(this.wdSessions()),
         container: templateRef(this.wdContainer()),
-        vm: templateRef(this.wdVm()),
+        vm: vms ? templateRef(this.wdVm()) : null,
       })
       .subscribe({
         next: (wd) => {
