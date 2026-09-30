@@ -186,6 +186,20 @@ def _k8s_ide_job(*, job_id: str, runtime_incarnation: str) -> dict:
     }
 
 
+def _native_ide_cleanup(svc, state="settled", *, error=None):
+    from orchestrator.services.container_provisioner import (
+        ContainerProvisioner,
+        WorkspaceCleanupOutcome,
+    )
+
+    provisioner = ContainerProvisioner()
+    provisioner.reconcile_ide_cleanup_intent = AsyncMock(
+        return_value=WorkspaceCleanupOutcome(state), side_effect=error
+    )
+    svc._container_provisioner = provisioner
+    return provisioner.reconcile_ide_cleanup_intent
+
+
 @pytest.mark.asyncio
 async def test_vm_ide_delete_stands_down_for_workspace_recovery(
     service_factory,
@@ -234,6 +248,7 @@ async def test_stop_k8s_ide_stale_deletion_is_superseded_without_context_mutatio
     svc._delete_k8s_ide_container_with_outcome = AsyncMock(
         return_value=RuntimeDeletionOutcome("stale_target_settled")
     )
+    reconcile = _native_ide_cleanup(svc, "superseded")
 
     result = await svc.stop_session(job_id)
 
@@ -244,20 +259,20 @@ async def test_stop_k8s_ide_stale_deletion_is_superseded_without_context_mutatio
     }
     assert db.cas_calls == []
     assert db.unconditional_calls == []
+    reconcile.assert_awaited_once_with(job_id, expected_runtime_incarnation=runtime)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("outcome_state", "expected_status", "expected_result"),
+    ("outcome_state", "expected_result"),
     (
-        ("current_deleted", "expired", "stopped"),
-        ("refused", "cleanup_pending", "cleanup_pending"),
+        ("current_deleted", "stopped"),
+        ("refused", "cleanup_pending"),
     ),
 )
 async def test_stop_k8s_ide_projects_outcome_through_exact_runtime_cas(
     service_factory,
     outcome_state,
-    expected_status,
     expected_result,
 ):
     from orchestrator.services.container_provisioner import RuntimeDeletionOutcome
@@ -270,23 +285,28 @@ async def test_stop_k8s_ide_projects_outcome_through_exact_runtime_cas(
     svc._delete_k8s_ide_container_with_outcome = AsyncMock(
         return_value=RuntimeDeletionOutcome(outcome_state)
     )
+    reconcile = _native_ide_cleanup(svc)
 
     result = await svc.stop_session(job_id)
 
     assert result["status"] == expected_result
-    assert len(db.cas_calls) == 1
-    observed_job, updates, observed_runtime = db.cas_calls[0]
-    assert observed_job == job_id
-    assert observed_runtime == runtime
-    assert updates["status"] == expected_status
+    if outcome_state == "current_deleted":
+        assert len(db.cas_calls) == 1
+        observed_job, updates, observed_runtime = db.cas_calls[0]
+        assert observed_job == job_id
+        assert observed_runtime == runtime
+        assert updates["status"] == "expired"
+        reconcile.assert_awaited_once_with(job_id, expected_runtime_incarnation=runtime)
+    else:
+        assert result["retryable"] is True
+        assert db.cas_calls == []
+        reconcile.assert_not_awaited()
     assert db.unconditional_calls == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome_state", ("current_deleted", "refused"))
 async def test_stop_k8s_ide_cas_loss_preserves_successor(
     service_factory,
-    outcome_state,
 ):
     from orchestrator.services.container_provisioner import RuntimeDeletionOutcome
 
@@ -299,8 +319,9 @@ async def test_stop_k8s_ide_cas_loss_preserves_successor(
     )
     svc._db = db
     svc._delete_k8s_ide_container_with_outcome = AsyncMock(
-        return_value=RuntimeDeletionOutcome(outcome_state)
+        return_value=RuntimeDeletionOutcome("current_deleted")
     )
+    _native_ide_cleanup(svc)
 
     result = await svc.stop_session(job_id)
 
@@ -312,6 +333,73 @@ async def test_stop_k8s_ide_cas_loss_preserves_successor(
     assert len(db.cas_calls) == 1
     assert db.cas_calls[0][2] == runtime
     assert db.unconditional_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("physical_state", ["current_deleted", "stale_target_settled"])
+@pytest.mark.parametrize("fault", ["retryable", "exception", "missing"])
+async def test_stop_k8s_ide_unsettled_cleanup_remains_retryable_without_projection(
+    service_factory, physical_state, fault
+):
+    from orchestrator.services.container_provisioner import RuntimeDeletionOutcome
+
+    job_id = "77777777-7777-4777-8777-777777777777"
+    runtime = "88888888-8888-4888-8888-888888888888"
+    svc = service_factory
+    db = _ExactIdeRuntimeDB(_k8s_ide_job(job_id=job_id, runtime_incarnation=runtime))
+    svc._db = db
+    svc._delete_k8s_ide_container_with_outcome = AsyncMock(
+        return_value=RuntimeDeletionOutcome(physical_state)
+    )
+    if fault == "missing":
+        svc._container_provisioner = object()
+    else:
+        _native_ide_cleanup(
+            svc,
+            "retryable",
+            error=RuntimeError("cleanup interrupted") if fault == "exception" else None,
+        )
+
+    assert await svc.stop_session(job_id) == {
+        "status": "cleanup_pending",
+        "job_id": job_id,
+        "retryable": True,
+    }
+    assert db.cas_calls == []
+    assert db.unconditional_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restore_type", ["k8s_container", "container", "vm"])
+@pytest.mark.parametrize("identity", ["exact", "missing", "malformed"])
+async def test_stop_retiring_ide_requires_exact_k8s_identity(
+    service_factory, restore_type, identity
+):
+    from orchestrator.services.container_provisioner import RuntimeDeletionOutcome
+
+    job_id = "99999999-9999-4999-8999-999999999999"
+    runtime = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    job = _k8s_ide_job(job_id=job_id, runtime_incarnation=runtime)
+    session = job["context"]["ide_session"]
+    session.update(status="retiring_process_zero", restore_type=restore_type)
+    if identity == "missing":
+        session.pop("_runtime_incarnation")
+    elif identity == "malformed":
+        session["_runtime_incarnation"] = "not-a-runtime"
+    svc = service_factory
+    svc._db = _ExactIdeRuntimeDB(job)
+    svc._delete_k8s_ide_container_with_outcome = AsyncMock(
+        return_value=RuntimeDeletionOutcome("current_deleted")
+    )
+    _native_ide_cleanup(svc)
+
+    result = await svc.stop_session(job_id)
+
+    if restore_type == "k8s_container" and identity == "exact":
+        assert result["status"] == "stopped"
+    else:
+        assert result["status"] == "no_active_session"
+        svc._delete_k8s_ide_container_with_outcome.assert_not_awaited()
 
 
 @pytest.mark.asyncio

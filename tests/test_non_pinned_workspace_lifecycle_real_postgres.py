@@ -19,6 +19,7 @@ from orchestrator.database.postgres import PostgresDB
 from orchestrator.services.container_provisioner import (
     ContainerProvisioner,
     RuntimeDeletionOutcome,
+    WorkspaceCleanupOutcome,
     WorkspaceRuntimeAttestation,
 )
 from orchestrator.services.ide_session import IdeSessionService
@@ -1018,7 +1019,13 @@ async def test_ide_context_runtime_merge_refuses_missing_wrong_or_replaced_owner
 
 
 @pytest.mark.asyncio
-async def test_ide_context_runtime_merge_allows_stop_but_never_resurrects_it(db):
+@pytest.mark.parametrize(
+    ("delete_settles_cleanup", "reconcile_fault"),
+    [(False, None), (True, None), (False, "retryable"), (False, "exception")],
+)
+async def test_ide_context_runtime_merge_allows_stop_but_never_resurrects_it(
+    db, delete_settles_cleanup, reconcile_fault
+):
     job_uuid = uuid4()
     job_id, runtime, _reservation = await _create_settled_restore_generation(
         db,
@@ -1029,24 +1036,43 @@ async def test_ide_context_runtime_merge_allows_stop_but_never_resurrects_it(db)
     )
     provisioner = ContainerProvisioner()
     provisioner._db = db
+    provisioner._k8s_available = True
 
-    async def delete_exact_runtime(_job_id, *, expected_runtime_incarnation):
+    async def delete_exact_runtime(
+        _job_id,
+        *,
+        expected_runtime_incarnation,
+        cleanup_intent=None,
+        _mutation_guard_held=False,
+    ):
         assert _job_id == job_id
         assert expected_runtime_incarnation == runtime
-        intent = await db.prepare_managed_repository_workspace_cleanup_intent(
-            job_id,
-            owner_kind="job",
-            scope="ide",
-            runtime_incarnation=runtime,
-            target_disposition="expired",
-            reclaim_shared_resources=False,
-            pod_uid=runtime,
-            resources_captured=True,
-        )
-        assert intent is not None
-        claimed = await db.claim_managed_repository_workspace_cleanup_intent(
-            str(intent["id"]), claimant="ide-stop:exact-runtime"
-        )
+        if cleanup_intent is None:
+            intent = await db.get_managed_repository_workspace_cleanup_intent(
+                job_id,
+                owner_kind="job",
+                scope="ide",
+                runtime_incarnation=runtime,
+            )
+            if intent is None:
+                intent = await db.prepare_managed_repository_workspace_cleanup_intent(
+                    job_id,
+                    owner_kind="job",
+                    scope="ide",
+                    runtime_incarnation=runtime,
+                    target_disposition="expired",
+                    reclaim_shared_resources=False,
+                    pod_uid=runtime,
+                    resources_captured=True,
+                )
+            assert intent is not None
+            claimed = await db.claim_managed_repository_workspace_cleanup_intent(
+                str(intent["id"]), claimant="ide-stop:exact-runtime"
+            )
+        else:
+            assert _mutation_guard_held is True
+            assert str(cleanup_intent["runtime_incarnation"]) == runtime
+            claimed = cleanup_intent
         assert claimed is not None
         assert await db.record_managed_repository_workspace_process_zero(
             job_id,
@@ -1055,15 +1081,16 @@ async def test_ide_context_runtime_merge_allows_stop_but_never_resurrects_it(db)
             provisioner="k8s",
             runtime_incarnation=runtime,
         )
-        assert await db.settle_managed_repository_workspace_cleanup_intent(
-            job_id,
-            owner_kind="job",
-            scope="ide",
-            runtime_incarnation=runtime,
-            intent_generation=int(claimed["intent_generation"]),
-            claimant=str(claimed["claimed_by"]),
-            claim_token=int(claimed["claim_token"]),
-        )
+        if delete_settles_cleanup:
+            assert await db.settle_managed_repository_workspace_cleanup_intent(
+                job_id,
+                owner_kind="job",
+                scope="ide",
+                runtime_incarnation=runtime,
+                intent_generation=int(claimed["intent_generation"]),
+                claimant=str(claimed["claimed_by"]),
+                claim_token=int(claimed["claim_token"]),
+            )
         return RuntimeDeletionOutcome("current_deleted")
 
     provisioner.delete_ide_pod_with_outcome = AsyncMock(
@@ -1071,6 +1098,41 @@ async def test_ide_context_runtime_merge_allows_stop_but_never_resurrects_it(db)
     )
     service = IdeSessionService()
     service.connect(db, None, None, container_provisioner=provisioner)
+    if reconcile_fault is not None:
+        reconcile = provisioner.reconcile_ide_cleanup_intent
+        provisioner.reconcile_ide_cleanup_intent = AsyncMock(
+            return_value=WorkspaceCleanupOutcome("retryable"),
+            side_effect=(
+                RuntimeError("injected cleanup reconciliation interruption")
+                if reconcile_fault == "exception"
+                else None
+            ),
+        )
+        assert await service.stop_session(job_id) == {
+            "status": "cleanup_pending",
+            "job_id": job_id,
+            "retryable": True,
+        }
+        provisioner.reconcile_ide_cleanup_intent.assert_awaited_once_with(
+            job_id, expected_runtime_incarnation=runtime
+        )
+        pending = await db.get_job(job_id)
+        pending_context = json.loads(pending["context"])
+        assert pending_context["ide_session"]["status"] == "retiring_process_zero"
+        assert pending_context["ide_session"]["_runtime_incarnation"] == runtime
+        intent = await db.get_managed_repository_workspace_cleanup_intent(
+            job_id, owner_kind="job", scope="ide", runtime_incarnation=runtime
+        )
+        assert intent["settled_at"] is None
+        assert await db.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM managed_repository_process_zero_receipts "
+            "WHERE owner_kind='job' AND owner_id=$1::uuid AND scope='ide' "
+            "AND provisioner='k8s' AND runtime_incarnation=$2)",
+            job_id,
+            runtime,
+        )
+        provisioner.reconcile_ide_cleanup_intent = reconcile
+    # A retry must use Stop itself, rather than bypassing its status admission.
     assert (await service.stop_session(job_id))["status"] == "stopped"
 
     merge = db.merge_ide_session_context_if_runtime
@@ -1089,6 +1151,12 @@ async def test_ide_context_runtime_merge_allows_stop_but_never_resurrects_it(db)
         )
     assert settled["ide_status"] == "expired"
     assert settled["stopped_at"] is not None
+    assert not await db.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+        "WHERE owner_kind='job' AND owner_id=$1::uuid AND scope='ide' "
+        "AND settled_at IS NULL)",
+        job_id,
+    )
 
 
 @pytest.mark.asyncio
