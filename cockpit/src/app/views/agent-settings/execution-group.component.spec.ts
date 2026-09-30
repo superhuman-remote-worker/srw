@@ -275,6 +275,20 @@ describe('ExecutionGroupComponent workspace default hint', () => {
       },
       'Installation default',
     ],
+    // An Expert's workspacePreference advisory already has its own "This
+    // Expert recommends {tier}" line above the picker (job-create /
+    // session-create); labelling it "Installation default" too would be
+    // factually wrong (review finding, fix round 1).
+    [
+      {
+        backend: 'container',
+        source: 'recommendation',
+        binding: {template: {inline: {backend: 'container'}}},
+        sources: {tier: 'installation', template: null},
+        template_name: null,
+      },
+      '',
+    ],
   ])('explains an unpinned default (%o)', (preview, text) => {
     // Job mode (the default) with no pinned workspace backend (also default).
     const {component} = createWith({is_admin: true}, translations);

@@ -590,12 +590,23 @@ export class ExecutionGroupComponent {
   /** Explains where an unpinned workspace backend comes from — the Project or
    *  the installation — so the create form doesn't leave the picker's default
    *  unexplained now that the template picker itself is a later slice. Blank
-   *  once the user pins a value, or when the preview reflects the caller's own
-   *  request rather than a resolved default. */
+   *  once the user pins a value, when the preview reflects the caller's own
+   *  request rather than a resolved default, or when it is an Expert's
+   *  `workspacePreference` advisory (`source: 'recommendation'`) — that case
+   *  already has its own "This Expert recommends {tier}" line above the
+   *  picker (job-create.component.ts / session-create.component.ts), and
+   *  labelling it "Installation default" too would be factually wrong. */
   readonly workspaceDefaultHint = computed(() => {
     this.activeLang();
     const preview = this.workspacePreview();
-    if (!preview || this.workspaceBackend() !== null || preview.source === 'request') return '';
+    if (
+      !preview ||
+      this.workspaceBackend() !== null ||
+      preview.source === 'request' ||
+      preview.source === 'recommendation'
+    ) {
+      return '';
+    }
     const layer = this.transloco.translate(
       preview.source === 'project'
         ? 'agentSettings.execution.workspaceDefaultProject'
