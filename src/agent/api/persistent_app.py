@@ -1515,6 +1515,8 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
+    await _session_attach.release_shutdown_receipt()
+
     # Exact drain settlement retries are independent of ordinary heartbeats
     # (Begin makes those authority-refused). Own their lifetime explicitly so
     # no HTTP/outcome task survives client close during process shutdown.

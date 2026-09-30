@@ -2324,6 +2324,35 @@ class SessionAttachCoordinator:
             await asyncio.sleep(delay)
         return False
 
+    async def release_shutdown_receipt(self, *, timeout: float = 5.0) -> bool:
+        """Boundedly confirm completed attach cleanup before closing its client.
+
+        Cancellation of unfinished setup is never a release proof. On timeout
+        the exact receipt and identity remain intact for normal reconciliation.
+        """
+        receipt = self._release_receipt
+        if receipt is None:
+            return True
+        if any(
+            task is not None and not task.done()
+            for task in (self._startup_task, self._pool_task)
+        ):
+            return False
+        try:
+            return await asyncio.wait_for(
+                self.release_receipt_until_confirmed(
+                    receipt["thread_id"],
+                    runtime_generation=receipt.get("session_runtime_generation"),
+                    runtime_attach_token=receipt.get("session_runtime_attach_token"),
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            self._logger.warning(
+                "Shutdown attach release remains unconfirmed; exact obligation retained"
+            )
+            return False
+
     async def release_before_dedicated_exit(self, thread_id: str) -> None:
         """Rotate a failed dedicated attach only from its exact zero proof."""
 
