@@ -773,11 +773,13 @@ class TestInterruptModeSelection:
     mode = 'graceful' if a tool is currently mid-`ainvoke`, else 'hard'.
     The mode picks the right behavior at the persistent_graph check sites."""
 
-    def setup_method(self):
+    @pytest.fixture(autouse=True)
+    def tool_state(self, monkeypatch):
         import agent.api.persistent_app as mod
 
-        mod._session_input._interrupt_mode = None
-        mod._tool_inflight = False
+        monkeypatch.setattr(mod._session_input, "_interrupt_mode", None)
+        monkeypatch.setattr(mod, "_tool_inflight", False)
+        monkeypatch.setattr(mod, "_tool_inflight_calls", set())
 
     def test_loop_on_tool_start_does_not_claim_execution_inflight(self):
         import agent.api.persistent_app as mod
@@ -794,9 +796,32 @@ class TestInterruptModeSelection:
         async def _run():
             await mod._loop_on_tool_execution_start("read_file", "tc1")
 
+        # This callback test owns the effect-authority response. Another test's
+        # retired session must not supply the authority for this synthetic turn.
+        authority = AsyncMock(return_value=True)
+        with patch.object(mod, "_loop_runtime_effect_authority_current", authority):
+            asyncio.run(_run())
+        authority.assert_awaited_once_with()
+        assert mod._tool_inflight is True
+        assert mod._tool_inflight_calls == {"tc1"}
+
+    def test_loop_on_tool_execution_start_refuses_termination_before_inflight(
+        self, monkeypatch
+    ):
+        import agent.api.persistent_app as mod
+
+        monkeypatch.setattr(
+            mod._session_termination, "termination_admission_fenced", True
+        )
+
+        async def _run():
+            with pytest.raises(mod.TerminationAdmissionClosed):
+                await mod._loop_on_tool_execution_start("read_file", "tc1")
+
         with patch.object(mod, "_protected_cloud_runtime_ready", return_value=True):
             asyncio.run(_run())
-        assert mod._tool_inflight is True
+        assert mod._tool_inflight is False
+        assert mod._tool_inflight_calls == set()
 
     def test_loop_on_tool_result_clears_inflight(self):
         import agent.api.persistent_app as mod
