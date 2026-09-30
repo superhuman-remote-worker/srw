@@ -55,6 +55,7 @@ async def pg_pool(pg_dsn):
                 attempts_since_completion integer NOT NULL DEFAULT 0,
                 queued_at timestamptz,
                 run_after timestamptz,
+                park_reason text,
                 input_seq bigint,
                 consumed_seq bigint,
                 control_input_seq bigint NOT NULL DEFAULT 0,
