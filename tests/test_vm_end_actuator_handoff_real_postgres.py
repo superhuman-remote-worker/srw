@@ -801,3 +801,61 @@ async def test_interrupted_permanent_delete_retries_its_own_purge_admission(
     admissions = await _cleanup_admissions(db, ids["thread"])
     assert len(admissions) == 2
     assert admissions[1]["outcome"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permanent", [False, True])
+async def test_pre_setup_end_nominates_exact_actuator_and_waits_for_settlement(
+    db, monkeypatch, permanent
+):
+    from orchestrator.application import sessions
+    from orchestrator.services.session_attach_binding import (
+        acknowledge_retiring_failed_attach,
+    )
+
+    ids, retirement, _, events, _, _ = await scenario(
+        db, monkeypatch, permanent=permanent
+    )
+    dependencies = sessions.session_attach_binding_dependencies(
+        main.app.state.resources
+    )
+    proof = dict(
+        expected_runtime_generation=ids["generation"],
+        expected_attach_token=ids["attach_token"],
+        expected_agent_pod_uid=ids["pod_uid"],
+        local_quiescence_protocol="agent_attach_not_started_v1",
+        workspace_generation=None,
+        workspace_runtime_incarnation=None,
+        dependencies=dependencies,
+    )
+    assert not await acknowledge_retiring_failed_attach(
+        ids["agent"], ids["thread"], **proof
+    )
+    current = await db.get_thread(ids["thread"])
+    assert current["runtime_retirement_local_quiescence"] is None
+    assert current["runtime_retirement_actuator_request"] is not None
+    candidates = await db.list_retryable_pinned_retirements()
+    assert len(candidates) == 1 and candidates[0]["nominated_before_grace"]
+    stopped = asyncio.Event()
+    gc = db.gc_offline_agents
+
+    async def finish_pass(**kwargs):
+        result = await gc(**kwargs)
+        stopped.set()
+        return result
+
+    monkeypatch.setattr(db, "gc_offline_agents", finish_pass)
+    await asyncio.wait_for(
+        detector.stale_agent_detector(
+            stopped,
+            dependencies=composition.stale_agent_detector_dependencies(
+                main.app.state.resources
+            ),
+        ),
+        timeout=15,
+    )
+    assert events == ["pod-stop", "vm-stop"]
+    assert await acknowledge_retiring_failed_attach(
+        ids["agent"], ids["thread"], **proof
+    )
+    assert await db.list_retryable_pinned_retirements() == []
