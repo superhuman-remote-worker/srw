@@ -374,16 +374,25 @@ def applies_codex_context_cap(
 # moves — a beta added upstream is one this header would suppress.
 #
 # Re-checked at v7.3.13 (2026-09-22): the header no longer *replaces* the list.
-# The executor assembles Claude Code 2.1.258's per-request betas itself, drops
-# every beta it manages from an inbound header, and forwards only unmanaged
-# ones — here just ``token-efficient-tools-2026-03-28``. It also sets
-# ``thinking.display: summarized`` whenever ``reasoning_effort`` is present and
-# omits the redaction beta once a display is set, so it should produce visible
-# thinking with no header at all. The header stays because deployments still
-# pin older proxies separately (prod-private is on v7.1.39), and there it is
-# the only thing between SRW and signature-only thinking. Retire it once no
-# supported deployment runs below v7.3.x and
-# ``scripts/subscription-proxy-probe.py opus-5-noheader`` reports VISIBLE.
+# The executor assembles Claude Code's per-request betas itself, drops every
+# beta it manages from an inbound header, and forwards only unmanaged ones —
+# here just ``token-efficient-tools-2026-03-28``. So from v7.3.x on the header
+# decides nothing about thinking visibility.
+#
+# Re-checked at v7.3.20 (2026-09-29, dev's pin; Anthropic now requires Claude
+# Code >= 2.1.280 for Opus 5.5, which v7.3.15+ presents): v7.3.13 derived
+# ``thinking.display: summarized`` from ``reasoning_effort``, but from v7.3.17
+# a Chat ``reasoning_effort`` is only depth, and without an explicit visibility
+# field the executor sends ``display: updates`` or leaves Anthropic's
+# ``omitted`` default — empty thinking again, header or not. The loader's
+# OpenAI factory therefore sends ``include_reasoning: true`` with the effort
+# for Claude on the proxy (``_create_openai_llm``), which the probe measured
+# VISIBLE with and without this header. The header stays because deployments
+# still pin older proxies separately (prod-private is on v7.1.39), which drop
+# the unknown body field and where the header is the only thing between SRW
+# and signature-only thinking. Retire it once no supported deployment runs
+# below v7.3.x and ``scripts/subscription-proxy-probe.py opus-5-noheader``
+# reports VISIBLE.
 CLAUDE_VISIBLE_THINKING_BETAS: tuple[str, ...] = (
     "claude-code-20250219",
     "oauth-2025-04-20",
