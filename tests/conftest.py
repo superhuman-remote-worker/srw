@@ -4,11 +4,34 @@ import os
 import sys
 import tempfile
 from contextlib import asynccontextmanager
+from functools import wraps
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
 import pytest
+
+
+def pytest_configure(config):
+    """Set disposable Postgres defaults before any test modules are collected."""
+    from testcontainers.postgres import PostgresContainer
+
+    original_init = PostgresContainer.__init__
+
+    @wraps(original_init)
+    def init_without_disk_sync(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        # These databases are recreated for each fixture, so crash durability
+        # only adds disk waits to schema creation, commits and TRUNCATE.
+        if self._command is None:
+            self.with_command(
+                "postgres -c fsync=off -c synchronous_commit=off -c full_page_writes=off"
+            )
+
+    patch = pytest.MonkeyPatch()
+    patch.setattr(PostgresContainer, "__init__", init_without_disk_sync)
+    config.add_cleanup(patch.undo)
+
 
 # orchestrator/main.py SystemExits at import time unless the license gate is
 # accepted. Tests only exercise its utility functions — auto-accept here so
