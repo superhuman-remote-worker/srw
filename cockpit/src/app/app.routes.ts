@@ -1,5 +1,4 @@
 import {Routes} from '@angular/router';
-import {ApiKeysPageComponent} from './views/settings/api-keys/api-keys-page.component';
 import {JobsPageComponent} from './views/jobs/jobs-page.component';
 import {JobReviewPageComponent} from './views/job-review/job-review-page.component';
 import {CreatePageComponent} from './views/create/create-page.component';
@@ -88,7 +87,14 @@ export const routes: Routes = [
   {path: 'settings/provider-keys', loadComponent: loadSettings, canActivate: [authGuard], data: {section: 'provider-keys'}},
   {path: 'settings/notifications', loadComponent: loadSettings, canActivate: [authGuard], data: {section: 'notifications'}},
   {path: 'settings/mcp', loadComponent: loadSettings, canActivate: [authGuard], data: {section: 'mcp'}},
-  { path: 'settings/api-keys', component: ApiKeysPageComponent, canActivate: [authGuard] },
+  {
+    path: 'settings/api-keys',
+    loadComponent: () =>
+      import('./views/settings/api-keys/api-keys-page.component').then(
+        (m) => m.ApiKeysPageComponent,
+      ),
+    canActivate: [authGuard],
+  },
   // SSH key management also loads on demand; its key-generation instructions
   // are only needed when this page is opened.
   {
