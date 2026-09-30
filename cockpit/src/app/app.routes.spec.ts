@@ -116,4 +116,15 @@ describe('app.routes — settings sections', () => {
   it.each(['settings/api-keys', 'settings/ssh-keys'])('keeps the %s page', (path) => {
     expect(routes.find((route) => route.path === path)).toBeDefined();
   });
+
+  it('loads API key settings on demand behind the existing auth guard', async () => {
+    const route = routes.find((r) => r.path === 'settings/api-keys');
+    expect(route?.canActivate?.includes(authGuard) ?? false).toBe(true);
+    expect(route?.component).toBeUndefined();
+    expect(typeof route?.loadComponent).toBe('function');
+    const component = await route!.loadComponent!();
+    expect(component).toBe(
+      (await import('./views/settings/api-keys/api-keys-page.component')).ApiKeysPageComponent,
+    );
+  });
 });
