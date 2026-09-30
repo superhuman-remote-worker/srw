@@ -267,14 +267,46 @@ agent/MCP bare-array compatibility adapter when extending this contract.
 
 ### Python
 
+Run from the repository root with the project virtual environment active and
+`requirements-dev.txt` installed:
+
 ```bash
-pytest tests/test_<area>.py -x -q --tb=short
+python -m pytest tests/test_<area>.py -x -q --tb=short
 ruff check src/ tests/
 ruff format --check src/ tests/
 
-# Full bounded runner used by CI
+# Full parallel suite used by CI; stops on first failure
 ./scripts/pytest-fast.sh
+
+# Full results for acceptance and timing, even when some tests fail
+./scripts/pytest-fast.sh tests/ -q --tb=short --maxfail=0
 ```
+
+The runner defaults to the smaller of the detected CPU count and eight workers.
+It uses `--dist loadfile`, keeping all tests from a file on the same worker so
+module-scoped fixtures retain their normal lifetime. Both `main` and `develop`
+Python CI jobs use this runner; `develop` can select affected test files.
+
+The runner uses the active `python`. Select an interpreter explicitly with
+`SRW_PYTHON`, and override the worker count with `SRW_PYTEST_WORKERS` when needed:
+
+```bash
+SRW_PYTHON=.venv/bin/python ./scripts/pytest-fast.sh
+SRW_PYTEST_WORKERS=4 ./scripts/pytest-fast.sh
+```
+
+Use the path of your actual virtual environment (`venv/bin/python` if following
+the setup above). Keep worker counts bounded; avoid `-n auto`, since each worker
+imports the substantial agent and orchestrator stacks.
+
+Fast Postgres settings are automatic. Before collection in every pytest process,
+including each xdist worker, `tests/conftest.py` gives disposable
+`PostgresContainer` instances `fsync=off`, `synchronous_commit=off`, and
+`full_page_writes=off`. No extra flag or plugin is needed, and explicit container
+commands are preserved. Direct `python -m pytest` receives the same database
+defaults but runs serially unless parallelism is requested. Database integration
+tests still need a working Docker-compatible container runtime; compare skipped
+tests as well as failures when measuring performance.
 
 Async tests require `@pytest.mark.asyncio`; mock awaitable collaborators with
 `AsyncMock`.
