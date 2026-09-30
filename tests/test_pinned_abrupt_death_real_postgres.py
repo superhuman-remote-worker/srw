@@ -275,7 +275,7 @@ async def test_killed_partial_turn_is_retired_without_fabricating_completion_or_
 async def test_killed_life_recovery_refuses_unproven_or_superseded_runtime(
     db, monkeypatch, defect
 ):
-    ids, retirement, deliveries, api, _ = await killed_life(db, monkeypatch)
+    ids, retirement, deliveries, api, provider = await killed_life(db, monkeypatch)
     if defect == "replacement_uid":
         pod = next(iter(api.pods.values()))
         pod.metadata.uid = str(uuid4())
@@ -289,6 +289,11 @@ async def test_killed_life_recovery_refuses_unproven_or_superseded_runtime(
         retirement = {**retirement, "generation": str(uuid4())}
     else:
         retirement = {**retirement, "token": str(uuid4())}
+    if defect in {"replacement_uid", "unavailable_proof"}:
+        pod_name = f"persistent-{ids['thread'][:12]}"
+        assert await provider.agent_pod_authority(
+            pod_name, expected_pod_uid=ids["pod_uid"], namespace="agents-a"
+        ) == ("replacement" if defect == "replacement_uid" else "unknown")
     assert not await controls.pinned_retirement_operations(
         main.app.state.resources
     ).recover_captured_process_zero(retirement)
@@ -296,6 +301,38 @@ async def test_killed_life_recovery_refuses_unproven_or_superseded_runtime(
     assert current["runtime_retirement_local_quiescence"] is None
     if defect in {"stale_generation", "stale_token"}:
         assert api.pods, "a stale request must refuse before its first Pod effect"
+    rows = await db.fetch(
+        "SELECT delivery_id,state FROM thread_input_deliveries WHERE thread_id=$1::uuid ORDER BY persisted_at",
+        ids["thread"],
+    )
+    assert [r["delivery_id"] for r in rows] == deliveries
+    assert [r["state"] for r in rows] == ["queued", "owned"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["sandbox", "vm"])
+async def test_killed_agent_pod_cannot_certify_ambiguous_remote_writers(
+    db, monkeypatch, backend
+):
+    ids, retirement, deliveries, api, _ = await killed_life(
+        db, monkeypatch, backend=backend
+    )
+    # Even truthful terminal agent-Pod evidence says nothing about a separate
+    # workspace process namespace. Neither the API owner nor SQL may borrow
+    # the lite/virtual shortcut without that namespace's exact proof.
+    assert await db.acknowledge_abrupt_pinned_actor_exit(
+        ids["thread"],
+        runtime_generation=retirement["generation"],
+        retirement_token=retirement["token"],
+        agent_id=ids["agent"],
+        attach_token=ids["attach_token"],
+        stopped_pod_uid=ids["pod_uid"],
+    ) is None
+    assert not await controls.pinned_retirement_operations(
+        main.app.state.resources
+    ).recover_captured_process_zero(retirement)
+    current = await db.get_thread(ids["thread"])
+    assert current["runtime_retirement_local_quiescence"] is None
     rows = await db.fetch(
         "SELECT delivery_id,state FROM thread_input_deliveries WHERE thread_id=$1::uuid ORDER BY persisted_at",
         ids["thread"],
