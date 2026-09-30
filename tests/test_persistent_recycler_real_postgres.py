@@ -9617,3 +9617,53 @@ async def test_failed_attach_retirement_release_confirms_settled_outcome_before_
         runtime_attach_token=ids["attach_token"],
     )
     assert (await db.get_thread(ids["thread"]))["status"] == "ended"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("input_state", ["owned", "queued", "admitted", "settled"])
+async def test_pre_setup_release_refuses_work_owned_by_distinct_process_generation(
+    db, input_state
+):
+    """Delivery owner G names the process, not the thread's session generation."""
+    from orchestrator import main
+
+    ids = await _seed(db, protected_agent_pod=True, workspace_claim=False)
+    await db.execute(
+        "UPDATE threads SET status='created' WHERE id=$1::uuid", ids["thread"]
+    )
+    generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
+    message_id = await db.fetchval(
+        "INSERT INTO thread_messages(thread_id,role,content,turn_number) "
+        "VALUES($1::uuid,'user','setup exposed work',1) RETURNING id",
+        ids["thread"],
+    )
+    await db.execute(
+        "INSERT INTO thread_input_deliveries(delivery_id,thread_id,message_id,source,state,"
+        "claim_generation,owner_agent_id,owner_pod_uid,owner_runtime_generation,"
+        "admitted_turn_number,admitted_at,settled_at) VALUES "
+        "($1::uuid,$2::uuid,$3,'direct_human',$4,1,$5::uuid,'old-pod',$6::uuid,"
+        "CASE WHEN $4 IN ('admitted','settled') THEN 1 END,"
+        "CASE WHEN $4 IN ('admitted','settled') THEN now() END,"
+        "CASE WHEN $4='settled' THEN now() END)",
+        str(uuid4()),
+        ids["thread"],
+        message_id,
+        input_state,
+        ids["agent"],
+        str(uuid4()),
+    )
+    with patch.object(main.app.state.resources, "postgres_db", db):
+        result = await session_attach_binding_module.release_session_attach_binding(
+            ids["agent"],
+            ids["thread"],
+            expected_runtime_generation=generation,
+            expected_attach_token=ids["attach_token"],
+            expected_agent_pod_uid="old-pod",
+            local_runtime_quiesced=True,
+            local_quiescence_protocol="agent_attach_not_started_v1",
+            dependencies=sessions_composition.session_attach_binding_dependencies(
+                main.app.state.resources
+            ),
+        )
+    assert result == "unsafe"
+    assert str((await db.get_thread(ids["thread"]))["runtime_generation"]) == generation
