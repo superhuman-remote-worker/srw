@@ -195,27 +195,54 @@ def test_the_new_variable_is_the_last_orchestrator_variable():
     assert entries[-1]["name"] == "WORKSPACE_DEFAULTS"
 
 
-def test_container_builtins_carry_the_installation_pull_policy():
-    declared = builtins()
-    assert declared["container-full"]["spec"]["environment"]["pullPolicy"] == "Always"
-    assert (
-        declared["container-minimal"]["spec"]["environment"]["pullPolicy"] == "Always"
-    )
+def pull_policies(*settings) -> dict[str, str]:
+    declared = builtins(*settings)
     assert "pullPolicy" not in declared["vm-full"]["spec"].get("environment", {})
+    return {
+        name: declared[name]["spec"]["environment"]["pullPolicy"]
+        for name in ("container-full", "container-minimal")
+    }
 
 
-def test_container_builtins_follow_an_overridden_pull_policy():
-    declared = builtins("image.workspace.pullPolicy=IfNotPresent")
-    assert (
-        declared["container-full"]["spec"]["environment"]["pullPolicy"]
-        == "IfNotPresent"
-    )
-    # workspaceMinimal has no pullPolicy of its own; it falls back to
-    # image.workspace.pullPolicy.
-    assert (
-        declared["container-minimal"]["spec"]["environment"]["pullPolicy"]
-        == "IfNotPresent"
-    )
+# Kubernetes' own default, which the untemplated workspace pod got before the
+# built-ins existed: Always for a digest-less `latest` (or empty) tag, else
+# IfNotPresent. The chart's image.workspace.pullPolicy never decides it.
+def test_shipped_latest_tags_pull_always():
+    assert pull_policies() == {
+        "container-full": "Always",
+        "container-minimal": "Always",
+    }
+
+
+def test_pinned_tags_pull_if_not_present():
+    assert pull_policies(
+        "image.workspace.tag=1.4.0", "image.workspaceMinimal.tag=1.4.0"
+    ) == {"container-full": "IfNotPresent", "container-minimal": "IfNotPresent"}
+
+
+def test_digests_pull_if_not_present():
+    assert pull_policies(
+        f"image.workspace.digest={DIGEST}", f"image.workspaceMinimal.digest={DIGEST}"
+    ) == {"container-full": "IfNotPresent", "container-minimal": "IfNotPresent"}
+
+
+def test_each_image_decides_its_own_pull_policy():
+    assert pull_policies(f"image.workspace.digest={DIGEST}") == {
+        "container-full": "IfNotPresent",
+        "container-minimal": "Always",
+    }
+
+
+def test_the_chart_pull_policy_does_not_decide():
+    assert pull_policies(
+        "image.workspace.pullPolicy=IfNotPresent",
+        "image.workspaceMinimal.pullPolicy=IfNotPresent",
+    ) == {"container-full": "Always", "container-minimal": "Always"}
+    assert pull_policies(
+        "image.workspace.tag=1.4.0",
+        "image.workspaceMinimal.tag=1.4.0",
+        "image.workspace.pullPolicy=Always",
+    ) == {"container-full": "IfNotPresent", "container-minimal": "IfNotPresent"}
 
 
 @pytest.mark.parametrize(

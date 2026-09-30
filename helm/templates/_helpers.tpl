@@ -120,6 +120,22 @@ Usage: {{ include "srw.imageRef" (dict "image" .Values.image.agent) }}
 {{- end }}
 
 {{/*
+The pull policy Kubernetes gives a container that sets none: Always for an
+image without a digest whose tag is `latest` or empty, else IfNotPresent. The
+container built-ins carry it so a default workspace pulls exactly as the
+untemplated workspace pod did; the chart's pullPolicy values don't decide it.
+Usage: {{ include "srw.defaultPullPolicy" (dict "image" .Values.image.workspace) }}
+*/}}
+{{- define "srw.defaultPullPolicy" -}}
+{{- $tag := default "" .image.tag -}}
+{{- if and (not (default "" .image.digest)) (or (eq $tag "") (eq $tag "latest")) -}}
+Always
+{{- else -}}
+IfNotPresent
+{{- end -}}
+{{- end }}
+
+{{/*
 Default VM image. The VM controller and the vm-full built-in template both use
 this, so they always name the same image.
 */}}
@@ -146,11 +162,9 @@ uses, so a workspace on it is the installation image in every respect.
       "srw.io/display-name" "Virtual"
       "srw.io/description" "A workspace without a container or a VM."))
     "spec" (dict "backend" "virtual")) -}}
-{{- $minimalEnvironment := dict "image" (include "srw.imageRef" (dict "image" .Values.image.workspaceMinimal)) -}}
-{{- $minimalPullPolicy := .Values.image.workspaceMinimal.pullPolicy | default .Values.image.workspace.pullPolicy -}}
-{{- if $minimalPullPolicy -}}
-{{- $_ := set $minimalEnvironment "pullPolicy" $minimalPullPolicy -}}
-{{- end -}}
+{{- $minimalEnvironment := dict
+    "image" (include "srw.imageRef" (dict "image" .Values.image.workspaceMinimal))
+    "pullPolicy" (include "srw.defaultPullPolicy" (dict "image" .Values.image.workspaceMinimal)) -}}
 {{- $templates = append $templates (dict
     "apiVersion" "srw/v1alpha1"
     "kind" "WorkspaceTemplate"
@@ -161,10 +175,9 @@ uses, so a workspace on it is the installation image in every respect.
       "backend" "sandbox"
       "environment" $minimalEnvironment
       "resources" $sizes)) -}}
-{{- $fullEnvironment := dict "image" (include "srw.imageRef" (dict "image" .Values.image.workspace)) -}}
-{{- if .Values.image.workspace.pullPolicy -}}
-{{- $_ := set $fullEnvironment "pullPolicy" .Values.image.workspace.pullPolicy -}}
-{{- end -}}
+{{- $fullEnvironment := dict
+    "image" (include "srw.imageRef" (dict "image" .Values.image.workspace))
+    "pullPolicy" (include "srw.defaultPullPolicy" (dict "image" .Values.image.workspace)) -}}
 {{- $templates = append $templates (dict
     "apiVersion" "srw/v1alpha1"
     "kind" "WorkspaceTemplate"

@@ -86,9 +86,11 @@ workspace:
   at its own images. Work that is already admitted keeps the image it was
   admitted with, like any template. That includes Jobs that named no workspace:
   they get `container-full` (see [Workspace defaults](#workspace-defaults)).
-- **They carry the chart's pull policy.** The container templates use
-  `image.workspace.pullPolicy` (`Always` in the shipped values);
-  `container-minimal` uses `image.workspaceMinimal.pullPolicy` when it is set.
+- **They pull like a pod without a pull policy.** Each container template gets
+  the policy Kubernetes would give its image: `Always` for a `latest` tag
+  without a digest (the shipped values), `IfNotPresent` for a pinned tag or a
+  digest. The chart's `image.workspace.pullPolicy` doesn't change it. To pull a
+  pinned tag every time, save a copy with its own `pullPolicy`.
 - **A Project copies a template when the Project is applied.** A Project whose
   workspace refers to a built-in keeps that copy, image included, until the
   Project is applied again.

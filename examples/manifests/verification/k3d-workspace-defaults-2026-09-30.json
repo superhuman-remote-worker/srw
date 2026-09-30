@@ -131,7 +131,8 @@
         "imagePullPolicy": "IfNotPresent on both: the template carries the local image.workspace.pullPolicy; the plain pod sets none and Kubernetes defaults a non-latest tag to IfNotPresent",
         "securityProfile": "privileged, SYS_ADMIN added, seccomp Unconfined, dev-fuse hostPath on both",
         "specDiff": "only per-Job values: the creation-reservation annotation, HASHED_PASSWORD, the service-account token volume name and the PVC name",
-        "shippedValues": "image.workspace is tag latest with pullPolicy Always, and Kubernetes defaults latest to Always, so shipped installs also see no change; an install that pins a tag while leaving pullPolicy Always now pulls Always for default Jobs instead of IfNotPresent (ruling R7, intended)"
+        "shippedValues": "image.workspace is tag latest with pullPolicy Always, and Kubernetes defaults latest to Always, so shipped installs also see no change",
+        "pullPolicyAmendment": "Recorded under ruling R7 (the template carried image.workspace.pullPolicy). Ruling R16 replaced it after this run: the container built-ins now carry Kubernetes' default for their own image (Always for a digest-less latest or empty tag, else IfNotPresent) and ignore image.workspace.pullPolicy. This run's non-latest Tilt tag gives IfNotPresent under both rules, so the observation stands; an install that pins a tag now keeps IfNotPresent, as before A2b (tests/test_workspace_builtin_templates_helm.py)"
       }
     },
     {

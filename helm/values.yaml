@@ -2741,9 +2741,10 @@ workspace:
     # the new start picks it up. With Reloader off, restart it by hand.
     enabled: true
     # -- Sizes of the two built-in container templates. cpu and memory are the
-    # maximum; requests is what Kubernetes reserves on the node. The defaults
-    # equal the pod a workspace gets when no template is selected. They don't
-    # change that pod.
+    # maximum; requests is what Kubernetes reserves on the node. A Job that
+    # names no workspace gets container-full (see workspace.defaults), so these
+    # are every such Job's sizes. The shipped values equal the sizes of a
+    # container workspace without a template.
     containerResources:
       cpu: 2
       memory: 4Gi
