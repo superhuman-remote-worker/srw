@@ -5950,7 +5950,7 @@ class StatelessTurnExecutor:
         # writeback. Public End owns a separate exact remote resident-retirement
         # acknowledgement before any emptyDir snapshot.
         preserve_workspace_daemons = True
-        await pa._terminate_session(
+        await pa._session_termination.terminate(
             reason,
             mark_thread=False,
             preserve_shell=True,

@@ -393,13 +393,13 @@ def _persistent_client(monkeypatch, *, session, terminate=None):
     monkeypatch.setattr(module, "_stateless_mode", lambda: False)
     monkeypatch.setattr(module, "_session", session)
     monkeypatch.setattr(module._session_identity, "_thread_id", "thread-1")
-    monkeypatch.setattr(module, "_sessions_served", 1)
+    monkeypatch.setattr(module._session_termination, "sessions_served", 1)
     monkeypatch.setattr(module._session_identity, "fingerprint", lambda: _SESSION_FP)
     monkeypatch.setattr(module, "_registered_pinned_agent_id", lambda: AGENT_ID)
     monkeypatch.setattr(module._session_identity, "_session_generation", "gen-1")
     monkeypatch.setattr(module._session_identity, "_attach_token", "tok-1")
     if terminate is not None:
-        monkeypatch.setattr(module, "_terminate_session", terminate)
+        monkeypatch.setattr(module._session_termination, "terminate", terminate)
     return TestClient(app, raise_server_exceptions=False), module
 
 
@@ -540,7 +540,7 @@ def test_dual_app_detach_failure_is_a_500_without_the_exception_text(monkeypatch
     monkeypatch.setattr(pa._session_identity, "_thread_id", "thread-1")
     monkeypatch.setattr(pa._session_identity, "fingerprint", lambda: _SESSION_FP)
     monkeypatch.setattr(
-        pa, "_terminate_session", AsyncMock(side_effect=RuntimeError(BOOM))
+        pa._session_termination, "terminate", AsyncMock(side_effect=RuntimeError(BOOM))
     )
     client = TestClient(app, raise_server_exceptions=False)
 

@@ -60,8 +60,8 @@ class TestParkedSessionSuspends:
     async def test_parked_session_drain_suspends(self):
         suspend = AsyncMock()
         with (
-            patch.object(pa, "_session_parked", return_value=True),
-            patch.object(pa, "_drain_suspend_session", suspend),
+            patch.object(pa._session_termination, "session_parked", return_value=True),
+            patch.object(pa._session_termination, "drain_suspend_session", suspend),
         ):
             await dual_app._handle_heartbeat_intents(_drain_response())
         suspend.assert_awaited_once()
@@ -73,8 +73,8 @@ class TestParkedSessionSuspends:
         """A retried heartbeat after the suspend must not suspend twice."""
         suspend = AsyncMock()
         with (
-            patch.object(pa, "_session_parked", return_value=True),
-            patch.object(pa, "_drain_suspend_session", suspend),
+            patch.object(pa._session_termination, "session_parked", return_value=True),
+            patch.object(pa._session_termination, "drain_suspend_session", suspend),
         ):
             await dual_app._handle_heartbeat_intents(_drain_response())
             await dual_app._handle_heartbeat_intents(_drain_response())
@@ -89,8 +89,8 @@ class TestDefersWhileNotParked:
         suspend = AsyncMock()
         parked = False
         with (
-            patch.object(pa, "_session_parked", side_effect=lambda: parked),
-            patch.object(pa, "_drain_suspend_session", suspend),
+            patch.object(pa._session_termination, "session_parked", side_effect=lambda: parked),
+            patch.object(pa._session_termination, "drain_suspend_session", suspend),
         ):
             await dual_app._handle_heartbeat_intents(_drain_response())
             await dual_app._handle_heartbeat_intents(_drain_response())
@@ -109,7 +109,7 @@ class TestDefersWhileNotParked:
         creates pa._session — a drain landing in that window must not act."""
         pa._session = None
         suspend = AsyncMock()
-        with patch.object(pa, "_drain_suspend_session", suspend):
+        with patch.object(pa._session_termination, "drain_suspend_session", suspend):
             await dual_app._handle_heartbeat_intents(_drain_response())
         suspend.assert_not_awaited()
         assert not dual_app._drain_intent_handled
@@ -117,7 +117,7 @@ class TestDefersWhileNotParked:
     @pytest.mark.asyncio
     async def test_deferral_logs_once(self):
         with (
-            patch.object(pa, "_session_parked", return_value=False),
+            patch.object(pa._session_termination, "session_parked", return_value=False),
             patch.object(dual_app, "logger") as log,
         ):
             await dual_app._handle_heartbeat_intents(_drain_response())
@@ -132,7 +132,7 @@ class TestOtherPodStatesUntouched:
         dual_app._pod_state = dual_app.PodState.WORKING
         dual_app._current_job_id = "job-under-test"
         suspend = AsyncMock()
-        with patch.object(pa, "_drain_suspend_session", suspend):
+        with patch.object(pa._session_termination, "drain_suspend_session", suspend):
             await dual_app._handle_heartbeat_intents(_drain_response())
         suspend.assert_not_awaited()
         assert dual_app._drain_intent_received
@@ -148,7 +148,7 @@ class TestOtherPodStatesUntouched:
     @pytest.mark.asyncio
     async def test_no_intent_is_a_no_op(self):
         suspend = AsyncMock()
-        with patch.object(pa, "_drain_suspend_session", suspend):
+        with patch.object(pa._session_termination, "drain_suspend_session", suspend):
             await dual_app._handle_heartbeat_intents({"status": "ok"})
             await dual_app._handle_heartbeat_intents({"status": "ok", "intents": {}})
         suspend.assert_not_awaited()

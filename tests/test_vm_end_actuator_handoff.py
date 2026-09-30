@@ -1,5 +1,6 @@
 """Healthy VM End drains locally without claiming whole-guest process zero."""
 
+from agent.api import session_termination
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -139,7 +140,22 @@ def attach_native_session(monkeypatch, session, events, *, lose_response=False):
         "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS": (0,),
     }
     for name, value in values.items():
-        monkeypatch.setattr(app, name, value)
+        fields = {
+            "_retirement_admission_identity": "retirement_admission_identity",
+            "_retirement_admission_token": "retirement_admission_token",
+            "_retirement_admission_disposition": "retirement_admission_disposition",
+            "_retirement_admission_permanent": "retirement_admission_permanent",
+            "_watchdog_tasks": "watchdog_tasks",
+            "_termination_task": "termination_task",
+            "_terminating": "terminating",
+            "_max_sessions_per_process": "max_sessions_per_process",
+        }
+        if name == "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS":
+            monkeypatch.setattr(session_termination, name, value)
+        elif name in fields:
+            monkeypatch.setattr(app._session_termination, fields[name], value)
+        else:
+            monkeypatch.setattr(app, name, value)
     for name, value in {
         "_thread_id": session.thread_id,
         "_session_generation": generation,
@@ -164,7 +180,7 @@ async def test_native_terminal_vm_handoff_keeps_end_pending(
         monkeypatch, session, events, lose_response=lose_response
     )
 
-    result = await app._terminate_session_inner("shutdown")
+    result = await app._session_termination._terminate_inner("shutdown")
 
     assert result == "actuator_requested"
     assert events.count("git-status") == 1
@@ -176,7 +192,7 @@ async def test_native_terminal_vm_handoff_keeps_end_pending(
     assert backend._retired and backend._shell_retired
     assert session.local_quiescence_protocol == ""
     assert app._session is session
-    assert app._retirement_admission_closed()
+    assert app._session_termination.retirement_admission_closed()
     assert not app._session_ready()
 
 
@@ -203,10 +219,10 @@ async def test_required_drain_failure_never_requests_vm_actuator(monkeypatch, fa
         session.memory_service = SimpleNamespace(close_background=AsyncMock(side_effect=fail))
 
     with pytest.raises((WorkspaceUnavailableError, app.EventJournalUnavailable)):
-        await app._terminate_session_inner("shutdown")
+        await app._session_termination._terminate_inner("shutdown")
     assert accepted == []
     assert session.local_quiescence_protocol == ""
-    assert app._session is session and app._retirement_admission_closed()
+    assert app._session is session and app._session_termination.retirement_admission_closed()
 
 
 @pytest.mark.asyncio
@@ -236,9 +252,9 @@ async def test_required_drain_retry_does_not_replay_final_git(monkeypatch, failu
             close=AsyncMock(side_effect=[OSError("writer drain unknown"), None]),
         ))
     with pytest.raises((WorkspaceUnavailableError, app.EventJournalUnavailable)):
-        await app._terminate_session_inner("shutdown")
+        await app._session_termination._terminate_inner("shutdown")
     assert not backend._retired and accepted == []
-    assert await app._terminate_session("shutdown") == "actuator_requested"
+    assert await app._session_termination.terminate("shutdown") == "actuator_requested"
     assert events.count("git-status") == events.count("git-push") == 1
     assert backend._retired and len(accepted) == 1
 
@@ -262,9 +278,9 @@ async def test_archive_handoff_sends_pending_without_false_end(monkeypatch):
 async def test_suspended_vm_retirement_keeps_existing_proof_refusal(monkeypatch):
     session, backend, events = native_vm_session(monkeypatch)
     accepted = attach_native_session(monkeypatch, session, events)
-    monkeypatch.setattr(app, "_retirement_admission_disposition", "suspended")
+    monkeypatch.setattr(app._session_termination, "retirement_admission_disposition", "suspended")
     with pytest.raises(WorkspaceUnavailableError):
-        await app._terminate_session_inner("drain", mark_thread=False, preserve_shell=False)
+        await app._session_termination._terminate_inner("drain", mark_thread=False, preserve_shell=False)
     assert not backend._retired and accepted == []
     assert session.local_quiescence_protocol == ""
     assert app._session is session
@@ -299,9 +315,9 @@ async def test_partially_retired_backend_retries_only_unfinished_local_close(mon
 
     monkeypatch.setattr(backend, "retire", retire_once_uncertain)
     with pytest.raises(WorkspaceUnavailableError):
-        await app._terminate_session_inner("shutdown")
+        await app._session_termination._terminate_inner("shutdown")
     assert backend._retired and not accepted
-    assert await app._terminate_session("shutdown") == "actuator_requested"
+    assert await app._session_termination.terminate("shutdown") == "actuator_requested"
     assert events.count("git-push") == events.count("shell-stop") == 1
 
 
@@ -322,7 +338,7 @@ async def test_optional_flush_failures_are_logged_once_and_do_not_block_drain(mo
         push_all=AsyncMock(side_effect=OSError("optional cloud unavailable")),
         pull_all=AsyncMock(), aclose=AsyncMock(),
     )
-    assert await app._terminate_session("shutdown") == "actuator_requested"
+    assert await app._session_termination.terminate("shutdown") == "actuator_requested"
     assert len(accepted) == 2 and backend._retired
     assert events.count("git-push-failed") == events.count("shell-stop") == 1
     assert "Final git push was unsuccessful" in caplog.text

@@ -15,7 +15,7 @@ from agent.api.session_identity import pinned_status_identity_advertised
 import pytest_asyncio
 from fastapi import HTTPException
 
-from agent.api import persistent_app, persistent_session
+from agent.api import persistent_app, persistent_session, session_termination
 from orchestrator.services import thread_workspace_delivery as delivery
 from orchestrator.services.session_runtime_admission import thread_runtime_is_preparable
 from orchestrator.services.vm_provisioner import VMProvisioner
@@ -427,7 +427,7 @@ async def vm_attach_setup(vm_delivery, monkeypatch):
     monkeypatch.setattr(persistent_app._session_identity, "_thread_id", None)
     monkeypatch.setattr(persistent_app, "_event_writer", None)
     monkeypatch.setattr(persistent_app._session_attach, "_cleanup_context", None)
-    monkeypatch.setattr(persistent_app, "_session_side_tasks", set())
+    monkeypatch.setattr(persistent_app._session_termination, "session_side_tasks", set())
     monkeypatch.setattr(persistent_app._session_identity, "_session_generation", None)
     monkeypatch.setattr(persistent_app._session_identity, "_attach_token", None)
     monkeypatch.setattr(persistent_app._session_identity, "_runtime_contract", False)
@@ -527,7 +527,7 @@ async def test_vm_setup_failure_is_logged_before_cleanup_settles(
         persistent_app._session_attach, "cleanup_failed_attach", cleanup
     )
     monkeypatch.setattr(
-        persistent_app, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)
+        session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)
     )
     caplog.set_level(logging.WARNING, logger=persistent_app.__name__)
     task = asyncio.create_task(

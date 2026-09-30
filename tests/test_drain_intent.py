@@ -1,7 +1,7 @@
 """Tests for Phase 1c drain-intent reaction.
 
 Covers:
-  - persistent_app._handle_heartbeat_intents — drain → clean suspend when
+  - persistent_app._session_termination.handle_heartbeat_intents — drain → clean suspend when
     parked, defer while a turn is in flight, plain exit with no session
     (knowledge-base/knowledge/issues/session_agent_drift_drain_kills_idle_sessions.md option b)
   - dual_app._handle_heartbeat_intents — idle exit + busy flag
@@ -14,6 +14,8 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from tests._session_termination_adapter import termination_target
 
 # R1.B06: this operation moved to services/agent_thread_status.
 from orchestrator.services import agent_thread_status  # noqa: E402
@@ -56,7 +58,7 @@ class TestPersistentDrainHandler:
         """Snapshot + restore persistent_app globals around every test."""
         from agent.api import persistent_app
 
-        saved = {name: getattr(persistent_app, name) for name in _PERSISTENT_GLOBALS}
+        saved = {name: getattr(*termination_target(persistent_app, name)) for name in _PERSISTENT_GLOBALS}
         saved_identity = {
             name: getattr(persistent_app._session_identity, name)
             for name in _PERSISTENT_IDENTITY_FIELDS
@@ -65,8 +67,8 @@ class TestPersistentDrainHandler:
             persistent_app._session_input._awaiting_input,
             persistent_app._session_input._queue,
         )
-        persistent_app._drain_intent_handled = False
-        persistent_app._drain_deferred_logged = False
+        persistent_app._session_termination.drain_intent_handled = False
+        persistent_app._session_termination.drain_deferred_logged = False
         persistent_app._session = None
         persistent_app._session_identity._thread_id = None
         persistent_app._session_input._awaiting_input = False
@@ -75,15 +77,15 @@ class TestPersistentDrainHandler:
         persistent_app._orchestrator_client = None
         persistent_app._session_identity._session_generation = None
         persistent_app._session_identity._attach_token = None
-        persistent_app._retirement_admission_identity = None
-        persistent_app._retirement_admission_disposition = None
-        persistent_app._retirement_admission_token = None
-        persistent_app._retirement_admission_permanent = None
-        persistent_app._pending_drain_suspend = None
-        persistent_app._pending_drain_suspend_retry_task = None
+        persistent_app._session_termination.retirement_admission_identity = None
+        persistent_app._session_termination.retirement_admission_disposition = None
+        persistent_app._session_termination.retirement_admission_token = None
+        persistent_app._session_termination.retirement_admission_permanent = None
+        persistent_app._session_termination.pending_drain_suspend = None
+        persistent_app._session_termination.pending_drain_suspend_retry_task = None
         yield
         for name, value in saved.items():
-            setattr(persistent_app, name, value)
+            setattr(*termination_target(persistent_app, name), value)
         for name, value in saved_identity.items():
             setattr(persistent_app._session_identity, name, value)
         (
@@ -112,16 +114,16 @@ class TestPersistentDrainHandler:
 
         with (
             patch.object(
-                persistent_app, "_terminate_session", new=AsyncMock()
+                persistent_app._session_termination, "terminate", new=AsyncMock()
             ) as detach,
-            patch.object(persistent_app, "_schedule_exit") as exit_,
+            patch.object(persistent_app._session_termination, "schedule_exit") as exit_,
         ):
-            await persistent_app._handle_heartbeat_intents(
+            await persistent_app._session_termination.handle_heartbeat_intents(
                 {"intents": {"should_drain": True, "drain_reason": "stale_image"}}
             )
         detach.assert_not_awaited()
         exit_.assert_called_once()
-        assert persistent_app._drain_intent_handled is True
+        assert persistent_app._session_termination.drain_intent_handled is True
 
     @pytest.mark.asyncio
     async def test_parked_session_drain_suspends(self):
@@ -139,7 +141,7 @@ class TestPersistentDrainHandler:
 
         async def begin(*_args, **_kwargs):
             order.append("begin")
-            persistent_app._retirement_admission_token = (
+            persistent_app._session_termination.retirement_admission_token = (
                 "99999999-9999-4999-8999-999999999999"
             )
             return True
@@ -152,19 +154,19 @@ class TestPersistentDrainHandler:
 
         with (
             patch.object(
-                persistent_app,
-                "_terminate_session",
+                persistent_app._session_termination,
+                "terminate",
                 new=AsyncMock(side_effect=terminate),
             ) as detach,
             patch.object(
-                persistent_app,
-                "_begin_exact_session_retirement",
+                persistent_app._session_termination,
+                "begin_retirement",
                 new=AsyncMock(side_effect=begin),
             ) as begin_retirement,
             patch.object(persistent_app, "_broadcast") as broadcast,
-            patch.object(persistent_app, "_schedule_exit") as exit_,
+            patch.object(persistent_app._session_termination, "schedule_exit") as exit_,
         ):
-            await persistent_app._handle_heartbeat_intents(
+            await persistent_app._session_termination.handle_heartbeat_intents(
                 {"intents": {"should_drain": True, "drain_reason": "stale_image"}}
             )
 
@@ -197,7 +199,7 @@ class TestPersistentDrainHandler:
         # session.suspended outcome. The agent must not pre-publish it before
         # snapshot/cleanup/CAS succeeds.
         broadcast.assert_not_called()
-        assert persistent_app._drain_intent_handled is True
+        assert persistent_app._session_termination.drain_intent_handled is True
 
     @pytest.mark.asyncio
     async def test_suspend_failure_falls_back_to_ended(self):
@@ -208,15 +210,15 @@ class TestPersistentDrainHandler:
 
         with (
             patch.object(
-                persistent_app,
-                "_begin_exact_session_retirement",
+                persistent_app._session_termination,
+                "begin_retirement",
                 new=AsyncMock(return_value=True),
             ),
-            patch.object(persistent_app, "_terminate_session", new=AsyncMock()),
+            patch.object(persistent_app._session_termination, "terminate", new=AsyncMock()),
             patch.object(persistent_app, "_broadcast"),
-            patch.object(persistent_app, "_schedule_exit") as exit_,
+            patch.object(persistent_app._session_termination, "schedule_exit") as exit_,
         ):
-            await persistent_app._handle_heartbeat_intents(
+            await persistent_app._session_termination.handle_heartbeat_intents(
                 {"intents": {"should_drain": True}}
             )
         # Fallback goes through the client with the captured thread_id —
@@ -242,21 +244,21 @@ class TestPersistentDrainHandler:
         client.suspend_thread = AsyncMock(side_effect=[False, True])
 
         async def begin(*_args, **_kwargs):
-            persistent_app._retirement_admission_token = (
+            persistent_app._session_termination.retirement_admission_token = (
                 "99999999-9999-4999-8999-999999999999"
             )
             return True
 
         with (
             patch.object(
-                persistent_app,
-                "_begin_exact_session_retirement",
+                persistent_app._session_termination,
+                "begin_retirement",
                 new=AsyncMock(side_effect=begin),
             ),
-            patch.object(persistent_app, "_terminate_session", new=AsyncMock()),
-            patch.object(persistent_app, "_schedule_exit") as exit_,
+            patch.object(persistent_app._session_termination, "terminate", new=AsyncMock()),
+            patch.object(persistent_app._session_termination, "schedule_exit") as exit_,
         ):
-            await persistent_app._handle_heartbeat_intents(
+            await persistent_app._session_termination.handle_heartbeat_intents(
                 {"intents": {"should_drain": True}}
             )
 
@@ -266,8 +268,8 @@ class TestPersistentDrainHandler:
             == (client.suspend_thread.await_args_list[1])
         )
         client.update_thread_status.assert_not_awaited()
-        assert persistent_app._pending_drain_suspend is None
-        assert persistent_app._drain_intent_handled is True
+        assert persistent_app._session_termination.pending_drain_suspend is None
+        assert persistent_app._session_termination.drain_intent_handled is True
         exit_.assert_called_once_with(delay=1.0)
 
     @pytest.mark.asyncio
@@ -285,24 +287,24 @@ class TestPersistentDrainHandler:
 
         with (
             patch.object(
-                persistent_app,
-                "_begin_exact_session_retirement",
+                persistent_app._session_termination,
+                "begin_retirement",
                 new=AsyncMock(return_value=True),
             ),
             patch.object(
-                persistent_app,
-                "_terminate_session",
+                persistent_app._session_termination,
+                "terminate",
                 new=AsyncMock(side_effect=RuntimeError("writer did not drain")),
             ),
-            patch.object(persistent_app, "_schedule_exit") as exit_,
+            patch.object(persistent_app._session_termination, "schedule_exit") as exit_,
         ):
-            await persistent_app._handle_heartbeat_intents(
+            await persistent_app._session_termination.handle_heartbeat_intents(
                 {"intents": {"should_drain": True}}
             )
 
         assert persistent_app._session is original_session
-        assert persistent_app._pending_drain_suspend["locally_quiesced"] is False
-        assert persistent_app._drain_intent_handled is False
+        assert persistent_app._session_termination.pending_drain_suspend["locally_quiesced"] is False
+        assert persistent_app._session_termination.drain_intent_handled is False
         client.suspend_thread.assert_not_awaited()
         client.update_thread_status.assert_not_awaited()
         exit_.assert_not_called()
@@ -315,18 +317,18 @@ class TestPersistentDrainHandler:
         original_session = persistent_app._session
         with (
             patch.object(
-                persistent_app,
-                "_begin_exact_session_retirement",
+                persistent_app._session_termination,
+                "begin_retirement",
                 new=AsyncMock(return_value=False),
             ),
             patch.object(
-                persistent_app,
-                "_terminate_session",
+                persistent_app._session_termination,
+                "terminate",
                 new=AsyncMock(),
             ) as detach,
-            patch.object(persistent_app, "_schedule_exit") as exit_,
+            patch.object(persistent_app._session_termination, "schedule_exit") as exit_,
         ):
-            await persistent_app._handle_heartbeat_intents(
+            await persistent_app._session_termination.handle_heartbeat_intents(
                 {"intents": {"should_drain": True}}
             )
 
@@ -334,7 +336,7 @@ class TestPersistentDrainHandler:
         client.suspend_thread.assert_not_awaited()
         exit_.assert_not_called()
         assert persistent_app._session is original_session
-        assert persistent_app._drain_intent_handled is False
+        assert persistent_app._session_termination.drain_intent_handled is False
 
     @pytest.mark.asyncio
     async def test_turn_in_flight_defers(self):
@@ -347,18 +349,18 @@ class TestPersistentDrainHandler:
 
         with (
             patch.object(
-                persistent_app, "_terminate_session", new=AsyncMock()
+                persistent_app._session_termination, "terminate", new=AsyncMock()
             ) as detach,
-            patch.object(persistent_app, "_schedule_exit") as exit_,
+            patch.object(persistent_app._session_termination, "schedule_exit") as exit_,
         ):
-            await persistent_app._handle_heartbeat_intents(
+            await persistent_app._session_termination.handle_heartbeat_intents(
                 {"intents": {"should_drain": True}}
             )
         detach.assert_not_awaited()
         exit_.assert_not_called()
         # NOT handled — the next heartbeat tick re-checks.
-        assert persistent_app._drain_intent_handled is False
-        assert persistent_app._drain_deferred_logged is True
+        assert persistent_app._session_termination.drain_intent_handled is False
+        assert persistent_app._session_termination.drain_deferred_logged is True
 
     @pytest.mark.asyncio
     async def test_tool_inflight_defers(self):
@@ -367,12 +369,12 @@ class TestPersistentDrainHandler:
         self._attach_parked_session(persistent_app)
         persistent_app._tool_inflight = True
 
-        with patch.object(persistent_app, "_schedule_exit") as exit_:
-            await persistent_app._handle_heartbeat_intents(
+        with patch.object(persistent_app._session_termination, "schedule_exit") as exit_:
+            await persistent_app._session_termination.handle_heartbeat_intents(
                 {"intents": {"should_drain": True}}
             )
         exit_.assert_not_called()
-        assert persistent_app._drain_intent_handled is False
+        assert persistent_app._session_termination.drain_intent_handled is False
 
     @pytest.mark.asyncio
     async def test_queued_input_defers(self):
@@ -383,12 +385,12 @@ class TestPersistentDrainHandler:
         queue.put_nowait("pending user message")
         persistent_app._session_input._queue = queue
 
-        with patch.object(persistent_app, "_schedule_exit") as exit_:
-            await persistent_app._handle_heartbeat_intents(
+        with patch.object(persistent_app._session_termination, "schedule_exit") as exit_:
+            await persistent_app._session_termination.handle_heartbeat_intents(
                 {"intents": {"should_drain": True}}
             )
         exit_.assert_not_called()
-        assert persistent_app._drain_intent_handled is False
+        assert persistent_app._session_termination.drain_intent_handled is False
 
     @pytest.mark.asyncio
     async def test_deferred_drain_fires_once_loop_parks(self):
@@ -399,27 +401,27 @@ class TestPersistentDrainHandler:
 
         with (
             patch.object(
-                persistent_app,
-                "_begin_exact_session_retirement",
+                persistent_app._session_termination,
+                "begin_retirement",
                 new=AsyncMock(return_value=True),
             ),
-            patch.object(persistent_app, "_terminate_session", new=AsyncMock()),
+            patch.object(persistent_app._session_termination, "terminate", new=AsyncMock()),
             patch.object(persistent_app, "_update_thread_status", new=AsyncMock()),
             patch.object(persistent_app, "_broadcast"),
-            patch.object(persistent_app, "_schedule_exit") as exit_,
+            patch.object(persistent_app._session_termination, "schedule_exit") as exit_,
         ):
-            await persistent_app._handle_heartbeat_intents(
+            await persistent_app._session_termination.handle_heartbeat_intents(
                 {"intents": {"should_drain": True}}
             )
-            assert persistent_app._drain_intent_handled is False
+            assert persistent_app._session_termination.drain_intent_handled is False
 
             persistent_app._session_input._awaiting_input = True  # loop parked
-            await persistent_app._handle_heartbeat_intents(
+            await persistent_app._session_termination.handle_heartbeat_intents(
                 {"intents": {"should_drain": True}}
             )
         client.suspend_thread.assert_awaited_once()
         exit_.assert_called_once()
-        assert persistent_app._drain_intent_handled is True
+        assert persistent_app._session_termination.drain_intent_handled is True
 
     @pytest.mark.asyncio
     async def test_subsequent_calls_are_idempotent(self):
@@ -429,22 +431,22 @@ class TestPersistentDrainHandler:
 
         with (
             patch.object(
-                persistent_app,
-                "_begin_exact_session_retirement",
+                persistent_app._session_termination,
+                "begin_retirement",
                 new=AsyncMock(return_value=True),
             ),
             patch.object(
-                persistent_app, "_terminate_session", new=AsyncMock()
+                persistent_app._session_termination, "terminate", new=AsyncMock()
             ) as detach,
             patch.object(persistent_app, "_update_thread_status", new=AsyncMock()),
             patch.object(persistent_app, "_broadcast"),
-            patch.object(persistent_app, "_schedule_exit") as exit_,
+            patch.object(persistent_app._session_termination, "schedule_exit") as exit_,
         ):
-            await persistent_app._handle_heartbeat_intents(
+            await persistent_app._session_termination.handle_heartbeat_intents(
                 {"intents": {"should_drain": True}}
             )
             # Second call must not suspend/exit again.
-            await persistent_app._handle_heartbeat_intents(
+            await persistent_app._session_termination.handle_heartbeat_intents(
                 {"intents": {"should_drain": True}}
             )
         assert detach.await_count == 1
@@ -469,8 +471,8 @@ class TestPersistentDrainHandler:
         session.cleanup = AsyncMock()
         persistent_app._session = session
         persistent_app._session_identity._thread_id = "tid-reentry-1"
-        persistent_app._terminating = False
-        persistent_app._max_sessions_per_process = 0
+        persistent_app._session_termination.terminating = False
+        persistent_app._session_termination.max_sessions_per_process = 0
 
         status_writes: list[str] = []
 
@@ -485,7 +487,7 @@ class TestPersistentDrainHandler:
                 await asyncio.sleep(60)
             except asyncio.CancelledError:
                 pass
-            await persistent_app._terminate_session("loop_complete")
+            await persistent_app._session_termination.terminate("loop_complete")
 
         loop_task = asyncio.create_task(fake_loop())
         await asyncio.sleep(0)  # let it park in the sleep
@@ -493,16 +495,16 @@ class TestPersistentDrainHandler:
 
         with (
             patch.object(persistent_app, "_update_thread_status", new=fake_update),
-            patch.object(persistent_app, "_stop_watchdogs"),
+            patch.object(persistent_app._session_termination, "stop_watchdogs"),
         ):
-            await persistent_app._terminate_session("drain", mark_thread=False)
+            await persistent_app._session_termination.terminate("drain", mark_thread=False)
 
         # Admission closes before the watcher stops. The orchestrator-owned
         # suspend happens after this inner teardown; neither the outer drain
         # nor the re-entrant loop_complete may write a lifecycle value here.
         assert status_writes == []
         assert persistent_app._session is None
-        assert persistent_app._terminating is False
+        assert persistent_app._session_termination.terminating is False
 
     @pytest.mark.asyncio
     async def test_no_intents_no_action(self):
@@ -510,19 +512,19 @@ class TestPersistentDrainHandler:
 
         with (
             patch.object(
-                persistent_app, "_terminate_session", new=AsyncMock()
+                persistent_app._session_termination, "terminate", new=AsyncMock()
             ) as detach,
-            patch.object(persistent_app, "_schedule_exit") as exit_,
+            patch.object(persistent_app._session_termination, "schedule_exit") as exit_,
         ):
             # Empty / missing / explicit-false should all be no-ops.
-            await persistent_app._handle_heartbeat_intents({})
-            await persistent_app._handle_heartbeat_intents({"intents": {}})
-            await persistent_app._handle_heartbeat_intents(
+            await persistent_app._session_termination.handle_heartbeat_intents({})
+            await persistent_app._session_termination.handle_heartbeat_intents({"intents": {}})
+            await persistent_app._session_termination.handle_heartbeat_intents(
                 {"intents": {"should_drain": False}}
             )
         detach.assert_not_awaited()
         exit_.assert_not_called()
-        assert persistent_app._drain_intent_handled is False
+        assert persistent_app._session_termination.drain_intent_handled is False
 
 
 class TestOrchestratorInactiveCapabilityFence:

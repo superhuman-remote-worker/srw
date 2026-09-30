@@ -165,12 +165,12 @@ class _InsertOnceDB:
 def _wire_input_runtime(monkeypatch, tmp_path, db, *, turn_count: int = 5):
     queue: asyncio.Queue = asyncio.Queue()
     monkeypatch.setattr(
-        persistent_app,
-        "_TERMINATION_SENTINEL_PATH",
+        persistent_app._session_termination,
+        "termination_sentinel_path",
         tmp_path / "terminating",
     )
-    monkeypatch.setattr(persistent_app, "_termination_admission_fenced", False)
-    monkeypatch.setattr(persistent_app, "_termination_fence_reason", None)
+    monkeypatch.setattr(persistent_app._session_termination, "termination_admission_fenced", False)
+    monkeypatch.setattr(persistent_app._session_termination, "termination_fence_reason", None)
     monkeypatch.setattr(persistent_app._session_input, "_awaiting_input", False)
     monkeypatch.setattr(persistent_app, "_turn_event_open", False)
     monkeypatch.setattr(persistent_app, "_tool_inflight", False)
@@ -253,7 +253,7 @@ async def _run_websocket_input(monkeypatch, content: str, *, before_receive=None
         session_identity_fingerprint=_current_session_identity_fingerprint()
     )
     ws.receive_text.side_effect = _receive_text
-    monkeypatch.setattr(persistent_app, "_signal_ws_connected", MagicMock())
+    monkeypatch.setattr(persistent_app._session_termination, "signal_ws_connected", MagicMock())
     monkeypatch.setattr(
         persistent_app,
         "_durable_session_control_modes",
@@ -481,7 +481,7 @@ async def test_retry_stable_event_is_enqueued_once_and_fence_rejects_new_wake(
     assert queue.qsize() == 1
     assert len(db.rows) == 1
 
-    assert persistent_app.activate_termination_admission_fence("test") is True
+    assert persistent_app._session_termination.activate_termination_admission_fence("test") is True
     with pytest.raises(persistent_app.TerminationAdmissionClosed):
         await persistent_app._session_input.accept(
             "must wait", role="event", delivery_id=str(uuid4())
@@ -681,7 +681,7 @@ async def test_direct_input_fenced_after_persist_is_truthfully_deferred(
     """The accept/fence race retains human input instead of silently losing it."""
 
     db = _InsertOnceDB()
-    db.after_persist = lambda: persistent_app.activate_termination_admission_fence(
+    db.after_persist = lambda: persistent_app._session_termination.activate_termination_admission_fence(
         "persist_race"
     )
     queue = _wire_input_runtime(monkeypatch, tmp_path, db)
@@ -807,7 +807,7 @@ async def test_websocket_fence_before_persist_rejects_as_retryable(
     ws = await _run_websocket_input(
         monkeypatch,
         "not persisted",
-        before_receive=lambda: persistent_app.activate_termination_admission_fence(
+        before_receive=lambda: persistent_app._session_termination.activate_termination_admission_fence(
             "before_persist"
         ),
     )
@@ -969,7 +969,7 @@ async def test_stateless_effect_boundary_awaits_exact_queue_lease(monkeypatch):
                 protected_cloud_required=False,
             ),
         )
-        monkeypatch.setattr(persistent_app, "_runtime_admission_closed", lambda: False)
+        monkeypatch.setattr(persistent_app._session_termination, "runtime_admission_closed", lambda: False)
 
         assert await persistent_app._loop_runtime_effect_authority_current() is False
 
@@ -1026,7 +1026,7 @@ async def test_stateless_effect_boundary_rechecks_local_life_after_db_await(
                 protected_cloud_required=False,
             ),
         )
-        monkeypatch.setattr(persistent_app, "_runtime_admission_closed", lambda: False)
+        monkeypatch.setattr(persistent_app._session_termination, "runtime_admission_closed", lambda: False)
 
         assert await persistent_app._loop_runtime_effect_authority_current() is False
         assert lease.lease_token == 18
@@ -1044,7 +1044,7 @@ async def test_force_end_after_provider_response_blocks_real_tool_effect(
     db = _InsertOnceDB()
     _wire_input_runtime(monkeypatch, tmp_path, db)
     monkeypatch.setattr(persistent_app._session_identity, "_runtime_contract", True)
-    monkeypatch.setattr(persistent_app, "_retirement_admission_identity", None)
+    monkeypatch.setattr(persistent_app._session_termination, "retirement_admission_identity", None)
 
     provider_calls = 0
     response_with_tool = AIMessage(
@@ -1112,7 +1112,7 @@ async def test_websocket_post_persist_fence_acknowledges_and_successor_reclaims_
     """A committed human input is owned work, never a retry invitation."""
 
     db = _InsertOnceDB()
-    db.after_persist = lambda: persistent_app.activate_termination_admission_fence(
+    db.after_persist = lambda: persistent_app._session_termination.activate_termination_admission_fence(
         "after_persist"
     )
     queue = _wire_input_runtime(monkeypatch, tmp_path, db)
@@ -1137,7 +1137,7 @@ async def test_websocket_post_persist_fence_acknowledges_and_successor_reclaims_
     # identity. A new process generation claims the existing delivery and
     # publishes exactly that one input to its queue.
     db.after_persist = None
-    persistent_app._termination_admission_fenced = False
+    persistent_app._session_termination.termination_admission_fenced = False
     persistent_app._session_identity._process_generation = str(uuid4())
     persistent_app._session_input._queued_claims.clear()
     reclaimed = await persistent_app._session_input.reclaim_pending()
@@ -1157,7 +1157,7 @@ async def test_rest_post_persist_event_defer_is_accepted_for_outbox_retry(
     """REST reports persistence while the wake outbox retains execution debt."""
 
     db = _InsertOnceDB()
-    db.after_persist = lambda: persistent_app.activate_termination_admission_fence(
+    db.after_persist = lambda: persistent_app._session_termination.activate_termination_admission_fence(
         "after_persist"
     )
     _wire_input_runtime(monkeypatch, tmp_path, db)
@@ -2434,9 +2434,9 @@ async def test_failed_officer_maintenance_fences_queued_auxiliary_and_rebuild(
     monkeypatch.setattr(persistent_app, "_session", session)
     monkeypatch.setattr(persistent_app, "_orchestrator_client", client)
     monkeypatch.setattr(
-        persistent_app, "_TERMINATION_SENTINEL_PATH", tmp_path / "terminating"
+        persistent_app._session_termination, "termination_sentinel_path", tmp_path / "terminating"
     )
-    monkeypatch.setattr(persistent_app, "_termination_admission_fenced", False)
+    monkeypatch.setattr(persistent_app._session_termination, "termination_admission_fenced", False)
     monkeypatch.setattr(persistent_app, "_runtime_authorization_admission_open", True)
     persistent_app._wire_session_aux_archiver()
 
@@ -2508,9 +2508,9 @@ async def test_auxiliary_gate_survives_rebuild_and_quiescence_tracks_inflight(
     session = SimpleNamespace(auxiliary_llm=rebuilt, memory_service=None)
     monkeypatch.setattr(persistent_app, "_session", session)
     monkeypatch.setattr(
-        persistent_app, "_TERMINATION_SENTINEL_PATH", tmp_path / "terminating"
+        persistent_app._session_termination, "termination_sentinel_path", tmp_path / "terminating"
     )
-    monkeypatch.setattr(persistent_app, "_termination_admission_fenced", False)
+    monkeypatch.setattr(persistent_app._session_termination, "termination_admission_fenced", False)
     monkeypatch.setattr(persistent_app._session_identity, "_thread_id", str(uuid4()))
     monkeypatch.setattr(persistent_app, "_tool_inflight", False)
     monkeypatch.setattr(persistent_app, "_turn_event_open", False)
@@ -2520,12 +2520,12 @@ async def test_auxiliary_gate_survives_rebuild_and_quiescence_tracks_inflight(
     call = asyncio.create_task(rebuilt.ainvoke([], task_name="rebuilt_aux"))
     await started.wait()
     assert rebuilt.provider_calls_inflight == 1
-    assert persistent_app._termination_quiescent() is False
+    assert persistent_app._session_termination.termination_quiescent() is False
     release.set()
     await call
-    assert persistent_app._termination_quiescent() is True
+    assert persistent_app._session_termination.termination_quiescent() is True
 
-    persistent_app.activate_termination_admission_fence("test")
+    persistent_app._session_termination.activate_termination_admission_fence("test")
     with pytest.raises(AuxiliaryProviderAdmissionClosed):
         await rebuilt.ainvoke([], task_name="after_fence")
     assert model.ainvoke.await_count == 1

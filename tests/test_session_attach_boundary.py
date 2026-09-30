@@ -24,6 +24,7 @@ OWNER_MODULES = (
     "agent.api.session_identity",
     "agent.api.session_workspace",
     "agent.api.session_attach",
+    "agent.api.session_termination",
 )
 
 FORBIDDEN = (

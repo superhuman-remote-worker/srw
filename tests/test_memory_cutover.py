@@ -1284,7 +1284,7 @@ class TestTeardownWiring:
                 new=AsyncMock(return_value=True),
             ),
             patch(
-                "agent.api.persistent_app._terminate_session",
+                "agent.api.persistent_app._session_termination.terminate",
                 new=AsyncMock(),
             ),
         ):
@@ -1316,7 +1316,7 @@ class TestTeardownWiring:
                 new=AsyncMock(return_value=True),
             ),
             patch(
-                "agent.api.persistent_app._terminate_session",
+                "agent.api.persistent_app._session_termination.terminate",
                 new=AsyncMock(),
             ),
         ):
@@ -1342,15 +1342,15 @@ class TestTeardownWiring:
         session.resume_subagents = AsyncMock()
         persistent_app._session = session
         persistent_app._session_identity._thread_id = "tid-b11-1"
-        persistent_app._terminating = False
+        persistent_app._session_termination.terminating = False
         persistent_app._loop_task = None
-        persistent_app._max_sessions_per_process = 0
+        persistent_app._session_termination.max_sessions_per_process = 0
 
         with (
             patch.object(persistent_app, "_update_thread_status", new=AsyncMock()),
-            patch.object(persistent_app, "_stop_watchdogs"),
+            patch.object(persistent_app._session_termination, "stop_watchdogs"),
         ):
-            await persistent_app._terminate_session("rest_detach")
+            await persistent_app._session_termination.terminate("rest_detach")
 
         assert [e.kind for e in service.captures] == ["session_end"]
         assert persistent_app._session is None
@@ -1369,20 +1369,20 @@ class TestTeardownWiring:
 
         persistent_app._session = session
         persistent_app._session_identity._thread_id = "tid-b11-2"
-        persistent_app._terminating = False
+        persistent_app._session_termination.terminating = False
         persistent_app._loop_task = None
-        persistent_app._max_sessions_per_process = 0
+        persistent_app._session_termination.max_sessions_per_process = 0
 
         with (
             patch.object(persistent_app, "_update_thread_status", new=AsyncMock()),
-            patch.object(persistent_app, "_stop_watchdogs"),
+            patch.object(persistent_app._session_termination, "stop_watchdogs"),
         ):
             # _handle_archive reads the patched-in module globals directly
             with patch(
                 "agent.api.persistent_app._session_identity._thread_id", "tid-b11-2"
             ):
                 await _handle_archive(ws)
-            await persistent_app._terminate_session("loop_complete")
+            await persistent_app._session_termination.terminate("loop_complete")
 
         # One capture total: archive's. Terminate honoured the guard flag.
         assert [e.kind for e in service.captures] == ["session_end"]

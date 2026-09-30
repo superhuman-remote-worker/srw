@@ -1014,15 +1014,15 @@ async def _terminate(reason: str = "rest_detach", **kwargs):
     """Drive the real terminate path with everything unrelated stubbed."""
     with (
         patch.object(pa, "_update_thread_status", AsyncMock()),
-        patch.object(pa, "_stop_watchdogs", MagicMock()),
+        patch.object(pa._session_termination, "stop_watchdogs", MagicMock()),
         patch.object(pa, "_stop_thread_control_watcher", AsyncMock()),
         patch.object(pa, "_stop_thread_interrupt_watcher", AsyncMock()),
         patch.object(pa._canvas_control, "clear_all", MagicMock()),
         patch.object(pa, "_loop_task", None),
         patch.object(pa, "_event_writer", None),
-        patch.object(pa, "_max_sessions_per_process", 0),
+        patch.object(pa._session_termination, "max_sessions_per_process", 0),
     ):
-        await pa._terminate_session_inner(reason, **kwargs)
+        await pa._session_termination._terminate_inner(reason, **kwargs)
 
 
 class TestTerminateDoesNotStrandOrLeakAnnouncedRows:

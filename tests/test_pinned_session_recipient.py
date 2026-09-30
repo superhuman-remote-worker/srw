@@ -157,7 +157,7 @@ async def test_detach_wrong_fingerprint_has_zero_effect():
             "fingerprint",
             return_value=FINGERPRINT,
         ),
-        patch.object(mod, "_terminate_session", terminate),
+        patch.object(mod._session_termination, "terminate", terminate),
     ):
         response = await route.endpoint(
             {"session_identity_fingerprint": "sha256:" + ("b" * 64)}
@@ -249,7 +249,7 @@ async def test_parked_pinned_loop_reclaims_durable_input(monkeypatch):
         return {("delivery-a", 1)}
 
     monkeypatch.setattr(mod._session_input, "reclaim_pending", reclaim)
-    monkeypatch.setattr(mod, "_runtime_admission_closed", lambda: False)
+    monkeypatch.setattr(mod._session_termination, "runtime_admission_closed", lambda: False)
     monkeypatch.setattr(mod, "_stateless_mode", lambda: False)
 
     item = await mod._session_input.wait_for_input(queue, timeout=0.1)

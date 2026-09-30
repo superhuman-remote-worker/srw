@@ -1079,8 +1079,8 @@ class TestAgentRestInputEndpointsNoSession:
         mod._session = MagicMock()
         mod._session.protected_cloud_required = False
         mod._session_input._queue = _asyncio.Queue()
-        mod._retirement_admission_identity = None
-        mod._termination_admission_fenced = False
+        mod._session_termination.retirement_admission_identity = None
+        mod._session_termination.termination_admission_fenced = False
 
         try:
             app = create_persistent_app("interactive")
@@ -1195,7 +1195,7 @@ class TestAgentRestInputEndpointsNoSession:
                     "run_persistent_loop",
                     new=fake_run_persistent_loop,
                 ),
-                patch.object(mod, "_loop_completion_handler", new=AsyncMock()),
+                patch.object(mod._session_termination, "loop_completion_handler", new=AsyncMock()),
                 patch.object(mod, "_early_title_from_prompt", new=AsyncMock()),
                 patch.object(
                     mod._session_identity,

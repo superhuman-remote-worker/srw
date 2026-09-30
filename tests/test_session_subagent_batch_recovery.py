@@ -951,7 +951,7 @@ async def test_attach_recovers_children_before_it_restores_the_transcript():
         patch.object(mod, "_build_sync_coordinator"),
         patch.object(mod, "_restore_session_messages", new=restore),
         patch.object(mod, "_update_thread_status", new=AsyncMock()),
-        patch.object(mod, "_start_watchdogs"),
+        patch.object(mod._session_termination, "start_watchdogs"),
     ):
         try:
             # The capability as the stateless executor passes it from the

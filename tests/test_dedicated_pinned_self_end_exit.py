@@ -17,6 +17,7 @@ See knowledge-base/knowledge/issues/agent_initiated_pinned_end_wedges_permanent_
 
 from __future__ import annotations
 
+from agent.api import session_termination
 import asyncio
 import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -52,22 +53,22 @@ def _attached_runtime(*, inner, bound_thread: str | None, exit_fn=None):
             patch.object(pa._session_identity, "_session_generation", GENERATION)
         )
         stack.enter_context(patch.object(pa._session_identity, "_attach_token", ATTACH))
-        stack.enter_context(patch.object(pa, "_termination_task", None))
-        stack.enter_context(patch.object(pa, "_terminating", False))
+        stack.enter_context(patch.object(pa._session_termination, "termination_task", None))
+        stack.enter_context(patch.object(pa._session_termination, "terminating", False))
         stack.enter_context(patch.object(pa, "_stateless_mode", return_value=False))
-        stack.enter_context(patch.object(pa, "_terminate_session_inner", inner))
+        stack.enter_context(patch.object(pa._session_termination, "_terminate_inner", inner))
         stack.enter_context(
-            patch.object(pa, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,))
+            patch.object(session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,))
         )
         yield stack.enter_context(
-            patch.object(pa, "_schedule_exit", side_effect=exit_fn)
+            patch.object(pa._session_termination, "schedule_exit", side_effect=exit_fn)
         )
 
 
 async def _terminate(reason: str, *, bound_thread: str | None, **kwargs):
     inner = AsyncMock(return_value=None)
     with _attached_runtime(inner=inner, bound_thread=bound_thread) as exit_fn:
-        await pa._terminate_session(reason, **kwargs)
+        await pa._session_termination.terminate(reason, **kwargs)
     inner.assert_awaited_once()
     assert inner.await_args.args == (reason,)
     return exit_fn
@@ -93,7 +94,7 @@ async def test_exit_is_scheduled_only_after_settlement_returns():
         bound_thread=THREAD,
         exit_fn=lambda **_: order.append("exit"),
     ):
-        await pa._terminate_session("archive")
+        await pa._session_termination.terminate("archive")
 
     assert order == ["settled", "exit"]
 
@@ -122,7 +123,7 @@ async def test_unproven_settlement_never_schedules_exit(reason):
 
     with _attached_runtime(inner=inner, bound_thread=THREAD) as exit_fn:
         with pytest.raises(pa.EventJournalUnavailable):
-            await pa._terminate_session(reason)
+            await pa._session_termination.terminate(reason)
 
     exit_fn.assert_not_called()
 
@@ -143,7 +144,7 @@ async def test_stateless_executor_never_exits_on_a_session_end():
     inner = AsyncMock(return_value=None)
     with _attached_runtime(inner=inner, bound_thread=THREAD) as exit_fn:
         with patch.object(pa, "_stateless_mode", return_value=True):
-            await pa._terminate_session("idle_timeout")
+            await pa._session_termination.terminate("idle_timeout")
 
     exit_fn.assert_not_called()
 
@@ -179,7 +180,7 @@ async def test_pending_vm_actuator_handoff_never_exits(reason, bound_thread):
 
     inner = AsyncMock(return_value="actuator_requested")
     with _attached_runtime(inner=inner, bound_thread=bound_thread) as exit_fn:
-        result = await pa._terminate_session(reason)
+        result = await pa._session_termination.terminate(reason)
 
     assert result == "actuator_requested"
     inner.assert_awaited_once()
@@ -197,7 +198,7 @@ async def test_idle_timeout_completion_handler_exits_dedicated_pod():
     inner = AsyncMock(return_value=None)
     with _attached_runtime(inner=inner, bound_thread=THREAD) as exit_fn:
         with patch.object(pa, "_handle_idle_archive", new=AsyncMock()) as archive:
-            await pa._loop_completion_handler(loop_task)
+            await pa._session_termination.loop_completion_handler(loop_task)
 
     archive.assert_awaited_once()
     assert inner.await_args.args == ("idle_timeout",)

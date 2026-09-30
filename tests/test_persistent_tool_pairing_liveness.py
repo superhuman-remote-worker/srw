@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+
+from tests._session_termination_adapter import termination_target
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from openai import BadRequestError
 
@@ -286,7 +288,7 @@ async def test_mid_tool_drift_waits_for_pair_then_replacement_restore_is_valid()
     from agent.api import persistent_app
 
     saved = {
-        name: getattr(persistent_app, name)
+        name: getattr(*termination_target(persistent_app, name))
         for name in (
             "_session",
             "_tool_inflight",
@@ -302,8 +304,8 @@ async def test_mid_tool_drift_waits_for_pair_then_replacement_restore_is_valid()
     persistent_app._session_input._awaiting_input = False
     persistent_app._tool_inflight = False
     persistent_app._session_input._queue = None
-    persistent_app._drain_intent_handled = False
-    persistent_app._drain_deferred_logged = False
+    persistent_app._session_termination.drain_intent_handled = False
+    persistent_app._session_termination.drain_deferred_logged = False
     drain = AsyncMock()
     durable: list = []
     input_count = 0
@@ -314,14 +316,14 @@ async def test_mid_tool_drift_waits_for_pair_then_replacement_restore_is_valid()
         if input_count == 1:
             return "inspect safely"
         persistent_app._session_input._awaiting_input = True
-        await persistent_app._handle_heartbeat_intents(
+        await persistent_app._session_termination.handle_heartbeat_intents(
             {"intents": {"should_drain": True, "drain_reason": "image_drift"}}
         )
         raise asyncio.CancelledError
 
     async def _tool_start(*_args):
         persistent_app._tool_inflight = True
-        await persistent_app._handle_heartbeat_intents(
+        await persistent_app._session_termination.handle_heartbeat_intents(
             {"intents": {"should_drain": True, "drain_reason": "image_drift"}}
         )
         drain.assert_not_awaited()
@@ -330,7 +332,7 @@ async def test_mid_tool_drift_waits_for_pair_then_replacement_restore_is_valid()
         # _execute_turn persists the ToolMessage before this callback.
         assert any(isinstance(message, ToolMessage) for message in durable)
         persistent_app._tool_inflight = False
-        await persistent_app._handle_heartbeat_intents(
+        await persistent_app._session_termination.handle_heartbeat_intents(
             {"intents": {"should_drain": True, "drain_reason": "image_drift"}}
         )
         drain.assert_not_awaited()
@@ -362,7 +364,7 @@ async def test_mid_tool_drift_waits_for_pair_then_replacement_restore_is_valid()
     )
 
     try:
-        with patch.object(persistent_app, "_drain_suspend_session", drain):
+        with patch.object(persistent_app._session_termination, "drain_suspend_session", drain):
             await run_persistent_loop(
                 llm_with_tools=first_llm,
                 tools=[tool],
@@ -427,4 +429,4 @@ async def test_mid_tool_drift_waits_for_pair_then_replacement_restore_is_valid()
             persistent_app._session_input._queue,
         ) = saved_input
         for name, value in saved.items():
-            setattr(persistent_app, name, value)
+            setattr(*termination_target(persistent_app, name), value)

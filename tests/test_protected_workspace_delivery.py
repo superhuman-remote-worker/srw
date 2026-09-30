@@ -12,6 +12,8 @@ from uuid import UUID
 
 import pytest
 
+from tests._session_termination_adapter import termination_target
+
 from agent.api import persistent_app
 
 
@@ -575,7 +577,7 @@ async def test_dedicated_attach_initial_engaging_polls_to_ready(monkeypatch):
         ("_event_writer", None),
         ("_session_side_tasks", set()),
     ):
-        monkeypatch.setattr(persistent_app, name, value)
+        monkeypatch.setattr(*termination_target(persistent_app, name), value)
     for name in (
         "_thread_id",
         "_process_generation",
@@ -602,7 +604,7 @@ async def test_dedicated_attach_initial_engaging_polls_to_ready(monkeypatch):
             new=AsyncMock(return_value=True),
         ) as update_status,
         patch.object(persistent_app._session_input, "reclaim_pending", new=AsyncMock()),
-        patch.object(persistent_app, "_start_watchdogs"),
+        patch.object(persistent_app._session_termination, "start_watchdogs"),
         patch.object(persistent_app, "_officer_cfg", return_value=None),
         patch.object(persistent_app, "_broadcast"),
         patch("agent.tools.registry.register_mcp_tools"),

@@ -430,15 +430,15 @@ async def test_teardown_skips_raw_sync_only_for_stateless(stateless: bool):
         patch.object(papp, "_control_owner_agent_id", None),
         patch.object(papp, "_registered_pinned_agent_id", return_value=None),
         patch.object(papp, "_stateless_mode", return_value=stateless),
-        patch.object(papp, "_stop_watchdogs"),
+        patch.object(papp._session_termination, "stop_watchdogs"),
         patch.object(papp, "_stop_thread_control_watcher", AsyncMock()),
         patch.object(papp, "_await_pending_cloud_push", AsyncMock()),
         patch.object(papp._canvas_control, "clear_all"),
         patch.object(papp, "_subscribers", {}),
-        patch.object(papp, "_sessions_served", 0),
-        patch.object(papp, "_max_sessions_per_process", 0),
+        patch.object(papp._session_termination, "sessions_served", 0),
+        patch.object(papp._session_termination, "max_sessions_per_process", 0),
     ):
-        await papp._terminate_session_inner("test", mark_thread=False)
+        await papp._session_termination._terminate_inner("test", mark_thread=False)
 
     if stateless:
         sync.push_all.assert_not_awaited()
@@ -1380,7 +1380,7 @@ async def test_none_agent_cloud_suppression_is_stateless_only(
         ),
         patch.object(papp, "_OrderedPersistentEventWriter") as writer_cls,
         patch.object(papp, "_update_thread_status", AsyncMock()),
-        patch.object(papp, "_start_watchdogs"),
+        patch.object(papp._session_termination, "start_watchdogs"),
         patch.object(papp, "_officer_cfg", return_value=None),
         patch.object(session_attach, "apply_session_embedding_env"),
     ):
@@ -1480,7 +1480,7 @@ async def test_late_workspace_fetch_retains_generation_without_coordinator():
         patch.object(papp, "_build_sync_coordinator") as build_sync,
         patch.object(papp, "_restore_session_messages", AsyncMock()),
         patch.object(papp, "_update_thread_status", AsyncMock()),
-        patch.object(papp, "_start_watchdogs"),
+        patch.object(papp._session_termination, "start_watchdogs"),
         patch.object(papp, "_officer_cfg", return_value=None),
         patch.object(session_attach, "apply_session_embedding_env"),
     ):

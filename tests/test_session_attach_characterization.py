@@ -21,6 +21,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from tests._session_termination_adapter import termination_target
+
 import agent.api.persistent_app as pa
 from agent.api.lease_context import LeaseHandle, current_lease
 from agent.api.orchestrator_client import OrchestratorClient
@@ -156,7 +158,7 @@ def patch_collaborator(monkeypatch, name: str, value: Any) -> None:
 
         monkeypatch.setattr(importlib.import_module(moved[0]), moved[1], value)
         return
-    monkeypatch.setattr(pa, name, value)
+    monkeypatch.setattr(*termination_target(pa, name), value)
 
 
 def reset_attach_state() -> None:
@@ -346,11 +348,11 @@ def _world(monkeypatch):
     monkeypatch.setattr(pa, "_orchestrator_client", None)
     monkeypatch.setattr(pa, "_event_writer", None)
     monkeypatch.setattr(pa, "_loop_task", None)
-    monkeypatch.setattr(pa, "_retirement_admission_identity", None)
-    monkeypatch.setattr(pa, "_retirement_admission_disposition", None)
-    monkeypatch.setattr(pa, "_retirement_admission_token", None)
-    monkeypatch.setattr(pa, "_retirement_admission_permanent", None)
-    monkeypatch.setattr(pa, "_termination_admission_fenced", False)
+    monkeypatch.setattr(pa._session_termination, "retirement_admission_identity", None)
+    monkeypatch.setattr(pa._session_termination, "retirement_admission_disposition", None)
+    monkeypatch.setattr(pa._session_termination, "retirement_admission_token", None)
+    monkeypatch.setattr(pa._session_termination, "retirement_admission_permanent", None)
+    monkeypatch.setattr(pa._session_termination, "termination_admission_fenced", False)
     patch_collaborator(monkeypatch, "PersistentSession", FakeSession)
     patch_collaborator(monkeypatch, "_build_sync_coordinator", MagicMock())
     patch_collaborator(monkeypatch, "_apply_session_embedding_env", MagicMock())
@@ -1019,7 +1021,7 @@ async def test_pool_failure_unconfirmed_release_keeps_the_claim(monkeypatch):
 
 
 async def _detach_for_reuse():
-    await pa._terminate_session("claim_switch", mark_thread=False, preserve_shell=True)
+    await pa._session_termination.terminate("claim_switch", mark_thread=False, preserve_shell=True)
 
 
 @pytest.mark.asyncio

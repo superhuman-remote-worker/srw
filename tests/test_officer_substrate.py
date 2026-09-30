@@ -632,20 +632,20 @@ class TestBootWsWatchdogOfficerExemption:
 
         _reset_agent_globals()
         _install_officer_session(officer_cfg=OfficerConfig(enabled=True))
-        mod._ws_connected_event = asyncio.Event()  # never set
+        mod._session_termination.ws_connected_event = asyncio.Event()  # never set
         terminated = []
 
         async def _fake_terminate(reason):
             terminated.append(reason)
 
-        original = mod._terminate_session
-        mod._terminate_session = _fake_terminate
+        original = mod._session_termination.terminate
+        mod._session_termination.terminate = _fake_terminate
         try:
             # Watchdog must return immediately — a 0-second timeout would
             # otherwise terminate on the spot.
-            await asyncio.wait_for(mod._boot_ws_watchdog(0), timeout=1.0)
+            await asyncio.wait_for(mod._session_termination.boot_ws_watchdog(0), timeout=1.0)
         finally:
-            mod._terminate_session = original
+            mod._session_termination.terminate = original
             _reset_agent_globals()
         assert terminated == []
 
@@ -655,20 +655,20 @@ class TestBootWsWatchdogOfficerExemption:
 
         _reset_agent_globals()
         _install_officer_session(officer_cfg=OfficerConfig(enabled=False))
-        mod._ws_connected_event = asyncio.Event()
+        mod._session_termination.ws_connected_event = asyncio.Event()
         terminated = []
 
         async def _fake_terminate(reason):
             terminated.append(reason)
 
-        original_terminate = mod._terminate_session
-        original_exit = mod._schedule_exit
-        mod._terminate_session = _fake_terminate
-        mod._schedule_exit = lambda delay=0: None
+        original_terminate = mod._session_termination.terminate
+        original_exit = mod._session_termination.schedule_exit
+        mod._session_termination.terminate = _fake_terminate
+        mod._session_termination.schedule_exit = lambda delay=0: None
         try:
-            await asyncio.wait_for(mod._boot_ws_watchdog(0), timeout=5.0)
+            await asyncio.wait_for(mod._session_termination.boot_ws_watchdog(0), timeout=5.0)
         finally:
-            mod._terminate_session = original_terminate
-            mod._schedule_exit = original_exit
+            mod._session_termination.terminate = original_terminate
+            mod._session_termination.schedule_exit = original_exit
             _reset_agent_globals()
         assert terminated == ["boot_ws_timeout"]

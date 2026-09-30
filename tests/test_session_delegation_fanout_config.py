@@ -975,7 +975,7 @@ async def test_the_pool_attach_handler_forwards_the_switch(monkeypatch):
     monkeypatch.setattr(papp._session_attach, "_pool_task", None)
     monkeypatch.setattr(papp._session_attach, "_pool_claim_generation", None)
     monkeypatch.setattr(papp._session_attach, "_pool_claim_token", None)
-    monkeypatch.setattr(papp, "_pending_drain_suspend", None)
+    monkeypatch.setattr(papp._session_termination, "pending_drain_suspend", None)
     monkeypatch.setattr(
         papp._session_attach, "_run_pool_attach_transaction", transaction
     )

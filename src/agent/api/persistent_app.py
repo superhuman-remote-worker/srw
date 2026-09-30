@@ -9,7 +9,6 @@ Connect with: websocat ws://localhost:8001/ws/chat
 
 import asyncio
 import hashlib
-import inspect
 import json
 import logging
 import contextlib
@@ -19,14 +18,12 @@ import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import (
     Any,
     Awaitable,
     Callable,
     Dict,
     List,
-    NoReturn,
     Optional,
     Set,
     Tuple,
@@ -40,6 +37,7 @@ from fastapi.responses import JSONResponse
 from agent.api import session_transport as _session_transport
 from agent.api._session_auth import SessionAuthBindings
 from agent.api.session_canvas_control import CanvasControlChannel
+from agent.api.session_termination import SessionTerminationCoordinator, SessionTerminationPorts
 from agent.api import session_workspace as _session_workspace
 from agent.api.session_attach import (
     SessionAttachCoordinator,
@@ -159,29 +157,12 @@ _session: Optional[PersistentSession] = None
 # Process-local mirror of the orchestrator's exact ``ending`` authority. It is
 # scoped to the complete attached runtime identity, not the process: pool/dual
 # agents may safely serve a successor after exact cleanup clears this tuple.
-_retirement_admission_identity: Optional[tuple[str, Optional[str], Optional[str]]] = (
-    None
-)
-_retirement_admission_disposition: Optional[str] = None
-_retirement_admission_token: Optional[str] = None
-_retirement_admission_permanent: Optional[bool] = None
+
+
 # An exact drain-suspend can outlive local teardown when the settlement
 # response is lost. Keep that process nonclaimable and retry the same immutable
 # identity from a tracked task independent of normal heartbeat authority;
 # never downgrade it to a broad End.
-_pending_drain_suspend: Optional[dict[str, Any]] = None
-_pending_drain_suspend_retry_task: Optional[asyncio.Task[None]] = None
-
-
-def _reset_retirement_admission_mirror() -> None:
-    """Drop the local ``ending`` mirror when the attached identity changes."""
-
-    global _retirement_admission_identity, _retirement_admission_disposition
-    global _retirement_admission_token, _retirement_admission_permanent
-    _retirement_admission_identity = None
-    _retirement_admission_disposition = None
-    _retirement_admission_token = None
-    _retirement_admission_permanent = None
 
 
 # The attached session's identity: bound thread, durable runtime generation and
@@ -195,26 +176,22 @@ _session_identity = SessionIdentityRuntime(
         lease=lambda: _current_lease_var.get(),
         stateless_mode=lambda: _stateless_mode(),
         orchestrator_client=lambda: _orchestrator_client,
-        identity_replaced=lambda: _reset_retirement_admission_mirror(),
+        identity_replaced=lambda: _session_termination.reset_retirement_admission_mirror(),
     )
 )
 
 # Pool mode: agent can be reused across sessions (Docker Compose mode)
-_sessions_served: int = 0
-_max_sessions_per_process: int = int(
-    os.environ.get("MAX_SESSIONS_PER_PROCESS", "0")
-)  # 0 = unlimited
+
 
 # Pod exit scheduling
-_pending_exit_task: Optional[asyncio.Task] = None
+
 
 # Drain intent — set the first time the orchestrator's heartbeat response
 # carries ``intents.should_drain=true`` AND the session is in a drainable
 # state. Drives a one-shot suspend/detach + exit so the agent doesn't keep
 # reacting on every subsequent heartbeat. While a turn is in flight the
 # intent is deferred (flag stays False) and re-checked on each 5s tick.
-_drain_intent_handled: bool = False
-_drain_deferred_logged: bool = False
+
 
 # Kubernetes termination-admission fence for dedicated persistent pods.
 #
@@ -224,10 +201,7 @@ _drain_deferred_logged: bool = False
 # refused.  The boolean is the fast in-process half, set by the loopback route.
 # Neither is durable authority: Kubernetes owns pod termination; Post/thread
 # state and the Officer recycler own durable replacement.
-_TERMINATION_SENTINEL_PATH = Path("/tmp/srw-persistent-terminating")
-_termination_admission_fenced: bool = False
-_termination_fence_reason: Optional[str] = None
-_TERMINATION_QUEUE_SENTINEL = INTERRUPT_SENTINEL
+
 
 # Process-local authorization latch for auxiliary provider work. The primary
 # loop must remain able to reach its pre-turn maintenance callback after a
@@ -256,8 +230,7 @@ def _persistent_input_cancellation_enabled() -> bool:
 # that the orchestrator reconciler can only catch with a 60s+ delay):
 #   _ws_connected_event  → set when /ws/chat first accepts a connection.
 #   _watchdog_tasks      → background tasks cancelled on detach/shutdown.
-_ws_connected_event: Optional[asyncio.Event] = None
-_watchdog_tasks: list[asyncio.Task] = []
+
 
 # Awaitable single-flight for _terminate_session. Out-of-band teardown (drain,
 # watchdog, REST detach) cancels the loop task and awaits it — but
@@ -270,8 +243,7 @@ _watchdog_tasks: list[asyncio.Task] = []
 # 'suspended' transition. The loop task itself remains a non-awaiting
 # re-entrant caller (otherwise outer teardown and cancelled loop deadlock),
 # while every independent caller awaits the same authoritative cleanup result.
-_terminating: bool = False
-_termination_task: Optional[asyncio.Task[str | None]] = None
+
 
 # Reference to the currently running persistent-loop task. Set by ws_chat when
 # it spawns the loop, cleared when _terminate_session runs. _terminate_session()
@@ -283,10 +255,7 @@ _termination_task: Optional[asyncio.Task[str | None]] = None
 # Headless sessions (chunk 1): the loop now outlives any single WebSocket. It is
 # only cancelled by _terminate_session, never by WS close.
 _loop_task: Optional[asyncio.Task] = None
-_session_boot_ws_timeout_s: int = int(
-    os.environ.get("SESSION_BOOT_WS_TIMEOUT_S", "600")
-)
-_thread_status_poll_s: int = int(os.environ.get("THREAD_STATUS_POLL_S", "60"))
+
 
 # Resume backstop: a hard ceiling on how many messages the restore read loads,
 # applied as `seq DESC LIMIT N` (newest N) so one pathological tail — thousands
@@ -343,14 +312,14 @@ _session_input = SessionInputRuntime(
         session=lambda: _session,
         identity=lambda: _session_identity.snapshot(),
         stateless_mode=lambda: _stateless_mode(),
-        runtime_admission_closed=lambda: _runtime_admission_closed(),
+        runtime_admission_closed=lambda: _session_termination.runtime_admission_closed(),
         protected_cloud_ready=lambda: _protected_cloud_runtime_ready(),
         identity_fingerprint=lambda: _session_identity.fingerprint(),
         cancellation_enabled=lambda: _persistent_input_cancellation_enabled(),
         turn_open=lambda: _turn_event_open,
         tool_inflight=lambda: _tool_inflight,
         broadcast=lambda method, params: _broadcast(method, params),
-        track_side_task=lambda task: _track_session_side_task(task),
+        track_side_task=lambda task: _session_termination.track_session_side_task(task),
         human_input_accepted=lambda content: _schedule_early_title(content),
         begin_input_wait=lambda: _begin_loop_input_wait(),
     ),
@@ -485,9 +454,9 @@ _session_attach = SessionAttachCoordinator(
         close_runtime_authorization=lambda: _close_runtime_authorization(),
         clear_canvas=lambda: _canvas_control.clear_all(),
         clear_subscribers=lambda: _subscribers.clear(),
-        side_tasks_active=lambda: any(not task.done() for task in _session_side_tasks),
-        quiesce_side_tasks=lambda: _quiesce_session_side_tasks(),
-        pending_drain_suspend=lambda: _pending_drain_suspend,
+        side_tasks_active=lambda: any(not task.done() for task in _session_termination.session_side_tasks),
+        quiesce_side_tasks=lambda: _session_termination.quiesce_session_side_tasks(),
+        pending_drain_suspend=lambda: _session_termination.pending_drain_suspend,
         event_writer=lambda: _event_writer,
         discard_event_writer=lambda: _discard_event_writer(),
         reset_journal_cursor=lambda: _reset_event_journal_cursor(),
@@ -495,8 +464,8 @@ _session_attach = SessionAttachCoordinator(
         events_epoch=lambda: _events_epoch,
         stop_interrupt_watcher=lambda: _stop_thread_interrupt_watcher(),
         stop_control_watcher=lambda: _stop_thread_control_watcher(),
-        stop_and_join_watchdogs=lambda: _stop_and_join_watchdogs(),
-        start_watchdogs=lambda: _start_watchdogs(),
+        stop_and_join_watchdogs=lambda: _session_termination.stop_and_join_watchdogs(),
+        start_watchdogs=lambda: _session_termination.start_watchdogs(),
         update_thread_status=lambda *args, **kwargs: _update_thread_status(
             *args, **kwargs
         ),
@@ -525,6 +494,79 @@ _session_attach = SessionAttachCoordinator(
     logger=logger,
 )
 
+
+def _publish_loop_task(value: Any) -> None:
+    global _loop_task
+    _loop_task = value
+
+
+def _publish_event_writer(value: Any) -> None:
+    global _event_writer
+    _event_writer = value
+
+
+def _publish_active_permission(value: Any) -> None:
+    global _active_permission_request_id
+    _active_permission_request_id = value
+
+
+def _publish_runtime_authorization(value: Any) -> None:
+    global _runtime_authorization_admission_open
+    _runtime_authorization_admission_open = value
+
+
+def _publish_draft_title(value: Any) -> None:
+    global _draft_title_value
+    _draft_title_value = value
+
+# Termination owns retirement, quiescence and its tasks; composition remains here
+# until R3.4. Each port names the collaborator read at invocation time.
+_session_termination = SessionTerminationCoordinator(
+    SessionTerminationPorts(
+        announced_permissions=lambda: _announced_permission_rows,
+        attach=lambda: _session_attach,
+        await_pending_cloud_push=lambda *args, **kwargs: _await_pending_cloud_push(*args, **kwargs),
+        background_push_owns=lambda *args, **kwargs: _background_push_owns(*args, **kwargs),
+        canvas_control=lambda: _canvas_control,
+        close_pinned_control_inbox=lambda *args, **kwargs: _close_pinned_control_inbox(*args, **kwargs),
+        control_owner_agent_id=lambda: _control_owner_agent_id,
+        event_writer=lambda: _event_writer,
+        handle_idle_archive=lambda *args, **kwargs: _handle_idle_archive(*args, **kwargs),
+        heartbeat_task=lambda: _heartbeat_task,
+        identity=lambda: _session_identity,
+        idle_timeout_error=IdleTimeoutError,
+        input_runtime=lambda: _session_input,
+        loop_on_error=lambda *args, **kwargs: _loop_on_error(*args, **kwargs),
+        loop_task=lambda: _loop_task,
+        officer_config=lambda *args, **kwargs: _officer_cfg(*args, **kwargs),
+        orchestrator_client=lambda: _orchestrator_client,
+        permission_gates=lambda: _gates_in_flight,
+        publish_active_permission=lambda *args, **kwargs: _publish_active_permission(*args, **kwargs),
+        publish_draft_title=lambda *args, **kwargs: _publish_draft_title(*args, **kwargs),
+        publish_event_writer=lambda *args, **kwargs: _publish_event_writer(*args, **kwargs),
+        publish_loop_task=lambda *args, **kwargs: _publish_loop_task(*args, **kwargs),
+        publish_runtime_authorization=lambda *args, **kwargs: _publish_runtime_authorization(*args, **kwargs),
+        publish_session=lambda *args, **kwargs: _publish_session(*args, **kwargs),
+        registered_pinned_agent_id=lambda *args, **kwargs: _registered_pinned_agent_id(*args, **kwargs),
+        reset_journal_cursor=lambda *args, **kwargs: _reset_event_journal_cursor(*args, **kwargs),
+        reset_turn_state=lambda *args, **kwargs: _reset_turn_state(*args, **kwargs),
+        retire_announced_permissions=lambda *args, **kwargs: _retire_announced_permission_rows(*args, **kwargs),
+        session=lambda: _session,
+        session_type=PersistentSession,
+        set_cloud_sync_retry_pending=lambda *args, **kwargs: _set_cloud_sync_retry_pending(*args, **kwargs),
+        set_pinned_control_admission=lambda *args, **kwargs: _set_pinned_control_admission(*args, **kwargs),
+        stateless_mode=lambda *args, **kwargs: _stateless_mode(*args, **kwargs),
+        stop_control_watcher=lambda *args, **kwargs: _stop_thread_control_watcher(*args, **kwargs),
+        stop_interrupt_watcher=lambda *args, **kwargs: _stop_thread_interrupt_watcher(*args, **kwargs),
+        subscribers=lambda: _subscribers,
+        tool_inflight=lambda: _tool_inflight,
+        turn_event_open=lambda: _turn_event_open,
+        update_thread_status=lambda *args, **kwargs: _update_thread_status(*args, **kwargs),
+    ),
+    logger=logger,
+    termination_queue_sentinel=INTERRUPT_SENTINEL,
+)
+
 # Serializes rewinds: two concurrent rewind frames on one session would race
 # the sweep/truncate pair. Second caller gets an error, not a queue.
 _rewind_lock: asyncio.Lock = asyncio.Lock()
@@ -540,13 +582,6 @@ _draft_title_value: Optional[str] = None
 # captures an immutable attach generation (``_session_identity``) and is
 # terminally joined during teardown before the event writer or claimant lease
 # is released.
-_session_side_tasks: set[asyncio.Task[Any]] = set()
-
-
-def _track_session_side_task(task: asyncio.Task[Any]) -> asyncio.Task[Any]:
-    _session_side_tasks.add(task)
-    task.add_done_callback(_session_side_tasks.discard)
-    return task
 
 
 def _session_identity_matches(
@@ -559,31 +594,6 @@ def _session_identity_matches(
         and _session_identity.thread_id == thread_id
         and _session_identity.attach_generation == generation
     )
-
-
-async def _quiesce_session_side_tasks() -> None:
-    """Cancel and join title/stage tasks before process-global identity reuse."""
-
-    pending = {
-        task
-        for task in _session_side_tasks
-        if task is not asyncio.current_task() and not task.done()
-    }
-    if not pending:
-        return
-    for task in pending:
-        task.cancel()
-    done, pending = await asyncio.wait(
-        pending,
-        timeout=float(os.environ.get("SESSION_SIDE_TASK_CLOSE_TIMEOUT_S", "5")),
-    )
-    for task in done:
-        try:
-            task.result()
-        except (asyncio.CancelledError, Exception):
-            pass
-    if pending:
-        raise RuntimeError(f"{len(pending)} session side task(s) ignored cancellation")
 
 
 # True while a tool call is mid-`ainvoke`. Read by POST /api/interrupt to
@@ -933,19 +943,6 @@ def _officer_cfg():
     return cfg if getattr(cfg, "enabled", False) is True else None
 
 
-def _terminal_retirement_disposition() -> str:
-    """Choose the immutable outcome before beginning pinned retirement."""
-
-    identity = _session_identity.retirement_identity()
-    if (
-        identity is not None
-        and _retirement_admission_identity == identity
-        and _retirement_admission_disposition in {"ended", "suspended"}
-    ):
-        return _retirement_admission_disposition
-    return "suspended" if _officer_cfg() is not None else "ended"
-
-
 async def emit_session_event(method: str, params: dict) -> None:
     """Publish a notification event to ``session.events.{oid}.{tid}`` on NATS.
 
@@ -1057,97 +1054,6 @@ def _app_guide_health() -> dict[str, str]:
     return app_guide_health_snapshot(reader_available=reader_available)
 
 
-def _termination_admission_closed() -> bool:
-    """Return the earliest process-visible Kubernetes termination signal.
-
-    ``deletionTimestamp`` itself lives outside the container, so this function
-    deliberately does not claim to observe the API-server mutation atomically.
-    The preStop shell creates the sentinel before Python/HTTP work; the route
-    then latches the in-process boolean.  Either one closes admission.
-    """
-
-    if _termination_admission_fenced:
-        return True
-    try:
-        return _TERMINATION_SENTINEL_PATH.exists()
-    except OSError:
-        # A broken pod-local fence path is not a reason to spend through a
-        # termination signal.  The normal /tmp path is always stat-able.
-        return True
-
-
-def _retirement_admission_closed() -> bool:
-    """True only for the exact attached life whose End has begun."""
-
-    identity = _session_identity.retirement_identity()
-    return identity is not None and _retirement_admission_identity == identity
-
-
-def _runtime_admission_closed() -> bool:
-    """Combined local fence for user/control/provider work.
-
-    Kubernetes termination is process-scoped. An owner End is session-scoped
-    so a pool agent can safely accept a later exact attach after cleanup.
-    """
-
-    return _termination_admission_closed() or _retirement_admission_closed()
-
-
-def activate_termination_admission_fence(source: str) -> bool:
-    """Latch the no-new-turn fence and wake an idle queue waiter.
-
-    Returns True only for the first process-local transition.  Repeated preStop
-    callbacks/signals are idempotent and never consume a queued user/event row.
-    """
-
-    global _termination_admission_fenced, _termination_fence_reason
-    first = not _termination_admission_fenced
-    _termination_admission_fenced = True
-    if _termination_fence_reason is None:
-        _termination_fence_reason = str(source or "termination")[:80]
-    if first:
-        logger.warning(
-            "Persistent runtime admission fenced for termination (source=%s, "
-            "turn_open=%s, tool_inflight=%s)",
-            _termination_fence_reason,
-            _turn_event_open,
-            _tool_inflight,
-        )
-    # queue.get() otherwise has no reason to wake and notice the file/flag.
-    # The sentinel is filtered by the loop and is never persisted.
-    _session_input.wake_parked_wait(_TERMINATION_QUEUE_SENTINEL)
-    return first
-
-
-def _termination_quiescent() -> bool:
-    """True after the current turn's complete settlement boundary."""
-
-    if _tool_inflight or _turn_event_open:
-        return False
-    session = _session
-    if session is not None:
-        auxiliary = getattr(session, "auxiliary_llm", None)
-        if int(getattr(auxiliary, "provider_calls_inflight", 0) or 0) > 0:
-            return False
-        memory = getattr(session, "memory_service", None)
-        if int(getattr(memory, "background_tasks_inflight", 0) or 0) > 0:
-            return False
-    task = _loop_task
-    return task is None or task.done() or _session_input.awaiting_input
-
-
-async def _wait_for_termination_quiescence(timeout_seconds: float) -> bool:
-    """Wait within preStop's grace budget; never cancel an active tool."""
-
-    deadline = asyncio.get_running_loop().time() + max(0.0, timeout_seconds)
-    while not _termination_quiescent():
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            return False
-        await asyncio.sleep(min(0.05, remaining))
-    return True
-
-
 def _protected_cloud_runtime_ready() -> bool:
     """Fail-closed runtime check shared by input, provider and tool gates."""
 
@@ -1166,7 +1072,7 @@ def _protected_cloud_runtime_ready() -> bool:
 
 
 def _runtime_input_admission_open() -> bool:
-    return not _runtime_admission_closed() and _protected_cloud_runtime_ready()
+    return not _session_termination.runtime_admission_closed() and _protected_cloud_runtime_ready()
 
 
 def _session_ready() -> bool:
@@ -1183,7 +1089,7 @@ def _session_ready() -> bool:
     get-user-input callback would crash on a ``None`` queue.
     """
     return (
-        not _runtime_admission_closed()
+        not _session_termination.runtime_admission_closed()
         and _session is not None
         and _session.llm_with_tools is not None
         and _session_input.queue is not None
@@ -1299,7 +1205,7 @@ def _ensure_persistent_loop_started(
             name="persistent-loop",
         )
         asyncio.create_task(
-            _loop_completion_handler(_loop_task),
+            _session_termination.loop_completion_handler(_loop_task),
             name="persistent-loop-completion",
         )
         logger.info(
@@ -1324,650 +1230,9 @@ def _ensure_persistent_loop_started(
     return True
 
 
-async def _handle_heartbeat_intents(response: dict[str, Any]) -> None:
-    """Heartbeat-response callback: react to orchestrator-set intents.
-
-    Currently only ``should_drain`` triggers anything. What it does depends
-    on session state:
-
-    - No session attached → exit the pod (idle pool agent, nothing to save).
-    - Session attached, loop parked between turns → clean drain-suspend:
-      flush + teardown, then ask the orchestrator to snapshot the workspace
-      and mark the thread ``suspended`` so the next user input walks the
-      proven suspended-resume path on a fresh (new-build) agent. Falls back
-      to the legacy ``ended`` detach if the orchestrator can't suspend.
-    - Session attached, turn in flight → defer; re-checked on every 5s
-      heartbeat until the loop parks. A drain never kills a running turn.
-
-    Idempotent: fires once per process; later heartbeats observing the same
-    intent are no-ops. See
-    knowledge-base/knowledge/issues/session_agent_drift_drain_kills_idle_sessions.md.
-    """
-    global _drain_intent_handled, _drain_deferred_logged
-    if _drain_intent_handled:
-        return
-    intents = response.get("intents") or {}
-    if not isinstance(intents, dict):
-        return
-    if not intents.get("should_drain"):
-        return
-    reason = intents.get("drain_reason", "unspecified")
-
-    pending = _pending_drain_suspend
-    if pending is not None and pending.get("locally_quiesced") is True:
-        # Begin makes ordinary heartbeats authority-refused, so they cannot be
-        # the retry clock. Rejoin/start the one tracked exact settlement task;
-        # it uses capped backoff and keeps this runtime non-ready throughout.
-        _drain_intent_handled = True
-        await asyncio.shield(_start_pending_exact_drain_suspend_retry())
-        return
-
-    if _session is not None and not _session_parked():
-        if not _drain_deferred_logged:
-            logger.info(
-                "Drain intent received from orchestrator (reason=%s) but a "
-                "turn is in flight — deferring until the loop parks",
-                reason,
-            )
-            _drain_deferred_logged = True
-        return
-
-    _drain_intent_handled = True
-    if _session is None:
-        logger.info(
-            "Drain intent received from orchestrator (reason=%s) — no session "
-            "attached, exiting",
-            reason,
-        )
-        _schedule_exit(delay=1.0)
-        return
-
-    logger.info(
-        "Drain intent received from orchestrator (reason=%s) — suspending "
-        "session and exiting",
-        reason,
-    )
-    await _drain_suspend_session()
-
-
-def _session_parked() -> bool:
-    """True when the persistent loop is parked waiting for user input.
-
-    Parked = blocked in the input owner's queue wait with nothing
-    queued and no tool call in flight. Anything else counts as an active
-    turn and must not be torn down out-of-band.
-    """
-    if not _session_input.awaiting_input or _tool_inflight:
-        return False
-    if _runtime_admission_closed():
-        # Queue contents remain durable/deferred for the replacement.  They do
-        # not make the predecessor active once termination admission is closed.
-        return True
-    queue = _session_input.queue
-    return queue is None or queue.empty()
-
-
-async def _drain_suspend_session() -> None:
-    """Drain an attached idle session via clean suspend instead of kill.
-
-    Converges on the attention-sleep terminal state — thread ``suspended``,
-    workspace snapshotted to S3, both pods gone — so the next user input
-    resumes through the existing suspended-restore path instead of racing a
-    half-deleted workspace pod (the 409→503 "session ended" failure this
-    replaces).
-    """
-    global _drain_intent_handled, _pending_drain_suspend
-
-    thread_id = _session_identity.thread_id
-    runtime_agent_id = _registered_pinned_agent_id()
-    runtime_generation = _session_identity.session_generation
-    runtime_attach_token = _session_identity.attach_token
-    runtime_session = _session
-
-    # Suspend is a terminal retirement disposition too. Close/drain durable
-    # controls and install the exact retirement token before touching the
-    # loop, workspace, mounts, or transport. A failed begin leaves the current
-    # session intact so a later heartbeat can retry safely.
-    if not await _begin_exact_session_retirement(
-        pinned_agent_id=runtime_agent_id,
-        retirement_disposition="suspended",
-    ):
-        _drain_intent_handled = False
-        logger.warning(
-            "Drain-suspend could not begin exact retirement; local teardown "
-            "suppressed (thread=%s)",
-            thread_id,
-        )
-        return
-
-    if runtime_generation is not None and runtime_attach_token is not None:
-        _pending_drain_suspend = {
-            "thread_id": thread_id,
-            "agent_id": runtime_agent_id,
-            "session_runtime_generation": runtime_generation,
-            "session_runtime_attach_token": runtime_attach_token,
-            "session_runtime_retirement_token": _retirement_admission_token,
-            "workspace_generation": str(
-                getattr(runtime_session, "workspace_generation", "") or ""
-            ),
-            "workspace_runtime_incarnation": str(
-                getattr(runtime_session, "workspace_runtime_incarnation", "") or ""
-            ),
-            "locally_quiesced": False,
-        }
-
-    # Flush + teardown WITHOUT marking the thread ended — the orchestrator
-    # owns the 'suspended' transition and its durable lifecycle frame below.
-    # Publishing that outcome from the agent before the settlement CAS would
-    # lie on a failed snapshot/cleanup. Clearing _session here also
-    # makes the SIGTERM shutdown handler a no-op when the orchestrator
-    # deletes this pod as part of the suspend.
-    try:
-        await _terminate_session(
-            "drain",
-            mark_thread=False,
-            preserve_shell=False,
-        )
-    except Exception as e:
-        logger.warning(f"Session teardown during drain-suspend failed: {e}")
-        # The exact ``ending`` token remains the durable authority fence. Do
-        # not ask the orchestrator to snapshot/delete/settle while local
-        # producers, the ordered writer, or mount managers may still be live.
-        # Leaving this unhandled lets the same runtime retry quiescence; the
-        # retirement reconciler is the cross-process backstop.
-        _drain_intent_handled = False
-        return
-
-    if _pending_drain_suspend is not None:
-        _pending_drain_suspend["locally_quiesced"] = True
-        _pending_drain_suspend["local_quiescence_protocol"] = str(
-            getattr(runtime_session, "local_quiescence_protocol", "") or ""
-        )
-        await asyncio.shield(_start_pending_exact_drain_suspend_retry())
-        return
-
-    suspended = False
-    if _orchestrator_client and thread_id:
-        try:
-            suspended = await _orchestrator_client.suspend_thread(
-                thread_id,
-                pinned_agent_id=runtime_agent_id,
-                session_runtime_generation=runtime_generation,
-                session_runtime_attach_token=runtime_attach_token,
-            )
-        except Exception as e:
-            logger.warning(f"Drain-suspend request failed: {e}")
-    if (
-        not suspended
-        and thread_id
-        and (runtime_generation is None or runtime_attach_token is None)
-    ):
-        # Legacy fallback: mark ended (recoverable — the orchestrator's
-        # 'ended' handler snapshots best-effort via _suspend_thread_resources
-        # and refuses to clobber an already-'suspended' thread, so a lost
-        # suspend response can't end a suspended session). Uses the captured
-        # thread_id — _update_thread_status reads module globals that
-        # _terminate_session already cleared.
-        logger.warning(
-            "Drain-suspend unavailable for thread %s — falling back to "
-            "legacy ended detach",
-            thread_id,
-        )
-        if _orchestrator_client:
-            try:
-                await _orchestrator_client.update_thread_status(
-                    thread_id,
-                    "ended",
-                    pinned_agent_id=runtime_agent_id,
-                    session_runtime_generation=runtime_generation,
-                    session_runtime_attach_token=runtime_attach_token,
-                )
-            except Exception as e:
-                logger.warning(f"Fallback ended write failed: {e}")
-    _schedule_exit(delay=1.0)
-
-
-def _start_pending_exact_drain_suspend_retry() -> asyncio.Task[None]:
-    """Own one exact post-quiescence suspend retry loop."""
-
-    global _pending_drain_suspend_retry_task
-
-    task = _pending_drain_suspend_retry_task
-    if task is not None and not task.done():
-        return task
-    task = asyncio.create_task(
-        _retry_pending_exact_drain_suspend(),
-        name="exact-drain-suspend-settlement",
-    )
-    _pending_drain_suspend_retry_task = task
-    return task
-
-
-async def _retry_pending_exact_drain_suspend() -> None:
-    """Retry/reconcile exact suspend without heartbeat or cleanup replay."""
-
-    global _drain_intent_handled, _pending_drain_suspend
-    global _pending_drain_suspend_retry_task
-
-    pending = _pending_drain_suspend
-    if pending is None or pending.get("locally_quiesced") is not True:
-        _drain_intent_handled = False
-        return
-    attempt = 0
-    try:
-        while _pending_drain_suspend is pending:
-            client = _orchestrator_client
-            suspended = False
-            if client is not None:
-                try:
-                    suspended = await client.suspend_thread(
-                        pending["thread_id"],
-                        pinned_agent_id=pending.get("agent_id"),
-                        session_runtime_generation=pending[
-                            "session_runtime_generation"
-                        ],
-                        session_runtime_attach_token=pending[
-                            "session_runtime_attach_token"
-                        ],
-                        session_runtime_retirement_token=pending.get(
-                            "session_runtime_retirement_token"
-                        ),
-                        local_runtime_quiesced=True,
-                        local_quiescence_protocol=pending.get(
-                            "local_quiescence_protocol"
-                        ),
-                        workspace_generation=pending.get("workspace_generation")
-                        or None,
-                        workspace_runtime_incarnation=pending.get(
-                            "workspace_runtime_incarnation"
-                        )
-                        or None,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Exact drain-suspend retry failed: %s",
-                        type(exc).__name__,
-                    )
-            if not suspended and client is not None:
-                outcome_reader = getattr(client, "get_thread_retirement_outcome", None)
-                if callable(outcome_reader):
-                    try:
-                        outcome = await outcome_reader(
-                            pending["thread_id"],
-                            pinned_agent_id=pending["agent_id"],
-                            session_runtime_generation=pending[
-                                "session_runtime_generation"
-                            ],
-                            session_runtime_attach_token=pending[
-                                "session_runtime_attach_token"
-                            ],
-                            session_runtime_retirement_token=pending[
-                                "session_runtime_retirement_token"
-                            ],
-                            retirement_disposition="suspended",
-                            retirement_permanent=False,
-                        )
-                    except Exception:
-                        outcome = None
-                    suspended = bool(
-                        isinstance(outcome, dict)
-                        and outcome.get("status") == "settled_or_superseded"
-                        and outcome.get("outcome") in {"settled", "deleted"}
-                        and outcome.get("retirement_disposition") == "suspended"
-                        and outcome.get("retirement_permanent") is False
-                    )
-            if suspended:
-                _pending_drain_suspend = None
-                _drain_intent_handled = True
-                _schedule_exit(delay=1.0)
-                return
-            _drain_intent_handled = True
-            delay = _EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS[
-                min(attempt + 1, len(_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS) - 1)
-            ]
-            logger.warning(
-                "Exact drain-suspend remains pending for thread %s; process "
-                "kept nonclaimable for retry",
-                pending["thread_id"],
-            )
-            attempt += 1
-            await asyncio.sleep(delay)
-    finally:
-        if _pending_drain_suspend_retry_task is asyncio.current_task():
-            _pending_drain_suspend_retry_task = None
-
-
-_DEREGISTER_ON_EXIT_TIMEOUT_S = 5.0
-
-
-async def _deregister_before_exit() -> None:
-    """Best-effort deregistration ahead of os._exit.
-
-    os._exit bypasses the lifespan shutdown that normally deregisters
-    (the startup-failure ``_exit_*`` helpers already deregister inline),
-    so without this every clean exit leaves an agents row that the
-    orchestrator's 3-minute heartbeat sweep flips to offline and reports
-    as a fleet:agents_offline corpse. Bounded and non-raising — a slow or
-    failed deregister must never hold up or abort the exit (the
-    stale-agent sweep stays the backstop, exactly as for crashes).
-    """
-    client = _orchestrator_client
-    if client is None:
-        return
-    client.stop_heartbeat()
-    hb = _heartbeat_task
-    if hb is not None and not hb.done() and hb is not asyncio.current_task():
-        # A heartbeat landing mid-deregister would 404 and re-register,
-        # resurrecting the row this call is about to delete. Never
-        # self-cancel — drain intents arrive inside the heartbeat task.
-        hb.cancel()
-    if not client.agent_id:
-        return
-    try:
-        await asyncio.wait_for(
-            client.deregister(), timeout=_DEREGISTER_ON_EXIT_TIMEOUT_S
-        )
-    except Exception as e:
-        logger.warning(f"Best-effort deregister before exit failed: {e}")
-
-
-def _schedule_exit(delay: float = 1.0) -> None:
-    """Schedule process exit after a short delay (allows final I/O to flush)."""
-    global _pending_exit_task
-
-    if _pending_exit_task and not _pending_exit_task.done():
-        _pending_exit_task.cancel()
-
-    async def _exit():
-        await asyncio.sleep(delay)
-        await _deregister_before_exit()
-        logger.info("Session complete — exiting process")
-        os._exit(0)
-
-    _pending_exit_task = asyncio.create_task(_exit())
-
-
 # ---------------------------------------------------------------------------
 # Self-cleanup watchdogs (PR 2)
 # ---------------------------------------------------------------------------
-
-
-async def _boot_ws_watchdog(timeout_s: int) -> None:
-    """Exit if no /ws/chat connection arrives within ``timeout_s`` of attach.
-
-    A persistent agent that boots, attaches to a thread, then never receives
-    a WebSocket has no other way to know it's been abandoned (e.g. user
-    navigated away during creation). Without this watchdog the pod sits
-    forever heartbeating and holding a slot. The orchestrator reconciler
-    catches this too, but only after a 60s+ delay; this watchdog kills
-    locally on the configured cadence.
-
-    Officer sessions are exempt: they are headless BY DESIGN — no browser
-    ever attaches, so "no WS yet" is their normal steady state, not
-    abandonment (found by the S3 k3d smoke: every officer died exactly
-    600s after boot and had to be respawned by the orchestrator watchdog).
-    The officer watchdog owns their lifecycle end to end.
-    """
-    if _officer_cfg() is not None:
-        return
-    if _ws_connected_event is None:
-        return
-    try:
-        await asyncio.wait_for(_ws_connected_event.wait(), timeout=timeout_s)
-        return  # WS arrived — normal lifecycle takes over
-    except asyncio.TimeoutError:
-        logger.warning(
-            "No WebSocket connection within %ds for thread %s — "
-            "exiting (likely abandoned during creation).",
-            timeout_s,
-            _session_identity.thread_id,
-        )
-    try:
-        await _terminate_session("boot_ws_timeout")
-    except Exception as e:
-        logger.warning(f"Detach during boot-WS timeout failed: {e}")
-        # Exact pinned teardown may still have a writer, workspace process, or
-        # unacknowledged retirement receipt.  Keep the runtime fenced and let
-        # its tracked retry/reconciler converge; exiting would discard the
-        # only truthful local-quiescence owner.
-        return
-    _schedule_exit(delay=1.0)
-
-
-async def _thread_status_watchdog(poll_s: int) -> None:
-    """Exit if the bound thread transitions to a terminal state out-of-band.
-
-    The orchestrator's stale_agent_detector can flip a thread to 'ended'
-    via ``mark_orphaned_threads_ended`` or release the binding via
-    ``mark_stuck_session_agents_ready`` (PR 1). When that happens this pod
-    is orphaned — no work to do, holding a slot.
-
-    'awaiting_user' is the eager-mode transient idle state set by this same
-    agent's loop on natural pause with no subscribers (Phase 5,
-    ``_begin_loop_input_wait``). It is NOT a terminal state — the orchestrator's
-    attention-sleep watchdog owns the eventual ``awaiting_user → suspended``
-    transition and we mustn't pre-empt it from here, or we kill the very
-    untethered-survival behaviour Phase 1 + Phase 5 were built to enable.
-
-    'suspended' means the orchestrator has already snapshotted + deleted the
-    workspace pod — at that point we're a stranded agent with no workspace,
-    so we exit.
-    """
-    global _retirement_admission_identity, _retirement_admission_disposition
-    global _retirement_admission_token
-    global _retirement_admission_permanent
-
-    bound_thread_id = _session_identity.thread_id
-    bound_runtime_generation = _session_identity.session_generation
-    bound_runtime_attach_token = _session_identity.attach_token
-    runtime_generation_required = _session_identity.runtime_contract
-    while True:
-        try:
-            await asyncio.sleep(poll_s)
-        except asyncio.CancelledError:
-            raise
-        if not _orchestrator_client or not bound_thread_id:
-            continue
-        if (
-            _session_identity.thread_id != bound_thread_id
-            or _session_identity.session_generation != bound_runtime_generation
-            or _session_identity.attach_token != bound_runtime_attach_token
-        ):
-            return
-        try:
-            lifecycle = await _orchestrator_client.get_thread_lifecycle(bound_thread_id)
-        except Exception as e:
-            logger.debug(f"Thread lifecycle poll failed (non-fatal): {e}")
-            continue
-        if not lifecycle:
-            continue
-        if (
-            _session_identity.thread_id != bound_thread_id
-            or _session_identity.session_generation != bound_runtime_generation
-            or _session_identity.attach_token != bound_runtime_attach_token
-        ):
-            return
-        status = lifecycle.get("status")
-        observed_generation = canonical_runtime_generation(
-            lifecycle.get("session_runtime_generation")
-        )
-        generation_moved = bool(
-            bound_runtime_generation is not None
-            and observed_generation != bound_runtime_generation
-        )
-        generation_missing = bool(
-            runtime_generation_required and observed_generation is None
-        )
-        observed_attach_token = canonical_runtime_generation(
-            lifecycle.get("session_runtime_attach_token")
-        )
-        attach_token_moved = observed_attach_token != bound_runtime_attach_token
-        retirement_preflight = lifecycle.get("runtime_retirement_preflight") is True
-        retirement_authorized = lifecycle.get("runtime_retirement_authorized") is True
-        if retirement_preflight and not retirement_authorized:
-            # Owner End is still checking turn/control preconditions. No
-            # authority has been minted and it may be aborted; keep the exact
-            # runtime fully alive and never infer retirement from "pending".
-            continue
-        if (
-            status == "ending"
-            and retirement_authorized
-            and not generation_moved
-            and not generation_missing
-            and not attach_token_moved
-        ):
-            disposition = lifecycle.get("retirement_disposition")
-            permanent = lifecycle.get("retirement_permanent")
-            retirement_token = canonical_runtime_generation(
-                lifecycle.get("session_runtime_retirement_token")
-            )
-            if disposition not in {"ended", "suspended"}:
-                logger.warning(
-                    "Authorized retirement omitted its immutable disposition "
-                    "(thread=%s)",
-                    bound_thread_id,
-                )
-                continue
-            if type(permanent) is not bool:
-                logger.warning(
-                    "Authorized retirement omitted immutable permanent intent "
-                    "(thread=%s)",
-                    bound_thread_id,
-                )
-                continue
-            identity = _session_identity.retirement_identity()
-            if identity is None:
-                return
-            _retirement_admission_identity = identity
-            _retirement_admission_disposition = disposition
-            # A malformed/missing token is not locally accepted. The common
-            # Begin call below will idempotently recover the exact token from
-            # the server before any teardown effect.
-            _retirement_admission_token = retirement_token
-            _retirement_admission_permanent = permanent
-            try:
-                await _terminate_session("thread_retirement_authorized")
-            except Exception as exc:
-                logger.warning(
-                    "Authorized retirement cleanup failed: %s", type(exc).__name__
-                )
-                return
-            _schedule_exit(delay=1.0)
-            return
-        if status == "ending":
-            # Exact-contract retirement is actionable only with the explicit
-            # authorization bit and immutable disposition/token handshake.
-            # A malformed or mixed-version shape must not trick the runtime
-            # into tearing down while owner preflight may still abort.
-            logger.warning(
-                "Ignoring unauthorised/malformed ending lifecycle response "
-                "for thread %s",
-                bound_thread_id,
-            )
-            continue
-        if (
-            status not in ("created", "active", "awaiting_user")
-            or generation_moved
-            or generation_missing
-            or attach_token_moved
-        ):
-            logger.info(
-                "Thread %s lifecycle no longer belongs to this runtime "
-                "(status=%r generation_match=%s attach_match=%s) — exiting.",
-                bound_thread_id,
-                status,
-                not (generation_moved or generation_missing),
-                not attach_token_moved,
-            )
-            try:
-                await _terminate_session("thread_ended_oob")
-            except Exception as e:
-                logger.warning(f"Detach during status-watchdog exit failed: {e}")
-                # Local writer/process/mount quiescence or exact receipt is
-                # unproven.  Exiting here would abandon live workspace writers
-                # and the only local retry owner. Stay fenced/nonclaimable;
-                # the exact retirement task or durable reconciler converges it.
-                return
-            _schedule_exit(delay=1.0)
-            return
-
-
-def _start_watchdogs() -> None:
-    """Start watchdog tasks for the active session. Safe to call repeatedly."""
-    global _ws_connected_event, _watchdog_tasks
-
-    # Stateless executor (M3): no boot-WS ever arrives (input rides the run
-    # queue) and thread status is orchestrator-owned — both watchdogs would
-    # tear down healthy cached sessions. The run_queue lease/reaper plays
-    # their abandoned-pod role in this mode.
-    if _stateless_mode():
-        logger.debug("Stateless executor mode: session watchdogs disabled")
-        return
-
-    # Stop any prior watchdogs (defensive — should already be cleared).
-    for task in _watchdog_tasks:
-        if not task.done():
-            task.cancel()
-    _watchdog_tasks = []
-
-    _ws_connected_event = asyncio.Event()
-    _watchdog_tasks = [
-        asyncio.create_task(
-            _boot_ws_watchdog(_session_boot_ws_timeout_s),
-            name="boot-ws-watchdog",
-        ),
-        asyncio.create_task(
-            _thread_status_watchdog(_thread_status_poll_s),
-            name="thread-status-watchdog",
-        ),
-    ]
-
-
-def _stop_watchdogs() -> None:
-    """Cancel all active watchdogs. Skips the current task to avoid self-cancel."""
-    global _watchdog_tasks
-    current = asyncio.current_task()
-    for task in _watchdog_tasks:
-        if task is current or task.done():
-            continue
-        task.cancel()
-    _watchdog_tasks = []
-
-
-async def _stop_and_join_watchdogs() -> None:
-    """Cancel watchdogs and prove every independent task has quiesced."""
-
-    global _watchdog_tasks
-    current = asyncio.current_task()
-    owned = [
-        task for task in _watchdog_tasks if task is not current and not task.done()
-    ]
-    _stop_watchdogs()
-    if not owned:
-        return
-    done, pending = await asyncio.wait(
-        owned,
-        timeout=float(os.environ.get("SESSION_WATCHDOG_CLOSE_TIMEOUT_S", "5")),
-    )
-    if pending:
-        # Retain exact task ownership so the same retirement can retry joining
-        # it. Remote stage/delete/settlement must not race an ignored cancel.
-        _watchdog_tasks = list(pending)
-        raise EventJournalUnavailable(
-            f"{len(pending)} session watchdog(s) ignored cancellation"
-        )
-    for task in done:
-        if not task.cancelled() and task.exception() is not None:
-            logger.warning(
-                "Session watchdog failed while joining terminal teardown: %s",
-                type(task.exception()).__name__,
-            )
-
-
-def _signal_ws_connected() -> None:
-    """Signal that a WebSocket has connected. Cancels the boot-WS watchdog."""
-    if _ws_connected_event is not None:
-        _ws_connected_event.set()
 
 
 def _get_agent_metrics() -> Optional[Dict[str, Any]]:
@@ -2037,151 +1302,6 @@ def _aux_health_for_heartbeat() -> Optional[Dict[str, Any]]:
         return aux_llm.health.heartbeat_summary()
     except Exception:
         return None
-
-
-async def _exit_workspace_not_ready(thread_id: str, exc: Exception) -> NoReturn:
-    """Handle an unrecoverable workspace error during lifespan startup
-    (WorkspaceNotReady — never provisioned/wedged; or WorkspaceUnavailableError
-    — pod dead/unreachable): best-effort deregister then exit.
-
-    Exits the process with status 0 (pod Completed, not Failed) so Kubernetes
-    does not restart-loop the pod.  The orchestrator's session reconciler will
-    recover the workspace and bind a fresh agent on the next interaction.
-    """
-    logger.info(
-        "Workspace not ready for thread %s (%s) — exiting cleanly so the "
-        "orchestrator can rebind once the workspace recovers (not a crash).",
-        thread_id,
-        exc,
-    )
-    await _session_attach.release_before_dedicated_exit(thread_id)
-    if _orchestrator_client:
-        try:
-            _orchestrator_client.stop_heartbeat()
-            if _heartbeat_task:
-                _heartbeat_task.cancel()
-            await _orchestrator_client.deregister()
-            await _orchestrator_client.close()
-        except Exception as de:
-            logger.warning(
-                "Best-effort deregister on workspace-not-ready failed: %s", de
-            )
-    os._exit(0)
-
-
-async def _exit_grant_denied(thread_id: str, exc: Exception) -> NoReturn:
-    """Handle a capability-grant denial at session attach (the workspace endpoint
-    returned 403): log the REAL reason and exit cleanly (status 0, pod Completed
-    — no K8s restart-loop). Unlike :func:`_exit_workspace_not_ready` this is NOT
-    a transient workspace problem — a rebind hits the identical denial — so we do
-    NOT claim the orchestrator will recover it. The cockpit re-surfaces the
-    reason on its next create/prepare via the grant pre-flight (Layers 1/2).
-    See knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md.
-    """
-    logger.error(
-        "Session attach denied for thread %s by capability grants (%s) — exiting "
-        "cleanly; NOT retrying (a rebind hits the same denial). The cockpit "
-        "surfaces this on its next create/prepare grant pre-flight.",
-        thread_id,
-        exc,
-    )
-    await _session_attach.release_before_dedicated_exit(thread_id)
-    if _orchestrator_client:
-        try:
-            _orchestrator_client.stop_heartbeat()
-            if _heartbeat_task:
-                _heartbeat_task.cancel()
-            await _orchestrator_client.deregister()
-            await _orchestrator_client.close()
-        except Exception as de:
-            logger.warning("Best-effort deregister on grant-denied exit failed: %s", de)
-    os._exit(0)
-
-
-async def _exit_memory_unavailable(thread_id: str, exc: Exception) -> NoReturn:
-    """Handle a required-memory setup failure at session attach: a configured
-    memory component (embedding-backed store or a plugin whose transport won't
-    resolve — e.g. the reranker endpoint) could not be set up.
-
-    Like :func:`_exit_grant_denied` this is a deterministic config failure, NOT
-    a transient workspace problem — a rebind hits the identical failure — so we
-    exit cleanly (status 0, pod Completed, no K8s restart-loop) rather than
-    crash-looping. The cockpit re-surfaces the reason on its next create/prepare
-    via the orchestrator's endpoint pre-flight (which validates the same roles
-    before spawning a pod). See
-    knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
-    """
-    logger.error(
-        "Session attach failed for thread %s — required memory unavailable (%s) "
-        "— exiting cleanly; NOT retrying (a rebind hits the same failure). The "
-        "cockpit surfaces this on its next create/prepare endpoint pre-flight.",
-        thread_id,
-        exc,
-    )
-    await _session_attach.release_before_dedicated_exit(thread_id)
-    if _orchestrator_client:
-        try:
-            _orchestrator_client.stop_heartbeat()
-            if _heartbeat_task:
-                _heartbeat_task.cancel()
-            await _orchestrator_client.deregister()
-            await _orchestrator_client.close()
-        except Exception as de:
-            logger.warning(
-                "Best-effort deregister on memory-unavailable exit failed: %s", de
-            )
-    os._exit(0)
-
-
-async def _exit_duplicate_provision(thread_id: str) -> NoReturn:
-    """Handle a lost provisioning race (409) during lifespan startup.
-
-    Another live agent already owns this thread, so this pod must not serve it.
-    We exit with status 0 (pod Completed under restartPolicy: Never, no restart
-    loop) so the pod drops out of the per-session Service's endpoints instead of
-    lingering as an orphan that black-holes ~half the cockpit's connection
-    attempts (the Service uses publishNotReadyAddresses, so a not-ready orphan
-    stays a live target). Only this pod's own agent record is cleaned up — never
-    any thread-scoped resource, which belongs to the winning agent.
-    """
-    logger.warning(
-        "Lost the provisioning race for thread %s — another live agent already "
-        "owns it; exiting cleanly so this orphan pod leaves the session Service "
-        "endpoints (not a crash).",
-        thread_id,
-    )
-    if _orchestrator_client:
-        try:
-            _orchestrator_client.stop_heartbeat()
-            if _heartbeat_task:
-                _heartbeat_task.cancel()
-            await _orchestrator_client.deregister()
-            await _orchestrator_client.close()
-        except Exception as de:
-            logger.warning(
-                "Best-effort deregister on duplicate-provision exit failed: %s", de
-            )
-    os._exit(0)
-
-
-async def _exit_session_ended(thread_id: str) -> NoReturn:
-    """Exit a dedicated runtime refused by the ended-session fence."""
-
-    logger.info(
-        "Thread %s ended before runtime attach — exiting without retrying or "
-        "serving credentials.",
-        thread_id,
-    )
-    if _orchestrator_client:
-        try:
-            _orchestrator_client.stop_heartbeat()
-            if _heartbeat_task:
-                _heartbeat_task.cancel()
-            await _orchestrator_client.deregister()
-            await _orchestrator_client.close()
-        except Exception as de:
-            logger.warning("Best-effort ended-session deregister failed: %s", de)
-    os._exit(0)
 
 
 @asynccontextmanager
@@ -2305,7 +1425,7 @@ async def lifespan(app: FastAPI):
                     get_status=_heartbeat_status,
                     get_job_id=lambda: None,
                     get_metrics=_get_agent_metrics,
-                    on_response=_handle_heartbeat_intents,
+                    on_response=_session_termination.handle_heartbeat_intents,
                 )
             )
             logger.info("Registered with orchestrator as persistent agent")
@@ -2314,9 +1434,9 @@ async def lifespan(app: FastAPI):
             # Exit cleanly so this orphan pod leaves the per-session Service
             # endpoints; the winning agent keeps serving and the orchestrator
             # does not rebind (the binding already exists). Does not return.
-            await _exit_duplicate_provision(_session_identity.thread_id)
+            await _session_termination.exit_duplicate_provision(_session_identity.thread_id)
         except SessionEnded:
-            await _exit_session_ended(_session_identity.thread_id)
+            await _session_termination.exit_session_ended(_session_identity.thread_id)
         except Exception as e:
             logger.warning(f"Failed to register with orchestrator (non-fatal): {e}")
             _orchestrator_client = None
@@ -2336,7 +1456,7 @@ async def lifespan(app: FastAPI):
         try:
             await _session_attach.attach(_session_identity.thread_id)
         except SessionEnded:
-            await _exit_session_ended(_session_identity.thread_id)
+            await _session_termination.exit_session_ended(_session_identity.thread_id)
         except SessionGrantDenied as e:
             # The session's resolved config exceeds the owner's capability grants
             # (workspace endpoint returned 403) — e.g. a grant revoked between the
@@ -2344,7 +1464,7 @@ async def lifespan(app: FastAPI):
             # attach. Permanent: exit with the REAL reason instead of the
             # misleading 'workspace not provisioned' rebind path; the cockpit
             # re-surfaces it on its next create/prepare grant pre-flight.
-            await _exit_grant_denied(_session_identity.thread_id, e)
+            await _session_termination.exit_grant_denied(_session_identity.thread_id, e)
         except MemoryUnavailableError as e:
             # A configured/required memory component couldn't be set up (store
             # init or a plugin transport that won't resolve — e.g. the reranker
@@ -2352,7 +1472,7 @@ async def lifespan(app: FastAPI):
             # reason instead of crashing (which triggered a workspace-release +
             # crash-loop retry). The cockpit re-surfaces it via the orchestrator
             # endpoint pre-flight.
-            await _exit_memory_unavailable(_session_identity.thread_id, e)
+            await _session_termination.exit_memory_unavailable(_session_identity.thread_id, e)
         except (WorkspaceNotReady, WorkspaceUnavailableError) as e:
             # Workspace raced us / is wedged (WorkspaceNotReady) or its pod is
             # dead/unreachable (WorkspaceUnavailableError — SSH connect exhausted
@@ -2360,7 +1480,7 @@ async def lifespan(app: FastAPI):
             # crashing, so K8s doesn't restart-loop. The orchestrator's session
             # reconcile (ensure_workspace drift probe) recreates the pod and
             # rebinds a fresh agent. See _exit_workspace_not_ready.
-            await _exit_workspace_not_ready(_session_identity.thread_id, e)
+            await _session_termination.exit_workspace_not_ready(_session_identity.thread_id, e)
     elif _session_identity.thread_id and not dedicated_register_ok:
         logger.info(
             "Skipping session attach for thread %s — orchestrator refused "
@@ -2396,7 +1516,7 @@ async def lifespan(app: FastAPI):
     # Exact drain settlement retries are independent of ordinary heartbeats
     # (Begin makes those authority-refused). Own their lifetime explicitly so
     # no HTTP/outcome task survives client close during process shutdown.
-    drain_retry_task = _pending_drain_suspend_retry_task
+    drain_retry_task = _session_termination.pending_drain_suspend_retry_task
     if drain_retry_task is not None and not drain_retry_task.done():
         drain_retry_task.cancel()
         try:
@@ -2416,7 +1536,7 @@ async def lifespan(app: FastAPI):
     # thread lifecycle belongs to the orchestrator, and the next claim (on any
     # pod) picks the thread back up from thread_messages.
     if _session:
-        await _terminate_session("shutdown", mark_thread=not stateless)
+        await _session_termination.terminate("shutdown", mark_thread=not stateless)
 
     if _orchestrator_client:
         try:
@@ -2894,150 +2014,6 @@ def _llm_config_with_cache_key(llm_cfg: Any) -> Any:
     return dataclasses.replace(llm_cfg, prompt_cache_key=f"srw-thread-{_session_identity.thread_id}")
 
 
-async def _terminate_session(
-    reason: str,
-    *,
-    mark_thread: bool = True,
-    preserve_shell: Optional[bool] = None,
-    preserve_workspace_daemons: bool = False,
-) -> str | None:
-    """Tear down the current session and return to idle.
-
-    Called by:
-      - WS-handler finally block? NO — under headless semantics WS close only
-        unsubscribes; the loop survives. WS close never calls this.
-      - Out-of-band lifecycle: drain intent, boot-WS timeout, thread-status
-        watchdog, REST /session/detach, process shutdown, MAX_SESSIONS sweep.
-      - The persistent loop's own completion handler (idle timeout, crash,
-        clean /done exit) routes here via _loop_completion_handler.
-
-    Re-entrancy: cancelling the loop task makes run_persistent_loop return
-    CLEANLY (it swallows CancelledError in the input wait), so the loop's
-    completion handler re-enters this function with reason="loop_complete"
-    while the out-of-band teardown is still running. The _terminating guard
-    makes that inner call a no-op — load-bearing for drain-suspend, where
-    the inner call's 'ended' write would defeat the orchestrator's
-    'suspended' transition.
-
-    Steps:
-      1. Cancel in-flight persistent-loop task (prevents permission_check race
-         that the commit 3a1d265 race-fix protects against).
-      2. Mark thread as ended (still resumable — `ended` is the only inactive
-         state). Skipped when ``mark_thread=False`` — the drain-suspend path
-         uses that to keep status authority with the orchestrator, which
-         flips the thread to 'suspended' instead.
-      3. Git commit + push.
-      4. Clean up session resources. ``preserve_shell`` is an independent
-         ownership disposition: true for a claim/pod handoff, false for a
-         genuine thread end. When omitted it follows ``not mark_thread`` for
-         back-compat, but losing an exact pinned binding always forces preserve.
-         ``preserve_workspace_daemons`` is narrower still: only the stateless
-         physical-claim handoff leaves workspace-side rclone/overlay processes
-         resident while retiring their agent-local controllers.
-      5. Clear session globals AND headless input primitives + subscribers.
-      6. Increment session counter, exit if max reached.
-
-    `reason` is logged and stored for observability — e.g. "drain",
-    "idle_timeout", "loop_crash", "loop_complete", "shutdown", "rest_detach",
-    "thread_ended_oob", "boot_ws_timeout", "legacy".
-    """
-    global _terminating, _termination_task
-    active = _termination_task
-    if active is not None and not active.done():
-        if asyncio.current_task() is _loop_task:
-            # The active owner cancels and awaits this loop task. Awaiting the
-            # owner here would form a cycle; this is the one safe no-op
-            # re-entry. Every independent release/complete caller waits below.
-            logger.debug("Terminate(%s) re-entered from the loop being joined", reason)
-            return
-        return await asyncio.shield(active)
-    if not _session:
-        return
-    termination_session = _session
-    termination_identity = _session_identity.retirement_identity()
-    termination_thread_id = _session_identity.thread_id
-
-    async def _run() -> str | None:
-        global _terminating, _termination_task
-        _terminating = True
-        try:
-            retry_attempt = 0
-            while True:
-                try:
-                    result = await _terminate_session_inner(
-                        reason,
-                        mark_thread=mark_thread,
-                        preserve_shell=preserve_shell,
-                        preserve_workspace_daemons=preserve_workspace_daemons,
-                    )
-                    if result != "actuator_requested" and reason in {
-                        "boot_ws_timeout",
-                        "thread_ended_oob",
-                        "thread_retirement_authorized",
-                    }:
-                        # These callers are watchdog tasks. The common teardown
-                        # cancels/joins them while this child remains shielded,
-                        # so only the surviving exact owner can schedule exit.
-                        _schedule_exit(delay=1.0)
-                    elif result != "actuator_requested" and _dedicated_pod_owes_exit(
-                        reason, termination_thread_id, mark_thread=mark_thread
-                    ):
-                        # A dedicated Pod exits once it settled its own End.
-                        # An End handed to the VM retirement actuator is still
-                        # pending, so in either branch the Pod stays for it.
-                        _schedule_exit(delay=1.0)
-                    return result
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    retry_identity = _retirement_admission_identity
-                    retryable_exact_retirement = bool(
-                        _session_identity.runtime_contract
-                        and termination_identity is not None
-                        and _session is termination_session
-                        and _session_identity.retirement_identity() == termination_identity
-                        and (
-                            retry_identity == termination_identity
-                            or (mark_thread and retry_identity is None)
-                        )
-                    )
-                    if not retryable_exact_retirement:
-                        raise
-                    delay = _EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS[
-                        min(
-                            retry_attempt + 1,
-                            len(_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS) - 1,
-                        )
-                    ]
-                    retry_attempt += 1
-                    logger.warning(
-                        "Exact local retirement quiescence failed; retaining "
-                        "the nonclaimable owner and retrying (thread=%s type=%s)",
-                        termination_identity[0],
-                        type(exc).__name__,
-                    )
-                    if delay:
-                        await asyncio.sleep(delay)
-        finally:
-            _terminating = False
-            if _termination_task is asyncio.current_task():
-                _termination_task = None
-
-    task = asyncio.create_task(
-        _run(),
-        name=f"session-terminate-{str(_session_identity.thread_id or 'detached')[:12]}",
-    )
-    _termination_task = task
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        # Teardown continues as the single owner. Propagate caller
-        # cancellation without publishing a false completion signal.
-        raise
-
-
-_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS = (0.0, 0.25, 1.0, 3.0)
-
 # A dedicated Pod (``--thread-id``; the provisioner stamps
 # SESSION_BOUND_THREAD_ID) serves exactly one thread. When the Pod's own
 # teardown settles that thread's End, the orchestrator deliberately leaves the
@@ -3046,536 +2022,6 @@ _EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS = (0.0, 0.25, 1.0, 3.0)
 # watchdog-driven End does. Pool and dual Pods carry no bound thread; the pool
 # owns their lifecycle. See
 # knowledge-base/knowledge/issues/agent_initiated_pinned_end_wedges_permanent_delete.md.
-_DEDICATED_SELF_END_REASONS = frozenset(
-    {"archive", "idle_timeout", "loop_complete", "loop_crash"}
-)
-
-
-def _dedicated_pod_owes_exit(
-    reason: str, thread_id: Optional[str], *, mark_thread: bool
-) -> bool:
-    """Whether a settled self-End leaves this dedicated Pod without a purpose."""
-
-    return bool(
-        mark_thread
-        and reason in _DEDICATED_SELF_END_REASONS
-        and not _stateless_mode()
-        and thread_id
-        and os.environ.get("SESSION_BOUND_THREAD_ID", "") == str(thread_id)
-    )
-
-
-async def _request_vm_retirement_actuator(
-    *, pinned_agent_id: str, retirement_permanent: bool,
-) -> str:
-    """Retry only the frozen drain handoff; acceptance leaves End pending."""
-    session = _session
-    identity = _session_identity.retirement_identity()
-    if (
-        not isinstance(session, PersistentSession)
-        or not session.terminal_vm_drain_complete
-        or identity is None
-        or _retirement_admission_identity != identity
-        or _retirement_admission_disposition != "ended"
-        or _retirement_admission_permanent is not retirement_permanent
-        or not _retirement_admission_token
-        or session.local_quiescence_protocol
-    ):
-        raise EventJournalUnavailable("VM actuator handoff lacks exact local drain")
-    if session.terminal_actuator_request_accepted:
-        return "actuator_requested"
-    if session.terminal_actuator_request is None:
-        session.terminal_actuator_request = {
-            "pinned_agent_id": pinned_agent_id,
-            "pod_uid": str(os.environ.get("POD_UID") or ""),
-            "process_generation": str(
-                getattr(_orchestrator_client, "dispatch_process_generation", "") or ""
-            ),
-            "session_runtime_generation": identity[1],
-            "session_runtime_attach_token": identity[2],
-            "session_runtime_retirement_token": _retirement_admission_token,
-            "retirement_disposition": "ended",
-            "retirement_permanent": retirement_permanent,
-            "workspace_generation": session.workspace_generation,
-            "workspace_runtime_incarnation": session.workspace_runtime_incarnation,
-        }
-    attempt = 0
-    while _session is session and _session_identity.retirement_identity() == identity:
-        try:
-            response = await _orchestrator_client.request_thread_retirement_actuator(
-                identity[0], **session.terminal_actuator_request,
-            )
-            if isinstance(response, dict) and response.get("status") in {
-                "actuator_requested", "settled_or_superseded",
-            }:
-                session.terminal_actuator_request_accepted = True
-                return "actuator_requested"
-        except Exception as exc:
-            logger.warning("VM actuator handoff response unavailable (thread=%s type=%s)",
-                           identity[0], type(exc).__name__)
-        delay = _EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS[
-            min(attempt, len(_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS) - 1)
-        ]
-        attempt += 1
-        await asyncio.sleep(delay)
-    raise EventJournalUnavailable("VM actuator handoff identity changed")
-
-
-async def _settle_exact_retirement_after_quiescence(
-    *,
-    pinned_agent_id: str | None,
-    retirement_disposition: str,
-    retirement_permanent: bool,
-    expected_identity: tuple[str, str | None, str | None] | None,
-) -> bool:
-    """Retry/reconcile only the immutable final ACK, never local cleanup.
-
-    The orchestrator may durably settle and then lose the HTTP 200. Replaying
-    the same G/attach/T/disposition/permanent/proof tuple is idempotent and a
-    settled-or-superseded 200 is authoritative.  The tracked common
-    termination task remains the retry owner with a capped backoff after the
-    short fast-retry window.  It never re-enters shell/mount/session cleanup.
-    A read of the append-only exact outcome ledger closes the masked-response
-    case without inferring success from a generic 409 or a successor life.
-    """
-
-    exact_generation = expected_identity[1] if expected_identity else None
-    exact_attach_token = expected_identity[2] if expected_identity else None
-    exact_retirement_token = _retirement_admission_token
-    exact_contract = bool(
-        _session_identity.runtime_contract
-        and pinned_agent_id
-        and exact_generation
-        and exact_attach_token
-        and exact_retirement_token
-    )
-    attempt = 0
-    while True:
-        delay = _EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS[
-            min(attempt, len(_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS) - 1)
-        ]
-        if delay:
-            await asyncio.sleep(delay)
-        if _session_identity.retirement_identity() != expected_identity:
-            return False
-        try:
-            settled = await _update_thread_status(
-                "ended",
-                pinned_agent_id=pinned_agent_id,
-                retirement_disposition=retirement_disposition,
-                retirement_permanent=retirement_permanent,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Exact retirement settlement attempt failed (thread=%s type=%s)",
-                expected_identity[0] if expected_identity else _session_identity.thread_id,
-                type(exc).__name__,
-            )
-            settled = False
-        if settled:
-            return True
-        if not exact_contract:
-            return False
-        outcome_reader = getattr(
-            _orchestrator_client, "get_thread_retirement_outcome", None
-        )
-        if callable(outcome_reader):
-            try:
-                outcome = await outcome_reader(
-                    expected_identity[0],
-                    pinned_agent_id=pinned_agent_id,
-                    session_runtime_generation=exact_generation,
-                    session_runtime_attach_token=exact_attach_token,
-                    session_runtime_retirement_token=exact_retirement_token,
-                    retirement_disposition=retirement_disposition,
-                    retirement_permanent=retirement_permanent,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Exact retirement outcome reconciliation failed "
-                    "(thread=%s type=%s)",
-                    expected_identity[0],
-                    type(exc).__name__,
-                )
-                outcome = None
-            if (
-                isinstance(outcome, dict)
-                and outcome.get("status") == "settled_or_superseded"
-                and outcome.get("outcome") in {"settled", "deleted"}
-                and outcome.get("retirement_disposition") == retirement_disposition
-                and outcome.get("retirement_permanent") is retirement_permanent
-            ):
-                return True
-        attempt += 1
-
-
-async def _terminate_session_inner(
-    reason: str,
-    *,
-    mark_thread: bool = True,
-    preserve_shell: Optional[bool] = None,
-    preserve_workspace_daemons: bool = False,
-) -> str | None:
-    """Body of _terminate_session — only reached holding the _terminating guard."""
-    global _session, _sessions_served, _loop_task
-    global _events_epoch, _next_seq, _tool_inflight, _turn_event_open
-    global _turn_tool_execution_identity, _turn_tool_execution_external_hook
-    global _event_writer, _cloud_sync_retry_pending, _draft_title_value
-    global _active_permission_request_id
-    global _runtime_authorization_admission_open
-
-    if not _session:
-        return
-
-    thread_id = _session_identity.thread_id
-    runtime_generation = _session_identity.session_generation
-    runtime_attach_token = _session_identity.attach_token
-    retirement_disposition = _terminal_retirement_disposition()
-    retirement_permanent = (
-        _retirement_admission_permanent
-        if _retirement_admission_identity == _session_identity.retirement_identity()
-        and _retirement_admission_permanent is not None
-        else False
-    )
-    preserve_remote_shell = (
-        not mark_thread if preserve_shell is None else preserve_shell
-    )
-    logger.info(f"Terminating session: thread={thread_id} reason={reason}")
-
-    pinned_control_owner = (
-        None
-        if _stateless_mode()
-        else (_control_owner_agent_id or _registered_pinned_agent_id())
-    )
-    if mark_thread and not _stateless_mode():
-        # Linearize retirement before *any* local teardown effect. Besides
-        # explicit/idle archive, this common path owns loop crash/complete,
-        # shutdown, watchdog and REST detach. Cancelling the loop, stopping
-        # transports or cleaning mounts before the durable ``ending`` fence
-        # would leave the row preparable while teardown was already in flight.
-        # Repeating the exact generation/attach-token transition is
-        # intentionally idempotent and reuses the orchestrator's pending
-        # retirement authority.
-        if not await _begin_exact_session_retirement(
-            pinned_agent_id=pinned_control_owner,
-            retirement_disposition=retirement_disposition,
-            retirement_permanent=retirement_permanent,
-            # Common termination owns a dedicated retry task and may run after
-            # the turn loop has already completed/crashed. Never reopen input
-            # or controls into a consumerless runtime between Begin retries.
-            reopen_controls_if_uncommitted=False,
-        ):
-            raise EventJournalUnavailable(
-                f"cannot begin exact thread retirement before teardown: {thread_id}"
-            )
-
-    vm_actuator_handoff = bool(
-        mark_thread
-        and not preserve_remote_shell
-        and not preserve_workspace_daemons
-        and _session_identity.runtime_contract
-        and pinned_control_owner
-        and retirement_disposition == "ended"
-        and _retirement_admission_identity == _session_identity.retirement_identity()
-        and _retirement_admission_token
-        and _session.workspace_backend_tier in {"vm", "remote"}
-    )
-    if vm_actuator_handoff and _session.terminal_vm_drain_complete is True:
-        return await _request_vm_retirement_actuator(
-            pinned_agent_id=pinned_control_owner,
-            retirement_permanent=retirement_permanent,
-        )
-
-    # Cancel in-flight loop_task FIRST. Out-of-band callers (heartbeat-intent
-    # drain, thread-status watchdog) reach this without going through the
-    # loop's normal exit path, so without this the loop's next
-    # _session.permission_mode access AttributeErrors when we null _session
-    # below. Skipped when invoked from inside the loop itself (e.g. via
-    # _loop_completion_handler's cleanup, which would deadlock awaiting self).
-    loop_task = _loop_task
-    if loop_task is not None and loop_task is not asyncio.current_task():
-        if not loop_task.done():
-            loop_task.cancel()
-            try:
-                await loop_task
-            except (asyncio.CancelledError, Exception):
-                pass
-    _loop_task = None
-
-    # Cancel and join self-cleanup watchdogs first — merely dropping their
-    # task references would let a delayed cancellation/finally block overlap
-    # the remote stage/delete/settlement actuator below.
-    await _stop_and_join_watchdogs()
-
-    # Close public admission before stopping a pinned owner. The dedicated
-    # gate is needed for drain-suspend: the general agent status route forbids
-    # writing ``suspended``, and marking ``ended`` would prevent the snapshot
-    # transition that follows teardown. The thread-row update serializes with
-    # admission; one last exact-owner drain then consumes every request that
-    # committed before closure. A lost binding means a successor owns that
-    # work, so this runtime must not adopt it.
-    admission_closed = True
-    if pinned_control_owner is not None and not _retirement_admission_closed():
-        admission_closed = await _close_pinned_control_inbox(
-            agent_id=pinned_control_owner
-        )
-        if not admission_closed:
-            # The reciprocal binding is the pinned owner's resource fence. A
-            # stale pod that lost it may close only its own transports; the
-            # successor can already be using the deterministic remote tmux.
-            preserve_remote_shell = True
-            logger.info(
-                "Pinned control admission close skipped: exact binding moved "
-                "(thread=%s agent=%s)",
-                thread_id,
-                pinned_control_owner,
-            )
-
-    # Retire this thread's announced permission rows, then drop the ledger.
-    # The turn-end sweep in _loop_on_turn_complete is the usual owner, but the
-    # cancel above skips it. The helper holds the exact queue lease or pinned
-    # reciprocal binding through each irreversible UPDATE, so a binding move
-    # after admission closure cannot let this stale runtime touch successor
-    # rows.
-    _gates_in_flight.clear()
-    _active_permission_request_id = None
-    await _retire_announced_permission_rows(f"session terminated ({reason})")
-    _announced_permission_rows.clear()
-
-    # A pinned consumer owns the attach lifetime; a stateless consumer owns
-    # the active lease. In both cases it must be fully stopped before the
-    # journal writer drains or ownership is released.
-    await _stop_thread_interrupt_watcher()
-    await _stop_thread_control_watcher()
-
-    # Join process-global side tasks while the captured session/thread identity
-    # and event writer are still authoritative.  A delayed title or protected
-    # cloud ping must never observe the next pool attachment.
-    await _quiesce_session_side_tasks()
-
-    # B11: final memory capture for ALL pinned terminate reasons — the ✕-button
-    # detach (and drain, watchdog, shutdown, …) historically skipped
-    # extraction entirely. Stateless turns instead mint one durable per-turn
-    # obligation and must never run this full-history writer as a duplicate.
-    # Manager-mode only; the flag-off pinned path keeps today's (skipping)
-    # behaviour. The guard flag stops a re-extraction when
-    # _handle_archive/_handle_idle_archive already captured. Must run before
-    # _session.cleanup() tears down the stores; contained like the sibling
-    # teardown steps — a memory failure must never skip cleanup.
-    if (
-        getattr(_session, "terminal_memory_capture_attempted", False) is not True
-        and not _stateless_mode()
-        and _session.memory_service is not None
-        and not _session.final_memory_extracted
-        and _session.messages
-        and not (_session.shell_owner_token is not None and not mark_thread)
-        and not _termination_admission_closed()
-    ):
-        _session.terminal_memory_capture_attempted = True
-        try:
-            from agent.services.memory import CaptureEvent
-
-            await _session.memory_service.capture(
-                CaptureEvent(kind="session_end", messages=_session.messages)
-            )
-            _session.final_memory_extracted = True
-            logger.info("Terminate(%s): final memory capture complete", reason)
-        except Exception as e:
-            logger.warning(f"Terminate memory capture failed (non-fatal): {e}")
-
-    # capture_nowait(pre_compaction) and asynchronous citation verification
-    # both carry session-scoped write/callback authority. Disarm and join them
-    # before the journal closes and before a queue claimant can be released.
-    try:
-        quiesce_result = _session.quiesce_background_tasks()
-        if inspect.isawaitable(quiesce_result):
-            await quiesce_result
-        elif isinstance(_session, PersistentSession):
-            raise RuntimeError("PersistentSession RAM quiescence is not awaitable")
-    except Exception as exc:
-        if not _stateless_mode():
-            raise EventJournalUnavailable(
-                "pinned session background work did not quiesce"
-            ) from exc
-        if _session.shell_owner_token is not None:
-            raise
-        logger.warning(
-            "Pinned session background-task quiescence failed (contained)",
-            exc_info=True,
-        )
-
-    if getattr(_session, "terminal_finalization_attempted", False) is not True:
-        _session.terminal_finalization_attempted = True
-        # Final cloud sync + drop secrets. No more background polling to stop:
-        # Phase 1 moved sync to turn boundaries via the coordinator. The last
-        # turn's background push must land first — never two concurrent walks of
-        # one mount, and never an aclose under an in-flight push.
-        if _session.workspace_sync:
-            try:
-                await _await_pending_cloud_push()
-                # Stateless bytes are committed only by the armed generation task
-                # above. A second raw push here would have no durable requirement
-                # or acknowledgement and, on lease-loss teardown, could overlap a
-                # successor's pull. Pinned teardown keeps its existing final
-                # push+pull byte-for-byte.
-                if not _stateless_mode():
-                    await _session.workspace_sync.push_all()
-                    await _session.workspace_sync.pull_all()
-            except Exception as e:
-                logger.warning(f"Final cloud sync failed (non-fatal): {e}")
-            if _background_push_owns(_session.workspace_sync):
-                # Step 4a: a handed-off push still transmits through this
-                # coordinator; its done-callback closes it. Closing here would
-                # yank the WebDAV client from under the off-slot transmit.
-                logger.info(
-                    "cloud sync coordinator left open for the handed-off push (thread %s)",
-                    thread_id,
-                )
-            else:
-                try:
-                    await _session.workspace_sync.aclose()
-                except Exception as e:
-                    logger.debug(f"Cloud sync aclose failed (non-fatal): {e}")
-
-        # Final git commit + push
-        if _session.workspace_manager:
-            git_mgr = getattr(_session.workspace_manager, "git_manager", None)
-            if git_mgr and git_mgr.is_active:
-                try:
-                    if git_mgr.has_uncommitted_changes():
-                        git_mgr.commit(f"Session detach: thread {thread_id}")
-                    if git_mgr.push() is False:
-                        logger.warning("Final git push was unsuccessful (non-fatal): %s",
-                                       getattr(git_mgr, "last_push_error", None))
-                except Exception as e:
-                    logger.warning(f"Final git push failed (non-fatal): {e}")
-
-    # The journal owns a captured pool + thread identity. Drain it while both
-    # the session and live subscribers still exist: terminal Canvas failures
-    # can then emit their direct reconciliation control before teardown clears
-    # either registry, and a pool-mode reattach cannot inherit queued events.
-    event_writer = _event_writer
-    if event_writer is not None:
-        try:
-            await event_writer.close()
-        except Exception as e:
-            if not _stateless_mode():
-                # A pinned End is not allowed to stage/delete/settle while an
-                # ordinary G-scoped journal batch may still be in flight.
-                # Preserve the writer and exact local retirement fence so the
-                # same authority can retry close; do not publish a false
-                # terminal lifecycle edge.
-                raise EventJournalUnavailable(
-                    "pinned thread event writer did not quiesce"
-                ) from e
-            logger.warning(
-                "thread_events writer close failed (thread=%s): %s",
-                thread_id,
-                e,
-            )
-        else:
-            _event_writer = None
-
-    # Shell ownership is deliberately separate from thread-status authority.
-    # Claim switches preserve by explicit/default disposition; a stale pinned
-    # owner that lost its reciprocal binding is forced to preserve above.
-    # This is deliberately after final Git: GitManager itself delegates through
-    # the remote shell. From here onward cleanup may mutate mount transports but
-    # no new tool/shell command is admitted.
-    _session.retire_shell_owner()
-    cleanup_kwargs = {
-        "preserve_shell": preserve_remote_shell,
-        "preserve_workspace_daemons": preserve_workspace_daemons,
-    }
-    if vm_actuator_handoff:
-        cleanup_kwargs["allow_vm_actuator_handoff"] = True
-    cleanup_result = await _session.cleanup(**cleanup_kwargs)
-    if cleanup_result == "actuator_required":
-        return await _request_vm_retirement_actuator(
-            pinned_agent_id=pinned_control_owner,
-            retirement_permanent=retirement_permanent,
-        )
-
-    if mark_thread and not await _settle_exact_retirement_after_quiescence(
-        pinned_agent_id=pinned_control_owner,
-        retirement_disposition=retirement_disposition,
-        retirement_permanent=retirement_permanent,
-        expected_identity=(
-            str(thread_id),
-            runtime_generation,
-            runtime_attach_token,
-        ),
-    ):
-        # Keep the exact local retirement mirror + captured session identity
-        # intact. The durable retirement reconciler may settle the same proof;
-        # no caller re-enters local cleanup, no false terminal frame is emitted,
-        # and no broad DB fallback may reopen Resume while unresolved.
-        raise EventJournalUnavailable(
-            f"cannot durably settle thread lifecycle after local teardown: {thread_id}"
-        )
-
-    # Clear session state
-    _session = None
-    _session_identity.release_thread()
-    _session_attach.clear_runtime_actor()
-
-    # Clear headless input state + subscriber registry. The pump tasks owned by
-    # each subscriber are cancelled by their socket handlers' finally blocks
-    # when those handlers notice the WS close; dropping the registry here
-    # ensures stale entries don't accumulate across sessions.
-    _session_input.teardown()
-    _session_identity.clear_process_generation()
-    _runtime_authorization_admission_open = False
-    _session_identity.set_status_contract(False)
-    _session_identity.clear(
-        expected_generation=runtime_generation,
-        expected_attach_token=runtime_attach_token,
-    )
-    _draft_title_value = None
-    _canvas_control.clear_all()
-    _subscribers.clear()
-
-    # Phase 2 event-log cursor reset. The next session attach reads the
-    # epoch fresh from the threads table. The ordered writer was already
-    # drained and cleared above, before either captured identity disappeared.
-    _events_epoch = 0
-    _next_seq = 0
-    _tool_inflight = False
-    _tool_inflight_calls.clear()
-    _turn_tool_execution_identity = None
-    _turn_tool_execution_external_hook = None
-    _turn_event_open = False
-    # Pool agents serve many threads; a pending retry must not leak into the
-    # next session, whose attach resolves its own cloud state.
-    _cloud_sync_retry_pending = False
-
-    # Safety valve: restart after N sessions to guard against state leakage
-    _sessions_served += 1
-    if _max_sessions_per_process > 0 and _sessions_served >= _max_sessions_per_process:
-        logger.info(
-            f"Max sessions per process reached ({_sessions_served}/{_max_sessions_per_process}). "
-            "Exiting — Docker will restart the container."
-        )
-        import sys
-
-        sys.exit(0)
-
-    logger.info(
-        f"Session terminated: thread={thread_id} "
-        f"reason={reason} (sessions served: {_sessions_served})"
-    )
-
-
-async def _detach_session() -> None:
-    """Back-compat shim. Prefer _terminate_session(reason) at new call sites.
-
-    Kept so existing tests patching `_detach_session` continue to work and so
-    code paths not yet updated don't break. Logs at DEBUG so each invocation
-    is traceable.
-    """
-    logger.debug("_detach_session() called via back-compat shim")
-    await _terminate_session("legacy")
-
 
 
 async def _pool_session_attach_response(request: Dict[str, Any]) -> JSONResponse:
@@ -3666,8 +2112,8 @@ def session_transport_bindings() -> SessionTransportBindings:
         session=lambda: _session,
         thread_id=lambda: _session_identity.thread_id,
         identity_fingerprint=lambda: _session_identity.fingerprint(),
-        runtime_admission_closed=lambda: _runtime_admission_closed(),
-        retirement_admission_closed=lambda: _retirement_admission_closed(),
+        runtime_admission_closed=lambda: _session_termination.runtime_admission_closed(),
+        retirement_admission_closed=lambda: _session_termination.retirement_admission_closed(),
         protected_cloud_ready=lambda: _protected_cloud_runtime_ready(),
         session_ready=lambda: _session_ready(),
         input_queue=lambda: _session_input.queue,
@@ -3698,8 +2144,8 @@ def session_transport_bindings() -> SessionTransportBindings:
             connection=SessionConnectionPorts(
                 subscribe=lambda client_id: _subscribe(client_id),
                 unsubscribe=lambda client_id: _unsubscribe(client_id),
-                note_connection_arrived=lambda: _signal_ws_connected(),
-                track_side_task=lambda task: _track_session_side_task(task),
+                note_connection_arrived=lambda: _session_termination.signal_ws_connected(),
+                track_side_task=lambda task: _session_termination.track_session_side_task(task),
             ),
             welcome=SessionWelcomePorts(
                 durable_control_modes=lambda: _durable_session_control_modes(),
@@ -3776,12 +2222,12 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         host = request.client.host if request.client is not None else ""
         if host not in {"127.0.0.1", "::1", "localhost"}:
             return JSONResponse({"error": "loopback only"}, status_code=403)
-        activate_termination_admission_fence("kubernetes_prestop")
+        _session_termination.activate_termination_admission_fence("kubernetes_prestop")
         timeout_seconds = max(
             0.0,
             float(os.environ.get("PERSISTENT_TERMINATION_DRAIN_SECONDS", "165")),
         )
-        parked = await _wait_for_termination_quiescence(timeout_seconds)
+        parked = await _session_termination.wait_for_termination_quiescence(timeout_seconds)
         if not parked:
             logger.error(
                 "Persistent termination grace expired before the current turn "
@@ -3961,14 +2407,14 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
         thread_id = _session_identity.thread_id
         try:
-            result = await _terminate_session("rest_detach")
+            result = await _session_termination.terminate("rest_detach")
             if result == "actuator_requested":
                 return JSONResponse({"status": "ending", "thread_id": thread_id}, status_code=202)
             return JSONResponse(
                 {
                     "status": "detached",
                     "thread_id": thread_id,
-                    "sessions_served": _sessions_served,
+                    "sessions_served": _session_termination.sessions_served,
                 }
             )
         except Exception:
@@ -4098,8 +2544,8 @@ async def _loop_runtime_authority_current(
 
     def local_authority_open() -> bool:
         return bool(
-            not _termination_admission_closed()
-            and (allow_retirement_settlement or not _retirement_admission_closed())
+            not _session_termination.termination_admission_closed()
+            and (allow_retirement_settlement or not _session_termination.retirement_admission_closed())
         )
 
     if not local_authority_open() or not _protected_cloud_runtime_ready():
@@ -4210,7 +2656,7 @@ def _schedule_early_title(content: str) -> None:
         title_session = _session
         title_thread_id = str(_session_identity.thread_id or "")
         title_generation = _session_identity.attach_generation
-        _track_session_side_task(
+        _session_termination.track_session_side_task(
             asyncio.create_task(
                 _early_title_from_prompt(
                     content,
@@ -4248,7 +2694,7 @@ def _subscribe(client_id: str) -> asyncio.Queue:
         _subscribers, client_id, maxsize=_SUBSCRIBER_QUEUE_MAXSIZE
     )
     if was_empty and _orchestrator_client is not None and _session_identity.thread_id is not None:
-        _track_session_side_task(
+        _session_termination.track_session_side_task(
             asyncio.create_task(
                 _safe_set_thread_status("active"), name="phase5-revert-active"
             )
@@ -9553,7 +7999,7 @@ async def _loop_on_turn_complete_body(
     # turn-start hook (e.g. workspace_sync.error) can tear down the WS before
     # the title frame is flushed, leaving the cockpit header stuck on
     # "Untitled Session" until a manual refetch.
-    if turn_id <= 3 and _session.postgres_conn and not _termination_admission_closed():
+    if turn_id <= 3 and _session.postgres_conn and not _session_termination.termination_admission_closed():
         await _auto_title_after_first_turn()
 
     # Phase 1 of cloud_collaboration_model.md §9: push the agent's edits to
@@ -9612,7 +8058,7 @@ async def _loop_on_turn_complete_body(
         stage_agent_id = str(getattr(_orchestrator_client, "agent_id", None) or "")
         stage_runtime_generation = _session_identity.session_generation
         stage_attach_token = _session_identity.attach_token
-        _track_session_side_task(
+        _session_termination.track_session_side_task(
             asyncio.create_task(
                 _notify_cloud_stage(
                     stage_thread_id,
@@ -9951,65 +8397,6 @@ async def _loop_compaction_progress(event: str, params: Dict[str, Any]) -> None:
     See knowledge-base/knowledge/features/context_summarization_rework.md (S3).
     """
     _broadcast(event, params)
-
-
-async def _loop_completion_handler(loop_task: asyncio.Task) -> None:
-    """Wait for the persistent loop to finish, then run reason-appropriate cleanup.
-
-    Under headless semantics the WS handler no longer cleans up after the loop
-    in its finally block — the loop outlives the WS. So we attach this
-    completion handler when the loop is spawned, and it routes the exit path:
-
-    - IdleTimeoutError → archive + terminate as "idle_timeout"
-    - Other exceptions → terminate as "loop_crash"
-    - Clean exit → terminate as "loop_complete"
-    - CancelledError → already inside _terminate_session, do nothing
-    """
-    try:
-        await loop_task
-    except IdleTimeoutError:
-        logger.info("Persistent loop exited via idle timeout")
-        if _stateless_mode():
-            # Stateless lane: the pod-side idle timer must never end the
-            # THREAD — thread lifecycle is orchestrator-owned, and an
-            # 'ended' status (or the session.ended frame the archive
-            # broadcasts) would force an epoch bump on the next claim's
-            # attach (client cache-wipe cascade). Just drop the cached
-            # session; the next claim rebuilds from thread_messages.
-            await _terminate_session("idle_timeout", mark_thread=False)
-            return
-        try:
-            await _handle_idle_archive()
-        except Exception as e:
-            logger.warning(f"Idle archive failed: {e}")
-        await _terminate_session("idle_timeout")
-    except asyncio.CancelledError:
-        # Cancellation came from _terminate_session itself — don't re-enter.
-        # Re-raise so the wrapper task surfaces as cancelled.
-        raise
-    except Exception as e:
-        logger.warning(f"Persistent loop crashed: {e}", exc_info=True)
-        # Every opened turn gets a terminal edge, on this path too: without a
-        # turn.error the journal keeps turn.started open, every attached
-        # client spins on a turn that ended, and every reload that replays
-        # the journal reopens it. Persisted as a role='error' row so the
-        # line survives reload. Not on a lost lease — that turn belongs to
-        # a successor claim now, which closes it itself.
-        if not isinstance(e, LeaseLostError):
-            try:
-                await _loop_on_error(
-                    "The session loop stopped before this turn could be "
-                    f"settled: {e}. The transcript is preserved — send a "
-                    "message to continue."
-                )
-            except Exception:
-                logger.debug(
-                    "turn.error on loop crash failed (non-fatal)", exc_info=True
-                )
-        await _terminate_session("loop_crash", mark_thread=not _stateless_mode())
-    else:
-        logger.info("Persistent loop completed cleanly")
-        await _terminate_session("loop_complete", mark_thread=not _stateless_mode())
 
 
 def _safe_serialize(obj: Any) -> Any:
@@ -11030,7 +9417,7 @@ async def _compact_session_manually(
 
     before_count = len(_session.messages)
     runs_before = getattr(ctx_mgr, "compaction_runs", 0)
-    if _runtime_admission_closed():
+    if _session_termination.runtime_admission_closed():
         raise _ManualCompactionRefused(
             "runtime_terminating",
             "Persistent runtime is terminating; retry on its replacement",
@@ -11094,7 +9481,7 @@ async def _handle_compact(
     from working memory. A request that arrives mid-turn waits (bounded) for
     the loop to park.
     """
-    if _runtime_admission_closed():
+    if _session_termination.runtime_admission_closed():
         await _ws_send(
             ws,
             "error",
@@ -11911,14 +10298,14 @@ async def _handle_archive(ws: WebSocket) -> None:
 
         archived_thread_id = _session_identity.thread_id
         archived_runtime_generation = _session_identity.session_generation
-        archived_disposition = _terminal_retirement_disposition()
+        archived_disposition = _session_termination.terminal_retirement_disposition()
         # Close durable input/control/Resume admission before the first
         # teardown-side await. Memory, title, cloud sync and Git finalization
         # can all be slow; leaving the runtime live through those operations
         # would admit work that this archive path is already committed to
         # discarding. The orchestrator's exact generation/token transition is
         # the cross-process authority fence.
-        if not await _begin_exact_session_retirement(
+        if not await _session_termination.begin_retirement(
             retirement_disposition=archived_disposition,
         ):
             raise EventJournalUnavailable(
@@ -11941,7 +10328,7 @@ async def _handle_archive(ws: WebSocket) -> None:
         if (
             not _stateless_mode()
             and _session.memory_service is not None
-            and not _termination_admission_closed()
+            and not _session_termination.termination_admission_closed()
         ):
             from agent.services.memory import CaptureEvent
 
@@ -11954,7 +10341,7 @@ async def _handle_archive(ws: WebSocket) -> None:
             and recall_store
             and _session.auxiliary_llm
             and _session.messages
-            and not _termination_admission_closed()
+            and not _session_termination.termination_admission_closed()
         ):
             try:
                 from shared.runtime.services.auxiliary import extract_and_store_memories
@@ -11998,7 +10385,7 @@ async def _handle_archive(ws: WebSocket) -> None:
         # state, not a falsely ended one. The orchestrator journals the
         # authoritative terminal edge; this direct WS acknowledgement is only
         # a low-latency echo for the command issuer after settlement succeeds.
-        result = await _terminate_session("archive")
+        result = await _session_termination.terminate("archive")
         if result == "actuator_requested":
             await _ws_send(ws, "session.ending", {
                 "thread_id": archived_thread_id,
@@ -12036,7 +10423,7 @@ async def _update_thread_status(
     """Durably update status via REST, falling back when REST says ``False``."""
     runtime_generation = _session_identity.session_generation
     runtime_attach_token = _session_identity.attach_token
-    runtime_retirement_token = _retirement_admission_token
+    runtime_retirement_token = _session_termination.retirement_admission_token
     if not _stateless_mode() and _session_identity.runtime_contract:
         if runtime_generation is None:
             logger.warning(
@@ -12115,9 +10502,9 @@ async def _update_thread_status(
                     identity = _session_identity.retirement_identity()
                     if (
                         identity is None
-                        or _retirement_admission_identity != identity
-                        or _retirement_admission_disposition != retirement_disposition
-                        or _retirement_admission_permanent is not retirement_permanent
+                        or _session_termination.retirement_admission_identity != identity
+                        or _session_termination.retirement_admission_disposition != retirement_disposition
+                        or _session_termination.retirement_admission_permanent is not retirement_permanent
                         or runtime_retirement_token is None
                         or _session is None
                     ):
@@ -12291,425 +10678,6 @@ async def _update_thread_status(
     return False
 
 
-async def _reconcile_retirement_begin_or_reopen_controls(
-    *,
-    identity: tuple[str, Optional[str], Optional[str]],
-    exact_agent_id: str,
-    retirement_disposition: str,
-    retirement_permanent: bool,
-    begin_was_sent: bool,
-    reopen_if_uncommitted: bool,
-) -> bool:
-    """Resolve an ambiguous Begin before reopening durable controls.
-
-    The control inbox is closed before the HTTP Begin. A dropped response may
-    mean either no retirement exists (the same runtime must reopen controls) or
-    an exact T was authorized (the runtime must adopt it and quiesce). Only the
-    exact lifecycle projection and token-null reopen CAS may distinguish those
-    cases; a generic 409, timeout, or moved successor never authorizes reopen.
-    """
-
-    global _retirement_admission_identity, _retirement_admission_disposition
-    global _retirement_admission_token, _retirement_admission_permanent
-
-    if _session_identity.retirement_identity() != identity:
-        return False
-
-    async def reopen_exact_runtime() -> bool | None:
-        """Reopen durable controls and the already-settled child runtime.
-
-        The DB CAS proves this exact life is still token-null.  Child resume
-        then performs its own awaited effect-authority proof.  If that second
-        proof or the settled-state check fails, close controls again and latch
-        local admission: an otherwise-live session must not resume only half
-        of its execution surfaces.
-        """
-
-        global _retirement_admission_identity, _retirement_admission_disposition
-        global _retirement_admission_token, _retirement_admission_permanent
-
-        if _session_identity.retirement_identity() != identity:
-            return None
-        if (
-            _retirement_admission_identity == identity
-            and _retirement_admission_token is not None
-        ):
-            return None
-        if not await _set_pinned_control_admission(
-            agent_id=exact_agent_id,
-            open_for_admission=True,
-        ):
-            return None
-        if _retirement_admission_identity == identity:
-            # A prior local resume failure may have latched a token-less
-            # admission fence. The exact token-null CAS above proves that
-            # fence is now safe to clear before SessionHost re-proves effect
-            # authority. An authorized token is never reopenable here.
-            _retirement_admission_identity = None
-            _retirement_admission_disposition = None
-            _retirement_admission_token = None
-            _retirement_admission_permanent = None
-        session = _session
-        resume = getattr(session, "resume_subagents", None)
-        try:
-            if session is None or not callable(resume):
-                raise RuntimeError("session has no child-runtime resume boundary")
-            await resume()
-            if _session is not session or _session_identity.retirement_identity() != identity:
-                raise RuntimeError("session identity moved during child-runtime resume")
-            return True
-        except Exception:
-            logger.warning(
-                "Child runtime could not resume after retirement abort "
-                "(thread=%s agent=%s)",
-                identity[0],
-                exact_agent_id,
-                exc_info=True,
-            )
-            try:
-                if _session_identity.retirement_identity() == identity:
-                    await _set_pinned_control_admission(
-                        agent_id=exact_agent_id,
-                        open_for_admission=False,
-                    )
-            except Exception:
-                logger.warning(
-                    "Control admission re-close failed after child-runtime "
-                    "resume refusal (thread=%s agent=%s)",
-                    identity[0],
-                    exact_agent_id,
-                    exc_info=True,
-                )
-            if _session_identity.retirement_identity() == identity:
-                _retirement_admission_identity = identity
-                _retirement_admission_disposition = retirement_disposition
-                _retirement_admission_token = None
-                _retirement_admission_permanent = retirement_permanent
-            return False
-
-    if not begin_was_sent:
-        # No retirement request crossed the process boundary. Reopening still
-        # uses the exact token-null DB CAS: a concurrent owner Begin or a moved
-        # successor wins and leaves this process closed.
-        if reopen_if_uncommitted:
-            try:
-                await reopen_exact_runtime()
-            except Exception:
-                logger.warning(
-                    "Exact control admission reopen failed after local retirement "
-                    "preflight (thread=%s agent=%s)",
-                    identity[0],
-                    exact_agent_id,
-                    exc_info=True,
-                )
-        return False
-
-    client = _orchestrator_client
-    lifecycle_reader = getattr(client, "get_thread_lifecycle", None)
-    if not callable(lifecycle_reader):
-        # Begin may have committed. A missing outcome reader cannot prove that
-        # controls are safe to reopen, even if the transport reported failure.
-        return False
-
-    attempt = 0
-    while _session_identity.retirement_identity() == identity:
-        try:
-            lifecycle = await lifecycle_reader(identity[0])
-        except Exception as exc:
-            logger.warning(
-                "Exact retirement Begin reconciliation failed (thread=%s type=%s)",
-                identity[0],
-                type(exc).__name__,
-            )
-            return False
-        if not isinstance(lifecycle, dict):
-            return False
-        observed_generation = canonical_runtime_generation(
-            lifecycle.get("session_runtime_generation")
-        )
-        observed_attach = canonical_runtime_generation(
-            lifecycle.get("session_runtime_attach_token")
-        )
-        exact_life = bool(
-            observed_generation == identity[1] and observed_attach == identity[2]
-        )
-        if lifecycle.get("authority_refused") is True or not exact_life:
-            # A successor/moved owner must never be reopened by this actor.
-            return False
-        pending = lifecycle.get("runtime_retirement_pending") is True
-        preflight = lifecycle.get("runtime_retirement_preflight") is True
-        authorized = lifecycle.get("runtime_retirement_authorized") is True
-        if pending and authorized and lifecycle.get("status") == "ending":
-            token = canonical_runtime_generation(
-                lifecycle.get("session_runtime_retirement_token")
-            )
-            if (
-                token is not None
-                and lifecycle.get("retirement_disposition") == retirement_disposition
-                and lifecycle.get("retirement_permanent") is retirement_permanent
-            ):
-                _retirement_admission_identity = identity
-                _retirement_admission_disposition = retirement_disposition
-                _retirement_admission_token = token
-                _retirement_admission_permanent = retirement_permanent
-                return True
-            # An authorized but malformed/conflicting immutable authority is
-            # not recoverable by this actor and must remain fail-closed.
-            return False
-        if (
-            not pending
-            and not preflight
-            and not authorized
-            and lifecycle.get("status")
-            in {
-                "created",
-                "active",
-                "awaiting_user",
-            }
-        ):
-            # This exact read proves no T at its snapshot. The reopen CAS
-            # repeats the same token-null predicate, so a Begin landing in
-            # between wins and forces another reconciliation iteration.
-            if not reopen_if_uncommitted:
-                return False
-            try:
-                reopened = await reopen_exact_runtime()
-                if reopened is not None:
-                    return False
-            except Exception:
-                logger.warning(
-                    "Exact control admission reopen raced retirement "
-                    "reconciliation (thread=%s agent=%s)",
-                    identity[0],
-                    exact_agent_id,
-                    exc_info=True,
-                )
-                return False
-        elif not (pending and preflight and not authorized):
-            # Only the server's hidden preflight is expected to remain
-            # unresolved until its TTL either authorizes or aborts it.
-            return False
-        delay = _EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS[
-            min(attempt + 1, len(_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS) - 1)
-        ]
-        attempt += 1
-        if delay:
-            await asyncio.sleep(delay)
-    return False
-
-
-async def _begin_exact_session_retirement(
-    *,
-    pinned_agent_id: Optional[str] = None,
-    retirement_disposition: str = "ended",
-    retirement_permanent: bool = False,
-    reopen_controls_if_uncommitted: bool = True,
-) -> bool:
-    """Close admission for this exact pinned life and mirror it locally."""
-
-    global _retirement_admission_identity, _retirement_admission_disposition
-    global _retirement_admission_token
-    global _retirement_admission_permanent
-
-    if _stateless_mode() or _session is None:
-        return False
-    if retirement_disposition not in {"ended", "suspended"}:
-        return False
-    if type(retirement_permanent) is not bool:
-        return False
-    identity = _session_identity.retirement_identity()
-    if identity is None:
-        return False
-    # Close the whole parent admission surface before child quiescence. A
-    # timeout or ambiguous terminal-delivery write leaves the child runtime
-    # non-accepting; keeping parent providers/inputs open in that state would
-    # create a half-live session. The common termination owner retries this
-    # exact tokenless identity until child settlement and Begin converge.
-    if _retirement_admission_identity != identity:
-        _retirement_admission_identity = identity
-        _retirement_admission_disposition = retirement_disposition
-        _retirement_admission_token = None
-        _retirement_admission_permanent = retirement_permanent
-    # Child terminal/transcript writes require the still-current parent
-    # authority. Close child admission and settle every generation before the
-    # server installs the retirement token that revokes it.
-    try:
-        await _session.quiesce_subagents(
-            f"parent session retiring as {retirement_disposition}"
-        )
-    except Exception:
-        logger.warning(
-            "Session child runtime did not quiesce before retirement "
-            "(thread=%s disposition=%s)",
-            _session_identity.thread_id,
-            retirement_disposition,
-            exc_info=True,
-        )
-        return False
-    # From this point onward every child is settled. Exact no-retirement
-    # reconciliation clears the tokenless latch and resumes both surfaces
-    # together; every other failure stays safely fail-closed.
-    if _retirement_admission_identity == identity:
-        if _retirement_admission_disposition != retirement_disposition:
-            return False
-        if _retirement_admission_permanent is not retirement_permanent:
-            return False
-        if _retirement_admission_token is not None:
-            return True
-        # The watchdog may have observed an authorised shape whose token was
-        # lost/malformed. Fall through to the idempotent exact Begin call and
-        # recover T before any local teardown effect.
-    exact_agent_id = pinned_agent_id or _registered_pinned_agent_id()
-    if exact_agent_id is not None:
-        # This is the sole pre-retirement operation. It serializes with public
-        # durable-control admission while the runtime token is still open and
-        # drains everything admitted before closure. Once `ending` installs a
-        # retirement token, the control owner fence intentionally refuses all
-        # further consumption; never move this drain after the status call.
-        try:
-            if not await _close_pinned_control_inbox(agent_id=exact_agent_id):
-                if _session_identity.runtime_contract:
-                    return await _reconcile_retirement_begin_or_reopen_controls(
-                        identity=identity,
-                        exact_agent_id=exact_agent_id,
-                        retirement_disposition=retirement_disposition,
-                        retirement_permanent=retirement_permanent,
-                        begin_was_sent=False,
-                        reopen_if_uncommitted=reopen_controls_if_uncommitted,
-                    )
-                return False
-        except Exception:
-            logger.warning(
-                "Exact control preflight failed before retirement (thread=%s agent=%s)",
-                _session_identity.thread_id,
-                exact_agent_id,
-                exc_info=True,
-            )
-            if _session_identity.runtime_contract:
-                return await _reconcile_retirement_begin_or_reopen_controls(
-                    identity=identity,
-                    exact_agent_id=exact_agent_id,
-                    retirement_disposition=retirement_disposition,
-                    retirement_permanent=retirement_permanent,
-                    begin_was_sent=False,
-                    reopen_if_uncommitted=reopen_controls_if_uncommitted,
-                )
-            return False
-    retirement_token: str | None = None
-    if _session_identity.runtime_contract:
-        if (
-            exact_agent_id is None
-            or _session_identity.session_generation is None
-            or _session_identity.attach_token is None
-            or _orchestrator_client is None
-        ):
-            if exact_agent_id is not None:
-                await _reconcile_retirement_begin_or_reopen_controls(
-                    identity=identity,
-                    exact_agent_id=exact_agent_id,
-                    retirement_disposition=retirement_disposition,
-                    retirement_permanent=retirement_permanent,
-                    begin_was_sent=False,
-                    reopen_if_uncommitted=reopen_controls_if_uncommitted,
-                )
-            return False
-        begin = getattr(_orchestrator_client, "begin_thread_retirement", None)
-        if not callable(begin):
-            await _reconcile_retirement_begin_or_reopen_controls(
-                identity=identity,
-                exact_agent_id=exact_agent_id,
-                retirement_disposition=retirement_disposition,
-                retirement_permanent=retirement_permanent,
-                begin_was_sent=False,
-                reopen_if_uncommitted=reopen_controls_if_uncommitted,
-            )
-            return False
-        try:
-            response = await begin(
-                str(_session_identity.thread_id),
-                pinned_agent_id=exact_agent_id,
-                session_runtime_generation=_session_identity.session_generation,
-                session_runtime_attach_token=_session_identity.attach_token,
-                retirement_disposition=retirement_disposition,
-                retirement_permanent=retirement_permanent,
-            )
-        except Exception:
-            logger.warning(
-                "Exact retirement Begin transport failed (thread=%s agent=%s)",
-                identity[0],
-                exact_agent_id,
-                exc_info=True,
-            )
-            return await _reconcile_retirement_begin_or_reopen_controls(
-                identity=identity,
-                exact_agent_id=exact_agent_id,
-                retirement_disposition=retirement_disposition,
-                retirement_permanent=retirement_permanent,
-                begin_was_sent=True,
-                reopen_if_uncommitted=reopen_controls_if_uncommitted,
-            )
-        if not isinstance(response, dict):
-            return await _reconcile_retirement_begin_or_reopen_controls(
-                identity=identity,
-                exact_agent_id=exact_agent_id,
-                retirement_disposition=retirement_disposition,
-                retirement_permanent=retirement_permanent,
-                begin_was_sent=True,
-                reopen_if_uncommitted=reopen_controls_if_uncommitted,
-            )
-        if (
-            response.get("status") != "ending"
-            or response.get("retirement_disposition") != retirement_disposition
-            or response.get("retirement_permanent") is not retirement_permanent
-        ):
-            return await _reconcile_retirement_begin_or_reopen_controls(
-                identity=identity,
-                exact_agent_id=exact_agent_id,
-                retirement_disposition=retirement_disposition,
-                retirement_permanent=retirement_permanent,
-                begin_was_sent=True,
-                reopen_if_uncommitted=reopen_controls_if_uncommitted,
-            )
-        retirement_token = canonical_runtime_generation(
-            response.get("session_runtime_retirement_token")
-        )
-        if retirement_token is None:
-            return await _reconcile_retirement_begin_or_reopen_controls(
-                identity=identity,
-                exact_agent_id=exact_agent_id,
-                retirement_disposition=retirement_disposition,
-                retirement_permanent=retirement_permanent,
-                begin_was_sent=True,
-                reopen_if_uncommitted=reopen_controls_if_uncommitted,
-            )
-    else:
-        if not await _update_thread_status(
-            "ending",
-            pinned_agent_id=exact_agent_id,
-            retirement_disposition=retirement_disposition,
-            retirement_permanent=retirement_permanent,
-        ):
-            if exact_agent_id is not None:
-                await _reconcile_retirement_begin_or_reopen_controls(
-                    identity=identity,
-                    exact_agent_id=exact_agent_id,
-                    retirement_disposition=retirement_disposition,
-                    retirement_permanent=retirement_permanent,
-                    begin_was_sent=False,
-                    reopen_if_uncommitted=reopen_controls_if_uncommitted,
-                )
-            return False
-    # The server fenced the captured G/token. Never mirror that fence onto a
-    # successor attached while the request was in flight.
-    if _session is None or _session_identity.retirement_identity() != identity:
-        return False
-    _retirement_admission_identity = identity
-    _retirement_admission_disposition = retirement_disposition
-    _retirement_admission_token = retirement_token
-    _retirement_admission_permanent = retirement_permanent
-    return True
-
-
 async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
     """Handle idle timeout — archive session state, set thread to ended.
 
@@ -12724,8 +10692,8 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
         # Idle exit is just as terminal as an explicit /done. Close exact
         # runtime admission before memory/title/Git awaits so a late control
         # or user input cannot enter behind the decision to retire.
-        if not await _begin_exact_session_retirement(
-            retirement_disposition=_terminal_retirement_disposition(),
+        if not await _session_termination.begin_retirement(
+            retirement_disposition=_session_termination.terminal_retirement_disposition(),
             # IdleTimeoutError means the loop has already returned. Keep the
             # gate closed and let common termination's exact retry owner retry
             # Begin; reopening here would admit work with no loop consumer.
@@ -12750,7 +10718,7 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
         if (
             not _stateless_mode()
             and _session.memory_service is not None
-            and not _termination_admission_closed()
+            and not _session_termination.termination_admission_closed()
         ):
             from agent.services.memory import CaptureEvent
 
@@ -12763,7 +10731,7 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
             and recall_store
             and _session.auxiliary_llm
             and _session.messages
-            and not _termination_admission_closed()
+            and not _session_termination.termination_admission_closed()
         ):
             try:
                 from shared.runtime.services.auxiliary import extract_and_store_memories
@@ -12808,7 +10776,7 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
         # durable ``session.ended`` journal edge. Publishing an agent-local
         # terminal frame earlier would make a failed settlement look ended and
         # could let Cockpit reopen Resume while cleanup is still in flight.
-        result = await _terminate_session("idle_timeout")
+        result = await _session_termination.terminate("idle_timeout")
         if result == "actuator_requested":
             logger.info("Idle archive awaiting VM stop: thread=%s", idle_thread_id)
             return
@@ -13330,7 +11298,7 @@ def _title_looks_conversational(title: str) -> bool:
 
 async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[str]:
     """Generate a short title from conversation using AuxiliaryLLM."""
-    if _termination_admission_closed():
+    if _session_termination.termination_admission_closed():
         logger.debug("Title generation skipped: termination admission is closed")
         return None
     if not auxiliary_llm or not messages:
@@ -13373,7 +11341,7 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
         # main-model fallback rather than a silent "Untitled Session".
         from shared.runtime.services.auxiliary import GenerateTitleTask
 
-        if _termination_admission_closed():
+        if _session_termination.termination_admission_closed():
             logger.debug("Title generation skipped: termination admission closed")
             return None
         result = await auxiliary_llm.chain(GenerateTitleTask("\n".join(sample)))

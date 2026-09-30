@@ -196,8 +196,8 @@ async def test_the_dedicated_boot_leaves_through_the_ended_session_exit(
 
     ended = AsyncMock()
     not_ready = AsyncMock()
-    monkeypatch.setattr(pa, "_exit_session_ended", ended)
-    monkeypatch.setattr(pa, "_exit_workspace_not_ready", not_ready)
+    monkeypatch.setattr(pa._session_termination, "exit_session_ended", ended)
+    monkeypatch.setattr(pa._session_termination, "exit_workspace_not_ready", not_ready)
     orchestrator = _Orchestrator(ending_generation=G1)
     client = _client(orchestrator)
     orchestrator.end()

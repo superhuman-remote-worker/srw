@@ -185,7 +185,7 @@ async def _loop_callbacks(monkeypatch):
         return None
 
     monkeypatch.setattr(pa, "run_persistent_loop", _fake_loop)
-    monkeypatch.setattr(pa, "_loop_completion_handler", _no_completion)
+    monkeypatch.setattr(pa._session_termination, "loop_completion_handler", _no_completion)
     monkeypatch.setattr(pa, "_loop_task", None)
     session = pa._session
     for name in (
@@ -216,10 +216,10 @@ async def _loop_callbacks(monkeypatch):
 
 
 def _open_admission(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(pa, "_TERMINATION_SENTINEL_PATH", tmp_path / "terminating")
-    monkeypatch.setattr(pa, "_termination_admission_fenced", False)
-    monkeypatch.setattr(pa, "_termination_fence_reason", None)
-    monkeypatch.setattr(pa, "_retirement_admission_identity", None)
+    monkeypatch.setattr(pa._session_termination, "termination_sentinel_path", tmp_path / "terminating")
+    monkeypatch.setattr(pa._session_termination, "termination_admission_fenced", False)
+    monkeypatch.setattr(pa._session_termination, "termination_fence_reason", None)
+    monkeypatch.setattr(pa._session_termination, "retirement_admission_identity", None)
     monkeypatch.setattr(pa, "_turn_event_open", False)
     monkeypatch.setattr(pa, "_tool_inflight", False)
     monkeypatch.setattr(pa, "_broadcast", MagicMock())
@@ -726,7 +726,7 @@ async def _attach(monkeypatch, thread_id: str) -> _AttachSession:
     )
     monkeypatch.setattr(pa, "_restore_session_messages", AsyncMock())
     monkeypatch.setattr(pa, "_update_thread_status", AsyncMock(return_value=True))
-    monkeypatch.setattr(pa, "_start_watchdogs", MagicMock())
+    monkeypatch.setattr(pa._session_termination, "start_watchdogs", MagicMock())
     monkeypatch.setattr(pa, "_build_sync_coordinator", MagicMock())
     monkeypatch.setattr(pa, "_session", None)
     monkeypatch.setattr(pa._session_identity, "_thread_id", None)
@@ -740,9 +740,9 @@ async def test_attach_teardown_attach_never_carries_input_state(monkeypatch, tmp
     _arrange_input_state(monkeypatch, queue_open=False)
     monkeypatch.setattr(pa, "_loop_task", None)
     monkeypatch.setattr(pa, "_event_writer", None)
-    monkeypatch.setattr(pa, "_terminating", False)
-    monkeypatch.setattr(pa, "_termination_task", None)
-    monkeypatch.setattr(pa, "_max_sessions_per_process", 0)
+    monkeypatch.setattr(pa._session_termination, "terminating", False)
+    monkeypatch.setattr(pa._session_termination, "termination_task", None)
+    monkeypatch.setattr(pa._session_termination, "max_sessions_per_process", 0)
     monkeypatch.setattr(pa, "_subscribers", {})
 
     first = await _attach(monkeypatch, "thread-one")
@@ -765,7 +765,7 @@ async def test_attach_teardown_attach_never_carries_input_state(monkeypatch, tmp
     assert _operations().signal_interrupt(2) == "hard"
     monkeypatch.setattr(pa, "_turn_event_open", False)
 
-    await pa._terminate_session("characterization", mark_thread=False)
+    await pa._session_termination.terminate("characterization", mark_thread=False)
     gone = _input_view()
     assert pa._session_identity.process_generation is None
     assert gone.queue is None
@@ -782,7 +782,7 @@ async def test_attach_teardown_attach_never_carries_input_state(monkeypatch, tmp
     assert (two.mode, two.target) == (None, None)
     assert two.hard_event is not one.hard_event and not two.hard_event.is_set()
     assert two.reclaim_lock is not one.reclaim_lock
-    await pa._terminate_session("characterization", mark_thread=False)
+    await pa._session_termination.terminate("characterization", mark_thread=False)
 
 
 # ---------------------------------------------------------------------------
@@ -823,12 +823,12 @@ async def test_parked_window_is_exactly_the_input_wait_and_termination_wakes_it(
                 break
         assert _input_view().awaiting is True
         assert pa._turn_in_flight() is False
-        assert pa._session_parked() is True
+        assert pa._session_termination.session_parked() is True
         pa._broadcast.assert_any_call("ready", {})
 
-        assert pa.activate_termination_admission_fence("characterization") is True
+        assert pa._session_termination.activate_termination_admission_fence("characterization") is True
         item = await asyncio.wait_for(getter, timeout=2)
-        assert item == pa._TERMINATION_QUEUE_SENTINEL
+        assert item == pa._session_termination.termination_queue_sentinel
         assert _input_view().awaiting is False
         assert pa._turn_in_flight() is True
     finally:
@@ -856,18 +856,18 @@ async def test_protected_reclaim_is_single_flight_and_joined_with_side_tasks(
     )
     monkeypatch.setattr(pa, "_session", session)
     monkeypatch.setattr(pa._session_identity, "_thread_id", "thread-protected")
-    monkeypatch.setattr(pa, "_session_side_tasks", set())
+    monkeypatch.setattr(pa._session_termination, "session_side_tasks", set())
     reclaims = AsyncMock(return_value=set())
     _replace_reclaim(monkeypatch, reclaims)
 
     _runtime_ops().schedule_protected_reclaim()
     task = _input_view().reclaim_task
-    assert task is not None and task in pa._session_side_tasks
+    assert task is not None and task in pa._session_termination.session_side_tasks
     _runtime_ops().schedule_protected_reclaim()
     assert _input_view().reclaim_task is task
     await asyncio.sleep(0)  # the task is now parked in its heal poll
 
-    await pa._quiesce_session_side_tasks()
+    await pa._session_termination.quiesce_session_side_tasks()
     assert task.cancelled()
     assert _input_view().reclaim_task is None
     reclaims.assert_not_awaited()
@@ -888,7 +888,7 @@ async def test_protected_reclaim_runs_once_when_the_same_life_heals(
     )
     monkeypatch.setattr(pa, "_session", session)
     monkeypatch.setattr(pa._session_identity, "_thread_id", "thread-heals")
-    monkeypatch.setattr(pa, "_session_side_tasks", set())
+    monkeypatch.setattr(pa._session_termination, "session_side_tasks", set())
     reclaim = AsyncMock(return_value=set())
     _replace_reclaim(monkeypatch, reclaim)
     monkeypatch.setattr(pa.asyncio, "sleep", _fast_sleep)

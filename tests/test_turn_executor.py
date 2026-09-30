@@ -607,7 +607,7 @@ class Harness:
             return harness.stale_result
 
         monkeypatch.setattr(pa._session_attach, "attach", fake_attach)
-        monkeypatch.setattr(pa, "_terminate_session", fake_terminate)
+        monkeypatch.setattr(pa._session_termination, "terminate", fake_terminate)
         monkeypatch.setattr(pa, "_ensure_persistent_loop_started", fake_ensure)
         monkeypatch.setattr(
             pa, "_start_thread_control_watcher", fake_start_control_watcher
@@ -1691,8 +1691,8 @@ class TestTurnError:
         pa._session_identity._thread_id = "physical-thread"
 
         with patch.object(
-            pa,
-            "_terminate_session",
+            pa._session_termination,
+            "terminate",
             new=AsyncMock(side_effect=RuntimeError("journal drain failed")),
         ):
             with pytest.raises(RuntimeError, match="journal drain failed"):

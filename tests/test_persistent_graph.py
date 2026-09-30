@@ -3534,7 +3534,7 @@ class TestToolExecutionLoop:
         async def authorize_end_after_provider(*_args):
             state["retirement_authorized"] = True
             # The delayed lifecycle watchdog has not installed the local latch.
-            assert pa._retirement_admission_identity is None
+            assert pa._session_termination.retirement_admission_identity is None
 
         callbacks = _make_callbacks(
             before_provider_execution=pa._loop_runtime_effect_authority_current,
@@ -3552,8 +3552,8 @@ class TestToolExecutionLoop:
             patch.object(pa._session_identity, "_process_generation", generation),
             patch.object(pa._session_identity, "_session_generation", generation),
             patch.object(pa._session_identity, "_attach_token", attach_token),
-            patch.object(pa, "_retirement_admission_identity", None),
-            patch.object(pa, "_termination_admission_fenced", False),
+            patch.object(pa._session_termination, "retirement_admission_identity", None),
+            patch.object(pa._session_termination, "termination_admission_fenced", False),
             patch.object(pa, "_tool_inflight", False),
             patch.dict(pa.os.environ, {"POD_UID": "pod-uid-a"}),
         ):

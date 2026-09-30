@@ -594,7 +594,7 @@ async def _handle_heartbeat_intents(response: Dict[str, Any]) -> None:
         # drain semantics are delegated, not re-implemented.
         import agent.api.persistent_app as pa
 
-        if pa._session is None or not pa._session_parked():
+        if pa._session is None or not pa._session_termination.session_parked():
             # No live session object yet (/session/attach flips the pod
             # state before the backgrounded setup creates pa._session) or a
             # turn is in flight — never tear down out-of-band. Left
@@ -614,7 +614,7 @@ async def _handle_heartbeat_intents(response: Dict[str, Any]) -> None:
             "Drain intent received (reason=%s) — suspending session and exiting",
             intents.get("drain_reason", "unspecified"),
         )
-        await pa._drain_suspend_session()
+        await pa._session_termination.drain_suspend_session()
     elif not _drain_intent_handled:
         # Busy — log once. The graph picks this up via is_drain_requested().
         _drain_intent_handled = True
@@ -723,9 +723,9 @@ async def lifespan(app: FastAPI):
     # Detach any active session
     if _pod_state == PodState.SESSION:
         try:
-            from agent.api.persistent_app import _detach_session
+            from agent.api.persistent_app import _session_termination
 
-            await _detach_session()
+            await _session_termination.detach_session()
         except Exception as e:
             logger.warning(f"Session detach during shutdown failed: {e}")
 
@@ -889,9 +889,9 @@ async def _reset_to_idle(
 
         if _pod_state == PodState.SESSION and not skip_session_cleanup:
             try:
-                from agent.api.persistent_app import _detach_session
+                from agent.api.persistent_app import _session_termination
 
-                await _detach_session()
+                await _session_termination.detach_session()
             except Exception as e:
                 logger.warning(f"Session cleanup during reset failed: {e}")
 
@@ -2129,7 +2129,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             # Same reason string as persistent_app's /session/detach so the
             # documented "Terminate(rest_detach)" signal greps identically
             # on dual pool pods (was the "legacy" back-compat shim).
-            await pa._terminate_session("rest_detach")
+            await pa._session_termination.terminate("rest_detach")
 
             if _should_loop():
                 await _reset_to_idle("session detach", skip_session_cleanup=True)
