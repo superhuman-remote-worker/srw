@@ -1792,6 +1792,12 @@ export interface ProjectWorkspaceDefaults {
     vm: Record<string, unknown> | null;
   };
   managed_by_manifest: boolean;
+  /** Whether this caller may edit these defaults: admin or Project owner,
+   *  Project not archived, row not manifest-owned — computed server-side. */
+  can_edit: boolean;
+  /** Whether this caller may pick their own Account templates here: true
+   *  only when this Project is the caller's own personal project. */
+  account_templates: boolean;
   effective: {
     jobs: {mode: WorkspaceMode; source: string};
     sessions: {mode: WorkspaceMode; source: string};

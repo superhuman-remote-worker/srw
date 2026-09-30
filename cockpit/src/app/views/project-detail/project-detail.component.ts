@@ -2155,12 +2155,12 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   readonly vmTemplates = computed(() => this.workspaceTemplates().filter((t) => t.backend === 'vm'));
   /** Manifest-owned rows, archived Projects and non-owner/non-admin members
    *  all render the same read-only fields (spec §6, Project page Settings
-   *  tab) — one gate for the template and the save button alike. */
+   *  tab) — one gate for the template and the save button alike. The server
+   *  decides `can_edit` (role, manifest ownership); `isArchived()` is kept
+   *  here too for instant feedback the moment this page archives the
+   *  Project, before a fresh defaults GET lands. */
   readonly canEditWorkspaceDefaults = computed(
-    () =>
-      !this.isArchived() &&
-      !this.workspaceDefaults()?.managed_by_manifest &&
-      (this.isAdmin() || this.project()?.user_role === 'owner'),
+    () => !this.isArchived() && this.workspaceDefaults()?.can_edit === true,
   );
   readonly workspaceModes = computed<WorkspaceMode[]>(() =>
     this.workspaceDefaults()?.vm_available === false
@@ -2266,7 +2266,6 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
         this.settingsCloudReadOnly.set(p.cloud_storage_read_only ?? false);
         this.settingsNetworkTier.set(p.network_tier ?? 'internet-only');
       }
-      // Reads this.project(), just set above, to decide the template scopes.
       this.loadWorkspaceDefaults();
     });
     this.loadJobs();
@@ -2715,43 +2714,45 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   }
 
   /** Workspace defaults: the Project's row in the chain (spec §6, Project
-   *  page Settings tab). Loads the stored/effective/installation view plus
+   *  page Settings tab). Loads the stored/effective/installation view, then
    *  the templates this Project may pick from, in the Catalog, Project and
-   *  (for the viewer's own personal project) Account scopes. */
+   *  (per the view's `account_templates` flag) Account scopes. Templates
+   *  load only once the view answers, since only it knows which scopes this
+   *  caller may see. */
   loadWorkspaceDefaults(): void {
     this.api.getProjectWorkspaceDefaults(this.projectId).subscribe({
-      next: (wd) => this.applyWorkspaceDefaults(wd),
+      next: (wd) => {
+        this.applyWorkspaceDefaults(wd);
+        const scopes: [string, string][] = [
+          ['Catalog', 'shared'],
+          ['Project', this.projectId],
+        ];
+        // The server's account_templates flag decides whether this Project's
+        // caller may see their own personal Account templates.
+        if (wd.account_templates) scopes.push(['Account', 'me']);
+        const me = this.userService.currentUser()?.id ?? 'me';
+        forkJoin(scopes.map(([kind, name]) => this.api.listWorkspaceTemplates(kind, name))).subscribe((lists) =>
+          this.workspaceTemplates.set(
+            lists.flatMap((list) =>
+              list.resources.map(({resource}) => {
+                const scope = resource.metadata.scope;
+                // The option list keys an Account scope to the caller's own id,
+                // not the literal 'me' sent in the query, so a stored personal-
+                // project Account ref (normalized to the caller's id server-side)
+                // matches an option here — see templateKey above.
+                const scopeName = scope.kind === 'Account' ? me : scope.name;
+                return {
+                  key: `${scope.kind}/${scopeName}/${resource.metadata.name}`,
+                  label: resource.metadata.annotations?.['srw.io/display-name'] ?? resource.metadata.name,
+                  backend: resource.spec.backend ?? '',
+                };
+              }),
+            ),
+          ),
+        );
+      },
       error: () => this.workspaceDefaults.set(null),
     });
-    const scopes: [string, string][] = [
-      ['Catalog', 'shared'],
-      ['Project', this.projectId],
-    ];
-    // Only the owner's Account templates are a personal project's to pick;
-    // an admin opening someone else's personal project must not see (and
-    // offer) their own.
-    const project = this.project();
-    if (project?.is_default && project.user_role === 'owner') scopes.push(['Account', 'me']);
-    const me = this.userService.currentUser()?.id ?? 'me';
-    forkJoin(scopes.map(([kind, name]) => this.api.listWorkspaceTemplates(kind, name))).subscribe((lists) =>
-      this.workspaceTemplates.set(
-        lists.flatMap((list) =>
-          list.resources.map(({resource}) => {
-            const scope = resource.metadata.scope;
-            // The option list keys an Account scope to the caller's own id,
-            // not the literal 'me' sent in the query, so a stored personal-
-            // project Account ref (normalized to the caller's id server-side)
-            // matches an option here — see templateKey above.
-            const scopeName = scope.kind === 'Account' ? me : scope.name;
-            return {
-              key: `${scope.kind}/${scopeName}/${resource.metadata.name}`,
-              label: resource.metadata.annotations?.['srw.io/display-name'] ?? resource.metadata.name,
-              backend: resource.spec.backend ?? '',
-            };
-          }),
-        ),
-      ),
-    );
   }
 
   private applyWorkspaceDefaults(wd: ProjectWorkspaceDefaults): void {
@@ -2831,7 +2832,11 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
         this.lifecycleBusy.set(false);
         this.pendingLifecycle.set(null);
         if (status === 'archived') this.archiveReport.set(this.describeArchive(report));
-        this.api.getProject(this.projectId).subscribe((p) => this.project.set(p));
+        this.api.getProject(this.projectId).subscribe((p) => {
+          this.project.set(p);
+          // can_edit follows the archive/unarchive without a page reload.
+          this.loadWorkspaceDefaults();
+        });
       },
       error: (err: unknown) => {
         this.lifecycleBusy.set(false);

@@ -52,6 +52,8 @@ function linkedDatasource(id: string): ProjectDatasource {
 const WORKSPACE_DEFAULTS: ProjectWorkspaceDefaults = {
   stored: {jobs: null, sessions: null, container: null, vm: null},
   managed_by_manifest: false,
+  can_edit: true,
+  account_templates: false,
   effective: {
     jobs: {mode: 'container', source: 'installation'},
     sessions: {mode: 'virtual', source: 'installation'},
@@ -66,10 +68,12 @@ const WORKSPACE_DEFAULTS: ProjectWorkspaceDefaults = {
 
 /** `createComponent(false)` (a bare boolean) keeps its old meaning:
  *  `datasourceScopeAutoAttachAvailable`. An options object adds `userRole`,
- *  which also switches the stubbed project from the suite's default
- *  (archived, no role — see the "archived read-only settings" describe below)
- *  to an active one carrying that role, since a role only matters for a
- *  Project that isn't already read-only for every member. */
+ *  which switches the stubbed project from the suite's default (archived —
+ *  see the "archived read-only settings" describe below) to an active one.
+ *  `GET /api/projects/{id}` never returns `user_role` (only the list
+ *  endpoints do), so the mock no longer carries it; the workspace-defaults
+ *  tests drive edit/template access through the `getProjectWorkspaceDefaults`
+ *  mock's `can_edit`/`account_templates` instead — see WORKSPACE_DEFAULTS. */
 function createComponent(options: boolean | {policyAvailable?: boolean; userRole?: ProjectMemberRole} = true) {
   const opts = typeof options === 'boolean' ? {policyAvailable: options} : options;
   const policyAvailable = opts.policyAvailable ?? true;
@@ -87,7 +91,7 @@ function createComponent(options: boolean | {policyAvailable?: boolean; userRole
     getProject: vi.fn().mockReturnValue(
       of(
         opts.userRole
-          ? {id: 'project-a', status: 'active', is_default: false, user_role: opts.userRole}
+          ? {id: 'project-a', status: 'active', is_default: false}
           : {id: 'project-a', status: 'archived'},
       ),
     ),
@@ -429,6 +433,18 @@ describe('ProjectDetailPageComponent archive lifecycle', () => {
     expect(component.lifecycleError()).toBeNull();
   });
 
+  it('reloads workspace defaults after the project refetch succeeds', () => {
+    // can_edit follows an archive or unarchive without a page reload.
+    const {api, component} = createComponent();
+    api.setProjectStatus.mockReturnValue(of({archived: true}));
+    api.getProjectWorkspaceDefaults.mockClear();
+
+    component.confirmArchive();
+    component.applyLifecycle();
+
+    expect(api.getProjectWorkspaceDefaults).toHaveBeenCalledWith('project-a');
+  });
+
   it('unarchives through the same path', () => {
     const {api, component} = createComponent();
     api.setProjectStatus.mockReturnValue(of({archived: false}));
@@ -654,14 +670,35 @@ describe('ProjectDetailPageComponent workspace defaults', () => {
     });
   });
 
-  it('is read-only for viewers, archived projects and manifest-owned defaults', () => {
-    const viewer = createComponent({userRole: 'viewer'});
-    viewer.component.loadAll();
-    expect(viewer.component.canEditWorkspaceDefaults()).toBe(false);
-    const managed = createComponent({userRole: 'owner'});
-    managed.api.getProjectWorkspaceDefaults.mockReturnValue(of({...WORKSPACE_DEFAULTS, managed_by_manifest: true}));
-    managed.component.loadAll();
-    expect(managed.component.canEditWorkspaceDefaults()).toBe(false);
+  it('can_edit: false makes the section read-only, even for an admin', () => {
+    const {api, component, currentUser} = createComponent({userRole: 'owner'});
+    currentUser.set({id: 'user-1', is_admin: true});
+    api.getProjectWorkspaceDefaults.mockReturnValue(of({...WORKSPACE_DEFAULTS, can_edit: false}));
+    component.loadAll();
+    expect(component.canEditWorkspaceDefaults()).toBe(false);
+  });
+
+  it('can_edit: true makes it editable for a non-admin', () => {
+    const {component} = createComponent({userRole: 'owner'});
+    component.loadAll();
+    expect(component.canEditWorkspaceDefaults()).toBe(true);
+  });
+
+  it('can_edit: true on an archived Project stays read-only', () => {
+    const {api, component} = createComponent();
+    api.getProjectWorkspaceDefaults.mockReturnValue(of({...WORKSPACE_DEFAULTS, can_edit: true}));
+    component.loadAll();
+    expect(component.canEditWorkspaceDefaults()).toBe(false);
+  });
+
+  it('lists no templates when the defaults GET fails', () => {
+    const {api, component} = createComponent({userRole: 'owner'});
+    api.getProjectWorkspaceDefaults.mockReturnValue(
+      throwError(() => new HttpErrorResponse({status: 500})),
+    );
+    component.loadAll();
+    expect(component.workspaceDefaults()).toBeNull();
+    expect(api.listWorkspaceTemplates).not.toHaveBeenCalled();
   });
 
   it('hides VM choices when VMs are unavailable', () => {
@@ -698,23 +735,23 @@ describe('ProjectDetailPageComponent workspace defaults', () => {
     });
   });
 
-  function personalProject(userRole?: ProjectMemberRole) {
+  function personalProject(accountTemplates: boolean) {
     const created = createComponent({userRole: 'owner'});
     created.api.getProject.mockReturnValue(
-      of({id: 'project-a', status: 'active', is_default: true, user_role: userRole}),
+      of({id: 'project-a', status: 'active', is_default: true}),
+    );
+    created.api.getProjectWorkspaceDefaults.mockReturnValue(
+      of({...WORKSPACE_DEFAULTS, account_templates: accountTemplates}),
     );
     created.component.loadAll();
     return created.api.listWorkspaceTemplates.mock.calls.map(([kind, name]) => `${kind}/${name}`);
   }
 
-  it("lists Account templates in the viewer's own personal project", () => {
-    expect(personalProject('owner')).toEqual(['Catalog/shared', 'Project/project-a', 'Account/me']);
+  it('account_templates: true lists Account/me', () => {
+    expect(personalProject(true)).toEqual(['Catalog/shared', 'Project/project-a', 'Account/me']);
   });
 
-  it("never lists the viewer's Account templates in someone else's personal project", () => {
-    // An admin (or a member) opening another user's personal project: the
-    // viewer's own Account templates aren't that project's to pick.
-    expect(personalProject(undefined)).toEqual(['Catalog/shared', 'Project/project-a']);
-    expect(personalProject('editor')).toEqual(['Catalog/shared', 'Project/project-a']);
+  it("account_templates: false does not list Account/me, even when the Project is_default", () => {
+    expect(personalProject(false)).toEqual(['Catalog/shared', 'Project/project-a']);
   });
 });

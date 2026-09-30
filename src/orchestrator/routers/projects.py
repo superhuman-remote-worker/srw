@@ -240,10 +240,12 @@ async def get_project_workspace_defaults(
     """The Project's workspace defaults: stored, effective, and any problems."""
     from orchestrator.services import project_workspace_defaults_view
 
-    _, project = await dependencies.require_project_member(
+    user, project = await dependencies.require_project_member(
         request, dependencies.store, project_id
     )
-    return await project_workspace_defaults_view.read_view(dependencies.store, project)
+    return await project_workspace_defaults_view.read_view(
+        dependencies.store, project, user
+    )
 
 
 @router.put("/api/projects/{project_id}/workspace-defaults")

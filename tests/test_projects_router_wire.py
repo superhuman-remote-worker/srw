@@ -446,6 +446,18 @@ class TestWorkspaceDefaultsRoutes:
         )
         view.assert_not_awaited()
 
+    def test_get_passes_the_caller_to_read_view(self, monkeypatch):
+        view = AsyncMock(return_value={"stored": {}})
+        monkeypatch.setattr(
+            "orchestrator.services.project_workspace_defaults_view.read_view", view
+        )
+        wired = _wire(store=_store())
+
+        response = wired.client.get(f"/api/projects/{PROJECT_ID}/workspace-defaults")
+
+        assert response.status_code == 200
+        view.assert_awaited_once_with(wired.store, dict(PROJECT), OWNER)
+
     def test_put_is_owner_gated(self, monkeypatch):
         update = AsyncMock(return_value={"stored": {}})
         monkeypatch.setattr(

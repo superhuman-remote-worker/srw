@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from orchestrator.schemas.projects import ProjectWorkspaceDefaultsUpdate
 from orchestrator.services.manifest_authority import ManifestAuthority
 from orchestrator.services.manifest_store import ManifestStore
+from orchestrator.services.project_status import project_is_archived
 from orchestrator.services.project_workspace_defaults import (
     read_current_project_defaults,
     save_settings_defaults,
@@ -62,8 +63,9 @@ def _template_name(selection: dict | None) -> str | None:
     return ref.get("name") if isinstance(ref, dict) else None
 
 
-async def read_view(db: Any, project: dict) -> dict[str, Any]:
-    """The Project's workspace defaults: stored, effective, and any problems."""
+async def read_view(db: Any, project: dict, user: dict) -> dict[str, Any]:
+    """The Project's workspace defaults: stored, effective, any problems, and
+    this caller's `can_edit`/`account_templates`."""
     row = await read_current_project_defaults(db, project["id"])
     stored = row or ProjectDefaults()
     try:
@@ -93,6 +95,17 @@ async def read_view(db: Any, project: dict) -> dict[str, Any]:
             problems[tier] = MISSING_PROJECT_TEMPLATE.format(
                 tier=tier, name=ref["name"]
             )
+    if user.get("is_admin"):
+        is_owner_or_admin = True
+    else:
+        role = await db.get_user_role_in_project(str(project["id"]), str(user["id"]))
+        is_owner_or_admin = role == "owner"
+    can_edit = (
+        is_owner_or_admin
+        and not project_is_archived(project)
+        and stored.source != "manifest"
+    )
+    account_templates = await _personal_owner(db, project) == str(user["id"])
     return {
         "stored": {
             "jobs": stored.jobs,
@@ -117,6 +130,8 @@ async def read_view(db: Any, project: dict) -> dict[str, Any]:
         "template_problems": problems,
         "installation_problems": installation_problems(),
         "vm_available": await vms_available(db),
+        "can_edit": can_edit,
+        "account_templates": account_templates,
     }
 
 
@@ -178,4 +193,4 @@ async def update_view(
         ProjectDefaults(jobs=body.jobs, sessions=body.sessions, **selections),
         actor_id=str(user["id"]),
     )
-    return await read_view(db, project)
+    return await read_view(db, project, user)
