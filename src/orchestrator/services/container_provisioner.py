@@ -3204,8 +3204,7 @@ class ContainerProvisioner:
             authority_check=check_authority,
             startup_reservation=(
                 _creation_reservation
-                if strict_stateless
-                or owner.kind == "job"
+                if (strict_stateless or owner.kind == "job")
                 and _creation_reservation.get("operation_kind") == "create"
                 else None
             ),
