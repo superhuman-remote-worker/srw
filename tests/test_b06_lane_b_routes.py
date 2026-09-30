@@ -76,6 +76,7 @@ def _admission_deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         replace_thread_mounts=AsyncMock(),
         list_thread_mounts=AsyncMock(return_value=[]),
         list_thread_mounts_bulk=AsyncMock(return_value={}),
+        container_workspace_creation_views=AsyncMock(return_value={}),
         list_threads=AsyncMock(return_value=[]),
         merge_thread_workspace_context=AsyncMock(),
         bind_thread_managed_repository=AsyncMock(return_value=True),
@@ -516,6 +517,9 @@ class TestList:
         assert response.json() == {"threads": []}
         deps.store.list_threads.assert_awaited_once_with(
             user_id=USER["id"], project_id="p-1", status="ended"
+        )
+        deps.store.container_workspace_creation_views.assert_awaited_once_with(
+            "thread", []
         )
 
 
