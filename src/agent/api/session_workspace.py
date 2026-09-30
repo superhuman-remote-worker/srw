@@ -471,7 +471,7 @@ async def poll_workspace_ready(
     """Poll orchestrator for workspace container readiness.
 
     ``vm_timeout`` is the extended budget applied automatically once the poll
-    observes a VM-backed thread in flight (``vm_status`` provisioning/created):
+    observes a VM-backed thread waiting for capacity or being created:
     a cold KubeVirt boot (CDI import + guest boot) routinely runs minutes past
     the sandbox-container ``timeout`` default, so the deadline self-extends
     rather than declaring a still-booting VM "not ready"
@@ -540,7 +540,11 @@ async def poll_workspace_ready(
         # sandbox-container default. Extend the poll deadline ONCE the moment we
         # observe the VM is in flight so a legitimate cold boot isn't declared
         # "not ready" — self-adjusting, no caller signal needed.
-        if not _vm_budget_applied and vm_status in ("provisioning", "created"):
+        if not _vm_budget_applied and vm_status in (
+            "waiting_capacity",
+            "provisioning",
+            "created",
+        ):
             deadline = start + max(timeout, vm_timeout)
             _vm_budget_applied = True
             logger.info(
