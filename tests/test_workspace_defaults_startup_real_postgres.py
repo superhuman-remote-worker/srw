@@ -18,6 +18,10 @@ from orchestrator.services.workspace_defaults_resolution import (
     installation_problems,
 )
 from tests import test_manifest_native_full_schema as full_schema
+from tests.test_workspace_defaults_resolution_real_postgres import (
+    _active_revision,
+    _manifest_project,
+)
 
 postgres_url = full_schema.postgres_url
 database = full_schema.database
@@ -27,6 +31,7 @@ actor = full_schema.actor
 @pytest.fixture(autouse=True)
 def chart(monkeypatch):
     monkeypatch.delenv("WORKSPACE_DEFAULTS", raising=False)
+    monkeypatch.delenv("WORKSPACE_BUILTIN_TEMPLATES", raising=False)
     monkeypatch.setenv("VM_MODE", "same-cluster")
 
 
@@ -62,6 +67,54 @@ async def test_vm_values_need_vms(database, monkeypatch):
     monkeypatch.setenv("WORKSPACE_DEFAULTS", json.dumps({"jobs": "vm"}))
     assert await check_installation_workspace_defaults(database) == [
         "VM workspaces are not available on this installation. (Helm workspace.defaults.jobs)"
+    ]
+
+
+def _catalog_template(name, backend):
+    return {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "WorkspaceTemplate",
+        "metadata": {"name": name, "scope": {"kind": "Catalog", "name": "shared"}},
+        "spec": {"backend": backend},
+    }
+
+
+@pytest.mark.asyncio
+async def test_an_empty_name_checks_the_declared_builtin(database, monkeypatch):
+    from orchestrator.services.builtin_workspace_templates import (
+        reconcile_builtin_workspace_templates,
+    )
+
+    declared = [
+        _catalog_template("container-full", "sandbox"),
+        _catalog_template("vm-full", "vm"),
+    ]
+    monkeypatch.setenv("WORKSPACE_BUILTIN_TEMPLATES", json.dumps(declared))
+    assert await check_installation_workspace_defaults(database) == [
+        "The built-in container template 'container-full' is missing; see the orchestrator's startup log.",
+        "The built-in vm template 'vm-full' is missing; see the orchestrator's startup log.",
+    ]
+    await reconcile_builtin_workspace_templates(database, declared)
+    assert await check_installation_workspace_defaults(database) == []
+
+
+@pytest.mark.asyncio
+async def test_a_builtin_name_held_by_another_tier_is_a_problem(
+    database, actor, monkeypatch
+):
+    from orchestrator.services.manifest_resources import ManifestResourceService
+
+    # A Catalog template that took the built-in's name first (the reconcile
+    # skips a conflicting built-in).
+    await ManifestResourceService(database).apply(
+        json.dumps(_catalog_template("container-full", "vm")), actor, format="json"
+    )
+    monkeypatch.setenv(
+        "WORKSPACE_BUILTIN_TEMPLATES",
+        json.dumps([_catalog_template("container-full", "sandbox")]),
+    )
+    assert await check_installation_workspace_defaults(database) == [
+        "The container template must be a container workspace. (built-in container-full)"
     ]
 
 
@@ -129,6 +182,8 @@ async def test_the_backfill_never_overwrites_a_row(database, actor):
         "manifest": 0,
         "legacy_project": 0,
         "preference": 0,
+        "healed": 0,
+        "skipped": 0,
     }
     assert (await read_project_defaults(database, manifest_project)).sessions == "vm"
 
@@ -179,10 +234,76 @@ async def test_a_legacy_project_migrated_into_a_manifest_resource_gets_a_setting
     )
 
     second = await backfill_workspace_defaults(database)
-    assert second == {"manifest": 0, "legacy_project": 0, "preference": 0}
+    assert second == {
+        "manifest": 0,
+        "legacy_project": 0,
+        "preference": 0,
+        "healed": 0,
+        "skipped": 0,
+    }
     unchanged = await read_project_defaults(database, project_id)
     assert (unchanged.jobs, unchanged.sessions, unchanged.source) == (
         "container",
         "container",
         "settings",
     )
+
+
+@pytest.mark.asyncio
+async def test_an_active_manifest_project_without_a_row_gets_a_manifest_row(
+    database, actor
+):
+    """Dev's real case: a Project manifest set defaults.workspace before A2b."""
+    project_id = await _manifest_project(database, actor)
+    await database.execute(
+        "DELETE FROM project_workspace_defaults WHERE project_id=$1::uuid", project_id
+    )
+
+    counts = await backfill_workspace_defaults(database)
+    assert counts["manifest"] == 1
+    row = await read_project_defaults(database, project_id)
+    assert (row.source, row.jobs, row.manifest_revision) == (
+        "manifest",
+        "container",
+        await _active_revision(database, project_id),
+    )
+    assert (await backfill_workspace_defaults(database))["manifest"] == 0
+
+
+@pytest.mark.asyncio
+async def test_the_backfill_heals_a_drifted_manifest_row(database, actor):
+    project_id = await _manifest_project(database, actor)
+    await database.execute(
+        "UPDATE project_workspace_defaults SET manifest_revision='sha256:stale' "
+        "WHERE project_id=$1::uuid",
+        project_id,
+    )
+
+    counts = await backfill_workspace_defaults(database)
+    assert (counts["healed"], counts["manifest"]) == (1, 0)
+    row = await read_project_defaults(database, project_id)
+    assert (row.source, row.manifest_revision) == (
+        "manifest",
+        await _active_revision(database, project_id),
+    )
+    assert (await backfill_workspace_defaults(database))["healed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_one_bad_project_never_stops_the_backfill(database):
+    first = await _project(
+        database, default_config_override={"workspace": {"backend": "sandbox"}}
+    )
+    # An unknown legacy backend: backend_mode raises ValueError.
+    bad = await _project(
+        database, default_config_override={"workspace": {"backend": "bogus"}}
+    )
+    last = await _project(
+        database, default_config_override={"workspace": {"backend": "vm"}}
+    )
+
+    counts = await backfill_workspace_defaults(database)
+    assert (counts["legacy_project"], counts["skipped"]) == (2, 1)
+    assert (await read_project_defaults(database, first)).jobs == "container"
+    assert (await read_project_defaults(database, last)).jobs == "vm"
+    assert await read_project_defaults(database, bad) is None

@@ -1,5 +1,6 @@
 """select_execution_workspace consults the defaults chain (Slice A2b)."""
 
+from copy import deepcopy
 import json
 from uuid import UUID
 
@@ -394,3 +395,142 @@ async def test_the_personal_project_row_decides_a_session(database, actor):
     )
     assert config["backend"] == "sandbox"
     assert receipt["sources"] == {"tier": "project", "template": "builtin"}
+
+
+# R15: a manifest-owned row holds only while its revision is the Project's
+# active one. Every writer that moves the revision syncs it, and a row left
+# behind (a missed writer, a pre-A2b pod in a rolling update) heals on read.
+BOX = {"backend": "sandbox", "resources": {"cpu": 1, "memory": "2Gi"}}
+
+
+async def _manifest_project(db, actor) -> str:
+    from orchestrator.services.manifest_resources import ManifestResourceService
+
+    document = {
+        "apiVersion": "srw/v1alpha1",
+        "kind": "Project",
+        "metadata": {"name": "managed-team"},
+        "spec": {
+            "description": "Manifest-owned workspace defaults",
+            "resources": {"workspaces": {"box": {"inline": deepcopy(BOX)}}},
+            "defaults": {"workspace": {"jobs": "container", "container": "box"}},
+        },
+    }
+    applied = await ManifestResourceService(db).apply(
+        json.dumps(document), actor, format="json"
+    )
+    uid = next(
+        item["uid"]
+        for item in applied["resources"]
+        if item["resource"]["kind"] == "Project"
+    )
+    return str(
+        await db.fetchval("SELECT linked_id FROM srw_resources WHERE id=$1", UUID(uid))
+    )
+
+
+async def _active_revision(db, project_id) -> str:
+    from orchestrator.services.manifest_projects import active_project_resource
+
+    return (await active_project_resource(db, project_id))["revision"]
+
+
+@pytest.mark.asyncio
+async def test_an_officer_kit_edit_keeps_the_manifest_defaults_current(database, actor):
+    from orchestrator.services.manifest_projects import persist_officer_controller
+    from orchestrator.services.project_workspace_defaults import (
+        read_project_defaults,
+    )
+
+    project_id = await _manifest_project(database, actor)
+    before = await _active_revision(database, project_id)
+    async with database.transaction_scope():
+        await persist_officer_controller(
+            database,
+            project_id,
+            {
+                "config_override": {"officer": {"enabled": True}},
+                "communication_policy": {},
+            },
+        )
+    active = await _active_revision(database, project_id)
+    assert active != before
+    # The writer itself moved the row with the revision (no read needed).
+    assert (await read_project_defaults(database, project_id)).manifest_revision == (
+        active
+    )
+
+    config, receipt = await select_execution_workspace(
+        database, actor, project_id=project_id, role="worker"
+    )
+    assert config == {"backend": "sandbox", "sandbox": {"cpu": 1, "memory": "2Gi"}}
+    assert receipt["sources"] == {"tier": "project", "template": "project"}
+    assert receipt["project_revision"] == active
+
+
+@pytest.mark.asyncio
+async def test_a_stale_manifest_row_heals_on_the_next_selection(database, actor):
+    from orchestrator.services.manifest_workspace_selection import (
+        select_generic_project_workspace,
+    )
+    from orchestrator.services.project_workspace_defaults import (
+        read_project_defaults,
+    )
+
+    project_id = await _manifest_project(database, actor)
+    active = await _active_revision(database, project_id)
+
+    async def make_stale():
+        await database.execute(
+            "UPDATE project_workspace_defaults SET manifest_revision='sha256:stale' "
+            "WHERE project_id=$1",
+            UUID(project_id),
+        )
+
+    await make_stale()
+    config, receipt = await select_execution_workspace(
+        database, actor, project_id=project_id, role="worker"
+    )
+    assert config == {"backend": "sandbox", "sandbox": {"cpu": 1, "memory": "2Gi"}}
+    assert receipt["project_revision"] == active
+    stored = await read_project_defaults(database, project_id)
+    assert (stored.source, stored.manifest_revision) == ("manifest", active)
+
+    # The generic-image path heals the same way.
+    await make_stale()
+    generic = await select_generic_project_workspace(
+        database, actor, project_id=project_id
+    )
+    assert generic["resolved"]["template"]["inline"]["backend"] == "sandbox"
+    assert (await read_project_defaults(database, project_id)).manifest_revision == (
+        active
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_manifest_row_without_its_project_manifest_is_released_on_read(
+    database, actor
+):
+    from orchestrator.services.project_workspace_defaults import (
+        read_project_defaults,
+    )
+
+    project_id = await _manifest_project(database, actor)
+    # The Project resource goes away without releasing the row.
+    await database.execute(
+        "UPDATE srw_resources SET deleted_at=now() WHERE kind='Project' AND linked_id=$1",
+        UUID(project_id),
+    )
+    config, receipt = await select_execution_workspace(
+        database, actor, project_id=project_id, role="worker"
+    )
+    # The installation's Jobs mode and no Project layer.
+    assert config == {"backend": "sandbox"}
+    assert receipt["sources"] == {"tier": "installation", "template": "builtin"}
+    assert receipt["project_revision"] is None
+    released = await read_project_defaults(database, project_id)
+    assert (released.source, released.manifest_revision, released.jobs) == (
+        "settings",
+        None,
+        None,
+    )

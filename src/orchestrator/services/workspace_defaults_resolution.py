@@ -6,7 +6,9 @@ from typing import Any, Mapping
 
 from fastapi import HTTPException
 
-from orchestrator.services.project_workspace_defaults import read_project_defaults
+from orchestrator.services.project_workspace_defaults import (
+    read_current_project_defaults,
+)
 from shared.workspace_defaults import (
     InvalidWorkspaceDefaults,
     Upgrade,
@@ -59,7 +61,9 @@ async def resolve_workspace_defaults(
         installation = installation_defaults()
     except InvalidWorkspaceDefaults as exc:
         raise HTTPException(503, INVALID_INSTALLATION.format(reason=exc)) from None
-    project = await read_project_defaults(db, project_id) if project_id else None
+    project = (
+        await read_current_project_defaults(db, project_id) if project_id else None
+    )
     try:
         return resolve_defaults(
             role,
@@ -99,7 +103,12 @@ async def check_installation_workspace_defaults(db: Any) -> list[str]:
 
     from orchestrator.services.manifest_store import ManifestStore
     from shared.workspace_contract import vm_mode_from_env
-    from shared.workspace_defaults import CATALOG_SHARED, TEMPLATE_TIERS, backend_mode
+    from shared.workspace_defaults import (
+        BUILTIN_TEMPLATES,
+        CATALOG_SHARED,
+        TEMPLATE_TIERS,
+        backend_mode,
+    )
 
     problems: list[str] = []
     try:
@@ -114,18 +123,26 @@ async def check_installation_workspace_defaults(db: Any) -> list[str]:
             if vms_off and (value == "vm" or (field == "vm" and value)):
                 problems.append(f"{VMS_UNAVAILABLE} (Helm workspace.defaults.{field})")
         store = ManifestStore(db)
+        builtins = declared_builtin_names()
         for tier in TEMPLATE_TIERS:
             name = getattr(installation, tier)
-            if not name:
+            if name:
+                missing = MISSING_INSTALLATION_TEMPLATE
+                where = f"Helm workspace.defaults.{tier}"
+            elif BUILTIN_TEMPLATES[tier] in builtins:
+                # An empty name means the tier's built-in, when the chart
+                # declares it: it must be there too.
+                name = BUILTIN_TEMPLATES[tier]
+                missing = MISSING_BUILTIN_TEMPLATE
+                where = f"built-in {name}"
+            else:
                 continue
             row = await store.by_name("WorkspaceTemplate", dict(CATALOG_SHARED), name)
             if row is None:
-                problems.append(
-                    MISSING_INSTALLATION_TEMPLATE.format(tier=tier, name=name)
-                )
+                problems.append(missing.format(tier=tier, name=name))
             elif backend_mode(row["resolved"]["spec"]["backend"]) != tier:
                 problems.append(
-                    f"The {tier} template must be a {tier} workspace. (Helm workspace.defaults.{tier})"
+                    f"The {tier} template must be a {tier} workspace. ({where})"
                 )
     for problem in problems:
         logging.getLogger(__name__).error("Workspace defaults: %s", problem)
@@ -156,7 +173,12 @@ async def work_owner(db: Any, user_id: Any) -> dict:
 async def find_readable_template(
     db: Any, user: dict, *, project_id: str | None, name: str
 ) -> tuple[dict, str]:
-    """Project, then the user's Account, then Catalog/shared: first readable wins."""
+    """Look in the Project, then the user's Account, then Catalog/shared.
+
+    The first scope that holds the name decides: its template is returned if
+    the user may read it, else the read is refused. A later scope is
+    never tried once one holds the name.
+    """
     from orchestrator.services.manifest_authority import ManifestAuthority
     from orchestrator.services.manifest_store import ManifestStore
     from shared.workspace_defaults import CATALOG_SHARED, backend_mode

@@ -76,6 +76,30 @@ async def read_project_defaults(db, project_id) -> ProjectDefaults | None:
     return _defaults(row) if row else None
 
 
+async def read_current_project_defaults(db, project_id) -> ProjectDefaults | None:
+    """The Project's row, healed first when a manifest owns it.
+
+    A manifest row holds only while its revision is the Project's active one.
+    A writer that moved the revision without syncing, or a pre-A2b pod during
+    a rolling update, leaves it behind: re-sync it from the active revision,
+    or release it when the Project no longer has an active manifest. The
+    writes are the same idempotent upserts activation uses.
+    """
+    current = await read_project_defaults(db, project_id)
+    if current is None or current.source != "manifest":
+        return current
+    from orchestrator.services.manifest_projects import active_project_resource
+
+    active = await active_project_resource(db, project_id)
+    if active is None:
+        await release_manifest_defaults(db, project_id)
+    elif active["revision"] != current.manifest_revision:
+        await sync_manifest_defaults(db, {**active, "linked_id": str(project_id)})
+    else:
+        return current
+    return await read_project_defaults(db, project_id)
+
+
 async def save_settings_defaults(
     db, project_id, values: ProjectDefaults, *, actor_id: str | None
 ) -> ProjectDefaults:

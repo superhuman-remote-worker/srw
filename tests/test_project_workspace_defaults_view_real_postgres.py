@@ -1,5 +1,7 @@
 """The Project workspace defaults API logic (Slice A2b)."""
 
+from uuid import UUID
+
 import pytest
 from fastapi import HTTPException
 
@@ -10,8 +12,8 @@ from orchestrator.services.builtin_workspace_templates import (
 )
 from orchestrator.services.project_workspace_defaults import (
     MANAGED_BY_MANIFEST,
+    read_project_defaults,
     save_settings_defaults,
-    write_manifest_defaults,
 )
 from orchestrator.services.project_workspace_defaults_view import (
     PICK_A_VISIBLE_TEMPLATE,
@@ -19,6 +21,10 @@ from orchestrator.services.project_workspace_defaults_view import (
     update_view,
 )
 from tests import test_manifest_native_full_schema as full_schema
+from tests.test_workspace_defaults_resolution_real_postgres import (
+    _active_revision,
+    _manifest_project,
+)
 
 postgres_url = full_schema.postgres_url
 database = full_schema.database
@@ -163,11 +169,11 @@ async def test_put_refuses_vm_values_when_vms_are_off(database, actor, monkeypat
 
 @pytest.mark.asyncio
 async def test_put_on_a_manifest_row_is_409(database, actor):
-    project = await _project(database)
-    await write_manifest_defaults(
-        database,
-        project["id"],
-        ProjectDefaults(jobs="vm", source="manifest", manifest_revision="sha256:v"),
+    project_id = await _manifest_project(database, actor)
+    project = dict(
+        await database.fetchrow(
+            "SELECT * FROM projects WHERE id=$1", UUID(str(project_id))
+        )
     )
     with pytest.raises(HTTPException) as refused:
         await update_view(
@@ -178,6 +184,36 @@ async def test_put_on_a_manifest_row_is_409(database, actor):
         MANAGED_BY_MANIFEST,
     )
     assert (await read_view(database, project))["managed_by_manifest"] is True
+
+
+@pytest.mark.asyncio
+async def test_the_view_heals_a_manifest_row_left_behind(database, actor):
+    project_id = await _manifest_project(database, actor)
+    project = dict(
+        await database.fetchrow(
+            "SELECT * FROM projects WHERE id=$1", UUID(str(project_id))
+        )
+    )
+    await database.execute(
+        "UPDATE project_workspace_defaults SET manifest_revision='sha256:stale' "
+        "WHERE project_id=$1",
+        project["id"],
+    )
+    view = await read_view(database, project)
+    assert view["managed_by_manifest"] is True
+    assert view["stored"]["jobs"] == "container"
+    assert (await read_project_defaults(database, project_id)).manifest_revision == (
+        await _active_revision(database, project_id)
+    )
+
+    # Without its Project manifest the row is released, and editable again.
+    await database.execute(
+        "UPDATE srw_resources SET deleted_at=now() WHERE kind='Project' AND linked_id=$1",
+        project["id"],
+    )
+    view = await read_view(database, project)
+    assert view["managed_by_manifest"] is False
+    assert view["stored"]["jobs"] is None
 
 
 @pytest.mark.asyncio

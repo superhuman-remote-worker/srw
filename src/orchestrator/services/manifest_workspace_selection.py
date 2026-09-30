@@ -313,7 +313,7 @@ async def select_generic_project_workspace(
     if not project_id:
         return None
     from orchestrator.services.project_workspace_defaults import (
-        read_project_defaults,
+        read_current_project_defaults,
     )
     from orchestrator.services.workspace_defaults_resolution import (
         MISSING_PROJECT_TEMPLATE,
@@ -321,7 +321,7 @@ async def select_generic_project_workspace(
         WRONG_TIER_TEMPLATE,
     )
 
-    defaults = await read_project_defaults(db, project_id)
+    defaults = await read_current_project_defaults(db, project_id)
     if defaults is None or defaults.jobs != "container" or defaults.container is None:
         return None
     authority = ManifestAuthority(db, user, request=request)

@@ -836,6 +836,13 @@ async def persist_officer_controller(db, project_id, post):
         saved["id"],
         saved["revision"],
     )
+    # team.controller is part of the content revision: the manifest-owned
+    # workspace defaults row must follow the new active revision.
+    from orchestrator.services.project_workspace_defaults import (
+        sync_manifest_defaults,
+    )
+
+    await sync_manifest_defaults(db, saved)
     return saved
 
 

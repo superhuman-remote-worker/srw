@@ -11,7 +11,7 @@ from orchestrator.schemas.projects import ProjectWorkspaceDefaultsUpdate
 from orchestrator.services.manifest_authority import ManifestAuthority
 from orchestrator.services.manifest_store import ManifestStore
 from orchestrator.services.project_workspace_defaults import (
-    read_project_defaults,
+    read_current_project_defaults,
     save_settings_defaults,
 )
 from orchestrator.services.workspace_defaults_resolution import (
@@ -64,7 +64,7 @@ def _template_name(selection: dict | None) -> str | None:
 
 async def read_view(db: Any, project: dict) -> dict[str, Any]:
     """The Project's workspace defaults: stored, effective, and any problems."""
-    row = await read_project_defaults(db, project["id"])
+    row = await read_current_project_defaults(db, project["id"])
     stored = row or ProjectDefaults()
     try:
         installation = installation_defaults()
