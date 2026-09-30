@@ -762,6 +762,21 @@ async def acknowledge_retiring_failed_attach(
     if settle_status not in {"ended", "suspended"}:
         return await _settled_readback()
 
+    if local_quiescence_protocol == "agent_attach_not_started_v1" and context.get(
+        "workspace_backend"
+    ) in {"vm", "remote"}:
+        # An agent that never entered setup may request the normal captured
+        # actuator. It cannot attest VM writers, and nomination is not release.
+        await store.request_pinned_pre_setup_retirement(
+            thread_id,
+            runtime_generation=expected_runtime_generation,
+            runtime_attach_token=expected_attach_token,
+            retirement_token=retirement_token,
+            agent_id=agent_id,
+            pod_uid=expected_agent_pod_uid,
+        )
+        return await _settled_readback()
+
     receipt_protocol = local_quiescence_protocol
     if local_quiescence_protocol == "agent_attach_not_started_v1":
         # The agent owns this monotonic pre-setup latch.  Under T, zero

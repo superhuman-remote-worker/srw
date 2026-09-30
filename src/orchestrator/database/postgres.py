@@ -45706,6 +45706,43 @@ class PostgresDB:
                 )
         return {"status": "actuator_requested", "actuator_request": marker}
 
+    async def request_pinned_pre_setup_retirement(
+        self, thread_id: str, *, runtime_generation: str, runtime_attach_token: str,
+        retirement_token: str, agent_id: str, pod_uid: str,
+    ) -> bool:
+        """Nominate exact cleanup only; the caller still owes outcome confirmation."""
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                owner = await conn.fetchrow(
+                    "SELECT * FROM threads WHERE id=$1::uuid FOR UPDATE", UUID(thread_id)
+                )
+                if owner is None:
+                    return False
+                marker = {
+                    "kind": "agent_pre_setup_retirement_v1", "thread_id": thread_id,
+                    "agent_id": agent_id, "pod_uid": pod_uid,
+                    "runtime_generation": runtime_generation,
+                    "runtime_attach_token": runtime_attach_token,
+                    "retirement_token": retirement_token, "disposition": "ended",
+                    "permanent": owner["runtime_retirement_permanent"],
+                }
+                encoded = json.dumps(marker, sort_keys=True, separators=(",", ":"))
+                valid = await conn.fetchval(
+                    "SELECT pinned_pre_setup_retirement_request_valid(t,$2::jsonb,true) "
+                    "FROM threads t WHERE id=$1::uuid", UUID(thread_id), encoded,
+                )
+                existing = owner["runtime_retirement_actuator_request"]
+                if isinstance(existing, str):
+                    existing = json.loads(existing)
+                if not valid or (existing is not None and existing != marker):
+                    return False
+                if existing is None:
+                    await conn.execute(
+                        "UPDATE threads SET runtime_retirement_actuator_request=$2::jsonb "
+                        "WHERE id=$1::uuid", UUID(thread_id), encoded,
+                    )
+                return True
+
     async def current_pinned_vm_actuator_request(
         self, thread_id: str, *, runtime_generation: str, retirement_token: str,
         context: Mapping[str, Any], marker: Mapping[str, Any],

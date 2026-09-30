@@ -1003,6 +1003,19 @@ class SessionTerminationCoordinator:
         )
         if self._ports.orchestrator_client():
             try:
+                # One exact pre-setup proof nominates normal retirement cleanup.
+                # Retain identity through process exit; an accepted nomination
+                # alone is deliberately not a confirmed release.
+                receipt = self._ports.attach().release_receipt
+                if isinstance(receipt, dict) and receipt.get("thread_id") == thread_id:
+                    await self._ports.orchestrator_client().release_thread_agent(
+                        thread_id,
+                        **{
+                            key: value
+                            for key, value in receipt.items()
+                            if key != "thread_id"
+                        },
+                    )
                 self._ports.orchestrator_client().stop_heartbeat()
                 if self._ports.heartbeat_task():
                     self._ports.heartbeat_task().cancel()

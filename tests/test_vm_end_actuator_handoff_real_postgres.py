@@ -46,6 +46,13 @@ async def _schema_applied(pg_dsn):
                 "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid='threads'::regclass AND attname='runtime_retirement_actuator_request')"
             ):
                 await conn.execute(migration.read_text())
+            pre_setup = migration.with_name(
+                "0308_pinned_pre_setup_retirement_request.sql"
+            )
+            if not await conn.fetchval(
+                "SELECT to_regprocedure('public.pinned_pre_setup_retirement_request_valid(threads,jsonb,boolean)') IS NOT NULL"
+            ):
+                await conn.execute(pre_setup.read_text())
         finally:
             await conn.close()
 
@@ -859,3 +866,55 @@ async def test_pre_setup_end_nominates_exact_actuator_and_waits_for_settlement(
         ids["agent"], ids["thread"], **proof
     )
     assert await db.list_retryable_pinned_retirements() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "defect", ["generation", "attach", "pod", "token", "missing_pre_setup_proof"]
+)
+async def test_pre_setup_retirement_nomination_refuses_stale_or_missing_proof(
+    db, monkeypatch, defect
+):
+    from orchestrator.application import sessions
+    from orchestrator.services.session_attach_binding import (
+        acknowledge_retiring_failed_attach,
+    )
+
+    ids, retirement, _, events, _, _ = await scenario(db, monkeypatch)
+    proof = dict(
+        expected_runtime_generation=str(uuid4())
+        if defect == "generation"
+        else ids["generation"],
+        expected_attach_token=str(uuid4())
+        if defect == "attach"
+        else ids["attach_token"],
+        expected_agent_pod_uid=str(uuid4()) if defect == "pod" else ids["pod_uid"],
+        local_quiescence_protocol="agent_runtime_zero_v1"
+        if defect == "missing_pre_setup_proof"
+        else "agent_attach_not_started_v1",
+        workspace_generation=None,
+        workspace_runtime_incarnation=None,
+        dependencies=sessions.session_attach_binding_dependencies(
+            main.app.state.resources
+        ),
+    )
+    if defect == "token":
+        # Direct nomination cannot borrow a different retirement token even
+        # though the life and its protected Pod are otherwise exact.
+        assert not await db.request_pinned_pre_setup_retirement(
+            ids["thread"],
+            runtime_generation=ids["generation"],
+            runtime_attach_token=ids["attach_token"],
+            retirement_token=str(uuid4()),
+            agent_id=ids["agent"],
+            pod_uid=ids["pod_uid"],
+        )
+    else:
+        assert not await acknowledge_retiring_failed_attach(
+            ids["agent"], ids["thread"], **proof
+        )
+    current = await db.get_thread(ids["thread"])
+    assert current["runtime_retirement_actuator_request"] is None
+    assert current["runtime_retirement_local_quiescence"] is None
+    assert await db.list_retryable_pinned_retirements() == []
+    assert events == []
