@@ -891,3 +891,39 @@ async def test_legacy_initial_vm_poll_preserves_its_bound_marker(db, monkeypatch
         )
         == 0
     )
+
+
+@pytest.mark.asyncio
+async def test_thread_vm_retry_admits_durable_source_without_resource_enforcement(db, monkeypatch):
+    """The retry lifecycle is needed even when whole-launcher quotas are off."""
+    thread_id, _, override, dependencies = await _initial_vm(db, monkeypatch)
+    current = await _bind_cold_agent(db, thread_id)
+    configuration = whole_launcher_configuration()
+    configuration.update(version=1, namespace="workers", storage_class="local")
+    configuration.pop("resource_admission")
+    monkeypatch.delenv("VM_RESOURCE_ADMISSION_CONFIG")
+    calls = []
+
+    async def resolve(_client, request, *, secret):
+        calls.append(request)
+        return {"request": request, "controller_configuration": configuration}
+
+    monkeypatch.setattr("orchestrator.services.vm_creation_transport.resolve_vm_creation_configuration", resolve)
+    from unittest.mock import AsyncMock
+    dependencies.vm_provisioner._create_http = AsyncMock(return_value={"status": "waiting_capacity"})
+    assert await dependencies.vm_provisioner.create_thread_vm(
+        str(thread_id), vm_image=override["workspace"]["vm"]["image"],
+        expected_runtime_generation=str(current["runtime_generation"]),
+        expected_agent_id=str(current["agent_id"]), expected_attach_token=str(current["runtime_attach_token"]),
+    )
+    source = await db.fetchrow("SELECT * FROM vm_creation_retries WHERE thread_id=$1", thread_id)
+    assert source is not None, "waiting before creation must retain immutable request authority for End"
+    assert source["thread_agent_id"] == current["agent_id"]
+    assert source["thread_runtime_generation"] == current["runtime_generation"]
+    assert source["thread_attach_token"] == current["runtime_attach_token"]
+    metadata = (await db.get_thread(str(thread_id)))["metadata"]
+    metadata = json.loads(metadata) if isinstance(metadata, str) else metadata
+    assert metadata["vm"]["creation_request_id"] == str(source["request_id"])
+    assert metadata["vm"].get("vm_uid") is None
+    dependencies.vm_provisioner._create_http.assert_not_awaited()
+    assert len(calls) == 1
