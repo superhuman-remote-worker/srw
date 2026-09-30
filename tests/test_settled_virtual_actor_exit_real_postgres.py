@@ -273,15 +273,28 @@ async def test_process_generation_difference_never_turns_used_life_into_zero_adm
     recovered = await controls_composition.pinned_retirement_operations(
         main.app.state.resources
     ).recover_captured_process_zero(retirement)
-    # Queued work was never admitted; the existing created-life protocol may
-    # still settle it. An admitted input from a distinct process UUID cannot.
+    assert recovered
+    thread = await db.get_thread(ids["thread"])
+    receipt = thread["runtime_retirement_local_quiescence"]
+    if isinstance(receipt, str):
+        import json
+
+        receipt = json.loads(receipt)
+    # Only the original never-used created life qualifies for zero admission.
+    # Used lives need the explicit abrupt protocol, which preserves input
+    # state and acknowledges partial execution without inventing completion.
     if status == "created" and input_state == "queued":
-        assert recovered
+        assert "recovery_protocol" not in receipt
     else:
-        assert not recovered
-        assert (await db.get_thread(ids["thread"]))[
-            "runtime_retirement_local_quiescence"
-        ] is None
+        assert receipt["recovery_protocol"] == "abrupt_virtual_actor_exit_v1"
+        assert receipt["stranded_input_count"] == int(input_state == "queued")
+        assert receipt["partial_admission_count"] == int(input_state == "admitted")
+    assert str(thread["runtime_retirement_token"]) == retirement["token"]
+    assert thread["status"] == status
+    assert await db.fetchval(
+        "SELECT state FROM thread_input_deliveries WHERE delivery_id=$1::uuid",
+        ids["delivery_id"],
+    ) == input_state
 
 
 @pytest.mark.asyncio

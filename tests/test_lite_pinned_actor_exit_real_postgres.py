@@ -243,21 +243,28 @@ async def test_used_lite_actor_exit_settles_after_exact_pod_stop(
 async def test_used_lite_actor_with_unfinished_input_stays_pending(
     db, monkeypatch, input_state
 ):
-    """The fence holds: an admitted, unsettled turn is not settled work.
+    """Exact death proves local zero while unfinished inputs stay durable.
 
-    A registered life with a queued-but-never-admitted input is the existing
-    created-life exception; an admitted one from a distinct process UUID is
-    never zero admission, and the settled-work contract refuses it too.
+    Abrupt recovery never reclassifies an admitted turn as unexecuted work or
+    marks it settled. Final retirement still waits for its cleanup protocol.
     """
     ids, retirement, _ = await _retired_lite_actor(
         db, monkeypatch, status="active", input_state=input_state
     )
-    assert not await controls_composition.pinned_retirement_operations(
+    assert await controls_composition.pinned_retirement_operations(
         main.app.state.resources
     ).recover_captured_process_zero(retirement)
-    assert (await db.get_thread(ids["thread"]))[
-        "runtime_retirement_local_quiescence"
-    ] is None
+    thread = await db.get_thread(ids["thread"])
+    receipt = _receipt(thread)
+    assert receipt["recovery_protocol"] == "abrupt_lite_actor_exit_v1"
+    assert receipt["stranded_input_count"] == int(input_state == "queued")
+    assert receipt["partial_admission_count"] == int(input_state == "admitted")
+    assert str(thread["runtime_retirement_token"]) == retirement["token"]
+    assert thread["status"] == "active"
+    assert await db.fetchval(
+        "SELECT state FROM thread_input_deliveries WHERE delivery_id=$1::uuid",
+        ids["delivery_id"],
+    ) == input_state
 
 
 @pytest.mark.asyncio
