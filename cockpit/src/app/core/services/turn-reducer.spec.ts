@@ -315,6 +315,47 @@ describe('turn-reducer — turn lifecycle', () => {
         expect((assistants[0].events[0] as TextEvent).content).toBe('persisted prefix');
     });
 
+    it('turn_started keeps the run a recovery replaced, also when the stream re-anchors', () => {
+        // History: the replaced run's call with its settled result, then the
+        // successor's answer. The replay starts at the successor's turn.started.
+        const call: ToolCallEvent = {
+            kind: 'tool_call',
+            id: 'd1',
+            tool: 'delegate_agent',
+            args: {},
+            status: 'completed',
+            result: 'report of d1',
+            startedAt: 100,
+        };
+        const historical: AssistantTurn = {
+            kind: 'assistant',
+            id: 'history-message-uuid',
+            turnNumber: 4,
+            historical: true,
+            priorRunEvents: 1,
+            events: [
+                call,
+                {kind: 'text', id: 'history-message-uuid.b1', content: 'answer', status: 'done', startedAt: 300},
+            ],
+            status: 'done',
+            startedAt: 100,
+            finishedAt: 300,
+        };
+        const replay: ReducerAction[] = [
+            {type: 'turn_started', turnId: '4', startedAt: 1000},
+            {type: 'token', content: 'answer', timestamp: 1010},
+        ];
+        const once = play(replay, {threadId: 'thread-1', turns: [historical], activeAssistantTurnId: null});
+        const twice = play(replay, once);
+        for (const state of [once, twice]) {
+            const assistants = state.turns.filter(isAssistantTurn);
+            expect(assistants).toHaveLength(1);
+            expect(assistants[0].events.map((e) => e.kind)).toEqual(['tool_call', 'text']);
+            expect(assistants[0].events[0]).toBe(call);
+            expect((assistants[0].events[1] as TextEvent).content).toBe('answer');
+        }
+    });
+
     it('turn_completed flips status to done and clears activeAssistantTurnId', () => {
         const state = play([
             {type: 'turn_started', turnId: 't1', startedAt: 1000},

@@ -8662,6 +8662,13 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
     // the viewer's language instead of the text written for the model.
     if (m.role === 'event') {
       const subagentRecovery = parseSubagentRecoveryContinuation(m.metrics);
+      // The continuation carries the abandoned turn's number, and the
+      // successor answers it as that same turn. Everything the turn holds so
+      // far came from the run it replaced, which the journal replay of the
+      // latest turn never re-delivers.
+      const resumed =
+        subagentRecovery && m.turn_number != null ? turnByNumber.get(m.turn_number) : undefined;
+      if (resumed) resumed.priorRunEvents = resumed.events.length;
       turns.push({
         kind: 'system',
         id: m.id,

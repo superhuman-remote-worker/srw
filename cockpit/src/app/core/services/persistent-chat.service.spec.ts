@@ -16,6 +16,7 @@ import { ApiService } from './api.service';
 import { CapabilitiesService } from './capabilities.service';
 import { IndexedDbService } from './indexed-db.service';
 import { NotificationService } from './notification.service';
+import { reduce } from './turn-reducer';
 import { AppToastService } from '../../ui/toast';
 import {
   AssistantTurn,
@@ -10479,6 +10480,64 @@ describe('PersistentChatService — usage.updated telemetry', () => {
       const { events, statuses } = batchOf(turns);
       expect(events.map((e) => e.result)).toEqual(['report of d1', 'interrupted d2']);
       expect(statuses).toEqual(['completed', 'interrupted']);
+    });
+
+    it('keeps the batch when a reload replays the turn the successor answered', () => {
+      // The successor ran the continuation as turn 3 in a new journal epoch,
+      // so the snapshot replays turn 3 from the successor's turn.started. That
+      // replay re-delivers the answer, never the calls of the run it replaced.
+      const answer = {
+        id: 'answer',
+        role: 'ai',
+        content: '1: done 2: INTERRUPTED',
+        tool_calls: null,
+        turn_number: 3,
+        metrics: null,
+        created_at: '2026-09-29T10:05:04+00:00',
+      };
+      const history = historyToTurns([
+        ai('m1', ['d1', 'd2']),
+        recoveredResult('d1', 'completed', 'report of d1', 'completed'),
+        recoveredResult('d2', 'interrupted', 'interrupted d2', 'interrupted'),
+        continuation({ calls: 2, interrupted: 1 }),
+        answer,
+      ] as never);
+      expect((history.find(isAssistantTurn) as AssistantTurn).priorRunEvents).toBe(2);
+
+      let state = reduce(
+        { threadId: 't', turns: [], activeAssistantTurnId: null },
+        { type: 'load_history', threadId: 't', turns: history },
+      );
+      state = reduce(state, { type: 'turn_started', turnId: '3', startedAt: 1 });
+      state = reduce(state, { type: 'token', content: '1: done 2: INTERRUPTED', timestamp: 2 });
+      state = reduce(state, { type: 'turn_completed', turnId: '3', finishedAt: 3 });
+
+      const turns = state.turns.filter(isAssistantTurn);
+      expect(turns).toHaveLength(1);
+      const groups = groupEvents(turns[0].events);
+      expect(groups.map((g) => g.kind)).toEqual(['delegate_batch', 'single']);
+      const batch = (groups[0] as { kind: 'delegate_batch'; events: ToolCallEvent[] }).events;
+      expect(batch.map((e) => e.result)).toEqual(['report of d1', 'interrupted d2']);
+      const members = buildDelegateBatchMembers(batch, toolCardViewFromEvent);
+      expect(members.map((m) => delegateMemberStatus(m, null, null))).toEqual(['completed', 'interrupted']);
+      expect(((groups[1] as { kind: 'single'; event: TextEvent }).event).content).toBe('1: done 2: INTERRUPTED');
+    });
+
+    it('marks no prior run for an event of its own turn or a continuation opening a new one', () => {
+      // A per-child recovery event carries no continuation marker, and a
+      // pinned continuation is renumbered to the next turn: in both, a replay
+      // of the latest turn still re-delivers all of it.
+      const legacy = historyToTurns([
+        ai('m1', ['d1']),
+        { ...continuation({ calls: 1 }), metrics: null },
+      ] as never);
+      const pinned = historyToTurns([
+        ai('m1', ['d1', 'd2']),
+        { ...continuation({ calls: 2, interrupted: 1 }), turn_number: 4 },
+      ] as never);
+      for (const turns of [legacy, pinned]) {
+        expect('priorRunEvents' in (turns.find(isAssistantTurn) as AssistantTurn)).toBe(false);
+      }
     });
 
     it('shows a declined call as denied and a retired child as cancelled', () => {
