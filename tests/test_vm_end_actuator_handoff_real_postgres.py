@@ -197,7 +197,9 @@ async def scenario(
         assert await db.merge_thread_vm_context_if_provision_generation(
             thread_id,
             vm_generation,
-            {"status": "deleted"},
+            # Production records process zero here; endpoint cleanup owns the
+            # later deletion projection. A fake writing deleted hid the CAS bug.
+            {"status": "retiring_process_zero"},
         )
         return VMTeardownResult("completed", True)
 
