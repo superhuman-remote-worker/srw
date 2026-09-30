@@ -33,6 +33,8 @@ import asyncio
 import inspect
 import logging
 import os
+import signal
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -465,6 +467,7 @@ class SessionAttachCoordinator:
         self._pool_claim_generation: Optional[str] = None
         self._pool_claim_token: Optional[str] = None
         self._pool_task: Optional[asyncio.Task[None]] = None
+        self._startup_task: Optional[asyncio.Task[None]] = None
         # Exact proof retained between exception-safe attach rollback and the
         # orchestrator's generation-rotating release CAS. Never inferred from
         # a swallowed cleanup error or an absent session.
@@ -663,6 +666,97 @@ class SessionAttachCoordinator:
         clear = getattr(client, "clear_runtime_actor", None) if client else None
         if callable(clear):
             clear()
+
+    @property
+    def startup_task(self) -> asyncio.Task[None] | None:
+        """Startup construction or its uncertain cleanup remains tracked."""
+        return self._startup_task
+
+    async def attach_during_startup(
+        self,
+        thread_id: str,
+        *,
+        on_shutdown: Callable[[], None],
+        cleanup_timeout: float = 20.0,
+    ) -> bool:
+        """Bridge server startup signals into one owned attach, with bounded cleanup.
+
+        Uvicorn installs handlers before lifespan but defers shutdown until
+        startup returns. Chain its handler and cancel this construction only.
+        Cancellation runs ordinary failed-attach cleanup; a timeout supplies
+        no process-zero proof and leaves the task tracked for shutdown.
+        """
+        task = asyncio.create_task(
+            self.attach(thread_id), name="persistent-startup-attach"
+        )
+        self._startup_task = task
+        interrupted = asyncio.Event()
+        previous: dict[Any, Any] = {}
+        handlers: dict[Any, Any] = {}
+
+        def handler(signum, frame):
+            try:
+                callback = previous[signum]
+                if callable(callback):
+                    callback(signum, frame)
+            finally:
+                if not interrupted.is_set():
+                    on_shutdown()
+                    interrupted.set()
+                    task.cancel()
+
+        if threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                previous[signum] = signal.getsignal(signum)
+                handlers[signum] = handler
+                signal.signal(signum, handler)
+        signal_task = asyncio.create_task(
+            interrupted.wait(), name="persistent-startup-signal"
+        )
+        try:
+            await asyncio.wait({task, signal_task}, return_when=asyncio.FIRST_COMPLETED)
+            if interrupted.is_set():
+                await asyncio.wait({task}, timeout=max(0.0, cleanup_timeout))
+                if task.done():
+                    try:
+                        task.result()
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                else:
+                    self._logger.warning(
+                        "Startup attach cleanup remains unproven at shutdown deadline; "
+                        "retaining exact identity and tracked cleanup (thread=%s)",
+                        thread_id,
+                    )
+                return False
+            await task
+            return True
+        finally:
+            signal_task.cancel()
+            await asyncio.gather(signal_task, return_exceptions=True)
+            for signum, installed in handlers.items():
+                if signal.getsignal(signum) is installed:
+                    signal.signal(signum, previous[signum])
+            if task.done() and self._startup_task is task:
+                self._startup_task = None
+
+    async def stop_startup_attach(self, *, cleanup_timeout: float = 5.0) -> bool:
+        """Bound the remaining local task; false means proof must come from recovery."""
+        task = self._startup_task
+        if task is None:
+            return True
+        if not task.done():
+            task.cancel()
+            await asyncio.wait({task}, timeout=max(0.0, cleanup_timeout))
+        if not task.done():
+            self._logger.warning(
+                "Startup cleanup still owns unproven work; remote quiescence refused"
+            )
+            return False
+        await asyncio.gather(task, return_exceptions=True)
+        if self._startup_task is task:
+            self._startup_task = None
+        return True
 
     async def attach(
         self,

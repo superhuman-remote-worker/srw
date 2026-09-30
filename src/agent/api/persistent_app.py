@@ -1454,7 +1454,10 @@ async def lifespan(app: FastAPI):
             _session_identity.bind_thread(str(uuid.uuid4()))
 
         try:
-            await _session_attach.attach(_session_identity.thread_id)
+            await _session_attach.attach_during_startup(
+                _session_identity.thread_id,
+                on_shutdown=lambda: _session_termination.activate_termination_admission_fence("startup_shutdown"),
+            )
         except SessionEnded:
             await _session_termination.exit_session_ended(_session_identity.thread_id)
         except SessionGrantDenied as e:
@@ -1501,6 +1504,8 @@ async def lifespan(app: FastAPI):
 
     # --- Shutdown ---
     logger.info("Shutting down persistent agent")
+
+    await _session_attach.stop_startup_attach()
 
     # A pool attach is admitted synchronously but finishes in the background.
     # Own that task through shutdown so workspace/setup code cannot continue

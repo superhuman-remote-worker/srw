@@ -1,4 +1,5 @@
 """Startup termination belongs to attach cancellation and retains cleanup proof."""
+
 import asyncio
 import signal
 from unittest.mock import Mock
@@ -9,11 +10,15 @@ from agent.api import persistent_app as pa
 
 
 @pytest.mark.asyncio
-async def test_startup_sigterm_cancels_owned_attach_and_chains_server_handler(monkeypatch):
+async def test_startup_sigterm_cancels_owned_attach_and_chains_server_handler(
+    monkeypatch,
+):
     handlers = {signal.SIGTERM: Mock(), signal.SIGINT: Mock()}
     prior = dict(handlers)
     monkeypatch.setattr(signal, "getsignal", lambda signum: handlers[signum])
-    monkeypatch.setattr(signal, "signal", lambda signum, handler: handlers.__setitem__(signum, handler))
+    monkeypatch.setattr(
+        signal, "signal", lambda signum, handler: handlers.__setitem__(signum, handler)
+    )
     entered, cleaned = asyncio.Event(), asyncio.Event()
 
     async def attach(thread_id):
@@ -25,7 +30,11 @@ async def test_startup_sigterm_cancels_owned_attach_and_chains_server_handler(mo
 
     monkeypatch.setattr(pa._session_attach, "attach", attach)
     fence = Mock()
-    task = asyncio.create_task(pa._session_attach.attach_during_startup("captured", on_shutdown=fence, cleanup_timeout=0.1))
+    task = asyncio.create_task(
+        pa._session_attach.attach_during_startup(
+            "captured", on_shutdown=fence, cleanup_timeout=0.1
+        )
+    )
     await entered.wait()
     handlers[signal.SIGTERM](signal.SIGTERM, None)
     assert await asyncio.wait_for(task, 1) is False
@@ -36,10 +45,14 @@ async def test_startup_sigterm_cancels_owned_attach_and_chains_server_handler(mo
 
 
 @pytest.mark.asyncio
-async def test_startup_cancellation_timeout_is_bounded_and_never_claims_quiescence(monkeypatch):
+async def test_startup_cancellation_timeout_is_bounded_and_never_claims_quiescence(
+    monkeypatch,
+):
     handlers = {signal.SIGTERM: Mock(), signal.SIGINT: Mock()}
     monkeypatch.setattr(signal, "getsignal", lambda signum: handlers[signum])
-    monkeypatch.setattr(signal, "signal", lambda signum, handler: handlers.__setitem__(signum, handler))
+    monkeypatch.setattr(
+        signal, "signal", lambda signum, handler: handlers.__setitem__(signum, handler)
+    )
     entered, finish = asyncio.Event(), asyncio.Event()
 
     async def attach(thread_id):
@@ -51,7 +64,11 @@ async def test_startup_cancellation_timeout_is_bounded_and_never_claims_quiescen
             raise
 
     monkeypatch.setattr(pa._session_attach, "attach", attach)
-    task = asyncio.create_task(pa._session_attach.attach_during_startup("captured", on_shutdown=Mock(), cleanup_timeout=0.01))
+    task = asyncio.create_task(
+        pa._session_attach.attach_during_startup(
+            "captured", on_shutdown=Mock(), cleanup_timeout=0.01
+        )
+    )
     await entered.wait()
     handlers[signal.SIGTERM](signal.SIGTERM, None)
     try:
