@@ -9569,20 +9569,51 @@ async def test_dedicated_pre_setup_abort_refuses_unproven_authority(db, defect):
 
 
 @pytest.mark.asyncio
-async def test_failed_attach_retirement_release_confirms_settled_outcome_before_identity_release(db):
+async def test_failed_attach_retirement_release_confirms_settled_outcome_before_identity_release(
+    db,
+):
     from orchestrator import main
     from orchestrator.services.agent_thread_status import release_thread_agent
 
     ids = await _seed(db, protected_agent_pod=True, workspace_claim=False)
-    await db.execute("UPDATE threads SET status='created', metadata=jsonb_set(metadata,'{config_override,officer,enabled}','false'::jsonb) WHERE id=$1::uuid", ids["thread"])
+    await db.execute(
+        "UPDATE threads SET status='created', metadata=jsonb_set(metadata,'{config_override,officer,enabled}','false'::jsonb) WHERE id=$1::uuid",
+        ids["thread"],
+    )
     retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
-    assert await db.authorize_pinned_thread_retirement(ids["thread"], token=retirement["token"], generation=retirement["generation"], settle_status="ended")
-    with patch.object(main.app.state.resources, "postgres_db", db), patch.object(main.app.state.resources.session_router, "teardown_route", AsyncMock(return_value=True)):
-        response = await release_thread_agent(ids["thread"], {
-            "agent_id": ids["agent"], "session_runtime_generation": retirement["generation"],
-            "session_runtime_attach_token": ids["attach_token"], "agent_pod_uid": "old-pod",
-            "local_runtime_quiesced": True, "local_quiescence_protocol": "agent_attach_not_started_v1",
-        }, dependencies=sessions_composition.agent_thread_status_dependencies(main.app.state.resources))
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    with (
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            main.app.state.resources.session_router,
+            "teardown_route",
+            AsyncMock(return_value=True),
+        ),
+    ):
+        response = await release_thread_agent(
+            ids["thread"],
+            {
+                "agent_id": ids["agent"],
+                "session_runtime_generation": retirement["generation"],
+                "session_runtime_attach_token": ids["attach_token"],
+                "agent_pod_uid": "old-pod",
+                "local_runtime_quiesced": True,
+                "local_quiescence_protocol": "agent_attach_not_started_v1",
+            },
+            dependencies=sessions_composition.agent_thread_status_dependencies(
+                main.app.state.resources
+            ),
+        )
     assert response == {"status": "retirement_acknowledged"}
-    assert await db.has_exact_pinned_runtime_retirement_outcome(ids["thread"], runtime_generation=retirement["generation"], agent_id=ids["agent"], runtime_attach_token=ids["attach_token"])
+    assert await db.has_exact_pinned_runtime_retirement_outcome(
+        ids["thread"],
+        runtime_generation=retirement["generation"],
+        agent_id=ids["agent"],
+        runtime_attach_token=ids["attach_token"],
+    )
     assert (await db.get_thread(ids["thread"]))["status"] == "ended"

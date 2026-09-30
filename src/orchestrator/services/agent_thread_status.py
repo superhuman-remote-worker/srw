@@ -92,22 +92,29 @@ class AgentThreadStatusDependencies:
 
 
 async def request_retirement_actuator(
-    thread_id: str, body: AgentRetirementActuatorRequest, *,
+    thread_id: str,
+    body: AgentRetirementActuatorRequest,
+    *,
     dependencies: AgentThreadStatusDependencies,
 ) -> dict[str, Any]:
     """Commit the complete authenticated End tuple without awaiting a stop."""
     result = await dependencies.db.request_pinned_thread_retirement_actuator(
-        thread_id, agent_id=str(body.agent_id), pod_uid=body.pod_uid,
+        thread_id,
+        agent_id=str(body.agent_id),
+        pod_uid=body.pod_uid,
         process_generation=body.process_generation,
         runtime_generation=str(body.session_runtime_generation),
         runtime_attach_token=str(body.session_runtime_attach_token),
         retirement_token=str(body.session_runtime_retirement_token),
-        disposition=body.retirement_disposition, permanent=body.retirement_permanent,
+        disposition=body.retirement_disposition,
+        permanent=body.retirement_permanent,
         workspace_generation=str(body.workspace_generation),
         workspace_runtime_incarnation=str(body.workspace_runtime_incarnation),
     )
     if result is None:
-        raise HTTPException(status_code=409, detail={"code": "pinned_vm_actuator_request_refused"})
+        raise HTTPException(
+            status_code=409, detail={"code": "pinned_vm_actuator_request_refused"}
+        )
     return result
 
 
@@ -414,8 +421,10 @@ async def update_thread_status(
                     vm = metadata.get("vm")
                     try:
                         authority = _identity_from_row(
-                            thread_row, owner_kind="thread",
-                            owner_id=str(thread_id), operation_kind="idle_policy",
+                            thread_row,
+                            owner_kind="thread",
+                            owner_id=str(thread_id),
+                            operation_kind="idle_policy",
                         )
                         if (
                             not isinstance(vm, dict)
@@ -423,9 +432,9 @@ async def update_thread_status(
                             or str(UUID(str(vm.get("vm_uid")))) != authority.vm_uid
                             or str(UUID(str(vm.get("vmi_uid")))) != vm.get("vmi_uid")
                             or str(UUID(str(vm.get("active_pod_uid"))))
-                                != authority.launcher_pod_uid
+                            != authority.launcher_pod_uid
                             or str(UUID(str(vm.get("rootdisk_pvc_uid"))))
-                                != vm.get("rootdisk_pvc_uid")
+                            != vm.get("rootdisk_pvc_uid")
                         ):
                             raise ValueError("unproven VM tuple")
                     except (VMRemoteOperationUnavailable, ValueError, TypeError):
@@ -434,13 +443,17 @@ async def update_thread_status(
                         await apply_idle_transition_on_conn(
                             conn,
                             runtime=RuntimeIdentity(
-                                "thread", str(thread_id), "vm",
-                                authority.workspace_generation, authority.vm_uid,
+                                "thread",
+                                str(thread_id),
+                                "vm",
+                                authority.workspace_generation,
+                                authority.vm_uid,
                             ),
                             event="enter",
                             expected_revision=thread_record["workspace_idle_revision"],
                             expected_episode_id=None,
-                            wait_kind="natural_pause", wait_key=str(uuid4()),
+                            wait_kind="natural_pause",
+                            wait_key=str(uuid4()),
                         )
 
         if result_status == "begin_retirement":
@@ -957,7 +970,41 @@ async def release_thread_agent(
         workspace_generation=workspace_generation,
         workspace_runtime_incarnation=workspace_runtime_incarnation,
     ):
-        outcome = "retirement_acknowledged"
+        # Local zero permits settlement, but is not settlement itself. Keep
+        # the actor's release pending until the exact append-only outcome exists.
+        settled = await dependencies.db.has_exact_pinned_runtime_retirement_outcome(
+            thread_id,
+            runtime_generation=runtime_generation,
+            agent_id=agent_id,
+            runtime_attach_token=attach_token,
+        )
+        if settled is not True:
+            current = await dependencies.db.get_thread(thread_id)
+            if isinstance(current, Mapping) and (
+                str(current.get("runtime_generation") or "") == runtime_generation
+                and str(current.get("agent_id") or "") == agent_id
+                and str(current.get("runtime_attach_token") or "") == attach_token
+                and current.get("runtime_retirement_authorized_at") is not None
+            ):
+                await dependencies.end_thread_flow(
+                    thread_id,
+                    current,
+                    permanent=bool(current.get("runtime_retirement_permanent")),
+                    force=True,
+                    expected_runtime_generation=runtime_generation,
+                    expected_agent_id=agent_id,
+                    expected_attach_token=attach_token,
+                    local_runtime_quiesced=True,
+                    retiring_agent_response_pending=True,
+                )
+            settled = await dependencies.db.has_exact_pinned_runtime_retirement_outcome(
+                thread_id,
+                runtime_generation=runtime_generation,
+                agent_id=agent_id,
+                runtime_attach_token=attach_token,
+            )
+        if settled is True:
+            outcome = "retirement_acknowledged"
     if outcome in {"released", "already_detached"}:
         dependencies.schedule_attach_abort_successor(
             thread_id,
