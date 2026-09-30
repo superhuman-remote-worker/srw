@@ -5,7 +5,7 @@ import { NetworkLedger, sanitizedDiagnostic } from './network-ledger';
 type PageEvent = 'request' | 'response' | 'requestfailed' | 'pageerror' | 'console';
 type PageHandler = (value: unknown) => void;
 
-function ledgerHarness(): {
+function ledgerHarness(applicationOrigin = 'http://srw-e2e.test'): {
   ledger: NetworkLedger;
   handlers: Map<PageEvent, PageHandler>;
 } {
@@ -16,7 +16,7 @@ function ledgerHarness(): {
     },
   } as unknown as Page;
   return {
-    ledger: new NetworkLedger(page, 'http://srw-e2e.test'),
+    ledger: new NetworkLedger(page, applicationOrigin),
     handlers,
   };
 }
@@ -97,6 +97,35 @@ describe('network ledger safety and warm-up classification', () => {
     );
 
     expect(ledger.problems()).toEqual([]);
+  });
+
+  it.each([409, 425])('allows HTTP/2 status %s without a reason phrase for an observed owned warm-up poll', (status) => {
+    const { ledger, handlers } = ledgerHarness('https://srw-e2e.test');
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('creating');
+    const url = 'https://srw-e2e.test/api/sessions/owned-thread/connection';
+    emitResponse(handlers, 'GET', url, status);
+    emitConsole(handlers, `Failed to load resource: the server responded with a status of ${status} ()`, url);
+
+    expect(ledger.problems()).toEqual([]);
+  });
+
+  it.each([
+    ['unobserved', 'GET', 425, 'https://srw-e2e.test/api/sessions/owned-thread/connection', 'creating', false],
+    ['wrong status', 'GET', 200, 'https://srw-e2e.test/api/sessions/owned-thread/connection', 'creating', true],
+    ['write method', 'POST', 425, 'https://srw-e2e.test/api/sessions/owned-thread/connection', 'creating', true],
+    ['foreign thread', 'GET', 425, 'https://srw-e2e.test/api/sessions/foreign-thread/connection', 'creating', true],
+    ['foreign origin', 'GET', 425, 'https://foreign.test/api/sessions/owned-thread/connection', 'creating', true],
+    ['unrelated endpoint', 'GET', 425, 'https://srw-e2e.test/api/persistent/threads/owned-thread/input', 'creating', true],
+    ['after warm-up', 'GET', 425, 'https://srw-e2e.test/api/sessions/owned-thread/connection', 'hydration', true],
+  ] as const)('rejects an HTTP/2 resource error for %s', (_, method, status, url, phase, observed) => {
+    const { ledger, handlers } = ledgerHarness('https://srw-e2e.test');
+    ledger.registerThread('owned-thread');
+    ledger.setPhase(phase);
+    if (observed) emitResponse(handlers, method, url, status);
+    emitConsole(handlers, 'Failed to load resource: the server responded with a status of 425 ()', url);
+
+    expect(ledger.problems().some((problem) => problem.startsWith('console error'))).toBe(true);
   });
 
   it('rejects a warm-up response for a foreign thread', () => {
