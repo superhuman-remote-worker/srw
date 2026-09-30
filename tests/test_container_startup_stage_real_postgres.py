@@ -177,6 +177,133 @@ async def test_unscheduled_wait_preserves_budget_then_freezes_exact_schedule(db)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("owner_kind", ["job", "thread"])
+async def test_whole_second_schedule_uses_receipt_second_without_changing_clock(
+    db, owner_kind
+):
+    if owner_kind == "job":
+        owner_id, reservation, pod_uid, _ = await _bound_job(db)
+    else:
+        owner_id, _, reservation, pod_uid = await _bound_thread(db)
+    kwargs = _observe_kwargs(owner_id, reservation, pod_uid) | {
+        "owner_kind": owner_kind
+    }
+    created_at = (datetime.now(timezone.utc) - timedelta(seconds=3)).replace(
+        microsecond=618798
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE managed_repository_workspace_creation_reservations "
+            "SET created_at=$2 WHERE id=$1",
+            reservation["id"],
+            created_at,
+        )
+    original = dict(await _reservation(db, reservation))
+    assert original["created_at"] == created_at
+    schedule = created_at.replace(microsecond=0)
+    local_schedule = schedule.astimezone(timezone(timedelta(hours=2)))
+    budgets = StageBudgets(180, None, 30)
+
+    for refused in (
+        schedule - timedelta(seconds=1),
+        created_at - timedelta(microseconds=1),
+        schedule.replace(tzinfo=None),
+        datetime.now(timezone.utc) + timedelta(minutes=1),
+    ):
+        assert not await db.observe_container_startup(
+            **kwargs,
+            observation=ScheduledAt(refused),
+            budgets=budgets,
+            adopt_if_unmarked=True,
+        )
+        assert dict(await _reservation(db, reservation)) == original
+
+    assert await db.observe_container_startup(
+        **kwargs,
+        observation=ScheduledAt(local_schedule),
+        budgets=budgets,
+        adopt_if_unmarked=True,
+    )
+    frozen = dict(await _reservation(db, reservation))
+    assert frozen["scheduled_at"] == schedule
+    assert frozen["ready_budget_seconds"] == 180
+    assert frozen["pull_budget_seconds"] is None
+    assert frozen["ssh_budget_seconds"] == 30
+    assert await db.observe_container_startup(
+        **kwargs,
+        observation=ScheduledAt(local_schedule),
+        adopt_if_unmarked=False,
+    )
+    assert dict(await _reservation(db, reservation)) == frozen
+    assert not await db.observe_container_startup(
+        **kwargs,
+        observation=ScheduledAt(schedule + timedelta(microseconds=1)),
+        adopt_if_unmarked=False,
+    )
+    assert dict(await _reservation(db, reservation)) == frozen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_kind", ["job", "thread"])
+@pytest.mark.parametrize(
+    ("ready_seconds", "ready_offset", "reason"),
+    [
+        (0.05, None, "readiness_deadline"),
+        (5, 0.1, "ssh_deadline"),
+    ],
+)
+async def test_whole_second_schedule_keeps_late_ready_attention_sticky(
+    db, owner_kind, ready_seconds, ready_offset, reason
+):
+    if owner_kind == "job":
+        owner_id, reservation, pod_uid, _ = await _bound_job(db)
+    else:
+        owner_id, _, reservation, pod_uid = await _bound_thread(db)
+    kwargs = _observe_kwargs(owner_id, reservation, pod_uid) | {
+        "owner_kind": owner_kind
+    }
+    created_at = (datetime.now(timezone.utc) - timedelta(seconds=3)).replace(
+        microsecond=618798
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE managed_repository_workspace_creation_reservations "
+            "SET created_at=$2 WHERE id=$1",
+            reservation["id"],
+            created_at,
+        )
+    schedule = created_at.replace(microsecond=0)
+    assert await db.observe_container_startup(
+        **kwargs,
+        observation=ScheduledAt(schedule),
+        budgets=StageBudgets(ready_seconds, None, 0.05),
+        adopt_if_unmarked=True,
+    )
+    ready_at = (
+        datetime.now(timezone.utc)
+        if ready_offset is None
+        else schedule + timedelta(seconds=ready_offset)
+    )
+    assert await db.observe_container_startup(
+        **kwargs,
+        observation=ReadyObservedAt(ready_at),
+        adopt_if_unmarked=False,
+    )
+    attention = dict(await _reservation(db, reservation))
+    assert attention["scheduled_at"] == schedule
+    assert (attention["startup_state"], attention["startup_reason_code"]) == (
+        "attention",
+        reason,
+    )
+    assert not await db.observe_container_startup(
+        **kwargs,
+        observation=ReadyObservedAt(datetime.now(timezone.utc)),
+        adopt_if_unmarked=False,
+    )
+    assert dict(await _reservation(db, reservation)) == attention
+
+
+@pytest.mark.asyncio
 async def test_waiting_capacity_can_rotate_claim_without_resetting_clock(db):
     job_id, reservation, pod_uid, _ = await _bound_job(db)
     kwargs = _observe_kwargs(job_id, reservation, pod_uid)
