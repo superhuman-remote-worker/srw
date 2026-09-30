@@ -21,6 +21,12 @@ PINNED_AGENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 def _exact_pinned_permission_owner(monkeypatch):
     """Permission sweeps in this unit module run as one exact pinned owner."""
 
+    # These legacy unit sessions have no advertised generation/attach contract.
+    # A prior file's modern runtime must not supply authority to their fakes.
+    monkeypatch.setattr(pa._session_identity, "_runtime_contract", False)
+    monkeypatch.setattr(pa._session_identity, "_status_contract", False)
+    monkeypatch.setattr(pa._session_identity, "_session_generation", None)
+    monkeypatch.setattr(pa._session_identity, "_attach_token", None)
     monkeypatch.setattr(
         pa,
         "_permission_retirement_authority",

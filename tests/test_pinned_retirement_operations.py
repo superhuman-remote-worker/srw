@@ -286,6 +286,7 @@ def _current_vm_thread() -> dict[str, object]:
         "runtime_retirement_token": RETIREMENT_TOKEN,
         "runtime_retirement_permanent": True,
         "runtime_retirement_authorized_at": "authorized",
+        "runtime_retirement_context": _vm_retirement()["context"],
         "runtime_retirement_local_quiescence": None,
         "metadata": {},
     }
@@ -307,9 +308,7 @@ async def test_vm_recovery_stops_exact_pod_before_releasing_captured_vm(
     retained_selector = _non_retained_vm_purge(monkeypatch)
     events: list[str] = []
     store = MagicMock()
-    store.get_thread = AsyncMock(
-        side_effect=[_current_vm_thread(), _current_vm_thread()]
-    )
+    store.get_thread = AsyncMock(return_value=_current_vm_thread())
 
     @asynccontextmanager
     async def lifecycle_lock(_thread_id: str):
@@ -530,9 +529,7 @@ async def test_vm_recovery_hold_blocks_pinned_retirement_vm_release(
 ) -> None:
     retained_selector = _non_retained_vm_purge(monkeypatch)
     store = MagicMock()
-    store.get_thread = AsyncMock(
-        side_effect=[_current_vm_thread(), _current_vm_thread()]
-    )
+    store.get_thread = AsyncMock(return_value=_current_vm_thread())
 
     @asynccontextmanager
     async def lifecycle_lock(_thread_id: str):

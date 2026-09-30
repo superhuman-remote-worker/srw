@@ -2433,7 +2433,9 @@ class TestAttachRoutesForwardConfigName:
 
         import agent.api.dual_app as dual_app
 
-        assert '_terminate_session("rest_detach")' in inspect.getsource(dual_app)
+        assert '_session_termination.terminate("rest_detach")' in inspect.getsource(
+            dual_app
+        )
 
 
 class TestLoadExpertConfig:

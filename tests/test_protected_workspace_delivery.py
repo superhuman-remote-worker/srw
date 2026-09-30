@@ -716,7 +716,11 @@ async def test_dedicated_attach_initial_engaging_timeout_fails_closed(monkeypatc
     poll.assert_awaited_once()
     constructor.assert_not_called()
     assert persistent_app._session is None
-    assert persistent_app._session_identity.thread_id is None
+    # The unconfirmed release still owns this exact life. Clearing identity
+    # here would strand its retry and stop valid booting/ready heartbeats.
+    assert persistent_app._session_identity.thread_id == "thread-protected"
+    assert persistent_app._session_attach._release_receipt is not None
+    client.clear_session_runtime_identity.assert_not_called()
 
 
 def test_advertised_pinned_runtime_contract_requires_exact_attach_token(monkeypatch):

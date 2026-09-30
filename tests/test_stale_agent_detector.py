@@ -199,6 +199,9 @@ async def test_permanent_retirement_recovers_from_exact_absent_sandbox_pod(
     current = {
         "runtime_generation": generation,
         "runtime_retirement_token": token,
+        "runtime_retirement_authorized_at": "authorized",
+        "runtime_retirement_permanent": True,
+        "runtime_retirement_context": context,
         "runtime_retirement_local_quiescence": None,
     }
     db = AsyncMock()
@@ -296,6 +299,9 @@ async def test_soft_retirement_recovers_never_delivered_warm_runtime():
         "status": "created",
         "runtime_generation": generation,
         "runtime_retirement_token": token,
+        "runtime_retirement_authorized_at": "authorized",
+        "runtime_retirement_permanent": False,
+        "runtime_retirement_context": context,
         "runtime_retirement_local_quiescence": None,
     }
     db = AsyncMock()
@@ -966,6 +972,9 @@ def _lite_retirement(*, backend="none", permanent=False):
         "id": thread_id,
         "runtime_generation": generation,
         "runtime_retirement_token": token,
+        "runtime_retirement_authorized_at": "authorized",
+        "runtime_retirement_permanent": permanent,
+        "runtime_retirement_context": context,
         "runtime_retirement_local_quiescence": None,
         "metadata": {},
     }
@@ -1391,6 +1400,7 @@ async def test_recovery_logs_when_the_receipt_is_refused_after_the_pod_stop(
     db, provisioner = _lite_recovery_mocks(current)
     db.acknowledge_pinned_thread_local_quiescence = AsyncMock(return_value=None)
     db.acknowledge_settled_virtual_actor_exit = AsyncMock(return_value=None)
+    db.acknowledge_abrupt_pinned_actor_exit = AsyncMock(return_value=None)
 
     async def immediate_observation(
         _self, pod_name, pod_uid, *, namespace, allowed, **_kwargs
@@ -1414,9 +1424,11 @@ async def test_recovery_logs_when_the_receipt_is_refused_after_the_pod_stop(
             main.app.state.resources
         ).recover_captured_process_zero(retirement)
 
-    # Both contracts were consulted for this used-or-created lite life.
+    # Every applicable contract refused; an unconfigured AsyncMock must never
+    # invent the new abrupt-exit receipt.
     db.acknowledge_pinned_thread_local_quiescence.assert_awaited_once()
     db.acknowledge_settled_virtual_actor_exit.assert_awaited_once()
+    db.acknowledge_abrupt_pinned_actor_exit.assert_awaited_once()
     refusals = [r for r in caplog.records if "receipt refused" in r.getMessage()]
     assert len(refusals) == 1
     assert retirement["context"]["thread_id"] in refusals[0].getMessage()

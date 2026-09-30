@@ -4658,7 +4658,7 @@ class TestHandleWorkspaceUpgradeTierOrTemplate:
                 self._session_with_backend(virtual),
             ),
             patch("agent.api.persistent_app._orchestrator_client", client),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
         ):
             await _handle_workspace_upgrade(ws)
 
@@ -4683,7 +4683,7 @@ class TestHandleWorkspaceUpgradeTierOrTemplate:
                 self._session_with_backend(sandbox),
             ),
             patch("agent.api.persistent_app._orchestrator_client", client),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
         ):
             await _handle_workspace_upgrade(ws)
 
@@ -4707,7 +4707,7 @@ class TestHandleWorkspaceUpgradeTierOrTemplate:
                 self._session_with_backend(virtual),
             ),
             patch("agent.api.persistent_app._orchestrator_client", client),
-            patch("agent.api.persistent_app._thread_id", "tid"),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
         ):
             await _handle_workspace_upgrade(ws, template="site")
 
