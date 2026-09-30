@@ -364,7 +364,9 @@ async def test_mid_tool_drift_waits_for_pair_then_replacement_restore_is_valid()
     )
 
     try:
-        with patch.object(persistent_app._session_termination, "drain_suspend_session", drain):
+        with patch.object(
+            persistent_app._session_termination, "drain_suspend_session", drain
+        ):
             await run_persistent_loop(
                 llm_with_tools=first_llm,
                 tools=[tool],

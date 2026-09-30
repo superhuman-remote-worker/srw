@@ -249,7 +249,9 @@ async def test_parked_pinned_loop_reclaims_durable_input(monkeypatch):
         return {("delivery-a", 1)}
 
     monkeypatch.setattr(mod._session_input, "reclaim_pending", reclaim)
-    monkeypatch.setattr(mod._session_termination, "runtime_admission_closed", lambda: False)
+    monkeypatch.setattr(
+        mod._session_termination, "runtime_admission_closed", lambda: False
+    )
     monkeypatch.setattr(mod, "_stateless_mode", lambda: False)
 
     item = await mod._session_input.wait_for_input(queue, timeout=0.1)

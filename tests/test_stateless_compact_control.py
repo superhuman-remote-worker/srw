@@ -520,7 +520,9 @@ async def test_core_reports_a_summarizer_failure_distinctly(monkeypatch):
         set_progress_callback=MagicMock(),
     )
     monkeypatch.setattr(pa, "_session", _core_session(ctx_mgr))
-    monkeypatch.setattr(pa._session_termination, "runtime_admission_closed", lambda: False)
+    monkeypatch.setattr(
+        pa._session_termination, "runtime_admission_closed", lambda: False
+    )
 
     outcome, summary, before, after = await pa._compact_session_manually()
 
@@ -555,7 +557,9 @@ async def test_pinned_compact_never_runs_beside_a_turn(monkeypatch):
 
     compaction = AsyncMock()
     monkeypatch.setattr(pa, "_ws_send", _ws_send)
-    monkeypatch.setattr(pa._session_termination, "runtime_admission_closed", lambda: False)
+    monkeypatch.setattr(
+        pa._session_termination, "runtime_admission_closed", lambda: False
+    )
     monkeypatch.setattr(pa, "_turn_in_flight", lambda: True)
     monkeypatch.setattr(pa, "_MANUAL_COMPACT_IDLE_WAIT_S", 0.05)
     monkeypatch.setattr(pa, "_MANUAL_COMPACT_IDLE_POLL_S", 0.01)
@@ -578,7 +582,9 @@ async def test_pinned_compact_waits_for_the_turn_to_park(monkeypatch):
         sent.append((method, params))
 
     monkeypatch.setattr(pa, "_ws_send", _ws_send)
-    monkeypatch.setattr(pa._session_termination, "runtime_admission_closed", lambda: False)
+    monkeypatch.setattr(
+        pa._session_termination, "runtime_admission_closed", lambda: False
+    )
     monkeypatch.setattr(pa, "_turn_in_flight", lambda: next(busy, False))
     monkeypatch.setattr(pa, "_MANUAL_COMPACT_IDLE_POLL_S", 0.001)
     monkeypatch.setattr(pa, "_compact_session_manually", compaction)
@@ -607,7 +613,9 @@ async def test_pinned_failed_compaction_does_not_claim_nothing_to_compact(
         sent.append((method, params))
 
     monkeypatch.setattr(pa, "_ws_send", _ws_send)
-    monkeypatch.setattr(pa._session_termination, "runtime_admission_closed", lambda: False)
+    monkeypatch.setattr(
+        pa._session_termination, "runtime_admission_closed", lambda: False
+    )
     monkeypatch.setattr(pa, "_turn_in_flight", lambda: False)
     monkeypatch.setattr(
         pa,

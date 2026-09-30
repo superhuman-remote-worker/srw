@@ -643,7 +643,9 @@ class TestBootWsWatchdogOfficerExemption:
         try:
             # Watchdog must return immediately — a 0-second timeout would
             # otherwise terminate on the spot.
-            await asyncio.wait_for(mod._session_termination.boot_ws_watchdog(0), timeout=1.0)
+            await asyncio.wait_for(
+                mod._session_termination.boot_ws_watchdog(0), timeout=1.0
+            )
         finally:
             mod._session_termination.terminate = original
             _reset_agent_globals()
@@ -666,7 +668,9 @@ class TestBootWsWatchdogOfficerExemption:
         mod._session_termination.terminate = _fake_terminate
         mod._session_termination.schedule_exit = lambda delay=0: None
         try:
-            await asyncio.wait_for(mod._session_termination.boot_ws_watchdog(0), timeout=5.0)
+            await asyncio.wait_for(
+                mod._session_termination.boot_ws_watchdog(0), timeout=5.0
+            )
         finally:
             mod._session_termination.terminate = original_terminate
             mod._session_termination.schedule_exit = original_exit

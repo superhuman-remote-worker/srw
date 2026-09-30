@@ -306,7 +306,9 @@ async def test_unconfirmed_partial_setup_release_stays_session_and_nonready():
             side_effect=_failing_attach(RuntimeError("overlay refused")),
         ),
         patch.object(
-            session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0, 0.01)
+            session_termination,
+            "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS",
+            (0.0, 0.01),
         ),
     ):
         response = await _attach_endpoint()(_request())

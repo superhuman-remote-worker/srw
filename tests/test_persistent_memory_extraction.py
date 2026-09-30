@@ -534,7 +534,9 @@ class TestTeardownExtraction:
                 "agent.api.persistent_app._update_thread_status",
                 new=AsyncMock(return_value=True),
             ),
-            patch("agent.api.persistent_app._session_termination.terminate", AsyncMock()),
+            patch(
+                "agent.api.persistent_app._session_termination.terminate", AsyncMock()
+            ),
             patch(
                 "shared.runtime.services.auxiliary.extract_and_store_memories",
                 extraction,
@@ -568,7 +570,9 @@ class TestTeardownExtraction:
                 "agent.api.persistent_app._update_thread_status",
                 AsyncMock(return_value=True),
             ),
-            patch("agent.api.persistent_app._session_termination.terminate", AsyncMock()),
+            patch(
+                "agent.api.persistent_app._session_termination.terminate", AsyncMock()
+            ),
             patch(
                 "shared.runtime.services.auxiliary.extract_and_store_memories",
                 extraction,
@@ -595,7 +599,9 @@ class TestTeardownExtraction:
             patch("agent.api.persistent_app._session", session),
             patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
             patch("agent.api.persistent_app._broadcast"),
-            patch("agent.api.persistent_app._session_termination.terminate", AsyncMock()),
+            patch(
+                "agent.api.persistent_app._session_termination.terminate", AsyncMock()
+            ),
             patch(
                 "shared.runtime.services.auxiliary.extract_and_store_memories",
                 extraction,
@@ -633,7 +639,9 @@ class TestTeardownExtraction:
             patch.object(pa, "_stop_thread_interrupt_watcher", AsyncMock()),
             patch.object(pa, "_stop_thread_control_watcher", AsyncMock()),
             patch.object(pa, "_retire_announced_permission_rows", AsyncMock()),
-            patch.object(pa._session_termination, "quiesce_session_side_tasks", AsyncMock()),
+            patch.object(
+                pa._session_termination, "quiesce_session_side_tasks", AsyncMock()
+            ),
             patch.object(pa._canvas_control, "clear_all"),
             patch.object(pa, "_subscribers", {}),
             patch.object(pa._session_termination, "max_sessions_per_process", 0),

@@ -427,7 +427,9 @@ async def vm_attach_setup(vm_delivery, monkeypatch):
     monkeypatch.setattr(persistent_app._session_identity, "_thread_id", None)
     monkeypatch.setattr(persistent_app, "_event_writer", None)
     monkeypatch.setattr(persistent_app._session_attach, "_cleanup_context", None)
-    monkeypatch.setattr(persistent_app._session_termination, "session_side_tasks", set())
+    monkeypatch.setattr(
+        persistent_app._session_termination, "session_side_tasks", set()
+    )
     monkeypatch.setattr(persistent_app._session_identity, "_session_generation", None)
     monkeypatch.setattr(persistent_app._session_identity, "_attach_token", None)
     monkeypatch.setattr(persistent_app._session_identity, "_runtime_contract", False)

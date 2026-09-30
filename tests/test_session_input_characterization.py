@@ -185,7 +185,9 @@ async def _loop_callbacks(monkeypatch):
         return None
 
     monkeypatch.setattr(pa, "run_persistent_loop", _fake_loop)
-    monkeypatch.setattr(pa._session_termination, "loop_completion_handler", _no_completion)
+    monkeypatch.setattr(
+        pa._session_termination, "loop_completion_handler", _no_completion
+    )
     monkeypatch.setattr(pa, "_loop_task", None)
     session = pa._session
     for name in (
@@ -216,7 +218,9 @@ async def _loop_callbacks(monkeypatch):
 
 
 def _open_admission(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(pa._session_termination, "termination_sentinel_path", tmp_path / "terminating")
+    monkeypatch.setattr(
+        pa._session_termination, "termination_sentinel_path", tmp_path / "terminating"
+    )
     monkeypatch.setattr(pa._session_termination, "termination_admission_fenced", False)
     monkeypatch.setattr(pa._session_termination, "termination_fence_reason", None)
     monkeypatch.setattr(pa._session_termination, "retirement_admission_identity", None)
@@ -826,7 +830,12 @@ async def test_parked_window_is_exactly_the_input_wait_and_termination_wakes_it(
         assert pa._session_termination.session_parked() is True
         pa._broadcast.assert_any_call("ready", {})
 
-        assert pa._session_termination.activate_termination_admission_fence("characterization") is True
+        assert (
+            pa._session_termination.activate_termination_admission_fence(
+                "characterization"
+            )
+            is True
+        )
         item = await asyncio.wait_for(getter, timeout=2)
         assert item == pa._session_termination.termination_queue_sentinel
         assert _input_view().awaiting is False

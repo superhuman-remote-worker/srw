@@ -89,7 +89,9 @@ class TestDefersWhileNotParked:
         suspend = AsyncMock()
         parked = False
         with (
-            patch.object(pa._session_termination, "session_parked", side_effect=lambda: parked),
+            patch.object(
+                pa._session_termination, "session_parked", side_effect=lambda: parked
+            ),
             patch.object(pa._session_termination, "drain_suspend_session", suspend),
         ):
             await dual_app._handle_heartbeat_intents(_drain_response())

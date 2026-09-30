@@ -75,8 +75,12 @@ def _partial_cleanup_patchers(context):
         patch.object(app, "_event_writer", None),
         patch.object(app, "_stop_thread_interrupt_watcher", new=AsyncMock()),
         patch.object(app, "_stop_thread_control_watcher", new=AsyncMock()),
-        patch.object(app._session_termination, "stop_and_join_watchdogs", new=AsyncMock()),
-        patch.object(app._session_termination, "quiesce_session_side_tasks", new=AsyncMock()),
+        patch.object(
+            app._session_termination, "stop_and_join_watchdogs", new=AsyncMock()
+        ),
+        patch.object(
+            app._session_termination, "quiesce_session_side_tasks", new=AsyncMock()
+        ),
         patch.object(app._session_identity, "clear", return_value=True),
         patch.object(app._session_attach, "clear_runtime_actor"),
         patch.object(session_attach, "apply_session_embedding_env"),
@@ -413,7 +417,9 @@ async def test_real_attach_rejects_workspace_identity_drift_before_constructor()
         patch.object(app._session_identity, "_attach_token", None),
         patch.object(app._session_identity, "_runtime_contract", False),
         patch.object(app._session_termination, "retirement_admission_identity", None),
-        patch.object(app._session_termination, "retirement_admission_disposition", None),
+        patch.object(
+            app._session_termination, "retirement_admission_disposition", None
+        ),
         patch.object(app._session_termination, "retirement_admission_token", None),
         patch.object(app._session_termination, "retirement_admission_permanent", None),
         patch.object(app, "PersistentSession", constructor),
@@ -451,7 +457,9 @@ async def test_partial_cleanup_failure_keeps_exact_retry_owner_until_proven():
         patch.object(app._session_identity, "_runtime_contract", True),
         patch.object(app._session_attach, "_cleanup_context", context),
         patch.object(app._session_attach, "cleanup_failed_attach", cleanup),
-        patch.object(session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)),
+        patch.object(
+            session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)
+        ),
     ):
         assert (
             await app._session_attach.cleanup_failed_attach_until_proven("thread-a")
@@ -477,7 +485,11 @@ async def test_unconfirmed_failure_retains_claim_and_non_ready_fence():
             "attach",
             AsyncMock(side_effect=RuntimeError("overlay refused")),
         ),
-        patch.object(session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0, 0.01)),
+        patch.object(
+            session_termination,
+            "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS",
+            (0.0, 0.01),
+        ),
     ):
         task = asyncio.create_task(
             app._session_attach._run_pool_attach_transaction(
@@ -566,7 +578,9 @@ async def test_lost_release_responses_replay_identical_proof_until_confirmed():
             "attach",
             AsyncMock(side_effect=RuntimeError("delivered attach failed")),
         ),
-        patch.object(session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)),
+        patch.object(
+            session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)
+        ),
     ):
         task = asyncio.create_task(
             app._session_attach._run_pool_attach_transaction(
@@ -740,7 +754,9 @@ async def test_dedicated_attach_failure_releases_receipt_before_exit(
 
     monkeypatch.setattr(app.os, "_exit", exit_process)
     with pytest.raises(SystemExit):
-        await getattr(app._session_termination, exit_helper_name.lstrip("_"))("thread-a", RuntimeError("attach failed"))
+        await getattr(app._session_termination, exit_helper_name.lstrip("_"))(
+            "thread-a", RuntimeError("attach failed")
+        )
 
     assert order == ["release", "deregister", "close", "exit:0"]
     assert app._session_attach._release_receipt is None
@@ -763,9 +779,13 @@ async def test_dedicated_exit_stays_nonready_while_release_is_unconfirmed(monkey
     exit_process = MagicMock()
     monkeypatch.setattr(app.os, "_exit", exit_process)
 
-    with patch.object(session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0, 0.01)):
+    with patch.object(
+        session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0, 0.01)
+    ):
         task = asyncio.create_task(
-            app._session_termination.exit_workspace_not_ready("thread-a", RuntimeError("attach failed"))
+            app._session_termination.exit_workspace_not_ready(
+                "thread-a", RuntimeError("attach failed")
+            )
         )
         await release_seen.wait()
         assert app._session_attach.pool_heartbeat_status() == "session"

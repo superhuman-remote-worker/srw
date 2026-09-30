@@ -58,7 +58,10 @@ class TestPersistentDrainHandler:
         """Snapshot + restore persistent_app globals around every test."""
         from agent.api import persistent_app
 
-        saved = {name: getattr(*termination_target(persistent_app, name)) for name in _PERSISTENT_GLOBALS}
+        saved = {
+            name: getattr(*termination_target(persistent_app, name))
+            for name in _PERSISTENT_GLOBALS
+        }
         saved_identity = {
             name: getattr(persistent_app._session_identity, name)
             for name in _PERSISTENT_IDENTITY_FIELDS
@@ -214,7 +217,9 @@ class TestPersistentDrainHandler:
                 "begin_retirement",
                 new=AsyncMock(return_value=True),
             ),
-            patch.object(persistent_app._session_termination, "terminate", new=AsyncMock()),
+            patch.object(
+                persistent_app._session_termination, "terminate", new=AsyncMock()
+            ),
             patch.object(persistent_app, "_broadcast"),
             patch.object(persistent_app._session_termination, "schedule_exit") as exit_,
         ):
@@ -255,7 +260,9 @@ class TestPersistentDrainHandler:
                 "begin_retirement",
                 new=AsyncMock(side_effect=begin),
             ),
-            patch.object(persistent_app._session_termination, "terminate", new=AsyncMock()),
+            patch.object(
+                persistent_app._session_termination, "terminate", new=AsyncMock()
+            ),
             patch.object(persistent_app._session_termination, "schedule_exit") as exit_,
         ):
             await persistent_app._session_termination.handle_heartbeat_intents(
@@ -303,7 +310,12 @@ class TestPersistentDrainHandler:
             )
 
         assert persistent_app._session is original_session
-        assert persistent_app._session_termination.pending_drain_suspend["locally_quiesced"] is False
+        assert (
+            persistent_app._session_termination.pending_drain_suspend[
+                "locally_quiesced"
+            ]
+            is False
+        )
         assert persistent_app._session_termination.drain_intent_handled is False
         client.suspend_thread.assert_not_awaited()
         client.update_thread_status.assert_not_awaited()
@@ -369,7 +381,9 @@ class TestPersistentDrainHandler:
         self._attach_parked_session(persistent_app)
         persistent_app._tool_inflight = True
 
-        with patch.object(persistent_app._session_termination, "schedule_exit") as exit_:
+        with patch.object(
+            persistent_app._session_termination, "schedule_exit"
+        ) as exit_:
             await persistent_app._session_termination.handle_heartbeat_intents(
                 {"intents": {"should_drain": True}}
             )
@@ -385,7 +399,9 @@ class TestPersistentDrainHandler:
         queue.put_nowait("pending user message")
         persistent_app._session_input._queue = queue
 
-        with patch.object(persistent_app._session_termination, "schedule_exit") as exit_:
+        with patch.object(
+            persistent_app._session_termination, "schedule_exit"
+        ) as exit_:
             await persistent_app._session_termination.handle_heartbeat_intents(
                 {"intents": {"should_drain": True}}
             )
@@ -405,7 +421,9 @@ class TestPersistentDrainHandler:
                 "begin_retirement",
                 new=AsyncMock(return_value=True),
             ),
-            patch.object(persistent_app._session_termination, "terminate", new=AsyncMock()),
+            patch.object(
+                persistent_app._session_termination, "terminate", new=AsyncMock()
+            ),
             patch.object(persistent_app, "_update_thread_status", new=AsyncMock()),
             patch.object(persistent_app, "_broadcast"),
             patch.object(persistent_app._session_termination, "schedule_exit") as exit_,
@@ -497,7 +515,9 @@ class TestPersistentDrainHandler:
             patch.object(persistent_app, "_update_thread_status", new=fake_update),
             patch.object(persistent_app._session_termination, "stop_watchdogs"),
         ):
-            await persistent_app._session_termination.terminate("drain", mark_thread=False)
+            await persistent_app._session_termination.terminate(
+                "drain", mark_thread=False
+            )
 
         # Admission closes before the watcher stops. The orchestrator-owned
         # suspend happens after this inner teardown; neither the outer drain
@@ -518,7 +538,9 @@ class TestPersistentDrainHandler:
         ):
             # Empty / missing / explicit-false should all be no-ops.
             await persistent_app._session_termination.handle_heartbeat_intents({})
-            await persistent_app._session_termination.handle_heartbeat_intents({"intents": {}})
+            await persistent_app._session_termination.handle_heartbeat_intents(
+                {"intents": {}}
+            )
             await persistent_app._session_termination.handle_heartbeat_intents(
                 {"intents": {"should_drain": False}}
             )

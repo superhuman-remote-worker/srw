@@ -53,12 +53,18 @@ def _attached_runtime(*, inner, bound_thread: str | None, exit_fn=None):
             patch.object(pa._session_identity, "_session_generation", GENERATION)
         )
         stack.enter_context(patch.object(pa._session_identity, "_attach_token", ATTACH))
-        stack.enter_context(patch.object(pa._session_termination, "termination_task", None))
+        stack.enter_context(
+            patch.object(pa._session_termination, "termination_task", None)
+        )
         stack.enter_context(patch.object(pa._session_termination, "terminating", False))
         stack.enter_context(patch.object(pa, "_stateless_mode", return_value=False))
-        stack.enter_context(patch.object(pa._session_termination, "_terminate_inner", inner))
         stack.enter_context(
-            patch.object(session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,))
+            patch.object(pa._session_termination, "_terminate_inner", inner)
+        )
+        stack.enter_context(
+            patch.object(
+                session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)
+            )
         )
         yield stack.enter_context(
             patch.object(pa._session_termination, "schedule_exit", side_effect=exit_fn)

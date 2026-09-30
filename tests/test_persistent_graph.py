@@ -3552,8 +3552,12 @@ class TestToolExecutionLoop:
             patch.object(pa._session_identity, "_process_generation", generation),
             patch.object(pa._session_identity, "_session_generation", generation),
             patch.object(pa._session_identity, "_attach_token", attach_token),
-            patch.object(pa._session_termination, "retirement_admission_identity", None),
-            patch.object(pa._session_termination, "termination_admission_fenced", False),
+            patch.object(
+                pa._session_termination, "retirement_admission_identity", None
+            ),
+            patch.object(
+                pa._session_termination, "termination_admission_fenced", False
+            ),
             patch.object(pa, "_tool_inflight", False),
             patch.dict(pa.os.environ, {"POD_UID": "pod-uid-a"}),
         ):
