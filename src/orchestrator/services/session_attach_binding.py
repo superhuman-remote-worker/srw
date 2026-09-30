@@ -393,7 +393,7 @@ async def release_session_attach_binding(
                     thread_id,
                 )
                 agent = await conn.fetchrow(
-                    "SELECT thread_id, current_job_id, status, hostname, pod_uid "
+                    "SELECT thread_id, current_job_id, status, agent_mode, hostname, pod_uid "
                     "FROM agents "
                     "WHERE id = $1 FOR UPDATE",
                     agent_id,
@@ -433,7 +433,6 @@ async def release_session_attach_binding(
                     str(thread.get("status") or "") != "created"
                     or thread.get("runtime_authority_exposed") is not True
                     or agent.get("current_job_id") is not None
-                    or str(agent.get("status") or "") != "session"
                 ):
                     return "unsafe"
                 current_pod_uid = str(agent.get("pod_uid") or "")
@@ -467,6 +466,43 @@ async def release_session_attach_binding(
                     # the marker proven reciprocal to the captured agent in
                     # this same rotation transaction—never UID-delete it.
                     updated_metadata.pop("agent_pod", None)
+                # Dedicated actors advertise booting/ready before setup. Only
+                # their exact protected create-intent Pod plus a monotonic
+                # pre-setup proof may release that delivered life. Other status
+                # mismatches still refuse; zero-admission is repeated below.
+                observed_status = str(agent.get("status") or "")
+                dedicated_pre_setup = bool(
+                    not pre_delivery
+                    and local_runtime_quiesced
+                    and local_quiescence_protocol == "agent_attach_not_started_v1"
+                    and observed_status in {"booting", "ready"}
+                    and str(agent.get("agent_mode") or "") == "persistent"
+                    and isinstance(agent_pod_marker, dict)
+                    and agent_pod_marker.get("protection_protocol") == "finalizer_v1"
+                    and str(agent_pod_marker.get("runtime_generation") or "")
+                    == expected_runtime_generation
+                    and not agent_pod_marker.get("warm_binding_protection")
+                )
+                if dedicated_pre_setup:
+                    # Provisioner ownership lives in the immutable create
+                    # intent, not in the published Pod marker.
+                    dedicated_pre_setup = bool(
+                        await conn.fetchval(
+                            "SELECT EXISTS (SELECT 1 FROM thread_agent_pod_provision_intents "
+                            "WHERE attempt_id::text=$1 AND thread_id=$2::uuid "
+                            "AND runtime_generation=$3::uuid AND provisioner='persistent' "
+                            "AND status='published' AND pod_name=$4 AND pod_uid=$5 "
+                            "AND namespace=$6 AND protection_protocol='finalizer_v1')",
+                            str(agent_pod_marker.get("provision_attempt") or ""),
+                            thread_id,
+                            expected_runtime_generation,
+                            str(agent.get("hostname") or ""),
+                            current_pod_uid,
+                            str(agent_pod_marker.get("namespace") or ""),
+                        )
+                    )
+                if observed_status != "session" and not dedicated_pre_setup:
+                    return "unsafe"
                 warm_binding = None
                 if isinstance(agent_pod_marker, dict) and str(
                     agent_pod_marker.get("warm_binding_protection") or ""
@@ -627,11 +663,12 @@ async def release_session_attach_binding(
                 agent_updated = await conn.execute(
                     "UPDATE agents SET thread_id=NULL, status=$4 "
                     "WHERE id=$1::uuid AND thread_id=$2::uuid "
-                    "AND pod_uid=$3 AND current_job_id IS NULL AND status='session'",
+                    "AND pod_uid=$3 AND current_job_id IS NULL AND status::text=$5",
                     agent_id,
                     thread_id,
                     current_pod_uid,
                     "draining" if warm_binding is not None else "ready",
+                    observed_status,
                 )
                 if thread_updated != "UPDATE 1" or agent_updated != "UPDATE 1":
                     raise _AttachAbortCASLost

@@ -157,7 +157,7 @@ async def test_end_during_vm_boot_ends_the_attach_at_the_first_refusal(boot):
     assert orchestrator.reads_after_end == 1
     # The ordinary failed-attach cleanup ran and kept its exact proof.
     assert pa._session is None
-    assert pa._session_identity.session_generation is None
+    assert pa._session_identity.session_generation == G1
     receipt = pa._session_attach.release_receipt
     assert receipt["session_runtime_generation"] == G1
     assert receipt["session_runtime_attach_token"] == T1
@@ -380,5 +380,5 @@ async def test_cancelling_the_attach_while_it_waits_keeps_the_cleanup_proof(boot
     receipt = pa._session_attach.release_receipt
     assert receipt["local_quiescence_protocol"] == "agent_attach_not_started_v1"
     assert receipt["session_runtime_generation"] == G1
-    assert pa._session_identity.session_generation is None
+    assert pa._session_identity.session_generation == G1
     assert pa._session is None

@@ -469,6 +469,7 @@ class SessionAttachCoordinator:
         # orchestrator's generation-rotating release CAS. Never inferred from
         # a swallowed cleanup error or an absent session.
         self._release_receipt: Optional[dict[str, Any]] = None
+        self._release_restore_thread_id: Optional[str] = None
         # Mutable only while one exact delivered attach is constructing: the
         # one-way setup boundary plus the attested workspace coordinates that
         # prove a partial sandbox runtime writer-free. Never logged (it holds
@@ -685,6 +686,8 @@ class SessionAttachCoordinator:
     ) -> None:
         """Exception-safe attach transaction around the full construction tail."""
 
+        if self._release_receipt is not None:
+            raise WorkspaceNotReady("Prior attach release remains unconfirmed")
         previous_thread_id = self._identity.thread_id
         try:
             await self._attach_inner(
@@ -725,7 +728,7 @@ class SessionAttachCoordinator:
                 and retained_receipt.get("session_runtime_attach_token")
                 == exact_identity[1]
             )
-            if (
+            if not exact_receipt_exists and (
                 self._session is not None
                 or self._identity.thread_id != previous_thread_id
                 or (
@@ -2089,27 +2092,31 @@ class SessionAttachCoordinator:
                 ),
             }
 
+        # Retain the identity that authenticated this delivered life until the
+        # rotation/retirement acknowledgement confirms its obligation settled.
+        # The input/session owners are closed; identity retention grants no work.
+        if release_receipt is not None:
+            if not self.retain_release_receipt(release_receipt):
+                raise EventJournalUnavailable(
+                    "partial attach release proof conflicts with another runtime"
+                )
+            self._release_restore_thread_id = restore_thread_id
         self._ports.publish_session(None)
-        self._identity.bind_thread(restore_thread_id)
         self._cleanup_context = None
         self._ports.reset_journal_cursor()
         self._ports.reset_turn_state()
         self._input.teardown()
         self._identity.clear_process_generation()
         self._ports.close_runtime_authorization()
-        self._identity.set_status_contract(False)
-        self._identity.clear()
-        self.clear_runtime_actor()
+        if release_receipt is None:
+            self._identity.bind_thread(restore_thread_id)
+            self._identity.set_status_contract(False)
+            self._identity.clear()
+            self.clear_runtime_actor()
         self._ports.clear_canvas()
         self._ports.clear_subscribers()
         self._ports.register_mcp_tools(None)
         apply_session_embedding_env(None)
-        if release_receipt is not None and not self.retain_release_receipt(
-            release_receipt
-        ):
-            raise EventJournalUnavailable(
-                "partial attach release proof conflicts with another runtime"
-            )
         return release_receipt
 
     async def cleanup_failed_attach_until_proven(
@@ -2204,7 +2211,17 @@ class SessionAttachCoordinator:
                 confirmed = False
             if confirmed:
                 if self._release_receipt is receipt:
+                    # A delayed acknowledgement of G1 cannot clear G2, its
+                    # actor credential, status contract or bound thread.
+                    if self._identity.clear(
+                        expected_generation=runtime_generation,
+                        expected_attach_token=runtime_attach_token,
+                    ):
+                        self._identity.bind_thread(self._release_restore_thread_id)
+                        self._identity.set_status_contract(False)
+                        self.clear_runtime_actor()
                     self._release_receipt = None
+                    self._release_restore_thread_id = None
                 return True
             delay = EXACT_SETTLEMENT_RETRY_DELAYS[
                 min(attempt + 1, len(EXACT_SETTLEMENT_RETRY_DELAYS) - 1)

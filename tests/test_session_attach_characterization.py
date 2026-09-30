@@ -48,6 +48,7 @@ _ATTACH_STATE_FIELDS = (
     "_pool_claim_token",
     "_pool_task",
     "_release_receipt",
+    "_release_restore_thread_id",
     "_cleanup_context",
 )
 # Collaborators that moved to a pure owner module with the coordinator.
@@ -566,12 +567,12 @@ async def test_workspace_generation_drift_rolls_back_with_not_started_proof(
         )
 
     assert pa._session is None
-    assert identity()["thread_id"] is None
-    assert (identity()["generation"], identity()["attach_token"]) == (None, None)
-    assert identity()["runtime_contract"] is False
+    assert identity()["thread_id"] == TA
+    assert (identity()["generation"], identity()["attach_token"]) == (G1, T1)
+    assert identity()["runtime_contract"] is True
     assert (client.session_runtime_generation, client.session_runtime_attach_token) == (
-        None,
-        None,
+        G1,
+        T1,
     )
     assert release_receipt() == {
         "thread_id": TA,
@@ -770,7 +771,7 @@ async def test_lifecycle_cas_refusal_aborts_before_queue_publication(monkeypatch
     assert ready_seen == [False]
     assert pa._session_input.queue is None
     assert pa._session is None
-    assert identity()["thread_id"] is None
+    assert identity()["thread_id"] == TA
     assert release_receipt()["thread_id"] == TA
     assert [name for name, _ in EVENTS] == []
 
