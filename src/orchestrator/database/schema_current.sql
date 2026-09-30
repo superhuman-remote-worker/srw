@@ -8814,7 +8814,16 @@ BEGIN
        OR NEW.canonical_request->>'job_id' IS DISTINCT FROM NEW.thread_id::text
        OR NEW.canonical_request->>'provision_generation' IS DISTINCT FROM NEW.provision_generation::text
        OR jsonb_typeof(NEW.controller_configuration) IS DISTINCT FROM 'object'
-       OR NEW.controller_configuration->'version' IS DISTINCT FROM '3'::jsonb THEN
+       OR (
+           NEW.controller_configuration->'version' IS DISTINCT FROM '3'::jsonb
+           AND (
+               NEW.controller_configuration->'version' IS DISTINCT FROM '1'::jsonb
+               OR NEW.controller_configuration->'persistent_rootdisk' IS DISTINCT FROM 'true'::jsonb
+               OR COALESCE(NEW.controller_configuration->'resource_admission','null'::jsonb) IS DISTINCT FROM 'null'::jsonb
+               OR COALESCE(NEW.controller_configuration->'network_profile_policy','null'::jsonb) IS DISTINCT FROM 'null'::jsonb
+               OR COALESCE(NEW.canonical_request->'network_profile','null'::jsonb) IS DISTINCT FROM 'null'::jsonb
+           )
+       ) THEN
         RAISE EXCEPTION 'VM thread creation request identity mismatch' USING ERRCODE='23514';
     END IF;
     SELECT * INTO current_thread FROM public.threads

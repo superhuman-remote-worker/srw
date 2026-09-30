@@ -857,6 +857,7 @@ async def test_legacy_initial_vm_poll_preserves_its_bound_marker(db, monkeypatch
         db, monkeypatch, native=True
     )
     monkeypatch.delenv("VM_RESOURCE_ADMISSION_CONFIG")
+    monkeypatch.setenv("VM_CREATION_RETRY_ENABLED", "false")
     current = await _bind_protected_agent(db, thread_id)
     monkeypatch.setattr(
         dependencies.vm_provisioner, "_create_http", AsyncMock(return_value=True)
@@ -894,9 +895,13 @@ async def test_legacy_initial_vm_poll_preserves_its_bound_marker(db, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_thread_vm_retry_admits_durable_source_without_resource_enforcement(db, monkeypatch):
+async def test_thread_vm_retry_admits_durable_source_without_resource_enforcement(
+    db, monkeypatch
+):
     """The retry lifecycle is needed even when whole-launcher quotas are off."""
-    thread_id, _, override, dependencies = await _initial_vm(db, monkeypatch)
+    thread_id, _, override, dependencies = await _initial_vm(
+        db, monkeypatch, native=True
+    )
     current = await _bind_cold_agent(db, thread_id)
     configuration = whole_launcher_configuration()
     configuration.update(version=1, namespace="workers", storage_class="local")
@@ -908,16 +913,28 @@ async def test_thread_vm_retry_admits_durable_source_without_resource_enforcemen
         calls.append(request)
         return {"request": request, "controller_configuration": configuration}
 
-    monkeypatch.setattr("orchestrator.services.vm_creation_transport.resolve_vm_creation_configuration", resolve)
-    from unittest.mock import AsyncMock
-    dependencies.vm_provisioner._create_http = AsyncMock(return_value={"status": "waiting_capacity"})
-    assert await dependencies.vm_provisioner.create_thread_vm(
-        str(thread_id), vm_image=override["workspace"]["vm"]["image"],
-        expected_runtime_generation=str(current["runtime_generation"]),
-        expected_agent_id=str(current["agent_id"]), expected_attach_token=str(current["runtime_attach_token"]),
+    monkeypatch.setattr(
+        "orchestrator.services.vm_creation_transport.resolve_vm_creation_configuration",
+        resolve,
     )
-    source = await db.fetchrow("SELECT * FROM vm_creation_retries WHERE thread_id=$1", thread_id)
-    assert source is not None, "waiting before creation must retain immutable request authority for End"
+    from unittest.mock import AsyncMock
+
+    dependencies.vm_provisioner._create_http = AsyncMock(
+        return_value={"status": "waiting_capacity"}
+    )
+    assert await dependencies.vm_provisioner.create_thread_vm(
+        str(thread_id),
+        vm_image=override["workspace"]["vm"]["image"],
+        expected_runtime_generation=str(current["runtime_generation"]),
+        expected_agent_id=str(current["agent_id"]),
+        expected_attach_token=str(current["runtime_attach_token"]),
+    )
+    source = await db.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE thread_id=$1", thread_id
+    )
+    assert source is not None, (
+        "waiting before creation must retain immutable request authority for End"
+    )
     assert source["thread_agent_id"] == current["agent_id"]
     assert source["thread_runtime_generation"] == current["runtime_generation"]
     assert source["thread_attach_token"] == current["runtime_attach_token"]
@@ -926,4 +943,29 @@ async def test_thread_vm_retry_admits_durable_source_without_resource_enforcemen
     assert metadata["vm"]["creation_request_id"] == str(source["request_id"])
     assert metadata["vm"].get("vm_uid") is None
     dependencies.vm_provisioner._create_http.assert_not_awaited()
+    assert len(calls) == 1
+    assert await db.merge_thread_vm_context_if_provision_generation(
+        str(thread_id),
+        str(source["provision_generation"]),
+        {"status": "waiting_capacity"},
+    )
+    retirement = await db.begin_pinned_thread_retirement(
+        str(thread_id), permanent=False
+    )
+    assert retirement["state"] == "pending"
+    assert retirement["context"]["vm"] is None
+    assert retirement["context"]["vm_creation_source"]["request_id"] == str(
+        source["request_id"]
+    )
+    assert await db.authorize_pinned_thread_retirement(
+        str(thread_id),
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    settled = await VMCreationRetryStore(db).settle_never_issued(
+        request_id=str(source["request_id"])
+    )
+    assert settled == {"settled": True, "disposition": "never_issued"}
+    assert await VMCreationRetryStore(db).claim_due(limit=10) == []
     assert len(calls) == 1

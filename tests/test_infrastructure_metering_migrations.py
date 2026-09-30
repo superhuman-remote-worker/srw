@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0309_pinned_abrupt_actor_exit.sql"
+    / "src/orchestrator/database/migrations/app/0310_pinned_vm_non_quota_creation_source.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

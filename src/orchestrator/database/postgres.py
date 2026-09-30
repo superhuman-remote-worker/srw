@@ -23761,7 +23761,7 @@ class PostgresDB:
                 if (
                     not isinstance(request, dict)
                     or not isinstance(configuration, dict)
-                    or configuration.get("version") != 3
+                    or configuration.get("version") not in {1, 3}
                     or request.get("entity_type") != "thread"
                     or request.get("job_id") != str(parsed_thread)
                     or request.get("provision_generation") != provision_generation
@@ -24147,11 +24147,10 @@ class PostgresDB:
                     resource = await installed_job_resource_store(
                         conn, self, configuration,
                     )
-                    if resource is None:
-                        raise RuntimeError("Thread resource installation unavailable")
-                    await resource._write_thread_waiter_on_conn(
-                        conn, retry=source,
-                    )
+                    if configuration["version"] == 3:
+                        if resource is None:
+                            raise RuntimeError("Thread resource installation unavailable")
+                        await resource._write_thread_waiter_on_conn(conn, retry=source)
                 return True
 
     async def merge_thread_preparation_if_current(
@@ -40667,7 +40666,7 @@ class PostgresDB:
                                 and canonical_request_digest(creation_request)
                                 == creation["request_digest"]
                                 and isinstance(configuration, dict)
-                                and configuration.get("version") == 3
+                                and configuration.get("version") in {1, 3}
                                 and canonical_configuration_digest(configuration)
                                 == creation["controller_configuration_digest"]
                                 and (

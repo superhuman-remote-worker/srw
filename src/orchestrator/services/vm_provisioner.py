@@ -3432,8 +3432,15 @@ class VMProvisioner:
             return False
         if retained is not None and not resource_enforced:
             return False
+        # Durable creation authority is a lifecycle requirement independent of
+        # optional resource quotas. Retry-enabled thread VMs must use the same
+        # immutable request/effect protocol as jobs even when quotas are off.
+        durable_creation = resource_enforced or (
+            self.mode == "same-cluster"
+            and os.getenv("VM_CREATION_RETRY_ENABLED", "false").lower() == "true"
+        )
         creation_source = None
-        if resource_enforced:
+        if durable_creation:
             # A claimed immutable source is the only route to a v3 effect. A
             # polling caller reuses its durable request; it never installs a
             # second source or replays a legacy POST/NATS create.
@@ -3542,7 +3549,11 @@ class VMProvisioner:
                     self._http_client, request,
                     secret=self._lifecycle_hmac_secret,
                 )
-                if resolved["controller_configuration"].get("version") != 3:
+                configuration_version = resolved["controller_configuration"].get("version")
+                if (
+                    configuration_version not in {1, 3}
+                    or resource_enforced and configuration_version != 3
+                ):
                     return False
                 from shared.vm_creation_retry import canonical_request_digest
                 from shared.vm_creation_issuance import canonical_configuration_digest
@@ -3589,7 +3600,7 @@ class VMProvisioner:
         if not persisted:
             return False
 
-        if resource_enforced:
+        if durable_creation:
             # The controller retry service owns every subsequent POST and
             # observation. A boolean here means durable source admission only.
             return True
