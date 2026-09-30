@@ -283,13 +283,20 @@ export class NetworkLedger {
     if (!pathname || !location) return false;
     const applicationUrl = new URL(this.applicationOrigin);
     const connectionMatch = pathname.match(CONNECTION);
+    // HTTPS/HTTP2 resource errors may omit the reason phrase. Classify only
+    // the owned GET response actually observed in this warm-up phase.
+    const statusMatch = message.match(/(?:409 \((?:Conflict)?\)|425 \((?:Too Early)?\))$/i);
+    const status = statusMatch ? Number.parseInt(statusMatch[0], 10) : null;
     const expectedConnectionFailure =
       location.origin === this.applicationOrigin &&
       WARM_PHASES.has(this.phase) &&
       connectionMatch !== null &&
       this.ownedThreadIds.has(decodeURIComponent(connectionMatch[1])) &&
       /Failed to load resource/i.test(message) &&
-      /(?:409 \(Conflict\)|425 \(Too Early\))/i.test(message);
+      status !== null &&
+      this.responses('GET', pathname).some(
+        (response) => response.status === status && response.phase === this.phase,
+      );
     if (expectedConnectionFailure) return true;
 
     const socketMatch = pathname.match(CONTROL_WEBSOCKET);
