@@ -349,7 +349,9 @@ def _world(monkeypatch):
     monkeypatch.setattr(pa, "_event_writer", None)
     monkeypatch.setattr(pa, "_loop_task", None)
     monkeypatch.setattr(pa._session_termination, "retirement_admission_identity", None)
-    monkeypatch.setattr(pa._session_termination, "retirement_admission_disposition", None)
+    monkeypatch.setattr(
+        pa._session_termination, "retirement_admission_disposition", None
+    )
     monkeypatch.setattr(pa._session_termination, "retirement_admission_token", None)
     monkeypatch.setattr(pa._session_termination, "retirement_admission_permanent", None)
     monkeypatch.setattr(pa._session_termination, "termination_admission_fenced", False)
@@ -1021,7 +1023,9 @@ async def test_pool_failure_unconfirmed_release_keeps_the_claim(monkeypatch):
 
 
 async def _detach_for_reuse():
-    await pa._session_termination.terminate("claim_switch", mark_thread=False, preserve_shell=True)
+    await pa._session_termination.terminate(
+        "claim_switch", mark_thread=False, preserve_shell=True
+    )
 
 
 @pytest.mark.asyncio
@@ -1295,3 +1299,70 @@ async def test_dual_attach_failure_clears_exactly_and_returns_idle(monkeypatch, 
         None,
         None,
     )
+
+
+@pytest.mark.asyncio
+async def test_failed_attach_retains_exact_heartbeat_identity_until_release(
+    monkeypatch,
+):
+    client = _client()
+    client.release_thread_agent = AsyncMock(return_value=True)
+    monkeypatch.setattr(pa, "_orchestrator_client", client)
+    _poll(monkeypatch, _workspace(G2))
+    with pytest.raises(WorkspaceNotReady, match="generation changed"):
+        await attach(
+            thread_id=TA,
+            pinned_runtime_generation_contract=1,
+            pinned_status_identity_contract=1,
+            session_runtime_generation=G1,
+            session_runtime_attach_token=T1,
+        )
+    assert heartbeat_status() == "session"
+    assert (
+        identity()["thread_id"],
+        identity()["generation"],
+        identity()["attach_token"],
+    ) == (TA, G1, T1)
+    assert (client.session_runtime_generation, client.session_runtime_attach_token) == (
+        G1,
+        T1,
+    )
+    assert await release_until_confirmed(TA, G1, T1) is True
+    assert identity()["generation"] is None
+    assert identity()["attach_token"] is None
+    assert identity()["thread_id"] is None
+    assert heartbeat_status() == "ready"
+
+
+@pytest.mark.asyncio
+async def test_failed_attach_release_cannot_clear_successor_identity(monkeypatch):
+    client = _client()
+    monkeypatch.setattr(pa, "_orchestrator_client", client)
+    _poll(monkeypatch, _workspace(G2))
+    with pytest.raises(WorkspaceNotReady):
+        await attach(
+            thread_id=TA,
+            pinned_runtime_generation_contract=1,
+            session_runtime_generation=G1,
+            session_runtime_attach_token=T1,
+        )
+
+    async def confirm(*args, **kwargs):
+        seed_identity(
+            monkeypatch,
+            thread_id=TB,
+            generation=G2,
+            attach_token=T2,
+            runtime_contract=True,
+            status_contract=True,
+        )
+        return True
+
+    client.release_thread_agent = AsyncMock(side_effect=confirm)
+    assert await release_until_confirmed(TA, G1, T1) is True
+    assert (
+        identity()["thread_id"],
+        identity()["generation"],
+        identity()["attach_token"],
+    ) == (TB, G2, T2)
+    assert identity()["status_contract"] is True

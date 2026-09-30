@@ -9461,3 +9461,102 @@ async def test_preparation_stage_preserves_deadline_and_allows_session_end(db):
         r["entity_id"] == ids["thread"]
         for r in await db.list_vm_preparation_cancellations()
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["booting", "ready"])
+@pytest.mark.parametrize("backend", ["none", "vm"])
+async def test_dedicated_pre_setup_abort_releases_exact_captured_life(
+    db, status, backend
+):
+    import orchestrator.main as orch_main
+
+    ids = await _seed(db, protected_agent_pod=True, workspace_claim=False)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET status='created', metadata=jsonb_set(metadata,"
+            "'{config_override,workspace,backend}',to_jsonb($2::text)) WHERE id=$1::uuid",
+            UUID(ids["thread"]),
+            backend,
+        )
+        await conn.execute(
+            "UPDATE agents SET status=$2 WHERE id=$1::uuid", UUID(ids["agent"]), status
+        )
+    generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
+    with patch.object(orch_main.app.state.resources, "postgres_db", db):
+        result = await session_attach_binding_module.release_session_attach_binding(
+            ids["agent"],
+            ids["thread"],
+            expected_runtime_generation=generation,
+            expected_attach_token=ids["attach_token"],
+            expected_agent_pod_uid="old-pod",
+            local_runtime_quiesced=True,
+            local_quiescence_protocol="agent_attach_not_started_v1",
+            dependencies=sessions_composition.session_attach_binding_dependencies(
+                orch_main.app.state.resources
+            ),
+        )
+    assert result == "released"
+    successor = await db.get_thread(ids["thread"])
+    assert str(successor["runtime_generation"]) != generation
+    assert successor["agent_id"] is None
+    assert successor["runtime_attach_token"] is None
+    assert successor["runtime_authority_exposed"] is False
+    async with db.acquire() as conn:
+        agent = await conn.fetchrow(
+            "SELECT status::text, thread_id FROM agents WHERE id=$1::uuid",
+            UUID(ids["agent"]),
+        )
+    assert dict(agent) == {"status": "ready", "thread_id": None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "defect",
+    ["setup_started", "replacement_uid", "dual", "missing_marker", "stale_generation"],
+)
+async def test_dedicated_pre_setup_abort_refuses_unproven_authority(db, defect):
+    import orchestrator.main as orch_main
+
+    ids = await _seed(db, protected_agent_pod=True, workspace_claim=False)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET status='created' WHERE id=$1::uuid", UUID(ids["thread"])
+        )
+        await conn.execute(
+            "UPDATE agents SET status='ready' WHERE id=$1::uuid", UUID(ids["agent"])
+        )
+        if defect == "dual":
+            await conn.execute(
+                "UPDATE agents SET agent_mode='dual' WHERE id=$1::uuid",
+                UUID(ids["agent"]),
+            )
+        if defect == "missing_marker":
+            await conn.execute(
+                "UPDATE threads SET metadata=metadata-'agent_pod' WHERE id=$1::uuid",
+                UUID(ids["thread"]),
+            )
+    generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
+    with patch.object(orch_main.app.state.resources, "postgres_db", db):
+        result = await session_attach_binding_module.release_session_attach_binding(
+            ids["agent"],
+            ids["thread"],
+            expected_runtime_generation=str(uuid4())
+            if defect == "stale_generation"
+            else generation,
+            expected_attach_token=ids["attach_token"],
+            expected_agent_pod_uid="replacement"
+            if defect == "replacement_uid"
+            else "old-pod",
+            local_runtime_quiesced=True,
+            local_quiescence_protocol="agent_runtime_zero_v1"
+            if defect == "setup_started"
+            else "agent_attach_not_started_v1",
+            dependencies=sessions_composition.session_attach_binding_dependencies(
+                orch_main.app.state.resources
+            ),
+        )
+    assert result == "unsafe"
+    current = await db.get_thread(ids["thread"])
+    assert str(current["runtime_generation"]) == generation
+    assert str(current["agent_id"]) == ids["agent"]
