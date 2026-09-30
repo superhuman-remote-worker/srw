@@ -874,13 +874,21 @@ class IdeSessionService:
         ctx = self._parse_context(job)
         session_ctx = ctx.get("ide_session", {})
         status = session_ctx.get("status")
-
-        if status not in ("active", "idle", "restoring", "cleanup_pending", "failed"):
-            return {"status": "no_active_session"}
-
         restore_type = session_ctx.get("restore_type", "vm")
         expected_runtime_incarnation = session_ctx.get("_runtime_incarnation")
-        stale_target_settled = False
+        retrying_exact_cleanup = (
+            status == "retiring_process_zero"
+            and restore_type == "k8s_container"
+            and isinstance(session_ctx.get("container_name"), str)
+            and bool(session_ctx["container_name"])
+            and _canonical_runtime(expected_runtime_incarnation) is not None
+        )
+
+        if (
+            status not in ("active", "idle", "restoring", "cleanup_pending", "failed")
+            and not retrying_exact_cleanup
+        ):
+            return {"status": "no_active_session"}
 
         if (
             status == "restoring"
@@ -894,14 +902,17 @@ class IdeSessionService:
             try:
                 token = int(session_ctx["_creation_claim_token"])
             except (TypeError, ValueError):
-                    return {"status": "cleanup_pending", "job_id": job_id, "retryable": True}
+                return {"status": "cleanup_pending", "job_id": job_id, "retryable": True}
             cancelled = await self._container_provisioner.cancel_ide_restore_attempt(
                 job_id,
                 attempt_id=str(session_ctx["_restore_attempt_id"]),
                 reservation_id=str(session_ctx["_creation_reservation_id"]),
                 claim_token=token,
             )
-            if isinstance(cancelled, dict) and cancelled.get("reconciliation_outcome") == "aborted":
+            if (
+                isinstance(cancelled, dict)
+                and cancelled.get("reconciliation_outcome") == "aborted"
+            ):
                 return {"status": "stopped", "job_id": job_id}
             # A started effect needs the native same-generation reconciler.
             # A refused claim cannot prove that Pod/process effects are gone.
@@ -914,8 +925,41 @@ class IdeSessionService:
                     job_id,
                     expected_runtime_incarnation=expected_runtime_incarnation,
                 )
-                deleted = outcome.current_deleted
-                stale_target_settled = outcome.stale_target_settled
+                pending = {"status": "cleanup_pending", "job_id": job_id, "retryable": True}
+                if not (outcome.current_deleted or outcome.stale_target_settled):
+                    return pending
+                reconcile = getattr(
+                    type(self._container_provisioner),
+                    "reconcile_ide_cleanup_intent",
+                    None,
+                )
+                if _canonical_runtime(expected_runtime_incarnation) is None or not callable(
+                    reconcile
+                ):
+                    return pending
+                try:
+                    cleanup = (
+                        await self._container_provisioner.reconcile_ide_cleanup_intent(
+                            job_id,
+                            expected_runtime_incarnation=expected_runtime_incarnation,
+                        )
+                    )
+                    if cleanup.superseded:
+                        return {
+                            "status": "superseded",
+                            "job_id": job_id,
+                            "retryable": False,
+                        }
+                    if not cleanup.settled:
+                        return pending
+                except Exception:
+                    logger.exception(
+                        "Failed to settle exact IDE cleanup for job %s", job_id
+                    )
+                    return pending
+                # Native settlement atomically closes the intent and projects
+                # expired. Never overwrite its retiring state on interruption.
+                deleted = True
             else:
                 deleted = bool(
                     container_name
@@ -935,31 +979,15 @@ class IdeSessionService:
                     deleted = await self._delete_ide_vm(job_id, vm_name)
                 except Exception as e:
                     logger.warning("Failed to delete IDE VM %s: %s", vm_name, e)
-        if stale_target_settled:
-            return {
-                "status": "superseded",
-                "job_id": job_id,
-                "retryable": False,
-            }
         if not deleted:
+            if restore_type == "k8s_container":
+                return {"status": "cleanup_pending", "job_id": job_id, "retryable": True}
             updates = {
                 "status": "cleanup_pending",
                 "code_server_url": None,
                 "cleanup_failure": "managed_repository_process_zero_unproven",
             }
-            if restore_type == "k8s_container":
-                if not await self._set_session_context_if_runtime(
-                    job_id,
-                    updates,
-                    expected_runtime_incarnation=expected_runtime_incarnation,
-                ):
-                    return {
-                        "status": "superseded",
-                        "job_id": job_id,
-                        "retryable": False,
-                    }
-            else:
-                await self._set_session_context(job_id, updates)
+            await self._set_session_context(job_id, updates)
             return {"status": "cleanup_pending", "job_id": job_id, "retryable": True}
 
         updates = {
