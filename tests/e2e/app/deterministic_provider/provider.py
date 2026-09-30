@@ -49,6 +49,7 @@ SUPPORTED_SCENARIOS = frozenset(
         "worker-job",
         "retained-sentinel-worker",
         "prepared-workspace-job",
+        "delegation-batch",
     }
 )
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$")
@@ -64,7 +65,6 @@ STARTUP_PROBE_INPUT: Final = "dimension probe"
 _STARTUP_PROBE_KEYS: Final = frozenset({"model", "input", "encoding_format"})
 _STARTUP_PROBE_FORMATS: Final = frozenset({"base64", "float"})
 _MAX_PROBE_WINDOWS: Final = 256
-
 
 
 class ArmScenarioRequest(BaseModel):
@@ -83,6 +83,7 @@ class ArmScenarioRequest(BaseModel):
         "worker-job",
         "retained-sentinel-worker",
         "prepared-workspace-job",
+        "delegation-batch",
     ] = "reply"
     required_responses: int = Field(default=1, ge=1, le=100)
     chunk_delay_ms: int = Field(default=100, ge=0, le=2_000)
@@ -95,6 +96,12 @@ class ArmProbeWindowRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_probes: int = Field(ge=1, le=32)
+
+
+class AdvanceScenarioRequest(ArmScenarioRequest):
+    """Add a phase without resetting the correlation, history or budgets."""
+
+    expected_cancelled: int = Field(default=0, ge=0, le=100)
 
 
 @dataclass
@@ -129,6 +136,7 @@ class ToolCallSpec:
 
     name: str
     arguments: str
+    following: tuple[ToolCallSpec, ...] = ()
 
 
 @dataclass
@@ -306,7 +314,9 @@ class ScenarioStore:
             request.sentinel_sha256 is not None
         ):
             raise ScenarioError(
-                422, "sentinel_contract_invalid", "Sentinel hash is required only for retained worker scenario."
+                422,
+                "sentinel_contract_invalid",
+                "Sentinel hash is required only for retained worker scenario.",
             )
         async with self._lock:
             if run_id in self._runs:
@@ -332,6 +342,48 @@ class ScenarioStore:
                 state.completion_release.set()
             return state is not None
 
+    async def advance(
+        self, run_id: str, request: AdvanceScenarioRequest
+    ) -> dict[str, Any]:
+        _validate_run_id(run_id)
+        if (
+            request.sentinel_sha256 is not None
+            or request.scenario == "retained-sentinel-worker"
+        ):
+            raise ScenarioError(
+                422, "advance_unsupported", "Retained worker phases cannot be advanced."
+            )
+        async with self._lock:
+            state = self._runs.get(run_id)
+            if state is None:
+                raise ScenarioError(404, "scenario_not_found", "No scenario is armed.")
+            cancelled = sum(
+                n
+                for (_, _, _, outcome), n in state.counters.items()
+                if outcome == "cancelled"
+            )
+            if (
+                state.pending
+                or state.remaining_required_responses > request.expected_cancelled
+                or state.unexpected_calls != request.expected_cancelled
+                or cancelled != request.expected_cancelled
+            ):
+                raise ScenarioError(
+                    409,
+                    "phase_unsettled",
+                    "The preceding phase has unfinished or unaccounted work.",
+                )
+            if state.required_responses + request.required_responses > 100:
+                raise ScenarioError(
+                    422,
+                    "phase_budget_exceeded",
+                    "Cumulative required responses exceed the run bound.",
+                )
+            state.scenario = request.scenario
+            state.required_responses += request.required_responses
+            state.chunk_delay_ms = request.chunk_delay_ms
+            return self._serialize(state)
+
     async def state(self, run_id: str) -> dict[str, Any]:
         _validate_run_id(run_id)
         async with self._lock:
@@ -353,7 +405,11 @@ class ScenarioStore:
                 or state.unexpected_calls != 0
                 or state.completion_release.is_set()
             ):
-                raise ScenarioError(409, "completion_proof_missing", "Retained completion is not releasable.")
+                raise ScenarioError(
+                    409,
+                    "completion_proof_missing",
+                    "Retained completion is not releasable.",
+                )
             state.completion_release.set()
             return self._serialize(state)
 
@@ -367,7 +423,11 @@ class ScenarioStore:
         try:
             await asyncio.wait_for(event.wait(), timeout=90)
         except asyncio.TimeoutError:
-            raise ScenarioError(409, "completion_barrier_timeout", "Retained completion was not released.") from None
+            raise ScenarioError(
+                409,
+                "completion_barrier_timeout",
+                "Retained completion was not released.",
+            ) from None
         async with self._lock:
             if self._runs.get(run_id) is not state:
                 raise ScenarioError(409, "scenario_changed", "Retained run changed.")
@@ -696,7 +756,8 @@ class ScenarioStore:
                 state.fetch_job_tool_steps += 1
             if (
                 outcome == "success"
-                and decision.scenario in {"worker-job", "prepared-workspace-job", "retained-sentinel-worker"}
+                and decision.scenario
+                in {"worker-job", "prepared-workspace-job", "retained-sentinel-worker"}
                 and decision.tool_phase
             ):
                 state.worker_job_tool_steps += 1
@@ -913,6 +974,66 @@ def create_inference_app(
                         name=_first_tool_name(payload) or "e2e_tool",
                         arguments="{}",
                     )
+            elif structured_name is None and state["scenario"] == "delegation-batch":
+                tool_names = _tool_names(payload)
+                has_tool_result = any(
+                    isinstance(m, dict) and m.get("role") == "tool" for m in messages
+                )
+                has_delegated = any(
+                    isinstance(m, dict)
+                    and any(
+                        isinstance(call, dict)
+                        and (call.get("function") or {}).get("name") == "delegate_agent"
+                        for call in m.get("tool_calls", [])
+                    )
+                    for m in messages
+                )
+                if (
+                    "delegate_agent" in tool_names
+                    and not has_tool_result
+                    and tool_names & {"shell_execute", "run_command"}
+                ):
+                    name = (
+                        "shell_execute"
+                        if "shell_execute" in tool_names
+                        else "run_command"
+                    )
+                    tool_call = ToolCallSpec(
+                        name,
+                        json.dumps(
+                            {"command": "printf 'R33C_SHELL_READY\\n'", "timeout": 10}
+                        ),
+                    )
+                elif not has_delegated and "delegate_agent" in tool_names:
+                    calls = tuple(
+                        ToolCallSpec(
+                            name="delegate_agent",
+                            arguments=json.dumps(
+                                {
+                                    "description": f"Lifecycle probe {index}",
+                                    "subagent_type": "probe",
+                                    "prompt": f"E2E-{run_id} lifecycle child {index}: run sleep 300 with timeout 390, then report.",
+                                    "run_in_background": False,
+                                }
+                            ),
+                        )
+                        for index in (1, 2)
+                    )
+                    tool_call = ToolCallSpec(
+                        calls[0].name, calls[0].arguments, following=calls[1:]
+                    )
+                elif not has_tool_result and tool_names & {
+                    "shell_execute",
+                    "run_command",
+                }:
+                    name = (
+                        "shell_execute"
+                        if "shell_execute" in tool_names
+                        else "run_command"
+                    )
+                    tool_call = ToolCallSpec(
+                        name, json.dumps({"command": "sleep 300", "timeout": 390})
+                    )
             elif structured_name is None and state["scenario"] == "search-job":
                 tool_names = _tool_names(payload)
                 if tool_names & {
@@ -958,8 +1079,10 @@ def create_inference_app(
                         )
                     elif state["scenario"] == "retained-sentinel-worker":
                         tool_call = _retained_sentinel_tool_call(
-                            state["worker_job_tool_steps"], run_id,
-                            state["sentinel_sha256"], messages,
+                            state["worker_job_tool_steps"],
+                            run_id,
+                            state["sentinel_sha256"],
+                            messages,
                         )
                     else:
                         tool_call = _worker_job_tool_call(
@@ -1207,6 +1330,13 @@ def create_control_app(store: ScenarioStore, *, control_token: str) -> FastAPI:
     async def run_state(run_id: str):
         try:
             return await store.state(run_id)
+        except ScenarioError as exc:
+            return _scenario_error_response(exc)
+
+    @app.post("/control/scenarios/{run_id}/advance")
+    async def advance(run_id: str, advance_request: AdvanceScenarioRequest):
+        try:
+            return await store.advance(run_id, advance_request)
         except ScenarioError as exc:
             return _scenario_error_response(exc)
 
@@ -1579,23 +1709,10 @@ async def _stream_completion(
                             "index": 0,
                             "delta": {
                                 "tool_calls": [
-                                    {
-                                        "index": 0,
-                                        "id": f"call_{decision.sequence}",
-                                        "type": "function",
-                                        "function": {
-                                            "name": (
-                                                tool_call.name
-                                                if tool_call is not None
-                                                else "e2e_tool"
-                                            ),
-                                            "arguments": (
-                                                tool_call.arguments
-                                                if tool_call is not None
-                                                else "{}"
-                                            ),
-                                        },
-                                    }
+                                    dict(index=i, **call)
+                                    for i, call in enumerate(
+                                        _wire_tool_calls(decision, tool_call)
+                                    )
                                 ]
                             },
                             "finish_reason": None,
@@ -1654,18 +1771,7 @@ def _non_stream_completion(
     message: dict[str, Any] = {"role": "assistant", "content": content}
     if decision.tool_phase:
         message["content"] = None
-        message["tool_calls"] = [
-            {
-                "id": f"call_{decision.sequence}",
-                "type": "function",
-                "function": {
-                    "name": tool_call.name if tool_call is not None else "e2e_tool",
-                    "arguments": (
-                        tool_call.arguments if tool_call is not None else "{}"
-                    ),
-                },
-            }
-        ]
+        message["tool_calls"] = _wire_tool_calls(decision, tool_call)
     return {
         "id": _response_id("chatcmpl"),
         "object": "chat.completion",
@@ -1680,6 +1786,24 @@ def _non_stream_completion(
         ],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
     }
+
+
+def _wire_tool_calls(
+    decision: CallDecision, tool_call: ToolCallSpec | None
+) -> list[dict[str, Any]]:
+    calls = (
+        (tool_call, *tool_call.following)
+        if tool_call is not None
+        else (ToolCallSpec("e2e_tool", "{}"),)
+    )
+    return [
+        {
+            "id": f"call_{decision.sequence}" + (f"_{index}" if index else ""),
+            "type": "function",
+            "function": {"name": call.name, "arguments": call.arguments},
+        }
+        for index, call in enumerate(calls)
+    ]
 
 
 def _first_tool_name(payload: dict[str, Any]) -> str | None:
@@ -1868,7 +1992,7 @@ def _retained_sentinel_tool_call(
                 "set -eu",
                 f"test -f {shlex.quote(path)}",
                 f"actual=$(sha256sum {shlex.quote(path)})",
-                f"test \"${{actual%% *}}\" = {shlex.quote(digest)}",
+                f'test "${{actual%% *}}" = {shlex.quote(digest)}',
                 f"printf '%s\\n' {shlex.quote('SRW_A1_SENTINEL_PASS:' + run_id)}",
             )
         )

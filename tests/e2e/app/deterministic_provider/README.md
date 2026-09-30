@@ -44,6 +44,25 @@ Normal messages carry `E2E-{run-id}` and receive `E2E_REPLY:{run-id}`. Lifecycle
 requests without a token are associated only when exactly one run is armed. Unknown,
 ambiguous, exhausted, unsupported-schema, and wrong-model requests fail closed.
 
+Multi-stage lifecycle cases retain one run ID across End and Resume. After all
+calls in a phase finish, `POST /control/scenarios/{run-id}/advance` adds another
+response budget and chooses the next scenario. It preserves every call, its
+sequence, consumed count, unexpected count and counter. The caller supplies
+`expected_cancelled` as the cumulative number of intentional cancellations;
+pending, unfinished and unaccounted work refuses advancement. Keep the run
+armed through the associated background work and resource cleanup, then delete
+it. A phase-local display may subtract earlier counters, but the cumulative
+ledger remains the acceptance evidence.
+
+`delegation-batch` drives the existing stateless recovery contract. It emits
+two foreground `delegate_agent` calls for `probe` children, which run a bounded
+`sleep 300` command. After the parent receives both tool results it emits one
+final answer. This fixture exercises platform replacement while a delegation
+batch is active; it does not enable pinned delegation fan-out.
+When the parent binds shell tools, it first runs a small command so the live
+gate can inspect its pane identity and prove shell preservation across claim
+handoff.
+
 The `search-job` scenario is a narrow live-gate driver. It advances the real agent
 through its strategic setup, stages a two-todo tactical phase, calls `web_search`,
 then returns through `job_complete` and the remaining strategic todos. It reads the
@@ -83,7 +102,7 @@ SRW and is not retained.
 From the repository root (using the repository Python environment):
 
 ```bash
-pytest tests/e2e/app/deterministic_provider/test_provider.py -q
+pytest tests/e2e/app/deterministic_provider/ -q
 ruff check tests/e2e/app/deterministic_provider/
 ```
 
