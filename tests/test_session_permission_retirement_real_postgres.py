@@ -47,7 +47,6 @@ async def pg_pool(pg_dsn):
                 unit_id uuid PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
                 unit_kind text NOT NULL,
                 state text NOT NULL,
-                park_reason text,
                 lease_token bigint NOT NULL,
                 leased_by text,
                 last_leased_by text,
