@@ -603,11 +603,13 @@ async def release_session_attach_binding(
                 admitted_input = await conn.fetchval(
                     "SELECT EXISTS (SELECT 1 FROM thread_input_deliveries "
                     "WHERE thread_id=$1::uuid AND owner_agent_id=$2::uuid "
-                    "AND owner_runtime_generation=$3::uuid "
-                    "AND state IN ('admitted','settled'))",
+                    "AND owner_pod_uid=$3 "
+                    "AND (state IN ('admitted','settled') OR "
+                    "($4::boolean AND state IN ('owned','queued'))))",
                     thread_id,
                     agent_id,
-                    expected_runtime_generation,
+                    current_pod_uid,
+                    proof_protocol == "agent_attach_not_started_v1",
                 )
                 admitted_control = await conn.fetchval(
                     "SELECT EXISTS (SELECT 1 FROM thread_control_requests "
