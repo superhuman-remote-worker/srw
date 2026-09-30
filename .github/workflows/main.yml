@@ -466,15 +466,9 @@ jobs:
   # ---------------------------------------------------------------------------
   # Python tests — always run on main (not change-based)
   # ---------------------------------------------------------------------------
-  test-python:
+  test-python-shards:
     needs: [lint]
     runs-on: ubuntu-latest
-    # 25, not 15: the suite is ~22.6k tests and takes ~14 min of test time on
-    # ubuntu-latest plus ~2 min of job setup. At 15 the 2026-09-02 develop run
-    # was killed at 91% while still progressing at full speed (46 progress
-    # marks in its final two minutes, largest single gap 62 s: no hang), and
-    # a timed-out job reports as 'cancelled', which the build jobs treat as a
-    # failure: nothing built and no chart published for that push.
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -486,10 +480,6 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-      # The chart render contract tests in tests/test_canvas_slice3_infra.py
-      # shell out to `helm template`. ubuntu-latest ships Helm, so their
-      # `which("helm")` skip guard never fires here; without the subchart
-      # vendored they fail on the Collabora dependency instead of skipping.
       - name: Install Helm
         uses: azure/setup-helm@v4
         with:
@@ -499,51 +489,60 @@ jobs:
           helm repo add collabora https://collaboraonline.github.io/online --force-update
           helm dependency build helm/
       - name: Install dependencies
-        run: uv pip install --system -r requirements.txt -r src/orchestrator/requirements.txt -r src/mcp_server/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
+        run: >-
+          uv pip install --system -r requirements.txt -r src/orchestrator/requirements.txt
+          -r src/mcp_server/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
       - name: Install editable application packages
         run: pip install --no-deps -e .
       - name: Check combined test environment compatibility
         run: python -m pip check
-      # Keep tests from the same file on one worker so file-local fixture/order
-      # assumptions remain intact. The runner caps worker count and also scales
-      # down automatically on smaller GitHub-hosted runners.
       - name: Run tests
-        run: ./scripts/pytest-fast.sh
+        run: >-
+          python scripts/pytest_shard.py --index ${{ matrix.shard }} --count 2
+          --report-dir test-results/python-${{ matrix.shard }} tests/
+      - name: Record file durations
+        if: always()
+        run: |
+          REPORT=test-results/python-${{ matrix.shard }}
+          if [ -f "$REPORT/junit.xml" ]; then
+            python scripts/pytest_file_timings.py "$REPORT/junit.xml" --output "$REPORT/file-timings.json"
+          fi
+      - name: Upload Python results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-shard-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: test-results/python-${{ matrix.shard }}/
+          if-no-files-found: warn
+          retention-days: 14
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - 0
+          - 1
 
-  # ---------------------------------------------------------------------------
-  # Cockpit unit + production-browser conformance tests — always run on main
-  # ---------------------------------------------------------------------------
-  test-cockpit:
+  # Preserve the existing aggregate check name for publication and branch rules.
+  test-python:
+    needs: [test-python-shards]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every Python shard
+        env:
+          SHARDS_RESULT: ${{ needs.test-python-shards.result }}
+        run: test "$SHARDS_RESULT" = success
+
+  # Unit tests overlap the one production build; browser gates share its artifact.
+  test-cockpit-build:
     needs: [lint]
     runs-on: ubuntu-latest
-    # The engines and every system library they need are baked into this image
-    # at /ms-playwright. The step this replaces (`playwright install --with-deps
-    # chromium firefox webkit`) pulled 181 apt packages / 114 MB from
-    # azure.archive.ubuntu.com on every run. That normally cost ~35 s, but a
-    # degraded mirror on 2026-08-18 stretched it to 18m40s and killed the job on
-    # its wall clock. On main that blocks resolve-version and every image build,
-    # so keep the engines off apt entirely.
-    # PLAYWRIGHT_VERSION must match this tag; the guard step below enforces it.
-    container:
-      image: mcr.microsoft.com/playwright:v1.59.0-noble
-    env:
-      PLAYWRIGHT_VERSION: 1.59.0
-      # A container job runs as root with HOME=/github/home, a runner-owned
-      # bind mount (pwuser inside this image). Firefox refuses to launch when
-      # $HOME belongs to another user ("Running Nightly as root in a regular
-      # user's session is not supported"), so all 11 firefox specs died at
-      # browser launch on the first cockpit push after the image switch, while
-      # chromium and webkit passed. /root is owned by the user this job
-      # actually runs as. This is Playwright's documented workaround; drop it
-      # only if the job stops running as root.
-      HOME: /root
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
-      # The image ships Node 24; pin to 22 so unit tests, the production build,
-      # and the conformance run all use the same Node as every other job.
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -552,9 +551,70 @@ jobs:
       - name: Install dependencies
         working-directory: cockpit
         run: npm ci
-      # Engines come from the image, so a @playwright/test bump that forgets the
-      # container tag would otherwise surface minutes later as a confusing
-      # "Executable doesn't exist". Bump the tag and PLAYWRIGHT_VERSION together.
+      - name: Build production Cockpit
+        working-directory: cockpit
+        run: npm run build
+      - name: Upload production Cockpit
+        uses: actions/upload-artifact@v4
+        with:
+          name: cockpit-production
+          path: cockpit/dist/
+          if-no-files-found: error
+          # Stable name supports rerunning only failed browser jobs.
+          overwrite: true
+          retention-days: 7
+  test-cockpit-unit:
+    needs: [lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cockpit/package-lock.json
+      - name: Install dependencies
+        working-directory: cockpit
+        run: npm ci
+      - name: Check i18n parity
+        working-directory: cockpit
+        run: npm run i18n:check
+      - name: Run tests
+        working-directory: cockpit
+        run: npm test
+  test-cockpit-browser:
+    needs:
+      - test-cockpit-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Browser engines and system libraries are baked in; avoid per-job apt installs.
+    container:
+      image: mcr.microsoft.com/playwright:v1.59.0-noble
+    env:
+      PLAYWRIGHT_VERSION: 1.59.0
+      # Firefox requires HOME to belong to the user running the browser.
+      HOME: /root
+    strategy:
+      fail-fast: false
+      matrix:
+        gate:
+          - canvas
+          - cloud-review
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cockpit/package-lock.json
+      - name: Install dependencies
+        working-directory: cockpit
+        run: npm ci
       - name: Verify Playwright matches the container image
         working-directory: cockpit
         run: |
@@ -565,41 +625,43 @@ jobs:
             exit 1
           fi
           echo "Playwright $HAVE matches the container image."
-      - name: Check i18n parity
+      - name: Download production Cockpit
+        uses: actions/download-artifact@v4
+        with:
+          name: cockpit-production
+          path: cockpit/dist/
+      - name: Run browser gate
         working-directory: cockpit
-        run: npm run i18n:check
-      # Step-level caps so a hung step names itself instead of silently eating
-      # the job budget. Healthy times are ~70 s / ~25 s / ~75 s.
-      - name: Run tests
-        working-directory: cockpit
-        timeout-minutes: 10
-        run: npm test
-      - name: Build production Cockpit
-        working-directory: cockpit
-        timeout-minutes: 10
-        run: npm run build
-      - name: Run Dynamic Canvas browser conformance
-        working-directory: cockpit
-        timeout-minutes: 10
-        run: npm run test:e2e:canvas:no-build
-      - name: Run protected-cloud review browser gate
-        working-directory: cockpit
-        timeout-minutes: 10
-        run: npm run test:e2e:cloud-review:no-build
+        run: npm run test:e2e:${{ matrix.gate }}:no-build
       - name: Upload browser gate reports
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cockpit-browser-reports-main-${{ github.run_attempt }}
-          path: |
+          name: cockpit-browser-${{ matrix.gate }}-${{ github.run_attempt }}
+          path: |-
             cockpit/playwright-report/
             cockpit/test-results/
           if-no-files-found: ignore
           retention-days: 7
+  test-cockpit:
+    needs:
+      - test-cockpit-unit
+      - test-cockpit-build
+      - test-cockpit-browser
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every Cockpit gate
+        env:
+          UNIT_RESULT: ${{ needs.test-cockpit-unit.result }}
+          BUILD_RESULT: ${{ needs.test-cockpit-build.result }}
+          BROWSER_RESULT: ${{ needs.test-cockpit-browser.result }}
+        run: |
+          test "$UNIT_RESULT" = success
+          test "$BUILD_RESULT" = success
+          test "$BROWSER_RESULT" = success
 
-  # ---------------------------------------------------------------------------
-  # Auto patch-bump version from last git v-tag
-  # ---------------------------------------------------------------------------
   resolve-version:
     needs: [lint, dependency-audit, test-python, test-cockpit]
     if: >-
@@ -1050,23 +1112,24 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # Stage 1: heavy, stable provisioning. On main, runs on push only — PR
+  # Stage 1: on main pushes, reuse a recent base with identical recorded inputs;
+  # otherwise run heavy provisioning. Stage2 consumes the verified digest. PR
   # validation re-uses a published stage1 image, which makes PRs to main much
   # faster (only stage2 rebuilds). Direct develop promotions use develop's
   # :experimental image below; other PRs use :latest. Cron refresh runs in
   # stage1-rebuild.yml so the baseline never drifts more than a week.
   # ---------------------------------------------------------------------------
   build-agent-vm-base-stage1:
-    needs: [architecture, lint, dependency-audit, test-python, test-cockpit, resolve-version]
-    if: >-
-      needs.architecture.result == 'success' &&
-      always() && !cancelled() &&
-      github.event_name == 'push' &&
-      needs.lint.result == 'success' &&
-      needs.dependency-audit.result == 'success' &&
-      needs.test-python.result == 'success' &&
-      needs.test-cockpit.result == 'success' &&
-      needs.resolve-version.result == 'success'
+    needs:
+      - architecture
+      - lint
+      - dependency-audit
+      - test-python
+      - test-cockpit
+      - resolve-version
+    if: needs.architecture.result == 'success' && always() && !cancelled() && github.event_name == 'push' && needs.lint.result
+      == 'success' && needs.dependency-audit.result == 'success' && needs.test-python.result == 'success' && needs.test-cockpit.result
+      == 'success' && needs.resolve-version.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -1076,13 +1139,21 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+      - name: Resolve reusable stage1 base
+        id: base
+        env:
+          STAGE1_IMAGE: ${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-agent-vm-base-stage1:latest
+        run: python3 scripts/vm_stage1_image.py --image "$STAGE1_IMAGE" >> "$GITHUB_OUTPUT"
       - name: Free disk space
-        # Hosted runners have ~14 GiB free and these jobs need more. Self-hosted
-        # runners do not need it, and the heavy variants below delete
-        # /opt/hostedtoolcache, which is where setup-* install. Guarded rather
-        # than deleted so the hosted fallback (gh variable delete CI_RUNNER_LABEL)
-        # still works.
-        if: runner.environment == 'github-hosted'
+        if: steps.base.outputs.reuse != 'true' && (runner.environment == 'github-hosted')
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/boost /usr/local/share/chromium \
@@ -1091,47 +1162,38 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage
+        if: steps.base.outputs.reuse != 'true'
       - name: Enable KVM (hosted runner udev rule)
-        # Hosted runners ship /dev/kvm as root:kvm with no world access, so this
-        # udev rule is how the runner user reaches it. Inside a container there is
-        # no udevd: the rule file goes nowhere and `udevadm control` fails. There,
-        # access comes from the pod spec instead — privileged + a /dev/kvm
-        # CharDevice hostPath, see HomeLab deployments_managed/arc-runners-kvm/.
-        # (Measured on node4: /dev/kvm is gid 36, mode 0666.)
-        if: runner.environment == 'github-hosted'
+        if: steps.base.outputs.reuse != 'true' && (runner.environment == 'github-hosted')
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-
       - name: Verify KVM is usable
-        # Runs on BOTH runner types, unconditionally. stage1.pkr.hcl and
-        # stage2.pkr.hcl set accelerator = "kvm", and without acceleration packer
-        # does not fail — it silently falls back to TCG and burns the entire
-        # 75-90 minute timeout. Fail in five seconds instead.
-        #
-        # KVM_GET_API_VERSION = _IO(KVMIO=0xAE, 0) = 0xAE00. Opening the device
-        # and getting an answer proves the permissions AND that the host kernel's
-        # KVM subsystem is reachable from in here, which `ls` alone does not.
+        # Fail before Packer can silently fall back to unaccelerated TCG.
         run: |
           set -euo pipefail
           ls -la /dev/kvm
           id
           python3 -c "import fcntl,os;fd=os.open('/dev/kvm',os.O_RDWR);print('KVM_GET_API_VERSION =',fcntl.ioctl(fd,0xAE00,0))"
+        if: steps.base.outputs.reuse != 'true'
       - uses: hashicorp/setup-packer@main
         with:
           version: latest
+        if: steps.base.outputs.reuse != 'true'
       - name: Compute cloud image cache key
         id: img-key
         run: echo "key=ubuntu-noble-cloudimg-$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+        if: steps.base.outputs.reuse != 'true'
       - name: Cache Ubuntu cloud image
         id: cloud-image-cache
         uses: actions/cache@v4
         with:
           path: docker/agent-vm-base/input/noble-server-cloudimg-amd64.img
           key: ${{ steps.img-key.outputs.key }}
+        if: steps.base.outputs.reuse != 'true'
       - name: Download Ubuntu cloud image
-        if: steps.cloud-image-cache.outputs.cache-hit != 'true'
+        if: steps.base.outputs.reuse != 'true' && (steps.cloud-image-cache.outputs.cache-hit != 'true')
         working-directory: docker/agent-vm-base
         run: |
           mkdir -p input
@@ -1140,9 +1202,11 @@ jobs:
       - name: Verify Ubuntu cloud image
         working-directory: docker/agent-vm-base
         run: qemu-img info input/noble-server-cloudimg-amd64.img
+        if: steps.base.outputs.reuse != 'true'
       - name: Packer init (stage1)
         working-directory: docker/agent-vm-base
         run: packer init stage1.pkr.hcl
+        if: steps.base.outputs.reuse != 'true'
       - name: Packer build (stage1)
         working-directory: docker/agent-vm-base
         run: |
@@ -1157,11 +1221,7 @@ jobs:
           done
           echo "::error::Stage1 packer build failed after 2 attempts"
           exit 1
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        if: steps.base.outputs.reuse != 'true'
       - name: Build and push stage1 containerDisk
         working-directory: docker/agent-vm-base
         run: |
@@ -1174,16 +1234,29 @@ jobs:
             --build-arg "SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}"
           )
           for T in "${TAGS[@]}"; do BUILD_ARGS+=(-t "$T"); done
+          STAGE1_INPUTS=$(python3 ../../scripts/vm_stage1_image.py)
+          BUILD_ARGS+=(--build-arg "SRW_STAGE1_INPUTS=${STAGE1_INPUTS}")
           docker build "${BUILD_ARGS[@]}" -f Dockerfile.containerDisk-stage1 .
           for T in "${TAGS[@]}"; do docker push "$T"; done
           printf 'Pushed stage1:\n'; printf '  %s\n' "${TAGS[@]}"
+        if: steps.base.outputs.reuse != 'true'
+      - name: Publish exact stage1 reference
+        id: resolved
+        env:
+          REUSED_IMAGE: ${{ steps.base.outputs.image }}
+          STAGE1_REPOSITORY: ${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-agent-vm-base-stage1
+        run: |
+          if [ -n "$REUSED_IMAGE" ]; then
+            echo "image=$REUSED_IMAGE" >> "$GITHUB_OUTPUT"
+          else
+            python3 scripts/vm_stage1_image.py --require-match \
+              --image "$STAGE1_REPOSITORY:sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+    outputs:
+      image: ${{ steps.resolved.outputs.image }}
 
-  # ---------------------------------------------------------------------------
-  # Stage 2: light per-commit layer. Pulls the stage1 containerDisk from GHCR,
-  # extracts the qcow2, and layers stage2 on top via stage2.pkr.hcl. PRs normally
-  # use :latest; a direct develop -> main promotion uses develop's :experimental
-  # base so new stage1 dependencies can pass validation before main publishes them.
-  # ---------------------------------------------------------------------------
+  # Stage2 layers per-commit configuration onto stage1. Main releases use the
+  # verified digest above; PRs retain the published latest/experimental choice.
   build-agent-vm-base:
     needs: [architecture, lint, dependency-audit, test-python, test-cockpit, build-sudo-gate, resolve-version, build-agent-vm-base-stage1]
     if: >-
@@ -1286,9 +1359,16 @@ jobs:
         working-directory: docker/agent-vm-base
         env:
           STAGE1_TAG: ${{ github.event_name == 'pull_request' && github.base_ref == 'main' && github.head_ref == 'develop' && 'experimental' || 'latest' }}
+          VERIFIED_STAGE1_IMAGE: ${{ needs.build-agent-vm-base-stage1.outputs.image }}
         run: |
-          STAGE1_IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base-stage1:${STAGE1_TAG}" | tr '[:upper:]' '[:lower:]')
-          echo "Using stage1 tag: ${STAGE1_TAG}"
+          # Push releases consume the exact verified digest; concurrent weekly
+          # refreshes cannot change this run's base between verification and use.
+          STAGE1_IMAGE="$VERIFIED_STAGE1_IMAGE"
+          if [ -z "$STAGE1_IMAGE" ]; then
+            test "${{ github.event_name }}" = pull_request
+            STAGE1_IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base-stage1:${STAGE1_TAG}" | tr '[:upper:]' '[:lower:]')
+          fi
+          echo "Using stage1 image: ${STAGE1_IMAGE}"
           docker pull "$STAGE1_IMAGE"
           # FROM scratch images have no shell so a real CMD doesn't matter — we
           # never start the container, just create-then-cp.

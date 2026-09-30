@@ -581,11 +581,14 @@ async def test_permanent_end_refuses_marker_upgrade_without_stranding_soft_end(
 
 @pytest.mark.asyncio
 async def test_acceptance_and_unknown_pod_keep_real_resource_charge(db, monkeypatch):
+    from orchestrator.services import pinned_retirement
+    from tests._asyncio_clock import accelerate_owner
     from unittest.mock import AsyncMock
     from orchestrator.services.vm_provisioning_phases import VMProvisioningPhaseStore
     from tests.test_pinned_vm_initial_binding_real_postgres import _bind_protected_agent
     from tests.test_vm_resource_thread_source_real_postgres import _ready_charged_thread
 
+    clock = accelerate_owner(monkeypatch, pinned_retirement, advance_clock=True)
     prepared = await _ready_charged_thread(db, monkeypatch)
     thread_id = str(prepared["thread_id"])
     assert await VMProvisioningPhaseStore(db).publish_thread_ready(
@@ -660,6 +663,7 @@ async def test_acceptance_and_unknown_pod_keep_real_resource_charge(db, monkeypa
         ),
     )
     vm_stop.assert_not_called()
+    assert clock.elapsed >= 60
     assert (
         dict(
             await db.fetchrow(

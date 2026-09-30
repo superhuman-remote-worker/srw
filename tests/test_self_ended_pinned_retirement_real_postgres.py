@@ -852,10 +852,16 @@ async def test_active_claimless_permanent_ack_hands_the_exact_pod_to_retry(stack
 
 
 @pytest.mark.asyncio
-async def test_active_claimless_retry_refuses_a_pod_that_did_not_exit(stack):
+async def test_active_claimless_retry_refuses_a_pod_that_did_not_exit(
+    stack, monkeypatch
+):
     """The retry stops only the exact captured Pod; a live one is deleted and
     waited for, never unprotected while its containers run."""
 
+    from orchestrator.services import pinned_retirement
+    from tests._asyncio_clock import accelerate_owner
+
+    clock = accelerate_owner(monkeypatch, pinned_retirement, advance_clock=True)
     ids = await _thread(stack.db)
     life = await _bind_life(stack, ids, with_claim=False)
     handoff = await _owner_permanent_then_agent_ack(stack, life)
@@ -865,6 +871,7 @@ async def test_active_claimless_retry_refuses_a_pod_that_did_not_exit(stack):
         await _durable_retry(stack, life)
 
     assert retry.value.status_code == 503
+    assert clock.elapsed >= 60
     pod = _pod(stack, life)
     assert pod is not None
     assert pod.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]

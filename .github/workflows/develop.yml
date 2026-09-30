@@ -724,7 +724,8 @@ jobs:
             echo "python=false" >> "$GITHUB_OUTPUT"
           fi
 
-          if git diff --name-only "$BASE" HEAD -- 'cockpit/' | grep -q .; then
+          if git diff --name-only "$BASE" HEAD -- 'cockpit/' \
+            '.github/workflows/main.yml' '.github/workflows/develop.yml' | grep -q .; then
             echo "cockpit=true" >> "$GITHUB_OUTPUT"
           else
             echo "cockpit=false" >> "$GITHUB_OUTPUT"
@@ -919,7 +920,11 @@ jobs:
           # the pre-browser_use stage1. Since stage1's paths are part of stage2's
           # identity below, stage2 also rebuilds whenever stage1 does — gate
           # requirements that are actually stage2-side stay covered too.
-          VM_BASE_STAGE1_PATHS=(docker/agent-vm-base/scripts/provision-stage1.sh
+          VM_BASE_STAGE1_PATHS=(scripts/vm_stage1_image.py
+            .github/workflows/main.yml
+            .github/workflows/develop.yml
+            .github/workflows/stage1-rebuild.yml
+            docker/agent-vm-base/scripts/provision-stage1.sh
             docker/agent-vm-base/scripts/cleanup-stage1.sh
             docker/agent-vm-base/stage1.pkr.hcl
             docker/agent-vm-base/Dockerfile.containerDisk-stage1
@@ -1004,14 +1009,10 @@ jobs:
   # ---------------------------------------------------------------------------
   # Python tests (change-based)
   # ---------------------------------------------------------------------------
-  test-python:
+  test-python-shards:
     needs: [changes]
     if: needs.changes.outputs.python-changed == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    # The VM follow-up selection now includes ~19.7k tests with real PostgreSQL
-    # fixtures. Run 36157300077 reached 76% at the former 25-minute limit while
-    # still progressing. Allow setup, collection and the remaining DB cases;
-    # fail fast below so an assertion is reported before a later timeout.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -1023,10 +1024,6 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-      # The chart render contract tests in tests/test_canvas_slice3_infra.py
-      # shell out to `helm template`. ubuntu-latest ships Helm, so their
-      # `which("helm")` skip guard never fires here; without the subchart
-      # vendored they fail on the Collabora dependency instead of skipping.
       - name: Install Helm
         uses: azure/setup-helm@v4
         with:
@@ -1036,52 +1033,61 @@ jobs:
           helm repo add collabora https://collaboraonline.github.io/online --force-update
           helm dependency build helm/
       - name: Install dependencies
-        run: uv pip install --system -r requirements.txt -r src/orchestrator/requirements.txt -r src/mcp_server/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
+        run: >-
+          uv pip install --system -r requirements.txt -r src/orchestrator/requirements.txt
+          -r src/mcp_server/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
       - name: Install editable application packages
         run: pip install --no-deps -e .
       - name: Check combined test environment compatibility
         run: python -m pip check
-      # `changes` narrowed this to the test files the diff can reach; the fallback
-      # covers a dispatch, where selection is skipped on purpose, and any path
-      # where the output is unset. loadfile keeps each selected file on one worker.
       - name: Run tests
-        run: ./scripts/pytest-fast.sh ${{ needs.changes.outputs.pytest-target || 'tests/' }} -x -q --tb=short
+        run: >-
+          python scripts/pytest_shard.py --index ${{ matrix.shard }} --count 2
+          --report-dir test-results/python-${{ matrix.shard }} ${{ needs.changes.outputs.pytest-target || 'tests/' }}
+      - name: Record file durations
+        if: always()
+        run: |
+          REPORT=test-results/python-${{ matrix.shard }}
+          if [ -f "$REPORT/junit.xml" ]; then
+            python scripts/pytest_file_timings.py "$REPORT/junit.xml" --output "$REPORT/file-timings.json"
+          fi
+      - name: Upload Python results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-shard-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: test-results/python-${{ matrix.shard }}/
+          if-no-files-found: warn
+          retention-days: 14
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - 0
+          - 1
 
-  # ---------------------------------------------------------------------------
-  # Cockpit unit + production-browser conformance tests (change-based)
-  # ---------------------------------------------------------------------------
-  test-cockpit:
+  # Preserve the existing aggregate check name for publication and branch rules.
+  test-python:
+    needs: [test-python-shards, changes]
+    if: always() && !cancelled() && (needs.changes.outputs.python-changed == 'true' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every Python shard
+        env:
+          SHARDS_RESULT: ${{ needs.test-python-shards.result }}
+        run: test "$SHARDS_RESULT" = success
+
+  # Unit tests overlap the one production build; browser gates share its artifact.
+  test-cockpit-build:
     needs: [changes]
     if: needs.changes.outputs.cockpit-changed == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    # The engines and every system library they need are baked into this image
-    # at /ms-playwright. The step this replaces (`playwright install --with-deps
-    # chromium firefox webkit`) pulled 181 apt packages / 114 MB from
-    # azure.archive.ubuntu.com on every cockpit change. That normally cost ~35 s,
-    # but when the mirror degraded on 2026-08-18 it ran 18m40s, blew the job's
-    # wall clock, and surfaced as a bare "The operation was canceled" that looked
-    # like a test failure (run 32157390228). Engines no longer touch apt.
-    # PLAYWRIGHT_VERSION must match this tag; the guard step below enforces it.
-    container:
-      image: mcr.microsoft.com/playwright:v1.59.0-noble
-    env:
-      PLAYWRIGHT_VERSION: 1.59.0
-      # A container job runs as root with HOME=/github/home, a runner-owned
-      # bind mount (pwuser inside this image). Firefox refuses to launch when
-      # $HOME belongs to another user ("Running Nightly as root in a regular
-      # user's session is not supported"), so all 11 firefox specs died at
-      # browser launch on the first cockpit push after the image switch, while
-      # chromium and webkit passed. /root is owned by the user this job
-      # actually runs as. This is Playwright's documented workaround; drop it
-      # only if the job stops running as root.
-      HOME: /root
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
-      # The image ships Node 24; pin to 22 so unit tests, the production build,
-      # and the conformance run all use the same Node as every other job.
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -1090,9 +1096,71 @@ jobs:
       - name: Install dependencies
         working-directory: cockpit
         run: npm ci
-      # Engines come from the image, so a @playwright/test bump that forgets the
-      # container tag would otherwise surface minutes later as a confusing
-      # "Executable doesn't exist". Bump the tag and PLAYWRIGHT_VERSION together.
+      - name: Build production Cockpit
+        working-directory: cockpit
+        run: npm run build
+      - name: Upload production Cockpit
+        uses: actions/upload-artifact@v4
+        with:
+          name: cockpit-production
+          path: cockpit/dist/
+          if-no-files-found: error
+          # Stable name supports rerunning only failed browser jobs.
+          overwrite: true
+          retention-days: 7
+  test-cockpit-unit:
+    needs: [changes]
+    if: needs.changes.outputs.cockpit-changed == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cockpit/package-lock.json
+      - name: Install dependencies
+        working-directory: cockpit
+        run: npm ci
+      - name: Check i18n parity
+        working-directory: cockpit
+        run: npm run i18n:check
+      - name: Run tests
+        working-directory: cockpit
+        run: npm test
+  test-cockpit-browser:
+    needs:
+      - test-cockpit-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Browser engines and system libraries are baked in; avoid per-job apt installs.
+    container:
+      image: mcr.microsoft.com/playwright:v1.59.0-noble
+    env:
+      PLAYWRIGHT_VERSION: 1.59.0
+      # Firefox requires HOME to belong to the user running the browser.
+      HOME: /root
+    strategy:
+      fail-fast: false
+      matrix:
+        gate:
+          - canvas
+          - cloud-review
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cockpit/package-lock.json
+      - name: Install dependencies
+        working-directory: cockpit
+        run: npm ci
       - name: Verify Playwright matches the container image
         working-directory: cockpit
         run: |
@@ -1103,42 +1171,44 @@ jobs:
             exit 1
           fi
           echo "Playwright $HAVE matches the container image."
-      - name: Check i18n parity
+      - name: Download production Cockpit
+        uses: actions/download-artifact@v4
+        with:
+          name: cockpit-production
+          path: cockpit/dist/
+      - name: Run browser gate
         working-directory: cockpit
-        run: npm run i18n:check
-      # Step-level caps so a hung step names itself instead of silently eating
-      # the job budget. Healthy times are ~70 s / ~25 s / ~75 s.
-      - name: Run tests
-        working-directory: cockpit
-        timeout-minutes: 10
-        run: npm test
-      - name: Build production Cockpit
-        working-directory: cockpit
-        timeout-minutes: 10
-        run: npm run build
-      - name: Run Dynamic Canvas browser conformance
-        working-directory: cockpit
-        timeout-minutes: 10
-        run: npm run test:e2e:canvas:no-build
-      - name: Run protected-cloud review browser gate
-        working-directory: cockpit
-        timeout-minutes: 10
-        run: npm run test:e2e:cloud-review:no-build
+        run: npm run test:e2e:${{ matrix.gate }}:no-build
       - name: Upload browser gate reports
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cockpit-browser-reports-develop-${{ github.run_attempt }}
-          path: |
+          name: cockpit-browser-${{ matrix.gate }}-${{ github.run_attempt }}
+          path: |-
             cockpit/playwright-report/
             cockpit/test-results/
           if-no-files-found: ignore
           retention-days: 7
+  test-cockpit:
+    needs:
+      - changes
+      - test-cockpit-unit
+      - test-cockpit-build
+      - test-cockpit-browser
+    if: always() && !cancelled() && (needs.changes.outputs.cockpit-changed == 'true' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every Cockpit gate
+        env:
+          UNIT_RESULT: ${{ needs.test-cockpit-unit.result }}
+          BUILD_RESULT: ${{ needs.test-cockpit-build.result }}
+          BROWSER_RESULT: ${{ needs.test-cockpit-browser.result }}
+        run: |
+          test "$UNIT_RESULT" = success
+          test "$BUILD_RESULT" = success
+          test "$BROWSER_RESULT" = success
 
-  # ---------------------------------------------------------------------------
-  # Image builds — change-based, SHA + :experimental tags only
-  # Lint is NOT required (non-blocking on develop).
-  # ---------------------------------------------------------------------------
   build-agent:
     needs: [architecture, changes, dependency-audit, test-python, test-cockpit]
     if: >-
@@ -1729,6 +1799,8 @@ jobs:
             --build-arg "SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}"
           )
           for T in "${TAGS[@]}"; do BUILD_ARGS+=(-t "$T"); done
+          STAGE1_INPUTS=$(python3 ../../scripts/vm_stage1_image.py)
+          BUILD_ARGS+=(--build-arg "SRW_STAGE1_INPUTS=${STAGE1_INPUTS}")
           docker build "${BUILD_ARGS[@]}" -f Dockerfile.containerDisk-stage1 .
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             for T in "${TAGS[@]}"; do docker push "$T"; done

@@ -12,11 +12,13 @@ ARG SRW_SOURCE_REVISION=""
 ARG SRW_SOURCE_URL="https://github.com/superhuman-remote-worker/srw"
 ARG SRW_RELEASE_VERSION=""
 ARG SRW_DOCUMENTATION_URL="https://github.com/superhuman-remote-worker/srw"
+ARG SRW_STAGE1_INPUTS=""
 
 LABEL org.opencontainers.image.source="${SRW_SOURCE_URL}"
 LABEL org.opencontainers.image.revision="${SRW_SOURCE_REVISION}"
 LABEL org.opencontainers.image.version="${SRW_RELEASE_VERSION}"
 LABEL org.opencontainers.image.documentation="${SRW_DOCUMENTATION_URL}"
 LABEL io.srw.component="workspace-stage1"
+LABEL io.srw.stage1-inputs="${SRW_STAGE1_INPUTS}"
 
 COPY output-stage1/agent-vm-base-stage1.qcow2 /disk/agent-vm-base-stage1.qcow2

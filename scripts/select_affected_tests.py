@@ -68,6 +68,9 @@ SOURCE_TREES = ("src", "tests")
 #: Changing any of these invalidates the whole graph or the environment the
 #: suite runs in, so selection is not safe. Matched as path prefixes.
 FULL_SUITE_TRIGGERS = (
+    "scripts/pytest_shard.py",
+    "scripts/pytest_file_timings.py",
+    "policy/pytest_file_timings.json",
     "tests/conftest.py",
     "conftest.py",
     "pytest.ini",

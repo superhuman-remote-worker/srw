@@ -83,8 +83,10 @@ helm lint helm/ -f helm/ci/test-values.yaml
 helm lint helm/ -f helm/ci/customer-external-values.yaml
 ```
 
-The Python runner used by CI defaults to at most eight workers and keeps each
-file's tests on one worker. Fast disposable Postgres settings apply automatically
+The Python runner defaults to at most eight workers and keeps each file's tests
+on one worker. CI runs two shards with this bounded runner and uploads selection,
+JUnit and timing reports; both shards gate publication. Fast disposable Postgres
+settings apply automatically
 to both parallel and serial pytest runs; no extra plugin or flag is needed.
 See the [Python testing guide](docs/development.md#python) for interpreter and
 worker overrides. Use the complete-results command for acceptance and timing,

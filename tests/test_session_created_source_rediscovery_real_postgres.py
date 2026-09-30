@@ -32,8 +32,13 @@ _schema_applied = pull._schema_applied
 
 
 async def leave_exact_source_after_end_disconnect(
-    db, monkeypatch, lane, *, seeded=False, protected_agent=False
+    db, monkeypatch, lane, *, seeded=False, protected_agent=False, fast_polling=True
 ):
+    from orchestrator.services import container_provisioner
+    from tests._asyncio_clock import accelerate_owner
+
+    if fast_polling:
+        accelerate_owner(monkeypatch, container_provisioner)
     case = await setup_case(db, monkeypatch, lane=lane, protected_agent=protected_agent)
     if seeded:
         monkeypatch.setattr(
