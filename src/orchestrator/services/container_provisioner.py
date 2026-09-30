@@ -5602,6 +5602,19 @@ class ContainerProvisioner:
                         != expected_creation.seed_configmap_uid
                     ):
                         return False
+                    if expected_creation.route == "retained_create":
+                        # This route observes only already-bound resources.
+                        # A missing or ambiguous controller is not authority
+                        # to mutate the seed ConfigMap into compliance.
+                        if (
+                            self._exact_seed_configmap_pod_owner_reference(
+                                seed,
+                                pod_name=owner.pod_name,
+                                runtime_incarnation=runtime_incarnation,
+                            )
+                            is None
+                        ):
+                            return False
             publish_impl = getattr(
                 type(self._db),
                 "publish_stateless_thread_workspace_runtime",
@@ -5623,8 +5636,10 @@ class ContainerProvisioner:
                 owner,
                 _creation_reservation,
                 scope="workspace_container",
-            ) or (
-                await self._adopt_configmap(
+            ):
+                return False
+            if expected_creation is None or expected_creation.route != "retained_create":
+                if await self._adopt_configmap(
                     seed_configmap,
                     pod,
                     expected_owner=owner,
@@ -5640,10 +5655,8 @@ class ContainerProvisioner:
                         _creation_reservation,
                         scope="workspace_container",
                     ),
-                )
-                is not True
-            ):
-                return False
+                ) is not True:
+                    return False
 
             if pvc_name:
                 if expected_creation is None and (

@@ -19,6 +19,7 @@ from orchestrator.services.session_provisioner import ensure_session_workspace
 from orchestrator.services.workspace_lifecycle import EnsureOutcome, WorkspaceOwner
 from tests import test_manifest_native_full_schema as full_schema
 from tests.test_sandbox_workspace_provisioner import stub_plan_inputs
+from tests.test_container_provisioner import _configmap_from_manifest
 from tests.test_workspace_pull_failure_real_postgres import NeverPullingCluster
 
 actor = full_schema.actor
@@ -105,6 +106,26 @@ class DelayedWorkspaceCluster(NeverPullingCluster):
                 SimpleNamespace(**container) for container in pod.spec.containers
             ]
 
+    def create_namespaced_config_map(self, *, body, **_):
+        if "seed" in self.objects:
+            raise AssertionError("seed must be absent before creation")
+        self.objects["seed"] = _configmap_from_manifest(body, uid=str(uuid4()))
+        return self.objects["seed"]
+
+    def read_namespaced_config_map(self, *, name, **_):
+        return self._read("seed", name)
+
+    def patch_namespaced_config_map(self, *, name, body, **_):
+        seed = self._read("seed", name)
+        assert body["metadata"]["resourceVersion"] == seed.metadata.resource_version
+        seed.metadata.owner_references = body["metadata"]["ownerReferences"]
+        seed.metadata.labels.update(body["metadata"].get("labels", {}))
+        seed.metadata.resource_version = str(int(seed.metadata.resource_version) + 1)
+        return seed
+
+    def delete_namespaced_config_map(self, *, name, body=None, **_):
+        self._delete("seed", name, body)
+
 
 def metadata(thread):
     value = thread["metadata"]
@@ -130,6 +151,7 @@ async def workspace_attempt(
     first_wait="pull_error",
     pvc_enabled=True,
     expected_first_outcome=None,
+    seeded=False,
 ):
     workspace, selection = await select_execution_workspace(
         database,
@@ -177,6 +199,12 @@ async def workspace_attempt(
     provisioner._pvc_enabled = pvc_enabled
     provisioner._core_api = cluster
     stub_plan_inputs(monkeypatch, provisioner)
+    if seeded:
+        monkeypatch.setattr(
+            provisioner,
+            "_resolve_ide_seed_files",
+            AsyncMock(return_value={"settings.json": {"content": "{}"}}),
+        )
     for name in ("open_interval", "close_interval"):
         monkeypatch.setattr(
             provisioner_module.workspace_metering, name, AsyncMock(return_value=None)

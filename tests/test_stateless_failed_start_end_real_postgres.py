@@ -335,11 +335,17 @@ async def test_interrupted_retained_resume_is_rediscovered_before_scheduling(
     )
     monkeypatch.setattr(continuation.DelayedWorkspaceCluster, "become_ready", ready_g1)
     monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
-    case = await workspace_attempt(database, actor, monkeypatch, first_wait="ready")
+    case = await workspace_attempt(
+        database, actor, monkeypatch, first_wait="ready", seeded=True
+    )
     assert case.creation["startup_protocol_version"] == 1
     assert case.creation["startup_stage"] == "readiness"
     assert case.creation["startup_state"] == "starting"
     assert case.creation["startup_first_ready_at"] is not None
+    assert (
+        str(case.creation["seed_configmap_uid"])
+        == case.cluster.objects["seed"].metadata.uid
+    )
     monkeypatch.setattr(
         continuation.DelayedWorkspaceCluster,
         "create_namespaced_pod",
@@ -371,6 +377,25 @@ async def test_interrupted_retained_resume_is_rediscovered_before_scheduling(
     monkeypatch.setattr(protocol, "verify_stateless_workspace_residents_retired", shell)
     from dataclasses import replace
 
+    # Simulate the Pod-owned seed disappearing between terminal attestation
+    # and the final physical cleanup capture. The latter uses the production
+    # read-only capture helper and observes its legitimate ConfigMap 404.
+    original_terminal_capture = case.provisioner.capture_terminal_workspace_identity
+
+    async def capture_after_seed_absence(owner):
+        terminal = await original_terminal_capture(owner)
+        case.cluster.objects.pop("seed")
+        absent = await case.provisioner.capture_workspace_teardown_identity(owner)
+        assert absent.seed_configmap_uid is None
+        assert absent.pod_uid == terminal.pod_uid
+        return replace(terminal, seed_configmap_uid=absent.seed_configmap_uid)
+
+    monkeypatch.setattr(
+        case.provisioner,
+        "capture_terminal_workspace_identity",
+        capture_after_seed_absence,
+    )
+
     end_dependencies = replace(
         retirement_dependencies(database, case),
         build_agent_cloud_mount=AsyncMock(return_value=None),
@@ -382,6 +407,16 @@ async def test_interrupted_retained_resume_is_rediscovered_before_scheduling(
         force=False,
         dependencies=end_dependencies,
     ) == {"status": "ended"}
+    cleanup = await database.fetchrow(
+        "SELECT * FROM managed_repository_workspace_cleanup_intents "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+        "AND thread_runtime_generation=$2::uuid",
+        case.thread_id,
+        case.creation["thread_runtime_generation"],
+    )
+    assert cleanup["capture_complete"] is True
+    assert cleanup["seed_configmap_uid"] is None
+    assert cleanup["pvc_uid"] == case.creation["pvc_uid"]
     await resume_case(database, case, actor)
     create_pod = case.cluster.create_namespaced_pod
 
@@ -411,6 +446,22 @@ async def test_interrupted_retained_resume_is_rediscovered_before_scheduling(
     assert source["startup_state"] == "waiting_capacity"
     assert source["scheduled_at"] is None
     assert source["pvc_uid"] == case.creation["pvc_uid"]
+    assert (
+        str(source["seed_configmap_uid"]) == case.cluster.objects["seed"].metadata.uid
+    )
+    assert source["seed_configmap_uid"] != case.creation["seed_configmap_uid"]
+    mutations = []
+    for verb in ("create", "patch", "delete", "replace"):
+        for kind in ("pod", "persistent_volume_claim", "service", "config_map"):
+            method = f"{verb}_namespaced_{kind}"
+
+            def refuse_mutation(*args, _method=method, **kwargs):
+                mutations.append(_method)
+                raise AssertionError(
+                    f"background continuation mutated Kubernetes: {_method}"
+                )
+
+            monkeypatch.setattr(case.cluster, method, refuse_mutation, raising=False)
     # Capable gate-off instances must finish a receipt that was already v1.
     monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "false")
     restarted = type(database)(
@@ -432,6 +483,7 @@ async def test_interrupted_retained_resume_is_rediscovered_before_scheduling(
             {"claim_token": candidate.claim_token + 1},
             {"pod_uid": str(uuid4())},
             {"pvc_uid": str(uuid4())},
+            {"seed_configmap_uid": str(uuid4())},
             {"source_fingerprint": "0" * 64},
         ):
             assert not await restarted.current_session_creation_candidate_is_exact(
@@ -491,6 +543,12 @@ async def test_interrupted_retained_resume_is_rediscovered_before_scheduling(
                 "missing_process_zero",
                 lambda row: row.update(retained_process_zeroes=None),
             ),
+            (
+                "contradictory_captured_seed",
+                lambda row: row["retained_cleanups"][0].update(
+                    seed_configmap_uid=str(uuid4())
+                ),
+            ),
             ("current_end", lambda row: row["owner"].update(status="ended")),
             (
                 "claim_loss_hold",
@@ -532,7 +590,7 @@ async def test_interrupted_retained_resume_is_rediscovered_before_scheduling(
         runner = SessionCreationContinuationRunner(
             db=restarted, provisioner=provider, shutdown_event=asyncio.Event()
         )
-        for kind in ("pod", "pvc"):
+        for kind in ("pod", "pvc", "seed"):
             resource = case.cluster.objects[kind]
             original_uid = resource.metadata.uid
             resource.metadata.uid = str(uuid4())
@@ -548,6 +606,21 @@ async def test_interrupted_retained_resume_is_rediscovered_before_scheduling(
                 assert refused["settled_at"] is None
             finally:
                 resource.metadata.uid = original_uid
+        seed = case.cluster.objects["seed"]
+        original_references = seed.metadata.owner_references
+        for changed_references in (
+            [],
+            original_references + [original_references[0]],
+        ):
+            seed.metadata.owner_references = changed_references
+            try:
+                (changed_candidate,) = (
+                    await restarted.list_current_session_creation_candidates()
+                ).candidates
+                assert not await runner._continue(changed_candidate)
+            finally:
+                seed.metadata.owner_references = original_references
+        assert mutations == []
         (candidate,) = (
             await restarted.list_current_session_creation_candidates()
         ).candidates
@@ -599,6 +672,7 @@ async def test_interrupted_retained_resume_is_rediscovered_before_scheduling(
         ).candidates
         assert not await runner._continue(candidate)
         assert case.cluster.pod_create_calls == 2
+        assert mutations == []
     finally:
         await restarted.close()
 

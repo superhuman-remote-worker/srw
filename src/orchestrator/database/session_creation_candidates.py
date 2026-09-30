@@ -271,7 +271,11 @@ def _retained_create_lineage(
         or cleanup.get("pod_uid") != predecessor_pod
         or cleanup.get("pvc_uid") != pvc_uid
         or cleanup.get("service_uid") != predecessor.get("service_uid")
-        or cleanup.get("seed_configmap_uid") != predecessor.get("seed_configmap_uid")
+        or (
+            cleanup.get("seed_configmap_uid") is not None
+            and cleanup.get("seed_configmap_uid")
+            != predecessor.get("seed_configmap_uid")
+        )
         or _object(cleanup.get("resource_location")).get("namespace") != namespace
         or cleanup.get("target_disposition") != "deleted"
         or cleanup.get("resource_policy") != "preserve"
