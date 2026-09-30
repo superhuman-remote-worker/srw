@@ -2031,17 +2031,11 @@
           "default": true,
           "description": "Trigger context compaction when archiving todos"
         },
-        "keep_recent_tool_results": {
-          "type": "integer",
-          "minimum": 0,
-          "default": 15,
-          "description": "Number of recent tool results to preserve in full during context compaction. Higher values retain more context but slow compaction."
-        },
         "keep_recent_messages": {
           "type": "integer",
           "minimum": 1,
           "default": 10,
-          "description": "Number of recent messages to preserve during compaction and trimming"
+          "description": "Number of recent messages to preserve during compaction"
         },
         "summarization_template": {
           "type": "string",

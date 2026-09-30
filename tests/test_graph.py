@@ -959,7 +959,6 @@ class TestArchivePhaseNode:
                 message_count_threshold=1000,
                 message_count_min_tokens=100,
                 keep_recent_messages=2,
-                keep_recent_tool_results=2,
                 model_max_context_tokens=4000,
             )
         )

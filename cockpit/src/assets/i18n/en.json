@@ -3001,7 +3001,6 @@
       "memoryEnabled": "Memory enabled",
       "budgetTokens": "Budget tokens",
       "compactOnArchive": "Compact on archive",
-      "keepRecentToolResults": "Keep recent tool results",
       "keepRecentMessages": "Keep recent messages",
       "vmCpuCores": "VM CPU cores",
       "vmMemory": "VM memory (GiB)",

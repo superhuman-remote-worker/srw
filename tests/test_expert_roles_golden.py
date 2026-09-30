@@ -110,12 +110,19 @@ _POST_SPLIT_OVERLAY_REMOVALS: dict[str, tuple[str, ...]] = {
     # rerank catalog capability (migration 0240): the shared root no longer
     # names the reranker model — the `rerank` pin arrives as RERANK_MODEL at
     # dispatch and the loader default is None, so the key left both overlays.
+    # Per-turn tool-result clearing was retired (it broke the prompt cache
+    # every turn), so its window key left the shared root.
     "worker": (
         "limits.tool_category_timeouts.delegation",
         "workspace.backend",
         "memory.reranker.model",
+        "context_management.keep_recent_tool_results",
     ),
-    "session": ("workspace.backend", "memory.reranker.model"),
+    "session": (
+        "workspace.backend",
+        "memory.reranker.model",
+        "context_management.keep_recent_tool_results",
+    ),
 }
 #: Tool names later work packages added to a tool CATEGORY on top of the
 #: frozen baseline (role -> category -> names, with the work that added them).

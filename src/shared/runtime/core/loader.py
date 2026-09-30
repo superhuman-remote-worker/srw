@@ -2418,7 +2418,6 @@ class ContextManagementConfig:
     """Context management configuration."""
 
     compact_on_archive: bool = True
-    keep_recent_tool_results: int = 15
     keep_recent_messages: int = 10
     keep_window_max_tool_result_chars: int = 16000
     summarization_template: str = "summarization_prompt.txt"
@@ -3440,7 +3439,6 @@ def load_agent_config(
     context_data = data.get("context_management", {})
     context_config = ContextManagementConfig(
         compact_on_archive=context_data.get("compact_on_archive", True),
-        keep_recent_tool_results=context_data.get("keep_recent_tool_results", 15),
         keep_recent_messages=context_data.get("keep_recent_messages", 10),
         keep_window_max_tool_result_chars=context_data.get(
             "keep_window_max_tool_result_chars", 16000
@@ -3710,7 +3708,6 @@ def load_agent_config_from_dict(
     context_data = data.get("context_management", {})
     context_config = ContextManagementConfig(
         compact_on_archive=context_data.get("compact_on_archive", True),
-        keep_recent_tool_results=context_data.get("keep_recent_tool_results", 15),
         keep_recent_messages=context_data.get("keep_recent_messages", 10),
         keep_window_max_tool_result_chars=context_data.get(
             "keep_window_max_tool_result_chars", 16000

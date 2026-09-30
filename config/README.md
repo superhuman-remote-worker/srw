@@ -625,7 +625,6 @@ limits:
 
 context_management:
   compact_on_archive: true
-  keep_recent_tool_results: 150
   keep_recent_messages: 10
 ```
 

@@ -189,7 +189,6 @@ def _context_manager() -> ContextManager:
             message_count_threshold=8,
             message_count_min_tokens=0,
             keep_recent_messages=4,
-            keep_recent_tool_results=2,
             keep_window_max_tool_result_chars=200,
             model_max_context_tokens=200_000,
         ),

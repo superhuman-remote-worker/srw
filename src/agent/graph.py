@@ -1115,8 +1115,11 @@ def create_execute_node(
                 except Exception as e:
                     logger.warning(f"[{job_id}] Failed to store compaction memory: {e}")
 
-        # Always clear old tool results, keep last 10
-        messages = context_mgr.clear_old_tool_results(messages)
+        # Old tool results are deliberately NOT cleared per turn: rewriting one
+        # mid-history invalidates the provider prompt cache from that point on,
+        # every turn. Compaction bounds the context instead, as the Codex and
+        # Claude Code harnesses do
+        # (knowledge-base/knowledge/issues/per_turn_tool_result_clearing_breaks_prompt_cache.md).
 
         # Sanitize message history to remove orphaned ToolMessages
         # (can occur from improper context compaction or checkpoint corruption)
@@ -5835,7 +5838,6 @@ def build_phase_alternation_graph(
         message_count_threshold=config.limits.message_count_threshold,
         message_count_min_tokens=config.limits.message_count_min_tokens,
         keep_recent_messages=config.context_management.keep_recent_messages,
-        keep_recent_tool_results=config.context_management.keep_recent_tool_results,
         keep_window_max_tool_result_chars=config.context_management.keep_window_max_tool_result_chars,
         # Safety layer constant (summarization budgets are computed at call
         # time from the aux model's window — src/core/summarizer.py)

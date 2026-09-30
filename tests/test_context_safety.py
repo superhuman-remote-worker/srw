@@ -56,7 +56,6 @@ def context_config():
         message_count_threshold=10,
         message_count_min_tokens=500,
         keep_recent_messages=3,
-        keep_recent_tool_results=2,
         model_max_context_tokens=2000,
     )
 

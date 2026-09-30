@@ -3159,7 +3159,6 @@ class PersistentSession:
             summarization_threshold_tokens=lim.context_threshold_tokens,
             message_count_threshold=lim.message_count_threshold,
             message_count_min_tokens=lim.message_count_min_tokens,
-            keep_recent_tool_results=ctx.keep_recent_tool_results,
             keep_recent_messages=ctx.keep_recent_messages,
             keep_window_max_tool_result_chars=ctx.keep_window_max_tool_result_chars,
             # Safety-layer constant (model-aware; see loader fractions).

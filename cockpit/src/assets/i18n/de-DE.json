@@ -3001,7 +3001,6 @@
       "memoryEnabled": "Memory aktiviert",
       "budgetTokens": "Budget-Tokens",
       "compactOnArchive": "Beim Archivieren komprimieren",
-      "keepRecentToolResults": "Letzte Tool-Ergebnisse behalten",
       "keepRecentMessages": "Letzte Nachrichten behalten",
       "vmCpuCores": "VM-CPU-Kerne",
       "vmMemory": "VM-Arbeitsspeicher (GiB)",
