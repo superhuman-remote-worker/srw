@@ -2077,6 +2077,16 @@ class PinnedRetirementOperations:
                         attach_token=str(context.get("runtime_attach_token") or ""),
                         stopped_pod_uid=next(iter(captured_pods))[1],
                     )
+                if receipt is None and (virtual_binding_agent_zero_only or lite_agent_zero_only):
+                    # All containers of the captured Pod were proven stopped
+                    # above. Unadmitted durable input remains owed; partial
+                    # provider admissions remain immutable effect evidence.
+                    receipt = await self.dependencies.store.acknowledge_abrupt_pinned_actor_exit(
+                        thread_id, runtime_generation=generation, retirement_token=token,
+                        agent_id=str(context.get("agent_id") or ""),
+                        attach_token=str(context.get("runtime_attach_token") or ""),
+                        stopped_pod_uid=next(iter(captured_pods))[1],
+                    )
                 if receipt is None:
                     # The exact Pod is already stopped; only the settled-work
                     # contract stands between this life and its receipt.

@@ -78,6 +78,243 @@ CREATE TYPE public.sudo_request_status AS ENUM (
 
 
 --
+-- Name: acknowledge_abrupt_pinned_actor_exit(uuid, uuid, uuid, uuid, uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.acknowledge_abrupt_pinned_actor_exit(owner_id uuid, generation_id uuid, retirement_id uuid, actor_id uuid, attach_id uuid, stopped_pod_uid text) RETURNS jsonb
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE
+    owner_row public.threads%ROWTYPE;
+    actor_row public.agents%ROWTYPE;
+    context jsonb;
+    marker jsonb;
+    binding jsonb;
+    backend text;
+    dedicated_authorized boolean;
+    warm_authorized boolean;
+    receipt jsonb;
+    input_count bigint;
+    input_digest text;
+    claim jsonb;
+    stranded_count bigint;
+    partial_count bigint;
+BEGIN
+    SELECT * INTO owner_row FROM public.threads
+     WHERE id = owner_id FOR UPDATE;
+    IF NOT FOUND OR owner_row.kind IS DISTINCT FROM 'session'
+       OR owner_row.execution_lane IS DISTINCT FROM 'pinned'
+       OR owner_row.runtime_generation IS DISTINCT FROM generation_id
+       OR owner_row.runtime_retirement_token IS DISTINCT FROM retirement_id
+       OR owner_row.runtime_retirement_authorized_at IS NULL
+       OR owner_row.agent_id IS DISTINCT FROM actor_id
+       OR owner_row.runtime_attach_token IS DISTINCT FROM attach_id
+       OR (owner_row.control_admission_agent_id IS NOT NULL
+           AND owner_row.control_admission_agent_id IS DISTINCT FROM actor_id)
+       OR owner_row.runtime_authority_exposed IS DISTINCT FROM true
+       OR actor_id IS NULL OR attach_id IS NULL
+       OR NULLIF(stopped_pod_uid, '') IS NULL THEN
+        RETURN NULL;
+    END IF;
+    context := owner_row.runtime_retirement_context;
+    marker := context->'agent_pod';
+    binding := context->'workspace_binding';
+    backend := context->>'workspace_backend';
+    claim := context->'agent_workspace_claim';
+    IF backend IS DISTINCT FROM 'virtual' AND backend IS DISTINCT FROM 'none' THEN
+        RETURN NULL;
+    END IF;
+    -- A virtual actor owns exactly its rclone backing; a lite actor owns no
+    -- backing at all. Either way the captured binding must match what the
+    -- live row still advertises.
+    IF backend = 'virtual' AND (
+           jsonb_typeof(binding) IS DISTINCT FROM 'object'
+        OR binding->>'kind' IS DISTINCT FROM 'virtual'
+        OR COALESCE(binding->>'backing_id', '') !~ '^rclone:[0-9a-f]{64}$'
+        OR COALESCE(binding->>'generation', '') !~
+           '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        OR binding->'ssh_host_key_fingerprint' IS DISTINCT FROM 'null'::jsonb
+        OR binding - ARRAY['generation','kind','backing_id','ssh_host_key_fingerprint']
+           IS DISTINCT FROM '{}'::jsonb
+        OR owner_row.metadata->'_workspace_binding' IS DISTINCT FROM binding
+    ) THEN
+        RETURN NULL;
+    END IF;
+    IF backend = 'none' AND (
+           COALESCE(binding, 'null'::jsonb) NOT IN ('null'::jsonb, '{}'::jsonb)
+        OR COALESCE(owner_row.metadata->'_workspace_binding', 'null'::jsonb)
+           NOT IN ('null'::jsonb, '{}'::jsonb)
+    ) THEN
+        RETURN NULL;
+    END IF;
+    IF context->>'generation' IS DISTINCT FROM generation_id::text
+       OR context->>'agent_id' IS DISTINCT FROM actor_id::text
+       OR context->>'runtime_attach_token' IS DISTINCT FROM attach_id::text
+       OR context->>'settle_status' IS DISTINCT FROM 'ended'
+       OR owner_row.metadata->'agent_pod' IS DISTINCT FROM marker
+       OR COALESCE(owner_row.metadata->'protected_cloud', 'false'::jsonb)
+          IS DISTINCT FROM 'false'::jsonb
+       OR EXISTS (
+           SELECT 1 FROM unnest(ARRAY[
+               'workspace_container','vm','workspace_provision_intent',
+               'agent_pod_provision_intent','protected_ro'
+           ]) AS field
+           WHERE COALESCE(context->field, 'null'::jsonb)
+                 NOT IN ('null'::jsonb, '{}'::jsonb)
+       )
+       OR marker->>'pod_uid' IS DISTINCT FROM stopped_pod_uid
+       OR marker->>'protection_protocol' IS DISTINCT FROM 'finalizer_v1'
+       OR NULLIF(marker->>'namespace', '') IS NULL
+       OR NULLIF(marker->>'pod_name', '') IS NULL
+       OR context->'agent'->>'hostname' IS DISTINCT FROM marker->>'pod_name'
+       OR context->'agent'->>'pod_uid' IS DISTINCT FROM stopped_pod_uid THEN
+        RETURN NULL;
+    END IF;
+    -- The same two Pod authorities enforce_pinned_warm_binding_publication
+    -- accepts at bind time. A dedicated Pod carries its provision attempt; a
+    -- warm-pool Pod carries the protection that was bound to this exact
+    -- thread, generation, attach token and actor. Exactly one must vouch.
+    dedicated_authorized := EXISTS (
+        SELECT 1 FROM public.thread_agent_pod_provision_intents intent
+         WHERE intent.thread_id = owner_id
+           AND intent.runtime_generation = generation_id
+           AND intent.attempt_id::text = marker->>'provision_attempt'
+           AND intent.pod_name = marker->>'pod_name'
+           AND intent.pod_uid = stopped_pod_uid
+           AND intent.namespace = marker->>'namespace'
+           AND intent.protection_protocol = 'finalizer_v1'
+           AND intent.status = 'published'
+           AND intent.workspace_claim_id::text IS NOT DISTINCT FROM claim->>'claim_id' 
+    );
+    warm_authorized := EXISTS (
+        SELECT 1 FROM public.thread_agent_warm_binding_protections warm
+         WHERE warm.protection_id::text = marker->>'warm_binding_protection'
+           AND warm.thread_id = owner_id
+           AND warm.runtime_generation = generation_id
+           AND warm.runtime_attach_token = attach_id
+           AND warm.agent_id = actor_id
+           AND warm.status = 'bound'
+           AND warm.namespace = marker->>'namespace'
+           AND warm.pod_name = marker->>'pod_name'
+           AND warm.pod_uid = stopped_pod_uid
+    );
+    IF NOT (dedicated_authorized OR warm_authorized) THEN
+        RETURN NULL;
+    END IF;
+    SELECT * INTO actor_row FROM public.agents
+     WHERE id = actor_id FOR SHARE;
+    IF NOT FOUND OR actor_row.thread_id IS DISTINCT FROM owner_id
+       OR actor_row.pod_uid IS DISTINCT FROM stopped_pod_uid
+       OR actor_row.hostname IS DISTINCT FROM marker->>'pod_name'
+       OR actor_row.current_job_id IS NOT NULL
+       OR EXISTS (SELECT 1 FROM public.agents other
+                   WHERE other.id <> actor_id
+                     AND (other.thread_id = owner_id OR other.pod_uid = stopped_pod_uid))
+    THEN
+        RETURN NULL;
+    END IF;
+
+    -- Storage debt is not another process. Accept only the same protected
+    -- PVC publication captured at Begin; End still owes exact reclaim/fencing.
+    IF COALESCE(claim,'null'::jsonb) <> 'null'::jsonb AND NOT EXISTS (
+        SELECT 1 FROM public.thread_agent_workspace_claims c
+         WHERE c.thread_id=owner_id AND c.claim_id::text=claim->>'claim_id'
+           AND c.created_runtime_generation::text=claim->>'created_runtime_generation'
+           AND c.create_attempt::text=claim->>'create_attempt'
+           AND c.provisioner=claim->>'provisioner'
+           AND c.pvc_name=claim->>'pvc_name' AND c.pvc_uid=claim->>'pvc_uid'
+           AND c.namespace=claim->>'namespace'
+           AND c.protection_protocol='finalizer_v1' AND c.status='ready'
+           AND claim->>'protection_protocol'='finalizer_v1'
+           AND claim->>'status'='ready'
+    ) THEN RETURN NULL; END IF;
+
+    -- All supported input/child/control admission locks the owner first and
+    -- rejects its retirement token. These reads run after that durable fence,
+    -- not before a still-open producer can commit an admission.
+    IF EXISTS (SELECT 1 FROM public.thread_input_deliveries
+                WHERE thread_id = owner_id AND state NOT IN ('settled','cancelled')
+                  AND (execution_lane IS DISTINCT FROM 'pinned'
+                       OR (owner_agent_id IS NOT NULL AND
+                           (owner_agent_id IS DISTINCT FROM actor_id
+                            OR owner_pod_uid IS DISTINCT FROM stopped_pod_uid))))
+       OR EXISTS (SELECT 1 FROM public.threads WHERE parent_thread_id = owner_id)
+       OR EXISTS (SELECT 1 FROM public.thread_control_requests
+                   WHERE thread_id = owner_id AND runtime_generation = generation_id)
+       OR EXISTS (SELECT 1 FROM public.thread_permission_requests
+                   WHERE thread_id = owner_id AND status = 'pending')
+       OR EXISTS (SELECT 1 FROM public.thread_interrupt_requests
+                   WHERE thread_id = owner_id AND
+                     (outcome IS NULL OR (outcome = 'applied' AND
+                      NOT (COALESCE(result, '{}'::jsonb) ? 'consumed_input_seq'))))
+       OR EXISTS (SELECT 1 FROM public.run_queue
+                   WHERE unit_id = owner_id AND (state <> 'done' OR leased_by IS NOT NULL))
+       OR EXISTS (SELECT 1 FROM public.completion_effects
+                   WHERE (scope_id = owner_id OR producer_id = owner_id)
+                     AND (state <> 'done' OR claimed_by IS NOT NULL))
+       OR EXISTS (SELECT 1 FROM public.thread_agent_workspace_claims
+                   WHERE thread_id = owner_id AND status <> 'reclaimed'
+                     AND claim_id::text IS DISTINCT FROM claim->>'claim_id')
+       OR EXISTS (SELECT 1 FROM public.thread_workspace_provision_intents
+                   WHERE thread_id = owner_id)
+       OR EXISTS (SELECT 1 FROM public.managed_repository_workspace_creation_reservations
+                   WHERE owner_kind = 'thread' AND
+                         managed_repository_workspace_creation_reservations.owner_id =
+                         acknowledge_abrupt_pinned_actor_exit.owner_id)
+       OR EXISTS (SELECT 1 FROM public.cloud_ro_mounts
+                   WHERE thread_id = owner_id AND status IN ('engaging','active','revoking'))
+    THEN
+        RETURN NULL;
+    END IF;
+
+    -- No delivery mutation: queued/owned input is reclaimed once by a successor;
+    -- admitted partial turns remain immutable receipts and are never replayed.
+    -- owner_runtime_generation is a process UUID, not the thread generation.
+    -- The current published Pod/actor join above owns these completed inputs
+    -- across container process restarts inside that same Kubernetes UID.
+    SELECT count(*), md5(string_agg(delivery_id::text || ':' || state, ',' ORDER BY delivery_id)),
+           count(*) FILTER (WHERE state IN ('owned','queued')),
+           count(*) FILTER (WHERE state='admitted')
+      INTO input_count, input_digest, stranded_count, partial_count
+      FROM public.thread_input_deliveries
+     WHERE thread_id = owner_id AND owner_agent_id = actor_id
+       AND owner_pod_uid = stopped_pod_uid
+       AND execution_lane = 'pinned';
+    IF input_count = 0 THEN
+        RETURN NULL;
+    END IF;
+    receipt := jsonb_build_object(
+        'version', 1,
+        'runtime_generation', generation_id,
+        'retirement_token', retirement_id,
+        'agent_id', actor_id,
+        'runtime_attach_token', attach_id,
+        'settle_status', 'ended',
+        'quiescence_protocol', 'agent_runtime_zero_v1',
+        'quiescence_actor', 'orchestrator',
+        'workspace_generation', NULL,
+        'workspace_runtime_incarnation', NULL,
+        'recovery_protocol', CASE WHEN backend = 'virtual'
+                                  THEN 'abrupt_virtual_actor_exit_v1'
+                                  ELSE 'abrupt_lite_actor_exit_v1' END,
+        'agent_pod_uid', stopped_pod_uid,
+        'captured_input_count', input_count,
+        'captured_input_ids_digest', input_digest,
+        'stranded_input_count', stranded_count,
+        'partial_admission_count', partial_count
+    );
+    IF owner_row.runtime_retirement_local_quiescence IS NOT NULL THEN
+        RETURN CASE WHEN owner_row.runtime_retirement_local_quiescence = receipt
+                    THEN receipt ELSE NULL END;
+    END IF;
+    UPDATE public.threads SET runtime_retirement_local_quiescence = receipt
+     WHERE id = owner_id;
+    RETURN receipt;
+END;
+$_$;
+
+
+--
 -- Name: acknowledge_settled_virtual_actor_exit(uuid, uuid, uuid, uuid, uuid, text); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -11619,6 +11856,387 @@ $$;
 
 
 --
+-- Name: threads; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.threads (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    title text DEFAULT 'Untitled Session'::text,
+    user_id uuid,
+    project_id uuid,
+    agent_id uuid,
+    status character varying(20) DEFAULT 'created'::character varying NOT NULL,
+    permission_mode character varying(20) DEFAULT 'supervised'::character varying NOT NULL,
+    config_name character varying(100),
+    created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+    last_activity timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+    ended_at timestamp with time zone,
+    metadata jsonb DEFAULT '{}'::jsonb,
+    total_turns integer DEFAULT 0,
+    total_tokens integer DEFAULT 0,
+    nc_session_folder text,
+    nc_share_id integer,
+    main_cloud_backend text,
+    main_cloud_session_handle text,
+    main_cloud_share_handle text,
+    events_epoch integer DEFAULT 0 NOT NULL,
+    awaiting_user_since timestamp with time zone,
+    extend_count integer DEFAULT 0 NOT NULL,
+    execution_lane text DEFAULT 'pinned'::text NOT NULL,
+    events_seq_hwm bigint DEFAULT 0 NOT NULL,
+    control_seq_hwm bigint DEFAULT 0 NOT NULL,
+    control_admission_agent_id uuid,
+    narration_mode text,
+    runtime_generation uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    runtime_retirement_token uuid,
+    runtime_retirement_permanent boolean,
+    runtime_retirement_started_at timestamp with time zone,
+    runtime_retirement_authorized_at timestamp with time zone,
+    runtime_retirement_context jsonb,
+    runtime_retirement_stage_receipt jsonb,
+    runtime_retirement_local_quiescence jsonb,
+    runtime_retirement_external_cleanup jsonb,
+    runtime_authority_exposed boolean DEFAULT false NOT NULL,
+    runtime_attach_token uuid,
+    runtime_attach_abort_receipt jsonb,
+    main_cloud_backend_instance_id uuid,
+    ssh_handle text,
+    kind text DEFAULT 'session'::text NOT NULL,
+    parent_job_id uuid,
+    parent_thread_id uuid,
+    parent_tool_call_id text,
+    subagent_handle text,
+    subagent_type text,
+    subagent_status text,
+    subagent_outcome text,
+    subagent_error text,
+    report_path text,
+    conversation_revision bigint DEFAULT 0 NOT NULL,
+    workspace_idle_revision bigint DEFAULT 0 NOT NULL,
+    workspace_idle_episode jsonb,
+    pinned_idle_terminal_intent_at timestamp with time zone,
+    runtime_retirement_actuator_request jsonb,
+    CONSTRAINT threads_conversation_revision_nonnegative CHECK ((conversation_revision >= 0)),
+    CONSTRAINT threads_kind_check CHECK ((kind = ANY (ARRAY['session'::text, 'subagent'::text]))),
+    CONSTRAINT threads_parent_shape_check CHECK ((((kind = 'session'::text) AND (parent_job_id IS NULL) AND (parent_thread_id IS NULL)) OR ((kind = 'subagent'::text) AND (num_nonnulls(parent_job_id, parent_thread_id) = 1)))),
+    CONSTRAINT threads_runtime_retirement_external_cleanup_shape CHECK (((runtime_retirement_external_cleanup IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (runtime_retirement_permanent = true) AND (jsonb_typeof(runtime_retirement_external_cleanup) = 'object'::text)))),
+    CONSTRAINT threads_runtime_retirement_local_quiescence_shape CHECK (((runtime_retirement_local_quiescence IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (jsonb_typeof(runtime_retirement_local_quiescence) = 'object'::text)))),
+    CONSTRAINT threads_runtime_retirement_shape CHECK ((((runtime_retirement_token IS NULL) AND (runtime_retirement_permanent IS NULL) AND (runtime_retirement_started_at IS NULL) AND (runtime_retirement_authorized_at IS NULL) AND (runtime_retirement_context IS NULL)) OR ((runtime_retirement_token IS NOT NULL) AND (runtime_retirement_permanent IS NOT NULL) AND (runtime_retirement_started_at IS NOT NULL) AND (jsonb_typeof(runtime_retirement_context) = 'object'::text)))),
+    CONSTRAINT threads_runtime_retirement_stage_receipt_shape CHECK (((runtime_retirement_stage_receipt IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (jsonb_typeof(runtime_retirement_stage_receipt) = 'object'::text)))),
+    CONSTRAINT valid_narration_mode CHECK ((narration_mode = ANY (ARRAY['silent'::text, 'verbose'::text, 'auto'::text]))),
+    CONSTRAINT valid_permission_mode CHECK (((permission_mode)::text = ANY ((ARRAY['supervised'::character varying, 'auto_accept'::character varying, 'autonomous'::character varying])::text[]))),
+    CONSTRAINT valid_thread_status CHECK (((status)::text = ANY ((ARRAY['created'::character varying, 'active'::character varying, 'idle'::character varying, 'awaiting_user'::character varying, 'suspended'::character varying, 'ended'::character varying])::text[])))
+);
+
+
+--
+-- Name: COLUMN threads.events_epoch; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.events_epoch IS 'Current event-log writer generation (client-visible). Bumped only deliberately: rewind, a reaper/steal takeover, or an attach that finds the previous session life terminal (terminal thread status, a terminal lifecycle frame in the epoch, or the epoch wholly beyond retention). Clean reattaches REUSE the epoch so cached client cursors stay valid; an older-epoch cursor triggers authoritative re-sync (gone_beyond_horizon). See docs/features/stateless_agents.md §5.3.2.';
+
+
+--
+-- Name: COLUMN threads.awaiting_user_since; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.awaiting_user_since IS 'Set by the agent when it reaches a natural pause untethered. The attention_sleep_sweeper suspends the workspace when this exceeds headless_attention_sleep_minutes. Cleared on reattach.';
+
+
+--
+-- Name: COLUMN threads.extend_count; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.extend_count IS 'Number of magic-link extend-window clicks since this awaiting_user session began. Capped at 4 (= 4h ceiling at default 60min/extend).';
+
+
+--
+-- Name: COLUMN threads.execution_lane; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.execution_lane IS 'Which execution plane serves this thread: ''pinned'' (registered-agent pod, the default) or ''stateless'' (run_queue claim by any pod). App-validated by design — no CHECK. See docs/features/stateless_agents.md §5.4.4.';
+
+
+--
+-- Name: COLUMN threads.events_seq_hwm; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.events_seq_hwm IS 'Highest seq ever allocated in the CURRENT events_epoch. Survives retention pruning of the thread_events rows themselves; reset to 0 atomically on every epoch bump. Maintained by the agent journal writer''s fenced flush (GREATEST over the batch in the same statement) and pre-incremented by the system-frame allocator (src/shared/event_journal). Attach seeds its in-process counter from GREATEST(events_seq_hwm, MAX(seq) of the epoch). See docs/features/stateless_agents.md §5.3.2.';
+
+
+--
+-- Name: COLUMN threads.control_seq_hwm; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.control_seq_hwm IS 'Highest commit-ordered thread_control_requests.request_seq allocated for this thread. Admission increments it while holding the threads row lock; never allocate request order from an IDENTITY/sequence.';
+
+
+--
+-- Name: COLUMN threads.control_admission_agent_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.control_admission_agent_id IS 'Exact pinned-owner capability and teardown fence. NULL is closed. An inbox-capable reciprocal owner writes its own agent UUID after attach and clears it before its final drain. A stale credential never transfers to a different owner generation.';
+
+
+--
+-- Name: COLUMN threads.narration_mode; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.narration_mode IS 'Durable interactive narration mode (silent | verbose | auto). NULL means the thread still inherits its resolved config; creation and the serving control owner materialize an explicit value.';
+
+
+--
+-- Name: COLUMN threads.runtime_generation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_generation IS 'Immutable authority for one pinned/stateless session runtime life. The database rotates it on the sole ended->created Resume edge.';
+
+
+--
+-- Name: COLUMN threads.runtime_retirement_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_retirement_token IS 'Non-NULL closes pinned runtime admission while exact external cleanup is retryable.';
+
+
+--
+-- Name: COLUMN threads.runtime_retirement_authorized_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_retirement_authorized_at IS 'Append-once preflight authorization for the pending retirement. Exact agents do not begin local teardown and reconcilers do not actuate before it is set.';
+
+
+--
+-- Name: COLUMN threads.runtime_retirement_context; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_retirement_context IS 'Immutable identities captured when pinned retirement closes admission; cleanup must target these identities, never names alone.';
+
+
+--
+-- Name: COLUMN threads.runtime_retirement_stage_receipt; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_retirement_stage_receipt IS 'Append-once exact staging publication receipt for retrying a soft retirement after workspace/reader cleanup; cleared only by settlement.';
+
+
+--
+-- Name: COLUMN threads.runtime_retirement_local_quiescence; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_retirement_local_quiescence IS 'Append-once exact agent acknowledgement that shell, overlay, mounts, and ordinary event writers are quiesced for the pending runtime retirement.';
+
+
+--
+-- Name: COLUMN threads.runtime_authority_exposed; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_authority_exposed IS 'Monotonic within one runtime_generation: true once any pinned process authority was delivered; reset only by the database generation-rotation edge.';
+
+
+--
+-- Name: COLUMN threads.runtime_attach_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_attach_token IS 'Exact physical pinned-process attach identity; register/bind rotates it and every maintenance or credential request must match it with runtime_generation.';
+
+
+--
+-- Name: COLUMN threads.runtime_attach_abort_receipt; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_attach_abort_receipt IS 'Last exact pre-input attach-abort rotation receipt. Internal authority only; browser thread payloads must redact it.';
+
+
+--
+-- Name: COLUMN threads.kind; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.kind IS 'What this row is: ''session'' (an interactive thread, the default) or ''subagent'' (a child session a worker job or a session spawned through delegate_agent; U3). Session listings filter on kind so child rows never reach the sessions page; the subagent_* / parent_* columns are NULL for sessions.';
+
+
+--
+-- Name: COLUMN threads.parent_job_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.parent_job_id IS 'kind=subagent only: the worker job that spawned this child. ON DELETE CASCADE — a job takes its children with it (delete_job ends live children first, because the pinned delete authority only lets an ended, authority-free row go).';
+
+
+--
+-- Name: COLUMN threads.parent_thread_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.parent_thread_id IS 'kind=subagent only: the session thread that spawned this child (U5 session parents). NULL for a worker-job parent. ON DELETE CASCADE.';
+
+
+--
+-- Name: COLUMN threads.parent_tool_call_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.parent_tool_call_id IS 'kind=subagent only: the parent''s delegate_agent tool call this child answered. The non-NULL parent plus parent_tool_call_id is the idempotency key: a parent re-running its tools node after a hard kill replays the stored report instead of spawning again; both parent forms are unique in the database.';
+
+
+--
+-- Name: COLUMN threads.subagent_handle; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.subagent_handle IS 'kind=subagent only: the short handle the parent sees (<type>-<4 hex>, e.g. implementer-7f3a) — unique per parent, not globally; the durable identity is the thread id.';
+
+
+--
+-- Name: COLUMN threads.subagent_type; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.subagent_type IS 'kind=subagent only: the roster entry name the child ran as (explorer, implementer, reviewer, ...).';
+
+
+--
+-- Name: COLUMN threads.subagent_status; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.subagent_status IS 'kind=subagent only: the bare lifecycle kind, written by the agent-side ledger. Open set by design — app-validated, no CHECK, so a new kind never needs a migration. Today: running | completed | parked | interrupted | capped | error | cancelled (src/subagents/ledger.py SUBAGENT_STATUSES). Anything other than running is terminal, and a terminal write also moves status to ended and stamps ended_at.';
+
+
+--
+-- Name: COLUMN threads.subagent_outcome; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.subagent_outcome IS 'kind=subagent only: the driver''s full classification behind subagent_status (capped:turns, interrupted:drain, interrupted:stale, cancelled:parent_deleted, ...). Free text; the cockpit shows it as the outcome badge detail.';
+
+
+--
+-- Name: COLUMN threads.subagent_error; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.subagent_error IS 'kind=subagent only: the error text of an error / cancelled child, NULL otherwise.';
+
+
+--
+-- Name: COLUMN threads.report_path; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.report_path IS 'kind=subagent only: workspace-relative path of the child''s full spilled report in the PARENT tree (.subagents/<handle>/report.md); NULL when the spill failed. The replay path re-renders the envelope from this file.';
+
+
+--
+-- Name: COLUMN threads.conversation_revision; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.conversation_revision IS 'Monotonic transcript-view revision. Incremented only by an applied conversation rewind; clients fence delayed human input and cached history against it.';
+
+
+--
+-- Name: COLUMN threads.runtime_retirement_actuator_request; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.runtime_retirement_actuator_request IS 'Exact authenticated local VM drain handoff; permits existing actuator only, never process zero or End completion.';
+
+
+--
+-- Name: pinned_pre_setup_retirement_request_valid(public.threads, jsonb, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_pre_setup_retirement_request_valid(owner_row public.threads, marker jsonb, require_actor boolean DEFAULT false) RETURNS boolean
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE
+    context jsonb := owner_row.runtime_retirement_context;
+    pod jsonb := context->'agent_pod';
+    actor public.agents%ROWTYPE;
+    expected jsonb;
+    source jsonb := context->'vm_creation_source';
+    physical jsonb := context->'vm';
+BEGIN
+    IF owner_row.execution_lane IS DISTINCT FROM 'pinned'
+       OR owner_row.runtime_retirement_token IS NULL
+       OR owner_row.runtime_retirement_authorized_at IS NULL
+       OR owner_row.agent_id IS NULL OR owner_row.runtime_attach_token IS NULL
+       OR context->>'thread_id' IS DISTINCT FROM owner_row.id::text
+       OR context->>'generation' IS DISTINCT FROM owner_row.runtime_generation::text
+       OR context->>'agent_id' IS DISTINCT FROM owner_row.agent_id::text
+       OR context->>'runtime_attach_token' IS DISTINCT FROM owner_row.runtime_attach_token::text
+       OR context->>'settle_status' IS DISTINCT FROM 'ended'
+       OR owner_row.status NOT IN ('created','active')
+       OR owner_row.runtime_authority_exposed IS DISTINCT FROM true
+       OR COALESCE(context->>'workspace_backend','') NOT IN ('vm','remote')
+       OR pod->>'protection_protocol' IS DISTINCT FROM 'finalizer_v1'
+       OR NULLIF(pod->>'namespace','') IS NULL OR NULLIF(pod->>'pod_name','') IS NULL
+       OR NULLIF(pod->>'pod_uid','') IS NULL
+       OR context->'agent'->>'hostname' IS DISTINCT FROM pod->>'pod_name'
+       OR context->'agent'->>'pod_uid' IS DISTINCT FROM pod->>'pod_uid'
+       OR owner_row.metadata->'agent_pod' IS DISTINCT FROM pod THEN
+        RETURN false;
+    END IF;
+    -- Physical identity is captured by Begin, never supplied or fabricated by
+    -- a booting actor. An uncreated VM requires its immutable creation source.
+    IF COALESCE(physical,'null'::jsonb) = 'null'::jsonb THEN
+        IF context->>'workspace_backend' IS DISTINCT FROM 'vm'
+           OR jsonb_typeof(source) IS DISTINCT FROM 'object'
+           OR source->'captured_vm'->>'vm_uid' IS NOT NULL
+           OR owner_row.metadata->'vm' IS DISTINCT FROM source->'captured_vm'
+           OR NOT EXISTS (
+               SELECT 1 FROM public.vm_creation_retries c
+                WHERE c.request_id::text=source->>'request_id'
+                  AND c.owner_kind='thread' AND c.thread_id=owner_row.id
+                  AND c.provision_generation::text=source->>'provision_generation'
+                  AND c.thread_runtime_generation::text=source->>'thread_runtime_generation'
+                  AND c.request_digest=source->>'request_digest'
+           ) THEN RETURN false; END IF;
+    ELSIF jsonb_typeof(physical) IS DISTINCT FROM 'object'
+       OR physical->'identity_authenticated' IS DISTINCT FROM 'true'::jsonb
+       OR physical->>'identity_provision_generation' IS DISTINCT FROM physical->>'provision_generation'
+       OR NULLIF(physical->>'vm_uid','') IS NULL
+       OR (owner_row.runtime_retirement_permanent AND NULLIF(physical->>'rootdisk_pvc_uid','') IS NULL)
+       OR public.pinned_retirement_external_cleanup_expected(context,owner_row.runtime_generation,
+            owner_row.runtime_retirement_token)->>'workspace_cleanup_protocol'
+            IS DISTINCT FROM 'workspace_actuator_zero_v1' THEN
+        RETURN false;
+    END IF;
+    expected := jsonb_build_object(
+        'kind','agent_pre_setup_retirement_v1','thread_id',owner_row.id::text,
+        'agent_id',owner_row.agent_id::text,'pod_uid',pod->>'pod_uid',
+        'runtime_generation',owner_row.runtime_generation::text,
+        'runtime_attach_token',owner_row.runtime_attach_token::text,
+        'retirement_token',owner_row.runtime_retirement_token::text,
+        'disposition','ended','permanent',owner_row.runtime_retirement_permanent
+    );
+    IF marker IS DISTINCT FROM expected THEN RETURN false; END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM public.thread_agent_pod_provision_intents i
+         WHERE i.attempt_id::text=pod->>'provision_attempt' AND i.thread_id=owner_row.id
+           AND i.runtime_generation=owner_row.runtime_generation AND i.status='published'
+           AND i.provisioner='persistent' AND i.namespace=pod->>'namespace'
+           AND i.pod_name=pod->>'pod_name' AND i.pod_uid=pod->>'pod_uid'
+           AND i.protection_protocol='finalizer_v1'
+    ) THEN RETURN false; END IF;
+    SELECT * INTO actor FROM public.agents WHERE id=owner_row.agent_id;
+    IF actor.id IS NULL THEN
+        IF require_actor THEN RETURN false; END IF;
+    ELSIF actor.thread_id IS DISTINCT FROM owner_row.id
+       OR actor.pod_uid IS DISTINCT FROM pod->>'pod_uid'
+       OR actor.hostname IS DISTINCT FROM pod->>'pod_name'
+       OR actor.agent_mode IS DISTINCT FROM 'persistent'
+       OR actor.current_job_id IS NOT NULL THEN RETURN false;
+    END IF;
+    -- Supported producers lock the owner and refuse T. Process input generation
+    -- is distinct from G, so work is checked by the captured actor/Pod tuple.
+    IF EXISTS (SELECT 1 FROM public.thread_input_deliveries
+                WHERE thread_id=owner_row.id AND owner_agent_id=owner_row.agent_id
+                  AND owner_pod_uid=pod->>'pod_uid'
+                  AND state IN ('owned','queued','admitted','settled'))
+       OR EXISTS (SELECT 1 FROM public.thread_control_requests
+                   WHERE thread_id=owner_row.id AND runtime_generation=owner_row.runtime_generation)
+       OR EXISTS (SELECT 1 FROM public.thread_permission_requests
+                   WHERE thread_id=owner_row.id AND status='pending')
+       OR EXISTS (SELECT 1 FROM public.threads WHERE parent_thread_id=owner_row.id) THEN
+        RETURN false;
+    END IF;
+    RETURN true;
+END;
+$$;
+
+
+--
 -- Name: pinned_retirement_external_cleanup_expected(jsonb, uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -12052,283 +12670,6 @@ $_$;
 
 
 --
--- Name: threads; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.threads (
-    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
-    title text DEFAULT 'Untitled Session'::text,
-    user_id uuid,
-    project_id uuid,
-    agent_id uuid,
-    status character varying(20) DEFAULT 'created'::character varying NOT NULL,
-    permission_mode character varying(20) DEFAULT 'supervised'::character varying NOT NULL,
-    config_name character varying(100),
-    created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
-    last_activity timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
-    ended_at timestamp with time zone,
-    metadata jsonb DEFAULT '{}'::jsonb,
-    total_turns integer DEFAULT 0,
-    total_tokens integer DEFAULT 0,
-    nc_session_folder text,
-    nc_share_id integer,
-    main_cloud_backend text,
-    main_cloud_session_handle text,
-    main_cloud_share_handle text,
-    events_epoch integer DEFAULT 0 NOT NULL,
-    awaiting_user_since timestamp with time zone,
-    extend_count integer DEFAULT 0 NOT NULL,
-    execution_lane text DEFAULT 'pinned'::text NOT NULL,
-    events_seq_hwm bigint DEFAULT 0 NOT NULL,
-    control_seq_hwm bigint DEFAULT 0 NOT NULL,
-    control_admission_agent_id uuid,
-    narration_mode text,
-    runtime_generation uuid DEFAULT public.uuid_generate_v4() NOT NULL,
-    runtime_retirement_token uuid,
-    runtime_retirement_permanent boolean,
-    runtime_retirement_started_at timestamp with time zone,
-    runtime_retirement_authorized_at timestamp with time zone,
-    runtime_retirement_context jsonb,
-    runtime_retirement_stage_receipt jsonb,
-    runtime_retirement_local_quiescence jsonb,
-    runtime_retirement_external_cleanup jsonb,
-    runtime_authority_exposed boolean DEFAULT false NOT NULL,
-    runtime_attach_token uuid,
-    runtime_attach_abort_receipt jsonb,
-    main_cloud_backend_instance_id uuid,
-    ssh_handle text,
-    kind text DEFAULT 'session'::text NOT NULL,
-    parent_job_id uuid,
-    parent_thread_id uuid,
-    parent_tool_call_id text,
-    subagent_handle text,
-    subagent_type text,
-    subagent_status text,
-    subagent_outcome text,
-    subagent_error text,
-    report_path text,
-    conversation_revision bigint DEFAULT 0 NOT NULL,
-    workspace_idle_revision bigint DEFAULT 0 NOT NULL,
-    workspace_idle_episode jsonb,
-    pinned_idle_terminal_intent_at timestamp with time zone,
-    runtime_retirement_actuator_request jsonb,
-    CONSTRAINT threads_conversation_revision_nonnegative CHECK ((conversation_revision >= 0)),
-    CONSTRAINT threads_kind_check CHECK ((kind = ANY (ARRAY['session'::text, 'subagent'::text]))),
-    CONSTRAINT threads_parent_shape_check CHECK ((((kind = 'session'::text) AND (parent_job_id IS NULL) AND (parent_thread_id IS NULL)) OR ((kind = 'subagent'::text) AND (num_nonnulls(parent_job_id, parent_thread_id) = 1)))),
-    CONSTRAINT threads_runtime_retirement_external_cleanup_shape CHECK (((runtime_retirement_external_cleanup IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (runtime_retirement_permanent = true) AND (jsonb_typeof(runtime_retirement_external_cleanup) = 'object'::text)))),
-    CONSTRAINT threads_runtime_retirement_local_quiescence_shape CHECK (((runtime_retirement_local_quiescence IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (jsonb_typeof(runtime_retirement_local_quiescence) = 'object'::text)))),
-    CONSTRAINT threads_runtime_retirement_shape CHECK ((((runtime_retirement_token IS NULL) AND (runtime_retirement_permanent IS NULL) AND (runtime_retirement_started_at IS NULL) AND (runtime_retirement_authorized_at IS NULL) AND (runtime_retirement_context IS NULL)) OR ((runtime_retirement_token IS NOT NULL) AND (runtime_retirement_permanent IS NOT NULL) AND (runtime_retirement_started_at IS NOT NULL) AND (jsonb_typeof(runtime_retirement_context) = 'object'::text)))),
-    CONSTRAINT threads_runtime_retirement_stage_receipt_shape CHECK (((runtime_retirement_stage_receipt IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (jsonb_typeof(runtime_retirement_stage_receipt) = 'object'::text)))),
-    CONSTRAINT valid_narration_mode CHECK ((narration_mode = ANY (ARRAY['silent'::text, 'verbose'::text, 'auto'::text]))),
-    CONSTRAINT valid_permission_mode CHECK (((permission_mode)::text = ANY ((ARRAY['supervised'::character varying, 'auto_accept'::character varying, 'autonomous'::character varying])::text[]))),
-    CONSTRAINT valid_thread_status CHECK (((status)::text = ANY ((ARRAY['created'::character varying, 'active'::character varying, 'idle'::character varying, 'awaiting_user'::character varying, 'suspended'::character varying, 'ended'::character varying])::text[])))
-);
-
-
---
--- Name: COLUMN threads.events_epoch; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.events_epoch IS 'Current event-log writer generation (client-visible). Bumped only deliberately: rewind, a reaper/steal takeover, or an attach that finds the previous session life terminal (terminal thread status, a terminal lifecycle frame in the epoch, or the epoch wholly beyond retention). Clean reattaches REUSE the epoch so cached client cursors stay valid; an older-epoch cursor triggers authoritative re-sync (gone_beyond_horizon). See docs/features/stateless_agents.md §5.3.2.';
-
-
---
--- Name: COLUMN threads.awaiting_user_since; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.awaiting_user_since IS 'Set by the agent when it reaches a natural pause untethered. The attention_sleep_sweeper suspends the workspace when this exceeds headless_attention_sleep_minutes. Cleared on reattach.';
-
-
---
--- Name: COLUMN threads.extend_count; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.extend_count IS 'Number of magic-link extend-window clicks since this awaiting_user session began. Capped at 4 (= 4h ceiling at default 60min/extend).';
-
-
---
--- Name: COLUMN threads.execution_lane; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.execution_lane IS 'Which execution plane serves this thread: ''pinned'' (registered-agent pod, the default) or ''stateless'' (run_queue claim by any pod). App-validated by design — no CHECK. See docs/features/stateless_agents.md §5.4.4.';
-
-
---
--- Name: COLUMN threads.events_seq_hwm; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.events_seq_hwm IS 'Highest seq ever allocated in the CURRENT events_epoch. Survives retention pruning of the thread_events rows themselves; reset to 0 atomically on every epoch bump. Maintained by the agent journal writer''s fenced flush (GREATEST over the batch in the same statement) and pre-incremented by the system-frame allocator (src/shared/event_journal). Attach seeds its in-process counter from GREATEST(events_seq_hwm, MAX(seq) of the epoch). See docs/features/stateless_agents.md §5.3.2.';
-
-
---
--- Name: COLUMN threads.control_seq_hwm; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.control_seq_hwm IS 'Highest commit-ordered thread_control_requests.request_seq allocated for this thread. Admission increments it while holding the threads row lock; never allocate request order from an IDENTITY/sequence.';
-
-
---
--- Name: COLUMN threads.control_admission_agent_id; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.control_admission_agent_id IS 'Exact pinned-owner capability and teardown fence. NULL is closed. An inbox-capable reciprocal owner writes its own agent UUID after attach and clears it before its final drain. A stale credential never transfers to a different owner generation.';
-
-
---
--- Name: COLUMN threads.narration_mode; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.narration_mode IS 'Durable interactive narration mode (silent | verbose | auto). NULL means the thread still inherits its resolved config; creation and the serving control owner materialize an explicit value.';
-
-
---
--- Name: COLUMN threads.runtime_generation; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.runtime_generation IS 'Immutable authority for one pinned/stateless session runtime life. The database rotates it on the sole ended->created Resume edge.';
-
-
---
--- Name: COLUMN threads.runtime_retirement_token; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.runtime_retirement_token IS 'Non-NULL closes pinned runtime admission while exact external cleanup is retryable.';
-
-
---
--- Name: COLUMN threads.runtime_retirement_authorized_at; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.runtime_retirement_authorized_at IS 'Append-once preflight authorization for the pending retirement. Exact agents do not begin local teardown and reconcilers do not actuate before it is set.';
-
-
---
--- Name: COLUMN threads.runtime_retirement_context; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.runtime_retirement_context IS 'Immutable identities captured when pinned retirement closes admission; cleanup must target these identities, never names alone.';
-
-
---
--- Name: COLUMN threads.runtime_retirement_stage_receipt; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.runtime_retirement_stage_receipt IS 'Append-once exact staging publication receipt for retrying a soft retirement after workspace/reader cleanup; cleared only by settlement.';
-
-
---
--- Name: COLUMN threads.runtime_retirement_local_quiescence; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.runtime_retirement_local_quiescence IS 'Append-once exact agent acknowledgement that shell, overlay, mounts, and ordinary event writers are quiesced for the pending runtime retirement.';
-
-
---
--- Name: COLUMN threads.runtime_authority_exposed; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.runtime_authority_exposed IS 'Monotonic within one runtime_generation: true once any pinned process authority was delivered; reset only by the database generation-rotation edge.';
-
-
---
--- Name: COLUMN threads.runtime_attach_token; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.runtime_attach_token IS 'Exact physical pinned-process attach identity; register/bind rotates it and every maintenance or credential request must match it with runtime_generation.';
-
-
---
--- Name: COLUMN threads.runtime_attach_abort_receipt; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.runtime_attach_abort_receipt IS 'Last exact pre-input attach-abort rotation receipt. Internal authority only; browser thread payloads must redact it.';
-
-
---
--- Name: COLUMN threads.kind; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.kind IS 'What this row is: ''session'' (an interactive thread, the default) or ''subagent'' (a child session a worker job or a session spawned through delegate_agent; U3). Session listings filter on kind so child rows never reach the sessions page; the subagent_* / parent_* columns are NULL for sessions.';
-
-
---
--- Name: COLUMN threads.parent_job_id; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.parent_job_id IS 'kind=subagent only: the worker job that spawned this child. ON DELETE CASCADE — a job takes its children with it (delete_job ends live children first, because the pinned delete authority only lets an ended, authority-free row go).';
-
-
---
--- Name: COLUMN threads.parent_thread_id; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.parent_thread_id IS 'kind=subagent only: the session thread that spawned this child (U5 session parents). NULL for a worker-job parent. ON DELETE CASCADE.';
-
-
---
--- Name: COLUMN threads.parent_tool_call_id; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.parent_tool_call_id IS 'kind=subagent only: the parent''s delegate_agent tool call this child answered. The non-NULL parent plus parent_tool_call_id is the idempotency key: a parent re-running its tools node after a hard kill replays the stored report instead of spawning again; both parent forms are unique in the database.';
-
-
---
--- Name: COLUMN threads.subagent_handle; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.subagent_handle IS 'kind=subagent only: the short handle the parent sees (<type>-<4 hex>, e.g. implementer-7f3a) — unique per parent, not globally; the durable identity is the thread id.';
-
-
---
--- Name: COLUMN threads.subagent_type; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.subagent_type IS 'kind=subagent only: the roster entry name the child ran as (explorer, implementer, reviewer, ...).';
-
-
---
--- Name: COLUMN threads.subagent_status; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.subagent_status IS 'kind=subagent only: the bare lifecycle kind, written by the agent-side ledger. Open set by design — app-validated, no CHECK, so a new kind never needs a migration. Today: running | completed | parked | interrupted | capped | error | cancelled (src/subagents/ledger.py SUBAGENT_STATUSES). Anything other than running is terminal, and a terminal write also moves status to ended and stamps ended_at.';
-
-
---
--- Name: COLUMN threads.subagent_outcome; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.subagent_outcome IS 'kind=subagent only: the driver''s full classification behind subagent_status (capped:turns, interrupted:drain, interrupted:stale, cancelled:parent_deleted, ...). Free text; the cockpit shows it as the outcome badge detail.';
-
-
---
--- Name: COLUMN threads.subagent_error; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.subagent_error IS 'kind=subagent only: the error text of an error / cancelled child, NULL otherwise.';
-
-
---
--- Name: COLUMN threads.report_path; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.report_path IS 'kind=subagent only: workspace-relative path of the child''s full spilled report in the PARENT tree (.subagents/<handle>/report.md); NULL when the spill failed. The replay path re-renders the envelope from this file.';
-
-
---
--- Name: COLUMN threads.conversation_revision; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.conversation_revision IS 'Monotonic transcript-view revision. Incremented only by an applied conversation rewind; clients fence delayed human input and cached history against it.';
-
-
---
--- Name: COLUMN threads.runtime_retirement_actuator_request; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON COLUMN public.threads.runtime_retirement_actuator_request IS 'Exact authenticated local VM drain handoff; permits existing actuator only, never process zero or End completion.';
-
-
---
 -- Name: pinned_vm_actuator_request_valid(public.threads, jsonb, boolean); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -12347,6 +12688,9 @@ DECLARE
         AND marker = owner_row.runtime_retirement_actuator_request
         AND marker->>'workspace_runtime_incarnation' = vm->>'vm_uid';
 BEGIN
+    IF marker->>'kind' = 'agent_pre_setup_retirement_v1' THEN
+        RETURN public.pinned_pre_setup_retirement_request_valid(owner_row,marker,require_actor);
+    END IF;
     IF owner_row.execution_lane IS DISTINCT FROM 'pinned'
        OR owner_row.runtime_retirement_token IS NULL
        OR owner_row.runtime_retirement_authorized_at IS NULL

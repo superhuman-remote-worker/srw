@@ -1,6 +1,5 @@
 """Killed pinned life: truthful Pod zero, durable inbox and exact successor."""
 
-import json
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock
@@ -266,3 +265,38 @@ async def test_killed_partial_turn_is_retired_without_fabricating_completion_or_
     assert [r["state"] for r in rows] == ["admitted", "owned"]
     assert rows[0]["settled_at"] is None
     assert rows[0]["delivery_id"] == deliveries[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "defect",
+    ["replacement_uid", "unavailable_proof", "stale_generation", "stale_token"],
+)
+async def test_killed_life_recovery_refuses_unproven_or_superseded_runtime(
+    db, monkeypatch, defect
+):
+    ids, retirement, deliveries, api, _ = await killed_life(db, monkeypatch)
+    if defect == "replacement_uid":
+        pod = next(iter(api.pods.values()))
+        pod.metadata.uid = str(uuid4())
+    elif defect == "unavailable_proof":
+
+        def unavailable(*args, **kwargs):
+            raise fixtures._K8sError(503)
+
+        api.read_namespaced_pod = unavailable
+    elif defect == "stale_generation":
+        retirement = {**retirement, "generation": str(uuid4())}
+    else:
+        retirement = {**retirement, "token": str(uuid4())}
+    assert not await controls.pinned_retirement_operations(
+        main.app.state.resources
+    ).recover_captured_process_zero(retirement)
+    current = await db.get_thread(ids["thread"])
+    assert current["runtime_retirement_local_quiescence"] is None
+    rows = await db.fetch(
+        "SELECT delivery_id,state FROM thread_input_deliveries WHERE thread_id=$1::uuid ORDER BY persisted_at",
+        ids["thread"],
+    )
+    assert [r["delivery_id"] for r in rows] == deliveries
+    assert [r["state"] for r in rows] == ["queued", "owned"]

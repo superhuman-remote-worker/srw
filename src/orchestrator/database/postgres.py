@@ -41474,6 +41474,32 @@ class PostgresDB:
             value = json.loads(value)
         return value if isinstance(value, dict) else None
 
+    async def acknowledge_abrupt_pinned_actor_exit(
+        self,
+        thread_id: str,
+        *,
+        runtime_generation: str,
+        retirement_token: str,
+        agent_id: str,
+        attach_token: str,
+        stopped_pod_uid: str,
+    ) -> dict[str, Any] | None:
+        """Receipt only a proven stopped captured actor, preserving stranded input and partial admissions."""
+
+        value = await self.fetchval(
+            "SELECT acknowledge_abrupt_pinned_actor_exit("
+            "$1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6)",
+            thread_id,
+            runtime_generation,
+            retirement_token,
+            agent_id,
+            attach_token,
+            stopped_pod_uid,
+        )
+        if isinstance(value, str):
+            value = json.loads(value)
+        return value if isinstance(value, dict) else None
+
     async def acknowledge_pinned_thread_pre_registration_pod_zero(
         self,
         thread_id: str,
