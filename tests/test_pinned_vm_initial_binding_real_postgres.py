@@ -963,6 +963,17 @@ async def test_thread_vm_retry_admits_durable_source_without_resource_enforcemen
         generation=retirement["generation"],
         settle_status="ended",
     )
+    pod_uid = await db.fetchval(
+        "SELECT pod_uid FROM agents WHERE id=$1::uuid", str(current["agent_id"])
+    )
+    assert await db.request_pinned_pre_setup_retirement(
+        str(thread_id),
+        runtime_generation=retirement["generation"],
+        runtime_attach_token=str(current["runtime_attach_token"]),
+        retirement_token=retirement["token"],
+        agent_id=str(current["agent_id"]),
+        pod_uid=pod_uid,
+    )
     settled = await VMCreationRetryStore(db).settle_never_issued(
         request_id=str(source["request_id"])
     )
@@ -971,6 +982,11 @@ async def test_thread_vm_retry_admits_durable_source_without_resource_enforcemen
         str(thread_id),
         runtime_generation=retirement["generation"],
         retirement_token=retirement["token"],
+    )
+    assert await db.fetchval(
+        "SELECT pinned_vm_actuator_request_valid(t,t.runtime_retirement_actuator_request,false) "
+        "FROM threads t WHERE id=$1::uuid",
+        str(thread_id),
     )
     assert await VMCreationRetryStore(db).claim_due(limit=10) == []
     assert len(calls) == 1
