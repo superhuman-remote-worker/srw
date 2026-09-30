@@ -447,6 +447,11 @@ async def test_http_boundary_routes_failed_attach_proof_into_retirement_only():
         }
     )
     with (
+        patch.object(
+            main.app.state.resources.postgres_db,
+            "has_exact_pinned_runtime_retirement_outcome",
+            AsyncMock(return_value=True),
+        ),
         patch.object(access_module, "require_internal", AsyncMock()),
         patch.object(
             session_attach_binding_module,
