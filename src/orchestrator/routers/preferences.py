@@ -61,12 +61,12 @@ class UserSettingsUpdate(BaseModel):
     # header (orchestrator/security/auth.py), this just persists the choice.
     admin_view_mode: Literal["me", "all"] | None = None
     # persistent_agent sub-object: model, permission_mode,
-    # idle_timeout_minutes, headless_mode, headless_attention_sleep_minutes,
-    # and workspace_backend (the user's default session workspace tier).
+    # idle_timeout_minutes, headless_mode and headless_attention_sleep_minutes.
     # Patch-replaces the whole sub-object. Free-form by design, so legacy keys
     # from removed controls (greeting, command_allowlist,
     # notification_channels) still round-trip harmlessly if a stored blob
-    # carries them — nothing reads them any more.
+    # carries them — nothing reads them any more. The retired workspace_backend
+    # is the exception: it is dropped (see _validate_persistent_agent).
     persistent_agent: dict[str, Any] | None = None
     # Read-aloud rewrite preferences: {reasoning_level, custom_prompt}. Controls
     # how the auxiliary LLM rewrites a message for speech — reasoning_level (off
@@ -231,8 +231,9 @@ async def get_user_preferences(
     user = await dependencies.require_approved_user(request, dependencies.db)
     prefs = await dependencies.db.get_user_settings(str(user["id"]))
     # persistent_agent.workspace_backend is a retired preference (Slice A2b):
-    # hide it on read even though a stored row may still carry it (the
-    # backfill in Task 9 clears it on the next write).
+    # hide it on read even though a stored row may still carry it. The startup
+    # backfill copies it into the personal project and leaves it in place; the
+    # next preferences PATCH that replaces persistent_agent drops it.
     if isinstance(prefs.get("persistent_agent"), dict):
         prefs["persistent_agent"] = {
             key: value

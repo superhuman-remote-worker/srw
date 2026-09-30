@@ -508,6 +508,24 @@ async def test_continuation_keeps_elapsed_custom_image_pull_budget(
 
 
 @pytest.mark.asyncio
+async def test_continuation_of_the_installation_image_has_no_pull_budget(
+    database, actor, monkeypatch
+):
+    """Like creation, a continuation watches only a custom image's pull: a
+    default Job's container-full carries the installation image itself."""
+    case = await workspace_attempt(database, actor, monkeypatch)
+    case.provisioner._workspace_image = IMAGE
+    waited = AsyncMock(return_value=None)
+    monkeypatch.setattr(case.provisioner, "_wait_for_ready", waited)
+    await case.provisioner.continue_stateless_workspace_creation(
+        case.owner,
+        generation=str(case.before["runtime_generation"]),
+        expected_runtime_incarnation=case.pod_uid,
+    )
+    assert waited.await_args.kwargs["pull_image"] is None
+
+
+@pytest.mark.asyncio
 async def test_not_ready_continuation_keeps_reservation_open_until_ready(
     database, actor, monkeypatch
 ):
