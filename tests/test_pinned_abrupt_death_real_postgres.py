@@ -32,7 +32,7 @@ async def _schema_applied(pg_dsn):
     await fixtures._schema_applied.__wrapped__(pg_dsn)
     migration = (
         Path(__file__).resolve().parents[1]
-        / "src/orchestrator/database/migrations/app/0309_pinned_abrupt_actor_exit.sql"
+        / "src/orchestrator/database/migrations/app/0313_pinned_abrupt_actor_exit.sql"
     )
     if migration.exists():
         conn = await asyncpg.connect(pg_dsn)

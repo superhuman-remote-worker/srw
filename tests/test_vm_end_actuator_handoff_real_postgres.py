@@ -47,7 +47,7 @@ async def _schema_applied(pg_dsn):
             ):
                 await conn.execute(migration.read_text())
             pre_setup = migration.with_name(
-                "0311_pinned_pre_setup_retirement_request.sql"
+                "0315_pinned_pre_setup_retirement_request.sql"
             )
             if not await conn.fetchval(
                 "SELECT to_regprocedure('public.pinned_pre_setup_retirement_request_valid(threads,jsonb,boolean)') IS NOT NULL"
