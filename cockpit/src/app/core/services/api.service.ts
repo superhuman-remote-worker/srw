@@ -86,6 +86,8 @@ import {
     ProjectRepositoryUpdateRequest,
     ProjectStatus,
     ProjectUpdateRequest,
+    ProjectWorkspaceDefaults,
+    ProjectWorkspaceDefaultsUpdate,
     PullRequestStatus,
     PromoteRequest,
     StuckJobsResponse,
@@ -100,6 +102,7 @@ import {
     User,
     UserCapabilities,
     VoiceCapabilities,
+    WorkspaceTemplateList,
 } from '../models/api.model';
 import type {
   AdminCapacity,
@@ -2582,6 +2585,35 @@ export class ApiService {
    */
   updateProjectFields(id: string, body: ProjectUpdateRequest): Observable<{ status: string }> {
     return this.http.patch<{ status: string }>(`${this.baseUrl}/projects/${id}`, body);
+  }
+
+  /** The Project's row in the workspace defaults chain: what it stores,
+   *  what each field resolves to and why, and whether the manifest owns it. */
+  getProjectWorkspaceDefaults(id: string): Observable<ProjectWorkspaceDefaults> {
+    return this.http.get<ProjectWorkspaceDefaults>(`${this.baseUrl}/projects/${id}/workspace-defaults`);
+  }
+
+  /** Replaces all four values. Errors propagate (409 manifest-owned, 422
+   *  validation, 403 not owner/admin) — the same reason `updateProjectFields`
+   *  does not swallow them. */
+  putProjectWorkspaceDefaults(
+    id: string,
+    body: ProjectWorkspaceDefaultsUpdate,
+  ): Observable<ProjectWorkspaceDefaults> {
+    return this.http.put<ProjectWorkspaceDefaults>(`${this.baseUrl}/projects/${id}/workspace-defaults`, body);
+  }
+
+  /** Visible WorkspaceTemplate resources for one scope, for the Settings
+   *  tab's template pickers. Falls back to an empty list rather than failing
+   *  the whole panel over one scope the caller can't read. */
+  listWorkspaceTemplates(scopeKind: string, scopeName: string): Observable<WorkspaceTemplateList> {
+    const params = new HttpParams()
+      .set('scope_kind', scopeKind)
+      .set('scope_name', scopeName)
+      .set('kind', 'WorkspaceTemplate');
+    return this.http
+      .get<WorkspaceTemplateList>(`${this.baseUrl}/resources`, {params})
+      .pipe(catchError(() => of({resources: []})));
   }
 
   /** The same PATCH with failures flattened to `null`. Nothing calls it today —

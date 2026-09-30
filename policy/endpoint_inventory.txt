@@ -460,6 +460,8 @@ GET    /api/projects/{project_id}/repositories                                  
 POST   /api/projects/{project_id}/repositories                                          pat=admin           gated:require_project_owner
 DELETE /api/projects/{project_id}/repositories/{repo_id}                                pat=admin           gated:require_project_owner
 PATCH  /api/projects/{project_id}/repositories/{repo_id}                                pat=admin           gated:require_project_owner
+GET    /api/projects/{project_id}/workspace-defaults                                    pat=jobs:read       gated:require_project_member
+PUT    /api/projects/{project_id}/workspace-defaults                                    pat=admin           gated:require_project_owner
 GET    /api/requests/{doc_id}                                                           pat=jobs:read       gated:require_job_access
 PUT    /api/resource-secrets/{name}                                                     pat=admin           gated:require_approved_user
 GET    /api/resources                                                                   pat=jobs:read       gated:require_approved_user

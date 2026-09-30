@@ -144,3 +144,16 @@ version/migration decision for a behavior change; do not regenerate the expected
 answer merely to make a changed resolver pass. These parser/resolver checks are
 one layer of acceptance. They do not replace admission/authorization tests, real
 runtime tests, migration replay or a deployment-specific upgrade/rollback exercise.
+
+Recorded behaviour changes within `srw/v1alpha1`, applied to the frozen answer by
+the test rather than regenerated into it:
+
+- **Workspace defaults chain.** A Job that omits `execution.workspace` keeps it
+  omitted in the preview; the Project's `defaults.workspace` is no longer copied
+  into it. Admission decides it, and the admitted execution snapshot records the
+  result. An SRW harness Job (`adapter: srw/v1`) gets the Project's workspace
+  defaults, otherwise the installation's. A generic-image Job gets its Project's
+  container template when the Project's Jobs default is a container (as the
+  shorthand to a `sandbox` template sets it, like `portable-team` in the portable
+  bundle), otherwise no workspace; installation defaults never apply to it.
+  `workspace: null` still means no workspace.

@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 from uuid import UUID
 
+from shared.workspace_defaults import default_backend
+
 WORKSPACE_CONTRACT_CONTEXT_KEY = "_workspace_contract"
 WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY = "_workspace_dispatch_authority"
 WORKSPACE_RUNTIME_CONTEXT_KEY = "workspace_runtime"
@@ -190,7 +192,9 @@ def build_workspace_contract(
 ) -> WorkspaceContract:
     """Build the one creation-time contract from trusted server inputs."""
 
-    assigned = configured_workspace_backend(config_override) or "sandbox"
+    assigned = configured_workspace_backend(config_override) or default_backend(
+        "worker"
+    )
     requested = normalize_workspace_backend(
         requested_backend, field="requested workspace.backend"
     )

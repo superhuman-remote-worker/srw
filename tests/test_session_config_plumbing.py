@@ -441,58 +441,16 @@ class TestThreadWorkspaceBackend:
 
 
 class TestSessionWorkspaceBackendDefaultChain:
-    """Instant-landing defaults chain (knowledge-base/knowledge/features/instant_landing_session.md):
-    explicit request > owner's saved ``persistent_agent.workspace_backend`` >
-    platform default (virtual). Sessions are never implicitly sandbox."""
+    """Slice A2b: a Session's tier comes only from the workspace defaults
+    chain (``select_execution_workspace``); the retired
+    ``persistent_agent.workspace_backend`` preference is accepted and
+    silently dropped on write, and hidden on read."""
 
-    def test_platform_default_is_virtual(self):
-        assert session_workspace_policy.SESSION_DEFAULT_WORKSPACE_BACKEND == "virtual"
-        assert (
-            session_workspace_policy.SESSION_DEFAULT_WORKSPACE_BACKEND
-            in session_workspace_policy.SESSION_WORKSPACE_BACKENDS
-        )
-
-    def test_no_settings_falls_back_to_platform_default(self):
-        assert (
-            session_workspace_policy_module.default_session_workspace_backend({})
-            == "virtual"
-        )
-        assert (
-            session_workspace_policy_module.default_session_workspace_backend(None)
-            == "virtual"
-        )
-
-    @pytest.mark.parametrize("backend", ["sandbox", "virtual", "none"])
-    def test_saved_user_default_wins_over_platform_default(self, backend):
-        assert (
-            session_workspace_policy_module.default_session_workspace_backend(
-                {"workspace_backend": backend}
-            )
-            == backend
-        )
-
-    @pytest.mark.parametrize("junk", ["vm", "bogus", "", 3, {"backend": "vm"}])
-    def test_junk_saved_value_falls_back_to_platform_default(self, junk):
-        # Legacy/hand-edited settings rows must not brick session creation.
-        assert (
-            session_workspace_policy_module.default_session_workspace_backend(
-                {"workspace_backend": junk}
-            )
-            == "virtual"
-        )
-
-    def test_settings_patch_accepts_valid_workspace_backend(self):
+    def test_settings_patch_drops_workspace_backend_and_keeps_other_keys(self):
         upd = preferences_module.UserSettingsUpdate(
             persistent_agent={"workspace_backend": "sandbox", "model": "m"}
         )
-        assert upd.persistent_agent == {"workspace_backend": "sandbox", "model": "m"}
-
-    @pytest.mark.parametrize("bad", ["vm", "bogus", ""])
-    def test_settings_patch_rejects_invalid_workspace_backend(self, bad):
-        with pytest.raises(ValueError):
-            preferences_module.UserSettingsUpdate(
-                persistent_agent={"workspace_backend": bad}
-            )
+        assert upd.persistent_agent == {"model": "m"}
 
     def test_settings_patch_leaves_other_keys_free_form(self):
         # persistent_agent stays a free dict for other keys. `greeting` is the
@@ -620,9 +578,9 @@ class TestSessionWorkspaceBackendDefaultChain:
         with pytest.raises(ValueError):
             preferences_module.UserSettingsUpdate(language=bad)
 
-    def test_resolved_preference_defaults_surface_workspace_backend(self):
-        # The Settings UI shows the resolved system default as the placeholder;
-        # it must match what create_thread will actually apply.
+    def test_resolved_preference_defaults_no_longer_surface_a_workspace_backend(self):
+        # Slice A2b: the tier preference retired; the resolved defaults must
+        # not offer a value the write path no longer stores.
         import asyncio
 
         from orchestrator.services import preference_defaults
@@ -640,10 +598,7 @@ class TestSessionWorkspaceBackendDefaultChain:
                 environ=wired.environ,
             )
         )
-        assert (
-            resolved["persistent_agent"]["workspace_backend"]
-            == session_workspace_policy.SESSION_DEFAULT_WORKSPACE_BACKEND
-        )
+        assert "workspace_backend" not in resolved["persistent_agent"]
 
     def test_fleet_management_tools_override_passes_through(self):
         tools = session_tool_policy_module.validated_session_fleet_tools_override(

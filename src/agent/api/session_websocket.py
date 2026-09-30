@@ -98,7 +98,9 @@ class SessionSocketCommands:
     compact: Callable[..., Awaitable[None]]
     archive: Callable[[WebSocket], Awaitable[None]]
     vm_upgrade: Callable[[WebSocket], Awaitable[None]]
-    workspace_upgrade: Callable[[WebSocket, str], Awaitable[None]]
+    workspace_upgrade: Callable[
+        [WebSocket, Optional[str], Optional[str]], Awaitable[None]
+    ]
     rewind: Callable[[WebSocket, dict[str, Any]], Awaitable[None]]
 
 
@@ -483,10 +485,12 @@ async def serve_session_websocket(ws: WebSocket, ports: SessionSocketPorts) -> N
                 _spawn_ws_effect(commands.vm_upgrade(ws), name="handle-vm-upgrade")
 
             elif method == "upgrade-to-workspace":
-                # Upgrade a lite (virtual) session to a real sandbox container
-                target_tier = data.get("target_tier", "sandbox")
+                # Upgrade a lite (virtual) session to a real sandbox container,
+                # a vm, or whatever tier a named template requires.
                 _spawn_ws_effect(
-                    commands.workspace_upgrade(ws, target_tier),
+                    commands.workspace_upgrade(
+                        ws, data.get("target_tier"), data.get("template")
+                    ),
                     name="handle-workspace-upgrade",
                 )
 

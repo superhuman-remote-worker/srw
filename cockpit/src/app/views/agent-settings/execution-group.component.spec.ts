@@ -12,7 +12,10 @@ import {User} from '../../core/models/api.model';
  * constructor's effect() needs) with a mocked UserService signal, so
  * canUseVm() resolves against controllable state.
  */
-function createWith(user: Partial<User> | null = {is_admin: true}) {
+function createWith(
+  user: Partial<User> | null = {is_admin: true},
+  translations: Record<string, string> = {},
+) {
   const currentUser = signal<User | null>(
     user
       ? ({
@@ -37,8 +40,11 @@ function createWith(user: Partial<User> | null = {is_admin: true}) {
     logout: vi.fn(),
   };
 
+  // Echoes the key back by default (most tests read raw keys), but a caller
+  // may supply real strings for the handful of keys it asserts rendered text
+  // against — see the workspace-default-hint suite below.
   const mockTransloco = {
-    translate: (key: string) => key,
+    translate: (key: string) => translations[key] ?? key,
     langChanges$: of('en'),
     getActiveLang: () => 'en',
   };
@@ -237,5 +243,78 @@ describe('ExecutionGroupComponent workspace backend', () => {
     c.onWorkspaceBackendChange('virtual');
     c.resetAll();
     expect(c.workspaceBackend()).toBeNull();
+  });
+});
+
+describe('ExecutionGroupComponent workspace default hint', () => {
+  // Only these two keys need real text; workspaceDefaultHint composes them
+  // itself, so a plain echo-back would hide a wiring mistake in the ternary.
+  const translations: Record<string, string> = {
+    'agentSettings.execution.workspaceDefaultProject': 'Default from this Project',
+    'agentSettings.execution.workspaceDefaultInstallation': 'Installation default',
+  };
+
+  it.each([
+    [
+      {
+        backend: 'sandbox',
+        source: 'project',
+        binding: null,
+        sources: {tier: 'project', template: 'project'},
+        template_name: 'website-builder',
+      },
+      'Default from this Project · website-builder',
+    ],
+    [
+      {
+        backend: 'virtual',
+        source: 'default',
+        binding: null,
+        sources: {tier: 'installation', template: null},
+        template_name: null,
+      },
+      'Installation default',
+    ],
+    // An Expert's workspacePreference advisory already has its own "This
+    // Expert recommends {tier}" line above the picker (job-create /
+    // session-create); labelling it "Installation default" too would be
+    // factually wrong (review finding, fix round 1).
+    [
+      {
+        backend: 'container',
+        source: 'recommendation',
+        binding: {template: {inline: {backend: 'container'}}},
+        sources: {tier: 'installation', template: null},
+        template_name: null,
+      },
+      '',
+    ],
+  ])('explains an unpinned default (%o)', (preview, text) => {
+    // Job mode (the default) with no pinned workspace backend (also default).
+    const {component} = createWith({is_admin: true}, translations);
+    Object.defineProperty(component, 'workspacePreview', {value: () => preview});
+    expect(component.workspaceDefaultHint()).toBe(text);
+  });
+
+  it('is blank once the user pins a workspace backend', () => {
+    const {component} = createWith({is_admin: true}, translations);
+    Object.defineProperty(component, 'workspacePreview', {
+      value: () => ({backend: 'sandbox', source: 'project', binding: null}),
+    });
+    component.onWorkspaceBackendChange('virtual');
+    expect(component.workspaceDefaultHint()).toBe('');
+  });
+
+  it("is blank when the preview reflects the caller's own request", () => {
+    const {component} = createWith({is_admin: true}, translations);
+    Object.defineProperty(component, 'workspacePreview', {
+      value: () => ({backend: 'vm', source: 'request', binding: null}),
+    });
+    expect(component.workspaceDefaultHint()).toBe('');
+  });
+
+  it('is blank with no preview at all', () => {
+    const {component} = createWith();
+    expect(component.workspaceDefaultHint()).toBe('');
   });
 });

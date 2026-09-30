@@ -543,6 +543,11 @@ async def persist_project_resource(
             resource["id"],
             resource["revision"],
         )
+        from orchestrator.services.project_workspace_defaults import (
+            sync_manifest_defaults,
+        )
+
+        await sync_manifest_defaults(db, resource)
         return resource
     owner_id = (
         (previous.get("owner_id") if previous else None)
@@ -669,6 +674,11 @@ async def persist_project_resource(
         resource["revision"],
     )
     resource["active_revision"] = resource["revision"]
+    from orchestrator.services.project_workspace_defaults import (
+        sync_manifest_defaults,
+    )
+
+    await sync_manifest_defaults(db, resource)
     await db.execute(
         "UPDATE projects SET manifest_resource_id=$2,default_config_name=NULL,default_config_override=NULL WHERE id=$1",
         UUID(str(project_id)),
@@ -826,6 +836,13 @@ async def persist_officer_controller(db, project_id, post):
         saved["id"],
         saved["revision"],
     )
+    # team.controller is part of the content revision: the manifest-owned
+    # workspace defaults row must follow the new active revision.
+    from orchestrator.services.project_workspace_defaults import (
+        sync_manifest_defaults,
+    )
+
+    await sync_manifest_defaults(db, saved)
     return saved
 
 

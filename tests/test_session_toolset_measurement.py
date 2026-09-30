@@ -1428,8 +1428,92 @@ async def test_explicit_workspace_preview_overrides_expert_recommendation(
         "backend": backend,
         "source": "request",
         "binding": selected,
+        "sources": {"tier": "explicit", "template": "explicit"},
+        "template_name": None,
     }
     assert result["origin"] == ORIGIN_PREDICTION
     if backend != "sandbox":
         assert result["categories"]["shell"]["state"] == STATE_UNAVAILABLE
         assert result["categories"]["shell"]["decided_by"] == "backend"
+
+
+async def _preview_with_selection(user, db, request, selection, **fields):
+    select = AsyncMock(return_value=selection)
+    with (
+        patch("orchestrator.security.auth.require_approved_user", _approved(user)),
+        patch("orchestrator.main.app.state.resources.postgres_db", db),
+        patch(
+            "orchestrator.services.grant_enforcement.resolve_runner_grants",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "orchestrator.services.manifest_workspace_selection."
+            "select_execution_workspace",
+            select,
+        ),
+    ):
+        return await _preview_tool_groups(
+            ToolGroupPreviewRequest(config_name="session_base", **fields), request
+        )
+
+
+@pytest.mark.asyncio
+async def test_preview_reports_the_supplying_layers(user_a, fake_db, fake_request):
+    """Slice A2b: any Project layer makes the default a Project default."""
+    result = await _preview_with_selection(
+        user_a,
+        fake_db,
+        fake_request,
+        (
+            {"backend": "sandbox"},
+            {
+                "document": {"template": {"inline": {"backend": "sandbox"}}},
+                "sources": {"tier": "installation", "template": "project"},
+                "template_name": None,
+                "project_revision": None,
+            },
+        ),
+    )
+    assert result["workspace"]["source"] == "project"
+    assert result["workspace"]["sources"] == {
+        "tier": "installation",
+        "template": "project",
+    }
+    assert result["workspace"]["template_name"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_recommendation_replaces_the_installation_default_binding(
+    user_a, fake_db, fake_request
+):
+    """The cockpit submits a recommendation's binding, so it must be the
+    recommended tier, never the installation template it replaced."""
+    result = await _preview_with_selection(
+        user_a,
+        fake_db,
+        fake_request,
+        (
+            {"backend": "sandbox"},
+            {
+                "document": {
+                    "template": {
+                        "ref": {
+                            "name": "container-full",
+                            "scope": {"kind": "Catalog", "name": "shared"},
+                        }
+                    }
+                },
+                "sources": {"tier": "installation", "template": "builtin"},
+                "template_name": "container-full",
+                "project_revision": None,
+            },
+        ),
+        workspace_preference="virtual",
+    )
+    assert result["workspace"] == {
+        "backend": "virtual",
+        "source": "recommendation",
+        "binding": {"template": {"inline": {"backend": "virtual"}}},
+        "sources": {"tier": "explicit", "template": "explicit"},
+        "template_name": None,
+    }

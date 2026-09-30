@@ -507,9 +507,11 @@ class TestAssembleAndConvergeRunner:
 
 def _configure_no_datasource_defaults(db: AsyncMock) -> None:
     """Give loop-job tests an approved owner with no automatic connectors."""
-    db.get_user = AsyncMock(return_value={"is_approved": True})
+    db.get_user = AsyncMock(return_value={"id": str(uuid.uuid4()), "is_approved": True})
     db.user_is_member_of_projects = AsyncMock(return_value=True)
     db.list_default_datasource_candidates = AsyncMock(return_value=[])
+    # No project_workspace_defaults row: the installation decides the tier.
+    db.fetchrow = AsyncMock(return_value=None)
 
 
 class TestLoopCurationEnabled:

@@ -4496,7 +4496,7 @@ class TestHandleWorkspaceUpgradeVm:
         half-provisioned VM down instead of leaking it (Q7)."""
         ws = AsyncMock()
         client = AsyncMock()
-        client.request_thread_workspace_upgrade.return_value = True
+        client.request_thread_workspace_upgrade.return_value = (True, None)
         sandbox = SimpleNamespace(supports_shell=True, sudo_action="freeze")
         with (
             patch(
@@ -4534,7 +4534,7 @@ class TestHandleWorkspaceUpgradeVm:
 
         ws = AsyncMock()
         client = AsyncMock()
-        client.request_thread_workspace_upgrade.return_value = True
+        client.request_thread_workspace_upgrade.return_value = (True, None)
         sandbox = SimpleNamespace(supports_shell=True, sudo_action="freeze")
         # RemoteBackend construction blows up → the except block runs.
         mock_remote_mod = MagicMock()
@@ -4577,7 +4577,7 @@ class TestHandleWorkspaceUpgradeVm:
 
         ws = AsyncMock()
         client = AsyncMock()
-        client.request_thread_workspace_upgrade.return_value = True
+        client.request_thread_workspace_upgrade.return_value = (True, None)
         fresh_mount = {
             "version": 1,
             "driver": "rclone",
@@ -4633,6 +4633,97 @@ class TestHandleWorkspaceUpgradeVm:
         ]
         assert len(complete) == 1
         client.abort_thread_vm_upgrade.assert_not_called()
+
+
+class TestHandleWorkspaceUpgradeTierOrTemplate:
+    """No tier/template resolves the next tier locally; a template always
+    goes to the orchestrator, whose refusal text is shown verbatim."""
+
+    def _session_with_backend(self, backend):
+        sess = MagicMock()
+        sess.protected_cloud_required = False
+        sess.shell_owner_token = None
+        sess.config.extra = {"shell": {}}
+        sess.workspace_manager.backend = backend
+        return sess
+
+    @pytest.mark.asyncio
+    async def test_no_tier_on_a_lite_session_is_the_container_refusal(self):
+        ws = AsyncMock()
+        client = AsyncMock()
+        virtual = SimpleNamespace(supports_shell=False)
+        with (
+            patch(
+                "agent.api.persistent_app._session",
+                self._session_with_backend(virtual),
+            ),
+            patch("agent.api.persistent_app._orchestrator_client", client),
+            patch("agent.api.persistent_app._thread_id", "tid"),
+        ):
+            await _handle_workspace_upgrade(ws)
+
+        client.request_thread_workspace_upgrade.assert_not_called()
+        failed = [
+            c[0][0]
+            for c in ws.send_json.call_args_list
+            if c[0][0].get("method") == "workspace_upgrade.failed"
+        ]
+        assert len(failed) == 1
+        assert "exact runtime authority" in failed[0]["params"]["reason"]
+
+    @pytest.mark.asyncio
+    async def test_no_tier_on_a_container_session_asks_for_a_vm(self):
+        ws = AsyncMock()
+        client = AsyncMock()
+        client.request_thread_workspace_upgrade.return_value = (False, None)
+        sandbox = SimpleNamespace(supports_shell=True, sudo_action="freeze")
+        with (
+            patch(
+                "agent.api.persistent_app._session",
+                self._session_with_backend(sandbox),
+            ),
+            patch("agent.api.persistent_app._orchestrator_client", client),
+            patch("agent.api.persistent_app._thread_id", "tid"),
+        ):
+            await _handle_workspace_upgrade(ws)
+
+        client.request_thread_workspace_upgrade.assert_awaited_once_with(
+            "tid", target_tier="vm", template=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_template_goes_to_the_orchestrator_and_its_refusal_is_shown(self):
+        ws = AsyncMock()
+        client = AsyncMock()
+        client.request_thread_workspace_upgrade.return_value = (
+            False,
+            "Container upgrades of a running Session are unavailable; start a "
+            "new Session with this template.",
+        )
+        virtual = SimpleNamespace(supports_shell=False)
+        with (
+            patch(
+                "agent.api.persistent_app._session",
+                self._session_with_backend(virtual),
+            ),
+            patch("agent.api.persistent_app._orchestrator_client", client),
+            patch("agent.api.persistent_app._thread_id", "tid"),
+        ):
+            await _handle_workspace_upgrade(ws, template="site")
+
+        client.request_thread_workspace_upgrade.assert_awaited_once_with(
+            "tid", target_tier="vm", template="site"
+        )
+        failed = [
+            c[0][0]
+            for c in ws.send_json.call_args_list
+            if c[0][0].get("method") == "workspace_upgrade.failed"
+        ]
+        assert len(failed) == 1
+        assert failed[0]["params"]["reason"] == (
+            "Container upgrades of a running Session are unavailable; start a "
+            "new Session with this template."
+        )
 
 
 class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
@@ -4714,7 +4805,7 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
 
         ws = AsyncMock()
         client = AsyncMock()
-        client.request_thread_workspace_upgrade.return_value = True
+        client.request_thread_workspace_upgrade.return_value = (True, None)
         client.get_thread_workspace.return_value = {}
         old_backend = SimpleNamespace(
             supports_shell=True,

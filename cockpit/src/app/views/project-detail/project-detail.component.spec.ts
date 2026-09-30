@@ -5,7 +5,13 @@ import {TranslocoService} from '@jsverse/transloco';
 import {of, Subject, throwError} from 'rxjs';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 
-import {Datasource, Job, ProjectDatasource} from '../../core/models/api.model';
+import {
+  Datasource,
+  Job,
+  ProjectDatasource,
+  ProjectMemberRole,
+  ProjectWorkspaceDefaults,
+} from '../../core/models/api.model';
 import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {ErrorMessageService} from '../../core/services/error-message.service';
@@ -41,7 +47,36 @@ function linkedDatasource(id: string): ProjectDatasource {
   };
 }
 
-function createComponent(policyAvailable = true) {
+/** The GET's shape for a bare installation, no Project row, VMs on: what a
+ *  freshly-created project's "Workspace defaults" section renders. */
+const WORKSPACE_DEFAULTS: ProjectWorkspaceDefaults = {
+  stored: {jobs: null, sessions: null, container: null, vm: null},
+  managed_by_manifest: false,
+  can_edit: true,
+  account_templates: false,
+  effective: {
+    jobs: {mode: 'container', source: 'installation'},
+    sessions: {mode: 'virtual', source: 'installation'},
+    container: {template_name: 'container-full', source: 'builtin'},
+    vm: {template_name: 'vm-full', source: 'builtin'},
+  },
+  installation: {jobs: 'container', sessions: 'virtual', container: 'container-full', vm: 'vm-full'},
+  template_problems: {},
+  installation_problems: [],
+  vm_available: true,
+};
+
+/** `createComponent(false)` (a bare boolean) keeps its old meaning:
+ *  `datasourceScopeAutoAttachAvailable`. An options object adds `userRole`,
+ *  which switches the stubbed project from the suite's default (archived —
+ *  see the "archived read-only settings" describe below) to an active one.
+ *  `GET /api/projects/{id}` never returns `user_role` (only the list
+ *  endpoints do), so the mock no longer carries it; the workspace-defaults
+ *  tests drive edit/template access through the `getProjectWorkspaceDefaults`
+ *  mock's `can_edit`/`account_templates` instead — see WORKSPACE_DEFAULTS. */
+function createComponent(options: boolean | {policyAvailable?: boolean; userRole?: ProjectMemberRole} = true) {
+  const opts = typeof options === 'boolean' ? {policyAvailable: options} : options;
+  const policyAvailable = opts.policyAvailable ?? true;
   const api = {
     getProjectDatasources: vi.fn().mockReturnValue(of([])),
     getLinkableProjectDatasources: vi.fn().mockReturnValue(
@@ -53,13 +88,22 @@ function createComponent(policyAvailable = true) {
     getProjectRepositories: vi.fn().mockReturnValue(of([])),
     attachProjectKnowledgeRepository: vi.fn().mockReturnValue(of({status: 'attached'})),
     getKnowledgeSummary: vi.fn().mockReturnValue(of(null)),
-    getProject: vi.fn().mockReturnValue(of({id: 'project-a', status: 'archived'})),
+    getProject: vi.fn().mockReturnValue(
+      of(
+        opts.userRole
+          ? {id: 'project-a', status: 'active', is_default: false}
+          : {id: 'project-a', status: 'archived'},
+      ),
+    ),
     setProjectStatus: vi.fn().mockReturnValue(of({archived: true})),
     updateProject: vi.fn().mockReturnValue(of({status: 'updated'})),
     updateProjectFields: vi.fn().mockReturnValue(of({status: 'updated'})),
     getProjectJobs: vi.fn().mockReturnValue(of([])),
     getProjectMembers: vi.fn().mockReturnValue(of([])),
     getProjectExperts: vi.fn().mockReturnValue(of([])),
+    getProjectWorkspaceDefaults: vi.fn().mockReturnValue(of(WORKSPACE_DEFAULTS)),
+    putProjectWorkspaceDefaults: vi.fn().mockReturnValue(of(WORKSPACE_DEFAULTS)),
+    listWorkspaceTemplates: vi.fn().mockReturnValue(of({resources: []})),
   };
   const currentUser = signal({id: 'user-1', is_admin: false});
   const injector = Injector.create({
@@ -389,6 +433,18 @@ describe('ProjectDetailPageComponent archive lifecycle', () => {
     expect(component.lifecycleError()).toBeNull();
   });
 
+  it('reloads workspace defaults after the project refetch succeeds', () => {
+    // can_edit follows an archive or unarchive without a page reload.
+    const {api, component} = createComponent();
+    api.setProjectStatus.mockReturnValue(of({archived: true}));
+    api.getProjectWorkspaceDefaults.mockClear();
+
+    component.confirmArchive();
+    component.applyLifecycle();
+
+    expect(api.getProjectWorkspaceDefaults).toHaveBeenCalledWith('project-a');
+  });
+
   it('unarchives through the same path', () => {
     const {api, component} = createComponent();
     api.setProjectStatus.mockReturnValue(of({archived: false}));
@@ -588,5 +644,114 @@ describe('ProjectDetailPageComponent project-memory toggle', () => {
         memory: {project_scoped: false, recall_limit: 5},
       },
     });
+  });
+});
+
+describe('ProjectDetailPageComponent workspace defaults', () => {
+  it('loads the defaults with the project', () => {
+    const {api, component} = createComponent();
+    component.loadAll();
+    expect(api.getProjectWorkspaceDefaults).toHaveBeenCalledWith('project-a');
+    expect(component.workspaceDefaults()?.installation.jobs).toBe('container');
+    expect(component.wdJobs()).toBeNull();
+  });
+
+  it('lets an owner save template references', () => {
+    const {api, component} = createComponent({userRole: 'owner'});
+    component.loadAll();
+    component.wdJobs.set('container');
+    component.wdContainer.set('Catalog/shared/container-minimal');
+    component.saveWorkspaceDefaults();
+    expect(api.putProjectWorkspaceDefaults).toHaveBeenCalledWith('project-a', {
+      jobs: 'container',
+      sessions: null,
+      container: {name: 'container-minimal', scope: {kind: 'Catalog', name: 'shared'}},
+      vm: null,
+    });
+  });
+
+  it('can_edit: false makes the section read-only, even for an admin', () => {
+    const {api, component, currentUser} = createComponent({userRole: 'owner'});
+    currentUser.set({id: 'user-1', is_admin: true});
+    api.getProjectWorkspaceDefaults.mockReturnValue(of({...WORKSPACE_DEFAULTS, can_edit: false}));
+    component.loadAll();
+    expect(component.canEditWorkspaceDefaults()).toBe(false);
+  });
+
+  it('can_edit: true makes it editable for a non-admin', () => {
+    const {component} = createComponent({userRole: 'owner'});
+    component.loadAll();
+    expect(component.canEditWorkspaceDefaults()).toBe(true);
+  });
+
+  it('can_edit: true on an archived Project stays read-only', () => {
+    const {api, component} = createComponent();
+    api.getProjectWorkspaceDefaults.mockReturnValue(of({...WORKSPACE_DEFAULTS, can_edit: true}));
+    component.loadAll();
+    expect(component.canEditWorkspaceDefaults()).toBe(false);
+  });
+
+  it('lists no templates when the defaults GET fails', () => {
+    const {api, component} = createComponent({userRole: 'owner'});
+    api.getProjectWorkspaceDefaults.mockReturnValue(
+      throwError(() => new HttpErrorResponse({status: 500})),
+    );
+    component.loadAll();
+    expect(component.workspaceDefaults()).toBeNull();
+    expect(api.listWorkspaceTemplates).not.toHaveBeenCalled();
+  });
+
+  it('hides VM choices when VMs are unavailable', () => {
+    const {api, component} = createComponent({userRole: 'owner'});
+    api.getProjectWorkspaceDefaults.mockReturnValue(of({...WORKSPACE_DEFAULTS, vm_available: false}));
+    component.loadAll();
+    expect(component.workspaceModes()).toEqual(['none', 'virtual', 'container']);
+  });
+
+  it('saves no VM values while VMs are unavailable', () => {
+    // A row saved while VMs were on still carries them; the fields are
+    // hidden now, and the server refuses VM values (422).
+    const {api, component} = createComponent({userRole: 'owner'});
+    api.getProjectWorkspaceDefaults.mockReturnValue(
+      of({
+        ...WORKSPACE_DEFAULTS,
+        stored: {
+          jobs: 'vm',
+          sessions: 'vm',
+          container: null,
+          vm: {ref: {name: 'vm-full', scope: {kind: 'Catalog', name: 'shared'}}},
+        },
+        vm_available: false,
+      }),
+    );
+    component.loadAll();
+    component.wdContainer.set('Catalog/shared/container-minimal');
+    component.saveWorkspaceDefaults();
+    expect(api.putProjectWorkspaceDefaults).toHaveBeenCalledWith('project-a', {
+      jobs: null,
+      sessions: null,
+      container: {name: 'container-minimal', scope: {kind: 'Catalog', name: 'shared'}},
+      vm: null,
+    });
+  });
+
+  function personalProject(accountTemplates: boolean) {
+    const created = createComponent({userRole: 'owner'});
+    created.api.getProject.mockReturnValue(
+      of({id: 'project-a', status: 'active', is_default: true}),
+    );
+    created.api.getProjectWorkspaceDefaults.mockReturnValue(
+      of({...WORKSPACE_DEFAULTS, account_templates: accountTemplates}),
+    );
+    created.component.loadAll();
+    return created.api.listWorkspaceTemplates.mock.calls.map(([kind, name]) => `${kind}/${name}`);
+  }
+
+  it('account_templates: true lists Account/me', () => {
+    expect(personalProject(true)).toEqual(['Catalog/shared', 'Project/project-a', 'Account/me']);
+  });
+
+  it("account_templates: false does not list Account/me, even when the Project is_default", () => {
+    expect(personalProject(false)).toEqual(['Catalog/shared', 'Project/project-a']);
   });
 });

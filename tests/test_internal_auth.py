@@ -1365,6 +1365,8 @@ class TestDualCallableEndpoints:
         scoped_thread = {**thread_a, "project_id": project_a["id"]}
         fake_db.get_thread = AsyncMock(return_value=scoped_thread)
         fake_db.get_user = AsyncMock(return_value=user_a)
+        # No project_workspace_defaults row: the installation decides the tier.
+        fake_db.fetchrow = AsyncMock(return_value=None)
         body = JobCreate(
             description="private datasource attempt",
             thread_id=str(thread_a["id"]),
@@ -1623,7 +1625,11 @@ class TestDualCallableEndpoints:
             # path already writes. See tests/test_unified_expert_selection.py.
             "expert_selection": {"source": "bundled", "expert": "critic"},
         }
-        assert kwargs["config_override"] == {"autonomy": "full"}
+        # Slice A2b: every root Job binds the workspace defaults chain.
+        assert kwargs["config_override"] == {
+            "autonomy": "full",
+            "workspace": {"backend": "sandbox"},
+        }
 
 
 @pytest.mark.asyncio

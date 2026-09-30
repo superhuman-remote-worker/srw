@@ -161,6 +161,21 @@ async def open_stores(resources: ApplicationResources) -> tuple[bool, Any]:
     )
 
     await reconcile_builtin_workspace_templates_at_startup(resources.postgres_db)
+    from orchestrator.services.workspace_defaults_backfill import (
+        backfill_workspace_defaults,
+    )
+    from orchestrator.services.workspace_defaults_resolution import (
+        check_installation_workspace_defaults,
+    )
+
+    try:
+        moved = await backfill_workspace_defaults(resources.postgres_db)
+        logger.info("Workspace defaults backfill: %s", moved)
+    except Exception:
+        logger.exception(
+            "Workspace defaults backfill failed; it retries at the next start"
+        )
+    await check_installation_workspace_defaults(resources.postgres_db)
     from orchestrator.services.manifest_projects import migrate_projects
 
     await migrate_projects(resources.postgres_db)

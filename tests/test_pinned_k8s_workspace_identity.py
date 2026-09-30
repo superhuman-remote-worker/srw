@@ -225,5 +225,5 @@ async def test_vm_hot_upgrade_keeps_separate_authority_path():
             ),
         )
 
-    assert result == expected
+    assert result == {**expected, "target_tier": "vm"}
     upgrade_vm.assert_awaited_once()

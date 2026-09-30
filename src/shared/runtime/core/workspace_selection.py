@@ -10,6 +10,7 @@ from copy import deepcopy
 from typing import Any
 
 from shared.workspace_contract import normalize_workspace_backend
+from shared.workspace_defaults import default_backend
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +20,9 @@ LEGACY_WORKSPACE_KEYS = frozenset({"container"})
 
 def execution_workspace_config(*layers: dict | None, role: str = "worker") -> dict:
     """Select infrastructure from explicit execution/default layers in order."""
-    result: dict[str, Any] = {"backend": "virtual" if role == "session" else "sandbox"}
+    # A floor never raises: any role other than a Session takes the Job floor.
+    floor = default_backend("session" if role == "session" else "worker")
+    result: dict[str, Any] = {"backend": floor}
     for layer in layers:
         workspace = (layer or {}).get("workspace")
         if not isinstance(workspace, dict):

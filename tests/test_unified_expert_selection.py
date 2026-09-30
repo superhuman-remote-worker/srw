@@ -311,6 +311,8 @@ def db():
     db.create_job = AsyncMock(return_value={"id": CREATED_JOB_ID, "status": "created"})
     db.get_datasource = AsyncMock(return_value=None)
     db.link_datasource_to_job = AsyncMock()
+    # No project_workspace_defaults row: the installation decides the tier.
+    db.fetchrow = AsyncMock(return_value=None)
     return db
 
 

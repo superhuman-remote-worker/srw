@@ -2741,9 +2741,10 @@ workspace:
     # the new start picks it up. With Reloader off, restart it by hand.
     enabled: true
     # -- Sizes of the two built-in container templates. cpu and memory are the
-    # maximum; requests is what Kubernetes reserves on the node. The defaults
-    # equal the pod a workspace gets when no template is selected. They don't
-    # change that pod.
+    # maximum; requests is what Kubernetes reserves on the node. A Job that
+    # names no workspace gets container-full (see workspace.defaults), so these
+    # are every such Job's sizes. The shipped values equal the sizes of a
+    # container workspace without a template.
     containerResources:
       cpu: 2
       memory: 4Gi
@@ -2757,11 +2758,24 @@ workspace:
     # larger than vmController.vmDiskSize on purpose: a VM is usually chosen to
     # install software, and 20Gi fills quickly. The VM controller never makes a
     # disk smaller than vmController.vmDiskSize, so a larger vmDiskSize wins.
-    # These values don't change a VM that is selected without a template.
+    # A VM upgrade (a Session's, or a Job frozen for sudo) that names no
+    # template gets the VM template of the workspace defaults, vm-full unless
+    # workspace.defaults.vm or the Project names another, so it gets these
+    # sizes too. They don't change a VM whose recipe states only backend: vm.
     vmResources:
       cpu: 8
       memory: 16Gi
       storage: 30Gi
+  # What a Job or Session gets when nobody names a workspace (Slice A2b).
+  # Modes: none | virtual | container | vm. A template name refers to a
+  # WorkspaceTemplate in Catalog/shared; empty means the built-in
+  # (container-full, vm-full), or the plain backend when builtinTemplates is
+  # off. A Project's own defaults win over these.
+  defaults:
+    jobs: container
+    sessions: virtual
+    container: ""
+    vm: ""
   # -- How long a custom workspace image may take to pull before a Job fails
   # with the pull error. The installation image is prewarmed and unaffected.
   # Job containers are dispatched one at a time, so while a custom image is

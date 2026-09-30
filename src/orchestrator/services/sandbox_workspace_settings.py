@@ -83,7 +83,9 @@ async def resolve_sandbox_settings(
     """Read the owner's frozen settings; historical work has none.
 
     A missing or non-SRW snapshot means the execution predates templates, so
-    the installation defaults apply. Database errors propagate: callers must
+    the installation defaults apply. A Job that started without a container
+    and upgraded in place reads its upgrade's template instead (Slice A2b);
+    snapshot settings always win. Database errors propagate: callers must
     fail closed rather than silently fall back to the default image.
     """
     try:
@@ -92,10 +94,19 @@ async def resolve_sandbox_settings(
         return SandboxSettings()
     work_kind = "Session" if owner_kind == "session" else "Job"
     snapshot = await read_execution(store, work_kind, str(owner_id))
-    if snapshot is None or snapshot.get("harness_adapter") != SRW_ADAPTER:
-        return SandboxSettings()
-    _, policy = srw_snapshot_config(snapshot)
-    return SandboxSettings.from_policy(policy)
+    settings = SandboxSettings()
+    if snapshot is not None and snapshot.get("harness_adapter") == SRW_ADAPTER:
+        _, policy = srw_snapshot_config(snapshot)
+        settings = SandboxSettings.from_policy(policy)
+    if settings.is_empty() and owner_kind != "session":
+        job = await store.get_job(str(owner_id))
+        context = object_value((job or {}).get("context"))
+        upgrade = object_value(
+            object_value(context.get("workspace_container")).get("upgrade_config")
+        )
+        if upgrade:
+            return SandboxSettings.from_policy({"workspace": {"sandbox": upgrade}})
+    return settings
 
 
 def image_repository(reference: str) -> str:

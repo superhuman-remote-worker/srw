@@ -81,9 +81,6 @@ from orchestrator.services.session_runtime_admission import (
 from orchestrator.services.session_tool_policy import (
     session_tool_group_disabled_markers,
 )
-from orchestrator.services.session_workspace_policy import (
-    default_session_workspace_backend,
-)
 from orchestrator.services.manifest_execution_snapshot import (
     apply_srw_delivery_bindings,
     read_execution,
@@ -299,7 +296,6 @@ async def resolve_session_account_defaults(
         )
     if headless:
         layer["headless"] = headless
-    layer["workspace"] = {"backend": default_session_workspace_backend(persistent)}
     return deep_merge_dicts(out, layer)
 
 
@@ -310,11 +306,13 @@ async def account_defaults_layer(
 
     Single source for "what the caller's account contributes below the expert",
     so the create forms can render the same resolved config the server will
-    actually build. Sessions get the full session layer — crucially including
-    ``workspace.backend``, which is ``virtual`` by default and therefore does
-    NOT match ``session_base.yaml``'s ``sandbox``; workers get only the
-    default-model floor, matching the ``base_defaults`` the job dispatcher
-    passes. Both mirror the exact calls in ``create_thread`` and the dispatcher.
+    actually build. Sessions get the full session layer (model, interactive
+    and headless preferences); workers get only the default-model floor,
+    matching the ``base_defaults`` the job dispatcher passes. Neither layer
+    carries a workspace tier any more — Slice A2b moved that to the defaults
+    chain (``select_execution_workspace``), so it is no longer an account
+    preference. Both mirror the exact calls in ``create_thread`` and the
+    dispatcher.
 
     Returns ``{}`` for an anonymous caller: with no account there is no layer,
     and the framework base is already the honest answer.
@@ -489,6 +487,24 @@ async def resolve_session_config(
         base_defaults = await resolve_session_account_defaults(
             user_id, dependencies=dependencies
         )
+        # A Session that predates snapshots, and never materialized a
+        # backend into its config_override, still needs a tier to render.
+        # Slice A2b: that tier comes from the defaults chain, not an account
+        # preference — templates still reach Sessions only through
+        # snapshots, so this renders the tier alone.
+        if not ((request_override or {}).get("workspace") or {}).get("backend"):
+            from orchestrator.services.workspace_defaults_resolution import (
+                resolve_workspace_defaults,
+            )
+            from shared.workspace_defaults import MODE_BACKEND
+
+            resolution = await resolve_workspace_defaults(
+                dependencies.store, role="session", project_id=project_id
+            )
+            base_defaults = {
+                **base_defaults,
+                "workspace": {"backend": MODE_BACKEND[resolution.mode]},
+            }
         project_overrides = None
         if project_id and expert_id:
             link = await dependencies.store.get_project_expert_link(

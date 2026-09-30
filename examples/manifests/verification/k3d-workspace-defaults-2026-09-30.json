@@ -1,0 +1,174 @@
+{
+  "date": "2026-09-30",
+  "commit": "eb3fc90ab2b6dd92c884e2a11ceac8c3531d03fb",
+  "stack": "local k3d (context k3d-srw, namespace srw), Tilt-built images (tilt-* tags), vm.mode off; chart values from values-local.yaml + values-tilt.yaml (image.workspace.pullPolicy IfNotPresent)",
+  "caller": "local admin user through the orchestrator API inside its pod (internal-key impersonation); viewer checks as dev-user-1",
+  "preChecks": {
+    "runningCode": "all 37 orchestrator/shared files changed since the slice started have the same md5 in the pod as in the tree; re-checked after the first Helm restart",
+    "migration0308": "SELECT count(*) FROM project_workspace_defaults -> 0 (table present)",
+    "backfillLine": "Workspace defaults backfill: {'manifest': 0, 'legacy_project': 0, 'preference': 0}",
+    "backfillNote": "one line per process start; Tilt's live update restarts the process once after each pod start, so each pod logs it twice",
+    "startupErrors": "no 'Workspace defaults:' error line"
+  },
+  "checks": [
+    {
+      "check": 1,
+      "name": "Empty Project shows the installation defaults",
+      "request": "POST /api/projects {name: a2b-t15-defaults}; GET /api/projects/{id}/workspace-defaults",
+      "ids": {"project": "55d19538-0bfe-4d0c-bb6b-31c16189948d"},
+      "result": "pass",
+      "observed": {
+        "installation": {"jobs": "container", "sessions": "virtual", "container": "container-full", "vm": null},
+        "installation_problems": [],
+        "effective": {"jobs": "container/installation", "sessions": "virtual/installation", "container": "container-full/builtin", "vm": "null/builtin"},
+        "vm_available": false
+      }
+    },
+    {
+      "check": 2,
+      "name": "Project Jobs mode and container template reach a Job",
+      "request": "PUT /api/projects/{id}/workspace-defaults {jobs: container, container: {name: container-minimal, scope: Catalog/shared}}; POST /api/jobs without workspace",
+      "ids": {"project": "55d19538-0bfe-4d0c-bb6b-31c16189948d", "job": "c2407afc-218a-4646-a992-d21fbba95fb7"},
+      "result": "pass",
+      "observed": {
+        "put": "200; row source settings, updated_by the admin",
+        "podImage": "srw-registry:5000/srw-workspace-minimal:tilt-0dfcde642f0466b0",
+        "pod": "workspace-c2407afc-218 Running 1/1; requests 500m/1Gi, limits 2/4Gi",
+        "context.workspace_sources": {"tier": "project", "template": "project", "template_name": "container-minimal"}
+      }
+    },
+    {
+      "check": 3,
+      "name": "Sessions take the Project's Sessions mode; the container template is shared by both roles",
+      "request": "POST /api/persistent/threads without workspace; PUT {jobs: container, sessions: container, container: container-minimal}; POST /api/persistent/threads again",
+      "ids": {"sessionVirtual": "60372177-f9ff-42ae-9458-d913db9f3194", "sessionContainer": "898fb485-12c7-4457-91c5-e0fb66e236bc"},
+      "result": "pass",
+      "observed": {
+        "first": {"backend": "virtual", "lane": "stateless", "metadata.workspace_sources": {"tier": "installation", "template": null, "template_name": null}},
+        "second": {
+          "backend": "sandbox",
+          "pod": "ws-thread-898fb485-12c Running 1/1, image srw-registry:5000/srw-workspace-minimal:tilt-0dfcde642f0466b0, requests 500m/1Gi, limits 2/4Gi, FUSE profile",
+          "metadata.workspace_sources": {"tier": "project", "template": "project", "template_name": "container-minimal"}
+        }
+      }
+    },
+    {
+      "check": 4,
+      "name": "Job manifests: omitted workspace uses the chain, null means none",
+      "request": "POST /api/manifests/apply (default_scope Project a2b-t15-nodefaults) of an srw/v1 Job referencing Catalog/shared general-worker, once without execution.workspace and once with workspace: null",
+      "ids": {"project": "9198d92f-5ade-4ceb-b865-cfb289e0ba5a", "jobOmitted": "4c0fb473-5a39-4a05-924b-c2b16554926a", "jobNull": "1cf2c65c-e5af-4a99-a07d-e5957732c2d8"},
+      "result": "pass",
+      "observed": {
+        "omitted": {"assigned_backend": "sandbox", "podImage": "srw-registry:5000/srw-workspace:tilt-3d51936c9b5978a4 (container-full)", "context.workspace_sources": {"tier": "installation", "template": "builtin", "template_name": "container-full"}},
+        "null": {"assigned_backend": "none", "workspacePod": "none", "context.workspace_sources": {"tier": "explicit", "template": "explicit", "template_name": null}}
+      }
+    },
+    {
+      "check": 5,
+      "name": "Refusals",
+      "request": "PUT {vm: {name: vm-full, scope: Catalog/shared}}; PUT {jobs: vm}; PUT {jobs: none} as a viewer member",
+      "ids": {"project": "55d19538-0bfe-4d0c-bb6b-31c16189948d"},
+      "result": "pass",
+      "observed": {
+        "vmTemplate": "422 VM workspaces are not available on this installation.",
+        "vmMode": "422 VM workspaces are not available on this installation.",
+        "viewerPut": "403 Project owner role required",
+        "viewerGet": "200 (members may read)",
+        "rowUnchanged": "jobs container, sessions container, container container-minimal, source settings"
+      }
+    },
+    {
+      "check": 6,
+      "name": "Helm workspace.defaults and built-ins turned off",
+      "request": "deployment/values-local.yaml: workspace.defaults.container: container-minimal (helm rev 834), then workspace.builtinTemplates.enabled: false without defaults.container (rev 835), then the original file restored byte for byte (rev 836)",
+      "ids": {"project": "9198d92f-5ade-4ceb-b865-cfb289e0ba5a", "jobInstallationTemplate": "92840976-6371-438d-8bba-9f15734f5729", "jobPlainBackend": "5e88eddd-4edb-432b-bbd1-e62a9cc9a124"},
+      "result": "pass",
+      "observed": {
+        "installationTemplate": {
+          "WORKSPACE_DEFAULTS": {"container": "container-minimal", "jobs": "container", "sessions": "virtual", "vm": ""},
+          "get": "installation.container container-minimal, installation_problems []",
+          "podImage": "srw-registry:5000/srw-workspace-minimal:tilt-0dfcde642f0466b0",
+          "context.workspace_sources": {"tier": "installation", "template": "installation", "template_name": "container-minimal"},
+          "startupErrors": "none"
+        },
+        "builtinsOff": {
+          "reconciler": "retired [container-full, virtual], kept [container-minimal] (a Project still referenced it)",
+          "get": "installation.container null, installation_problems []",
+          "podImage": "srw-registry:5000/srw-workspace:tilt-3d51936c9b5978a4 (the installation image, WORKSPACE_IMAGE)",
+          "context.workspace_sources": {"tier": "installation", "template": "builtin", "template_name": null},
+          "startupErrors": "none"
+        },
+        "restored": "sha256 of values-local.yaml equal to the saved copy; reconciler restored [virtual, container-full]; WORKSPACE_DEFAULTS back to the shipped values"
+      }
+    },
+    {
+      "check": 7,
+      "name": "Cockpit",
+      "request": "Playwright on https://localhost as the local owner/admin: Project page Settings tab; /settings/defaults",
+      "ids": {"project": "55d19538-0bfe-4d0c-bb6b-31c16189948d"},
+      "result": "pass",
+      "observed": {
+        "workspaceDefaultsSection": {
+          "Jobs": "Container selected; options Installation default (Container), None (no files), Virtual, Container",
+          "Sessions": "Container selected; options Installation default (Virtual), None (no files), Virtual, Container",
+          "Container template": "Container (minimal) selected; options Installation default (container-full), Container (full), Container (minimal)",
+          "VM template": "hidden (VMs off)",
+          "editable": true
+        },
+        "settingsPage": "no Workspace backend field; the line \"The workspace for new Sessions is set in your personal project's settings.\" with a link to the admin's personal project"
+      }
+    },
+    {
+      "check": "a",
+      "name": "A default Job's pod equals the pre-slice plain pod",
+      "request": "POST /api/jobs without workspace in the empty Project (shipped values), compared with the plain-backend Job of check 6 (built-ins off, which is the pre-slice code path)",
+      "ids": {"jobDefault": "67eada68-4e7a-4ff9-89a8-eeeeb892998d", "jobPlainBackend": "5e88eddd-4edb-432b-bbd1-e62a9cc9a124"},
+      "result": "pass",
+      "observed": {
+        "context.workspace_sources": {"tier": "installation", "template": "builtin", "template_name": "container-full"},
+        "image": "srw-registry:5000/srw-workspace:tilt-3d51936c9b5978a4 on both (the chart's image.workspace ref)",
+        "resources": "requests cpu 500m / memory 1Gi, limits cpu 2 / memory 4Gi on both (the Python bare defaults and workspace.builtinTemplates.containerResources)",
+        "imagePullPolicy": "IfNotPresent on both: the template carries the local image.workspace.pullPolicy; the plain pod sets none and Kubernetes defaults a non-latest tag to IfNotPresent",
+        "securityProfile": "privileged, SYS_ADMIN added, seccomp Unconfined, dev-fuse hostPath on both",
+        "specDiff": "only per-Job values: the creation-reservation annotation, HASHED_PASSWORD, the service-account token volume name and the PVC name",
+        "shippedValues": "image.workspace is tag latest with pullPolicy Always, and Kubernetes defaults latest to Always, so shipped installs also see no change",
+        "pullPolicyAmendment": "Recorded under ruling R7 (the template carried image.workspace.pullPolicy). Ruling R16 replaced it after this run: the container built-ins now carry Kubernetes' default for their own image (Always for a digest-less latest or empty tag, else IfNotPresent) and ignore image.workspace.pullPolicy. This run's non-latest Tilt tag gives IfNotPresent under both rules, so the observation stands; an install that pins a tag now keeps IfNotPresent, as before A2b (tests/test_workspace_builtin_templates_helm.py)"
+      }
+    },
+    {
+      "check": "b",
+      "name": "The public API exposes the recorded sources",
+      "request": "GET /api/jobs/{id}; GET /api/persistent/threads/{id} (the call the cockpit uses)",
+      "result": "pass",
+      "observed": {
+        "job": "context.workspace_sources present; the Job response's context is a JSON-encoded string, as before this slice",
+        "session": "metadata.workspace_sources present in the metadata object"
+      }
+    }
+  ],
+  "cleanup": {
+    "jobsDeleted": ["67eada68-4e7a-4ff9-89a8-eeeeb892998d", "c2407afc-218a-4646-a992-d21fbba95fb7", "4c0fb473-5a39-4a05-924b-c2b16554926a", "1cf2c65c-e5af-4a99-a07d-e5957732c2d8", "5e88eddd-4edb-432b-bbd1-e62a9cc9a124"],
+    "sessionDeleted": "898fb485-12c7-4457-91c5-e0fb66e236bc: End 200, permanent delete 503 then 200, GET 404",
+    "manifestResourcesDeleted": ["c21df4fa-d9b2-4708-b2fd-ca98724cc74d", "4474e084-59ba-4589-95c8-1d55064c92e1"],
+    "projectsDeleted": ["9198d92f-5ade-4ceb-b865-cfb289e0ba5a"],
+    "valuesLocal": "restored byte for byte",
+    "leftovers": [
+      {
+        "id": "60372177-f9ff-42ae-9458-d913db9f3194",
+        "kind": "Session (stateless, virtual)",
+        "state": "ended",
+        "why": "permanent delete answers 500 CheckViolationError 'Workspace provisioner authority is required before mutation or teardown': the open issue ended_session_permanent_delete_500s_on_provisioner_authority_trigger (2026-09-23), not this slice"
+      },
+      {
+        "id": "55d19538-0bfe-4d0c-bb6b-31c16189948d",
+        "kind": "Project a2b-t15-defaults",
+        "why": "DELETE answers 409 'Project resources are referenced by unfinished work or resumable sessions.' because of the ended Session above; the viewer member was removed"
+      },
+      {
+        "id": "92840976-6371-438d-8bba-9f15734f5729",
+        "kind": "Job (cancelled)",
+        "why": "cancelled seconds before Reloader restarted the orchestrator for the next Helm change; its workspace_container stays retiring_process_zero, pod workspace-92840976-637 and its PVC remain, and DELETE answers 503 'Workspace authority retirement is incomplete' ('Kubernetes workspace exact teardown is incomplete' in the log)"
+      }
+    ]
+  }
+}

@@ -28,6 +28,13 @@ async def vm_provisioning_options(store, work_kind: str, work: dict, *, fallback
         _, configuration = srw_snapshot_config(snapshot)
     workspace = object_value(object_value(configuration).get("workspace"))
     vm = object_value(workspace.get("vm"))
+    if not vm:
+        # Work that upgraded to a VM records its template's options next to
+        # the VM (Slice A2b); VM settings in the snapshot always win.
+        record = work.get("context") if work_kind == "Job" else work.get("metadata")
+        vm = object_value(
+            object_value(object_value(record).get("vm")).get("upgrade_config")
+        )
     options = {
         target: deepcopy(vm[source])
         for source, target in (

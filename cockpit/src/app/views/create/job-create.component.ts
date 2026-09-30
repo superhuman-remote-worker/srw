@@ -299,6 +299,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
             [config]="workspaceConfig()"
             [resolvedToolset]="toolPreview()"
             [readsResolvedToolset]="true"
+            [workspacePreview]="toolPreview()?.workspace ?? null"
             [gatedCapabilities]="capabilities.grants() ?? null"
             [disabled]="isSubmitting()"
             [showProjectMemory]="projectHasSharedMemory()"

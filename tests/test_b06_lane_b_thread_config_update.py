@@ -27,11 +27,14 @@ from orchestrator.services import thread_config_update as tcu
 
 THREAD = "11111111-1111-4111-8111-111111111111"
 GENERATION = "22222222-2222-4222-8222-222222222222"
+OWNER = "33333333-3333-4333-8333-333333333333"
+CHAIN_SOURCES = {"tier": "upgrade", "template": "builtin", "template_name": None}
 
 
 def _pinned_thread(**over: Any) -> dict[str, Any]:
     row = {
         "id": THREAD,
+        "user_id": OWNER,
         "execution_lane": "pinned",
         "status": "created",
         "metadata": {},
@@ -75,6 +78,7 @@ def _deps(**over: Any) -> tcu.ThreadConfigUpdateDependencies:
             return_value={"delivery_override": {"llm": {"api_key": "secret"}}}
         ),
         merge_thread_vm_context=AsyncMock(),
+        get_user=AsyncMock(return_value={"id": OWNER}),
     )
     for key, value in store_over.items():
         setattr(store, key, value)
@@ -120,6 +124,14 @@ def _deps(**over: Any) -> tcu.ThreadConfigUpdateDependencies:
     )
     fields.update(over)
     return tcu.ThreadConfigUpdateDependencies(**fields)
+
+
+@pytest.fixture(autouse=True)
+def shipped_chart(monkeypatch) -> None:
+    """Upgrades resolve the shipped chain: no built-ins declared, so a tier's
+    template is backend-only."""
+    monkeypatch.delenv("WORKSPACE_DEFAULTS", raising=False)
+    monkeypatch.delenv("WORKSPACE_BUILTIN_TEMPLATES", raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -349,6 +361,95 @@ class TestUpgradeToVm:
         assert exc.value.detail == {"code": "vm_provision_authority_changed"}
 
     @pytest.mark.asyncio
+    async def test_the_chain_template_is_recorded_before_provisioning(self):
+        deps = _deps()
+        await tcu.agent_upgrade_thread_to_vm(MagicMock(), THREAD, dependencies=deps)
+        record = {"upgrade_config": {}, "upgrade_sources": CHAIN_SOURCES}
+        deps.store.get_user.assert_awaited_once_with(OWNER)
+        deps.store.merge_thread_vm_context.assert_awaited_once_with(THREAD, record)
+        call = deps.vm_provisioner.create_thread_vm.await_args
+        assert call.kwargs["expected_vm_context"] == record
+
+    @pytest.mark.asyncio
+    async def test_a_missing_owner_fails_before_any_write(self):
+        deps = _deps(store={"get_user": AsyncMock(return_value=None)})
+        with pytest.raises(HTTPException) as exc:
+            await tcu.agent_upgrade_thread_to_vm(MagicMock(), THREAD, dependencies=deps)
+        assert (exc.value.status_code, exc.value.detail) == (
+            409,
+            "The execution owner is unavailable.",
+        )
+        deps.store.merge_thread_vm_context.assert_not_awaited()
+        deps.vm_provisioner.create_thread_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_ownerless_session_upgrades_to_a_bare_vm(self):
+        # Agent child threads are created without an owner.
+        deps = _deps()
+        deps.store.get_thread = AsyncMock(return_value=_pinned_thread(user_id=None))
+        result = await tcu.agent_upgrade_thread_to_vm(
+            MagicMock(), THREAD, dependencies=deps
+        )
+        assert result["status"] == "provisioning"
+        record = {"upgrade_config": {}, "upgrade_sources": None}
+        deps.store.get_user.assert_not_awaited()
+        deps.store.merge_thread_vm_context.assert_awaited_once_with(THREAD, record)
+        call = deps.vm_provisioner.create_thread_vm.await_args
+        assert call.kwargs["expected_vm_context"] == record
+
+    @pytest.mark.asyncio
+    async def test_a_refused_vm_option_writes_no_record(self, monkeypatch):
+        monkeypatch.setattr(
+            tcu,
+            "vm_provisioning_options",
+            AsyncMock(side_effect=HTTPException(422, "refused option")),
+        )
+        deps = _deps()
+        with pytest.raises(HTTPException) as exc:
+            await tcu.agent_upgrade_thread_to_vm(MagicMock(), THREAD, dependencies=deps)
+        assert exc.value.status_code == 422
+        deps.store.merge_thread_vm_context.assert_not_awaited()
+        deps.vm_provisioner.create_thread_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_retry_after_an_aborted_vm_upgrade_still_provisions(self):
+        # A VM upgrade stamps the vm tier before its VM exists; abort-vm-upgrade
+        # leaves it there so the user can retry.
+        deps = _deps()
+        deps.store.get_thread = AsyncMock(
+            return_value=_pinned_thread(
+                metadata={
+                    "config_override": {"workspace": {"backend": "vm"}},
+                    "vm": {"status": "aborted"},
+                }
+            )
+        )
+        result = await tcu.agent_upgrade_thread_to_vm(
+            MagicMock(), THREAD, dependencies=deps
+        )
+        assert result["status"] == "provisioning"
+        deps.vm_provisioner.create_thread_vm.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_session_already_on_a_vm_is_not_upgraded_again(self):
+        deps = _deps()
+        deps.store.get_thread = AsyncMock(
+            return_value=_pinned_thread(
+                metadata={
+                    "config_override": {"workspace": {"backend": "vm"}},
+                    "vm": {"status": "suspended"},
+                }
+            )
+        )
+        with pytest.raises(HTTPException) as exc:
+            await tcu.agent_upgrade_thread_to_vm(MagicMock(), THREAD, dependencies=deps)
+        assert (exc.value.status_code, exc.value.detail) == (
+            400,
+            "An upgrade must move to a higher tier than the current one.",
+        )
+        deps.vm_provisioner.create_thread_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_success_reports_the_provisioner_mode(self):
         deps = _deps()
         result = await tcu.agent_upgrade_thread_to_vm(
@@ -458,6 +559,7 @@ class TestUpgradeToWorkspace:
             dependencies=deps,
         )
         assert result["vm_provisioner_mode"] == "same-cluster"
+        assert result["target_tier"] == "vm"
         deps.enforce_workspace_upgrade_grants.assert_awaited_once()
         assert deps.enforce_workspace_upgrade_grants.await_args.kwargs == {
             "target_tier": "vm"
@@ -517,6 +619,192 @@ class TestUpgradeToWorkspace:
         deps.container_provisioner.create_pinned_thread_workspace.assert_awaited_once_with(
             THREAD
         )
+
+    @pytest.mark.asyncio
+    async def test_no_body_moves_a_container_session_to_a_vm(self):
+        deps = _deps()
+        deps.store.get_thread = AsyncMock(
+            return_value=_pinned_thread(
+                metadata={"config_override": {"workspace": {"backend": "sandbox"}}}
+            )
+        )
+        result = await tcu.agent_upgrade_thread_to_workspace(
+            MagicMock(), THREAD, None, dependencies=deps
+        )
+        assert (result["target_tier"], result["vm_provisioner_mode"]) == (
+            "vm",
+            "same-cluster",
+        )
+        assert deps.enforce_workspace_upgrade_grants.await_args.kwargs == {
+            "target_tier": "vm"
+        }
+        deps.container_provisioner.create_pinned_thread_workspace.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("grant_refusal", "vms_available"),
+        [(None, True), (HTTPException(403, "vm grant denied"), True), (None, False)],
+        ids=["vm-rights", "no-vm-rights", "vms-off"],
+    )
+    async def test_a_container_template_upgrade_is_refused_for_sessions(
+        self, monkeypatch, grant_refusal, vms_available
+    ):
+        monkeypatch.setattr(
+            "orchestrator.services.workspace_defaults_resolution.find_readable_template",
+            AsyncMock(return_value=({"ref": {"name": "site"}}, "container")),
+        )
+        deps = _deps()
+        deps.enforce_workspace_upgrade_grants.side_effect = grant_refusal
+        deps.vm_provisioner.is_available = vms_available
+        with pytest.raises(HTTPException) as refused:
+            await tcu.agent_upgrade_thread_to_workspace(
+                MagicMock(),
+                THREAD,
+                ThreadWorkspaceUpgradeRequest(template="site"),
+                dependencies=deps,
+            )
+        assert refused.value.status_code == 409
+        assert refused.value.detail == (
+            "Container upgrades of a running Session are unavailable; "
+            "start a new Session with this template."
+        )
+        deps.container_provisioner.create_pinned_thread_workspace.assert_not_called()
+        deps.store.merge_thread_vm_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_session_on_a_vm_refuses_a_vm_template(self, monkeypatch):
+        monkeypatch.setattr(
+            "orchestrator.services.workspace_defaults_resolution.find_readable_template",
+            AsyncMock(return_value=({"ref": {"name": "vm-big"}}, "vm")),
+        )
+        deps = _deps()
+        deps.store.get_thread = AsyncMock(
+            return_value=_pinned_thread(
+                metadata={
+                    "config_override": {"workspace": {"backend": "vm"}},
+                    "vm": {"status": "ready"},
+                }
+            )
+        )
+        with pytest.raises(HTTPException) as refused:
+            await tcu.agent_upgrade_thread_to_workspace(
+                MagicMock(),
+                THREAD,
+                ThreadWorkspaceUpgradeRequest(template="vm-big"),
+                dependencies=deps,
+            )
+        assert (refused.value.status_code, refused.value.detail) == (
+            400,
+            "An upgrade must move to a higher tier than the current one.",
+        )
+        deps.store.merge_thread_vm_context.assert_not_awaited()
+        deps.vm_provisioner.create_thread_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_named_template_on_ownerless_work_is_refused(self, monkeypatch):
+        find = AsyncMock()
+        monkeypatch.setattr(
+            "orchestrator.services.workspace_defaults_resolution.find_readable_template",
+            find,
+        )
+        deps = _deps()
+        deps.store.get_thread = AsyncMock(return_value=_pinned_thread(user_id=None))
+        with pytest.raises(HTTPException) as refused:
+            await tcu.agent_upgrade_thread_to_workspace(
+                MagicMock(),
+                THREAD,
+                ThreadWorkspaceUpgradeRequest(template="vm-big"),
+                dependencies=deps,
+            )
+        assert (refused.value.status_code, refused.value.detail) == (
+            409,
+            "The execution owner is unavailable.",
+        )
+        find.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("thread", "grant_refusal", "vms_available", "status"),
+        [
+            (_pinned_thread(execution_lane="stateless"), None, True, 409),
+            (_pinned_thread(metadata={"protected_cloud": True}), None, True, 409),
+            (_pinned_thread(), HTTPException(403, "vm grant denied"), True, 403),
+            (_pinned_thread(), None, False, 503),
+        ],
+        ids=["stateless-lane", "protected-session", "vm-grant-denied", "vms-off"],
+    )
+    async def test_a_template_upgrade_runs_the_guards_before_resolving(
+        self, monkeypatch, thread, grant_refusal, vms_available, status
+    ):
+        find = AsyncMock(return_value=({"ref": {"name": "vm-big"}}, "vm"))
+        render = AsyncMock(return_value=("vm", {"backend": "vm"}, {}))
+        monkeypatch.setattr(
+            "orchestrator.services.workspace_defaults_resolution.find_readable_template",
+            find,
+        )
+        monkeypatch.setattr(
+            "orchestrator.services.workspace_defaults_resolution.render_upgrade_workspace",
+            render,
+        )
+        deps = _deps()
+        deps.store.get_thread = AsyncMock(return_value=thread)
+        deps.enforce_workspace_upgrade_grants.side_effect = grant_refusal
+        deps.vm_provisioner.is_available = vms_available
+        with pytest.raises(HTTPException) as refused:
+            await tcu.agent_upgrade_thread_to_workspace(
+                MagicMock(),
+                THREAD,
+                ThreadWorkspaceUpgradeRequest(template="vm-big"),
+                dependencies=deps,
+            )
+        assert refused.value.status_code == status
+        # Only the read-only lookup may precede the VM guards; nothing is
+        # rendered or written before every guard has passed.
+        if status == 409:
+            find.assert_not_awaited()
+            deps.store.get_user.assert_not_awaited()
+        render.assert_not_awaited()
+        deps.store.merge_thread_vm_context.assert_not_awaited()
+        deps.vm_provisioner.create_thread_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_vm_template_upgrade_provisions_that_template(self, monkeypatch):
+        sources = {
+            "tier": "explicit",
+            "template": "explicit",
+            "template_name": "vm-big",
+        }
+        vm = {"image": "r.example/vm:2", "cpu_cores": 4}
+        render = AsyncMock(return_value=("vm", {"backend": "vm", "vm": vm}, sources))
+        monkeypatch.setattr(
+            "orchestrator.services.workspace_defaults_resolution.find_readable_template",
+            AsyncMock(return_value=({"ref": {"name": "vm-big"}}, "vm")),
+        )
+        monkeypatch.setattr(
+            "orchestrator.services.workspace_defaults_resolution.render_upgrade_workspace",
+            render,
+        )
+        deps = _deps()
+        result = await tcu.agent_upgrade_thread_to_workspace(
+            MagicMock(),
+            THREAD,
+            ThreadWorkspaceUpgradeRequest(template="vm-big"),
+            dependencies=deps,
+        )
+        assert result["vm_provisioner_mode"] == "same-cluster"
+        assert [call.kwargs["template_name"] for call in render.await_args_list] == [
+            "vm-big"
+        ]
+        assert render.await_args.args[1] == {"id": OWNER}
+        assert render.await_args.kwargs["current_backend"] == "virtual"
+        record = {"upgrade_config": vm, "upgrade_sources": sources}
+        deps.store.merge_thread_vm_context.assert_awaited_once_with(THREAD, record)
+        call = deps.vm_provisioner.create_thread_vm.await_args
+        assert (call.kwargs["vm_image"], call.kwargs["cpu_cores"]) == (
+            "r.example/vm:2",
+            4,
+        )
+        assert call.kwargs["expected_vm_context"] == record
 
 
 class TestOwnerFacingPatch:

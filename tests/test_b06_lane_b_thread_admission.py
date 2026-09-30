@@ -38,6 +38,15 @@ OTHER_PROJECT = "44444444-4444-4444-8444-444444444444"
 USER = {"id": "55555555-5555-4555-8555-555555555555", "is_admin": False}
 
 
+@pytest.fixture(autouse=True)
+def _container_sessions(monkeypatch):
+    """Slice A2b: an unpinned Session's tier comes from the defaults chain,
+    not the account preference. These flows exercise container Sessions, so
+    the installation supplies that tier."""
+    monkeypatch.setenv("WORKSPACE_DEFAULTS", '{"sessions": "container"}')
+    monkeypatch.delenv("WORKSPACE_BUILTIN_TEMPLATES", raising=False)
+
+
 def _created_thread(**over: Any) -> dict[str, Any]:
     row = {
         "id": THREAD,

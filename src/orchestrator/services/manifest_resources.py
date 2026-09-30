@@ -285,6 +285,11 @@ class ManifestResourceService:
                 row, _ = saved[key]
                 prepared = resolver.prepared[key]
                 await sync_project_identity(self.db, row)
+                from orchestrator.services.project_workspace_defaults import (
+                    sync_manifest_defaults,
+                )
+
+                await sync_manifest_defaults(self.db, row)
                 if self.project_activation:
                     await self.project_activation(
                         prepared, user, request=request, validate_only=False

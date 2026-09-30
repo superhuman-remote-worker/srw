@@ -2164,8 +2164,8 @@ def session_transport_bindings() -> SessionTransportBindings:
                 compact=lambda *args, **kwargs: _handle_compact(*args, **kwargs),
                 archive=lambda ws: _handle_archive(ws),
                 vm_upgrade=lambda ws: _handle_vm_upgrade(ws),
-                workspace_upgrade=lambda ws, target_tier: _handle_workspace_upgrade(
-                    ws, target_tier
+                workspace_upgrade=lambda ws, target_tier, template: (
+                    _handle_workspace_upgrade(ws, target_tier, template)
                 ),
                 rewind=lambda ws, data: _handle_rewind(ws, data),
             ),
@@ -10829,9 +10829,10 @@ async def _handle_vm_upgrade(ws: WebSocket) -> None:
 
 
 async def _handle_workspace_upgrade(
-    ws: WebSocket, target_tier: str = "sandbox"
+    ws: WebSocket, target_tier: str | None = None, template: str | None = None
 ) -> None:
-    """Handle a lite (``virtual``) → ``sandbox`` workspace upgrade from cockpit.
+    """Handle a lite (``virtual``) → ``sandbox``/``vm`` workspace upgrade from
+    cockpit, optionally to a named template.
 
     The live, in-process counterpart to the worker freeze→re-dispatch path
     (``workspace_tier_upgrade.md`` §4.2 S3): provision a real workspace
@@ -10847,6 +10848,12 @@ async def _handle_workspace_upgrade(
     ``_poll_vm_ready``, builds the backend with ``sudo_action="allow"``, seeds +
     swaps as usual, and re-opens the shell-layer sudo gate after the swap. (The
     pre-existing ``_handle_vm_upgrade`` stays the sandbox→vm sudo-escalation path.)
+
+    A ``template`` always resolves to the ``vm`` tier client-side — the
+    orchestrator refuses a template of any other tier — and its refusal text
+    (e.g. an unavailable container-tier template, a tier that isn't higher, an
+    unknown name) is surfaced verbatim as the ``workspace_upgrade.failed``
+    reason.
     """
     if not _session or not _orchestrator_client or not _session_identity.thread_id:
         await _ws_send(ws, "workspace_upgrade.failed", {"reason": "Session not ready"})
@@ -10869,7 +10876,16 @@ async def _handle_workspace_upgrade(
         )
         return
 
-    target_tier = target_tier or "sandbox"
+    src_backend = (
+        _session.workspace_manager.backend if _session.workspace_manager else None
+    )
+
+    if template:
+        target_tier = "vm"  # the orchestrator refuses a template of any other tier
+    elif not target_tier:
+        target_tier = (
+            "vm" if _upgrade_already_satisfied(src_backend, "sandbox") else "sandbox"
+        )
     if target_tier == "sandbox":
         # The old in-process swap has no durable receipt spanning Pod
         # attestation, repository-key delivery, and seed writes. Fail before
@@ -10892,10 +10908,6 @@ async def _handle_workspace_upgrade(
     )
 
     try:
-        src_backend = (
-            _session.workspace_manager.backend if _session.workspace_manager else None
-        )
-
         # Already serves the requested tier — nothing to upgrade (idempotent).
         # Tier-aware: a sandbox source does NOT satisfy a vm target (sandbox is
         # shell-capable but unprivileged), so sandbox→vm falls through to provision
@@ -10913,14 +10925,14 @@ async def _handle_workspace_upgrade(
             return
 
         # 1. Request provisioning via orchestrator (S2).
-        ok = await _orchestrator_client.request_thread_workspace_upgrade(
-            _session_identity.thread_id, target_tier=target_tier
+        ok, detail = await _orchestrator_client.request_thread_workspace_upgrade(
+            _session_identity.thread_id, target_tier=target_tier, template=template
         )
         if not ok:
             await _ws_send(
                 ws,
                 "workspace_upgrade.failed",
-                {"reason": "Orchestrator rejected workspace upgrade request"},
+                {"reason": detail or "Orchestrator rejected workspace upgrade request"},
             )
             return
 

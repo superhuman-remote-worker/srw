@@ -122,7 +122,8 @@ def test_generic_settings_and_preference_do_not_select_a_workspace():
     resolved = preview_documents(
         [doc], default_scope={"kind": "Catalog", "name": "shared"}
     )["resolved"][0]
-    assert resolved["spec"]["execution"]["workspace"] is None
+    # Still omitted: only admission resolves it (the workspace defaults chain).
+    assert "workspace" not in resolved["spec"]["execution"]
     assert (
         resolved["spec"]["execution"]["expert"]["inline"]["runtime"]["config"]
         == selected["runtime"]["config"]

@@ -427,6 +427,59 @@ class TestArchivedProject:
 
 
 # =============================================================================
+# Workspace defaults (Slice A2b)
+# =============================================================================
+
+
+class TestWorkspaceDefaultsRoutes:
+    def test_get_is_member_gated(self, monkeypatch):
+        view = AsyncMock(return_value={"stored": {}})
+        monkeypatch.setattr(
+            "orchestrator.services.project_workspace_defaults_view.read_view", view
+        )
+        wired = _wire(store=_store(), project_member=_deny(403, "Not a member"))
+        assert (
+            wired.client.get(
+                f"/api/projects/{PROJECT_ID}/workspace-defaults"
+            ).status_code
+            == 403
+        )
+        view.assert_not_awaited()
+
+    def test_get_passes_the_caller_to_read_view(self, monkeypatch):
+        view = AsyncMock(return_value={"stored": {}})
+        monkeypatch.setattr(
+            "orchestrator.services.project_workspace_defaults_view.read_view", view
+        )
+        wired = _wire(store=_store())
+
+        response = wired.client.get(f"/api/projects/{PROJECT_ID}/workspace-defaults")
+
+        assert response.status_code == 200
+        view.assert_awaited_once_with(wired.store, dict(PROJECT), OWNER)
+
+    def test_put_is_owner_gated(self, monkeypatch):
+        update = AsyncMock(return_value={"stored": {}})
+        monkeypatch.setattr(
+            "orchestrator.services.project_workspace_defaults_view.update_view", update
+        )
+        wired = _wire(store=_store(), project_owner=_deny(403, "Owner access required"))
+        response = wired.client.put(
+            f"/api/projects/{PROJECT_ID}/workspace-defaults", json={"jobs": "vm"}
+        )
+        assert response.status_code == 403
+        update.assert_not_awaited()
+
+    def test_put_rejects_unknown_fields_and_modes(self):
+        wired = _wire(store=_store())
+        for body in ({"jobs": "sandbox"}, {"cpu": 2}):
+            response = wired.client.put(
+                f"/api/projects/{PROJECT_ID}/workspace-defaults", json=body
+            )
+            assert response.status_code == 422
+
+
+# =============================================================================
 # Redaction on the way out
 # =============================================================================
 
@@ -1007,6 +1060,8 @@ def test_the_router_carries_exactly_the_expected_route_identities():
         ("GET", "/api/projects"),
         ("GET", "/api/projects/{project_id}"),
         ("PATCH", "/api/projects/{project_id}"),
+        ("GET", "/api/projects/{project_id}/workspace-defaults"),
+        ("PUT", "/api/projects/{project_id}/workspace-defaults"),
         ("DELETE", "/api/projects/{project_id}"),
         ("GET", "/api/projects/{project_id}/members"),
         ("POST", "/api/projects/{project_id}/members"),

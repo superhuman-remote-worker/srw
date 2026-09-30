@@ -6343,8 +6343,12 @@ export class PersistentChatService {
         return true;
       }
       case '/upgrade-workspace': {
-        const tier = arg.trim().toLowerCase() === 'vm' ? 'vm' : 'sandbox';
-        this.upgradeWorkspace(tier);
+        const word = arg.trim();
+        const lower = word.toLowerCase();
+        if (!word) this.upgradeWorkspace(null);
+        else if (lower === 'vm') this.upgradeWorkspace('vm');
+        else if (lower === 'container' || lower === 'sandbox') this.upgradeWorkspace('sandbox');
+        else this.upgradeWorkspace(null, {template: word});
         return true;
       }
       default:
@@ -7143,8 +7147,10 @@ export class PersistentChatService {
    * and hot-swaps in place so shell/git/file tools become available without
    * dropping the conversation (workspace_tier_upgrade.md §4.2 S3 /
    * Phase 2). `vm` is the explicit human-intent trigger for the privileged
-   * tier — the server still gates it (can_use_vm + global kill-switch).
-   * Upgrade-only; progress and completion arrive via the
+   * tier — the server still gates it (can_use_vm + global kill-switch). A
+   * `null` tier with no template lets the server pick the next tier up;
+   * `opts.template` asks for a named template instead, whose tier the server
+   * infers. Upgrade-only; progress and completion arrive via the
    * `workspace_upgrade.*` frames (see `workspaceUpgradeInProgress`).
    *
    * `thenContinue` auto-sends a continuation once the upgrade lands, so the
@@ -7155,21 +7161,27 @@ export class PersistentChatService {
    * silently order-dependent. Clearing the offer here rather than in the card
    * is deliberate for the same reason: accepting from the pane while the card
    * is live has to dismiss it too. */
-  upgradeWorkspace(tier: 'sandbox' | 'vm', opts: { thenContinue?: boolean } = {}): void {
+  upgradeWorkspace(
+    tier: 'sandbox' | 'vm' | null,
+    opts: {thenContinue?: boolean; template?: string} = {},
+  ): void {
     if (this.controlTransport('upgrade-to-workspace') !== 'websocket') {
       // No transport on this session (queue-served sessions have none yet):
       // refuse before arming the in-progress state, and say so.
       this.error.set(this.transloco.translate('chat.control.upgradeUnavailable'));
       return;
     }
+    const control: Record<string, unknown> = {method: 'upgrade-to-workspace'};
+    if (tier) control['target_tier'] = tier;
+    if (opts.template) control['template'] = opts.template;
     // _sendControl refuses (and says so) on a retired control plane; arm
     // nothing for a frame that was never dispatched.
-    if (!this._sendControl({ method: 'upgrade-to-workspace', target_tier: tier })) return;
+    if (!this._sendControl(control)) return;
     this.pendingWorkspaceOffer.set(null);
     this.continueAfterUpgrade.set(opts.thenContinue === true);
-    this.workspaceUpgradeInProgress.set({ tier });
+    this.workspaceUpgradeInProgress.set({tier: tier ?? (opts.template ? 'vm' : 'next')});
     this._systemMessage(
-      tier === 'vm'
+      tier === 'vm' || opts.template
         ? 'Provisioning a VM workspace (requires approval), please wait...'
         : 'Provisioning workspace, please wait...',
     );

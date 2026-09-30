@@ -278,17 +278,13 @@ class LiveManifestResolver:
             if project:
                 defaults = project.get("defaults", {})
                 resources = project["resources"]
+                # defaults.workspace is not copied: an omitted workspace
+                # resolves the workspace defaults chain at admission.
                 for field, value in defaults.items():
                     if field in execution:
                         continue
                     if field == "expert":
                         execution[field] = deepcopy(resources["experts"][value])
-                    elif field == "workspace":
-                        execution[field] = (
-                            {"template": deepcopy(resources["workspaces"][value])}
-                            if value is not None
-                            else None
-                        )
                     elif field == "connectors":
                         execution[field] = {
                             alias: deepcopy(resources["connectors"][alias])
@@ -302,7 +298,7 @@ class LiveManifestResolver:
             execution["expert"] = await self.selection(
                 "Expert", execution["expert"], scope, dependencies
             )
-            workspace = execution.setdefault("workspace", None)
+            workspace = execution.get("workspace")
             if workspace and "template" in workspace:
                 workspace["template"] = await self.selection(
                     "WorkspaceTemplate", workspace["template"], scope, dependencies

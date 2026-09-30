@@ -279,19 +279,26 @@ async def preview_tool_groups(
         account_defaults=account,
         request=request,
     )
+    sources = (workspace_selection or {}).get("sources") or {}
+    template_name = (workspace_selection or {}).get("template_name")
     workspace_source = (
-        "project"
-        if workspace_selection and workspace_selection.get("project_revision")
-        else "request"
+        "request"
         if "workspace" in body.model_fields_set
         or "backend" in ((body.config_override or {}).get("workspace") or {})
+        else "project"
+        if "project" in sources.values()
         else "default"
     )
     # A creation client can ask to preview its proposed recommendation. It must
     # materialize that choice in the submitted execution; admission never reads it.
     if workspace_source == "default" and body.workspace_preference is not None:
-        workspace_config["backend"] = body.workspace_preference
+        workspace_config = {"backend": body.workspace_preference}
         workspace_source = "recommendation"
+        # The client submits this binding as its explicit choice, so it names
+        # the recommended tier, never the default template it replaces.
+        workspace_selection = None
+        sources = {"tier": "explicit", "template": "explicit"}
+        template_name = None
     preview_override = bind_execution_workspace(
         body.config_override or {}, workspace_config
     )
@@ -305,6 +312,8 @@ async def preview_tool_groups(
             if workspace_config["backend"] == "none"
             else {"template": {"inline": {"backend": workspace_config["backend"]}}}
         ),
+        "sources": sources,
+        "template_name": template_name,
     }
 
     # The legacy branch models ONE agent's behaviour: persistent_session's
