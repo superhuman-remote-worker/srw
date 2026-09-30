@@ -1826,6 +1826,24 @@ class PinnedRetirementOperations:
         thread_id = str(context.get("thread_id") or "")
         permanent = bool(retirement.get("permanent"))
         current = await self.dependencies.store.get_thread(thread_id)
+        # Refuse stale worklist hints before Pod deletion or any separate
+        # workspace effect. Repeat the immutable captured context as well as
+        # G/T; a token alone cannot nominate a different actor/physical life.
+        current_context = (current or {}).get("runtime_retirement_context")
+        if isinstance(current_context, str):
+            try:
+                current_context = json.loads(current_context)
+            except (TypeError, ValueError):
+                return False
+        if not (
+            current
+            and str(current.get("runtime_generation") or "") == str(retirement.get("generation") or "")
+            and str(current.get("runtime_retirement_token") or "") == str(retirement.get("token") or "")
+            and current.get("runtime_retirement_authorized_at") is not None
+            and bool(current.get("runtime_retirement_permanent")) == bool(retirement.get("permanent"))
+            and current_context == context
+        ):
+            return False
         if current and self._agent_pod_provision_intent_zero_candidate(
             retirement, current
         ):
