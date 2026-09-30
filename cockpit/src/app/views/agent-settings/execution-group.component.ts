@@ -18,6 +18,7 @@ import {
 import {PinOnInteractDirective} from './pin-on-interact.directive';
 import {allowedEnumOptions} from './capability-gates';
 import type {GrantCatalog} from '../../core/models/api.model';
+import type {WorkspacePreview} from '../../core/models/workspace.model';
 
 /**
  * Execution settings group: autonomy, scholar, critic, project memory.
@@ -140,6 +141,9 @@ import type {GrantCatalog} from '../../core/models/api.model';
               </button>
             }
           </div>
+          @if (workspaceDefaultHint(); as hint) {
+            <span class="field-hint">{{ hint }}</span>
+          }
           @if (isLiteBackend()) {
             <span class="field-hint">{{ (isNoneBackend() ? 'advanced.hints.noneBackend' : 'advanced.hints.virtualBackend') | transloco }}</span>
           }
@@ -433,6 +437,9 @@ export class ExecutionGroupComponent {
   tierReachability = input<Record<string, TierReachability>>({});
   /** Non-null while an upgrade is running, which disables the control. */
   upgradeInProgress = input<{tier: string; elapsed?: number} | null>(null);
+  /** The resolver's answer for what an unpinned workspace backend would
+   *  resolve to on this creation form — null in live mode / before it loads. */
+  workspacePreview = input<WorkspacePreview | null>(null);
 
   change = output<void>();
   /** A live tier the user picked. Intent only — the host confirms and
@@ -579,6 +586,23 @@ export class ExecutionGroupComponent {
   readonly resolvedWorkspaceBackend = computed(() =>
     (readConfigPath(this.config(), 'workspace.backend') as string) ?? 'sandbox'
   );
+
+  /** Explains where an unpinned workspace backend comes from — the Project or
+   *  the installation — so the create form doesn't leave the picker's default
+   *  unexplained now that the template picker itself is a later slice. Blank
+   *  once the user pins a value, or when the preview reflects the caller's own
+   *  request rather than a resolved default. */
+  readonly workspaceDefaultHint = computed(() => {
+    this.activeLang();
+    const preview = this.workspacePreview();
+    if (!preview || this.workspaceBackend() !== null || preview.source === 'request') return '';
+    const layer = this.transloco.translate(
+      preview.source === 'project'
+        ? 'agentSettings.execution.workspaceDefaultProject'
+        : 'agentSettings.execution.workspaceDefaultInstallation',
+    );
+    return preview.template_name ? `${layer} · ${preview.template_name}` : layer;
+  });
 
   readonly effectiveAutonomyDesc = computed(() => {
     this.activeLang();
