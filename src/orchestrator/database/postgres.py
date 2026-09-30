@@ -15091,7 +15091,8 @@ class PostgresDB:
                     and (
                         current_vm_status is None
                         or isinstance(current_vm_status, str)
-                        and current_vm_status in {"", "deleting", "deleted"}
+                        and current_vm_status
+                        in {"", "deleting", "deleted", "retiring_process_zero"}
                     )
                 ):
                     return False
