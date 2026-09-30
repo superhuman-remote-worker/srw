@@ -287,8 +287,23 @@ async def test_normal_resume_keeps_exact_initial_retained_volume(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "late_change",
+    (
+        None,
+        "seed_uid",
+        "seed_missing",
+        "seed_controller_wrong",
+        "seed_controller_ambiguous",
+        "service_uid",
+        "seed_uid_after_ssh",
+        "seed_controller_ambiguous_after_ssh",
+        "service_uid_after_ssh",
+    ),
+    ids=lambda change: change or "healthy",
+)
 async def test_interrupted_retained_resume_is_rediscovered_before_scheduling(
-    database, actor, monkeypatch
+    database, actor, monkeypatch, late_change
 ):
     import asyncio
     from datetime import datetime, timezone
@@ -649,6 +664,79 @@ async def test_interrupted_retained_resume_is_rediscovered_before_scheduling(
         (candidate,) = (
             await restarted.list_current_session_creation_candidates()
         ).candidates
+        if late_change is not None:
+            # _wait_for_ready follows the early UID checks and resource receipt
+            # recording. Inject external replacement at that awaited boundary.
+            original_wait = provider._wait_for_ready
+            restorations = []
+            injections = []
+            change_kind = late_change.removesuffix("_after_ssh")
+
+            def change_physical_identity():
+                injections.append(late_change)
+                if change_kind == "seed_missing":
+                    original = case.cluster.objects.pop("seed")
+                    restorations.append(
+                        lambda: case.cluster.objects.__setitem__("seed", original)
+                    )
+                elif change_kind == "service_uid":
+                    service = case.cluster.objects["service"]
+                    original = service.metadata.uid
+                    service.metadata.uid = str(uuid4())
+                    restorations.append(
+                        lambda: setattr(service.metadata, "uid", original)
+                    )
+                else:
+                    seed = case.cluster.objects["seed"]
+                    if change_kind == "seed_uid":
+                        original = seed.metadata.uid
+                        seed.metadata.uid = str(uuid4())
+                        restorations.append(
+                            lambda: setattr(seed.metadata, "uid", original)
+                        )
+                    else:
+                        original = seed.metadata.owner_references
+                        if change_kind == "seed_controller_wrong":
+                            changed = copy.deepcopy(original)
+                            changed[0]["uid"] = str(uuid4())
+                        else:
+                            changed = original + [dict(original[0])]
+                        seed.metadata.owner_references = changed
+                        restorations.append(
+                            lambda: setattr(seed.metadata, "owner_references", original)
+                        )
+
+            async def inject_after_record(*args, **kwargs):
+                recorded = await restarted.fetchrow(
+                    "SELECT seed_configmap_uid,service_uid FROM "
+                    "managed_repository_workspace_creation_reservations WHERE id=$1",
+                    source["id"],
+                )
+                assert recorded["seed_configmap_uid"] == source["seed_configmap_uid"]
+                assert recorded["service_uid"] == source["service_uid"]
+                if late_change.endswith("_after_ssh"):
+                    ready_ip = await original_wait(*args, **kwargs)
+                    assert ready_ip is not None
+                    change_physical_identity()
+                    return ready_ip
+                change_physical_identity()
+                return await original_wait(*args, **kwargs)
+
+            monkeypatch.setattr(provider, "_wait_for_ready", inject_after_record)
+            assert not await runner._continue(candidate)
+            assert injections == [late_change]
+            refused = await restarted.fetchrow(
+                "SELECT settled_at FROM managed_repository_workspace_creation_reservations WHERE id=$1",
+                source["id"],
+            )
+            assert refused["settled_at"] is None
+            assert mutations == []
+            for restore in restorations:
+                restore()
+            monkeypatch.setattr(provider, "_wait_for_ready", original_wait)
+            (candidate,) = (
+                await restarted.list_current_session_creation_candidates()
+            ).candidates
         assert await runner._continue(candidate)
         settled = await restarted.fetchrow(
             "SELECT * FROM managed_repository_workspace_creation_reservations WHERE id=$1",
