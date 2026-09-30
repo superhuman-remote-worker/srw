@@ -27,6 +27,17 @@ RUNTIME_GENERATION = UUID("55555555-5555-4555-8555-555555555555")
 RUNTIME_ATTACH_TOKEN = UUID("66666666-6666-4666-8666-666666666666")
 
 
+@pytest.fixture(autouse=True)
+def isolated_legacy_status_contract(monkeypatch):
+    # Every test starts before advertisement; modern cases explicitly install
+    # their captured life. A prior module's bound G must not turn these legacy
+    # arrangements into an incomplete/stale runtime contract.
+    monkeypatch.setattr(pa._session_identity, "_status_contract", False)
+    monkeypatch.setattr(pa._session_identity, "_runtime_contract", False)
+    monkeypatch.setattr(pa._session_identity, "_session_generation", None)
+    monkeypatch.setattr(pa._session_identity, "_attach_token", None)
+
+
 class _Acquire:
     def __init__(self, conn):
         self.conn = conn
