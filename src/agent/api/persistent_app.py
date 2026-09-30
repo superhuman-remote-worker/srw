@@ -1204,10 +1204,7 @@ def _ensure_persistent_loop_started(
             ),
             name="persistent-loop",
         )
-        asyncio.create_task(
-            _session_termination.loop_completion_handler(_loop_task),
-            name="persistent-loop-completion",
-        )
+        _session_termination.start_loop_completion_handler(_loop_task)
         logger.info(
             "Persistent loop started: thread=%s source=%s",
             _session_identity.thread_id,
@@ -1542,6 +1539,8 @@ async def lifespan(app: FastAPI):
     # pod) picks the thread back up from thread_messages.
     if _session:
         await _session_termination.terminate("shutdown", mark_thread=not stateless)
+
+    await _session_termination.drain_loop_completion_tasks()
 
     if _orchestrator_client:
         try:

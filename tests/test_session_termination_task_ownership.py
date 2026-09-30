@@ -1,6 +1,6 @@
 """Loop completion joins the termination owner but is drained only at shutdown."""
+
 import asyncio
-from unittest.mock import AsyncMock
 
 import pytest
 

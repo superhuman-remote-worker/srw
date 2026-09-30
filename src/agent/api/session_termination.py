@@ -100,6 +100,7 @@ class SessionTerminationCoordinator:
             os.environ.get("MAX_SESSIONS_PER_PROCESS", "0")
         )
         self.session_side_tasks = set()
+        self.loop_completion_tasks: set[asyncio.Task[Any]] = set()
         self.termination_sentinel_path = Path("/tmp/srw-persistent-terminating")
         self.termination_queue_sentinel = termination_queue_sentinel
         self.session_boot_ws_timeout_s = int(
@@ -1732,6 +1733,25 @@ class SessionTerminationCoordinator:
         """
         self._logger.debug("_detach_session() called via back-compat shim")
         await self.terminate("legacy")
+
+    def start_loop_completion_handler(self, loop_task: asyncio.Task) -> asyncio.Task:
+        """Track completion separately: it may shield/join the termination owner."""
+        task = asyncio.create_task(
+            self.loop_completion_handler(loop_task), name="persistent-loop-completion"
+        )
+        self.loop_completion_tasks.add(task)
+        task.add_done_callback(self.loop_completion_tasks.discard)
+        return task
+
+    async def drain_loop_completion_tasks(self) -> None:
+        """Shutdown joins these after termination, never from its cleanup loop."""
+        pending = {
+            task
+            for task in self.loop_completion_tasks
+            if task is not asyncio.current_task() and not task.done()
+        }
+        if pending:
+            await asyncio.gather(*(asyncio.shield(task) for task in pending))
 
     async def loop_completion_handler(self, loop_task: asyncio.Task) -> None:
         """Wait for the persistent loop to finish, then run reason-appropriate cleanup.
