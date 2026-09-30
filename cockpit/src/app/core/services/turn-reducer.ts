@@ -256,6 +256,8 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
             // incrementally persisted prefix under a message UUID; rebuild
             // that same logical turn in place from the full replay instead of
             // appending a duplicate live bubble (and duplicating its text).
+            // The replay starts at the latest run's turn.started, so a run a
+            // recovery replaced is not in it: its events stay.
             const turnNumber = numericTurnNumber(action.turnId);
             const historicalIndex =
                 turnNumber === undefined
@@ -272,7 +274,7 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                 const rebuilt: AssistantTurn = {
                     ...historical,
                     id: action.turnId,
-                    events: [],
+                    events: historical.events.slice(0, historical.priorRunEvents ?? 0),
                     status: 'streaming',
                     turnNumber,
                     model: action.model ?? historical.model,
@@ -301,7 +303,7 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                         turn === existing
                             ? {
                                   ...existing,
-                                  events: [],
+                                  events: existing.events.slice(0, existing.priorRunEvents ?? 0),
                                   status: 'streaming',
                                   finishedAt: undefined,
                                   model: action.model ?? existing.model,

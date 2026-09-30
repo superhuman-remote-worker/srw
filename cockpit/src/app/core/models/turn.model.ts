@@ -121,6 +121,15 @@ export interface AssistantTurn {
      * §Approach 2. The turn gets promoted to the real id (or closed) when
      * `turn.completed` / `turn.interrupted` finally arrives. */
     recovered?: boolean;
+    /**
+     * Leading events a replay of this turn cannot re-deliver: what the run
+     * before a delegation-batch recovery wrote (its calls, with the results
+     * the settle stored for them). The successor's journal starts at its own
+     * `turn.started`, so rebuilding the turn from that replay keeps these and
+     * appends the successor's frames behind them. Set by REST history from
+     * the recovery's continuation row.
+     */
+    priorRunEvents?: number;
 }
 
 export interface UserTurn {
