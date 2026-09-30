@@ -47,13 +47,21 @@ async def db(_base_db):
     yield _base_db
 
 
-async def killed_life(db, monkeypatch, *, backend="none", claim=False, partial=False):
+async def killed_life(
+    db,
+    monkeypatch,
+    *,
+    backend="none",
+    claim=False,
+    partial=False,
+    with_virtual_binding=True,
+):
     pod_uid = str(uuid4())
     ids = await fixtures._seed(
         db, protected_agent_pod=True, workspace_claim=claim, pod_uid=pod_uid
     )
     ids["pod_uid"] = pod_uid
-    if backend == "virtual":
+    if backend == "virtual" and with_virtual_binding:
         assert await db.bind_thread_workspace_backing(
             ids["thread"], backing_kind="virtual", backing_id=f"rclone:{'a' * 64}"
         )
@@ -155,13 +163,23 @@ async def killed_life(db, monkeypatch, *, backend="none", claim=False, partial=F
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "backend,claim", [("none", False), ("virtual", False), ("virtual", True)]
+    "backend,claim,with_virtual_binding",
+    [
+        ("none", False, True),
+        ("virtual", False, True),
+        ("virtual", True, True),
+        ("virtual", False, False),
+    ],
 )
 async def test_killed_life_zero_preserves_stranded_inputs(
-    db, monkeypatch, backend, claim
+    db, monkeypatch, backend, claim, with_virtual_binding
 ):
     ids, retirement, deliveries, api, _ = await killed_life(
-        db, monkeypatch, backend=backend, claim=claim
+        db,
+        monkeypatch,
+        backend=backend,
+        claim=claim,
+        with_virtual_binding=with_virtual_binding,
     )
     operations = controls.pinned_retirement_operations(main.app.state.resources)
     assert await operations.recover_captured_process_zero(retirement)
@@ -179,11 +197,12 @@ async def test_killed_life_zero_preserves_stranded_inputs(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_virtual_binding", [True, False])
 async def test_killed_life_end_resume_and_successor_claim_each_stranded_input_once(
-    db, monkeypatch
+    db, monkeypatch, with_virtual_binding
 ):
     ids, retirement, deliveries, _, _ = await killed_life(
-        db, monkeypatch, backend="virtual"
+        db, monkeypatch, backend="virtual", with_virtual_binding=with_virtual_binding
     )
     assert await controls.pinned_retirement_operations(
         main.app.state.resources
@@ -251,10 +270,19 @@ async def test_killed_life_end_resume_and_successor_claim_each_stranded_input_on
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "backend,with_virtual_binding", [("none", True), ("virtual", False)]
+)
 async def test_killed_partial_turn_is_retired_without_fabricating_completion_or_replaying_effects(
-    db, monkeypatch
+    db, monkeypatch, backend, with_virtual_binding
 ):
-    ids, retirement, deliveries, _, _ = await killed_life(db, monkeypatch, partial=True)
+    ids, retirement, deliveries, _, _ = await killed_life(
+        db,
+        monkeypatch,
+        partial=True,
+        backend=backend,
+        with_virtual_binding=with_virtual_binding,
+    )
     assert await controls.pinned_retirement_operations(
         main.app.state.resources
     ).recover_captured_process_zero(retirement)
@@ -265,6 +293,27 @@ async def test_killed_partial_turn_is_retired_without_fabricating_completion_or_
     assert [r["state"] for r in rows] == ["admitted", "owned"]
     assert rows[0]["settled_at"] is None
     assert rows[0]["delivery_id"] == deliveries[0]
+
+
+@pytest.mark.asyncio
+async def test_killed_virtual_actor_without_backing_has_exact_abrupt_sql_receipt(
+    db, monkeypatch
+):
+    ids, retirement, _, _, _ = await killed_life(
+        db, monkeypatch, backend="virtual", with_virtual_binding=False
+    )
+    receipt = await db.acknowledge_abrupt_pinned_actor_exit(
+        ids["thread"],
+        runtime_generation=retirement["generation"],
+        retirement_token=retirement["token"],
+        agent_id=ids["agent"],
+        attach_token=ids["attach_token"],
+        stopped_pod_uid=ids["pod_uid"],
+    )
+    assert receipt is not None
+    assert receipt["recovery_protocol"] == "abrupt_virtual_actor_exit_v1"
+    assert receipt["stranded_input_count"] == 2
+    assert receipt["partial_admission_count"] == 0
 
 
 @pytest.mark.asyncio
