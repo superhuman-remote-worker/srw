@@ -1077,6 +1077,108 @@ async def test_retained_attention_begin_refuses_changed_current_authority_withou
 
 
 @pytest.mark.asyncio
+async def test_retained_attention_begin_refuses_legal_claim_rotation_after_capture(
+    database, actor, monkeypatch
+):
+    from orchestrator.services.container_provisioner import WorkspaceOwner
+
+    case, predecessor, attention, _ = await retained_attention_case(
+        database, actor, monkeypatch
+    )
+    captured = (
+        await case.provisioner.capture_retained_stateless_startup_attention_retirement(
+            WorkspaceOwner.session(case.thread_id)
+        )
+    )
+    assert captured and captured["claim_token"] == attention["claim_token"]
+    # Expire only the current lease. Production reconciliation then rotates
+    # the reservation and matching owner projection in its owner-ordered tx.
+    assert (
+        await database.execute(
+            "UPDATE managed_repository_workspace_creation_reservations "
+            "SET expires_at=created_at+interval '1 microsecond' "
+            "WHERE id=$1::uuid AND claim_token=$2 AND settled_at IS NULL "
+            "AND created_at+interval '1 microsecond' <= now()",
+            str(attention["id"]),
+            captured["claim_token"],
+        )
+        == "UPDATE 1"
+    )
+    rotated = await database.claim_managed_repository_workspace_creation_reconciliation(
+        str(attention["id"]), claimant="retained-end-race", lease_seconds=300
+    )
+    assert rotated is not None
+    assert rotated["id"] == attention["id"]
+    assert rotated["claim_token"] > captured["claim_token"]
+    assert rotated["pod_uid"] == attention["pod_uid"]
+    assert rotated["pvc_uid"] == attention["pvc_uid"]
+    assert (
+        await database.get_current_retained_startup_attention_source(case.thread_id)
+    )["claim_token"] == rotated["claim_token"]
+    before_thread = await database.get_thread(case.thread_id)
+    assert metadata(before_thread)["workspace_container"][
+        "_creation_claim_token"
+    ] == str(rotated["claim_token"])
+    before_queue = await database.fetchrow(
+        "SELECT * FROM run_queue WHERE unit_id=$1::uuid", case.thread_id
+    )
+    before_receipt = await database.fetchrow(
+        "SELECT * FROM managed_repository_workspace_creation_reservations "
+        "WHERE id=$1::uuid",
+        str(attention["id"]),
+    )
+    before_predecessor = await database.fetchrow(
+        "SELECT * FROM managed_repository_workspace_creation_reservations "
+        "WHERE id=$1::uuid",
+        str(predecessor["id"]),
+    )
+    physical = {name: obj.metadata.uid for name, obj in case.cluster.objects.items()}
+    with pytest.raises(
+        RuntimeError, match="retained startup retirement admission changed"
+    ):
+        await database.begin_stateless_thread_workspace_retirement(
+            case.thread_id,
+            force=False,
+            permanent=False,
+            retained_startup_attention=captured,
+        )
+    assert await database.get_thread(case.thread_id) == before_thread
+    assert (
+        await database.fetchrow(
+            "SELECT * FROM run_queue WHERE unit_id=$1::uuid", case.thread_id
+        )
+        == before_queue
+    )
+    assert (
+        await database.fetchrow(
+            "SELECT * FROM managed_repository_workspace_creation_reservations "
+            "WHERE id=$1::uuid",
+            str(attention["id"]),
+        )
+        == before_receipt
+    )
+    assert (
+        await database.fetchrow(
+            "SELECT * FROM managed_repository_workspace_creation_reservations "
+            "WHERE id=$1::uuid",
+            str(predecessor["id"]),
+        )
+        == before_predecessor
+    )
+    assert not await database.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+        "AND thread_runtime_generation=$2::uuid)",
+        case.thread_id,
+        str(attention["thread_runtime_generation"]),
+    )
+    assert case.cluster.pod_create_calls == 2
+    assert {
+        name: obj.metadata.uid for name, obj in case.cluster.objects.items()
+    } == physical
+
+
+@pytest.mark.asyncio
 async def test_retained_attention_predecessor_result_cannot_change_after_ready_end(
     database, actor, monkeypatch
 ):
