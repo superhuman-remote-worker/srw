@@ -645,9 +645,28 @@ async def _do_prepare(
             expected_session_identity_fingerprint=(
                 binding.session_identity_fingerprint
             ),
+            **(
+                {
+                    "vm_store": db,
+                    "vm_thread_id": thread_id,
+                    "vm_runtime_generation": runtime_authority.generation,
+                    "vm_binding": binding,
+                }
+                if _backend == "vm"
+                else {}
+            ),
         ):
             current = await db.get_thread(thread_id)
-            if same_thread_runtime_authority(current, runtime_authority):
+            current_binding = await db.get_pinned_session_binding(
+                thread_id,
+                expected_runtime_generation=runtime_authority.generation,
+            )
+            if (
+                same_thread_runtime_authority(current, runtime_authority)
+                and current_binding is not None
+                and current_binding.target_key == binding.target_key
+                and current_binding.agent_status in startup_statuses
+            ):
                 _emit("failed", reason="agent /ready timeout")
             return
 

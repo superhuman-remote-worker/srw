@@ -1,8 +1,7 @@
-"""A dedicated VM attach stays bounded while its Pod waits in startup.
+"""A dedicated VM attach can wait while its Pod serves process health.
 
-With a startup allowance that covers the session's readiness budget
-(``session_pod_startup_allowance_s``), nothing on the kubelet side ends a
-slow attach any more, so the attach's own exits are what bound it:
+The finite startup allowance covers initialization and mixed-version pods.
+The agent's own exits still bound non-waiting attach paths:
 
 * a genuinely failed VM ends the poll at once (``vm_status='failed'``), and
   a VM that never becomes ready ends it at the agent's budget, which is below
@@ -15,6 +14,9 @@ slow attach any more, so the attach's own exits are what bound it:
 
 from __future__ import annotations
 
+import asyncio
+from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -23,6 +25,110 @@ import pytest
 from agent.api import persistent_app
 from agent.api.orchestrator_client import OrchestratorClient, SessionEnded
 from orchestrator.services import session_workspace_policy
+
+
+@pytest.mark.asyncio
+async def test_dedicated_lifespan_serves_health_while_exact_attach_waits(monkeypatch):
+    """A capacity wait beyond the old probe allowance must not block startup."""
+    for name in (
+        "_config_path",
+        "_thread_id",
+        "_agent",
+        "_orchestrator_client",
+        "_heartbeat_task",
+        "_dedicated_attach_task",
+        "_started_at",
+    ):
+        monkeypatch.setattr(persistent_app, name, getattr(persistent_app, name))
+    thread_id = str(uuid4())
+    attach_started = asyncio.Event()
+    admit = asyncio.Event()
+    shutdown_order = []
+    client = MagicMock()
+    client.connect = AsyncMock()
+    client.register = AsyncMock(return_value=True)
+    client.deregister = AsyncMock()
+    client.close = AsyncMock(side_effect=lambda: shutdown_order.append("client_closed"))
+
+    async def heartbeat(**_kwargs):
+        await asyncio.Event().wait()
+
+    client.run_heartbeat_loop = heartbeat
+    agent = MagicMock(config=SimpleNamespace(agent_id=str(uuid4())))
+    agent.initialize = AsyncMock()
+    agent.shutdown = AsyncMock()
+    monkeypatch.setattr(persistent_app.UniversalAgent, "from_config", lambda _: agent)
+    monkeypatch.setattr(
+        persistent_app, "create_orchestrator_client_from_env", lambda _: client
+    )
+    monkeypatch.setattr(persistent_app, "_app_guide_health", lambda: {"state": "ready"})
+    monkeypatch.setattr(persistent_app, "_session", None)
+    monkeypatch.setattr(persistent_app, "_pool_attach_claim", None)
+
+    async def attach(_thread_id):
+        assert _thread_id == thread_id
+        attach_started.set()
+        try:
+            await admit.wait()
+        finally:
+            shutdown_order.append("attach_stopped")
+
+    monkeypatch.setattr(persistent_app, "_attach_session", attach)
+    app = persistent_app.create_persistent_app("session_base", thread_id=thread_id)
+    context = persistent_app.lifespan(app)
+    enter = asyncio.create_task(context.__aenter__())
+    try:
+        await asyncio.wait_for(attach_started.wait(), timeout=1)
+        await asyncio.wait_for(asyncio.shield(enter), timeout=0.1)
+        # The old default startup probe gives this VM Session only 1060 s.
+        monkeypatch.setattr(
+            persistent_app,
+            "_started_at",
+            persistent_app._started_at - timedelta(seconds=1100),
+        )
+        health = next(route.endpoint for route in app.routes if route.path == "/health")
+        ready = next(route.endpoint for route in app.routes if route.path == "/ready")
+        assert (await health()).status_code == 200
+        assert (await ready()).status_code == 503
+        assert persistent_app._pool_heartbeat_status() != "ready"
+        monkeypatch.setattr(
+            persistent_app, "_pinned_session_recipient_refusal", lambda *_a, **_k: None
+        )
+        second = await persistent_app._admit_pool_session_attach(
+            {"thread_id": str(uuid4())}
+        )
+        assert second.status_code == 409
+    finally:
+        if enter.done() and not enter.cancelled() and enter.exception() is None:
+            await context.__aexit__(None, None, None)
+        else:
+            enter.cancel()
+            try:
+                await enter
+            except asyncio.CancelledError:
+                pass
+    assert shutdown_order == ["attach_stopped", "client_closed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error,exit_name",
+    [
+        (SessionEnded("ended"), "_exit_session_ended"),
+        (persistent_app.SessionGrantDenied("denied"), "_exit_grant_denied"),
+        (persistent_app.MemoryUnavailableError("memory"), "_exit_memory_unavailable"),
+        (persistent_app.WorkspaceNotReady("workspace"), "_exit_workspace_not_ready"),
+    ],
+)
+async def test_dedicated_background_attach_preserves_exact_exit_reason(
+    monkeypatch, error, exit_name
+):
+    monkeypatch.setattr(persistent_app, "_attach_session", AsyncMock(side_effect=error))
+    exit_handler = AsyncMock()
+    monkeypatch.setattr(persistent_app, exit_name, exit_handler)
+    await persistent_app._run_dedicated_attach("tid")
+    assert exit_handler.await_count == 1
+    assert exit_handler.await_args.args[0] == "tid"
 
 
 def _client():
@@ -183,6 +289,37 @@ async def test_current_resource_wait_signal_loss_expires_after_120(vm_startup_cl
     )
     assert clock["now"] == 120
     assert client.get_thread_workspace.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_typed_resource_wait_propagates_session_ended(vm_startup_clock):
+    _, wait, _, _ = vm_startup_clock
+    client = AsyncMock()
+    client.get_thread_workspace.side_effect = [
+        wait,
+        SessionEnded("session ended while waiting for resources"),
+    ]
+    with pytest.raises(SessionEnded):
+        await persistent_app._poll_workspace_ready(
+            client, "tid", timeout=120, poll_interval=30, require_vm=True
+        )
+    assert client.get_thread_workspace.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_typed_resource_wait_refuses_ready_sandbox(vm_startup_clock):
+    clock, wait, _, _ = vm_startup_clock
+    client = AsyncMock()
+    client.get_thread_workspace.side_effect = [
+        {**wait, "status": "ready", "pod_ip": "10.0.0.9", "pod_port": 30022}
+    ] + [None] * 8
+    assert (
+        await persistent_app._poll_workspace_ready(
+            client, "tid", timeout=120, poll_interval=30, require_vm=True
+        )
+        is None
+    )
+    assert clock["now"] == 120
 
 
 @pytest.mark.asyncio

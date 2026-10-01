@@ -186,6 +186,7 @@ _pool_attach_claim: Optional[str] = None
 _pool_attach_runtime_generation: Optional[str] = None
 _pool_attach_token: Optional[str] = None
 _pool_attach_task: Optional[asyncio.Task[None]] = None
+_dedicated_attach_task: Optional[asyncio.Task[None]] = None
 # Exact proof retained between exception-safe attach rollback and the
 # orchestrator's generation-rotating release CAS. Never infer it from a
 # swallowed cleanup error or from an absent session after globals were reset.
@@ -218,11 +219,12 @@ def _retain_failed_attach_release_receipt(receipt: dict[str, Any]) -> bool:
 
 
 def _pool_heartbeat_status() -> str:
-    """Advertise a synchronous pool claim before ``_session`` exists."""
+    """Only an unbound pool process may advertise idle availability."""
 
     return (
         "ready"
-        if _session is None
+        if _thread_id is None
+        and _session is None
         and _pool_attach_claim is None
         and _pending_drain_suspend is None
         and _failed_attach_release_receipt is None
@@ -2765,6 +2767,31 @@ async def _exit_session_ended(thread_id: str) -> NoReturn:
     os._exit(0)
 
 
+async def _run_dedicated_attach(thread_id: str) -> None:
+    """Own a dedicated attach after registration without blocking health startup."""
+    try:
+        await _attach_session(thread_id)
+    except asyncio.CancelledError:
+        raise
+    except SessionEnded:
+        await _exit_session_ended(thread_id)
+    except SessionGrantDenied as exc:
+        await _exit_grant_denied(thread_id, exc)
+    except MemoryUnavailableError as exc:
+        await _exit_memory_unavailable(thread_id, exc)
+    except (WorkspaceNotReady, WorkspaceUnavailableError) as exc:
+        await _exit_workspace_not_ready(thread_id, exc)
+    except Exception as exc:
+        # A synchronous lifespan exception stopped the dedicated pod. Keep
+        # that failure behavior now that attach runs under a task.
+        logger.error(
+            "Dedicated session attach failed for thread %s (%s)",
+            thread_id,
+            type(exc).__name__,
+        )
+        os._exit(1)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize persistent agent, register with orchestrator, start heartbeat."""
@@ -2774,7 +2801,8 @@ async def lifespan(app: FastAPI):
         _orchestrator_client, \
         _heartbeat_task, \
         _started_at, \
-        _thread_id
+        _thread_id, \
+        _dedicated_attach_task
 
     _started_at = datetime.now()
     stateless = _stateless_mode()
@@ -2905,44 +2933,14 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("No ORCHESTRATOR_URL — running standalone")
 
-    # If we have a thread_id (dedicated mode) and registration succeeded, set
-    # up the session immediately. If register was refused (409), skip the
-    # attach — the legitimate owner already holds this thread.
+    # A dedicated process may serve /health once its bounded initialization and
+    # exact registration finish. The task owns the long workspace wait; /ready
+    # remains gated by the completed session transaction.
     if _thread_id and dedicated_register_ok:
-        # Fallback: generate UUID if still None (standalone mode)
-        if _thread_id is None:
-            import uuid
-
-            _thread_id = str(uuid.uuid4())
-
-        try:
-            await _attach_session(_thread_id)
-        except SessionEnded:
-            await _exit_session_ended(_thread_id)
-        except SessionGrantDenied as e:
-            # The session's resolved config exceeds the owner's capability grants
-            # (workspace endpoint returned 403) — e.g. a grant revoked between the
-            # orchestrator's create/provision pre-flight (Layers 1/2) and this
-            # attach. Permanent: exit with the REAL reason instead of the
-            # misleading 'workspace not provisioned' rebind path; the cockpit
-            # re-surfaces it on its next create/prepare grant pre-flight.
-            await _exit_grant_denied(_thread_id, e)
-        except MemoryUnavailableError as e:
-            # A configured/required memory component couldn't be set up (store
-            # init or a plugin transport that won't resolve — e.g. the reranker
-            # endpoint). Deterministic config failure: exit cleanly with the REAL
-            # reason instead of crashing (which triggered a workspace-release +
-            # crash-loop retry). The cockpit re-surfaces it via the orchestrator
-            # endpoint pre-flight.
-            await _exit_memory_unavailable(_thread_id, e)
-        except (WorkspaceNotReady, WorkspaceUnavailableError) as e:
-            # Workspace raced us / is wedged (WorkspaceNotReady) or its pod is
-            # dead/unreachable (WorkspaceUnavailableError — SSH connect exhausted
-            # against a destroyed workspace): exit cleanly (status 0) instead of
-            # crashing, so K8s doesn't restart-loop. The orchestrator's session
-            # reconcile (ensure_workspace drift probe) recreates the pod and
-            # rebinds a fresh agent. See _exit_workspace_not_ready.
-            await _exit_workspace_not_ready(_thread_id, e)
+        _dedicated_attach_task = asyncio.create_task(
+            _run_dedicated_attach(_thread_id),
+            name=f"dedicated-session-attach:{_thread_id}",
+        )
     elif _thread_id and not dedicated_register_ok:
         logger.info(
             "Skipping session attach for thread %s — orchestrator refused "
@@ -2963,6 +2961,16 @@ async def lifespan(app: FastAPI):
 
     # --- Shutdown ---
     logger.info("Shutting down persistent agent")
+
+    dedicated_task = _dedicated_attach_task
+    if dedicated_task is not None:
+        if not dedicated_task.done():
+            dedicated_task.cancel()
+        try:
+            await dedicated_task
+        except asyncio.CancelledError:
+            pass
+        _dedicated_attach_task = None
 
     # A pool attach is admitted synchronously but finishes in the background.
     # Own that task through shutdown so workspace/setup code cannot continue
@@ -6118,7 +6126,9 @@ async def _admit_pool_session_attach(request: Dict[str, Any]) -> JSONResponse:
 
     async with _pool_attach_lock:
         if (
-            _session is not None
+            _thread_id is not None
+            or _dedicated_attach_task is not None
+            or _session is not None
             or _pool_attach_claim is not None
             or _pending_drain_suspend is not None
         ):

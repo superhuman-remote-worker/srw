@@ -402,12 +402,33 @@ async def provision_or_assign(
             expected_session_identity_fingerprint=(
                 binding.session_identity_fingerprint
             ),
+            **(
+                {
+                    "vm_store": postgres_db,
+                    "vm_thread_id": tid,
+                    "vm_runtime_generation": expected_runtime.generation,
+                    "vm_binding": binding,
+                }
+                if _is_vm
+                else {}
+            ),
         ):
             cur = await postgres_db.get_thread(tid)
-            if await _same_runtime(cur):
+            current_binding = await postgres_db.get_pinned_session_binding(
+                tid,
+                expected_runtime_generation=expected_runtime.generation,
+            )
+            if (
+                await _same_runtime(cur)
+                and current_binding is not None
+                and current_binding.target_key == binding.target_key
+                and current_binding.agent_status in startup_statuses
+            ):
                 await _safe_emit("failed", reason="agent /ready timeout")
             return
 
+        if not await _same_runtime():
+            return
         current_binding: (
             PinnedSessionBinding | None
         ) = await postgres_db.get_pinned_session_binding(

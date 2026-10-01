@@ -21,14 +21,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from typing import Any
+from uuid import UUID
 
 import httpx
 
 from orchestrator.services.notification_feed import notification_feed
-from orchestrator.services.session_runtime_admission import thread_runtime_is_preparable
+from orchestrator.services.session_runtime_admission import (
+    ThreadRuntimeAuthority,
+    same_thread_runtime_authority,
+    thread_runtime_is_preparable,
+)
+from orchestrator.services.vm_thread_initial import initial_vm_startup_view
 
 logger = logging.getLogger(__name__)
+_INITIAL_VM_COMMUNICATION_ALLOWANCE_S = 120
 
 
 def emit(user_id: str, thread_id: str, state: str, **extra: Any) -> None:
@@ -65,6 +73,10 @@ async def wait_for_ready(
     *,
     require_protected_cloud: bool = False,
     expected_session_identity_fingerprint: str | None = None,
+    vm_store: Any | None = None,
+    vm_thread_id: str | None = None,
+    vm_runtime_generation: str | None = None,
+    vm_binding: Any | None = None,
 ) -> bool:
     """Poll the agent pod's /ready until it returns ready=true, or timeout.
 
@@ -72,12 +84,177 @@ async def wait_for_ready(
     ``_session_ready()`` passes its 3-way check (session attached,
     LLM tools wired, loop queue initialized). Mid-attach windows
     correctly return False, so this is the truthful signal for "the
-    cockpit's WS will succeed if opened now."
+    cockpit's WS will succeed if opened now." VM callers also pass the exact
+    captured binding. Only a current initial source may renew the communication
+    allowance, and durable admission consumes the original finite budget.
     """
-    deadline = asyncio.get_event_loop().time() + timeout_s
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout_s
     interval = 2
-    while asyncio.get_event_loop().time() < deadline:
-        if await probe_ready(
+    vm_observer = (
+        vm_store is not None
+        and vm_thread_id is not None
+        and vm_runtime_generation is not None
+        and vm_binding is not None
+    )
+    if (
+        any(
+            value is not None
+            for value in (vm_store, vm_thread_id, vm_runtime_generation, vm_binding)
+        )
+        and not vm_observer
+    ):
+        return False
+    if vm_observer:
+        try:
+            if (
+                vm_thread_id != vm_binding.thread_id
+                or vm_runtime_generation != vm_binding.runtime_generation
+                or pod_ip != vm_binding.pod_ip
+                or pod_port != vm_binding.pod_port
+                or expected_session_identity_fingerprint
+                != vm_binding.session_identity_fingerprint
+            ):
+                return False
+        except (AttributeError, ValueError):
+            return False
+    source_key: tuple[str, str, str] | None = None
+    communication_deadline: float | None = None
+    admission_deadline: float | None = None
+    unavailable = object()
+
+    async def current_vm_thread():
+        """Fence each asynchronous observation to the captured actor and pod."""
+        try:
+            thread = await vm_store.get_thread(vm_thread_id)
+            expected = ThreadRuntimeAuthority(vm_thread_id, vm_runtime_generation)
+            if (
+                not same_thread_runtime_authority(thread, expected)
+                or str(thread.get("agent_id")) != vm_binding.agent_id
+                or str(thread.get("runtime_attach_token"))
+                != vm_binding.runtime_attach_token
+            ):
+                return None
+            current_binding = await vm_store.get_pinned_session_binding(
+                vm_thread_id,
+                expected_runtime_generation=vm_runtime_generation,
+            )
+            if (
+                current_binding is None
+                or current_binding.target_key != vm_binding.target_key
+                or current_binding.agent_status
+                not in {"booting", "ready", "working", "session"}
+            ):
+                return None
+            # The joined binding read is an await: End may race without G rotation.
+            thread = await vm_store.get_thread(vm_thread_id)
+            if (
+                not same_thread_runtime_authority(thread, expected)
+                or str(thread.get("agent_id")) != vm_binding.agent_id
+                or str(thread.get("runtime_attach_token"))
+                != vm_binding.runtime_attach_token
+            ):
+                return None
+            return thread
+        except Exception as exc:
+            logger.warning(
+                "VM readiness authority unavailable for thread %s (%s)",
+                vm_thread_id,
+                type(exc).__name__,
+            )
+            return unavailable
+
+    while True:
+        now = loop.time()
+        prior_deadline = (
+            admission_deadline
+            if admission_deadline is not None
+            else communication_deadline
+            if communication_deadline is not None
+            else deadline
+        )
+        if now >= prior_deadline:
+            return False
+        phase = None
+        if vm_observer:
+            thread = await current_vm_thread()
+            if thread is unavailable:
+                await asyncio.sleep(interval)
+                continue
+            if thread is None:
+                return False
+            try:
+                view = await initial_vm_startup_view(thread, store=vm_store)
+            except Exception as exc:
+                # A temporary source-read outage spends the existing allowance.
+                logger.warning(
+                    "Initial VM readiness source unavailable for thread %s (%s)",
+                    vm_thread_id,
+                    type(exc).__name__,
+                )
+                view = None
+            current = await current_vm_thread()
+            if current is unavailable:
+                await asyncio.sleep(interval)
+                continue
+            if current is None:
+                return False
+            now = loop.time()
+            if now >= prior_deadline:
+                return False
+            if view is not None:
+                if not isinstance(view, dict):
+                    return False
+                try:
+                    key = tuple(
+                        str(UUID(view[field]))
+                        for field in (
+                            "request_id",
+                            "provision_generation",
+                            "runtime_generation",
+                        )
+                    )
+                    valid = (
+                        type(view.get("contract_version")) is int
+                        and view["contract_version"] == 1
+                        and key[2] == vm_runtime_generation
+                        and view.get("phase") in {"resource_wait", "admitted"}
+                    )
+                    if not valid or (source_key is not None and key != source_key):
+                        return False
+                except (KeyError, TypeError, ValueError):
+                    return False
+                source_key = key
+                phase = view["phase"]
+                if phase == "resource_wait":
+                    if admission_deadline is not None:
+                        return False
+                    communication_deadline = now + _INITIAL_VM_COMMUNICATION_ALLOWANCE_S
+                else:
+                    elapsed = view.get("admission_elapsed_s")
+                    if (
+                        type(elapsed) not in (int, float)
+                        or not math.isfinite(elapsed)
+                        or elapsed < 0
+                    ):
+                        return False
+                    candidate = now + max(0.0, timeout_s - elapsed)
+                    admission_deadline = (
+                        candidate
+                        if admission_deadline is None
+                        else min(admission_deadline, candidate)
+                    )
+
+        if admission_deadline is not None:
+            live_deadline = admission_deadline
+        elif communication_deadline is not None:
+            live_deadline = communication_deadline
+        else:
+            live_deadline = deadline
+        if now >= live_deadline:
+            return False
+        # A pre-admission wait is a timing hint only. It cannot confer Ready.
+        if phase != "resource_wait" and await probe_ready(
             pod_ip,
             pod_port,
             require_protected_cloud=require_protected_cloud,
@@ -85,9 +262,17 @@ async def wait_for_ready(
                 expected_session_identity_fingerprint
             ),
         ):
-            return True
+            if vm_observer:
+                current = await current_vm_thread()
+                if current is unavailable:
+                    await asyncio.sleep(interval)
+                    continue
+                if current is None:
+                    return False
+            # Legacy and sandbox probes retain their historical in-flight
+            # result. A source-attested wait has a strict irreversible bound.
+            return source_key is None or loop.time() < live_deadline
         await asyncio.sleep(interval)
-    return False
 
 
 async def probe_ready(
