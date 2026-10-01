@@ -1758,6 +1758,39 @@ def _json_body(body: bytes, *, label: str) -> Any:
         raise HarnessError(f"{label} returned invalid JSON") from exc
 
 
+def _close_provider_scope(
+    root: str, *, headers: Mapping[str, str], run_id: str
+) -> dict:
+    """Retain one quiescent scope and prove cumulative accounting readback."""
+
+    _, prior_body = _http_request(root, headers=headers)
+    prior = _json_body(prior_body, label="provider before retaining close")
+    _, closed_body = _http_request(
+        root + "/close",
+        method="POST",
+        headers=headers,
+        json_body={"expected_cancelled": 0},
+        expected=(200,),
+    )
+    closed = _json_body(closed_body, label="provider retained close")
+    _, observed_body = _http_request(root, headers=headers)
+    observed = _json_body(observed_body, label="provider retained readback")
+    if not (
+        isinstance(prior, dict)
+        and isinstance(closed, dict)
+        and closed.get("run_id") == run_id
+        and closed.get("closed") is True
+        and closed.get("expected_cancelled") == 0
+        and closed.get("pending_calls") == 0
+        and closed.get("unexpected_count") == 0
+        and closed.get("remaining_required_responses") == 0
+        and all(closed.get(key) == value for key, value in prior.items())
+        and observed == closed
+    ):
+        raise HarnessError("provider retaining close changed cumulative accounting")
+    return closed
+
+
 class ApplicationE2EHarness:
     def __init__(self, state_root: Path, runner: CommandRunner | None = None):
         self.store = StateStore(state_root)
@@ -2852,11 +2885,14 @@ class ApplicationE2EHarness:
                         "provider preflight accounting did not close cleanly"
                     )
             finally:
-                _http_request(
+                closed = _close_provider_scope(
                     f"{control_root}/control/scenarios/{preflight_id}",
-                    method="DELETE",
                     headers=control_headers,
-                    expected=(200,),
+                    run_id=preflight_id,
+                )
+                write_private_json(
+                    self._run_dir(ledger) / "provider-preflight-closed-state.json",
+                    closed,
                 )
         self._mark_layer(ledger, "provider-contract")
 
@@ -3691,11 +3727,26 @@ class ApplicationE2EHarness:
                 raise HarnessError(
                     "provider cleanup found unsettled startup-probe windows"
                 )
+            state = _close_provider_scope(root, headers=headers, run_id=run_id)
+            _, overview_body = _http_request(overview_root, headers=headers)
+            overview = _json_body(overview_body, label="provider after retaining close")
+            if not (
+                isinstance(overview, dict)
+                and overview.get("unscoped_unexpected_calls") == 0
+                and overview.get("unscoped_calls_truncated") == 0
+                and overview.get("unscoped_calls") == []
+                and state in overview.get("closed_runs", [])
+                and not any(
+                    item.get("run_id") == run_id for item in overview.get("runs", [])
+                )
+            ):
+                raise HarnessError(
+                    "provider retaining close lost accounting or gained an unscoped call"
+                )
             write_private_json(
                 self._run_dir(ledger) / "provider-cleanup-state.json",
                 {"scenario": state, "overview": overview},
             )
-            _http_request(root, method="DELETE", headers=headers, expected=(200,))
 
     def cleanup(self, ledger: Mapping[str, Any]) -> None:
         self._assert_owned_cluster(ledger)

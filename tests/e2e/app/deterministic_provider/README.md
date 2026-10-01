@@ -111,3 +111,11 @@ The container build context is this directory:
 ```bash
 docker build -t srw-e2e-model-fixture:local tests/e2e/app/deterministic_provider
 ```
+
+Owned acceptance closes a settled life with `POST /control/scenarios/{run_id}/close`
+(`expected_cancelled` defaults to zero). Closed scopes remain readable by GET
+and in `closed_runs`; their IDs cannot be rearmed, advanced or reset. Closure
+refuses pending or unaccounted work. A cancelled auxiliary call cannot satisfy
+a required response. Late calls retain global unscoped accounting and leave
+archived counters unchanged. The historical DELETE/reset contract remains for
+fixture unit tests; owned acceptance callers use retaining close.

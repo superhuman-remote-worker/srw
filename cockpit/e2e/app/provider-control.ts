@@ -17,6 +17,8 @@ export interface ProviderCall {
 }
 
 export interface ProviderScenarioState {
+  closed?: boolean;
+  expected_cancelled?: number;
   run_id: string;
   scenario: string;
   required_responses: number;
@@ -30,6 +32,7 @@ export interface ProviderScenarioState {
 
 export interface ProviderOverview {
   runs: ProviderScenarioState[];
+  closed_runs?: ProviderScenarioState[];
   unscoped_unexpected_calls: number;
 }
 
@@ -86,8 +89,24 @@ export class ProviderControlClient {
     return this.call('/control/scenarios');
   }
 
-  async reset(runId: string): Promise<void> {
-    await this.call(`/control/scenarios/${encodeURIComponent(runId)}`, { method: 'DELETE' });
+  async close(runId: string): Promise<ProviderScenarioState> {
+    const root = `/control/scenarios/${encodeURIComponent(runId)}`;
+    const closed = await this.call<ProviderScenarioState>(`${root}/close`, {
+      method: 'POST', body: { expected_cancelled: 0 },
+    });
+    const observed = await this.state(runId);
+    const accounting = (state: ProviderScenarioState) => JSON.stringify([
+      state.run_id, state.closed, state.expected_cancelled, state.pending_calls,
+      state.unexpected_count, state.required_responses, state.consumed_required_responses,
+      state.remaining_required_responses, state.counters, state.calls,
+    ]);
+    if (closed.run_id !== runId || closed.closed !== true ||
+        closed.expected_cancelled !== 0 || closed.pending_calls !== 0 ||
+        closed.unexpected_count !== 0 || closed.remaining_required_responses !== 0 ||
+        accounting(closed) !== accounting(observed)) {
+      throw new Error('Closed provider accounting readback changed.');
+    }
+    return observed;
   }
 }
 

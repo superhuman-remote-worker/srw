@@ -253,7 +253,7 @@ export const test = base.extend<ApplicationFixtures>({
         testInfo.annotations.push({
           type: 'cleanup-deferred',
           description:
-            'Outer owned-cluster runner must diagnose, exact-clean, then reset provider.',
+            'Outer owned-cluster runner must diagnose, exact-clean, then retain closed provider accounting.',
         });
       } else {
         try {
@@ -287,15 +287,16 @@ export const test = base.extend<ApplicationFixtures>({
           teardownErrors.push(new Error(`Provider accounting failed: ${errorMessage(error)}`));
         } finally {
           // A failed exact cleanup leaves the lifecycle responders armed for
-          // the outer runner's crash-recovery cleanup. Reset is legal only
+          // the outer runner's crash-recovery cleanup. Close is legal only
           // after every ledger-owned resource is absent.
           if (cleanupSucceeded) {
             try {
-              await provider.reset(runId);
+              finalProviderState = await provider.close(runId);
+              finalProviderOverview = await provider.overview();
               providerCleanupSucceeded = true;
             } catch (error) {
               teardownErrors.push(
-                new Error(`Provider scenario reset failed: ${errorMessage(error)}`),
+                new Error(`Provider retaining close failed: ${errorMessage(error)}`),
               );
             }
           }

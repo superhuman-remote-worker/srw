@@ -35,7 +35,7 @@ the exact ledger-owned thread is deleted under a 180-second graceful deadline.
 Retryable `409`/`503` responses keep retrying the same terminal authority; if the
 graceful phase does not settle, a separately bounded 60-second force phase may
 run. Each HTTP request receives only the time remaining in its phase. A green run
-requires a verified `404`, successful provider reset, and deletion of the exact
+requires a verified `404`, successful retaining provider close, and deletion of the exact
 owned cluster.
 
 Use a separate private state root for a dirty-tree development run and expect the
@@ -99,7 +99,7 @@ The authoritative lifecycle runner sets `APP_E2E_DEFER_FAILED_CLEANUP=1`.
 After a browser/body/network failure, the fixture closes transport and captures
 sanitized evidence but leaves exact ledger ids and the provider scenario intact
 until the runner has collected cluster diagnostics. The runner must then invoke
-its unconditional exact-ledger cleanup and reset that run's provider scenario.
+its unconditional exact-ledger cleanup and retain that run's closed provider accounting.
 Without this opt-in, the Playwright fixture cleans failed tests itself.
 The fixture refuses to overwrite an earlier incomplete resource ledger, so a
 manual owned-stack rerun after failure must run `diagnostics` and `cleanup`
