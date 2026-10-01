@@ -687,3 +687,34 @@ async def test_first_typed_ready_requires_the_captured_runtime(
     )
     assert client.get_thread_workspace.await_count == 1
     assert clock["now"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_younger_admission_hint_cannot_reset_the_expiry(vm_startup_clock):
+    """Expiry refuses a late Ready even when every later source is otherwise valid."""
+    clock, _, admitted, ready = vm_startup_clock
+    client = AsyncMock()
+    client.get_thread_workspace.side_effect = [
+        {
+            **admitted,
+            "vm_startup": {**admitted["vm_startup"], "admission_elapsed_s": 840},
+        },
+        {
+            **admitted,
+            "vm_startup": {**admitted["vm_startup"], "admission_elapsed_s": 1},
+        },
+        {**ready, "vm_startup": {**ready["vm_startup"], "admission_elapsed_s": 2}},
+    ]
+    assert (
+        await _poll_workspace_ready(
+            client,
+            "tid",
+            timeout=120,
+            poll_interval=30,
+            require_vm=True,
+            vm_timeout=900,
+        )
+        is None
+    )
+    assert clock["now"] == 60
+    assert client.get_thread_workspace.await_count == 2
