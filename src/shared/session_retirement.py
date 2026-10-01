@@ -132,6 +132,72 @@ def initial_creation_retirement_authority(value: Any) -> dict[str, Any]:
     return result
 
 
+def retained_startup_attention_retirement_authority(value: Any) -> dict[str, Any]:
+    """Parse one retained G2 attention End; this never grants Ready authority."""
+
+    fields = {
+        "version",
+        "generation",
+        "reservation_id",
+        "reservation_generation",
+        "claim_token",
+        "runtime_incarnation",
+        "pvc_uid",
+        "service_uid",
+        "seed_configmap_uid",
+        "namespace",
+        "predecessor_reservation_id",
+        "predecessor_generation",
+        "predecessor_binding_generation",
+        "predecessor_runtime_incarnation",
+        "predecessor_cleanup_id",
+        "scheduled_at",
+        "startup_attention_at",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise RuntimeError("retained startup attention authority is malformed")
+    result = dict(value)
+    if type(result["version"]) is not int or result["version"] != 1:
+        raise RuntimeError("retained startup attention version is malformed")
+    for field in ("reservation_generation", "claim_token"):
+        if _exact_nonnegative_int(result[field], label=field) <= 0:
+            raise RuntimeError("retained startup attention claim is malformed")
+    for field in (
+        "generation",
+        "reservation_id",
+        "runtime_incarnation",
+        "pvc_uid",
+        "service_uid",
+        "seed_configmap_uid",
+        "predecessor_reservation_id",
+        "predecessor_generation",
+        "predecessor_binding_generation",
+        "predecessor_runtime_incarnation",
+        "predecessor_cleanup_id",
+    ):
+        raw = result[field]
+        if raw is None and field == "seed_configmap_uid":
+            continue
+        try:
+            if not isinstance(raw, str) or str(UUID(raw)) != raw:
+                raise ValueError()
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise RuntimeError(
+                "retained startup attention identity is malformed"
+            ) from exc
+    if not isinstance(result["namespace"], str) or not result["namespace"].strip():
+        raise RuntimeError("retained startup attention namespace is malformed")
+    for field in ("scheduled_at", "startup_attention_at"):
+        raw = result[field]
+        try:
+            at = datetime.fromisoformat(raw)
+            if at.tzinfo is None or at.utcoffset() is None:
+                raise ValueError()
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise RuntimeError("retained startup attention clock is malformed") from exc
+    return result
+
+
 def _retirement_ack_matches(
     root: dict[str, Any],
     marker: dict[str, Any],
@@ -252,6 +318,22 @@ def stateless_retirement_authority(
         ):
             raise RuntimeError(
                 "initial creation retirement disagrees with terminal authority"
+            )
+    if "retained_startup_attention" in marker:
+        retained = retained_startup_attention_retirement_authority(
+            marker["retained_startup_attention"]
+        )
+        if (
+            "initial_creation" in marker
+            or retained["runtime_incarnation"] != marker["runtime_incarnation"]
+            or marker["terminal_token"] <= 0
+            or not marker["claimant_quiesced"]
+            or not marker["shell_retirement_required"]
+            or not marker["resident_cleanup_required"]
+            or marker["endpoint_generation"] is not None
+        ):
+            raise RuntimeError(
+                "retained startup attention disagrees with terminal authority"
             )
 
     # Compatibility for acknowledgements written by the first S2 build: its
@@ -409,6 +491,18 @@ def stateless_settled_retirement_authority(
             or backing_id != expected_backing
         ):
             raise RuntimeError("settled initial creation authority disagrees")
+    if "retained_startup_attention" in settled:
+        retained = retained_startup_attention_retirement_authority(
+            settled["retained_startup_attention"]
+        )
+        if (
+            "initial_creation" in settled
+            or retained["runtime_incarnation"] != settled["runtime_incarnation"]
+            or settled["terminal_token"] <= 0
+            or settled["snapshot_restore_required"] is not False
+            or backing_id != f"k8s-pvc:{retained['namespace']}:{retained['pvc_uid']}"
+        ):
+            raise RuntimeError("settled retained startup attention disagrees")
     return settled
 
 

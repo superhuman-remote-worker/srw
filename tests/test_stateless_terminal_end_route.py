@@ -581,6 +581,7 @@ async def test_end_holds_before_begin_when_published_runtime_cannot_reach_ready(
     in_progress = _in_progress_creation_thread()
     db = SimpleNamespace(
         get_thread=AsyncMock(side_effect=[in_progress, in_progress]),
+        get_current_retained_startup_attention_source=AsyncMock(return_value=None),
         begin_stateless_thread_workspace_retirement=AsyncMock(),
     )
     ensure = AsyncMock()
@@ -619,6 +620,7 @@ async def test_end_continues_exact_runtime_to_ready_before_begin() -> None:
     ready = _in_progress_creation_thread(ready=True)
     db = SimpleNamespace(
         get_thread=AsyncMock(side_effect=[in_progress, ready]),
+        get_current_retained_startup_attention_source=AsyncMock(return_value=None),
         begin_stateless_thread_workspace_retirement=AsyncMock(
             return_value={"state": "busy", "reason": "turn_in_flight"}
         ),

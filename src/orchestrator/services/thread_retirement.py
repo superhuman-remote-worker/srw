@@ -378,6 +378,7 @@ async def reconcile_stateless_thread_retirement(
     # crash plus force deletion while the partitioned process still runs.
     workspace_absence_proven = False
     initial_creation = None
+    retained_startup_attention = None
     preflight_thread = await postgres_db.get_thread(thread_id)
     if preflight_thread is None:
         return {"state": "missing"}
@@ -432,17 +433,44 @@ async def reconcile_stateless_thread_retirement(
             and "initial_creation" in pending_authority
         ):
             initial_creation = pending_authority["initial_creation"]
+        elif (
+            isinstance(pending_authority, dict)
+            and "retained_startup_attention" in pending_authority
+        ):
+            retained_startup_attention = pending_authority["retained_startup_attention"]
         elif creation_pending and not restore_pending:
+            retained_source = (
+                await postgres_db.get_current_retained_startup_attention_source(
+                    thread_id
+                )
+            )
+            capture_retained = getattr(
+                type(container_provisioner),
+                "capture_retained_stateless_startup_attention_retirement",
+                None,
+            )
+            if retained_source is not None and not callable(capture_retained):
+                raise HTTPException(503, "Retained startup capture is unavailable")
+            if retained_source is not None and callable(capture_retained):
+                retained_startup_attention = await capture_retained(
+                    container_provisioner, WorkspaceOwner.session(thread_id)
+                )
+                if retained_startup_attention != retained_source:
+                    raise HTTPException(
+                        503, "Retained startup physical identity changed"
+                    )
             capture_initial = getattr(
                 type(container_provisioner),
                 "capture_initial_stateless_creation_retirement",
                 None,
             )
-            if callable(capture_initial):
+            if retained_source is None and callable(capture_initial):
                 initial_creation = await capture_initial(
                     container_provisioner, WorkspaceOwner.session(thread_id)
                 )
-        if (creation_pending or restore_pending) and initial_creation is None:
+        if (creation_pending or restore_pending) and (
+            initial_creation is None and retained_startup_attention is None
+        ):
             # Cancellation after the one-shot Pod call may leave a published
             # UID but no Ready binding/fingerprint. Terminal retirement cannot
             # infer those fields or mutate the thread to ended first: doing so
@@ -510,6 +538,11 @@ async def reconcile_stateless_thread_retirement(
                 **(
                     {"initial_creation": initial_creation}
                     if initial_creation is not None
+                    else {}
+                ),
+                **(
+                    {"retained_startup_attention": retained_startup_attention}
+                    if retained_startup_attention is not None
                     else {}
                 ),
             )
@@ -610,6 +643,77 @@ async def reconcile_stateless_thread_retirement(
         )
 
     terminal_token = int(closure.get("terminal_token") or 0)
+    if retained_startup_attention is not None:
+        retained = (
+            await postgres_db.get_stateless_retained_startup_attention_retirement(
+                thread_id
+            )
+        )
+        if retained != retained_startup_attention or not closure.get(
+            "claimant_quiesced"
+        ):
+            raise HTTPException(503, "Retained startup retirement authority changed")
+        if not await postgres_db.get_stateless_retained_startup_attention_retirement(
+            thread_id, require_settled=True
+        ):
+            cancelled = (
+                await container_provisioner.request_workspace_creation_cancellation(
+                    WorkspaceOwner.session(thread_id),
+                    target_disposition="deleted",
+                    reclaim_shared_resources=False,
+                )
+            )
+            if not isinstance(cancelled, dict) or cancelled.get(
+                "reconciliation_outcome"
+            ) not in {"handed_off", "aborted"}:
+                raise HTTPException(
+                    503, "Retained startup cancellation remains incomplete"
+                )
+        cleanup = await container_provisioner.reconcile_workspace_cleanup_intent(
+            WorkspaceOwner.session(thread_id),
+            expected_runtime_incarnation=retained["runtime_incarnation"],
+        )
+        if not isinstance(cleanup, WorkspaceCleanupOutcome) or not cleanup.settled:
+            raise HTTPException(503, "Retained startup cleanup remains incomplete")
+        owner = WorkspaceOwner.session(thread_id)
+        async with container_provisioner._workspace_mutation_guard(
+            owner, scope="workspace_container"
+        ) as owned:
+            if (
+                not owned
+                or not await container_provisioner.retained_startup_attention_stop_is_exact(
+                    owner, retained, _mutation_guard_held=True
+                )
+            ):
+                raise HTTPException(503, "Retained startup storage or stop changed")
+            if not await postgres_db.acknowledge_stateless_thread_runtime_process_zero(
+                thread_id,
+                terminal_token=terminal_token,
+                runtime_incarnation=retained["runtime_incarnation"],
+            ):
+                raise HTTPException(
+                    503, "Retained startup stop proof remains incomplete"
+                )
+            if not await container_provisioner.retained_startup_attention_stop_is_exact(
+                owner, retained, _mutation_guard_held=True
+            ):
+                raise HTTPException(
+                    503, "Retained startup storage changed before settlement"
+                )
+            if (
+                not permanent
+                and not await postgres_db.finish_stateless_thread_workspace_retirement(
+                    thread_id
+                )
+            ):
+                raise HTTPException(
+                    503, "Retained startup settlement remains incomplete"
+                )
+        return {
+            "state": "settled",
+            "thread": await postgres_db.get_thread(thread_id),
+            "closure": closure,
+        }
     if initial_creation is not None:
         # No Ready binding ever existed. The captured initial creation may skip
         # SSH and snapshots, but shell/resident ACKs still require actual stop.
@@ -2351,6 +2455,7 @@ async def _end_thread_flow_owned(
                     if (
                         expected_stateless_retirement_runtime is not None
                         and "_stateless_workspace_retirement_pending" in fresh_metadata
+                        and "retained_startup_attention" not in expected_marker
                     ):
                         expected_marker = stateless_retirement_release_authorized(
                             fresh_metadata
