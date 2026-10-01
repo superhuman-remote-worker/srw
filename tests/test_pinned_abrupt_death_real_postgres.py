@@ -287,6 +287,9 @@ async def test_early_detector_refuses_ambiguous_actor_without_effects(
         pod.status.conditions = [NS(type="DisruptionTarget", reason="DeletionByPodGC")]
     initial_pods = dict(api.pods)
     mutations = list(api.mutation_timeouts)
+    assert not await controls.pinned_retirement_operations(
+        main.app.state.resources
+    ).captured_agent_is_terminal(retirement)
     monkeypatch.setattr(detector, "PINNED_RETIREMENT_TERMINAL_PROBE_GRACE_SECONDS", 0)
     await db.execute(
         "UPDATE agents SET last_heartbeat=now()-interval '5 minutes' WHERE id=$1::uuid",
