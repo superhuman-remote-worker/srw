@@ -189,15 +189,25 @@ async def test_disconnected_end_finishes_through_background_full_end(
     monkeypatch.setattr(
         case.provisioner, "_bounded_kubernetes_mutation", observe_finalizer_release
     )
+    replay_operations = ThreadRetirementOperations(
+        retirement_dependencies(database, case)
+    )
+    replay_force: list[bool] = []
+
+    async def replay_full_funnel(*args, **kwargs):
+        replay_force.append(kwargs["force"])
+        return await replay_operations.end_thread_flow(*args, **kwargs)
+
     dependencies = SimpleNamespace(
         store=database,
-        thread_retirement_operations=lambda: ThreadRetirementOperations(
-            retirement_dependencies(database, case)
+        thread_retirement_operations=lambda: SimpleNamespace(
+            end_thread_flow=replay_full_funnel
         ),
     )
     assert await retry_initial_creation_retirement(
         candidates[0], dependencies=dependencies
     )
+    assert replay_force == [True]
     assert finalizer_releases == ([] if upgrade else [case.pod_uid])
     assert await database.list_retryable_initial_creation_retirements(limit=25) == []
     assert "pod" not in case.cluster.objects
@@ -657,6 +667,297 @@ async def test_retained_attention_end_replays_full_funnel_after_response_loss(
         assert case.cluster.objects["pvc"].metadata.uid == str(attention["pvc_uid"])
     finally:
         await restarted.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", ["stand_down_error", "stand_down_cancelled"])
+async def test_retained_attention_end_replays_business_effects_before_finish(
+    database, actor, monkeypatch, interruption
+):
+    import asyncio
+    from dataclasses import replace
+
+    from orchestrator.services.stale_agent_detector import (
+        retry_initial_creation_retirement,
+    )
+    from orchestrator.services.thread_retirement import ThreadRetirementOperations
+    from tests.test_session_created_source_rediscovery_real_postgres import (
+        reconstructed_provider,
+    )
+
+    case, predecessor, attention, dependencies = await retained_attention_case(
+        database, actor, monkeypatch
+    )
+    before_messages = await database.fetch(
+        "SELECT * FROM thread_messages WHERE thread_id=$1::uuid ORDER BY id",
+        case.thread_id,
+    )
+    before_queue = await database.fetchrow(
+        "SELECT * FROM run_queue WHERE unit_id=$1::uuid", case.thread_id
+    )
+    original_pvc_uid = case.cluster.objects["pvc"].metadata.uid
+    failure = (
+        RuntimeError("conference stand-down unavailable")
+        if interruption == "stand_down_error"
+        else asyncio.CancelledError()
+    )
+    first_conclude = AsyncMock(side_effect=failure)
+    dependencies = replace(dependencies, conclude_conference_if_any=first_conclude)
+    with pytest.raises(type(failure)):
+        await end_thread_flow(
+            case.thread_id,
+            await database.get_thread(case.thread_id),
+            permanent=False,
+            force=False,
+            dependencies=dependencies,
+        )
+    first_conclude.assert_awaited_once()
+    pending = await database.get_thread(case.thread_id)
+    assert pending["status"] == "ended"
+    cleanup = await database.fetchrow(
+        "SELECT * FROM managed_repository_workspace_cleanup_intents "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+        "AND thread_runtime_generation=$2::uuid",
+        case.thread_id,
+        str(attention["thread_runtime_generation"]),
+    )
+    assert cleanup["result_kind"] == "settled"
+    assert "pod" not in case.cluster.objects
+    assert case.cluster.objects["pvc"].metadata.uid == original_pvc_uid
+    marker = metadata(pending)["_stateless_claim_retirement"]
+    assert metadata(pending)["_stateless_workspace_retirement_pending"] is True
+    assert "_stateless_workspace_retirement_settled" not in metadata(pending)
+    assert marker["remote_retired"] is True
+    assert marker["residents_retired"] is True
+    token = marker["terminal_token"]
+    candidates = await database.list_retryable_initial_creation_retirements(limit=25)
+    assert [str(candidate["id"]) for candidate in candidates] == [case.thread_id]
+
+    restarted = type(database)(
+        database._connection_string, min_connections=1, max_connections=3
+    )
+    await restarted.connect()
+    try:
+        case.provisioner = reconstructed_provider(restarted, case, monkeypatch)
+        replay_conclude = AsyncMock(return_value=None)
+        replay_operations = ThreadRetirementOperations(
+            replace(
+                retirement_dependencies(restarted, case),
+                conclude_conference_if_any=replay_conclude,
+            )
+        )
+        replay_force: list[bool] = []
+
+        async def replay_full_funnel(*args, **kwargs):
+            replay_force.append(kwargs["force"])
+            return await replay_operations.end_thread_flow(*args, **kwargs)
+
+        replay_dependencies = SimpleNamespace(
+            store=restarted,
+            thread_retirement_operations=lambda: SimpleNamespace(
+                end_thread_flow=replay_full_funnel
+            ),
+        )
+        assert await retry_initial_creation_retirement(
+            candidates[0], dependencies=replay_dependencies
+        )
+        assert replay_force == [False]
+        replay_conclude.assert_awaited_once()
+        ended = await restarted.get_thread(case.thread_id)
+        settled = metadata(ended)["_stateless_workspace_retirement_settled"]
+        assert settled["terminal_token"] == token
+        assert (
+            settled["retained_startup_attention"]
+            == marker["retained_startup_attention"]
+        )
+        assert (
+            await restarted.list_retryable_initial_creation_retirements(limit=25) == []
+        )
+        assert (
+            await restarted.fetchrow(
+                "SELECT * FROM managed_repository_workspace_creation_reservations "
+                "WHERE id=$1::uuid",
+                str(predecessor["id"]),
+            )
+            == predecessor
+        )
+        receipt = await restarted.fetchrow(
+            "SELECT * FROM managed_repository_workspace_creation_reservations "
+            "WHERE id=$1::uuid",
+            str(attention["id"]),
+        )
+        assert receipt["result_kind"] == "aborted"
+        assert receipt["scheduled_at"] == attention["scheduled_at"]
+        assert receipt["startup_attention_at"] == attention["startup_attention_at"]
+        after_queue = await restarted.fetchrow(
+            "SELECT * FROM run_queue WHERE unit_id=$1::uuid", case.thread_id
+        )
+        assert after_queue["lease_token"] == token
+        assert after_queue["input_seq"] == before_queue["input_seq"]
+        assert after_queue["consumed_seq"] == before_queue["consumed_seq"]
+        assert (
+            await restarted.fetch(
+                "SELECT * FROM thread_messages WHERE thread_id=$1::uuid ORDER BY id",
+                case.thread_id,
+            )
+            == before_messages
+        )
+        assert case.cluster.pod_create_calls == 2
+        assert "pod" not in case.cluster.objects
+        assert case.cluster.objects["pvc"].metadata.uid == original_pvc_uid
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_retained_attention_initial_permanent_end_refuses_before_effects(
+    database, actor, monkeypatch
+):
+    from fastapi import HTTPException
+
+    case, predecessor, attention, dependencies = await retained_attention_case(
+        database, actor, monkeypatch
+    )
+    before_thread = await database.get_thread(case.thread_id)
+    before_queue = await database.fetchrow(
+        "SELECT * FROM run_queue WHERE unit_id=$1::uuid", case.thread_id
+    )
+    physical = {name: obj.metadata.uid for name, obj in case.cluster.objects.items()}
+    with pytest.raises(HTTPException) as refused:
+        await end_thread_flow(
+            case.thread_id,
+            before_thread,
+            permanent=True,
+            force=False,
+            dependencies=dependencies,
+        )
+    assert refused.value.status_code in {409, 503}
+    assert await database.get_thread(case.thread_id) == before_thread
+    assert (
+        await database.fetchrow(
+            "SELECT * FROM run_queue WHERE unit_id=$1::uuid", case.thread_id
+        )
+        == before_queue
+    )
+    assert (
+        await database.fetchrow(
+            "SELECT * FROM managed_repository_workspace_creation_reservations "
+            "WHERE id=$1::uuid",
+            str(predecessor["id"]),
+        )
+        == predecessor
+    )
+    assert (
+        await database.fetchrow(
+            "SELECT * FROM managed_repository_workspace_creation_reservations "
+            "WHERE id=$1::uuid",
+            str(attention["id"]),
+        )
+        == attention
+    )
+    assert not await database.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+        "AND thread_runtime_generation=$2::uuid)",
+        case.thread_id,
+        str(attention["thread_runtime_generation"]),
+    )
+    assert case.cluster.pod_create_calls == 2
+    assert {
+        name: obj.metadata.uid for name, obj in case.cluster.objects.items()
+    } == physical
+
+
+@pytest.mark.asyncio
+async def test_retained_attention_initial_permanent_begin_refuses_before_effects(
+    database, actor, monkeypatch
+):
+    from orchestrator.services.container_provisioner import WorkspaceOwner
+
+    case, predecessor, attention, _ = await retained_attention_case(
+        database, actor, monkeypatch
+    )
+    captured = (
+        await case.provisioner.capture_retained_stateless_startup_attention_retirement(
+            WorkspaceOwner.session(case.thread_id)
+        )
+    )
+    assert captured
+    before_thread = await database.get_thread(case.thread_id)
+    before_queue = await database.fetchrow(
+        "SELECT * FROM run_queue WHERE unit_id=$1::uuid", case.thread_id
+    )
+    physical = {name: obj.metadata.uid for name, obj in case.cluster.objects.items()}
+    with pytest.raises(RuntimeError):
+        await database.begin_stateless_thread_workspace_retirement(
+            case.thread_id,
+            force=False,
+            permanent=True,
+            retained_startup_attention=captured,
+        )
+    assert await database.get_thread(case.thread_id) == before_thread
+    assert (
+        await database.fetchrow(
+            "SELECT * FROM run_queue WHERE unit_id=$1::uuid", case.thread_id
+        )
+        == before_queue
+    )
+    assert (
+        await database.fetchrow(
+            "SELECT * FROM managed_repository_workspace_creation_reservations "
+            "WHERE id=$1::uuid",
+            str(predecessor["id"]),
+        )
+        == predecessor
+    )
+    assert (
+        await database.fetchrow(
+            "SELECT * FROM managed_repository_workspace_creation_reservations "
+            "WHERE id=$1::uuid",
+            str(attention["id"]),
+        )
+        == attention
+    )
+    assert not await database.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+        "AND thread_runtime_generation=$2::uuid)",
+        case.thread_id,
+        str(attention["thread_runtime_generation"]),
+    )
+    assert case.cluster.pod_create_calls == 2
+    assert {
+        name: obj.metadata.uid for name, obj in case.cluster.objects.items()
+    } == physical
+
+
+@pytest.mark.asyncio
+async def test_retained_attention_settled_soft_end_allows_existing_permanent_upgrade(
+    database, actor, monkeypatch
+):
+    case, _, attention, dependencies = await retained_attention_case(
+        database, actor, monkeypatch
+    )
+    assert await end_thread_flow(
+        case.thread_id,
+        await database.get_thread(case.thread_id),
+        permanent=False,
+        force=False,
+        dependencies=dependencies,
+    ) == {"status": "ended"}
+    settled = await database.get_thread(case.thread_id)
+    assert metadata(settled)["_stateless_workspace_retirement_settled"][
+        "retained_startup_attention"
+    ]["reservation_id"] == str(attention["id"])
+    assert await end_thread_flow(
+        case.thread_id,
+        settled,
+        permanent=True,
+        force=False,
+        dependencies=dependencies,
+    ) == {"status": "deleted"}
+    assert await database.get_thread(case.thread_id) is None
+    assert case.cluster.objects == {}
 
 
 @pytest.mark.asyncio

@@ -343,7 +343,7 @@ async def retry_initial_creation_retirement(
             thread_id,
             dict(thread),
             permanent=marker["permanent"],
-            force=True,
+            force=retained is None,
             expected_runtime_generation=generation,
             expected_stateless_retirement_token=marker["terminal_token"],
             **(

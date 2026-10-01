@@ -325,9 +325,10 @@ async def reconcile_stateless_thread_retirement(
     """Converge one already-serialized stateless terminal lifecycle.
 
     Queue closure is the first durable effect. Claimant quiescence, exact
-    remote shell retirement, snapshot/delete, and marker clearance then occur
-    in that order. Every ambiguous boundary leaves the ended thread + closed
-    queue marker intact so End or soft Resume can retry the same token.
+    remote shell retirement and snapshot/delete then occur in that order.
+    The retained-attention variant leaves marker clearance to the full End
+    funnel after its business stand-down. Every ambiguous boundary keeps the
+    ended thread + closed queue marker for the same-token retry.
     """
 
     postgres_db = dependencies.store
@@ -528,6 +529,12 @@ async def reconcile_stateless_thread_retirement(
                     ),
                 )
 
+    if retained_startup_attention is not None and permanent:
+        raise HTTPException(
+            status_code=409,
+            detail="Retained startup attention supports normal soft End only",
+        )
+
     async def _begin_retirement(*, requested_force: bool) -> dict[str, Any]:
         try:
             return await postgres_db.begin_stateless_thread_workspace_retirement(
@@ -700,19 +707,11 @@ async def reconcile_stateless_thread_retirement(
                 raise HTTPException(
                     503, "Retained startup storage changed before settlement"
                 )
-            if (
-                not permanent
-                and not await postgres_db.finish_stateless_thread_workspace_retirement(
-                    thread_id
-                )
-            ):
-                raise HTTPException(
-                    503, "Retained startup settlement remains incomplete"
-                )
         return {
-            "state": "settled",
+            "state": "retained_business_pending",
             "thread": await postgres_db.get_thread(thread_id),
             "closure": closure,
+            "retained_startup_attention": retained,
         }
     if initial_creation is not None:
         # No Ready binding ever existed. The captured initial creation may skip
@@ -2523,7 +2522,37 @@ async def _end_thread_flow_owned(
 
             # These side effects are serialized after the fresh-state check;
             # a stale End can no longer mutate a thread that End->Resume reopened.
-            await _stand_down(fresh_thread)
+            stand_down = await _stand_down(fresh_thread)
+            retained = result.get("retained_startup_attention")
+            if retained is not None:
+                if isinstance(stand_down, dict) and stand_down.get(
+                    "blocked_by_in_flight"
+                ):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Retained startup business stand-down remains incomplete",
+                    )
+                owner = WorkspaceOwner.session(thread_id)
+                async with container_provisioner._workspace_mutation_guard(
+                    owner, scope="workspace_container"
+                ) as owned:
+                    if (
+                        not owned
+                        or not await container_provisioner.retained_startup_attention_stop_is_exact(
+                            owner, retained, _mutation_guard_held=True
+                        )
+                        or not await postgres_db.finish_stateless_thread_workspace_retirement(
+                            thread_id,
+                            expected_retained_startup_attention=retained,
+                            expected_terminal_token=int(
+                                result["closure"]["terminal_token"]
+                            ),
+                        )
+                    ):
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Retained startup settlement remains incomplete",
+                        )
             if permanent:
                 closure = result.get("closure") or {}
                 terminal_thread = result.get("thread") or fresh_thread

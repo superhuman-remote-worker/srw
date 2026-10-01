@@ -44088,6 +44088,8 @@ class PostgresDB:
         terminal token.  This is what lets an ambiguous remote acknowledgement
         or Kubernetes cleanup be retried without minting a new owner each time.
         """
+        if retained_startup_attention is not None and permanent:
+            raise RuntimeError("retained startup attention supports soft End only")
         from orchestrator.services.container_provisioner import (
             WORKSPACE_RUNTIME_INCARNATION_KEY,
         )
@@ -45303,7 +45305,11 @@ class PostgresDB:
         return row is not None
 
     async def finish_stateless_thread_workspace_retirement(
-        self, thread_id: str
+        self,
+        thread_id: str,
+        *,
+        expected_retained_startup_attention: dict[str, Any] | None = None,
+        expected_terminal_token: int | None = None,
     ) -> bool:
         """Replace a proven soft-retirement fence with a durable tombstone."""
         from shared.session_retirement import (
@@ -45330,6 +45336,15 @@ class PostgresDB:
                 if marker["permanent"] is not False:
                     return False
                 token = int(marker["terminal_token"])
+                if expected_retained_startup_attention is not None and (
+                    marker.get("retained_startup_attention")
+                    != expected_retained_startup_attention
+                    or type(expected_terminal_token) is not int
+                    or token != expected_terminal_token
+                    or str(thread["runtime_generation"])
+                    != expected_retained_startup_attention.get("generation")
+                ):
+                    return False
                 queue = await conn.fetchrow(
                     "SELECT unit_kind, state, lease_token FROM run_queue "
                     "WHERE unit_id = $1::uuid FOR UPDATE",
