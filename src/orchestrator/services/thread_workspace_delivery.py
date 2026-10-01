@@ -1203,13 +1203,21 @@ async def agent_get_thread_workspace_locked(
         if prepared_protected_mount is None:
             return _protected_workspace_wait_payload(state="engaging")
 
-    # Everything above this point crosses policy, workspace, repository and
-    # cloud awaits. This is the actual credential-delivery boundary and the
-    # final await before returning coordinates.
+    # Complete all policy, workspace, repository, cloud and startup awaits
+    # before the final lifecycle and credential-delivery checks below.
     if dependencies.capture_session_config is not None:
         session_resolved = await dependencies.capture_session_config(
             thread, session_resolved, _sess_status, project_ids=project_ids
         )
+    startup = None
+    if (
+        authority_vm.get("status") == "ready"
+        and authority_vm.get("creation_request_id")
+        and is_initial_thread_vm_poll(thread, authority_vm)
+    ):
+        startup = await initial_vm_startup_view(thread, store=postgres_db)
+        if startup is None:
+            raise HTTPException(409, "Initial VM startup source changed")
     final_thread = await postgres_db.get_thread(thread_id)
     if not _thread_accepts_runtime(final_thread):
         raise HTTPException(
@@ -1289,16 +1297,6 @@ async def agent_get_thread_workspace_locked(
             status_code=409,
             detail={"code": "pinned_runtime_generation_unavailable"},
         )
-
-    startup = None
-    if (
-        final_vm.get("status") == "ready"
-        and final_vm.get("creation_request_id")
-        and is_initial_thread_vm_poll(final_thread, final_vm)
-    ):
-        startup = await initial_vm_startup_view(final_thread, store=postgres_db)
-        if startup is None:
-            raise HTTPException(409, "Initial VM startup source changed")
 
     return {
         "status": ws.get("status", "none"),

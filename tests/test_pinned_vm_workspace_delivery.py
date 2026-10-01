@@ -289,6 +289,45 @@ async def test_current_initial_vm_ready_delivery_carries_admitted_age(vm_deliver
 
 
 @pytest.mark.asyncio
+async def test_initial_ready_rechecks_physical_identity_after_startup_read(vm_delivery):
+    request = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    vm_delivery.vm.update(
+        {
+            "creation_request_id": request,
+            "initial_runtime": {
+                "runtime_generation": RUNTIME,
+                "agent_id": AGENT,
+                "runtime_attach_token": ATTACH,
+            },
+        }
+    )
+    read_at = datetime(2026, 10, 1, tzinfo=timezone.utc)
+
+    async def rotate_during_startup_read(*_args):
+        # The immutable source is still current, but its physical runtime has
+        # changed since the prior attestation and credential preparation.
+        vm_delivery.vm["active_pod_uid"] = SUCCESSOR
+        return {
+            "state": "succeeded",
+            "reason": None,
+            "boot_counted": True,
+            "observed_vm_uid": "vm-uid",
+            "observed_pvc_uid": vm_delivery.vm["rootdisk_pvc_uid"],
+            "creation_admission_id": None,
+            "waiter_state": "admitted",
+            "first_reservation_at": read_at - timedelta(seconds=30),
+            "issued_effects": 1,
+            "read_at": read_at,
+        }
+
+    vm_delivery.store.fetchrow = AsyncMock(side_effect=rotate_during_startup_read)
+    with pytest.raises(HTTPException) as refused:
+        await _deliver(vm_delivery)
+    assert refused.value.status_code == 409
+    assert refused.value.detail == {"code": "workspace_runtime_identity_changed"}
+
+
+@pytest.mark.asyncio
 async def test_an_unwired_delivery_advertises_fanout_off(vm_delivery):
     """A composition that does not wire the switch fails closed."""
     payload = await _deliver(vm_delivery)
