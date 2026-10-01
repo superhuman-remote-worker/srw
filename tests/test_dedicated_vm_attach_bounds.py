@@ -658,3 +658,32 @@ async def test_admitted_budget_never_increases_or_returns_to_wait(vm_startup_clo
     )
     assert clock["now"] == 120
     assert client.get_thread_workspace.await_count == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("captured", [None, "different"])
+async def test_first_typed_ready_requires_the_captured_runtime(
+    vm_startup_clock, monkeypatch, captured
+):
+    """A self-consistent response cannot attest another captured life."""
+    clock, _, _, ready = vm_startup_clock
+    _patch(
+        monkeypatch,
+        "_session_runtime_generation",
+        None if captured is None else str(uuid4()),
+    )
+    client = AsyncMock()
+    client.get_thread_workspace.return_value = ready
+    assert (
+        await _poll_workspace_ready(
+            client,
+            "tid",
+            timeout=120,
+            poll_interval=30,
+            require_vm=True,
+            vm_timeout=900,
+        )
+        is None
+    )
+    assert client.get_thread_workspace.await_count == 1
+    assert clock["now"] == 0
