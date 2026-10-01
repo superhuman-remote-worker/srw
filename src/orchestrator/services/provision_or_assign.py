@@ -32,6 +32,7 @@ from orchestrator.services.session_config_resolution import (
 )
 from orchestrator.services.session_runtime_identity import thread_accepts_runtime
 from orchestrator.services.session_workspace_policy import session_ready_timeout_s
+from orchestrator.services.vm_thread_initial import initial_thread_vm_blocks_runtime
 from shared.pinned_session_identity import PinnedSessionBinding
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,8 @@ async def provision_or_assign(
     async def _same_runtime(current: dict | None = None) -> bool:
         if current is None:
             current = await postgres_db.get_thread(tid)
+        if initial_thread_vm_blocks_runtime(current):
+            return False
         if expected_runtime is None:
             # Direct mixed-version/test callers retain the historical status
             # gate. The production scheduler always passes a generation.

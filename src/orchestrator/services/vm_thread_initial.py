@@ -1,5 +1,6 @@
 """Admit a fresh pinned VM only after its exact agent has bound."""
 
+from collections.abc import Mapping
 from uuid import UUID
 
 from fastapi import HTTPException
@@ -11,6 +12,34 @@ from orchestrator.services.vm_workspace_policy import (
     VmPermissionDependencies,
     check_vm_permission,
 )
+
+
+def initial_thread_vm_blocks_runtime(thread) -> bool:
+    """Hold a successor while a non-ready initial VM belongs to an older G.
+
+    This only reads the current projection. It cannot recapture the old source
+    or turn its marker into authority for the successor.
+    """
+    if thread is None:
+        return False
+    vm = thread_metadata_object(thread).get("vm")
+    if not isinstance(vm, Mapping):
+        return False
+    if vm.get("rootdisk") == "kept" or vm.get("idle_wake_operation_id") is not None:
+        return False
+    if "initial_runtime" not in vm:
+        return False
+    marker = vm["initial_runtime"]
+    if not isinstance(marker, Mapping):
+        return True
+    try:
+        marker_generation = UUID(str(marker["runtime_generation"]))
+        UUID(str(marker["agent_id"]))
+        UUID(str(marker["runtime_attach_token"]))
+        current_generation = UUID(str(thread["runtime_generation"]))
+    except (KeyError, TypeError, ValueError):
+        return True
+    return vm.get("status") != "ready" and marker_generation != current_generation
 
 
 def is_initial_thread_vm_poll(thread, vm):

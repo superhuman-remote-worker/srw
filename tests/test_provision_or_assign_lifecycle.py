@@ -181,6 +181,48 @@ def _install_fake_lifecycle_module(monkeypatch, emit_calls: list[dict]):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "delayed", [False, True], ids=["already-held", "changed-during-await"]
+)
+async def test_old_initial_vm_marker_holds_common_binding(monkeypatch, delayed):
+    old_vm = {
+        "status": "waiting_capacity",
+        "initial_runtime": {
+            "runtime_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        },
+        "creation_request_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    }
+    held = _thread_row(metadata={"vm": old_vm})
+    ports = _ports(monkeypatch)
+    ports.store.get_thread = AsyncMock(
+        side_effect=_sequence_then_repeat(_thread_row(), held) if delayed else None,
+        return_value=held,
+    )
+    ports.find_idle_persistent_agent = AsyncMock(return_value=None)
+    ports.send_session_attach = AsyncMock()
+    emit_calls: list[dict] = []
+    _install_fake_lifecycle_module(monkeypatch, emit_calls)
+
+    from orchestrator.services.provision_or_assign import provision_or_assign
+
+    await provision_or_assign(
+        "u1",
+        THREAD_ID,
+        "session_base",
+        {"workspace": {"backend": "vm"}},
+        [],
+        None,
+        runtime_generation=RUNTIME_GENERATION,
+        dependencies=ports.dependencies,
+    )
+
+    assert emit_calls == []
+    ports.find_idle_persistent_agent.assert_not_awaited()
+    ports.send_session_attach.assert_not_awaited()
+    ports.agent_provisioner.provision_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_create_path_refetch_treats_stateless_as_ready_without_lifecycle_error(
     monkeypatch,
 ):
