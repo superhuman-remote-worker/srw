@@ -549,7 +549,13 @@ async def test_reclaimed_input_loop_start_still_refuses_closed_admission(monkeyp
         return {("captured-delivery", 2)}
 
     monkeypatch.setattr(pa._session_input, "reclaim_pending", reclaim_then_fence)
-    start = MagicMock(wraps=pa._ensure_persistent_loop_started)
+    original_start = pa._ensure_persistent_loop_started
+
+    def refuse_start(source):
+        assert not pa._session_ready(), "closed admission became ready during recovery"
+        return original_start(source)
+
+    start = MagicMock(side_effect=refuse_start)
     patch_collaborator(monkeypatch, "_ensure_persistent_loop_started", start)
     await attach(thread_id=TA)
     start.assert_called_once_with("attach_recovered_input")
