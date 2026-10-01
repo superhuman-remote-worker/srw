@@ -29,7 +29,7 @@ import pytest
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 
 from agent.api.persistent_app import _save_turn_ai_messages
-from agent.core.context import ContextConfig, ContextManager, ConversationSummary
+from agent.core.context import ContextConfig, ContextManager
 from agent.core.thread_messages import _serialize_message_row
 from agent.persistent_graph import PersistentLoopCallbacks, run_persistent_loop
 from shared.row_identity import _coerce_row_id
@@ -123,22 +123,13 @@ class _Transcript:
 def _aux() -> Any:
     from shared.runtime.services.auxiliary import AuxiliaryLLM
 
-    structured = AsyncMock()
-    structured.ainvoke = AsyncMock(
-        return_value={
-            "raw": AIMessage(content="structured output"),
-            "parsed": ConversationSummary(
-                summary="Read the rows one by one.",
-                tasks_completed="- rows read",
-                key_decisions="",
-                current_state="answering",
-                blockers="",
-            ),
-            "parsing_error": None,
-        }
-    )
     llm = MagicMock()
-    llm.with_structured_output = MagicMock(return_value=structured)
+    llm.ainvoke = AsyncMock(
+        return_value=AIMessage(
+            content="## Objective\n- Read the rows one by one.\n\n"
+            "## Work State\n- rows read"
+        )
+    )
     return AuxiliaryLLM(llm=llm, max_context_tokens=50_000)
 
 
@@ -189,7 +180,6 @@ def _context_manager() -> ContextManager:
             message_count_threshold=8,
             message_count_min_tokens=0,
             keep_recent_messages=4,
-            keep_recent_tool_results=2,
             keep_window_max_tool_result_chars=200,
             model_max_context_tokens=200_000,
         ),

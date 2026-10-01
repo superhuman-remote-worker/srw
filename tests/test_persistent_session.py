@@ -53,7 +53,6 @@ def _make_config(**overrides):
     cfg.memory.pipeline.scorers = overrides.get("memory_scorers", [])
     cfg.memory.pipeline.retrievers = overrides.get("memory_retrievers", [])
     cfg.memory.observer_interval = 5
-    cfg.context_management.keep_recent_tool_results = 10
     cfg.context_management.keep_recent_messages = 50
     cfg.context_management.max_summary_length = 10000
     cfg.extra = overrides.get("extra", {})

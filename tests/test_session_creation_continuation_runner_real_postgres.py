@@ -694,8 +694,9 @@ async def test_background_clock_allows_valid_late_pull_without_charging_pre_pod_
             return original_create(self, **kwargs)
 
         monkeypatch.setattr(ObservingCluster, "create_namespaced_pod", delayed)
+    # This case proves real elapsed time after Pod birth, so retain real polling.
     case, source, _ = await leave_exact_source_after_end_disconnect(
-        db, monkeypatch, lane
+        db, monkeypatch, lane, fast_polling=False
     )
     provider = reconstructed_provider(db, case, monkeypatch)
     provider._reattach_ready_timeout = 1

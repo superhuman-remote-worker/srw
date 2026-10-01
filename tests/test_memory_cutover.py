@@ -163,9 +163,6 @@ class FakeContextMgr:
             return self._ensure_hook(messages, self)
         return messages
 
-    def clear_old_tool_results(self, messages):
-        return messages
-
 
 @pytest.fixture
 def workspace_manager(tmp_path):
@@ -522,27 +519,16 @@ def _count_text(request, text: str) -> int:
 
 
 def _mock_aux():
-    """AuxiliaryLLM whose structured summariser returns a fixed short summary."""
-    from agent.core.context import ConversationSummary
+    """AuxiliaryLLM whose summariser writes a fixed short checkpoint."""
     from shared.runtime.services.auxiliary import AuxiliaryLLM
 
-    parsed = ConversationSummary(
-        summary="Summary of the work so far.",
-        tasks_completed="- read files",
-        key_decisions="",
-        current_state="mid-phase",
-        blockers="",
-    )
-    structured = AsyncMock()
-    structured.ainvoke = AsyncMock(
-        return_value={
-            "raw": AIMessage(content="s"),
-            "parsed": parsed,
-            "parsing_error": None,
-        }
-    )
     llm = MagicMock()
-    llm.with_structured_output = MagicMock(return_value=structured)
+    llm.ainvoke = AsyncMock(
+        return_value=AIMessage(
+            content="## Objective\n- Summary of the work so far.\n\n"
+            "## Work State\n- read files"
+        )
+    )
     return AuxiliaryLLM(llm=llm, max_context_tokens=15_000)
 
 
@@ -715,13 +701,13 @@ class TestWorkerExecuteWiring:
         ]
 
     @pytest.mark.asyncio
-    async def test_phase_block_is_present_exactly_once_after_each_strategy(
+    async def test_phase_block_is_present_exactly_once_after_summarisation(
         self, execute_env
     ):
-        """Acceptance (a): over the same history, tool-result clearing,
-        trimming and summarisation each leave exactly one phase block —
-        and summarisation seats it right after the summary, before the
-        kept window."""
+        """Acceptance (a): summarisation leaves exactly one phase block and
+        seats it right after the summary, before the kept window. (Tool-result
+        clearing and trimming, the other two strategies this once covered,
+        were retired: they rewrote history and broke the prompt cache.)"""
         from agent.core.context import ContextConfig, ContextManager
 
         env = execute_env
@@ -768,7 +754,6 @@ class TestWorkerExecuteWiring:
                 compaction_threshold_tokens=500,
                 summarization_threshold_tokens=500,
                 keep_recent_messages=3,
-                keep_recent_tool_results=2,
                 model_max_context_tokens=4000,
             )
         )
@@ -776,14 +761,6 @@ class TestWorkerExecuteWiring:
 
         def protected(messages):
             return [m for m in messages if is_protected_message(m)]
-
-        cleared = mgr.clear_old_tool_results(history)
-        assert protected(cleared) == [block]
-        assert cleared[1] is block
-
-        trimmed = mgr.trim_messages(history, keep_recent=3)
-        assert protected(trimmed) == [block]
-        assert trimmed[1] is block  # after the task, before the window
 
         summarised = await mgr.summarize_and_compact(history, _mock_aux())
         kept = [m for m in summarised if not isinstance(m, RemoveMessage)]

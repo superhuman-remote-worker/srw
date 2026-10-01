@@ -713,7 +713,6 @@ class TestExecuteRendersGuidance:
         context_mgr.ensure_within_limits = AsyncMock(
             side_effect=lambda msgs, *a, **k: msgs
         )
-        context_mgr.clear_old_tool_results.side_effect = lambda msgs: msgs
 
         return create_execute_node(
             llm_with_tools=llm,

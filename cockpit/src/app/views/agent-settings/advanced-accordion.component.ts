@@ -283,18 +283,6 @@ function validVmSizeGiB(value: number | null): value is number {
                 <button type="button" class="reset-btn" (click)="compactOnArchive.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
               }
             </div>
-            <div class="field-row" [class.modified]="keepRecentToolResults() !== null">
-              <label class="field-label">{{ 'advanced.labels.keepRecentToolResults' | transloco }}</label>
-              <div class="field-control">
-                <input type="number" class="form-input compact-input" min="0"
-                  [ngModel]="keepRecentToolResults() ?? resolvedKeepRecentToolResults()"
-                  (ngModelChange)="keepRecentToolResults.set($event); emitChange()"
-                  [disabled]="disabled()">
-                @if (keepRecentToolResults() !== null) {
-                  <button type="button" class="reset-btn" (click)="keepRecentToolResults.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
-                }
-              </div>
-            </div>
             <div class="field-row" [class.modified]="keepRecentMessages() !== null">
               <label class="field-label">{{ 'advanced.labels.keepRecentMessages' | transloco }}</label>
               <div class="field-control">
@@ -798,7 +786,6 @@ export class AdvancedAccordionComponent {
 
   // --- Context ---
   readonly compactOnArchive = signal<boolean | null>(null);
-  readonly keepRecentToolResults = signal<number | null>(null);
   readonly keepRecentMessages = signal<number | null>(null);
 
   // --- Workspace ---
@@ -871,7 +858,6 @@ export class AdvancedAccordionComponent {
   readonly resolvedMemoryBudget = computed(() => (this.r('memory.budget_tokens') ?? 10000) as number);
 
   readonly resolvedCompactOnArchive = computed(() => (this.r('context_management.compact_on_archive') ?? true) as boolean);
-  readonly resolvedKeepRecentToolResults = computed(() => (this.r('context_management.keep_recent_tool_results') ?? 150) as number);
   readonly resolvedKeepRecentMessages = computed(() => (this.r('context_management.keep_recent_messages') ?? 10) as number);
 
   readonly resolvedWorkspaceBackend = computed(() => (this.r('workspace.backend') ?? 'sandbox') as string);
@@ -1011,7 +997,6 @@ export class AdvancedAccordionComponent {
     // Context
     const ctx: Record<string, unknown> = {};
     if (this.compactOnArchive() !== null) ctx['compact_on_archive'] = this.compactOnArchive();
-    if (this.keepRecentToolResults() !== null) ctx['keep_recent_tool_results'] = this.keepRecentToolResults();
     if (this.keepRecentMessages() !== null) ctx['keep_recent_messages'] = this.keepRecentMessages();
     if (Object.keys(ctx).length) o['context_management'] = ctx;
 
@@ -1100,7 +1085,6 @@ export class AdvancedAccordionComponent {
     this.memoryEnabled.set(null);
     this.memoryBudget.set(null);
     this.compactOnArchive.set(null);
-    this.keepRecentToolResults.set(null);
     this.keepRecentMessages.set(null);
     this.vmCpuCores.set(null);
     this.vmMemory.set(null);

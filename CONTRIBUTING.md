@@ -65,8 +65,10 @@ CI uses Python 3.12, Node.js 22, npm, and the versions pinned by the repository.
 Run checks proportional to the change. Common commands are:
 
 ```bash
-# Python
-pytest tests/test_<area>.py -x -q --tb=short
+# Python (with the project virtual environment active)
+python -m pytest tests/test_<area>.py -x -q --tb=short
+./scripts/pytest-fast.sh  # Full parallel suite, stops on first failure
+./scripts/pytest-fast.sh tests/ -q --tb=short --maxfail=0  # Complete results
 ruff check src/ tests/
 ruff format --check src/ tests/
 
@@ -81,8 +83,16 @@ helm lint helm/ -f helm/ci/test-values.yaml
 helm lint helm/ -f helm/ci/customer-external-values.yaml
 ```
 
-Use `./scripts/pytest-fast.sh` for the bounded full Python suite. A UI or
-cross-component change should also be exercised in the running local
+The Python runner defaults to at most eight workers and keeps each file's tests
+on one worker. CI runs two shards with this bounded runner and uploads selection,
+JUnit and timing reports; both shards gate publication. Fast disposable Postgres
+settings apply automatically
+to both parallel and serial pytest runs; no extra plugin or flag is needed.
+See the [Python testing guide](docs/development.md#python) for interpreter and
+worker overrides. Use the complete-results command for acceptance and timing,
+so a failure does not stop the remaining tests.
+
+A UI or cross-component change should also be exercised in the running local
 application.
 
 ## Pull requests

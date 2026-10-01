@@ -1344,8 +1344,8 @@ async def test_auxiliary_schemas_are_modelled_and_an_unknown_one_is_not(
 ) -> None:
     """Every structured schema a real worker asks for is answered, and only those.
 
-    A worker job that runs long enough compacts its context
-    (``ConversationSummary``) and may curate or converge its knowledge
+    A worker job that runs long enough compacts its context (a Markdown
+    checkpoint, no ``response_format``) and may curate or converge its knowledge
     (``CurationResult`` / ``KnowledgeAssemblyResult``). Leaving those
     unmodelled made each one a 422 that the agent retried and then degraded
     around — a real behaviour change, and `unexpected_schema` noise that hides
@@ -1367,26 +1367,31 @@ async def test_auxiliary_schemas_are_modelled_and_an_unknown_one_is_not(
             },
         )
 
-    summary = await inference.post(
-        "/v1/chat/completions", json=structured("ConversationSummary")
+    checkpoint = await inference.post(
+        "/v1/chat/completions",
+        json=chat_request(
+            run_id,
+            extra={
+                "messages": [
+                    {"role": "system", "content": "You are writing a checkpoint."},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Here is the conversation to summarize:\n\n"
+                            f"<conversation>\n[User]: E2E-{run_id} verify\n"
+                            "</conversation>\n\nWrite the checkpoint now."
+                        ),
+                    },
+                ]
+            },
+        ),
     )
-    assert summary.status_code == 200
-    payload = json.loads(summary.json()["choices"][0]["message"]["content"])
-    assert payload["summary"] == f"E2E-{run_id} deterministic conversation summary."
-    # Every field the compaction model declares must be present, or the agent
-    # falls back to trimming exactly as it did against a 422.
-    assert set(payload) == {
-        "summary",
-        "tasks_completed",
-        "tasks_in_progress",
-        "key_decisions",
-        "current_state",
-        "blockers",
-        "critical_facts",
-        "state_changes",
-        "pinned_instructions",
-        "identity_anchor",
-    }
+    assert checkpoint.status_code == 200
+    content = checkpoint.json()["choices"][0]["message"]["content"]
+    # Compaction is text mode: the agent needs Markdown sections back, or it
+    # rejects the pass and keeps the history uncompacted.
+    assert content.startswith("## Objective\n")
+    assert f"E2E-{run_id} deterministic conversation summary." in content
 
     curation = await inference.post(
         "/v1/chat/completions", json=structured("CurationResult")

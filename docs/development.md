@@ -267,14 +267,74 @@ agent/MCP bare-array compatibility adapter when extending this contract.
 
 ### Python
 
+Run from the repository root with the project virtual environment active and
+`requirements-dev.txt` installed:
+
 ```bash
-pytest tests/test_<area>.py -x -q --tb=short
+python -m pytest tests/test_<area>.py -x -q --tb=short
 ruff check src/ tests/
 ruff format --check src/ tests/
 
-# Full bounded runner used by CI
+# Full parallel suite; stops on first failure
 ./scripts/pytest-fast.sh
+
+# Full results for acceptance and timing, even when some tests fail
+./scripts/pytest-fast.sh tests/ -q --tb=short --maxfail=0
 ```
+
+The runner defaults to the smaller of the detected CPU count and eight workers.
+It uses `--dist loadfile`, keeping all tests from a file on the same worker so
+module-scoped fixtures retain their normal lifetime. Both `main` and `develop`
+Python CI jobs use this runner inside two independent shards; `develop` can
+select affected test files. CI completes both shards even when a test fails.
+
+The runner uses the active `python`. Select an interpreter explicitly with
+`SRW_PYTHON`, and override the worker count with `SRW_PYTEST_WORKERS` when needed:
+
+```bash
+SRW_PYTHON=.venv/bin/python ./scripts/pytest-fast.sh
+SRW_PYTEST_WORKERS=4 ./scripts/pytest-fast.sh
+```
+
+Use the path of your actual virtual environment (`venv/bin/python` if following
+the setup above). Keep worker counts bounded; avoid `-n auto`, since each worker
+imports the substantial agent and orchestrator stacks.
+
+Fast Postgres settings are automatic. Before collection in every pytest process,
+including each xdist worker, `tests/conftest.py` gives disposable
+`PostgresContainer` instances `fsync=off`, `synchronous_commit=off`, and
+`full_page_writes=off`. No extra flag or plugin is needed, and explicit container
+commands are preserved. Direct `python -m pytest` receives the same database
+defaults but runs serially unless parallelism is requested. Database integration
+tests still need a working Docker-compatible container runtime; compare skipped
+tests as well as failures when measuring performance.
+
+CI partitions pytest's actual collection by file, balancing measured durations
+from `policy/pytest_file_timings.json`. New files are included automatically;
+stale timing data affects balance, never coverage. Each shard uploads its exact
+selection, JUnit results and file durations as a `python-shard-*` artifact.
+Reproduce one shard from the repository root with the active environment:
+
+```bash
+python scripts/pytest_shard.py --index 0 --count 2 \
+  --report-dir /tmp/srw-python-shard-0 tests/
+python scripts/pytest_shard.py --index 1 --count 2 \
+  --report-dir /tmp/srw-python-shard-1 tests/
+```
+
+Run both to cover the suite. Worker overrides apply to each shard separately;
+two local shards with four workers each use eight workers in total. Add
+`--plan-only` to inspect the partition without executing tests. To refresh the
+advisory weights from a complete pair of downloaded reports:
+
+```bash
+python scripts/pytest_file_timings.py /tmp/shard-0/junit.xml /tmp/shard-1/junit.xml \
+  --output policy/pytest_file_timings.json
+```
+
+Tests modeling external polling can use `tests/_asyncio_clock.py` to accelerate
+one owner's waits. Keep real elapsed-time checks on the real clock; never patch
+the shared asyncio module or change production timeouts to speed up tests.
 
 Async tests require `@pytest.mark.asyncio`; mock awaitable collaborators with
 `AsyncMock`.
@@ -286,11 +346,28 @@ cd cockpit
 npm test
 npm run i18n:check
 npm run build
+npm run test:e2e:canvas:no-build
+npm run test:e2e:cloud-review:no-build
 ```
+
+CI runs unit tests alongside a single production build, then runs both browser
+gates concurrently against that build artifact. Every gate must pass before
+publication. Browser jobs use the pinned Playwright image with its system
+libraries; local browser checks need the matching engines and dependencies.
 
 For user-visible changes, exercise the running Cockpit as well as the unit
 test. Angular signal mocks must remain callable and expose `.set()` or
 `.update()` when production code uses those methods.
+
+### VM base reuse in CI
+
+On `main` pushes, stage1 reuses the published base only if its recorded build
+input hash matches this checkout, its platform/component match, and it is at
+most eight days old. Stage2 pulls the verified immutable digest. Missing,
+unlabelled, changed or stale bases trigger a full stage1 build. The weekly
+refresh still rebuilds it. Provisioning sources, Playwright pin, wrapper and
+the workflows that build stage1 participate in its identity; ordinary
+application changes can therefore reuse the expensive base.
 
 ### Helm
 

@@ -206,9 +206,6 @@ class FakeContextMgr:
         )
         return messages
 
-    def clear_old_tool_results(self, messages):
-        return messages
-
 
 class CapturingLLM:
     """Bound-LLM stand-in: captures each request, answers from a script."""

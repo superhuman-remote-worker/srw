@@ -224,7 +224,6 @@ limits:
   # overlays/worker.yaml — they bound the phase loop, which only a worker runs.
 
 context_management:
-  keep_recent_tool_results: 150
   keep_recent_messages: 10
   keep_window_max_tool_result_chars: 16000
   summarization_template: summarization_prompt.txt

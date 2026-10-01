@@ -118,7 +118,6 @@ from shared.runtime.core.loader import (
     db_phase_addendum,
     get_phase_system_prompt,
     load_auxiliary_prompt,
-    load_summarization_prompt,
     resolve_model_settings,
     _is_output_truncated,
     _resolve_max_output_tokens,
@@ -132,6 +131,7 @@ from agent.core.phase import (
 )
 from agent.core.phase_snapshot import PhaseSnapshotManager
 from agent.core.response_validator import validate_response
+from agent.core.summarizer import load_summarizer_prompt
 from agent.core.state import CompletionReportPayload, UniversalAgentState
 from agent.core.tool_output_redaction import redact_tool_result
 from agent.core.toolcall_recovery import (
@@ -1115,8 +1115,11 @@ def create_execute_node(
                 except Exception as e:
                     logger.warning(f"[{job_id}] Failed to store compaction memory: {e}")
 
-        # Always clear old tool results, keep last 10
-        messages = context_mgr.clear_old_tool_results(messages)
+        # Old tool results are deliberately NOT cleared per turn: rewriting one
+        # mid-history invalidates the provider prompt cache from that point on,
+        # every turn. Compaction bounds the context instead, as the Codex and
+        # Claude Code harnesses do
+        # (knowledge-base/knowledge/issues/per_turn_tool_result_clearing_breaks_prompt_cache.md).
 
         # Sanitize message history to remove orphaned ToolMessages
         # (can occur from improper context compaction or checkpoint corruption)
@@ -5835,7 +5838,6 @@ def build_phase_alternation_graph(
         message_count_threshold=config.limits.message_count_threshold,
         message_count_min_tokens=config.limits.message_count_min_tokens,
         keep_recent_messages=config.context_management.keep_recent_messages,
-        keep_recent_tool_results=config.context_management.keep_recent_tool_results,
         keep_window_max_tool_result_chars=config.context_management.keep_window_max_tool_result_chars,
         # Safety layer constant (summarization budgets are computed at call
         # time from the aux model's window — src/core/summarizer.py)
@@ -5889,11 +5891,10 @@ def build_phase_alternation_graph(
     # exhaustion triggers the Tier-2 pause+backoff freeze in the execute node).
     retry_manager = ToolRetryManager(max_retries=config.limits.llm_inproc_retries)
 
-    # Load summarization prompt (use summarization model for matrix resolution)
+    # Summarization prompt: the variant for the model that writes the summary
     summarization_config = config.llm.get_phase_config("summarization")
-    summarization_prompt = load_summarization_prompt(
-        config, model=summarization_config.model
-    )
+    summarization_prompt = load_summarizer_prompt(config) or ""
+    context_mgr.summarization_prompt = summarization_prompt or None
 
     # Load auxiliary task prompts (use auxiliary model for matrix resolution)
     aux_model = config.auxiliary.model or summarization_config.model or config.llm.model

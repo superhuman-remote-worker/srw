@@ -706,6 +706,7 @@ def drop_missing_before_tool_bindings(
 def build_context_manager(cfg: Any) -> Any:
     """``PersistentSession._build_context_config`` / ``_setup_context_manager``."""
     from agent.core.context import ContextConfig, ContextManager
+    from agent.core.summarizer import load_summarizer_prompt
 
     ctx, lim = cfg.context_management, cfg.limits
     return ContextManager(
@@ -714,7 +715,6 @@ def build_context_manager(cfg: Any) -> Any:
             summarization_threshold_tokens=lim.context_threshold_tokens,
             message_count_threshold=lim.message_count_threshold,
             message_count_min_tokens=lim.message_count_min_tokens,
-            keep_recent_tool_results=ctx.keep_recent_tool_results,
             keep_recent_messages=ctx.keep_recent_messages,
             keep_window_max_tool_result_chars=ctx.keep_window_max_tool_result_chars,
             model_max_context_tokens=lim.model_max_context_tokens,
@@ -722,6 +722,7 @@ def build_context_manager(cfg: Any) -> Any:
         ),
         model=cfg.llm.model or "gpt-4",
         summarization_call_timeout=cfg.auxiliary.summarization_call_timeout,
+        summarization_prompt=load_summarizer_prompt(cfg),
     )
 
 
