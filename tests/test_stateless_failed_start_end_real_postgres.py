@@ -951,6 +951,414 @@ async def test_retained_attention_begin_keeps_pending_control_busy(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changed_authority",
+    [
+        "active_claimant",
+        "live_lease",
+        "unresolved_loss",
+        "attempted_marker",
+        "restore_marker",
+        "retained_binding",
+        "predecessor_zero",
+    ],
+)
+async def test_retained_attention_begin_refuses_changed_current_authority_without_effect(
+    database, actor, monkeypatch, changed_authority
+):
+    from uuid import uuid4
+
+    from orchestrator.services.container_provisioner import WorkspaceOwner
+
+    case, predecessor, attention, _ = await retained_attention_case(
+        database, actor, monkeypatch
+    )
+    captured = (
+        await case.provisioner.capture_retained_stateless_startup_attention_retirement(
+            WorkspaceOwner.session(case.thread_id)
+        )
+    )
+    assert captured
+    if changed_authority == "active_claimant":
+        await database.execute(
+            "UPDATE threads SET metadata=metadata || jsonb_build_object("
+            "'_stateless_active_claim',jsonb_build_object("
+            "'lease_token',2,'pod','active-worker-pod','pod_uid',$2::text)) "
+            "WHERE id=$1::uuid",
+            case.thread_id,
+            str(attention["pod_uid"]),
+        )
+    elif changed_authority == "live_lease":
+        await database.execute(
+            "UPDATE run_queue SET state='leased',leased_by='active-worker',"
+            "leased_until=now()+interval '30 seconds' WHERE unit_id=$1::uuid",
+            case.thread_id,
+        )
+    elif changed_authority == "unresolved_loss":
+        await database.execute(
+            "UPDATE run_queue SET state='parked' WHERE unit_id=$1::uuid",
+            case.thread_id,
+        )
+        await database.execute(
+            "UPDATE threads SET metadata=metadata || jsonb_build_object("
+            "'_stateless_claim_losses',jsonb_build_object("
+            "'2',jsonb_build_object('quiesced',false,'pod','lost-worker-pod',"
+            "'pod_uid',$2::text)),"
+            "'_stateless_claim_loss_hold',jsonb_build_object("
+            "'lease_token',2,'attempts_since_completion',0,"
+            "'intended_state','parked')) WHERE id=$1::uuid",
+            case.thread_id,
+            str(attention["pod_uid"]),
+        )
+    elif changed_authority == "attempted_marker":
+        await database.execute(
+            "UPDATE threads SET metadata=jsonb_set(metadata,"
+            "'{workspace_container,_runtime_creation,attempted}',"
+            "'false'::jsonb) WHERE id=$1::uuid",
+            case.thread_id,
+        )
+    elif changed_authority == "restore_marker":
+        await database.execute(
+            "UPDATE threads SET metadata=jsonb_set(metadata,"
+            "'{workspace_container,_runtime_creation,mode}',"
+            "'\"restore\"'::jsonb) WHERE id=$1::uuid",
+            case.thread_id,
+        )
+    elif changed_authority == "retained_binding":
+        await database.execute(
+            "UPDATE threads SET metadata=jsonb_set(metadata,"
+            "'{_workspace_binding,generation}',to_jsonb($2::text)) "
+            "WHERE id=$1::uuid",
+            case.thread_id,
+            str(uuid4()),
+        )
+    else:
+        await database.execute(
+            "DELETE FROM managed_repository_process_zero_receipts "
+            "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+            "AND runtime_incarnation=$2",
+            case.thread_id,
+            str(predecessor["runtime_incarnation"]),
+        )
+
+    before_thread = await database.get_thread(case.thread_id)
+    before_queue = await database.fetchrow(
+        "SELECT * FROM run_queue WHERE unit_id=$1::uuid", case.thread_id
+    )
+    physical = {name: obj.metadata.uid for name, obj in case.cluster.objects.items()}
+    with pytest.raises(RuntimeError):
+        await database.begin_stateless_thread_workspace_retirement(
+            case.thread_id,
+            force=False,
+            permanent=False,
+            retained_startup_attention=captured,
+        )
+    assert await database.get_thread(case.thread_id) == before_thread
+    assert (
+        await database.fetchrow(
+            "SELECT * FROM run_queue WHERE unit_id=$1::uuid", case.thread_id
+        )
+        == before_queue
+    )
+    assert (
+        await database.fetchval(
+            "SELECT count(*) FROM managed_repository_workspace_cleanup_intents "
+            "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+            "AND thread_runtime_generation=$2::uuid",
+            case.thread_id,
+            str(attention["thread_runtime_generation"]),
+        )
+        == 0
+    )
+    assert case.cluster.pod_create_calls == 2
+    assert {
+        name: obj.metadata.uid for name, obj in case.cluster.objects.items()
+    } == physical
+
+
+@pytest.mark.asyncio
+async def test_retained_attention_predecessor_result_cannot_change_after_ready_end(
+    database, actor, monkeypatch
+):
+    from asyncpg import PostgresError
+
+    case, predecessor, attention, _ = await retained_attention_case(
+        database, actor, monkeypatch
+    )
+    before_thread = await database.get_thread(case.thread_id)
+    before_queue = await database.fetchrow(
+        "SELECT * FROM run_queue WHERE unit_id=$1::uuid", case.thread_id
+    )
+    with pytest.raises(PostgresError):
+        await database.execute(
+            "UPDATE managed_repository_workspace_creation_reservations "
+            "SET result_kind='aborted' WHERE id=$1::uuid",
+            str(predecessor["id"]),
+        )
+    assert (
+        await database.fetchrow(
+            "SELECT * FROM managed_repository_workspace_creation_reservations "
+            "WHERE id=$1::uuid",
+            str(predecessor["id"]),
+        )
+        == predecessor
+    )
+    assert await database.get_thread(case.thread_id) == before_thread
+    assert (
+        await database.fetchrow(
+            "SELECT * FROM run_queue WHERE unit_id=$1::uuid", case.thread_id
+        )
+        == before_queue
+    )
+    assert not await database.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+        "AND thread_runtime_generation=$2::uuid)",
+        case.thread_id,
+        str(attention["thread_runtime_generation"]),
+    )
+    assert case.cluster.pod_create_calls == 2
+    assert {"pod", "pvc", "service", "seed"} <= set(case.cluster.objects)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changed_authority", ["predecessor_cleanup", "current_generation", "current_claim"]
+)
+async def test_retained_attention_invalid_drift_is_rejected_by_native_schema(
+    database, actor, monkeypatch, changed_authority
+):
+    from uuid import uuid4
+
+    from asyncpg import PostgresError
+
+    case, predecessor, attention, _ = await retained_attention_case(
+        database, actor, monkeypatch
+    )
+    before_thread = await database.get_thread(case.thread_id)
+    before_queue = await database.fetchrow(
+        "SELECT * FROM run_queue WHERE unit_id=$1::uuid", case.thread_id
+    )
+    before_cleanup = await database.fetchrow(
+        "SELECT * FROM managed_repository_workspace_cleanup_intents "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+        "AND thread_runtime_generation=$2::uuid",
+        case.thread_id,
+        str(predecessor["thread_runtime_generation"]),
+    )
+    physical = {name: obj.metadata.uid for name, obj in case.cluster.objects.items()}
+    with pytest.raises(PostgresError):
+        if changed_authority == "predecessor_cleanup":
+            await database.execute(
+                "UPDATE managed_repository_workspace_cleanup_intents "
+                "SET resource_policy='terminal_reclaim',"
+                "reclaim_shared_resources=true "
+                "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+                "AND thread_runtime_generation=$2::uuid",
+                case.thread_id,
+                str(predecessor["thread_runtime_generation"]),
+            )
+        elif changed_authority == "current_generation":
+            await database.execute(
+                "UPDATE threads SET runtime_generation=$2::uuid WHERE id=$1::uuid",
+                case.thread_id,
+                str(uuid4()),
+            )
+        else:
+            await database.execute(
+                "UPDATE threads SET metadata=jsonb_set(metadata,"
+                "'{workspace_container,_creation_claim_token}',to_jsonb($2::text)) "
+                "WHERE id=$1::uuid",
+                case.thread_id,
+                str(attention["claim_token"] + 1),
+            )
+    assert await database.get_thread(case.thread_id) == before_thread
+    assert (
+        await database.fetchrow(
+            "SELECT * FROM run_queue WHERE unit_id=$1::uuid", case.thread_id
+        )
+        == before_queue
+    )
+    assert (
+        await database.fetchrow(
+            "SELECT * FROM managed_repository_workspace_cleanup_intents "
+            "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+            "AND thread_runtime_generation=$2::uuid",
+            case.thread_id,
+            str(predecessor["thread_runtime_generation"]),
+        )
+        == before_cleanup
+    )
+    assert not await database.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+        "AND thread_runtime_generation=$2::uuid)",
+        case.thread_id,
+        str(attention["thread_runtime_generation"]),
+    )
+    assert case.cluster.pod_create_calls == 2
+    assert {
+        name: obj.metadata.uid for name, obj in case.cluster.objects.items()
+    } == physical
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending_gate", ["permission", "interrupt"])
+async def test_retained_attention_begin_preserves_pending_permission_or_interrupt(
+    database, actor, monkeypatch, pending_gate
+):
+    from uuid import uuid4
+
+    from orchestrator.services.container_provisioner import WorkspaceOwner
+
+    case, _, attention, _ = await retained_attention_case(database, actor, monkeypatch)
+    captured = (
+        await case.provisioner.capture_retained_stateless_startup_attention_retirement(
+            WorkspaceOwner.session(case.thread_id)
+        )
+    )
+    assert captured
+    request_id = uuid4()
+    if pending_gate == "permission":
+        await database.execute(
+            "INSERT INTO thread_permission_requests "
+            "(id,thread_id,tool_call_id,tool_name) "
+            "VALUES($1,$2::uuid,$3,'bash')",
+            request_id,
+            case.thread_id,
+            f"tool-{request_id}",
+        )
+        table = "thread_permission_requests"
+    else:
+        await database.execute(
+            "INSERT INTO thread_interrupt_requests "
+            "(id,thread_id,client_request_id,target_turn_id,"
+            "accepted_lease_token,accepted_leased_by,requested_by) "
+            "VALUES($1,$2::uuid,$3,1,2,'old-worker','user')",
+            request_id,
+            case.thread_id,
+            uuid4(),
+        )
+        table = "thread_interrupt_requests"
+    before_request = await database.fetchrow(
+        f"SELECT * FROM {table} WHERE id=$1", request_id
+    )
+    before_thread = await database.get_thread(case.thread_id)
+    before_queue = await database.fetchrow(
+        "SELECT * FROM run_queue WHERE unit_id=$1::uuid", case.thread_id
+    )
+    physical = {name: obj.metadata.uid for name, obj in case.cluster.objects.items()}
+    result = await database.begin_stateless_thread_workspace_retirement(
+        case.thread_id,
+        force=False,
+        permanent=False,
+        retained_startup_attention=captured,
+    )
+    assert result["state"] == "busy"
+    assert result[f"pending_{pending_gate}"] is True
+    assert (
+        await database.fetchrow(f"SELECT * FROM {table} WHERE id=$1", request_id)
+        == before_request
+    )
+    assert await database.get_thread(case.thread_id) == before_thread
+    assert (
+        await database.fetchrow(
+            "SELECT * FROM run_queue WHERE unit_id=$1::uuid", case.thread_id
+        )
+        == before_queue
+    )
+    assert (
+        await database.fetchval(
+            "SELECT count(*) FROM managed_repository_workspace_cleanup_intents "
+            "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+            "AND thread_runtime_generation=$2::uuid",
+            case.thread_id,
+            str(attention["thread_runtime_generation"]),
+        )
+        == 0
+    )
+    assert case.cluster.pod_create_calls == 2
+    assert {
+        name: obj.metadata.uid for name, obj in case.cluster.objects.items()
+    } == physical
+
+
+@pytest.mark.asyncio
+async def test_retained_attention_end_refuses_replaced_pvc_after_stop_before_ack(
+    database, actor, monkeypatch
+):
+    from uuid import uuid4
+
+    from fastapi import HTTPException
+
+    case, _, attention, dependencies = await retained_attention_case(
+        database, actor, monkeypatch
+    )
+    reconcile = case.provisioner.reconcile_workspace_cleanup_intent
+    acknowledgement = type(database).acknowledge_stateless_thread_runtime_process_zero
+    acknowledgements = 0
+    replacement_uid = str(uuid4())
+
+    async def replace_after_stop(*args, **kwargs):
+        outcome = await reconcile(*args, **kwargs)
+        if outcome.settled:
+            case.cluster.objects["pvc"].metadata.uid = replacement_uid
+        return outcome
+
+    async def record_ack(store, *args, **kwargs):
+        nonlocal acknowledgements
+        acknowledgements += 1
+        return await acknowledgement(store, *args, **kwargs)
+
+    monkeypatch.setattr(
+        case.provisioner, "reconcile_workspace_cleanup_intent", replace_after_stop
+    )
+    monkeypatch.setattr(
+        type(database),
+        "acknowledge_stateless_thread_runtime_process_zero",
+        record_ack,
+    )
+    with pytest.raises(HTTPException) as refused:
+        await end_thread_flow(
+            case.thread_id,
+            await database.get_thread(case.thread_id),
+            permanent=False,
+            force=False,
+            dependencies=dependencies,
+        )
+    assert refused.value.status_code == 503
+    assert acknowledgements == 0
+    current = await database.get_thread(case.thread_id)
+    assert current["status"] == "ended"
+    marker = metadata(current)["_stateless_claim_retirement"]
+    assert marker["remote_retired"] is False
+    assert marker["residents_retired"] is False
+    assert "_stateless_workspace_retirement_settled" not in metadata(current)
+    queue = await database.fetchrow(
+        "SELECT * FROM run_queue WHERE unit_id=$1::uuid", case.thread_id
+    )
+    assert queue["state"] == "done"
+    assert queue["lease_token"] == marker["terminal_token"]
+    receipt = await database.fetchrow(
+        "SELECT * FROM managed_repository_workspace_creation_reservations "
+        "WHERE id=$1::uuid",
+        str(attention["id"]),
+    )
+    assert receipt["result_kind"] == "aborted"
+    cleanup = await database.fetchrow(
+        "SELECT * FROM managed_repository_workspace_cleanup_intents "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+        "AND thread_runtime_generation=$2::uuid",
+        case.thread_id,
+        str(attention["thread_runtime_generation"]),
+    )
+    assert cleanup["result_kind"] == "settled"
+    assert case.cluster.objects["pvc"].metadata.uid == replacement_uid
+    assert "pod" not in case.cluster.objects
+    assert case.cluster.pod_create_calls == 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("replace_pvc", [False, True])
 async def test_normal_resume_keeps_exact_initial_retained_volume(
     database, actor, monkeypatch, replace_pvc
