@@ -1800,6 +1800,46 @@ class PinnedRetirementOperations:
         await self._complete_vm_cleanup(permit, disposition)
         return disposition == "completed" and await clear_terminal_vm_projection(self.dependencies.store, retirement)
 
+    async def captured_agent_is_terminal(self, retirement: Mapping[str, Any]) -> bool:
+        """Probe only the fully authorized captured life; perform no effects."""
+        context = retirement.get("context")
+        if not isinstance(context, Mapping):
+            return False
+        thread_id = str(context.get("thread_id") or "")
+        generation = str(retirement.get("generation") or "")
+        token = str(retirement.get("token") or "")
+        if not thread_id or not generation or not token:
+            return False
+        current = await self.dependencies.store.get_thread(thread_id)
+        current_context = (current or {}).get("runtime_retirement_context")
+        if isinstance(current_context, str):
+            try:
+                current_context = json.loads(current_context)
+            except (TypeError, ValueError):
+                return False
+        if not (
+            current
+            and str(current.get("runtime_generation") or "") == generation
+            and str(current.get("runtime_retirement_token") or "") == token
+            and str(context.get("generation") or "") == generation
+            and current.get("runtime_retirement_authorized_at") is not None
+            and bool(current.get("runtime_retirement_permanent"))
+            == bool(retirement.get("permanent"))
+            and current_context == context
+        ):
+            return False
+        captured_pods = self._captured_retirement_agent_pods(retirement)
+        if not captured_pods:
+            return False
+        for name, uid, namespace, protocol in captured_pods:
+            if not name or not uid or not namespace or protocol != "finalizer_v1":
+                return False
+            if not await self.dependencies.agent_provisioner.agent_pod_terminal_process_zero(
+                name, expected_pod_uid=uid, namespace=namespace
+            ):
+                return False
+        return True
+
     async def _recover_captured_sandbox_process_zero(
         self,
         retirement: Mapping[str, Any],

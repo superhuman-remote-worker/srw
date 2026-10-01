@@ -46476,6 +46476,7 @@ class PostgresDB:
         grace_seconds: int = 900,
         limit: int = 25,
         proven_grace_seconds: int | None = None,
+        terminal_probe_grace_seconds: int | None = None,
         after: tuple[datetime, str] | None = None,
     ) -> list[Dict[str, Any]]:
         """Return durable retirements whose local runtime can no longer finish.
@@ -46497,6 +46498,12 @@ class PostgresDB:
         ``nominated_before_grace`` so the caller never hands them to crash
         recovery before the full grace; the End funnel revalidates both
         proofs exactly under the lifecycle lock.
+
+        ``terminal_probe_grace_seconds`` separately opts in to read-only
+        terminal-Pod probes of absent/offline actors. These early candidates
+        carry no quiescence proof: the caller must observe the exact captured
+        UID and all containers terminal before entering crash recovery, whose
+        separate workspace/VM proofs remain required.
         """
 
         bounded_grace = max(0, int(grace_seconds))
@@ -46504,6 +46511,11 @@ class PostgresDB:
             None if proven_grace_seconds is None else max(0, int(proven_grace_seconds))
         )
         bounded_limit = max(1, min(int(limit), 100))
+        bounded_terminal_probe_grace = (
+            None
+            if terminal_probe_grace_seconds is None
+            else max(0, int(terminal_probe_grace_seconds))
+        )
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
@@ -46528,6 +46540,12 @@ class PostgresDB:
                      OR ((
                        t.runtime_retirement_started_at
                            <= now() - make_interval(secs => $1::double precision)
+                       OR (
+                           $6::double precision IS NOT NULL
+                           AND t.runtime_retirement_started_at
+                               <= now()
+                                  - make_interval(secs => $6::double precision)
+                       )
                        OR (
                            $3::double precision IS NOT NULL
                            AND t.runtime_retirement_started_at
@@ -46576,6 +46594,9 @@ class PostgresDB:
                 None if bounded_proven_grace is None else float(bounded_proven_grace),
                 after[0] if after is not None else None,
                 UUID(after[1]) if after is not None else None,
+                None
+                if bounded_terminal_probe_grace is None
+                else float(bounded_terminal_probe_grace),
             )
         return [dict(row) for row in rows]
 

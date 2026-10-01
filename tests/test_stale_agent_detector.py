@@ -105,6 +105,7 @@ def _pinned_operations(*, recover=None):
             return_value={"after": None, "results": []}
         ),
         retirement_context_runtime_exposed=real.retirement_context_runtime_exposed,
+        captured_agent_is_terminal=AsyncMock(return_value=False),
         retirement_has_exact_local_quiescence=(
             real.retirement_has_exact_local_quiescence
         ),
@@ -1284,6 +1285,7 @@ async def test_sweep_reports_unresolved_pinned_retirements(caplog):
         grace_seconds=detector.PINNED_RETIREMENT_RETRY_GRACE_SECONDS,
         limit=25,
         proven_grace_seconds=detector.PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS,
+        terminal_probe_grace_seconds=detector.PINNED_RETIREMENT_TERMINAL_PROBE_GRACE_SECONDS,
         after=None,
     )
     unresolved = [r for r in caplog.records if "remain unresolved" in r.getMessage()]

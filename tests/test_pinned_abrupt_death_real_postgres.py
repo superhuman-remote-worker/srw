@@ -64,6 +64,7 @@ async def killed_life(
     claim=False,
     partial=False,
     with_virtual_binding=True,
+    authorized=True,
 ):
     pod_uid = str(uuid4())
     ids = await fixtures._seed(
@@ -126,12 +127,13 @@ async def killed_life(
                         )
                 deliveries.append(row["delivery_id"])
     retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
-    assert await db.authorize_pinned_thread_retirement(
-        ids["thread"],
-        token=retirement["token"],
-        generation=retirement["generation"],
-        settle_status="ended",
-    )
+    if authorized:
+        assert await db.authorize_pinned_thread_retirement(
+            ids["thread"],
+            token=retirement["token"],
+            generation=retirement["generation"],
+            settle_status="ended",
+        )
     api = fixtures.StatefulPinnedK8sApi()
     pod_name = f"persistent-{ids['thread'][:12]}"
     api.install_old_pod(
@@ -222,6 +224,119 @@ async def test_detector_settles_captured_sigkill_before_full_grace(
     assert [row["state"] for row in rows] == (
         ["admitted", "queued", "owned"] if partial else ["queued", "owned"]
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "live",
+        "unknown",
+        "replacement",
+        "missing-uid",
+        "absent",
+        "api-error",
+        "unobserved-container",
+        "unobserved-init",
+        "unobserved-ephemeral",
+        "running-ephemeral",
+        "restarting",
+        "pod-gc",
+    ],
+)
+async def test_early_detector_refuses_ambiguous_actor_without_effects(
+    db, monkeypatch, fault
+):
+    ids, retirement, deliveries, api, _ = await killed_life(
+        db, monkeypatch, backend="virtual", with_virtual_binding=False
+    )
+    pod = next(iter(api.pods.values()))
+    pod.spec.restart_policy = "Never"
+    if fault == "live":
+        api.mark_ready(*next(iter(api.pods)))
+    elif fault == "unknown":
+        pod.status.container_statuses = []
+        pod.status.phase = "Unknown"
+    elif fault == "replacement":
+        pod.metadata.uid = str(uuid4())
+    elif fault == "missing-uid":
+        pod.metadata.uid = None
+    elif fault == "absent":
+        api.pods.clear()
+    elif fault == "api-error":
+
+        def unavailable(**kwargs):
+            raise fixtures._K8sError(503)
+
+        monkeypatch.setattr(api, "read_namespaced_pod", unavailable)
+    elif fault.startswith("unobserved-"):
+        field = {
+            "unobserved-container": "containers",
+            "unobserved-init": "init_containers",
+            "unobserved-ephemeral": "ephemeral_containers",
+        }[fault]
+        getattr(pod.spec, field).append(NS(name="unobserved-writer"))
+    elif fault == "running-ephemeral":
+        pod.spec.ephemeral_containers = [NS(name="writer")]
+        pod.status.ephemeral_container_statuses = [
+            NS(name="writer", state=NS(running=NS(), terminated=None))
+        ]
+    elif fault == "restarting":
+        pod.spec.restart_policy = "Always"
+    elif fault == "pod-gc":
+        pod.status.conditions = [NS(type="DisruptionTarget", reason="DeletionByPodGC")]
+    initial_pods = dict(api.pods)
+    mutations = list(api.mutation_timeouts)
+    monkeypatch.setattr(detector, "PINNED_RETIREMENT_TERMINAL_PROBE_GRACE_SECONDS", 0)
+    await db.execute(
+        "UPDATE agents SET last_heartbeat=now()-interval '5 minutes' WHERE id=$1::uuid",
+        ids["agent"],
+    )
+    await _run_one_detector_pass()
+
+    candidates = await db.list_retryable_pinned_retirements(
+        terminal_probe_grace_seconds=0
+    )
+    assert len(candidates) == 1 and candidates[0]["nominated_before_grace"]
+
+    current = await db.get_thread(ids["thread"])
+    assert current["status"] == "active"
+    assert str(current["runtime_retirement_token"]) == retirement["token"]
+    assert current["runtime_retirement_local_quiescence"] is None
+    assert api.pods == initial_pods
+    assert api.mutation_timeouts == mutations
+    rows = await db.fetch(
+        "SELECT delivery_id,state FROM thread_input_deliveries "
+        "WHERE thread_id=$1::uuid ORDER BY persisted_at",
+        ids["thread"],
+    )
+    assert [row["delivery_id"] for row in rows] == deliveries
+    assert [row["state"] for row in rows] == ["queued", "owned"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault", ["generation", "token", "context", "permanent", "unauthorized"]
+)
+async def test_early_terminal_probe_refuses_stale_authority_before_kubernetes(
+    db, monkeypatch, fault
+):
+    ids, retirement, _, _, provider = await killed_life(
+        db, monkeypatch, authorized=fault != "unauthorized"
+    )
+    retirement = dict(retirement)
+    if fault in {"generation", "token"}:
+        retirement[fault] = str(uuid4())
+    elif fault == "context":
+        retirement["context"] = {**retirement["context"], "agent_id": str(uuid4())}
+    elif fault == "permanent":
+        retirement["permanent"] = True
+    probe = AsyncMock(return_value=True)
+    monkeypatch.setattr(provider, "agent_pod_terminal_process_zero", probe)
+    assert not await controls.pinned_retirement_operations(
+        main.app.state.resources
+    ).captured_agent_is_terminal(retirement)
+    probe.assert_not_awaited()
 
 
 @pytest.mark.asyncio

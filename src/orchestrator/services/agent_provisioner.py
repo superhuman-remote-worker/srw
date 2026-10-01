@@ -1083,6 +1083,38 @@ class AgentProvisioner:
             return "unknown"
         return state
 
+    async def agent_pod_terminal_process_zero(
+        self,
+        pod_name: str,
+        *,
+        expected_pod_uid: str,
+        namespace: str,
+    ) -> bool:
+        """Read-only proof for an exact actor that cannot restart in this Pod.
+
+        A 404, offline row or terminal phase alone is insufficient. Require
+        every declared regular/init/ephemeral container's termination and the
+        production Never restart policy. This says nothing about remote writers.
+        """
+        try:
+            state, pod = await self.observe_agent_pod_exact(
+                pod_name, expected_pod_uid=expected_pod_uid, namespace=namespace
+            )
+        except AgentPodObservationError:
+            return False
+        if state != "exact_terminal" or pod is None:
+            return False
+        if getattr(getattr(pod, "spec", None), "restart_policy", None) != "Never":
+            return False
+        if any(
+            getattr(condition, "type", None) == "DisruptionTarget"
+            and getattr(condition, "reason", None) == "DeletionByPodGC"
+            for condition in getattr(getattr(pod, "status", None), "conditions", None)
+            or []
+        ):
+            return False
+        return pod_containers_are_terminal(pod)
+
     async def observe_agent_pod_exact(
         self,
         pod_name: str,

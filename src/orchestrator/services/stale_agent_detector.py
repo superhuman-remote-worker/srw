@@ -38,6 +38,7 @@ __all__ = [
     "PINNED_RETIREMENT_PREFLIGHT_GRACE_SECONDS",
     "PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS",
     "PINNED_RETIREMENT_RETRY_GRACE_SECONDS",
+    "PINNED_RETIREMENT_TERMINAL_PROBE_GRACE_SECONDS",
     "StaleAgentDetectorDependencies",
     "retire_orphaned_pinned_runtime",
     "retry_pending_pinned_retirement",
@@ -62,6 +63,11 @@ PINNED_RETIREMENT_PREFLIGHT_GRACE_SECONDS = max(
 # sweep from racing the request that is still finishing it.
 PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS = max(
     0, int(os.environ.get("PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS", "60"))
+)
+# This nominates an API read, never a destructive effect. A dead protected
+# actor cannot write its own ACK; an offline hint alone proves nothing.
+PINNED_RETIREMENT_TERMINAL_PROBE_GRACE_SECONDS = max(
+    0, int(os.environ.get("PINNED_RETIREMENT_TERMINAL_PROBE_GRACE_SECONDS", "60"))
 )
 
 # This additional sweep may finish several acknowledged Ends, but never
@@ -241,16 +247,30 @@ async def retry_pending_pinned_retirement(
             # Recovery's first physical effect is Pod deletion, before its
             # later lifecycle-lock reread. Revalidate the complete durable
             # tuple immediately before entering that existing actuator.
-            actuator_requested = await dependencies.store.current_pinned_vm_actuator_request(
-                thread_id, runtime_generation=generation, retirement_token=token,
-                context=context, marker=marker,
+            actuator_requested = (
+                await dependencies.store.current_pinned_vm_actuator_request(
+                    thread_id,
+                    runtime_generation=generation,
+                    retirement_token=token,
+                    context=context,
+                    marker=marker,
+                )
             )
             if not actuator_requested:
                 return False
         if candidate.get("nominated_before_grace") and not actuator_requested:
-            # Nominated early for a proof it no longer shows exactly. Crash
-            # recovery stays behind the full live-drain grace.
-            return False
+            # The worklist's offline hint is not proof. Only a read-only
+            # observation of this immutable captured actor can shorten the
+            # live-drain grace. Recovery independently fences remote writers.
+            if not await dependencies.pinned_retirement_operations().captured_agent_is_terminal(
+                {
+                    "generation": generation,
+                    "token": token,
+                    "permanent": permanent,
+                    "context": context,
+                }
+            ):
+                return False
         recovered = await dependencies.pinned_retirement_operations().recover_captured_process_zero(
             {
                 "generation": generation,
@@ -694,6 +714,7 @@ async def stale_agent_detector(
                     grace_seconds=PINNED_RETIREMENT_RETRY_GRACE_SECONDS,
                     limit=pinned_retirement_batch_size,
                     proven_grace_seconds=PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS,
+                    terminal_probe_grace_seconds=PINNED_RETIREMENT_TERMINAL_PROBE_GRACE_SECONDS,
                     after=pinned_retirement_cursor,
                 ),
             )
