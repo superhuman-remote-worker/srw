@@ -48,6 +48,9 @@ async def _rotated_soft_end(db, monkeypatch, *, ephemeral, aborts=1):
             dependencies=SimpleNamespace(store=db),
         )
         assert released == "released"
+        # Confirmed release is followed by normal actor deregistration. The
+        # exited-Pod model must not retain a ready registration as live proof.
+        assert await db.delete_agent(ids["agent"])
         rotated = await db.get_thread(owner.id)
         assert str(rotated["runtime_generation"]) != generation
         successor, _actor = await workspace.authority._bind_replacement_agent(
