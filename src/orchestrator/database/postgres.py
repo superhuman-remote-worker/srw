@@ -19840,6 +19840,7 @@ class PostgresDB:
                 except RuntimeError:
                     return None
                 initial_retirement = None
+                retained_retirement = None
                 if owner_kind == "thread":
                     marker = state.get("_stateless_claim_retirement")
                     candidate = (
@@ -19860,6 +19861,24 @@ class PostgresDB:
                         candidate,
                     ):
                         initial_retirement = candidate
+                    retained_candidate = (
+                        marker.get("retained_startup_attention")
+                        if isinstance(marker, dict)
+                        else None
+                    )
+                    if isinstance(
+                        retained_candidate, dict
+                    ) and await self._retained_startup_attention_is_current_on_conn(
+                        conn,
+                        {
+                            **dict(owner),
+                            "id": owner_uuid,
+                            "metadata": state,
+                            "status": owner["owner_status"],
+                        },
+                        retained_candidate,
+                    ):
+                        retained_retirement = retained_candidate
                 observed = await conn.fetchrow(
                     "SELECT cancel_resource_policy FROM "
                     "managed_repository_workspace_creation_reservations "
@@ -19972,7 +19991,11 @@ class PostgresDB:
                         return None
                     if (
                         not allow_existing_terminal_intent
-                        or (owner_kind != "job" and initial_retirement is None)
+                        or (
+                            owner_kind != "job"
+                            and initial_retirement is None
+                            and retained_retirement is None
+                        )
                         or scope != "workspace_container"
                         or owner.get("owner_status")
                         != ("cancelled" if owner_kind == "job" else "ended")
@@ -43408,6 +43431,406 @@ class PostgresDB:
                 )
                 return updated == "UPDATE 1"
 
+    async def _retained_startup_attention_source_on_conn(
+        self, conn: Any, thread_id: str
+    ) -> dict[str, Any] | None:
+        """Read the exact open retained G2 source and immediate G1 lineage."""
+        from orchestrator.database.session_creation_candidates import (
+            SESSION_CREATION_SCAN_SQL,
+            candidate_from_record,
+        )
+        from shared.session_retirement import (
+            retained_startup_attention_retirement_authority,
+        )
+
+        rows = await conn.fetch(
+            SESSION_CREATION_SCAN_SQL, thread_id, None, None, None, 2
+        )
+        if len(rows) != 1:
+            return None
+        row = rows[0]
+        candidate = candidate_from_record(row)
+        if candidate is None or candidate.route != "retained_create":
+            return None
+        source = row["source"]
+        predecessors = row["retained_predecessors"]
+        cleanups = row["retained_cleanups"]
+        try:
+            source = json.loads(source) if isinstance(source, str) else source
+            predecessors = (
+                json.loads(predecessors)
+                if isinstance(predecessors, str)
+                else predecessors
+            )
+            cleanups = json.loads(cleanups) if isinstance(cleanups, str) else cleanups
+        except (TypeError, ValueError):
+            return None
+        if (
+            not isinstance(source, dict)
+            or not isinstance(predecessors, list)
+            or len(predecessors) != 1
+            or not isinstance(cleanups, list)
+            or len(cleanups) != 1
+            or source.get("startup_protocol_version") != 1
+            or source.get("startup_stage") != "readiness"
+            or source.get("startup_state") != "attention"
+            or source.get("startup_reason_code") != "ssh_deadline"
+            or source.get("startup_first_ready_at") is None
+            or candidate.pvc_uid is None
+            or candidate.service_uid is None
+        ):
+            return None
+        predecessor, cleanup = predecessors[0], cleanups[0]
+        try:
+            owner = row["owner"]
+            owner = json.loads(owner) if isinstance(owner, str) else owner
+            owner_metadata = owner["metadata"]
+            owner_metadata = (
+                json.loads(owner_metadata)
+                if isinstance(owner_metadata, str)
+                else owner_metadata
+            )
+            return retained_startup_attention_retirement_authority(
+                {
+                    "version": 1,
+                    "generation": candidate.runtime_generation,
+                    "reservation_id": candidate.source_id,
+                    "reservation_generation": source["reservation_generation"],
+                    "claim_token": candidate.claim_token,
+                    "runtime_incarnation": candidate.pod_uid,
+                    "pvc_uid": candidate.pvc_uid,
+                    "service_uid": candidate.service_uid,
+                    "seed_configmap_uid": candidate.seed_configmap_uid,
+                    "namespace": candidate.namespace,
+                    "predecessor_reservation_id": predecessor["id"],
+                    "predecessor_generation": predecessor["thread_runtime_generation"],
+                    "predecessor_binding_generation": owner_metadata[
+                        "_workspace_binding"
+                    ]["generation"],
+                    "predecessor_runtime_incarnation": predecessor[
+                        "runtime_incarnation"
+                    ],
+                    "predecessor_cleanup_id": cleanup["id"],
+                    "scheduled_at": source["scheduled_at"],
+                    "startup_attention_at": source["startup_attention_at"],
+                }
+            )
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            return None
+
+    async def get_current_retained_startup_attention_source(
+        self, thread_id: str
+    ) -> dict[str, Any] | None:
+        async with self.acquire() as conn:
+            return await self._retained_startup_attention_source_on_conn(
+                conn, thread_id
+            )
+
+    async def _retained_startup_attention_is_current_on_conn(
+        self,
+        conn: Any,
+        thread: Any,
+        retained: dict[str, Any],
+        *,
+        admission: bool = False,
+        require_settled: bool = False,
+    ) -> bool:
+        """Validate G2, immediate G1 and cleanup under owner→queue→ledger locks."""
+        from shared.session_retirement import (
+            retained_startup_attention_retirement_authority,
+            stateless_retirement_authority,
+            stateless_settled_retirement_authority,
+        )
+
+        try:
+            retained = retained_startup_attention_retirement_authority(retained)
+            metadata = _strict_json_object(thread["metadata"], label="thread metadata")
+        except RuntimeError:
+            return False
+        workspace = metadata.get("workspace_container")
+        binding = metadata.get("_workspace_binding")
+        if (
+            thread["execution_lane"] != "stateless"
+            or str(thread["runtime_generation"]) != retained["generation"]
+            or not isinstance(workspace, dict)
+            or not isinstance(binding, dict)
+            or workspace.get("provisioner") != "k8s"
+            or workspace.get("namespace") != retained["namespace"]
+            or workspace.get("_creation_reservation_id") != retained["reservation_id"]
+            or binding.get("kind") != "remote"
+            or binding.get("generation") != retained["predecessor_binding_generation"]
+            or binding.get("backing_id")
+            != f"k8s-pvc:{retained['namespace']}:{retained['pvc_uid']}"
+            or workspace.get("_snapshot_restore_required", False) is not False
+            or workspace.get("_canvas_workspace_generation") is not None
+            or metadata.get("_stateless_active_claim") is not None
+            or metadata.get("_stateless_claim_losses") is not None
+            or metadata.get("_stateless_claim_loss_hold") is not None
+        ):
+            return False
+        queue = await conn.fetchrow(
+            "SELECT * FROM run_queue WHERE unit_id=$1::uuid FOR UPDATE", thread["id"]
+        )
+        if queue is None or queue["unit_kind"] != "session_turn":
+            return False
+        if admission:
+            if (
+                thread["status"] != "created"
+                or queue["state"] not in {"queued", "parked", "done"}
+                or queue["leased_by"] is not None
+                or metadata.get("_stateless_claim_retirement") is not None
+                or metadata.get("_stateless_workspace_retirement_pending") is not None
+                or metadata.get("_stateless_workspace_retirement_settled") is not None
+                or await self._retained_startup_attention_source_on_conn(
+                    conn, str(thread["id"])
+                )
+                != retained
+            ):
+                return False
+            marker = None
+        else:
+            try:
+                marker = stateless_retirement_authority(
+                    metadata
+                ) or stateless_settled_retirement_authority(metadata)
+            except RuntimeError:
+                return False
+            if (
+                thread["status"] != "ended"
+                or not isinstance(marker, dict)
+                or marker.get("retained_startup_attention") != retained
+                or marker.get("runtime_incarnation") != retained["runtime_incarnation"]
+                or queue["state"] != "done"
+                or queue["lease_token"] != marker.get("terminal_token")
+                or queue["leased_by"] is not None
+            ):
+                return False
+        creation = await conn.fetchrow(
+            "SELECT * FROM managed_repository_workspace_creation_reservations "
+            "WHERE id=$1::uuid AND owner_kind='thread' AND owner_id=$2::uuid "
+            "AND scope='workspace_container' FOR UPDATE",
+            retained["reservation_id"],
+            thread["id"],
+        )
+        predecessor = await conn.fetchrow(
+            "SELECT * FROM managed_repository_workspace_creation_reservations "
+            "WHERE id=$1::uuid AND owner_kind='thread' AND owner_id=$2::uuid "
+            "AND scope='workspace_container' FOR UPDATE",
+            retained["predecessor_reservation_id"],
+            thread["id"],
+        )
+        cleanup = await conn.fetchrow(
+            "SELECT * FROM managed_repository_workspace_cleanup_intents "
+            "WHERE id=$1::uuid AND owner_kind='thread' AND owner_id=$2::uuid "
+            "AND scope='workspace_container' FOR UPDATE",
+            retained["predecessor_cleanup_id"],
+            thread["id"],
+        )
+        if creation is None or predecessor is None or cleanup is None:
+            return False
+        if (
+            str(creation["thread_runtime_generation"]) != retained["generation"]
+            or creation["reservation_generation"] != retained["reservation_generation"]
+            or creation["operation_kind"] != "create"
+            or str(creation["pod_uid"]) != retained["runtime_incarnation"]
+            or str(creation["runtime_incarnation"]) != retained["runtime_incarnation"]
+            or str(creation["pvc_uid"]) != retained["pvc_uid"]
+            or str(creation["service_uid"]) != retained["service_uid"]
+            or (
+                str(creation["seed_configmap_uid"])
+                if creation["seed_configmap_uid"]
+                else None
+            )
+            != retained["seed_configmap_uid"]
+            or creation["startup_protocol_version"] != 1
+            or creation["startup_stage"] != "readiness"
+            or creation["startup_state"] != "attention"
+            or creation["startup_reason_code"] != "ssh_deadline"
+            or creation["scheduled_at"]
+            != datetime.fromisoformat(retained["scheduled_at"])
+            or creation["startup_attention_at"]
+            != datetime.fromisoformat(retained["startup_attention_at"])
+            or str(predecessor["thread_runtime_generation"])
+            != retained["predecessor_generation"]
+            or str(predecessor["runtime_incarnation"])
+            != retained["predecessor_runtime_incarnation"]
+            or predecessor["reservation_generation"]
+            >= creation["reservation_generation"]
+            or predecessor["result_kind"] != "settled"
+            or predecessor["settled_at"] is None
+            or predecessor["startup_protocol_version"] not in {None, 1}
+            or (
+                predecessor["startup_protocol_version"] == 1
+                and (
+                    predecessor["startup_stage"] != "readiness"
+                    or predecessor["startup_state"] != "starting"
+                    or predecessor["startup_reason_code"] != "scheduled"
+                    or predecessor["startup_attention_at"] is not None
+                )
+            )
+            or predecessor["scheduled_at"] is None
+            or predecessor["startup_first_ready_at"] is None
+            or not predecessor["scheduled_at"]
+            <= predecessor["startup_first_ready_at"]
+            <= predecessor["settled_at"]
+            or predecessor["cancel_requested_at"] is not None
+            or predecessor["pvc_uid"] != creation["pvc_uid"]
+            or cleanup["thread_runtime_generation"]
+            != predecessor["thread_runtime_generation"]
+            or cleanup["runtime_incarnation"] != predecessor["runtime_incarnation"]
+            or cleanup["pvc_uid"] != predecessor["pvc_uid"]
+            or cleanup["service_uid"] != predecessor["service_uid"]
+            or cleanup["resource_policy"] != "preserve"
+            or cleanup["target_disposition"] != "deleted"
+            or cleanup["reclaim_shared_resources"] is not False
+            or cleanup["snapshot_restore_required"] is not False
+            or cleanup["result_kind"] != "settled"
+            or cleanup["capture_complete"] is not True
+            or cleanup["resources_captured_at"] is None
+            or cleanup["settled_at"] is None
+            or cleanup["cleanup_completed_at"] is None
+            or await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM managed_repository_workspace_creation_reservations "
+                "WHERE owner_kind='thread' AND owner_id=$1::uuid AND scope='workspace_container' "
+                "AND id NOT IN ($2::uuid,$3::uuid) AND reservation_generation >= $4)",
+                thread["id"],
+                predecessor["id"],
+                creation["id"],
+                predecessor["reservation_generation"],
+            )
+            or await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+                "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+                "AND scope='workspace_container' AND thread_runtime_generation=$2::uuid "
+                "AND runtime_incarnation<>$3::uuid)",
+                thread["id"],
+                retained["generation"],
+                retained["runtime_incarnation"],
+            )
+            or not await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM managed_repository_process_zero_receipts "
+                "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+                "AND scope IN ('workspace_container','stateless_workspace') "
+                "AND provisioner='k8s' AND runtime_incarnation=$2)",
+                thread["id"],
+                retained["predecessor_runtime_incarnation"],
+            )
+        ):
+            return False
+        if admission:
+            return bool(
+                workspace.get("_runtime_creation")
+                == {
+                    "generation": retained["generation"],
+                    "mode": "create",
+                    "attempted": True,
+                    "replaces_uid": None,
+                }
+                and workspace.get("_runtime_incarnation")
+                == retained["runtime_incarnation"]
+                and workspace.get("_creation_claim_token")
+                == str(retained["claim_token"])
+                and creation["claim_token"] == retained["claim_token"]
+                and creation["phase"] == "runtime_bound"
+                and creation["settled_at"] is None
+                and creation["cancel_requested_at"] is None
+                and not await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+                    "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+                    "AND thread_runtime_generation=$2::uuid)",
+                    thread["id"],
+                    retained["generation"],
+                )
+            )
+        if (
+            creation["cancel_requested_at"] is None
+            or creation["claim_token"] <= retained["claim_token"]
+            or creation["result_kind"] not in {None, "aborted"}
+            or workspace.get("_creation_claim_token") != str(creation["claim_token"])
+            or workspace.get("_runtime_incarnation")
+            not in {None, retained["runtime_incarnation"]}
+        ):
+            return False
+        intent = await conn.fetchrow(
+            "SELECT * FROM managed_repository_workspace_cleanup_intents "
+            "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+            "AND scope='workspace_container' AND runtime_incarnation=$2::uuid "
+            "ORDER BY intent_generation DESC LIMIT 1 FOR UPDATE",
+            thread["id"],
+            retained["runtime_incarnation"],
+        )
+        if (
+            intent is None
+            or intent["thread_runtime_generation"]
+            != creation["thread_runtime_generation"]
+            or intent["target_disposition"] != "deleted"
+            or intent["resource_policy"] != "preserve"
+            or intent["reclaim_shared_resources"] is not False
+            or intent["terminal_queue_token"] is not None
+            or intent["pod_uid"] != creation["pod_uid"]
+            or (
+                intent["resources_captured_at"] is not None
+                and (
+                    intent["pvc_uid"] != creation["pvc_uid"]
+                    or intent["service_uid"] != creation["service_uid"]
+                    or intent["seed_configmap_uid"] != creation["seed_configmap_uid"]
+                )
+            )
+        ):
+            return False
+        if require_settled:
+            return bool(
+                creation["result_kind"] == "aborted"
+                and creation["settled_at"] is not None
+                and intent["result_kind"] == "settled"
+                and intent["settled_at"] is not None
+                and intent["cleanup_completed_at"] is not None
+                and intent["resources_captured_at"] is not None
+                and await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM managed_repository_process_zero_receipts "
+                    "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+                    "AND scope='stateless_workspace' AND provisioner='k8s' "
+                    "AND runtime_incarnation=$2)",
+                    thread["id"],
+                    retained["runtime_incarnation"],
+                )
+            )
+        return True
+
+    async def get_stateless_retained_startup_attention_retirement(
+        self, thread_id: str, *, require_settled: bool = False
+    ) -> dict[str, Any] | None:
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                thread = await conn.fetchrow(
+                    "SELECT id,status::text AS status,execution_lane,runtime_generation,metadata "
+                    "FROM threads WHERE id=$1::uuid FOR UPDATE",
+                    thread_id,
+                )
+                if thread is None:
+                    return None
+                metadata = _strict_json_object(
+                    thread["metadata"], label="thread metadata"
+                )
+                marker = metadata.get("_stateless_claim_retirement") or metadata.get(
+                    "_stateless_workspace_retirement_settled"
+                )
+                retained = (
+                    marker.get("retained_startup_attention")
+                    if isinstance(marker, dict)
+                    else None
+                )
+                if not isinstance(
+                    retained, dict
+                ) or not await self._retained_startup_attention_is_current_on_conn(
+                    conn,
+                    thread,
+                    retained,
+                    require_settled=require_settled,
+                ):
+                    return None
+                return retained
+
     async def _initial_creation_retirement_is_current_on_conn(
         self,
         conn: Any,
@@ -43637,10 +44060,12 @@ class PostgresDB:
             "AND queue.state='done' AND queue.leased_by IS NULL "
             "WHERE thread.execution_lane='stateless' AND thread.status='ended' "
             "AND ((thread.metadata->'_stateless_workspace_retirement_pending'='true'::jsonb "
-            "AND jsonb_typeof(thread.metadata#>'{_stateless_claim_retirement,initial_creation}')='object' "
+            "AND (jsonb_typeof(thread.metadata#>'{_stateless_claim_retirement,initial_creation}')='object' "
+            "OR jsonb_typeof(thread.metadata#>'{_stateless_claim_retirement,retained_startup_attention}')='object') "
             "AND thread.metadata#>'{_stateless_claim_retirement,terminal_token}'=to_jsonb(queue.lease_token)) "
             "OR (thread.metadata#>'{_stateless_workspace_retirement_settled,permanent}'='true'::jsonb "
-            "AND jsonb_typeof(thread.metadata#>'{_stateless_workspace_retirement_settled,initial_creation}')='object' "
+            "AND (jsonb_typeof(thread.metadata#>'{_stateless_workspace_retirement_settled,initial_creation}')='object' "
+            "OR jsonb_typeof(thread.metadata#>'{_stateless_workspace_retirement_settled,retained_startup_attention}')='object') "
             "AND thread.metadata#>'{_stateless_workspace_retirement_settled,terminal_token}'=to_jsonb(queue.lease_token))) "
             "AND ($2::timestamptz IS NULL OR (thread.ended_at,thread.id)>($2,$3::uuid)) "
             "ORDER BY thread.ended_at, thread.id LIMIT $1",
@@ -43671,6 +44096,7 @@ class PostgresDB:
             "thread.metadata->'_stateless_workspace_retirement_settled') AS marker) AS retirement "
             "WHERE thread.execution_lane='stateless' AND thread.status='ended' "
             "AND NOT (retirement.marker ? 'initial_creation') "
+            "AND NOT (retirement.marker ? 'retained_startup_attention') "
             "AND retirement.marker->'terminal_token'=to_jsonb(queue.lease_token) "
             "AND queue.lease_token > 0 "
             "AND jsonb_typeof(retirement.marker->'runtime_incarnation')='string' "
@@ -43781,6 +44207,7 @@ class PostgresDB:
         permanent: bool = False,
         workspace_absence_proven: bool = False,
         initial_creation: dict[str, Any] | None = None,
+        retained_startup_attention: dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """Atomically close a stateless session queue before external teardown.
 
@@ -43796,6 +44223,8 @@ class PostgresDB:
         terminal token.  This is what lets an ambiguous remote acknowledgement
         or Kubernetes cleanup be retried without minting a new owner each time.
         """
+        if retained_startup_attention is not None and permanent:
+            raise RuntimeError("retained startup attention supports soft End only")
         from orchestrator.services.container_provisioner import (
             WORKSPACE_RUNTIME_INCARNATION_KEY,
         )
@@ -43949,6 +44378,15 @@ class PostgresDB:
                             if "initial_creation" in settled
                             else {}
                         ),
+                        **(
+                            {
+                                "retained_startup_attention": settled[
+                                    "retained_startup_attention"
+                                ]
+                            }
+                            if "retained_startup_attention" in settled
+                            else {}
+                        ),
                         "terminal_token": token,
                         "permanent": settled["permanent"],
                         "backing_id": settled.get("backing_id"),
@@ -43970,6 +44408,15 @@ class PostgresDB:
                     retirement = stateless_retirement_authority(metadata)
                     if retirement is None:
                         raise RuntimeError("pending retirement authority disappeared")
+                    if (
+                        "retained_startup_attention" in retirement
+                        and not await self._retained_startup_attention_is_current_on_conn(
+                            conn, thread, retirement["retained_startup_attention"]
+                        )
+                    ):
+                        raise RuntimeError(
+                            "retained startup retirement authority changed"
+                        )
                     token = int(retirement["terminal_token"])
                     queue_token = (
                         int(queue["lease_token"] or 0) if queue is not None else 0
@@ -44059,9 +44506,16 @@ class PostgresDB:
                         thread_id,
                     )
                 )
+                if (
+                    retained_startup_attention is not None
+                    and not await self._retained_startup_attention_is_current_on_conn(
+                        conn, thread, retained_startup_attention, admission=True
+                    )
+                ):
+                    raise RuntimeError("retained startup retirement admission changed")
                 if not force and (
                     queue_state == "leased"
-                    or pending_input
+                    or (pending_input and retained_startup_attention is None)
                     or pending_control
                     or pending_interrupt
                     or pending_permission
@@ -44323,6 +44777,10 @@ class PostgresDB:
                 }
                 if initial_creation is not None:
                     marker["initial_creation"] = dict(initial_creation)
+                if retained_startup_attention is not None:
+                    marker["retained_startup_attention"] = dict(
+                        retained_startup_attention
+                    )
                 if not permanent:
                     await self._terminalize_live_session_subagents_for_retirement(
                         conn,
@@ -44330,7 +44788,10 @@ class PostgresDB:
                         execution_lane="stateless",
                         disposition="ended",
                     )
-                if initial_creation is not None:
+                if (
+                    initial_creation is not None
+                    or retained_startup_attention is not None
+                ):
                     # The terminal trigger composes claim rotation + runtime
                     # retirement only while all non-workspace metadata is
                     # unchanged. Stage the exact End marker first inside this
@@ -44825,7 +45286,27 @@ class PostgresDB:
             sort_keys=True,
             separators=(",", ":"),
         )
-        async with self.acquire() as conn:
+        async with self.acquire() as conn, conn.transaction():
+            thread = await conn.fetchrow(
+                "SELECT id,status::text AS status,execution_lane,runtime_generation,metadata "
+                "FROM threads WHERE id=$1::uuid FOR UPDATE",
+                thread_id,
+            )
+            if thread is None:
+                return False
+            metadata = _strict_json_object(thread["metadata"], label="thread metadata")
+            marker = metadata.get("_stateless_claim_retirement")
+            if (
+                isinstance(marker, dict)
+                and "retained_startup_attention" in marker
+                and not await self._retained_startup_attention_is_current_on_conn(
+                    conn,
+                    thread,
+                    marker["retained_startup_attention"],
+                    require_settled=True,
+                )
+            ):
+                return False
             row = await conn.fetchval(
                 """
                 UPDATE threads
@@ -44959,7 +45440,11 @@ class PostgresDB:
         return row is not None
 
     async def finish_stateless_thread_workspace_retirement(
-        self, thread_id: str
+        self,
+        thread_id: str,
+        *,
+        expected_retained_startup_attention: dict[str, Any] | None = None,
+        expected_terminal_token: int | None = None,
     ) -> bool:
         """Replace a proven soft-retirement fence with a durable tombstone."""
         from shared.session_retirement import (
@@ -44986,6 +45471,15 @@ class PostgresDB:
                 if marker["permanent"] is not False:
                     return False
                 token = int(marker["terminal_token"])
+                if expected_retained_startup_attention is not None and (
+                    marker.get("retained_startup_attention")
+                    != expected_retained_startup_attention
+                    or type(expected_terminal_token) is not int
+                    or token != expected_terminal_token
+                    or str(thread["runtime_generation"])
+                    != expected_retained_startup_attention.get("generation")
+                ):
+                    return False
                 queue = await conn.fetchrow(
                     "SELECT unit_kind, state, lease_token FROM run_queue "
                     "WHERE unit_id = $1::uuid FOR UPDATE",
@@ -45015,6 +45509,7 @@ class PostgresDB:
                 if not isinstance(workspace, dict) or not isinstance(binding, dict):
                     return False
                 initial = marker.get("initial_creation")
+                retained = marker.get("retained_startup_attention")
                 if initial is not None:
                     if not await self._initial_creation_retirement_is_current_on_conn(
                         conn,
@@ -45026,6 +45521,22 @@ class PostgresDB:
                     creation = workspace.get(_STATELESS_RUNTIME_CREATION_KEY)
                     if creation != {
                         "generation": initial["generation"],
+                        "mode": "create",
+                        "attempted": True,
+                        "replaces_uid": None,
+                    }:
+                        return False
+                    workspace = dict(workspace)
+                    workspace.pop(_STATELESS_RUNTIME_CREATION_KEY)
+                    metadata["workspace_container"] = workspace
+                if retained is not None:
+                    if not await self._retained_startup_attention_is_current_on_conn(
+                        conn, thread, retained, require_settled=True
+                    ):
+                        return False
+                    creation = workspace.get(_STATELESS_RUNTIME_CREATION_KEY)
+                    if creation != {
+                        "generation": retained["generation"],
                         "mode": "create",
                         "attempted": True,
                         "replaces_uid": None,
@@ -45085,6 +45596,8 @@ class PostgresDB:
                 }
                 if initial is not None:
                     settled["initial_creation"] = initial
+                if retained is not None:
+                    settled["retained_startup_attention"] = retained
                 await self._terminalize_live_session_subagents_for_retirement(
                     conn,
                     parent_thread_id=thread_id,

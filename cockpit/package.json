@@ -95,7 +95,7 @@
   },
   "overrides": {
     "undici": "^7.29.1",
-    "piscina": "^5.2.0",
+    "piscina": "^5.3.2",
     "picomatch": "^4.0.4",
     "vite": "^7.3.5",
     "ws": "^8.21.0",

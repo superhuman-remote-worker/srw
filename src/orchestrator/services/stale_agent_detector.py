@@ -332,7 +332,7 @@ async def retry_initial_creation_retirement(
     *,
     dependencies: StaleAgentDetectorDependencies,
 ) -> bool:
-    """Replay only an admitted initial stateless End through all business effects."""
+    """Replay admitted initial or retained-attention End through all effects."""
     from shared.session_retirement import (
         stateless_retirement_authority,
         stateless_settled_retirement_authority,
@@ -346,10 +346,13 @@ async def retry_initial_creation_retirement(
                 return False
     except RuntimeError:
         return False
-    if "initial_creation" not in marker:
+    initial = marker.get("initial_creation")
+    retained = marker.get("retained_startup_attention")
+    if (initial is None) == (retained is None):
         return False
     generation = str(candidate.get("runtime_generation") or "")
-    if marker["initial_creation"]["generation"] != generation:
+    provenance = initial if initial is not None else retained
+    if provenance["generation"] != generation:
         return False
     thread_id = str(candidate.get("id") or "")
     thread = await dependencies.store.get_thread(thread_id)
@@ -360,9 +363,18 @@ async def retry_initial_creation_retirement(
             thread_id,
             dict(thread),
             permanent=marker["permanent"],
-            force=True,
+            force=retained is None,
             expected_runtime_generation=generation,
             expected_stateless_retirement_token=marker["terminal_token"],
+            **(
+                {
+                    "expected_stateless_retirement_runtime": retained[
+                        "runtime_incarnation"
+                    ]
+                }
+                if retained is not None
+                else {}
+            ),
         )
     except HTTPException as exc:
         if exc.status_code not in {409, 503}:

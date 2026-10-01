@@ -6990,6 +6990,147 @@ class ContainerProvisioner:
                 },
             }
 
+    async def capture_retained_stateless_startup_attention_retirement(
+        self, owner: WorkspaceOwner
+    ) -> dict[str, Any] | None:
+        """Bracket exact G2 and G1-retained PVC identity before normal End."""
+        if owner.kind != "session" or self._db is None or not self._k8s_available:
+            return None
+        async with self._workspace_mutation_guard(
+            owner, scope="workspace_container"
+        ) as owned:
+            if not owned:
+                return None
+            source = await self._db.get_current_retained_startup_attention_source(
+                owner.id
+            )
+            if source is None or source["namespace"] != self._namespace:
+                return None
+            try:
+                pod = await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_pod,
+                    name=owner.pod_name,
+                    namespace=self._namespace,
+                )
+                if (
+                    self._require_workspace_pod_owner(
+                        pod, owner=owner, allow_owner_unlabeled=False
+                    )
+                    != source["runtime_incarnation"]
+                ):
+                    return None
+                if not self._has_stateless_process_zero_finalizer(pod):
+                    return None
+                self._require_workspace_creation_reservation_annotation(
+                    pod, reservation_id=source["reservation_id"]
+                )
+                identity = await self.capture_workspace_teardown_identity(
+                    owner,
+                    expected_runtime_incarnation=source["runtime_incarnation"],
+                )
+                if identity.pod_uid != source["runtime_incarnation"] or any(
+                    getattr(identity, field) != source[field]
+                    for field in ("pvc_uid", "service_uid", "seed_configmap_uid")
+                ):
+                    return None
+                pvc = await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_persistent_volume_claim,
+                    name=self._workspace_pvc_name_from_pod(pod, owner=owner),
+                    namespace=self._namespace,
+                )
+                if (
+                    self._require_stateless_pvc_identity(
+                        pvc,
+                        owner=owner,
+                        pvc_name=self._workspace_pvc_name_from_pod(pod, owner=owner),
+                        allow_any_storage_class=True,
+                    )
+                    != source["pvc_uid"]
+                ):
+                    return None
+                self._require_workspace_creation_reservation_annotation(
+                    pvc, reservation_id=source["predecessor_reservation_id"]
+                )
+            except Exception:
+                return None
+            if (
+                await self._db.get_current_retained_startup_attention_source(owner.id)
+                != source
+            ):
+                return None
+            return source
+
+    async def retained_startup_attention_stop_is_exact(
+        self,
+        owner: WorkspaceOwner,
+        retained: dict[str, Any],
+        *,
+        _mutation_guard_held: bool = False,
+    ) -> bool:
+        """Keep G1's exact PVC after G2's proven stop and guarded cleanup."""
+        if not _mutation_guard_held:
+            async with self._workspace_mutation_guard(
+                owner, scope="workspace_container"
+            ) as owned:
+                return bool(
+                    owned
+                    and await self.retained_startup_attention_stop_is_exact(
+                        owner, retained, _mutation_guard_held=True
+                    )
+                )
+        if (
+            owner.kind != "session"
+            or self._db is None
+            or retained["namespace"] != self._namespace
+            or await self._db.get_stateless_retained_startup_attention_retirement(
+                owner.id, require_settled=True
+            )
+            != retained
+            or await self.workspace_pod_authority(
+                owner,
+                expected_runtime_incarnation=retained["runtime_incarnation"],
+            )
+            != "exact_absent"
+        ):
+            return False
+        try:
+            identity = await self.capture_workspace_teardown_identity(
+                owner,
+                expected_runtime_incarnation=retained["runtime_incarnation"],
+            )
+            if (
+                identity.pvc_uid != retained["pvc_uid"]
+                or identity.service_uid is not None
+                or identity.seed_configmap_uid is not None
+            ):
+                return False
+            pvc = await self._bounded_kubernetes_call(
+                self._core_api.read_namespaced_persistent_volume_claim,
+                name=_pvc_name_for(owner),
+                namespace=self._namespace,
+            )
+            if (
+                self._require_stateless_pvc_identity(
+                    pvc,
+                    owner=owner,
+                    pvc_name=_pvc_name_for(owner),
+                    allow_any_storage_class=True,
+                )
+                != retained["pvc_uid"]
+            ):
+                return False
+            self._require_workspace_creation_reservation_annotation(
+                pvc, reservation_id=retained["predecessor_reservation_id"]
+            )
+        except Exception:
+            return False
+        return (
+            await self._db.get_stateless_retained_startup_attention_retirement(
+                owner.id, require_settled=True
+            )
+            == retained
+        )
+
     async def request_workspace_creation_cancellation(
         self,
         owner: WorkspaceOwner,
@@ -8195,13 +8336,68 @@ class ContainerProvisioner:
     ) -> bool:
         if owner.kind == "session":
             initial = await self._db.get_stateless_initial_creation_retirement(owner.id)
-            return bool(
+            if bool(
                 initial is not None
                 and initial["reservation_id"] == str(reservation["id"])
                 and initial["namespace"] == self._namespace
                 and initial["runtime_incarnation"]
                 == str(reservation["runtime_incarnation"])
                 and self._has_stateless_process_zero_finalizer(pod)
+            ):
+                return True
+            retained = (
+                await self._db.get_stateless_retained_startup_attention_retirement(
+                    owner.id
+                )
+            )
+            if (
+                retained is None
+                or retained["reservation_id"] != str(reservation["id"])
+                or retained["namespace"] != self._namespace
+                or retained["runtime_incarnation"]
+                != str(reservation["runtime_incarnation"])
+                or not self._has_stateless_process_zero_finalizer(pod)
+            ):
+                return False
+            try:
+                self._require_workspace_creation_reservation_annotation(
+                    pod, reservation_id=retained["reservation_id"]
+                )
+                identity = await self.capture_workspace_teardown_identity(
+                    owner,
+                    expected_runtime_incarnation=retained["runtime_incarnation"],
+                )
+                if identity.pod_uid != retained["runtime_incarnation"] or any(
+                    getattr(identity, field) != retained[field]
+                    for field in ("pvc_uid", "service_uid", "seed_configmap_uid")
+                ):
+                    return False
+                pvc_name = self._workspace_pvc_name_from_pod(pod, owner=owner)
+                pvc = await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_persistent_volume_claim,
+                    name=pvc_name,
+                    namespace=self._namespace,
+                )
+                if (
+                    self._require_stateless_pvc_identity(
+                        pvc,
+                        owner=owner,
+                        pvc_name=pvc_name,
+                        allow_any_storage_class=True,
+                    )
+                    != retained["pvc_uid"]
+                ):
+                    return False
+                self._require_workspace_creation_reservation_annotation(
+                    pvc, reservation_id=retained["predecessor_reservation_id"]
+                )
+            except Exception:
+                return False
+            return (
+                await self._db.get_stateless_retained_startup_attention_retirement(
+                    owner.id
+                )
+                == retained
             )
         container_statuses = getattr(
             getattr(pod, "status", None), "container_statuses", None
