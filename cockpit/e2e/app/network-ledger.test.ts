@@ -110,6 +110,28 @@ describe('network ledger safety and warm-up classification', () => {
     expect(ledger.problems()).toEqual([]);
   });
 
+  it.each([409, 425])('matches delayed status %s diagnostics across permitted warm-up phases', (status) => {
+    const { ledger, handlers } = ledgerHarness('https://srw-e2e.test');
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('creating');
+    const url = 'https://srw-e2e.test/api/sessions/owned-thread/connection';
+    emitResponse(handlers, 'GET', url, status);
+    ledger.setPhase('turn');
+    emitConsole(handlers, `Failed to load resource: the server responded with a status of ${status} ()`, url);
+    expect(ledger.problems()).toEqual([]);
+  });
+
+  it('requires a distinct observed response for each delayed diagnostic', () => {
+    const { ledger, handlers } = ledgerHarness('https://srw-e2e.test');
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('turn');
+    const url = 'https://srw-e2e.test/api/sessions/owned-thread/connection';
+    emitResponse(handlers, 'GET', url, 425);
+    emitConsole(handlers, 'Failed to load resource: the server responded with a status of 425 ()', url);
+    emitConsole(handlers, 'Failed to load resource: the server responded with a status of 425 ()', url);
+    expect(ledger.problems().filter((problem) => problem.startsWith('console error'))).toHaveLength(1);
+  });
+
   it.each([
     ['unobserved', 'GET', 425, 'https://srw-e2e.test/api/sessions/owned-thread/connection', 'creating', false],
     ['wrong status', 'GET', 200, 'https://srw-e2e.test/api/sessions/owned-thread/connection', 'creating', true],
