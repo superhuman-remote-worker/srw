@@ -111,6 +111,123 @@ async def test_dedicated_lifespan_serves_health_while_exact_attach_waits(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_completed_dedicated_attach_can_detach_and_rejoin_idle_pool(monkeypatch):
+    """Normal REST detach leaves a completed startup task but frees the process."""
+    mod = persistent_app
+    first_thread = str(uuid4())
+    next_thread = str(uuid4())
+    attached = []
+    session = MagicMock()
+    session.config = SimpleNamespace(officer=SimpleNamespace(enabled=False))
+    session.workspace_sync = None
+    session.workspace_manager = None
+    session.memory_service = None
+    session.messages = []
+    session.shell_owner_token = None
+    session.terminal_finalization_attempted = False
+    session.quiesce_background_tasks = AsyncMock()
+    session.cleanup = AsyncMock()
+
+    async def attach(thread_id, **_kwargs):
+        attached.append(thread_id)
+        if thread_id == first_thread:
+            mod._thread_id = thread_id
+            mod._session = session
+
+    for name, value in (
+        ("_thread_id", None),
+        ("_session", None),
+        ("_loop_task", None),
+        ("_event_writer", None),
+        ("_orchestrator_client", None),
+        ("_pool_attach_claim", None),
+        ("_pool_attach_task", None),
+        ("_dedicated_attach_task", None),
+        ("_pending_drain_suspend", None),
+        ("_failed_attach_release_receipt", None),
+        ("_session_runtime_generation", None),
+        ("_session_runtime_attach_token", None),
+        ("_retirement_admission_identity", None),
+        ("_pinned_runtime_generation_enabled", False),
+        ("_control_owner_agent_id", None),
+        ("_terminating", False),
+        ("_termination_task", None),
+        ("_sessions_served", 0),
+        ("_max_sessions_per_process", 0),
+    ):
+        monkeypatch.setattr(mod, name, value)
+    monkeypatch.delenv("POD_UID", raising=False)
+    monkeypatch.delenv("SESSION_BOUND_THREAD_ID", raising=False)
+    monkeypatch.setattr(mod, "_attach_session", attach)
+    monkeypatch.setattr(mod, "_registered_pinned_agent_id", lambda: None)
+    monkeypatch.setattr(mod, "_stateless_mode", lambda: False)
+    monkeypatch.setattr(
+        mod, "_begin_exact_session_retirement", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(
+        mod, "_settle_exact_retirement_after_quiescence", AsyncMock(return_value=True)
+    )
+    for name in (
+        "_stop_and_join_watchdogs",
+        "_retire_announced_permission_rows",
+        "_stop_thread_interrupt_watcher",
+        "_stop_thread_control_watcher",
+        "_quiesce_session_side_tasks",
+    ):
+        monkeypatch.setattr(mod, name, AsyncMock())
+
+    dedicated = asyncio.create_task(mod._run_dedicated_attach(first_thread))
+    monkeypatch.setattr(mod, "_dedicated_attach_task", dedicated)
+    await dedicated
+    assert attached == [first_thread]
+    assert mod._pool_heartbeat_status() == "session"
+    active_refusal = await mod._admit_pool_session_attach({"thread_id": next_thread})
+    assert active_refusal.status_code == 409
+
+    await mod._terminate_session("rest_detach")
+    assert mod._session is None
+    assert mod._thread_id is None
+    assert dedicated.done() and mod._dedicated_attach_task is dedicated
+    assert mod._pool_heartbeat_status() == "ready"
+
+    response = await mod._admit_pool_session_attach({"thread_id": next_thread})
+    assert response.status_code == 200
+    assert mod._pool_heartbeat_status() == "session"
+    pool_task = mod._pool_attach_task
+    assert pool_task is not None
+    await pool_task
+    assert attached == [first_thread, next_thread]
+    assert mod._pool_attach_claim is None
+
+
+@pytest.mark.asyncio
+async def test_pending_dedicated_attach_refuses_without_thread_or_drain(monkeypatch):
+    """An in-flight task alone must remain nonclaimable with a controlled 409."""
+    mod = persistent_app
+    pending = asyncio.create_task(asyncio.Event().wait())
+    for name, value in (
+        ("_thread_id", None),
+        ("_session", None),
+        ("_pool_attach_claim", None),
+        ("_pending_drain_suspend", None),
+        ("_failed_attach_release_receipt", None),
+        ("_dedicated_attach_task", pending),
+    ):
+        monkeypatch.setattr(mod, name, value)
+    monkeypatch.delenv("POD_UID", raising=False)
+    try:
+        assert mod._pool_heartbeat_status() == "session"
+        response = await mod._admit_pool_session_attach({"thread_id": str(uuid4())})
+        assert response.status_code == 409
+        assert b"Already attached" in response.body
+        assert mod._pool_attach_claim is None
+    finally:
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error,exit_name",
     [

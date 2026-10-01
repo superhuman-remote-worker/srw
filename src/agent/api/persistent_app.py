@@ -224,6 +224,7 @@ def _pool_heartbeat_status() -> str:
     return (
         "ready"
         if _thread_id is None
+        and (_dedicated_attach_task is None or _dedicated_attach_task.done())
         and _session is None
         and _pool_attach_claim is None
         and _pending_drain_suspend is None
@@ -6127,7 +6128,9 @@ async def _admit_pool_session_attach(request: Dict[str, Any]) -> JSONResponse:
     async with _pool_attach_lock:
         if (
             _thread_id is not None
-            or _dedicated_attach_task is not None
+            or (
+                _dedicated_attach_task is not None and not _dedicated_attach_task.done()
+            )
             or _session is not None
             or _pool_attach_claim is not None
             or _pending_drain_suspend is not None
@@ -6135,7 +6138,7 @@ async def _admit_pool_session_attach(request: Dict[str, Any]) -> JSONResponse:
             owner = (
                 _thread_id
                 or _pool_attach_claim
-                or _pending_drain_suspend.get("thread_id")
+                or (_pending_drain_suspend or {}).get("thread_id")
             )
             return JSONResponse(
                 {
