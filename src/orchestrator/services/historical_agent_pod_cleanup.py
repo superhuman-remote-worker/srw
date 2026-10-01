@@ -61,6 +61,7 @@ async def _retire_exact_candidates(
     pvc_name: str | None,
     assert_current: Callable[[], Awaitable[None]],
     agent_provisioner: Any,
+    aborted_attempts: frozenset[str] = frozenset(),
 ) -> None:
     """Retire each proven candidate on its own; report what remains.
 
@@ -104,10 +105,133 @@ async def _retire_exact_candidates(
             expected_labels=_pod_labels(intent, thread_id),
             pvc_name=pvc_name,
             known_successor_uids=successors,
+            **(
+                {"require_nonrestartable": True}
+                if str(intent["attempt_id"]) in aborted_attempts
+                else {}
+            ),
         ):
             refusal = refusal or "historical claimant Pod retirement is retryable"
     if refusal is not None:
         raise RuntimeError(refusal)
+
+
+def _exact_pre_setup_abort(
+    intent: Mapping[str, Any], outcomes: Sequence[Mapping[str, Any]]
+) -> str | None:
+    """An immutable abort releases only its captured life, never remote writers."""
+
+    related = [
+        outcome
+        for outcome in outcomes
+        if str(outcome["runtime_generation"]) == str(intent["runtime_generation"])
+        or str(outcome["agent_pod_uid"] or "") == str(intent["pod_uid"] or "")
+    ]
+    if not related:
+        return None
+    exact = [
+        outcome
+        for outcome in related
+        if outcome["thread_id"] == intent["thread_id"]
+        and outcome["runtime_generation"] == intent["runtime_generation"]
+        and outcome["agent_pod_uid"] == intent["pod_uid"]
+        and outcome["runtime_attach_token"] is not None
+        and outcome["agent_id"] is not None
+        and outcome["successor_generation"] != outcome["runtime_generation"]
+        and outcome["release_kind"] == "process_zero"
+        and outcome["quiescence_protocol"] == "agent_attach_not_started_v1"
+        and intent["status"] == "published"
+        and intent["workspace_claim_id"] is None
+        and intent["protection_protocol"] == "finalizer_v1"
+        and intent["provisioner"] in {"agent", "persistent"}
+        and intent["namespace"]
+        and intent["pod_uid"]
+    ]
+    if len(related) != 1 or len(exact) != 1:
+        raise RuntimeError("aborted claimant lacks one exact pre-setup settlement")
+    return str(exact[0]["agent_id"])
+
+
+async def retire_aborted_unclaimed_agent_pod(
+    db: Any, *, pod_name: str, pod_uid: str, namespace: str, agent_provisioner: Any
+) -> bool:
+    """Retry exact terminal abort cleanup in the existing Pod reaper.
+
+    The published intent and append-only abort survive thread deletion. They
+    remain the durable obligation; no current generation is adopted, and no
+    synthetic End or process-zero receipt is written. A missing Pod is already
+    settled; an unknown replacement is refused and no replacement is touched.
+    """
+
+    hints = await db.fetch(
+        "SELECT * FROM thread_agent_pod_provision_intents WHERE pod_name=$1 "
+        "AND pod_uid=$2 AND namespace=$3 AND status='published' "
+        "AND workspace_claim_id IS NULL LIMIT 2",
+        pod_name,
+        pod_uid,
+        namespace,
+    )
+    if len(hints) != 1:
+        return False
+    hint = hints[0]
+    thread_id = str(hint["thread_id"])
+    async with db.try_thread_advisory_lock(thread_id) as acquired:
+        if not acquired:
+            return False
+        intents = await db.fetch(
+            "SELECT * FROM thread_agent_pod_provision_intents WHERE thread_id=$1::uuid "
+            "AND status='published' ORDER BY attempt_id",
+            thread_id,
+        )
+        outcomes = await db.fetch(
+            "SELECT * FROM thread_runtime_attach_abort_outcomes WHERE thread_id=$1::uuid",
+            thread_id,
+        )
+        try:
+            old_agent_id = _exact_pre_setup_abort(hint, outcomes)
+            if old_agent_id is None:
+                return False
+
+            async def assert_released_life() -> None:
+                current = await db.get_thread(thread_id)
+                if current:
+                    metadata = _json(current.get("metadata")) or {}
+                    pod = metadata.get("agent_pod") or {}
+                    if (
+                        str(current.get("runtime_generation"))
+                        == str(hint["runtime_generation"])
+                        or str(current.get("agent_id") or "") == old_agent_id
+                        or str(pod.get("pod_uid") or "") == pod_uid
+                    ):
+                        raise RuntimeError("aborted claimant is current or rebound")
+                fresh = await db.fetchrow(
+                    "SELECT * FROM thread_agent_pod_provision_intents WHERE attempt_id=$1::uuid",
+                    hint["attempt_id"],
+                )
+                fresh_outcomes = await db.fetch(
+                    "SELECT * FROM thread_runtime_attach_abort_outcomes WHERE thread_id=$1::uuid",
+                    thread_id,
+                )
+                if (
+                    fresh is None
+                    or dict(fresh) != dict(hint)
+                    or _exact_pre_setup_abort(fresh, fresh_outcomes) != old_agent_id
+                ):
+                    raise RuntimeError("aborted claimant authority changed")
+
+            await _retire_exact_candidates(
+                db,
+                thread_id=thread_id,
+                candidates=[(hint, old_agent_id)],
+                intents=intents,
+                pvc_name=None,
+                assert_current=assert_released_life,
+                agent_provisioner=agent_provisioner,
+                aborted_attempts=frozenset({str(hint["attempt_id"])}),
+            )
+        except RuntimeError:
+            return False
+    return True
 
 
 async def retire_historical_claimant_pods(
@@ -223,8 +347,8 @@ async def retire_historical_unclaimed_agent_pods(
 ) -> None:
     """Retire old dedicated Pods that mounted no agent workspace claim.
 
-    Soft settlement records such a Pod's exact identity on the append-only
-    outcome (0301). An intent with no recorded relation is left untouched —
+    Soft settlement or exact pre-setup abort records the released Pod's life
+    on append-only outcomes. An intent with no recorded relation is left untouched —
     nothing is inferred from its generation, name or an absent actor. A
     recorded relation must match the published intent exactly; a relation
     that names the Pod but disagrees with it refuses the whole set. Authority
@@ -245,7 +369,12 @@ async def retire_historical_unclaimed_agent_pods(
         "AND NOT retired_agent_pod ? 'workspace_claim_id'",
         thread_id,
     )
+    aborts = await db.fetch(
+        "SELECT * FROM thread_runtime_attach_abort_outcomes WHERE thread_id=$1::uuid",
+        thread_id,
+    )
     candidates = []
+    aborted_attempts = set()
     for intent in intents:
         attempt = str(intent["attempt_id"])
         if _is_current_intent(intent, current_pod):
@@ -259,6 +388,10 @@ async def retire_historical_unclaimed_agent_pods(
             ):
                 related.append((outcome, proof))
         if not related:
+            aborted_agent_id = _exact_pre_setup_abort(intent, aborts)
+            if aborted_agent_id is not None:
+                candidates.append((intent, aborted_agent_id))
+                aborted_attempts.add(attempt)
             continue
         if not (
             intent["protection_protocol"] == "finalizer_v1"
@@ -298,4 +431,5 @@ async def retire_historical_unclaimed_agent_pods(
         pvc_name=None,
         assert_current=assert_current,
         agent_provisioner=agent_provisioner,
+        aborted_attempts=frozenset(aborted_attempts),
     )

@@ -156,11 +156,13 @@ async def retire_terminal_claimant_pod(
     expected_labels: dict[str, str],
     pvc_name: str | None,
     known_successor_uids: frozenset[str] = frozenset(),
+    require_nonrestartable: bool = False,
 ) -> bool:
     """Retire one historically authorized, terminal dedicated agent Pod.
 
     This is not process-zero recovery for an active actor. The caller must
-    possess immutable settlement/handoff proof and current retirement authority.
+    possess immutable settlement/handoff proof and current retirement authority,
+    or the exact pre-setup abort of a released, nonrestartable, claim-less life.
     A UID/RV patch binds all finalizer preconditions to the same fresh Pod read.
     ``pvc_name`` is the claim a claimant must still mount; ``None`` is a
     claim-less dedicated Pod, identified by its UID and labels alone.
@@ -191,6 +193,18 @@ async def retire_terminal_claimant_pod(
                 )
             )
             and pod_containers_are_terminal(pod)
+            and (
+                not require_nonrestartable
+                or (
+                    getattr(getattr(pod, "spec", None), "restart_policy", None)
+                    == "Never"
+                    and pvc_name is None
+                    and not any(
+                        getattr(volume, "persistent_volume_claim", None) is not None
+                        for volume in volumes
+                    )
+                )
+            )
         )
 
     try:

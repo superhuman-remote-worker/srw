@@ -2446,6 +2446,28 @@ class AgentProvisioner:
         for pod in pods.items:
             if self._is_completed(pod):
                 category = "completed"
+                if self._db is not None and PINNED_AUTHORITY_FINALIZER in (
+                    pod.metadata.finalizers or []
+                ):
+                    from orchestrator.services.historical_agent_pod_cleanup import (
+                        retire_aborted_unclaimed_agent_pod,
+                    )
+
+                    try:
+                        if await retire_aborted_unclaimed_agent_pod(
+                            self._db,
+                            pod_name=pod.metadata.name,
+                            pod_uid=str(pod.metadata.uid or ""),
+                            namespace=self._namespace,
+                            agent_provisioner=self,
+                        ):
+                            stats[category] += 1
+                            continue
+                    except Exception:
+                        logger.exception(
+                            "Exact aborted claimant cleanup remains retryable for %s",
+                            pod.metadata.name,
+                        )
             elif self._is_crashed(pod, crashed_grace_seconds):
                 category = "crashed"
             elif self._is_tunnel_dark(pod, tunnel_dark_grace_seconds):
