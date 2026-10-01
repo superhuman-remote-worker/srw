@@ -58,6 +58,7 @@ class KubeBoundary:
         self.winner_published = Event()
         self.coordinate_patches = False
         self.patch_count = 0
+        self.interfere_on_patch = {}
         self.lock = Lock()
         self.force_unrelated_422 = False
 
@@ -75,10 +76,10 @@ class KubeBoundary:
         assert (name, namespace) == (POD_NAME, "srw")
         tests = {op["path"]: op["value"] for op in body if op["op"] == "test"}
         self.patch_tests.append(tests)
+        with self.lock:
+            self.patch_count += 1
+            patch_number = self.patch_count
         if self.coordinate_patches:
-            with self.lock:
-                self.patch_count += 1
-                patch_number = self.patch_count
             if patch_number == 1:
                 self.first_patch_entered.set()
                 if not self.second_patch_entered.wait(10):
@@ -87,6 +88,8 @@ class KubeBoundary:
                 self.second_patch_entered.set()
                 if not self.winner_published.wait(10):
                     raise AssertionError("winner was not published")
+        if patch_number in self.interfere_on_patch:
+            self.interfere_on_patch[patch_number]()
         if self.force_unrelated_422:
             self.history.append("unrelated-422")
             raise ApiException(status=422, reason="unrelated admission validation")
@@ -99,8 +102,9 @@ class KubeBoundary:
             if op["op"] == "add":
                 label = op["path"].removeprefix("/metadata/labels/").replace("~1", "/")
                 self.pod["metadata"]["labels"][label] = op["value"]
-        self.pod["metadata"]["resourceVersion"] = "8"
-        self.history.append("pod-patch-rv7-to-rv8")
+        old_rv = self.pod["metadata"]["resourceVersion"]
+        self.pod["metadata"]["resourceVersion"] = str(int(old_rv) + 1)
+        self.history.append(f"pod-patch-rv{old_rv}-to-rv{int(old_rv) + 1}")
         return deepcopy(self.pod)
 
     def _read_route(self, collection, *, name, namespace, **_kwargs):
@@ -131,6 +135,30 @@ class KubeBoundary:
 
     def create_namespaced_ingress(self, **kwargs):
         return self._create_route(self.ingresses, "ingress", **kwargs)
+
+    def _patch_route(self, collection, *, name, namespace, body, **_kwargs):
+        assert namespace == "srw"
+        item = collection[name]
+        for operation in body:
+            if operation["op"] == "test":
+                assert operation["path"] == "/metadata/uid"
+                if operation["value"] != item["metadata"]["uid"]:
+                    raise ApiException(status=422)
+            elif operation["path"] == "/metadata/labels/srw.io~1runtime-generation":
+                item["metadata"]["labels"]["srw.io/runtime-generation"] = operation[
+                    "value"
+                ]
+            elif operation["path"] == "/metadata/ownerReferences":
+                item["metadata"]["ownerReferences"] = operation["value"]
+            elif operation["path"] == "/spec/selector":
+                item["spec"]["selector"] = operation["value"]
+        return deepcopy(item)
+
+    def patch_namespaced_service(self, **kwargs):
+        return self._patch_route(self.services, **kwargs)
+
+    def patch_namespaced_ingress(self, **kwargs):
+        return self._patch_route(self.ingresses, **kwargs)
 
     def _delete_route(self, collection, kind, *, name, namespace, body, **_kwargs):
         assert namespace == "srw"
@@ -221,7 +249,7 @@ async def test_same_recipient_stale_rv_preserves_winner_and_emits_no_failure(mon
     }
     assert before_loser["service"] and before_loser["ingress"]
     kube.winner_published.set()
-    await asyncio.wait_for(loser, 10)
+    assert await asyncio.wait_for(loser, 10) is True
     actual = {
         "pod_uid": kube.pod["metadata"]["uid"],
         "pod_rv": kube.pod["metadata"]["resourceVersion"],
@@ -236,7 +264,7 @@ async def test_same_recipient_stale_rv_preserves_winner_and_emits_no_failure(mon
     }
     print("DIAGNOSTIC " + json.dumps(actual, sort_keys=True))
     assert all(t["/metadata/uid"] == POD_UID for t in kube.patch_tests)
-    assert [t["/metadata/resourceVersion"] for t in kube.patch_tests] == ["7", "7"]
+    assert [t["/metadata/resourceVersion"] for t in kube.patch_tests] == ["7", "7", "8"]
     assert kube.history.count("stale-or-uid-422") == 1
     assert (
         actual["after_loser"]["service"],
@@ -270,10 +298,119 @@ async def test_unrelated_422_and_changed_recipient_fail_closed():
                 )
                 kube.services[ROUTE_NAME]["metadata"]["uid"] = "foreign-service-uid"
         prior_services = deepcopy(kube.services)
-        with pytest.raises(SessionRouteAuthorityError):
+        with pytest.raises(SessionRouteAuthorityError) as error:
             await service.ensure_route(THREAD, POD_NAME, POD_UID, GENERATION)
+        if mode == "unrelated-422":
+            assert error.value.no_route_effect is True
+            assert len(kube.patch_tests) == 1
         assert kube.services == prior_services and kube.ingresses == {}, mode
         print("CONTROL " + json.dumps({"mode": mode, "history": kube.history}))
+
+
+def _advance_pod_version(kube, *, generation=GENERATION):
+    kube.pod["metadata"]["resourceVersion"] = str(
+        int(kube.pod["metadata"]["resourceVersion"]) + 1
+    )
+    kube.pod["metadata"]["labels"].update(
+        {
+            "srw.io/thread-id": THREAD,
+            "srw/thread-id": THREAD[:12],
+            "srw/purpose": "session",
+            "srw.io/runtime-generation": generation,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "mode", ["changed-uid", "changed-generation", "changed-binding", "exhausted"]
+)
+@pytest.mark.asyncio
+async def test_stale_patch_retry_requires_exact_current_recipient(mode):
+    kube = KubeBoundary()
+    db = MagicMock()
+    db.get_pinned_session_binding = AsyncMock(return_value=make_binding())
+    service = make_service(kube, db)
+
+    def first_interference():
+        _advance_pod_version(kube)
+        if mode == "changed-uid":
+            kube.pod["metadata"]["uid"] = "replacement-pod-uid"
+        elif mode == "changed-generation":
+            kube.pod["metadata"]["labels"]["srw.io/runtime-generation"] = (
+                "foreign-generation"
+            )
+        elif mode == "changed-binding":
+            db.get_pinned_session_binding.return_value = make_binding(
+                pod_uid="different-binding-uid"
+            )
+
+    kube.interfere_on_patch[1] = first_interference
+    if mode == "exhausted":
+        kube.interfere_on_patch[2] = lambda: _advance_pod_version(kube)
+    with pytest.raises(SessionRouteAuthorityError) as error:
+        await service.ensure_route(THREAD, POD_NAME, POD_UID, GENERATION)
+    assert error.value.no_route_effect is True
+    assert len(kube.patch_tests) == (2 if mode == "exhausted" else 1)
+    assert kube.services == {} and kube.ingresses == {}
+
+
+@pytest.mark.asyncio
+async def test_missing_pod_patch_refusal_does_not_retry_or_publish():
+    kube = KubeBoundary()
+    db = MagicMock()
+    db.get_pinned_session_binding = AsyncMock(return_value=make_binding())
+    kube.interfere_on_patch[1] = kube._missing
+    with pytest.raises(SessionRouteAuthorityError) as error:
+        await make_service(kube, db).ensure_route(THREAD, POD_NAME, POD_UID, GENERATION)
+    assert error.value.no_route_effect is True
+    assert len(kube.patch_tests) == 1
+    assert kube.services == {} and kube.ingresses == {}
+
+
+@pytest.mark.asyncio
+async def test_foreign_service_appearing_during_contention_blocks_retry():
+    kube = KubeBoundary()
+    db = MagicMock()
+    db.get_pinned_session_binding = AsyncMock(return_value=make_binding())
+    service = make_service(kube, db)
+
+    def foreign_interference():
+        _advance_pod_version(kube)
+        kube.services[ROUTE_NAME] = service._service_body(
+            THREAD, ROUTE_NAME, POD_NAME, "foreign-pod-uid", GENERATION,
+            namespace="srw",
+        )
+        kube.services[ROUTE_NAME]["metadata"]["uid"] = "foreign-service-uid"
+
+    kube.interfere_on_patch[1] = foreign_interference
+    with pytest.raises(SessionRouteAuthorityError) as error:
+        await service.ensure_route(THREAD, POD_NAME, POD_UID, GENERATION)
+    assert error.value.no_route_effect is True
+    assert len(kube.patch_tests) == 1
+    assert kube.services[ROUTE_NAME]["metadata"]["uid"] == "foreign-service-uid"
+    assert kube.ingresses == {}
+
+
+@pytest.mark.asyncio
+async def test_same_recipient_existing_route_stays_idempotent():
+    kube = KubeBoundary()
+    db = MagicMock()
+    db.get_pinned_session_binding = AsyncMock(return_value=make_binding())
+    service = make_service(kube, db)
+    assert (
+        await service.ensure_route(THREAD, POD_NAME, POD_UID, GENERATION)
+        == f"/p/{THREAD}"
+    )
+    first_service_uid = kube.services[ROUTE_NAME]["metadata"]["uid"]
+    first_ingress_uid = kube.ingresses[ROUTE_NAME]["metadata"]["uid"]
+    assert (
+        await service.ensure_route(THREAD, POD_NAME, POD_UID, GENERATION)
+        == f"/p/{THREAD}"
+    )
+    assert kube.services[ROUTE_NAME]["metadata"]["uid"] == first_service_uid
+    assert kube.ingresses[ROUTE_NAME]["metadata"]["uid"] == first_ingress_uid
+    assert kube.history.count("create-service") == 1
+    assert kube.history.count("create-ingress") == 1
 
 
 @pytest.mark.asyncio

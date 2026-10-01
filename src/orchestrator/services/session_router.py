@@ -39,6 +39,13 @@ _KUBERNETES_NAMESPACE = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$")
 class SessionRouteAuthorityError(RuntimeError):
     """The requested route is not bound to one exact live session Pod."""
 
+    def __init__(self, message: str, *, no_route_effect: bool = False) -> None:
+        super().__init__(message)
+        # A refused atomic Pod patch cannot have reached Service/Ingress
+        # publication in this ensure_route call. The prepare caller must not
+        # remove another prepare's completed route for that same recipient.
+        self.no_route_effect = no_route_effect
+
 
 def _value(obj: Any, *names: str) -> Any:
     """Read one Kubernetes model/dict field without trusting mock defaults."""
@@ -172,63 +179,70 @@ class SessionRouterService:
         pod_ip = binding.pod_ip
         namespace = binding.pod_namespace
 
-        # A route with the same host/path in the release namespace can race or
-        # conflict with a legacy-namespace route. Never publish a second route
-        # until the prior deterministic resources have been removed through an
-        # exact owner/generation-fenced lifecycle path.
-        for candidate_namespace in legacy_pinned_namespace_candidates(self._namespace):
-            if candidate_namespace == namespace:
-                continue
-            shadow_service = await self._read_or_none(
+        async def read_trusted_routes() -> tuple[Any | None, Any | None]:
+            # Repeat these checks before a contention retry: a sibling or a
+            # foreign route may have appeared since the first observation.
+            for candidate_namespace in legacy_pinned_namespace_candidates(
+                self._namespace
+            ):
+                if candidate_namespace == namespace:
+                    continue
+                shadow_service = await self._read_or_none(
+                    self._core_api.read_namespaced_service,
+                    name,
+                    namespace=candidate_namespace,
+                )
+                shadow_ingress = await self._read_or_none(
+                    self._networking_api.read_namespaced_ingress,
+                    name,
+                    namespace=candidate_namespace,
+                )
+                if shadow_service is not None or shadow_ingress is not None:
+                    raise SessionRouteAuthorityError(
+                        "session route shadow exists outside authoritative namespace"
+                    )
+
+            # A predecessor may omit G, but owner and routing shape must
+            # already be exact before adoption or another Pod mutation.
+            current_service = await self._read_or_none(
                 self._core_api.read_namespaced_service,
                 name,
-                namespace=candidate_namespace,
+                namespace=namespace,
             )
-            shadow_ingress = await self._read_or_none(
+            current_ingress = await self._read_or_none(
                 self._networking_api.read_namespaced_ingress,
                 name,
-                namespace=candidate_namespace,
+                namespace=namespace,
             )
-            if shadow_service is not None or shadow_ingress is not None:
+            if current_service is not None and not self._service_matches(
+                current_service,
+                thread_id=thread_id,
+                name=name,
+                pod_name=pod_name,
+                pod_uid=pod_uid,
+                runtime_generation=runtime_generation,
+                namespace=namespace,
+                allow_missing_generation=True,
+            ):
                 raise SessionRouteAuthorityError(
-                    "session route shadow exists outside authoritative namespace"
+                    "existing session Service is not trusted"
                 )
+            if current_ingress is not None and not self._ingress_matches(
+                current_ingress,
+                thread_id=thread_id,
+                name=name,
+                pod_name=pod_name,
+                pod_uid=pod_uid,
+                runtime_generation=runtime_generation,
+                namespace=namespace,
+                allow_missing_generation=True,
+            ):
+                raise SessionRouteAuthorityError(
+                    "existing session Ingress is not trusted"
+                )
+            return current_service, current_ingress
 
-        # Refuse foreign or malformed deterministic resources before touching
-        # the Pod. A predecessor route may omit G, but it must already have the
-        # exact owner and immutable routing shape before it can be adopted.
-        service = await self._read_or_none(
-            self._core_api.read_namespaced_service,
-            name,
-            namespace=namespace,
-        )
-        ingress = await self._read_or_none(
-            self._networking_api.read_namespaced_ingress,
-            name,
-            namespace=namespace,
-        )
-        if service is not None and not self._service_matches(
-            service,
-            thread_id=thread_id,
-            name=name,
-            pod_name=pod_name,
-            pod_uid=pod_uid,
-            runtime_generation=runtime_generation,
-            namespace=namespace,
-            allow_missing_generation=True,
-        ):
-            raise SessionRouteAuthorityError("existing session Service is not trusted")
-        if ingress is not None and not self._ingress_matches(
-            ingress,
-            thread_id=thread_id,
-            name=name,
-            pod_name=pod_name,
-            pod_uid=pod_uid,
-            runtime_generation=runtime_generation,
-            namespace=namespace,
-            allow_missing_generation=True,
-        ):
-            raise SessionRouteAuthorityError("existing session Ingress is not trusted")
+        service, ingress = await read_trusted_routes()
 
         pod = await self._read_exact_ready_pod(
             thread_id=thread_id,
@@ -252,46 +266,86 @@ class SessionRouterService:
             pod_namespace=namespace,
         )
 
-        try:
-            await self._call(
-                self._core_api.patch_namespaced_pod,
-                name=pod_name,
-                namespace=namespace,
-                body=[
-                    {"op": "test", "path": "/metadata/uid", "value": pod_uid},
-                    {
-                        "op": "test",
-                        "path": "/metadata/resourceVersion",
-                        "value": resource_version,
-                    },
-                    {
-                        "op": "add",
-                        "path": "/metadata/labels/srw.io~1thread-id",
-                        "value": thread_id,
-                    },
-                    {
-                        "op": "add",
-                        "path": "/metadata/labels/srw~1thread-id",
-                        "value": thread_id[:12],
-                    },
-                    {
-                        "op": "add",
-                        "path": "/metadata/labels/srw~1purpose",
-                        "value": "session",
-                    },
-                    {
-                        "op": "add",
-                        "path": "/metadata/labels/srw.io~1runtime-generation",
-                        "value": runtime_generation,
-                    },
-                ],
-            )
-        except Exception as exc:
-            if any(_is_k8s_status(exc, status) for status in (404, 409, 422)):
-                raise SessionRouteAuthorityError(
-                    "session Pod changed before route publication"
-                ) from exc
-            raise
+        for attempt in range(2):
+            try:
+                await self._call(
+                    self._core_api.patch_namespaced_pod,
+                    name=pod_name,
+                    namespace=namespace,
+                    body=[
+                        {"op": "test", "path": "/metadata/uid", "value": pod_uid},
+                        {
+                            "op": "test",
+                            "path": "/metadata/resourceVersion",
+                            "value": resource_version,
+                        },
+                        {
+                            "op": "add",
+                            "path": "/metadata/labels/srw.io~1thread-id",
+                            "value": thread_id,
+                        },
+                        {
+                            "op": "add",
+                            "path": "/metadata/labels/srw~1thread-id",
+                            "value": thread_id[:12],
+                        },
+                        {
+                            "op": "add",
+                            "path": "/metadata/labels/srw~1purpose",
+                            "value": "session",
+                        },
+                        {
+                            "op": "add",
+                            "path": "/metadata/labels/srw.io~1runtime-generation",
+                            "value": runtime_generation,
+                        },
+                    ],
+                )
+                break
+            except Exception as exc:
+                if not any(_is_k8s_status(exc, status) for status in (404, 409, 422)):
+                    raise
+                refusal = SessionRouteAuthorityError(
+                    "session Pod changed before route publication",
+                    no_route_effect=True,
+                )
+                if attempt or _is_k8s_status(exc, 404):
+                    raise refusal from exc
+                # One changed-RV retry is allowed only after the same ready
+                # Pod already carries this exact thread/generation label and
+                # the reciprocal pinned binding still matches.
+                try:
+                    current_pod = await self._read_exact_ready_pod(
+                        thread_id=thread_id,
+                        runtime_generation=runtime_generation,
+                        pod_name=pod_name,
+                        pod_uid=pod_uid,
+                        pod_ip=pod_ip,
+                        namespace=namespace,
+                        require_route_labels=True,
+                    )
+                    await self._require_current_binding(
+                        thread_id=thread_id,
+                        runtime_generation=runtime_generation,
+                        pod_name=pod_name,
+                        pod_uid=pod_uid,
+                        pod_ip=pod_ip,
+                        pod_namespace=namespace,
+                    )
+                    service, ingress = await read_trusted_routes()
+                except Exception as verification_error:
+                    raise refusal from verification_error
+                next_version = str(
+                    _value(
+                        _value(current_pod, "metadata"),
+                        "resource_version",
+                        "resourceVersion",
+                    )
+                    or ""
+                ).strip()
+                if not next_version or next_version == resource_version:
+                    raise refusal from exc
+                resource_version = next_version
 
         await self._read_exact_ready_pod(
             thread_id=thread_id,

@@ -892,6 +892,59 @@ async def test_do_prepare_cleans_partial_route_on_every_exception(
 
 
 @pytest.mark.asyncio
+async def test_do_prepare_does_not_teardown_sibling_after_failed_atomic_pod_patch(
+    monkeypatch,
+):
+    from orchestrator.routers import sessions as sessions_mod
+    from orchestrator.services.session_router import SessionRouteAuthorityError
+
+    original = _connection_binding()
+    db = AsyncMock()
+    db.get_thread.return_value = _connection_thread()
+    db.get_pinned_session_binding.side_effect = [original, original]
+    lock_cm = AsyncMock()
+    lock_cm.__aenter__.return_value = None
+    lock_cm.__aexit__.return_value = False
+    db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+    fake_main = _fake_main(db)
+    monkeypatch.setattr(
+        sessions_mod, "wait_for_ready", AsyncMock(return_value=True), raising=True
+    )
+    error = SessionRouteAuthorityError(
+        "session Pod changed before route publication", no_route_effect=True
+    )
+    fake_main.session_router = MagicMock()
+    fake_main.session_router.ensure_route = AsyncMock(side_effect=error)
+    fake_main.session_router.teardown_route = AsyncMock(return_value=True)
+    emitted: list[dict] = []
+    monkeypatch.setattr(
+        sessions_mod,
+        "lifecycle_emit",
+        lambda _uid, _tid, state, **extra: emitted.append({"state": state, **extra}),
+        raising=True,
+    )
+
+    await sessions_mod._do_prepare(
+        thread_id=CONNECTION_THREAD_ID,
+        user_id="u1",
+        config_name="persistent_defaults",
+        config_override=None,
+        runtime_authority=sessions_mod.ThreadRuntimeAuthority(
+            thread_id=CONNECTION_THREAD_ID,
+            generation=CONNECTION_GENERATION,
+        ),
+        dependencies=fake_main.dependencies,
+    )
+
+    fake_main.session_router.teardown_route.assert_not_awaited()
+    assert [event["state"] for event in emitted] == [
+        "provisioning",
+        "booting",
+        "failed",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_do_prepare_reports_failed_when_exact_route_cleanup_is_incomplete(
     monkeypatch,
 ):
@@ -1585,6 +1638,52 @@ def test_connection_cleans_partial_route_on_every_exception(
         expected_runtime_generation=CONNECTION_GENERATION,
         expected_owner_uid=CONNECTION_POD_UID,
     )
+
+
+@pytest.mark.parametrize("no_route_effect", [False, True])
+def test_connection_preserves_sibling_after_failed_atomic_pod_patch(
+    monkeypatch, no_route_effect
+):
+    from orchestrator.routers import sessions as sessions_mod
+    from orchestrator.services.session_router import SessionRouteAuthorityError
+
+    fastapi_app = FastAPI()
+    _install_fake_auth(monkeypatch)
+    original = _connection_binding()
+    fake_db = AsyncMock()
+    fake_db.get_thread.return_value = _connection_thread()
+    fake_db.get_pinned_session_binding.side_effect = [original, original]
+    fake_main = _fake_main(fake_db)
+    monkeypatch.setattr(
+        sessions_mod, "probe_ready", AsyncMock(return_value=True), raising=True
+    )
+    fake_main.session_tokens = MagicMock()
+    fake_main.session_router = MagicMock()
+    fake_main.session_router.ensure_route = AsyncMock(
+        side_effect=SessionRouteAuthorityError(
+            "session Pod changed before route publication",
+            no_route_effect=no_route_effect,
+        )
+    )
+    fake_main.session_router.teardown_route = AsyncMock(return_value=True)
+    fastapi_app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
+    fastapi_app.include_router(sessions_mod.router)
+
+    response = TestClient(fastapi_app).get(
+        f"/api/sessions/{CONNECTION_THREAD_ID}/connection"
+    )
+
+    assert response.status_code == 425
+    fake_main.session_tokens.mint.assert_not_called()
+    if no_route_effect:
+        fake_main.session_router.teardown_route.assert_not_awaited()
+    else:
+        fake_main.session_router.teardown_route.assert_awaited_once_with(
+            CONNECTION_THREAD_ID,
+            expected_namespace="srw",
+            expected_runtime_generation=CONNECTION_GENERATION,
+            expected_owner_uid=CONNECTION_POD_UID,
+        )
 
 
 @pytest.mark.parametrize(

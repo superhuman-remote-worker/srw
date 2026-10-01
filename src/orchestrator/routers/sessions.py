@@ -688,13 +688,22 @@ async def _do_prepare(
 
         # Create the route resource.
         route_published = False
+        route_cleanup_required = True
         try:
-            await dependencies.session_router.ensure_route(
-                thread_id=thread_id,
-                pod_name=binding.agent_hostname,
-                pod_uid=binding.pod_uid,
-                runtime_generation=runtime_authority.generation,
-            )
+            try:
+                await dependencies.session_router.ensure_route(
+                    thread_id=thread_id,
+                    pod_name=binding.agent_hostname,
+                    pod_uid=binding.pod_uid,
+                    runtime_generation=runtime_authority.generation,
+                )
+            except SessionRouteAuthorityError as route_error:
+                # A definite failed atomic Pod patch has no Service/Ingress
+                # effect from this attempt. Exact-recipient teardown here
+                # could otherwise delete a sibling prepare's completed route.
+                if route_error.no_route_effect:
+                    route_cleanup_required = False
+                raise
 
             current_binding = await db.get_pinned_session_binding(
                 thread_id,
@@ -714,12 +723,10 @@ async def _do_prepare(
             route_published = True
             return True
         finally:
-            # ``ensure_route`` may create the deterministic Service before an
-            # Ingress failure. Any path that does not publish ready therefore
-            # owes exact G/Pod cleanup, including exceptions from the final DB
-            # reread. A false result means cleanup authority was not proven;
-            # surface that failure instead of silently wedging the successor.
-            if not route_published:
+            # Once route publication may have begun, a Service-only failure or
+            # final DB reread failure still owes exact G/Pod cleanup. A false
+            # result means cleanup authority was not proven; surface it.
+            if not route_published and route_cleanup_required:
                 route_removed = await dependencies.session_router.teardown_route(
                     thread_id,
                     expected_namespace=binding.pod_namespace,
@@ -1147,6 +1154,7 @@ async def get_connection(
     # Service + Ingress exist by the time the cockpit opens the WS — no matter
     # which path bound the agent.
     route_committed = False
+    route_cleanup_required = True
     try:
         await dependencies.session_router.ensure_route(
             thread_id=runtime_authority.thread_id,
@@ -1188,12 +1196,14 @@ async def get_connection(
         route_committed = True
         return response
     except SessionRouteAuthorityError as exc:
+        if exc.no_route_effect:
+            route_cleanup_required = False
         raise HTTPException(status_code=425, detail="session not ready") from exc
     finally:
         # Exact cleanup covers partial Service/Ingress creation, a failed final
         # DB read, a status/identity race, and token construction failure.  It
         # is deliberately armed only when route mutation begins.
-        if not route_committed:
+        if not route_committed and route_cleanup_required:
             route_removed = await dependencies.session_router.teardown_route(
                 runtime_authority.thread_id,
                 expected_namespace=binding.pod_namespace,
