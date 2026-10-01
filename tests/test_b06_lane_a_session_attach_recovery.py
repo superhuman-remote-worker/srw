@@ -20,6 +20,7 @@ from orchestrator.services.session_attach_recovery import (
     SessionAttachRecoveryDependencies,
     current_attach_abort_successor,
     prepare_attach_abort_successor_workspace,
+    reconcile_attach_abort_successor,
     schedule_attach_abort_successor,
 )
 from orchestrator.services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
@@ -157,6 +158,188 @@ class TestCurrentAttachAbortSuccessor:
     @pytest.mark.parametrize("thread", [None, {}])
     def test_a_missing_row_is_not_the_successor(self, thread):
         assert self._call(thread) is False
+
+    @pytest.mark.parametrize(
+        "vm,eligible",
+        [
+            (None, True),
+            ({"status": "waiting_capacity"}, True),
+            ({"status": "waiting_capacity", "initial_runtime": None}, False),
+            ({"status": "waiting_capacity", "initial_runtime": "broken"}, False),
+            ({"status": "waiting_capacity", "initial_runtime": {}}, False),
+            ({"status": "ready", "initial_runtime": "broken"}, False),
+            (
+                {
+                    "status": "waiting_capacity",
+                    "initial_runtime": {
+                        "runtime_generation": SUCCESSOR_GENERATION,
+                        "agent_id": AGENT_ID,
+                        "runtime_attach_token": ATTACH_TOKEN,
+                    },
+                },
+                True,
+            ),
+            (
+                {
+                    "status": "waiting_capacity",
+                    "initial_runtime": {
+                        "runtime_generation": RUNTIME_GENERATION,
+                        "agent_id": AGENT_ID,
+                        "runtime_attach_token": ATTACH_TOKEN,
+                    },
+                },
+                False,
+            ),
+            (
+                {
+                    "status": "failed",
+                    "initial_runtime": {
+                        "runtime_generation": RUNTIME_GENERATION,
+                        "agent_id": AGENT_ID,
+                        "runtime_attach_token": ATTACH_TOKEN,
+                    },
+                },
+                False,
+            ),
+            (
+                {
+                    "status": "ready",
+                    "initial_runtime": {
+                        "runtime_generation": RUNTIME_GENERATION,
+                        "agent_id": AGENT_ID,
+                        "runtime_attach_token": ATTACH_TOKEN,
+                    },
+                },
+                True,
+            ),
+            (
+                {
+                    "status": "waiting_capacity",
+                    "rootdisk": "kept",
+                    "initial_runtime": {
+                        "runtime_generation": RUNTIME_GENERATION,
+                    },
+                },
+                True,
+            ),
+            (
+                {
+                    "status": "waiting_capacity",
+                    "idle_wake_operation_id": AGENT_ID,
+                    "initial_runtime": {"runtime_generation": RUNTIME_GENERATION},
+                },
+                True,
+            ),
+        ],
+        ids=[
+            "no-vm",
+            "no-marker",
+            "null-marker",
+            "malformed-marker",
+            "incomplete-marker",
+            "ready-malformed",
+            "same-runtime",
+            "old-waiting",
+            "old-failed",
+            "ready",
+            "retained",
+            "wake",
+        ],
+    )
+    def test_initial_vm_marker_controls_successor_eligibility(self, vm, eligible):
+        current = _successor_thread()
+        if vm is not None:
+            current["metadata"]["vm"] = vm
+        assert self._call(current) is eligible
+
+
+@pytest.mark.asyncio
+async def test_abort_successor_holds_old_nonready_initial_vm_source():
+    old_vm = {
+        "status": "waiting_capacity",
+        "initial_runtime": {
+            "runtime_generation": RUNTIME_GENERATION,
+            "agent_id": AGENT_ID,
+            "runtime_attach_token": ATTACH_TOKEN,
+        },
+        "creation_request_id": "77777777-7777-4777-8777-777777777777",
+    }
+    current = _successor_thread()
+    current["metadata"]["vm"] = old_vm
+    store = MagicMock()
+    store.get_thread = AsyncMock(return_value=current)
+    store.try_thread_advisory_lock = MagicMock()
+
+    @asynccontextmanager
+    async def lock(_thread_id):
+        yield True
+
+    store.try_thread_advisory_lock.side_effect = lock
+    provision = AsyncMock()
+    deps = _deps(store=store, provision=provision)
+    candidate = _candidate(quiescence_protocol="agent_attach_not_started_v1")
+
+    assert await reconcile_attach_abort_successor(candidate, dependencies=deps) is False
+    assert current["runtime_generation"] == SUCCESSOR_GENERATION
+    assert current["agent_id"] is None
+    assert current["metadata"]["vm"] is old_vm
+    deps.thread_project_ids.assert_not_awaited()
+    provision.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_abort_successor_rechecks_initial_vm_marker_after_project_lookup():
+    initial = _successor_thread()
+    held = _successor_thread()
+    held["metadata"]["vm"] = {
+        "status": "waiting_capacity",
+        "initial_runtime": {
+            "runtime_generation": RUNTIME_GENERATION,
+            "agent_id": AGENT_ID,
+            "runtime_attach_token": ATTACH_TOKEN,
+        },
+    }
+    store = MagicMock()
+    store.get_thread = AsyncMock(side_effect=[initial, held])
+
+    @asynccontextmanager
+    async def lock(_thread_id):
+        yield True
+
+    store.try_thread_advisory_lock = lock
+    provision = AsyncMock()
+    project_ids = AsyncMock(return_value=[])
+    deps = _deps(store=store, provision=provision, project_ids=project_ids)
+    assert (
+        await reconcile_attach_abort_successor(
+            _candidate(quiescence_protocol="agent_attach_not_started_v1"),
+            dependencies=deps,
+        )
+        is False
+    )
+    project_ids.assert_awaited_once_with(THREAD_ID)
+    provision.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_abort_workspace_preparation_holds_old_initial_vm_marker():
+    current = _successor_thread()
+    current["metadata"]["vm"] = {
+        "status": "waiting_capacity",
+        "initial_runtime": {
+            "runtime_generation": RUNTIME_GENERATION,
+            "agent_id": AGENT_ID,
+            "runtime_attach_token": ATTACH_TOKEN,
+        },
+    }
+    assert (
+        await prepare_attach_abort_successor_workspace(
+            _candidate(quiescence_protocol="agent_attach_not_started_v1"),
+            current,
+            dependencies=_deps(),
+        )
+        is None
+    )
 
 
 class TestPrepareWorkspaceProtocolDispatch:

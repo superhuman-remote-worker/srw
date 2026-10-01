@@ -65,6 +65,7 @@ from orchestrator.services.session_runtime_admission import (
 )
 from orchestrator.services.session_runtime_identity import thread_uses_pinned_execution
 from orchestrator.services.stateless_workspace_gate import thread_metadata_object
+from orchestrator.services.vm_thread_initial import initial_thread_vm_blocks_runtime
 from orchestrator.services.workspace_binding import (
     CANVAS_WORKSPACE_GENERATION_KEY,
     remote_canvas_presentation_available,
@@ -128,6 +129,7 @@ def current_attach_abort_successor(
         and thread.get("runtime_retirement_token") is None
         and thread.get("agent_id") is None
         and thread.get("runtime_attach_token") is None
+        and not initial_thread_vm_blocks_runtime(thread)
     )
 
 
@@ -149,6 +151,8 @@ async def prepare_attach_abort_successor_workspace(
     """
 
     store = dependencies.store
+    if initial_thread_vm_blocks_runtime(current):
+        return None
     container_provisioner = dependencies.container_provisioner
     docker_provisioner = dependencies.docker_provisioner
 

@@ -446,6 +446,187 @@ async def test_unissued_bound_initial_source_can_enter_normal_end(db, monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source_state", ["queued", "attention", "cancel_requested"])
+async def test_real_abort_holds_unbound_successor_and_preserves_initial_end_history(
+    db, monkeypatch, source_state
+):
+    from orchestrator.services.provision_or_assign import (
+        ProvisionOrAssignDependencies,
+        provision_or_assign,
+    )
+    from orchestrator.services.session_attach_recovery import (
+        SessionAttachRecoveryDependencies,
+        reconcile_attach_abort_successor,
+    )
+    from tests.test_pinned_vm_failed_initial_end_real_postgres import (
+        _begin,
+        _release_binding,
+    )
+    from tests.test_provision_or_assign_lifecycle import _install_fake_lifecycle_module
+
+    thread_id, _policy, override, dependencies = await _initial_vm(
+        db, monkeypatch, native=True
+    )
+    initial = await _bind_protected_agent(db, thread_id)
+    await _poll(db, dependencies.vm_provisioner, initial)
+    request_id = await db.fetchval(
+        "SELECT request_id FROM vm_creation_retries WHERE thread_id=$1", thread_id
+    )
+    if source_state == "attention":
+        await db.execute(
+            "UPDATE vm_creation_retries SET state='reconciling',revision=revision+1 "
+            "WHERE request_id=$1",
+            request_id,
+        )
+        await db.execute(
+            "UPDATE vm_creation_retries SET state='attention',revision=revision+1,"
+            "reason='vm_creation_retry_blocked' WHERE request_id=$1",
+            request_id,
+        )
+    elif source_state == "cancel_requested":
+        await db.execute(
+            "UPDATE vm_creation_retries SET state='cancel_requested',revision=revision+1 "
+            "WHERE request_id=$1",
+            request_id,
+        )
+    source = dict(
+        await db.fetchrow(
+            "SELECT * FROM vm_creation_retries WHERE thread_id=$1", thread_id
+        )
+    )
+    assert source["state"] == source_state
+    assert source["thread_runtime_generation"] == initial["runtime_generation"]
+    assert await _release_binding(db, initial) == "released"
+    held = await db.get_thread(str(thread_id))
+    old_vm = json.loads(held["metadata"])["vm"]
+    assert old_vm["initial_runtime"]["runtime_generation"] == str(
+        initial["runtime_generation"]
+    )
+    assert held["runtime_generation"] != initial["runtime_generation"]
+    assert held["agent_id"] is None and held["runtime_attach_token"] is None
+    outcome = dict(
+        await db.fetchrow(
+            "SELECT * FROM thread_runtime_attach_abort_outcomes "
+            "WHERE thread_id=$1 AND runtime_generation=$2",
+            thread_id,
+            initial["runtime_generation"],
+        )
+    )
+    assert outcome["successor_generation"] == held["runtime_generation"]
+    provision = AsyncMock()
+    recovery = SessionAttachRecoveryDependencies(
+        store=db,
+        container_provisioner=SimpleNamespace(),
+        docker_provisioner=SimpleNamespace(),
+        workspace_suspension_service=None,
+        ensure_session_workspace=AsyncMock(),
+        thread_project_ids=AsyncMock(return_value=[]),
+        reconcile_attach_abort_successor=AsyncMock(),
+        provision_or_assign=provision,
+        successor_tasks={},
+    )
+    assert (
+        await reconcile_attach_abort_successor(outcome, dependencies=recovery) is False
+    )
+    provision.assert_not_awaited()
+
+    agent_provisioner = SimpleNamespace(provision_agent=AsyncMock(return_value=None))
+    _install_fake_lifecycle_module(monkeypatch, [])
+    common = ProvisionOrAssignDependencies(
+        store=db,
+        agent_provisioner=agent_provisioner,
+        await_protected_cloud_runtime_ready=AsyncMock(return_value=True),
+        session_grant_violations=AsyncMock(return_value=[]),
+        session_endpoint_violations=AsyncMock(return_value=[]),
+        find_idle_persistent_agent=AsyncMock(return_value=None),
+        send_session_attach=AsyncMock(return_value=False),
+    )
+    await provision_or_assign(
+        str(held["user_id"]),
+        str(thread_id),
+        held["config_name"],
+        override,
+        [],
+        None,
+        runtime_generation=str(held["runtime_generation"]),
+        dependencies=common,
+    )
+    agent_provisioner.provision_agent.assert_not_awaited()
+    after_common = await db.get_thread(str(thread_id))
+    assert after_common["runtime_generation"] == held["runtime_generation"]
+    assert after_common["agent_id"] is None
+    assert after_common["runtime_attach_token"] is None
+    assert json.loads((await db.get_thread(str(thread_id)))["metadata"])["vm"] == old_vm
+    assert (
+        dict(
+            await db.fetchrow(
+                "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+                source["request_id"],
+            )
+        )
+        == source
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_creation_retries WHERE thread_id=$1", thread_id
+        )
+        == 1
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_creation_effects WHERE request_id=$1",
+            source["request_id"],
+        )
+        == 0
+    )
+
+    retirement = await _begin(db, held)
+    assert retirement["state"] == "pending", retirement
+    assert retirement["context"]["vm_creation_source"]["request_id"] == str(
+        source["request_id"]
+    )
+    assert await db.authorize_pinned_thread_retirement(
+        str(thread_id),
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    assert await VMCreationRetryStore(db).settle_never_issued(
+        request_id=str(source["request_id"])
+    ) == {"settled": True, "disposition": "never_issued"}
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM thread_runtime_attach_abort_outcomes WHERE thread_id=$1",
+            thread_id,
+        )
+        == 1
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_creation_retries WHERE thread_id=$1", thread_id
+        )
+        == 1
+    )
+    settled = dict(
+        await db.fetchrow(
+            "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+            source["request_id"],
+        )
+    )
+    assert settled["state"] == "settled"
+    for field in (
+        "request_id",
+        "thread_runtime_generation",
+        "thread_agent_id",
+        "thread_attach_token",
+        "provision_generation",
+        "canonical_request",
+        "request_digest",
+    ):
+        assert settled[field] == source[field]
+
+
+@pytest.mark.asyncio
 async def test_historical_prebind_source_end_captures_cleanup_only_authority(
     db, monkeypatch
 ):

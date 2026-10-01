@@ -6,6 +6,7 @@ import asyncio
 import logging
 from copy import deepcopy
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -228,6 +229,108 @@ async def test_vm_ready_payload_carries_the_fanout_advertisement(
     assert session_attach.session_subagent_advertisement(
         None, None, (normalized,), from_workspace=True
     ) == (True, fanout)
+
+
+def test_initial_vm_wait_payload_carries_only_typed_startup_hint():
+    from orchestrator.services.vm_thread_initial import initial_vm_wait_payload
+
+    startup = {
+        "contract_version": 1,
+        "phase": "resource_wait",
+        "request_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "provision_generation": GENERATION,
+        "runtime_generation": RUNTIME,
+    }
+    thread = {
+        "runtime_generation": RUNTIME,
+        "metadata": {"vm": {"status": "waiting_capacity"}},
+    }
+    payload = initial_vm_wait_payload(thread, startup_view=startup)
+    assert payload["vm_startup"] == startup
+    assert payload["vm_status"] == "waiting_capacity"
+    assert payload["session_runtime_generation"] == RUNTIME
+    assert "vm_startup" not in initial_vm_wait_payload(thread)
+
+
+@pytest.mark.asyncio
+async def test_current_initial_vm_ready_delivery_carries_admitted_age(vm_delivery):
+    request = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    vm_delivery.vm.update(
+        {
+            "creation_request_id": request,
+            "initial_runtime": {
+                "runtime_generation": RUNTIME,
+                "agent_id": AGENT,
+                "runtime_attach_token": ATTACH,
+            },
+        }
+    )
+    read_at = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    vm_delivery.store.fetchrow = AsyncMock(
+        return_value={
+            "request_id": request,
+            "provision_generation": GENERATION,
+            "state": "succeeded",
+            "reason": None,
+            "boot_counted": True,
+            "observed_vm_uid": "vm-uid",
+            "observed_pvc_uid": vm_delivery.vm["rootdisk_pvc_uid"],
+            "creation_admission_id": None,
+            "waiter_state": "admitted",
+            "first_reservation_at": read_at - timedelta(seconds=901),
+            "issued_effects": 1,
+            "read_at": read_at,
+        }
+    )
+    payload = await _deliver(vm_delivery)
+    assert payload["vm_startup"] == {
+        "contract_version": 1,
+        "phase": "admitted",
+        "request_id": request,
+        "provision_generation": GENERATION,
+        "runtime_generation": RUNTIME,
+        "admission_elapsed_s": 901.0,
+    }
+    assert payload["vm_ssh_host"] == "10.42.1.23"
+
+
+@pytest.mark.asyncio
+async def test_initial_ready_rechecks_physical_identity_after_startup_read(vm_delivery):
+    request = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    vm_delivery.vm.update(
+        {
+            "creation_request_id": request,
+            "initial_runtime": {
+                "runtime_generation": RUNTIME,
+                "agent_id": AGENT,
+                "runtime_attach_token": ATTACH,
+            },
+        }
+    )
+    read_at = datetime(2026, 10, 1, tzinfo=timezone.utc)
+
+    async def rotate_during_startup_read(*_args):
+        # The immutable source is still current, but its physical runtime has
+        # changed since the prior attestation and credential preparation.
+        vm_delivery.vm["active_pod_uid"] = SUCCESSOR
+        return {
+            "state": "succeeded",
+            "reason": None,
+            "boot_counted": True,
+            "observed_vm_uid": "vm-uid",
+            "observed_pvc_uid": vm_delivery.vm["rootdisk_pvc_uid"],
+            "creation_admission_id": None,
+            "waiter_state": "admitted",
+            "first_reservation_at": read_at - timedelta(seconds=30),
+            "issued_effects": 1,
+            "read_at": read_at,
+        }
+
+    vm_delivery.store.fetchrow = AsyncMock(side_effect=rotate_during_startup_read)
+    with pytest.raises(HTTPException) as refused:
+        await _deliver(vm_delivery)
+    assert refused.value.status_code == 409
+    assert refused.value.detail == {"code": "workspace_runtime_identity_changed"}
 
 
 @pytest.mark.asyncio

@@ -970,6 +970,9 @@ async def test_the_pool_attach_handler_forwards_the_switch(monkeypatch):
         captured.update(attach)
 
     monkeypatch.delenv("POD_UID", raising=False)
+    # Model a fully idle process independently of earlier lifecycle tests.
+    monkeypatch.setattr(papp, "_thread_id", None)
+    monkeypatch.setattr(papp, "_dedicated_attach_task", None)
     monkeypatch.setattr(papp, "_session", None)
     monkeypatch.setattr(papp._session_attach, "_pool_claim", None)
     monkeypatch.setattr(papp._session_attach, "_pool_task", None)

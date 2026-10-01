@@ -10,6 +10,7 @@ agent. See the warm-pool regression on dev cluster thread ``68acde8d``
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
 from dataclasses import replace
@@ -181,6 +182,48 @@ def _install_fake_lifecycle_module(monkeypatch, emit_calls: list[dict]):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "delayed", [False, True], ids=["already-held", "changed-during-await"]
+)
+async def test_old_initial_vm_marker_holds_common_binding(monkeypatch, delayed):
+    old_vm = {
+        "status": "waiting_capacity",
+        "initial_runtime": {
+            "runtime_generation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        },
+        "creation_request_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    }
+    held = _thread_row(metadata={"vm": old_vm})
+    ports = _ports(monkeypatch)
+    ports.store.get_thread = AsyncMock(
+        side_effect=_sequence_then_repeat(_thread_row(), held) if delayed else None,
+        return_value=held,
+    )
+    ports.find_idle_persistent_agent = AsyncMock(return_value=None)
+    ports.send_session_attach = AsyncMock()
+    emit_calls: list[dict] = []
+    _install_fake_lifecycle_module(monkeypatch, emit_calls)
+
+    from orchestrator.services.provision_or_assign import provision_or_assign
+
+    await provision_or_assign(
+        "u1",
+        THREAD_ID,
+        "session_base",
+        {"workspace": {"backend": "vm"}},
+        [],
+        None,
+        runtime_generation=RUNTIME_GENERATION,
+        dependencies=ports.dependencies,
+    )
+
+    assert emit_calls == []
+    ports.find_idle_persistent_agent.assert_not_awaited()
+    ports.send_session_attach.assert_not_awaited()
+    ports.agent_provisioner.provision_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_create_path_refetch_treats_stateless_as_ready_without_lifecycle_error(
     monkeypatch,
 ):
@@ -344,6 +387,114 @@ async def test_idle_pool_attach_emits_provisioning_booting_ready(monkeypatch):
         require_protected_cloud=False,
         expected_session_identity_fingerprint=_binding().session_identity_fingerprint,
     )
+
+
+@pytest.mark.asyncio
+async def test_create_path_keeps_exact_vm_wait_past_old_readiness_bound(monkeypatch):
+    """The real common caller must retain a healthy source until actual /ready."""
+    from orchestrator.services import session_lifecycle as lifecycle
+    from orchestrator.services.provision_or_assign import provision_or_assign
+
+    monkeypatch.setenv("VM_WS_READY_TIMEOUT_S", "960")
+    clock = {"now": 0.0}
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "time", lambda: clock["now"])
+    original_sleep = asyncio.sleep
+
+    async def advance(_seconds):
+        clock["now"] += 30.0
+        await original_sleep(0)
+
+    monkeypatch.setattr(lifecycle.asyncio, "sleep", advance)
+    source = {
+        "contract_version": 1,
+        "phase": "resource_wait",
+        "request_id": "66666666-6666-4666-8666-666666666666",
+        "provision_generation": "77777777-7777-4777-8777-777777777777",
+        "runtime_generation": RUNTIME_GENERATION,
+    }
+
+    async def startup_view(_thread, *, store):
+        assert store is ports.store
+        if clock["now"] < 1830:
+            return source
+        return {**source, "phase": "admitted", "admission_elapsed_s": 30.0}
+
+    async def probe(*_args, **_kwargs):
+        return clock["now"] >= 1860
+
+    monkeypatch.setattr(
+        lifecycle, "initial_vm_startup_view", startup_view, raising=False
+    )
+    monkeypatch.setattr(lifecycle, "probe_ready", probe)
+    calls = []
+    monkeypatch.setattr(
+        lifecycle,
+        "emit",
+        lambda _uid, _tid, state, **_extra: calls.append(state),
+    )
+    ports = _Ports()
+    current = _thread_row()
+    ports.store.get_thread = AsyncMock(side_effect=lambda _tid: current)
+    ports.find_idle_persistent_agent = AsyncMock(
+        return_value={"id": AGENT_ID, "hostname": "srw-agent-pool-1"}
+    )
+
+    async def attach(*_args, **_kwargs):
+        nonlocal current
+        current = _thread_row(agent_id=AGENT_ID)
+        return True
+
+    ports.send_session_attach = attach
+    await provision_or_assign(
+        "u1",
+        THREAD_ID,
+        "session_base",
+        {"workspace": {"backend": "vm"}},
+        [],
+        None,
+        runtime_generation=RUNTIME_GENERATION,
+        dependencies=ports.dependencies,
+    )
+    assert clock["now"] >= 1860
+    assert calls == ["provisioning", "booting", "ready"]
+
+
+@pytest.mark.asyncio
+async def test_create_path_drops_timeout_for_rotated_physical_binding(monkeypatch):
+    ports = _Ports()
+    current = _thread_row()
+    ports.store.get_thread = AsyncMock(side_effect=lambda _tid: current)
+    ports.store.get_pinned_session_binding.side_effect = [
+        _binding(),
+        replace(_binding(), pod_ip="10.0.0.99"),
+    ]
+    ports.find_idle_persistent_agent = AsyncMock(
+        return_value={"id": AGENT_ID, "hostname": "srw-agent-pool-1"}
+    )
+
+    async def attach(*_args, **_kwargs):
+        nonlocal current
+        current = _thread_row(agent_id=AGENT_ID)
+        return True
+
+    ports.send_session_attach = attach
+    events = []
+    lifecycle = _install_fake_lifecycle_module(monkeypatch, events)
+    lifecycle.wait_for_ready.return_value = False
+    from orchestrator.services.provision_or_assign import provision_or_assign
+
+    await provision_or_assign(
+        "u1",
+        THREAD_ID,
+        "session_base",
+        {"workspace": {"backend": "vm"}},
+        [],
+        None,
+        runtime_generation=RUNTIME_GENERATION,
+        dependencies=ports.dependencies,
+    )
+    assert [event["state"] for event in events] == ["provisioning", "booting"]
 
 
 @pytest.mark.parametrize(

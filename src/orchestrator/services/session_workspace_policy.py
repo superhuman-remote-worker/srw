@@ -103,14 +103,11 @@ AGENT_POD_STARTUP_ALLOWANCE_S = 100
 def session_pod_startup_allowance_s(thread: Any) -> int:
     """Startup-probe allowance for an agent Pod bound to ``thread`` at creation.
 
-    A thread-bound agent attaches its session inside FastAPI lifespan startup,
-    so it serves no ``/health`` until that attach completes; a VM-tier attach
-    waits for the VM. The allowance is the pre-attach allowance plus this
-    session's readiness budget (``session_ready_timeout_s``), which the
-    orchestrator already waits after registration and which is sized above
-    the agent's own attach budget. The agent therefore gives up first with its
-    truthful reason, and the kubelet never ends an attach the orchestrator is
-    still waiting for (knowledge-base/knowledge/issues/
+    A dedicated agent now serves ``/health`` after bounded initialization and
+    registration while its lifecycle-owned attach task waits for a VM. Keep
+    this finite allowance as a process-start safety margin and for mixed-version
+    agents; session readiness is observed separately with the exact source-aware
+    budget (knowledge-base/knowledge/issues/
     dedicated_vm_session_ended_at_attach_by_startup_probe.md).
     """
     import json

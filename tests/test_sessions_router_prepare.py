@@ -563,6 +563,121 @@ async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch, metadata):
     assert observed_ready["require_protected_cloud"] is False
 
 
+@pytest.mark.asyncio
+async def test_prepare_keeps_exact_vm_wait_then_accepts_active_ready(monkeypatch):
+    """The shared observer lets /prepare outlast 960 s and accept real Ready."""
+    import asyncio
+
+    from orchestrator.routers import sessions as sessions_mod
+    from orchestrator.services import session_lifecycle as lifecycle
+
+    monkeypatch.setenv("VM_WS_READY_TIMEOUT_S", "960")
+    clock = {"now": 0.0}
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "time", lambda: clock["now"])
+    original_sleep = asyncio.sleep
+
+    async def advance(_seconds):
+        clock["now"] += 30.0
+        await original_sleep(0)
+
+    monkeypatch.setattr(lifecycle.asyncio, "sleep", advance)
+    initial = {
+        **_connection_thread(),
+        "metadata": {"config_override": {"workspace": {"backend": "vm"}}},
+    }
+    db = AsyncMock()
+    db.get_thread = AsyncMock(
+        side_effect=lambda _tid: {
+            **initial,
+            "status": "active" if clock["now"] >= 1860 else "created",
+        }
+    )
+    db.get_pinned_session_binding.return_value = _connection_binding()
+    lock_cm = AsyncMock()
+    lock_cm.__aenter__.return_value = None
+    lock_cm.__aexit__.return_value = False
+    db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+    ports = _fake_main(db)
+    ports.session_router = AsyncMock()
+    source = {
+        "contract_version": 1,
+        "phase": "resource_wait",
+        "request_id": "66666666-6666-4666-8666-666666666666",
+        "provision_generation": "77777777-7777-4777-8777-777777777777",
+        "runtime_generation": CONNECTION_GENERATION,
+    }
+
+    async def startup_view(thread, *, store):
+        assert store is db
+        if thread["status"] == "active":
+            return None
+        if clock["now"] < 1830:
+            return source
+        return {**source, "phase": "admitted", "admission_elapsed_s": 30.0}
+
+    async def probe(*_args, **_kwargs):
+        return clock["now"] >= 1860
+
+    monkeypatch.setattr(lifecycle, "initial_vm_startup_view", startup_view)
+    monkeypatch.setattr(lifecycle, "probe_ready", probe)
+    events = []
+    monkeypatch.setattr(
+        sessions_mod,
+        "lifecycle_emit",
+        lambda _uid, _tid, state, **_extra: events.append(state),
+    )
+    await sessions_mod._do_prepare(
+        thread_id=CONNECTION_THREAD_ID,
+        user_id="u1",
+        config_name="session_base",
+        config_override=None,
+        runtime_authority=sessions_mod.ThreadRuntimeAuthority(
+            CONNECTION_THREAD_ID, CONNECTION_GENERATION
+        ),
+        dependencies=ports.dependencies,
+    )
+    assert clock["now"] >= 1860
+    assert events == ["provisioning", "booting", "ready"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_drops_timeout_for_rotated_physical_binding(monkeypatch):
+    from dataclasses import replace
+
+    from orchestrator.routers import sessions as sessions_mod
+
+    db = AsyncMock()
+    db.get_thread.return_value = _connection_thread()
+    db.get_pinned_session_binding.side_effect = [
+        _connection_binding(),
+        replace(_connection_binding(), pod_ip="10.0.0.99"),
+    ]
+    lock_cm = AsyncMock()
+    lock_cm.__aenter__.return_value = None
+    lock_cm.__aexit__.return_value = False
+    db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+    ports = _fake_main(db)
+    monkeypatch.setattr(sessions_mod, "wait_for_ready", AsyncMock(return_value=False))
+    events = []
+    monkeypatch.setattr(
+        sessions_mod,
+        "lifecycle_emit",
+        lambda _uid, _tid, state, **_extra: events.append(state),
+    )
+    await sessions_mod._do_prepare(
+        thread_id=CONNECTION_THREAD_ID,
+        user_id="u1",
+        config_name="session_base",
+        config_override=None,
+        runtime_authority=sessions_mod.ThreadRuntimeAuthority(
+            CONNECTION_THREAD_ID, CONNECTION_GENERATION
+        ),
+        dependencies=ports.dependencies,
+    )
+    assert events == ["provisioning", "booting"]
+
+
 @pytest.mark.parametrize("mutation_phase", ["post_ready", "post_route"])
 @pytest.mark.asyncio
 async def test_do_prepare_end_intent_fences_route_and_ready(
