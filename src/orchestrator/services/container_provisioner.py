@@ -5602,6 +5602,19 @@ class ContainerProvisioner:
                         != expected_creation.seed_configmap_uid
                     ):
                         return False
+                    if expected_creation.route == "retained_create":
+                        # This route observes only already-bound resources.
+                        # A missing or ambiguous controller is not authority
+                        # to mutate the seed ConfigMap into compliance.
+                        if (
+                            self._exact_seed_configmap_pod_owner_reference(
+                                seed,
+                                pod_name=owner.pod_name,
+                                runtime_incarnation=runtime_incarnation,
+                            )
+                            is None
+                        ):
+                            return False
             publish_impl = getattr(
                 type(self._db),
                 "publish_stateless_thread_workspace_runtime",
@@ -5623,27 +5636,33 @@ class ContainerProvisioner:
                 owner,
                 _creation_reservation,
                 scope="workspace_container",
-            ) or (
-                await self._adopt_configmap(
-                    seed_configmap,
-                    pod,
-                    expected_owner=owner,
-                    expected_creation_generation=generation,
-                    creation_reservation_id=str(_creation_reservation["id"]),
-                    expected_configmap_uid=(
-                        expected_creation.seed_configmap_uid
-                        if expected_creation
-                        else None
-                    ),
-                    mutation_authority=lambda: self._workspace_creation_reservation_is_current(
-                        owner,
-                        _creation_reservation,
-                        scope="workspace_container",
-                    ),
-                )
-                is not True
             ):
                 return False
+            if (
+                expected_creation is None
+                or expected_creation.route != "retained_create"
+            ):
+                if (
+                    await self._adopt_configmap(
+                        seed_configmap,
+                        pod,
+                        expected_owner=owner,
+                        expected_creation_generation=generation,
+                        creation_reservation_id=str(_creation_reservation["id"]),
+                        expected_configmap_uid=(
+                            expected_creation.seed_configmap_uid
+                            if expected_creation
+                            else None
+                        ),
+                        mutation_authority=lambda: self._workspace_creation_reservation_is_current(
+                            owner,
+                            _creation_reservation,
+                            scope="workspace_container",
+                        ),
+                    )
+                    is not True
+                ):
+                    return False
 
             if pvc_name:
                 if expected_creation is None and (
@@ -5743,6 +5762,12 @@ class ContainerProvisioner:
                     if _creation_reservation.get("operation_kind") == "create"
                     else None
                 ),
+                **(
+                    {"retained_creation": expected_creation}
+                    if expected_creation is not None
+                    and expected_creation.route == "retained_create"
+                    else {}
+                ),
             )
             if not pod_ip:
                 return True
@@ -5760,6 +5785,12 @@ class ContainerProvisioner:
                 expected_seed_configmap=seed_configmap,
                 expected_pvc_uid=pvc_uid,
                 expected_pvc_storage_class=pvc_storage_class,
+                **(
+                    {"retained_creation": expected_creation}
+                    if expected_creation is not None
+                    and expected_creation.route == "retained_create"
+                    else {}
+                ),
             )
             complete_impl = getattr(
                 type(self._db),
@@ -15696,6 +15727,7 @@ class ContainerProvisioner:
         pull_image: str | None,
         observation_check: SessionCreationObservationBudget | None,
         authority_check: Callable[[], Awaitable[None]] | None,
+        retained_creation: SessionCreationCandidate | None = None,
     ) -> str | None:
         """Observe one exact Pod and its frozen stage; never create or replace it.
 
@@ -15935,6 +15967,11 @@ class ContainerProvisioner:
             expected_creation_generation=expected_creation_generation,
             expected_network_tier=expected_network_tier,
             expected_seed_configmap=expected_seed_configmap,
+            **(
+                {"retained_creation": retained_creation}
+                if retained_creation is not None
+                else {}
+            ),
         )
         if confirmed_uid != expected_runtime_incarnation:
             raise WorkspaceRuntimeAuthorityError("workspace Pod UID changed")
@@ -16015,6 +16052,7 @@ class ContainerProvisioner:
         observation_check: SessionCreationObservationBudget | None = None,
         authority_check: Callable[[], Awaitable[None]] | None = None,
         startup_reservation: Mapping[str, Any] | None = None,
+        retained_creation: SessionCreationCandidate | None = None,
     ) -> Optional[str]:
         """Poll until the pod is ready and accepts the configured SSH key.
 
@@ -16062,6 +16100,11 @@ class ContainerProvisioner:
                     pull_image=pull_image,
                     observation_check=observation_check,
                     authority_check=authority_check,
+                    **(
+                        {"retained_creation": retained_creation}
+                        if retained_creation is not None
+                        else {}
+                    ),
                 )
         loop = asyncio.get_event_loop()
         elapsed = (
@@ -16279,6 +16322,7 @@ class ContainerProvisioner:
         expected_retained_service_uid: str | None = None,
         expected_pod_name: str | None = None,
         expected_component: str | None = None,
+        retained_creation: SessionCreationCandidate | None = None,
     ) -> tuple[str, str, str]:
         """Read backing identity, host key, and Pod UID from the control plane."""
 
@@ -16357,6 +16401,26 @@ class ContainerProvisioner:
                         _canonical_runtime_uuid(value, label=label)
             except ValueError as exc:
                 raise WorkspaceRuntimeAuthorityError(str(exc)) from exc
+        if retained_creation is not None and (
+            retained_creation.route != "retained_create"
+            or pinned_attempt
+            or expected_owner is None
+            or expected_owner.kind != "session"
+            or retained_creation.thread_id != expected_owner.id
+            or retained_creation.namespace != self._namespace
+            or expected_runtime_incarnation != retained_creation.pod_uid
+            or expected_creation_generation != retained_creation.runtime_generation
+            or not pvc_name
+            or retained_creation.pvc_uid is None
+            or retained_creation.service_uid is None
+            or expected_pvc_uid not in (None, retained_creation.pvc_uid)
+            or expected_seed_configmap is _UNSPECIFIED_RESOURCE_BINDING
+            or (expected_seed_configmap is None)
+            != (retained_creation.seed_configmap_uid is None)
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "retained workspace attestation authority is incomplete"
+            )
         pod = await self._bounded_kubernetes_call(
             self._core_api.read_namespaced_pod,
             name=pod_name,
@@ -16425,6 +16489,11 @@ class ContainerProvisioner:
                         owner=expected_owner,
                         generation=expected_creation_generation,
                         pod_name=pod_name,
+                        creation_reservation_id=(
+                            retained_creation.source_id
+                            if retained_creation is not None
+                            else None
+                        ),
                     )
                 )
                 if pinned_attempt and (
@@ -16434,11 +16503,25 @@ class ContainerProvisioner:
                     raise WorkspaceRuntimeAuthorityError(
                         "workspace seed ConfigMap UID changed"
                     )
-                self._require_seed_configmap_pod_owner_reference(
-                    seed,
-                    pod_name=pod_name,
-                    runtime_incarnation=runtime_incarnation,
-                )
+                if retained_creation is not None:
+                    if (
+                        trusted_seed_uid != retained_creation.seed_configmap_uid
+                        or self._exact_seed_configmap_pod_owner_reference(
+                            seed,
+                            pod_name=pod_name,
+                            runtime_incarnation=runtime_incarnation,
+                        )
+                        is None
+                    ):
+                        raise WorkspaceRuntimeAuthorityError(
+                            "retained workspace seed identity changed"
+                        )
+                else:
+                    self._require_seed_configmap_pod_owner_reference(
+                        seed,
+                        pod_name=pod_name,
+                        runtime_incarnation=runtime_incarnation,
+                    )
         backing_kind = "pod"
         backing_uid = runtime_incarnation
         trusted_claim_uid: str | None = None
@@ -16474,6 +16557,13 @@ class ContainerProvisioner:
                     and trusted_claim_uid != expected_pvc_uid
                 ):
                     raise WorkspaceRuntimeAuthorityError("workspace PVC UID changed")
+                if (
+                    retained_creation is not None
+                    and trusted_claim_uid != retained_creation.pvc_uid
+                ):
+                    raise WorkspaceRuntimeAuthorityError(
+                        "retained workspace PVC UID changed"
+                    )
                 backing_uid = trusted_claim_uid
             else:
                 backing_uid = str(getattr(claim.metadata, "uid", "") or "")
@@ -16505,6 +16595,13 @@ class ContainerProvisioner:
                 ):
                     raise WorkspaceRuntimeAuthorityError(
                         "workspace Service UID changed"
+                    )
+                if (
+                    retained_creation is not None
+                    and trusted_service_uid != retained_creation.service_uid
+                ):
+                    raise WorkspaceRuntimeAuthorityError(
+                        "retained workspace Service UID changed"
                     )
         if not backing_uid:
             raise RuntimeError("workspace pod has no Kubernetes UID")
@@ -16632,17 +16729,36 @@ class ContainerProvisioner:
                         owner=expected_owner,
                         generation=expected_creation_generation,
                         pod_name=pod_name,
+                        creation_reservation_id=(
+                            retained_creation.source_id
+                            if retained_creation is not None
+                            else None
+                        ),
                     )
                 )
                 if confirmed_seed_uid != trusted_seed_uid:
                     raise WorkspaceRuntimeAuthorityError(
                         "workspace seed ConfigMap UID changed"
                     )
-                self._require_seed_configmap_pod_owner_reference(
-                    confirmed_seed,
-                    pod_name=pod_name,
-                    runtime_incarnation=runtime_incarnation,
-                )
+                if retained_creation is not None:
+                    if (
+                        confirmed_seed_uid != retained_creation.seed_configmap_uid
+                        or self._exact_seed_configmap_pod_owner_reference(
+                            confirmed_seed,
+                            pod_name=pod_name,
+                            runtime_incarnation=runtime_incarnation,
+                        )
+                        is None
+                    ):
+                        raise WorkspaceRuntimeAuthorityError(
+                            "retained workspace seed identity changed"
+                        )
+                else:
+                    self._require_seed_configmap_pod_owner_reference(
+                        confirmed_seed,
+                        pod_name=pod_name,
+                        runtime_incarnation=runtime_incarnation,
+                    )
         return (
             f"k8s-{backing_kind}:{self._namespace}:{backing_uid}",
             fingerprint,

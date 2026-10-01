@@ -287,6 +287,485 @@ async def test_normal_resume_keeps_exact_initial_retained_volume(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "late_change",
+    (
+        None,
+        "seed_uid",
+        "seed_missing",
+        "seed_controller_wrong",
+        "seed_controller_ambiguous",
+        "service_uid",
+        "seed_uid_after_ssh",
+        "seed_controller_ambiguous_after_ssh",
+        "service_uid_after_ssh",
+    ),
+    ids=lambda change: change or "healthy",
+)
+async def test_interrupted_retained_resume_is_rediscovered_before_scheduling(
+    database, actor, monkeypatch, late_change
+):
+    import asyncio
+    from datetime import datetime, timezone
+    from orchestrator.services.session_creation_continuation import (
+        SessionCreationContinuationRunner,
+    )
+    from orchestrator.services.session_provisioner import ensure_session_workspace
+    from orchestrator.services import stateless_session_retirement as protocol
+    from tests.test_session_created_source_rediscovery_real_postgres import (
+        reconstructed_provider,
+    )
+
+    # G1 itself is a settled v1 Ready create, matching the installed receipt
+    # shape: settlement leaves its startup state at readiness/starting.
+    original_create = continuation.DelayedWorkspaceCluster.create_namespaced_pod
+    original_ready = continuation.DelayedWorkspaceCluster.become_ready
+
+    def scheduled_g1(self, *, body, **kwargs):
+        pod = original_create(self, body=body, **kwargs)
+        pod.spec.node_name = "node8"
+        pod.status.conditions = [
+            SimpleNamespace(
+                type="PodScheduled",
+                status="True",
+                last_transition_time=datetime.now(timezone.utc),
+            )
+        ]
+        return pod
+
+    def ready_g1(self):
+        original_ready(self)
+        self.objects["pod"].status.conditions.append(
+            SimpleNamespace(
+                type="Ready",
+                status="True",
+                last_transition_time=datetime.now(timezone.utc),
+            )
+        )
+
+    monkeypatch.setattr(
+        continuation.DelayedWorkspaceCluster,
+        "create_namespaced_pod",
+        scheduled_g1,
+    )
+    monkeypatch.setattr(continuation.DelayedWorkspaceCluster, "become_ready", ready_g1)
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    case = await workspace_attempt(
+        database, actor, monkeypatch, first_wait="ready", seeded=True
+    )
+    assert case.creation["startup_protocol_version"] == 1
+    assert case.creation["startup_stage"] == "readiness"
+    assert case.creation["startup_state"] == "starting"
+    assert case.creation["startup_first_ready_at"] is not None
+    assert (
+        str(case.creation["seed_configmap_uid"])
+        == case.cluster.objects["seed"].metadata.uid
+    )
+    monkeypatch.setattr(
+        continuation.DelayedWorkspaceCluster,
+        "create_namespaced_pod",
+        original_create,
+    )
+    monkeypatch.setattr(
+        continuation.DelayedWorkspaceCluster, "become_ready", original_ready
+    )
+    await database.execute(
+        "INSERT INTO run_queue(unit_id,unit_kind,state,lease_token) "
+        "VALUES($1::uuid,'session_turn','done',2)",
+        case.thread_id,
+    )
+
+    async def residents(thread, *, terminal_token, **_):
+        return protocol.ResidentRetirementProof(
+            authority=protocol.resolve_shell_retirement_authority(
+                thread, terminal_token=terminal_token
+            )
+        )
+
+    async def shell(thread, *, terminal_token, **_):
+        return protocol.resolve_shell_retirement_authority(
+            thread, terminal_token=terminal_token
+        )
+
+    monkeypatch.setattr(protocol, "retire_stateless_workspace_residents", residents)
+    monkeypatch.setattr(protocol, "retire_stateless_session_shell", shell)
+    monkeypatch.setattr(protocol, "verify_stateless_workspace_residents_retired", shell)
+    from dataclasses import replace
+
+    # Simulate the Pod-owned seed disappearing between terminal attestation
+    # and the final physical cleanup capture. The latter uses the production
+    # read-only capture helper and observes its legitimate ConfigMap 404.
+    original_terminal_capture = case.provisioner.capture_terminal_workspace_identity
+
+    async def capture_after_seed_absence(owner):
+        terminal = await original_terminal_capture(owner)
+        case.cluster.objects.pop("seed")
+        absent = await case.provisioner.capture_workspace_teardown_identity(owner)
+        assert absent.seed_configmap_uid is None
+        assert absent.pod_uid == terminal.pod_uid
+        return replace(terminal, seed_configmap_uid=absent.seed_configmap_uid)
+
+    monkeypatch.setattr(
+        case.provisioner,
+        "capture_terminal_workspace_identity",
+        capture_after_seed_absence,
+    )
+
+    end_dependencies = replace(
+        retirement_dependencies(database, case),
+        build_agent_cloud_mount=AsyncMock(return_value=None),
+    )
+    assert await end_thread_flow(
+        case.thread_id,
+        case.before,
+        permanent=False,
+        force=False,
+        dependencies=end_dependencies,
+    ) == {"status": "ended"}
+    cleanup = await database.fetchrow(
+        "SELECT * FROM managed_repository_workspace_cleanup_intents "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+        "AND thread_runtime_generation=$2::uuid",
+        case.thread_id,
+        case.creation["thread_runtime_generation"],
+    )
+    assert cleanup["capture_complete"] is True
+    assert cleanup["seed_configmap_uid"] is None
+    assert cleanup["pvc_uid"] == case.creation["pvc_uid"]
+    await resume_case(database, case, actor)
+    create_pod = case.cluster.create_namespaced_pod
+
+    def unscheduled_pod(*, body, **kwargs):
+        pod = create_pod(body=body, **kwargs)
+        pod.spec.node_name = None
+        pod.status.phase = "Pending"
+        pod.status.conditions = [
+            SimpleNamespace(type="PodScheduled", status="False", reason="Unschedulable")
+        ]
+        return pod
+
+    monkeypatch.setattr(case.cluster, "create_namespaced_pod", unscheduled_pod)
+    await ensure_session_workspace(
+        case.thread_id,
+        db=database,
+        provisioner=case.provisioner,
+        suspension=case.suspension,
+    )
+    source = await database.fetchrow(
+        "SELECT * FROM managed_repository_workspace_creation_reservations "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+        "AND settled_at IS NULL",
+        case.thread_id,
+    )
+    assert source["startup_protocol_version"] == 1
+    assert source["startup_state"] == "waiting_capacity"
+    assert source["scheduled_at"] is None
+    assert source["pvc_uid"] == case.creation["pvc_uid"]
+    assert (
+        str(source["seed_configmap_uid"]) == case.cluster.objects["seed"].metadata.uid
+    )
+    assert source["seed_configmap_uid"] != case.creation["seed_configmap_uid"]
+    mutations = []
+    for verb in ("create", "patch", "delete", "replace"):
+        for kind in ("pod", "persistent_volume_claim", "service", "config_map"):
+            method = f"{verb}_namespaced_{kind}"
+
+            def refuse_mutation(*args, _method=method, **kwargs):
+                mutations.append(_method)
+                raise AssertionError(
+                    f"background continuation mutated Kubernetes: {_method}"
+                )
+
+            monkeypatch.setattr(case.cluster, method, refuse_mutation, raising=False)
+    # Capable gate-off instances must finish a receipt that was already v1.
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "false")
+    restarted = type(database)(
+        database._connection_string, min_connections=1, max_connections=3
+    )
+    await restarted.connect()
+    try:
+        provider = reconstructed_provider(restarted, case, monkeypatch)
+        page = await restarted.list_current_session_creation_candidates()
+        assert len(page.candidates) == 1
+        (candidate,) = page.candidates
+        assert candidate.route == "retained_create"
+        assert await restarted.current_session_creation_candidate_is_exact(candidate)
+        from dataclasses import replace as replace_candidate
+        from uuid import uuid4
+
+        for change in (
+            {"runtime_generation": str(uuid4())},
+            {"claim_token": candidate.claim_token + 1},
+            {"pod_uid": str(uuid4())},
+            {"pvc_uid": str(uuid4())},
+            {"seed_configmap_uid": str(uuid4())},
+            {"source_fingerprint": "0" * 64},
+        ):
+            assert not await restarted.current_session_creation_candidate_is_exact(
+                replace_candidate(candidate, **change)
+            ), change
+
+        import copy
+        import json
+        from uuid import UUID
+        from orchestrator.database.session_creation_candidates import (
+            SESSION_CREATION_SCAN_SQL,
+            candidate_from_record,
+        )
+
+        raw = dict(
+            await restarted.fetchrow(
+                SESSION_CREATION_SCAN_SQL, UUID(case.thread_id), None, None, None, 2
+            )
+        )
+        for key in (
+            "owner",
+            "source",
+            "retained_predecessors",
+            "retained_cleanups",
+            "retained_process_zeroes",
+        ):
+            if isinstance(raw[key], str):
+                raw[key] = json.loads(raw[key])
+        assert candidate_from_record(raw) == candidate
+        refusals = (
+            ("open_cleanup", lambda row: row.update(conflicting_authority=True)),
+            (
+                "unsettled_predecessor",
+                lambda row: row["retained_predecessors"][0].update(
+                    phase="runtime_bound"
+                ),
+            ),
+            (
+                "predecessor_attention",
+                lambda row: row["retained_predecessors"][0].update(
+                    startup_state="attention"
+                ),
+            ),
+            (
+                "incomplete_cleanup",
+                lambda row: row["retained_cleanups"][0].update(
+                    cleanup_completed_at=None
+                ),
+            ),
+            (
+                "not_ready_predecessor",
+                lambda row: row["retained_cleanups"][0]["lifecycle_fingerprint"].update(
+                    runtime_status="failed"
+                ),
+            ),
+            (
+                "missing_process_zero",
+                lambda row: row.update(retained_process_zeroes=None),
+            ),
+            (
+                "contradictory_captured_seed",
+                lambda row: row["retained_cleanups"][0].update(
+                    seed_configmap_uid=str(uuid4())
+                ),
+            ),
+            ("current_end", lambda row: row["owner"].update(status="ended")),
+            (
+                "claim_loss_hold",
+                lambda row: row["owner"]["metadata"].update(
+                    _stateless_claim_loss_hold={}
+                ),
+            ),
+            (
+                "restore_marker",
+                lambda row: row["owner"]["metadata"]["workspace_container"].update(
+                    _snapshot_restore_required=True
+                ),
+            ),
+            (
+                "restore_operation",
+                lambda row: row["source"].update(operation_kind="restore"),
+            ),
+            (
+                "current_cancellation",
+                lambda row: row["source"].update(
+                    cancel_requested_at=row["source"]["created_at"]
+                ),
+            ),
+            (
+                "replaced_binding",
+                lambda row: row["owner"]["metadata"]["_workspace_binding"].update(
+                    backing_id="k8s-pvc:agent-workspaces:" + str(uuid4())
+                ),
+            ),
+            (
+                "bindingless_initial",
+                lambda row: row["owner"]["metadata"].pop("_workspace_binding"),
+            ),
+        )
+        for name, mutate in refusals:
+            altered = copy.deepcopy(raw)
+            mutate(altered)
+            assert candidate_from_record(altered) is None, name
+        runner = SessionCreationContinuationRunner(
+            db=restarted, provisioner=provider, shutdown_event=asyncio.Event()
+        )
+        for kind in ("pod", "pvc", "seed"):
+            resource = case.cluster.objects[kind]
+            original_uid = resource.metadata.uid
+            resource.metadata.uid = str(uuid4())
+            try:
+                (changed_candidate,) = (
+                    await restarted.list_current_session_creation_candidates()
+                ).candidates
+                assert not await runner._continue(changed_candidate)
+                refused = await restarted.fetchrow(
+                    "SELECT settled_at FROM managed_repository_workspace_creation_reservations WHERE id=$1",
+                    source["id"],
+                )
+                assert refused["settled_at"] is None
+            finally:
+                resource.metadata.uid = original_uid
+        seed = case.cluster.objects["seed"]
+        original_references = seed.metadata.owner_references
+        for changed_references in (
+            [],
+            original_references + [original_references[0]],
+        ):
+            seed.metadata.owner_references = changed_references
+            try:
+                (changed_candidate,) = (
+                    await restarted.list_current_session_creation_candidates()
+                ).candidates
+                assert not await runner._continue(changed_candidate)
+            finally:
+                seed.metadata.owner_references = original_references
+        assert mutations == []
+        (candidate,) = (
+            await restarted.list_current_session_creation_candidates()
+        ).candidates
+        pod = case.cluster.objects["pod"]
+        scheduled = datetime.now(timezone.utc)
+        pod.spec.node_name = "node8"
+        pod.status.conditions = [
+            SimpleNamespace(
+                type="PodScheduled", status="True", last_transition_time=scheduled
+            )
+        ]
+        # First continuation freezes the physical scheduling timestamp.
+        assert not await runner._continue(candidate)
+        still_open = await restarted.fetchrow(
+            "SELECT * FROM managed_repository_workspace_creation_reservations WHERE id=$1",
+            source["id"],
+        )
+        assert still_open["scheduled_at"] == scheduled
+        assert not await restarted.current_session_creation_candidate_is_exact(
+            candidate
+        )
+        case.cluster.become_ready()
+        pod.status.conditions.append(
+            SimpleNamespace(type="Ready", status="True", last_transition_time=scheduled)
+        )
+        (candidate,) = (
+            await restarted.list_current_session_creation_candidates()
+        ).candidates
+        if late_change is not None:
+            # _wait_for_ready follows the early UID checks and resource receipt
+            # recording. Inject external replacement at that awaited boundary.
+            original_wait = provider._wait_for_ready
+            restorations = []
+            injections = []
+            change_kind = late_change.removesuffix("_after_ssh")
+
+            def change_physical_identity():
+                injections.append(late_change)
+                if change_kind == "seed_missing":
+                    original = case.cluster.objects.pop("seed")
+                    restorations.append(
+                        lambda: case.cluster.objects.__setitem__("seed", original)
+                    )
+                elif change_kind == "service_uid":
+                    service = case.cluster.objects["service"]
+                    original = service.metadata.uid
+                    service.metadata.uid = str(uuid4())
+                    restorations.append(
+                        lambda: setattr(service.metadata, "uid", original)
+                    )
+                else:
+                    seed = case.cluster.objects["seed"]
+                    if change_kind == "seed_uid":
+                        original = seed.metadata.uid
+                        seed.metadata.uid = str(uuid4())
+                        restorations.append(
+                            lambda: setattr(seed.metadata, "uid", original)
+                        )
+                    else:
+                        original = seed.metadata.owner_references
+                        if change_kind == "seed_controller_wrong":
+                            changed = copy.deepcopy(original)
+                            changed[0]["uid"] = str(uuid4())
+                        else:
+                            changed = original + [dict(original[0])]
+                        seed.metadata.owner_references = changed
+                        restorations.append(
+                            lambda: setattr(seed.metadata, "owner_references", original)
+                        )
+
+            async def inject_after_record(*args, **kwargs):
+                recorded = await restarted.fetchrow(
+                    "SELECT seed_configmap_uid,service_uid FROM "
+                    "managed_repository_workspace_creation_reservations WHERE id=$1",
+                    source["id"],
+                )
+                assert recorded["seed_configmap_uid"] == source["seed_configmap_uid"]
+                assert recorded["service_uid"] == source["service_uid"]
+                if late_change.endswith("_after_ssh"):
+                    ready_ip = await original_wait(*args, **kwargs)
+                    assert ready_ip is not None
+                    change_physical_identity()
+                    return ready_ip
+                change_physical_identity()
+                return await original_wait(*args, **kwargs)
+
+            monkeypatch.setattr(provider, "_wait_for_ready", inject_after_record)
+            assert not await runner._continue(candidate)
+            assert injections == [late_change]
+            refused = await restarted.fetchrow(
+                "SELECT settled_at FROM managed_repository_workspace_creation_reservations WHERE id=$1",
+                source["id"],
+            )
+            assert refused["settled_at"] is None
+            assert mutations == []
+            for restore in restorations:
+                restore()
+            monkeypatch.setattr(provider, "_wait_for_ready", original_wait)
+            (candidate,) = (
+                await restarted.list_current_session_creation_candidates()
+            ).candidates
+        assert await runner._continue(candidate)
+        settled = await restarted.fetchrow(
+            "SELECT * FROM managed_repository_workspace_creation_reservations WHERE id=$1",
+            source["id"],
+        )
+        assert settled["settled_at"] is not None
+        assert settled["startup_first_ready_at"] == scheduled
+        completed_metadata = metadata(await restarted.get_thread(case.thread_id))
+        assert completed_metadata["workspace_container"]["status"] == "ready"
+        assert (
+            completed_metadata["_workspace_binding"]["ssh_host_key_fingerprint"]
+            == continuation.FINGERPRINT
+        )
+        assert completed_metadata["_workspace_binding"]["backing_id"].endswith(
+            case.pvc_uid
+        )
+        assert case.cluster.objects["pod"].metadata.uid == str(source["pod_uid"])
+        assert case.cluster.objects["pvc"].metadata.uid == case.pvc_uid
+        assert not (
+            await restarted.list_current_session_creation_candidates()
+        ).candidates
+        assert not await runner._continue(candidate)
+        assert case.cluster.pod_create_calls == 2
+        assert mutations == []
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("missing", [False, True])
 @pytest.mark.parametrize("after_read", [False, True])
 async def test_resume_refuses_volume_replacement_during_create(

@@ -22447,14 +22447,15 @@ class PostgresDB:
                     reason = observation.reason_code
                 elif isinstance(observation, ScheduledAt):
                     proposed = observation.scheduled_at
-                    if (
-                        proposed.tzinfo is None
-                        or proposed.utcoffset() is None
-                        or proposed.astimezone(timezone.utc) < receipt["created_at"]
-                        or proposed.astimezone(timezone.utc) > now
-                    ):
+                    if proposed.tzinfo is None or proposed.utcoffset() is None:
                         return False
                     proposed = proposed.astimezone(timezone.utc)
+                    created_at = receipt["created_at"].astimezone(timezone.utc)
+                    if (
+                        proposed < created_at
+                        and proposed != created_at.replace(microsecond=0)
+                    ) or proposed > now:
+                        return False
                     if scheduled_at is not None:
                         if scheduled_at != proposed or (
                             budgets is not None
