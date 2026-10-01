@@ -12,6 +12,7 @@ Its diagnostic records contain only run/model/endpoint/stream/outcome metadata.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import hmac
 import json
@@ -101,6 +102,13 @@ class ArmProbeWindowRequest(BaseModel):
 class AdvanceScenarioRequest(ArmScenarioRequest):
     """Add a phase without resetting the correlation, history or budgets."""
 
+    expected_cancelled: int = Field(default=0, ge=0, le=100)
+
+
+class CloseScenarioRequest(BaseModel):
+    """Confirm attributed cancellations while preserving the exact run life."""
+
+    model_config = ConfigDict(extra="forbid")
     expected_cancelled: int = Field(default=0, ge=0, le=100)
 
 
@@ -198,6 +206,7 @@ class ScenarioStore:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._runs: dict[str, RunState] = {}
+        self._closed_runs: dict[str, dict[str, Any]] = {}
         self._unscoped_unexpected_calls = 0
         self._unscoped_calls: list[dict[str, Any]] = []
         self._probe_windows: dict[str, ProbeWindow] = {}
@@ -319,6 +328,10 @@ class ScenarioStore:
                 "Sentinel hash is required only for retained worker scenario.",
             )
         async with self._lock:
+            if run_id in self._closed_runs:
+                raise ScenarioError(
+                    409, "scenario_closed", "This run life was already closed."
+                )
             if run_id in self._runs:
                 raise ScenarioError(
                     409,
@@ -337,10 +350,68 @@ class ScenarioStore:
     async def reset(self, run_id: str) -> bool:
         _validate_run_id(run_id)
         async with self._lock:
+            if run_id in self._closed_runs:
+                raise ScenarioError(
+                    409, "scenario_closed", "Closed accounting cannot be reset."
+                )
             state = self._runs.pop(run_id, None)
             if state is not None:
                 state.completion_release.set()
             return state is not None
+
+    async def close(self, run_id: str, request: CloseScenarioRequest) -> dict[str, Any]:
+        """Archive settled accounting atomically; never erase or reuse its ID."""
+
+        _validate_run_id(run_id)
+        async with self._lock:
+            closed = self._closed_runs.get(run_id)
+            if closed is not None:
+                if closed["expected_cancelled"] != request.expected_cancelled:
+                    raise ScenarioError(
+                        409,
+                        "close_accounting_changed",
+                        "Close cancellation accounting changed.",
+                    )
+                return copy.deepcopy(closed)
+            state = self._runs.get(run_id)
+            if state is None:
+                raise ScenarioError(404, "scenario_not_found", "No scenario is armed.")
+            cancelled = sum(
+                n
+                for (_, _, _, outcome), n in state.counters.items()
+                if outcome == "cancelled"
+            )
+            cancelled_required = sum(
+                call["outcome"] == "cancelled" and call.get("consume_required") is True
+                for call in state.calls
+            )
+            observed = Counter(
+                (call["model"], call["endpoint"], call["stream"], call["outcome"])
+                for call in state.calls
+            )
+            sequences = [call["sequence"] for call in state.calls]
+            if (
+                state.pending
+                or state.remaining_required_responses > cancelled_required
+                or state.unexpected_calls != request.expected_cancelled
+                or cancelled != request.expected_cancelled
+                or observed != state.counters
+                or sorted(sequences) != list(range(1, state.next_sequence))
+            ):
+                raise ScenarioError(
+                    409,
+                    "close_unsettled",
+                    "The run has unfinished or unaccounted work.",
+                )
+            closed = copy.deepcopy(self._serialize(state))
+            closed.update(
+                closed=True,
+                closed_at=_observed_at(),
+                expected_cancelled=request.expected_cancelled,
+            )
+            self._closed_runs[run_id] = closed
+            del self._runs[run_id]
+            return copy.deepcopy(closed)
 
     async def advance(
         self, run_id: str, request: AdvanceScenarioRequest
@@ -389,6 +460,8 @@ class ScenarioStore:
         async with self._lock:
             state = self._runs.get(run_id)
             if state is None:
+                if run_id in self._closed_runs:
+                    return copy.deepcopy(self._closed_runs[run_id])
                 raise ScenarioError(404, "scenario_not_found", "No scenario is armed.")
             return self._serialize(state)
 
@@ -437,6 +510,10 @@ class ScenarioStore:
             return {
                 "runs": [
                     self._serialize(self._runs[key]) for key in sorted(self._runs)
+                ],
+                "closed_runs": [
+                    copy.deepcopy(self._closed_runs[key])
+                    for key in sorted(self._closed_runs)
                 ],
                 "unscoped_unexpected_calls": self._unscoped_unexpected_calls,
                 "unscoped_calls_truncated": max(
@@ -776,6 +853,7 @@ class ScenarioStore:
                     "endpoint": decision.endpoint,
                     "stream": decision.stream,
                     "outcome": outcome,
+                    "consume_required": decision.consume_required,
                     "duration_ms": duration_ms,
                 }
             )
@@ -804,6 +882,7 @@ class ScenarioStore:
                 "endpoint": endpoint,
                 "stream": stream,
                 "outcome": outcome,
+                "consume_required": False,
                 "duration_ms": 0,
             }
         )
@@ -1356,6 +1435,13 @@ def create_control_app(store: ScenarioStore, *, control_token: str) -> FastAPI:
         if not removed:
             return _error_response(404, "scenario_not_found", "No scenario is armed.")
         return {"run_id": run_id, "reset": True}
+
+    @app.post("/control/scenarios/{run_id}/close")
+    async def close(run_id: str, close_request: CloseScenarioRequest):
+        try:
+            return await store.close(run_id, close_request)
+        except ScenarioError as exc:
+            return _scenario_error_response(exc)
 
     @app.post("/control/probe-windows/{window_id}/arm", status_code=201)
     async def arm_probe_window(window_id: str, arm_request: ArmProbeWindowRequest):

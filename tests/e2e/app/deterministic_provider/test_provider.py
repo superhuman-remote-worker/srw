@@ -1335,6 +1335,7 @@ async def test_control_state_never_retains_prompts_tool_arguments_or_headers(
         "stream",
         "outcome",
         "duration_ms",
+        "consume_required",
     }
 
 

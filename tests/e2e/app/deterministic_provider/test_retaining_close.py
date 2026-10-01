@@ -2,13 +2,13 @@
 
 import pytest
 
-from tests.e2e.app.deterministic_provider.test_provider import (
-    arm,
-    chat_request,
-    control,
-    inference,
-    store,
-)
+from tests.e2e.app.deterministic_provider import test_provider as fixtures
+
+arm = fixtures.arm
+chat_request = fixtures.chat_request
+control = fixtures.control
+inference = fixtures.inference
+store = fixtures.store
 
 pytestmark = pytest.mark.asyncio
 
