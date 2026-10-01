@@ -1243,6 +1243,58 @@ def test_provider_cleanup_waits_for_work_and_retains_closed_readback(
     assert receipt["overview"]["closed_runs"] == [closed]
 
 
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "wrong-life",
+        "not-closed",
+        "counter-reset",
+        "changed-readback",
+        "missing-readback",
+    ],
+)
+def test_retaining_provider_close_refuses_lost_or_changed_evidence(monkeypatch, fault):
+    rid = "retained-harness-guard"
+    prior = {
+        "run_id": rid,
+        "pending_calls": 0,
+        "unexpected_count": 0,
+        "remaining_required_responses": 0,
+        "counters": [{"count": 1}],
+        "calls": [{"sequence": 1}],
+    }
+    closed = {**prior, "closed": True, "expected_cancelled": 0}
+    if fault == "wrong-life":
+        closed["run_id"] = "successor-life"
+    elif fault == "not-closed":
+        closed["closed"] = False
+    elif fault == "counter-reset":
+        closed["counters"] = []
+    reads = 0
+
+    def request(url, **kwargs):
+        nonlocal reads
+        if kwargs.get("method") == "POST":
+            return 200, json.dumps(closed).encode()
+        reads += 1
+        if reads == 1:
+            return 200, json.dumps(prior).encode()
+        observed = (
+            {**closed, "calls": []}
+            if fault == "changed-readback"
+            else {}
+            if fault == "missing-readback"
+            else closed
+        )
+        return 200, json.dumps(observed).encode()
+
+    monkeypatch.setattr(harness, "_http_request", request)
+    with pytest.raises(harness.HarnessError, match="cumulative accounting"):
+        harness._close_provider_scope(
+            "http://provider.test/control/scenarios/" + rid, headers={}, run_id=rid
+        )
+
+
 def test_provider_cleanup_refuses_global_unscoped_rejections(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_clock
 ) -> None:
