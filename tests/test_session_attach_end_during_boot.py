@@ -221,6 +221,7 @@ async def test_the_dedicated_boot_leaves_through_the_ended_session_exit(
     manager = pa.lifespan(MagicMock())
     await manager.__aenter__()
     try:
+        await pa._session_attach.startup_task
         ended.assert_awaited_once_with(THREAD)
         not_ready.assert_not_awaited()
         assert orchestrator.reads_after_end >= 1

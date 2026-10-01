@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Any, Callable, NoReturn, Optional
 
 from agent.api.lease_context import LeaseLostError
-from agent.api.session_contract import EventJournalUnavailable
+from agent.api.orchestrator_client import SessionEnded, SessionGrantDenied
+from agent.api.session_contract import EventJournalUnavailable, WorkspaceNotReady
 from agent.api.session_identity import canonical_runtime_generation
 
 _DEREGISTER_ON_EXIT_TIMEOUT_S = 5.0
@@ -39,6 +40,8 @@ class SessionTerminationPorts:
     heartbeat_task: Callable[..., Any]
     identity: Callable[..., Any]
     idle_timeout_error: type[Exception]
+    memory_unavailable_error: type[Exception]
+    workspace_unavailable_error: type[Exception]
     input_runtime: Callable[..., Any]
     loop_on_error: Callable[..., Any]
     loop_task: Callable[..., Any]
@@ -868,6 +871,26 @@ class SessionTerminationCoordinator:
         """Signal that a WebSocket has connected. Cancels the boot-WS watchdog."""
         if self.ws_connected_event is not None:
             self.ws_connected_event.set()
+
+    async def handle_attach_failure(self, thread_id: str, exc: Exception) -> None:
+        """Preserve dedicated attach's exact failure exit after async startup."""
+        if isinstance(exc, SessionEnded):
+            await self.exit_session_ended(thread_id)
+        elif isinstance(exc, SessionGrantDenied):
+            await self.exit_grant_denied(thread_id, exc)
+        elif isinstance(exc, self._ports.memory_unavailable_error):
+            await self.exit_memory_unavailable(thread_id, exc)
+        elif isinstance(
+            exc, (WorkspaceNotReady, self._ports.workspace_unavailable_error)
+        ):
+            await self.exit_workspace_not_ready(thread_id, exc)
+        else:
+            self._logger.error(
+                "Dedicated session attach failed for thread %s (%s)",
+                thread_id,
+                type(exc).__name__,
+            )
+            os._exit(1)
 
     async def exit_workspace_not_ready(
         self, thread_id: str, exc: Exception

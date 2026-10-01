@@ -568,7 +568,11 @@ class SessionAttachCoordinator:
 
         try:
             return await self._ports.poll_workspace_ready(
-                self._client, thread_id, **kwargs, **self._ending_fence()
+                self._client,
+                thread_id,
+                session_runtime_generation=self._identity.session_generation,
+                **kwargs,
+                **self._ending_fence(),
             )
         except SessionEnding as ending:
             outcome = self._ending_outcome(ending)
@@ -594,11 +598,13 @@ class SessionAttachCoordinator:
         return True
 
     def pool_heartbeat_status(self) -> str:
-        """Advertise a synchronous pool claim before ``self._session`` exists."""
+        """Only an unbound process with no pending attach may advertise idle."""
 
         return (
             "ready"
-            if self._session is None
+            if self._identity.thread_id is None
+            and (self._startup_task is None or self._startup_task.done())
+            and self._session is None
             and self._pool_claim is None
             and self._ports.pending_drain_suspend() is None
             and self._release_receipt is None
@@ -671,6 +677,31 @@ class SessionAttachCoordinator:
     def startup_task(self) -> asyncio.Task[None] | None:
         """Startup construction or its uncertain cleanup remains tracked."""
         return self._startup_task
+
+    def start_dedicated_attach(
+        self, thread_id: str, *, on_failure: Callable[[str, Exception], Awaitable[None]]
+    ) -> asyncio.Task[None]:
+        """Own construction after registration while process health can be served."""
+        if self._startup_task is not None and not self._startup_task.done():
+            raise RuntimeError(
+                "Dedicated attach construction already owns this process"
+            )
+        self._startup_task = asyncio.create_task(
+            self.run_dedicated_attach(thread_id, on_failure=on_failure),
+            name=f"dedicated-session-attach:{thread_id}",
+        )
+        return self._startup_task
+
+    async def run_dedicated_attach(
+        self, thread_id: str, *, on_failure: Callable[[str, Exception], Awaitable[None]]
+    ) -> None:
+        """Run one exact attach; the termination owner makes failure exit decisions."""
+        try:
+            await self.attach(thread_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await on_failure(thread_id, exc)
 
     async def attach_during_startup(
         self,
@@ -2490,14 +2521,16 @@ class SessionAttachCoordinator:
 
         async with self._pool_lock:
             if (
-                self._session is not None
+                self._identity.thread_id is not None
+                or (self._startup_task is not None and not self._startup_task.done())
+                or self._session is not None
                 or self._pool_claim is not None
                 or self._ports.pending_drain_suspend() is not None
             ):
                 owner = (
                     self._identity.thread_id
                     or self._pool_claim
-                    or self._ports.pending_drain_suspend().get("thread_id")
+                    or (self._ports.pending_drain_suspend() or {}).get("thread_id")
                 )
                 return PoolAttachAdmission(
                     409,

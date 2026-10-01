@@ -48,7 +48,7 @@ from agent.api.session_contract import (
     SessionOperations,
     SessionRuntimeView,
     TerminationAdmissionClosed,
-    WorkspaceNotReady,
+    WorkspaceNotReady as WorkspaceNotReady,
     canonical_session_identity_fingerprint,
 )
 from agent.api.session_identity import (
@@ -79,7 +79,7 @@ from agent.api.orchestrator_client import (
     DuplicateThreadBinding,
     OrchestratorClient,
     SessionEnded,
-    SessionGrantDenied,
+    SessionGrantDenied as SessionGrantDenied,
     ThreadConfigUpdateDenied,
     create_orchestrator_client_from_env,
 )
@@ -535,6 +535,8 @@ _session_termination = SessionTerminationCoordinator(
         heartbeat_task=lambda: _heartbeat_task,
         identity=lambda: _session_identity,
         idle_timeout_error=IdleTimeoutError,
+        memory_unavailable_error=MemoryUnavailableError,
+        workspace_unavailable_error=WorkspaceUnavailableError,
         input_runtime=lambda: _session_input,
         loop_on_error=lambda *args, **kwargs: _loop_on_error(*args, **kwargs),
         loop_task=lambda: _loop_task,
@@ -1440,47 +1442,13 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("No ORCHESTRATOR_URL — running standalone")
 
-    # If we have a thread_id (dedicated mode) and registration succeeded, set
-    # up the session immediately. If register was refused (409), skip the
-    # attach — the legitimate owner already holds this thread.
+    # Serve process health after bounded initialization/registration. The attach
+    # coordinator owns the long exact workspace wait; /ready stays transaction-gated.
     if _session_identity.thread_id and dedicated_register_ok:
-        # Fallback: generate UUID if still None (standalone mode)
-        if _session_identity.thread_id is None:
-            import uuid
-
-            _session_identity.bind_thread(str(uuid.uuid4()))
-
-        try:
-            await _session_attach.attach_during_startup(
-                _session_identity.thread_id,
-                on_shutdown=lambda: _session_termination.activate_termination_admission_fence("startup_shutdown"),
-            )
-        except SessionEnded:
-            await _session_termination.exit_session_ended(_session_identity.thread_id)
-        except SessionGrantDenied as e:
-            # The session's resolved config exceeds the owner's capability grants
-            # (workspace endpoint returned 403) — e.g. a grant revoked between the
-            # orchestrator's create/provision pre-flight (Layers 1/2) and this
-            # attach. Permanent: exit with the REAL reason instead of the
-            # misleading 'workspace not provisioned' rebind path; the cockpit
-            # re-surfaces it on its next create/prepare grant pre-flight.
-            await _session_termination.exit_grant_denied(_session_identity.thread_id, e)
-        except MemoryUnavailableError as e:
-            # A configured/required memory component couldn't be set up (store
-            # init or a plugin transport that won't resolve — e.g. the reranker
-            # endpoint). Deterministic config failure: exit cleanly with the REAL
-            # reason instead of crashing (which triggered a workspace-release +
-            # crash-loop retry). The cockpit re-surfaces it via the orchestrator
-            # endpoint pre-flight.
-            await _session_termination.exit_memory_unavailable(_session_identity.thread_id, e)
-        except (WorkspaceNotReady, WorkspaceUnavailableError) as e:
-            # Workspace raced us / is wedged (WorkspaceNotReady) or its pod is
-            # dead/unreachable (WorkspaceUnavailableError — SSH connect exhausted
-            # against a destroyed workspace): exit cleanly (status 0) instead of
-            # crashing, so K8s doesn't restart-loop. The orchestrator's session
-            # reconcile (ensure_workspace drift probe) recreates the pod and
-            # rebinds a fresh agent. See _exit_workspace_not_ready.
-            await _session_termination.exit_workspace_not_ready(_session_identity.thread_id, e)
+        _session_attach.start_dedicated_attach(
+            _session_identity.thread_id,
+            on_failure=_session_termination.handle_attach_failure,
+        )
     elif _session_identity.thread_id and not dedicated_register_ok:
         logger.info(
             "Skipping session attach for thread %s — orchestrator refused "

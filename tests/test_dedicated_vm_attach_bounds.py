@@ -29,38 +29,77 @@ from orchestrator.services import session_workspace_policy
 
 _FIELDS = {
     "_thread_id": (persistent_app._session_identity, "_thread_id"),
-    "_session_runtime_generation": (persistent_app._session_identity, "_session_generation"),
-    "_session_runtime_attach_token": (persistent_app._session_identity, "_attach_token"),
-    "_pinned_runtime_generation_enabled": (persistent_app._session_identity, "_runtime_contract"),
+    "_session_runtime_generation": (
+        persistent_app._session_identity,
+        "_session_generation",
+    ),
+    "_session_runtime_attach_token": (
+        persistent_app._session_identity,
+        "_attach_token",
+    ),
+    "_pinned_runtime_generation_enabled": (
+        persistent_app._session_identity,
+        "_runtime_contract",
+    ),
     "_pool_attach_claim": (persistent_app._session_attach, "_pool_claim"),
     "_pool_attach_task": (persistent_app._session_attach, "_pool_task"),
     "_dedicated_attach_task": (persistent_app._session_attach, "_startup_task"),
-    "_failed_attach_release_receipt": (persistent_app._session_attach, "_release_receipt"),
-    "_pending_drain_suspend": (persistent_app._session_termination, "pending_drain_suspend"),
-    "_retirement_admission_identity": (persistent_app._session_termination, "retirement_admission_identity"),
+    "_failed_attach_release_receipt": (
+        persistent_app._session_attach,
+        "_release_receipt",
+    ),
+    "_pending_drain_suspend": (
+        persistent_app._session_termination,
+        "pending_drain_suspend",
+    ),
+    "_retirement_admission_identity": (
+        persistent_app._session_termination,
+        "retirement_admission_identity",
+    ),
     "_terminating": (persistent_app._session_termination, "terminating"),
     "_termination_task": (persistent_app._session_termination, "termination_task"),
     "_sessions_served": (persistent_app._session_termination, "sessions_served"),
-    "_max_sessions_per_process": (persistent_app._session_termination, "max_sessions_per_process"),
+    "_max_sessions_per_process": (
+        persistent_app._session_termination,
+        "max_sessions_per_process",
+    ),
     "_attach_session": (persistent_app._session_attach, "attach"),
-    "_begin_exact_session_retirement": (persistent_app._session_termination, "begin_retirement"),
-    "_settle_exact_retirement_after_quiescence": (persistent_app._session_termination, "settle_exact_retirement_after_quiescence"),
-    "_stop_and_join_watchdogs": (persistent_app._session_termination, "stop_and_join_watchdogs"),
-    "_quiesce_session_side_tasks": (persistent_app._session_termination, "quiesce_session_side_tasks"),
+    "_begin_exact_session_retirement": (
+        persistent_app._session_termination,
+        "begin_retirement",
+    ),
+    "_settle_exact_retirement_after_quiescence": (
+        persistent_app._session_termination,
+        "settle_exact_retirement_after_quiescence",
+    ),
+    "_stop_and_join_watchdogs": (
+        persistent_app._session_termination,
+        "stop_and_join_watchdogs",
+    ),
+    "_quiesce_session_side_tasks": (
+        persistent_app._session_termination,
+        "quiesce_session_side_tasks",
+    ),
 }
+
 
 def _patch(monkeypatch, name, value):
     owner, attr = _FIELDS.get(name, (persistent_app, name))
     monkeypatch.setattr(owner, attr, value)
 
+
 def _preserve(monkeypatch, name):
     owner, attr = _FIELDS.get(name, (persistent_app, name))
     monkeypatch.setattr(owner, attr, getattr(owner, attr))
 
+
 async def _poll_workspace_ready(*args, **kwargs):
     return await session_workspace.poll_workspace_ready(
-        *args, **kwargs
+        *args,
+        session_runtime_generation=persistent_app._session_identity.session_generation,
+        **kwargs,
     )
+
 
 @pytest.mark.asyncio
 async def test_dedicated_lifespan_serves_health_while_exact_attach_waits(monkeypatch):
@@ -200,7 +239,9 @@ async def test_completed_dedicated_attach_can_detach_and_rejoin_idle_pool(monkey
         mod._session_termination, "begin_retirement", AsyncMock(return_value=True)
     )
     monkeypatch.setattr(
-        mod._session_termination, "settle_exact_retirement_after_quiescence", AsyncMock(return_value=True)
+        mod._session_termination,
+        "settle_exact_retirement_after_quiescence",
+        AsyncMock(return_value=True),
     )
     for name in (
         "_stop_and_join_watchdogs",
@@ -211,7 +252,11 @@ async def test_completed_dedicated_attach_can_detach_and_rejoin_idle_pool(monkey
     ):
         _patch(monkeypatch, name, AsyncMock())
 
-    dedicated = asyncio.create_task(mod._session_attach.run_dedicated_attach(first_thread, on_failure=mod._session_termination.handle_attach_failure))
+    dedicated = asyncio.create_task(
+        mod._session_attach.run_dedicated_attach(
+            first_thread, on_failure=mod._session_termination.handle_attach_failure
+        )
+    )
     _patch(monkeypatch, "_dedicated_attach_task", dedicated)
     await dedicated
     assert attached == [first_thread]
@@ -232,7 +277,7 @@ async def test_completed_dedicated_attach_can_detach_and_rejoin_idle_pool(monkey
     assert pool_task is not None
     await pool_task
     assert attached == [first_thread, next_thread]
-    assert mod._session_attach.pool_claim is None
+    assert mod._session_attach.pool_claim == (None, None, None)
 
 
 @pytest.mark.asyncio
@@ -255,7 +300,7 @@ async def test_pending_dedicated_attach_refuses_without_thread_or_drain(monkeypa
         response = await mod._pool_session_attach_response({"thread_id": str(uuid4())})
         assert response.status_code == 409
         assert b"Already attached" in response.body
-        assert mod._session_attach.pool_claim is None
+        assert mod._session_attach.pool_claim == (None, None, None)
     finally:
         pending.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -277,8 +322,12 @@ async def test_dedicated_background_attach_preserves_exact_exit_reason(
 ):
     _patch(monkeypatch, "_attach_session", AsyncMock(side_effect=error))
     exit_handler = AsyncMock()
-    monkeypatch.setattr(persistent_app._session_termination, exit_name.removeprefix("_"), exit_handler)
-    await persistent_app._session_attach.run_dedicated_attach("tid", on_failure=persistent_app._session_termination.handle_attach_failure)
+    monkeypatch.setattr(
+        persistent_app._session_termination, exit_name.removeprefix("_"), exit_handler
+    )
+    await persistent_app._session_attach.run_dedicated_attach(
+        "tid", on_failure=persistent_app._session_termination.handle_attach_failure
+    )
     assert exit_handler.await_count == 1
     assert exit_handler.await_args.args[0] == "tid"
 
