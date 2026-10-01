@@ -1163,7 +1163,7 @@ def test_cleanup_rejects_nonexact_ledger_ids_before_any_request(
         application.cleanup(ledger)
 
 
-def test_provider_cleanup_waits_for_required_background_work_before_reset(
+def test_provider_cleanup_waits_for_work_and_retains_closed_readback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_clock
 ) -> None:
     run_id = "provider-cleanup-run"
@@ -1201,15 +1201,26 @@ def test_provider_cleanup_waits_for_required_background_work_before_reset(
         "unscoped_calls": [],
     }
     requests: list[tuple[str, str]] = []
+    closed = {**states[-1], "run_id": run_id, "closed": True, "expected_cancelled": 0}
+    did_close = False
 
     def fake_request(url: str, **kwargs):
+        nonlocal did_close
         method = kwargs.get("method", "GET")
         requests.append((method, url))
         if method == "DELETE":
             return 200, b"{}"
+        if method == "POST" and url.endswith("/close"):
+            did_close = True
+            return 200, json.dumps(closed).encode()
         if url.endswith(f"/{run_id}"):
-            return 200, json.dumps(states.pop(0)).encode()
-        return 200, json.dumps(overview).encode()
+            return 200, json.dumps(
+                closed if did_close else states.pop(0) if len(states) > 1 else states[0]
+            ).encode()
+        current = (
+            {**overview, "runs": [], "closed_runs": [closed]} if did_close else overview
+        )
+        return 200, json.dumps(current).encode()
 
     application = harness.ApplicationE2EHarness(tmp_path / "state")
     monkeypatch.setattr(
@@ -1221,9 +1232,15 @@ def test_provider_cleanup_waits_for_required_background_work_before_reset(
     monkeypatch.setenv("APP_E2E_PROVIDER_SETTLE_SECONDS", "1")
     application._cleanup_provider_run(ledger, resource_ledger)
 
-    assert requests[-1][0] == "DELETE"
+    assert not any(method == "DELETE" for method, _ in requests)
+    assert any(
+        method == "POST" and url.endswith(f"/{run_id}/close")
+        for method, url in requests
+    )
     receipt = json.loads((run_dir / "provider-cleanup-state.json").read_text())
-    assert receipt == {"scenario": overview["runs"][0], "overview": overview}
+    assert receipt["scenario"] == closed
+    assert receipt["overview"]["runs"] == []
+    assert receipt["overview"]["closed_runs"] == [closed]
 
 
 def test_provider_cleanup_refuses_global_unscoped_rejections(
