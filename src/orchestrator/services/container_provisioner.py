@@ -10001,13 +10001,20 @@ class ContainerProvisioner:
             return False
         if runtime is None:
             # A same-generation soft outcome is the only authority for a
-            # Pod-less retained PVC. Never infer process zero from Pod 404.
+            # retained PVC or settled ephemeral Pod. Never infer zero from 404.
+            ephemeral = retained.get("backing_kind") == "pod"
             if (
                 not reclaim_volume
                 or not retained
                 or context.get("entry_status") != "ended"
-                or retained.get("pvc_uid")
+                or retained.get("pod_uid" if ephemeral else "pvc_uid")
                 != binding.get("backing_id", "").rsplit(":", 1)[-1]
+                or ephemeral
+                and (
+                    not authority["process_zero"]
+                    or identity.pvc_uid is not None
+                    or identity.seed_configmap_uid is not None
+                )
                 or identity.service_uid is not None
                 or not await self._captured_teardown_pod_is_absent(owner)
             ):

@@ -1803,23 +1803,30 @@ def _json_runtime_status_is_absent(value: dict[str, Any]) -> bool:
     return isinstance(value["status"], str) and value["status"] in {"", "deleted"}
 
 
-def _retained_pinned_workspace_pvc_identity(
+def _retained_pinned_workspace_resource_identity(
     *,
     workspace: Mapping[str, Any],
     binding: Mapping[str, Any],
     namespace: str,
     pod_name: str,
     pvc_name: str | None,
+    backing_kind: str = "pvc",
 ) -> tuple[str, str] | None:
-    """Parse one exact post-soft-End Kubernetes PVC shell."""
+    """Parse one exact post-soft-End Kubernetes backing shell."""
 
     if (
-        pvc_name is None
+        backing_kind not in {"pvc", "pod"}
+        or (backing_kind == "pvc" and pvc_name is None)
         or workspace.get("status") != "deleted"
         or workspace.get("provisioner") != "k8s"
         or workspace.get("namespace") != namespace
         or workspace.get("pod_name") != pod_name
-        or workspace.get("host") != f"{pod_name}.{namespace}.svc.cluster.local"
+        or workspace.get("host")
+        != (
+            f"{pod_name}.{namespace}.svc.cluster.local"
+            if backing_kind == "pvc"
+            else None
+        )
         or type(workspace.get("port")) is not int
         or workspace.get("port") != 30022
         or workspace.get("_runtime_incarnation") is not None
@@ -1848,16 +1855,16 @@ def _retained_pinned_workspace_pvc_identity(
         ):
             return None
         backing_id = str(binding.get("backing_id") or "")
-        expected_prefix = f"k8s-pvc:{namespace}:"
+        expected_prefix = f"k8s-{backing_kind}:{namespace}:"
         if not backing_id.startswith(expected_prefix):
             return None
-        pvc_uid = _canonical_uuid_text(
+        resource_uid = _canonical_uuid_text(
             backing_id.removeprefix(expected_prefix),
-            label="retained workspace PVC UID",
+            label="retired workspace resource UID",
         )
     except RuntimeError:
         return None
-    return binding_generation, pvc_uid
+    return binding_generation, resource_uid
 
 
 async def _settled_pinned_workspace_predecessor_generation(
@@ -1880,7 +1887,7 @@ async def _settled_pinned_workspace_predecessor_generation(
     append-only soft-retirement outcome agree on that exact predecessor.
     """
 
-    identity = _retained_pinned_workspace_pvc_identity(
+    identity = _retained_pinned_workspace_resource_identity(
         workspace=workspace,
         binding=binding,
         namespace=namespace,
@@ -1938,21 +1945,25 @@ async def _settled_pinned_workspace_current_generation(
     workspace: Mapping[str, Any],
     binding: Mapping[str, Any],
 ) -> dict[str, Any] | None:
-    """Capture an exact retained PVC from this generation's soft End."""
+    """Capture this generation's exact retained PVC or settled ephemeral Pod."""
 
     namespace = str(workspace.get("namespace") or "")
     pod_name = str(workspace.get("pod_name") or "")
-    pvc_name = f"pvc-{pod_name}" if pod_name else None
-    identity = _retained_pinned_workspace_pvc_identity(
+    backing_kind = (
+        "pod" if str(binding.get("backing_id") or "").startswith("k8s-pod:") else "pvc"
+    )
+    pvc_name = f"pvc-{pod_name}" if pod_name and backing_kind == "pvc" else None
+    identity = _retained_pinned_workspace_resource_identity(
         workspace=workspace,
         binding=binding,
         namespace=namespace,
         pod_name=pod_name,
         pvc_name=pvc_name,
+        backing_kind=backing_kind,
     )
     if identity is None:
         return None
-    workspace_generation, pvc_uid = identity
+    workspace_generation, resource_uid = identity
     row = await conn.fetchrow(
         """
         SELECT intent.attempt_id::text AS attempt_id,
@@ -1966,11 +1977,21 @@ async def _settled_pinned_workspace_current_generation(
            AND intent.runtime_generation = $2::uuid
            AND intent.namespace = $3
            AND intent.pod_name = $4
-           AND intent.pvc_name = $5
-           AND intent.service_name = $4
-           AND intent.pvc_uid = $6
            AND intent.pod_uid IS NOT NULL
-           AND intent.service_uid IS NOT NULL
+           AND (
+                ($7 = 'pvc' AND intent.pvc_name = $5
+                 AND intent.service_name = $4 AND intent.pvc_uid = $6
+                 AND intent.service_uid IS NOT NULL)
+                OR ($7 = 'pod' AND intent.pvc_name IS NULL AND intent.pvc_uid IS NULL
+                    AND intent.service_name IS NULL AND intent.service_uid IS NULL
+                    AND intent.pod_uid = $6
+                    AND EXISTS (
+                        SELECT 1 FROM managed_repository_process_zero_receipts AS proof
+                         WHERE proof.owner_kind = 'thread' AND proof.owner_id = $1::uuid
+                           AND proof.scope = 'workspace_container' AND proof.provisioner = 'k8s'
+                           AND proof.runtime_incarnation = intent.pod_uid
+                    ))
+           )
            AND intent.status = 'published'
            AND outcome.disposition = 'ended'
            AND outcome.permanent = false
@@ -1984,7 +2005,8 @@ async def _settled_pinned_workspace_current_generation(
         namespace,
         pod_name,
         pvc_name,
-        pvc_uid,
+        resource_uid,
+        backing_kind,
     )
     if row is None:
         return None
@@ -1996,7 +2018,12 @@ async def _settled_pinned_workspace_current_generation(
         "namespace": namespace,
         "pod_name": pod_name,
         "pvc_name": pvc_name,
-        "pvc_uid": pvc_uid,
+        "pvc_uid": resource_uid if backing_kind == "pvc" else None,
+        **(
+            {"pod_uid": resource_uid, "backing_kind": "pod"}
+            if backing_kind == "pod"
+            else {}
+        ),
     }
 
 
@@ -15357,8 +15384,12 @@ class PostgresDB:
                            SELECT 1 FROM managed_repository_process_zero_receipts r
                             WHERE r.owner_kind='thread' AND r.owner_id=threads.id
                               AND r.scope='workspace_container' AND r.provisioner='k8s'
-                              AND r.runtime_incarnation=runtime_retirement_context
-                                  #>>'{workspace_container,_runtime_incarnation}'
+                              AND r.runtime_incarnation=COALESCE(
+                                  runtime_retirement_context#>>'{workspace_container,_runtime_incarnation}',
+                                  CASE WHEN runtime_retirement_context
+                                      #>>'{retained_soft_workspace,backing_kind}'='pod'
+                                  THEN runtime_retirement_context
+                                      #>>'{retained_soft_workspace,pod_uid}' END)
                        ) AS process_zero
                   FROM threads
                  WHERE id=$1 AND execution_lane='pinned'

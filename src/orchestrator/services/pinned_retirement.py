@@ -2542,6 +2542,8 @@ class PinnedRetirementOperations:
             captured_backing = str(binding.get("backing_id") or "")
             retained_pvc_uid = str(retained_soft_workspace.get("pvc_uid") or "")
             retained_authority = bool(retained_soft_workspace)
+            retained_pod_uid = str(retained_soft_workspace.get("pod_uid") or "")
+            retained_ephemeral = retained_soft_workspace.get("backing_kind") == "pod"
             if (
                 not captured_generation
                 or binding.get("kind") != "remote"
@@ -2558,14 +2560,20 @@ class PinnedRetirementOperations:
                     UUID(captured_runtime)
                 if retained_authority:
                     UUID(str(retained_soft_workspace.get("attempt_id") or ""))
-                    UUID(retained_pvc_uid)
+                    UUID(retained_pod_uid if retained_ephemeral else retained_pvc_uid)
             except (TypeError, ValueError):
                 raise RuntimeError(
                     "exact Kubernetes cleanup authority is malformed"
                 ) from None
             if retained_authority:
                 expected_owner = WorkspaceOwner.session(thread_id)
-                expected_pvc_name = f"pvc-{expected_owner.pod_name}"
+                expected_pvc_name = (
+                    "" if retained_ephemeral else f"pvc-{expected_owner.pod_name}"
+                )
+                retained_resource_uid = (
+                    retained_pod_uid if retained_ephemeral else retained_pvc_uid
+                )
+                retained_backing_kind = "pod" if retained_ephemeral else "pvc"
                 if (
                     not permanent
                     or context.get("entry_status") != "ended"
@@ -2581,11 +2589,11 @@ class PinnedRetirementOperations:
                     or str(ws.get("pod_name") or "") != expected_owner.pod_name
                     or str(retained_soft_workspace.get("pvc_name") or "")
                     != expected_pvc_name
-                    or retained_pvc_uid != backing_resource_uid
+                    or retained_resource_uid != backing_resource_uid
                     or captured_backing
                     != (
-                        f"k8s-pvc:{retained_soft_workspace.get('namespace')}:"
-                        f"{retained_pvc_uid}"
+                        f"k8s-{retained_backing_kind}:{retained_soft_workspace.get('namespace')}:"
+                        f"{retained_resource_uid}"
                     )
                     or ws.get("status") != "deleted"
                     or ws.get("provisioner") != "k8s"
@@ -2599,6 +2607,11 @@ class PinnedRetirementOperations:
                     or workspace_identity.pod_uid is not None
                     or workspace_identity.service_uid is not None
                     or workspace_identity.pvc_uid not in (None, retained_pvc_uid)
+                    or (retained_ephemeral and retained_pvc_uid)
+                    or (
+                        retained_ephemeral
+                        and workspace_identity.seed_configmap_uid is not None
+                    )
                 ):
                     raise RuntimeError(
                         "retained Kubernetes workspace authority changed before deletion"
@@ -2611,7 +2624,9 @@ class PinnedRetirementOperations:
             ):
                 raise RuntimeError("workspace Pod identity changed before retirement")
             if captured_backing.startswith("k8s-pod:"):
-                if backing_resource_uid != captured_runtime:
+                if backing_resource_uid != (
+                    retained_pod_uid if retained_ephemeral else captured_runtime
+                ):
                     raise RuntimeError(
                         "workspace Pod backing authority is inconsistent"
                     )

@@ -324,8 +324,7 @@ async def test_pinned_workspace_end_and_permanent_delete(
     assert await db.get_thread(owner.id) is None
 
 
-@pytest.mark.asyncio
-async def test_ephemeral_workspace_soft_end_then_permanent_delete(db, monkeypatch):
+async def _soft_ended_ephemeral(db, monkeypatch):
     ids, owner, p, resources, effects = await _scenario(db, monkeypatch, ephemeral=True)
     pod_uid = resources["pod"].metadata.uid
     retirement = await _begin(db, ids, False)
@@ -355,6 +354,14 @@ async def test_ephemeral_workspace_soft_end_then_permanent_delete(db, monkeypatc
         )
         == 1
     )
+    return ids, owner, p, resources, effects, pod_uid
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_workspace_soft_end_then_permanent_delete(db, monkeypatch):
+    ids, owner, p, resources, effects, pod_uid = await _soft_ended_ephemeral(
+        db, monkeypatch
+    )
     permanent = await db.begin_pinned_thread_retirement(owner.id, permanent=True)
     assert permanent["state"] == "pending", permanent
     assert await db.authorize_pinned_thread_retirement(
@@ -372,6 +379,203 @@ async def test_ephemeral_workspace_soft_end_then_permanent_delete(db, monkeypatc
         expected_runtime_generation=permanent["generation"],
     )
     assert await db.get_thread(owner.id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["backing", "endpoint-generation", "host", "runtime"])
+async def test_ephemeral_permanent_begin_refuses_changed_settled_endpoint(
+    db, monkeypatch, fault
+):
+    ids, owner, p, resources, effects, pod_uid = await _soft_ended_ephemeral(
+        db, monkeypatch
+    )
+    thread = await db.get_thread(owner.id)
+    metadata = authority._json(thread["metadata"])
+    if fault == "backing":
+        metadata["_workspace_binding"]["backing_id"] = (
+            f"k8s-pod:agent-workspaces:{uuid4()}"
+        )
+    elif fault == "endpoint-generation":
+        metadata["workspace_container"]["_canvas_workspace_generation"] = str(uuid4())
+    elif fault == "host":
+        metadata["workspace_container"]["host"] = "replacement-host"
+    else:
+        metadata["workspace_container"]["_runtime_incarnation"] = "unresolved"
+    await db.execute(
+        "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
+        owner.id,
+        json.dumps(metadata),
+    )
+    permanent = await db.begin_pinned_thread_retirement(owner.id, permanent=True)
+    assert permanent["state"] == "malformed", permanent
+    assert (await db.get_thread(owner.id))["runtime_retirement_token"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resource", ["pod", "pvc", "service"])
+async def test_ephemeral_permanent_cleanup_preserves_replacement_resources(
+    db, monkeypatch, resource
+):
+    ids, owner, p, resources, effects, pod_uid = await _soft_ended_ephemeral(
+        db, monkeypatch
+    )
+    permanent = await db.begin_pinned_thread_retirement(owner.id, permanent=True)
+    assert permanent["state"] == "pending"
+    assert await db.authorize_pinned_thread_retirement(
+        owner.id,
+        token=permanent["token"],
+        generation=permanent["generation"],
+        settle_status="ended",
+    )
+    from orchestrator.services.container_provisioner import WorkspaceTeardownIdentity
+
+    replacement = str(uuid4())
+    identity = WorkspaceTeardownIdentity(
+        pod_uid=replacement if resource == "pod" else None,
+        pvc_uid=replacement if resource == "pvc" else None,
+        service_uid=replacement if resource == "service" else None,
+        seed_configmap_uid=None,
+    )
+    monkeypatch.setattr(
+        p, "capture_workspace_teardown_identity", AsyncMock(return_value=identity)
+    )
+    release = AsyncMock(wraps=p.release_workspace)
+    monkeypatch.setattr(p, "release_workspace", release)
+    original_effects = list(effects)
+    with pytest.raises(RuntimeError):
+        await controls_composition.pinned_retirement_operations(
+            main.app.state.resources
+        ).cleanup_pinned_thread_retirement(permanent, cleanup_agent_pod=False)
+    assert effects == original_effects
+    release.assert_not_called()
+    assert await db.get_thread(owner.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_capture_refuses_missing_workspace_process_zero(
+    db, monkeypatch
+):
+    """A local agent ACK and soft outcome do not attest a separate workspace."""
+    ids, owner, p, resources, effects = await _scenario(db, monkeypatch, ephemeral=True)
+    retirement = await _begin(db, ids, False)
+    assert await db.settle_pinned_thread_retirement(
+        owner.id,
+        token=retirement["token"],
+        generation=retirement["generation"],
+        final_status="ended",
+    )
+    thread = await db.get_thread(owner.id)
+    metadata = authority._json(thread["metadata"])
+    workspace = dict(metadata["workspace_container"])
+    workspace.update(
+        status="deleted",
+        _runtime_incarnation=None,
+        pod_ip=None,
+        host=None,
+        ide_host=None,
+        ide_port=None,
+    )
+    from orchestrator.database.postgres import (
+        _settled_pinned_workspace_current_generation,
+    )
+    from uuid import UUID
+
+    async with db.acquire() as conn:
+        assert (
+            await _settled_pinned_workspace_current_generation(
+                conn,
+                thread_id=UUID(owner.id),
+                current_generation=UUID(retirement["generation"]),
+                workspace=workspace,
+                binding=metadata["_workspace_binding"],
+            )
+            is None
+        )
+    assert "pod" in resources and not effects
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_capture_refuses_cleanup_without_soft_settlement(
+    db, monkeypatch
+):
+    from orchestrator.database.postgres import (
+        _settled_pinned_workspace_current_generation,
+    )
+    from uuid import UUID
+
+    ids, owner, p, resources, effects = await _scenario(db, monkeypatch, ephemeral=True)
+    retirement = await _begin(db, ids, False)
+    await controls_composition.pinned_retirement_operations(
+        main.app.state.resources
+    ).cleanup_pinned_thread_retirement(retirement, cleanup_agent_pod=False)
+    metadata = authority._json((await db.get_thread(owner.id))["metadata"])
+    async with db.acquire() as conn:
+        assert (
+            await _settled_pinned_workspace_current_generation(
+                conn,
+                thread_id=UUID(owner.id),
+                current_generation=UUID(retirement["generation"]),
+                workspace=metadata["workspace_container"],
+                binding=metadata["_workspace_binding"],
+            )
+            is None
+        )
+    assert (await db.get_thread(owner.id))["runtime_retirement_token"] == UUID(
+        retirement["token"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_capture_refuses_another_runtime_generation(db, monkeypatch):
+    from orchestrator.database.postgres import (
+        _settled_pinned_workspace_current_generation,
+    )
+    from uuid import UUID
+
+    ids, owner, p, resources, effects, pod_uid = await _soft_ended_ephemeral(
+        db, monkeypatch
+    )
+    metadata = authority._json((await db.get_thread(owner.id))["metadata"])
+    async with db.acquire() as conn:
+        assert (
+            await _settled_pinned_workspace_current_generation(
+                conn,
+                thread_id=UUID(owner.id),
+                current_generation=uuid4(),
+                workspace=metadata["workspace_container"],
+                binding=metadata["_workspace_binding"],
+            )
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_actuator_refuses_unconfirmed_remote_zero(db, monkeypatch):
+    ids, owner, p, resources, effects, pod_uid = await _soft_ended_ephemeral(
+        db, monkeypatch
+    )
+    permanent = await db.begin_pinned_thread_retirement(owner.id, permanent=True)
+    assert permanent["state"] == "pending"
+    assert await db.authorize_pinned_thread_retirement(
+        owner.id,
+        token=permanent["token"],
+        generation=permanent["generation"],
+        settle_status="ended",
+    )
+    real_authority = db.get_pinned_workspace_cleanup_authority
+
+    async def unconfirmed(*args, **kwargs):
+        authority = await real_authority(*args, **kwargs)
+        assert authority is not None and authority["process_zero"] is True
+        return {**authority, "process_zero": False}
+
+    monkeypatch.setattr(db, "get_pinned_workspace_cleanup_authority", unconfirmed)
+    with pytest.raises(RuntimeError):
+        await controls_composition.pinned_retirement_operations(
+            main.app.state.resources
+        ).cleanup_pinned_thread_retirement(permanent, cleanup_agent_pod=False)
+    assert not resources
+    assert await db.get_thread(owner.id) is not None
 
 
 @pytest.mark.asyncio
