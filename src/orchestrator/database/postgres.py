@@ -1945,7 +1945,7 @@ async def _settled_pinned_workspace_current_generation(
     workspace: Mapping[str, Any],
     binding: Mapping[str, Any],
 ) -> dict[str, Any] | None:
-    """Capture this generation's exact retained PVC or settled ephemeral Pod."""
+    """Capture a settled workspace, including proved pre-setup abort lineage."""
 
     namespace = str(workspace.get("namespace") or "")
     pod_name = str(workspace.get("pod_name") or "")
@@ -2008,10 +2008,88 @@ async def _settled_pinned_workspace_current_generation(
         resource_uid,
         backing_kind,
     )
+    lineage_authority: dict[str, Any] = {}
     if row is None:
-        return None
+        # A published workspace survives a confirmed pre-setup actor abort.
+        # Capture its immutable creation life separately from the successor's
+        # settled End. Every link must retain this exact workspace, and a zero
+        # observation after the final abort must precede the successor's End.
+        candidates = await conn.fetch(
+            """
+            WITH RECURSIVE sources AS (
+                SELECT intent.* FROM thread_workspace_provision_intents AS intent
+                 WHERE intent.thread_id=$1::uuid AND intent.status='published'
+                   AND intent.runtime_generation<>$2::uuid
+                   AND intent.namespace=$3 AND intent.pod_name=$4
+                   AND intent.pod_uid IS NOT NULL
+                   AND (($7='pvc' AND intent.pvc_name=$5 AND intent.service_name=$4
+                         AND intent.pvc_uid=$6 AND intent.service_uid IS NOT NULL)
+                     OR ($7='pod' AND intent.pvc_name IS NULL AND intent.pvc_uid IS NULL
+                         AND intent.service_name IS NULL AND intent.service_uid IS NULL
+                         AND intent.pod_uid=$6))
+            ), abort_path AS (
+                SELECT source.attempt_id, source.runtime_generation AS source_generation,
+                       source.pod_uid, $2::uuid AS generation, ARRAY[$2::uuid] AS generations,
+                       0 AS depth, NULL::timestamptz AS latest_abort
+                  FROM sources AS source
+                UNION ALL
+                SELECT path.attempt_id, path.source_generation, path.pod_uid,
+                       abort.runtime_generation, path.generations||abort.runtime_generation,
+                       path.depth+1, greatest(path.latest_abort,abort.released_at)
+                  FROM abort_path AS path
+                  JOIN thread_runtime_attach_abort_outcomes AS abort
+                    ON abort.thread_id=$1::uuid AND abort.successor_generation=path.generation
+                 WHERE path.depth<16 AND abort.runtime_generation<>ALL(path.generations)
+                   AND abort.release_kind='process_zero'
+                   AND abort.quiescence_protocol='agent_attach_not_started_v1'
+                   AND abort.workspace_generation=$8::uuid
+                   AND abort.workspace_runtime_incarnation::text=path.pod_uid
+            )
+            SELECT intent.attempt_id::text AS attempt_id, intent.pod_uid, intent.service_uid,
+                   intent.runtime_generation::text AS source_generation, path.generations
+              FROM thread_workspace_provision_intents AS intent
+              JOIN abort_path AS path ON path.attempt_id=intent.attempt_id
+               AND path.generation=path.source_generation AND path.depth>0
+              JOIN thread_runtime_retirement_outcomes AS outcome
+                ON outcome.thread_id=$1::uuid AND outcome.runtime_generation=$2::uuid
+               AND outcome.disposition='ended' AND outcome.permanent=false
+               AND outcome.outcome='settled'
+             WHERE intent.thread_id=$1::uuid AND intent.status='published'
+               AND intent.runtime_generation=path.source_generation
+               AND intent.namespace=$3 AND intent.pod_name=$4
+               AND intent.pod_uid=path.pod_uid
+               AND EXISTS (
+                SELECT 1 FROM managed_repository_process_zero_receipts AS proof
+                 WHERE proof.owner_kind='thread' AND proof.owner_id=$1::uuid
+                   AND proof.scope='workspace_container' AND proof.provisioner='k8s'
+                   AND proof.runtime_incarnation=intent.pod_uid
+                   AND proof.observed_at>=path.latest_abort
+                   AND proof.observed_at<=outcome.settled_at
+             )
+             ORDER BY intent.resolved_at DESC NULLS LAST, intent.created_at DESC
+             LIMIT 2 FOR SHARE OF intent, outcome
+            """,
+            thread_id,
+            current_generation,
+            namespace,
+            pod_name,
+            pvc_name,
+            resource_uid,
+            backing_kind,
+            UUID(workspace_generation),
+        )
+        if len(candidates) != 1:
+            return None
+        row = candidates[0]
+        lineage_authority = {
+            "source_runtime_generation": row["source_generation"],
+            "attach_abort_path": [
+                str(generation) for generation in reversed(row["generations"])
+            ],
+        }
     return {
         "version": 1,
+        **lineage_authority,
         "runtime_generation": str(current_generation),
         "workspace_generation": workspace_generation,
         "attempt_id": str(row["attempt_id"]),
