@@ -396,6 +396,40 @@ async def test_aborted_reaper_rechecks_release_authority_before_effect(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["permanent", "reaper"])
+async def test_aborted_cleanup_refuses_nonzero_release_projection(
+    db, monkeypatch, path
+):
+    old, k8s, provider, ops, permanent = await _aborted_life(db, monkeypatch)
+    fetch = db.fetch
+
+    async def observed(query, *args):
+        rows = await fetch(query, *args)
+        if "FROM thread_runtime_attach_abort_outcomes" in query:
+            # The schema already pairs kind/protocol. Independently reject a
+            # corrupted store projection without violating an applied CHECK.
+            return [{**row, "release_kind": "server_pre_delivery"} for row in rows]
+        return rows
+
+    monkeypatch.setattr(db, "fetch", observed)
+    if path == "permanent":
+        with pytest.raises(RuntimeError, match="exact pre-setup settlement"):
+            await ops.cleanup_pinned_thread_retirement(
+                permanent, cleanup_agent_pod=False
+            )
+    else:
+        assert not await retire_aborted_unclaimed_agent_pod(
+            db,
+            pod_name=old["pod_name"],
+            pod_uid=old["pod_uid"],
+            namespace=old["namespace"],
+            agent_provisioner=provider,
+        )
+    assert (old["namespace"], old["pod_name"]) in k8s.pods
+    assert not k8s.removed_pods
+
+
+@pytest.mark.asyncio
 async def test_normal_reaper_recovers_pre_setup_aborted_pod_after_thread_was_deleted(
     db, monkeypatch
 ):
