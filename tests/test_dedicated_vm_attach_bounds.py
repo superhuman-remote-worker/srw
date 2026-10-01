@@ -29,8 +29,8 @@ from orchestrator.services import session_workspace_policy
 
 _FIELDS = {
     "_thread_id": (persistent_app._session_identity, "_thread_id"),
-    "_session_runtime_generation": (persistent_app._session_identity, "_runtime_generation"),
-    "_session_runtime_attach_token": (persistent_app._session_identity, "_runtime_attach_token"),
+    "_session_runtime_generation": (persistent_app._session_identity, "_session_generation"),
+    "_session_runtime_attach_token": (persistent_app._session_identity, "_attach_token"),
     "_pinned_runtime_generation_enabled": (persistent_app._session_identity, "_runtime_contract"),
     "_pool_attach_claim": (persistent_app._session_attach, "_pool_claim"),
     "_pool_attach_task": (persistent_app._session_attach, "_pool_task"),
