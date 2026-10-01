@@ -44,6 +44,7 @@ from typing import Any, Optional  # noqa: F401  (used by the moved bodies)
 from uuid import UUID
 
 from fastapi import HTTPException
+from shared.session_attach_cleanup_identity import PreSetupWorkspaceIdentity
 from orchestrator.services.session_workspace_policy import preparation_wait_budget
 
 from orchestrator.security.access import externalize_gitea_url
@@ -979,18 +980,33 @@ async def agent_get_thread_workspace_locked(
     # Session dispatch PEP (fail closed): a grant denial or resolve error must not
     # fall through to the unvetted config_override — refuse the attach (403).
     _sess_status: dict[str, Any] = {"_capture_manifest": True}
+    denied_cleanup_headers = None
+    if pinned_k8s_attestation is not None:
+        try:
+            denied_cleanup_headers = PreSetupWorkspaceIdentity(
+                thread_id,
+                str(thread.get("runtime_generation") or ""),
+                workspace_generation,
+                workspace_runtime_incarnation,
+            ).headers()
+        except (TypeError, ValueError):
+            # An incomplete identity is never a cleanup/release authorization.
+            pass
     try:
         session_resolved = await _resolve_session_config(
             thread, metadata, status=_sess_status
         )
     except GrantDenied as gd:
         raise HTTPException(
-            status_code=403, detail=_grant_violations_detail(gd.violations)
+            status_code=403,
+            detail=_grant_violations_detail(gd.violations),
+            headers=denied_cleanup_headers,
         )
     if _sess_status.get("state") == "error":
         raise HTTPException(
             status_code=403,
             detail="capability grants could not be verified for this session config",
+            headers=denied_cleanup_headers,
         )
     if (
         thread.get("execution_lane") == "pinned"

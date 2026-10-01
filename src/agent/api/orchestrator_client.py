@@ -39,6 +39,7 @@ from shared.session_subagent_authority import (
     session_subagent_delivery_id,
 )
 from shared.session_subagent_batch import session_subagent_batch_delivery_id
+from shared.session_attach_cleanup_identity import PreSetupWorkspaceIdentity
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,13 @@ class SessionGrantDenied(Exception):
     RuntimeError so the pool-mode ``except RuntimeError`` attach handler doesn't
     swallow it. See knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md.
     """
+
+
+    def __init__(
+        self, detail: Any, *, cleanup_identity: PreSetupWorkspaceIdentity | None = None
+    ) -> None:
+        super().__init__(detail)
+        self.cleanup_identity = cleanup_identity
 
 
 class SessionEnded(Exception):
@@ -1815,7 +1823,14 @@ class OrchestratorClient:
                     detail = response.json().get("detail") or detail
                 except Exception:
                     pass
-                raise SessionGrantDenied(detail)
+                # A denial still refuses every config/credential. The attested
+                # identifiers name this captured life's pre-setup obligation only.
+                cleanup_identity = PreSetupWorkspaceIdentity.from_headers(
+                    response.headers,
+                    expected_thread_id=thread_id,
+                    expected_session_generation=self.session_runtime_generation,
+                )
+                raise SessionGrantDenied(detail, cleanup_identity=cleanup_identity)
             if response.status_code == 409:
                 try:
                     detail = response.json().get("detail")

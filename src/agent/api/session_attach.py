@@ -40,7 +40,11 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from agent.api.lease_context import LeaseHandle, LeaseLostError
-from agent.api.orchestrator_client import SessionEnded, SessionEnding
+from agent.api.orchestrator_client import (
+    SessionEnded,
+    SessionEnding,
+    SessionGrantDenied,
+)
 from agent.api.session_contract import (
     EventJournalUnavailable,
     ProtectedCloudUnavailable,
@@ -69,6 +73,7 @@ from shared.runtime.core.loader import (
 )
 from shared.runtime.core.tool_policy import normalize_tool_policy
 from shared.runtime_actor import RuntimeActorContext
+from shared.session_attach_cleanup_identity import PreSetupWorkspaceIdentity
 from shared.session_subagent_batch import (
     SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT,
     SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
@@ -836,7 +841,32 @@ class SessionAttachCoordinator:
                 ),
                 session_subagent_fanout=session_subagent_fanout,
             )
-        except BaseException:
+        except BaseException as exc:
+            context = self._cleanup_context
+            hint = exc.cleanup_identity if isinstance(exc, SessionGrantDenied) else None
+            if (
+                isinstance(hint, PreSetupWorkspaceIdentity)
+                and isinstance(context, dict)
+                and context.get("setup_started") is False
+                and self._session is None
+                and context.get("remote") is None
+                and context.get("thread_id")
+                == self._identity.thread_id
+                == thread_id
+                == hint.thread_id
+                and self._identity.session_generation == hint.session_runtime_generation
+                and context.get("workspace_generation")
+                in (None, "", hint.workspace_generation)
+                and context.get("workspace_runtime_incarnation")
+                in (None, "", hint.workspace_runtime_incarnation)
+            ):
+                # No construction crossed the monotonic setup boundary. Carry
+                # the denied read's exact identifiers into the existing release
+                # CAS; they assert no remote process-zero proof.
+                context["workspace_generation"] = hint.workspace_generation
+                context["workspace_runtime_incarnation"] = (
+                    hint.workspace_runtime_incarnation
+                )
             # Covers every post-construction await, including event-journal setup,
             # repository/message restore, lifecycle CAS, and input reclamation.
             # The helper is idempotent when the inner setup guard already ran.
