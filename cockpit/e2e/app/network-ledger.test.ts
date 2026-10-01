@@ -132,6 +132,33 @@ describe('network ledger safety and warm-up classification', () => {
     expect(ledger.problems().filter((problem) => problem.startsWith('console error'))).toHaveLength(1);
   });
 
+  it('requires the observed response to originate in a warm-up phase', () => {
+    const { ledger, handlers } = ledgerHarness('https://srw-e2e.test');
+    ledger.registerThread('owned-thread');
+    const url = 'https://srw-e2e.test/api/sessions/owned-thread/connection';
+    ledger.setPhase('hydration');
+    emitResponse(handlers, 'GET', url, 425);
+    ledger.setPhase('turn');
+    emitConsole(handlers, 'Failed to load resource: the server responded with a status of 425 ()', url);
+    expect(ledger.problems().some((problem) => problem.startsWith('console error'))).toBe(true);
+  });
+
+  it('keeps each real response available once across warm-up phase changes', () => {
+    const { ledger, handlers } = ledgerHarness('https://srw-e2e.test');
+    ledger.registerThread('owned-thread');
+    const url = 'https://srw-e2e.test/api/sessions/owned-thread/connection';
+    ledger.setPhase('creating');
+    emitResponse(handlers, 'GET', url, 425);
+    emitResponse(handlers, 'GET', url, 425);
+    ledger.setPhase('turn');
+    emitConsole(handlers, 'Failed to load resource: the server responded with a status of 425 ()', url);
+    ledger.setPhase('reload');
+    emitConsole(handlers, 'Failed to load resource: the server responded with a status of 425 ()', url);
+    expect(ledger.problems()).toEqual([]);
+    emitConsole(handlers, 'Failed to load resource: the server responded with a status of 425 ()', url);
+    expect(ledger.problems().filter((problem) => problem.startsWith('console error'))).toHaveLength(1);
+  });
+
   it.each([
     ['unobserved', 'GET', 425, 'https://srw-e2e.test/api/sessions/owned-thread/connection', 'creating', false],
     ['wrong status', 'GET', 200, 'https://srw-e2e.test/api/sessions/owned-thread/connection', 'creating', true],
