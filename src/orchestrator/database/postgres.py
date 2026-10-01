@@ -44342,17 +44342,6 @@ class PostgresDB:
                         settled = {**settled, "permanent": True}
                         metadata = dict(metadata)
                         metadata["_stateless_workspace_retirement_settled"] = settled
-                        # Upgrading a resumable End to a permanent one reclaims
-                        # the volume, so the retention record set by
-                        # ``finish_stateless_thread_workspace_retirement`` stops
-                        # being true and is corrected here rather than left to
-                        # contradict the intent.
-                        upgraded = metadata.get("workspace_container")
-                        if isinstance(upgraded, dict):
-                            metadata["workspace_container"] = {
-                                **upgraded,
-                                "volume_reclaimed": True,
-                            }
                         updated = await conn.fetchval(
                             "UPDATE threads SET metadata = $2::jsonb "
                             "WHERE id = $1::uuid AND execution_lane = 'stateless' "

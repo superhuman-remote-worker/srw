@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 
 from orchestrator.services import stale_agent_detector as detector
 from orchestrator.services import stateless_session_retirement as protocol
@@ -133,6 +134,60 @@ async def test_detector_finishes_acknowledged_end_after_physical_cleanup(
         assert metadata(after)["workspace_container"]["volume_reclaimed"] is False
         assert case.cluster.objects["pvc"].metadata.uid == case.pvc_uid
     assert store.gc_offline_agents.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_physical_soft_end_keeps_retention_truth_until_permanent_reclaim(
+    database, actor, monkeypatch
+):
+    case, pending, operations = await acknowledged_running_end(
+        database, actor, monkeypatch, permanent=False, physical_cleanup=True
+    )
+    assert await operations.end_thread_flow(
+        case.thread_id, pending, permanent=False, force=False
+    ) == {"status": "ended"}
+    retained = await database.get_thread(case.thread_id)
+    retained_metadata = metadata(retained)
+    assert retained_metadata["workspace_container"]["volume_reclaimed"] is False
+    assert (
+        retained_metadata["_stateless_workspace_retirement_settled"]["permanent"]
+        is False
+    )
+    assert case.cluster.objects["pvc"].metadata.uid == case.pvc_uid
+    assert await database.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM managed_repository_process_zero_receipts "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+        "AND scope='workspace_container' AND provisioner='k8s' "
+        "AND runtime_incarnation=$2)",
+        case.thread_id,
+        case.pod_uid,
+    )
+
+    async def refuse_reclaim(*args, **kwargs):
+        return None
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            case.provisioner, "reconcile_workspace_cleanup_intent", refuse_reclaim
+        )
+        with pytest.raises(HTTPException) as exc:
+            await operations.end_thread_flow(
+                case.thread_id, retained, permanent=True, force=False
+            )
+    assert exc.value.status_code == 503
+    retry = await database.get_thread(case.thread_id)
+    retry_metadata = metadata(retry)
+    assert (
+        retry_metadata["_stateless_workspace_retirement_settled"]["permanent"] is True
+    )
+    assert retry_metadata["workspace_container"]["volume_reclaimed"] is False
+    assert case.cluster.objects["pvc"].metadata.uid == case.pvc_uid
+
+    assert await operations.end_thread_flow(
+        case.thread_id, retry, permanent=True, force=False
+    ) == {"status": "deleted"}
+    assert await database.get_thread(case.thread_id) is None
+    assert case.cluster.objects == {}
 
 
 @pytest.mark.asyncio
