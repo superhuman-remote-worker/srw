@@ -107,6 +107,7 @@ export class NetworkLedger {
   private readonly ownedThreadIds = new Set<string>();
   private readonly records: NetworkEntry[] = [];
   private pendingWarmupStreamReconnects = 0;
+  private readonly claimedWarmupConsoleResponses = new WeakSet<ResponseEntry>();
 
   constructor(
     page: Page,
@@ -284,7 +285,7 @@ export class NetworkLedger {
     const applicationUrl = new URL(this.applicationOrigin);
     const connectionMatch = pathname.match(CONNECTION);
     // HTTPS/HTTP2 resource errors may omit the reason phrase. Classify only
-    // the owned GET response actually observed in this warm-up phase.
+    // an owned GET response actually observed during permitted warm-up.
     const statusMatch = message.match(/(?:409 \((?:Conflict)?\)|425 \((?:Too Early)?\))$/i);
     const status = statusMatch ? Number.parseInt(statusMatch[0], 10) : null;
     const expectedConnectionFailure =
@@ -293,11 +294,19 @@ export class NetworkLedger {
       connectionMatch !== null &&
       this.ownedThreadIds.has(decodeURIComponent(connectionMatch[1])) &&
       /Failed to load resource/i.test(message) &&
-      status !== null &&
-      this.responses('GET', pathname).some(
-        (response) => response.status === status && response.phase === this.phase,
+      status !== null;
+    if (expectedConnectionFailure) {
+      // Chrome can report a response's diagnostic after the journey advances
+      // to another warm phase. Retain its observed GET proof exactly once.
+      const response = this.responses('GET', pathname).find(
+        (entry) => entry.status === status && WARM_PHASES.has(entry.phase) &&
+          !this.claimedWarmupConsoleResponses.has(entry),
       );
-    if (expectedConnectionFailure) return true;
+      if (response) {
+        this.claimedWarmupConsoleResponses.add(response);
+        return true;
+      }
+    }
 
     const socketMatch = pathname.match(CONTROL_WEBSOCKET);
     return (
