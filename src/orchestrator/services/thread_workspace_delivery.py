@@ -64,6 +64,7 @@ from orchestrator.services.session_runtime_admission import (
 from orchestrator.services.stateless_workspace_gate import thread_metadata_object
 from orchestrator.services.vm_thread_initial import (
     ensure_initial_thread_vm,
+    initial_vm_startup_view,
     initial_vm_wait_payload,
     is_initial_thread_vm_poll,
     require_current_initial_vm_source,
@@ -1070,7 +1071,8 @@ async def agent_get_thread_workspace_locked(
         )
         if thread_metadata_object(current).get("vm") is not None:
             await require_current_initial_vm_source(current, store=postgres_db)
-        return initial_vm_wait_payload(current)
+        startup = await initial_vm_startup_view(current, store=postgres_db)
+        return initial_vm_wait_payload(current, startup_view=startup)
     # Lite (virtual/none) sessions run with no workspace pod. Attach the
     # object-store mounts in-flight here — the same enrichment
     # _send_session_attach does for the idle-pool path — so a DEDICATED session
@@ -1288,8 +1290,19 @@ async def agent_get_thread_workspace_locked(
             detail={"code": "pinned_runtime_generation_unavailable"},
         )
 
+    startup = None
+    if (
+        final_vm.get("status") == "ready"
+        and final_vm.get("creation_request_id")
+        and is_initial_thread_vm_poll(final_thread, final_vm)
+    ):
+        startup = await initial_vm_startup_view(final_thread, store=postgres_db)
+        if startup is None:
+            raise HTTPException(409, "Initial VM startup source changed")
+
     return {
         "status": ws.get("status", "none"),
+        **({"vm_startup": startup} if startup is not None else {}),
         "pinned_status_identity_contract": 1,
         "pinned_runtime_generation_contract": 1,
         # Same advertisements as the pushed pinned attach body

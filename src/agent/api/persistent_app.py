@@ -15507,10 +15507,57 @@ async def _poll_workspace_ready(
         or None if timeout, unavailable, or no workspace provisioned.
     """
     import time
+    import math
+
+    def startup_view(payload: Dict[str, Any]):
+        raw = payload.get("vm_startup")
+        if not isinstance(raw, dict) or type(raw.get("contract_version")) is not int:
+            return None
+        if raw["contract_version"] != 1:
+            return None
+        phase = raw.get("phase")
+        if phase not in {"resource_wait", "admitted"}:
+            return None
+        required = {
+            "contract_version",
+            "phase",
+            "request_id",
+            "provision_generation",
+            "runtime_generation",
+        }
+        if phase == "admitted":
+            required.add("admission_elapsed_s")
+        if set(raw) != required:
+            return None
+        try:
+            identity = tuple(
+                raw[key]
+                if isinstance(raw[key], str) and str(UUID(raw[key])) == raw[key]
+                else None
+                for key in ("request_id", "provision_generation", "runtime_generation")
+            )
+        except (TypeError, ValueError):
+            return None
+        if (
+            None in identity
+            or identity[2] != _session_runtime_generation
+            or identity[2] != payload.get("session_runtime_generation")
+        ):
+            return None
+        elapsed = raw.get("admission_elapsed_s")
+        if phase == "admitted" and (
+            type(elapsed) not in {int, float}
+            or not math.isfinite(elapsed)
+            or elapsed < 0
+        ):
+            return None
+        return identity, phase, elapsed
 
     start = time.monotonic()
     deadline = start + timeout
     _vm_budget_applied = False
+    startup_identity = None
+    admission_deadline = None
 
     while time.monotonic() < deadline:
         ws = await client.get_thread_workspace(
@@ -15544,6 +15591,36 @@ async def _poll_workspace_ready(
 
         # Check VM workspace first (takes precedence over container)
         vm_status = ws.get("vm_status")
+
+        if require_vm and "vm_startup" in ws:
+            view = startup_view(ws)
+            if view is None:
+                return None
+            identity, phase, elapsed = view
+            if startup_identity is not None and identity != startup_identity:
+                return None
+            startup_identity = identity
+            _vm_budget_applied = True
+            now = time.monotonic()
+            if phase == "resource_wait":
+                if admission_deadline is not None or vm_status == "ready":
+                    return None
+                deadline = now + timeout
+            else:
+                candidate = now + max(0.0, vm_timeout - elapsed)
+                admission_deadline = (
+                    candidate
+                    if admission_deadline is None
+                    else min(admission_deadline, candidate)
+                )
+                deadline = admission_deadline
+                if now >= deadline:
+                    return None
+        elif require_vm and startup_identity is not None and vm_status == "ready":
+            # A Ready response after a typed source must retain that source.
+            # A transient missing hint spends the already fixed deadline.
+            await asyncio.sleep(poll_interval)
+            continue
 
         # A VM-backed thread pays a cold KubeVirt boot far beyond the
         # sandbox-container default. Extend the poll deadline ONCE the moment we

@@ -150,12 +150,140 @@ async def require_current_initial_vm_source(thread, *, store):
             raise HTTPException(409, "Initial VM source runtime changed")
 
 
-def initial_vm_wait_payload(thread):
+async def initial_vm_startup_view(thread, *, store):
+    """Read one current initial Session source and its durable admission clock.
+
+    This hint changes only the agent's poll lifetime. The query neither claims
+    the retry nor admits a reservation and cannot grant runtime authority.
+    """
+    metadata = thread_metadata_object(thread)
+    vm = metadata.get("vm")
+    if (
+        thread.get("execution_lane") != "pinned"
+        or thread.get("status") != "created"
+        or thread.get("runtime_retirement_token") is not None
+        or thread.get("pinned_idle_terminal_intent_at") is not None
+        or not thread.get("agent_id")
+        or not thread.get("runtime_attach_token")
+        or not isinstance(vm, dict)
+        or vm.get("rootdisk") == "kept"
+        or vm.get("idle_wake_operation_id") is not None
+        or not isinstance(vm.get("initial_runtime"), dict)
+    ):
+        return None
+    try:
+        runtime = UUID(str(thread["runtime_generation"]))
+        agent = UUID(str(thread["agent_id"]))
+        attach = UUID(str(thread["runtime_attach_token"]))
+        request = UUID(str(vm["creation_request_id"]))
+        provision = UUID(str(vm["provision_generation"]))
+        thread_id = UUID(str(thread["id"]))
+        owner = UUID(str(thread["user_id"])) if thread.get("user_id") else None
+        project = UUID(str(thread["project_id"])) if thread.get("project_id") else None
+    except (KeyError, TypeError, ValueError):
+        return None
+    marker = vm["initial_runtime"]
+    if any(
+        marker.get(key) != str(value)
+        for key, value in (
+            ("runtime_generation", runtime),
+            ("agent_id", agent),
+            ("runtime_attach_token", attach),
+        )
+    ):
+        return None
+    if any(
+        str(vm[key]) != str(value)
+        for key, value in (
+            ("creation_request_id", request),
+            ("provision_generation", provision),
+        )
+    ):
+        return None
+    row = await store.fetchrow(
+        "SELECT r.request_id,r.provision_generation,r.state,r.reason,r.boot_counted,"
+        "r.observed_vm_uid,r.observed_pvc_uid,r.creation_admission_id,"
+        "w.state AS waiter_state,"
+        "(SELECT min(v.created_at) FROM vm_resource_reservations v "
+        "WHERE v.request_id=r.request_id) AS first_reservation_at,"
+        "(SELECT count(*) FROM vm_creation_effects e WHERE e.request_id=r.request_id "
+        "AND e.state<>'rejected') AS issued_effects,"
+        "clock_timestamp() AS read_at "
+        "FROM threads t JOIN agents a ON a.id=t.agent_id AND a.thread_id=t.id "
+        "JOIN vm_creation_retries r ON r.request_id=$5 AND r.owner_kind='thread' "
+        "AND r.thread_id=t.id AND r.origin='initial' "
+        "AND r.thread_runtime_generation=t.runtime_generation "
+        "AND r.thread_agent_id=t.agent_id AND r.thread_attach_token=t.runtime_attach_token "
+        "AND r.provision_generation=$6 AND r.thread_wake_operation_id IS NULL "
+        "AND r.thread_owner_user_id IS NOT DISTINCT FROM t.user_id "
+        "AND r.thread_owner_project_id IS NOT DISTINCT FROM t.project_id "
+        "JOIN vm_resource_waiters w ON w.request_id=r.request_id "
+        "AND w.owner_kind='thread' AND w.thread_id=t.id AND w.job_id IS NULL "
+        "AND w.provision_generation=r.provision_generation "
+        "AND w.request_digest=r.request_digest "
+        "AND w.owner_key=CASE WHEN t.user_id IS NULL THEN 'system' "
+        "ELSE 'user:'||t.user_id::text END "
+        "AND w.project_id IS NOT DISTINCT FROM t.project_id "
+        "WHERE t.id=$1 AND t.runtime_generation=$2 AND t.agent_id=$3 "
+        "AND t.runtime_attach_token=$4 AND t.user_id IS NOT DISTINCT FROM $7::uuid "
+        "AND t.project_id IS NOT DISTINCT FROM $8::uuid "
+        "AND t.execution_lane='pinned' AND t.status='created' "
+        "AND t.runtime_retirement_token IS NULL "
+        "AND t.pinned_idle_terminal_intent_at IS NULL "
+        "AND t.metadata->'vm'->>'creation_request_id'=$5::text "
+        "AND t.metadata->'vm'->>'provision_generation'=$6::text "
+        "AND t.metadata->'vm'->'initial_runtime'->>'runtime_generation'=$2::text "
+        "AND t.metadata->'vm'->'initial_runtime'->>'agent_id'=$3::text "
+        "AND t.metadata->'vm'->'initial_runtime'->>'runtime_attach_token'=$4::text",
+        thread_id,
+        runtime,
+        agent,
+        attach,
+        request,
+        provision,
+        owner,
+        project,
+    )
+    if row is None or row["state"] in {"attention", "cancel_requested", "settled"}:
+        return None
+    identity = {
+        "contract_version": 1,
+        "request_id": str(request),
+        "provision_generation": str(provision),
+        "runtime_generation": str(runtime),
+    }
+    if row["first_reservation_at"] is not None:
+        if row["waiter_state"] != "admitted":
+            return None
+        return {
+            **identity,
+            "phase": "admitted",
+            "admission_elapsed_s": max(
+                0.0, (row["read_at"] - row["first_reservation_at"]).total_seconds()
+            ),
+        }
+    if (
+        row["state"] in {"queued", "reconciling"}
+        and row["reason"] == "resource_wait"
+        and row["waiter_state"] == "waiting"
+        and not row["boot_counted"]
+        and row["observed_vm_uid"] is None
+        and row["observed_pvc_uid"] is None
+        and row["creation_admission_id"] is None
+        and row["issued_effects"] == 0
+        and not vm.get("vm_uid")
+        and not vm.get("rootdisk_pvc_uid")
+    ):
+        return {**identity, "phase": "resource_wait"}
+    return None
+
+
+def initial_vm_wait_payload(thread, *, startup_view=None):
     """Only readiness and the already-bound runtime contract cross this poll."""
     metadata = thread_metadata_object(thread)
     context = metadata.get("workspace_preparation") or metadata.get("vm") or {}
     status = str(context.get("status") or "provisioning")
-    return {
+    payload = {
         "status": "failed" if status == "failed" else "creating",
         "vm_status": status,
         "pinned_status_identity_contract": 1,
@@ -165,3 +293,6 @@ def initial_vm_wait_payload(thread):
         "protected_cloud": False,
         "protected_cloud_state": None,
     }
+    if startup_view is not None:
+        payload["vm_startup"] = startup_view
+    return payload
