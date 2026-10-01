@@ -28,14 +28,17 @@ db = _db
 setup = _setup
 
 
-async def cancelled_source(db, monkeypatch, *, retire=True):
+async def cancelled_source(db, monkeypatch, *, retire=True, golden_enabled=True):
     thread_id, _, override, dependencies = await _initial_vm(
         db, monkeypatch, native=True
     )
     current = await _bind_cold_agent(db, thread_id)
     configuration = whole_launcher_configuration()
     configuration.update(
-        version=1, namespace="workers", storage_class="local", golden_enabled=True
+        version=1,
+        namespace="workers",
+        storage_class="local",
+        golden_enabled=golden_enabled,
     )
     configuration.pop("resource_admission")
     monkeypatch.delenv("VM_RESOURCE_ADMISSION_CONFIG")
