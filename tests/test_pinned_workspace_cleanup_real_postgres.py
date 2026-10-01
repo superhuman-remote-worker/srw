@@ -33,7 +33,7 @@ pg_dsn = authority.pg_dsn
 _schema_applied = authority._schema_applied
 
 
-async def _scenario(db, monkeypatch):
+async def _scenario(db, monkeypatch, *, ephemeral=False):
     ids = await authority._seed(db, protected_agent_pod=True, workspace_claim=False)
     thread = await db.get_thread(ids["thread"])
     generation = str(thread["runtime_generation"])
@@ -47,6 +47,8 @@ async def _scenario(db, monkeypatch):
     )
     owner = WorkspaceOwner.session(ids["thread"])
     attempt, pod_uid, pvc_uid, service_uid = (str(uuid4()) for _ in range(4))
+    if ephemeral:
+        pvc_uid = service_uid = None
     assert await db.reserve_pinned_thread_workspace_provision_intent(
         owner.id,
         expected_runtime_generation=generation,
@@ -57,14 +59,16 @@ async def _scenario(db, monkeypatch):
         attempt_id=attempt,
         namespace="agent-workspaces",
         pod_name=owner.pod_name,
-        pvc_name="pvc-" + owner.pod_name,
+        pvc_name=None if ephemeral else "pvc-" + owner.pod_name,
         seed_configmap_name=None,
-        service_name=owner.pod_name,
+        service_name=None if ephemeral else owner.pod_name,
         retained_service_uid=None,
         network_tier="internet-only",
         manifest_fingerprint="a" * 64,
     )
     for resource, uid in (("pod", pod_uid), ("pvc", pvc_uid), ("service", service_uid)):
+        if uid is None:
+            continue
         assert await db.publish_pinned_thread_workspace_provision_resource(
             owner.id,
             expected_runtime_generation=generation,
@@ -86,6 +90,8 @@ async def _scenario(db, monkeypatch):
     p, resources = _absent_pod_provisioner(
         db, owner, {"pvc_uid": pvc_uid, "service_uid": service_uid}
     )
+    if ephemeral:
+        resources.clear()
     pod = NS(
         metadata=NS(
             name=owner.pod_name,
@@ -115,7 +121,10 @@ async def _scenario(db, monkeypatch):
             volumes=[
                 NS(
                     name="workspace-data",
-                    persistent_volume_claim=NS(claim_name="pvc-" + owner.pod_name),
+                    persistent_volume_claim=(
+                        None if ephemeral else NS(claim_name="pvc-" + owner.pod_name)
+                    ),
+                    empty_dir=NS() if ephemeral else None,
                 )
             ],
         ),
@@ -311,6 +320,56 @@ async def test_pinned_workspace_end_and_permanent_delete(
         owner.id,
         expected_runtime_retirement_token=retirement["token"],
         expected_runtime_generation=retirement["generation"],
+    )
+    assert await db.get_thread(owner.id) is None
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_workspace_soft_end_then_permanent_delete(db, monkeypatch):
+    ids, owner, p, resources, effects = await _scenario(db, monkeypatch, ephemeral=True)
+    pod_uid = resources["pod"].metadata.uid
+    retirement = await _begin(db, ids, False)
+    await controls_composition.pinned_retirement_operations(
+        main.app.state.resources
+    ).cleanup_pinned_thread_retirement(retirement, cleanup_agent_pod=False)
+    assert effects == [("delete", pod_uid), ("finalizer", pod_uid)]
+    assert not resources
+    assert await db.settle_pinned_thread_retirement(
+        owner.id,
+        token=retirement["token"],
+        generation=retirement["generation"],
+        final_status="ended",
+    )
+    thread = await db.get_thread(owner.id)
+    metadata = authority._json(thread["metadata"])
+    assert metadata["workspace_container"]["status"] == "deleted"
+    assert metadata["workspace_container"]["_runtime_incarnation"] is None
+    assert metadata["_workspace_binding"]["backing_id"].endswith(pod_uid)
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM managed_repository_process_zero_receipts "
+            "WHERE owner_id=$1::uuid AND scope='workspace_container' "
+            "AND runtime_incarnation=$2",
+            owner.id,
+            pod_uid,
+        )
+        == 1
+    )
+    permanent = await db.begin_pinned_thread_retirement(owner.id, permanent=True)
+    assert permanent["state"] == "pending", permanent
+    assert await db.authorize_pinned_thread_retirement(
+        owner.id,
+        token=permanent["token"],
+        generation=permanent["generation"],
+        settle_status="ended",
+    )
+    await controls_composition.pinned_retirement_operations(
+        main.app.state.resources
+    ).cleanup_pinned_thread_retirement(permanent, cleanup_agent_pod=False)
+    await db.delete_thread(
+        owner.id,
+        expected_runtime_retirement_token=permanent["token"],
+        expected_runtime_generation=permanent["generation"],
     )
     assert await db.get_thread(owner.id) is None
 
