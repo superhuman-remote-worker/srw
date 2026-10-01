@@ -15,6 +15,10 @@ from uuid import UUID
 INTENT_ANNOTATION = "srw.io/vm-thread-creation-cancel-intent"
 SIGNATURE_ANNOTATION = "srw.io/vm-thread-creation-cancel-signature"
 LABEL = "srw.io/vm-thread-creation-cancel-carrier"
+_RESOURCE_FIELDS = {
+    "reservation_id", "reservation_revision", "reservation_cluster_id",
+    "reservation_policy_digest",
+}
 _FIELDS = {
     "version", "kind", "source", "admission_id", "reservation_request_id",
     "intent_digest", "retry_request_id", "thread_id",
@@ -32,17 +36,23 @@ def _uuid(value):
 
 
 def validate_intent(value):
-    if not isinstance(value, Mapping) or set(value) != _FIELDS:
+    if not isinstance(value, Mapping):
         raise ValueError("Thread cancellation intent is incomplete")
     value = dict(value)
+    version = value.get("version")
+    if type(version) is not int or version not in {1, 2} or set(value) != (
+        _FIELDS if version == 1 else _FIELDS - _RESOURCE_FIELDS
+    ):
+        raise ValueError("Thread cancellation intent is incomplete")
     if (
-        type(value["version"]) is not int or value["version"] != 1
-        or value["kind"] != "thread_creation_cancel"
+        value["kind"] != "thread_creation_cancel"
         or value["source"] != "controller_vm_create_cancel"
-        or type(value["reservation_revision"]) is not int
-        or value["reservation_revision"] <= 0
-        or not isinstance(value["reservation_cluster_id"], str)
-        or not value["reservation_cluster_id"]
+        or version == 1 and (
+            type(value["reservation_revision"]) is not int
+            or value["reservation_revision"] <= 0
+            or not isinstance(value["reservation_cluster_id"], str)
+            or not value["reservation_cluster_id"]
+        )
         or value["source_pin_key"] != value["retry_request_id"]
         or (value["thread_agent_id"] is None)
         != (value["thread_attach_token"] is None)
@@ -51,15 +61,17 @@ def validate_intent(value):
     for key in (
         "admission_id", "reservation_request_id", "retry_request_id",
         "thread_id", "thread_runtime_generation", "retirement_token",
-        "provision_generation", "reservation_id", "source_pin_key",
+        "provision_generation", "source_pin_key",
     ):
         _uuid(value[key])
+    if version == 1:
+        _uuid(value["reservation_id"])
     for key in ("thread_agent_id", "thread_attach_token", "thread_wake_operation_id"):
         if value[key] is not None:
             _uuid(value[key])
     for key in (
         "intent_digest", "request_digest", "controller_configuration_digest",
-        "reservation_policy_digest",
+        *(["reservation_policy_digest"] if version == 1 else []),
     ):
         if not isinstance(value[key], str) or not re.fullmatch(
             r"sha256:[0-9a-f]{64}", value[key]
@@ -77,7 +89,7 @@ def _signature(values, *, namespace, name, uid, secret):
     if not isinstance(secret, bytes) or not secret:
         raise ValueError("Thread cancellation signing key is missing")
     payload = json.dumps(
-        ["srw-thread-creation-cancel-v1", namespace, name, uid, values],
+        [f"srw-thread-creation-cancel-v{values['version']}", namespace, name, uid, values],
         sort_keys=True, separators=(",", ":"), ensure_ascii=True,
     ).encode()
     return hmac.new(secret, payload, hashlib.sha256).hexdigest()

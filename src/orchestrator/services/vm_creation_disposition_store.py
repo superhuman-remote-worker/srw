@@ -119,6 +119,34 @@ class VMCreationDispositionStore:
         )
         config = row["controller_configuration"]
         resource = config.get("resource_admission") if isinstance(config, dict) else None
+        intent = {
+            "kind": "thread_creation_cancel",
+            "source": "controller_vm_create_cancel",
+            "admission_id": str(permit["id"]),
+            "reservation_request_id": str(permit["request_id"]),
+            "intent_digest": permit["intent_digest"],
+            "retry_request_id": str(row["request_id"]),
+            "thread_id": str(row["thread_id"]),
+            "thread_runtime_generation": str(row["thread_runtime_generation"]),
+            "thread_agent_id": str(row["thread_agent_id"]) if row["thread_agent_id"] else None,
+            "thread_attach_token": str(row["thread_attach_token"]) if row["thread_attach_token"] else None,
+            "thread_wake_operation_id": str(row["thread_wake_operation_id"]) if row["thread_wake_operation_id"] else None,
+            "retirement_token": str(owner["runtime_retirement_token"]),
+            "provision_generation": str(row["provision_generation"]),
+            "request_digest": row["request_digest"],
+            "controller_configuration_digest": row["controller_configuration_digest"],
+            "source_pin_key": str(row["request_id"]),
+        }
+        # Durable typed creation also supports the quota-free v1 configuration.
+        # Its original cleanup admission is authority; never invent a resource
+        # charge or treat a missing charge from a resource config as quota-free.
+        if (
+            isinstance(config, dict)
+            and type(config.get("version")) is int and config["version"] == 1
+            and "resource_admission" not in config
+            and reservation is None and waiter is None
+        ):
+            return validate_intent({**intent, "version": 2})
         if (
             reservation is None or waiter is None or not isinstance(resource, dict)
             or not (
@@ -141,26 +169,11 @@ class VMCreationDispositionStore:
         ):
             raise VMCreationRetryConflict("creation_reservation_changed")
         return validate_intent({
-            "version": 1, "kind": "thread_creation_cancel",
-            "source": "controller_vm_create_cancel",
-            "admission_id": str(permit["id"]),
-            "reservation_request_id": str(permit["request_id"]),
-            "intent_digest": permit["intent_digest"],
-            "retry_request_id": str(row["request_id"]),
-            "thread_id": str(row["thread_id"]),
-            "thread_runtime_generation": str(row["thread_runtime_generation"]),
-            "thread_agent_id": str(row["thread_agent_id"]) if row["thread_agent_id"] else None,
-            "thread_attach_token": str(row["thread_attach_token"]) if row["thread_attach_token"] else None,
-            "thread_wake_operation_id": str(row["thread_wake_operation_id"]) if row["thread_wake_operation_id"] else None,
-            "retirement_token": str(owner["runtime_retirement_token"]),
-            "provision_generation": str(row["provision_generation"]),
-            "request_digest": row["request_digest"],
-            "controller_configuration_digest": row["controller_configuration_digest"],
+            **intent, "version": 1,
             "reservation_id": str(reservation["id"]),
             "reservation_revision": reservation["revision"],
             "reservation_cluster_id": reservation["cluster_id"],
             "reservation_policy_digest": reservation["policy_digest"],
-            "source_pin_key": str(row["request_id"]),
         })
 
     async def _job_cancel_intent_on_conn(self, conn, row, permit, *, completed=False):

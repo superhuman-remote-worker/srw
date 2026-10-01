@@ -14,10 +14,12 @@ from tests.test_vm_resource_configuration import whole_launcher_configuration
 from tests.test_vm_resource_thread_source_real_postgres import (
     _base_db,  # noqa: F401
     _schema_applied,  # noqa: F401
-    db,  # noqa: F401
+    db as _db,
     pg_dsn,  # noqa: F401
     thread_schema,  # noqa: F401
 )
+
+db = _db
 
 
 async def cancelled_source(db, monkeypatch):
