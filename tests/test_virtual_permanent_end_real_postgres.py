@@ -16,6 +16,7 @@ from orchestrator.services.thread_retirement import (
     ThreadRetirementDependencies,
     ThreadRetirementOperations,
 )
+from shared.run_queue import ENQUEUE_INSERTED, STATE_QUEUED, enqueue_unit
 from tests import test_manifest_native_full_schema as full_schema
 
 actor = full_schema.actor
@@ -47,11 +48,13 @@ async def _soft_ended_virtual(database, actor, monkeypatch, *, failure=None):
         )
         is not None
     )
-    await database.execute(
-        "INSERT INTO run_queue(unit_id,unit_kind,state,lease_token) "
-        "VALUES($1::uuid,'session_turn','queued',0)",
-        thread_id,
-    )
+    async with database.acquire() as conn:
+        async with conn.transaction():
+            admitted = await enqueue_unit(
+                conn, unit_id=thread_id, unit_kind="session_turn"
+            )
+    assert admitted.status == ENQUEUE_INSERTED
+    assert admitted.state == STATE_QUEUED
     prefix = f"threads/{thread_id}/"
     keys = {prefix + "first", prefix + "second"}
     purge_targets = []
@@ -194,6 +197,39 @@ async def test_stale_queue_refuses_permanent_virtual_end_before_purge(
     assert targets == [] and len(keys) == 2
     metadata = thread_metadata_object(await database.get_thread(thread_id))
     assert metadata["_stateless_workspace_retirement_settled"]["permanent"] is False
+
+
+@pytest.mark.asyncio
+async def test_stale_ended_caller_after_resume_cannot_purge_or_delete_successor(
+    database, actor, monkeypatch
+):
+    thread_id, ended, operations, _, _, keys, targets = await _soft_ended_virtual(
+        database, actor, monkeypatch
+    )
+    assert await database.resume_thread(thread_id) is True
+    resumed = await database.get_thread(thread_id)
+    assert resumed["status"] == "created"
+    assert "_stateless_workspace_retirement_settled" not in thread_metadata_object(
+        resumed
+    )
+    assert (
+        await database.fetchval(
+            "SELECT public.stateless_virtual_permanent_delete_is_authority_free("
+            "id, metadata) FROM threads WHERE id=$1::uuid",
+            thread_id,
+        )
+        is False
+    )
+
+    with pytest.raises(asyncpg.CheckViolationError) as delete_exc:
+        await database.execute("DELETE FROM threads WHERE id=$1::uuid", thread_id)
+    assert delete_exc.value.sqlstate == "23514"
+
+    with pytest.raises(HTTPException) as exc:
+        await operations.end_thread_flow(thread_id, ended, permanent=True, force=False)
+    assert exc.value.status_code == 409
+    assert targets == [] and len(keys) == 2
+    assert (await database.get_thread(thread_id))["status"] == "created"
 
 
 @pytest.mark.asyncio
