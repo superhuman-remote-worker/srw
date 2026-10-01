@@ -159,6 +159,28 @@ describe('network ledger safety and warm-up classification', () => {
     expect(ledger.problems().filter((problem) => problem.startsWith('console error'))).toHaveLength(1);
   });
 
+  it('requires the delayed callback to retain the application origin', () => {
+    const { ledger, handlers } = ledgerHarness('https://srw-e2e.test');
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('creating');
+    emitResponse(handlers, 'GET', 'https://srw-e2e.test/api/sessions/owned-thread/connection', 425);
+    ledger.setPhase('turn');
+    emitConsole(handlers, 'Failed to load resource: the server responded with a status of 425 ()',
+      'https://foreign.test/api/sessions/owned-thread/connection');
+    expect(ledger.problems().filter((problem) => problem.startsWith('console error'))).toHaveLength(1);
+  });
+
+  it('refuses a post-warm-up callback even with an unused warm response', () => {
+    const { ledger, handlers } = ledgerHarness('https://srw-e2e.test');
+    ledger.registerThread('owned-thread');
+    const url = 'https://srw-e2e.test/api/sessions/owned-thread/connection';
+    ledger.setPhase('creating');
+    emitResponse(handlers, 'GET', url, 425);
+    ledger.setPhase('hydration');
+    emitConsole(handlers, 'Failed to load resource: the server responded with a status of 425 ()', url);
+    expect(ledger.problems().filter((problem) => problem.startsWith('console error'))).toHaveLength(1);
+  });
+
   it.each([
     ['unobserved', 'GET', 425, 'https://srw-e2e.test/api/sessions/owned-thread/connection', 'creating', false],
     ['wrong status', 'GET', 200, 'https://srw-e2e.test/api/sessions/owned-thread/connection', 'creating', true],
