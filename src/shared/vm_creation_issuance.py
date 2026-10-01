@@ -290,8 +290,11 @@ def _values(value):
         raise ValueError("Incomplete creation carrier intent")
     value = dict(value)
     if thread_source:
-        if version not in (4, 5):
-            raise ValueError("Thread creation requires a resource grant")
+        # Version2 binds a quota-free thread's exact tuple and rootdisk source.
+        # The issuer still matches carrier/resource versions to the immutable
+        # configuration before granting any effect; v4/v5 keep their charge.
+        if version not in (2, 4, 5):
+            raise ValueError("Thread creation requires a rootdisk source")
         _uuid(value["thread_runtime_generation"])
         if (value["thread_agent_id"] is None) != (
             value["thread_attach_token"] is None
