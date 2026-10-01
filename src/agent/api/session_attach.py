@@ -1983,12 +1983,21 @@ class SessionAttachCoordinator:
         # reclaimer here makes every pooled attach fail after all of its durable
         # setup has already completed.  The turn executor reads the stateless
         # inbox through input_seq/consumed_seq after this attach returns.
+        reclaimed_input = set()
         if not self._ports.stateless_mode():
-            await self._input.reclaim_pending()
+            reclaimed_input = await self._input.reclaim_pending()
 
         # Start self-cleanup watchdogs (PR 2): exit on boot-WS timeout or
         # out-of-band thread.status='ended'. Cancelled by _terminate_session.
         self._ports.start_watchdogs()
+
+        # Reclaimed durable work already is input. Give it the same existing
+        # loop consumer as a new REST input; a resumed life may have no socket
+        # subscriber or further human input to trigger that lazy start.
+        # The loop-start port still checks readiness and admission, and the
+        # loop owns its normal provider/effect authority checks.
+        if reclaimed_input:
+            self._ports.ensure_loop_started("attach_recovered_input")
 
         # Officer boot self-wake (centurion.md §4): the loop starts LAZILY on
         # first input / WS attach, so a freshly booted or respawned officer would

@@ -505,6 +505,59 @@ async def test_dedicated_attach_adopts_registration_identity_before_any_await(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stateless", [False, True])
+async def test_attach_without_reclaimed_pinned_input_keeps_loop_lazy(
+    monkeypatch, stateless
+):
+    workspace = _workspace(None if stateless else G1)
+    client = _client(
+        generation=None if stateless else G1,
+        attach_token=None if stateless else T1,
+        contract=not stateless,
+    )
+    client.get_thread_workspace = AsyncMock(return_value=workspace)
+    monkeypatch.setattr(pa, "_orchestrator_client", client)
+    _poll(monkeypatch, workspace)
+    start = MagicMock()
+    patch_collaborator(monkeypatch, "_ensure_persistent_loop_started", start)
+    token = None
+    if stateless:
+        monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+        lease = LeaseHandle()
+        lease.update(TA, 7, executor_id="executor-a", pod_uid=POD_UID)
+        token = current_lease.set(lease)
+    try:
+        await attach(thread_id=TA)
+        start.assert_not_called()
+        assert [name for name, _ in EVENTS].count("reclaim") == (0 if stateless else 1)
+    finally:
+        if token is not None:
+            current_lease.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_reclaimed_input_loop_start_still_refuses_closed_admission(monkeypatch):
+    client = _client(generation=G1, attach_token=T1, contract=True)
+    client.get_thread_workspace = AsyncMock(return_value=_workspace())
+    monkeypatch.setattr(pa, "_orchestrator_client", client)
+    _poll(monkeypatch, _workspace())
+
+    async def reclaim_then_fence():
+        monkeypatch.setattr(
+            pa._session_termination, "termination_admission_fenced", True
+        )
+        return {("captured-delivery", 2)}
+
+    monkeypatch.setattr(pa._session_input, "reclaim_pending", reclaim_then_fence)
+    start = MagicMock(wraps=pa._ensure_persistent_loop_started)
+    patch_collaborator(monkeypatch, "_ensure_persistent_loop_started", start)
+    await attach(thread_id=TA)
+    start.assert_called_once_with("attach_recovered_input")
+    assert pa._loop_task is None
+    assert not pa._session_ready()
+
+
+@pytest.mark.asyncio
 async def test_payload_identity_beats_registration_and_is_mirrored(monkeypatch):
     client = _client(generation=G1, attach_token=T1, contract=True)
     client.get_thread_workspace = AsyncMock(return_value=_workspace(G2))

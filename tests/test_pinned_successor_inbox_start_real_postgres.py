@@ -121,8 +121,9 @@ async def test_successor_attach_consumes_stranded_inbox_without_transport_or_inp
         assert consumed == [str(item) for item in expected]
         assert await pa._session_input.reclaim_pending() == set()
         rows = await db.fetch(
-            "SELECT delivery_id,state,admitted_turn_number,settled_at,owner_pod_uid "
-            "FROM thread_input_deliveries WHERE thread_id=$1::uuid ORDER BY persisted_at",
+            "SELECT d.delivery_id,d.state,d.admitted_turn_number,d.settled_at,d.owner_pod_uid "
+            "FROM thread_input_deliveries d JOIN thread_messages m ON m.id=d.message_id "
+            "WHERE d.thread_id=$1::uuid ORDER BY m.seq",
             ids["thread"],
         )
         recovered = rows[1:] if partial else rows
