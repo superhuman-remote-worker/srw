@@ -309,6 +309,22 @@ async def test_abort_workspace_lineage_refuses_incomplete_or_changed_authority(
                 owner.id,
                 value,
             )
+    from orchestrator.database.postgres import (
+        _settled_pinned_workspace_current_generation,
+    )
+
+    metadata = workspace.authority._json((await db.get_thread(owner.id))["metadata"])
+    async with db.acquire() as conn:
+        assert (
+            await _settled_pinned_workspace_current_generation(
+                conn,
+                thread_id=UUID(owner.id),
+                current_generation=UUID(current),
+                workspace=metadata["workspace_container"],
+                binding=metadata["_workspace_binding"],
+            )
+            is None
+        )
     permanent = await db.begin_pinned_thread_retirement(owner.id, permanent=True)
     assert permanent["state"] == "malformed", permanent
     thread = await db.get_thread(owner.id)
