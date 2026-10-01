@@ -13,6 +13,7 @@ import pytest_asyncio
 from orchestrator import main
 from orchestrator.application import controls
 from orchestrator.services import agent_provisioner as agent_provider
+from orchestrator.services import stale_agent_detector as detector
 from orchestrator.services.agent_provisioner import AgentProvisioner
 from shared.persistent_input_delivery import (
     persist_input_delivery,
@@ -22,6 +23,9 @@ from shared.persistent_input_delivery import (
 )
 from tests import test_persistent_recycler_real_postgres as fixtures
 from tests.test_pinned_vm_initial_binding_real_postgres import _bind_cold_agent
+from tests.test_pinned_retirement_retry_parity_real_postgres import (
+    _run_one_detector_pass,
+)
 
 pg_dsn = fixtures.pg_dsn
 _base_schema = fixtures._schema_applied
@@ -164,6 +168,60 @@ async def killed_life(
         AsyncMock(return_value=True),
     )
     return ids, retirement, deliveries, api, provider
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["none", "virtual"])
+@pytest.mark.parametrize("partial", [False, True])
+async def test_detector_settles_captured_sigkill_before_full_grace(
+    db, monkeypatch, backend, partial
+):
+    """Exercise nomination and retry, rather than calling recovery directly."""
+    ids, retirement, deliveries, api, _ = await killed_life(
+        db,
+        monkeypatch,
+        backend=backend,
+        partial=partial,
+        with_virtual_binding=False,
+    )
+    for pod in api.pods.values():
+        pod.spec.restart_policy = "Never"
+    # Begin's timestamp is immutable. Exercise the shorter nomination clock
+    # through the detector's explicit policy, without rewriting that ledger.
+    monkeypatch.setattr(
+        detector, "PINNED_RETIREMENT_TERMINAL_PROBE_GRACE_SECONDS", 0, raising=False
+    )
+    await db.execute(
+        "UPDATE agents SET last_heartbeat=now()-interval '5 minutes' WHERE id=$1::uuid",
+        ids["agent"],
+    )
+
+    await _run_one_detector_pass()
+
+    current = await db.get_thread(ids["thread"])
+    assert current["status"] == "ended"
+    assert current["runtime_retirement_token"] is None
+    assert current["agent_id"] is None
+    assert not api.pods
+    outcomes = await db.fetch(
+        "SELECT runtime_generation,retirement_token,disposition,outcome "
+        "FROM thread_runtime_retirement_outcomes WHERE thread_id=$1::uuid",
+        ids["thread"],
+    )
+    assert len(outcomes) == 1
+    assert str(outcomes[0]["runtime_generation"]) == retirement["generation"]
+    assert str(outcomes[0]["retirement_token"]) == retirement["token"]
+    assert outcomes[0]["disposition"] == "ended"
+    assert outcomes[0]["outcome"] == "settled"
+    rows = await db.fetch(
+        "SELECT delivery_id,state FROM thread_input_deliveries "
+        "WHERE thread_id=$1::uuid ORDER BY persisted_at",
+        ids["thread"],
+    )
+    assert [row["delivery_id"] for row in rows] == deliveries
+    assert [row["state"] for row in rows] == (
+        ["admitted", "queued", "owned"] if partial else ["queued", "owned"]
+    )
 
 
 @pytest.mark.asyncio
