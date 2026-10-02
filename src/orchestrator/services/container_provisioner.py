@@ -447,6 +447,40 @@ def _pod_has_exact_process_zero(pod: Any) -> bool:
     ) or _deleting_pod_was_never_scheduled(pod)
 
 
+def _pod_is_terminal_before_first_ready(pod: Any) -> bool:
+    """A scheduled Never Pod ran its workspace container and then stopped."""
+
+    spec = getattr(pod, "spec", None)
+    status = getattr(pod, "status", None)
+    if (
+        getattr(status, "phase", None) not in {"Failed", "Succeeded"}
+        or getattr(spec, "restart_policy", None) != "Never"
+        or not getattr(spec, "node_name", None)
+        or not _all_pod_container_statuses_terminated(pod)
+        or any(
+            getattr(condition, "type", None) == "Ready"
+            and getattr(condition, "status", None) == "True"
+            for condition in (getattr(status, "conditions", None) or ())
+        )
+    ):
+        return False
+    workspaces = [
+        item
+        for item in (getattr(status, "container_statuses", None) or ())
+        if getattr(item, "name", None) == "workspace"
+    ]
+    if len(workspaces) != 1:
+        return False
+    workspace = workspaces[0]
+    terminated = getattr(getattr(workspace, "state", None), "terminated", None)
+    return bool(
+        terminated is not None
+        and type(getattr(terminated, "exit_code", None)) is int
+        and getattr(workspace, "restart_count", None) == 0
+        and getattr(workspace, "container_id", None)
+    )
+
+
 def _container_never_started(container: Any) -> bool:
     state = getattr(container, "state", None)
     last_state = getattr(container, "last_state", None)
@@ -5524,10 +5558,111 @@ class ContainerProvisioner:
                 expected_network_tier=network_tier,
                 expected_pvc_name=_UNSPECIFIED_RESOURCE_BINDING,
                 expected_seed_configmap=_UNSPECIFIED_RESOURCE_BINDING,
+                allow_terminal_observation=(
+                    expected_creation is not None
+                    and expected_creation.route == "initial"
+                    and _creation_reservation.get("startup_protocol_version") == 1
+                ),
             )
             if pod is None:
                 # Once attempted, Kubernetes absence is an absorbing safe hold:
                 # the original API call might have reached a partitioned node.
+                return False
+            if _pod_has_exact_process_zero(pod):
+                # A failed initial Pod cannot publish an endpoint. Observe its
+                # frozen startup clock on this exact source without entering
+                # adoption, resource writes, SSH, or replacement creation.
+                if (
+                    expected_creation is None
+                    or expected_creation.route != "initial"
+                    or _creation_reservation.get("startup_protocol_version") != 1
+                    or _creation_reservation.get("startup_state") != "starting"
+                    or _creation_reservation.get("startup_first_ready_at") is not None
+                    or _creation_reservation.get("claim_token")
+                    != expected_creation.claim_token
+                    or not _pod_is_terminal_before_first_ready(pod)
+                ):
+                    return False
+                pvc_name = self._workspace_pvc_name_from_pod(pod, owner=owner)
+                seed_name = self._require_stateless_pod_storage_binding(
+                    pod,
+                    owner=owner,
+                    expected_pvc_name=pvc_name,
+                    expected_seed_configmap=_UNSPECIFIED_RESOURCE_BINDING,
+                )
+                if (pvc_name is None) != (expected_creation.pvc_uid is None) or (
+                    seed_name is None
+                ) != (expected_creation.seed_configmap_uid is None):
+                    return False
+                if pvc_name is not None:
+                    claim = await self._bounded_kubernetes_call(
+                        self._core_api.read_namespaced_persistent_volume_claim,
+                        name=pvc_name,
+                        namespace=self._namespace,
+                    )
+                    if (
+                        self._require_stateless_pvc_identity(
+                            claim,
+                            owner=owner,
+                            pvc_name=pvc_name,
+                            allow_any_storage_class=True,
+                        )
+                        != expected_creation.pvc_uid
+                    ):
+                        return False
+                    service = await self._bounded_kubernetes_call(
+                        self._core_api.read_namespaced_service,
+                        name=owner.pod_name,
+                        namespace=self._namespace,
+                    )
+                    if (
+                        self._require_stateless_service_identity(service, owner=owner)
+                        != expected_creation.service_uid
+                    ):
+                        return False
+                elif expected_creation.service_uid is not None:
+                    return False
+                if seed_name is not None:
+                    seed = await self._bounded_kubernetes_call(
+                        self._core_api.read_namespaced_config_map,
+                        name=seed_name,
+                        namespace=self._namespace,
+                    )
+                    if (
+                        self._require_stateless_seed_configmap_identity(
+                            seed,
+                            owner=owner,
+                            generation=generation,
+                            pod_name=owner.pod_name,
+                            creation_reservation_id=str(_creation_reservation["id"]),
+                        )
+                        != expected_creation.seed_configmap_uid
+                    ):
+                        return False
+                self._require_workspace_creation_reservation_annotation(
+                    pod, reservation_id=str(_creation_reservation["id"])
+                )
+                if not await self._workspace_creation_reservation_is_current(
+                    owner, _creation_reservation, scope="workspace_container"
+                ):
+                    return False
+                await self._observe_container_startup_stage(
+                    owner.pod_name,
+                    owner=owner,
+                    reservation=_creation_reservation,
+                    expected_runtime_incarnation=expected_runtime,
+                    expected_creation_generation=generation,
+                    expected_network_tier=network_tier,
+                    expected_pvc_name=pvc_name,
+                    expected_seed_configmap=seed_name,
+                    timeout=self._reattach_ready_timeout if pvc_name else 120,
+                    pull_image=None,  # A terminated container was pulled.
+                    observation_check=observation_check,
+                    authority_check=lambda: self._session_observation_checkpoint(
+                        owner, generation
+                    ),
+                    terminal_observation_only=True,
+                )
                 return False
             runtime_incarnation = self._require_stateless_pod_identity(
                 pod,
@@ -5844,6 +5979,7 @@ class ContainerProvisioner:
         expected_network_tier: str,
         expected_pvc_name: str | None,
         expected_seed_configmap: str | None | object,
+        allow_terminal_observation: bool = False,
     ) -> Any | None:
         try:
             pod = await self._bounded_kubernetes_call(
@@ -5888,7 +6024,7 @@ class ContainerProvisioner:
                 raise WorkspaceRuntimeAuthorityError(
                     "workspace seed ConfigMap authority changed"
                 ) from error
-        if _pod_has_exact_process_zero(pod):
+        if _pod_has_exact_process_zero(pod) and not allow_terminal_observation:
             raise WorkspaceRuntimeAuthorityError("authorized workspace Pod is terminal")
         return pod
 
@@ -15938,6 +16074,7 @@ class ContainerProvisioner:
         observation_check: SessionCreationObservationBudget | None,
         authority_check: Callable[[], Awaitable[None]] | None,
         retained_creation: SessionCreationCandidate | None = None,
+        terminal_observation_only: bool = False,
     ) -> str | None:
         """Observe one exact Pod and its frozen stage; never create or replace it.
 
@@ -16002,10 +16139,17 @@ class ContainerProvisioner:
         self._require_workspace_creation_reservation_annotation(
             pod, reservation_id=str(reservation["id"])
         )
+        if terminal_observation_only and not _pod_is_terminal_before_first_ready(pod):
+            return None
         if observation_check is not None:
             observation_check.start()
         current = await refresh()
         if current is None:
+            return None
+        if (
+            terminal_observation_only
+            and current.get("startup_first_ready_at") is not None
+        ):
             return None
         if current.get("startup_protocol_version") != 1:
             if not await record(BoundPodObserved()):

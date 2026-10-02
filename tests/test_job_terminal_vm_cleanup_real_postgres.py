@@ -19,6 +19,115 @@ db = _db_fixture
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "workspace_context",
+    [{}, {"workspace_container": {"status": "deleted"}}, {"vm": {}}],
+    ids=["virtual", "container-reclaimed", "empty-vm"],
+)
+async def test_cancelled_stateless_non_vm_owner_is_nominated_after_caller_loss(
+    db,
+    workspace_context,
+):
+    owner = uuid4()
+    await db.execute(
+        "INSERT INTO jobs(id,description,status,execution_lane,context) "
+        "VALUES($1,'cancel caller disappeared','created','stateless',$2::jsonb)",
+        owner,
+        json.dumps(workspace_context),
+    )
+    assert await db.cancel_stateless_job(str(owner)) == (True, False)
+
+    # The caller never enters the settle loop. The durable worker must still
+    # select this owner after a restart, even after its container is reclaimed.
+    nominated = await db.list_terminal_vm_cleanup_jobs(limit=4)
+    assert [row["id"] for row in nominated] == [str(owner)]
+    assert (
+        json.loads(nominated[0]["context"])["_stateless_cancel_cleanup_pending"] is True
+    )
+    assert (
+        await db.list_terminal_vm_cleanup_jobs(
+            limit=4,
+            after_id=str(owner),
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,lane,marker,inherited",
+    [
+        ("cancelled", "stateless", False, False),
+        ("cancelled", "stateless", "true", False),
+        ("cancelled", "stateless", None, False),
+        ("cancelled", "pinned", True, False),
+        ("completed", "stateless", True, False),
+        ("failed", "stateless", True, False),
+        ("cancelled", "stateless", True, True),
+    ],
+    ids=["false", "string", "null", "pinned", "completed", "failed", "inherited"],
+)
+async def test_non_vm_nomination_requires_exact_shared_cancel_intent(
+    db,
+    status,
+    lane,
+    marker,
+    inherited,
+):
+    owner, parent = uuid4(), uuid4()
+    await db.execute(
+        "INSERT INTO jobs(id,description,status,execution_lane) "
+        "VALUES($1,'parent','processing','stateless')",
+        parent,
+    )
+    await db.execute(
+        "INSERT INTO jobs(id,parent_job_id,description,status,execution_lane,context) "
+        "VALUES($1,$2,'not an eligible cancel',$3,$4,$5::jsonb)",
+        owner,
+        parent,
+        status,
+        lane,
+        json.dumps(
+            {
+                "_stateless_cancel_cleanup_pending": marker,
+                "inherits_parent_workspace": inherited,
+            }
+        ),
+    )
+    assert await db.list_terminal_vm_cleanup_jobs(limit=4) == []
+
+
+@pytest.mark.asyncio
+async def test_shared_cancel_reconciler_retries_archive_before_clearing_marker(db):
+    from tests.test_job_terminal_vm_cleanup import controls
+
+    owner = uuid4()
+    await db.execute(
+        "INSERT INTO jobs(id,description,status,execution_lane,context) "
+        "VALUES($1,'caller lost','created','stateless','{}')",
+        owner,
+    )
+    assert await db.cancel_stateless_job(str(owner)) == (True, False)
+    archive = AsyncMock(side_effect=RuntimeError("external cleanup unavailable"))
+
+    # A fresh worker uses the real nomination, locks, strict checkpoint prune
+    # and marker transaction. External teardown is a port, deliberately held.
+    assert (
+        await controls(store=db, archive=archive).reconcile_terminal_vm_cleanups() == 0
+    )
+    archive.assert_awaited_once_with(str(owner))
+    assert await db.stateless_cancel_cleanup_pending(str(owner)) is True
+
+    archive = AsyncMock()
+    assert (
+        await controls(store=db, archive=archive).reconcile_terminal_vm_cleanups() == 1
+    )
+    archive.assert_awaited_once_with(str(owner))
+    assert await db.stateless_cancel_cleanup_pending(str(owner)) is False
+    assert await db.list_terminal_vm_cleanup_jobs(limit=4) == []
+
+
+@pytest.mark.asyncio
 async def test_pinned_cancel_marks_intent_without_purging_historical_terminal_vm(db):
     historical, cancelled, generation, pvc_uid = (uuid4() for _ in range(4))
     vm = {

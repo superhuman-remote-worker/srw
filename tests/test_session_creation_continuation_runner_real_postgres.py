@@ -291,6 +291,294 @@ async def test_v1_scheduled_pull_deadline_is_sticky_across_continuation(
 
 
 @pytest.mark.asyncio
+async def test_failed_exit17_initial_session_records_frozen_deadline_without_client(
+    db, monkeypatch
+):
+    """A terminated original Pod still needs an unattended startup observation."""
+
+    from orchestrator.services.session_creation_continuation import (
+        SessionCreationContinuationRunner,
+    )
+
+    case, original, thread = await leave_exact_source_after_end_disconnect(
+        db, monkeypatch, "stateless"
+    )
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    provider = reconstructed_provider(db, case, monkeypatch)
+    ssh = AsyncMock(side_effect=AssertionError("terminal Pod reached SSH"))
+    monkeypatch.setattr(provider_module, "wait_for_agent_ssh", ssh)
+    provider._reattach_ready_timeout = 10
+    provider._image_pull_timeout = 10
+    pod = case.cluster.objects["pod"]
+    scheduled = datetime.now(timezone.utc)
+    pod.spec.node_name = "node8"
+    pod.spec.restart_policy = "Never"
+    pod.status.conditions = [
+        SimpleNamespace(
+            type="PodScheduled", status="True", last_transition_time=scheduled
+        )
+    ]
+    runner = SessionCreationContinuationRunner(
+        db=db, provisioner=provider, shutdown_event=asyncio.Event()
+    )
+    (candidate,) = (await db.list_current_session_creation_candidates()).candidates
+    assert not await runner._continue(candidate)
+    frozen = await exact_source(db, case, "stateless")
+    assert frozen["startup_state"] == "starting"
+    assert frozen["scheduled_at"] == scheduled
+    assert frozen["ready_budget_seconds"] == frozen["pull_budget_seconds"] == 10
+
+    pod.status.phase = "Failed"
+    (workspace_status,) = pod.status.container_statuses
+    workspace_status.ready = False
+    workspace_status.started = False
+    workspace_status.restart_count = 0
+    workspace_status.container_id = "containerd://original-exit17"
+    workspace_status.state = SimpleNamespace(
+        waiting=None,
+        running=None,
+        terminated=SimpleNamespace(
+            exit_code=17,
+            reason="Error",
+            started_at=datetime.now(timezone.utc),
+            finished_at=datetime.now(timezone.utc),
+        ),
+    )
+    (candidate,) = (await db.list_current_session_creation_candidates()).candidates
+    assert not await runner._continue(candidate)
+    before_deadline = await exact_source(db, case, "stateless")
+    assert before_deadline["startup_state"] == "starting"
+    assert before_deadline["startup_attention_at"] is None
+    await asyncio.sleep(10.2)
+    (candidate,) = (await db.list_current_session_creation_candidates()).candidates
+    assert not await runner._continue(candidate)
+    attention = await exact_source(db, case, "stateless")
+    current = await db.get_thread(case.thread_id)
+    assert (attention["startup_state"], attention["startup_reason_code"]) == (
+        "attention",
+        "readiness_deadline",
+    )
+    assert attention["startup_attention_at"] is not None
+    assert attention["startup_first_ready_at"] is None
+    assert attention["scheduled_at"] == scheduled
+    assert attention["ready_budget_seconds"] == frozen["ready_budget_seconds"]
+    assert attention["pull_budget_seconds"] == frozen["pull_budget_seconds"]
+    for key in (
+        "id",
+        "thread_runtime_generation",
+        "claim_token",
+        "pod_uid",
+        "pvc_uid",
+        "service_uid",
+        "seed_configmap_uid",
+        "runtime_incarnation",
+    ):
+        assert attention[key] == frozen[key] == original[key]
+    assert current["runtime_generation"] == thread["runtime_generation"]
+    assert metadata(current)["workspace_container"]["status"] == "created"
+    assert not metadata(current).get("_workspace_binding")
+    ssh.assert_not_called()
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM run_queue WHERE unit_id=$1::uuid", case.thread_id
+        )
+        == 0
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM thread_input_deliveries WHERE thread_id=$1::uuid",
+            case.thread_id,
+        )
+        == 0
+    )
+    assert case.cluster.pod_create_calls == 1
+    assert case.cluster.objects["pod"].metadata.uid == str(original["pod_uid"])
+    assert all(kind in case.cluster.objects for kind in ("pod", "pvc", "service"))
+    with pytest.raises(
+        provider_module.WorkspaceRuntimeAuthorityError,
+        match="authorized workspace Pod is terminal",
+    ):
+        await provider._read_stateless_creation_pod(
+            provider_module.WorkspaceOwner.session(case.thread_id),
+            generation=str(thread["runtime_generation"]),
+            expected_runtime_incarnation=str(original["pod_uid"]),
+            expected_network_tier=await provider._resolve_network_tier(
+                case.thread_id, kind="thread"
+            ),
+            expected_pvc_name=provider_module._UNSPECIFIED_RESOURCE_BINDING,
+            expected_seed_configmap=provider_module._UNSPECIFIED_RESOURCE_BINDING,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second_snapshot", ["ready", "unknown"])
+async def test_terminal_observation_refuses_changed_second_pod_read(
+    db, monkeypatch, second_snapshot
+):
+    """A once-terminal Pod cannot enter Ready/SSH from a different reread."""
+
+    from orchestrator.services.session_creation_continuation import (
+        SessionCreationContinuationRunner,
+    )
+
+    case, _, _ = await leave_exact_source_after_end_disconnect(
+        db, monkeypatch, "stateless"
+    )
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    provider = reconstructed_provider(db, case, monkeypatch)
+    ssh = AsyncMock(side_effect=AssertionError("changed terminal Pod reached SSH"))
+    monkeypatch.setattr(provider_module, "wait_for_agent_ssh", ssh)
+    provider._reattach_ready_timeout = provider._image_pull_timeout = 2
+    pod = case.cluster.objects["pod"]
+    scheduled = datetime.now(timezone.utc)
+    pod.spec.node_name = "node8"
+    pod.spec.restart_policy = "Never"
+    pod.status.conditions = [
+        SimpleNamespace(
+            type="PodScheduled", status="True", last_transition_time=scheduled
+        )
+    ]
+    runner = SessionCreationContinuationRunner(
+        db=db, provisioner=provider, shutdown_event=asyncio.Event()
+    )
+    (candidate,) = (await db.list_current_session_creation_candidates()).candidates
+    assert not await runner._continue(candidate)
+    pod.status.phase = "Failed"
+    (status,) = pod.status.container_statuses
+    status.ready = False
+    status.started = False
+    status.restart_count = 0
+    status.container_id = "containerd://original-exit17"
+    status.state = SimpleNamespace(
+        waiting=None,
+        running=None,
+        terminated=SimpleNamespace(exit_code=17, reason="Error"),
+    )
+    await asyncio.sleep(2.2)
+
+    original_read = case.cluster.read_namespaced_pod
+    reads = 0
+
+    def changed_second_read(*, name, **kwargs):
+        nonlocal reads
+        result = original_read(name=name, **kwargs)
+        reads += 1
+        if reads == 2:
+            result.status.phase = "Running"
+            status.state = SimpleNamespace(
+                waiting=None,
+                running=SimpleNamespace() if second_snapshot == "ready" else None,
+                terminated=None,
+            )
+            status.ready = second_snapshot == "ready"
+            if second_snapshot == "ready":
+                result.status.conditions.append(
+                    SimpleNamespace(
+                        type="Ready", status="True", last_transition_time=scheduled
+                    )
+                )
+        return result
+
+    monkeypatch.setattr(case.cluster, "read_namespaced_pod", changed_second_read)
+    (candidate,) = (await db.list_current_session_creation_candidates()).candidates
+    assert not await runner._continue(candidate)
+    source = await exact_source(db, case, "stateless")
+    assert reads >= 2
+    assert source["startup_state"] == "starting"
+    assert source["startup_first_ready_at"] is None
+    assert source["startup_attention_at"] is None
+    assert source["settled_at"] is None
+    assert not metadata(await db.get_thread(case.thread_id)).get("_workspace_binding")
+    ssh.assert_not_called()
+    assert case.cluster.pod_create_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "pod_absent",
+        "pod_uid",
+        "reservation_annotation",
+        "pvc_absent",
+        "pvc_uid",
+        "service_uid",
+        "seed_uid",
+        "stale_candidate_claim",
+        "stale_candidate_generation",
+    ],
+)
+async def test_terminal_observation_requires_exact_original_resources(
+    db, monkeypatch, fault
+):
+    """A terminal shortcut never accepts a replacement or stale authority."""
+
+    from dataclasses import replace
+    from orchestrator.services.session_creation_continuation import (
+        SessionCreationContinuationRunner,
+    )
+
+    case, original, _ = await leave_exact_source_after_end_disconnect(
+        db, monkeypatch, "stateless", seeded=fault == "seed_uid"
+    )
+    monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", "true")
+    provider = reconstructed_provider(db, case, monkeypatch)
+    provider._reattach_ready_timeout = provider._image_pull_timeout = 2
+    pod = case.cluster.objects["pod"]
+    scheduled = datetime.now(timezone.utc)
+    pod.spec.node_name = "node8"
+    pod.spec.restart_policy = "Never"
+    pod.status.conditions = [
+        SimpleNamespace(
+            type="PodScheduled", status="True", last_transition_time=scheduled
+        )
+    ]
+    runner = SessionCreationContinuationRunner(
+        db=db, provisioner=provider, shutdown_event=asyncio.Event()
+    )
+    (candidate,) = (await db.list_current_session_creation_candidates()).candidates
+    assert not await runner._continue(candidate)
+    pod.status.phase = "Failed"
+    (status,) = pod.status.container_statuses
+    status.ready = False
+    status.started = False
+    status.restart_count = 0
+    status.container_id = "containerd://original-exit17"
+    status.state = SimpleNamespace(
+        waiting=None,
+        running=None,
+        terminated=SimpleNamespace(exit_code=17, reason="Error"),
+    )
+    if fault == "pod_absent":
+        case.cluster.objects.pop("pod")
+    elif fault == "pod_uid":
+        pod.metadata.uid = str(uuid4())
+    elif fault == "reservation_annotation":
+        pod.metadata.annotations[
+            provider_module.WORKSPACE_CREATION_RESERVATION_ANNOTATION
+        ] = str(uuid4())
+    elif fault == "pvc_absent":
+        case.cluster.objects.pop("pvc")
+    elif fault in {"pvc_uid", "service_uid", "seed_uid"}:
+        case.cluster.objects[fault.split("_")[0]].metadata.uid = str(uuid4())
+    await asyncio.sleep(2.2)
+    (candidate,) = (await db.list_current_session_creation_candidates()).candidates
+    if fault == "stale_candidate_claim":
+        candidate = replace(candidate, claim_token=candidate.claim_token + 1)
+    elif fault == "stale_candidate_generation":
+        candidate = replace(candidate, runtime_generation=str(uuid4()))
+    assert not await runner._continue(candidate)
+    source = await exact_source(db, case, "stateless")
+    assert source["id"] == original["id"]
+    assert source["pod_uid"] == original["pod_uid"]
+    assert source["startup_state"] == "starting"
+    assert source["startup_first_ready_at"] is None
+    assert source["startup_attention_at"] is None
+    assert source["settled_at"] is None
+    assert case.cluster.pod_create_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_two_slow_sources_yield_slots_to_later_ready_source(db, monkeypatch):
     from orchestrator.services.session_creation_continuation import (
         SessionCreationContinuationRunner,
