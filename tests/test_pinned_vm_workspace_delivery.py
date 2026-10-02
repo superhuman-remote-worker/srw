@@ -140,7 +140,7 @@ async def _normalize(payload):
         SimpleNamespace(get_thread_workspace=AsyncMock(return_value=payload)),
         THREAD,
         timeout=1,
-        require_vm=True,
+        require_vm=True, session_runtime_generation=None,
     )
 
 
@@ -221,7 +221,7 @@ async def test_vm_ready_payload_carries_the_fanout_advertisement(
         get_thread_workspace=AsyncMock(side_effect=[waiting, payload])
     )
     normalized = await session_workspace.poll_workspace_ready(
-        client, THREAD, timeout=5, poll_interval=0, require_vm=True
+        client, THREAD, timeout=5, poll_interval=0, require_vm=True, session_runtime_generation=None
     )
     assert client.get_thread_workspace.await_count == 2
     assert normalized["session_subagent_batch_settle_contract"] == 1

@@ -369,7 +369,7 @@ async def test_vm_attach_stops_when_the_session_ends_mid_boot():
 
     with pytest.raises(SessionEnded):
         await session_workspace.poll_workspace_ready(
-            client, "tid", timeout=120, poll_interval=0, require_vm=True
+            client, "tid", timeout=120, poll_interval=0, require_vm=True, session_runtime_generation=None
         )
     assert client.get_thread_workspace.call_count == 3
 
@@ -391,7 +391,7 @@ async def test_vm_attach_that_never_becomes_ready_ends_at_the_agent_budget(
     client.get_thread_workspace.return_value = {"vm_status": "provisioning"}
 
     result = await session_workspace.poll_workspace_ready(
-        client, "tid", timeout=120, poll_interval=30, require_vm=True, vm_timeout=900
+        client, "tid", timeout=120, poll_interval=30, require_vm=True, vm_timeout=900, session_runtime_generation=None
     )
 
     assert result is None

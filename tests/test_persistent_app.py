@@ -2584,7 +2584,7 @@ class TestPollWorkspaceReady:
         client.get_thread_workspace.return_value = workspace
 
         result = await session_workspace.poll_workspace_ready(
-            client, "tid", timeout=5, require_vm=backend == "vm"
+            client, "tid", timeout=5, require_vm=backend == "vm", session_runtime_generation=None
         )
 
         if identity == "exact":
@@ -2607,7 +2607,7 @@ class TestPollWorkspaceReady:
         client = AsyncMock()
         client.get_thread_workspace.return_value = None
 
-        result = await poll_workspace_ready(client, "tid", timeout=5)
+        result = await poll_workspace_ready(client, "tid", timeout=5, session_runtime_generation=None)
         assert result is None
         # Should have been called only once (no retry)
         assert client.get_thread_workspace.call_count == 1
@@ -2628,7 +2628,7 @@ class TestPollWorkspaceReady:
             )
         )
         with pytest.raises(SessionGrantDenied):
-            await poll_workspace_ready(client, "tid", timeout=5, raise_on_denied=True)
+            await poll_workspace_ready(client, "tid", timeout=5, raise_on_denied=True, session_runtime_generation=None)
         client.get_thread_workspace.assert_called_once_with("tid", raise_on_denied=True)
 
     @pytest.mark.asyncio
@@ -2646,7 +2646,7 @@ class TestPollWorkspaceReady:
             "canvas_shared_browser_available": True,
         }
 
-        result = await poll_workspace_ready(client, "tid", timeout=5)
+        result = await poll_workspace_ready(client, "tid", timeout=5, session_runtime_generation=None)
 
         assert result is not None
         assert result["backend"] == "vm"
@@ -2675,7 +2675,7 @@ class TestPollWorkspaceReady:
             "canvas_shared_browser_available": True,
         }
 
-        result = await poll_workspace_ready(client, "tid", timeout=5)
+        result = await poll_workspace_ready(client, "tid", timeout=5, session_runtime_generation=None)
 
         assert result is not None
         assert result["backend"] == "sandbox"
@@ -2701,7 +2701,7 @@ class TestPollWorkspaceReady:
             "workspace_ssh_host_key_fingerprint": "SHA256:orphaned",
         }
 
-        result = await poll_workspace_ready(client, "tid", timeout=5)
+        result = await poll_workspace_ready(client, "tid", timeout=5, session_runtime_generation=None)
 
         assert result is not None
         assert result["backend"] == "sandbox"
@@ -2716,7 +2716,7 @@ class TestPollWorkspaceReady:
         client = AsyncMock()
         client.get_thread_workspace.return_value = {"status": "none"}
 
-        result = await poll_workspace_ready(client, "tid", timeout=5)
+        result = await poll_workspace_ready(client, "tid", timeout=5, session_runtime_generation=None)
         assert result is None
 
     @pytest.mark.asyncio
@@ -2729,7 +2729,7 @@ class TestPollWorkspaceReady:
             "managed_repository_credentials": [{"private_key": private_material}],
         }
 
-        result = await poll_workspace_ready(client, "tid", timeout=5)
+        result = await poll_workspace_ready(client, "tid", timeout=5, session_runtime_generation=None)
         assert result is None
         assert private_material not in caplog.text
 
@@ -2750,7 +2750,7 @@ class TestPollWorkspaceReady:
 
         with patch("agent.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
             result = await poll_workspace_ready(
-                client, "tid", timeout=30, poll_interval=0.01
+                client, "tid", timeout=30, poll_interval=0.01, session_runtime_generation=None
             )
 
         assert result is not None
@@ -2766,7 +2766,7 @@ class TestPollWorkspaceReady:
             # Use a very short timeout and mock time.monotonic to expire immediately
             with patch("time.monotonic", side_effect=[0, 100]):
                 result = await poll_workspace_ready(
-                    client, "tid", timeout=5, poll_interval=0.01
+                    client, "tid", timeout=5, poll_interval=0.01, session_runtime_generation=None
                 )
 
         assert result is None
@@ -2782,7 +2782,7 @@ class TestPollWorkspaceReady:
             "pod_ip": "pod-ip",
         }
 
-        result = await poll_workspace_ready(client, "tid", timeout=5)
+        result = await poll_workspace_ready(client, "tid", timeout=5, session_runtime_generation=None)
         assert result["remote"]["host"] == "vm-host"
 
     @pytest.mark.asyncio
@@ -2810,7 +2810,7 @@ class TestPollWorkspaceReady:
             # polling so the second poll returns the ready VM.
             with patch("time.monotonic", side_effect=[0, 0.5, 2, 2]):
                 result = await poll_workspace_ready(
-                    client, "tid", timeout=1, vm_timeout=1000, poll_interval=0.01
+                    client, "tid", timeout=1, vm_timeout=1000, poll_interval=0.01, session_runtime_generation=None
                 )
 
         assert result is not None
@@ -2841,7 +2841,7 @@ class TestPollWorkspaceReady:
                     timeout=1,
                     vm_timeout=1,
                     poll_interval=0.01,
-                    require_vm=True,
+                    require_vm=True, session_runtime_generation=None,
                 )
 
         assert result is None  # timed out waiting for the VM — never downgraded
@@ -2856,7 +2856,7 @@ class TestPollWorkspaceReady:
             "vm_ssh_port": 22,
         }
 
-        result = await poll_workspace_ready(client, "tid", timeout=5, require_vm=True)
+        result = await poll_workspace_ready(client, "tid", timeout=5, require_vm=True, session_runtime_generation=None)
 
         assert result is not None
         assert result["backend"] == "vm"
@@ -2870,7 +2870,7 @@ class TestPollWorkspaceReady:
         client = AsyncMock()
         client.get_thread_workspace.return_value = {"vm_status": "failed"}
 
-        result = await poll_workspace_ready(client, "tid", timeout=5, require_vm=True)
+        result = await poll_workspace_ready(client, "tid", timeout=5, require_vm=True, session_runtime_generation=None)
 
         assert result is None
         assert client.get_thread_workspace.call_count == 1  # no retry
@@ -2883,7 +2883,7 @@ class TestPollWorkspaceReady:
         client = AsyncMock()
         client.get_thread_workspace.return_value = {"status": "none"}
 
-        result = await poll_workspace_ready(client, "tid", timeout=5, require_vm=True)
+        result = await poll_workspace_ready(client, "tid", timeout=5, require_vm=True, session_runtime_generation=None)
 
         assert result is None
         assert client.get_thread_workspace.call_count == 1  # no retry
@@ -2900,7 +2900,7 @@ class TestPollWorkspaceReady:
             "pod_ip": "10.42.2.32",
         }
 
-        result = await poll_workspace_ready(client, "tid", timeout=5)
+        result = await poll_workspace_ready(client, "tid", timeout=5, session_runtime_generation=None)
 
         assert result is not None
         assert result["backend"] == "sandbox"
@@ -8636,7 +8636,7 @@ async def test_vm_tier_poll_rides_out_a_transient_workspace_failure():
     )
 
     result = await poll_workspace_ready(
-        client, "tid", timeout=10, poll_interval=0.01, require_vm=True
+        client, "tid", timeout=10, poll_interval=0.01, require_vm=True, session_runtime_generation=None
     )
 
     assert result is not None

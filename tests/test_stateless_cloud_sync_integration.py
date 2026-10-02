@@ -475,7 +475,7 @@ async def test_workspace_poll_preserves_generation(
         get_thread_workspace=AsyncMock(return_value=workspace_response)
     )
 
-    result = await session_workspace.poll_workspace_ready(client, THREAD_ID, timeout=1)
+    result = await session_workspace.poll_workspace_ready(client, THREAD_ID, timeout=1, session_runtime_generation=None)
 
     assert result is not None
     assert result["backend"] == expected_backend

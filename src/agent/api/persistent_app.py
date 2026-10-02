@@ -10940,7 +10940,8 @@ async def _handle_workspace_upgrade(
             )
         else:
             ws_config = await _session_workspace.poll_workspace_ready(
-                _orchestrator_client, _session_identity.thread_id, timeout=300
+                _orchestrator_client, _session_identity.thread_id, timeout=300,
+                session_runtime_generation=None,
             )
         if not ws_config or not ws_config.get("remote"):
             # A vm that never came ready (usually the cold ~2.8GB CDI import

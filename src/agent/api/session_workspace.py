@@ -467,9 +467,13 @@ async def poll_workspace_ready(
     vm_timeout: int = VM_WORKSPACE_POLL_TIMEOUT_S,
     require_vm: bool = False,
     raise_on_ending: bool = False,
-    session_runtime_generation: Optional[str] = None,
+    session_runtime_generation: Optional[str],
 ) -> Optional[Dict[str, Any]]:
     """Poll orchestrator for workspace container readiness.
+
+    Callers explicitly provide their captured runtime generation. Legacy and
+    tier-upgrade reads may consciously pass None; a typed VM startup hint then
+    remains refused by the exact-life check.
 
     ``vm_timeout`` is the extended budget applied automatically once the poll
     observes a VM-backed thread waiting for capacity or being created:
