@@ -197,13 +197,14 @@ async def handle_input(request: Request, ports: SessionHttpPorts) -> JSONRespons
         )
     except SessionIdentityMismatch:
         return session_identity_mismatch_rejection()
-    # SSE/REST clients need no WebSocket. A newly queued human message proves
-    # this runtime was used; deferred work, injected notices and old receipts
-    # do not. Recheck after admission's awaits so a predecessor cannot disarm
-    # a successor's abandoned-session watchdog.
+    # SSE/REST clients need no WebSocket. A fresh queued human message proves
+    # this runtime was used even when its durable inbox poll published it while
+    # HTTP admission awaited persistence. Deferred work, injected notices and
+    # duplicate receipts do not. Recheck after admission's awaits so a
+    # predecessor cannot disarm a successor's abandoned-session watchdog.
     if (
         role == "human"
-        and admission.enqueued is True
+        and admission.duplicate is False
         and admission.delivery_state == "queued"
         and not admission.deferred
         and runtime.session() is input_session
