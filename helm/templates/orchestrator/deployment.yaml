@@ -33,6 +33,10 @@ spec:
         srw.io/vm-remote-operation-protocol: v1
         {{- end }}
       annotations:
+        # Pool admission settings are read once by AgentProvisioner. Bind the
+        # exact ConfigMap inputs so a zero-floor upgrade stops refill even when
+        # Reloader is disabled. Normalize rendered strings without losing zero.
+        checksum/agent-pool-settings: {{ dict "maxAgents" (.Values.agent.pool.maxAgents | toString) "minAgents" (.Values.agent.pool.minAgents | toString) "buffer" (.Values.agent.pool.buffer | toString) "reservedSessionSlots" (.Values.agent.pool.reservedSessionSlots | toString) "reservedJobSlots" (.Values.agent.pool.reservedJobSlots | toString) | toJson | sha256sum | quote }}
         {{- if (get (.Values.vm.resourceAdmission | default dict) "observerEnabled" | default false) }}
         checksum/vm-resource-policy: {{ include "srw.vmResourceInventoryConfig" . | sha256sum | quote }}
         {{- end }}
