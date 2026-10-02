@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 class SessionHttpPorts:
     runtime: SessionRuntimeView
     operations: SessionOperations
+    note_human_input_queued: Optional[Callable[[], None]] = None
 
 
 def stateless_rejection() -> JSONResponse:
@@ -172,6 +173,7 @@ async def handle_input(request: Request, ports: SessionHttpPorts) -> JSONRespons
         if runtime.runtime_admission_closed():
             return termination_rejection()
         return JSONResponse({"error": "Session not ready"}, status_code=503)
+    input_session = runtime.session()
     try:
         admission = await ports.operations.accept_input(
             content,
@@ -195,6 +197,21 @@ async def handle_input(request: Request, ports: SessionHttpPorts) -> JSONRespons
         )
     except SessionIdentityMismatch:
         return session_identity_mismatch_rejection()
+    # SSE/REST clients need no WebSocket. A newly queued human message proves
+    # this runtime was used; deferred work, injected notices and old receipts
+    # do not. Recheck after admission's awaits so a predecessor cannot disarm
+    # a successor's abandoned-session watchdog.
+    if (
+        role == "human"
+        and admission.enqueued is True
+        and admission.delivery_state == "queued"
+        and not admission.deferred
+        and runtime.session() is input_session
+        and runtime.identity_fingerprint() == expected_session_identity_fingerprint
+        and not runtime.runtime_admission_closed()
+        and ports.note_human_input_queued is not None
+    ):
+        ports.note_human_input_queued()
     return JSONResponse(
         {
             **accepted_input_payload(admission),

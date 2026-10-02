@@ -606,7 +606,7 @@ def _persistent_input_cancellation_enabled() -> bool:
 
 # Self-cleanup watchdogs (PR 2 — protect against the abandoned-pod failure modes
 # that the orchestrator reconciler can only catch with a 60s+ delay):
-#   _ws_connected_event  → set when /ws/chat first accepts a connection.
+#   _ws_connected_event  → set on a WS connection or newly queued human input.
 #   _watchdog_tasks      → background tasks cancelled on detach/shutdown.
 _ws_connected_event: Optional[asyncio.Event] = None
 _watchdog_tasks: list[asyncio.Task] = []
@@ -2256,11 +2256,12 @@ def _schedule_exit(delay: float = 1.0) -> None:
 
 
 async def _boot_ws_watchdog(timeout_s: int) -> None:
-    """Exit if no /ws/chat connection arrives within ``timeout_s`` of attach.
+    """Exit if no client connects or queues human input within ``timeout_s``.
 
     A persistent agent that boots, attaches to a thread, then never receives
-    a WebSocket has no other way to know it's been abandoned (e.g. user
-    navigated away during creation). Without this watchdog the pod sits
+    a WebSocket or accepted human input has no other way to know it's been
+    abandoned (e.g. user navigated away during creation). Without this watchdog
+    the pod sits
     forever heartbeating and holding a slot. The orchestrator reconciler
     catches this too, but only after a 60s+ delay; this watchdog kills
     locally on the configured cadence.
@@ -2277,10 +2278,10 @@ async def _boot_ws_watchdog(timeout_s: int) -> None:
         return
     try:
         await asyncio.wait_for(_ws_connected_event.wait(), timeout=timeout_s)
-        return  # WS arrived — normal lifecycle takes over
+        return  # A client used this runtime — normal lifecycle takes over.
     except asyncio.TimeoutError:
         logger.warning(
-            "No WebSocket connection within %ds for thread %s — "
+            "No WebSocket connection or queued human input within %ds for thread %s — "
             "exiting (likely abandoned during creation).",
             timeout_s,
             _thread_id,
@@ -2528,7 +2529,7 @@ async def _stop_and_join_watchdogs() -> None:
 
 
 def _signal_ws_connected() -> None:
-    """Signal that a WebSocket has connected. Cancels the boot-WS watchdog."""
+    """Signal a client connection or accepted input, ending the boot watchdog."""
     if _ws_connected_event is not None:
         _ws_connected_event.set()
 
@@ -6297,7 +6298,11 @@ def session_transport_bindings() -> SessionTransportBindings:
             attached_thread_id=lambda: _attached_session_thread_id(),
             identity_fingerprint=lambda: _current_pinned_session_identity_fingerprint(),
         ),
-        http=SessionHttpPorts(runtime=runtime, operations=operations),
+        http=SessionHttpPorts(
+            runtime=runtime,
+            operations=operations,
+            note_human_input_queued=lambda: _signal_ws_connected(),
+        ),
         socket=SessionSocketPorts(
             runtime=runtime,
             operations=operations,
