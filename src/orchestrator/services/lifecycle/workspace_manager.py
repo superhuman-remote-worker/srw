@@ -446,6 +446,14 @@ class WorkspaceInstanceManager:
             # stateless session workspace.  In particular, a Failed pod must
             # not take the reconciler's immediate unhealthy-delete shortcut.
             return True
+        if (
+            inst.metadata.get("job_status") == "created"
+            and inst.metadata.get("execution_lane") == "stateless"
+            and inst.metadata.get("workspace_status") == "creating"
+        ):
+            # Startup and explicit cancellation own this runtime. A failed
+            # pre-Ready Pod must not acquire a competing lifecycle delete claim.
+            return True
         if inst.metadata.get("completion_lifecycle_deferred"):
             # Live commands stand down; expired/parked commands have already
             # been nudged into the shared durable router.  Neither path may use
