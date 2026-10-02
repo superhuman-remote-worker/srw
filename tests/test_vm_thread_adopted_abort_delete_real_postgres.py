@@ -88,7 +88,27 @@ async def test_adopted_vm_pre_setup_release_then_permanent_delete(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "defect", ["replacement_uid", "missing_intent", "other_generation"]
+    "defect",
+    [
+        "replacement_uid",
+        "missing_intent",
+        "other_generation",
+        "other_owner",
+        "unpublished",
+        "unprotected",
+        "late_pod_publication",
+        "missing_abort",
+        "source_generation",
+        "successor_generation",
+        "source_actor",
+        "source_token",
+        "setup_work",
+        "release_kind",
+        "late_creation_adoption",
+        "workspace_generation",
+        "workspace_incarnation",
+        "partial_workspace_identity",
+    ],
 )
 async def test_pre_setup_abort_delete_requires_exact_published_agent_pod(
     db,  # noqa: F811
@@ -119,13 +139,64 @@ async def test_pre_setup_abort_delete_requires_exact_published_agent_pod(
                 original["id"],
                 original["runtime_generation"],
             )
-        else:
+        elif defect in {
+            "other_generation",
+            "other_owner",
+            "unpublished",
+            "unprotected",
+            "late_pod_publication",
+        }:
+            change = {
+                "other_generation": "runtime_generation='" + str(uuid4()) + "'",
+                "other_owner": "thread_id='" + str(uuid4()) + "'",
+                "unpublished": "status='retired',fenced_at=now(),gc_after=now()",
+                "unprotected": "namespace=NULL,protection_protocol=NULL",
+                "late_pod_publication": "resolved_at=now()+interval '1 day'",
+            }[defect]
             await conn.execute(
-                "UPDATE thread_agent_pod_provision_intents SET runtime_generation=$3 "
+                f"UPDATE thread_agent_pod_provision_intents SET {change} "
                 "WHERE thread_id=$1 AND runtime_generation=$2",
                 original["id"],
                 original["runtime_generation"],
-                uuid4(),
+            )
+        elif defect == "late_creation_adoption":
+            await conn.execute(
+                "UPDATE vm_workspace_cleanup_admissions SET completed_at=now()+interval '1 day' "
+                "WHERE owner_kind='thread' AND owner_id=$1 AND source='controller_vm_create'",
+                original["id"],
+            )
+        elif defect == "missing_abort":
+            await conn.execute(
+                "DELETE FROM thread_runtime_attach_abort_outcomes "
+                "WHERE thread_id=$1 AND runtime_generation=$2",
+                original["id"],
+                original["runtime_generation"],
+            )
+        else:
+            change = {
+                "source_generation": "runtime_generation='" + str(uuid4()) + "'",
+                "successor_generation": "successor_generation='" + str(uuid4()) + "'",
+                "source_actor": "agent_id='" + str(uuid4()) + "'",
+                "source_token": "runtime_attach_token='" + str(uuid4()) + "'",
+                "setup_work": "quiescence_protocol='agent_quiescent_v1'",
+                "release_kind": "release_kind='server_pre_delivery'",
+                "workspace_generation": "workspace_generation='"
+                + str(uuid4())
+                + "',workspace_runtime_incarnation='"
+                + str(uuid4())
+                + "'",
+                "workspace_incarnation": "workspace_generation=(SELECT provision_generation FROM vm_creation_retries WHERE thread_id=$1 LIMIT 1),workspace_runtime_incarnation='"
+                + str(uuid4())
+                + "'",
+                "partial_workspace_identity": "workspace_generation='"
+                + str(uuid4())
+                + "'",
+            }[defect]
+            await conn.execute(
+                f"UPDATE thread_runtime_attach_abort_outcomes SET {change} "
+                "WHERE thread_id=$1 AND runtime_generation=$2",
+                original["id"],
+                original["runtime_generation"],
             )
     with pytest.raises(asyncpg.CheckViolationError):
         await db.delete_thread(
