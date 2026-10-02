@@ -140,7 +140,8 @@ async def _normalize(payload):
         SimpleNamespace(get_thread_workspace=AsyncMock(return_value=payload)),
         THREAD,
         timeout=1,
-        require_vm=True, session_runtime_generation=None,
+        require_vm=True,
+        session_runtime_generation=None,
     )
 
 
@@ -221,7 +222,12 @@ async def test_vm_ready_payload_carries_the_fanout_advertisement(
         get_thread_workspace=AsyncMock(side_effect=[waiting, payload])
     )
     normalized = await session_workspace.poll_workspace_ready(
-        client, THREAD, timeout=5, poll_interval=0, require_vm=True, session_runtime_generation=None
+        client,
+        THREAD,
+        timeout=5,
+        poll_interval=0,
+        require_vm=True,
+        session_runtime_generation=None,
     )
     assert client.get_thread_workspace.await_count == 2
     assert normalized["session_subagent_batch_settle_contract"] == 1
@@ -633,9 +639,7 @@ async def test_vm_setup_failure_is_logged_before_cleanup_settles(
     )
     retry_sleep = AsyncMock()
     monkeypatch.setattr(session_attach.asyncio, "sleep", retry_sleep)
-    monkeypatch.setattr(
-        session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.0,)
-    )
+    monkeypatch.setattr(session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.0,))
     caplog.set_level(logging.WARNING, logger=persistent_app.__name__)
     task = asyncio.create_task(
         persistent_app._session_attach.attach(

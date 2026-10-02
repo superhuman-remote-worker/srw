@@ -322,7 +322,8 @@ async def test_workspace_poll_waits_for_engage_then_preserves_ready_contract():
         "thread-protected",
         timeout=1,
         poll_interval=0,
-        raise_on_denied=True, session_runtime_generation=None,
+        raise_on_denied=True,
+        session_runtime_generation=None,
     )
 
     assert normalized is not None
@@ -354,7 +355,8 @@ async def test_workspace_poll_treats_failed_engage_as_terminal_without_construct
             "thread-protected",
             timeout=1,
             poll_interval=0,
-            raise_on_denied=True, session_runtime_generation=None,
+            raise_on_denied=True,
+            session_runtime_generation=None,
         )
     assert client.get_thread_workspace.await_count == 1
 

@@ -109,9 +109,7 @@ async def test_lifespan_never_terminates_over_attach_cleanup(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("dedicated", [True, False], ids=["dedicated", "pool"])
-async def test_repeated_stop_preserves_the_running_attach_rollback(
-    runtime, dedicated
-):
+async def test_repeated_stop_preserves_the_running_attach_rollback(runtime, dedicated):
     entered, cleanup, finish = (asyncio.Event() for _ in range(3))
 
     async def attach():

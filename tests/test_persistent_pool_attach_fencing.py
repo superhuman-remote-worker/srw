@@ -442,7 +442,9 @@ async def test_real_attach_rejects_workspace_identity_drift_before_constructor()
 
 
 @pytest.mark.asyncio
-async def test_partial_cleanup_failure_keeps_exact_retry_owner_until_proven(monkeypatch):
+async def test_partial_cleanup_failure_keeps_exact_retry_owner_until_proven(
+    monkeypatch,
+):
     retry_sleep = AsyncMock()
     monkeypatch.setattr(session_attach.asyncio, "sleep", retry_sleep)
     context = _partial_cleanup_context(setup_started=True)
@@ -458,9 +460,7 @@ async def test_partial_cleanup_failure_keeps_exact_retry_owner_until_proven(monk
         patch.object(app._session_identity, "_runtime_contract", True),
         patch.object(app._session_attach, "_cleanup_context", context),
         patch.object(app._session_attach, "cleanup_failed_attach", cleanup),
-        patch.object(
-            session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.0,)
-        ),
+        patch.object(session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.0,)),
     ):
         assert (
             await app._session_attach.cleanup_failed_attach_until_proven("thread-a")
@@ -580,9 +580,7 @@ async def test_lost_release_responses_replay_identical_proof_until_confirmed():
             "attach",
             AsyncMock(side_effect=RuntimeError("delivered attach failed")),
         ),
-        patch.object(
-            session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.0,)
-        ),
+        patch.object(session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.0,)),
     ):
         task = asyncio.create_task(
             app._session_attach._run_pool_attach_transaction(
@@ -781,9 +779,7 @@ async def test_dedicated_exit_stays_nonready_while_release_is_unconfirmed(monkey
     exit_process = MagicMock()
     monkeypatch.setattr(app.os, "_exit", exit_process)
 
-    with patch.object(
-        session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.0, 0.01)
-    ):
+    with patch.object(session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.0, 0.01)):
         task = asyncio.create_task(
             app._session_termination.exit_workspace_not_ready(
                 "thread-a", RuntimeError("attach failed")

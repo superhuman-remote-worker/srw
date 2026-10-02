@@ -137,7 +137,8 @@ async def end_by_handoff(db, monkeypatch, vm_delivery):
         NS(get_thread_workspace=AsyncMock(return_value=payload)),
         thread_id,
         timeout=1,
-        require_vm=True, session_runtime_generation=None,
+        require_vm=True,
+        session_runtime_generation=None,
     )
     assert len({case["vm_uid"], case["vmi_uid"], case["launcher_uid"]}) == 3
     assert workspace["workspace_runtime_incarnation"] == case["launcher_uid"]

@@ -231,9 +231,7 @@ async def test_pre_setup_release_replays_same_proof_until_already_detached(monke
     client = _client(bound=False, release=lambda *_a, **_kw: next(outcomes))
     dual_app._orchestrator_client = client
 
-    with patch.object(
-        session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.0,)
-    ):
+    with patch.object(session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.0,)):
         response = await _attach_endpoint()(_request(workspace=True))
         assert response.status_code == 409
         await dual_app._session_attach_task
