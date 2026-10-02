@@ -1245,6 +1245,45 @@ def _archive_session(service: RecordingManager) -> MagicMock:
 
 
 class TestTeardownWiring:
+    @pytest.fixture(autouse=True)
+    def _memory_lifecycle(self, monkeypatch):
+        """These legacy memory tests own no exact remote runtime obligation."""
+        from agent.api import persistent_app as pa
+        from agent.api.session_identity import SessionIdentityRuntime
+        from agent.api.session_input import SessionInputRuntime
+        from agent.api.session_termination import SessionTerminationCoordinator
+
+        old_identity = pa._session_identity
+        old_termination = pa._session_termination
+        old_input = pa._session_input
+        monkeypatch.setattr(
+            pa, "_session_identity", SessionIdentityRuntime(old_identity._ports)
+        )
+        monkeypatch.setattr(
+            pa,
+            "_session_termination",
+            SessionTerminationCoordinator(
+                old_termination._ports,
+                logger=old_termination._logger,
+                termination_queue_sentinel=old_termination.termination_queue_sentinel,
+            ),
+        )
+        monkeypatch.setattr(pa, "_session_input", SessionInputRuntime(old_input._ports))
+        for name in (
+            "_session",
+            "_loop_task",
+            "_event_writer",
+            "_orchestrator_client",
+            "_control_owner_agent_id",
+            "_heartbeat_task",
+        ):
+            monkeypatch.setattr(pa, name, None)
+        for name in ("_tool_inflight", "_turn_event_open"):
+            monkeypatch.setattr(pa, name, False)
+        monkeypatch.setattr(pa, "_announced_permission_rows", {})
+        monkeypatch.delenv("SESSION_BOUND_THREAD_ID", raising=False)
+        monkeypatch.delenv("STATELESS_EXECUTOR", raising=False)
+
     @pytest.mark.asyncio
     async def test_archive_captures_session_end(self):
         from agent.api.persistent_app import _handle_archive
