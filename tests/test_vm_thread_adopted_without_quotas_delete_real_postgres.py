@@ -1,5 +1,6 @@
 """Non-quota physical VM creation keeps audit evidence through permanent End."""
 
+import hashlib
 import json
 import logging
 from types import SimpleNamespace
@@ -139,9 +140,12 @@ async def adopted_source(db, setup, monkeypatch):
         "source_actor",
         "vm_uid",
         "pvc_uid",
+        "vm_uid_with_matching_purge",
+        "pvc_uid_with_matching_purge",
         "configuration",
         "purge_digest",
         "purge_incomplete",
+        "purge_outcome",
         "effect_issued",
         "other_cleanup_pending",
     ],
@@ -156,30 +160,70 @@ async def test_nonquota_audit_delete_refuses_inexact_source_or_unsettled_debt(
     # evidence; normal live writers cannot make these changes.
     async with db.acquire() as conn, conn.transaction():
         await conn.execute("SET LOCAL session_replication_role='replica'")
-        if defect in {"source_generation", "source_actor", "vm_uid", "pvc_uid"}:
+        if defect in {
+            "source_generation",
+            "source_actor",
+            "vm_uid",
+            "pvc_uid",
+            "vm_uid_with_matching_purge",
+            "pvc_uid_with_matching_purge",
+        }:
             column = {
                 "source_generation": "thread_runtime_generation",
                 "source_actor": "thread_agent_id",
                 "vm_uid": "observed_vm_uid",
                 "pvc_uid": "observed_pvc_uid",
+                "vm_uid_with_matching_purge": "observed_vm_uid",
+                "pvc_uid_with_matching_purge": "observed_pvc_uid",
             }[defect]
+            changed = uuid4() if column.startswith("thread_") else str(uuid4())
             await conn.execute(
                 f"UPDATE vm_creation_retries SET {column}=$2 WHERE request_id=$1",
                 source["request_id"],
-                uuid4() if column.startswith("thread_") else str(uuid4()),
+                changed,
             )
+            if defect.endswith("_with_matching_purge"):
+                intent = {
+                    "owner_id": str(current["id"]),
+                    "owner_kind": "thread",
+                    "provision_generation": str(source["provision_generation"]),
+                    "purge_disk": True,
+                    "pvc_uid": changed
+                    if column == "observed_pvc_uid"
+                    else str(source["observed_pvc_uid"]),
+                    "resource": "vm_workspace",
+                    "source": "pinned_thread_retirement",
+                    "vm_uid": changed
+                    if column == "observed_vm_uid"
+                    else str(source["observed_vm_uid"]),
+                }
+                digest = (
+                    "sha256:"
+                    + hashlib.sha256(
+                        json.dumps(
+                            intent, sort_keys=True, separators=(",", ":")
+                        ).encode()
+                    ).hexdigest()
+                )
+                await conn.execute(
+                    "UPDATE vm_workspace_cleanup_admissions SET intent_digest=$2,pvc_uid=$3 "
+                    "WHERE owner_kind='thread' AND owner_id=$1 AND source='pinned_thread_retirement'",
+                    current["id"],
+                    digest,
+                    intent["pvc_uid"],
+                )
         elif defect == "configuration":
             await conn.execute(
                 "UPDATE vm_creation_retries SET controller_configuration=jsonb_set("
                 "controller_configuration,'{version}','3') WHERE request_id=$1",
                 source["request_id"],
             )
-        elif defect in {"purge_digest", "purge_incomplete"}:
-            change = (
-                "intent_digest='unproven'"
-                if defect == "purge_digest"
-                else ("completed_at=NULL,outcome=NULL")
-            )
+        elif defect in {"purge_digest", "purge_incomplete", "purge_outcome"}:
+            change = {
+                "purge_digest": "intent_digest='unproven'",
+                "purge_incomplete": "completed_at=NULL,outcome=NULL",
+                "purge_outcome": "outcome='adopted'",
+            }[defect]
             await conn.execute(
                 f"UPDATE vm_workspace_cleanup_admissions SET {change} "
                 "WHERE owner_kind='thread' AND owner_id=$1 AND source='pinned_thread_retirement'",
