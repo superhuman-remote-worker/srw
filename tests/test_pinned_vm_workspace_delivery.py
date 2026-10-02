@@ -23,7 +23,10 @@ from orchestrator.services.vm_provisioner import VMProvisioner
 from orchestrator.services.workspace_tier_policy import thread_workspace_backend
 from shared.runtime.core.backends.remote import RemoteBackend
 from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
+from shared.vm_creation_issuance import canonical_configuration_digest
+from shared.vm_creation_retry import canonical_request_digest
 from tests.test_persistent_session import _make_config
+from tests.test_vm_resource_configuration import whole_launcher_configuration
 
 THREAD = "11111111-1111-4111-8111-111111111111"
 AGENT = "22222222-2222-4222-8222-222222222222"
@@ -258,6 +261,25 @@ def test_initial_vm_wait_payload_carries_only_typed_startup_hint():
     assert "vm_startup" not in initial_vm_wait_payload(thread)
 
 
+def _frozen_startup_source_fields():
+    configuration = whole_launcher_configuration()
+    request = {
+        "job_id": THREAD,
+        "entity_type": "thread",
+        "provision_generation": GENERATION,
+    }
+    return {
+        "controller_configuration": configuration,
+        "controller_configuration_digest": canonical_configuration_digest(
+            configuration
+        ),
+        "canonical_request": request,
+        "request_digest": canonical_request_digest(request),
+        "has_waiter": True,
+        "controller_admission_at": None,
+    }
+
+
 @pytest.mark.asyncio
 async def test_current_initial_vm_ready_delivery_carries_admitted_age(vm_delivery):
     request = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -274,6 +296,7 @@ async def test_current_initial_vm_ready_delivery_carries_admitted_age(vm_deliver
     read_at = datetime(2026, 10, 1, tzinfo=timezone.utc)
     vm_delivery.store.fetchrow = AsyncMock(
         return_value={
+            **_frozen_startup_source_fields(),
             "request_id": request,
             "provision_generation": GENERATION,
             "state": "succeeded",
@@ -320,6 +343,7 @@ async def test_initial_ready_rechecks_physical_identity_after_startup_read(vm_de
         # changed since the prior attestation and credential preparation.
         vm_delivery.vm["active_pod_uid"] = SUCCESSOR
         return {
+            **_frozen_startup_source_fields(),
             "state": "succeeded",
             "reason": None,
             "boot_counted": True,
