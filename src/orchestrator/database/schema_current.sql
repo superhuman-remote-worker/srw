@@ -20408,6 +20408,14 @@ BEGIN
        AND abort.runtime_attach_token=source_row.thread_attach_token
        AND abort.agent_id=source_row.thread_agent_id
        AND NULLIF(abort.agent_pod_uid,'') IS NOT NULL
+       AND EXISTS (SELECT 1 FROM public.thread_agent_pod_provision_intents intent
+           WHERE intent.thread_id=abort.thread_id
+             AND intent.runtime_generation=abort.runtime_generation
+             AND intent.pod_uid=abort.agent_pod_uid
+             AND intent.status='published'
+             AND intent.provisioner IN ('agent','persistent')
+             AND intent.protection_protocol='finalizer_v1'
+             AND intent.resolved_at IS NOT NULL AND intent.resolved_at<=abort.released_at)
        AND abort.successor_generation=owner_row.runtime_generation
        AND abort.release_kind='process_zero'
        AND abort.quiescence_protocol='agent_attach_not_started_v1'
