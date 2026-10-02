@@ -237,6 +237,110 @@ describe('network ledger safety and warm-up classification', () => {
     );
   });
 
+  it('accepts an owned thread-detail GET aborted by the explicit reload of its old document', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('turn');
+    const request = requestForFailure(
+      'GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread', 'net::ERR_ABORTED',
+    );
+    handlers.get('request')?.(request);
+
+    // session-chat.spec.ts sets this phase immediately before page.reload().
+    ledger.setPhase('reload');
+    handlers.get('requestfailed')?.(request);
+
+    expect(ledger.problems()).toEqual([]);
+    expect(ledger.entries()).toContainEqual(
+      expect.objectContaining({
+        kind: 'requestfailed',
+        pathname: '/api/persistent/threads/owned-thread',
+        phase: 'reload',
+        started_phase: 'turn',
+        classification: 'expected-navigation-cancellation',
+      }),
+    );
+  });
+
+  it.each([
+    ['GET', 'http://srw-e2e.test/api/persistent/threads/foreign', 'net::ERR_ABORTED'],
+    ['POST', 'http://srw-e2e.test/api/persistent/threads/owned-thread', 'net::ERR_ABORTED'],
+    ['GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread', 'net::ERR_CONNECTION_RESET'],
+    ['GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread', 'NS_BINDING_ABORTED'],
+    ['GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread/messages', 'net::ERR_ABORTED'],
+    ['GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread/input', 'net::ERR_ABORTED'],
+  ])('rejects a non-owned-detail reload abort %s %s %s', (method, url, failure) => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('turn');
+    const request = requestForFailure(method, url, failure);
+    handlers.get('request')?.(request);
+    ledger.setPhase('reload');
+    handlers.get('requestfailed')?.(request);
+
+    expect(ledger.problems()).toHaveLength(1);
+  });
+
+  it('rejects an owned thread-detail abort that started after reload began', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('reload');
+    const request = requestForFailure(
+      'GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread', 'net::ERR_ABORTED',
+    );
+    handlers.get('request')?.(request);
+    handlers.get('requestfailed')?.(request);
+
+    expect(ledger.problems()).toHaveLength(1);
+  });
+
+  it('rejects a thread-detail abort for an id that was never registered as owned', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.setPhase('turn');
+    const request = requestForFailure(
+      'GET', 'http://srw-e2e.test/api/persistent/threads/unregistered', 'net::ERR_ABORTED',
+    );
+    handlers.get('request')?.(request);
+    ledger.setPhase('reload');
+    handlers.get('requestfailed')?.(request);
+
+    expect(ledger.problems()).toHaveLength(1);
+  });
+
+  it('rejects a thread-detail abort that began before the owned turn', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('creating');
+    const request = requestForFailure(
+      'GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread', 'net::ERR_ABORTED',
+    );
+    handlers.get('request')?.(request);
+    ledger.setPhase('reload');
+    handlers.get('requestfailed')?.(request);
+
+    expect(ledger.problems()).toHaveLength(1);
+  });
+
+  it('rejects an owned thread-detail abort without a recorded start or reload window', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('reload');
+    emitRequestFailed(
+      handlers,
+      'GET',
+      'http://srw-e2e.test/api/persistent/threads/owned-thread',
+    );
+    expect(ledger.problems()).toHaveLength(1);
+
+    ledger.setPhase('turn');
+    const request = requestForFailure(
+      'GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread', 'net::ERR_ABORTED',
+    );
+    handlers.get('request')?.(request);
+    handlers.get('requestfailed')?.(request);
+    expect(ledger.problems()).toHaveLength(2);
+  });
+
   it('still rejects an owned connection poll that starts and aborts during reload', () => {
     const { ledger, handlers } = ledgerHarness();
     ledger.registerThread('owned-thread');
