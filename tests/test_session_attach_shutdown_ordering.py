@@ -102,4 +102,42 @@ async def test_lifespan_never_terminates_over_attach_cleanup(
         runtime.close.assert_awaited_once()
     finally:
         finish.set()
+        if not task.done():
+            task.cancel()
         await asyncio.gather(task, shutdown, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dedicated", [True, False], ids=["dedicated", "pool"])
+async def test_repeated_stop_preserves_the_running_attach_rollback(
+    runtime, dedicated
+):
+    entered, cleanup, finish = (asyncio.Event() for _ in range(3))
+
+    async def attach():
+        entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cleanup.set()
+            await finish.wait()
+            raise
+
+    task = asyncio.create_task(attach())
+    coordinator = pa._session_attach
+    setattr(coordinator, "_startup_task" if dedicated else "_pool_task", task)
+    await entered.wait()
+    try:
+        assert await coordinator.stop_startup_attach(cleanup_timeout=0.01) is False
+        assert cleanup.is_set() and not task.done()
+        assert await coordinator.stop_startup_attach(cleanup_timeout=0.01) is False
+        assert task.cancelling() == 1 and not task.done()
+        finish.set()
+        await asyncio.gather(task, return_exceptions=True)
+        assert await coordinator.stop_startup_attach(cleanup_timeout=0.01) is True
+        assert coordinator.startup_task is None and coordinator.pool_task is None
+    finally:
+        finish.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
