@@ -237,6 +237,62 @@ async def test_pre_setup_poll_refuses_a_different_captured_actor(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "corruption",
+    [
+        "vm_uid",
+        "rootdisk_pvc_uid",
+        "terminal_intent",
+        "terminal_status",
+        "original_pod",
+    ],
+)
+async def test_pre_setup_source_refuses_changed_physical_or_terminal_authority(
+    pg_store,  # noqa: F811 - imported PostgreSQL fixture
+    monkeypatch,
+    corruption,
+):
+    ready, current, source = await successor(pg_store, monkeypatch)
+    async with pg_store.acquire() as conn, conn.transaction():
+        await conn.execute("SET LOCAL session_replication_role='replica'")
+        if corruption == "terminal_intent":
+            await conn.execute(
+                "UPDATE threads SET pinned_idle_terminal_intent_at=clock_timestamp() WHERE id=$1",
+                ready["thread_id"],
+            )
+        elif corruption == "terminal_status":
+            await conn.execute(
+                "UPDATE threads SET status='ended',ended_at=clock_timestamp() WHERE id=$1",
+                ready["thread_id"],
+            )
+        elif corruption == "original_pod":
+            await conn.execute(
+                "UPDATE thread_agent_pod_provision_intents SET pod_uid=$2 WHERE thread_id=$1",
+                ready["thread_id"],
+                str(uuid4()),
+            )
+        else:
+            await conn.execute(
+                "UPDATE threads SET metadata=jsonb_set(metadata,ARRAY['vm',$2::text],to_jsonb($3::text)) WHERE id=$1",
+                ready["thread_id"],
+                corruption,
+                str(uuid4()),
+            )
+    assert await poll_original(pg_store, monkeypatch, ready, current) is False
+    assert (
+        await VMProvisioningPhaseStore(pg_store).publish_thread_ready(
+            str(ready["thread_id"]),
+            str(ready["generation"]),
+            ready["registration"],
+            ready["vm_uid"],
+            ready["updates"],
+        )
+        is False
+    )
+    await unchanged(pg_store, ready, source)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "field", ["runtime_generation", "agent_id", "runtime_attach_token"]
 )
 async def test_successor_changed_after_ssh_read_cannot_admit_remote_writes(
