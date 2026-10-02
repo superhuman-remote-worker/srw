@@ -9,10 +9,14 @@ import pytest
 
 
 @pytest.mark.parametrize(
-    "name",
-    ["test_archive_captures_session_end", "test_terminate_captures_session_end_once"],
+    "name,prior_task",
+    [
+        ("test_archive_captures_session_end", False),
+        ("test_terminate_captures_session_end_once", False),
+        ("test_terminate_captures_session_end_once", True),
+    ],
 )
-def test_legacy_memory_teardown_isolates_inherited_runtime_identity(name):
+def test_legacy_memory_teardown_isolates_inherited_runtime_identity(name, prior_task):
     root = Path(__file__).resolve().parents[1]
     env = {**os.environ, "KUBECONFIG": "/dev/null"}
     for key in (
@@ -22,6 +26,7 @@ def test_legacy_memory_teardown_isolates_inherited_runtime_identity(name):
         "PYTEST_XDIST_WORKER",
     ):
         env.pop(key, None)
+    env["MEMORY_INHERITED_TERMINATION_TASK"] = "1" if prior_task else "0"
     try:
         result = subprocess.run(
             [
