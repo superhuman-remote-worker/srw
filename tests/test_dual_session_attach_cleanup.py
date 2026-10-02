@@ -9,7 +9,7 @@ import pytest
 
 import agent.api.dual_app as dual_app
 import agent.api.persistent_app as persistent_app
-from agent.api import session_attach, session_termination
+from agent.api import session_attach
 
 
 GENERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -232,7 +232,7 @@ async def test_pre_setup_release_replays_same_proof_until_already_detached(monke
     dual_app._orchestrator_client = client
 
     with patch.object(
-        session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)
+        session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.0,)
     ):
         response = await _attach_endpoint()(_request(workspace=True))
         assert response.status_code == 409
@@ -309,8 +309,8 @@ async def test_unconfirmed_partial_setup_release_stays_session_and_nonready():
             side_effect=_failing_attach(RuntimeError("overlay refused")),
         ),
         patch.object(
-            session_termination,
-            "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS",
+            session_attach,
+            "EXACT_SETTLEMENT_RETRY_DELAYS",
             (0.0, 0.01),
         ),
     ):

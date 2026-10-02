@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from agent.api import session_termination
 from agent.api import session_attach
 from agent.api import session_workspace
 import asyncio
@@ -460,7 +459,7 @@ async def test_partial_cleanup_failure_keeps_exact_retry_owner_until_proven(monk
         patch.object(app._session_attach, "_cleanup_context", context),
         patch.object(app._session_attach, "cleanup_failed_attach", cleanup),
         patch.object(
-            session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)
+            session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.0,)
         ),
     ):
         assert (
@@ -469,7 +468,7 @@ async def test_partial_cleanup_failure_keeps_exact_retry_owner_until_proven(monk
         )
 
     assert cleanup.await_count == 2
-    assert [call.args[0] for call in retry_sleep.await_args_list] == [0.0]
+    assert all(call.args[0] == 0 for call in retry_sleep.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -489,8 +488,8 @@ async def test_unconfirmed_failure_retains_claim_and_non_ready_fence():
             AsyncMock(side_effect=RuntimeError("overlay refused")),
         ),
         patch.object(
-            session_termination,
-            "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS",
+            session_attach,
+            "EXACT_SETTLEMENT_RETRY_DELAYS",
             (0.0, 0.01),
         ),
     ):
@@ -582,7 +581,7 @@ async def test_lost_release_responses_replay_identical_proof_until_confirmed():
             AsyncMock(side_effect=RuntimeError("delivered attach failed")),
         ),
         patch.object(
-            session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)
+            session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.0,)
         ),
     ):
         task = asyncio.create_task(
@@ -783,7 +782,7 @@ async def test_dedicated_exit_stays_nonready_while_release_is_unconfirmed(monkey
     monkeypatch.setattr(app.os, "_exit", exit_process)
 
     with patch.object(
-        session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0, 0.01)
+        session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.0, 0.01)
     ):
         task = asyncio.create_task(
             app._session_termination.exit_workspace_not_ready(

@@ -16,7 +16,7 @@ from agent.api.session_identity import pinned_status_identity_advertised
 import pytest_asyncio
 from fastapi import HTTPException
 
-from agent.api import persistent_app, persistent_session, session_termination
+from agent.api import persistent_app, persistent_session
 from orchestrator.services import thread_workspace_delivery as delivery
 from orchestrator.services.session_runtime_admission import thread_runtime_is_preparable
 from orchestrator.services.vm_provisioner import VMProvisioner
@@ -634,7 +634,7 @@ async def test_vm_setup_failure_is_logged_before_cleanup_settles(
     retry_sleep = AsyncMock()
     monkeypatch.setattr(session_attach.asyncio, "sleep", retry_sleep)
     monkeypatch.setattr(
-        session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)
+        session_attach, "EXACT_SETTLEMENT_RETRY_DELAYS", (0.0,)
     )
     caplog.set_level(logging.WARNING, logger=persistent_app.__name__)
     task = asyncio.create_task(
