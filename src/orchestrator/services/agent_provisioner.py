@@ -3110,6 +3110,23 @@ class AgentProvisioner:
             },
         ]
 
+        if purpose == "session" and thread_id:
+            # Kubelet runs preStop before SIGTERM. Fence the next paid turn in
+            # the shell, even while Python/HTTP drain startup is delayed. Match
+            # the persistent pool hook and retain its image compatibility shim.
+            containers[0]["lifecycle"] = {
+                "preStop": {
+                    "exec": {
+                        "command": [
+                            "sh",
+                            "-c",
+                            ": > /tmp/srw-persistent-terminating; "
+                            "exec python -m src.api.persistent_termination",
+                        ],
+                    },
+                },
+            }
+
         volumes: list[dict] = [
             # /workspace in the AGENT pod. For `sandbox`-tier sessions and for
             # jobs this really is scratch: the authoritative workspace is the
