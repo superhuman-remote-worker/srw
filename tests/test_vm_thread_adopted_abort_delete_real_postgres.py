@@ -184,9 +184,7 @@ async def test_pre_setup_abort_delete_requires_exact_published_agent_pod(
                 "release_kind": "release_kind='server_pre_delivery'",
                 "workspace_generation": "workspace_generation='"
                 + str(uuid4())
-                + "',workspace_runtime_incarnation='"
-                + str(uuid4())
-                + "'",
+                + "',workspace_runtime_incarnation=(SELECT observed_vm_uid::uuid FROM vm_creation_retries WHERE thread_id=$1 LIMIT 1)",
                 "workspace_incarnation": "workspace_generation=(SELECT provision_generation FROM vm_creation_retries WHERE thread_id=$1 LIMIT 1),workspace_runtime_incarnation='"
                 + str(uuid4())
                 + "'",
