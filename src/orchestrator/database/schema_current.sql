@@ -12451,7 +12451,7 @@ BEGIN
         SELECT 1 FROM public.thread_agent_pod_provision_intents i
          WHERE i.attempt_id::text=pod->>'provision_attempt' AND i.thread_id=owner_row.id
            AND i.runtime_generation=owner_row.runtime_generation AND i.status='published'
-           AND i.provisioner='persistent' AND i.namespace=pod->>'namespace'
+           AND i.provisioner IN ('agent','persistent') AND i.namespace=pod->>'namespace'
            AND i.pod_name=pod->>'pod_name' AND i.pod_uid=pod->>'pod_uid'
            AND i.protection_protocol='finalizer_v1'
     ) THEN RETURN false; END IF;
