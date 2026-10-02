@@ -1064,6 +1064,80 @@ REJECTIONS = [
 
 
 class TestInput:
+    def test_rest_human_input_clears_abandoned_session_watchdog(self, client, rt):
+        connected = asyncio.Event()
+        rt.set("_ws_connected_event", connected)
+
+        response = client.post("/api/input", json=_input_body())
+
+        assert response.status_code == 202
+        assert connected.is_set()
+
+    @pytest.mark.parametrize(
+        "admission",
+        [
+            _admission(state="deferred", deferred=True, enqueued=False),
+            _admission(enqueued=False, duplicate=True),
+            _admission(state="admitted", enqueued=False, duplicate=True),
+            _admission(state="settled", enqueued=False, duplicate=True),
+            _admission(state="cancelled", enqueued=False, duplicate=True),
+        ],
+        ids=["deferred", "already-queued", "admitted", "settled", "cancelled"],
+    )
+    def test_rest_receipt_keeps_abandoned_session_watchdog(self, client, rt, admission):
+        connected = asyncio.Event()
+        rt.set("_ws_connected_event", connected)
+        rt.accept.return_value = admission
+
+        client.post("/api/input", json=_input_body())
+
+        assert not connected.is_set()
+
+    def test_rest_event_keeps_abandoned_session_watchdog(self, client, rt, monkeypatch):
+        connected = asyncio.Event()
+        rt.set("_ws_connected_event", connected)
+        monkeypatch.setenv("MCP_INTERNAL_KEY", INTERNAL_KEY)
+
+        response = client.post(
+            "/api/input",
+            json=_input_body(role="event", delivery_id=DELIVERY_ID),
+            headers={"X-Internal-Key": INTERNAL_KEY},
+        )
+
+        assert response.status_code == 202
+        assert not connected.is_set()
+
+    def test_stale_rest_input_keeps_abandoned_session_watchdog(self, client, rt):
+        connected = asyncio.Event()
+        rt.set("_ws_connected_event", connected)
+
+        response = client.post(
+            "/api/input", json=_input_body(session_identity_fingerprint=FP_B)
+        )
+
+        assert response.status_code == 409
+        assert not connected.is_set()
+
+    @pytest.mark.parametrize("race", ["identity", "session", "retirement"])
+    def test_rest_admission_cannot_clear_successor_watchdog(self, client, rt, race):
+        connected = asyncio.Event()
+        rt.set("_ws_connected_event", connected)
+
+        async def accept_then_change_runtime(*args, **kwargs):
+            if race == "identity":
+                rt.set("_session_runtime_generation", GEN_B)
+                rt.set("_session_runtime_attach_token", ATTACH_B)
+            elif race == "session":
+                rt.set("_session", _make_session(name="successor"))
+            else:
+                rt.set("_termination_admission_fenced", True)
+            return _admission()
+
+        rt.accept.side_effect = accept_then_change_runtime
+        client.post("/api/input", json=_input_body())
+
+        assert not connected.is_set()
+
     def test_rest_deferred_admission_returns_202(self, client, rt):
         admission = _admission(state="deferred", deferred=True, enqueued=False)
         rt.accept.return_value = admission
