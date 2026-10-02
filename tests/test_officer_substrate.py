@@ -22,6 +22,44 @@ from agent.tools.context import ToolContext
 from agent.tools.core.officer import OFFICER_TOOLS_METADATA, create_officer_tools
 
 
+@pytest.fixture(autouse=True)
+def _officer_runtime_owners(monkeypatch, tmp_path):
+    """Legacy Officer tests own no earlier file's exact lifecycle obligation."""
+    from agent.api import persistent_app as pa
+    from agent.api.session_identity import SessionIdentityRuntime
+    from agent.api.session_input import SessionInputRuntime
+    from agent.api.session_termination import SessionTerminationCoordinator
+
+    old_identity, old_termination, old_input = (
+        pa._session_identity,
+        pa._session_termination,
+        pa._session_input,
+    )
+    monkeypatch.setattr(
+        pa, "_session_identity", SessionIdentityRuntime(old_identity._ports)
+    )
+    termination = SessionTerminationCoordinator(
+        old_termination._ports,
+        logger=old_termination._logger,
+        termination_queue_sentinel=old_termination.termination_queue_sentinel,
+    )
+    termination.termination_sentinel_path = tmp_path / "no-termination"
+    monkeypatch.setattr(pa, "_session_termination", termination)
+    monkeypatch.setattr(pa, "_session_input", SessionInputRuntime(old_input._ports))
+    for name in (
+        "_session",
+        "_orchestrator_client",
+        "_loop_task",
+        "_event_writer",
+        "_heartbeat_task",
+        "_control_owner_agent_id",
+    ):
+        monkeypatch.setattr(pa, name, None)
+    for name in ("_tool_inflight", "_turn_event_open"):
+        monkeypatch.setattr(pa, name, False)
+    monkeypatch.setattr(pa, "_subscribers", {})
+
+
 def _watchdog_deps(db, provisioner, recycler, *, reconciliation):
     """What the watchdog task carries. The recycler is a callable because the
     application assigns that global during startup and the tick re-reads it;
