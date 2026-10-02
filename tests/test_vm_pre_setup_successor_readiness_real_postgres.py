@@ -12,6 +12,7 @@ from orchestrator.services.vm_provisioning_phases import VMProvisioningPhaseStor
 from orchestrator.services.vm_readiness import VMReadinessService
 from orchestrator.services.vm_thread_network import document
 from tests.test_pinned_vm_failed_initial_end_real_postgres import (
+    _begin,
     _damage_first_edge,
     _release_binding,
 )
@@ -277,6 +278,28 @@ async def test_pre_setup_source_refuses_changed_physical_or_terminal_authority(
                 corruption,
                 str(uuid4()),
             )
+    assert await poll_original(pg_store, monkeypatch, ready, current) is False
+    assert (
+        await VMProvisioningPhaseStore(pg_store).publish_thread_ready(
+            str(ready["thread_id"]),
+            str(ready["generation"]),
+            ready["registration"],
+            ready["vm_uid"],
+            ready["updates"],
+        )
+        is False
+    )
+    await unchanged(pg_store, ready, source)
+
+
+@pytest.mark.asyncio
+async def test_pre_setup_source_refuses_retirement_admitted_through_normal_api(
+    pg_store,  # noqa: F811 - imported PostgreSQL fixture
+    monkeypatch,
+):
+    ready, current, source = await successor(pg_store, monkeypatch)
+    retirement = await _begin(pg_store, current)
+    assert retirement["state"] == "pending"
     assert await poll_original(pg_store, monkeypatch, ready, current) is False
     assert (
         await VMProvisioningPhaseStore(pg_store).publish_thread_ready(
