@@ -5355,7 +5355,11 @@ class PostgresDB:
     async def list_terminal_vm_cleanup_jobs(
         self, *, limit: int = 4, after_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Nominate durable terminal VM owners, including unsettled receipts.
+        """Nominate shared stateless cancellation and terminal VM cleanup.
+
+        Cancelled stateless owners retain their shared cleanup marker until
+        checkpoint and external workspace cleanup settle, for every backend.
+        The historical method name also serves that caller-loss recovery path.
 
         Terminal review storage belongs to the VM idle operation and is kept
         until its own reconciler proves compute absent. Ordinary terminal Jobs
@@ -5372,44 +5376,52 @@ class PostgresDB:
                 FROM jobs j
                 WHERE j.status IN ('completed','failed','cancelled')
                   AND ($2::uuid IS NULL OR j.id > $2::uuid)
-                  AND jsonb_typeof(j.context->'vm')='object'
-                  AND j.context->'vm' <> '{}'::jsonb
                   AND (j.parent_job_id IS NULL OR
                        j.context->>'inherits_parent_workspace' IS DISTINCT FROM 'true')
                   AND (
-                    j.context ? '_job_terminal_vm_cleanup'
-                    OR j.context ? '_stateless_cancel_cleanup_pending'
-                    OR EXISTS (
-                        SELECT 1 FROM vm_workspace_cleanup_admissions a
-                        WHERE a.owner_kind='job' AND a.owner_id=j.id
-                          AND a.source='job_terminal_vm_release'
-                          AND a.completed_at IS NULL
-                    )
-                  )
-                  AND (
-                    COALESCE(j.context->'vm'->>'status','')
-                        NOT IN ('deleted','deleting')
-                    OR j.context ? '_stateless_cancel_cleanup_pending'
-                    OR EXISTS (
-                        SELECT 1 FROM vm_workspace_cleanup_admissions a
-                        WHERE a.owner_kind='job' AND a.owner_id=j.id
-                          AND a.source='job_terminal_vm_release'
-                          AND a.completed_at IS NULL
+                    (
+                      j.status='cancelled' AND j.execution_lane='stateless'
+                      AND j.context->'_stateless_cancel_cleanup_pending'='true'::jsonb
                     )
                     OR (
-                        j.context->'_job_terminal_vm_cleanup'->>'version'='1'
-                        AND j.context->'_job_terminal_vm_cleanup'->>'provision_generation'=
-                            j.context->'vm'->>'provision_generation'
-                        AND EXISTS (
+                      jsonb_typeof(j.context->'vm')='object'
+                      AND j.context->'vm' <> '{}'::jsonb
+                      AND (
+                        j.context ? '_job_terminal_vm_cleanup'
+                        OR j.context ? '_stateless_cancel_cleanup_pending'
+                        OR EXISTS (
                             SELECT 1 FROM vm_workspace_cleanup_admissions a
-                            WHERE a.id::text=j.context->'_job_terminal_vm_cleanup'->>'admission_id'
-                              AND a.owner_kind='job' AND a.owner_id=j.id
+                            WHERE a.owner_kind='job' AND a.owner_id=j.id
                               AND a.source='job_terminal_vm_release'
-                              AND a.parent_admission_id IS NULL
-                              AND a.pvc_uid::text IS NOT DISTINCT FROM
-                                  j.context->'vm'->>'rootdisk_pvc_uid'
-                              AND a.completed_at IS NOT NULL AND a.outcome='completed'
+                              AND a.completed_at IS NULL
                         )
+                      )
+                      AND (
+                        COALESCE(j.context->'vm'->>'status','')
+                            NOT IN ('deleted','deleting')
+                        OR j.context ? '_stateless_cancel_cleanup_pending'
+                        OR EXISTS (
+                            SELECT 1 FROM vm_workspace_cleanup_admissions a
+                            WHERE a.owner_kind='job' AND a.owner_id=j.id
+                              AND a.source='job_terminal_vm_release'
+                              AND a.completed_at IS NULL
+                        )
+                        OR (
+                            j.context->'_job_terminal_vm_cleanup'->>'version'='1'
+                            AND j.context->'_job_terminal_vm_cleanup'->>'provision_generation'=
+                                j.context->'vm'->>'provision_generation'
+                            AND EXISTS (
+                                SELECT 1 FROM vm_workspace_cleanup_admissions a
+                                WHERE a.id::text=j.context->'_job_terminal_vm_cleanup'->>'admission_id'
+                                  AND a.owner_kind='job' AND a.owner_id=j.id
+                                  AND a.source='job_terminal_vm_release'
+                                  AND a.parent_admission_id IS NULL
+                                  AND a.pvc_uid::text IS NOT DISTINCT FROM
+                                      j.context->'vm'->>'rootdisk_pvc_uid'
+                                  AND a.completed_at IS NOT NULL AND a.outcome='completed'
+                            )
+                        )
+                      )
                     )
                   )
                   AND NOT EXISTS (
