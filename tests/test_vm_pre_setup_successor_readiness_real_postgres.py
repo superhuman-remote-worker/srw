@@ -9,6 +9,7 @@ import pytest
 from orchestrator.services.vm_provisioner import VMProvisioner
 from orchestrator.services.vm_provisioning_phases import VMProvisioningPhaseStore
 from orchestrator.services.vm_readiness import VMReadinessService
+from orchestrator.services.vm_thread_network import document
 from tests.test_pinned_vm_failed_initial_end_real_postgres import _release_binding
 from tests.test_pinned_vm_initial_binding_real_postgres import _bind_cold_agent
 from tests.test_vm_resource_thread_source_real_postgres import (
@@ -69,7 +70,9 @@ async def test_confirmed_pre_setup_successor_reaches_actual_ssh_readiness_gate(
     monkeypatch,
 ):
     ready, current, source = await successor(pg_store, monkeypatch)
-    vm = current["metadata"]["vm"]
+    rows = await pg_store.list_thread_vm_readiness_candidates()
+    row = next(row for row in rows if row["entity_id"] == str(ready["thread_id"]))
+    vm = document(row["vm"])
     ssh = AsyncMock(return_value=(False, 1, "controlled SSH observation"))
     monkeypatch.setattr("orchestrator.services.vm_readiness.wait_for_agent_ssh", ssh)
     provisioner = SimpleNamespace(
@@ -91,7 +94,7 @@ async def test_confirmed_pre_setup_successor_reaches_actual_ssh_readiness_gate(
         str(ready["thread_id"]),
         str(ready["generation"]),
         vm,
-        {**current, "runtime_generation": str(current["runtime_generation"])},
+        row,
         False,
     )
     assert ssh.await_count == 1
@@ -117,7 +120,7 @@ async def test_confirmed_pre_setup_successor_polls_original_request_without_crea
             expected_runtime_generation=str(current["runtime_generation"]),
             expected_agent_id=str(current["agent_id"]),
             expected_attach_token=str(current["runtime_attach_token"]),
-            expected_vm_context=current["metadata"]["vm"],
+            expected_vm_context=document(current["metadata"])["vm"],
             poll=True,
         )
         is True
@@ -143,5 +146,19 @@ async def test_confirmed_pre_setup_successor_publishes_ready_under_locked_curren
     )
     after = await pg_store.get_thread(str(ready["thread_id"]))
     assert after["runtime_generation"] == current["runtime_generation"]
-    assert after["metadata"]["vm"]["status"] == "ready"
+    assert document(after["metadata"])["vm"]["status"] == "ready"
+    await unchanged(pg_store, ready, source)
+
+
+@pytest.mark.asyncio
+async def test_readiness_candidate_carries_exact_current_binding(
+    pg_store,  # noqa: F811 - imported PostgreSQL fixture
+    monkeypatch,
+):
+    ready, current, source = await successor(pg_store, monkeypatch)
+    rows = await pg_store.list_thread_vm_readiness_candidates()
+    row = next(row for row in rows if row["entity_id"] == str(ready["thread_id"]))
+    assert row.get("agent_id") == str(current["agent_id"])
+    assert row.get("runtime_attach_token") == str(current["runtime_attach_token"])
+    assert row["runtime_generation"] == str(current["runtime_generation"])
     await unchanged(pg_store, ready, source)
