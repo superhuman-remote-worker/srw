@@ -3,8 +3,10 @@
 import json
 import logging
 from types import SimpleNamespace
+from uuid import uuid4
 from unittest.mock import AsyncMock, MagicMock
 
+import asyncpg
 import pytest
 
 from orchestrator.services.pinned_retirement import PinnedRetirementOperations
@@ -127,6 +129,89 @@ async def adopted_source(db, setup, monkeypatch):
         == 0
     )
     return current, dict(source)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "source_generation",
+        "source_actor",
+        "vm_uid",
+        "pvc_uid",
+        "configuration",
+        "purge_digest",
+        "purge_incomplete",
+        "effect_issued",
+        "other_cleanup_pending",
+    ],
+)
+async def test_nonquota_audit_delete_refuses_inexact_source_or_unsettled_debt(
+    db, setup, monkeypatch, defect
+):
+    current, source = await adopted_source(db, setup, monkeypatch)
+    retirement = await cleaned_retirement(db, current, permanent=True)
+    # Fault injection is confined to this disposable database. Bypass mutation
+    # guards to independently test the final deletion authority against damaged
+    # evidence; normal live writers cannot make these changes.
+    async with db.acquire() as conn, conn.transaction():
+        await conn.execute("SET LOCAL session_replication_role='replica'")
+        if defect in {"source_generation", "source_actor", "vm_uid", "pvc_uid"}:
+            column = {
+                "source_generation": "thread_runtime_generation",
+                "source_actor": "thread_agent_id",
+                "vm_uid": "observed_vm_uid",
+                "pvc_uid": "observed_pvc_uid",
+            }[defect]
+            await conn.execute(
+                f"UPDATE vm_creation_retries SET {column}=$2 WHERE request_id=$1",
+                source["request_id"],
+                uuid4() if column.startswith("thread_") else str(uuid4()),
+            )
+        elif defect == "configuration":
+            await conn.execute(
+                "UPDATE vm_creation_retries SET controller_configuration=jsonb_set("
+                "controller_configuration,'{version}','3') WHERE request_id=$1",
+                source["request_id"],
+            )
+        elif defect in {"purge_digest", "purge_incomplete"}:
+            change = (
+                "intent_digest='unproven'"
+                if defect == "purge_digest"
+                else ("completed_at=NULL,outcome=NULL")
+            )
+            await conn.execute(
+                f"UPDATE vm_workspace_cleanup_admissions SET {change} "
+                "WHERE owner_kind='thread' AND owner_id=$1 AND source='pinned_thread_retirement'",
+                current["id"],
+            )
+        elif defect == "effect_issued":
+            await conn.execute(
+                "UPDATE vm_creation_effects SET state='issued',evidence='{}'::jsonb,resolved_at=NULL "
+                "WHERE request_id=$1 AND effect_kind='vm'",
+                source["request_id"],
+            )
+        else:
+            await conn.execute(
+                "INSERT INTO vm_workspace_cleanup_admissions "
+                "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest) "
+                "VALUES($1,'thread',$2,$3,'pinned_thread_retirement',$4,'unproven')",
+                uuid4(),
+                current["id"],
+                source["observed_pvc_uid"],
+                uuid4(),
+            )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.delete_thread(
+            str(current["id"]),
+            expected_runtime_generation=retirement["generation"],
+            expected_runtime_retirement_token=retirement["token"],
+        )
+    assert await db.get_thread(str(current["id"])) is not None
+    owner = await db.fetchrow(
+        "SELECT * FROM vm_thread_creation_owners WHERE thread_id=$1", current["id"]
+    )
+    assert owner["live_thread_id"] == current["id"] and owner["deleted_at"] is None
 
 
 async def cleaned_retirement(db, current, *, permanent):

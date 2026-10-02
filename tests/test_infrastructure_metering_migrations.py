@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0318_pinned_pre_setup_dedicated_pod_owners.sql"
+    / "src/orchestrator/database/migrations/app/0319_pinned_nonquota_adopted_vm_delete.sql"
 )
 AUDIT_EXPANSION = (
     ROOT
