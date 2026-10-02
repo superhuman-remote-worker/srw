@@ -238,6 +238,35 @@ async def test_pre_setup_poll_refuses_a_different_captured_actor(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "field", ["thread_id", "creation_request_id", "provision_generation"]
+)
+async def test_pre_setup_poll_refuses_a_different_captured_source(
+    pg_store,  # noqa: F811 - imported PostgreSQL fixture
+    monkeypatch,
+    field,
+):
+    ready, current, source = await successor(pg_store, monkeypatch)
+    captured_vm = document(current["metadata"])["vm"]
+    target = ready
+    if field == "thread_id":
+        target = ready | {field: uuid4()}
+    else:
+        captured_vm[field] = str(uuid4())
+    assert (
+        await poll_original(
+            pg_store,
+            monkeypatch,
+            target,
+            current,
+            expected_vm_context=captured_vm,
+        )
+        is False
+    )
+    await unchanged(pg_store, ready, source)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "corruption",
     [
         "vm_uid",
