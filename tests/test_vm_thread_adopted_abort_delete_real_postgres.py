@@ -99,6 +99,7 @@ async def test_adopted_vm_pre_setup_release_then_permanent_delete(
         "late_pod_publication",
         "missing_abort",
         "source_generation",
+        "abort_owner",
         "successor_generation",
         "source_actor",
         "source_token",
@@ -175,6 +176,7 @@ async def test_pre_setup_abort_delete_requires_exact_published_agent_pod(
         else:
             change = {
                 "source_generation": "runtime_generation='" + str(uuid4()) + "'",
+                "abort_owner": "thread_id='" + str(uuid4()) + "'",
                 "successor_generation": "successor_generation='" + str(uuid4()) + "'",
                 "source_actor": "agent_id='" + str(uuid4()) + "'",
                 "source_token": "runtime_attach_token='" + str(uuid4()) + "'",
@@ -197,6 +199,20 @@ async def test_pre_setup_abort_delete_requires_exact_published_agent_pod(
                 "WHERE thread_id=$1 AND runtime_generation=$2",
                 original["id"],
                 original["runtime_generation"],
+            )
+        if defect in {"source_generation", "abort_owner"}:
+            column = (
+                "runtime_generation" if defect == "source_generation" else "thread_id"
+            )
+            # Keep the Pod edge internally coherent; the independent source
+            # owner/generation comparison must still refuse the wrong life.
+            await conn.execute(
+                f"UPDATE thread_agent_pod_provision_intents SET {column}="
+                f"(SELECT {column} FROM thread_runtime_attach_abort_outcomes "
+                "WHERE agent_id=$3) WHERE thread_id=$1 AND runtime_generation=$2",
+                original["id"],
+                original["runtime_generation"],
+                original["agent_id"],
             )
     with pytest.raises(asyncpg.CheckViolationError):
         await db.delete_thread(
