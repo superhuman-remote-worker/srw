@@ -597,11 +597,12 @@ class SessionTerminationCoordinator:
         self.pending_exit_task = asyncio.create_task(_exit())
 
     async def boot_ws_watchdog(self, timeout_s: int) -> None:
-        """Exit if no /ws/chat connection arrives within ``timeout_s`` of attach.
+        """Exit if no client connects or queues human input within ``timeout_s``.
 
         A persistent agent that boots, attaches to a thread, then never receives
-        a WebSocket has no other way to know it's been abandoned (e.g. user
-        navigated away during creation). Without this watchdog the pod sits
+        a WebSocket or accepted human input has no other way to know it's been
+        abandoned (e.g. user navigated away during creation). Without this watchdog
+        the pod sits
         forever heartbeating and holding a slot. The orchestrator reconciler
         catches this too, but only after a 60s+ delay; this watchdog kills
         locally on the configured cadence.
@@ -618,10 +619,10 @@ class SessionTerminationCoordinator:
             return
         try:
             await asyncio.wait_for(self.ws_connected_event.wait(), timeout=timeout_s)
-            return  # WS arrived — normal lifecycle takes over
+            return  # A client used this runtime — normal lifecycle takes over.
         except asyncio.TimeoutError:
             self._logger.warning(
-                "No WebSocket connection within %ds for thread %s — "
+                "No WebSocket connection or queued human input within %ds for thread %s — "
                 "exiting (likely abandoned during creation).",
                 timeout_s,
                 self._ports.identity().thread_id,
@@ -868,7 +869,7 @@ class SessionTerminationCoordinator:
                 )
 
     def signal_ws_connected(self) -> None:
-        """Signal that a WebSocket has connected. Cancels the boot-WS watchdog."""
+        """Signal a client connection or accepted input, ending the boot watchdog."""
         if self.ws_connected_event is not None:
             self.ws_connected_event.set()
 

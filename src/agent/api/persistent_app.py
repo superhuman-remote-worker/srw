@@ -228,7 +228,7 @@ def _persistent_input_cancellation_enabled() -> bool:
 
 # Self-cleanup watchdogs (PR 2 — protect against the abandoned-pod failure modes
 # that the orchestrator reconciler can only catch with a 60s+ delay):
-#   _ws_connected_event  → set when /ws/chat first accepts a connection.
+#   _ws_connected_event  → set on a WS connection or newly queued human input.
 #   _watchdog_tasks      → background tasks cancelled on detach/shutdown.
 
 
@@ -2111,7 +2111,11 @@ def session_transport_bindings() -> SessionTransportBindings:
             attached_thread_id=lambda: _attached_session_thread_id(),
             identity_fingerprint=lambda: _session_identity.fingerprint(),
         ),
-        http=SessionHttpPorts(runtime=runtime, operations=operations),
+        http=SessionHttpPorts(
+            runtime=runtime,
+            operations=operations,
+            note_human_input_queued=lambda: _session_termination.signal_ws_connected(),
+        ),
         socket=SessionSocketPorts(
             runtime=runtime,
             operations=operations,
