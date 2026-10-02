@@ -23,7 +23,8 @@ from tests.test_pinned_vm_initial_binding_real_postgres import (
 
 @pytest.mark.asyncio
 async def test_coordinator_polls_the_exact_postgres_startup_generation(
-    pg_store, monkeypatch
+    pg_store,  # noqa: F811
+    monkeypatch,
 ):
     from agent.api.session_attach import SessionAttachCoordinator
     from agent.api.session_workspace import poll_workspace_ready
@@ -167,7 +168,8 @@ async def _nonquota_waiting_source(store, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_nonquota_authenticated_capacity_wait_outlasts_900_for_exact_life(
-    pg_store, monkeypatch
+    pg_store,  # noqa: F811
+    monkeypatch,
 ):
     from agent.api.session_attach import SessionAttachCoordinator
     from agent.api.session_workspace import poll_workspace_ready
@@ -270,7 +272,9 @@ async def test_nonquota_authenticated_capacity_wait_outlasts_900_for_exact_life(
     ],
 )
 async def test_nonquota_capacity_hint_refuses_inexact_or_unproven_source(
-    pg_store, monkeypatch, mutation
+    pg_store,  # noqa: F811
+    monkeypatch,
+    mutation,
 ):
     current, source = await _nonquota_waiting_source(pg_store, monkeypatch)
     current = dict(current)
@@ -307,8 +311,42 @@ async def test_nonquota_capacity_hint_refuses_inexact_or_unproven_source(
 
 
 @pytest.mark.asyncio
+async def test_nonquota_readiness_clock_starts_at_durable_controller_admission(
+    pg_store,  # noqa: F811
+    monkeypatch,
+):
+    from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
+
+    current, source = await _nonquota_waiting_source(pg_store, monkeypatch)
+    await pg_store.execute(
+        "UPDATE vm_creation_retries SET next_probe_at=clock_timestamp() WHERE request_id=$1",
+        source["request_id"],
+    )
+    retry = VMCreationRetryStore(pg_store)
+    claim = (await retry.claim_due(limit=1))[0]
+    admission = await retry.authorize_controller(
+        request_id=str(source["request_id"]), claim_token=str(claim["claim_token"]),
+        observed={
+            "job_id": str(current["id"]), "provision_generation": str(source["provision_generation"]),
+            "request_digest": source["request_digest"],
+            "controller_configuration_digest": source["controller_configuration_digest"],
+            "expected_pvc_uid": None,
+        },
+    )
+    assert admission["allowed"] is True
+    for _ in range(2):
+        view = await vm_thread_initial.initial_vm_startup_view(current, store=pg_store)
+        assert view is not None and view["phase"] == "admitted"
+        assert 0 <= view["admission_elapsed_s"] < 30
+    assert await pg_store.fetchval(
+        "SELECT count(*) FROM vm_creation_effects WHERE request_id=$1", source["request_id"]
+    ) == 0
+
+
+@pytest.mark.asyncio
 async def test_bound_postgres_life_is_reserved_before_session_construction(
-    pg_store, monkeypatch
+    pg_store,  # noqa: F811
+    monkeypatch,
 ):
     import asyncio
     from agent.api.session_attach import SessionAttachCoordinator
