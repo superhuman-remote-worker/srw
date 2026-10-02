@@ -63,11 +63,23 @@ async def db(_base_db):
 
 
 async def scenario(
-    db, monkeypatch, *, permanent=False, legacy_vm_incarnation=False, vm_updates=None
+    db,
+    monkeypatch,
+    *,
+    permanent=False,
+    legacy_vm_incarnation=False,
+    vm_updates=None,
+    pod_provisioner="persistent",
+    actor_status="session",
+    thread_status="active",
 ):
     pod_uid = str(uuid4())
     ids = await fixtures._seed(
-        db, protected_agent_pod=True, workspace_claim=False, pod_uid=pod_uid
+        db,
+        protected_agent_pod=True,
+        workspace_claim=False,
+        pod_uid=pod_uid,
+        pod_provisioner=pod_provisioner,
     )
     ids["process_generation"] = str(uuid4())
     ids["pod_uid"] = pod_uid
@@ -103,6 +115,12 @@ async def scenario(
         "WHERE id=$1::uuid",
         ids["agent"],
         ids["process_generation"],
+    )
+    await db.execute(
+        "UPDATE threads SET status=$2 WHERE id=$1::uuid", ids["thread"], thread_status
+    )
+    await db.execute(
+        "UPDATE agents SET status=$2 WHERE id=$1::uuid", ids["agent"], actor_status
     )
     retirement = await db.begin_pinned_thread_retirement(
         ids["thread"], permanent=permanent
@@ -870,6 +888,38 @@ async def test_pre_setup_end_nominates_exact_actuator_and_waits_for_settlement(
         ids["agent"], ids["thread"], **proof
     )
     assert await db.list_retryable_pinned_retirements() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pod_provisioner", ["agent", "persistent"])
+@pytest.mark.parametrize("actor_status", ["booting", "ready"])
+async def test_pre_setup_boot_end_nominates_both_exact_dedicated_pod_owners(
+    db, monkeypatch, pod_provisioner, actor_status
+):
+    """Production's cold agent Pod is distinct from a persistent pool Pod."""
+    ids, retirement, _, _, _, _ = await scenario(
+        db,
+        monkeypatch,
+        pod_provisioner=pod_provisioner,
+        actor_status=actor_status,
+        thread_status="created",
+        vm_updates={"status": "provisioning", "active_pod_uid": None, "vmi_uid": None},
+    )
+    assert await db.request_pinned_pre_setup_retirement(
+        ids["thread"],
+        runtime_generation=ids["generation"],
+        runtime_attach_token=ids["attach_token"],
+        retirement_token=retirement["token"],
+        agent_id=ids["agent"],
+        pod_uid=ids["pod_uid"],
+    )
+    current = await db.get_thread(ids["thread"])
+    assert current["runtime_retirement_local_quiescence"] is None
+    candidates = await db.list_retryable_pinned_retirements()
+    assert len(candidates) == 1 and candidates[0]["nominated_before_grace"]
+    assert fixtures._json(candidates[0]["runtime_retirement_actuator_request"])[
+        "kind"
+    ] == ("agent_pre_setup_retirement_v1")
 
 
 @pytest.mark.asyncio

@@ -654,6 +654,7 @@ async def _seed(
     protected_agent_pod: bool = False,
     workspace_claim: bool = True,
     pod_uid: str = "old-pod",
+    pod_provisioner: str = "persistent",
 ):
     ids = {key: str(uuid4()) for key in ("user", "project", "thread", "agent")}
     ids["attach_token"] = str(uuid4())
@@ -715,7 +716,7 @@ async def _seed(
             expected_runtime_generation=generation,
             attempt_id=attempt,
             pod_name=f"persistent-{ids['thread'][:12]}",
-            provisioner="persistent",
+            provisioner=pod_provisioner,
             namespace="agents-a",
             # The pinned lite tier runs an emptyDir Pod with no separate
             # workspace PVC; only a claim-bearing fixture owes a fenced claim
