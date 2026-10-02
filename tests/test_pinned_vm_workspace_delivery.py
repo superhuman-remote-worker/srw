@@ -631,6 +631,8 @@ async def test_vm_setup_failure_is_logged_before_cleanup_settles(
     monkeypatch.setattr(
         persistent_app._session_attach, "cleanup_failed_attach", cleanup
     )
+    retry_sleep = AsyncMock()
+    monkeypatch.setattr(session_attach.asyncio, "sleep", retry_sleep)
     monkeypatch.setattr(
         session_termination, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)
     )
@@ -646,6 +648,7 @@ async def test_vm_setup_failure_is_logged_before_cleanup_settles(
     )
     try:
         await asyncio.wait_for(cleanup_entered.wait(), timeout=2)
+        assert all(call.args[0] == 0 for call in retry_sleep.await_args_list)
         records = [r for r in caplog.records if "stage=session_setup" in r.getMessage()]
         assert len(records) == 1
         record = records[0]

@@ -443,7 +443,9 @@ async def test_real_attach_rejects_workspace_identity_drift_before_constructor()
 
 
 @pytest.mark.asyncio
-async def test_partial_cleanup_failure_keeps_exact_retry_owner_until_proven():
+async def test_partial_cleanup_failure_keeps_exact_retry_owner_until_proven(monkeypatch):
+    retry_sleep = AsyncMock()
+    monkeypatch.setattr(session_attach.asyncio, "sleep", retry_sleep)
     context = _partial_cleanup_context(setup_started=True)
     receipt = _release_receipt()
     cleanup = AsyncMock(
@@ -467,6 +469,7 @@ async def test_partial_cleanup_failure_keeps_exact_retry_owner_until_proven():
         )
 
     assert cleanup.await_count == 2
+    assert [call.args[0] for call in retry_sleep.await_args_list] == [0.0]
 
 
 @pytest.mark.asyncio

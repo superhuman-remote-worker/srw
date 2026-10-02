@@ -9,7 +9,7 @@ import pytest
 
 import agent.api.dual_app as dual_app
 import agent.api.persistent_app as persistent_app
-from agent.api import session_termination
+from agent.api import session_attach, session_termination
 
 
 GENERATION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -224,7 +224,9 @@ async def test_setup_forwards_canonical_workspace_identity_to_shared_attach():
 
 
 @pytest.mark.asyncio
-async def test_pre_setup_release_replays_same_proof_until_already_detached():
+async def test_pre_setup_release_replays_same_proof_until_already_detached(monkeypatch):
+    retry_sleep = AsyncMock()
+    monkeypatch.setattr(session_attach.asyncio, "sleep", retry_sleep)
     outcomes = iter((False, False, True))
     client = _client(bound=False, release=lambda *_a, **_kw: next(outcomes))
     dual_app._orchestrator_client = client
@@ -237,6 +239,7 @@ async def test_pre_setup_release_replays_same_proof_until_already_detached():
         await dual_app._session_attach_task
 
     assert client.release_thread_agent.await_count == 3
+    assert [call.args[0] for call in retry_sleep.await_args_list] == [0.0, 0.0]
     assert (
         len({str(call.kwargs) for call in client.release_thread_agent.await_args_list})
         == 1
