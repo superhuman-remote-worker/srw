@@ -16,6 +16,8 @@ below. The extraction may change that block and nothing else in this file.
 from __future__ import annotations
 
 import asyncio
+import json
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
@@ -24,6 +26,7 @@ import pytest
 import pytest_asyncio
 
 import agent.api.persistent_app as pa
+from agent.api import session_http
 from agent.api.lease_context import LeaseHandle, current_lease
 from agent.api.session_contract import DurableInputUnavailable
 from agent.database.postgres_db import PostgresDB as AgentPostgresDB
@@ -399,6 +402,77 @@ async def test_concurrent_duplicate_admission_publishes_one_queue_item(
     assert sum(1 for result in results if not result.duplicate) == 1
     assert len(_drain(_input_view().queue)) == 1
     assert await _transcript_rows(pinned_runtime.db, pinned_runtime.thread_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_real_durable_poll_wins_while_fresh_http_persist_reply_waits(
+    pinned_runtime, monkeypatch
+):
+    """A fresh queued human input must disarm the boot watchdog even if the
+    durable poll publishes it before the HTTP coroutine resumes after persist.
+
+    The HTTP transport and SessionInputRuntime are real; only the return from
+    the already committed PostgreSQL insert is held at a deterministic barrier.
+    """
+    from starlette.requests import Request
+
+    agent_db = pinned_runtime.agent_db
+    real_persist = agent_db.persist_pinned_input_delivery
+    committed = asyncio.Event()
+    release_reply = asyncio.Event()
+
+    async def persist_then_pause(**kwargs):
+        row = await real_persist(**kwargs)
+        committed.set()
+        await release_reply.wait()
+        return row
+
+    monkeypatch.setattr(agent_db, "persist_pinned_input_delivery", persist_then_pause)
+    fingerprint = pa._current_pinned_session_identity_fingerprint()
+    assert fingerprint is not None
+    body = json.dumps(
+        {
+            "content": "one fresh human input",
+            "session_identity_fingerprint": fingerprint,
+        }
+    ).encode()
+    received = False
+
+    async def receive():
+        nonlocal received
+        if not received:
+            received = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/api/input", "headers": []},
+        receive=receive,
+    )
+    note = MagicMock()
+    bound = pa.session_transport_bindings().http
+    ports = replace(
+        bound,
+        operations=replace(bound.operations, ensure_loop_started=lambda *_: True),
+        note_human_input_queued=note,
+    )
+    handling = asyncio.create_task(session_http.handle_input(request, ports))
+    try:
+        await asyncio.wait_for(committed.wait(), timeout=5)
+        poll = await _runtime_ops().reclaim()
+        assert len(poll) == 1
+        assert len(_input_view().queue._queue) == 1
+    finally:
+        release_reply.set()
+    response = await asyncio.wait_for(handling, timeout=5)
+    payload = json.loads(response.body)
+    assert response.status_code == 202
+    assert payload["accepted"] is True
+    assert payload["duplicate"] is False
+    assert payload["deferred"] is False
+    assert payload["delivery_state"] == "queued"
+    assert len(_drain(_input_view().queue)) == 1
+    note.assert_called_once_with()
 
 
 @pytest.mark.asyncio
