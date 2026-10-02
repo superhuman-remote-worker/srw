@@ -5,8 +5,40 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from langchain_core.messages import AIMessage, HumanMessage
+import pytest
 
 from agent.persistent_graph import PersistentLoopCallbacks
+
+
+@pytest.fixture(autouse=True)
+def _rewind_runtime_owners(monkeypatch, tmp_path):
+    """Legacy rewind tests arrange their own life and restore prior obligations."""
+    from agent.api import persistent_app as pa
+    from agent.api.session_identity import SessionIdentityRuntime
+    from agent.api.session_input import SessionInputRuntime
+    from agent.api.session_termination import SessionTerminationCoordinator
+
+    old_identity, old_termination, old_input = (
+        pa._session_identity,
+        pa._session_termination,
+        pa._session_input,
+    )
+    monkeypatch.setattr(
+        pa, "_session_identity", SessionIdentityRuntime(old_identity._ports)
+    )
+    termination = SessionTerminationCoordinator(
+        old_termination._ports,
+        logger=old_termination._logger,
+        termination_queue_sentinel=old_termination.termination_queue_sentinel,
+    )
+    termination.termination_sentinel_path = tmp_path / "no-termination"
+    monkeypatch.setattr(pa, "_session_termination", termination)
+    monkeypatch.setattr(pa, "_session_input", SessionInputRuntime(old_input._ports))
+    for name in ("_session", "_loop_task", "_event_writer"):
+        monkeypatch.setattr(pa, name, None)
+    for name in ("_tool_inflight", "_turn_event_open"):
+        monkeypatch.setattr(pa, name, False)
+    monkeypatch.setattr(pa, "_rewind_lock", asyncio.Lock())
 
 
 def _minimal_callbacks(**overrides):
