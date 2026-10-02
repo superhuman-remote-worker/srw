@@ -506,8 +506,11 @@ class VMReadinessService:
         host_key_fingerprint = vm.get("ssh_host_key_fingerprint")
         frozen_request = _vm_object(_vm_object(vm.get("creation_preflight")).get("request"))
         network_profile = frozen_request.get("network_profile") if entity_type == "job" else None
+        pre_setup_source = False
         if entity_type == "thread" and vm.get("creation_request_id") is not None:
-            from orchestrator.services.vm_thread_network import verified_source
+            from orchestrator.services.vm_thread_network import (
+                confirmed_pre_setup_source, verified_source,
+            )
 
             try:
                 source = await self._db.fetchrow(
@@ -521,10 +524,18 @@ class VMReadinessService:
                 )
             except (TypeError, ValueError, AttributeError, KeyError):
                 request = None
+            if request is not None and source["thread_runtime_generation"] is not None and (
+                str(source["thread_runtime_generation"]) != row.get("runtime_generation")
+            ):
+                pre_setup_source = await confirmed_pre_setup_source(
+                    self._db, thread_id=entity_id, request_id=vm["creation_request_id"],
+                    generation=generation, runtime_generation=row.get("runtime_generation"),
+                    agent_id=row.get("agent_id"), attach_token=row.get("runtime_attach_token"),
+                )
             if (
                 request is None or source["thread_runtime_generation"] is None
-                or str(source["thread_runtime_generation"])
-                != row.get("runtime_generation")
+                or (str(source["thread_runtime_generation"]) != row.get("runtime_generation")
+                    and not pre_setup_source)
             ):
                 await self._transient_failure(
                     key, entity_type, entity_id, generation, vm,
@@ -737,6 +748,13 @@ class VMReadinessService:
 
         async def mutation_authority() -> tuple[str, int, str] | None:
             """Re-prove the exact launcher immediately before each SSH write."""
+
+            if pre_setup_source and not await confirmed_pre_setup_source(
+                self._db, thread_id=entity_id, request_id=vm["creation_request_id"],
+                generation=generation, runtime_generation=row.get("runtime_generation"),
+                agent_id=row.get("agent_id"), attach_token=row.get("runtime_attach_token"),
+            ):
+                return None
 
             try:
                 current = await self._provisioner.attest_workspace_runtime(

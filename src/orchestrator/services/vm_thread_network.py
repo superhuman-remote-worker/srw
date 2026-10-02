@@ -77,6 +77,55 @@ def verified_source(
     return request if valid else None
 
 
+async def confirmed_pre_setup_source(
+    store,
+    *,
+    thread_id,
+    request_id,
+    generation,
+    runtime_generation,
+    agent_id,
+    attach_token,
+) -> bool:
+    """Admit only the original source's exact confirmed pre-setup successor.
+
+    This proves creation lineage, never guest quiescence. Current binding and
+    physical source must still match before writes and final Ready publication.
+    The existing abort proof retains its published Pod UID and adoption guards.
+    """
+    try:
+        values = (
+            UUID(str(thread_id)),
+            UUID(str(request_id)),
+            UUID(str(generation)),
+            UUID(str(runtime_generation)),
+            UUID(str(agent_id)) if agent_id is not None else None,
+            UUID(str(attach_token)) if attach_token is not None else None,
+        )
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return (
+        await store.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM threads t JOIN vm_creation_retries c "
+            "ON c.thread_id=t.id AND c.owner_kind='thread' "
+            "WHERE t.id=$1 AND c.request_id=$2 AND c.provision_generation=$3 "
+        "AND t.execution_lane='pinned' AND t.runtime_generation=$4 "
+        "AND t.status<>'ended' AND t.ended_at IS NULL "
+            "AND t.agent_id IS NOT DISTINCT FROM $5::uuid "
+            "AND t.runtime_attach_token IS NOT DISTINCT FROM $6::uuid "
+            "AND t.runtime_retirement_token IS NULL "
+            "AND t.pinned_idle_terminal_intent_at IS NULL "
+            "AND t.metadata->'vm'->>'creation_request_id'=c.request_id::text "
+            "AND t.metadata->'vm'->>'provision_generation'=c.provision_generation::text "
+            "AND t.metadata->'vm'->>'vm_uid'=c.observed_vm_uid::text "
+            "AND t.metadata->'vm'->>'rootdisk_pvc_uid'=c.observed_pvc_uid::text "
+            "AND public.vm_thread_creation_pre_setup_abort_evidence(t,c) IS NOT NULL)",
+            *values,
+        )
+        is True
+    )
+
+
 async def inherited_profile_on_conn(
     conn,
     *,

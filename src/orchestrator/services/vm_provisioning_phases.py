@@ -106,13 +106,23 @@ class VMProvisioningPhaseStore:
                 return None if configured_enforcement_policy() is None else False
             metadata = _object(thread["metadata"])
             vm = _object(metadata.get("vm"))
+            exact_actor = (
+                thread["runtime_generation"] == retry["thread_runtime_generation"]
+                and thread["agent_id"] == retry["thread_agent_id"]
+                and thread["runtime_attach_token"] == retry["thread_attach_token"]
+            )
+            from orchestrator.services.vm_thread_network import confirmed_pre_setup_source
+
+            if not exact_actor and not await confirmed_pre_setup_source(
+                conn, thread_id=thread_id, request_id=retry["request_id"],
+                generation=generation, runtime_generation=thread["runtime_generation"],
+                agent_id=thread["agent_id"], attach_token=thread["runtime_attach_token"],
+            ):
+                return False
             if (
                 thread["execution_lane"] != "pinned"
                 or thread["runtime_retirement_token"] is not None
                 or thread["pinned_idle_terminal_intent_at"] is not None
-                or thread["runtime_generation"] != retry["thread_runtime_generation"]
-                or thread["agent_id"] != retry["thread_agent_id"]
-                or thread["runtime_attach_token"] != retry["thread_attach_token"]
                 or retry["state"] != "succeeded"
                 or retry["reason"] != "creation_adopted"
                 or retry["observed_vm_uid"] != UUID(vm_uid)
@@ -219,7 +229,7 @@ class VMProvisioningPhaseStore:
                 "WHERE id=$1 AND runtime_generation=$3 "
                 "AND runtime_retirement_token IS NULL",
                 thread["id"], json.dumps(metadata),
-                retry["thread_runtime_generation"],
+                thread["runtime_generation"],
             )
             if changed != "UPDATE 1":
                 return False

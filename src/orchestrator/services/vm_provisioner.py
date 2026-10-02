@@ -3463,7 +3463,7 @@ class VMProvisioner:
                     )
                 except (TypeError, ValueError):
                     return False
-                return bool(
+                exact_source = bool(
                     source and source["owner_kind"] == "thread"
                     and str(source["thread_id"]) == thread_id
                     and str(source["thread_runtime_generation"])
@@ -3474,6 +3474,15 @@ class VMProvisioner:
                     and (str(source["thread_attach_token"])
                          if source["thread_attach_token"] else None)
                     == expected_attach_token
+                )
+                if exact_source:
+                    return True
+                from orchestrator.services.vm_thread_network import confirmed_pre_setup_source
+
+                return await confirmed_pre_setup_source(
+                    self._db, thread_id=thread_id, request_id=request_id,
+                    generation=generation, runtime_generation=expected_runtime_generation,
+                    agent_id=expected_agent_id, attach_token=expected_attach_token,
                 )
             from orchestrator.services.vm_creation_request import (
                 build_vm_creation_request,

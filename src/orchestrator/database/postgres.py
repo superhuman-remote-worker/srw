@@ -25098,6 +25098,8 @@ class PostgresDB:
         query = (
             "SELECT id::text AS entity_id, user_id::text AS user_id, "
             "runtime_generation::text AS runtime_generation, "
+            "agent_id::text AS agent_id, "
+            "runtime_attach_token::text AS runtime_attach_token, "
             "COALESCE(metadata->'workspace_preparation',metadata->'vm') AS vm FROM threads WHERE ("
             + status_clause
             + (
