@@ -23,6 +23,8 @@ def pytest_runtest_setup(item):
     identity._runtime_contract = True
     identity._session_generation = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
     termination.termination_admission_fenced = True
+    queue = asyncio.Queue()
+    inputs._queue = queue
     loop, task = None, None
     if os.environ.get("OFFICER_INHERITED_TASK") == "1":
         loop = asyncio.new_event_loop()
@@ -34,7 +36,7 @@ def pytest_runtest_setup(item):
         loop.run_until_complete(asyncio.sleep(0))
         termination.termination_task = task
     global _prior
-    _prior = (identity, termination, inputs, loop, task)
+    _prior = (identity, termination, inputs, queue, loop, task)
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -42,11 +44,12 @@ def pytest_sessionfinish(session, exitstatus):
         return
     from agent.api import persistent_app as pa
 
-    identity, termination, inputs, loop, task = _prior
+    identity, termination, inputs, queue, loop, task = _prior
     try:
         assert pa._session_identity is identity
         assert pa._session_termination is termination
         assert pa._session_input is inputs
+        assert inputs.queue is queue
         assert identity.thread_id == "prior-fixture-thread"
         assert identity.session_generation == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
         assert termination.termination_admission_fenced
