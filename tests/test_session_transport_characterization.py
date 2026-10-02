@@ -1073,6 +1073,18 @@ class TestInput:
         assert response.status_code == 202
         assert connected.is_set()
 
+    def test_rest_human_input_queued_by_poll_clears_abandoned_session_watchdog(
+        self, client, rt
+    ):
+        connected = asyncio.Event()
+        rt.set("_ws_connected_event", connected)
+        rt.accept.return_value = _admission(enqueued=False, duplicate=False)
+
+        response = client.post("/api/input", json=_input_body())
+
+        assert response.status_code == 202
+        assert connected.is_set()
+
     @pytest.mark.parametrize(
         "admission",
         [
