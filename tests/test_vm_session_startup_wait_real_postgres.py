@@ -19,6 +19,9 @@ from tests.test_pinned_vm_initial_binding_real_postgres import (
     pg_dsn,  # noqa: F401
     thread_schema,  # noqa: F401
 )
+from tests.test_session_attach_shutdown_ordering import (
+    runtime as shutdown_runtime,  # noqa: F401
+)
 
 
 @pytest.mark.asyncio
@@ -655,6 +658,126 @@ async def test_wait_hint_rejects_corrupt_immutable_waiter_digest_without_writing
 
 class _RollbackFixture(Exception):
     pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dedicated", [True, False], ids=["dedicated", "pool"])
+async def test_shutdown_cannot_retire_a_postgres_life_while_attach_owns_cleanup(
+    pg_store,  # noqa: F811
+    monkeypatch,
+    shutdown_runtime,  # noqa: F811
+    dedicated,
+):
+    from agent.api import persistent_app as pa
+    from tests.test_session_attach_shutdown_ordering import (
+        test_lifespan_never_terminates_over_attach_cleanup,
+    )
+
+    current, source = await _nonquota_waiting_source(pg_store, monkeypatch)
+
+    async def retire(*args, **kwargs):
+        return await pg_store.begin_pinned_thread_retirement(
+            str(current["id"]),
+            permanent=False,
+            expected_runtime_generation=str(current["runtime_generation"]),
+            expected_agent_id=str(current["agent_id"]),
+            expected_attach_token=str(current["runtime_attach_token"]),
+            settle_status="ended",
+        )
+
+    pa._session_termination.terminate.side_effect = retire
+    await test_lifespan_never_terminates_over_attach_cleanup(
+        monkeypatch, shutdown_runtime, dedicated, True, thread=str(current["id"])
+    )
+    after = await pg_store.get_thread(str(current["id"]))
+    assert after["runtime_generation"] == current["runtime_generation"]
+    assert after["runtime_retirement_token"] is None
+    assert after["agent_id"] == current["agent_id"]
+    assert after["runtime_attach_token"] == current["runtime_attach_token"]
+    assert (
+        await pg_store.fetchval(
+            "SELECT state FROM vm_creation_retries WHERE request_id=$1",
+            source["request_id"],
+        )
+        == source["state"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_nonquota_admission_age_cannot_restart_on_read(
+    pg_store,  # noqa: F811
+    monkeypatch,
+):
+    from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
+
+    current, source = await _nonquota_waiting_source(pg_store, monkeypatch)
+    await pg_store.execute(
+        "UPDATE vm_creation_retries SET next_probe_at=clock_timestamp() WHERE request_id=$1",
+        source["request_id"],
+    )
+    retry = VMCreationRetryStore(pg_store)
+    claim = (await retry.claim_due(limit=1))[0]
+    admission = await retry.authorize_controller(
+        request_id=str(source["request_id"]),
+        claim_token=str(claim["claim_token"]),
+        observed={
+            "job_id": str(current["id"]),
+            "provision_generation": str(source["provision_generation"]),
+            "request_digest": source["request_digest"],
+            "controller_configuration_digest": source[
+                "controller_configuration_digest"
+            ],
+            "expected_pvc_uid": None,
+        },
+    )
+    assert admission["allowed"] is True
+    with pytest.raises(_RollbackFixture):
+        async with pg_store.acquire() as conn, conn.transaction():
+            # Age only this disposable fixture inside a rolled-back transaction.
+            # The readiness view must read its persisted admission, not poll time.
+            await conn.execute(
+                "UPDATE vm_workspace_cleanup_admissions SET admitted_at=clock_timestamp()-interval '1900 seconds' "
+                "WHERE id=(SELECT creation_admission_id FROM vm_creation_retries WHERE request_id=$1)",
+                source["request_id"],
+            )
+            for _ in range(2):
+                view = await vm_thread_initial.initial_vm_startup_view(
+                    current, store=conn
+                )
+                assert view is not None and view["phase"] == "admitted"
+                assert 1900 <= view["admission_elapsed_s"] < 1930
+            raise _RollbackFixture
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "column", ["request_digest", "controller_configuration_digest"]
+)
+async def test_nonquota_wait_refuses_corrupt_frozen_digest_without_writing(
+    pg_store,  # noqa: F811
+    monkeypatch,
+    column,
+):
+    current, source = await _nonquota_waiting_source(pg_store, monkeypatch)
+    with pytest.raises(_RollbackFixture):
+        async with pg_store.acquire() as conn, conn.transaction():
+            await conn.execute("SET LOCAL session_replication_role = replica")
+            await conn.execute(
+                f"UPDATE vm_creation_retries SET {column}=$2 WHERE request_id=$1",
+                source["request_id"],
+                "sha256:" + "f" * 64,
+            )
+            assert (
+                await vm_thread_initial.initial_vm_startup_view(current, store=conn)
+                is None
+            )
+            raise _RollbackFixture
+    after = await pg_store.fetchrow(
+        "SELECT state,reason,revision,request_digest,controller_configuration_digest "
+        "FROM vm_creation_retries WHERE request_id=$1",
+        source["request_id"],
+    )
+    assert all(after[key] == source[key] for key in after.keys())
 
 
 @pytest.mark.asyncio

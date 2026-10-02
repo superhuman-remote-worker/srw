@@ -49,10 +49,10 @@ def runtime(monkeypatch):
 @pytest.mark.parametrize("dedicated", [True, False], ids=["dedicated", "pool"])
 @pytest.mark.parametrize("cleanup_blocked", [True, False], ids=["unproven", "joined"])
 async def test_lifespan_never_terminates_over_attach_cleanup(
-    monkeypatch, runtime, dedicated, cleanup_blocked
+    monkeypatch, runtime, dedicated, cleanup_blocked, *, thread=None
 ):
     entered, cleanup, finish = (asyncio.Event() for _ in range(3))
-    thread = str(uuid4())
+    thread = thread or str(uuid4())
 
     async def attach(_thread):
         pa._session = SimpleNamespace()
