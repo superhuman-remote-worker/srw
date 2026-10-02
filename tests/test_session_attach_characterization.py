@@ -463,11 +463,12 @@ async def test_dedicated_attach_adopts_registration_identity_before_any_await(
             }
         )
 
-    _poll(monkeypatch, _workspace(), on_call=during_poll)
+    poll_calls = _poll(monkeypatch, _workspace(), on_call=during_poll)
     before = identity()["attach_generation"]
 
     await attach(thread_id=TA)
 
+    assert poll_calls[0]["session_runtime_generation"] == G1
     (during,) = seen
     assert during["identity"]["thread_id"] == TA
     assert during["identity"]["generation"] == G1

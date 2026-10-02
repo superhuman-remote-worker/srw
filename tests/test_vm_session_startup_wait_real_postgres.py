@@ -1,6 +1,8 @@
 """The internal startup hint is read from the current native Session source."""
 
 from copy import deepcopy
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -17,6 +19,57 @@ from tests.test_pinned_vm_initial_binding_real_postgres import (
     pg_dsn,  # noqa: F401
     thread_schema,  # noqa: F401
 )
+
+
+@pytest.mark.asyncio
+async def test_coordinator_polls_the_exact_postgres_startup_generation(
+    pg_store, monkeypatch
+):
+    from agent.api.session_attach import SessionAttachCoordinator
+    from agent.api.session_workspace import poll_workspace_ready
+    from tests.test_session_attach_runtime import _identity, _ports
+
+    current, source, _policy = await _waiting_source(pg_store, monkeypatch)
+    view = await vm_thread_initial.initial_vm_startup_view(current, store=pg_store)
+    assert view is not None
+    generation = str(current["runtime_generation"])
+    identity, _ = _identity()
+    identity.bind_thread(str(current["id"]))
+    identity.adopt(
+        generation, str(current["runtime_attach_token"]), contract_advertised=True
+    )
+    wait = {
+        "vm_status": "waiting_capacity",
+        "session_runtime_generation": generation,
+        "vm_startup": view,
+    }
+    ready = {
+        **wait,
+        "vm_status": "ready",
+        "vm_ssh_host": "192.0.2.10",
+        "vm_startup": {**view, "phase": "admitted", "admission_elapsed_s": 1},
+    }
+    client = SimpleNamespace(get_thread_workspace=AsyncMock(side_effect=[wait, ready]))
+    coordinator = SessionAttachCoordinator(
+        _ports(
+            identity,
+            orchestrator_client=lambda: client,
+            poll_workspace_ready=poll_workspace_ready,
+        )
+    )
+    result = await coordinator._poll_workspace(
+        str(current["id"]), require_vm=True, poll_interval=0
+    )
+    assert result is not None
+    assert result["session_runtime_generation"] == generation
+    assert client.get_thread_workspace.await_count == 2
+    assert (
+        await pg_store.fetchval(
+            "SELECT count(*) FROM vm_creation_effects WHERE request_id=$1",
+            source["request_id"],
+        )
+        == 0
+    )
 
 
 async def _waiting_source(store, monkeypatch):
