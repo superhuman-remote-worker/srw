@@ -1470,20 +1470,9 @@ async def lifespan(app: FastAPI):
     # --- Shutdown ---
     logger.info("Shutting down persistent agent")
 
-    await _session_attach.stop_startup_attach()
-
-    # A pool attach is admitted synchronously but finishes in the background.
-    # Own that task through shutdown so workspace/setup code cannot continue
-    # after the client is deregistered and lose its exact release fence.
-    attach_task = _session_attach.pool_task
-    if attach_task is not None and not attach_task.done():
-        attach_task.cancel()
-        try:
-            await attach_task
-        except asyncio.CancelledError:
-            pass
-
-    await _session_attach.release_shutdown_receipt()
+    attach_settled = await _session_attach.stop_startup_attach()
+    if attach_settled:
+        await _session_attach.release_shutdown_receipt()
 
     # Exact drain settlement retries are independent of ordinary heartbeats
     # (Begin makes those authority-refused). Own their lifetime explicitly so
@@ -1507,7 +1496,7 @@ async def lifespan(app: FastAPI):
     # Detach any active session. Stateless lane: never mark the thread ended —
     # thread lifecycle belongs to the orchestrator, and the next claim (on any
     # pod) picks the thread back up from thread_messages.
-    if _session:
+    if _session and attach_settled:
         await _session_termination.terminate("shutdown", mark_thread=not stateless)
 
     await _session_termination.drain_loop_completion_tasks()

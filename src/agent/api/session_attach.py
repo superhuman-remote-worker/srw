@@ -777,21 +777,34 @@ class SessionAttachCoordinator:
                 self._startup_task = None
 
     async def stop_startup_attach(self, *, cleanup_timeout: float = 5.0) -> bool:
-        """Bound the remaining local task; false means proof must come from recovery."""
-        task = self._startup_task
-        if task is None:
+        """Bound dedicated and pool cleanup; pending work requires recovery proof.
+
+        Both tasks own the same attach transaction. Cancellation requests its
+        rollback; only a completed join permits shutdown to touch that session.
+        A repeated stop must not inject another cancellation into the rollback.
+        """
+        tasks = {
+            task for task in (self._startup_task, self._pool_task) if task is not None
+        }
+        if not tasks:
             return True
-        if not task.done():
-            task.cancel()
-            await asyncio.wait({task}, timeout=max(0.0, cleanup_timeout))
-        if not task.done():
+        pending = {task for task in tasks if not task.done()}
+        for task in pending:
+            if not task.cancelling():
+                task.cancel()
+        if pending:
+            await asyncio.wait(pending, timeout=max(0.0, cleanup_timeout))
+        done = {task for task in tasks if task.done()}
+        await asyncio.gather(*done, return_exceptions=True)
+        if self._startup_task in done:
+            self._startup_task = None
+        if self._pool_task in done:
+            self._pool_task = None
+        if done != tasks:
             self._logger.warning(
-                "Startup cleanup still owns unproven work; remote quiescence refused"
+                "Attach cleanup still owns unproven work; remote quiescence refused"
             )
             return False
-        await asyncio.gather(task, return_exceptions=True)
-        if self._startup_task is task:
-            self._startup_task = None
         return True
 
     async def attach(
