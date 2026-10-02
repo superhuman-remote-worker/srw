@@ -49,6 +49,7 @@ interface ConsoleErrorEntry {
 export type NetworkEntry = ResponseEntry | FailureEntry | PageErrorEntry | ConsoleErrorEntry;
 
 const THREAD_STREAM = /^\/api\/persistent\/threads\/([^/]+)\/stream$/;
+const THREAD_DETAIL = /^\/api\/persistent\/threads\/([^/]+)$/;
 const CONNECTION = /^\/api\/sessions\/([^/]+)\/connection$/;
 const CONTROL_WEBSOCKET = /^\/p\/([^/]+)\/ws$/;
 const GLOBAL_SSE = new Set(['/api/notifications/events', '/api/sudo/events']);
@@ -218,15 +219,15 @@ export class NetworkLedger {
     if (this.phase === 'list-navigation' && ownedThreadStream) {
       return 'expected-navigation-cancellation';
     }
-    const connectionMatch = pathname.match(CONNECTION);
-    // A Chrome reload cancels a poll from the old document. Keep failures of
-    // polls started by the new document visible to the network guard.
+    const oldDocumentReadMatch = pathname.match(CONNECTION) ?? pathname.match(THREAD_DETAIL);
+    // A Chrome reload cancels an owned read from the old document. Keep
+    // failures of reads started by the new document visible to the guard.
     if (
       this.phase === 'reload' &&
       startedPhase === 'turn' &&
       reason === 'net::ERR_ABORTED' &&
-      connectionMatch !== null &&
-      this.ownedThreadIds.has(decodeURIComponent(connectionMatch[1]))
+      oldDocumentReadMatch !== null &&
+      this.ownedThreadIds.has(decodeURIComponent(oldDocumentReadMatch[1]))
     ) {
       return 'expected-navigation-cancellation';
     }
