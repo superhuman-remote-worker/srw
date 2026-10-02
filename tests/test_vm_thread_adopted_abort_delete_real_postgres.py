@@ -1,5 +1,8 @@
 """A confirmed pre-setup release preserves the original VM creation audit."""
 
+from uuid import uuid4
+
+import asyncpg
 import pytest
 
 from tests.test_pinned_vm_failed_initial_end_real_postgres import _release_binding
@@ -81,3 +84,53 @@ async def test_adopted_vm_pre_setup_release_then_permanent_delete(
             original["runtime_generation"],
         )
     ) == dict(abort)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "defect", ["replacement_uid", "missing_intent", "other_generation"]
+)
+async def test_pre_setup_abort_delete_requires_exact_published_agent_pod(
+    db,  # noqa: F811
+    setup,  # noqa: F811
+    monkeypatch,
+    defect,
+):
+    original, _ = await adopted_source(db, setup, monkeypatch)
+    assert await _release_binding(db, original) == "released"
+    current = await db.get_thread(str(original["id"]))
+    assert await db.delete_agent(str(original["agent_id"]))
+    retirement = await cleaned_retirement(db, current, permanent=True)
+    # Corrupt only a disposable test database to test final audit authority.
+    async with db.acquire() as conn, conn.transaction():
+        await conn.execute("SET LOCAL session_replication_role='replica'")
+        if defect == "replacement_uid":
+            await conn.execute(
+                "UPDATE thread_runtime_attach_abort_outcomes SET agent_pod_uid=$3 "
+                "WHERE thread_id=$1 AND runtime_generation=$2",
+                original["id"],
+                original["runtime_generation"],
+                str(uuid4()),
+            )
+        elif defect == "missing_intent":
+            await conn.execute(
+                "DELETE FROM thread_agent_pod_provision_intents "
+                "WHERE thread_id=$1 AND runtime_generation=$2",
+                original["id"],
+                original["runtime_generation"],
+            )
+        else:
+            await conn.execute(
+                "UPDATE thread_agent_pod_provision_intents SET runtime_generation=$3 "
+                "WHERE thread_id=$1 AND runtime_generation=$2",
+                original["id"],
+                original["runtime_generation"],
+                uuid4(),
+            )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.delete_thread(
+            str(current["id"]),
+            expected_runtime_generation=retirement["generation"],
+            expected_runtime_retirement_token=retirement["token"],
+        )
+    assert await db.get_thread(str(current["id"])) is not None
