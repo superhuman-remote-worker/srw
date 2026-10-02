@@ -325,11 +325,15 @@ async def test_nonquota_readiness_clock_starts_at_durable_controller_admission(
     retry = VMCreationRetryStore(pg_store)
     claim = (await retry.claim_due(limit=1))[0]
     admission = await retry.authorize_controller(
-        request_id=str(source["request_id"]), claim_token=str(claim["claim_token"]),
+        request_id=str(source["request_id"]),
+        claim_token=str(claim["claim_token"]),
         observed={
-            "job_id": str(current["id"]), "provision_generation": str(source["provision_generation"]),
+            "job_id": str(current["id"]),
+            "provision_generation": str(source["provision_generation"]),
             "request_digest": source["request_digest"],
-            "controller_configuration_digest": source["controller_configuration_digest"],
+            "controller_configuration_digest": source[
+                "controller_configuration_digest"
+            ],
             "expected_pvc_uid": None,
         },
     )
@@ -338,9 +342,13 @@ async def test_nonquota_readiness_clock_starts_at_durable_controller_admission(
         view = await vm_thread_initial.initial_vm_startup_view(current, store=pg_store)
         assert view is not None and view["phase"] == "admitted"
         assert 0 <= view["admission_elapsed_s"] < 30
-    assert await pg_store.fetchval(
-        "SELECT count(*) FROM vm_creation_effects WHERE request_id=$1", source["request_id"]
-    ) == 0
+    assert (
+        await pg_store.fetchval(
+            "SELECT count(*) FROM vm_creation_effects WHERE request_id=$1",
+            source["request_id"],
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio

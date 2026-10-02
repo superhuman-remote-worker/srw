@@ -1,9 +1,13 @@
 """Admit a fresh pinned VM only after its exact agent has bound."""
 
 from collections.abc import Mapping
+import json
 from uuid import UUID
 
 from fastapi import HTTPException
+
+from shared.vm_creation_issuance import canonical_configuration_digest
+from shared.vm_creation_retry import canonical_request_digest
 
 from orchestrator.services.manifest_execution_snapshot import read_execution
 from orchestrator.services.stateless_workspace_gate import thread_metadata_object
@@ -232,9 +236,14 @@ async def initial_vm_startup_view(thread, *, store):
     row = await store.fetchrow(
         "SELECT r.request_id,r.provision_generation,r.state,r.reason,r.boot_counted,"
         "r.observed_vm_uid,r.observed_pvc_uid,r.creation_admission_id,"
+        "r.controller_configuration,r.controller_configuration_digest,"
+        "r.canonical_request,r.request_digest,"
         "w.state AS waiter_state,"
+        "EXISTS(SELECT 1 FROM vm_resource_waiters x WHERE x.request_id=r.request_id) AS has_waiter,"
         "(SELECT min(v.created_at) FROM vm_resource_reservations v "
         "WHERE v.request_id=r.request_id) AS first_reservation_at,"
+        "(SELECT c.admitted_at FROM vm_workspace_cleanup_admissions c "
+        "WHERE c.id=r.creation_admission_id) AS controller_admission_at,"
         "(SELECT count(*) FROM vm_creation_effects e WHERE e.request_id=r.request_id "
         "AND e.state<>'rejected') AS issued_effects,"
         "clock_timestamp() AS read_at "
@@ -246,7 +255,7 @@ async def initial_vm_startup_view(thread, *, store):
         "AND r.provision_generation=$6 AND r.thread_wake_operation_id IS NULL "
         "AND r.thread_owner_user_id IS NOT DISTINCT FROM t.user_id "
         "AND r.thread_owner_project_id IS NOT DISTINCT FROM t.project_id "
-        "JOIN vm_resource_waiters w ON w.request_id=r.request_id "
+        "LEFT JOIN vm_resource_waiters w ON w.request_id=r.request_id "
         "AND w.owner_kind='thread' AND w.thread_id=t.id AND w.job_id IS NULL "
         "AND w.provision_generation=r.provision_generation "
         "AND w.request_digest=r.request_digest "
@@ -275,26 +284,62 @@ async def initial_vm_startup_view(thread, *, store):
     )
     if row is None or row["state"] in {"attention", "cancel_requested", "settled"}:
         return None
+    try:
+        configuration = row["controller_configuration"]
+        request_payload = row["canonical_request"]
+        if isinstance(configuration, str):
+            configuration = json.loads(configuration)
+        if isinstance(request_payload, str):
+            request_payload = json.loads(request_payload)
+        if (
+            canonical_configuration_digest(configuration)
+            != row["controller_configuration_digest"]
+            or canonical_request_digest(request_payload) != row["request_digest"]
+            or configuration["version"] not in {1, 3}
+            or configuration.get("persistent_rootdisk") is not True
+        ):
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    nonquota = configuration["version"] == 1
+    if nonquota and (
+        row["has_waiter"]
+        or configuration.get("resource_admission") is not None
+        or configuration.get("network_profile_policy") is not None
+        or request_payload.get("network_profile") is not None
+    ):
+        return None
+    if not nonquota and row["waiter_state"] is None:
+        return None
     identity = {
         "contract_version": 1,
         "request_id": str(request),
         "provision_generation": str(provision),
         "runtime_generation": str(runtime),
     }
-    if row["first_reservation_at"] is not None:
-        if row["waiter_state"] != "admitted":
+    first_admission_at = (
+        row["controller_admission_at"] if nonquota else row["first_reservation_at"]
+    )
+    if first_admission_at is not None:
+        if not nonquota and row["waiter_state"] != "admitted":
             return None
         return {
             **identity,
             "phase": "admitted",
             "admission_elapsed_s": max(
-                0.0, (row["read_at"] - row["first_reservation_at"]).total_seconds()
+                0.0, (row["read_at"] - first_admission_at).total_seconds()
             ),
         }
     if (
         row["state"] in {"queued", "reconciling"}
-        and row["reason"] == "resource_wait"
-        and row["waiter_state"] == "waiting"
+        and (
+            (nonquota and row["reason"] == "controller_count_wait")
+            or (
+                not nonquota
+                and row["reason"] == "resource_wait"
+                and row["waiter_state"] == "waiting"
+            )
+        )
         and not row["boot_counted"]
         and row["observed_vm_uid"] is None
         and row["observed_pvc_uid"] is None
