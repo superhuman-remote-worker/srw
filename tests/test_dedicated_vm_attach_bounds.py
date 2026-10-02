@@ -315,12 +315,33 @@ async def test_pending_dedicated_attach_refuses_without_thread_or_drain(monkeypa
         (persistent_app.SessionGrantDenied("denied"), "_exit_grant_denied"),
         (persistent_app.MemoryUnavailableError("memory"), "_exit_memory_unavailable"),
         (persistent_app.WorkspaceNotReady("workspace"), "_exit_workspace_not_ready"),
+        (
+            persistent_app.WorkspaceUnavailableError("remote unavailable"),
+            "_exit_workspace_not_ready",
+        ),
+        (RuntimeError("unexpected setup failure"), None),
     ],
 )
 async def test_dedicated_background_attach_preserves_exact_exit_reason(
     monkeypatch, error, exit_name
 ):
     _patch(monkeypatch, "_attach_session", AsyncMock(side_effect=error))
+
+    def exit_process(code):
+        raise SystemExit(code)
+
+    process_exit = MagicMock(side_effect=exit_process)
+    monkeypatch.setattr(persistent_app._session_termination, "_logger", MagicMock())
+    monkeypatch.setattr(persistent_app.os, "_exit", process_exit)
+    if exit_name is None:
+        with pytest.raises(SystemExit) as exit_result:
+            await persistent_app._session_attach.run_dedicated_attach(
+                "tid",
+                on_failure=persistent_app._session_termination.handle_attach_failure,
+            )
+        assert exit_result.value.code == 1
+        process_exit.assert_called_once_with(1)
+        return
     exit_handler = AsyncMock()
     monkeypatch.setattr(
         persistent_app._session_termination, exit_name.removeprefix("_"), exit_handler
@@ -330,6 +351,22 @@ async def test_dedicated_background_attach_preserves_exact_exit_reason(
     )
     assert exit_handler.await_count == 1
     assert exit_handler.await_args.args[0] == "tid"
+    process_exit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ready_after_typed_wait_must_keep_the_source(vm_startup_clock):
+    clock, _wait, admitted, ready = vm_startup_clock
+    missing_source = {key: value for key, value in ready.items() if key != "vm_startup"}
+    client = AsyncMock()
+    client.get_thread_workspace.side_effect = [admitted, missing_source, ready]
+    result = await _poll_workspace_ready(
+        client, "tid", require_vm=True, poll_interval=30
+    )
+    assert result is not None
+    assert result["session_runtime_generation"] == ready["session_runtime_generation"]
+    assert client.get_thread_workspace.await_count == 3
+    assert clock["now"] == 60
 
 
 def _client():
@@ -369,7 +406,12 @@ async def test_vm_attach_stops_when_the_session_ends_mid_boot():
 
     with pytest.raises(SessionEnded):
         await session_workspace.poll_workspace_ready(
-            client, "tid", timeout=120, poll_interval=0, require_vm=True, session_runtime_generation=None
+            client,
+            "tid",
+            timeout=120,
+            poll_interval=0,
+            require_vm=True,
+            session_runtime_generation=None,
         )
     assert client.get_thread_workspace.call_count == 3
 
@@ -391,7 +433,13 @@ async def test_vm_attach_that_never_becomes_ready_ends_at_the_agent_budget(
     client.get_thread_workspace.return_value = {"vm_status": "provisioning"}
 
     result = await session_workspace.poll_workspace_ready(
-        client, "tid", timeout=120, poll_interval=30, require_vm=True, vm_timeout=900, session_runtime_generation=None
+        client,
+        "tid",
+        timeout=120,
+        poll_interval=30,
+        require_vm=True,
+        vm_timeout=900,
+        session_runtime_generation=None,
     )
 
     assert result is None

@@ -93,6 +93,42 @@ async def _waiting_source(store, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_bound_postgres_life_is_reserved_before_session_construction(
+    pg_store, monkeypatch
+):
+    import asyncio
+    from agent.api.session_attach import SessionAttachCoordinator
+    from tests.test_session_attach_runtime import _identity, _ports
+
+    current, source, _policy = await _waiting_source(pg_store, monkeypatch)
+    identity, _ = _identity()
+    identity.bind_thread(str(current["id"]))
+    identity.adopt(
+        str(current["runtime_generation"]),
+        str(current["runtime_attach_token"]),
+        contract_advertised=True,
+    )
+    coordinator = SessionAttachCoordinator(_ports(identity))
+    coordinator.attach = AsyncMock()
+    try:
+        assert coordinator.pool_heartbeat_status() == "session"
+        admission = await coordinator.admit_pool_attach(str(current["id"]), {})
+        assert admission.status_code == 409
+        coordinator.attach.assert_not_awaited()
+        assert coordinator.pool_task is None
+        assert (
+            await pg_store.fetchval(
+                "SELECT count(*) FROM vm_creation_effects WHERE request_id=$1",
+                source["request_id"],
+            )
+            == 0
+        )
+    finally:
+        if coordinator.pool_task is not None:
+            await asyncio.gather(coordinator.pool_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_current_initial_session_wait_has_only_typed_read_only_hint(
     pg_store,  # noqa: F811
     monkeypatch,
