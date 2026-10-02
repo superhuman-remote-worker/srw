@@ -28,7 +28,9 @@ db = _db
 setup = _setup
 
 
-async def cancelled_source(db, monkeypatch, *, retire=True, golden_enabled=True):
+async def cancelled_source(
+    db, monkeypatch, *, retire=True, golden_enabled=True, creation_resolver=None
+):
     thread_id, _, override, dependencies = await _initial_vm(
         db, monkeypatch, native=True
     )
@@ -45,7 +47,9 @@ async def cancelled_source(db, monkeypatch, *, retire=True, golden_enabled=True)
     monkeypatch.setenv("VM_LIFECYCLE_HMAC_SECRET", SECRET.decode())
 
     async def resolve(_client, request, *, secret):
-        return {"request": request, "controller_configuration": configuration}
+        return creation_resolver(request) if creation_resolver else {
+            "request": request, "controller_configuration": configuration
+        }
 
     monkeypatch.setattr(
         "orchestrator.services.vm_creation_transport.resolve_vm_creation_configuration",
