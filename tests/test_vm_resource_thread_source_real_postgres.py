@@ -301,7 +301,7 @@ async def test_thread_source_and_cleanup_permit_do_not_deadlock_on_observed_pvc(
 
 async def _adopted_charged_thread(
     db, monkeypatch, *, stop_after="vm", adopt=True, observe_last=True,
-    stop_before_effect=False, golden_enabled=False,
+    stop_before_effect=False, golden_enabled=False, bind_actor=None,
 ):
     """Real typed CAS, shared admit, signed effects and optional adoption."""
     from tests.test_vm_creation_actuation import SECRET
@@ -310,6 +310,9 @@ async def _adopted_charged_thread(
     monkeypatch.setenv("VM_LIFECYCLE_HMAC_SECRET", SECRET.decode())
     policy, inventory, sample, demand = await environment(db)
     _, thread_id = await _thread(db, lane="pinned", status="created")
+    binding = await bind_actor(db, thread_id) if bind_actor is not None else None
+    actor = str(binding["agent_id"]) if binding is not None else None
+    attach = str(binding["runtime_attach_token"]) if binding is not None else None
     runtime = await db.fetchval(
         "SELECT runtime_generation FROM threads WHERE id=$1", thread_id,
     )
@@ -338,7 +341,7 @@ async def _adopted_charged_thread(
     proposed.update(status="provisioning", provision_generation=str(generation))
     assert await db.begin_pinned_thread_vm_provisioning(
         str(thread_id), expected_runtime_generation=str(runtime),
-        expected_agent_id=None, expected_attach_token=None,
+        expected_agent_id=actor, expected_attach_token=attach,
         expected_vm_context=None, provision_context=proposed,
         creation_source={
             "request_id": str(request_id), "request": request,
@@ -375,7 +378,7 @@ async def _adopted_charged_thread(
         "intent_digest": grant["intent_digest"],
         "retry_request_id": str(request_id), "job_id": str(thread_id),
         "owner_kind": "thread", "thread_runtime_generation": str(runtime),
-        "thread_agent_id": None, "thread_attach_token": None,
+        "thread_agent_id": actor, "thread_attach_token": attach,
         "thread_wake_operation_id": None,
         "provision_generation": str(generation),
         "request_digest": canonical_request_digest(request),
@@ -479,11 +482,11 @@ async def _adopted_charged_thread(
     )
 
 
-async def _ready_charged_thread(db, monkeypatch, *, compact_registration=True):
+async def _ready_charged_thread(db, monkeypatch, *, compact_registration=True, bind_actor=None):
     (
         _, inventory, sample, demand, thread_id, runtime, generation,
         request_id, admitted, observations, _,
-    ) = await _adopted_charged_thread(db, monkeypatch)
+    ) = await _adopted_charged_thread(db, monkeypatch, bind_actor=bind_actor)
     vm_uid = observations["vm"]["object"]["metadata"]["uid"]
     vmi_uid, launcher_uid = (str(uuid4()) for _ in range(2))
     # The live SSH readiness prober issues uuid4().hex, not a hyphenated UUID.
