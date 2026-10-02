@@ -8402,21 +8402,28 @@ class ContainerProvisioner:
         container_statuses = getattr(
             getattr(pod, "status", None), "container_statuses", None
         )
-        if (
-            owner.kind == "job"
-            and reservation.get("cancel_target_disposition") == "deleted"
-            and reservation.get("cancel_resource_policy") == "terminal_reclaim"
-            and getattr(getattr(pod, "status", None), "phase", None) == "Running"
+        phase = getattr(getattr(pod, "status", None), "phase", None)
+        running_job = (
+            phase == "Running"
             and isinstance(container_statuses, (list, tuple))
             and any(
                 getattr(getattr(status, "state", None), "running", None) is not None
                 for status in container_statuses
             )
+        )
+        stopped_job = phase in {"Failed", "Succeeded"} and _pod_has_exact_process_zero(
+            pod
+        )
+        if (
+            owner.kind == "job"
+            and reservation.get("cancel_target_disposition") == "deleted"
+            and reservation.get("cancel_resource_policy") == "terminal_reclaim"
+            and (running_job or stopped_job)
         ):
-            # A running Job may have started before its creation reservation
-            # settled. The owner-locked conversion can reuse only its exact,
-            # still-unclaimed terminal intent; cleanup still has to prove
-            # process zero before releasing the Pod or reclaiming its storage.
+            # A Job may have started before its creation reservation settled,
+            # then still be running or have exact Pod process-zero evidence.
+            # The owner-locked conversion reuses only its exact unclaimed
+            # terminal intent; cleanup retains the finalizer and SQL fences.
             return await self._creation_has_fresh_owned_storage(
                 owner, reservation, pod=pod
             )
