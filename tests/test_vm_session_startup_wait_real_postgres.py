@@ -92,6 +92,220 @@ async def _waiting_source(store, monkeypatch):
     return current, source, policy
 
 
+async def _nonquota_waiting_source(store, monkeypatch):
+    import httpx
+    from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
+    from orchestrator.services.vm_creation_transport import replay_vm_creation
+    from shared.vm_lifecycle_auth import AUTH_FIELD, sign_payload, verify_payload
+    from tests.test_vm_resource_configuration import whole_launcher_configuration
+
+    thread_id, _policy, _override, dependencies = await _initial_vm(
+        store, monkeypatch, native=True
+    )
+    current = await _bind_cold_agent(store, thread_id)
+    configuration = whole_launcher_configuration()
+    configuration.update(version=1, namespace="workers", storage_class="local")
+    configuration.pop("resource_admission")
+    monkeypatch.delenv("VM_RESOURCE_ADMISSION_CONFIG")
+
+    async def resolve(_client, request, *, secret):
+        return {"request": request, "controller_configuration": configuration}
+
+    monkeypatch.setattr(
+        "orchestrator.services.vm_creation_transport.resolve_vm_creation_configuration",
+        resolve,
+    )
+    await _poll(store, dependencies.vm_provisioner, current)
+    retry = VMCreationRetryStore(store)
+    claim = (await retry.claim_due(limit=1))[0]
+    secret = b"initial-binding-test"
+
+    async def capacity_response(path, *, json, timeout):
+        assert path == "/vm-creation/create"
+        assert verify_payload(
+            json, direction="request", operation="creation_retry_create", secret=secret
+        )
+        result = sign_payload(
+            {
+                "status": "creation_pending",
+                "reason": "capacity_wait",
+                "job_id": str(thread_id),
+                "provision_generation": str(claim["provision_generation"]),
+            },
+            direction="response",
+            operation="creation_retry_create",
+            secret=secret,
+            correlation_id=json[AUTH_FIELD]["request_id"],
+        )
+        return httpx.Response(
+            200, json=result, request=httpx.Request("POST", "http://controller" + path)
+        )
+
+    observation = await replay_vm_creation(
+        SimpleNamespace(post=AsyncMock(side_effect=capacity_response)),
+        claim,
+        secret=secret,
+    )
+    assert observation == {"outcome": "capacity_wait", "reason": "capacity_wait"}
+    assert await retry.apply_observation(
+        request_id=str(claim["request_id"]),
+        claim_token=str(claim["claim_token"]),
+        expected_revision=claim["revision"],
+        observation=observation,
+    )
+    source = await store.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE request_id=$1", claim["request_id"]
+    )
+    assert source["reason"] == "controller_count_wait"
+    assert await store.merge_thread_vm_context_if_provision_generation(
+        str(thread_id),
+        str(source["provision_generation"]),
+        {"status": "waiting_capacity"},
+    )
+    return await store.get_thread(str(thread_id)), source
+
+
+@pytest.mark.asyncio
+async def test_nonquota_authenticated_capacity_wait_outlasts_900_for_exact_life(
+    pg_store, monkeypatch
+):
+    from agent.api.session_attach import SessionAttachCoordinator
+    from agent.api.session_workspace import poll_workspace_ready
+    from tests.test_session_attach_runtime import _identity, _ports
+    import time
+
+    current, source = await _nonquota_waiting_source(pg_store, monkeypatch)
+    before = await pg_store.fetchrow(
+        "SELECT state,reason,revision,boot_counted FROM vm_creation_retries WHERE request_id=$1",
+        source["request_id"],
+    )
+    view = await vm_thread_initial.initial_vm_startup_view(current, store=pg_store)
+    assert view == {
+        "contract_version": 1,
+        "phase": "resource_wait",
+        "request_id": str(source["request_id"]),
+        "provision_generation": str(source["provision_generation"]),
+        "runtime_generation": str(current["runtime_generation"]),
+    }
+    identity, _ = _identity()
+    identity.bind_thread(str(current["id"]))
+    identity.adopt(
+        str(current["runtime_generation"]),
+        str(current["runtime_attach_token"]),
+        contract_advertised=True,
+    )
+    clock = {"now": 0}
+
+    async def payload(*_args, **_kwargs):
+        result = {
+            "vm_status": "waiting_capacity",
+            "vm_startup": view,
+            "session_runtime_generation": str(current["runtime_generation"]),
+        }
+        if clock["now"] >= 1860:
+            result.update(
+                vm_status="ready",
+                vm_ssh_host="192.0.2.10",
+                vm_startup={**view, "phase": "admitted", "admission_elapsed_s": 0},
+            )
+        return result
+
+    async def sleep(seconds):
+        clock["now"] += seconds
+
+    client = SimpleNamespace(get_thread_workspace=AsyncMock(side_effect=payload))
+    coordinator = SessionAttachCoordinator(
+        _ports(
+            identity,
+            orchestrator_client=lambda: client,
+            poll_workspace_ready=poll_workspace_ready,
+        )
+    )
+    with monkeypatch.context() as timing:
+        timing.setattr(time, "monotonic", lambda: clock["now"])
+        timing.setattr("agent.api.session_workspace.asyncio.sleep", sleep)
+        result = await coordinator._poll_workspace(
+            str(current["id"]), require_vm=True, poll_interval=30
+        )
+    assert result is not None and result["session_runtime_generation"] == str(
+        current["runtime_generation"]
+    )
+    assert clock["now"] == 1860
+    assert (
+        await pg_store.fetchrow(
+            "SELECT state,reason,revision,boot_counted FROM vm_creation_retries WHERE request_id=$1",
+            source["request_id"],
+        )
+        == before
+    )
+    for table in (
+        "vm_resource_waiters",
+        "vm_resource_reservations",
+        "vm_creation_effects",
+    ):
+        assert (
+            await pg_store.fetchval(
+                f"SELECT count(*) FROM {table} WHERE request_id=$1",
+                source["request_id"],
+            )
+            == 0
+        )
+    assert source["observed_vm_uid"] is None and source["observed_pvc_uid"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "runtime",
+        "agent",
+        "attach",
+        "owner",
+        "project",
+        "marker",
+        "unknown_wait",
+        "quota_wait",
+        "cancelled",
+        "physical_vm",
+    ],
+)
+async def test_nonquota_capacity_hint_refuses_inexact_or_unproven_source(
+    pg_store, monkeypatch, mutation
+):
+    current, source = await _nonquota_waiting_source(pg_store, monkeypatch)
+    current = dict(current)
+    if mutation in {"runtime", "agent", "attach", "owner", "project"}:
+        key = {
+            "runtime": "runtime_generation",
+            "agent": "agent_id",
+            "attach": "runtime_attach_token",
+            "owner": "user_id",
+            "project": "project_id",
+        }[mutation]
+        current[key] = uuid4()
+    elif mutation in {"marker", "physical_vm"}:
+        metadata = deepcopy(thread_metadata_object(current))
+        if mutation == "marker":
+            metadata["vm"]["initial_runtime"]["agent_id"] = str(uuid4())
+        else:
+            metadata["vm"]["vm_uid"] = str(uuid4())
+        current["metadata"] = metadata
+    elif mutation in {"unknown_wait", "quota_wait"}:
+        await pg_store.execute(
+            "UPDATE vm_creation_retries SET reason=$2 WHERE request_id=$1",
+            source["request_id"],
+            "capacity_wait" if mutation == "unknown_wait" else "resource_wait",
+        )
+    else:
+        await pg_store.execute(
+            "UPDATE vm_creation_retries SET state='cancel_requested' WHERE request_id=$1",
+            source["request_id"],
+        )
+    assert (
+        await vm_thread_initial.initial_vm_startup_view(current, store=pg_store) is None
+    )
+
+
 @pytest.mark.asyncio
 async def test_bound_postgres_life_is_reserved_before_session_construction(
     pg_store, monkeypatch
