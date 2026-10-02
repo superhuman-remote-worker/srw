@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -943,6 +944,50 @@ async def test_virtual_materialization_saturation_fails_boundedly(monkeypatch) -
     finally:
         saturated.release()
     assert error.value.code == "canvas_capacity_exhausted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("result", "status", "code"),
+    [
+        (
+            subprocess.CompletedProcess([], 3, b"", b"directory not found"),
+            404,
+            "canvas_file_not_found",
+        ),
+        (
+            subprocess.CompletedProcess([], 1, b"", b"remote not found"),
+            409,
+            "workspace_unavailable",
+        ),
+        (
+            subprocess.CompletedProcess(
+                [], 0, b'{"IsDir":false,"Size":999999999}', b""
+            ),
+            413,
+            "canvas_file_too_large",
+        ),
+    ],
+)
+async def test_virtual_canvas_exact_read_maps_absence_size_and_transport(
+    monkeypatch, result, status, code
+) -> None:
+    from orchestrator.services import canvas_files
+    from orchestrator.services.workspace_binding import virtual_thread_backing_id
+    from shared.runtime.core.backends.rclone import RcloneObjectStore
+
+    spec = {"type": "s3", "root": "bucket/canvas"}
+    thread = _thread(backend="virtual")
+    thread["metadata"]["_workspace_binding"]["backing_id"] = virtual_thread_backing_id(
+        THREAD_ID, spec
+    )
+    monkeypatch.setattr(canvas_files, "virtual_workspace_rclone_spec", lambda: spec)
+    monkeypatch.setattr(canvas_files.shutil, "which", lambda _name: "/usr/bin/rclone")
+    monkeypatch.setattr(RcloneObjectStore, "_run", lambda *_args, **_kwargs: result)
+
+    with pytest.raises(CanvasFileError) as error:
+        await canvas_files._read_virtual_default(thread, "output/report.md", GENERATION)
+    assert (error.value.status_code, error.value.code) == (status, code)
 
 
 @pytest.mark.asyncio
