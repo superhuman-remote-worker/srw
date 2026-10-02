@@ -704,14 +704,17 @@ class JobControlOperations:
                     if deadline_guard:
                         return {"status": "unchanged"}
                     refreshed = await d.store.get_job(job_id)
+                    # asyncpg returns JSONB as text. A rejected cancellation
+                    # must inspect the decoded marker before reporting its
+                    # authority conflict, just like the successful path.
+                    refreshed_context = refreshed.get("context") if refreshed else None
+                    if isinstance(refreshed_context, str):
+                        refreshed_context = json.loads(refreshed_context)
                     if refreshed and refreshed.get("execution_lane") == "pinned":
                         job = refreshed
                     elif (
-                        refreshed
-                        and (refreshed.get("context") or {}).get(
-                            "_stateless_delete_pending"
-                        )
-                        is True
+                        isinstance(refreshed_context, dict)
+                        and refreshed_context.get("_stateless_delete_pending") is True
                     ):
                         raise HTTPException(
                             status_code=409,
