@@ -87,6 +87,8 @@ async def test_lifespan_never_terminates_over_attach_cleanup(
     try:
         await asyncio.wait_for(asyncio.shield(shutdown), 0.25)
         assert cleanup.is_set()
+        assert pa._session_termination.termination_admission_fenced is True
+        assert pa._session_termination.termination_fence_reason == "startup_shutdown"
         if cleanup_blocked:
             assert not task.done()
             pa._session_termination.terminate.assert_not_awaited()
