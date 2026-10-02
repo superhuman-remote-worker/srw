@@ -1470,6 +1470,17 @@ async def lifespan(app: FastAPI):
     # --- Shutdown ---
     logger.info("Shutting down persistent agent")
 
+    attaching = any(
+        task is not None and not task.done()
+        for task in (_session_attach.startup_task, _session_attach.pool_task)
+    )
+    _session_termination.activate_termination_admission_fence(
+        "startup_shutdown" if attaching else "shutdown"
+    )
+    logger.info(
+        "Shutting down attach: admission fenced (source=%s)",
+        _session_termination.termination_fence_reason,
+    )
     attach_settled = await _session_attach.stop_startup_attach()
     if attach_settled:
         await _session_attach.release_shutdown_receipt()
