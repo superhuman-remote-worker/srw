@@ -19,7 +19,7 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -73,6 +73,10 @@ PINNED_RETIREMENT_TERMINAL_PROBE_GRACE_SECONDS = max(
 # This additional sweep may finish several acknowledged Ends, but never
 # monopolizes the detector while an external business effect remains held.
 STATELESS_END_SETTLEMENT_SWEEP_SECONDS = 5.0
+# Exact retirement handoffs need prompt remote-cleanup observation and final
+# settlement. The same tracked detector owns these retries between full scans;
+# this cadence is not a deadline or permission to cancel an external actuator.
+PINNED_RETIREMENT_POLL_SECONDS = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,6 +447,70 @@ async def retry_stateless_end_settlement(
     return result.get("status") == ("deleted" if marker["permanent"] else "ended")
 
 
+async def _retry_pinned_retirement_batch(
+    *,
+    dependencies: StaleAgentDetectorDependencies,
+    retirement_cursor: tuple[datetime, str] | None,
+    resource_cursor: tuple[datetime, str] | None,
+    run_step: Callable[[str, Awaitable[Any]], Awaitable[Any]],
+) -> tuple[tuple[datetime, str] | None, tuple[datetime, str] | None]:
+    """Reuse one bounded, exact retirement sweep under the detector's task."""
+    batch_size = 25
+    # Authorized Begin is durable and keeps Resume closed until this exact
+    # disposition settles. SQL nominates authenticated actuator handoffs
+    # immediately; unmarked lives retain their offline/proof grace. The shared
+    # advisory lock and captured remote proofs still guard every effect.
+    resource_cleanup = await run_step(
+        "settled_vm_cleanup_resources",
+        dependencies.pinned_retirement_operations().reconcile_settled_vm_resources(
+            limit=batch_size,
+            after=resource_cursor,
+        ),
+    )
+    if isinstance(resource_cleanup, dict):
+        resource_cursor = resource_cleanup.get("after")
+
+    pending_retirements = await run_step(
+        "pending_pinned_retirements",
+        dependencies.store.list_retryable_pinned_retirements(
+            grace_seconds=PINNED_RETIREMENT_RETRY_GRACE_SECONDS,
+            limit=batch_size,
+            proven_grace_seconds=PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS,
+            terminal_probe_grace_seconds=PINNED_RETIREMENT_TERMINAL_PROBE_GRACE_SECONDS,
+            after=retirement_cursor,
+        ),
+    )
+    if pending_retirements:
+        retired = 0
+        for candidate in pending_retirements:
+            if (
+                isinstance(candidate, Mapping)
+                and isinstance(candidate.get("runtime_retirement_started_at"), datetime)
+                and candidate.get("id")
+            ):
+                retirement_cursor = (
+                    candidate["runtime_retirement_started_at"],
+                    str(candidate["id"]),
+                )
+            if isinstance(candidate, Mapping) and await run_step(
+                "retry_pending_pinned_retirement",
+                retry_pending_pinned_retirement(candidate, dependencies=dependencies),
+            ):
+                retired += 1
+        if retired:
+            logger.info("Completed %d durable pinned retirement retry(s)", retired)
+        unresolved = len(pending_retirements) - retired
+        if unresolved:
+            logger.warning(
+                "%d durable pinned retirement(s) remain unresolved after "
+                "this pass; each refusal is logged above",
+                unresolved,
+            )
+    if pending_retirements is not None and len(pending_retirements) < batch_size:
+        retirement_cursor = None
+    return retirement_cursor, resource_cursor
+
+
 async def stale_agent_detector(
     shutdown_event: asyncio.Event, *, dependencies: StaleAgentDetectorDependencies
 ) -> None:
@@ -488,7 +556,6 @@ async def stale_agent_detector(
     stateless_settlement_batch_size = 25
     pinned_retirement_cursor: tuple[datetime, str] | None = None
     vm_cleanup_resource_cursor: tuple[datetime, str] | None = None
-    pinned_retirement_batch_size = 25
 
     while not shutdown_event.is_set():
         try:
@@ -705,68 +772,15 @@ async def stale_agent_detector(
                     len(expired_preflights),
                 )
 
-            # 3d. Authorized Begin is durable.  If an orchestrator/agent dies after it
-            # closes admission, Resume must remain blocked until another
-            # replica finishes the immutable captured disposition.  Only
-            # sufficiently old markers whose exact actor is absent/offline
-            # are nominated; the shared advisory lock serializes replicas.
-            resource_cleanup = await _step(
-                "settled_vm_cleanup_resources",
-                dependencies.pinned_retirement_operations().reconcile_settled_vm_resources(
-                    limit=pinned_retirement_batch_size,
-                    after=vm_cleanup_resource_cursor,
-                ),
+            (
+                pinned_retirement_cursor,
+                vm_cleanup_resource_cursor,
+            ) = await _retry_pinned_retirement_batch(
+                dependencies=dependencies,
+                retirement_cursor=pinned_retirement_cursor,
+                resource_cursor=vm_cleanup_resource_cursor,
+                run_step=_step,
             )
-            if isinstance(resource_cleanup, dict):
-                vm_cleanup_resource_cursor = resource_cleanup.get("after")
-
-            pending_retirements = await _step(
-                "pending_pinned_retirements",
-                dependencies.store.list_retryable_pinned_retirements(
-                    grace_seconds=PINNED_RETIREMENT_RETRY_GRACE_SECONDS,
-                    limit=pinned_retirement_batch_size,
-                    proven_grace_seconds=PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS,
-                    terminal_probe_grace_seconds=PINNED_RETIREMENT_TERMINAL_PROBE_GRACE_SECONDS,
-                    after=pinned_retirement_cursor,
-                ),
-            )
-            if pending_retirements:
-                retired = 0
-                for candidate in pending_retirements:
-                    if (
-                        isinstance(candidate, Mapping)
-                        and isinstance(
-                            candidate.get("runtime_retirement_started_at"), datetime
-                        )
-                        and candidate.get("id")
-                    ):
-                        pinned_retirement_cursor = (
-                            candidate["runtime_retirement_started_at"],
-                            str(candidate["id"]),
-                        )
-                    if isinstance(candidate, Mapping) and await _step(
-                        "retry_pending_pinned_retirement",
-                        retry_pending_pinned_retirement(
-                            candidate, dependencies=dependencies
-                        ),
-                    ):
-                        retired += 1
-                if retired:
-                    logger.info(
-                        "Completed %d durable pinned retirement retry(s)", retired
-                    )
-                unresolved = len(pending_retirements) - retired
-                if unresolved:
-                    logger.warning(
-                        "%d durable pinned retirement(s) remain unresolved after "
-                        "this pass; each refusal is logged above",
-                        unresolved,
-                    )
-            if (
-                pending_retirements is not None
-                and len(pending_retirements) < pinned_retirement_batch_size
-            ):
-                pinned_retirement_cursor = None
 
             # An admitted initial stateless End needs no claimant drain or
             # SSH endpoint. Retry its full End funnel, including business
@@ -991,11 +1005,33 @@ async def stale_agent_detector(
             # landing here is a bug in the loop scaffolding itself.
             logger.error(f"Error in stale agent detector: {e}")
 
-        # Wait 60 seconds or until shutdown
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
-            break  # Shutdown signaled
-        except asyncio.TimeoutError:
-            pass  # Continue loop
+        # Keep unrelated full scans at their existing cadence. Reconcile only
+        # exact pinned retirements during this wait, using the same cursors,
+        # authority checks, task ownership and remote cleanup as the full scan.
+        # Shutdown interrupts the wait; it never cancels a remote proof attempt.
+        remaining = 60.0
+        deadline = asyncio.get_running_loop().time() + remaining
+        while remaining > 0 and not shutdown_event.is_set():
+            delay = min(PINNED_RETIREMENT_POLL_SECONDS, remaining)
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=delay)
+                break
+            except asyncio.TimeoutError:
+                remaining -= delay
+            if remaining > 0 and not shutdown_event.is_set():
+                retried = await _step(
+                    "pinned_retirement_poll",
+                    _retry_pinned_retirement_batch(
+                        dependencies=dependencies,
+                        retirement_cursor=pinned_retirement_cursor,
+                        resource_cursor=vm_cleanup_resource_cursor,
+                        run_step=_step,
+                    ),
+                )
+                if retried is not None:
+                    pinned_retirement_cursor, vm_cleanup_resource_cursor = retried
+            # Remote actuation time counts toward the full-scan interval. The
+            # wait budget also bounds immediate/spurious timeout retries.
+            remaining = min(remaining, deadline - asyncio.get_running_loop().time())
 
     logger.info("Stale agent detector stopped")
