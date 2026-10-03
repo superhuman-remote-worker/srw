@@ -513,3 +513,123 @@ async def test_nonquota_resume_refuses_damaged_retained_proof_before_rotation(
     )
     assert await db.fetchval("SELECT count(*) FROM vm_thread_retained_resumes") == 0
     assert await db.fetchval("SELECT count(*) FROM vm_creation_retries") == 1
+
+
+@pytest.mark.asyncio
+async def test_nonquota_retained_resume_actuates_same_disk_and_permanently_deletes(
+    db,  # noqa: F811
+    setup,  # noqa: F811
+    monkeypatch,
+):
+    from uuid import UUID, uuid4
+    from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
+    from orchestrator.services.vm_thread_retained_resume import (
+        ensure_retained_thread_vm,
+    )
+    from orchestrator.services.vm_provisioner import VMProvisioner
+    from tests.test_pinned_vm_initial_binding_real_postgres import _bind_cold_agent
+    from tests.test_vm_creation_actuation import SECRET
+    from vm_controller.creation_actuation import CreationActuator
+    from vm_controller.creation_configuration import resolve_creation_configuration
+
+    controller, api, _, _ = setup
+    ended, original = await ended_nonquota(db, setup, monkeypatch)
+    # The external adapter models the completed old End: exact compute gone,
+    # original DV/PVC survive. Durable authority was established through SQL.
+    for key in list(api.objects):
+        if key[0] not in {"DataVolume", "PersistentVolumeClaim", "Lease"}:
+            del api.objects[key]
+    disk_uids = {
+        key: obj["metadata"]["uid"]
+        for key, obj in api.objects.items()
+        if key[0] in {"DataVolume", "PersistentVolumeClaim"}
+    }
+    assert await db.resume_thread(str(ended["id"]))
+    current = await _bind_cold_agent(
+        db, ended["id"], pod_name="srw-agent-s-" + uuid4().hex[:8]
+    )
+
+    async def resolve(_client, request, *, secret):
+        assert secret == SECRET
+        return resolve_creation_configuration(controller, request)
+
+    monkeypatch.setattr(
+        "orchestrator.services.vm_creation_transport.resolve_vm_creation_configuration",
+        resolve,
+    )
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    monkeypatch.setenv("VM_CREATION_RETRY_ENABLED", "true")
+    provisioner = VMProvisioner()
+    provisioner._db = db
+    provisioner._controller_url = "http://controller.test"
+    provisioner._http_client = object()
+    provisioner._lifecycle_hmac_secret = SECRET
+    assert await ensure_retained_thread_vm(current, store=db, provisioner=provisioner)
+    source = await db.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE thread_id=$1 AND request_id<>$2",
+        ended["id"],
+        original["request_id"],
+    )
+    retry = VMCreationRetryStore(db)
+    claim = (await retry.claim_due(limit=1))[0]
+
+    async def authority(path, body, *, operation):
+        method = path.rsplit("/", 1)[1].replace("-", "_")
+        assert operation == "creation_retry_" + method
+        return await getattr(
+            retry, "authorize_controller" if method == "authorize" else method
+        )(**body)
+
+    controller._workspace_cleanup_authority_request = authority
+    payload = {
+        **json.loads(source["canonical_request"]),
+        "creation_retry": {
+            "version": 1,
+            "request_id": str(source["request_id"]),
+            "claim_token": str(claim["claim_token"]),
+            "request_digest": source["request_digest"],
+            "controller_configuration_digest": source[
+                "controller_configuration_digest"
+            ],
+        },
+    }
+    for _ in range(8):
+        result = await CreationActuator(controller)._run(payload)
+        if result["status"] == "created":
+            break
+    assert result["status"] == "created", result
+    adopted = await db.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE request_id=$1", source["request_id"]
+    )
+    assert adopted["state"] == "succeeded" and adopted["reason"] == "creation_adopted"
+    assert (
+        adopted["expected_pvc_uid"]
+        == original["observed_pvc_uid"]
+        == adopted["observed_pvc_uid"]
+    )
+    assert adopted["observed_vm_uid"] != original["observed_vm_uid"]
+    assert {
+        key: obj["metadata"]["uid"]
+        for key, obj in api.objects.items()
+        if key[0] in {"DataVolume", "PersistentVolumeClaim"}
+    } == disk_uids
+    assert await db.fetchval("SELECT count(*) FROM vm_resource_reservations") == 0
+    permanent = await cleaned_retirement(
+        db, await db.get_thread(str(ended["id"])), permanent=True
+    )
+    await db.delete_thread(
+        str(ended["id"]),
+        expected_runtime_generation=permanent["generation"],
+        expected_runtime_retirement_token=permanent["token"],
+    )
+    assert await db.get_thread(str(ended["id"])) is None
+    assert (
+        dict(
+            await db.fetchrow(
+                "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+                original["request_id"],
+            )
+        )
+        == original
+    )
+    assert UUID(permanent["generation"]) == current["runtime_generation"]
