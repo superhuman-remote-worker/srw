@@ -196,3 +196,50 @@ async def test_short_retry_keeps_ambiguous_remote_writers_pending(db, monkeypatc
     assert current["status"] == "active"
     # Even proven death of the separate agent Pod cannot settle remote writers.
     assert events and set(events) == {"pod-stop"}
+
+
+@pytest.mark.asyncio
+async def test_remote_retry_time_counts_toward_unrelated_full_scan(db, monkeypatch):
+    ids, retirement, request, _, _, vm = await fixtures.scenario(db, monkeypatch)
+    assert await db.request_pinned_thread_retirement_actuator(ids["thread"], **request)
+    stopped = asyncio.Event()
+    clock = RetryClock(stopped)
+    monkeypatch.setattr(detector, "asyncio", clock)
+    attempts = []
+
+    async def still_unproven(*args, **kwargs):
+        attempts.append(clock.elapsed)
+        if len(attempts) == 2:
+            # A real remote operation can outlast the next full-scan deadline.
+            # The owned call finishes; its duration must not buy eleven more waits.
+            clock.elapsed += 57
+        return VMTeardownResult("process_zero_unproven", False)
+
+    monkeypatch.setattr(vm, "release_vm_captured", still_unproven)
+    scans = []
+    gc = db.gc_offline_agents
+
+    async def stop_after_second_full_scan(**kwargs):
+        result = await gc(**kwargs)
+        scans.append(clock.elapsed)
+        if len(scans) == 2:
+            stopped.set()
+        return result
+
+    monkeypatch.setattr(db, "gc_offline_agents", stop_after_second_full_scan)
+    await asyncio.wait_for(
+        detector.stale_agent_detector(
+            stopped,
+            dependencies=controls.stale_agent_detector_dependencies(
+                main.app.state.resources
+            ),
+        ),
+        timeout=15,
+    )
+    assert scans == [0, 62]
+    assert clock.delays == [5]
+    current = await db.get_thread(ids["thread"])
+    assert str(current["runtime_retirement_token"]) == retirement["token"]
+    assert str(current["agent_id"]) == ids["agent"]
+    assert current["status"] == "active"
+    assert current["runtime_retirement_local_quiescence"] is None
