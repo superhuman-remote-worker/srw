@@ -283,12 +283,34 @@ async def cleaned_retirement(db, current, *, permanent):
             provisioner="vm",
             runtime_incarnation=identity.provision_generation,
         )
-        assert await db.merge_thread_vm_context_if_provision_generation(
-            thread_id,
-            identity.provision_generation,
-            {"status": "retiring_process_zero"},
-        )
+        if (
+            kwargs["parent_cleanup"]["intent"]["source"]
+            != "pinned_thread_retained_disk_purge"
+        ):
+            assert await db.merge_thread_vm_context_if_provision_generation(
+                thread_id,
+                identity.provision_generation,
+                {"status": "retiring_process_zero"},
+            )
         return VMTeardownResult("completed", True)
+
+    async def attest_vm_cleanup_stop(candidate):
+        assert candidate["owner_id"] == thread_id
+        assert candidate["vm_uid"] == vm["vm_uid"]
+        assert candidate["pvc_uid"] == vm["rootdisk_pvc_uid"]
+        assert candidate["provision_generation"] == vm["provision_generation"]
+        assert candidate["purge_disk"] is permanent
+        return {
+            "version": 1,
+            "kind": "vm_cleanup_physical_stop",
+            **{key: value for key, value in candidate.items() if key != "purge_disk"},
+            "vm_absent": True,
+            "vmi_absent": True,
+            "launcher_absent": True,
+            "same_generation_replacement": False,
+            "controller_authenticated": True,
+            "pvc_disposition": "purged" if permanent else "retained",
+        }
 
     # Only external process absence is modeled. All cleanup admissions, exact
     # G/T receipts, endpoint CAS, settlement and audit triggers use PostgreSQL.
@@ -307,6 +329,7 @@ async def cleaned_retirement(db, current, *, permanent):
             vm_provisioner=SimpleNamespace(
                 lifecycle_available=True,
                 release_vm_captured=stop_vm,
+                attest_vm_cleanup_stop=attest_vm_cleanup_stop,
             ),
             agent_provisioner=agent,
             session_router=SessionRouterService(
@@ -324,6 +347,10 @@ async def cleaned_retirement(db, current, *, permanent):
     await operations.cleanup_pinned_thread_retirement(
         retirement, cleanup_agent_pod=True
     )
+    if not permanent:
+        assert await db.merge_thread_vm_context_if_provision_generation(
+            thread_id, vm["provision_generation"], {"status": "deleted"}
+        )
     return retirement
 
 

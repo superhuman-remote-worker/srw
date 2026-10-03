@@ -155,3 +155,361 @@ async def test_native_nonquota_end_resume_records_retained_operation_without_kep
         "accepted non-quota Resume has no durable retained-disk operation"
     )
     assert operation["predecessor_runtime_generation"] == ended["runtime_generation"]
+
+
+async def ended_nonquota(store, controller_setup, monkeypatch):
+    current, source = await adopted_source(store, controller_setup, monkeypatch)
+    retirement = await cleaned_retirement(store, current, permanent=False)
+    assert await store.settle_pinned_thread_retirement(
+        str(current["id"]),
+        token=retirement["token"],
+        generation=retirement["generation"],
+        final_status="ended",
+    )
+    return await store.get_thread(str(current["id"])), source
+
+
+@pytest.mark.asyncio
+async def test_nonquota_retained_resume_waits_for_actor_then_admits_one_exact_source(
+    db,  # noqa: F811 - imported fixture
+    setup,  # noqa: F811 - imported fixture
+    monkeypatch,  # noqa: F811
+):
+    from orchestrator.services.vm_thread_retained_resume import (
+        ensure_retained_thread_vm,
+    )
+    from orchestrator.services.vm_provisioner import VMProvisioner
+    from tests.test_pinned_vm_initial_binding_real_postgres import _bind_cold_agent
+    from tests.test_vm_creation_actuation import SECRET
+
+    ended, old_source = await ended_nonquota(db, setup, monkeypatch)
+    assert await db.resume_thread(str(ended["id"]))
+    resumed = await db.get_thread(str(ended["id"]))
+    operation = await db.fetchrow(
+        "SELECT * FROM vm_thread_retained_resumes WHERE thread_id=$1", ended["id"]
+    )
+    assert operation is not None
+    calls = []
+    configuration = json.loads(old_source["controller_configuration"])
+
+    async def resolve(_client, request, *, secret):
+        assert secret == SECRET
+        calls.append(request)
+        return {"request": request, "controller_configuration": configuration}
+
+    monkeypatch.setattr(
+        "orchestrator.services.vm_creation_transport.resolve_vm_creation_configuration",
+        resolve,
+    )
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    monkeypatch.setenv("VM_CREATION_RETRY_ENABLED", "true")
+    monkeypatch.setenv("VM_NETWORK_PROFILE_ENABLED", "false")
+    provisioner = VMProvisioner()
+    provisioner._db = db
+    provisioner._controller_url = "http://controller.test"
+    provisioner._http_client = object()
+    provisioner._lifecycle_hmac_secret = SECRET
+    assert (
+        await ensure_retained_thread_vm(resumed, store=db, provisioner=provisioner)
+        is False
+    )
+    assert calls == []
+    assert await db.fetchval("SELECT count(*) FROM vm_creation_retries") == 1
+    from uuid import uuid4
+
+    current = await _bind_cold_agent(
+        db, ended["id"], pod_name="srw-agent-s-" + uuid4().hex[:8]
+    )
+    assert await ensure_retained_thread_vm(current, store=db, provisioner=provisioner)
+    source = await db.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE request_id=$1", operation["request_id"]
+    )
+    assert source is not None
+    assert source["thread_runtime_generation"] == current["runtime_generation"]
+    assert source["thread_agent_id"] == current["agent_id"]
+    assert source["thread_attach_token"] == current["runtime_attach_token"]
+    assert source["expected_pvc_uid"] == old_source["observed_pvc_uid"]
+    assert source["provision_generation"] == operation["provision_generation"]
+    assert source["thread_retained_resume_id"] == operation["id"]
+    assert await ensure_retained_thread_vm(
+        await db.get_thread(str(ended["id"])), store=db, provisioner=provisioner
+    )
+    assert dict(
+        await db.fetchrow(
+            "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+            operation["request_id"],
+        )
+    ) == dict(source)
+    assert (
+        dict(
+            await db.fetchrow(
+                "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+                old_source["request_id"],
+            )
+        )
+        == old_source
+    )
+    assert await db.fetchval("SELECT count(*) FROM vm_creation_retries") == 2
+    assert await db.fetchval("SELECT count(*) FROM vm_resource_reservations") == 0
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_creation_effects WHERE request_id=$1",
+            source["request_id"],
+        )
+        == 0
+    )
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "runtime_generation",
+        "agent_id",
+        "attach_token",
+        "vm_uid",
+        "pvc_uid",
+        "reservation_id",
+        "vmi_uid",
+        "missing_vmi",
+        "missing_launcher",
+        "missing_both_processes",
+    ],
+)
+async def test_nonquota_cleanup_authority_refuses_changed_exact_tuple(
+    db,  # noqa: F811 - imported fixture
+    setup,  # noqa: F811 - imported fixture
+    monkeypatch,
+    fault,  # noqa: F811
+):
+    from uuid import uuid4
+
+    current, source, _, _ = await prepared(db, setup, monkeypatch, False)
+    retirement = await db.begin_pinned_thread_retirement(
+        str(current["id"]), permanent=False
+    )
+    assert await db.authorize_pinned_thread_retirement(
+        str(current["id"]),
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    vm = retirement["context"]["vm"]
+    permit = await acquire_pinned_thread_retirement_cleanup_permit(
+        VMWorkspaceRecoveryStore(db),
+        thread_id=current["id"],
+        identity=VMTeardownIdentity(
+            provision_generation=vm["provision_generation"],
+            vm_uid=vm["vm_uid"],
+            rootdisk_pvc_uid=vm["rootdisk_pvc_uid"],
+        ),
+        purge_disk=False,
+    )
+    changed = {fault: str(uuid4())}
+    if fault.startswith("missing_"):
+        changed = {
+            key: None
+            for key in ("vmi_uid", "launcher_uid")
+            if fault == "missing_both_processes"
+            or key == ("vmi_uid" if fault == "missing_vmi" else "launcher_uid")
+        }
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.fetchval(
+                "SELECT public.validate_vm_thread_cleanup_authority(json_populate_record(NULL::public.vm_resource_thread_cleanup_authorities, (to_jsonb(a)||$2::jsonb)::json)) FROM vm_resource_thread_cleanup_authorities a WHERE cleanup_admission_id=$1",
+                permit.admission_id,
+                json.dumps(changed),
+            )
+    assert (
+        await db.fetchval("SELECT count(*) FROM vm_resource_thread_cleanup_stops") == 0
+    )
+    assert await db.fetchval(
+        "SELECT completed_at IS NULL FROM vm_workspace_cleanup_admissions WHERE id=$1",
+        permit.admission_id,
+    )
+    assert (
+        dict(
+            await db.fetchrow(
+                "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+                source["request_id"],
+            )
+        )
+        == source
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "vm_uid",
+        "pvc_uid",
+        "controller_authenticated",
+        "vm_absent",
+        "pvc_disposition",
+        "missing_zero",
+    ],
+)
+async def test_nonquota_end_records_only_exact_authenticated_stop(
+    db,  # noqa: F811 - imported fixture
+    setup,  # noqa: F811 - imported fixture
+    monkeypatch,
+    fault,  # noqa: F811
+):
+    from uuid import uuid4
+    from unittest.mock import AsyncMock
+    from types import SimpleNamespace
+    from shared.vm_resource_admission import ResourceAdmissionError
+    from orchestrator.services.vm_workspace_recovery_store import (
+        complete_vm_cleanup_permit,
+    )
+
+    current, source = await adopted_source(db, setup, monkeypatch)
+    retirement = await db.begin_pinned_thread_retirement(
+        str(current["id"]), permanent=False
+    )
+    assert await db.authorize_pinned_thread_retirement(
+        str(current["id"]),
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    vm = retirement["context"]["vm"]
+    recovery = VMWorkspaceRecoveryStore(db)
+    permit = await acquire_pinned_thread_retirement_cleanup_permit(
+        recovery,
+        thread_id=current["id"],
+        identity=VMTeardownIdentity(
+            provision_generation=vm["provision_generation"],
+            vm_uid=vm["vm_uid"],
+            rootdisk_pvc_uid=vm["rootdisk_pvc_uid"],
+        ),
+        purge_disk=False,
+    )
+    candidate = await prepare_vm_cleanup_resource(recovery, permit)
+    assert candidate is not None
+    proof = {
+        "version": 1,
+        "kind": "vm_cleanup_physical_stop",
+        **{k: v for k, v in candidate.items() if k != "purge_disk"},
+        "vm_absent": True,
+        "vmi_absent": True,
+        "launcher_absent": True,
+        "same_generation_replacement": False,
+        "controller_authenticated": True,
+        "pvc_disposition": "retained",
+    }
+    if fault in {"vm_uid", "pvc_uid"}:
+        proof[fault] = str(uuid4())
+    elif fault in {"controller_authenticated", "vm_absent"}:
+        proof[fault] = False
+    elif fault == "pvc_disposition":
+        proof[fault] = "purged"
+    if fault != "missing_zero":
+        assert await db.record_managed_repository_workspace_process_zero(
+            str(current["id"]),
+            owner_kind="thread",
+            scope="vm",
+            provisioner="vm",
+            runtime_incarnation=str(source["provision_generation"]),
+        )
+    physical = SimpleNamespace(attest_vm_cleanup_stop=AsyncMock(return_value=proof))
+    if fault:
+        with pytest.raises(ResourceAdmissionError):
+            await complete_vm_cleanup_permit(
+                recovery, permit, outcome="completed", provisioner=physical
+            )
+        assert (
+            await db.fetchval("SELECT count(*) FROM vm_resource_thread_cleanup_stops")
+            == 0
+        )
+        assert await db.fetchval(
+            "SELECT completed_at IS NULL FROM vm_workspace_cleanup_admissions WHERE id=$1",
+            permit.admission_id,
+        )
+    else:
+        await complete_vm_cleanup_permit(
+            recovery, permit, outcome="completed", provisioner=physical
+        )
+        await complete_vm_cleanup_permit(
+            recovery, permit, outcome="completed", provisioner=physical
+        )
+        assert (
+            await db.fetchval("SELECT count(*) FROM vm_resource_thread_cleanup_stops")
+            == 1
+        )
+        assert (
+            await db.fetchval(
+                "SELECT outcome FROM vm_workspace_cleanup_admissions WHERE id=$1",
+                permit.admission_id,
+            )
+            == "completed"
+        )
+        assert physical.attest_vm_cleanup_stop.await_count == 1
+    assert await db.fetchval("SELECT count(*) FROM vm_resource_reservations") == 0
+    assert (
+        dict(
+            await db.fetchrow(
+                "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+                source["request_id"],
+            )
+        )
+        == source
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing_stop",
+        "wrong_stop",
+        "missing_zero",
+        "unfinished_cleanup",
+        "wrong_outcome",
+    ],
+)
+async def test_nonquota_resume_refuses_damaged_retained_proof_before_rotation(
+    db,  # noqa: F811 - imported fixture
+    setup,  # noqa: F811 - imported fixture
+    monkeypatch,
+    fault,  # noqa: F811
+):
+    ended, _ = await ended_nonquota(db, setup, monkeypatch)
+    # Model damaged historical evidence in a disposable database only. Every
+    # production authority table remains append-only; no live ledger is changed.
+    async with db.acquire() as conn, conn.transaction():
+        await conn.execute("SET LOCAL session_replication_role=replica")
+        if fault == "missing_stop":
+            await conn.execute("DELETE FROM vm_resource_thread_cleanup_stops")
+        elif fault == "wrong_stop":
+            await conn.execute(
+                "UPDATE vm_resource_thread_cleanup_stops SET stop_evidence=jsonb_set(stop_evidence,'{vm_absent}','false')"
+            )
+        elif fault == "missing_zero":
+            await conn.execute(
+                "DELETE FROM managed_repository_process_zero_receipts WHERE scope='vm'"
+            )
+        elif fault == "unfinished_cleanup":
+            await conn.execute(
+                "UPDATE vm_workspace_cleanup_admissions SET completed_at=NULL,outcome=NULL "
+                "WHERE source='pinned_thread_retirement' AND owner_id=$1 AND completed_at IS NOT NULL",
+                ended["id"],
+            )
+        elif fault == "wrong_outcome":
+            await conn.execute(
+                "UPDATE vm_workspace_cleanup_admissions SET outcome='refused' "
+                "WHERE source='pinned_thread_retirement' AND owner_id=$1 AND completed_at IS NOT NULL",
+                ended["id"],
+            )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.resume_thread(str(ended["id"]))
+    current = await db.get_thread(str(ended["id"]))
+    assert (
+        current["status"] == "ended"
+        and current["runtime_generation"] == ended["runtime_generation"]
+    )
+    assert await db.fetchval("SELECT count(*) FROM vm_thread_retained_resumes") == 0
+    assert await db.fetchval("SELECT count(*) FROM vm_creation_retries") == 1

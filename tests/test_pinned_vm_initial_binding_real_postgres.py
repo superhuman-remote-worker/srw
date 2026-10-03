@@ -174,11 +174,11 @@ async def _bind_protected_agent(db, thread_id):
     return await db.get_thread(str(thread_id))
 
 
-async def _bind_cold_agent(db, thread_id):
+async def _bind_cold_agent(db, thread_id, *, pod_name=None):
     thread = await db.get_thread(str(thread_id))
     generation = str(thread["runtime_generation"])
     attempt, agent_id, pod_uid = (uuid4() for _ in range(3))
-    pod_name = "persistent-thread-" + str(thread_id)[:12]
+    pod_name = pod_name or "persistent-thread-" + str(thread_id)[:12]
     assert await db.reserve_pinned_agent_pod_provision_intent(
         str(thread_id),
         expected_runtime_generation=generation,
