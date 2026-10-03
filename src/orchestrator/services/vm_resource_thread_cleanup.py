@@ -40,8 +40,20 @@ async def thread_cleanup_scope(conn, recovery_store, permit, proof):
         owner,
         generation,
     )
-    if retry is None or _json(retry["controller_configuration"]).get("version") != 3:
+    if retry is None:
         return None
+    version = _json(retry["controller_configuration"]).get("version")
+    nonquota = version == 1 and proof["intent"]["purge_disk"] is False
+    if version != 3 and not nonquota:
+        return None
+    if nonquota:
+        from orchestrator.services.vm_thread_network import verified_source
+
+        if (
+            verified_source(retry, thread_id=str(owner), generation=str(generation))
+            is None
+        ):
+            raise ResourceAdmissionError("resource_cleanup_source_unproven")
     if thread is None:
         raise ResourceAdmissionError("resource_cleanup_identity_unproven")
     cleanup = await conn.fetchrow(
@@ -53,8 +65,19 @@ async def thread_cleanup_scope(conn, recovery_store, permit, proof):
         "ORDER BY revision DESC LIMIT 1",
         retry["request_id"],
     )
-    if charge is None:
+    if charge is None and not nonquota:
         raise ResourceAdmissionError("resource_cleanup_charge_unproven")
+    if nonquota:
+        recorded_stop = await conn.fetchval(
+            "SELECT public.validate_vm_thread_cleanup_stop(a,s,true) "
+            "FROM vm_resource_thread_cleanup_authorities a "
+            "JOIN vm_resource_thread_cleanup_stops s USING(cleanup_admission_id) "
+            "WHERE a.cleanup_admission_id=$1",
+            cleanup["id"],
+        )
+        if recorded_stop is True:
+            return None
+        return ThreadCleanupResource(None, nonquota=True), retry, thread, cleanup, proof
     if charge["state"] == "released":
         return None
     resource = await installed_job_resource_store(
@@ -69,18 +92,35 @@ async def thread_cleanup_scope(conn, recovery_store, permit, proof):
 
 
 class ThreadCleanupResource:
-    def __init__(self, resource):
+    def __init__(self, resource, *, nonquota=False):
         self.resource = resource
+        self.nonquota = nonquota
 
     async def mark_cleanup_teardown_on_conn(self, conn, *, retry, job, cleanup, intent):
-        await self.resource._lock_policy(conn, allow_off=True)
+        if not self.nonquota:
+            await self.resource._lock_policy(conn, allow_off=True)
         charge = await conn.fetchrow(
             "SELECT * FROM vm_resource_reservations WHERE request_id=$1 "
             "AND state<>'released' FOR UPDATE",
             retry["request_id"],
         )
-        if charge is None or cleanup is None:
+        if cleanup is None or (charge is None and not self.nonquota):
             raise ResourceAdmissionError("resource_cleanup_charge_unproven")
+        if self.nonquota:
+            if charge is not None:
+                raise ResourceAdmissionError("resource_cleanup_charge_unproven")
+            vm = _json(job["metadata"]).get("vm") or {}
+            # NULL records absence of quota authority. Physical identities still
+            # come from the captured native VM, before its delete effect.
+            charge = {
+                "id": None,
+                "revision": None,
+                "state": "teardown",
+                "vmi_uid": UUID(vm["vmi_uid"]) if vm.get("vmi_uid") else None,
+                "launcher_uid": UUID(vm["active_pod_uid"])
+                if vm.get("active_pod_uid")
+                else None,
+            }
         authority = await conn.fetchrow(
             "SELECT * FROM vm_resource_thread_cleanup_authorities "
             "WHERE cleanup_admission_id=$1",
@@ -151,7 +191,7 @@ class ThreadCleanupResource:
         )
         # A never-Ready reservation deliberately keeps its runtime binding NULL.
         # Its adopted VM UID belongs to the source, not to a synthetic Ready.
-        if charge["state"] != "teardown":
+        if not self.nonquota and charge["state"] != "teardown":
             await conn.execute(
                 "UPDATE vm_resource_reservations SET state='teardown' WHERE id=$1",
                 charge["id"],
@@ -221,6 +261,8 @@ class ThreadCleanupResource:
             zero,
             json.dumps(proof),
         )
+        if self.nonquota:
+            return True
         await conn.execute(
             "UPDATE vm_resource_reservations r SET state='released',released_at=clock_timestamp(),"
             "release_evidence=jsonb_build_object('kind','exact_cleanup_compute_absent',"

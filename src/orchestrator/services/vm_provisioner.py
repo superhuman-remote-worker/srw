@@ -3430,7 +3430,7 @@ class VMProvisioner:
             "VM_NETWORK_PROFILE_ENABLED", "false"
         ).lower() == "true":
             return False
-        if retained is not None and not resource_enforced:
+        if retained is not None and not resource_enforced and not retained["nonquota"]:
             return False
         # Durable creation authority is a lifecycle requirement independent of
         # optional resource quotas. Retry-enabled thread VMs must use the same
@@ -3439,6 +3439,8 @@ class VMProvisioner:
             self.mode == "same-cluster"
             and os.getenv("VM_CREATION_RETRY_ENABLED", "false").lower() == "true"
         )
+        if retained is not None and not durable_creation:
+            return False
         creation_source = None
         if durable_creation:
             # A claimed immutable source is the only route to a v3 effect. A

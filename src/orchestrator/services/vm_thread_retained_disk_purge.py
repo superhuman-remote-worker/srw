@@ -75,10 +75,9 @@ async def acquire_retained_disk_purge(store, *, thread_id, identity, generation,
             vm.get("creation_request_id"),
             owner,
         )
-        if (
-            source is None
-            or _json(source["controller_configuration"]).get("version") != 3
-        ):
+        if source is None or _json(source["controller_configuration"]).get(
+            "version"
+        ) not in {1, 3}:
             # Missing/replaced metadata is not legacy when an adopted v3 source
             # exists. This query recognizes refusal only; it selects no authority.
             recognized = await conn.fetchval(

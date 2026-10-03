@@ -761,8 +761,10 @@ async def complete_vm_cleanup_permit(
             if await conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM vm_resource_thread_cleanup_authorities a "
                 "JOIN vm_resource_thread_cleanup_stops s USING(cleanup_admission_id) "
-                "JOIN vm_resource_reservations r ON r.id=a.reservation_id "
-                "WHERE a.cleanup_admission_id=$1 AND r.state='released') "
+                "LEFT JOIN vm_resource_reservations r ON r.id=a.reservation_id "
+                "JOIN vm_creation_retries source ON source.request_id=a.request_id "
+                "WHERE a.cleanup_admission_id=$1 AND (r.state='released' OR "
+                "public.valid_vm_thread_nonquota_cleanup_source(a,source))) "
                 "OR EXISTS(SELECT 1 FROM vm_resource_cleanup_stop_receipts s "
                 "JOIN vm_resource_reservations r ON r.id=s.reservation_id "
                 "WHERE s.cleanup_admission_id=$1 AND r.state='released')",

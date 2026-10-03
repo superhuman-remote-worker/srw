@@ -39,7 +39,9 @@ async def predecessor_on_conn(conn, thread):
         vm["creation_request_id"],
         thread["id"],
     )
-    if source is None or _json(source["controller_configuration"]).get("version") != 3:
+    if source is None or _json(source["controller_configuration"]).get(
+        "version"
+    ) not in {1, 3}:
         return None
     outcome = await conn.fetchrow(
         "SELECT * FROM thread_runtime_retirement_outcomes WHERE thread_id=$1 "
@@ -185,7 +187,19 @@ async def operation_on_conn(conn, operation_id, thread_id):
     )
     if request is None:
         return None
-    return {**dict(operation), "pvc_uid": cleanup["pvc_uid"], "request": request}
+    nonquota = await conn.fetchval(
+        "SELECT public.valid_vm_thread_nonquota_cleanup_source(a,source) "
+        "FROM vm_resource_thread_cleanup_authorities a "
+        "JOIN vm_creation_retries source ON source.request_id=a.request_id "
+        "WHERE a.cleanup_admission_id=$1",
+        operation["compute_cleanup_admission_id"],
+    )
+    return {
+        **dict(operation),
+        "pvc_uid": cleanup["pvc_uid"],
+        "request": request,
+        "nonquota": nonquota is True,
+    }
 
 
 async def ensure_retained_thread_vm(thread, *, store, provisioner):

@@ -18681,8 +18681,8 @@ $$;
 
 CREATE TABLE public.vm_resource_thread_cleanup_authorities (
     cleanup_admission_id uuid NOT NULL,
-    reservation_id uuid NOT NULL,
-    reservation_revision bigint NOT NULL,
+    reservation_id uuid,
+    reservation_revision bigint,
     request_id uuid NOT NULL,
     thread_id uuid NOT NULL,
     runtime_generation uuid NOT NULL,
@@ -18699,8 +18699,67 @@ CREATE TABLE public.vm_resource_thread_cleanup_authorities (
     cleanup_request_id uuid NOT NULL,
     retirement_context jsonb,
     created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
-    CONSTRAINT vm_resource_thread_cleanup_authorities_check CHECK (((vmi_uid IS NULL) = (launcher_uid IS NULL)))
+    CONSTRAINT vm_resource_thread_cleanup_authorities_check CHECK (((vmi_uid IS NULL) = (launcher_uid IS NULL))),
+    CONSTRAINT vm_thread_cleanup_optional_reservation_pair CHECK (((reservation_id IS NULL) = (reservation_revision IS NULL)))
 );
+
+
+--
+-- Name: valid_vm_thread_nonquota_cleanup_source(public.vm_resource_thread_cleanup_authorities, public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_thread_nonquota_cleanup_source(a public.vm_resource_thread_cleanup_authorities, source public.vm_creation_retries) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT (public.valid_vm_thread_nonquota_creation(source)
+       AND a.reservation_id IS NULL AND a.reservation_revision IS NULL
+       AND source.thread_id=a.thread_id
+       AND ((source.thread_runtime_generation=a.runtime_generation
+             AND source.thread_agent_id IS NOT DISTINCT FROM a.agent_id
+             AND source.thread_attach_token IS NOT DISTINCT FROM a.attach_token)
+            OR public.vm_thread_creation_pre_setup_abort_path_evidence(
+                json_populate_record(NULL::public.threads,json_build_object(
+                    'id',a.thread_id,'runtime_generation',a.runtime_generation,
+                    'runtime_retirement_started_at',a.created_at)),source) IS NOT NULL)
+       AND source.provision_generation=a.provision_generation
+       AND source.observed_vm_uid=a.vm_uid AND source.observed_pvc_uid=a.pvc_uid
+       AND a.vmi_uid::text IS NOT DISTINCT FROM a.retirement_context->'vm'->>'vmi_uid'
+       AND a.launcher_uid::text IS NOT DISTINCT FROM a.retirement_context->'vm'->>'active_pod_uid'
+       AND (source.state='succeeded' AND source.reason='creation_adopted'
+            OR public.valid_vm_thread_retained_cleanup_source(a,source))
+       AND source.boot_counted
+       AND (source.origin='initial' AND source.expected_pvc_uid IS NULL
+            OR public.valid_vm_thread_retained_resume_source(source))
+       AND NOT EXISTS (SELECT 1 FROM public.vm_creation_effects e
+           WHERE e.request_id=source.request_id AND e.state='issued')
+       AND EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+           WHERE c.id=source.creation_admission_id AND c.owner_kind='thread'
+             AND c.owner_id=a.thread_id AND c.source='controller_vm_create'
+             AND c.completed_at IS NOT NULL AND c.outcome='adopted')
+    ) IS TRUE;
+$$;
+
+
+--
+-- Name: valid_vm_thread_nonquota_creation(public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_thread_nonquota_creation(source public.vm_creation_retries) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT (source.owner_kind='thread'
+       AND source.controller_configuration->'version'='1'::jsonb
+       AND source.controller_configuration->'persistent_rootdisk'='true'::jsonb
+       AND COALESCE(source.controller_configuration->'resource_admission','null'::jsonb)='null'::jsonb
+       AND COALESCE(source.controller_configuration->'network_profile_policy','null'::jsonb)='null'::jsonb
+       AND COALESCE(source.canonical_request->'network_profile','null'::jsonb)='null'::jsonb
+       AND source.canonical_request->>'entity_type'='thread'
+       AND source.canonical_request->>'job_id'=source.thread_id::text
+       AND source.canonical_request->>'provision_generation'=source.provision_generation::text
+       AND NOT EXISTS (SELECT 1 FROM public.vm_resource_reservations r WHERE r.request_id=source.request_id)
+       AND NOT EXISTS (SELECT 1 FROM public.vm_resource_waiters w WHERE w.request_id=source.request_id)
+    ) IS TRUE;
+$$;
 
 
 --
@@ -19516,15 +19575,15 @@ BEGIN
        OR source.request_id IS NULL OR source.owner_kind IS DISTINCT FROM 'thread'
        OR source.thread_id IS DISTINCT FROM a.thread_id OR (source.state IS DISTINCT FROM 'succeeded' AND NOT terminal_handoff)
        OR (terminal_handoff AND NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false))
-       OR (NOT terminal_handoff AND (
+       OR (NOT terminal_handoff AND NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) AND (
            source.thread_runtime_generation IS DISTINCT FROM a.runtime_generation
            OR source.thread_agent_id IS DISTINCT FROM a.agent_id
            OR source.thread_attach_token IS DISTINCT FROM a.attach_token))
        OR source.provision_generation IS DISTINCT FROM a.provision_generation
        OR source.observed_vm_uid IS DISTINCT FROM a.vm_uid
        OR source.observed_pvc_uid IS DISTINCT FROM a.pvc_uid
-       OR source.controller_configuration->>'version' IS DISTINCT FROM '3'
-       OR charge.id IS NULL OR charge.request_id IS DISTINCT FROM a.request_id
+       OR source.controller_configuration->>'version' IS DISTINCT FROM '3' AND NOT public.valid_vm_thread_nonquota_cleanup_source(a,source)
+       OR (NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) AND (charge.id IS NULL OR charge.request_id IS DISTINCT FROM a.request_id
        OR charge.revision IS DISTINCT FROM a.reservation_revision OR charge.resource_version<>2
        OR (charge.state NOT IN ('reserved','active','warm','teardown')
            AND NOT (allow_released AND charge.state='released'))
@@ -19543,6 +19602,7 @@ BEGIN
            WHERE w.request_id=a.request_id AND w.owner_kind='thread' AND w.thread_id=a.thread_id
              AND w.provision_generation=a.provision_generation
              AND (w.state='admitted' OR (allow_released AND w.state='released')))
+))
        OR cleanup.id IS NULL OR cleanup.owner_kind IS DISTINCT FROM 'thread'
        OR cleanup.owner_id IS DISTINCT FROM a.thread_id OR cleanup.pvc_uid IS DISTINCT FROM a.pvc_uid
        OR cleanup.source IS DISTINCT FROM 'pinned_thread_retirement'
@@ -19634,8 +19694,10 @@ BEGIN
         'same_generation_replacement',false,'controller_authenticated',true,
         'pvc_disposition',CASE WHEN a.purge_disk THEN 'purged' ELSE 'retained' END);
     IF s.stop_evidence IS DISTINCT FROM expected
-       OR NOT EXISTS (SELECT 1 FROM public.vm_resource_reservations r
+       OR (NOT EXISTS (SELECT 1 FROM public.vm_resource_reservations r
            WHERE r.id=a.reservation_id AND (r.state='teardown' OR (allow_released AND r.state='released')))
+           AND NOT EXISTS (SELECT 1 FROM public.vm_creation_retries source WHERE source.request_id=a.request_id
+               AND public.valid_vm_thread_nonquota_cleanup_source(a,source)))
        OR NOT EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
            WHERE c.id=a.cleanup_admission_id AND c.completed_at IS NOT NULL AND c.outcome='completed')
        OR NOT EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts p
@@ -19729,7 +19791,7 @@ BEGIN
            WHERE p.id=s.process_zero_receipt_id AND p.owner_kind='thread' AND p.owner_id=a.thread_id
              AND p.scope='vm' AND p.provisioner='vm' AND p.runtime_incarnation=a.provision_generation::text
              AND p.observed_at<=soft.settled_at)
-       OR charge.id IS NULL OR charge.state IS DISTINCT FROM 'released'
+       OR (NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) AND (charge.id IS NULL OR charge.state IS DISTINCT FROM 'released'
        OR charge.resource_version IS DISTINCT FROM 2 OR charge.request_id IS DISTINCT FROM a.request_id
        OR charge.revision IS DISTINCT FROM a.reservation_revision
        OR charge.released_at IS NULL OR charge.released_at<s.accepted_at
@@ -19745,7 +19807,8 @@ BEGIN
        OR EXISTS (SELECT 1 FROM public.vm_resource_recovery_successors r WHERE r.reservation_id=a.reservation_id
            AND (r.successor_vmi_uid IS DISTINCT FROM a.vmi_uid OR r.successor_launcher_uid IS DISTINCT FROM a.launcher_uid))
        OR NOT EXISTS (SELECT 1 FROM public.vm_resource_waiters w WHERE w.request_id=a.request_id
-           AND w.owner_kind='thread' AND w.thread_id=a.thread_id AND w.provision_generation=a.provision_generation AND w.state='released') THEN
+           AND w.owner_kind='thread' AND w.thread_id=a.thread_id AND w.provision_generation=a.provision_generation AND w.state='released')))
+ THEN
         RAISE EXCEPTION 'VM retained disk predecessor unproven' USING ERRCODE='23514';
     END IF;
     IF source.request_id IS NULL OR source.owner_kind IS DISTINCT FROM 'thread'
@@ -19759,12 +19822,12 @@ BEGIN
                  AND op.runtime_generation=source.thread_runtime_generation
                  AND op.request_id=source.request_id AND op.provision_generation=source.provision_generation
                  AND prior.pvc_uid=source.expected_pvc_uid AND prior.pvc_uid=a.pvc_uid))
-       OR (NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false) AND (
+       OR (NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false) AND NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) AND (
            source.thread_runtime_generation IS DISTINCT FROM a.runtime_generation
            OR source.thread_agent_id IS DISTINCT FROM a.agent_id OR source.thread_attach_token IS DISTINCT FROM a.attach_token))
        OR source.provision_generation IS DISTINCT FROM a.provision_generation
        OR source.observed_vm_uid IS DISTINCT FROM a.vm_uid OR source.observed_pvc_uid IS DISTINCT FROM a.pvc_uid
-       OR source.controller_configuration->>'version' IS DISTINCT FROM '3' THEN
+       OR source.controller_configuration->>'version' IS DISTINCT FROM '3' AND NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) THEN
         RAISE EXCEPTION 'VM retained compute source unproven' USING ERRCODE='23514';
     END IF;
     RETURN true;
@@ -19858,7 +19921,7 @@ BEGIN
            WHERE p.id=s.process_zero_receipt_id AND p.owner_kind='thread' AND p.owner_id=a.thread_id
              AND p.scope='vm' AND p.provisioner='vm' AND p.runtime_incarnation=a.provision_generation::text
              AND p.observed_at<=soft.settled_at)
-       OR charge.id IS NULL OR charge.state IS DISTINCT FROM 'released'
+       OR (NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) AND (charge.id IS NULL OR charge.state IS DISTINCT FROM 'released'
        OR charge.resource_version IS DISTINCT FROM 2 OR charge.request_id IS DISTINCT FROM a.request_id
        OR charge.revision IS DISTINCT FROM a.reservation_revision
        OR charge.released_at IS NULL OR charge.released_at<s.accepted_at
@@ -19874,7 +19937,8 @@ BEGIN
        OR EXISTS (SELECT 1 FROM public.vm_resource_recovery_successors r WHERE r.reservation_id=a.reservation_id
            AND (r.successor_vmi_uid IS DISTINCT FROM a.vmi_uid OR r.successor_launcher_uid IS DISTINCT FROM a.launcher_uid))
        OR NOT EXISTS (SELECT 1 FROM public.vm_resource_waiters w WHERE w.request_id=a.request_id
-           AND w.owner_kind='thread' AND w.thread_id=a.thread_id AND w.provision_generation=a.provision_generation AND w.state='released') THEN
+           AND w.owner_kind='thread' AND w.thread_id=a.thread_id AND w.provision_generation=a.provision_generation AND w.state='released')))
+ THEN
         RAISE EXCEPTION 'VM retained disk predecessor unproven' USING ERRCODE='23514';
     END IF;
     SELECT terminal_row.* INTO terminal FROM public.vm_thread_retained_resume_terminals terminal_row
@@ -19900,12 +19964,12 @@ BEGIN
        OR source.request_id IS NULL OR source.owner_kind IS DISTINCT FROM 'thread'
        OR source.thread_id IS DISTINCT FROM a.thread_id OR (source.state IS DISTINCT FROM 'succeeded' AND NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false))
        OR NOT (source.origin='initial' OR public.valid_vm_thread_retained_resume_source(source)) OR source.thread_wake_operation_id IS NOT NULL
-       OR (NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false) AND (
+       OR (NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false) AND NOT public.valid_vm_thread_nonquota_cleanup_source(a,source) AND (
            source.thread_runtime_generation IS DISTINCT FROM a.runtime_generation
            OR source.thread_agent_id IS DISTINCT FROM a.agent_id OR source.thread_attach_token IS DISTINCT FROM a.attach_token))
        OR source.provision_generation IS DISTINCT FROM a.provision_generation
        OR source.observed_vm_uid IS DISTINCT FROM a.vm_uid OR source.observed_pvc_uid IS DISTINCT FROM a.pvc_uid
-       OR source.controller_configuration->>'version' IS DISTINCT FROM '3'
+       OR source.controller_configuration->>'version' IS DISTINCT FROM '3' AND NOT public.valid_vm_thread_nonquota_cleanup_source(a,source)
        OR source.revision IS DISTINCT FROM d.source_revision
        OR owner_row.runtime_retirement_token IS DISTINCT FROM d.retirement_token
        OR d.retirement_token=a.retirement_token OR owner_row.runtime_retirement_permanent IS DISTINCT FROM true
@@ -20700,7 +20764,8 @@ BEGIN
        OR retry.reason IS NULL OR retry.reason NOT IN ('creation_never_issued','creation_disposed','retained_creation_handoff')
        OR EXISTS (SELECT 1 FROM public.vm_creation_effects e WHERE e.request_id=retry.request_id AND e.state='issued')
        OR EXISTS (SELECT 1 FROM public.vm_resource_reservations r WHERE r.request_id=retry.request_id AND r.state<>'released')
-       OR NOT EXISTS (SELECT 1 FROM public.vm_resource_waiters w WHERE w.request_id=retry.request_id AND w.state IN ('released','cancelled'))
+       OR (NOT EXISTS (SELECT 1 FROM public.vm_resource_waiters w WHERE w.request_id=retry.request_id AND w.state IN ('released','cancelled'))
+           AND NOT public.valid_vm_thread_nonquota_creation(retry))
        OR (retry.creation_admission_id IS NOT NULL AND NOT EXISTS (
            SELECT 1 FROM public.vm_workspace_cleanup_admissions a WHERE a.id=retry.creation_admission_id
              AND a.completed_at IS NOT NULL AND a.outcome=CASE retry.reason WHEN 'creation_never_issued' THEN 'never_issued' WHEN 'creation_disposed' THEN 'creation_disposed' ELSE 'adopted' END)) THEN
