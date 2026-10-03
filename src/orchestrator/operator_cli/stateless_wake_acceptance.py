@@ -425,9 +425,11 @@ class StatelessWakeGate:
                 api.delete_namespaced_pod,
                 name=name,
                 namespace=self.namespace,
-                grace_period_seconds=0,
-                propagation_policy="Background",
-                body={"preconditions": {"uid": uid}},
+                body={
+                    "preconditions": {"uid": uid},
+                    "gracePeriodSeconds": 0,
+                    "propagationPolicy": "Background",
+                },
             )
         except Exception:
             raise GateError(
