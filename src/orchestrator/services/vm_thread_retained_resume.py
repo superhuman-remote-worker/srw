@@ -187,13 +187,23 @@ async def operation_on_conn(conn, operation_id, thread_id):
     )
     if request is None:
         return None
-    nonquota = await conn.fetchval(
-        "SELECT public.valid_vm_thread_nonquota_cleanup_source(a,source) "
-        "FROM vm_resource_thread_cleanup_authorities a "
-        "JOIN vm_creation_retries source ON source.request_id=a.request_id "
-        "WHERE a.cleanup_admission_id=$1",
-        operation["compute_cleanup_admission_id"],
+    source_version = await conn.fetchval(
+        "SELECT controller_configuration->>'version' FROM vm_creation_retries "
+        "WHERE request_id=$1",
+        cleanup["request_id"],
     )
+    nonquota = False
+    # The inherited request already locks and verifies this immutable source.
+    # v3 retains its existing quota proof on populated older schemas; only v1
+    # requires the newer non-quota validator, which must never be bypassed.
+    if source_version == "1":
+        nonquota = await conn.fetchval(
+            "SELECT public.valid_vm_thread_nonquota_cleanup_source(a,source) "
+            "FROM vm_resource_thread_cleanup_authorities a "
+            "JOIN vm_creation_retries source ON source.request_id=a.request_id "
+            "WHERE a.cleanup_admission_id=$1",
+            operation["compute_cleanup_admission_id"],
+        )
     return {
         **dict(operation),
         "pvc_uid": cleanup["pvc_uid"],
