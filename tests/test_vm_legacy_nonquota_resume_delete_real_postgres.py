@@ -3,6 +3,7 @@
 import json
 from uuid import UUID, uuid4
 
+import asyncpg
 import pytest
 
 from tests.test_pinned_vm_failed_initial_end_real_postgres import _release_binding
@@ -134,3 +135,137 @@ async def test_legacy_nonquota_resume_permanent_delete_keeps_exact_old_source(
         )
         == source
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing_soft",
+        "wrong_soft_actor",
+        "missing_keep",
+        "wrong_keep_digest",
+        "unfinished_keep",
+        "missing_old_zero",
+        "late_old_zero",
+    ],
+)
+async def test_legacy_nonquota_delete_refuses_missing_historical_proof(
+    db,  # noqa: F811
+    setup,  # noqa: F811
+    monkeypatch,
+    fault,
+):
+    current, source, _ = await legacy_resumed(
+        db, setup, monkeypatch, released_actor=True
+    )
+    permanent = await cleaned_retirement(db, current, permanent=True)
+    # Damaged history is confined to disposable PG; protected live ledgers and
+    # normal application writers retain all append-only protections.
+    async with db.acquire() as conn, conn.transaction():
+        await conn.execute("SET LOCAL session_replication_role=replica")
+        if fault == "missing_soft":
+            await conn.execute(
+                "DELETE FROM thread_runtime_retirement_outcomes WHERE thread_id=$1 AND NOT permanent",
+                current["id"],
+            )
+        elif fault == "wrong_soft_actor":
+            await conn.execute(
+                "UPDATE thread_runtime_retirement_outcomes SET agent_id=$2 WHERE thread_id=$1 AND NOT permanent",
+                current["id"],
+                uuid4(),
+            )
+        elif fault in {"missing_keep", "wrong_keep_digest", "unfinished_keep"}:
+            statement = {
+                "missing_keep": "DELETE FROM vm_workspace_cleanup_admissions WHERE owner_id=$1 AND source='pinned_thread_retirement' AND completed_at<$2",
+                "wrong_keep_digest": "UPDATE vm_workspace_cleanup_admissions SET intent_digest='sha256:'||repeat('0',64) WHERE owner_id=$1 AND source='pinned_thread_retirement' AND completed_at<$2",
+                "unfinished_keep": "UPDATE vm_workspace_cleanup_admissions SET completed_at=NULL,outcome=NULL WHERE owner_id=$1 AND source='pinned_thread_retirement' AND completed_at<$2",
+            }[fault]
+            await conn.execute(
+                statement,
+                current["id"],
+                permanent["context"]["started_at"]
+                if "started_at" in permanent["context"]
+                else await conn.fetchval(
+                    "SELECT runtime_retirement_started_at FROM threads WHERE id=$1",
+                    current["id"],
+                ),
+            )
+        elif fault == "missing_old_zero":
+            await conn.execute(
+                "DELETE FROM managed_repository_process_zero_receipts WHERE owner_id=$1 AND scope='vm'",
+                current["id"],
+            )
+        elif fault == "late_old_zero":
+            await conn.execute(
+                "UPDATE managed_repository_process_zero_receipts SET observed_at=clock_timestamp() WHERE owner_id=$1 AND scope='vm'",
+                current["id"],
+            )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.delete_thread(
+            str(current["id"]),
+            expected_runtime_generation=permanent["generation"],
+            expected_runtime_retirement_token=permanent["token"],
+        )
+    assert await db.get_thread(str(current["id"])) is not None
+    assert (
+        dict(
+            await db.fetchrow(
+                "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+                source["request_id"],
+            )
+        )
+        == source
+    )
+    assert await db.fetchval(
+        "SELECT deleted_at IS NULL AND live_thread_id=thread_id FROM vm_thread_creation_owners WHERE thread_id=$1",
+        current["id"],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "exposed",
+        "actor",
+        "control",
+        "same_source_generation",
+        "wrong_entry",
+        "captured_actor",
+    ],
+)
+async def test_legacy_nonquota_lineage_refuses_exposed_or_bound_current_life(
+    db,  # noqa: F811
+    setup,  # noqa: F811
+    monkeypatch,
+    fault,
+):
+    current, source, _ = await legacy_resumed(
+        db, setup, monkeypatch, released_actor=False
+    )
+    await cleaned_retirement(db, current, permanent=True)
+    changes = {
+        "exposed": {"runtime_authority_exposed": True},
+        "actor": {"agent_id": str(uuid4())},
+        "control": {"control_admission_agent_id": str(uuid4())},
+        "same_source_generation": {
+            "runtime_generation": str(source["thread_runtime_generation"])
+        },
+    }
+    row = await db.get_thread(str(current["id"]))
+    context = json.loads(row["runtime_retirement_context"])
+    if fault == "wrong_entry":
+        context["entry_status"] = "active"
+    elif fault == "captured_actor":
+        context["agent_id"] = str(uuid4())
+    changed = changes.get(fault, {"runtime_retirement_context": context})
+    assert (
+        await db.fetchval(
+            "SELECT public.vm_thread_creation_legacy_resume_delete_lineage(json_populate_record(NULL::threads,(to_jsonb(t)||$2::jsonb)::json),r) FROM threads t JOIN vm_creation_retries r ON r.thread_id=t.id WHERE t.id=$1",
+            current["id"],
+            json.dumps(changed),
+        )
+        is None
+    )
+    assert await db.get_thread(str(current["id"])) == row
