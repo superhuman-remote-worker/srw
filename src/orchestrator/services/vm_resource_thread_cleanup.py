@@ -69,9 +69,34 @@ async def thread_cleanup_scope(conn, recovery_store, permit, proof):
         raise ResourceAdmissionError("resource_cleanup_charge_unproven")
     if nonquota:
         recorded_stop = await conn.fetchval(
-            "SELECT public.validate_vm_thread_cleanup_stop(a,s,true) "
+            "SELECT CASE WHEN a.runtime_generation IS DISTINCT FROM t.runtime_generation "
+            "AND t.status='created' AND NOT t.runtime_authority_exposed "
+            "AND t.agent_id IS NULL AND t.runtime_attach_token IS NULL "
+            "AND t.control_admission_agent_id IS NULL "
+            "AND t.runtime_retirement_token IS NOT NULL "
+            "AND t.runtime_retirement_authorized_at IS NOT NULL "
+            "AND t.runtime_retirement_permanent IS FALSE "
+            "AND t.runtime_retirement_context->>'thread_id'=t.id::text "
+            "AND t.runtime_retirement_context->>'generation'=t.runtime_generation::text "
+            "AND t.runtime_retirement_context->>'settle_status'='ended' "
+            "AND t.runtime_retirement_context->'runtime_authority_exposed'='false'::jsonb "
+            "AND t.runtime_retirement_context->'agent_id'='null'::jsonb "
+            "AND t.runtime_retirement_context->'runtime_attach_token'='null'::jsonb "
+            "AND t.runtime_retirement_context->'control_admission_agent_id'='null'::jsonb "
+            "AND NOT EXISTS (SELECT 1 FROM agents actor WHERE actor.thread_id=t.id) "
+            "AND EXISTS (SELECT 1 FROM vm_thread_retained_resumes op "
+            "WHERE op.thread_id=t.id AND op.compute_cleanup_admission_id=a.cleanup_admission_id "
+            "AND public.valid_vm_thread_retained_runtime(op,t) "
+            "AND t.runtime_retirement_context->'vm'=op.retained_vm "
+            "AND NOT EXISTS (SELECT 1 FROM vm_creation_retries r WHERE r.request_id=op.request_id) "
+            "AND NOT EXISTS (SELECT 1 FROM vm_resource_waiters w WHERE w.request_id=op.request_id) "
+            "AND NOT EXISTS (SELECT 1 FROM vm_resource_reservations r WHERE r.request_id=op.request_id) "
+            "AND NOT EXISTS (SELECT 1 FROM vm_creation_effects e WHERE e.request_id=op.request_id)) "
+            "THEN public.validate_vm_thread_retained_compute(a.cleanup_admission_id) "
+            "ELSE public.validate_vm_thread_cleanup_stop(a,s,true) END "
             "FROM vm_resource_thread_cleanup_authorities a "
             "JOIN vm_resource_thread_cleanup_stops s USING(cleanup_admission_id) "
+            "JOIN threads t ON t.id=a.thread_id "
             "WHERE a.cleanup_admission_id=$1",
             cleanup["id"],
         )
