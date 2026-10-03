@@ -269,6 +269,14 @@ async def cleaned_retirement(db, current, *, permanent):
         settle_status="ended",
     )
     vm = retirement["context"]["vm"]
+    if vm is None:
+        captured_retained = await db.fetchval(
+            "SELECT op.retained_vm FROM vm_thread_retained_resumes op JOIN threads t ON t.id=op.thread_id "
+            "WHERE op.thread_id=$1 AND public.valid_vm_thread_retained_runtime(op,t)",
+            current["id"],
+        )
+        assert captured_retained is not None
+        vm = json.loads(captured_retained)
 
     async def stop_vm(owner, identity, **kwargs):
         assert owner == thread_id

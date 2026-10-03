@@ -633,3 +633,56 @@ async def test_nonquota_retained_resume_actuates_same_disk_and_permanently_delet
         == original
     )
     assert UUID(permanent["generation"]) == current["runtime_generation"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "permanent", [False, True], ids=["soft-again", "permanent-before-actor"]
+)
+async def test_nonquota_retained_resume_end_before_actor_or_creation_settles(
+    db,  # noqa: F811
+    setup,  # noqa: F811
+    monkeypatch,
+    permanent,
+):
+    ended, source = await ended_nonquota(db, setup, monkeypatch)
+    assert await db.resume_thread(str(ended["id"]))
+    current = await db.get_thread(str(ended["id"]))
+    assert current["agent_id"] is None
+    assert await db.fetchval("SELECT count(*) FROM vm_creation_retries") == 1
+    retirement = await cleaned_retirement(db, current, permanent=permanent)
+    # Begin captures the proven retained predecessor, never a new VM identity.
+    assert retirement["context"]["vm"]["vm_uid"] == str(source["observed_vm_uid"])
+    assert retirement["context"]["vm"]["provision_generation"] == str(
+        source["provision_generation"]
+    )
+    assert await db.fetchval("SELECT count(*) FROM vm_creation_retries") == 1
+    assert await db.fetchval("SELECT count(*) FROM vm_resource_reservations") == 0
+    if permanent:
+        await db.delete_thread(
+            str(ended["id"]),
+            expected_runtime_generation=retirement["generation"],
+            expected_runtime_retirement_token=retirement["token"],
+        )
+        assert await db.get_thread(str(ended["id"])) is None
+    else:
+        assert await db.settle_pinned_thread_retirement(
+            str(ended["id"]),
+            token=retirement["token"],
+            generation=retirement["generation"],
+            final_status="ended",
+        )
+        assert await db.resume_thread(str(ended["id"]))
+        resumed = await db.get_thread(str(ended["id"]))
+        assert resumed["runtime_generation"] != current["runtime_generation"]
+        assert resumed["agent_id"] is None and resumed["runtime_attach_token"] is None
+        assert await db.fetchval("SELECT count(*) FROM vm_thread_retained_resumes") == 2
+    assert (
+        dict(
+            await db.fetchrow(
+                "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+                source["request_id"],
+            )
+        )
+        == source
+    )
