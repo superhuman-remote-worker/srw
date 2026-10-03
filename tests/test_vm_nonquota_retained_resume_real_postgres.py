@@ -686,3 +686,105 @@ async def test_nonquota_retained_resume_end_before_actor_or_creation_settles(
         )
         == source
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing_operation",
+        "changed_capture",
+        "new_source",
+        "exposed",
+        "captured_exposed",
+        "captured_control",
+        "old_stop",
+        "old_zero",
+    ],
+)
+async def test_nonquota_uncreated_end_refuses_changed_predecessor_or_current_work(
+    db,  # noqa: F811
+    setup,  # noqa: F811
+    monkeypatch,
+    fault,
+):
+    ended, source = await ended_nonquota(db, setup, monkeypatch)
+    assert await db.resume_thread(str(ended["id"]))
+    current = await db.get_thread(str(ended["id"]))
+    retirement = await db.begin_pinned_thread_retirement(
+        str(ended["id"]), permanent=False
+    )
+    assert await db.authorize_pinned_thread_retirement(
+        str(ended["id"]),
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    async with db.acquire() as conn, conn.transaction():
+        await conn.execute("SET LOCAL session_replication_role=replica")
+        if fault == "missing_operation":
+            await conn.execute(
+                "DELETE FROM vm_thread_retained_resumes WHERE thread_id=$1", ended["id"]
+            )
+        elif fault == "changed_capture":
+            await conn.execute(
+                "UPDATE vm_thread_retained_resumes SET retained_vm=jsonb_set(retained_vm,'{vm_uid}',to_jsonb(gen_random_uuid()::text)) WHERE thread_id=$1",
+                ended["id"],
+            )
+        elif fault == "new_source":
+            await conn.execute(
+                "INSERT INTO vm_creation_retries SELECT changed.* FROM vm_creation_retries r "
+                "JOIN vm_thread_retained_resumes op ON op.thread_id=r.thread_id "
+                "CROSS JOIN LATERAL json_populate_record(NULL::vm_creation_retries, "
+                "(to_jsonb(r)||jsonb_build_object('request_id',op.request_id,'provision_generation',op.provision_generation,'thread_runtime_generation',op.runtime_generation))::json) changed "
+                "WHERE r.request_id=$1",
+                source["request_id"],
+            )
+        elif fault == "exposed":
+            await conn.execute(
+                "UPDATE threads SET runtime_authority_exposed=true WHERE id=$1",
+                ended["id"],
+            )
+        elif fault == "captured_exposed":
+            await conn.execute(
+                "UPDATE threads SET runtime_retirement_context=jsonb_set(runtime_retirement_context,'{runtime_authority_exposed}','true') WHERE id=$1",
+                ended["id"],
+            )
+        elif fault == "captured_control":
+            await conn.execute(
+                "UPDATE threads SET runtime_retirement_context=jsonb_set(runtime_retirement_context,'{control_admission_agent_id}',to_jsonb(gen_random_uuid()::text)) WHERE id=$1",
+                ended["id"],
+            )
+        elif fault == "old_stop":
+            await conn.execute(
+                "UPDATE vm_resource_thread_cleanup_stops SET stop_evidence=jsonb_set(stop_evidence,'{vm_absent}','false')"
+            )
+        elif fault == "old_zero":
+            await conn.execute(
+                "DELETE FROM managed_repository_process_zero_receipts WHERE owner_id=$1 AND scope='vm'",
+                ended["id"],
+            )
+    vm = retirement["context"]["vm"]
+    with pytest.raises(asyncpg.CheckViolationError):
+        await acquire_pinned_thread_retirement_cleanup_permit(
+            VMWorkspaceRecoveryStore(db),
+            thread_id=ended["id"],
+            identity=VMTeardownIdentity(
+                provision_generation=vm["provision_generation"],
+                vm_uid=vm["vm_uid"],
+                rootdisk_pvc_uid=vm["rootdisk_pvc_uid"],
+            ),
+            purge_disk=False,
+        )
+    after = await db.get_thread(str(ended["id"]))
+    assert after["runtime_generation"] == current["runtime_generation"]
+    assert after["runtime_retirement_token"] is not None
+    assert (
+        dict(
+            await db.fetchrow(
+                "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+                source["request_id"],
+            )
+        )
+        == source
+    )
