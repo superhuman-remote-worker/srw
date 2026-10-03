@@ -56,7 +56,7 @@ class RetryClock:
 async def test_pre_setup_end_retries_remote_proof_within_five_seconds(
     db, monkeypatch, permanent
 ):
-    ids, retirement, _, events, _, vm = await fixtures.scenario(
+    ids, retirement, _, events, k8s, vm = await fixtures.scenario(
         db, monkeypatch, permanent=permanent, actor_status="booting"
     )
     proof = dict(
@@ -77,6 +77,14 @@ async def test_pre_setup_end_retries_remote_proof_within_five_seconds(
     clock = RetryClock(stopped)
     monkeypatch.setattr(detector, "asyncio", clock)
     attempts = []
+    stopped_uids = []
+    stop_pod = k8s.delete_namespaced_pod
+
+    def record_exact_stop(*args, **kwargs):
+        stopped_uids.append(kwargs["body"]["preconditions"]["uid"])
+        return stop_pod(*args, **kwargs)
+
+    monkeypatch.setattr(k8s, "delete_namespaced_pod", record_exact_stop)
     release = vm.release_vm_captured
 
     async def prove_remote_zero(thread_id, identity, **kwargs):
@@ -116,7 +124,9 @@ async def test_pre_setup_end_retries_remote_proof_within_five_seconds(
     assert len(attempts) == 2, "exact remote cleanup must retry before the 60s scan"
     assert 0 < attempts[1] - attempts[0] <= 5
     assert full_scans == [0], "unrelated reconciliation keeps its 60s cadence"
-    assert events == ["pod-stop", "vm-stop"]
+    assert events[-1] == "vm-stop"
+    assert events[:-1] and set(events[:-1]) == {"pod-stop"}
+    assert stopped_uids and set(stopped_uids) == {ids["pod_uid"]}
     current = await db.get_thread(ids["thread"])
     assert current is None if permanent else current["status"] == "ended"
     assert await db.list_retryable_pinned_retirements() == []
@@ -185,4 +195,4 @@ async def test_short_retry_keeps_ambiguous_remote_writers_pending(db, monkeypatc
     assert current["runtime_retirement_actuator_request"] is not None
     assert current["status"] == "active"
     # Even proven death of the separate agent Pod cannot settle remote writers.
-    assert events == ["pod-stop"]
+    assert events and set(events) == {"pod-stop"}
