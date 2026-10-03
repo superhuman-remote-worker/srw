@@ -1229,11 +1229,16 @@ def create_inference_app(
             consume_required = structured_name is None and not tool_phase
             if state["scenario"] == "slow-nonstream" and consume_required and stream:
                 await _account_rejection(
-                    store, run_id=run_id, endpoint="chat.completions",
-                    model=model, stream=stream, outcome="unexpected_stream_mode",
+                    store,
+                    run_id=run_id,
+                    endpoint="chat.completions",
+                    model=model,
+                    stream=stream,
+                    outcome="unexpected_stream_mode",
                 )
                 raise ScenarioError(
-                    422, "stream_not_supported",
+                    422,
+                    "stream_not_supported",
                     "The slow-nonstream ordinary reply requires stream=false.",
                 )
             decision = await store.begin_call(
