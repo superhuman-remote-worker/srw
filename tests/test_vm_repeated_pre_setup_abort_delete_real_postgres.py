@@ -122,12 +122,14 @@ async def test_repeated_confirmed_pre_setup_release_then_normal_permanent_delete
         "last_branch",
         "last_cycle",
         "last_protocol",
+        "last_release_kind",
         "last_pod",
         "last_workspace_generation",
         "last_workspace_incarnation",
         "last_partial_workspace",
         "last_future_release",
         "last_reverse_time",
+        "first_before_adoption",
         "last_unpublished",
         "last_unprotected",
         "last_late_publication",
@@ -198,6 +200,7 @@ async def test_repeated_abort_delete_refuses_inexact_path_or_purge(
                 change = {
                     "last_cycle": "successor_generation=$3",
                     "last_protocol": "quiescence_protocol='agent_runtime_zero_v1'",
+                    "last_release_kind": "release_kind='server_pre_delivery'",
                     "last_pod": "agent_pod_uid='replacement-pod-uid'",
                     "last_workspace_generation": "workspace_generation='"
                     + str(uuid4())
@@ -221,6 +224,28 @@ async def test_repeated_abort_delete_refuses_inexact_path_or_purge(
                 await conn.execute(
                     f"UPDATE thread_runtime_attach_abort_outcomes SET {change} WHERE thread_id=$1 AND runtime_generation=$2",
                     *args,
+                )
+                if defect == "last_reverse_time":
+                    # Keep publication earlier so this independently exercises
+                    # monotonic abort order rather than the Pod-time check.
+                    await conn.execute(
+                        "UPDATE thread_agent_pod_provision_intents SET resolved_at=now()-interval '2 days' "
+                        "WHERE thread_id=$1 AND runtime_generation=$2",
+                        current["id"],
+                        last["runtime_generation"],
+                    )
+            elif defect == "first_before_adoption":
+                await conn.execute(
+                    "UPDATE thread_runtime_attach_abort_outcomes SET released_at=now()-interval '1 day' "
+                    "WHERE thread_id=$1 AND runtime_generation=$2",
+                    current["id"],
+                    first["runtime_generation"],
+                )
+                await conn.execute(
+                    "UPDATE thread_agent_pod_provision_intents SET resolved_at=now()-interval '2 days' "
+                    "WHERE thread_id=$1 AND runtime_generation=$2",
+                    current["id"],
+                    first["runtime_generation"],
                 )
             elif defect.startswith("purge_"):
                 change = {

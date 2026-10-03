@@ -252,3 +252,21 @@ async def test_nonquota_source_refuses_coherently_digested_invalid_policy(
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["request_digest", "controller_configuration_digest"])
+async def test_nonquota_source_refuses_changed_frozen_digest(
+    db,  # noqa: F811
+    setup,  # noqa: F811
+    monkeypatch,
+    key,
+):
+    current, source = await adopted_source(db, setup, monkeypatch)
+    arguments = dict(
+        thread_id=str(current["id"]),
+        generation=str(source["provision_generation"]),
+        request_id=str(source["request_id"]),
+    )
+    assert verified_source(source, **arguments) is not None
+    assert verified_source(source | {key: "sha256:" + "0" * 64}, **arguments) is None
