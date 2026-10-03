@@ -1,10 +1,12 @@
 """Permanent Delete must settle already accepted legacy non-quota Resume."""
 
 import json
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
+import pytest_asyncio
 
 from tests.test_pinned_vm_failed_initial_end_real_postgres import _release_binding
 from tests.test_pinned_vm_initial_binding_real_postgres import _bind_cold_agent
@@ -17,8 +19,25 @@ from tests.test_vm_nonquota_retained_resume_real_postgres import (
     db,  # noqa: F401
     pg_dsn,  # noqa: F401
     setup,  # noqa: F401
-    thread_schema,  # noqa: F401
+    thread_schema as retained_schema,  # noqa: F401
 )
+
+
+@pytest_asyncio.fixture(scope="module")
+async def thread_schema(pg_dsn, retained_schema):  # noqa: F811 - imported fixture
+    migration = (
+        Path(__file__).resolve().parents[1]
+        / "src/orchestrator/database/migrations/app/0324_legacy_nonquota_resume_delete.sql"
+    )
+    if migration.exists():
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            if not await conn.fetchval(
+                "SELECT to_regprocedure('public.vm_thread_creation_legacy_resume_delete_lineage(public.threads,public.vm_creation_retries)') IS NOT NULL"
+            ):
+                await conn.execute(migration.read_text())
+        finally:
+            await conn.close()
 
 
 async def legacy_resumed(store, controller_setup, monkeypatch, *, released_actor):
