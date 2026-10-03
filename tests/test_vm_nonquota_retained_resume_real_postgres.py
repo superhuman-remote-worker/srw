@@ -1,8 +1,13 @@
 """Native non-quota End must preserve an exact retained-Resume predecessor."""
 
 import json
+from pathlib import Path
+
+import asyncpg
+import pytest_asyncio
 
 import pytest
+from tests.test_vm_nonquota_readiness_real_postgres import prepared
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.services.vm_provisioner import VMTeardownIdentity
@@ -18,7 +23,7 @@ from tests.test_vm_thread_adopted_without_quotas_delete_real_postgres import (
     cleaned_retirement,
     db,  # noqa: F401
     setup,  # noqa: F401
-    thread_schema,  # noqa: F401
+    thread_schema as _thread_schema,  # noqa: F401 - pytest fixture registration
 )
 
 
@@ -41,10 +46,27 @@ def pg_dsn():
         container.stop()
 
 
+@pytest_asyncio.fixture(scope="module")
+async def thread_schema(pg_dsn, _thread_schema):  # noqa: F811 - fixture dependency
+    migration = (
+        Path(__file__).resolve().parents[1]
+        / "src/orchestrator/database/migrations/app/0323_nonquota_retained_vm_resume.sql"
+    )
+    if migration.exists():
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            if not await conn.fetchval(
+                "SELECT to_regprocedure('public.valid_vm_thread_nonquota_creation(public.vm_creation_retries)') IS NOT NULL"
+            ):
+                await conn.execute(migration.read_text())
+        finally:
+            await conn.close()
+
+
 @pytest.mark.asyncio
 async def test_nonquota_soft_end_requires_exact_controller_stop_before_completion(
-    db,
-    setup,
+    db,  # noqa: F811 - imported fixture
+    setup,  # noqa: F811 - imported fixture
     monkeypatch,  # noqa: F811 - imported PostgreSQL/controller fixtures
 ):
     current, source = await adopted_source(db, setup, monkeypatch)
@@ -85,12 +107,16 @@ async def test_nonquota_soft_end_requires_exact_controller_stop_before_completio
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rotated", [False, True], ids=["original-actor", "confirmed-successor"]
+)
 async def test_native_nonquota_end_resume_records_retained_operation_without_kept_marker(
-    db,
-    setup,
-    monkeypatch,  # noqa: F811 - imported PostgreSQL/controller fixtures
+    db,  # noqa: F811 - imported fixture
+    setup,  # noqa: F811 - imported fixture
+    monkeypatch,
+    rotated,
 ):
-    current, source = await adopted_source(db, setup, monkeypatch)
+    current, source, _, _ = await prepared(db, setup, monkeypatch, rotated)
     retirement = await cleaned_retirement(db, current, permanent=False)
     assert await db.settle_pinned_thread_retirement(
         str(current["id"]),
