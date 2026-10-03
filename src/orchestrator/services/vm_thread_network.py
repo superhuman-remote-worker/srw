@@ -60,7 +60,8 @@ def verified_source(
             and configuration["version"] in {1, 3}
             and (
                 configuration["version"] != 1
-                or configuration.get("resource_admission") is None and profile is None
+                or configuration.get("resource_admission") is None
+                and profile is None
             )
             and canonical_configuration_digest(configuration)
             == source["controller_configuration_digest"]
@@ -114,8 +115,8 @@ async def confirmed_pre_setup_source(
             "SELECT EXISTS(SELECT 1 FROM threads t JOIN vm_creation_retries c "
             "ON c.thread_id=t.id AND c.owner_kind='thread' "
             "WHERE t.id=$1 AND c.request_id=$2 AND c.provision_generation=$3 "
-        "AND t.execution_lane='pinned' AND t.runtime_generation=$4 "
-        "AND t.status<>'ended' AND t.ended_at IS NULL "
+            "AND t.execution_lane='pinned' AND t.runtime_generation=$4 "
+            "AND t.status<>'ended' AND t.ended_at IS NULL "
             "AND t.agent_id IS NOT DISTINCT FROM $5::uuid "
             "AND t.runtime_attach_token IS NOT DISTINCT FROM $6::uuid "
             "AND t.runtime_retirement_token IS NULL "
