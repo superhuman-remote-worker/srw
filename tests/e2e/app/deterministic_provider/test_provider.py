@@ -4,12 +4,14 @@ import asyncio
 import hashlib
 import json
 import os
+import socket
 import subprocess
 
 import httpx
 import pytest
 import pytest_asyncio
 import yaml
+import uvicorn
 
 from tests.e2e.app.deterministic_provider.provider import (
     CHAT_MODEL_ID,
@@ -67,6 +69,7 @@ async def arm(
     scenario: str = "reply",
     required_responses: int = 1,
     chunk_delay_ms: int | None = None,
+    nonstream_delay_ms: int | None = None,
 ) -> dict:
     body: dict[str, object] = {
         "scenario": scenario,
@@ -74,6 +77,8 @@ async def arm(
     }
     if chunk_delay_ms is not None:
         body["chunk_delay_ms"] = chunk_delay_ms
+    if nonstream_delay_ms is not None:
+        body["nonstream_delay_ms"] = nonstream_delay_ms
     response = await control.post(
         f"/control/scenarios/{run_id}/arm",
         json=body,
@@ -225,6 +230,180 @@ async def test_non_streaming_reply_and_exhaustion_are_accounted(
         "success",
         "unexpected_exhausted",
     }
+
+
+async def _wait_for_pending(store: ScenarioStore, run_id: str) -> dict:
+    async def pending() -> dict:
+        for _ in range(100):
+            state = await store.state(run_id)
+            if state["pending_calls"] == 1:
+                return state
+            await asyncio.sleep(0.01)
+        raise AssertionError("required nonstream call never became pending")
+
+    return await asyncio.wait_for(pending(), timeout=2)
+
+
+async def test_slow_nonstream_cancelled_client_keeps_response_unconsumed(
+    store: ScenarioStore,
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    run_id = "slow-nonstream-cancel-001"
+    await arm(control, run_id, scenario="slow-nonstream",
+              nonstream_delay_ms=15_000)
+    request = asyncio.create_task(inference.post(
+        "/v1/chat/completions", json=chat_request(run_id)))
+    pending = await _wait_for_pending(store, run_id)
+    assert pending["reserved_required_responses"] == 1
+    assert pending["remaining_required_responses"] == 0
+    assert pending["consumed_required_responses"] == 0
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    for _ in range(100):
+        settled = await store.state(run_id)
+        if settled["pending_calls"] == 0:
+            break
+        await asyncio.sleep(0.01)
+    assert settled["pending_calls"] == 0
+    assert settled["reserved_required_responses"] == 0
+    assert settled["remaining_required_responses"] == 1
+    assert settled["consumed_required_responses"] == 0
+    assert settled["calls"][-1]["stream"] is False
+    assert settled["calls"][-1]["outcome"] == "cancelled"
+
+
+async def test_slow_nonstream_releases_one_response_only_after_delay(
+    store: ScenarioStore,
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    run_id = "slow-nonstream-success-001"
+    await arm(control, run_id, scenario="slow-nonstream",
+              nonstream_delay_ms=15_000)
+    request = asyncio.create_task(inference.post(
+        "/v1/chat/completions", json=chat_request(run_id)))
+    pending = await _wait_for_pending(store, run_id)
+    assert pending["reserved_required_responses"] == 1
+    assert pending["consumed_required_responses"] == 0
+    response = await asyncio.wait_for(request, timeout=18)
+    assert response.status_code == 200
+    settled = await store.state(run_id)
+    assert settled["pending_calls"] == 0
+    assert settled["consumed_required_responses"] == 1
+    assert settled["remaining_required_responses"] == 0
+    assert settled["calls"][-1]["outcome"] == "success"
+    assert settled["calls"][-1]["stream"] is False
+    assert settled["calls"][-1]["duration_ms"] >= 14_000
+
+
+async def test_slow_nonstream_arm_bounds_and_stream_refusal(
+    store: ScenarioStore,
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    for delay in (14_999, 30_001):
+        response = await control.post("/control/scenarios/slow-nonstream-bound-001/arm",
+            json={"scenario": "slow-nonstream", "required_responses": 1,
+                  "nonstream_delay_ms": delay})
+        assert response.status_code == 422
+    for body in (
+        {"scenario": "slow-nonstream", "required_responses": 1},
+        {"scenario": "slow-nonstream", "required_responses": 2,
+         "nonstream_delay_ms": 15_000},
+        {"scenario": "reply", "required_responses": 1,
+         "nonstream_delay_ms": 15_000},
+    ):
+        response = await control.post("/control/scenarios/slow-nonstream-bound-001/arm",
+                                      json=body)
+        assert response.status_code == 422
+    await arm(control, "slow-nonstream-bound-001", scenario="slow-nonstream",
+              nonstream_delay_ms=15_000)
+    response = await inference.post("/v1/chat/completions",
+        json=chat_request("slow-nonstream-bound-001", stream=True))
+    assert response.status_code == 422
+    state = await store.state("slow-nonstream-bound-001")
+    assert state["pending_calls"] == state["consumed_required_responses"] == 0
+    assert state["remaining_required_responses"] == 1
+
+
+async def test_slow_nonstream_real_http_socket_disconnect_is_cancelled(
+    store: ScenarioStore,
+    control: httpx.AsyncClient,
+) -> None:
+    run_id = "slow-nonstream-socket-001"
+    await arm(control, run_id, scenario="slow-nonstream",
+              nonstream_delay_ms=15_000)
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(
+        create_inference_app(store, inference_api_key=INFERENCE_KEY),
+        host="127.0.0.1", port=port, log_level="critical", lifespan="off",
+    ))
+    serving = asyncio.create_task(server.serve())
+    writer = None
+    try:
+        for _ in range(100):
+            if server.started:
+                break
+            await asyncio.sleep(0.01)
+        assert server.started
+        _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        body = json.dumps(chat_request(run_id)).encode()
+        writer.write((
+            f"POST /v1/chat/completions HTTP/1.1\r\n"
+            f"Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {INFERENCE_KEY}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n"
+        ).encode() + body)
+        await writer.drain()
+        pending = await _wait_for_pending(store, run_id)
+        assert pending["reserved_required_responses"] == 1
+        writer.close()
+        await writer.wait_closed()
+        for _ in range(100):
+            settled = await store.state(run_id)
+            if settled["pending_calls"] == 0:
+                break
+            await asyncio.sleep(0.01)
+        assert settled["pending_calls"] == 0
+        assert settled["consumed_required_responses"] == 0
+        assert settled["remaining_required_responses"] == 1
+        assert settled["calls"][-1]["outcome"] == "cancelled"
+    finally:
+        if writer is not None and not writer.is_closing():
+            writer.close()
+            await writer.wait_closed()
+        server.should_exit = True
+        server.force_exit = True
+        await asyncio.wait_for(serving, timeout=3)
+
+
+async def test_slow_nonstream_keeps_structured_nonrequired_calls_immediate(
+    store: ScenarioStore,
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    run_id = "slow-nonstream-structured-001"
+    await arm(control, run_id, scenario="slow-nonstream",
+              nonstream_delay_ms=15_000)
+    structured = chat_request(run_id, extra={"response_format": {
+        "type": "json_schema",
+        "json_schema": {"name": "ConversationTitle", "schema": {"type": "object"}},
+    }})
+    for streaming in (False, True):
+        structured["stream"] = streaming
+        response = await asyncio.wait_for(inference.post(
+            "/v1/chat/completions", json=structured), timeout=2)
+        assert response.status_code == 200
+    state = await store.state(run_id)
+    assert state["pending_calls"] == 0
+    assert state["required_responses"] == state["remaining_required_responses"] == 1
+    assert state["consumed_required_responses"] == 0
+    assert [call["stream"] for call in state["calls"]] == [False, True]
 
 
 async def test_concurrent_required_calls_cannot_share_one_reserved_response(
