@@ -465,6 +465,18 @@ async def test_populated_0297_retained_source_survives_0298(
             marker=False,
             bind=True,
         )
+        assert await store.fetchval(
+            "SELECT to_regprocedure('public.valid_vm_thread_nonquota_cleanup_source("
+            "public.vm_resource_thread_cleanup_authorities,public.vm_creation_retries)') IS NULL"
+        )
+        assert (
+            await store.fetchval(
+                "SELECT controller_configuration->>'version' FROM vm_creation_retries "
+                "WHERE thread_id=$1",
+                case["thread_id"],
+            )
+            == "3"
+        )
         await ensure_session_workspace(
             str(case["thread_id"]),
             db=store,
