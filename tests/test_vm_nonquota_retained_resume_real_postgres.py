@@ -189,6 +189,11 @@ async def test_nonquota_retained_resume_waits_for_actor_then_admits_one_exact_so
         "SELECT * FROM vm_thread_retained_resumes WHERE thread_id=$1", ended["id"]
     )
     assert operation is not None
+    from orchestrator.services.vm_thread_retained_resume import operation_on_conn
+
+    async with db.acquire() as conn:
+        proven = await operation_on_conn(conn, operation["id"], ended["id"])
+    assert proven["nonquota"] is True
     calls = []
     configuration = json.loads(old_source["controller_configuration"])
 

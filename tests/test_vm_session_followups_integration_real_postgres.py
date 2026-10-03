@@ -495,9 +495,11 @@ async def test_populated_0297_retained_source_survives_0298(
                 return await self.conn.fetchval(query, *args)
 
         async def quota_operation(conn, operation_id, thread_id):
-            return await native_operation(
+            value = await native_operation(
                 QuotaConnection(conn), operation_id, thread_id
             )
+            assert value is None or value["nonquota"] is False
+            return value
 
         monkeypatch.setattr(retained, "operation_on_conn", quota_operation)
         await ensure_session_workspace(
