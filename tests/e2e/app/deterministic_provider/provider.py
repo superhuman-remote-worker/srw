@@ -28,7 +28,7 @@ from typing import Any, AsyncIterator, Final, Literal
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 CHAT_MODEL_ID = os.environ.get("E2E_CHAT_MODEL_ID", "e2e-chat")
@@ -42,6 +42,7 @@ SUPPORTED_SCENARIOS = frozenset(
     {
         "reply",
         "slow-stream",
+        "slow-nonstream",
         "error-once",
         "tool-call",
         "numbered-stream",
@@ -76,6 +77,7 @@ class ArmScenarioRequest(BaseModel):
     scenario: Literal[
         "reply",
         "slow-stream",
+        "slow-nonstream",
         "error-once",
         "tool-call",
         "numbered-stream",
@@ -88,7 +90,16 @@ class ArmScenarioRequest(BaseModel):
     ] = "reply"
     required_responses: int = Field(default=1, ge=1, le=100)
     chunk_delay_ms: int = Field(default=100, ge=0, le=2_000)
+    nonstream_delay_ms: int | None = Field(default=None, ge=15_000, le=30_000)
     sentinel_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+    @model_validator(mode="after")
+    def require_explicit_nonstream_delay(self) -> "ArmScenarioRequest":
+        if (self.scenario == "slow-nonstream") != (self.nonstream_delay_ms is not None):
+            raise ValueError("slow-nonstream requires an exclusive bounded delay")
+        if self.scenario == "slow-nonstream" and self.required_responses != 1:
+            raise ValueError("slow-nonstream requires exactly one response")
+        return self
 
 
 class ArmProbeWindowRequest(BaseModel):
@@ -159,6 +170,7 @@ class RunState:
     scenario: str
     required_responses: int
     chunk_delay_ms: int
+    nonstream_delay_ms: int | None = None
     consumed_required_responses: int = 0
     unexpected_calls: int = 0
     error_once_emitted: bool = False
@@ -343,6 +355,7 @@ class ScenarioStore:
                 scenario=request.scenario,
                 required_responses=request.required_responses,
                 chunk_delay_ms=request.chunk_delay_ms,
+                nonstream_delay_ms=request.nonstream_delay_ms,
                 sentinel_sha256=request.sentinel_sha256,
             )
             return self._serialize(self._runs[run_id])
@@ -902,7 +915,7 @@ class ScenarioStore:
                 state.counters.items(), key=lambda item: item[0]
             )
         ]
-        return {
+        result = {
             "run_id": state.run_id,
             "scenario": state.scenario,
             "required_responses": state.required_responses,
@@ -919,6 +932,9 @@ class ScenarioStore:
             "counters": counters,
             "calls": list(state.calls),
         }
+        if state.scenario == "slow-nonstream":
+            result["nonstream_delay_ms"] = state.nonstream_delay_ms
+        return result
 
 
 def create_inference_app(
@@ -1211,6 +1227,15 @@ def create_inference_app(
 
             tool_phase = tool_call is not None
             consume_required = structured_name is None and not tool_phase
+            if state["scenario"] == "slow-nonstream" and consume_required and stream:
+                await _account_rejection(
+                    store, run_id=run_id, endpoint="chat.completions",
+                    model=model, stream=stream, outcome="unexpected_stream_mode",
+                )
+                raise ScenarioError(
+                    422, "stream_not_supported",
+                    "The slow-nonstream ordinary reply requires stream=false.",
+                )
             decision = await store.begin_call(
                 run_id=run_id,
                 endpoint="chat.completions",
@@ -1247,14 +1272,29 @@ def create_inference_app(
                     },
                 )
 
-            response = _non_stream_completion(
-                decision=decision,
-                content=content,
-                finish_reason=finish_reason,
-                tool_call=tool_call,
-            )
-            await store.finish_call(decision, "success")
-            return response
+            try:
+                if decision.scenario == "slow-nonstream" and decision.consume_required:
+                    if not await _wait_nonstream_delay(
+                        request, state["nonstream_delay_ms"]
+                    ):
+                        await store.finish_call(decision, "cancelled")
+                        return _error_response(
+                            499, "client_disconnected", "Client disconnected."
+                        )
+                response = _non_stream_completion(
+                    decision=decision,
+                    content=content,
+                    finish_reason=finish_reason,
+                    tool_call=tool_call,
+                )
+                await store.finish_call(decision, "success")
+                return response
+            except asyncio.CancelledError:
+                await asyncio.shield(store.finish_call(decision, "cancelled"))
+                raise
+            except Exception:
+                await store.finish_call(decision, "fixture_error")
+                raise
         except ScenarioError as exc:
             return _scenario_error_response(exc)
 
@@ -1850,6 +1890,23 @@ async def _stream_completion(
         raise
     else:
         await store.finish_call(decision, "success")
+
+
+async def _wait_nonstream_delay(request: Request, delay_ms: int) -> bool:
+    """Bound one nonstream response on the ASGI disconnect channel.
+
+    The body is already read. Starlette exposes the underlying receive channel;
+    a disconnected client produces ``http.disconnect``. A deadline ends the
+    wait even when the client remains connected and sends no further events.
+    """
+    try:
+        async with asyncio.timeout(delay_ms / 1_000):
+            while True:
+                message = await request.receive()
+                if message.get("type") == "http.disconnect":
+                    return False
+    except TimeoutError:
+        return True
 
 
 def _non_stream_completion(
