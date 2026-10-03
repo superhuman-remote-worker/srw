@@ -212,17 +212,28 @@ class VMProvisioningPhaseStore:
             ready_vm = {**vm, **dict(updates)}
             if not _ready(ready_vm, retry, evidence, now):
                 return False
-            try:
-                resource = await installed_job_resource_store(
-                    conn, self.db, retry["controller_configuration"], fresh=False,
-                )
-                if resource is None or not await resource.bind_ready_on_conn(
-                    conn, retry=retry, vm=vm,
-                    job_id=thread_id, generation=generation,
+            configuration = _object(retry["controller_configuration"])
+            if configuration["version"] == 1:
+                # Non-quota creation carries the same immutable effect/Ready
+                # authority, but never owns a fabricated resource reservation.
+                if configured_enforcement_policy() is not None or await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_resource_reservations WHERE request_id=$1) "
+                    "OR EXISTS(SELECT 1 FROM vm_resource_waiters WHERE request_id=$1)",
+                    retry["request_id"],
                 ):
                     return False
-            except (ResourceAdmissionError, InventoryError):
-                return False
+            else:
+                try:
+                    resource = await installed_job_resource_store(
+                        conn, self.db, retry["controller_configuration"], fresh=False,
+                    )
+                    if resource is None or not await resource.bind_ready_on_conn(
+                        conn, retry=retry, vm=vm,
+                        job_id=thread_id, generation=generation,
+                    ):
+                        return False
+                except (ResourceAdmissionError, InventoryError):
+                    return False
             metadata["vm"] = ready_vm
             changed = await conn.execute(
                 "UPDATE threads SET metadata=$2::jsonb,last_activity=clock_timestamp() "

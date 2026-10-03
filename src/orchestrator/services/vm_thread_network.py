@@ -56,7 +56,12 @@ def verified_source(
             and request.get("job_id") == thread_id
             and request.get("provision_generation") == generation
             and canonical_request_digest(request) == source["request_digest"]
-            and configuration.get("version") == 3
+            and type(configuration.get("version")) is int
+            and configuration["version"] in {1, 3}
+            and (
+                configuration["version"] != 1
+                or configuration.get("resource_admission") is None and profile is None
+            )
             and canonical_configuration_digest(configuration)
             == source["controller_configuration_digest"]
             and (profile is None or request.get("preparation") is None)
