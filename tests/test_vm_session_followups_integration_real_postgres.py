@@ -477,6 +477,29 @@ async def test_populated_0297_retained_source_survives_0298(
             )
             == "3"
         )
+        from orchestrator.services import vm_thread_retained_resume as retained
+
+        native_operation = retained.operation_on_conn
+
+        class QuotaConnection:
+            def __init__(self, conn):
+                self.conn = conn
+
+            def __getattr__(self, name):
+                return getattr(self.conn, name)
+
+            async def fetchval(self, query, *args):
+                assert "valid_vm_thread_nonquota_cleanup_source" not in query, (
+                    "Quota Resume must not require the newer non-quota validator"
+                )
+                return await self.conn.fetchval(query, *args)
+
+        async def quota_operation(conn, operation_id, thread_id):
+            return await native_operation(
+                QuotaConnection(conn), operation_id, thread_id
+            )
+
+        monkeypatch.setattr(retained, "operation_on_conn", quota_operation)
         await ensure_session_workspace(
             str(case["thread_id"]),
             db=store,
