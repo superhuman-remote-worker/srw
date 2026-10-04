@@ -239,7 +239,7 @@ jobs:
       # layer and its encryption/main-cloud value objects later in this job.
       - run: >-
           pip install --quiet asyncpg cryptography httpx tenacity
-          'pydantic>=2.10' pytest pytest-asyncio
+          'pydantic>=2.10' pytest pytest-asyncio 'testcontainers[postgres]>=4.0'
       - run: pip install --quiet --no-deps -e .
       - name: Create the vector database
         env:
