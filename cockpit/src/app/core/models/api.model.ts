@@ -1820,14 +1820,7 @@ export interface ProjectWorkspaceDefaultsUpdate {
 
 /** `GET /api/resources?...&kind=WorkspaceTemplate`: the visible templates for
  *  a scope, used to populate the Settings tab's template pickers. */
-export interface WorkspaceTemplateList {
-  resources: {
-    resource: {
-      metadata: {name: string; scope: {kind: string; name: string}; annotations?: Record<string, string>};
-      spec: {backend?: string};
-    };
-  }[];
-}
+export type WorkspaceTemplateList = import('./workspace-template.model').WorkspaceTemplateItems;
 
 /**
  * Project member with user info.
