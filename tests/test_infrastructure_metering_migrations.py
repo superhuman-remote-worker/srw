@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0324_legacy_nonquota_resume_delete.sql"
+    / "src/orchestrator/database/migrations/app/0325_vm_thread_cleanup_refusal_recovery.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

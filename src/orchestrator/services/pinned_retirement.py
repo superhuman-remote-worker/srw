@@ -90,6 +90,21 @@ class PinnedRetirementOperations:
             identity=identity,
             purge_disk=purge_disk,
         )
+        if (
+            permit.allowed
+            and completed_cleanup_outcome(permit) == "identity_superseded"
+            and purge_disk
+        ):
+            from orchestrator.services.vm_thread_cleanup_refusal_recovery import (
+                recover_completed_thread_vm_refusal,
+            )
+
+            permit = await recover_completed_thread_vm_refusal(
+                self.dependencies.recovery_store,
+                self.dependencies.vm_provisioner,
+                permit,
+                retirement,
+            )
         return permit if permit.allowed else None
 
     async def _complete_vm_cleanup(self, permit: Any, outcome: str) -> None:
