@@ -2,7 +2,7 @@ import {describe, expect, it, vi} from 'vitest';
 import {TestBed} from '@angular/core/testing';
 import {signal} from '@angular/core';
 import {TranslocoService} from '@jsverse/transloco';
-import {of} from 'rxjs';
+import {Subject, of, throwError} from 'rxjs';
 import {WorkspacePickerComponent} from './workspace-picker.component';
 import {ApiService} from '../../core/services/api.service';
 import {UserService} from '../../core/services/user.service';
@@ -50,6 +50,7 @@ function create(opts: {projectId?: string | null; defaults?: ProjectWorkspaceDef
   stub('recommendedBy', 'Engineer');
   stub('preview', null);
   stub('disabled', false);
+  TestBed.tick();
   TestBed.tick();
   return {c, api};
 }
@@ -135,5 +136,90 @@ describe('WorkspacePickerComponent', () => {
     expect(doc.metadata).toEqual({name: 'my-lean', scope: {kind: 'Account', name: 'me'}});
     expect(api.checkWorkspaceRecipe).toHaveBeenCalledWith(doc.spec, 'p-1');
     expect(c.choice()).toMatchObject({kind: 'ref', ref: {name: 'my-lean', scope: {kind: 'Account', name: USER}}});
+  });
+
+  it('shows tier, sizes and image in each option label', () => {
+    const {c} = create();
+    const label = c.groups()[0].options.find((o) => o.value.endsWith('/container-full'))!.label;
+    expect(label).toContain('workspaces.tier.container');
+    expect(label).toContain('2 CPU · 4Gi');
+    expect(label).toContain('container-full:1');
+  });
+
+  it('summarises the Default: found template and not-found fallback', () => {
+    const found = create({projectId: 'p-1'});
+    expect(found.c.summary()).toContain('2 CPU · 4Gi');
+    expect(found.c.summary()).toContain('container-full:1');
+    expect(found.c.summary()).toContain('agentSettings.workspacePicker.layer.installation');
+    const missing = create({projectId: 'p-1', defaults: DEFAULTS({effective: {...DEFAULTS().effective, container: {template_name: 'gone', source: 'builtin'}}})});
+    expect(missing.c.summary()).toBe('agentSettings.workspacePicker.mode.container (agentSettings.workspacePicker.layer.installation)');
+  });
+
+  it('customizes from the default preview when there is no Project', () => {
+    const {c} = create();
+    c.lastDefaultPreview.set({backend: 'virtual', source: 'default', binding: null, template_name: 'virtual'});
+    c.openCustomize();
+    expect(c.draft().backend).toBe('virtual');
+  });
+
+  it('validates the inline run without the template name, and reports a bad name on save', () => {
+    const {c, api} = create();
+    c.select('ref:Catalog/shared/container-full');
+    c.openCustomize();
+    c.draft.update((v) => ({...v, name: 'My Lean'}));
+    c.useCustom();
+    expect(c.choice().kind).toBe('inline');
+    c.openCustomize();
+    c.draft.update((v) => ({...v, name: 'My Lean'}));
+    c.saveToMine();
+    expect(c.nameError()).toBe('workspaces.errors.name');
+    expect(api.applyManifest).not.toHaveBeenCalled();
+  });
+
+  it('drops a superseded Project load', () => {
+    const p1 = new Subject<unknown>();
+    const p2 = new Subject<unknown>();
+    TestBed.resetTestingModule();
+    const pid = signal<string | null>('p1');
+    const api = {
+      listWorkspaceTemplates: vi.fn().mockImplementation((kind: string, name: string) =>
+        kind === 'Project' ? (name === 'p1' ? p1 : p2) : of({resources: []})),
+      getProjectWorkspaceDefaults: vi.fn().mockReturnValue(of(DEFAULTS())),
+      checkWorkspaceRecipe: vi.fn(), applyManifest: vi.fn(),
+    };
+    TestBed.configureTestingModule({providers: [
+      WorkspacePickerComponent, {provide: ApiService, useValue: api},
+      {provide: UserService, useValue: {currentUser: signal({id: USER, is_admin: false, can_use_vm: true}), currentUserId: signal(USER)}},
+      {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+    ]});
+    const c = TestBed.inject(WorkspacePickerComponent);
+    Object.defineProperty(c, 'projectId', {value: pid});
+    TestBed.tick();
+    TestBed.tick();
+    pid.set('p2');
+    TestBed.tick();
+    TestBed.tick();
+    p2.next({resources: [t('two', 'sandbox', {kind: 'Project', name: 'p2'}, false)]});
+    p1.next({resources: [t('one', 'sandbox', {kind: 'Project', name: 'p1'}, false)]});
+    expect(c.projectItems().map((i) => i.resource.metadata.name)).toEqual(['two']);
+  });
+
+  it('treats a failed listing as empty', () => {
+    const {c, api} = create({projectId: 'p-1'});
+    expect(c.groups().length).toBe(3);
+    TestBed.resetTestingModule();
+    api.listWorkspaceTemplates.mockImplementation((kind: string) => kind === 'Account' ? throwError(() => new Error('x')) : of({resources: SHARED}));
+    TestBed.configureTestingModule({providers: [
+      WorkspacePickerComponent, {provide: ApiService, useValue: api},
+      {provide: UserService, useValue: {currentUser: signal({id: USER, is_admin: false, can_use_vm: true}), currentUserId: signal(USER)}},
+      {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+    ]});
+    const d = TestBed.inject(WorkspacePickerComponent);
+    Object.defineProperty(d, 'projectId', {value: () => 'p-1'});
+    TestBed.tick();
+    TestBed.tick();
+    expect(d.groups().map((g) => g.labelKey)).toEqual([
+      'agentSettings.workspacePicker.group.shared', 'agentSettings.workspacePicker.group.project',
+    ]);
   });
 });

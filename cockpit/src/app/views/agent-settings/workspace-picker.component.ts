@@ -1,6 +1,6 @@
 import {Component, computed, effect, inject, input, model, signal, untracked} from '@angular/core';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
-import {catchError, of, switchMap} from 'rxjs';
+import {Observable, Subject, catchError, map, of, switchMap, tap} from 'rxjs';
 import {ApiService} from '../../core/services/api.service';
 import {UserService} from '../../core/services/user.service';
 import {ProjectWorkspaceDefaults} from '../../core/models/api.model';
@@ -114,8 +114,9 @@ export class WorkspacePickerComponent {
   readonly mine = signal<WorkspaceTemplateItem[]>([]);
   readonly projectItems = signal<WorkspaceTemplateItem[]>([]);
   readonly defaults = signal<ProjectWorkspaceDefaults | null>(null);
-  private readonly lastDefaultPreview = signal<WorkspacePreview | null>(null);
+  readonly lastDefaultPreview = signal<WorkspacePreview | null>(null);
   private touched = false;
+  private readonly projectChanges = new Subject<string | null>();
   private readonly autoPicked = signal(false);
 
   readonly customizing = signal(false);
@@ -145,7 +146,10 @@ export class WorkspacePickerComponent {
       const vm = i.resource.spec.backend === 'vm';
       const tier = this.transloco.translate(`workspaces.tier.${modeOf(i.resource.spec.backend) === 'container' ? 'container' : i.resource.spec.backend}`);
       const unavailable = vm && !this.vmAllowed() ? ` (${this.transloco.translate(this.vmReasonKey() || 'workspaces.vm.notAllowed')})` : '';
-      return {value: `ref:${itemKey(i)}`, label: `${displayName(i.resource)} · ${tier}${unavailable}`, disabled: vm && !this.vmAllowed()};
+      const spec = i.resource.spec;
+      const image = spec.environment?.image;
+      const label = [displayName(i.resource), tier, sizeSummary(spec), image ? shortImage(image) : ''].filter(Boolean).join(' · ');
+      return {value: `ref:${itemKey(i)}`, label: `${label}${unavailable}`, disabled: vm && !this.vmAllowed()};
     };
     const groups: PickerGroup[] = [
       {labelKey: 'agentSettings.workspacePicker.group.shared', options: builtinsFirst(this.shared()).map(option)},
@@ -163,22 +167,23 @@ export class WorkspacePickerComponent {
   });
 
   /** What "Default" resolves to: from the Project's defaults when a Project is chosen, otherwise from the last preview taken while Default was selected. */
-  readonly defaultLabel = computed(() => {
+  private readonly resolvedDefault = computed<{mode: Mode | null; template: string | null; layer: string}>(() => {
     const roleKey = this.role() === 'job' ? 'jobs' : 'sessions';
     const d = this.defaults();
-    let mode: Mode | null = null;
-    let template: string | null = null;
-    let layer = 'installation';
     if (d) {
-      mode = d.effective[roleKey].mode as Mode;
-      layer = d.effective[roleKey].source === 'project' ? 'project' : 'installation';
-      if (mode === 'container' || mode === 'vm') template = d.effective[mode].template_name;
-    } else {
-      const p = this.lastDefaultPreview();
-      mode = modeOf(p?.backend);
-      template = p?.template_name ?? null;
-      layer = p?.sources?.tier === 'project' ? 'project' : 'installation';
+      const mode = d.effective[roleKey].mode as Mode;
+      return {
+        mode,
+        template: mode === 'container' || mode === 'vm' ? d.effective[mode].template_name : null,
+        layer: d.effective[roleKey].source === 'project' ? 'project' : 'installation',
+      };
     }
+    const p = this.lastDefaultPreview();
+    return {mode: modeOf(p?.backend), template: p?.template_name ?? null, layer: p?.sources?.tier === 'project' ? 'project' : 'installation'};
+  });
+
+  readonly defaultLabel = computed(() => {
+    const {mode, template, layer} = this.resolvedDefault();
     if (!mode) return this.transloco.translate('agentSettings.workspacePicker.defaultUnknown');
     const what = [this.transloco.translate(`agentSettings.workspacePicker.mode.${mode}`), template].filter(Boolean).join(' · ');
     return this.transloco.translate('agentSettings.workspacePicker.default', {
@@ -196,7 +201,7 @@ export class WorkspacePickerComponent {
 
   readonly summary = computed(() => {
     const c = this.choice();
-    if (c.kind === 'default') return '';
+    if (c.kind === 'default') return this.defaultSummary();
     if (c.kind === 'none') return this.transloco.translate('agentSettings.workspacePicker.summaryNone');
     const spec: WorkspaceTemplateSpec | undefined = c.kind === 'inline' ? c.spec : this.find(c.ref.scope.kind, c.ref.scope.name, c.ref.name)?.resource.spec;
     if (!spec) return c.kind === 'ref' ? c.label : '';
@@ -218,12 +223,20 @@ export class WorkspacePickerComponent {
   });
 
   constructor() {
-    this.api.listWorkspaceTemplates('Catalog', 'shared').subscribe((l) => this.shared.set(l.resources));
-    this.api.listWorkspaceTemplates('Account', 'me').subscribe((l) => this.mine.set(l.resources));
+    this.listOrEmpty('Catalog', 'shared').subscribe((l) => this.shared.set(l));
+    this.listOrEmpty('Account', 'me').subscribe((l) => this.mine.set(l));
     effect(() => {
       const id = this.projectId();
-      untracked(() => this.loadProject(id));
+      untracked(() => this.projectChanges.next(id));
     });
+    // switchMap drops a superseded Project's late responses.
+    this.projectChanges.pipe(
+      tap((id) => this.onProjectChange(id)),
+      switchMap((id) => (id ? this.listOrEmpty('Project', id) : of([] as WorkspaceTemplateItem[]))),
+    ).subscribe((l) => this.projectItems.set(l));
+    this.projectChanges.pipe(
+      switchMap((id) => (id ? this.api.getProjectWorkspaceDefaults(id).pipe(catchError(() => of(null))) : of(null))),
+    ).subscribe((d) => this.defaults.set(d));
     effect(() => {
       this.recommendation();
       this.defaults();
@@ -237,16 +250,37 @@ export class WorkspacePickerComponent {
     });
   }
 
-  private loadProject(id: string | null): void {
+  private listOrEmpty(kind: string, name: string): Observable<WorkspaceTemplateItem[]> {
+    return this.api.listWorkspaceTemplates(kind, name).pipe(
+      map((l) => l.resources),
+      catchError(() => of([] as WorkspaceTemplateItem[])),
+    );
+  }
+
+  private onProjectChange(id: string | null): void {
     const c = untracked(() => this.choice());
     if (c.kind === 'ref' && c.ref.scope.kind === 'Project' && c.ref.scope.name !== id) this.choice.set({kind: 'default'});
-    if (!id) {
-      this.projectItems.set([]);
-      this.defaults.set(null);
-      return;
-    }
-    this.api.listWorkspaceTemplates('Project', id).subscribe((l) => this.projectItems.set(l.resources));
-    this.api.getProjectWorkspaceDefaults(id).pipe(catchError(() => of(null))).subscribe((d) => this.defaults.set(d));
+    this.projectItems.set([]);
+    this.defaults.set(null);
+  }
+
+  /** The template Default resolves to, looked up in the loaded items. */
+  private resolvedDefaultItem(): WorkspaceTemplateItem | undefined {
+    const name = this.resolvedDefault().template;
+    if (!name) return undefined;
+    return [...this.projectItems(), ...this.mine(), ...this.shared()].find((i) => i.resource.metadata.name === name);
+  }
+
+  private defaultSummary(): string {
+    const {mode, layer} = this.resolvedDefault();
+    if (!mode) return '';
+    const spec = this.resolvedDefaultItem()?.resource.spec;
+    const image = spec?.environment?.image;
+    const tier = spec
+      ? this.transloco.translate(`workspaces.tier.${modeOf(spec.backend) === 'container' ? 'container' : spec.backend}`)
+      : this.transloco.translate(`agentSettings.workspacePicker.mode.${mode}`);
+    const what = [tier, spec ? sizeSummary(spec) : '', image ? shortImage(image) : ''].filter(Boolean).join(' · ');
+    return `${what} (${this.transloco.translate(`agentSettings.workspacePicker.layer.${layer}`)})`;
   }
 
   /** Preselect the Expert's recommendation unless the user chose by hand. */
@@ -298,7 +332,7 @@ export class WorkspacePickerComponent {
 
   useCustom(): void {
     this.draftTried.set(true);
-    const errors = validateTemplateForm({...this.draft(), name: this.draft().name || 'inline'});
+    const errors = validateTemplateForm({...this.draft(), name: 'inline'});
     if (Object.keys(errors).length) return;
     this.touched = true;
     this.autoPicked.set(false);
@@ -309,8 +343,9 @@ export class WorkspacePickerComponent {
   saveToMine(): void {
     this.draftTried.set(true);
     this.nameError.set('');
-    if (Object.keys(validateTemplateForm(this.draft())).length) {
-      if (!this.draft().name) this.nameError.set(this.transloco.translate('workspaces.errors.name'));
+    const errors = validateTemplateForm(this.draft());
+    if (Object.keys(errors).length) {
+      if (errors.name) this.nameError.set(this.transloco.translate(errors.name));
       return;
     }
     const doc = toDocument({...this.draft(), scope: {...ACCOUNT_ME}}, this.draftPreserved);
@@ -354,12 +389,13 @@ export class WorkspacePickerComponent {
       const found = this.find(c.ref.scope.kind, c.ref.scope.name, c.ref.name);
       if (found) return found.resource.spec;
     }
-    const d = this.defaults();
-    const mode = d?.effective[this.role() === 'job' ? 'jobs' : 'sessions'].mode;
-    if (c.kind === 'default' && mode === 'virtual') return {backend: 'virtual'};
-    if (c.kind === 'default' && (mode === 'container' || mode === 'vm')) {
-      const name = d!.effective[mode].template_name;
-      const found = [...this.projectItems(), ...this.shared()].find((i) => i.resource.metadata.name === name);
+    if (c.kind === 'default') {
+      const {mode} = this.resolvedDefault();
+      const named = this.resolvedDefaultItem();
+      if (named) return named.resource.spec;
+      if (mode === 'virtual') return {backend: 'virtual'};
+      const fallback = mode === 'vm' ? 'vm-full' : 'container-full';
+      const found = this.shared().find((i) => i.resource.metadata.name === fallback);
       if (found) return found.resource.spec;
     }
     const full = this.shared().find((i) => i.resource.metadata.name === 'container-full');
