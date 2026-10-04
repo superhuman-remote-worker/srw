@@ -2624,6 +2624,7 @@
       "requestMemory": "Guaranteed memory can't exceed memory.",
       "setupSteps": "At most 32 setup steps.",
       "loadFailed": "This template couldn't be loaded.",
+      "nameTaken": "A template with this name already exists here. Choose another name.",
       "saveFailed": "This template couldn't be saved.",
       "deleteFailed": "This template couldn't be deleted.",
       "listFailed": "These templates couldn't be loaded."

@@ -109,8 +109,8 @@ VM permission.
 
 A new session or job picks its workspace in the **Workspace** field of
 **Sessions → New Session** or **Jobs → New Job**. Its **Default** entry follows
-the project's default, then the installation default. The platform default is
-Virtual.
+the project's default, then the installation default. The shipped installation
+default is Container for jobs and Virtual for sessions; an operator can change it.
 
 | Workspace | What it provides | Important limits |
 |---|---|---|

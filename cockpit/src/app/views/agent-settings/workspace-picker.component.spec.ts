@@ -3,6 +3,7 @@ import {TestBed} from '@angular/core/testing';
 import {signal} from '@angular/core';
 import {TranslocoService} from '@jsverse/transloco';
 import {Subject, of, throwError} from 'rxjs';
+import {HttpErrorResponse} from '@angular/common/http';
 import {WorkspacePickerComponent} from './workspace-picker.component';
 import {ApiService} from '../../core/services/api.service';
 import {UserService} from '../../core/services/user.service';
@@ -174,6 +175,29 @@ describe('WorkspacePickerComponent', () => {
     c.saveToMine();
     expect(c.nameError()).toBe('workspaces.errors.name');
     expect(api.applyManifest).not.toHaveBeenCalled();
+  });
+
+  it('reports a taken name on Save to Mine instead of a version conflict', () => {
+    const {c, api} = create();
+    api.applyManifest.mockReturnValue(throwError(() => new HttpErrorResponse({status: 409, error: {detail: 'Updating a resource requires its expected resource version.'}})));
+    c.openCustomize();
+    c.draft.update((v) => ({...v, name: 'lean'}));
+    c.saveToMine();
+    expect(c.nameError()).toBe('workspaces.errors.nameTaken');
+    expect(c.saving()).toBe(false);
+    expect(c.customizing()).toBe(true);
+  });
+
+  it('blocks Enter from submitting an enclosing form, except in a textarea', () => {
+    const {c} = create();
+    const press = (el: HTMLElement) => {
+      const e = new KeyboardEvent('keydown', {key: 'Enter', cancelable: true});
+      Object.defineProperty(e, 'target', {value: el});
+      c.blockImplicitSubmit(e);
+      return e.defaultPrevented;
+    };
+    expect(press(document.createElement('input'))).toBe(true);
+    expect(press(document.createElement('textarea'))).toBe(false);
   });
 
   it('drops a superseded Project load', () => {

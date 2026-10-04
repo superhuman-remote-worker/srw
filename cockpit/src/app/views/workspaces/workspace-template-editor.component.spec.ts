@@ -102,6 +102,15 @@ describe('WorkspaceTemplateEditorComponent', () => {
     expect(stale.c.conflict()).toEqual({kind: 'version', message: 'Resource version changed.'});
   });
 
+  it('maps a 409 on a NEW template to the name field, not a version conflict', () => {
+    const {c, api} = create();
+    api.applyManifest.mockReturnValue(throwError(() => new HttpErrorResponse({status: 409, error: {detail: 'Updating a resource requires its expected resource version.'}})));
+    c.value.update((v) => ({...v, name: 'fresh', image: 'ghcr.io/me/x:1'}));
+    c.save();
+    expect(c.conflict()).toBeNull();
+    expect(c.fieldErrors()).toEqual({name: 'workspaces.errors.nameTaken'});
+  });
+
   it('opens built-ins read-only and duplicates them into Mine', () => {
     const {c, router} = create({uid: 'b-1', item: {...ITEM, uid: 'b-1', installationManaged: true}});
     expect(c.readOnly()).toBe(true);

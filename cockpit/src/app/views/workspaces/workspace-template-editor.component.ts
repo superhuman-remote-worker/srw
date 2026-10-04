@@ -254,6 +254,11 @@ export class WorkspaceTemplateEditorComponent implements OnInit {
     const detail = (err as {error?: {detail?: unknown}})?.error?.detail;
     if (status === 409) {
       const message = typeof detail === 'string' ? detail : this.transloco.translate(fallbackKey);
+      if (this.isNew() && message !== INSTALLATION_MANAGED) {
+        // A new template has no version to conflict with: the name is taken.
+        this.fieldErrors.set({name: this.transloco.translate('workspaces.errors.nameTaken')});
+        return;
+      }
       this.conflict.set({kind: message === INSTALLATION_MANAGED ? 'builtin' : 'version', message});
       return;
     }

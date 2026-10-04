@@ -79,12 +79,14 @@ function builtinsFirst(items: WorkspaceTemplateItem[]): WorkspaceTemplateItem[] 
 
     <app-dialog [open]="customizing()" size="lg" [title]="'agentSettings.workspacePicker.customizeTitle' | transloco"
       (closed)="customizing.set(false)">
+      <div (keydown.enter)="blockImplicitSubmit($event)">
       <app-workspace-template-form purpose="inline" [value]="draft()" (valueChange)="draft.set($event)"
         [vmAllowed]="vmAllowed()" [vmUnavailableReasonKey]="vmReasonKey()" [srwImages]="images()"
         [showErrors]="draftTried()" [serverErrors]="draftErrors()" />
       <app-form-field [label]="'agentSettings.workspacePicker.saveName' | transloco" [error]="nameError()">
         <app-input [value]="draft().name" (valueChange)="patchDraft({name: $event})" />
       </app-form-field>
+      </div>
       <div appDialogActions>
         <app-button variant="secondary" (clicked)="customizing.set(false)">{{ 'common.cancel' | transloco }}</app-button>
         <app-button variant="secondary" [loading]="saving()" (clicked)="saveToMine()">{{ 'agentSettings.workspacePicker.saveToMine' | transloco }}</app-button>
@@ -330,6 +332,11 @@ export class WorkspacePickerComponent {
     this.draft.update((v) => ({...v, ...change}));
   }
 
+  /** The dialog renders inline, so Enter in a text input would submit an enclosing form (e.g. New Job). */
+  blockImplicitSubmit(event: Event): void {
+    if ((event.target as HTMLElement | null)?.tagName === 'INPUT') event.preventDefault();
+  }
+
   useCustom(): void {
     this.draftTried.set(true);
     const errors = validateTemplateForm({...this.draft(), name: 'inline'});
@@ -365,6 +372,11 @@ export class WorkspacePickerComponent {
         error: (err) => {
           this.saving.set(false);
           const d = (err as {error?: {detail?: unknown}})?.error?.detail;
+          if ((err as {status?: number})?.status === 409) {
+            // A new template whose name exists already: not a version conflict.
+            this.nameError.set(this.transloco.translate('workspaces.errors.nameTaken'));
+            return;
+          }
           const message = typeof d === 'string' ? d
             : d && typeof d === 'object' && 'message' in d ? String((d as {message: unknown}).message)
             : this.transloco.translate('workspaces.errors.saveFailed');
