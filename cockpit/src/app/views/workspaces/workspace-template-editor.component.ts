@@ -69,7 +69,9 @@ const NO_PRESERVED: PreservedParts = {metadata: {}, spec: {}, hasAny: false};
           <app-button variant="danger" (clicked)="confirmDelete.set(true)">{{ 'common.delete' | transloco }}</app-button>
         }
         <span class="spacer"></span>
-        <app-button variant="secondary" (clicked)="duplicate()">{{ 'workspaces.editor.duplicate' | transloco }}</app-button>
+        @if (!isNew()) {
+          <app-button variant="secondary" (clicked)="duplicate()">{{ 'workspaces.editor.duplicate' | transloco }}</app-button>
+        }
         @if (!readOnly()) {
           <app-button variant="primary" [loading]="saving()" (clicked)="save()">{{ 'common.save' | transloco }}</app-button>
         }
@@ -230,7 +232,15 @@ export class WorkspaceTemplateEditorComponent implements OnInit {
   }
 
   duplicate(): void {
-    const doc = this.item()?.resource ?? toDocument(this.value(), this.preserved());
+    if (this.isNew()) {
+      // Already on /workspaces/new: the Router ignores a same-URL navigation, so apply the copy in place.
+      const draft = toDocument(this.value(), this.preserved());
+      this.conflict.set(null);
+      this.value.set(duplicateValue(draft, ACCOUNT_ME));
+      this.preserved.set(fromDocument(draft).preserved);
+      return;
+    }
+    const doc = this.item()!.resource;
     const state: WorkspaceEditorNavigationState = {duplicateOf: doc};
     void this.router.navigate(['/workspaces/new'], {state});
   }

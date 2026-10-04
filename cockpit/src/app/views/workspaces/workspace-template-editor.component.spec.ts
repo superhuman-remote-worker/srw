@@ -130,4 +130,17 @@ describe('WorkspaceTemplateEditorComponent', () => {
     expect(api.deleteResource).toHaveBeenCalledWith('u-1', 7);
     expect(router.navigate).toHaveBeenCalledWith(['/workspaces']);
   });
+
+  it('duplicates an unsaved template in place after a built-in 409', () => {
+    const {c, api, router} = create();
+    api.applyManifest.mockReturnValue(throwError(() => new HttpErrorResponse({status: 409, error: {detail: 'This template is managed by the installation. Duplicate it to change it.'}})));
+    c.value.update((v) => ({...v, name: 'fresh', image: 'ghcr.io/me/x:1'}));
+    c.save();
+    expect(c.conflict()?.kind).toBe('builtin');
+    c.duplicate();
+    expect(router.navigate).not.toHaveBeenCalled();
+    expect(c.value().name).toBe('fresh-copy');
+    expect(c.value().scope).toEqual({kind: 'Account', name: 'me'});
+    expect(c.conflict()).toBeNull();
+  });
 });
