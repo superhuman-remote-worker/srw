@@ -991,16 +991,21 @@ async def test_sweeper_drains_then_exits_on_shutdown(monkeypatch):
 async def test_sweeper_tick_survives_a_raising_drain(monkeypatch):
     monkeypatch.setattr(session_wake, "TICK_SECONDS", 0.01)
     calls = []
+    retried = asyncio.Event()
 
     async def _boom(db, **kw):
         calls.append(1)
+        if len(calls) >= 2:
+            retried.set()
         raise RuntimeError("tick blew up")
 
     monkeypatch.setattr(session_wake, "drain_pending_wakes", _boom)
     shutdown = asyncio.Event()
     task = asyncio.create_task(session_wake.session_wake_sweeper_loop(_db(), shutdown))
-    await asyncio.sleep(0.05)
-    shutdown.set()
-    await asyncio.wait_for(task, timeout=2)
+    try:
+        await asyncio.wait_for(retried.wait(), timeout=2)
+    finally:
+        shutdown.set()
+        await asyncio.wait_for(task, timeout=2)
 
     assert len(calls) >= 2, "a raising tick must not kill the loop"
