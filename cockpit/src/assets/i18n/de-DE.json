@@ -2625,6 +2625,7 @@
       "setupSteps": "Höchstens 32 Einrichtungsschritte.",
       "loadFailed": "Diese Vorlage konnte nicht geladen werden.",
       "nameTaken": "Eine Vorlage mit diesem Namen gibt es hier schon. Wählen Sie einen anderen Namen.",
+      "versionConflict": "Diese Vorlage hat sich geändert, seit Sie sie geöffnet haben.",
       "saveFailed": "Diese Vorlage konnte nicht gespeichert werden.",
       "deleteFailed": "Diese Vorlage konnte nicht gelöscht werden.",
       "listFailed": "Diese Vorlagen konnten nicht geladen werden."

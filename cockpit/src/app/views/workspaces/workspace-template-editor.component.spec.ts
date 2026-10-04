@@ -99,7 +99,18 @@ describe('WorkspaceTemplateEditorComponent', () => {
     const stale = create({uid: 'u-1'});
     stale.api.applyManifest.mockReturnValue(throwError(() => new HttpErrorResponse({status: 409, error: {detail: 'Resource version changed.'}})));
     stale.c.save();
-    expect(stale.c.conflict()).toEqual({kind: 'version', message: 'Resource version changed.'});
+    expect(stale.c.conflict()).toEqual({kind: 'version', message: 'workspaces.errors.versionConflict'});
+  });
+
+  it('treats an unchanged apply of a NEW template as a taken name', () => {
+    const {c, api, router} = create();
+    api.applyManifest.mockReturnValue(of({resources: [{uid: 'u-old', resourceVersion: 1, changed: false}]}));
+    c.value.update((v) => ({...v, name: 'fresh', image: 'ghcr.io/me/x:1'}));
+    c.save();
+    expect(c.fieldErrors()).toEqual({name: 'workspaces.errors.nameTaken'});
+    expect(c.errorMessage()).toBe('');
+    expect(c.saving()).toBe(false);
+    expect(router.navigate).not.toHaveBeenCalled();
   });
 
   it('maps a 409 on a NEW template to the name field, not a version conflict', () => {

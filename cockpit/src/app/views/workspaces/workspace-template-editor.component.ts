@@ -202,6 +202,11 @@ export class WorkspaceTemplateEditorComponent implements OnInit {
         next: (result) => {
           this.saving.set(false);
           const uid = result.resources[0]?.uid;
+          if (!item && result.resources[0]?.changed === false) {
+            // An identical template under this name exists already: the apply was a no-op, not a create.
+            this.fieldErrors.set({name: this.transloco.translate('workspaces.errors.nameTaken')});
+            return;
+          }
           if (item && uid === item.uid) {
             this.savedMessage.set(this.transloco.translate('workspaces.editor.saved'));
             this.load(uid);
@@ -259,7 +264,9 @@ export class WorkspaceTemplateEditorComponent implements OnInit {
         this.fieldErrors.set({name: this.transloco.translate('workspaces.errors.nameTaken')});
         return;
       }
-      this.conflict.set({kind: message === INSTALLATION_MANAGED ? 'builtin' : 'version', message});
+      this.conflict.set(message === INSTALLATION_MANAGED
+        ? {kind: 'builtin', message}
+        : {kind: 'version', message: this.transloco.translate('workspaces.errors.versionConflict')});
       return;
     }
     if (status === 422 && detail && typeof detail === 'object' && 'message' in detail) {

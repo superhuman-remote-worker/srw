@@ -360,8 +360,13 @@ export class WorkspacePickerComponent {
     this.api.checkWorkspaceRecipe(doc.spec, this.projectId())
       .pipe(switchMap(() => this.api.applyManifest(doc)))
       .subscribe({
-        next: () => {
+        next: (result) => {
           this.saving.set(false);
+          if (result.resources[0]?.changed === false) {
+            // An identical template under this name exists already: nothing was created.
+            this.nameError.set(this.transloco.translate('workspaces.errors.nameTaken'));
+            return;
+          }
           this.touched = true;
           this.autoPicked.set(false);
           const scope = {kind: 'Account' as const, name: this.users.currentUserId() ?? 'me'};

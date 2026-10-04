@@ -93,8 +93,10 @@ function ordered(items: WorkspaceTemplateItem[]): WorkspaceTemplateItem[] {
               <thead><tr>
                 <th>{{ 'workspaces.list.colName' | transloco }}</th>
                 <th>{{ 'workspaces.list.colTier' | transloco }}</th>
-                <th>{{ 'workspaces.list.colImage' | transloco }}</th>
-                <th>{{ 'workspaces.list.colSize' | transloco }}</th>
+                @if (!viewport.isMobile()) {
+                  <th>{{ 'workspaces.list.colImage' | transloco }}</th>
+                  <th>{{ 'workspaces.list.colSize' | transloco }}</th>
+                }
                 <th class="actions-col">{{ 'workspaces.list.colActions' | transloco }}</th>
               </tr></thead>
               <tbody>
@@ -104,10 +106,13 @@ function ordered(items: WorkspaceTemplateItem[]): WorkspaceTemplateItem[] {
                       <button type="button" class="link" (click)="open(i)">{{ label(i) }}</button>
                       @if (i.installationManaged) { <app-badge tone="neutral" size="xs">{{ 'workspaces.list.builtin' | transloco }}</app-badge> }
                       @if (description(i)) { <small class="desc">{{ description(i) }}</small> }
+                      @if (viewport.isMobile()) { <small class="desc">{{ size(i) }}</small> }
                     </td>
                     <td><app-badge tone="info">{{ 'workspaces.tier.' + tierKey(i) | transloco }}</app-badge></td>
-                    <td class="mono">{{ image(i) }}</td>
-                    <td>{{ size(i) }}</td>
+                    @if (!viewport.isMobile()) {
+                      <td class="mono">{{ image(i) }}</td>
+                      <td>{{ size(i) }}</td>
+                    }
                     <td class="actions-col">
                       @if (viewport.isMobile()) {
                         <app-icon-button variant="ghost" size="sm" [ariaLabel]="'workspaces.list.moreActions' | transloco"

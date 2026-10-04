@@ -177,6 +177,18 @@ describe('WorkspacePickerComponent', () => {
     expect(api.applyManifest).not.toHaveBeenCalled();
   });
 
+  it('reports a taken name when Save to Mine applies unchanged', () => {
+    const {c, api} = create();
+    api.applyManifest.mockReturnValue(of({resources: [{uid: 'u-old', resourceVersion: 1, changed: false}]}));
+    c.select('ref:Catalog/shared/container-full');
+    c.openCustomize();
+    c.draft.update((v) => ({...v, name: 'lean'}));
+    c.saveToMine();
+    expect(c.nameError()).toBe('workspaces.errors.nameTaken');
+    expect(c.choice()).toMatchObject({kind: 'ref', ref: {name: 'container-full'}});
+    expect(c.customizing()).toBe(true);
+  });
+
   it('reports a taken name on Save to Mine instead of a version conflict', () => {
     const {c, api} = create();
     api.applyManifest.mockReturnValue(throwError(() => new HttpErrorResponse({status: 409, error: {detail: 'Updating a resource requires its expected resource version.'}})));
