@@ -375,10 +375,17 @@ test.describe('Dynamic Canvas production-browser conformance', () => {
     request,
   }) => {
     await resetFixture(request, 'lease-expiry');
+    await page.clock.install();
     await installViewerGateway(context);
     await openCanvas(page);
     await applicationFrame(page);
 
+    await expect.poll(async () => (await fixtureState(request)).requests.some(
+      entry => entry.method === 'POST' && entry.path.endsWith('/renew'),
+    )).toBe(true);
+    // Advance past the lease only once the app is ready and renewal is stalled.
+    // Slow browser startup must not consume the expiry window under test.
+    await page.clock.fastForward(61_000);
     await expect(page.locator(LIVE_FRAME)).toHaveCount(0, {timeout: 9_000});
     await expect(
       page.getByRole('heading', {name: 'Secure live preview is unavailable'}),
