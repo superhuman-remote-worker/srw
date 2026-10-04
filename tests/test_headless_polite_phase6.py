@@ -133,6 +133,19 @@ def test_reset_agent_globals_clears_pinned_identity_protocol() -> None:
     assert mod._session_identity.attach_token is None
 
 
+def test_reset_agent_globals_clears_process_termination_admission(monkeypatch):
+    """A previous lifespan shutdown cannot park this fake session's input."""
+    import agent.api.persistent_app as mod
+
+    monkeypatch.setattr(mod._session_termination, "termination_admission_fenced", True)
+    monkeypatch.setattr(
+        mod._session_termination, "termination_fence_reason", "prior-shutdown"
+    )
+    _reset_agent_globals()
+    assert mod._session_termination.termination_admission_fenced is False
+    assert mod._session_termination.termination_fence_reason is None
+
+
 class TestPoliteModeFlip:
     def setup_method(self):
         _reset_agent_globals()
