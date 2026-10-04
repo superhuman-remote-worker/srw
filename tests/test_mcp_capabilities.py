@@ -159,7 +159,7 @@ def test_health_build_info_reports_digest_provenance_and_artifact_match(
 
     info = _build_info(artifact)
 
-    assert info["tool_schema_revision"] == "13"
+    assert info["tool_schema_revision"] == "14"
     assert info["tool_schema_digest"] == schema["digest"]
     assert info["schema_artifact_digest"] == schema["digest"]
     assert info["schema_artifact_status"] == "match"
@@ -184,9 +184,14 @@ def test_priority_job_project_and_connector_schema_drift_is_closed() -> None:
     assert "paused" in list_status["anyOf"][0]["enum"]
 
     job_fields = tools["create_job"]["inputSchema"]["properties"]
-    assert {"expert_id", "kickoff_message", "priority", "context", "slot"} <= set(
-        job_fields
-    )
+    assert {
+        "expert_id",
+        "kickoff_message",
+        "priority",
+        "context",
+        "slot",
+        "workspace",
+    } <= set(job_fields)
     # project_id is deliberately model-visible on both lanes (explicit value
     # wins over the hidden lineage default); the rest of the lineage stays
     # server-bound.
@@ -207,12 +212,14 @@ def test_priority_job_project_and_connector_schema_drift_is_closed() -> None:
         "priority",
         "context",
         "required_deliverables",
+        "workspace",
     } <= set(project_job_fields)
     assert project_job_fields["datasource_ids"]["type"] == "array"
     assert "anyOf" not in project_job_fields["datasource_ids"]
 
     persistent_thread_schema = tools["create_persistent_thread"]["inputSchema"]
     persistent_thread_fields = persistent_thread_schema["properties"]
+    assert "workspace" in persistent_thread_fields
     assert persistent_thread_fields["datasource_ids"]["type"] == "array"
     assert "anyOf" not in persistent_thread_fields["datasource_ids"]
     assert "datasource_ids" not in persistent_thread_schema.get("required", [])

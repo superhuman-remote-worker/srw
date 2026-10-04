@@ -1273,6 +1273,8 @@ class AsyncCockpitClient:
         required_deliverables: list[str] | None = None,
         ticket: str | None = None,
         work_category: str | None = None,
+        workspace: dict[str, Any] | None = None,
+        workspace_supplied: bool = False,
     ) -> dict[str, Any]:
         """Create a new job.
 
@@ -1302,6 +1304,8 @@ class AsyncCockpitClient:
             work_category: Explicit work category for the precedence law —
                 the caller's stated intent, recorded against the slot's
                 category in the kickoff contract
+            workspace / workspace_supplied: the REST WorkspaceBinding (None = no
+                workspace), sent only when supplied.
 
         Returns:
             Created job record with ID
@@ -1339,6 +1343,8 @@ class AsyncCockpitClient:
             body["thread_id"] = thread_id
         if required_deliverables:
             body["required_deliverables"] = required_deliverables
+        if workspace_supplied:
+            body["workspace"] = workspace
         resp = await self._mutation_request("POST", "/api/jobs", json=body)
         resp.raise_for_status()
         return resp.json()
@@ -2478,6 +2484,8 @@ class AsyncCockpitClient:
         context: dict[str, Any] | None = None,
         priority: int = 5,
         required_deliverables: list[str] | None = None,
+        workspace: dict[str, Any] | None = None,
+        workspace_supplied: bool = False,
     ) -> dict[str, Any]:
         """Create a job within a project context.
 
@@ -2498,6 +2506,8 @@ class AsyncCockpitClient:
                 one exact "pr:<owner>/<repository>" bound to a writable
                 attached repository. Do not use repos/<alias>/ paths or
                 replace a refused publication contract with a note.
+            workspace / workspace_supplied: the REST WorkspaceBinding (None = no
+                workspace), sent only when supplied.
 
         Returns:
             Created job record with ID
@@ -2523,6 +2533,8 @@ class AsyncCockpitClient:
             body["context"] = context
         if required_deliverables:
             body["required_deliverables"] = required_deliverables
+        if workspace_supplied:
+            body["workspace"] = workspace
         resp = await self._mutation_request(
             "POST", f"/api/projects/{project_id}/jobs", json=body
         )
@@ -3252,6 +3264,8 @@ class AsyncCockpitClient:
         datasource_ids: list[str] | None = None,
         model: str | None = None,
         temperature: float | None = None,
+        workspace: dict[str, Any] | None = None,
+        workspace_supplied: bool = False,
     ) -> dict[str, Any]:
         """Create a new persistent thread.
 
@@ -3259,6 +3273,9 @@ class AsyncCockpitClient:
         arrives here as the internal ``None`` sentinel and requests automatic
         defaults, while ``[]`` attaches no connectors and IDs request exactly
         that authorized selection. The MCP schema rejects explicit JSON null.
+
+        workspace / workspace_supplied: the REST WorkspaceBinding (None = no
+        workspace), sent only when supplied.
 
         Returns:
             Dict with ``thread_id`` and ``status``.
@@ -3280,6 +3297,8 @@ class AsyncCockpitClient:
             body["model"] = model
         if temperature is not None:
             body["temperature"] = temperature
+        if workspace_supplied:
+            body["workspace"] = workspace
         resp = await self._mutation_request(
             "POST", "/api/persistent/threads", json=body
         )
