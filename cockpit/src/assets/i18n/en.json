@@ -3464,6 +3464,24 @@
       "credentialsLocked": "Credentials stay attached for this session",
       "credentialsUnavailable": "This credential connector is no longer available. End this session and start another to change its connectors."
     },
+    "workspacePicker": {
+      "label": "Workspace",
+      "default": "Default: {{what}} ({{layer}})",
+      "defaultUnknown": "Default (project or installation)",
+      "layer": {"project": "project default", "installation": "installation default"},
+      "mode": {"none": "No workspace", "virtual": "Virtual", "container": "Container", "vm": "VM"},
+      "group": {"shared": "Shared", "project": "This project", "mine": "Mine"},
+      "none": "No workspace",
+      "custom": "Custom (this run only)",
+      "customize": "Customize…",
+      "customizeTitle": "Customize the workspace",
+      "useOnce": "Use for this run",
+      "saveToMine": "Save to Mine",
+      "saveName": "Template name (for Save to Mine)",
+      "summaryNone": "No workspace: no files and no shell.",
+      "recommended": "Recommended by {{expert}}.",
+      "recommendedUnavailable": "{{expert}} recommends a VM, which isn't available to you here."
+    },
     "execution": {
       "group": "Execution",
       "autonomy": "Autonomy",

@@ -3464,6 +3464,24 @@
       "credentialsLocked": "Zugangsdaten bleiben für diese Sitzung verbunden",
       "credentialsUnavailable": "Dieser Zugangsdaten-Konnektor ist nicht mehr verfügbar. Beende diese Sitzung und starte eine neue, um ihre Konnektoren zu ändern."
     },
+    "workspacePicker": {
+      "label": "Workspace",
+      "default": "Standard: {{what}} ({{layer}})",
+      "defaultUnknown": "Standard (Projekt oder Installation)",
+      "layer": {"project": "Projektstandard", "installation": "Installationsstandard"},
+      "mode": {"none": "Kein Workspace", "virtual": "Virtuell", "container": "Container", "vm": "VM"},
+      "group": {"shared": "Geteilt", "project": "Dieses Projekt", "mine": "Meine"},
+      "none": "Kein Workspace",
+      "custom": "Angepasst (nur dieser Lauf)",
+      "customize": "Anpassen…",
+      "customizeTitle": "Workspace anpassen",
+      "useOnce": "Für diesen Lauf verwenden",
+      "saveToMine": "Unter „Meine“ speichern",
+      "saveName": "Vorlagenname (für „Unter Meine speichern“)",
+      "summaryNone": "Kein Workspace: keine Dateien und keine Shell.",
+      "recommended": "Empfohlen von {{expert}}.",
+      "recommendedUnavailable": "{{expert}} empfiehlt eine VM, die Ihnen hier nicht zur Verfügung steht."
+    },
     "execution": {
       "group": "Ausführung",
       "autonomy": "Autonomie",
