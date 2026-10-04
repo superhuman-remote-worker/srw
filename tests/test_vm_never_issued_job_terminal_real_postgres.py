@@ -59,8 +59,7 @@ async def test_0324_upgrade_preserves_applied_ledger_and_thread_predicate(
 ):
     """A clean 0324 database gains only the forward Job source at 0325."""
     migration_dir = (
-        Path(__file__).resolve().parents[1]
-        / "src/orchestrator/database/migrations/app"
+        Path(__file__).resolve().parents[1] / "src/orchestrator/database/migrations/app"
     )
     through_0324 = tmp_path / "through-0324"
     through_0324.mkdir()
@@ -80,7 +79,9 @@ async def test_0324_upgrade_preserves_applied_ledger_and_thread_predicate(
     try:
         await run_migrations(pool, through_0324)
         async with pool.acquire() as conn:
-            applied = dict(await conn.fetch("SELECT filename,checksum FROM schema_migrations"))
+            applied = dict(
+                await conn.fetch("SELECT filename,checksum FROM schema_migrations")
+            )
             assert any(name.startswith("0324_") for name in applied)
             assert not any(name.startswith("0325_") for name in applied)
             thread_before = await conn.fetchval(
@@ -95,35 +96,56 @@ async def test_0324_upgrade_preserves_applied_ledger_and_thread_predicate(
             thread_id = uuid4()
             thread_result_before = await conn.fetchval(
                 "SELECT public.managed_repository_process_zero_receipt_exists("
-                "'thread',$1,'vm','vm',$2)", thread_id, generation,
+                "'thread',$1,'vm','vm',$2)",
+                thread_id,
+                generation,
             )
             assert thread_result_before is False
 
         await run_migrations(pool, migration_dir)
         async with pool.acquire() as conn:
-            after = dict(await conn.fetch("SELECT filename,checksum FROM schema_migrations"))
+            after = dict(
+                await conn.fetch("SELECT filename,checksum FROM schema_migrations")
+            )
             assert {name: after[name] for name in applied} == applied
             assert len(after) == len(applied) + 1
             assert "0325_job_never_issued_vm_terminal.sql" in after
-            assert await conn.fetchval(
-                "SELECT pg_get_functiondef("
-                "'public.thread_vm_creation_never_issued_source(uuid,text)'::regprocedure)"
-            ) == thread_before
-            assert await conn.fetchval(
-                "SELECT pg_get_functiondef("
-                "'public.pinned_vm_actuator_request_valid(public.threads,jsonb,boolean)'::regprocedure)"
-            ) == pinned_before
-            assert await conn.fetchval(
-                "SELECT public.managed_repository_process_zero_receipt_exists("
-                "'thread',$1,'vm','vm',$2)", thread_id, generation,
-            ) == thread_result_before
+            assert (
+                await conn.fetchval(
+                    "SELECT pg_get_functiondef("
+                    "'public.thread_vm_creation_never_issued_source(uuid,text)'::regprocedure)"
+                )
+                == thread_before
+            )
+            assert (
+                await conn.fetchval(
+                    "SELECT pg_get_functiondef("
+                    "'public.pinned_vm_actuator_request_valid(public.threads,jsonb,boolean)'::regprocedure)"
+                )
+                == pinned_before
+            )
+            assert (
+                await conn.fetchval(
+                    "SELECT public.managed_repository_process_zero_receipt_exists("
+                    "'thread',$1,'vm','vm',$2)",
+                    thread_id,
+                    generation,
+                )
+                == thread_result_before
+            )
             for name in (
-                "evidence", "terminal_source", "predecessors", "source",
+                "evidence",
+                "terminal_source",
+                "predecessors",
+                "source",
             ):
-                assert await conn.fetchval(
-                    "SELECT to_regprocedure($1)",
-                    f"public.job_vm_creation_never_issued_{name}(uuid,text)",
-                ) is not None
+                assert (
+                    await conn.fetchval(
+                        "SELECT to_regprocedure($1)",
+                        f"public.job_vm_creation_never_issued_{name}(uuid,text)",
+                    )
+                    is not None
+                )
     finally:
         await pool.close()
         admin = await asyncpg.connect(pg_dsn)
