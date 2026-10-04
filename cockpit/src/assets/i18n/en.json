@@ -2638,6 +2638,22 @@
       "saved": "Saved.",
       "deleteTitle": "Delete workspace template",
       "deleteBody": "Delete {{name}}? Work that already started keeps its workspace."
+    },
+    "list": {
+      "title": "Workspaces",
+      "new": "New template",
+      "chip": {"available": "Available to me", "mine": "Mine", "shared": "Shared", "project": "Project…"},
+      "projectAria": "Show a project's templates",
+      "group": {"shared": "Shared", "mine": "Mine", "project": "Project"},
+      "retry": "Retry",
+      "empty": "No templates here yet.",
+      "builtin": "Built-in",
+      "colName": "Name",
+      "colTier": "Tier",
+      "colImage": "Image",
+      "colSize": "Size",
+      "colActions": "Actions",
+      "moreActions": "More actions"
     }
   },
   "datasources": {

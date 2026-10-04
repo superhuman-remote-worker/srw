@@ -2638,6 +2638,22 @@
       "saved": "Gespeichert.",
       "deleteTitle": "Workspace-Vorlage löschen",
       "deleteBody": "{{name}} löschen? Bereits gestartete Arbeit behält ihren Workspace."
+    },
+    "list": {
+      "title": "Workspaces",
+      "new": "Neue Vorlage",
+      "chip": {"available": "Für mich verfügbar", "mine": "Meine", "shared": "Geteilt", "project": "Projekt…"},
+      "projectAria": "Vorlagen eines Projekts anzeigen",
+      "group": {"shared": "Geteilt", "mine": "Meine", "project": "Projekt"},
+      "retry": "Erneut versuchen",
+      "empty": "Hier gibt es noch keine Vorlagen.",
+      "builtin": "Eingebaut",
+      "colName": "Name",
+      "colTier": "Stufe",
+      "colImage": "Image",
+      "colSize": "Größe",
+      "colActions": "Aktionen",
+      "moreActions": "Weitere Aktionen"
     }
   },
   "datasources": {
