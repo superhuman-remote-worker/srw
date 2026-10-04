@@ -57,7 +57,8 @@ Two entries are special:
 
 Templates live under **Customize → Workspaces**. Built-in templates are read-only; duplicate
 one to change it. A template can name any image. Images that aren't SRW's run without elevated
-privileges, so they get no cloud-folder mount. Try a new image with a Job before using it in a
+privileges, so they get no cloud-folder mount unless your operator sets the Helm value
+`workspace.customImages.privileged`. Try a new image with a Job before using it in a
 Session.
 
 A template's tier is **Container**, eligible **VM (QEMU)**, or **Virtual (cloud files)**; the

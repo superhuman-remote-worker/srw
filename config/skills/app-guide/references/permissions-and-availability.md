@@ -103,13 +103,14 @@ provisioning, dispatch, and individual actions recheck the applicable policy.
 ## Choose the workspace for the work
 
 Workspace templates are edited under **Customize → Workspaces**: Shared templates
-by admins only, a project's templates by its editors and owners. VM templates need
+by admins only. A project's templates can be changed by admins and by project
+members with the editor role, and not in an archived project. VM templates need
 VM permission.
 
-The account default is under
-**Settings → Persistent Agent → Default Workspace**. A new session can override
-it under **Sessions → New Session → Agent Settings → Settings → Workspace**.
-The platform default is Virtual.
+A new session or job picks its workspace in the **Workspace** field of
+**Sessions → New Session** or **Jobs → New Job**. Its **Default** entry follows
+the project's default, then the installation default. The platform default is
+Virtual.
 
 | Workspace | What it provides | Important limits |
 |---|---|---|
