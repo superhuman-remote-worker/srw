@@ -481,6 +481,11 @@ def test_create_job_schema_has_no_model_selectable_lineage() -> None:
         "slot",
         "ticket",
         "work_category",
+        # workspace is model-visible because the shared descriptor also
+        # builds the MCP create_job (schema parity). Child jobs inherit the
+        # parent's workspace; the server refuses it on them. See
+        # tests/test_mcp_workspace_choice.py.
+        "workspace",
     }
     assert not {"user_id", "thread_id", "parent_job_id"} & fields
 
