@@ -256,6 +256,8 @@ describe('JobCreateComponent project picker', () => {
       getExperts: vi.fn().mockReturnValue(of([])),
       getExpertDetail: vi.fn().mockReturnValue(of(null)),
       previewToolGroups: vi.fn().mockReturnValue(of(null)),
+      listWorkspaceTemplates: vi.fn().mockReturnValue(of({resources: []})),
+      getProjectWorkspaceDefaults: vi.fn().mockReturnValue(of(null)),
       createJob: vi.fn().mockReturnValue(of({id: 'job-1'})),
     };
     TestBed.resetTestingModule();
@@ -372,6 +374,27 @@ describe('JobCreateComponent project picker', () => {
       instructions: 'Instructions', kickoff_message: 'Start here', datasource_ids: ['connector-1'],
       priority: 7, project_id: 'proj-1', user_id: 'user-1',
     });
+  });
+
+  it('sends the picked template in the preview and the create, never config_override.workspace', async () => {
+    const {component, api} = setup(null);
+    const choice = {kind: 'ref' as const, ref: {name: 'container-minimal', scope: {kind: 'Catalog' as const, name: 'shared'}}, backend: 'sandbox' as const, label: 'container-minimal'};
+    component.onWorkspaceChoice(choice);
+    const previewBody = api.previewToolGroups.mock.calls.at(-1)![0];
+    expect(previewBody.workspace).toEqual({template: {ref: {name: 'container-minimal', scope: {kind: 'Catalog', name: 'shared'}}}});
+    expect(previewBody).not.toHaveProperty('workspace_preference');
+    component.formData.description = 'Do it';
+    await component.onSubmit();
+    const request = api.createJob.mock.calls.at(-1)![0];
+    expect(request.workspace).toEqual(previewBody.workspace);
+    expect(request.config_override?.['workspace']).toBeUndefined();
+  });
+
+  it('omits workspace entirely for the default choice', async () => {
+    const {component, api} = setup(null);
+    component.formData.description = 'Do it';
+    await component.onSubmit();
+    expect(api.createJob.mock.calls.at(-1)![0]).not.toHaveProperty('workspace');
   });
 
   it('does not create a job while VM sizing is invalid', async () => {

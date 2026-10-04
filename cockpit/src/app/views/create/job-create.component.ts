@@ -1,4 +1,7 @@
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
+import {WorkspacePickerComponent} from '../agent-settings/workspace-picker.component';
+import {WorkspaceChoice} from '../../core/models/workspace-template.model';
+import {choiceBackend, choiceRequestFields} from '../workspaces/workspace-template-utils';
 import {workspaceCreationFields, workspacePreviewConfig} from "../agent-settings/workspace-selection";
 import {Component, computed, effect, ElementRef, inject, OnInit, signal, ViewChild} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
@@ -32,7 +35,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
   selector: 'app-job-create',
   standalone: true,
   imports: [
-    SidebarToggleComponent, AgentSettingsComponent,
+    SidebarToggleComponent, AgentSettingsComponent, WorkspacePickerComponent,
     TranslocoPipe,
     AppButtonComponent,
     AppIconButtonComponent,
@@ -291,11 +294,20 @@ import {AppTooltipDirective} from '../../ui/tooltip';
           }
 
           <!-- Agent Settings (tabbed: Settings / Instructions / Advanced) -->
-        @if (expertDetail()?.workspace_preference?.backend; as preference) {
-          <p class="field-hint">{{ 'agentSettings.execution.workspaceRecommendation' | transloco:{tier: preference} }}</p>
-        }
+          <app-workspace-picker
+            role="job"
+            [projectId]="selectedProjectId()"
+            [preview]="toolPreview()?.workspace ?? null"
+            [recommendation]="expertDetail()?.workspace_preference?.backend ?? null"
+            [recommendedBy]="selectedExpert()?.display_name ?? ''"
+            [disabled]="isSubmitting()"
+            [choice]="workspaceChoice()"
+            (choiceChange)="onWorkspaceChoice($event)"
+          />
           <app-agent-settings
             mode="job"
+            [workspacePicker]="true"
+            [pickerBackend]="pickerBackend()"
             [config]="workspaceConfig()"
             [resolvedToolset]="toolPreview()"
             [readsResolvedToolset]="true"
@@ -1387,6 +1399,14 @@ export class JobCreateComponent implements OnInit {
   readonly workspaceConfig = computed(() => workspacePreviewConfig(
     this.expertDetail()?.config ?? this.frameworkDefaults() ?? {}, this.toolPreview()?.workspace,
   ));
+  readonly workspaceChoice = signal<WorkspaceChoice>({kind: 'default'});
+  readonly pickerBackend = computed(() => choiceBackend(this.workspaceChoice(), this.toolPreview()?.workspace));
+
+  onWorkspaceChoice(choice: WorkspaceChoice): void {
+    this.workspaceChoice.set(choice);
+    this.loadToolPreview();
+  }
+
   private toolPreviewSerial = 0;
   private expertDetailSerial = 0;
   readonly loadingWorkspacePreview = signal(false);
@@ -1420,7 +1440,7 @@ export class JobCreateComponent implements OnInit {
     this.api
       .previewToolGroups({
       config_override: this.agentSettings?.getOverrides() ?? {},
-      workspace_preference: this.expertDetail()?.workspace_preference?.backend ?? null,
+        ...choiceRequestFields(this.workspaceChoice()),
         expert_type: 'worker',
         config_name: isBundled ? expert!.id : null,
         expert_id: isDbExpert ? expert!.id : null,
@@ -1662,7 +1682,7 @@ export class JobCreateComponent implements OnInit {
     if (this.uploadId) request.upload_id = this.uploadId;
 
     // Collect overrides from the settings component
-    const workspaceFields = workspaceCreationFields(this.agentSettings?.getOverrides() ?? {}, {kind: 'default'});
+    const workspaceFields = workspaceCreationFields(this.agentSettings?.getOverrides() ?? {}, this.workspaceChoice());
     if ("workspace" in workspaceFields) request.workspace = workspaceFields.workspace;
     const configOverride = workspaceFields.config_override;
     if (configOverride && Object.keys(configOverride).length > 0) {
@@ -1757,6 +1777,7 @@ export class JobCreateComponent implements OnInit {
     this.expertSelectionTouched = false;
     this.expertDetail.set(null);
     this.selectedPriority.set(5);
+    this.workspaceChoice.set({kind: 'default'});
     this.cloudStorageOverride.set('inherit');
     this.agentSettings?.resetAll();
     this.selectDefaultProject(this.projects());
