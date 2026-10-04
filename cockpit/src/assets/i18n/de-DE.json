@@ -2116,7 +2116,6 @@
       "defaultsFailed": "Sitzungsstandards konnten nicht geladen werden. Vor dem Senden erneut versuchen.",
       "recoveryTitle": "Dein Chat konnte nicht starten",
       "recoveryBody": "Deine Nachrichten wurden noch nicht gesendet. Passe die Optionen unten an und versuche es erneut.",
-      "workspaceDefault": "Projekt- oder Kontostandard verwenden",
       "retrySend": "Erneut senden"
     },
     "ended": {

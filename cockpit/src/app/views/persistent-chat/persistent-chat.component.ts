@@ -1844,9 +1844,11 @@ export function clearDraft(threadId: string | null): void {
             [connectorsError]="chat.draftDefaultsError()"
             [connectorsEnabled]="chat.draftConnectorsEnabled()"
             [datasourceCount]="chat.draftDatasourceIds()?.length ?? 0"
-            [workspaceBackend]="chat.draftWorkspaceBackend()"
+            [workspaceChoice]="chat.draftWorkspaceChoice()"
+            [projectId]="chat.draftProjectId()"
+            [workspacePreview]="chat.draftWorkspacePreview()"
             (connectorsToggled)="chat.setDraftConnectorsEnabled($event)"
-            (workspaceChanged)="chat.setDraftWorkspaceBackend($event)"
+            (workspaceChoiceChanged)="chat.setDraftWorkspaceChoice($event)"
             (retryRequested)="chat.retryDraftDefaults()"
             (sendRetried)="chat.retryDraftSession()"
           />

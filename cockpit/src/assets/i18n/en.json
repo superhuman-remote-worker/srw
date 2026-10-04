@@ -2116,7 +2116,6 @@
       "defaultsFailed": "Your session defaults could not be loaded. Retry before sending.",
       "recoveryTitle": "Your chat could not start",
       "recoveryBody": "Your messages have not been sent. Adjust the options below, then retry.",
-      "workspaceDefault": "Use project or account default",
       "retrySend": "Retry sending"
     },
     "ended": {
