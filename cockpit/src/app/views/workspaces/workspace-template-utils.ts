@@ -52,7 +52,10 @@ export function emptyFormValue(scope: ResourceScope): TemplateFormValue {
 }
 
 function isShellStep(step: WorkspaceStep): boolean {
-  return step.command.length === 3 && step.command[0] === SHELL[0] && step.command[1] === SHELL[1];
+  if (step.command.length !== 3 || step.command[0] !== SHELL[0] || step.command[1] !== SHELL[1]) return false;
+  // Only single-line, already-trimmed scripts survive the newline-joined textarea unchanged.
+  const script = step.command[2];
+  return script !== '' && !script.includes('\n') && script === script.trim();
 }
 
 const text = (n: number | undefined): string => (n === undefined ? '' : String(n));

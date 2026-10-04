@@ -58,6 +58,18 @@ describe('workspace template form round trip', () => {
       .toEqual([{command: ['/bin/sh', '-c', 'make']}, {command: ['/bin/sh', '-c', 'ls -la']}]);
   });
 
+  it.each([
+    ['a multi-line script', 'if true; then\n  make\nfi'],
+    ['leading and trailing whitespace', '  make  '],
+  ])('keeps a stored shell step with %s byte-identical', (_label, script) => {
+    const d = doc({backend: 'vm', resources: {cpu: 2}, environment: {image: 'ghcr.io/srw/vm:1'},
+      initialize: [{command: ['/bin/sh', '-c', 'echo first']}, {command: ['/bin/sh', '-c', script]}]});
+    const {value, preserved} = fromDocument(d);
+    expect(value.setupLines).toBe('');
+    expect(preserved.hasAny).toBe(true);
+    expect(toDocument(value, preserved)).toEqual(d);
+  });
+
   it('builds a virtual template with no environment or sizes', () => {
     const value = {...emptyFormValue(ACCOUNT_ME), name: 'files', backend: 'virtual' as const, image: 'ignored', cpu: '2'};
     expect(toDocument(value, fromDocument(doc()).preserved).spec).toEqual({backend: 'virtual'});
