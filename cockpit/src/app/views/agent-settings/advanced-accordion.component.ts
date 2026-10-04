@@ -313,7 +313,7 @@ function validVmSizeGiB(value: number | null): value is number {
             @if (isLiteBackend()) {
               <p class="field-hint lite-hint">{{ (isNoneBackend() ? 'advanced.hints.noneBackend' : 'advanced.hints.virtualBackend') | transloco }}</p>
             }
-            @if (effectiveBackend() === 'vm') {
+            @if (vmSizing() && effectiveBackend() === 'vm') {
               <div class="field-row" [class.modified]="vmCpuCores() !== null">
                 <label class="field-label">{{ 'advanced.labels.vmCpuCores' | transloco }}</label>
                 <div class="field-control">
@@ -758,6 +758,9 @@ export class AdvancedAccordionComponent {
    *  in ExecutionGroupComponent; this section reads it to grey the tools a lite
    *  tier cannot run and to scope what its own `getOverrides()` emits. */
   backendOverride = input<string | null>(null);
+  /** False when a create form's workspace picker owns the workspace (Slice A3):
+   *  templates carry their sizes, so the legacy VM sizing neither shows nor emits. */
+  vmSizing = input(true);
 
   change = output<void>();
 
@@ -871,7 +874,7 @@ export class AdvancedAccordionComponent {
   readonly vmDiskSizeInvalid = computed(() => this.vmDiskSize() === null
     ? this.r('workspace.vm.disk_size') != null && this.r('workspace.vm.disk_size') !== '' && this.resolvedVmDiskSize() === null
     : !validVmSizeGiB(this.vmDiskSize()));
-  readonly vmSizingValid = computed(() => this.effectiveBackend() !== 'vm'
+  readonly vmSizingValid = computed(() => !this.vmSizing() || this.effectiveBackend() !== 'vm'
     || (!this.vmMemoryInvalid() && !this.vmDiskSizeInvalid()));
   readonly resolvedMaxReadWords = computed(() => (this.r('workspace.max_read_words') ?? 25000) as number);
   readonly resolvedMaxWriteWords = computed(() => (this.r('workspace.max_write_words') ?? 10000) as number);
@@ -1008,7 +1011,7 @@ export class AdvancedAccordionComponent {
     // selector; the host deep-merges the two `workspace` fragments.
     const lite = this.isLiteBackend();
     const ws: Record<string, unknown> = {};
-    if (this.effectiveBackend() === 'vm') {
+    if (this.vmSizing() && this.effectiveBackend() === 'vm') {
       const vm: Record<string, unknown> = {};
       if (this.vmCpuCores() !== null) vm['cpu_cores'] = this.vmCpuCores();
       if (validVmSizeGiB(this.vmMemory())) vm['memory'] = `${this.vmMemory()}Gi`;

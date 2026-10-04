@@ -237,7 +237,6 @@ interface ExpertDetail extends Expert {
           [config]="workspaceConfig()"
           [resolvedToolset]="toolPreview()"
           [readsResolvedToolset]="true"
-          [workspacePreview]="toolPreview()?.workspace ?? null"
           [disabled]="creating()"
           [settingsMatrix]="expertDetail()?.settings_matrix ?? frameworkSettingsMatrix()"
           [effectiveModels]="resolvedEffectiveModels()"
@@ -1012,7 +1011,7 @@ export class SessionCreateComponent implements OnInit {
     const projectIds = Array.from(this.selectedProjectIds());
 
     // Build config_override from settings component
-    const workspaceFields = workspaceCreationFields(this.agentSettings?.getOverrides() ?? {}, this.toolPreview()?.workspace);
+    const workspaceFields = workspaceCreationFields(this.agentSettings?.getOverrides() ?? {}, {kind: 'default'});
     const configOverride = workspaceFields.config_override;
 
     // Extract permission_mode and model from overrides (session-specific handling).

@@ -299,7 +299,6 @@ import {AppTooltipDirective} from '../../ui/tooltip';
             [config]="workspaceConfig()"
             [resolvedToolset]="toolPreview()"
             [readsResolvedToolset]="true"
-            [workspacePreview]="toolPreview()?.workspace ?? null"
             [gatedCapabilities]="capabilities.grants() ?? null"
             [disabled]="isSubmitting()"
             [showProjectMemory]="projectHasSharedMemory()"
@@ -1663,7 +1662,7 @@ export class JobCreateComponent implements OnInit {
     if (this.uploadId) request.upload_id = this.uploadId;
 
     // Collect overrides from the settings component
-    const workspaceFields = workspaceCreationFields(this.agentSettings?.getOverrides() ?? {}, this.toolPreview()?.workspace);
+    const workspaceFields = workspaceCreationFields(this.agentSettings?.getOverrides() ?? {}, {kind: 'default'});
     if ("workspace" in workspaceFields) request.workspace = workspaceFields.workspace;
     const configOverride = workspaceFields.config_override;
     if (configOverride && Object.keys(configOverride).length > 0) {

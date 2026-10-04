@@ -7,7 +7,6 @@ import type {
     SessionToolGroupsResponse,
 } from '../../core/services/api.service';
 import {SettingsMode, TierReachability} from './agent-settings.types';
-import type {WorkspacePreview} from '../../core/models/workspace.model';
 import {ExecutionGroupComponent} from './execution-group.component';
 import {ModelGroupComponent} from './model-group.component';
 import {delegationCapScopeForMode, ToolsGroupComponent} from './tools-group.component';
@@ -83,7 +82,7 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
             [liveTier]="liveTier()"
             [tierReachability]="tierReachability()"
             [upgradeInProgress]="upgradeInProgress()"
-            [workspacePreview]="workspacePreview()"
+            [showWorkspaceBackend]="!workspacePicker()"
             (change)="onChange()"
             (tierChangeRequested)="tierChangeRequested.emit($event)"
           />
@@ -119,7 +118,7 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
             [error]="datasourceLoadError()"
             [contextKey]="datasourceContextKey()"
             [disabled]="disabled()"
-            [isLiteBackend]="mode() === 'live' ? liteBackend() : (executionGroup?.isLiteBackend() ?? false)"
+            [isLiteBackend]="mode() === 'live' ? liteBackend() : workspacePicker() ? isLite(pickerBackend()) : (executionGroup?.isLiteBackend() ?? false)"
             [initialSelectedIds]="mode() === 'live' || mode() === 'session' ? initialDatasourceIds() : null"
             [datasourceDefaultsEnabled]="datasourceDefaultsEnabled()"
             [lockedIds]="lockedDatasourceIds()"
@@ -156,7 +155,8 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
               [disabled]="disabled()"
               [settingsMatrix]="settingsMatrix()"
               [modelOverride]="modelGroup?.model() ?? null"
-              [backendOverride]="executionGroup?.workspaceBackend() ?? null"
+              [backendOverride]="workspacePicker() ? pickerBackend() : (executionGroup?.workspaceBackend() ?? null)"
+              [vmSizing]="!workspacePicker()"
               (change)="onChange()"
             />
           </div>
@@ -301,10 +301,15 @@ export class AgentSettingsComponent {
   liveTier = input<string | null>(null);
   tierReachability = input<Record<string, TierReachability>>({});
   upgradeInProgress = input<{tier: string; elapsed?: number} | null>(null);
-  /** The resolver's answer for what an unpinned workspace backend would
-   *  resolve to, forwarded to the execution group's hint (Slice A2b §6,
-   *  "Create form"). Null outside job/session creation. */
-  workspacePreview = input<WorkspacePreview | null>(null);
+  /** True on the create forms, which render `app-workspace-picker` themselves
+   *  (Slice A3). The tier row and VM sizing then step aside. */
+  workspacePicker = input(false);
+  /** The backend the picker's choice runs on, for the lite-tier greying. */
+  pickerBackend = input<string | null>(null);
+
+  protected isLite(backend: string | null): boolean {
+    return backend === 'virtual' || backend === 'none';
+  }
   /** Expert detail loading state. */
   loadingExpert = input(false);
 
