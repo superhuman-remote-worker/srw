@@ -30,7 +30,7 @@
         "swControlling": "navigator.serviceWorker.controller non-null (scriptURL http://localhost:4174/ngsw-worker.js) on every route",
         "/workspaces": "tabs [Experts, Workspaces, Skills, Connectors, Contacts], active Workspaces; rows Container (full), Container (minimal), Virtual, each with Built-in (3 badges)",
         "/workspaces/new": "editor form: Name, Save to, Display name, Description, Tier, Image, CPU, Memory, Disk, Guaranteed CPU, Guaranteed memory, Pull policy",
-        "/jobs/new": "picker: Default: Container · container-full (installation default); Container (full); Container (minimal); Virtual; No workspace",
+        "/jobs/new": "picker: Default: Container \u00b7 container-full (installation default); Container (full); Container (minimal); Virtual; No workspace",
         "/sessions/new": "picker: Default: Virtual (installation default); Container (full); Container (minimal); Virtual; No workspace"
       },
       "negativeControls": {
@@ -43,14 +43,15 @@
       "gate": "3.2",
       "name": "Overflow probe at 390x844 and 1440x900",
       "request": "PROBE_ROUTES=/workspaces,/workspaces/new,/jobs/new,/sessions/new node e2e/visual-walk/overflow-probe.cjs (cockpit/playwright-report/overflow-probe/probe.json)",
-      "result": "fail",
+      "result": "pass",
       "observed": {
         "desktop": "no overflow on any route (only the known 3px sidebar-logo and expert-card icon spill-y noise)",
         "mobile /workspaces": "div.workspaces scrollWidth 449 > 390; table.app-table right edge 449; th/td.actions-col past the viewport; the row-actions kebab sits at x 393-437, outside the 390px viewport. The document doesn't scroll (no page-hscroll): app-workspace-templates-list has overflow-x:auto and scrolls 59px, so the row actions are reachable only by scrolling the list sideways",
         "comparison": "/experts and /skills at 390: no such findings (only the Customize tab bar)",
         "mobile /workspaces/new, /jobs/new, /sessions/new": "known noise only",
         "customizeTabBar": "pass: nav.customize-tabs overflow-x auto, scrollWidth 385 > clientWidth 330; on /contacts it is scrolled (scrollLeft 55) so the active tab ends at x 382 <= 390"
-      }
+      },
+      "note": "Failed in the first run; passes in the recheck after 5f3c6dde7 (see recheck.checks)."
     }
   ],
   "checks": [
@@ -63,7 +64,7 @@
         "tabs": "Experts (/experts), Workspaces (/workspaces, active), Skills (/skills), Connectors (/datasources), Contacts (/contacts)",
         "rail": "Customize row active",
         "chips": "Available to me, Mine, Shared, plus the Project select",
-        "shared": "Container (full) · Container · srw-workspace:tilt-03de0312fe5b96fe · 2 CPU · 4Gi; Container (minimal) · Container · srw-workspace-minimal:tilt-7e7d19b52f06906a · 2 CPU · 4Gi; Virtual · Virtual (cloud files); all three Built-in, no Delete action",
+        "shared": "Container (full) \u00b7 Container \u00b7 srw-workspace:tilt-03de0312fe5b96fe \u00b7 2 CPU \u00b7 4Gi; Container (minimal) \u00b7 Container \u00b7 srw-workspace-minimal:tilt-7e7d19b52f06906a \u00b7 2 CPU \u00b7 4Gi; Virtual \u00b7 Virtual (cloud files); all three Built-in, no Delete action",
         "vmFull": "not listed (VMs off)"
       }
     },
@@ -71,14 +72,21 @@
       "check": "A2",
       "name": "A Mine container template from the editor runs a New Job with its image and sizes",
       "request": "editor /workspaces/new: name a3-mine-lean, Save to Mine, image srw-registry:5000/srw-workspace-minimal:tilt-0dfcde642f0466b0, CPU 1, Memory 2Gi, Disk 15Gi; then /jobs/new with the picker on A3 Mine lean",
-      "ids": {"template": "1c423bfa-db28-4646-a906-2ce97a8cc547", "job": "730731d5-ff8a-4c9f-8608-fcc583beb932"},
+      "ids": {
+        "template": "1c423bfa-db28-4646-a906-2ce97a8cc547",
+        "job": "730731d5-ff8a-4c9f-8608-fcc583beb932"
+      },
       "result": "pass",
       "observed": {
         "editorRequests": "POST /api/persistent/tool-groups/preview {workspace: {template: {inline}}} 200; POST /api/manifests/apply (scope Account/me, no expected_versions) 200; redirect to /workspaces/1c423bfa-...",
-        "pickerOption": "A3 Mine lean · Container · 1 CPU · 2Gi · 15Gi · srw-workspace-minimal:tilt-0dfcde642f0466b0",
+        "pickerOption": "A3 Mine lean \u00b7 Container \u00b7 1 CPU \u00b7 2Gi \u00b7 15Gi \u00b7 srw-workspace-minimal:tilt-0dfcde642f0466b0",
         "createBody": "POST /api/jobs {workspace: {template: {ref: {name: a3-mine-lean, scope: {kind: Account, name: 6ed1b6f4-...}}}}, config_override: {autonomy, scholar, verification, llm}} -> 200; no config_override.workspace",
         "pod": "workspace-730731d5-ff8: image srw-registry:5000/srw-workspace-minimal:tilt-0dfcde642f0466b0, limits cpu 1 / memory 2Gi, requests cpu 250m / memory 2Gi; PVC pvc-workspace-730731d5-ff8 15Gi",
-        "context.workspace_sources": {"tier": "explicit", "template": "explicit", "template_name": null},
+        "context.workspace_sources": {
+          "tier": "explicit",
+          "template": "explicit",
+          "template_name": null
+        },
         "imageNote": "The image is an older tag of SRW's own srw-workspace-minimal repository, so it is trusted by repository: no custom-image notice (isSrwImage compares repositories) and the pod is privileged. The unprivileged custom-image path wasn't exercised; no other usable image is in the local registry."
       }
     },
@@ -86,28 +94,43 @@
       "check": "A3",
       "name": "Project Sessions default Container with a Project template shows in New Session and reaches the Session",
       "request": "editor: a3-project-lean saved to Project a2b-t15-defaults (1 CPU, 3Gi, image ...minimal:tilt-7e7d19b52f06906a); Project page Settings tab: Container template -> A3 Project lean, Save Changes; /sessions/new with chip a2b-t15-defaults, picker left on Default",
-      "ids": {"project": "55d19538-0bfe-4d0c-bb6b-31c16189948d", "template": "e0a7c28e-298d-4627-8b70-d3fd7ae73381", "session": "311e6603-459b-4df0-b310-b8540f37b841"},
+      "ids": {
+        "project": "55d19538-0bfe-4d0c-bb6b-31c16189948d",
+        "template": "e0a7c28e-298d-4627-8b70-d3fd7ae73381",
+        "session": "311e6603-459b-4df0-b310-b8540f37b841"
+      },
       "result": "pass",
       "observed": {
         "settingsPut": "PUT /api/projects/55d19538-.../workspace-defaults {jobs: container, sessions: container, container: {name: a3-project-lean, scope: Project/55d19538-...}, vm: null} 200",
-        "pickerDefault": "Default: Container · a3-project-lean (project default)",
-        "summary": "Container · 1 CPU · 3Gi · srw-workspace-minimal:tilt-7e7d19b52f06906a (project default)",
+        "pickerDefault": "Default: Container \u00b7 a3-project-lean (project default)",
+        "summary": "Container \u00b7 1 CPU \u00b7 3Gi \u00b7 srw-workspace-minimal:tilt-7e7d19b52f06906a (project default)",
         "createBody": "POST /api/persistent/threads {title, config_name: session_base, expert_id, project_ids: [55d19538-...], datasource_ids: []}: no workspace key, no config_override",
         "pod": "ws-thread-311e6603-459: image srw-registry:5000/srw-workspace-minimal:tilt-7e7d19b52f06906a, limits cpu 1 / memory 3Gi, requests cpu 250m / memory 3Gi",
-        "metadata.workspace_sources": {"tier": "project", "template": "project", "template_name": "a3-project-lean"},
+        "metadata.workspace_sources": {
+          "tier": "project",
+          "template": "project",
+          "template_name": "a3-project-lean"
+        },
         "lane": "stateless"
       }
     },
     {
       "check": "A4",
-      "name": "Customize… starts a Job with an inline recipe; No workspace starts a Session with backend none",
-      "request": "/jobs/new: picker Container (minimal), Customize… prefilled from it, CPU 1.5, Memory 3Gi, Use for this run; /sessions/new: picker No workspace",
-      "ids": {"job": "65e16656-b8bb-4ad7-9ebf-0456ff6f081c", "session": "69345b72-5ca3-4568-a703-bcf3c6a82f39"},
+      "name": "Customize\u2026 starts a Job with an inline recipe; No workspace starts a Session with backend none",
+      "request": "/jobs/new: picker Container (minimal), Customize\u2026 prefilled from it, CPU 1.5, Memory 3Gi, Use for this run; /sessions/new: picker No workspace",
+      "ids": {
+        "job": "65e16656-b8bb-4ad7-9ebf-0456ff6f081c",
+        "session": "69345b72-5ca3-4568-a703-bcf3c6a82f39"
+      },
       "result": "pass",
       "observed": {
-        "picker": "Custom (this run only); summary Container · 1.5 CPU · 3Gi · srw-workspace-minimal:tilt-7e7d19b52f06906a",
+        "picker": "Custom (this run only); summary Container \u00b7 1.5 CPU \u00b7 3Gi \u00b7 srw-workspace-minimal:tilt-7e7d19b52f06906a",
         "jobBody": "POST /api/jobs {workspace: {template: {inline: {backend: sandbox, resources: {cpu: 1.5, memory: 3Gi, requests: {cpu: 0.5, memory: 1Gi}}, environment: {image: ...minimal:tilt-7e7d19b52f06906a, pullPolicy: IfNotPresent}}}}} 200",
-        "job.context.workspace_sources": {"tier": "explicit", "template": "explicit", "template_name": null},
+        "job.context.workspace_sources": {
+          "tier": "explicit",
+          "template": "explicit",
+          "template_name": null
+        },
         "jobPod": "workspace-65e16656-b8b: limits cpu 1500m / memory 3Gi, requests cpu 500m / memory 1Gi",
         "sessionBody": "POST /api/persistent/threads {..., project_ids: [c325de45-...], workspace: null, datasource_ids: []} 200",
         "session": "metadata.config_override.workspace {backend: none} (written by the server), metadata.workspace_sources explicit, lane stateless, no ws-thread pod"
@@ -117,7 +140,10 @@
       "check": "A5",
       "name": "Mine template in a non-personal Project (owner's stop rule)",
       "request": "/jobs/new with Project a2b-t15-defaults and the picker on A3 Mine lean",
-      "ids": {"project": "55d19538-0bfe-4d0c-bb6b-31c16189948d", "job": "a5dac45f-cdbb-452a-9ce4-e0928d3dff0c"},
+      "ids": {
+        "project": "55d19538-0bfe-4d0c-bb6b-31c16189948d",
+        "job": "a5dac45f-cdbb-452a-9ce4-e0928d3dff0c"
+      },
       "result": "pass",
       "observed": {
         "offered": "Mine group present in the picker with that Project selected",
@@ -130,21 +156,27 @@
       "check": "A6",
       "name": "Built-in read-only, Duplicate to Mine, stale edit conflict",
       "request": "/workspaces/ab8bb40a-2f2d-4f74-ad22-36acb3f68eef (container-minimal); Duplicate; Save; the copy open in two tabs; save in tab A (Display name), then tab B (Description)",
-      "ids": {"builtin": "ab8bb40a-2f2d-4f74-ad22-36acb3f68eef", "copy": "7b8aa8ba-e931-43a9-9066-7cbbd919835f"},
+      "ids": {
+        "builtin": "ab8bb40a-2f2d-4f74-ad22-36acb3f68eef",
+        "copy": "7b8aa8ba-e931-43a9-9066-7cbbd919835f"
+      },
       "result": "pass",
       "observed": {
         "builtin": "every field read-only; banner 'Built-in template, managed by the installation. Duplicate it to make your own.'; buttons All workspaces and Duplicate only",
         "duplicate": "/workspaces/new prefilled: name container-minimal-copy, Save to Account/me, display 'Container (minimal) (copy)', all fields editable; Save -> apply 200 -> /workspaces/7b8aa8ba-...",
         "tabA": "apply with expected_versions {WorkspaceTemplate/Account/6ed1b6f4-.../container-minimal-copy: 1} 200, 'Saved.'",
         "tabB": "same expected version 1 -> 409; banner 'Resource version changed; read the current resource and retry.' with Reload; Reload re-read (display 'Copy edited in tab A', description reverted)",
-        "copyNote": "The banner shows the server's detail text, not the §7 copy 'This template changed since you opened it.' (the editor uses detail when present). Copy only."
-      }
+        "copyNote": "The banner shows the server's detail text, not the \u00a77 copy 'This template changed since you opened it.' (the editor uses detail when present). Copy only."
+      },
+      "note": "The copy deviation (server text in the version-conflict banner) is fixed in 5f3c6dde7; verified in the recheck."
     },
     {
       "check": "A7",
       "name": "New Session takes one project; Start a new session from a two-project Session picks its non-default project",
       "request": "/sessions/new chip clicks; POST /api/persistent/threads {project_ids: [c325de45-... (personal), 55d19538-...], workspace: null}; /sessions/new?from=<that session> (the route onStartNewSession navigates to)",
-      "ids": {"sourceSession": "adb747fd-e636-4b57-a1da-ee564a9b38e1"},
+      "ids": {
+        "sourceSession": "adb747fd-e636-4b57-a1da-ee564a9b38e1"
+      },
       "result": "pass",
       "observed": {
         "singleChoice": "initial [test's Project]; click a2b-t15-defaults -> [a2b-t15-defaults]; click KB Hardening Gate 2026-09-04 secondary -> [that one]; click No project -> [No project]",
@@ -158,7 +190,11 @@
       "check": "A8",
       "name": "MCP workspace argument",
       "request": "in srw-mcp-78cbd5677f-74kb2: mcp.call_tool('create_project_job', {project_id: 55d19538-..., workspace: ...}) with _get_mcp_caller_ctx bound to the admin",
-      "ids": {"jobMine": "1c366f0d-933e-4b0b-936f-6c681225b354", "jobNone": "29f50126-ec4c-41ae-b2c5-1af2840acb33", "sessionNone": "8e79d8d1-172f-4e0c-9d0f-19196f726934"},
+      "ids": {
+        "jobMine": "1c366f0d-933e-4b0b-936f-6c681225b354",
+        "jobNone": "29f50126-ec4c-41ae-b2c5-1af2840acb33",
+        "sessionNone": "8e79d8d1-172f-4e0c-9d0f-19196f726934"
+      },
       "result": "pass",
       "observed": {
         "unknown": "workspace 'a3-no-such-template' -> \"Refusing to create job: No workspace template named 'a3-no-such-template' is visible here; list them with manifest_list kind=WorkspaceTemplate.\" (3 GET /api/resources lookups: Project, Account, Catalog; no create)",
@@ -172,7 +208,10 @@
       "check": "A9",
       "name": "Chat recovery view creates a Session with the picker's binding; no create surface sends config_override.workspace.backend or .vm",
       "request": "landing draft at https://localhost/; models.enabled=false for MiniMax-M3 (about 10 s) so the draft create fails at the readiness gate; send; re-enable; recovery picker -> Container (minimal); Retry",
-      "ids": {"session": "af1e0c6a-034a-4564-ae1b-a8f68277b69b", "jobBehaviourKeys": "c0a580b0-f515-4610-a6bf-3565e212ccfd"},
+      "ids": {
+        "session": "af1e0c6a-034a-4564-ae1b-a8f68277b69b",
+        "jobBehaviourKeys": "c0a580b0-f515-4610-a6bf-3565e212ccfd"
+      },
       "result": "pass",
       "observed": {
         "failedCreate": "POST /api/persistent/threads {project_ids: [c325de45-...], title, datasource_ids: []} 503 system_not_ready",
@@ -187,8 +226,8 @@
     },
     {
       "check": "A10",
-      "name": "Enter in the Customize… dialog on New Job doesn't submit the job",
-      "request": "/jobs/new with a description; Customize…; CPU input: type 3, press Enter; then Enter in the Template name field",
+      "name": "Enter in the Customize\u2026 dialog on New Job doesn't submit the job",
+      "request": "/jobs/new with a description; Customize\u2026; CPU input: type 3, press Enter; then Enter in the Template name field",
       "result": "pass",
       "observed": {
         "postsToApiJobs": "0 before, 0 after either Enter",
@@ -200,19 +239,26 @@
       "check": "A11",
       "name": "Duplicating the same built-in twice: the second save reports the taken name",
       "request": "Duplicate container-minimal twice and Save both unchanged; then a third duplicate with CPU changed to 3",
-      "ids": {"existingCopy": "7b8aa8ba-e931-43a9-9066-7cbbd919835f"},
-      "result": "fail",
+      "ids": {
+        "existingCopy": "7b8aa8ba-e931-43a9-9066-7cbbd919835f"
+      },
+      "result": "pass",
       "observed": {
         "secondUnchanged": "POST /api/manifests/apply 200 with changed: false, same uid, resourceVersion 1 (the document is identical, so the server treats it as a no-op apply). The editor navigated to the existing /workspaces/7b8aa8ba-... with no message: the user is told nothing and lands on the earlier copy",
         "changedDuplicate": "apply 409 -> 'A template with this name already exists here. Choose another name.' rendered only in the Name field's error (app-form-field__error); no banner, no Reload",
         "rootCause": "workspace-template-editor handleError maps only a 409 on a new template to nameTaken; an apply of a new template that returns 200 with resources[0].changed false (an identical document already exists) is treated as success"
-      }
+      },
+      "note": "Failed in the first run; passes in the recheck after 5f3c6dde7 (see recheck.checks)."
     },
     {
       "check": "A12",
       "name": "Agent-side create_job with workspace (anyOf schema) through a real chat model",
       "request": "POST /api/persistent/threads {project_ids: [c325de45-...], workspace: null, config_override: {tools: {job_control: [create_job], job_inspection: [get_job]}}}; input asking for create_job(description, workspace='a3-mine-lean'); approval approved via POST .../approve/{id}",
-      "ids": {"session": "8e489a3e-e1f1-4c08-9d24-ec197db0c563", "approval": "eb04965f-6771-4052-986e-da817b04594a", "job": "fb7afb71-ced8-43c3-ab9e-b9d857284143"},
+      "ids": {
+        "session": "8e489a3e-e1f1-4c08-9d24-ec197db0c563",
+        "approval": "eb04965f-6771-4052-986e-da817b04594a",
+        "job": "fb7afb71-ced8-43c3-ab9e-b9d857284143"
+      },
       "result": "pass",
       "observed": {
         "provider": "MiniMax-M3 accepted the tool list (no schema error) and emitted create_job {workspace: 'a3-mine-lean', description: ...}",
@@ -242,8 +288,23 @@
     }
   ],
   "cleanup": {
-    "jobsDeleted": ["730731d5-ff8a-4c9f-8608-fcc583beb932", "65e16656-b8bb-4ad7-9ebf-0456ff6f081c", "a5dac45f-cdbb-452a-9ce4-e0928d3dff0c", "1c366f0d-933e-4b0b-936f-6c681225b354", "29f50126-ec4c-41ae-b2c5-1af2840acb33", "fb7afb71-ced8-43c3-ab9e-b9d857284143", "c0a580b0-f515-4610-a6bf-3565e212ccfd"],
-    "sessionsDeleted": ["69345b72-5ca3-4568-a703-bcf3c6a82f39", "311e6603-459b-4df0-b310-b8540f37b841", "adb747fd-e636-4b57-a1da-ee564a9b38e1", "8e79d8d1-172f-4e0c-9d0f-19196f726934", "af1e0c6a-034a-4564-ae1b-a8f68277b69b", "8e489a3e-e1f1-4c08-9d24-ec197db0c563"],
+    "jobsDeleted": [
+      "730731d5-ff8a-4c9f-8608-fcc583beb932",
+      "65e16656-b8bb-4ad7-9ebf-0456ff6f081c",
+      "a5dac45f-cdbb-452a-9ce4-e0928d3dff0c",
+      "1c366f0d-933e-4b0b-936f-6c681225b354",
+      "29f50126-ec4c-41ae-b2c5-1af2840acb33",
+      "fb7afb71-ced8-43c3-ab9e-b9d857284143",
+      "c0a580b0-f515-4610-a6bf-3565e212ccfd"
+    ],
+    "sessionsDeleted": [
+      "69345b72-5ca3-4568-a703-bcf3c6a82f39",
+      "311e6603-459b-4df0-b310-b8540f37b841",
+      "adb747fd-e636-4b57-a1da-ee564a9b38e1",
+      "8e79d8d1-172f-4e0c-9d0f-19196f726934",
+      "af1e0c6a-034a-4564-ae1b-a8f68277b69b",
+      "8e489a3e-e1f1-4c08-9d24-ec197db0c563"
+    ],
     "templatesDeleted": {
       "7b8aa8ba-e931-43a9-9066-7cbbd919835f": "container-minimal-copy, through the list's Delete with confirmation (DELETE /api/resources/{uid}?expected_version=2 200)",
       "1c423bfa-db28-4646-a906-2ce97a8cc547": "a3-mine-lean, API",
@@ -251,5 +312,33 @@
     },
     "projectDefaultsRestored": "55d19538-...: {jobs: container, sessions: container, container: container-minimal Catalog/shared}, as before the run",
     "leftovers": "none from this run: no workspace-* or ws-thread-* pods and no PVCs from these IDs; only the two pool agent pods noted above"
+  },
+  "recheck": {
+    "date": "2026-10-04",
+    "commit": "5f3c6dde7",
+    "commitRange": "62c40de2d..5f3c6dde7",
+    "stack": "local k3d; cockpit live-synced (grep versionConflict in /app/src/assets/i18n/en.json = 1); headless Chromium via Node Playwright, login test/test; REST via orchestrator pod with internal key",
+    "checks": [
+      {
+        "check": "A11",
+        "result": "pass",
+        "ids": {
+          "createdCopy": "b36995fd-3aad-485f-913e-236d39217fae (container-minimal-copy, built-in ab8bb40a-2f2d-4f74-ad22-36acb3f68eef)"
+        },
+        "observed": "First duplicate saved (apply 200). Second unchanged duplicate: apply 200 (changed:false), stayed on /workspaces/new, Name field error \"A template with this name already exists here. Choose another name.\". Third duplicate with CPU 3: apply 409, same message on the name field, stayed on /workspaces/new. GET /api/resources total 5 before, 6 after all three saves (one template created), 5 after cleanup."
+      },
+      {
+        "check": "A6 copy",
+        "result": "pass",
+        "observed": "Copy b36995fd-... in two tabs: tab A saved Description (apply 200, \"Saved.\"); tab B saved (apply 409) and showed \"This template changed since you opened it.\" with a Reload button; Reload re-read the template (Description showed \"tab A edit\", banner gone)."
+      },
+      {
+        "check": "overflow",
+        "result": "pass",
+        "request": "PROBE_ROUTES=/workspaces,/workspaces/new,/jobs/new,/sessions/new node e2e/visual-walk/overflow-probe.cjs",
+        "observed": "No page-level horizontal overflow at 390x844 or 1440x900 on the four routes. /workspaces at 390 has no div.workspaces overflow and no actions-column finding. Only findings: known sidebar-logo and expert-icon vertical 3px noise, and a.customize-tab \"Contacts\" past the viewport inside nav.customize-tabs, which scrolls inside itself by design. (Home-page captures in the probe are outside scope.)"
+      }
+    ],
+    "cleanup": "Template b36995fd-... deleted via DELETE /api/resources/{uid}?expected_version=2 (200); resource count back to 5; headless browser closed."
   }
 }
