@@ -431,15 +431,31 @@ jobs:
         #   (Deno-only loader — unused here) (high)
         # GHSA-g7r4-m6w7-qqqr: arbitrary file read in the dev server on Windows
         #   (dev-server + Windows only; CI/prod run `ng build` on Linux) (high)
+        #
+        # GHSA-vfj7-8cjw-p6xm: Braces stack exhaustion from deeply nested globs.
+        # No patched release; Stylelint uses the fixed, repository-controlled
+        # src/**/*.scss pattern. Accept only dev-only Braces 3.0.3 below.
+        # Exposure, guards and removal criteria: policy/npm_audit_exceptions.md.
         run: |
           npm audit --json | python3 -c "
           import json, sys
+          from pathlib import Path
           IGNORE_ADVISORIES = {
               'GHSA-r5fr-rjxr-66jc', 'GHSA-f23m-r3pf-42rh',
               'GHSA-gv7w-rqvm-qjhr', 'GHSA-g7r4-m6w7-qqqr',
           }
           data = json.load(sys.stdin)
-          vulns = data.get('vulnerabilities', {})
+          vulns = data.get('vulnerabilities')
+          if data.get('error') or not isinstance(vulns, dict):
+              print('npm audit did not return a vulnerability report', file=sys.stderr)
+              sys.exit(2)
+
+          lock = json.loads(Path('package-lock.json').read_text())
+          braces = [pkg for path, pkg in lock['packages'].items()
+                    if path == 'node_modules/braces' or path.endswith('/node_modules/braces')]
+          if braces and all(pkg.get('version') == '3.0.3' and pkg.get('dev') is True
+                            for pkg in braces):
+              IGNORE_ADVISORIES.add('GHSA-vfj7-8cjw-p6xm')
 
           # Mark packages whose only root-cause advisories are all ignored
           ignored_pkgs = set()
@@ -449,7 +465,7 @@ jobs:
               for name, vuln in vulns.items():
                   if name in ignored_pkgs:
                       continue
-                  dominated = True
+                  dominated = bool(vuln.get('via'))
                   for v in vuln.get('via', []):
                       if isinstance(v, dict):
                           ghsa = v.get('url', '').split('/')[-1]
