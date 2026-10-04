@@ -1577,6 +1577,12 @@ class VMProvisioner:
                     return "unknown"
                 if identity.rootdisk_pvc_uid is None:
                     return "unknown"
+                if current.rootdisk_pvc_uid is None:
+                    # The controller deletes compute and disk asynchronously.
+                    # A known-absent disk with the captured VM still present is
+                    # incomplete teardown, never evidence of a replacement UID.
+                    # Leave admission open until the whole runtime is proven gone.
+                    return "unknown"
                 if current.rootdisk_pvc_uid != identity.rootdisk_pvc_uid:
                     return "superseded"
             return "matched"

@@ -23,11 +23,14 @@ from tests.test_vm_thread_adopted_without_quotas_delete_real_postgres import (
     _base_db,  # noqa: F401
     _schema_applied,  # noqa: F401
     adopted_source,
-    db,  # noqa: F401
+    db as _db,
     pg_dsn,  # noqa: F401
-    setup,  # noqa: F401
+    setup as _setup,
     thread_schema,  # noqa: F401
 )
+
+db = _db
+setup = _setup
 
 
 def observation(identity, *, vm=True, disk=True, writers=False):
