@@ -2626,6 +2626,18 @@
       "saveFailed": "This template couldn't be saved.",
       "deleteFailed": "This template couldn't be deleted.",
       "listFailed": "These templates couldn't be loaded."
+    },
+    "editor": {
+      "newTitle": "New workspace template",
+      "editTitle": "Workspace template",
+      "back": "All workspaces",
+      "builtin": "Built-in template, managed by the installation. Duplicate it to make your own.",
+      "notEditable": "You can't edit this template. Duplicate it to make your own.",
+      "duplicate": "Duplicate",
+      "reload": "Reload",
+      "saved": "Saved.",
+      "deleteTitle": "Delete workspace template",
+      "deleteBody": "Delete {{name}}? Work that already started keeps its workspace."
     }
   },
   "datasources": {

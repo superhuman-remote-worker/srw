@@ -2626,6 +2626,18 @@
       "saveFailed": "Diese Vorlage konnte nicht gespeichert werden.",
       "deleteFailed": "Diese Vorlage konnte nicht gelöscht werden.",
       "listFailed": "Diese Vorlagen konnten nicht geladen werden."
+    },
+    "editor": {
+      "newTitle": "Neue Workspace-Vorlage",
+      "editTitle": "Workspace-Vorlage",
+      "back": "Alle Workspaces",
+      "builtin": "Eingebaute Vorlage, von der Installation verwaltet. Duplizieren Sie sie für eine eigene.",
+      "notEditable": "Sie können diese Vorlage nicht bearbeiten. Duplizieren Sie sie für eine eigene.",
+      "duplicate": "Duplizieren",
+      "reload": "Neu laden",
+      "saved": "Gespeichert.",
+      "deleteTitle": "Workspace-Vorlage löschen",
+      "deleteBody": "{{name}} löschen? Bereits gestartete Arbeit behält ihren Workspace."
     }
   },
   "datasources": {
