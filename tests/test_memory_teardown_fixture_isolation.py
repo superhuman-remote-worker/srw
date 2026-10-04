@@ -19,8 +19,11 @@ import pytest
 def test_legacy_memory_teardown_isolates_inherited_runtime_identity(name, prior_task):
     root = Path(__file__).resolve().parents[1]
     env = {**os.environ, "KUBECONFIG": "/dev/null"}
+    # This child loads a repository-only pytest plugin before collection adds
+    # the test root. Keep that test import available under CI's safe-path env.
     for key in (
         "PYTHONPATH",
+        "PYTHONSAFEPATH",
         "PYTEST_ADDOPTS",
         "PYTEST_PLUGINS",
         "PYTEST_XDIST_WORKER",
@@ -49,6 +52,6 @@ def test_legacy_memory_teardown_isolates_inherited_runtime_identity(name, prior_
         )
     except subprocess.TimeoutExpired:
         pytest.fail("legacy memory fixture waited for an inherited exact retirement")
-    assert result.returncode == 0, (
-        "legacy memory fixture borrowed another file's identity"
+    assert result.returncode == 0, (result.stdout + result.stderr).decode(
+        errors="replace"
     )

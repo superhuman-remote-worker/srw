@@ -16,8 +16,11 @@ def test_officer_queue_fixture_isolates_and_restores_inherited_owners(
 ):
     root = Path(__file__).resolve().parents[1]
     env = {**os.environ, "KUBECONFIG": "/dev/null"}
+    # This child loads a repository-only pytest plugin before collection adds
+    # the test root. Keep that test import available under CI's safe-path env.
     for key in (
         "PYTHONPATH",
+        "PYTHONSAFEPATH",
         "PYTEST_ADDOPTS",
         "PYTEST_PLUGINS",
         "PYTEST_XDIST_WORKER",
@@ -48,4 +51,6 @@ def test_officer_queue_fixture_isolates_and_restores_inherited_owners(
         )
     except subprocess.TimeoutExpired:
         pytest.fail("Officer fixture waited behind an inherited termination fence")
-    assert result.returncode == 0, "Officer fixture borrowed or changed prior owners"
+    assert result.returncode == 0, (result.stdout + result.stderr).decode(
+        errors="replace"
+    )
