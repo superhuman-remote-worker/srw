@@ -2577,6 +2577,57 @@
     "saveFailed": "Save failed",
     "invalidZip": "Invalid skill archive"
   },
+  "workspaces": {
+    "tier": {"container": "Container", "vm": "VM", "virtual": "Virtual (cloud files)"},
+    "scope": {"mine": "Mine", "shared": "Shared", "project": "Project: {{name}}"},
+    "vm": {
+      "notInstalled": "VMs aren't enabled on this installation.",
+      "notAllowed": "Your account can't use VMs."
+    },
+    "form": {
+      "name": "Name",
+      "nameHint": "Lowercase letters, digits and hyphens. Can't be changed later.",
+      "saveTo": "Save to",
+      "displayName": "Display name",
+      "description": "Description",
+      "tier": "Tier",
+      "image": "Image",
+      "imageHint": "SRW's images are suggested; any registry image works.",
+      "cpu": "CPU",
+      "memory": "Memory",
+      "storage": "Disk",
+      "quantityHint": "For example 512Mi, 4Gi or 1Ti.",
+      "advanced": "Advanced",
+      "requestCpu": "Guaranteed CPU",
+      "requestMemory": "Guaranteed memory",
+      "requestHint": "Kubernetes request; the numbers above are the maximum.",
+      "pullPolicy": "Pull policy",
+      "pullPolicyDefault": "Default",
+      "setupSteps": "Setup steps",
+      "setupStepsHint": "One shell command per line, run in order as the workspace user when a VM is created.",
+      "preserved": "This template has settings this form can't edit. Saving keeps them unchanged."
+    },
+    "customImage": {
+      "title": "This isn't one of SRW's images.",
+      "unprivileged": "It runs without elevated privileges unless your operator allows it, so there is no cloud-folder mount and no protected cloud.",
+      "digest": "Pin a digest (image@sha256:…) rather than a tag, so every run uses the same image.",
+      "jobFirst": "Try a new image with a Job first: a Session whose image can't be pulled can't be ended yet."
+    },
+    "errors": {
+      "name": "Use 1-63 lowercase letters, digits or hyphens, starting and ending with a letter or digit.",
+      "image": "An image is required.",
+      "cpu": "CPU must be a number above 0.",
+      "cpuWhole": "VMs need a whole number of CPUs.",
+      "quantity": "Use a whole number followed by Mi, Gi or Ti.",
+      "requestCpu": "Guaranteed CPU must be above 0 and no more than CPU.",
+      "requestMemory": "Guaranteed memory can't exceed memory.",
+      "setupSteps": "At most 32 setup steps.",
+      "loadFailed": "This template couldn't be loaded.",
+      "saveFailed": "This template couldn't be saved.",
+      "deleteFailed": "This template couldn't be deleted.",
+      "listFailed": "These templates couldn't be loaded."
+    }
+  },
   "datasources": {
     "title": "Connectors",
     "new": "New Connector",
