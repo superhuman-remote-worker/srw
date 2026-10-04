@@ -401,6 +401,7 @@
     "datasources": "Connectors",
     "contacts": "Contacts",
     "experts": "Experts",
+    "workspaces": "Workspaces",
     "skills": "Skills",
     "automations": "Automations",
     "create": "Create",

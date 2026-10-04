@@ -32,7 +32,7 @@ const DEFAULT_ROUTES = [
   '/', '/sessions', '/sessions/new', ...(THREAD ? [`/sessions/${THREAD}`] : []),
   '/jobs', '/jobs/new', '/jobs/review', '/inbox',
   '/projects', ...(PROJECT ? [`/projects/${PROJECT}`] : []),
-  '/datasources', '/contacts', '/experts', '/experts/new', '/skills', '/skills/new',
+  '/datasources', '/contacts', '/experts', '/experts/new', '/workspaces', '/workspaces/new', '/skills', '/skills/new',
   '/automations', '/settings/general', '/settings/defaults', '/settings/provider-keys',
   '/settings/notifications', '/settings/mcp', '/settings/api-keys', '/settings/ssh-keys',
   '/admin/models', '/admin/subscriptions', '/admin/users', '/admin/config', '/admin/grants',

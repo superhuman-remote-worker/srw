@@ -35,8 +35,8 @@ export interface RailLinkGroup {
   items: RailLink[];
 }
 
-/** The four pages the Customize row stands for — they share a tab bar. */
-const CUSTOMIZE_ROUTES = ['/experts', '/skills', '/datasources', '/contacts'];
+/** The five pages the Customize row stands for — they share a tab bar. */
+const CUSTOMIZE_ROUTES = ['/experts', '/workspaces', '/skills', '/datasources', '/contacts'];
 
 /**
  * Pages that lend the rail their own list on desktop. Known here by route,
@@ -662,7 +662,7 @@ export class SidebarComponent {
 
   readonly railView = computed(() => railViewFor(this.currentPath(), this.viewport.isMobile()));
 
-  /** The Customize row stands for four pages and has no route of its own to
+  /** The Customize row stands for five pages and has no route of its own to
    *  match with routerLinkActive. */
   readonly customizeActive = computed(() =>
     CUSTOMIZE_ROUTES.some((prefix) => isUnder(this.currentPath(), prefix)),

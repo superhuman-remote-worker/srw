@@ -70,6 +70,26 @@ export const routes: Routes = [
   { path: 'skills', component: SkillsPageComponent, canActivate: [authGuard] },
   { path: 'skills/new', component: SkillEditorComponent, canActivate: [authGuard] },
   { path: 'skills/:id/edit', component: SkillEditorComponent, canActivate: [authGuard] },
+  // Slice A3: workspace templates, the fifth Customize tab. Lazy, like the
+  // other Customize editors, so the chat bundle doesn't carry them.
+  {
+    path: 'workspaces',
+    loadComponent: () =>
+      import('./views/workspaces/workspace-templates-page.component').then((m) => m.WorkspaceTemplatesPageComponent),
+    canActivate: [authGuard],
+  },
+  {
+    path: 'workspaces/new',
+    loadComponent: () =>
+      import('./views/workspaces/workspace-template-editor.component').then((m) => m.WorkspaceTemplateEditorComponent),
+    canActivate: [authGuard],
+  },
+  {
+    path: 'workspaces/:uid',
+    loadComponent: () =>
+      import('./views/workspaces/workspace-template-editor.component').then((m) => m.WorkspaceTemplateEditorComponent),
+    canActivate: [authGuard],
+  },
   // Automations loads on demand: the schedule editor is the only screen that
   // needs cronstrue + cron-parser, and both are CommonJS, so keeping the route
   // eager taxed every page load with a cron library it would never call.
