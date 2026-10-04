@@ -15,6 +15,7 @@ import {ModelGroupComponent} from '../agent-settings/model-group.component';
 import {
   keepEligibleIds,
   mapThreadToPrefill,
+  pickPrefillProject,
   protectedCloudToggleVisible,
   SessionCreateComponent,
 } from './session-create.component';
@@ -40,6 +41,8 @@ function stubApi(
     // Only reached when a prefilled project is missing from the active list;
     // `null` is "gone for good", which is the pre-archive behaviour.
     getProject: vi.fn().mockReturnValue(of(null)),
+    listWorkspaceTemplates: vi.fn().mockReturnValue(of({resources: []})),
+    getProjectWorkspaceDefaults: vi.fn().mockReturnValue(of(null)),
   };
 }
 
@@ -91,6 +94,7 @@ describe('mapThreadToPrefill', () => {
     };
     expect(mapThreadToPrefill(thread)).toEqual({
       projectIds: ['proj-1', 'proj-2'],
+      primaryProjectId: null,
       expertId: 'expert-9',
       model: 'gpt-5.6-sol',
       datasourceIds: ['ds-1', 'ds-2'],
@@ -100,6 +104,7 @@ describe('mapThreadToPrefill', () => {
   it('a thread with none of these fields maps to an all-empty object, not null — a real answer, just an empty one', () => {
     expect(mapThreadToPrefill({})).toEqual({
       projectIds: [],
+      primaryProjectId: null,
       expertId: null,
       model: null,
       datasourceIds: [],
@@ -109,6 +114,7 @@ describe('mapThreadToPrefill', () => {
   it('missing metadata/config_override/llm at any level degrades to the empty case rather than throwing', () => {
     expect(mapThreadToPrefill({project_ids: ['p1'], metadata: {}})).toEqual({
       projectIds: ['p1'],
+      primaryProjectId: null,
       expertId: null,
       model: null,
       datasourceIds: [],
@@ -119,10 +125,23 @@ describe('mapThreadToPrefill', () => {
     const thread = {project_ids: [42], metadata: {datasource_ids: [true]}};
     expect(mapThreadToPrefill(thread)).toEqual({
       projectIds: ['42'],
+      primaryProjectId: null,
       expertId: null,
       model: null,
       datasourceIds: ['true'],
     });
+  });
+});
+
+describe('pickPrefillProject (Slice A3)', () => {
+  it('takes the primary project, else the one non-default project, else none', () => {
+    expect(pickPrefillProject({projectIds: ['x'], primaryProjectId: 'p', expertId: null, model: null, datasourceIds: []})).toBe('p');
+    expect(pickPrefillProject({projectIds: ['x'], primaryProjectId: null, expertId: null, model: null, datasourceIds: []})).toBe('x');
+    expect(pickPrefillProject({projectIds: [], primaryProjectId: null, expertId: null, model: null, datasourceIds: []})).toBeNull();
+  });
+
+  it('maps the thread primary project', () => {
+    expect(mapThreadToPrefill({project_id: 'p', project_ids: ['x'], metadata: {}})?.primaryProjectId).toBe('p');
   });
 });
 
@@ -261,6 +280,27 @@ describe('SessionCreateComponent submit flow', () => {
     expect(component.createError()).toBeNull();
   });
 
+  it('creates with the picked template, never config_override.workspace', async () => {
+    const {fixture, http} = setup();
+    const component = fixture.componentInstance;
+    component.onWorkspaceChoice({kind: 'none'});
+    const pending = component.createSession();
+    const request = http.expectOne((r) => r.url.endsWith('/persistent/threads') && r.method === 'POST');
+    expect(request.request.body.workspace).toBeNull();
+    expect(request.request.body.config_override?.workspace).toBeUndefined();
+    request.flush({thread_id: 'thread-xyz'});
+    await pending;
+  });
+
+  it('omits workspace for the default choice', async () => {
+    const {fixture, http} = setup();
+    const pending = fixture.componentInstance.createSession();
+    const request = http.expectOne((r) => r.url.endsWith('/persistent/threads') && r.method === 'POST');
+    expect(request.request.body).not.toHaveProperty('workspace');
+    request.flush({thread_id: 'thread-xyz'});
+    await pending;
+  });
+
   it('does not create a session while VM sizing is invalid', async () => {
     const {fixture, http, navigate} = setup();
     const component = fixture.componentInstance;
@@ -328,7 +368,7 @@ describe('SessionCreateComponent submit flow', () => {
 // `loadEffectiveDefault()`'s own response landing (`:493` — itself re-issued
 // from `loadExperts()`'s tail call at `:479` AND from `loadProjects()`'s
 // response handler at `:464`, once a default project auto-populates), and
-// `toggleProject()` (`:531`).
+// `selectProject()` (`:531`).
 //
 // The first two settle in parallel at `ngOnInit`, typically within a few
 // hundred ms — a near-zero real-world window for a human to have already
@@ -447,7 +487,7 @@ describe('SessionCreateComponent — reasoning pick lost to an involuntary prefi
     // The user clicks a project chip — an ordinary action on this form, and
     // the only one taken besides the Model/Reasoning picks. toggleExpert()
     // never runs; expertSelectionTouched stays false throughout.
-    fixture.componentInstance.toggleProject('project-x');
+    fixture.componentInstance.selectProject('project-x');
 
     http.expectOne((r) => r.url.includes('/datasources/eligible')).flush([]);
     // The project's own effective default expert differs from expert-1 —
@@ -599,7 +639,6 @@ describe('SessionCreateComponent tool preview', () => {
 
     expect(api.previewToolGroups).toHaveBeenCalledWith({
       config_override: {},
-      workspace_preference: null,
       config_name: 'session_base',
       expert_id: 'db-expert-1',
       project_id: null,
@@ -620,7 +659,6 @@ describe('SessionCreateComponent tool preview', () => {
 
     expect(api.previewToolGroups).toHaveBeenCalledWith({
       config_override: {},
-      workspace_preference: null,
       config_name: 'scholar',
       expert_id: null,
       project_id: null,
@@ -674,15 +712,30 @@ describe('SessionCreateComponent tool preview', () => {
 
   it('the project selection moves the prediction, because the project layer can', () => {
     const {fixture, api} = setup(ANSWER);
-    fixture.componentInstance.toggleProject('proj-1');
+    fixture.componentInstance.selectProject('proj-1');
 
     expect(api.previewToolGroups).toHaveBeenLastCalledWith({
       config_override: {},
-      workspace_preference: null,
       config_name: 'session_base',
       expert_id: null,
       project_id: 'proj-1',
     });
+  });
+
+  it('keeps one project: selecting another replaces it, and "No project" clears it', () => {
+    const {fixture} = setup(ANSWER);
+    const component = fixture.componentInstance;
+    component.selectProject('proj-1');
+    component.selectProject('proj-2');
+    expect([...component.selectedProjectIds()]).toEqual(['proj-2']);
+    component.selectProject(null);
+    expect(component.selectedProjectIds().size).toBe(0);
+  });
+
+  it('previews with the picked template', () => {
+    const {fixture, api} = setup(ANSWER);
+    fixture.componentInstance.onWorkspaceChoice({kind: 'none'});
+    expect(api.previewToolGroups.mock.calls.at(-1)![0].workspace).toBeNull();
   });
 
   it('a failed preview leaves the surface with no answer rather than a wrong one', () => {
@@ -696,7 +749,7 @@ describe('SessionCreateComponent tool preview', () => {
       hasToolEdits: () => false,
     } as never;
 
-    component.toggleProject('proj-1');
+    component.selectProject('proj-1');
 
     expect(component.toolPreview()).toBeNull();
     expect(prefill).not.toHaveBeenCalled();
@@ -806,7 +859,7 @@ describe('SessionCreateComponent "Start a new session" prefill (session_config_d
    *  and any number of duplicate calls to the same endpoint, which is the
    *  point: these tests care about the FINAL converged state, not the exact
    *  request count for any one ordering. */
-  function drainAll(http: HttpTestingController): void {
+  function drainAll(http: HttpTestingController, projects: unknown[] = PROJECTS): void {
     for (let round = 0; round < 20; round++) {
       const pending = http.match(() => true);
       if (pending.length === 0) return;
@@ -821,7 +874,7 @@ describe('SessionCreateComponent "Start a new session" prefill (session_config_d
         } else if (url.includes('/experts/session_base')) {
           req.flush({config: {}});
         } else if (url.includes('/projects?user_id=')) {
-          req.flush(PROJECTS);
+          req.flush(projects);
         } else if (/\/experts\/(expert-\d)\?/.test(url)) {
           const id = url.match(/\/experts\/(expert-\d)\?/)![1];
           req.flush({...EXPERTS.find((e) => e.id === id), config: {llm: {}}, id});
@@ -1002,6 +1055,26 @@ describe('SessionCreateComponent "Start a new session" prefill (session_config_d
     expect(component.projects().map((p) => p.id)).toContain('proj-archived');
     expect(component.selectedProjectIds()).toEqual(new Set(['proj-archived']));
     expect(component.archivedSelected()).toBe(true);
+  });
+
+  it('a source thread with several projects prefills exactly one: its primary project', () => {
+    const subject = new Subject<Record<string, unknown> | null>();
+    const {fixture, component, http} = setup('thread-77', subject.asObservable());
+    fixture.detectChanges();
+    subject.next({...THREAD, project_id: 'proj-2', project_ids: ['proj-1', 'proj-2']});
+    subject.complete();
+    drainAll(http, [...PROJECTS, {id: 'proj-2', name: 'Two', status: 'active', is_default: false}]);
+    expect(component.selectedProjectIds()).toEqual(new Set(['proj-2']));
+  });
+
+  it('a source thread with no project at all falls back to the personal project', () => {
+    const subject = new Subject<Record<string, unknown> | null>();
+    const {fixture, component, http} = setup('thread-77', subject.asObservable());
+    fixture.detectChanges();
+    subject.next({...THREAD, project_ids: []});
+    subject.complete();
+    drainAll(http);
+    expect(component.selectedProjectIds()).toEqual(new Set(['proj-1']));
   });
 
   it('a project the source thread had, but this account can no longer see, is dropped rather than falling back to the account default', () => {

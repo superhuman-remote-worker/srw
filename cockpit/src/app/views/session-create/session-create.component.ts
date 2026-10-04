@@ -1,4 +1,7 @@
 import {workspaceCreationFields, workspacePreviewConfig} from "../agent-settings/workspace-selection";
+import {WorkspacePickerComponent} from '../agent-settings/workspace-picker.component';
+import {WorkspaceChoice} from '../../core/models/workspace-template.model';
+import {choiceBackend, choiceRequestFields} from '../workspaces/workspace-template-utils';
 import {Component, computed, effect, inject, OnInit, signal, ViewChild} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
 import {HttpClient} from '@angular/common/http';
@@ -58,6 +61,8 @@ export function protectedCloudToggleVisible(
  */
 export interface SessionCreatePrefill {
   projectIds: string[];
+  /** The source thread's `project_id` column: set only when it had exactly one project. */
+  primaryProjectId: string | null;
   expertId: string | null;
   model: string | null;
   datasourceIds: string[];
@@ -74,10 +79,19 @@ export function mapThreadToPrefill(thread: Record<string, unknown> | null): Sess
   const model = llm['model'];
   return {
     projectIds: rawProjectIds.map(String),
+    primaryProjectId: typeof thread['project_id'] === 'string' && thread['project_id'] ? (thread['project_id'] as string) : null,
     expertId: typeof expertId === 'string' && expertId ? expertId : null,
     model: typeof model === 'string' && model ? model : null,
     datasourceIds: rawDatasourceIds.map(String),
   };
+}
+
+/** Sessions carry one project (single_project_sessions.md). From a source thread
+ *  take its primary project. Otherwise take its one non-default project
+ *  (`project_ids` excludes the personal project). Otherwise none, and the caller
+ *  falls back to the personal project. */
+export function pickPrefillProject(prefill: SessionCreatePrefill): string | null {
+  return prefill.primaryProjectId ?? prefill.projectIds[0] ?? null;
 }
 
 /**
@@ -124,6 +138,7 @@ interface ExpertDetail extends Expert {
   standalone: true,
   imports: [
     AgentSettingsComponent,
+    WorkspacePickerComponent,
     SidebarToggleComponent,
     TranslocoPipe,
     AppButtonComponent,
@@ -153,7 +168,7 @@ interface ExpertDetail extends Expert {
           />
         </app-form-field>
 
-        <!-- Projects (multi-select chips) -->
+        <!-- Projects (single choice; single_project_sessions.md) -->
         @if (projects().length > 0) {
           <app-form-field
             [label]="'sessions.create.projectsLabel' | transloco"
@@ -161,12 +176,15 @@ interface ExpertDetail extends Expert {
             [error]="archivedSelected() ? ('sessions.create.projectArchivedWarning' | transloco) : ''"
           >
             <div class="project-chips">
+              <app-chip [selected]="selectedProjectIds().size === 0" [disabled]="creating()" (clicked)="selectProject(null)">
+                {{ 'sessions.create.noProject' | transloco }}
+              </app-chip>
               @for (project of projects(); track project.id) {
                 <app-chip
                   [selected]="selectedProjectIds().has(project.id)"
                   [disabled]="creating()"
                   [ariaLabel]="project.description || project.name"
-                  (clicked)="toggleProject(project.id)"
+                  (clicked)="selectProject(project.id)"
                 >{{ project.name }}@if (project.status === 'archived') { {{ 'sessions.create.projectArchived' | transloco }}}</app-chip>
               }
             </div>
@@ -229,11 +247,20 @@ interface ExpertDetail extends Expert {
         </app-form-field>
 
         <!-- Agent Settings (horizontal tabs: Settings / Advanced) -->
-        @if (expertDetail()?.workspace_preference?.backend; as preference) {
-          <p class="field-hint">{{ 'agentSettings.execution.workspaceRecommendation' | transloco:{tier: preference} }}</p>
-        }
+        <app-workspace-picker
+          role="session"
+          [projectId]="selectedProjectId()"
+          [preview]="toolPreview()?.workspace ?? null"
+          [recommendation]="expertDetail()?.workspace_preference?.backend ?? null"
+          [recommendedBy]="selectedExpert()?.display_name ?? ''"
+          [disabled]="creating()"
+          [choice]="workspaceChoice()"
+          (choiceChange)="onWorkspaceChoice($event)"
+        />
         <app-agent-settings
           mode="session"
+          [workspacePicker]="true"
+          [pickerBackend]="pickerBackend()"
           [config]="workspaceConfig()"
           [resolvedToolset]="toolPreview()"
           [readsResolvedToolset]="true"
@@ -478,6 +505,14 @@ export class SessionCreateComponent implements OnInit {
   readonly createError = signal<string | null>(null);
   readonly projects = signal<Project[]>([]);
   readonly selectedProjectIds = signal<Set<string>>(new Set());
+  readonly selectedProjectId = computed(() => [...this.selectedProjectIds()][0] ?? null);
+  readonly workspaceChoice = signal<WorkspaceChoice>({kind: 'default'});
+  readonly pickerBackend = computed(() => choiceBackend(this.workspaceChoice(), this.toolPreview()?.workspace));
+
+  onWorkspaceChoice(choice: WorkspaceChoice): void {
+    this.workspaceChoice.set(choice);
+    this.loadToolPreview();
+  }
   readonly selectedProjects = computed(() =>
     this.projects().filter(p => this.selectedProjectIds().has(p.id)),
   );
@@ -669,30 +704,28 @@ export class SessionCreateComponent implements OnInit {
     if (!this.projectsLoaded) return; // this form's own project list still in flight
     const projects = this.projects();
     if (this.threadPrefill) {
-      const survivors = keepEligibleIds(this.threadPrefill.projectIds, projects);
-      if (survivors.length > 0) {
-        this.selectedProjectIds.set(new Set(survivors));
-        this.loadDatasourcesList();
-        this.loadEffectiveDefault();
-        this.loadToolPreview();
+      const wanted = pickPrefillProject(this.threadPrefill);
+      if (wanted) {
+        const survivors = keepEligibleIds([wanted], projects);
+        if (survivors.length > 0) {
+          this.selectedProjectIds.set(new Set(survivors));
+          this.loadDatasourcesList();
+          this.loadEffectiveDefault();
+          this.loadToolPreview();
+        }
+        // A project the source thread had but this account can't see any more is dropped, not
+        // replaced by the personal project, as before. A merely archived one is kept.
+        this.resolveArchivedPrefillProjects(survivors.length ? [] : [wanted]);
+        return;
       }
-      // else: the source thread had no project, or none it had are still
-      // accessible here — leave unselected. Faithful to what actually
-      // survived on the source thread, rather than substituting the
-      // unrelated account default.
-      //
-      // "Not in the list" now has one benign cause — merely archived — which
-      // is kept rather than dropped.
-      this.resolveArchivedPrefillProjects(
-        this.threadPrefill.projectIds.filter((id) => !survivors.includes(id)),
-      );
-      return;
+      // The source thread had no project at all: fall through to the personal project.
     }
     const defaultProject = projects.find(p => p.is_default);
     if (defaultProject) {
       this.selectedProjectIds.set(new Set([defaultProject.id]));
       // Refresh eligible datasources now that a project is selected.
       this.loadDatasourcesList();
+      this.loadToolPreview();
     }
   }
 
@@ -866,19 +899,12 @@ export class SessionCreateComponent implements OnInit {
     });
   }
 
-  toggleProject(id: string): void {
+  selectProject(id: string | null): void {
     this.projectSelectionTouched = true;
-    this.selectedProjectIds.update(current => {
-      const next = new Set(current);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-    // Refresh eligible datasources for the new project selection.
+    this.selectedProjectIds.set(id ? new Set([id]) : new Set());
     this.loadDatasourcesList();
     this.loadEffectiveDefault();
-    // The project layer can override the expert's tools, so the prediction
-    // moves with the selection.
+    // The project layer can override the expert's tools and workspace, so the prediction moves with the selection.
     this.loadToolPreview();
   }
 
@@ -952,17 +978,16 @@ export class SessionCreateComponent implements OnInit {
     const serial = ++this.toolPreviewSerial;
     this.loadingWorkspacePreview.set(true);
     const expert = this.selectedExpert();
-    const projectIds = Array.from(this.selectedProjectIds());
     // Routed EXACTLY as createSession routes it. A preview that resolved a
     // different expert layer from the create it previews would be this
     // series' defect in the surface built to prevent it.
     const {configName, expertId} = this.expertRouting(expert);
     this.api.previewToolGroups({
       config_override: this.agentSettings?.getOverrides() ?? {},
-      workspace_preference: this.expertDetail()?.workspace_preference?.backend ?? null,
+      ...choiceRequestFields(this.workspaceChoice()),
       config_name: configName,
       expert_id: expertId ?? null,
-      project_id: projectIds.length === 1 ? projectIds[0] : null,
+      project_id: this.selectedProjectId(),
     }).subscribe((preview) => {
       if (serial !== this.toolPreviewSerial) return;
       this.loadingWorkspacePreview.set(false);
@@ -1011,7 +1036,7 @@ export class SessionCreateComponent implements OnInit {
     const projectIds = Array.from(this.selectedProjectIds());
 
     // Build config_override from settings component
-    const workspaceFields = workspaceCreationFields(this.agentSettings?.getOverrides() ?? {}, {kind: 'default'});
+    const workspaceFields = workspaceCreationFields(this.agentSettings?.getOverrides() ?? {}, this.workspaceChoice());
     const configOverride = workspaceFields.config_override;
 
     // Extract permission_mode and model from overrides (session-specific handling).
