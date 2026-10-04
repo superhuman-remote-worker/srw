@@ -56,7 +56,7 @@ async def workspace_field(
         name = workspace.strip()
         if not name:
             raise WorkspaceArgumentError(SHAPE_HINT)
-        if name == NO_WORKSPACE:
+        if name.lower() == NO_WORKSPACE:
             return True, None
         return True, await _lookup(client, name, project_id=project_id)
     if isinstance(workspace, dict) and set(workspace) == {"template"}:

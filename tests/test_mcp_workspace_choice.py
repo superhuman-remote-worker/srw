@@ -64,6 +64,15 @@ async def test_none_means_no_workspace():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["None", "NONE", " none "])
+async def test_none_is_case_insensitive(value):
+    assert await workspace_field(_FakeLister({}), value, project_id="p-1") == (
+        True,
+        None,
+    )
+
+
+@pytest.mark.asyncio
 async def test_project_template_wins_over_shared():
     lister = _FakeLister(
         {

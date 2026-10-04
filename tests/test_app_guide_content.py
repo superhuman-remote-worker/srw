@@ -451,7 +451,7 @@ def test_permissions_guide_keeps_current_policy_and_workspace_boundaries():
     assert "autonomous needs an explicit grant" in body
     assert "global, project, and user scope" in body
     assert "most restrictive result wins" in body
-    assert "the platform default is virtual" in body
+    assert "installation default is container for jobs and virtual for sessions" in body
     for tier in ("virtual", "container", "none", "vm"):
         assert f"| **{tier}**" in body
     assert "workspace changes are upgrade-only" in body
