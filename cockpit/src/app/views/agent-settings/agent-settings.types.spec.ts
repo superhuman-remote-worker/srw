@@ -169,6 +169,23 @@ describe('detectModelFamily — GPT-6', () => {
   });
 });
 
+describe('detectModelFamily — GPT-6.1 Sol', () => {
+  it.each(['', 'openai/', 'codex/', 'openrouter/openai/'])(
+    'resolves Sol through %s', (prefix) => {
+      for (const model of ['gpt-6.1-sol', 'GPT-6.1-SOL', 'gpt-6.1-sol-20260929', 'gpt-6.1-sol:batch']) {
+        expect(detectModelFamily(prefix + model)).toBe('gpt-6.1-sol');
+      }
+    },
+  );
+
+  it('preserves Codex variants and rejects similar names', () => {
+    expect(detectModelFamily('gpt-6.1-sol-codex')).toBe('codex');
+    expect(detectModelFamily('codex/gpt-6.1-sol-codex-spark')).toBe('codex-spark');
+    expect(detectModelFamily('gpt-6.10-sol')).toBe('gpt-6');
+    expect(detectModelFamily('gpt-6.1-solstice')).toBe('gpt-6');
+  });
+});
+
 describe('detectModelFamily — Mistral', () => {
   it('maps Mistral 3 family + specialists across transports', () => {
     expect(detectModelFamily('mistral-large-latest')).toBe('mistral');

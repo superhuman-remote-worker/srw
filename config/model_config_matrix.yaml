@@ -874,6 +874,33 @@ gpt-6:
     # Same 32px-patch vision scheme as the gpt-5 family.
     image_tokens: { mode: openai_patches, patch_px: 32, budget: 10000, flat: 3000 }
 
+# GPT-6.1 Sol uses the GPT-6 context/vision contract, with medium default
+# reasoning and its own prompts. Tool calls require Responses; sampling
+# controls are omitted by the factories even when a session override sets them.
+# https://developers.openai.com/api/docs/models/gpt-6.1-sol
+gpt-6.1-sol:
+  reasoning: { method: effort_enum, delivery: native, default: medium, options: [low, medium, high, xhigh, max] }
+  prompts:
+    systemprompt: systemprompt_gpt_6_1_sol.txt
+    systemprompt_interactive: systemprompt_interactive_gpt_6_1_sol.txt
+    persona: persona_gpt_6_1_sol.txt
+    summarization: summarization_prompt_gpt_5.txt
+    memory_extraction: memory_extraction_prompt_gpt_5.txt
+    memory_assembler: memory_assembler_prompt_gpt_5.txt
+    curation: curation_prompt_gpt_5.txt
+  guardrails:
+    file: gpt_6.yaml
+  settings:
+    shell_mode: persistent
+    structured_output_method: json_schema
+    reasoning_level: medium
+    temperature: 1.0  # Internal compatibility value; never sent on the wire.
+    multimodal: true
+    parallel_tool_calls: true
+    model_max_context_tokens: 1050000  # 80% compaction = 840K, below 922K max input.
+    max_output_tokens: 128000
+    image_tokens: { mode: openai_patches, patch_px: 32, budget: 10000, flat: 3000 }
+
 codex:
   reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   prompts:

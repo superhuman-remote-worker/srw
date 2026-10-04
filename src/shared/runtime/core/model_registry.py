@@ -353,6 +353,10 @@ def family_of(model_id: str, default: str = "default") -> str:
         return "codex-spark"
     if "codex" in name and name.startswith(("gpt-5", "gpt-6")):
         return "codex"
+    # Sol 6.1 has dedicated prompts and medium default effort. Keep dated and
+    # batch IDs, while rejecting near-matches such as gpt-6.1-solstice.
+    if re.match(r"gpt-6\.1-sol(?:$|[-:])", name):
+        return "gpt-6.1-sol"
     # GPT-6 (Astra) — a single flagship row today, no tier suffixes. Must sit
     # below the codex checks (which now also cover a future gpt-6 codex
     # variant) so the two resolvers agree; family_matcher.detect_family orders

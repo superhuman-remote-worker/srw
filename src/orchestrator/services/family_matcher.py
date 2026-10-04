@@ -40,6 +40,8 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
         re.compile(r"^openrouter/(.+)$"),
         lambda m: detect_family(m.group(1)),
     ),
+    # The codex/ transport prefix does not make a model a Codex variant.
+    (re.compile(r"^codex/(.+)$", re.IGNORECASE), lambda m: detect_family(m.group(1))),
     # Anthropic. claude-opus-5-5 must beat claude-opus-5, which must beat the
     # generic claude-opus rule: only Opus 5.x accepts the full effort ladder,
     # and 5.5 moved the default effort, so each has its own matrix family
@@ -61,6 +63,10 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
     # the `gpt-5` prefix and the `codex` substring.
     (re.compile(r"codex-spark", re.IGNORECASE), "codex-spark"),
     (re.compile(r"codex", re.IGNORECASE), "codex"),
+    (
+        re.compile(r"(?:^|/)gpt-6\.1-sol(?:$|[-:])", re.IGNORECASE),
+        "gpt-6.1-sol",
+    ),
     # GPT-6 (Astra). Sits below the codex rules on purpose: those match any id
     # containing "codex", so a future gpt-6 codex variant keeps landing in the
     # codex family rather than here — family_of() in model_registry.py encodes

@@ -200,6 +200,7 @@ export function detectModelFamily(model: string): string {
   if (name.startsWith('claude-fable')) return 'claude-fable';
   if (name.includes('codex-spark')) return 'codex-spark';
   if (name.includes('codex') && (name.startsWith('gpt-5') || name.startsWith('gpt-6'))) return 'codex';
+  if (/^gpt-6\.1-sol(?:$|[-:])/.test(name)) return 'gpt-6.1-sol';
   // GPT-6 (Astra). Mirrors family_of() in src/shared/runtime/core/model_registry.py:
   // below the codex checks, above the gpt-5 prefixes.
   if (name.startsWith('gpt-6')) return 'gpt-6';

@@ -4452,7 +4452,8 @@ def _create_openai_llm(
     # receive it in the request body; skip it for native api.openai.com
     # since the SDK rejects unknown kwargs.
     extra_body: dict = {}
-    if config.top_k is not None and base_url:
+    sol_6_1 = family_of(config.model) == "gpt-6.1-sol"
+    if config.top_k is not None and base_url and not sol_6_1:
         extra_body["top_k"] = config.top_k
 
     # Build kwargs for ChatOpenAI.
@@ -4461,12 +4462,14 @@ def _create_openai_llm(
     # (https://github.com/langchain-ai/langchain/issues/34660, still open).
     llm_kwargs = {
         "model": config.model,
-        "temperature": config.temperature,
+        "temperature": None if sol_6_1 else config.temperature,
         "api_key": api_key,
         "max_retries": config.max_retries,
-        "use_responses_api": False,
+        # Sol 6.1 requires Responses for tool calls, including when no effort
+        # is injected and the provider's default reasoning applies.
+        "use_responses_api": sol_6_1,
     }
-    if config.top_p is not None:
+    if config.top_p is not None and not sol_6_1:
         llm_kwargs["top_p"] = config.top_p
 
     # Reasoning delivery is driven by the family's `reasoning` capability
@@ -4484,8 +4487,12 @@ def _create_openai_llm(
         level = _clamp_reasoning_level(
             _rplan["value"], _supported_efforts(_rplan["cap"])
         )
-        model_kwargs["reasoning_effort"] = level
-        reasoning_mode = f"chat_completions(effort={level})"
+        if sol_6_1:
+            llm_kwargs["reasoning"] = {"effort": level, "summary": "auto"}
+            reasoning_mode = f"responses_api(effort={level})"
+        else:
+            model_kwargs["reasoning_effort"] = level
+            reasoning_mode = f"chat_completions(effort={level})"
     elif _rplan["method"] == "binary_toggle" and _rplan.get("value"):
         _cap = _rplan["cap"]
         _param = _cap.get("toggle_param", "chat_template_kwargs.enable_thinking")
@@ -4882,7 +4889,8 @@ def _create_openrouter_llm(
         extra_body["reasoning"] = {"effort": level}
 
     # top_k is likewise non-standard for the typed Chat Completions signature.
-    if config.top_k is not None:
+    sol_6_1 = family_of(config.model) == "gpt-6.1-sol"
+    if config.top_k is not None and not sol_6_1:
         extra_body["top_k"] = config.top_k
 
     # Declared provider params (family settings-matrix `extra_body`) — same
@@ -4895,7 +4903,7 @@ def _create_openrouter_llm(
     # Build kwargs for ReasoningChatOpenAI
     llm_kwargs = {
         "model": model,
-        "temperature": config.temperature,
+        "temperature": None if sol_6_1 else config.temperature,
         "api_key": api_key,
         "base_url": base_url,
         "max_retries": config.max_retries,
@@ -4904,7 +4912,7 @@ def _create_openrouter_llm(
         # which is not compatible with all OpenRouter-routed models.
         "use_responses_api": False,
     }
-    if config.top_p is not None:
+    if config.top_p is not None and not sol_6_1:
         llm_kwargs["top_p"] = config.top_p
 
     # Add optional OpenRouter headers for leaderboard identification
@@ -5125,14 +5133,17 @@ def _create_codex_llm(
     # We must use the Responses API here. LangChain's Responses API streaming
     # has a known bug with tool call args (langchain-ai/langchain#34660),
     # but the ainvoke workaround in persistent_graph.py handles this.
+    sol_6_1 = family_of(config.model) == "gpt-6.1-sol"
     llm_kwargs = {
         "model": model,
-        "temperature": config.temperature,
+        "temperature": None if sol_6_1 else config.temperature,
         "api_key": api_key,
         "base_url": base_url,
         "max_retries": config.max_retries,
     }
-    if config.top_p is not None:
+    if sol_6_1:
+        llm_kwargs["use_responses_api"] = True
+    if config.top_p is not None and not sol_6_1:
         llm_kwargs["top_p"] = config.top_p
 
     # Reasoning via Responses API (required by Codex proxy). Codex models are
