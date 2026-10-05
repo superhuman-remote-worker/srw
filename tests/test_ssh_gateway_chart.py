@@ -246,15 +246,23 @@ def test_gateway_can_stay_on_its_old_digest_during_relay_upgrade() -> None:
 
 
 @pytest.mark.parametrize(
-    "override",
+    ("flag", "override"),
     [
-        "sshGateway.image.tag=old",
-        "sshGateway.image.repository=ghcr.io/superhuman-remote-worker/srw-orchestrator",
-        "sshGateway.image=old",
+        ("--set", "sshGateway.image.tag=old"),
+        (
+            "--set",
+            "sshGateway.image.repository=ghcr.io/superhuman-remote-worker/srw-orchestrator",
+        ),
+        ("--set", "sshGateway.image=old"),
+        ("--set-json", "sshGateway.image={}"),
+        ("--set-json", "sshGateway.image=[]"),
+        ("--set", "sshGateway.image=false"),
     ],
 )
-def test_incomplete_gateway_image_override_is_rejected(override: str) -> None:
-    result = _run(*ENABLE, "--set", override)
+def test_incomplete_gateway_image_override_is_rejected(
+    flag: str, override: str
+) -> None:
+    result = _run(*ENABLE, flag, override)
     assert result.returncode != 0
     assert "sshGateway.image" in result.stderr
 

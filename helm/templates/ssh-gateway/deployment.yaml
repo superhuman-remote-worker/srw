@@ -1,8 +1,8 @@
 {{- if .Values.sshGateway.enabled }}
 {{- $gw := .Values.sshGateway -}}
 {{- include "srw.sshGatewayValidate" . -}}
-{{- $gatewayImage := default .Values.image.orchestrator $gw.image -}}
-{{- if $gw.image -}}
+{{- $gatewayImage := .Values.image.orchestrator -}}
+{{- if not (kindIs "invalid" $gw.image) -}}
 {{- if not (kindIs "map" $gw.image) -}}
 {{- fail "sshGateway.image must be a complete image descriptor or null" -}}
 {{- end -}}
@@ -13,6 +13,7 @@
 {{- if not (has $gw.image.pullPolicy (list "Always" "IfNotPresent" "Never")) -}}
 {{- fail "sshGateway.image.pullPolicy must be Always, IfNotPresent or Never" -}}
 {{- end -}}
+{{- $gatewayImage = $gw.image -}}
 {{- end -}}
 apiVersion: apps/v1
 kind: Deployment
