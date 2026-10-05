@@ -1,11 +1,13 @@
 import {
   Component,
+  Type,
   input,
   inject,
   ViewContainerRef,
   effect,
   viewChild,
   computed,
+  DestroyRef,
 } from '@angular/core';
 import { ComponentMetadata, ComponentType } from '../../layout.model';
 import { ComponentRegistryService } from '../../../core/services/component-registry.service';
@@ -57,6 +59,9 @@ import { PanelHeaderComponent } from '../panel-header/panel-header.component';
 export class ComponentHostComponent {
   private readonly registry = inject(ComponentRegistryService);
   private readonly layoutService = inject(LayoutService);
+  private readonly destroyRef = inject(DestroyRef);
+  private destroyed = false;
+  private loadSeq = 0;
 
   readonly componentType = input.required<ComponentType>();
   readonly path = input<number[]>([]);
@@ -74,18 +79,29 @@ export class ComponentHostComponent {
   readonly canClose = computed(() => this.layoutService.getPanelCount() > 1);
 
   constructor() {
+    this.destroyRef.onDestroy(() => (this.destroyed = true));
+
     effect(() => {
       const type = this.componentType();
       const container = this.outlet();
       if (!container) return;
 
       container.clear();
-
-      const componentClass = this.registry.getComponent(type);
-      if (componentClass) {
-        container.createComponent(componentClass);
-      }
+      void this.mountPanel(type, container, ++this.loadSeq);
     });
+  }
+
+  /** Loads the panel class, then creates it unless a newer request or destroy superseded this one. */
+  private async mountPanel(type: ComponentType, container: ViewContainerRef, seq: number): Promise<void> {
+    let componentClass: Type<unknown> | undefined;
+    try {
+      componentClass = await this.registry.loadComponent(type);
+    } catch (err) {
+      console.error(`Failed to load workbench panel "${type}":`, err);
+      return;
+    }
+    if (this.destroyed || seq !== this.loadSeq || !componentClass) return;
+    container.createComponent(componentClass);
   }
 
   displayName(): string {

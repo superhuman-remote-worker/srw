@@ -10,29 +10,6 @@ import {ViewportService} from './core/services/viewport.service';
 import {UserService} from './core/services/user.service';
 import {SidebarService} from './core/services/sidebar.service';
 import {ActionCenterService} from './core/services/action-center.service';
-// Workbench-only components
-import {PlaceholderAComponent} from './workbench/components/placeholders/placeholder-a.component';
-import {PlaceholderBComponent} from './workbench/components/placeholders/placeholder-b.component';
-import {PlaceholderCComponent} from './workbench/components/placeholders/placeholder-c.component';
-import {DbTableComponent} from './workbench/components/db-table/db-table.component';
-import {AgentActivityComponent} from './workbench/components/agent-activity/agent-activity.component';
-import {RequestViewerComponent} from './workbench/components/request-viewer/request-viewer.component';
-import {GraphTimelineComponent} from './workbench/components/graph-timeline/graph-timeline.component';
-// Shared components
-import {TodoListComponent} from './views/todos/todo-list.component';
-import {ChatHistoryComponent} from './views/chat-history/chat-history.component';
-import {AgentListComponent} from './views/agents/agent-list.component';
-import {JobListComponent} from './views/jobs/job-list.component';
-import {JobCreateComponent} from './views/create/job-create.component';
-import {StatisticsComponent} from './views/statistics/statistics.component';
-import {DatasourceListLoaderComponent} from './views/datasources/datasource-list-loader.component';
-import {ExpertsListComponent} from './views/experts/experts-list.component';
-import {JobReviewComponent} from './views/job-review/job-review.component';
-import {WorkspaceBrowserComponent} from './views/workspace-browser/workspace-browser.component';
-import {ProjectListPageComponent} from './views/projects/project-list.component';
-import {MemoryPanelComponent} from './workbench/components/memory-panel/memory-panel.component';
-import {InboxPageComponent} from './views/inbox/inbox-page.component';
-import {ConfigEditorComponent} from './views/config-editor/config-editor.component';
 import {EmptyCatalogBannerComponent} from './shell/empty-catalog-banner/empty-catalog-banner.component';
 import {ReadinessGateBannerComponent} from './shell/readiness-gate-banner/readiness-gate-banner.component';
 import {ViewModeBannerComponent} from './shell/view-mode-banner/view-mode-banner.component';
@@ -310,127 +287,127 @@ export class App implements OnInit {
     this.registry.register({
       type: 'placeholder-a',
       displayName: 'Workspace',
-      component: PlaceholderAComponent,
+      load: () => import('./workbench/components/placeholders/placeholder-a.component').then((m) => m.PlaceholderAComponent),
     });
 
     this.registry.register({
       type: 'placeholder-b',
       displayName: 'Agent Chat',
-      component: PlaceholderBComponent,
+      load: () => import('./workbench/components/placeholders/placeholder-b.component').then((m) => m.PlaceholderBComponent),
     });
 
     this.registry.register({
       type: 'placeholder-c',
       displayName: 'Database',
-      component: PlaceholderCComponent,
+      load: () => import('./workbench/components/placeholders/placeholder-c.component').then((m) => m.PlaceholderCComponent),
     });
 
     this.registry.register({
       type: 'db-table',
       displayName: 'PostgreSQL Tables',
-      component: DbTableComponent,
+      load: () => import('./workbench/components/db-table/db-table.component').then((m) => m.DbTableComponent),
     });
 
     this.registry.register({
       type: 'agent-activity',
       displayName: 'Agent Activity',
-      component: AgentActivityComponent,
+      load: () => import('./workbench/components/agent-activity/agent-activity.component').then((m) => m.AgentActivityComponent),
     });
 
     this.registry.register({
       type: 'request-viewer',
       displayName: 'Request Viewer',
-      component: RequestViewerComponent,
+      load: () => import('./workbench/components/request-viewer/request-viewer.component').then((m) => m.RequestViewerComponent),
     });
 
     this.registry.register({
       type: 'graph-timeline',
       displayName: 'Graph Timeline',
-      component: GraphTimelineComponent,
+      load: () => import('./workbench/components/graph-timeline/graph-timeline.component').then((m) => m.GraphTimelineComponent),
     });
 
     this.registry.register({
       type: 'todo-list',
       displayName: 'Todo List',
-      component: TodoListComponent,
+      load: () => import('./views/todos/todo-list.component').then((m) => m.TodoListComponent),
     });
 
     this.registry.register({
       type: 'agent-chat',
       displayName: 'Chat History',
-      component: ChatHistoryComponent,
+      load: () => import('./views/chat-history/chat-history.component').then((m) => m.ChatHistoryComponent),
     });
 
     this.registry.register({
       type: 'agent-list',
       displayName: 'Agents',
-      component: AgentListComponent,
+      load: () => import('./views/agents/agent-list.component').then((m) => m.AgentListComponent),
     });
 
     this.registry.register({
       type: 'job-list',
       displayName: 'Jobs',
-      component: JobListComponent,
+      load: () => import('./views/jobs/job-list.component').then((m) => m.JobListComponent),
     });
 
     this.registry.register({
       type: 'job-create',
       displayName: 'New Job',
-      component: JobCreateComponent,
+      load: () => import('./views/create/job-create.component').then((m) => m.JobCreateComponent),
     });
 
     this.registry.register({
       type: 'statistics',
       displayName: 'Statistics',
-      component: StatisticsComponent,
+      load: () => import('./views/statistics/statistics.component').then((m) => m.StatisticsComponent),
     });
 
     this.registry.register({
       type: 'datasource-list',
       displayName: 'Connectors',
-      component: DatasourceListLoaderComponent,
+      load: () => import('./views/datasources/datasource-list-loader.component').then((m) => m.DatasourceListLoaderComponent),
     });
 
     this.registry.register({
       type: 'experts-list',
       displayName: 'Experts',
-      component: ExpertsListComponent,
+      load: () => import('./views/experts/experts-list.component').then((m) => m.ExpertsListComponent),
     });
 
     this.registry.register({
       type: 'job-review',
       displayName: 'Job Review',
-      component: JobReviewComponent,
+      load: () => import('./views/job-review/job-review.component').then((m) => m.JobReviewComponent),
     });
 
     this.registry.register({
       type: 'workspace-browser',
       displayName: 'Workspace Browser',
-      component: WorkspaceBrowserComponent,
+      load: () => import('./views/workspace-browser/workspace-browser.component').then((m) => m.WorkspaceBrowserComponent),
     });
 
     this.registry.register({
       type: 'project-list',
       displayName: 'Projects',
-      component: ProjectListPageComponent,
+      load: () => import('./views/projects/project-list.component').then((m) => m.ProjectListPageComponent),
     });
 
     this.registry.register({
       type: 'memory-panel',
       displayName: 'Memory Panel',
-      component: MemoryPanelComponent,
+      load: () => import('./workbench/components/memory-panel/memory-panel.component').then((m) => m.MemoryPanelComponent),
     });
 
     this.registry.register({
       type: 'action-center',
       displayName: 'Action Center',
-      component: InboxPageComponent,
+      load: () => import('./views/inbox/inbox-page.component').then((m) => m.InboxPageComponent),
     });
 
     this.registry.register({
       type: 'config-editor',
       displayName: 'Config Editor',
-      component: ConfigEditorComponent,
+      load: () => import('./views/config-editor/config-editor.component').then((m) => m.ConfigEditorComponent),
     });
   }
 }
