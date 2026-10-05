@@ -1,5 +1,6 @@
 """A cancelled Job with committed non-issuance retires its exact VM generation."""
 
+import asyncio
 from functools import partial
 from copy import deepcopy
 import json
@@ -258,6 +259,144 @@ async def test_final_delete_rollback_keeps_live_audit_link_and_no_packets(
         "SELECT count(*) FROM vm_job_creation_terminal_packets WHERE job_id=$1",
         owner,
     ) == 0
+
+
+@pytest.mark.asyncio
+async def test_final_delete_serializes_losing_cleanup_writer_and_freezes_packet(
+    db, monkeypatch,
+):
+    retry, recovery, _ = await never_issued_cancel(db, monkeypatch)
+    owner = retry["job_id"]
+    archive, _ = actual_archive(db, recovery, monkeypatch)
+    assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
+        str(owner), timeout_seconds=0,
+    )
+    assert await db.prepare_stateless_job_for_delete(str(owner))
+
+    # Pause the real Delete inside its final jobs DELETE, after it has taken
+    # the Job row lock and captured the terminal packet. The competing child
+    # INSERT must wait for that lock, then see the retired owner after commit.
+    barrier_key = 927362875
+    await db.execute(
+        "CREATE FUNCTION public.m1_test_delete_barrier() RETURNS trigger "
+        "LANGUAGE plpgsql AS $$ BEGIN "
+        "PERFORM pg_advisory_xact_lock(927362875::bigint); RETURN OLD; END $$"
+    )
+    await db.execute(
+        "CREATE TRIGGER zz_m1_test_delete_barrier BEFORE DELETE ON public.jobs "
+        "FOR EACH ROW EXECUTE FUNCTION public.m1_test_delete_barrier()"
+    )
+    try:
+        async with db.acquire() as holder:
+            await holder.execute("SELECT pg_advisory_lock($1::bigint)", barrier_key)
+            try:
+                delete_task = asyncio.create_task(
+                    db.delete_job(str(owner), prepared_stateless=True)
+                )
+                for _ in range(100):
+                    if await db.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM pg_locks "
+                        "WHERE locktype='advisory' AND objid=$1 "
+                        "AND granted=false)", barrier_key,
+                    ):
+                        break
+                    assert not delete_task.done()
+                    await asyncio.sleep(0.05)
+                else:
+                    pytest.fail("final Delete never reached the Job-row-held barrier")
+                async with db.acquire() as writer:
+                    writer_pid = await writer.fetchval("SELECT pg_backend_pid()")
+                    writer_task = asyncio.create_task(writer.execute(
+                        "INSERT INTO vm_workspace_cleanup_admissions "
+                        "(id,owner_kind,owner_id,source,request_id,intent_digest) "
+                        "VALUES($1,'job',$2,'late_cleanup',$3,'sha256:late')",
+                        uuid4(), owner, uuid4(),
+                    ))
+                    for _ in range(100):
+                        if await db.fetchval(
+                            "SELECT wait_event_type='Lock' FROM pg_stat_activity "
+                            "WHERE pid=$1", writer_pid,
+                        ):
+                            break
+                        assert not writer_task.done()
+                        await asyncio.sleep(0.05)
+                    else:
+                        pytest.fail("cleanup INSERT never waited on the locked Job")
+                    await holder.execute(
+                        "SELECT pg_advisory_unlock($1::bigint)", barrier_key,
+                    )
+                    assert await asyncio.wait_for(delete_task, timeout=5) is True
+                    with pytest.raises(asyncpg.CheckViolationError):
+                        await asyncio.wait_for(writer_task, timeout=5)
+            finally:
+                await holder.execute("SELECT pg_advisory_unlock($1::bigint)", barrier_key)
+    finally:
+        await db.execute("DROP TRIGGER zz_m1_test_delete_barrier ON public.jobs")
+        await db.execute("DROP FUNCTION public.m1_test_delete_barrier()")
+    assert await db.fetchval("SELECT count(*) FROM jobs WHERE id=$1", owner) == 0
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_workspace_cleanup_admissions "
+        "WHERE owner_kind='job' AND owner_id=$1 AND source='late_cleanup'", owner,
+    ) == 0
+    packet = await db.fetchval(
+        "SELECT evidence FROM vm_job_creation_terminal_packets WHERE request_id=$1",
+        retry["request_id"],
+    )
+    if isinstance(packet, str):
+        packet = json.loads(packet)
+    assert packet["kind"] == "never_issued"
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.execute(
+            "UPDATE vm_job_creation_terminal_packets "
+            "SET evidence='{}'::jsonb WHERE request_id=$1", retry["request_id"],
+        )
+    after = await db.fetchval(
+        "SELECT evidence FROM vm_job_creation_terminal_packets WHERE request_id=$1",
+        retry["request_id"],
+    )
+    assert (json.loads(after) if isinstance(after, str) else after) == packet
+
+
+@pytest.mark.asyncio
+async def test_repository_writer_wins_job_lock_then_final_delete_holds(
+    db, monkeypatch,
+):
+    retry, recovery, _ = await never_issued_cancel(db, monkeypatch)
+    owner = retry["job_id"]
+    archive, _ = actual_archive(db, recovery, monkeypatch)
+    assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
+        str(owner), timeout_seconds=0,
+    )
+    assert await db.prepare_stateless_job_for_delete(str(owner))
+    repo_name = f"job-{str(owner)[:8]}"
+    async with db.acquire() as writer, writer.transaction():
+        await writer.execute(
+            "INSERT INTO managed_repository_creation_intents "
+            "(repository_owner,repo_name,authority_kind,authority_id,access_mode,"
+            "generation,status,repository_created_at) "
+            "VALUES('srw',$1,'job',$2,'write',1,'created',now())",
+            repo_name, owner,
+        )
+        delete_task = asyncio.create_task(
+            db.delete_job(str(owner), prepared_stateless=True)
+        )
+        await asyncio.sleep(0.1)
+        assert not delete_task.done()
+    with pytest.raises(
+        asyncpg.CheckViolationError,
+        match="Managed repository authority must be contained first",
+    ):
+        await asyncio.wait_for(delete_task, timeout=5)
+    assert await db.fetchval("SELECT count(*) FROM jobs WHERE id=$1", owner) == 1
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_job_creation_terminal_packets WHERE job_id=$1",
+        owner,
+    ) == 0
+    audit = await db.fetchrow(
+        "SELECT live_job_id,deleted_at FROM vm_job_creation_owners WHERE job_id=$1",
+        owner,
+    )
+    assert audit["live_job_id"] == owner and audit["deleted_at"] is None
 
 
 @pytest.mark.asyncio
