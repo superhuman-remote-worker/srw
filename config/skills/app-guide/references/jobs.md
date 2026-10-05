@@ -35,14 +35,36 @@ those tools. The form includes:
   lower)**.
 - Project cloud access, when the selected project has cloud storage.
 - **Agent Settings** — autonomy, models, tool categories, selected connectors,
-  custom instructions, memory, quality helpers, limits, and the workspace
-  backend.
+  custom instructions, memory, quality helpers, and limits.
+- **Workspace** — see below.
 
-The advanced workspace choices are **Container**, eligible **VM (QEMU)**,
-**Virtual (cloud files)**, and **None (no workspace)**. Virtual keeps file
-tools but disables shell, browser, and git tools. None also disables file
-tools. Container and VM are the full workspace tiers; their exact tools still
-depend on the expert and grants.
+### Choosing a workspace
+
+New Job and New Session have a **Workspace** field. Its first entry, **Default**, says what the
+project (or, without one, the installation) will use, for example "Default: Container ·
+container-full (installation default)". Keep it unless the work needs something else.
+
+The other entries are workspace templates:
+- **Shared** templates come with SRW: `container-minimal`, `container-full`, `virtual`, and
+  `vm-full` when VMs are on.
+- The project's own templates.
+- **Mine**: your own templates.
+
+Two entries are special:
+- **No workspace** runs without files or a shell.
+- **Customize…** changes CPU, memory, disk or image for this one run, or saves the result under
+  Mine.
+
+Templates live under **Customize → Workspaces**. Built-in templates are read-only; duplicate
+one to change it. A template can name any image. Images that aren't SRW's run without elevated
+privileges, so they get no cloud-folder mount unless your operator sets the Helm value
+`workspace.customImages.privileged`. Try a new image with a Job before using it in a
+Session.
+
+A template's tier is **Container**, eligible **VM (QEMU)**, or **Virtual (cloud files)**; the
+**None (no workspace)** entry has no template. Virtual keeps file tools but disables shell,
+browser, and git tools. None also disables file tools. Container and VM are the full workspace
+tiers; their exact tools still depend on the expert and grants.
 
 ## Choose the review cadence
 

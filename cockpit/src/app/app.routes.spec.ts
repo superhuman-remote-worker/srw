@@ -128,3 +128,22 @@ describe('app.routes — settings sections', () => {
     );
   });
 });
+
+describe('app.routes — workspace templates (Slice A3)', () => {
+  it.each([
+    ['workspaces', './views/workspaces/workspace-templates-page.component', 'WorkspaceTemplatesPageComponent'],
+    ['workspaces/new', './views/workspaces/workspace-template-editor.component', 'WorkspaceTemplateEditorComponent'],
+    ['workspaces/:uid', './views/workspaces/workspace-template-editor.component', 'WorkspaceTemplateEditorComponent'],
+  ])('loads %s on demand behind the auth guard', async (path, file, name) => {
+    const route = routes.find((r) => r.path === path);
+    expect(route?.canActivate?.includes(authGuard) ?? false).toBe(true);
+    expect(route?.component).toBeUndefined();
+    const component = await route!.loadComponent!();
+    expect(component).toBe((await import(/* @vite-ignore */ file))[name]);
+  });
+
+  it('declares workspaces/new before workspaces/:uid', () => {
+    const paths = routes.map((r) => r.path);
+    expect(paths.indexOf('workspaces/new')).toBeLessThan(paths.indexOf('workspaces/:uid'));
+  });
+});

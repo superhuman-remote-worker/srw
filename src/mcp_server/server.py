@@ -29,6 +29,10 @@ from shared.expert_reference import (
 from shared.orch_surface import formatters as fmt
 from shared.orch_surface.client import AsyncCockpitClient, MutationOutcomeUnknown
 from shared.orch_surface.jobs import AUTH_CONTEXT_FAILURE_NOTICE, CallerCtx
+from shared.orch_surface.workspace_choice import (
+    WorkspaceArgumentError,
+    workspace_field,
+)
 from shared.sudo_command_line import render_sudo_command_line
 
 DatasourceType = Literal[
@@ -206,7 +210,10 @@ def _format_action_error(action: str, target: str, error: Exception) -> str:
 # "12": one expert selector — create_job / create_project_job take `expert`
 # (a bundled expert id or a DB expert UUID, exactly as list_experts prints
 # it); config_name and expert_id stay as deprecated single-store aliases.
-MCP_TOOL_SCHEMA_REVISION = "13"
+# "14": create_job / create_project_job / create_persistent_thread take `workspace`
+# (a template name, "none", or a {"template": {"ref": ...}} binding; inline
+# recipes are refused: Slice A3, shared/orch_surface/workspace_choice.py).
+MCP_TOOL_SCHEMA_REVISION = "14"
 _tool_schema_cache: tuple[list[dict[str, Any]], str] | None = None
 
 
@@ -1492,6 +1499,7 @@ async def create_project_job(
     datasource_ids: list[str] = None,  # type: ignore[assignment]
     priority: int = 5,
     required_deliverables: list[str] | None = None,
+    workspace: str | dict[str, Any] | None = None,
 ) -> str:
     """Create a job within a project context.
 
@@ -1525,6 +1533,11 @@ async def create_project_job(
             slugs that must exist before a completion claiming success may
             seal. Shown to the worker at dispatch; missing deliverables
             bounce the seal back to the worker with the precise list.
+        workspace: The workspace this job runs in. Omit it to use the project's
+            default (or, without a project, the installation's). "none" runs the
+            job with no workspace. A template name such as "container-minimal",
+            or one listed by manifest_list kind=WorkspaceTemplate, is looked up
+            in the project, then your own templates, then the shared catalog.
 
     Returns:
         Created job summary with ID
@@ -1538,6 +1551,12 @@ async def create_project_job(
     except ExpertReferenceConflict as conflict:
         return f"Refusing to create job: {conflict}"
     client = _get_client()
+    try:
+        workspace_supplied, workspace_binding = await workspace_field(
+            client, workspace, project_id=project_id
+        )
+    except WorkspaceArgumentError as problem:
+        return f"Refusing to create job: {problem}"
     result = await client.create_project_job(
         project_id=project_id,
         description=description,
@@ -1550,6 +1569,8 @@ async def create_project_job(
         datasource_ids=datasource_ids,
         priority=priority,
         required_deliverables=required_deliverables,
+        workspace=workspace_binding,
+        workspace_supplied=workspace_supplied,
     )
     return fmt.format_created_job(result, choice.config_name, expert=choice.reference)
 
@@ -2416,6 +2437,7 @@ async def create_persistent_thread(
     datasource_ids: list[str] = None,  # type: ignore[assignment]
     model: str | None = None,
     temperature: float | None = None,
+    workspace: str | dict[str, Any] | None = None,
 ) -> str:
     """Create a new persistent thread (interactive agent session).
 
@@ -2444,11 +2466,30 @@ async def create_persistent_thread(
             pass [] for none, or IDs for exactly that authorized selection.
         model: LLM model override (e.g. "RedHatAI/gemma-4-31B-it-FP8-Dynamic")
         temperature: Temperature override
+        workspace: The session's workspace. Omit it to use the project's default
+            (without a project, the installation's). "none" means no workspace;
+            a template name is looked up in the project, your own templates, then
+            the shared catalog. Inline recipes are refused, deliberately, for the
+            same reason this tool has no config_override.
 
     Returns:
         Created thread ID and status
     """
     client = _get_client()
+    single_project = project_id or (
+        project_ids[0] if project_ids and len(project_ids) == 1 else None
+    )
+    try:
+        workspace_supplied, workspace_binding = await workspace_field(
+            client, workspace, project_id=single_project
+        )
+    except WorkspaceArgumentError as problem:
+        return f"Refusing to create the session: {problem}"
+    extra = (
+        {"workspace": workspace_binding, "workspace_supplied": True}
+        if workspace_supplied
+        else {}
+    )
     try:
         result = await client.create_persistent_thread(
             config_name=config_name,
@@ -2459,6 +2500,7 @@ async def create_persistent_thread(
             datasource_ids=datasource_ids,
             model=model,
             temperature=temperature,
+            **extra,
         )
         return fmt.format_created_thread(result, config_name, title)
     except Exception as e:

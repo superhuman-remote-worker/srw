@@ -144,14 +144,14 @@ describe('SidebarComponent rail view', () => {
 });
 
 describe('SidebarComponent primary rows', () => {
-  it.each(['/experts', '/experts/new', '/skills', '/skills/s-1/edit', '/datasources', '/contacts'])(
+  it.each(['/experts', '/experts/new', '/skills', '/skills/s-1/edit', '/datasources', '/contacts', '/workspaces', '/workspaces/new', '/workspaces/u-1'])(
     'lights Customize on %s',
     (url) => {
       expect(create({url}).component.customizeActive()).toBe(true);
     },
   );
 
-  it.each(['/', '/jobs', '/automations', '/expertsish'])('leaves Customize dark on %s', (url) => {
+  it.each(['/', '/jobs', '/automations', '/expertsish', '/workspacesish'])('leaves Customize dark on %s', (url) => {
     expect(create({url}).component.customizeActive()).toBe(false);
   });
 

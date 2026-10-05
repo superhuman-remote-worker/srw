@@ -18,7 +18,6 @@ import {
 import {PinOnInteractDirective} from './pin-on-interact.directive';
 import {allowedEnumOptions} from './capability-gates';
 import type {GrantCatalog} from '../../core/models/api.model';
-import type {WorkspacePreview} from '../../core/models/workspace.model';
 
 /**
  * Execution settings group: autonomy, scholar, critic, project memory.
@@ -118,9 +117,9 @@ import type {WorkspacePreview} from '../../core/models/workspace.model';
         </div>
       }
 
-      @if (mode() !== 'live') {
+      @if (mode() !== 'live' && showWorkspaceBackend()) {
         <div class="field-row" [class.modified]="workspaceBackend() !== null">
-          <label class="field-label">{{ 'agentSettings.execution.workspaceBackend' | transloco }}</label>
+          <label class="field-label">{{ workspaceBackendLabel() | transloco }}</label>
           <div class="field-control">
             <select
               class="form-input"
@@ -141,9 +140,6 @@ import type {WorkspacePreview} from '../../core/models/workspace.model';
               </button>
             }
           </div>
-          @if (workspaceDefaultHint(); as hint) {
-            <span class="field-hint">{{ hint }}</span>
-          }
           @if (isLiteBackend()) {
             <span class="field-hint">{{ (isNoneBackend() ? 'advanced.hints.noneBackend' : 'advanced.hints.virtualBackend') | transloco }}</span>
           }
@@ -408,7 +404,7 @@ export class ExecutionGroupComponent {
     // Creation forms only: a live session already running on a VM is a fact,
     // not a proposal, and the form has no business second-guessing it.
     effect(() => {
-      if (this.mode() === 'live') return;
+      if (this.mode() === 'live' || !this.showWorkspaceBackend()) return;
       if (this.canUseVm()) return;
       if (this.effectiveBackend() === 'vm') {
         this.workspaceBackend.set('sandbox');
@@ -437,9 +433,12 @@ export class ExecutionGroupComponent {
   tierReachability = input<Record<string, TierReachability>>({});
   /** Non-null while an upgrade is running, which disables the control. */
   upgradeInProgress = input<{tier: string; elapsed?: number} | null>(null);
-  /** The resolver's answer for what an unpinned workspace backend would
-   *  resolve to on this creation form — null in live mode / before it loads. */
-  workspacePreview = input<WorkspacePreview | null>(null);
+  /** False when a create form's workspace picker owns the choice (Slice A3):
+   *  the row, the VM snap and the backend override all stay out of the way. */
+  showWorkspaceBackend = input(true);
+  /** The row's label key. The Expert editor passes
+   *  'agentSettings.execution.workspaceRecommended', because an Expert only recommends. */
+  workspaceBackendLabel = input('agentSettings.execution.workspaceBackend');
 
   change = output<void>();
   /** A live tier the user picked. Intent only — the host confirms and
@@ -586,34 +585,6 @@ export class ExecutionGroupComponent {
   readonly resolvedWorkspaceBackend = computed(() =>
     (readConfigPath(this.config(), 'workspace.backend') as string) ?? 'sandbox'
   );
-
-  /** Explains where an unpinned workspace backend comes from — the Project or
-   *  the installation — so the create form doesn't leave the picker's default
-   *  unexplained now that the template picker itself is a later slice. Blank
-   *  once the user pins a value, when the preview reflects the caller's own
-   *  request rather than a resolved default, or when it is an Expert's
-   *  `workspacePreference` advisory (`source: 'recommendation'`) — that case
-   *  already has its own "This Expert recommends {tier}" line above the
-   *  picker (job-create.component.ts / session-create.component.ts), and
-   *  labelling it "Installation default" too would be factually wrong. */
-  readonly workspaceDefaultHint = computed(() => {
-    this.activeLang();
-    const preview = this.workspacePreview();
-    if (
-      !preview ||
-      this.workspaceBackend() !== null ||
-      preview.source === 'request' ||
-      preview.source === 'recommendation'
-    ) {
-      return '';
-    }
-    const layer = this.transloco.translate(
-      preview.source === 'project'
-        ? 'agentSettings.execution.workspaceDefaultProject'
-        : 'agentSettings.execution.workspaceDefaultInstallation',
-    );
-    return preview.template_name ? `${layer} · ${preview.template_name}` : layer;
-  });
 
   readonly effectiveAutonomyDesc = computed(() => {
     this.activeLang();
@@ -776,7 +747,7 @@ export class ExecutionGroupComponent {
     // Never in live mode: there the tier moves through the upgrade verb, and
     // letting it ride the pane's debounced config.update would be a second,
     // silent writer of the same fact.
-    if (this.mode() !== 'live' && this.workspaceBackend() !== null) {
+    if (this.mode() !== 'live' && this.showWorkspaceBackend() && this.workspaceBackend() !== null) {
       o['workspace'] = {backend: this.workspaceBackend()};
     }
 

@@ -1,5 +1,20 @@
 # Container workspace templates
 
+## From the cockpit
+
+**Customize → Workspaces** lists the templates you can use: Shared (including the built-ins), your
+own (Mine) and a chosen project's.
+- **New template** opens a form for the tier, image, CPU, memory and disk. Container templates can
+  also set guaranteed CPU/memory and a pull policy. VM templates can also set setup steps (one shell
+  command per line).
+- Saving checks the template the way admission will, then applies it as a manifest.
+- Built-in templates open read-only; **Duplicate** copies one into Mine.
+
+New Job and New Session pick a template in their **Workspace** field. **Default** follows the
+project, then the installation. **Customize…** sends a one-off inline copy. MCP callers pass
+`workspace` to `create_job`, `create_project_job` or `create_persistent_thread`: a template name or
+`"none"`. Inline recipes go through `manifest_apply`.
+
 A `backend: sandbox` WorkspaceTemplate chooses the image, CPU, memory and storage
 of a Job's or Session's container. See [the example](srw-container-workspace.yaml).
 

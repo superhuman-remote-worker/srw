@@ -1,33 +1,38 @@
 import {describe, expect, it} from 'vitest';
 import {workspaceCreationFields, workspacePreviewConfig} from './workspace-selection';
 import {WorkspacePreview} from '../../core/models/workspace.model';
+import {CATALOG_SHARED} from '../../core/models/workspace-template.model';
 
-const recommendation: WorkspacePreview = {
-  backend: 'sandbox', source: 'recommendation', binding: {template: {inline: {backend: 'sandbox'}}},
-};
-
-describe('execution workspace selection', () => {
-  it('materializes a recommendation independently of the private configuration', () => {
-    const config = {llm: {model: 'chosen'}};
-    expect(workspaceCreationFields(config, recommendation)).toEqual({config_override: config, workspace: recommendation.binding});
-    expect(config).toEqual({llm: {model: 'chosen'}});
-  });
-
-  it('preserves an explicit no-workspace choice over a recommendation', () => {
-    const config = {workspace: {backend: 'none', max_read_words: 100}, llm: {model: 'chosen'}};
-    expect(workspaceCreationFields(config, recommendation)).toEqual({
-      workspace: null, config_override: {workspace: {max_read_words: 100}, llm: {model: 'chosen'}},
+describe('execution workspace selection (Slice A3)', () => {
+  it('omits workspace for the default and strips the legacy backend and VM sizing', () => {
+    const config = {workspace: {backend: 'vm', vm: {cpu_cores: 8}, max_read_words: 100}, llm: {model: 'chosen'}};
+    expect(workspaceCreationFields(config, {kind: 'default'})).toEqual({
+      config_override: {workspace: {max_read_words: 100}, llm: {model: 'chosen'}},
     });
-    expect(config.workspace.backend).toBe('none');
+    expect(config.workspace.backend).toBe('vm');
   });
 
-  it('lets the server select and freeze a Project default', () => {
-    expect(workspaceCreationFields({}, {...recommendation, source: 'project'})).toEqual({config_override: {}});
+  it('sends null for no workspace', () => {
+    expect(workspaceCreationFields({}, {kind: 'none'})).toEqual({config_override: {}, workspace: null});
   });
 
-  it('renders selected infrastructure without changing Expert behavior', () => {
+  it('sends a template reference', () => {
+    const choice = {kind: 'ref' as const, ref: {name: 'container-minimal', scope: CATALOG_SHARED}, backend: 'sandbox' as const, label: 'x'};
+    expect(workspaceCreationFields({workspace: {backend: 'sandbox'}}, choice)).toEqual({
+      config_override: {}, workspace: {template: {ref: {name: 'container-minimal', scope: {kind: 'Catalog', name: 'shared'}}}},
+    });
+  });
+
+  it('sends an inline recipe', () => {
+    expect(workspaceCreationFields({}, {kind: 'inline', spec: {backend: 'vm', resources: {cpu: 4}}})).toEqual({
+      config_override: {}, workspace: {template: {inline: {backend: 'vm', resources: {cpu: 4}}}},
+    });
+  });
+
+  it('renders the resolved tier into the preview config without changing Expert behavior', () => {
+    const preview: WorkspacePreview = {backend: 'sandbox', source: 'default', binding: null};
     const expert = {workspace: {backend: 'virtual', git_versioning: false}, tools: {shell: ['run_command']}};
-    expect(workspacePreviewConfig(expert, recommendation)).toEqual({...expert, workspace: {backend: 'sandbox', git_versioning: false}});
+    expect(workspacePreviewConfig(expert, preview)).toEqual({...expert, workspace: {backend: 'sandbox', git_versioning: false}});
     expect(expert.workspace.backend).toBe('virtual');
   });
 });

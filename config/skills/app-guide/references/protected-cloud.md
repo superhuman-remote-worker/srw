@@ -52,8 +52,8 @@ authority.
 
 1. Go to **Sessions → New Session** and select the eligible project.
 2. Enable **Protected cloud — agent writes are staged for your review**.
-3. Under **Agent Settings → Settings**, set **Workspace** to
-   **Container**, then create the session.
+3. In the **Workspace** field, choose a **Container** template (for example
+   `container-full`), then create the session.
 4. Ask the agent to work in `workspace/cloud`. It should describe completed
    cloud writes as “staged for your review,” not saved or shared.
 5. After a turn stages at least one change, click **Cloud changes (N)** in the

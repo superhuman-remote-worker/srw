@@ -22,6 +22,8 @@ function mount(options: {
   liveTier?: string | null;
   tierReachability?: Record<string, TierReachability>;
   upgradeInProgress?: {tier: string; elapsed?: number} | null;
+  showWorkspaceBackend?: boolean;
+  workspaceBackendLabel?: string;
 } = {}) {
   TestBed.configureTestingModule({
     imports: [
@@ -47,6 +49,8 @@ function mount(options: {
   stub('liveTier', options.liveTier ?? null);
   stub('tierReachability', options.tierReachability ?? {});
   stub('upgradeInProgress', options.upgradeInProgress ?? null);
+  if (options.showWorkspaceBackend !== undefined) stub('showWorkspaceBackend', options.showWorkspaceBackend);
+  if (options.workspaceBackendLabel !== undefined) stub('workspaceBackendLabel', options.workspaceBackendLabel);
   fixture.detectChanges();
   return fixture;
 }
@@ -110,6 +114,16 @@ describe('ExecutionGroupComponent — workspace backend placement', () => {
   it('withholds the VM tier from a user who may not', () => {
     expect(optionValues(mount({canUseVm: false}), 'Workspace'))
       .toEqual(['sandbox', 'virtual', 'none']);
+  });
+
+  it('is absent when the picker owns the workspace', () => {
+    const fixture = mount({mode: 'job', showWorkspaceBackend: false});
+    expect(labels(fixture)).not.toContain('Workspace');
+  });
+
+  it('can carry the Expert editor label', () => {
+    const fixture = mount({mode: 'job', workspaceBackendLabel: 'agentSettings.execution.workspaceRecommended'});
+    expect(labels(fixture)).toContain('Recommended workspace');
   });
 
   it('renders resolved copy, never a raw translation key', () => {

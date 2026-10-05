@@ -1,6 +1,6 @@
--- migration:     0325_job_never_issued_vm_terminal.sql
+-- migration:     0326_job_never_issued_vm_terminal.sql
 -- description:   Admit exact cancelled Job VM logical non-issuance and proven predecessors.
--- depends-on:    0324_legacy_nonquota_resume_delete.sql
+-- depends-on:    0325_vm_thread_cleanup_refusal_recovery.sql
 -- expected:      < 1s. Function additions/replacement only; no row rewrite.
 -- locks:         Function-catalog locks; existing owner triggers remain active.
 -- transactional: yes

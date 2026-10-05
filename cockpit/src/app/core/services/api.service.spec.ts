@@ -12,6 +12,7 @@ import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from './error-message.service';
 import type {ThreadUploadedFile, ThreadUploadEvent} from '../models/file.model';
 import type {Job, JobCreateRequest} from '../models/api.model';
+import {WorkspaceTemplateDocument} from '../models/workspace-template.model';
 import jobListPage from '../models/fixtures/job-list-page.json';
 
 describe('ApiService.createJob public wire contract', () => {
@@ -1500,5 +1501,76 @@ describe('ApiService.getThreadQueue — the durable queue block', () => {
       .expectOne((item) => item.url.endsWith('/persistent/threads/t1/queue'))
       .flush({thread_id: 't1'});
     await expect(pending).resolves.toBeNull();
+  });
+});
+
+describe('workspace templates (Slice A3)', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({providers: [
+      ApiService, provideHttpClient(), provideHttpClientTesting(),
+      {provide: AppToastService, useValue: {success: vi.fn()}},
+      {provide: TranslocoService, useValue: {translate: (key: string) => key}},
+      {provide: ErrorMessageService, useValue: {}},
+    ]});
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  it('listWorkspaceTemplatesStrict lets errors through', async () => {
+    const listing = firstValueFrom(api.listWorkspaceTemplatesStrict('Account', 'me'));
+    const req = httpMock.expectOne((r) => r.url.endsWith('/resources'));
+    expect(req.request.params.get('scope_kind')).toBe('Account');
+    expect(req.request.params.get('scope_name')).toBe('me');
+    expect(req.request.params.get('kind')).toBe('WorkspaceTemplate');
+    req.flush({detail: 'no'}, {status: 403, statusText: 'Forbidden'});
+    await expect(listing).rejects.toBeInstanceOf(HttpErrorResponse);
+  });
+
+  it('getResource reads one resource by uid', async () => {
+    const got = firstValueFrom(api.getResource('u-1'));
+    httpMock.expectOne((r) => r.url.endsWith('/resources/u-1') && r.method === 'GET').flush({uid: 'u-1'});
+    await expect(got).resolves.toMatchObject({uid: 'u-1'});
+  });
+
+  it('applyManifest sends JSON source and only non-empty expected versions', async () => {
+    const doc: WorkspaceTemplateDocument = {apiVersion: 'srw/v1alpha1', kind: 'WorkspaceTemplate', metadata: {name: 'a', scope: {kind: 'Account', name: 'me'}}, spec: {backend: 'virtual'}};
+    const created = firstValueFrom(api.applyManifest(doc));
+    const req = httpMock.expectOne((r) => r.url.endsWith('/manifests/apply'));
+    expect(req.request.method).toBe('POST');
+    expect(req.request.body).toEqual({source: JSON.stringify(doc), format: 'json'});
+    req.flush({resources: [{uid: 'u-9', resourceVersion: 1, changed: true}]});
+    await expect(created).resolves.toMatchObject({resources: [{uid: 'u-9'}]});
+
+    const updated = firstValueFrom(api.applyManifest(doc, {'WorkspaceTemplate/Account/x/a': 3}));
+    const second = httpMock.expectOne((r) => r.url.endsWith('/manifests/apply'));
+    expect(second.request.body.expected_versions).toEqual({'WorkspaceTemplate/Account/x/a': 3});
+    second.flush({resources: []});
+    await updated;
+  });
+
+  it('deleteResource sends the expected version', async () => {
+    const deleted = firstValueFrom(api.deleteResource('u-1', 4));
+    const req = httpMock.expectOne((r) => r.url.endsWith('/resources/u-1'));
+    expect(req.request.method).toBe('DELETE');
+    expect(req.request.params.get('expected_version')).toBe('4');
+    req.flush({deleted: true, uid: 'u-1'});
+    await expect(deleted).resolves.toEqual({deleted: true, uid: 'u-1'});
+  });
+
+  it('checkWorkspaceRecipe previews an inline recipe and surfaces a 422', async () => {
+    const checked = firstValueFrom(api.checkWorkspaceRecipe({backend: 'sandbox', initialize: [{command: ['true']}]}, 'p-1'));
+    const req = httpMock.expectOne((r) => r.url.endsWith('/persistent/tool-groups/preview'));
+    expect(req.request.body).toEqual({
+      expert_type: 'worker', project_id: 'p-1',
+      workspace: {template: {inline: {backend: 'sandbox', initialize: [{command: ['true']}]}}},
+    });
+    req.flush({detail: 'SRW template images, resources and initialization require backend vm.'}, {status: 422, statusText: 'Unprocessable'});
+    await expect(checked).rejects.toBeInstanceOf(HttpErrorResponse);
   });
 });

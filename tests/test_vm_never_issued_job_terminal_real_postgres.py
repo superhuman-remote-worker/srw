@@ -53,22 +53,28 @@ db = _db_fixture
 
 
 @pytest.mark.asyncio
-async def test_0324_upgrade_preserves_applied_ledger_and_thread_predicate(
+async def test_0325_upgrade_preserves_applied_ledger_and_thread_predicate(
     pg_dsn,  # noqa: F811 - imported fixture
     tmp_path: Path,
 ):
-    """A clean 0324 database gains only the forward Job source at 0325."""
+    """A clean 0325 database gains only the forward Job source at 0326."""
     migration_dir = (
         Path(__file__).resolve().parents[1] / "src/orchestrator/database/migrations/app"
     )
-    through_0324 = tmp_path / "through-0324"
-    through_0324.mkdir()
+    through_0325 = tmp_path / "through-0325"
+    through_0325.mkdir()
+    through_0326 = tmp_path / "through-0326"
+    through_0326.mkdir()
+    # Stop at 0326 so later heads do not change this upgrade's exact delta.
     for path in discover(migration_dir):
-        if path.name.startswith("0325_"):
+        version = path.name.split("_", 1)[0]
+        if version > "0326":
             break
-        (through_0324 / path.name).write_bytes(path.read_bytes())
+        if version != "0326":
+            (through_0325 / path.name).write_bytes(path.read_bytes())
+        (through_0326 / path.name).write_bytes(path.read_bytes())
 
-    database = f"test_job_0325_{uuid4().hex[:12]}"
+    database = f"test_job_0326_{uuid4().hex[:12]}"
     admin = await asyncpg.connect(pg_dsn)
     try:
         await admin.execute(f'CREATE DATABASE "{database}"')
@@ -77,13 +83,13 @@ async def test_0324_upgrade_preserves_applied_ledger_and_thread_predicate(
     dsn = pg_dsn.rsplit("/", 1)[0] + "/" + database
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
     try:
-        await run_migrations(pool, through_0324)
+        await run_migrations(pool, through_0325)
         async with pool.acquire() as conn:
             applied = dict(
                 await conn.fetch("SELECT filename,checksum FROM schema_migrations")
             )
-            assert any(name.startswith("0324_") for name in applied)
-            assert not any(name.startswith("0325_") for name in applied)
+            assert any(name.startswith("0325_") for name in applied)
+            assert not any(name.startswith("0326_") for name in applied)
             thread_before = await conn.fetchval(
                 "SELECT pg_get_functiondef("
                 "'public.thread_vm_creation_never_issued_source(uuid,text)'::regprocedure)"
@@ -102,14 +108,14 @@ async def test_0324_upgrade_preserves_applied_ledger_and_thread_predicate(
             )
             assert thread_result_before is False
 
-        await run_migrations(pool, migration_dir)
+        await run_migrations(pool, through_0326)
         async with pool.acquire() as conn:
             after = dict(
                 await conn.fetch("SELECT filename,checksum FROM schema_migrations")
             )
             assert {name: after[name] for name in applied} == applied
             assert len(after) == len(applied) + 1
-            assert "0325_job_never_issued_vm_terminal.sql" in after
+            assert "0326_job_never_issued_vm_terminal.sql" in after
             assert (
                 await conn.fetchval(
                     "SELECT pg_get_functiondef("

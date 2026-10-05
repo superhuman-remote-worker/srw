@@ -174,4 +174,13 @@ describe('AdvancedAccordionComponent — VM sizing', () => {
     const o = component.getOverrides() as Record<string, any>;
     expect(o['workspace']?.vm).toBeUndefined();
   });
+
+  it('neither shows nor emits VM sizing when the picker owns the workspace', () => {
+    const {component, backend} = createComponent();
+    backend.set('vm');
+    Object.defineProperty(component, 'vmSizing', {value: () => false});
+    component.vmCpuCores.set(4);
+    expect(component.getOverrides()['workspace']).toBeUndefined();
+    expect(component.vmSizingValid()).toBe(true);
+  });
 });

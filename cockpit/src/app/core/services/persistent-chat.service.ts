@@ -37,6 +37,9 @@ import {
   parseSubagentRecoveryResult,
 } from '../models/subagent-recovery.model';
 import { TranslocoService } from '@jsverse/transloco';
+import { WorkspaceChoice } from '../models/workspace-template.model';
+import { WorkspacePreview } from '../models/workspace.model';
+import { choiceBackend, choiceRequestFields } from '../../views/workspaces/workspace-template-utils';
 import { ApiService } from './api.service';
 import type { SessionQueueState } from '../models/api.model';
 import { ErrorMessageService } from './error-message.service';
@@ -1609,8 +1612,12 @@ export class PersistentChatService {
   readonly draftDefaultsLoading = signal(false);
   readonly draftDefaultsError = signal(false);
   readonly draftConnectorsEnabled = signal(true);
-  /** Empty means follow the project/account defaults, including workspace recipes. */
-  readonly draftWorkspaceBackend = signal('');
+  /** The recovery view's workspace choice (Slice A3). `default` omits the field, so the project or installation decides. */
+  readonly draftWorkspaceChoice = signal<WorkspaceChoice>({kind: 'default'});
+  /** The draft's one project, for the picker's lists and defaults. */
+  readonly draftProjectId = signal<string | null>(null);
+  /** What the thread preview resolved, for the picker's Default label. */
+  readonly draftWorkspacePreview = signal<WorkspacePreview | null>(null);
   private draftDefaultsGeneration = 0;
   private creatingFromDraft = false;
 
@@ -2506,7 +2513,7 @@ export class PersistentChatService {
     this.error.set(null);
     this.creatingFromDraft = false;
     this.draftConnectorsEnabled.set(true);
-    this.draftWorkspaceBackend.set('');
+    this.draftWorkspaceChoice.set({kind: 'default'});
     this.isDraftSession.set(true);
     // Resolve the default project and compatible connector defaults as one
     // fail-closed context. The composer remains usable for drafting, but
@@ -2533,6 +2540,7 @@ export class PersistentChatService {
       if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
       const defaultProject = projects.find((project) => project.is_default);
       this.draftProjectIds = defaultProject ? [defaultProject.id] : [];
+      this.draftProjectId.set(this.draftProjectIds?.[0] ?? null);
       const body = this.draftCreationContext();
       if (this.capabilities.datasourceScopeAutoAttachAvailable() && this.draftConnectorsEnabled()) {
         body['use_datasource_defaults'] = true;
@@ -2551,6 +2559,8 @@ export class PersistentChatService {
       );
       if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
       this.draftProjectIds = preview.project_ids;
+      this.draftProjectId.set(preview.project_ids[0] ?? null);
+      this.draftWorkspacePreview.set({backend: preview.workspace_backend, source: 'default', binding: null});
       this.draftDatasourceIds.set(preview.datasource_ids);
     } catch (err) {
       if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
@@ -2568,17 +2578,15 @@ export class PersistentChatService {
     void this.retryDraftDefaults();
   }
 
-  setDraftWorkspaceBackend(backend: string | null): void {
-    if (!['', 'virtual', 'sandbox', 'vm', 'none'].includes(backend ?? '')) return;
-    this.draftWorkspaceBackend.set(backend ?? '');
+  setDraftWorkspaceChoice(choice: WorkspaceChoice): void {
+    this.draftWorkspaceChoice.set(choice);
     void this.retryDraftDefaults();
   }
 
   private draftCreationContext(): Record<string, any> {
     const body: Record<string, any> = {};
     if (this.draftProjectIds?.length) body['project_ids'] = this.draftProjectIds;
-    const backend = this.draftWorkspaceBackend();
-    if (backend) body['config_override'] = {workspace: {backend}};
+    Object.assign(body, choiceRequestFields(this.draftWorkspaceChoice()));
     return body;
   }
 
@@ -2610,7 +2618,7 @@ export class PersistentChatService {
     const body: Record<string, any> = {...this.draftCreationContext(), title: draftTitleFrom(firstMessage)};
     body['datasource_ids'] = this.draftConnectorsEnabled() ? (this.draftDatasourceIds() ?? []) : [];
     try {
-      await this.createAndConnect(body);
+      await this.createAndConnect(body, {vm: choiceBackend(this.draftWorkspaceChoice(), this.draftWorkspacePreview()) === 'vm'});
     } catch {
       // createAndConnect surfaced the error state and re-showed the
       // queued bubbles; re-enter draft so the next send retries the
@@ -2627,7 +2635,7 @@ export class PersistentChatService {
    * Create a new persistent thread via REST, then connect.
    * Sets isCreating=true immediately so the UI can show a spinner.
    */
-  async createAndConnect(body: Record<string, any>): Promise<string> {
+  async createAndConnect(body: Record<string, any>, opts: {vm?: boolean} = {}): Promise<string> {
     this.disconnect();
     const creationGeneration = this.connectGeneration;
     let createdThreadId: string | null = null;
@@ -2647,7 +2655,7 @@ export class PersistentChatService {
     // A VM-backed create pays a cold KubeVirt boot — flag it up front so the
     // startup card shows the "Booting VM" copy and connect()'s readiness
     // poll uses the longer VM budget from the first iteration.
-    this.isVmSession.set((body?.['config_override'] as any)?.workspace?.backend === 'vm');
+    this.isVmSession.set(opts.vm ?? (body?.['config_override'] as any)?.workspace?.backend === 'vm');
     try {
       const resp = await firstValueFrom(
         this.http.post<{ thread_id: string }>(`${environment.apiUrl}/persistent/threads`, body),

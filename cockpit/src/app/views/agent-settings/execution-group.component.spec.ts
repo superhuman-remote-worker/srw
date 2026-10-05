@@ -246,75 +246,19 @@ describe('ExecutionGroupComponent workspace backend', () => {
   });
 });
 
-describe('ExecutionGroupComponent workspace default hint', () => {
-  // Only these two keys need real text; workspaceDefaultHint composes them
-  // itself, so a plain echo-back would hide a wiring mistake in the ternary.
-  const translations: Record<string, string> = {
-    'agentSettings.execution.workspaceDefaultProject': 'Default from this Project',
-    'agentSettings.execution.workspaceDefaultInstallation': 'Installation default',
-  };
-
-  it.each([
-    [
-      {
-        backend: 'sandbox',
-        source: 'project',
-        binding: null,
-        sources: {tier: 'project', template: 'project'},
-        template_name: 'website-builder',
-      },
-      'Default from this Project · website-builder',
-    ],
-    [
-      {
-        backend: 'virtual',
-        source: 'default',
-        binding: null,
-        sources: {tier: 'installation', template: null},
-        template_name: null,
-      },
-      'Installation default',
-    ],
-    // An Expert's workspacePreference advisory already has its own "This
-    // Expert recommends {tier}" line above the picker (job-create /
-    // session-create); labelling it "Installation default" too would be
-    // factually wrong (review finding, fix round 1).
-    [
-      {
-        backend: 'container',
-        source: 'recommendation',
-        binding: {template: {inline: {backend: 'container'}}},
-        sources: {tier: 'installation', template: null},
-        template_name: null,
-      },
-      '',
-    ],
-  ])('explains an unpinned default (%o)', (preview, text) => {
-    // Job mode (the default) with no pinned workspace backend (also default).
-    const {component} = createWith({is_admin: true}, translations);
-    Object.defineProperty(component, 'workspacePreview', {value: () => preview});
-    expect(component.workspaceDefaultHint()).toBe(text);
+describe('ExecutionGroupComponent without its workspace row (Slice A3)', () => {
+  it('emits no backend when the picker owns the workspace', () => {
+    const {component} = createWith({is_admin: true});
+    Object.defineProperty(component, 'showWorkspaceBackend', {value: () => false});
+    component.workspaceBackend.set('vm');
+    expect(component.getOverrides()['workspace']).toBeUndefined();
   });
 
-  it('is blank once the user pins a workspace backend', () => {
-    const {component} = createWith({is_admin: true}, translations);
-    Object.defineProperty(component, 'workspacePreview', {
-      value: () => ({backend: 'sandbox', source: 'project', binding: null}),
-    });
-    component.onWorkspaceBackendChange('virtual');
-    expect(component.workspaceDefaultHint()).toBe('');
-  });
-
-  it("is blank when the preview reflects the caller's own request", () => {
-    const {component} = createWith({is_admin: true}, translations);
-    Object.defineProperty(component, 'workspacePreview', {
-      value: () => ({backend: 'vm', source: 'request', binding: null}),
-    });
-    expect(component.workspaceDefaultHint()).toBe('');
-  });
-
-  it('is blank with no preview at all', () => {
-    const {component} = createWith();
-    expect(component.workspaceDefaultHint()).toBe('');
+  it('does not snap an ineligible user off a vm default it is not showing', () => {
+    const {component} = createWith({is_admin: false, can_use_vm: false});
+    Object.defineProperty(component, 'showWorkspaceBackend', {value: () => false});
+    Object.defineProperty(component, 'config', {value: () => ({workspace: {backend: 'vm'}})});
+    TestBed.tick();
+    expect(component.workspaceBackend()).toBeNull();
   });
 });

@@ -377,16 +377,16 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         expect(ctx.service.error()).toBe(detail);
         expect(ctx.service.threadId()).toBeNull();
 
-        ctx.service.setDraftWorkspaceBackend('sandbox');
+        ctx.service.setDraftWorkspaceChoice({kind: 'ref', ref: {name: 'container-minimal', scope: {kind: 'Catalog', name: 'shared'}}, backend: 'sandbox', label: 'container-minimal'});
         await flushTick();
         expect(ctx.mockHttp.post).toHaveBeenCalledWith(
             expect.stringContaining('/persistent/threads/preview'),
-            {config_override: {workspace: {backend: 'sandbox'}}, use_datasource_defaults: true},
+            {workspace: {template: {ref: {name: 'container-minimal', scope: {kind: 'Catalog', name: 'shared'}}}}, use_datasource_defaults: true},
         );
         opts.createFails = false;
         await Promise.all([ctx.service.retryDraftSession(), ctx.service.retryDraftSession()]);
         expect(createPosts(ctx)).toHaveLength(2); // one refusal, one successful creation
-        expect(createPosts(ctx)[1][1]).toMatchObject({config_override: {workspace: {backend: 'sandbox'}}});
+        expect(createPosts(ctx)[1][1]).toMatchObject({workspace: {template: {ref: {name: 'container-minimal', scope: {kind: 'Catalog', name: 'shared'}}}}});
         expect(ctx.service.error()).toBeNull();
         expect(ctx.service.outbox().map(i => i.displayContent)).toEqual(['inspect my repository']);
         fireSseOpen(ctx.sseInstances[0]);
@@ -461,7 +461,7 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         ctx.mockHttp.post.mockReturnValueOnce(oldPreview).mockReturnValueOnce(newPreview);
         ctx.service.enterDraftSession();
         await flushTick();
-        ctx.service.setDraftWorkspaceBackend('sandbox');
+        ctx.service.setDraftWorkspaceChoice({kind: 'ref', ref: {name: 'container-minimal', scope: {kind: 'Catalog', name: 'shared'}}, backend: 'sandbox', label: 'container-minimal'});
         await flushTick();
         newPreview.next({project_ids: [], workspace_backend: 'sandbox', datasource_ids: ['repo']});
         await flushTick();
@@ -469,6 +469,18 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         await flushTick();
         expect(ctx.service.draftDatasourceIds()).toEqual(['repo']);
         expect(ctx.service.draftDefaultsLoading()).toBe(false);
+    });
+
+    it('flags a VM create from the picked tier', async () => {
+        const ctx = createService();
+        ctx.service.enterDraftSession();
+        await flushTick();
+        ctx.service.setDraftWorkspaceChoice({kind: 'inline', spec: {backend: 'vm'}});
+        await flushTick();
+        await ctx.service.sendMessage('hello');
+        await flushTick();
+        expect(createPosts(ctx)).toHaveLength(1);
+        expect(ctx.service.isVmSession()).toBe(true);
     });
 
     it('connecting to a real thread leaves draft mode', async () => {

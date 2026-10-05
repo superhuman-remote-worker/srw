@@ -59,14 +59,15 @@ the applicable policy.
 
 For non-admin users, effective grants combine global, project, and user scope.
 More specific grants cannot widen a restriction imposed above them, and when
-several attached projects contribute values the most restrictive result wins.
+several values apply the most restrictive result wins. A session belongs to one
+project or none.
 Admins bypass this grant policy, but not deployment kill switches, missing
 services, ownership checks, or other operation-specific authorization.
 
 The current grant catalog covers:
 
 - `personal_default_experts` — set or fork personal default experts;
-- `vm_workspace` — select or upgrade to a VM workspace;
+- `vm_workspace` — select or upgrade to a VM workspace (VM templates need it);
 - `shell_tools` — load shell tools;
 - `delegation` — enable subagent delegation;
 - `public_datasources` — publish a connector to all users;
@@ -101,10 +102,15 @@ provisioning, dispatch, and individual actions recheck the applicable policy.
 
 ## Choose the workspace for the work
 
-The account default is under
-**Settings → Persistent Agent → Default Workspace**. A new session can override
-it under **Sessions → New Session → Agent Settings → Settings → Workspace**.
-The platform default is Virtual.
+Workspace templates are edited under **Customize → Workspaces**: Shared templates
+by admins only. A project's templates can be changed by admins and by project
+members with the editor role, and not in an archived project. VM templates need
+VM permission.
+
+A new session or job picks its workspace in the **Workspace** field of
+**Sessions → New Session** or **Jobs → New Job**. Its **Default** entry follows
+the project's default, then the installation default. The shipped installation
+default is Container for jobs and Virtual for sessions; an operator can change it.
 
 | Workspace | What it provides | Important limits |
 |---|---|---|

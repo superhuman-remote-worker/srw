@@ -94,6 +94,8 @@ def _reset_agent_globals():
     mod._orchestrator_client = None
     mod._subscribers.clear()
     mod._session_input._queue = None
+    mod._session_termination.termination_admission_fenced = False
+    mod._session_termination.termination_fence_reason = None
 
 
 def _install_session(*, turn_count: int, headless_mode: str = "eager"):
@@ -133,6 +135,19 @@ def test_reset_agent_globals_clears_pinned_identity_protocol() -> None:
     assert mod._session_identity.attach_token is None
 
 
+def test_reset_agent_globals_clears_process_termination_admission(monkeypatch):
+    """A previous lifespan shutdown cannot park this fake session's input."""
+    import agent.api.persistent_app as mod
+
+    monkeypatch.setattr(mod._session_termination, "termination_admission_fenced", True)
+    monkeypatch.setattr(
+        mod._session_termination, "termination_fence_reason", "prior-shutdown"
+    )
+    _reset_agent_globals()
+    assert mod._session_termination.termination_admission_fenced is False
+    assert mod._session_termination.termination_fence_reason is None
+
+
 class TestPoliteModeFlip:
     def setup_method(self):
         _reset_agent_globals()
@@ -152,7 +167,7 @@ class TestPoliteModeFlip:
         client.update_thread_status.reset_mock()
 
         mod._session_input.queue.put_nowait("hi")
-        await mod._session_input.get_user_input()
+        await asyncio.wait_for(mod._session_input.get_user_input(), timeout=1)
         await asyncio.sleep(0)
 
         client.update_thread_status.assert_awaited_with(
@@ -168,7 +183,7 @@ class TestPoliteModeFlip:
         _, client = _install_session(turn_count=0, headless_mode="polite")
         mod._session_input.queue.put_nowait("hi")
 
-        await mod._session_input.get_user_input()
+        await asyncio.wait_for(mod._session_input.get_user_input(), timeout=1)
         await asyncio.sleep(0)
 
         client.update_thread_status.assert_not_called()
@@ -184,7 +199,7 @@ class TestPoliteModeFlip:
         client.update_thread_status.reset_mock()
 
         mod._session_input.queue.put_nowait("hi")
-        await mod._session_input.get_user_input()
+        await asyncio.wait_for(mod._session_input.get_user_input(), timeout=1)
         await asyncio.sleep(0)
 
         for call in client.update_thread_status.await_args_list:
@@ -198,7 +213,7 @@ class TestPoliteModeFlip:
         _, client = _install_session(turn_count=2, headless_mode="eager")
         mod._session_input.queue.put_nowait("hi")
 
-        await mod._session_input.get_user_input()
+        await asyncio.wait_for(mod._session_input.get_user_input(), timeout=1)
         await asyncio.sleep(0)
 
         client.update_thread_status.assert_awaited_with(
@@ -217,7 +232,7 @@ class TestPoliteModeFlip:
         del mod._session.config.headless
 
         mod._session_input.queue.put_nowait("hi")
-        await mod._session_input.get_user_input()
+        await asyncio.wait_for(mod._session_input.get_user_input(), timeout=1)
         await asyncio.sleep(0)
 
         # Eager fallback + no subscribers → should flip.

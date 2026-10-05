@@ -4,8 +4,8 @@ import {TranslocoPipe} from '@jsverse/transloco';
 import {SidebarToggleComponent} from '../sidebar-toggle/sidebar-toggle.component';
 
 /**
- * The tab bar the four Customize pages share (navigation_fixed_rail.md F3):
- * one rail row, "Customize", stands for Experts, Skills, Connectors and
+ * The tab bar the five Customize pages share (navigation_fixed_rail.md F3):
+ * one rail row, "Customize", stands for Experts, Workspaces, Skills, Connectors and
  * Contacts, and this bar moves between them. Their routes are unchanged.
  *
  * Real links rather than the app-tab-nav tablist: each tab is a page, so it
@@ -44,7 +44,7 @@ import {SidebarToggleComponent} from '../sidebar-toggle/sidebar-toggle.component
       border-bottom: 1px solid var(--border-color);
     }
 
-    /* Four tabs fit a 360px phone; anything narrower scrolls rather than
+    /* Five tabs scroll below about 400px; anything narrower scrolls rather than
        wrapping to a second row, with the current page's tab kept in view
        (revealIfActive). */
     .customize-tabs {
@@ -97,6 +97,7 @@ import {SidebarToggleComponent} from '../sidebar-toggle/sidebar-toggle.component
 export class CustomizeTabsComponent {
   protected readonly tabs = [
     {path: '/experts', labelKey: 'nav.experts'},
+    {path: '/workspaces', labelKey: 'nav.workspaces'},
     {path: '/skills', labelKey: 'nav.skills'},
     {path: '/datasources', labelKey: 'nav.datasources'},
     {path: '/contacts', labelKey: 'nav.contacts'},

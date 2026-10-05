@@ -1,5 +1,5 @@
 import {afterEach, beforeAll, describe, expect, it} from 'vitest';
-import {Component, EventEmitter, Injector, runInInjectionContext, ɵresolveComponentResources} from '@angular/core';
+import {Component, EventEmitter, Input, Output, Injector, runInInjectionContext, ɵresolveComponentResources} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
 import {provideRouter} from '@angular/router';
 import {TranslocoService, TranslocoTestingModule} from '@jsverse/transloco';
@@ -7,6 +7,7 @@ import {ChatEmptyStateComponent} from './chat-empty-state.component';
 import en from '../../../../assets/i18n/en.json';
 import {AppSelectComponent} from '../../../ui/select';
 import {AppButtonComponent} from '../../../ui/button';
+import {WorkspacePickerComponent} from '../../agent-settings/workspace-picker.component';
 
 // Vitest's JIT transform does not retain model()/viewChild() metadata. Keep
 // the production recovery template, substituting only the shared UI controls.
@@ -31,6 +32,16 @@ class ButtonStub {
   disabled = false;
   size = '';
   clicked = new EventEmitter<void>();
+}
+
+// The real picker loads data; this render spec only needs it to exist.
+@Component({selector: 'app-workspace-picker', standalone: true, template: ''})
+class WorkspacePickerStub {
+  @Input() role = 'session';
+  @Input() projectId: string | null = null;
+  @Input() preview: unknown = null;
+  @Input() choice: unknown = null;
+  @Output() choiceChange = new EventEmitter<unknown>();
 }
 
 function create() {
@@ -73,8 +84,8 @@ describe('ChatEmptyStateComponent variants', () => {
 
   function render(inputs: Record<string, unknown>): HTMLElement {
     TestBed.overrideComponent(ChatEmptyStateComponent, {
-      remove: {imports: [AppSelectComponent, AppButtonComponent]},
-      add: {imports: [SelectStub, ButtonStub]},
+      remove: {imports: [AppSelectComponent, AppButtonComponent, WorkspacePickerComponent]},
+      add: {imports: [SelectStub, ButtonStub, WorkspacePickerStub]},
     });
     TestBed.overrideComponent(ChatEmptyStateComponent, {
       set: {styleUrl: undefined, styleUrls: []},
@@ -145,13 +156,11 @@ describe('ChatEmptyStateComponent variants', () => {
   it('renders recovery controls without navigating away from retained messages', () => {
     const root = render({
       variant: 'recovery', suggestions: [], connectorsEnabled: true,
-      datasourceCount: 1, workspaceBackend: '',
+      datasourceCount: 1,
     });
     expect(root.querySelector('[data-testid="draft-recovery"]')).not.toBeNull();
     expect(root.querySelector('input[type="checkbox"]')).not.toBeNull();
-    const select = root.querySelector('select');
-    expect(select).not.toBeNull();
-    expect(Array.from(select!.options).map(o => o.value)).toEqual(['', 'virtual', 'sandbox', 'vm', 'none']);
+    expect(root.querySelector('app-workspace-picker')).not.toBeNull();
     expect(root.querySelector('.draft-retry button')?.textContent).toContain('Retry sending');
     expect(text(root)).toContain('Your messages have not been sent');
     expect(root.querySelector('.draft-advanced')).toBeNull();
@@ -162,7 +171,7 @@ describe('ChatEmptyStateComponent variants', () => {
     const root = render({
       variant: 'recovery', suggestions: [], connectorsError: true,
     });
-    expect(root.querySelector('select')).not.toBeNull();
+    expect(root.querySelector('app-workspace-picker')).not.toBeNull();
     expect(root.querySelector<HTMLInputElement>('input[type="checkbox"]')?.disabled).toBe(false);
     expect(root.querySelector<HTMLButtonElement>('.draft-retry button')?.disabled).toBe(true);
     expect(root.querySelector('.draft-connectors-error button')).not.toBeNull();

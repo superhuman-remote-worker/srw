@@ -136,6 +136,10 @@ import {
   TtsLibraryFilters,
   TtsLibrarySetting,
 } from '../models/tts-voices';
+import {
+  ManifestApplyResult, WorkspaceBinding, WorkspaceTemplateDocument, WorkspaceTemplateItem,
+  WorkspaceTemplateItems, WorkspaceTemplateSpec,
+} from '../models/workspace-template.model';
 import {environment} from '../environment';
 
 /**
@@ -2057,7 +2061,7 @@ export class ApiService {
      * Same deadline and same silent-null contract as the thread read.
      */
     previewToolGroups(body: {
-        workspace?: Record<string, unknown> | null;
+        workspace?: WorkspaceBinding;
         workspace_preference?: 'none' | 'virtual' | 'sandbox' | 'vm' | null;
         config_name?: string | null;
         expert_id?: string | null;
@@ -2614,6 +2618,46 @@ export class ApiService {
     return this.http
       .get<WorkspaceTemplateList>(`${this.baseUrl}/resources`, {params})
       .pipe(catchError(() => of({resources: []})));
+  }
+
+  /** The Workspaces list's variant of `listWorkspaceTemplates`: errors reach the
+   *  caller, so one unreadable scope shows its own error instead of an empty group. */
+  listWorkspaceTemplatesStrict(scopeKind: string, scopeName: string): Observable<WorkspaceTemplateItems> {
+    const params = new HttpParams()
+      .set('scope_kind', scopeKind)
+      .set('scope_name', scopeName)
+      .set('kind', 'WorkspaceTemplate');
+    return this.http.get<WorkspaceTemplateItems>(`${this.baseUrl}/resources`, {params});
+  }
+
+  getResource(uid: string): Observable<WorkspaceTemplateItem> {
+    return this.http.get<WorkspaceTemplateItem>(`${this.baseUrl}/resources/${uid}`);
+  }
+
+  /** Creates or replaces a resource. An update must send the version it read,
+   *  keyed `Kind/ScopeKind/ScopeName/name`; a stale one gets 409. */
+  applyManifest(
+    document: WorkspaceTemplateDocument,
+    expectedVersions?: Record<string, number>,
+  ): Observable<ManifestApplyResult> {
+    const body: Record<string, unknown> = {source: JSON.stringify(document), format: 'json'};
+    if (expectedVersions && Object.keys(expectedVersions).length) body['expected_versions'] = expectedVersions;
+    return this.http.post<ManifestApplyResult>(`${this.baseUrl}/manifests/apply`, body);
+  }
+
+  deleteResource(uid: string, expectedVersion: number): Observable<{deleted: boolean; uid: string}> {
+    const params = new HttpParams().set('expected_version', String(expectedVersion));
+    return this.http.delete<{deleted: boolean; uid: string}>(`${this.baseUrl}/resources/${uid}`, {params});
+  }
+
+  /** Runs a recipe through the same selection admission uses (A1/A2b), so the
+   *  editor sees admission's 422 for fields the manifest preview accepts. */
+  checkWorkspaceRecipe(spec: WorkspaceTemplateSpec, projectId: string | null): Observable<unknown> {
+    return this.http.post(`${this.baseUrl}/persistent/tool-groups/preview`, {
+      expert_type: 'worker',
+      workspace: {template: {inline: spec}},
+      project_id: projectId,
+    });
   }
 
   /** The same PATCH with failures flattened to `null`. Nothing calls it today —
