@@ -1246,8 +1246,9 @@ not start a model turn or authorize workspace cleanup.
 
 For key rotation, configure both old and new public keys on all verifying
 participants before changing the gateway signer. Retain the old public key
-through the 30-second proof lifetime and check that running participants have
-received the new set before removing it.
+through the 30-second proof lifetime plus the five-second clock allowance after
+its last use. Check that running participants have received the new set before
+removing it.
 
 | Value | Why it has no default |
 |---|---|
