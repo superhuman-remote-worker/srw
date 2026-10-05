@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from uuid import UUID, uuid4
+from uuid import UUID, NAMESPACE_URL, uuid4, uuid5
 
 import asyncpg
 
@@ -16,6 +16,8 @@ from tests.test_completion_finalizer_real_postgres import (
 from tests.test_vm_remote_operation_real_postgres import _vm_identity
 from tests._previous_release_seed import seed_previous_release_row
 from orchestrator.services.job_completion_commands import accept_completion_command
+from orchestrator.services.vm_creation_request import build_vm_creation_request
+from shared.vm_creation_retry import canonical_request_digest
 from shared.workspace_contract import workspace_runtime_authority_digest
 from shared.worker_queue import record_worker_bundle_authorized
 
@@ -40,18 +42,6 @@ async def seed(pg, *, proof=True, lane="stateless", manifest=None, repository=No
         {"required_deliverables": manifest} if manifest is not None else {}
     )
     reserved_job_id = uuid4()
-    if repository is not None:
-        from tests.test_managed_repository_authority_real_postgres import _reserve
-        from tests.test_completion_finalizer_real_postgres import _pool_db
-
-        repository_db = _pool_db(pg)
-        authority = await _reserve(
-            repository_db, repo_name=repository, authority_id=reserved_job_id
-        )
-        assert await repository_db.activate_managed_repository_authority(
-            str(authority["id"]), forge_key_id=91, access_mode="write"
-        )
-        admitted_context["git_remote_url"] = authority["clean_repo_url"]
     context = {**admitted_context, "vm": vm}
     config = {"workspace": {"backend": "vm"}}
     policy = {"agent": {"autonomy": "guided", "verification": {"enabled": True}}}
@@ -63,15 +53,32 @@ async def seed(pg, *, proof=True, lane="stateless", manifest=None, repository=No
                 f"idle-completion-{uuid4()}",
             )
         job_id = await conn.fetchval(
-            "INSERT INTO jobs(description,status,execution_lane,assigned_agent_id,resolved_config,context,id,repo_name) "
-            "VALUES('idle acceptance','processing',$1,$2,$3::jsonb,$4::jsonb,$5,$6) RETURNING id",
+            "INSERT INTO jobs(description,status,execution_lane,assigned_agent_id,resolved_config,context,id) "
+            "VALUES('idle acceptance','processing',$1,$2,$3::jsonb,$4::jsonb,$5) RETURNING id",
             lane,
             agent,
             json.dumps(policy),
             json.dumps(admitted_context),
             reserved_job_id,
-            repository,
         )
+    if repository is not None:
+        from tests.test_managed_repository_authority_real_postgres import _reserve
+        from tests.test_completion_finalizer_real_postgres import _pool_db
+
+        repository_db = _pool_db(pg)
+        authority = await _reserve(
+            repository_db, repo_name=repository, authority_id=job_id
+        )
+        assert await repository_db.activate_managed_repository_authority(
+            str(authority["id"]), forge_key_id=91, access_mode="write"
+        )
+        assert await repository_db.bind_job_managed_repository(
+            str(job_id), repo_name=repository,
+            clean_url=authority["clean_repo_url"],
+        )
+        admitted_context["git_remote_url"] = authority["clean_repo_url"]
+        context["git_remote_url"] = authority["clean_repo_url"]
+    async with pg.acquire() as conn:
         await seed_previous_release_row(
             conn,
             "jobs",
@@ -81,6 +88,45 @@ async def seed(pg, *, proof=True, lane="stateless", manifest=None, repository=No
             json.dumps(config),
         )
         if lane == "stateless":
+            # Authorization now requires a succeeded immutable creation source
+            # for this exact VM generation and retained disk, not just ready
+            # coordinates in mutable Job context.
+            execution_id, request_id, admission_id = uuid4(), uuid4(), uuid4()
+            request = build_vm_creation_request(
+                job_id=str(job_id), provision_generation=vm["provision_generation"],
+                agent_config="worker_base", vm_image="pinned:image",
+                cpu_cores=2, memory="2Gi", description="idle acceptance",
+                network_tier="restricted",
+            )
+            await conn.execute(
+                "INSERT INTO srw_execution_specs "
+                "(id,work_kind,work_id,document,resolved,revision,harness_adapter) "
+                "VALUES($1,'Job',$2,'{}','{}','revision-1','srw/v1')",
+                execution_id, job_id,
+            )
+            await conn.execute(
+                "INSERT INTO vm_workspace_cleanup_admissions "
+                "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,"
+                "completed_at,outcome) VALUES($1,'job',$2,$3,'controller_vm_create',"
+                "$4,$5,clock_timestamp(),'adopted')",
+                admission_id, job_id, UUID(vm["rootdisk_pvc_uid"]),
+                uuid5(NAMESPACE_URL, f"vm-create:{request_id}"),
+                "sha256:" + "a" * 64,
+            )
+            await conn.execute(
+                "INSERT INTO vm_creation_retries "
+                "(request_id,job_id,provision_generation,origin,request_digest,"
+                "canonical_request,controller_configuration_digest,execution_id,"
+                "execution_revision,execution_generation,admission_deadline,"
+                "creation_admission_id,state,observed_vm_uid,observed_pvc_uid,"
+                "resolved_at) VALUES($1,$2,$3,'initial',$4,$5::jsonb,$6,$7,"
+                "'revision-1',1,clock_timestamp()+interval '1 hour',$8,"
+                "'succeeded',$9,$10,clock_timestamp())",
+                request_id, job_id, UUID(vm["provision_generation"]),
+                canonical_request_digest(request), json.dumps(request),
+                "sha256:" + "a" * 64, execution_id, admission_id,
+                UUID(vm["vm_uid"]), UUID(vm["rootdisk_pvc_uid"]),
+            )
             await conn.execute(
                 "INSERT INTO run_queue(unit_id,unit_kind,state,lease_token,leased_by,last_leased_by,"
                 "leased_until,attempts_since_completion,input_seq,consumed_seq) "

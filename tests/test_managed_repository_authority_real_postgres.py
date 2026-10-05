@@ -119,7 +119,7 @@ async def _reserve(db: PostgresDB, *, repo_name: str, authority_id: UUID) -> dic
 
 @pytest.mark.asyncio
 async def test_concurrent_reservation_has_one_encrypted_authority_generation(db):
-    job_id = uuid4()
+    job_id = UUID(str((await db.create_job("concurrent repository reservation"))["id"]))
     repo_name = f"job-{str(job_id)[:8]}"
 
     first, second = await asyncio.gather(
@@ -863,7 +863,8 @@ async def test_read_only_jobs_repository_cannot_receive_or_substitute_write_auth
 
 @pytest.mark.asyncio
 async def test_creation_intent_is_concurrent_exact_scope_and_mode_identity(db):
-    job_id = uuid4()
+    job_id = UUID(str((await db.create_job("concurrent repository intent"))["id"]))
+    other_job_id = UUID(str((await db.create_job("foreign repository intent"))["id"]))
     repo_name = f"job-{str(job_id)[:8]}"
     kwargs = {
         "repository_owner": "srw",
@@ -881,7 +882,7 @@ async def test_creation_intent_is_concurrent_exact_scope_and_mode_identity(db):
     assert first["intent_marker"] == second["intent_marker"]
     with pytest.raises(RuntimeError):
         await db.reserve_managed_repository_creation_intent(
-            **{**kwargs, "authority_id": str(uuid4())}
+            **{**kwargs, "authority_id": str(other_job_id)}
         )
     with pytest.raises(RuntimeError):
         await db.reserve_managed_repository_creation_intent(
@@ -1460,7 +1461,7 @@ async def test_ambiguous_historical_repository_scope_is_not_guessed(db):
 
 @pytest.mark.asyncio
 async def test_revocation_contains_key_before_owner_cleanup(db):
-    job_id = uuid4()
+    job_id = UUID(str((await db.create_job("repository revocation"))["id"]))
     repo_name = f"job-{str(job_id)[:8]}"
     reserved = await _reserve(db, repo_name=repo_name, authority_id=job_id)
     await db.activate_managed_repository_authority(
