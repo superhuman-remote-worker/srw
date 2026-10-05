@@ -187,6 +187,7 @@ def test_default_orchestrator_is_untouched(default_docs: list[dict]) -> None:
     container = _container(orchestrator, "orchestrator")
     assert "SSH_GATEWAY_PUBLIC_HOST_KEYS" not in _env(container)
     assert "SSH_GATEWAY_HOSTNAME" not in _env(container)
+    assert "AGENT_SSH_GATEWAY_HOST_KEY_SECRET" not in _env(container)
     volumes = orchestrator["spec"]["template"]["spec"].get("volumes", [])
     assert not [v for v in volumes if "ssh-gateway" in v["name"]]
 
@@ -416,11 +417,12 @@ def test_host_key_env_is_appended_after_the_existing_orchestrator_env(
     end leaves every pre-existing index where it was.
     """
     names = [entry["name"] for entry in _container(orchestrator, "orchestrator")["env"]]
-    assert names[-4:] == [
+    assert names[-5:] == [
         "SSH_GATEWAY_PUBLIC_HOST_KEYS",
         "SSH_GATEWAY_HOSTNAME",
         "WORKSPACE_BUILTIN_TEMPLATES",
         "WORKSPACE_DEFAULTS",
+        "AGENT_SSH_GATEWAY_HOST_KEY_SECRET",
     ]
 
 

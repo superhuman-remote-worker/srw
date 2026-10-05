@@ -1169,20 +1169,22 @@ sshGateway:
   #
   # This Secret must carry, for every name in `hostKeyNames` below, BOTH the
   # private half (`<name>`, mounted into the gateway) and its public half
-  # (`<name>.pub`, mounted into the ORCHESTRATOR, which is where
-  # `GET /api/ssh/host-keys` runs). Without the `.pub` halves that endpoint
-  # answers 200 with an empty list forever and pinning clients silently
-  # degrade to trust-on-first-use.
+  # (`<name>.pub`, projected into the ORCHESTRATOR for host-key publication
+  # and into pinned agents for native first-use proof verification). Without
+  # the `.pub` halves, the publication endpoint answers 200 with an empty
+  # list forever and pinning clients silently degrade to trust-on-first-use.
   hostKeySecret: ""
-  # -- Host-key names inside `hostKeySecret`. ONE list drives all four
+  # -- Host-key names inside `hostKeySecret`. ONE list drives
   # derived things — the gateway's `SSH_GATEWAY_HOST_KEYS`, the orchestrator's
-  # `SSH_GATEWAY_PUBLIC_HOST_KEYS`, and both pods' projected `items` — because
+  # `SSH_GATEWAY_PUBLIC_HOST_KEYS`, all public-only projections, and the
+  # provisioner's selected item names — because
   # when the served and the published key sets drift, clients see a host-key
   # mismatch indistinguishable from an active MITM.
   #
-  # Ed25519 ONLY. `_require_ed25519_host_key` (ssh_gateway_config.py) raises on
-  # any algorithm that is not `ssh-ed25519` at `load_config`, so an RSA host
-  # key means the gateway refuses to start; a server's advertised host-key
+  # At most four unique, safe names; the key material must be Ed25519.
+  # `_require_ed25519_host_key`
+  # (ssh_gateway_config.py) raises on any non-Ed25519 key at `load_config`,
+  # so an RSA host key means the gateway refuses to start; a server's host-key
   # algorithms come straight from the loaded key material, and an RSA key drags
   # in legacy SHA-1 `ssh-rsa`.
   hostKeyNames:

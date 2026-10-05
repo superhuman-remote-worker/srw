@@ -17,6 +17,7 @@ Docker Compose mode is unaffected — agents use the static container pool.
 import asyncio
 import logging
 import os
+import re
 import shlex
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -59,6 +60,43 @@ from orchestrator.services.session_runtime_admission import (
 )
 
 logger = logging.getLogger(__name__)
+
+_SSH_GATEWAY_PUBLIC_HOST_KEY_DIR = "/run/secrets/ssh-gateway/host"
+_SSH_GATEWAY_PUBLIC_HOST_KEY_PATTERN = re.compile(
+    rf"{re.escape(_SSH_GATEWAY_PUBLIC_HOST_KEY_DIR)}/"
+    r"([A-Za-z0-9._-]{1,253})\.pub"
+)
+
+
+def _agent_gateway_public_key_config() -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    """Resolve the public-only gateway key projection for provisioned Pods."""
+    secret_metadata = os.environ.get("AGENT_SSH_GATEWAY_HOST_KEY_SECRET", "")
+    path_list = os.environ.get("SSH_GATEWAY_PUBLIC_HOST_KEYS", "")
+    if not secret_metadata and not path_list:
+        return "", (), ()
+    secret_name = secret_metadata.strip()
+    paths = tuple(path_list.split(","))
+    names: list[str] = []
+    for path in paths:
+        match = _SSH_GATEWAY_PUBLIC_HOST_KEY_PATTERN.fullmatch(path)
+        if match is None:
+            raise ValueError(
+                "SSH_GATEWAY_PUBLIC_HOST_KEYS must contain only absolute public .pub paths"
+            )
+        name = match.group(1)
+        if (
+            name in {".", ".."}
+            or name.endswith(".pub")
+            or re.search(r"(?i)(rsa|ecdsa|dss|dsa)", name)
+        ):
+            raise ValueError("SSH_GATEWAY_PUBLIC_HOST_KEYS has an invalid key basename")
+        names.append(f"{name}.pub")
+    if not secret_name or not 1 <= len(names) <= 4 or len(set(names)) != len(names):
+        raise ValueError(
+            "SSH_GATEWAY_PUBLIC_HOST_KEYS requires a Secret and one to four unique .pub paths"
+        )
+    return secret_name, paths, tuple(names)
+
 
 # Must exceed the executor's 120s shutdown/abort budget plus local backend and
 # durable claimant-ACK drain. A shorter Kubernetes grace can SIGKILL the only
@@ -380,6 +418,11 @@ class AgentProvisioner:
         self._ssh_secret_name: str = os.environ.get(
             "WORKSPACE_SSH_SECRET", "vm-ssh-key"
         )
+        (
+            self._gateway_host_key_secret,
+            self._gateway_public_host_key_paths,
+            self._gateway_public_host_key_names,
+        ) = _agent_gateway_public_key_config()
         # Durable /workspace for SESSION agent pods. Gated on the SAME flag,
         # size and storage class as workspace PVCs (ContainerProvisioner) so a
         # cluster has one storage switch, not two. Off (the default) → the
@@ -3110,6 +3153,22 @@ class AgentProvisioner:
             },
         ]
 
+        gateway_paths = getattr(self, "_gateway_public_host_key_paths", ())
+        if gateway_paths:
+            containers[0]["env"].append(
+                {
+                    "name": "SSH_GATEWAY_PUBLIC_HOST_KEYS",
+                    "value": ",".join(gateway_paths),
+                }
+            )
+            containers[0]["volumeMounts"].append(
+                {
+                    "name": "ssh-gateway-host-keys",
+                    "mountPath": _SSH_GATEWAY_PUBLIC_HOST_KEY_DIR,
+                    "readOnly": True,
+                }
+            )
+
         if purpose == "session" and thread_id:
             # Kubelet runs preStop before SIGTERM. Fence the next paid turn in
             # the shell, even while Python/HTTP drain startup is delayed. Match
@@ -3161,6 +3220,20 @@ class AgentProvisioner:
             },
             {"name": "home-srw", "emptyDir": {"sizeLimit": "512Mi"}},
         ]
+        if gateway_paths:
+            volumes.append(
+                {
+                    "name": "ssh-gateway-host-keys",
+                    "secret": {
+                        "secretName": self._gateway_host_key_secret,
+                        "defaultMode": 0o444,
+                        "items": [
+                            {"key": name, "path": name}
+                            for name in self._gateway_public_host_key_names
+                        ],
+                    },
+                }
+            )
 
         if self._tailscale_enabled and self._headscale_url:
             tailscale_args = (

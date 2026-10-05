@@ -1639,9 +1639,18 @@ Emits nothing.
 {{- if empty $gw.hostKeyNames -}}
 {{- fail "sshGateway.enabled requires a non-empty sshGateway.hostKeyNames; with no names neither the gateway's SSH_GATEWAY_HOST_KEYS nor the orchestrator's SSH_GATEWAY_PUBLIC_HOST_KEYS has anything to point at" -}}
 {{- end -}}
+{{- if gt (len $gw.hostKeyNames) 4 -}}
+{{- fail "sshGateway.hostKeyNames accepts at most four Ed25519 keys for native proof verification" -}}
+{{- end -}}
+{{- if ne (len (uniq $gw.hostKeyNames)) (len $gw.hostKeyNames) -}}
+{{- fail "sshGateway.hostKeyNames must not contain duplicate keys" -}}
+{{- end -}}
 {{- range $gw.hostKeyNames -}}
 {{- if regexMatch "(?i)(rsa|ecdsa|dss|dsa)" . -}}
 {{- fail (printf "sshGateway.hostKeyNames entry %q is not an Ed25519 host key. _require_ed25519_host_key (services/ssh_gateway_config.py) raises on any algorithm that is not ssh-ed25519, so the gateway would refuse to start -- a crash-loop three files away from this value. Use ssh_host_ed25519_key. (Naming-convention tripwire only; the load-time check is the real enforcement.)" .) -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[A-Za-z0-9._-]{1,253}$" .)) (eq . ".") (eq . "..") (hasSuffix ".pub" .) -}}
+{{- fail (printf "sshGateway.hostKeyNames entry %q must be a safe Secret key basename without a .pub suffix" .) -}}
 {{- end -}}
 {{- end -}}
 {{- if eq (trim $gw.userCaSecret) "" -}}
