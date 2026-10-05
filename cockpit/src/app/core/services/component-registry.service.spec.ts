@@ -56,10 +56,11 @@ describe('ComponentRegistryService.loadComponent', () => {
     expect(load).toHaveBeenCalledTimes(2);
   });
 
-  it('drops the cache when a type is registered again', async () => {
+  it('drops only the re-registered type\'s cache', async () => {
     const registry = new ComponentRegistryService();
+    const loadB = vi.fn(() => Promise.resolve(B as Type<unknown>));
     registry.register(meta(TYPE_A, () => Promise.resolve(A)));
-    registry.register(meta(TYPE_B, () => Promise.resolve(B)));
+    registry.register(meta(TYPE_B, loadB));
     await registry.loadComponent(TYPE_A);
     await registry.loadComponent(TYPE_B);
 
@@ -67,5 +68,6 @@ describe('ComponentRegistryService.loadComponent', () => {
 
     await expect(registry.loadComponent(TYPE_A)).resolves.toBe(B);
     await expect(registry.loadComponent(TYPE_B)).resolves.toBe(B);
+    expect(loadB).toHaveBeenCalledTimes(1);
   });
 });

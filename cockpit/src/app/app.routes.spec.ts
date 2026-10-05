@@ -153,18 +153,34 @@ describe('app.routes — workspace templates (Slice A3)', () => {
 describe('app.routes — lazy pages', () => {
   // The landing page IS ChatPageComponent, so it is in the initial bundle
   // anyway; sessions/:threadId reuses it rather than adding an async hop.
-  const EAGER_PATHS = ['', 'sessions/:threadId'];
+  const EAGER_TOP_LEVEL_PATHS = ['', 'sessions/:threadId'];
 
   const walk = (list: Route[]): Route[] => list.flatMap((r) => [r, ...walk(r.children ?? [])]);
   const all = walk(routes);
 
+  // Only a top-level route may carry `component`, and only the two Chat routes.
+  const eagerOffenders = (tree: Route[]): string[] =>
+    walk(tree)
+      .filter((r) => r.component)
+      .filter((r) => !(tree.includes(r) && EAGER_TOP_LEVEL_PATHS.includes(r.path ?? '\0') && r.component === ChatPageComponent))
+      .map((r) => r.path ?? '(pathless)');
+
   it('gives only the landing page and the session view an eager component', () => {
-    const eager = all.filter((r) => r.component).map((r) => r.path);
-    const unexpected = eager.filter((p) => !EAGER_PATHS.includes(p ?? ''));
-    expect(unexpected, `routes with an eager component: ${unexpected.join(', ')}`).toEqual([]);
+    const offenders = eagerOffenders(routes);
+    expect(offenders, `routes with an eager component: ${offenders.join(', ')}`).toEqual([]);
   });
 
-  it.each(EAGER_PATHS)("renders '%s' with ChatPageComponent", (path) => {
+  it('flags eager components that hide behind a reused path, a pathless route or nesting', () => {
+    const synthetic: Route[] = [
+      {path: '', component: ChatPageComponent},
+      {path: 'x', children: [{path: '', component: ChatPageComponent}]},
+      {component: ChatPageComponent, children: []},
+      {path: 'sessions/:threadId', component: class Other {}},
+    ];
+    expect(eagerOffenders(synthetic)).toEqual(['', '(pathless)', 'sessions/:threadId']);
+  });
+
+  it.each(EAGER_TOP_LEVEL_PATHS)("renders '%s' with ChatPageComponent", (path) => {
     expect(routes.find((r) => r.path === path)?.component).toBe(ChatPageComponent);
   });
 
