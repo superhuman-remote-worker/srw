@@ -18,6 +18,7 @@ from fastapi import HTTPException
 from typing_extensions import NotRequired, TypedDict
 
 from shared.operator_pause_hold import operator_pause_hold_present
+from orchestrator.database.postgres import JobVMAuditNotReady
 from orchestrator.services.manifest_runtime_ownership import (
     require_srw_runtime,
     uses_srw_runtime,
@@ -406,6 +407,11 @@ class JobControlOperations:
                     else "Job deleted. This job had no durable backlog-ticket claim."
                 ),
             }
+        except JobVMAuditNotReady as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="VM Job terminal audit authority is incomplete; retry deletion",
+            ) from exc
         except HTTPException:
             raise
         except Exception as exc:

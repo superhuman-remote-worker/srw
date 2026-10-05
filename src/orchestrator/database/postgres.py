@@ -37,6 +37,10 @@ from typing import (
 )
 from uuid import UUID, uuid4
 
+
+class JobVMAuditNotReady(RuntimeError):
+    """Final Job deletion lacks an exact terminal VM audit disposition."""
+
 from shared.helm_provenance import provenance_from_breadcrumb
 from shared.credential_connectors import CredentialConnectorAttachedError
 
@@ -4597,6 +4601,186 @@ class PostgresDB:
         )
         return result
 
+    @staticmethod
+    async def _capture_vm_job_delete_audit(
+        conn: Any, job_id: UUID, *, status: str, deletion_reason: str,
+    ) -> None:
+        """Freeze every typed generation and cascaded terminal field before Delete."""
+        owner = await conn.fetchrow(
+            "SELECT * FROM vm_job_creation_owners WHERE job_id=$1 FOR UPDATE",
+            job_id,
+        )
+        if owner is None:
+            if await conn.fetchval(
+                "SELECT jsonb_typeof(context->'vm')='object' "
+                "AND context->'vm'<>'{}'::jsonb FROM jobs WHERE id=$1",
+                job_id,
+            ):
+                raise JobVMAuditNotReady(
+                    "VM Job has no classifiable creation source history"
+                )
+            return
+        if owner["live_job_id"] != job_id or owner["deleted_at"] is not None:
+            raise JobVMAuditNotReady("VM Job audit owner is already retired")
+        if status not in {"completed", "cancelled", "failed"}:
+            raise JobVMAuditNotReady("VM Job is not terminal")
+        if await conn.fetchval(
+            "SELECT execution_lane='stateless' FROM jobs WHERE id=$1", job_id,
+        ):
+            if not await conn.fetchval(
+                "SELECT state='done' FROM run_queue WHERE unit_id=$1 "
+                "AND unit_kind='worker_batch'", job_id,
+            ) or not await conn.fetchval(
+                "SELECT context->'_stateless_delete_pending'='true'::jsonb "
+                "FROM jobs WHERE id=$1", job_id,
+            ):
+                raise JobVMAuditNotReady("VM Job worker queue is not closed")
+        if await conn.fetchval(
+            f"SELECT assigned_agent_id IS NOT NULL OR "
+            f"({_completion_control_active_sql('context')}) OR "
+            "context ? '_job_terminal_vm_cleanup' OR "
+            "COALESCE(context->'vm'->>'status','') NOT IN ('deleted','') "
+            "FROM jobs WHERE id=$1", job_id,
+        ):
+            raise JobVMAuditNotReady("VM Job still has active workspace authority")
+        if await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE current_job_id=$1)", job_id,
+        ):
+            raise JobVMAuditNotReady("VM Job still has an agent writer")
+        if await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM vm_workspace_recoveries WHERE owner_kind='job' "
+            "AND owner_id=$1 AND resolved_at IS NULL) OR "
+            "EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs WHERE job_id=$1 "
+            "AND resolved_at IS NULL) OR "
+            "EXISTS(SELECT 1 FROM vm_idle_access_leases WHERE owner_kind='job' "
+            "AND owner_id=$1 AND closed_at IS NULL) OR "
+            "EXISTS(SELECT 1 FROM vm_idle_operations WHERE owner_kind='job' "
+            "AND owner_id=$1 AND closed_at IS NULL) OR "
+            "EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
+            "WHERE owner_kind='job' AND owner_id=$1 AND completed_at IS NULL)",
+            job_id,
+        ):
+            raise JobVMAuditNotReady("VM Job cleanup or access remains open")
+        await conn.fetch(
+            "SELECT id FROM vm_workspace_cleanup_admissions "
+            "WHERE owner_kind='job' AND owner_id=$1 ORDER BY id FOR SHARE", job_id,
+        )
+        retries = await conn.fetch(
+            "SELECT request_id,provision_generation FROM vm_creation_retries "
+            "WHERE owner_kind='job' AND job_id=$1 ORDER BY request_id FOR SHARE",
+            job_id,
+        )
+        if not retries:
+            raise JobVMAuditNotReady("VM Job audit owner has no source")
+        request_ids = [row["request_id"] for row in retries]
+        await conn.fetch(
+            "SELECT effect_nonce FROM vm_creation_effects WHERE request_id=ANY($1::uuid[]) "
+            "ORDER BY effect_nonce FOR SHARE", request_ids,
+        )
+        await conn.fetch(
+            "SELECT id FROM vm_resource_reservations WHERE request_id=ANY($1::uuid[]) "
+            "ORDER BY id FOR SHARE", request_ids,
+        )
+        await conn.fetch(
+            "SELECT request_id FROM vm_resource_waiters WHERE request_id=ANY($1::uuid[]) "
+            "ORDER BY request_id FOR SHARE", request_ids,
+        )
+        await conn.fetch(
+            "SELECT reservation_id FROM vm_resource_cleanup_stop_receipts "
+            "WHERE job_id=$1 ORDER BY reservation_id FOR SHARE", job_id,
+        )
+        await conn.fetch(
+            "SELECT reservation_id,ordinal FROM vm_resource_recovery_successors "
+            "WHERE owner_id=$1 ORDER BY reservation_id,ordinal FOR SHARE", job_id,
+        )
+        attempts = await conn.fetch(
+            "SELECT to_jsonb(attempt) AS evidence FROM worker_batch_attempts attempt "
+            "WHERE job_id=$1 "
+            "ORDER BY lease_token FOR SHARE", job_id,
+        )
+        recoveries = await conn.fetch(
+            "SELECT to_jsonb(recovery) - 'prior_control_reference' "
+            "- 'prior_freeze_reference' AS evidence "
+            "FROM vm_workspace_recovery_jobs recovery "
+            "WHERE job_id=$1 ORDER BY recovery_id FOR SHARE", job_id,
+        )
+        await conn.fetch(
+            "SELECT id FROM srw_execution_specs WHERE work_kind='Job' AND work_id=$1 "
+            "ORDER BY id FOR SHARE", job_id,
+        )
+        await conn.fetch(
+            "SELECT revision.execution_id,revision.generation "
+            "FROM srw_execution_spec_revisions revision "
+            "JOIN srw_execution_specs execution ON execution.id=revision.execution_id "
+            "WHERE execution.work_kind='Job' AND execution.work_id=$1 "
+            "ORDER BY revision.execution_id,revision.generation FOR SHARE OF revision",
+            job_id,
+        )
+        await conn.fetch(
+            "SELECT attempt.execution_id,attempt.attempt "
+            "FROM srw_execution_attempts attempt "
+            "JOIN srw_execution_specs execution ON execution.id=attempt.execution_id "
+            "WHERE execution.work_kind='Job' AND execution.work_id=$1 "
+            "ORDER BY attempt.execution_id,attempt.attempt FOR SHARE OF attempt",
+            job_id,
+        )
+        await conn.fetch(
+            "SELECT binding.execution_id,binding.instance_id "
+            "FROM srw_execution_workspace_bindings binding "
+            "JOIN srw_execution_specs execution ON execution.id=binding.execution_id "
+            "WHERE execution.work_kind='Job' AND execution.work_id=$1 "
+            "ORDER BY binding.execution_id,binding.instance_id FOR SHARE OF binding",
+            job_id,
+        )
+        await conn.fetch(
+            "SELECT instance.id FROM srw_workspace_instances instance "
+            "JOIN srw_execution_workspace_bindings binding ON binding.instance_id=instance.id "
+            "JOIN srw_execution_specs execution ON execution.id=binding.execution_id "
+            "WHERE execution.work_kind='Job' AND execution.work_id=$1 "
+            "ORDER BY instance.id FOR SHARE OF instance", job_id,
+        )
+        packets: list[dict[str, Any]] = []
+        for retry in retries:
+            raw = await conn.fetchval(
+                "SELECT vm_job_terminal_packet_evidence($1)", retry["request_id"],
+            )
+            if raw is None:
+                raise JobVMAuditNotReady(
+                    f"VM Job generation {retry['provision_generation']} has no exact terminal proof"
+                )
+            packet = json.loads(raw) if isinstance(raw, str) else raw
+            packets.append(packet)
+            await conn.execute(
+                "INSERT INTO vm_job_creation_terminal_packets "
+                "(request_id,job_id,provision_generation,terminal_kind,cleanup_admission_id,evidence) "
+                "VALUES($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT(request_id) DO NOTHING",
+                retry["request_id"], job_id, retry["provision_generation"],
+                packet["kind"], UUID(packet["cleanup_admission_id"]),
+                json.dumps(packet),
+            )
+        receipt = {
+            "version": 1,
+            "job_id": str(job_id),
+            "status": status,
+            "deletion_reason": deletion_reason,
+            "generations": packets,
+            "worker_attempts": [
+                json.loads(a["evidence"]) if isinstance(a["evidence"], str)
+                else a["evidence"] for a in attempts
+            ],
+            "workspace_recoveries": [
+                json.loads(r["evidence"]) if isinstance(r["evidence"], str)
+                else r["evidence"] for r in recoveries
+            ],
+        }
+        result = await conn.execute(
+            "UPDATE vm_job_creation_owners SET deleted_at=transaction_timestamp(),"
+            "deletion_receipt=$2::jsonb WHERE job_id=$1 AND live_job_id=$1 "
+            "AND deleted_at IS NULL", job_id, json.dumps(receipt),
+        )
+        if result != "UPDATE 1":
+            raise JobVMAuditNotReady("VM Job audit tombstone changed")
+
     async def delete_job(
         self,
         job_id: str,
@@ -4664,6 +4848,30 @@ class PostgresDB:
                     "SELECT pg_advisory_xact_lock(hashtext($1))",
                     "srw-docker-workspace-pool",
                 )
+                # Cleanup takes VM owner/PVC advisory locks before the Job
+                # row. Join that order before final deletion locks the owner.
+                if await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_job_creation_owners WHERE job_id=$1)",
+                    uuid_val,
+                ):
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                        f"workspace-recovery:job:{uuid_val}",
+                    )
+                    pvc_rows = await conn.fetch(
+                        "SELECT DISTINCT pvc_uid FROM ("
+                        "SELECT observed_pvc_uid AS pvc_uid FROM vm_creation_retries "
+                        "WHERE owner_kind='job' AND job_id=$1 UNION "
+                        "SELECT pvc_uid FROM vm_workspace_cleanup_admissions "
+                        "WHERE owner_kind='job' AND owner_id=$1) s "
+                        "WHERE pvc_uid IS NOT NULL ORDER BY pvc_uid",
+                        uuid_val,
+                    )
+                    for pvc in pvc_rows:
+                        await conn.execute(
+                            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                            f"workspace-recovery-pvc:{pvc['pvc_uid']}",
+                        )
                 if prepared_stateless:
                     # Preserve both global lock orders: worker lifecycle is
                     # queue -> jobs, while Docker lease transitions are
@@ -4717,6 +4925,10 @@ class PostgresDB:
                     )
 
                     require_srw_runtime(deleting_job)
+                    await self._capture_vm_job_delete_audit(
+                        conn, uuid_val, status=str(deleting_job["status"]),
+                        deletion_reason=str(deletion_reason or "database_delete"),
+                    )
                     # Deletion is never a release. This update and the jobs
                     # DELETE share the transaction, so a fault cannot leave an
                     # audit tombstone for a job row that survived (or erase the

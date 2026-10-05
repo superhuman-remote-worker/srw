@@ -1396,7 +1396,7 @@ async def test_idle_charge_requires_persisted_exact_operation_before_teardown(db
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stop_case", [
-    "exact", "flag_off", "partial_unknown", "wrong_successor", "logical_delete",
+    "exact", "exact_completed", "flag_off", "partial_unknown", "wrong_successor", "logical_delete",
     "lost_response", "missing_process_zero", "native_release_without_receipt",
 ])
 async def test_public_delete_settles_adopted_charge_only_with_exact_cleanup_stop(
@@ -1564,6 +1564,22 @@ async def test_public_delete_settles_adopted_charge_only_with_exact_cleanup_stop
             "DELETE FROM vm_resource_cleanup_stop_receipts WHERE reservation_id=$1",
             UUID(admitted["reservation_id"]),
         )
+    if stop_case in {"exact", "exact_completed"}:
+        terminal_status = "completed" if stop_case == "exact_completed" else "cancelled"
+        await db.execute(
+            "UPDATE jobs SET status=$2,"
+            "context=jsonb_set(context,'{vm,status}','\"deleted\"'::jsonb,true) "
+            "WHERE id=$1", retry["job_id"], terminal_status,
+        )
+        assert await db.delete_job(str(retry["job_id"]))
+        assert await db.fetchval(
+            "SELECT live_job_id IS NULL AND deleted_at IS NOT NULL "
+            "FROM vm_job_creation_owners WHERE job_id=$1", retry["job_id"],
+        )
+        assert await db.fetchval(
+            "SELECT terminal_kind FROM vm_job_creation_terminal_packets "
+            "WHERE request_id=$1", retry["request_id"],
+        ) == "physical_stop"
 
 
 @pytest.mark.asyncio

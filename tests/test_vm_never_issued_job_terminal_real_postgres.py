@@ -12,6 +12,14 @@ import asyncpg
 import pytest
 
 from orchestrator.database.migrate import discover, run_migrations
+from orchestrator.database.postgres import JobVMAuditNotReady
+from orchestrator.security import crypto
+from orchestrator.services.managed_repository_authority import (
+    create_managed_repository,
+    ensure_managed_repository_authority,
+    revoke_managed_repository_authority,
+    revoke_and_delete_managed_repository,
+)
 from orchestrator.services import thread_retirement
 from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
 from orchestrator.services.vm_provisioner import (
@@ -50,6 +58,251 @@ from tests.test_vm_resource_whole_store_real_postgres import (
 )
 
 db = _db_fixture
+
+
+async def _bind_own_created_repository(db, job_id, *, key_generation=3, intent_generation=7):
+    """Install the same durable own pair that root provisioning binds before VM use."""
+    repo_name = f"job-{str(job_id)[:8]}"
+    remote = f"http://gitea:3000/srw/{repo_name}.git"
+    async with db.acquire() as conn, conn.transaction():
+        intent_id = await conn.fetchval(
+            "INSERT INTO managed_repository_creation_intents "
+            "(repository_owner,repo_name,authority_kind,authority_id,access_mode,"
+            "generation,status,repository_created_at) "
+            "VALUES('srw',$1,'job',$2,'write',$3,'created',now()) RETURNING id",
+            repo_name, job_id, intent_generation,
+        )
+        authority_id = await conn.fetchval(
+            "INSERT INTO managed_repository_authorities "
+            "(repository_owner,repo_name,authority_kind,authority_id,access_mode,"
+            "creation_intent_id,generation,clean_repo_url,public_key,"
+            "public_key_fingerprint,private_key_ciphertext,forge_key_id,status,activated_at) "
+            "VALUES('srw',$1,'job',$2,'write',$3,$4,$5,'ssh-ed25519 test',"
+            "'SHA256:test','v1:test',91,'active',now()) RETURNING id",
+            repo_name, job_id, intent_id, key_generation, remote,
+        )
+    assert await db.bind_job_managed_repository(
+        str(job_id), repo_name=repo_name, clean_url=remote,
+    )
+    return authority_id, intent_id
+
+
+@pytest.mark.asyncio
+async def test_own_created_repository_never_issued_cancel_settles_and_keeps_pair(
+    db, monkeypatch,
+):
+    retry, recovery, _ = await never_issued_cancel(db, monkeypatch)
+    owner = retry["job_id"]
+    authority_id, intent_id = await _bind_own_created_repository(db, owner)
+    archive, _ = actual_archive(db, recovery, monkeypatch)
+    assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
+        str(owner), timeout_seconds=0,
+    )
+    pair = await db.fetchrow(
+        "SELECT a.id AS authority_id,a.generation AS key_generation,a.status AS key_status,"
+        "i.id AS intent_id,i.generation AS intent_generation,i.status AS intent_status "
+        "FROM managed_repository_authorities a JOIN managed_repository_creation_intents i "
+        "ON i.id=a.creation_intent_id WHERE a.authority_id=$1", owner,
+    )
+    assert pair["authority_id"] == authority_id
+    assert pair["intent_id"] == intent_id
+    assert (pair["key_generation"], pair["intent_generation"]) == (3, 7)
+    assert (pair["key_status"], pair["intent_status"]) == ("active", "created")
+
+
+@pytest.mark.asyncio
+async def test_normal_repository_provisioning_cancel_resume_cancel_keeps_own_pair(
+    db, monkeypatch,
+):
+    monkeypatch.setenv("APP_ENCRYPTION_KEY", "M" * 32)
+    crypto.reset_cipher_cache()
+    retry, recovery, _ = await never_issued_cancel(db, monkeypatch)
+    owner = retry["job_id"]
+    repo_name = f"job-{str(owner)[:8]}"
+    remote = f"http://gitea:3000/srw/{repo_name}.git"
+    gitea = SimpleNamespace(
+        repository_owner="srw",
+        create_repo=AsyncMock(return_value=remote),
+        clean_repo_url=lambda name: f"http://gitea:3000/srw/{name}.git",
+        ensure_repo_deploy_key=AsyncMock(side_effect=[91, 92]),
+        probe_repo_deploy_key=AsyncMock(return_value=True),
+        delete_repo_deploy_key=AsyncMock(return_value=True),
+        delete_repo=AsyncMock(return_value=True),
+    )
+    try:
+        created_url, intent = await create_managed_repository(
+            db, gitea, repo_name=repo_name, authority_kind="job",
+            authority_id=str(owner), project_id=None, access_mode="write",
+        )
+        authority = await ensure_managed_repository_authority(
+            db, gitea, repo_name=repo_name, authority_kind="job",
+            authority_id=str(owner), access_mode="write",
+            creation_intent_id=str(intent["id"]),
+        )
+        assert created_url == remote and authority["status"] == "active"
+        assert await db.bind_job_managed_repository(
+            str(owner), repo_name=repo_name, clean_url=remote,
+        )
+        assert await revoke_managed_repository_authority(db, gitea, repo_name)
+        authority = await ensure_managed_repository_authority(
+            db, gitea, repo_name=repo_name, authority_kind="job",
+            authority_id=str(owner), access_mode="write",
+            creation_intent_id=str(intent["id"]),
+        )
+        assert authority["generation"] == 2
+        assert intent["generation"] == 1
+        archive, _ = actual_archive(db, recovery, monkeypatch)
+        assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
+            str(owner), timeout_seconds=0,
+        )
+        assert await db.queue_stateless_job_for_resume(
+            str(owner), expected_status="cancelled",
+        )
+        policy, _, _, _ = await environment(db)
+        second, recovery, _ = await normal_never_issued_generation(
+            db, monkeypatch, owner=owner, policy=policy,
+        )
+        archive, _ = actual_archive(db, recovery, monkeypatch)
+        assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
+            str(owner), timeout_seconds=0,
+        )
+        assert second["provision_generation"] != retry["provision_generation"]
+        assert await db.fetchval(
+            "SELECT count(*) FROM managed_repository_authorities WHERE id=$1 "
+            "AND status='active' AND creation_intent_id=$2",
+            authority["id"], intent["id"],
+        ) == 1
+        assert await revoke_and_delete_managed_repository(db, gitea, repo_name)
+        assert await db.prepare_stateless_job_for_delete(str(owner))
+        assert await db.delete_job(str(owner), prepared_stateless=True)
+        assert await db.fetchval(
+            "SELECT count(*) FROM vm_job_creation_terminal_packets WHERE job_id=$1",
+            owner,
+        ) == 2
+    finally:
+        crypto.reset_cipher_cache()
+
+
+@pytest.mark.asyncio
+async def test_final_delete_retains_never_issued_vm_source_and_terminal_receipt(
+    db, monkeypatch,
+):
+    retry, recovery, _ = await never_issued_cancel(db, monkeypatch)
+    owner = retry["job_id"]
+    archive, _ = actual_archive(db, recovery, monkeypatch)
+    assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
+        str(owner), timeout_seconds=0,
+    )
+    assert await db.prepare_stateless_job_for_delete(str(owner))
+    result = await db.delete_job(
+        str(owner), prepared_stateless=True,
+        deletion_reason="authorized_api_delete", return_claim_state=True,
+    )
+    assert result["deleted"] is True
+    assert await db.fetchval("SELECT count(*) FROM jobs WHERE id=$1", owner) == 0
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_creation_retries WHERE job_id=$1", owner,
+    ) == 1
+    audit = await db.fetchrow(
+        "SELECT live_job_id,deleted_at,deletion_receipt FROM vm_job_creation_owners "
+        "WHERE job_id=$1", owner,
+    )
+    assert audit["live_job_id"] is None and audit["deleted_at"]
+    packet = json.loads(audit["deletion_receipt"])
+    assert packet["job_id"] == str(owner)
+    assert packet["generations"][0]["request_id"] == str(retry["request_id"])
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.execute(
+            "UPDATE vm_creation_retries SET reason='changed' WHERE request_id=$1",
+            retry["request_id"],
+        )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.execute(
+            "INSERT INTO jobs(id,description,status) VALUES($1,'reused','created')",
+            owner,
+        )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.execute(
+            "INSERT INTO vm_workspace_cleanup_admissions "
+            "(id,owner_kind,owner_id,source,request_id,intent_digest) "
+            "VALUES($1,'job',$2,'late_cleanup',$3,'sha256:late')",
+            uuid4(), owner, uuid4(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_final_delete_rollback_keeps_live_audit_link_and_no_packets(
+    db, monkeypatch,
+):
+    retry, recovery, _ = await never_issued_cancel(db, monkeypatch)
+    owner = retry["job_id"]
+    archive, _ = actual_archive(db, recovery, monkeypatch)
+    assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
+        str(owner), timeout_seconds=0,
+    )
+    child = uuid4()
+    await db.execute(
+        "INSERT INTO jobs(id,parent_job_id,description,status) "
+        "VALUES($1,$2,'blocking child','created')", child, owner,
+    )
+    assert await db.prepare_stateless_job_for_delete(str(owner))
+    with pytest.raises(asyncpg.ForeignKeyViolationError):
+        await db.delete_job(str(owner), prepared_stateless=True)
+    audit = await db.fetchrow(
+        "SELECT live_job_id,deleted_at,deletion_receipt FROM vm_job_creation_owners "
+        "WHERE job_id=$1", owner,
+    )
+    assert audit["live_job_id"] == owner
+    assert audit["deleted_at"] is None and audit["deletion_receipt"] is None
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_job_creation_terminal_packets WHERE job_id=$1",
+        owner,
+    ) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("contradiction", ["unpaired", "wrong_remote", "bundle_delivered"])
+async def test_repository_pair_needs_exact_undelivered_history(
+    db, monkeypatch, contradiction,
+):
+    retry, recovery, _ = await never_issued_cancel(db, monkeypatch)
+    owner = retry["job_id"]
+    authority_id, _ = await _bind_own_created_repository(db, owner)
+    if contradiction == "unpaired":
+        await db.execute(
+            "UPDATE managed_repository_authorities SET creation_intent_id=NULL "
+            "WHERE id=$1", authority_id,
+        )
+    elif contradiction == "wrong_remote":
+        await db.execute(
+            "UPDATE managed_repository_authorities SET clean_repo_url=$2 WHERE id=$1",
+            authority_id, "http://gitea:3000/srw/other.git",
+        )
+    else:
+        await db.execute(
+            "INSERT INTO worker_batch_attempts(job_id,lease_token,claimed_attempt,"
+            "bundle_authorized_at,authority_digest) "
+            "VALUES($1,991,1,now(),'sha256:delivered')", owner,
+        )
+    archive, _ = actual_archive(db, recovery, monkeypatch)
+    assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
+        str(owner), timeout_seconds=0,
+    ) is False
+    assert await db.fetchval("SELECT count(*) FROM jobs WHERE id=$1", owner) == 1
+
+
+@pytest.mark.asyncio
+async def test_vm_job_without_source_history_stays_live_on_final_delete(db):
+    owner = uuid4()
+    await db.execute(
+        "INSERT INTO jobs(id,description,status,context) VALUES "
+        "($1,'legacy unknown VM','cancelled',"
+        "jsonb_build_object('vm',jsonb_build_object('status','deleted'))) ",
+        owner,
+    )
+    with pytest.raises(JobVMAuditNotReady):
+        await db.delete_job(str(owner))
+    assert await db.fetchval("SELECT count(*) FROM jobs WHERE id=$1", owner) == 1
 
 
 @pytest.mark.asyncio

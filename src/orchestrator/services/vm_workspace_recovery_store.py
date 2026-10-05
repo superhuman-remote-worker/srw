@@ -2130,6 +2130,36 @@ class VMWorkspaceRecoveryStore:
                 "FROM srw_execution_specs WHERE work_kind='Job' AND work_id=$1 "
                 "FOR SHARE", owner_id,
             )
+            # The source predicate below is about every generation. Block
+            # mutations of existing child evidence while it is evaluated;
+            # 0327's INSERT guards serialize rows without a Job FK with the
+            # locked owner, including repository and execution writers.
+            await conn.fetch(
+                "SELECT lease_token FROM worker_batch_attempts WHERE job_id=$1 "
+                "ORDER BY lease_token FOR SHARE", owner_id,
+            )
+            await conn.fetch(
+                "SELECT id FROM managed_repository_creation_intents "
+                "WHERE authority_kind='job' AND authority_id=$1 "
+                "ORDER BY id FOR SHARE", owner_id,
+            )
+            await conn.fetch(
+                "SELECT id FROM managed_repository_authorities "
+                "WHERE authority_kind='job' AND authority_id=$1 "
+                "ORDER BY id FOR SHARE", owner_id,
+            )
+            await conn.fetch(
+                "SELECT a.execution_id,a.attempt FROM srw_execution_attempts a "
+                "JOIN srw_execution_specs x ON x.id=a.execution_id "
+                "WHERE x.work_kind='Job' AND x.work_id=$1 "
+                "ORDER BY a.execution_id,a.attempt FOR SHARE OF a", owner_id,
+            )
+            await conn.fetch(
+                "SELECT b.execution_id,b.instance_id FROM srw_execution_workspace_bindings b "
+                "JOIN srw_execution_specs x ON x.id=b.execution_id "
+                "WHERE x.work_kind='Job' AND x.work_id=$1 "
+                "ORDER BY b.execution_id,b.instance_id FOR SHARE OF b", owner_id,
+            )
             context = _json(job["context"]) if job is not None else None
             vm = context.get("vm") if isinstance(context, dict) else None
             try:
