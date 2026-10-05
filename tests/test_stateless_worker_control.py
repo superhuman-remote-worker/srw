@@ -722,6 +722,9 @@ async def test_final_prepared_delete_removes_queue_and_job_atomically():
             return {"execution_lane": "stateless", "delete_pending": True}
         if normalized.startswith("SELECT status, completion_outcome_kind,"):
             return {"status": "created", "completion_outcome_kind": None}
+        if normalized.startswith("SELECT * FROM vm_job_creation_owners WHERE job_id="):
+            # Ordinary stateless Job: no VM retry has created an audit owner.
+            return None
         raise AssertionError(normalized)
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
