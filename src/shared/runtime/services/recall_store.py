@@ -267,6 +267,31 @@ class MemoryRecord:
         )
 
 
+#: Topics the up-front memory summary lists (D35: "about 5-10").
+MEMORY_SUMMARY_MAX_TOPICS = 8
+#: Longer keywords are noise (a sentence the extractor put in the list), not
+#: a topic; the summary skips them.
+MEMORY_SUMMARY_MAX_TOPIC_CHARS = 40
+
+
+@dataclass(frozen=True)
+class MemorySummaryStats:
+    """What a memory scope holds, for the up-front memory summary (D35).
+
+    Only memories retrieval can serve count: currently valid
+    (``valid_to IS NULL``, so superseded rows are out) and at or above the
+    retrieval importance floor. ``by_type`` is ``(memory_type, count)``,
+    largest first, ties by type name; ``topics`` are the most frequent
+    keywords (by how many memories carry them, ties alphabetical, C
+    collation), lowercased and whitespace-collapsed. The same memory set
+    always gives the same stats.
+    """
+
+    total: int = 0
+    by_type: Tuple[Tuple[str, int], ...] = ()
+    topics: Tuple[str, ...] = ()
+
+
 # Sleep between access-stat write retries after a deadlock. Module-level so
 # tests can zero it; length bounds the retry count (len + 1 attempts total).
 _ACCESS_STAT_RETRY_DELAYS = (0.05, 0.15)
@@ -1484,6 +1509,42 @@ class RecallStore:
             blocks.append(cls.format_memory(memory, index, handle=handle))
         return ENTRY_SEPARATOR.join(blocks)
 
+    @staticmethod
+    def render_memory_summary(
+        stats: MemorySummaryStats, model: Optional[str] = None
+    ) -> str:
+        """Body of the up-front memory summary entry (D35).
+
+        One small block: how many memories the scope holds, the count per
+        type, the most frequent topics and a one-line hint to call
+        ``memory_search``. Static text (D11): no timestamps, no per-turn
+        data, so the same stats always render the same bytes. The caller
+        renders it only when ``memory_search`` is bound, since the hint is
+        what the summary is for.
+
+        Returns:
+            The entry body, or "" when the scope holds no memory
+        """
+        if stats.total <= 0:
+            return ""
+
+        from shared.runtime.services.guardrails import format_nudge
+
+        count = (
+            f"{stats.total} memory" if stats.total == 1 else f"{stats.total} memories"
+        )
+        lines = [format_nudge("memory_summary_header", model=model, count=count)]
+        if stats.by_type:
+            lines.append(
+                "By type: "
+                + ", ".join(f"{n} {memory_type}" for memory_type, n in stats.by_type)
+                + "."
+            )
+        if stats.topics:
+            lines.append("Frequent topics: " + ", ".join(stats.topics) + ".")
+        lines.append(format_nudge("memory_summary_hint", model=model))
+        return "\n".join(lines)
+
     @classmethod
     def assemble_memory_block(
         cls,
@@ -1585,3 +1646,64 @@ class RecallStore:
         if row:
             return dict(row)
         return {"total": 0, "total_tokens": 0}
+
+    async def summary_stats(
+        self, *, max_topics: int = MEMORY_SUMMARY_MAX_TOPICS
+    ) -> MemorySummaryStats:
+        """Counts by type and the top topics of the scope (D35), read-only.
+
+        Two aggregate reads over the rows retrieval can serve: in scope
+        (project or job, as every query here), currently valid and at or
+        above ``retrieval_importance_floor``. Nothing is written, not even
+        the access stats a search hit records. Topics are the keywords most
+        memories carry, normalised (lowercase, whitespace collapsed),
+        non-empty and at most :data:`MEMORY_SUMMARY_MAX_TOPIC_CHARS` long;
+        ties break alphabetically in C collation, so the order does not
+        depend on the server's locale.
+        """
+        scope_clause, scope_val = self._scope_where(1)
+        floor = float(self.retrieval_importance_floor)
+        type_rows = await self.db.fetch(
+            f"""
+            SELECT memory_type, COUNT(*) AS n
+            FROM memories
+            WHERE {scope_clause} AND valid_to IS NULL AND importance >= $2
+            GROUP BY memory_type
+            """,
+            scope_val,
+            floor,
+        )
+        counts: Dict[str, int] = {}
+        for row in type_rows:
+            memory_type = row["memory_type"] or DEFAULT_MEMORY_TYPE
+            counts[memory_type] = counts.get(memory_type, 0) + int(row["n"])
+        total = sum(counts.values())
+        if total == 0:
+            return MemorySummaryStats()
+
+        topic_rows = await self.db.fetch(
+            f"""
+            SELECT topic, COUNT(DISTINCT id) AS n
+            FROM (
+                SELECT id,
+                       regexp_replace(lower(btrim(keyword)), '[[:space:]]+', ' ', 'g')
+                           AS topic
+                FROM memories, unnest(keywords) AS keyword
+                WHERE {scope_clause} AND valid_to IS NULL AND importance >= $2
+            ) AS tagged
+            WHERE topic <> '' AND char_length(topic) <= $4
+            GROUP BY topic
+            ORDER BY n DESC, topic COLLATE "C"
+            LIMIT $3
+            """,
+            scope_val,
+            floor,
+            max(0, int(max_topics)),
+            MEMORY_SUMMARY_MAX_TOPIC_CHARS,
+        )
+        by_type = tuple(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+        return MemorySummaryStats(
+            total=total,
+            by_type=by_type,
+            topics=tuple(str(row["topic"]) for row in topic_rows),
+        )

@@ -59,7 +59,9 @@ knowledge-base/knowledge/plans/append_only_context_injection_plan_2026_10_05.md
   last append_only worker request carries each kind the scenario injects the
   expected number of times (memory and guidance exactly once without churn);
   the session's last request holds one App Guide turn boundary per user turn
-  (two), the charter, memory, knowledge and subagent status once each.
+  (two), the charter, memory, knowledge and subagent status once each. Both
+  bind ``memory_search`` with the context sources, so both carry the
+  up-front memory summary (D35) exactly once, read once per run.
   ``todos-only`` and ``control`` carry no context sources, so they run once,
   in the default mode.
 - Asynchronous retrieval (WP3, D6/D8). append_only retrieves memory off the
@@ -297,6 +299,15 @@ def _srw(kind: str) -> str:
     return f'<srw_context kind="{kind}">'
 
 
+def _assert_memory_summary_once(body: object) -> None:
+    """The up-front memory summary (D35) is in the request exactly once:
+    given at conversation start, never again (its read is counted by the
+    runner: once per run)."""
+    topics = "Frequent topics: " + ", ".join(harness.MEMORY_SUMMARY_TOPICS) + "."
+    assert text_occurrences(body, topics) == 1
+    assert text_occurrences(body, "call memory_search") == 1
+
+
 def _assert_appended_once(scenario: str, last: Captured) -> None:
     """Non-vacuity of an append_only worker case: the context is there.
 
@@ -309,6 +320,7 @@ def _assert_appended_once(scenario: str, last: Captured) -> None:
     body = last.body
     churn = SCENARIOS[scenario].get("churn", False)
     expected = {
+        "memory_summary": 1,
         "memory": 3 if churn else 1,
         "knowledge": 2 if churn else 1,
         "citation": 1,
@@ -319,6 +331,7 @@ def _assert_appended_once(scenario: str, last: Captured) -> None:
         assert text_occurrences(body, _srw(kind)) == count, (kind, count)
     guidance_text = harness.GUIDANCE[0]["text"]
     assert text_occurrences(body, guidance_text) == 1
+    _assert_memory_summary_once(body)
     # Nothing of the legacy tail reaches an append_only request.
     assert text_occurrences(body, harness.MEMORY_TEXT) == 0
     assert text_occurrences(body, "[SUPERVISOR GUIDANCE]") == 1
@@ -345,6 +358,7 @@ def _assert_session_appended_once(last: Captured) -> None:
     expected = {
         "turn_boundary": 2,
         "charter": 1,
+        "memory_summary": 1,
         "memory": 1,
         "knowledge": 1,
         "subagents": 1,
@@ -354,6 +368,7 @@ def _assert_session_appended_once(last: Captured) -> None:
     assert text_occurrences(body, "<managed_product_guide_turn_boundary") == 2
     assert text_occurrences(body, harness.CHARTER["content"]) == 1
     assert text_occurrences(body, "<active_subagents>") == 1
+    _assert_memory_summary_once(body)
     for _memory_type, fact in harness.MEMORY_FACTS:
         assert text_occurrences(body, fact) == 1
     # The legacy tail renders memory as one block and the charter and memory

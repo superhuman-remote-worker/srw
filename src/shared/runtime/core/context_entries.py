@@ -72,9 +72,14 @@ FOLDED_KEY = "_srw_folded"
 # Joins a carrier's text and its entries. Part of the prompt-cache contract:
 # changing it costs one cache miss per conversation.
 ENTRY_SEPARATOR = "\n\n"
-# Every kind, in the order one request build appends them.
+# Every kind, in the order one request build appends them. The order only
+# matters within one build (entries of a later build follow the earlier ones
+# on the history). ``memory_summary`` (D35: what project memory holds, plus
+# the memory_search hint) goes in once per conversation like the charter and
+# sits right before the pushed memories it introduces.
 INJECTION_KINDS = (
     "charter",
+    "memory_summary",
     "memory",
     "knowledge",
     "citation",
@@ -85,6 +90,8 @@ INJECTION_KINDS = (
 # Kinds whose entries list per-item keys and hashes (presence by item); the
 # others are tracked by one state hash per section.
 ITEM_KINDS = ("memory", "knowledge", "guidance")
+# The up-front memory summary (D35): its kind and its presence section.
+MEMORY_SUMMARY_KIND = "memory_summary"
 
 # --- The rollback flag (spec §I) ----------------------------------------------
 
@@ -479,6 +486,7 @@ __all__ = [
     "INJECTION_MODE_APPEND_ONLY",
     "INJECTION_MODE_LEGACY",
     "ITEM_KINDS",
+    "MEMORY_SUMMARY_KIND",
     "PERSIST_ROLE_CONTEXT",
     "SCHEMA_VERSION",
     "SRW_INJECTION_KEY",

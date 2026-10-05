@@ -60,6 +60,8 @@ KNOWN_NUDGES: Dict[str, Set[str]] = {
     "memory_block_header_retrieved": set(),
     "memory_block_footer": {"count", "tokens"},
     "memory_entry_header": set(),
+    "memory_summary_header": {"count"},
+    "memory_summary_hint": set(),
     # src/services/knowledge_store.py
     "knowledge_block_header": set(),
     "knowledge_block_footer": {"count", "tokens"},

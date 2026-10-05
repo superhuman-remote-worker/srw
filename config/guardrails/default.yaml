@@ -337,6 +337,15 @@ nudges:
   # this text must carry no per-turn data (no counts, TTLs or token totals).
   memory_entry_header: "Recalled memories from earlier work, as background for the current task (harness context, not a user message):"
 
+  # Sites: RecallStore.render_memory_summary (append-only context injection,
+  # D35). The up-front memory summary: given once per conversation and kept
+  # in the history unchanged, so no per-turn data (its counts are computed
+  # once at conversation start). Placeholders: {count} (e.g. "42 memories").
+  memory_summary_header: "Project memory overview (harness context, not a user message): {count} from earlier jobs and sessions."
+  # The summary's last line; the summary is given only while memory_search is
+  # bound.
+  memory_summary_hint: "Relevant memories arrive on their own as context. To look up anything else from earlier work, such as a past decision, a fix or a preference, call memory_search with a short query."
+
   # ----- src/shared/runtime/services/knowledge_store.py -----
 
   knowledge_block_header: "--- Project Knowledge ---"

@@ -3,7 +3,8 @@
 ``plan_context_entries`` reads presence from the history's own entries and
 appends only what is new or changed: item mode for memory, knowledge and
 guidance; state mode for charter, citation and subagents (with cleared
-renderings, O6); once per turn for the App Guide boundary. The planner is
+renderings, O6); once per conversation for the memory summary (D35,
+append-if-absent); once per turn for the App Guide boundary. The planner is
 pure and not wired yet, so these tests drive it directly and feed each plan
 back into the history, the way the wiring will.
 """
@@ -69,6 +70,11 @@ SUBAGENTS = (
     "Reports push automatically as evidence; do not poll.\n</active_subagents>"
 )
 BOUNDARY = "<managed_product_guide_turn_boundary>\nReturn to the request.\n</managed_product_guide_turn_boundary>"
+SUMMARY = (
+    "Project memory overview (harness context, not a user message): 3 memories "
+    "from earlier jobs and sessions.\nBy type: 2 factual, 1 procedural.\n"
+    "Frequent topics: deploy, release.\nCall memory_search to look up the rest."
+)
 
 
 def mem(n: int, content: str | None = None, **kwargs) -> MemoryRecord:
@@ -516,6 +522,72 @@ class TestCharterState:
         )
 
 
+# --- Once per conversation (D35) -------------------------------------------------
+
+
+class TestMemorySummary:
+    """The up-front memory summary: append-if-absent, never on change."""
+
+    def test_appended_once_then_quiet(self):
+        history = base_history()
+        first = plan(history, ContextSources(memory_summary=SUMMARY))
+        entry = only(first, "memory_summary")
+        assert entry_body(entry) == SUMMARY
+        meta = entry_meta(entry)
+        assert meta["section"] == "memory_summary"
+        assert meta["items"] == []
+        assert meta["hash"] == digest(SUMMARY)
+        history += first.entries
+
+        for _ in range(3):
+            history += [
+                AIMessage(
+                    content="", tool_calls=[{"name": "t", "args": {}, "id": "c1"}]
+                ),
+                ToolMessage(content="out", tool_call_id="c1"),
+            ]
+            assert plan(history, ContextSources(memory_summary=SUMMARY)).entries == []
+
+    def test_a_changed_body_is_never_appended(self):
+        """Counts that moved mid-conversation (or a fresh process that
+        recomputed them) do not re-send it: the summary is static (D35)."""
+        history = base_history()
+        history += plan(history, ContextSources(memory_summary=SUMMARY)).entries
+        grown = SUMMARY.replace("3 memories", "4 memories")
+        assert plan(history, ContextSources(memory_summary=grown)).entries == []
+
+    def test_again_after_compaction_drops_the_entry(self):
+        history = base_history()
+        history += plan(history, ContextSources(memory_summary=SUMMARY)).entries
+        history += [AIMessage(content="done"), HumanMessage(content="next")]
+
+        compacted = _compact(history)
+        again = only(
+            plan(compacted, ContextSources(memory_summary=SUMMARY)), "memory_summary"
+        )
+        assert entry_body(again) == SUMMARY
+
+    def test_nothing_to_summarize_plans_nothing(self):
+        assert plan(base_history(), ContextSources(memory_summary="")).entries == []
+        assert plan(base_history(), ContextSources(memory_summary="  \n")).entries == []
+
+    def test_after_the_charter_and_before_the_memories(self):
+        planned = plan(
+            base_history(),
+            ContextSources(
+                charter=CHARTER, memory_summary=SUMMARY, memory_records=[mem(1)]
+            ),
+        )
+        assert kinds(planned) == ["charter", "memory_summary", "memory"]
+
+    def test_a_session_entry_carries_the_turn(self):
+        entry = only(
+            plan(base_history(), ContextSources(memory_summary=SUMMARY, turn=2)),
+            "memory_summary",
+        )
+        assert entry_meta(entry)["turn"] == 2
+
+
 # --- Once per turn ----------------------------------------------------------------
 
 
@@ -627,6 +699,7 @@ class TestGuidance:
 def _all_sources(turn: int = 4) -> ContextSources:
     return ContextSources(
         charter=CHARTER,
+        memory_summary=SUMMARY,
         memory_records=[mem(1), mem(2)],
         knowledge_records=[note("n1", "kb body")],
         failed_citations=[citation("c1")],

@@ -61,6 +61,8 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
+from shared.tool_catalog.names import MEMORY_SEARCH_TOOL_NAME
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE_DIR = Path(__file__).resolve().parent / "fixtures" / "chat_templates"
 WORKER_CONFIG_PATH = str(REPO_ROOT / "config" / "worker_base.yaml")
@@ -721,6 +723,35 @@ def knowledge_records(*, churn: bool = False, call: int = 0) -> List[Any]:
     ]
 
 
+#: The project-memory statistics behind the up-front memory summary (D35),
+#: consistent with ``MEMORY_FACTS``.
+MEMORY_SUMMARY_TOPICS = ("release", "workspace")
+
+
+class SummaryStatsStore:
+    """The recall store behind the memory summary: fixed stats, counted reads.
+
+    The summary is loaded once per conversation runtime (D35), so a run
+    reads it once; ``calls`` lets a runner check that.
+    """
+
+    def __init__(self, stats: Any = None) -> None:
+        self.stats = stats
+        self.calls = 0
+
+    async def summary_stats(self, **_kwargs: Any) -> Any:
+        from shared.runtime.services.recall_store import MemorySummaryStats
+
+        self.calls += 1
+        if self.stats is not None:
+            return self.stats
+        return MemorySummaryStats(
+            total=len(MEMORY_FACTS),
+            by_type=tuple((memory_type, 1) for memory_type, _ in MEMORY_FACTS),
+            topics=MEMORY_SUMMARY_TOPICS,
+        )
+
+
 class RecordingMemoryManager:
     """MemoryManager seam stub with a memory + knowledge payload.
 
@@ -737,11 +768,17 @@ class RecordingMemoryManager:
     request plans from its own payload, as the synchronous path did. With
     ``lag=1`` it finishes only once the next request is being built: its
     result reaches the request after the one that started it (D6, D8).
+
+    ``runtime.recall_store`` answers the memory summary's read (D35); the
+    summary is given only where ``memory_search`` is bound too.
     """
 
     def __init__(self, *, churn: bool = False, lag: int = 0) -> None:
         self.churn = churn
         self.lag = lag
+        self.runtime = SimpleNamespace(
+            recall_store=SummaryStatsStore(), retrieval_timeout=None
+        )
         self.assemble_requests: List[Any] = []
         self.captures: List[Any] = []
         self.payload = self._payload(0)
@@ -907,6 +944,7 @@ async def run_worker_scenario(
     churn: bool = False,
     injection_mode: str = "legacy",
     memory_lag: int = 0,
+    memory_search: bool = True,
 ) -> List[Captured]:
     """Run the tactical tool loop through ``create_execute_node``.
 
@@ -934,7 +972,9 @@ async def run_worker_scenario(
     late an append_only retrieval result arrives (``RecordingMemoryManager``).
     Supervisor guidance is pending on two consecutive requests, as the
     heartbeat inbox keeps an entry until the ack lands;
-    ``delivered_guidance_ids`` is carried into state.
+    ``delivered_guidance_ids`` is carried into state. ``memory_search``
+    binds the memory tool with the context sources, which brings the
+    up-front memory summary (D35) in append_only mode.
     """
     from shared.runtime.core.loader import create_llm, load_agent_config
     from shared.runtime.services.guardrails import format_nudge
@@ -995,8 +1035,13 @@ async def run_worker_scenario(
 
     memory_service = None
     guidance_turns: set[int] = set()
+    tool_names: Optional[List[str]] = None
     if context_on:
         memory_service = RecordingMemoryManager(churn=churn, lag=memory_lag)
+        if memory_search:
+            tool_names = [t["function"]["name"] for t in WORKER_TOOLS] + [
+                MEMORY_SEARCH_TOOL_NAME
+            ]
         ctx.citation_engine = SimpleNamespace(
             list_citations=AsyncMock(return_value=[_failed_citation()])
         )
@@ -1017,7 +1062,7 @@ async def run_worker_scenario(
         auxiliary_llm=MagicMock(),
         summarization_prompt="summarize",
         tool_context=ctx,
-        tool_names=None,
+        tool_names=tool_names,
         memory_service=memory_service,
     )
     state: Dict[str, Any] = {
@@ -1081,9 +1126,28 @@ async def run_worker_scenario(
         raise AssertionError("the Layer-0 emergency rebuild did not run")
     if context_on and memory_service.assemble_requests == []:
         raise AssertionError("the memory seam was never consulted")
+    _check_summary_reads(memory_service, injection_mode, tool_names or ())
     if todos_on and todo.all_complete() is not True:
         raise AssertionError("the scripted todo changes did not run")
     return provider.requests
+
+
+def _check_summary_reads(
+    memory_service: Optional[RecordingMemoryManager],
+    injection_mode: str,
+    tool_names: Any,
+) -> None:
+    """The memory summary is read once per run where it applies, else never."""
+    if memory_service is None:
+        return
+    expected = int(
+        injection_mode == "append_only" and MEMORY_SEARCH_TOOL_NAME in tool_names
+    )
+    calls = memory_service.runtime.recall_store.calls
+    if calls != expected:
+        raise AssertionError(
+            f"memory summary read {calls} time(s), expected {expected}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1150,6 +1214,7 @@ async def run_session_scenario(
     monkeypatch: Any,
     injection_mode: str = "legacy",
     memory_lag: int = 0,
+    memory_search: bool = True,
 ) -> List[Captured]:
     """Two user turns through the real ``run_persistent_loop`` (astream path).
 
@@ -1160,7 +1225,9 @@ async def run_session_scenario(
     payload's ``InjectionBlock.records`` (memory and knowledge) with
     ``memory.max_memories_per_entry = 5`` and appends each kind once (the
     turn boundary once per user turn). ``memory_lag=1`` makes the turn-one
-    retrieval finish only when turn two starts its own.
+    retrieval finish only when turn two starts its own. ``memory_search``
+    binds the memory tool with the context sources, which brings the
+    up-front memory summary (D35) in append_only mode.
     """
     injections = "context" in sources
     import asyncio
@@ -1205,17 +1272,21 @@ async def run_session_scenario(
     )
     tool_context = SimpleNamespace(knowledge_bindings=[], citation_engine=None)
     kwargs: Dict[str, Any] = {}
+    memory_service: Optional[RecordingMemoryManager] = None
     if injections:
         tool_context.subagent_runtime = SimpleNamespace(
             active_subagents_block=lambda: ACTIVE_SUBAGENTS
         )
         knowledge_store = MagicMock()
         knowledge_store.get_charter_note = AsyncMock(return_value=CHARTER)
+        memory_service = RecordingMemoryManager(lag=memory_lag)
         kwargs = {
-            "memory_service": RecordingMemoryManager(lag=memory_lag),
+            "memory_service": memory_service,
             "knowledge_store": knowledge_store,
             "project_ids": [PROJECT_ID],
         }
+        if memory_search:
+            tools.append(_session_tool(MEMORY_SEARCH_TOOL_NAME))
 
     await run_persistent_loop(
         llm_with_tools=llm_with_tools,
@@ -1232,6 +1303,7 @@ async def run_session_scenario(
     )
     if errors:
         raise AssertionError(f"session turn reported errors: {errors}")
+    _check_summary_reads(memory_service, injection_mode, [tool.name for tool in tools])
     if len(provider.requests) != len(SESSION_SCRIPT):
         raise AssertionError(
             f"expected {len(SESSION_SCRIPT)} requests, got {len(provider.requests)}"

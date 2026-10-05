@@ -11,7 +11,7 @@ history once, as typed entries (``shared.runtime.core.context_entries``),
 and appended again only when it changes. :func:`plan_context_entries` decides
 what to append: it reads what the history already holds
 (:func:`scan_presence`, the entries' own metadata, D3) and compares it with
-what the sources hold now. Three modes:
+what the sources hold now. Four modes:
 
 - **item** (memory, knowledge, guidance): an item whose ``(kind, key)`` is
   absent is new; present with another hash it is changed and rendered with
@@ -23,6 +23,10 @@ what the sources hold now. Three modes:
   compared with the hash of the current rendering. A cleared state appends
   the cleared rendering once (O6); an absent section with an empty state
   appends nothing.
+- **once per conversation** (memory_summary, D35): appended while its
+  section is absent, i.e. at conversation start and again after a
+  compaction removed it, never because its body changed: the summary is
+  static for the conversation.
 - **once per turn** (turn_boundary): one entry per session turn (D22).
 
 Presence is read from the history *after* compaction, so whatever
@@ -55,6 +59,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 
 from shared.runtime.core.context_entries import (
     INJECTION_KINDS,
+    MEMORY_SUMMARY_KIND,
     digest,
     entry_meta,
     is_append_only,
@@ -240,6 +245,9 @@ class ContextSources:
 
     - ``charter``: the rendered charter block ("" when there is none; a
       charter has no cleared rendering).
+    - ``memory_summary``: the up-front memory summary (D35), loaded once per
+      conversation (``agent.core.memory_summary``); "" when there is none
+      or the history already holds it.
     - ``memory_records``: memory rows in rank order (``InjectionBlock.records``
       of kind memory, or the legacy ``recall_store.retrieve`` list).
     - ``knowledge_records``, ``knowledge_bindings``, ``external_watermarks``:
@@ -256,6 +264,7 @@ class ContextSources:
     """
 
     charter: str = ""
+    memory_summary: str = ""
     memory_records: Sequence[Any] = ()
     knowledge_records: Sequence[Any] = ()
     knowledge_bindings: Optional[Sequence[Any]] = None
@@ -464,6 +473,29 @@ def _plan_charter(
     )
 
 
+def _plan_memory_summary(
+    sources: ContextSources, presence: Presence
+) -> Optional[HumanMessage]:
+    """Once per conversation (D35): append the summary while it is absent.
+
+    Append-if-absent, never on change: the summary is computed once at
+    conversation start and stays as it was (D11). A body that differs from
+    the one in the history (memory grew, or a fresh process recomputed it)
+    appends nothing; only a compaction that removed the entry makes it
+    absent, and then the current body goes in again (D21).
+    """
+    body = (sources.memory_summary or "").strip()
+    if not body or MEMORY_SUMMARY_KIND in presence.sections:
+        return None
+    return make_context_entry(
+        MEMORY_SUMMARY_KIND,
+        body,
+        section=MEMORY_SUMMARY_KIND,
+        state_hash=digest(body),
+        turn=sources.turn,
+    )
+
+
 def _plan_citation(
     sources: ContextSources,
     presence: Presence,
@@ -566,6 +598,7 @@ def plan_context_entries(
     planned = Planned()
     planners: Dict[str, Callable[[], Optional[HumanMessage]]] = {
         "charter": lambda: _plan_charter(sources, presence),
+        "memory_summary": lambda: _plan_memory_summary(sources, presence),
         "memory": lambda: _plan_memory(
             sources, presence, planned, model=model, max_memories=max_memories
         ),

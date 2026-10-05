@@ -44,6 +44,10 @@ from agent.core.context_injection import (
     max_memories_per_entry,
     plan_context_entries,
 )
+from agent.core.memory_summary import (
+    conversation_memory_summary,
+    memory_summary_enabled,
+)
 from shared.runtime.core.context_entries import (
     entry_kind,
     fold_context_entries,
@@ -2673,6 +2677,20 @@ async def _execute_turn(
                 e,
             )
 
+    # The up-front memory summary (D35): loaded once per session runtime,
+    # only with memory_search bound, and not at all while the (restored)
+    # history holds it; append_only only.
+    memory_summary = ""
+    if append_only and memory_summary_enabled(memory_service, tool_map):
+        if _provider_admission_closed():
+            return _closed_result()
+        memory_summary = await conversation_memory_summary(
+            memory_service,
+            messages,
+            tool_names=tool_map,
+            model=getattr(config.llm, "model", None),
+        )
+
     # append_only (WP2 spec §C): the turn-start payload as the planner's
     # input. Every provider call of the turn plans against it after
     # compaction, so what a compaction evicted is appended again (D4, D21)
@@ -2680,6 +2698,7 @@ async def _execute_turn(
     # call, as the legacy tail read it. Sessions carry no supervisor guidance.
     context_sources = ContextSources(
         charter=charter_block,
+        memory_summary=memory_summary,
         memory_records=memory_records,
         knowledge_records=knowledge_records,
         knowledge_bindings=knowledge_bindings,

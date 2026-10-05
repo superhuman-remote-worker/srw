@@ -150,6 +150,7 @@ class TestSchema:
     def test_kinds_are_the_append_order(self):
         assert INJECTION_KINDS == (
             "charter",
+            "memory_summary",
             "memory",
             "knowledge",
             "citation",

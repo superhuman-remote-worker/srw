@@ -83,6 +83,7 @@ from agent.core.context_injection import (
     max_memories_per_entry,
     plan_context_entries,
 )
+from agent.core.memory_summary import conversation_memory_summary
 from shared.runtime.core.context_entries import (
     entry_kind,
     fold_context_entries,
@@ -1589,8 +1590,20 @@ def create_execute_node(
         # append_only (WP2 spec §C): what the harness holds now, as the
         # planner's input. Planned against the history after every
         # compaction (normal, Layer-1, Layer-0), so whatever a compaction
-        # evicted is absent there and appended again (D4, D21).
+        # evicted is absent there and appended again (D4, D21). The memory
+        # summary (D35) is loaded once per job runtime, only with
+        # memory_search bound, and not at all while the history holds it.
         _context_sources = ContextSources(
+            memory_summary=(
+                await conversation_memory_summary(
+                    memory_service,
+                    messages,
+                    tool_names=tool_names,
+                    model=config.llm.model,
+                )
+                if append_only
+                else ""
+            ),
             memory_records=_memory_records,
             knowledge_records=_knowledge_records,
             knowledge_bindings=_knowledge_bindings,
