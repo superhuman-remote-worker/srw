@@ -11,9 +11,10 @@ This guide links to it instead of repeating it.
 
 ## When to build one
 
-Try a built-in template first. Every installation has `container-minimal` and
-`container-full`, and `vm-full` when your operator has turned VMs on. Their
-contents are listed under
+Try a built-in template first. By default an installation has
+`container-minimal` and `container-full`, and `vm-full` when your operator has
+turned VMs on; an operator can turn the built-ins off with
+`workspace.builtinTemplates.enabled`. Their contents are listed under
 [SRW base images](../examples/manifests/container-workspace-templates.md#srw-base-images).
 
 Build your own image when a base lacks something you need on every run, such as
@@ -37,7 +38,8 @@ SRW release around it. The built-in templates name exactly those images:
 1. Open **Customize → Workspaces**. The **Shared** group lists the built-ins by
    display name: **Container (minimal)** is `container-minimal`, and
    **Container (full)** is `container-full`.
-2. Open the one you want to build on. Its **Image** field shows the full
+2. Open the one you want to build on. The list's Image column leaves out the
+   registry, so open the template: its **Image** field shows the full
    reference, for example
    `ghcr.io/superhuman-remote-worker/srw-workspace-minimal:<tag>`.
 3. Copy the reference. The form is read-only. If your browser won't let you
@@ -91,7 +93,10 @@ Follow three rules:
   only in `srw-workspace`, not in the minimal base.
 - **Don't set `ENTRYPOINT`, `CMD` or `USER`.** The base's entrypoint runs as
   root, starts sshd and keeps the container running. SRW reaches the workspace
-  over SSH, so a container that exits never becomes ready.
+  over SSH, so a container that exits never becomes ready. Replacing
+  `ENTRYPOINT` or `USER` stops the workspace from starting. The entrypoint
+  ignores `CMD`, so a `CMD` does nothing and only misleads whoever reads the
+  Dockerfile.
 - **End with `assert-workspace-contract`.** It checks the programs and settings
   SRW relies on and fails the build when one is missing. The
   [contract table](../examples/manifests/container-workspace-templates.md#images)
@@ -100,7 +105,8 @@ Follow three rules:
 ## 3. Build and check it locally
 
 The commands use Podman. With Docker, write `docker` instead of `podman`; the
-options in this step are the same.
+options in this step are the same, except in the last command: Docker's `rm`
+has no `-t` option and kills at once, so write `docker rm -f workspace-test`.
 
 1. Build the image:
 
@@ -136,8 +142,11 @@ options in this step are the same.
 4. Remove the test container:
 
    ```bash
-   podman rm -f workspace-test
+   podman rm -f -t 0 workspace-test
    ```
+
+   The entrypoint doesn't stop on `SIGTERM`, so without `-t 0` Podman waits 10
+   seconds and then kills it with `SIGKILL`.
 
 ## 4. Push it
 
@@ -170,13 +179,16 @@ the namespace's `default` ServiceAccount or configures the nodes. See "Private
 registries" under
 [Images](../examples/manifests/container-workspace-templates.md#images).
 
-On the local cluster from [Local Kubernetes with k3d](local-kubernetes.md), push
-to `localhost:5005/<name>`. The cluster's nodes reach the same registry as
-`srw-registry:5000`, so the template's reference is
-`srw-registry:5000/<name>@sha256:…`. The other way round, a base reference that
-starts with `srw-registry:5000/` is pulled from your machine as
-`localhost:5005/`. That registry serves plain HTTP: with Podman, add
-`--tls-verify=false` to `podman build` and `podman push`.
+On the local cluster from [Local Kubernetes with k3d](local-kubernetes.md), your
+machine reaches the cluster's registry as `localhost:5005` and the cluster's
+nodes reach it as `srw-registry:5000`:
+
+- In `BASE`, replace `srw-registry:5000/` with `localhost:5005/`.
+- Set `IMAGE` to `localhost:5005/<name>:<tag>`, with a tag.
+- In the template's reference, replace `localhost:5005/` with
+  `srw-registry:5000/`, which gives `srw-registry:5000/<name>@sha256:…`.
+- The registry serves plain HTTP: with Podman, add `--tls-verify=false` to
+  `podman build` and `podman push`.
 
 ## 5. Create the template
 
@@ -193,7 +205,11 @@ In the cockpit:
      can save here.
 4. Leave **Tier** on **Container** and paste your reference into **Image**. A
    notice says that this isn't one of SRW's images; see
-   [When it doesn't start](#when-it-doesnt-start) for what that changes.
+   [When it doesn't start](#when-it-doesnt-start) for what that changes. The
+   image runs with your connector and repository credentials, so use only
+   images whose authors you trust (see "Use images only from authors you
+   trust" under
+   [Images](../examples/manifests/container-workspace-templates.md#images)).
 5. Set **CPU**, **Memory** and **Disk**, or leave them empty for the
    installation's defaults. **Advanced** holds the guaranteed CPU and memory and
    the pull policy.
@@ -245,36 +261,49 @@ project template, write `scope: {kind: Project, name: <project UUID>}`.
 **Try a new image with a Job first.** A Job reports why its image failed and
 cleans up after itself; a Session doesn't. See
 [When a workspace can't start](../examples/manifests/container-workspace-templates.md#when-a-workspace-cant-start).
+To have the trial Job run your tools, give it an Expert with a shell, such as
+**Engineer**: pick it under **Agent Expert** on New Job, or pass
+`expert="engineer"` over MCP.
 
-A Job's IDE terminal runs in a separate pod with the installation's image, so it
-doesn't have your tools; the agent's own shell does. See
+The agent runs your tools through its shell, so only an Expert with a shell can
+use them. The shipped default Expert for Jobs, **General Worker**, has none; a
+Job on it can't run your tools even when the image has them. A Job's IDE
+terminal runs in a separate pod with the installation's image, so it doesn't
+have your tools either. See
 [Known limitations](../examples/manifests/container-workspace-templates.md#known-limitations).
 
 ## When it doesn't start
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| The Job stays **Created**. After the startup limit (Helm `workspace.imagePullTimeoutSeconds`, 600 seconds by default), the Jobs list shows "Workspace needs attention: readiness exceeded its startup boundary." The Job has no error message. | The container exited or never opened SSH, for example because the image replaces the base's `ENTRYPOINT` or `USER`, or isn't built `FROM` an SRW base. SRW doesn't yet report this case with a clearer message. | Rebuild `FROM` a base without those settings, and run step 3 before you push. |
-| The Job fails with "Workspace image `<ref>` could not be pulled: `<reason>`", or the Jobs list shows "Workspace needs attention: its image is invalid." | The reference is wrong, the pull secret is missing, or the nodes can't reach the registry. | Check the reference from step 4 and the registry access. See [When a workspace can't start](../examples/manifests/container-workspace-templates.md#when-a-workspace-cant-start). |
-| `/cloud` is empty; your cloud folder isn't mounted. | Images that aren't SRW's run unprivileged, without the FUSE mount. | Your operator adds your image's repository to `workspace.images.trustedRepositories`, or sets `workspace.customImages.privileged: true`. See [Privilege](../examples/manifests/container-workspace-templates.md#privilege). |
+| The Job stays **Created** and never starts, with no error message. Where your installation reports container startup stages (see below), the Jobs list says "Workspace needs attention: readiness exceeded its startup boundary." once the startup limit has passed: for your own image, `workspace.imagePullTimeoutSeconds` (600 seconds by default). | The container exited or never opened SSH, for example because the image replaces the base's `ENTRYPOINT` or `USER`, or isn't built `FROM` an SRW base. SRW doesn't yet report this case with a clearer message. | Rebuild `FROM` a base without those settings, and run step 3 before you push. |
+| The Job fails with "Workspace image `<ref>` could not be pulled: `<reason>`". Where your installation reports startup stages, the Jobs list says "Workspace needs attention: image pull exceeded its startup boundary." instead, or "Workspace needs attention: its image is invalid." for a malformed reference. | The reference is wrong, the pull secret is missing, or the nodes can't reach the registry. | Check the reference from step 4 and the registry access. See [When a workspace can't start](../examples/manifests/container-workspace-templates.md#when-a-workspace-cant-start). |
+| `/cloud` is empty; your cloud folder isn't mounted. | Images that aren't SRW's run unprivileged, without the FUSE mount. | Your operator adds your image's repository to `workspace.images.trustedRepositories`. `workspace.customImages.privileged: true` gives every custom image that profile, which is one step from root on the node; it suits only an installation that trusts everyone who can author templates. See [Privilege](../examples/manifests/container-workspace-templates.md#privilege). |
 | "command not found" for a tool your Dockerfile installed. | It was installed under `/home/agent-host`, which the workspace volume hides, for example by `pip` or `npm` without unsetting `PIP_TARGET` or `npm_config_prefix`. | Install system-wide, as in step 2. |
 
+Startup stages are reported when the operator enables Helm
+`orchestrator.containerStartupStageAuthority.enabled` (off by default); see
+[Container startup stage rollout](../helm/README.md#container-startup-stage-rollout).
+
 An operator can read a Job's pod status and events with
-`kubectl describe pod workspace-<first 12 characters of the Job ID>` in the
-workspace namespace.
+`kubectl describe pod workspace-<first 12 characters of the Job ID, hyphen included>`
+in the workspace namespace. For example, Job `1ec4b61d-51fc-…` has the pod
+`workspace-1ec4b61d-51f`.
 
 ## VM workspaces
 
-A VM workspace boots a VM disk image, not a container image, so the steps above
-don't apply. To add software to a VM workspace, give a VM template `prepare`
-steps. They run as root in an isolated builder before the VM starts; SRW caches
-the prepared disk and reuses it for later VMs with the same recipe.
+A VM workspace boots a VM disk image (shipped as an OCI image), not a workspace
+container image, so the steps above don't apply. To add software to a VM
+workspace, give a VM template `prepare` steps. They run as root in an isolated
+builder before the VM starts; SRW caches the prepared disk and reuses it for
+later VMs with the same recipe.
 
 Your operator must turn preparation on first: `vmController.preparation.enabled`
-is off by default. Until then, SRW refuses `prepare` steps with "VM workspace
-preparation requires enabled same-cluster hosting." Preparation runs offline
-unless the operator also enables its network, which package downloads such as
-the one below need. See
+is off by default, and it needs VMs in the installation's own cluster
+(`vm.mode: same-cluster`). Until then, SRW refuses `prepare` steps with "VM
+workspace preparation requires enabled same-cluster hosting." Preparation runs
+offline unless the operator also enables its network, which package downloads
+such as the one below need. See
 [Operator setup](../examples/manifests/workspace-preparation.md#operator-setup).
 
 This template is `vm-full` with a C++ toolchain added:
