@@ -27,6 +27,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 
 from shared.runtime.core.loader import (
     LLMConfig,
+    build_auxiliary_llm_config,
     create_llm,
     load_config_from_resolved,
     resolve_model_settings,
@@ -378,18 +379,7 @@ def _build_auxiliary_llm(config: Any) -> AuxiliaryLLM:
         )
 
     model_settings = resolve_model_settings(aux_config.model, config._deployment_dir)
-    llm_config = LLMConfig(
-        model=aux_config.model,
-        base_url=aux_config.base_url,
-        api_key=aux_config.api_key,
-        provider=aux_config.provider,
-        temperature=aux_config.temperature,
-        top_p=model_settings.get("top_p"),
-        top_k=model_settings.get("top_k"),
-        model_max_context_tokens=model_settings.get("model_max_context_tokens"),
-        extra_body=model_settings.get("extra_body"),
-        max_retries=1,
-    )
+    llm_config = build_auxiliary_llm_config(aux_config, model_settings)
     _require_explicit_llm_transport(llm_config, role="auxiliary")
     return AuxiliaryLLM(
         llm=create_llm(llm_config, limits=config.limits),

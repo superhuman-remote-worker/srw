@@ -13,6 +13,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field, fields as dataclass_fields
+from dataclasses import replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -2686,6 +2687,13 @@ class AuxiliaryConfig:
     # pass is one bounded call (src/core/summarizer.py); a hung aux endpoint
     # costs at most this much per attempt, not a single shared 600s blob.
     summarization_call_timeout: float = 240.0
+    # Reasoning level of the dedicated aux model's summarization calls only;
+    # the other tasks keep the client's level. "off" = the family's off switch,
+    # else its lowest effort (resolve_reasoning_plan). None = no separate
+    # client. Reasoning does not make summaries more faithful and can add
+    # hallucinations (compaction refactor Q5,
+    # knowledge-base/knowledge/issues/auxiliary_reasoning_level_not_configurable.md).
+    summarization_reasoning_level: Optional[str] = "off"
     tasks: Dict[str, AuxiliaryTaskConfig] = field(
         default_factory=lambda: {
             "extract_memories": AuxiliaryTaskConfig(enabled=True),
@@ -3229,8 +3237,20 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
         max_iterations=data.get("max_iterations", 15),
         timeout=data.get("timeout", 120.0),
         summarization_call_timeout=data.get("summarization_call_timeout", 240.0),
+        summarization_reasoning_level=_parse_reasoning_level_value(
+            data.get("summarization_reasoning_level", "off")
+        ),
         tasks=tasks,
     )
+
+
+def _parse_reasoning_level_value(value: Any) -> Optional[str]:
+    """A reasoning level from YAML; an unquoted ``off`` arrives as ``False``."""
+    if value is None:
+        return None
+    if value is False:
+        return "off"
+    return str(value)
 
 
 def _parse_process_artifact_patterns(limits_data: Dict[str, Any]) -> List[str]:
@@ -4135,7 +4155,13 @@ def resolve_reasoning_plan(config: "LLMConfig") -> Dict[str, Any]:
         # is applied by the upstream resolution layer, not re-applied here, so an
         # unset level stays unset — this preserves the prior factory gate and
         # keeps non-reasoning fallthrough models from getting an unwanted effort.
-        value = None if (req_l is None or req_l == "none") else requested
+        if req_l == "off":
+            # Thinking off: the family's own "none" when it lists one, else its
+            # lowest effort. Sending nothing is not off — the provider's
+            # default effort applies.
+            value = _clamp_reasoning_level("none", _supported_efforts(cap))
+        else:
+            value = None if (req_l is None or req_l == "none") else requested
         return {
             "method": method,
             "value": value,
@@ -4231,6 +4257,63 @@ def create_llm(
         return _create_codex_llm(config, limits)
     else:
         return _create_openai_llm(config, limits)
+
+
+def build_auxiliary_llm_config(
+    aux: AuxiliaryConfig, model_settings: Dict[str, Any]
+) -> LLMConfig:
+    """The dedicated auxiliary model's ``LLMConfig``, for every site that builds it.
+
+    ``model_settings`` is ``resolve_model_settings(aux.model, ...)``. The
+    ``AuxiliaryConfig`` fields win; the family settings give sampling, window
+    and ``extra_body``. One builder because the sites drifted before: each of
+    ``provider`` and ``extra_headers`` once reached some sites and not others.
+    """
+    return LLMConfig(
+        model=aux.model,
+        base_url=aux.base_url,
+        api_key=aux.api_key,
+        provider=aux.provider,
+        extra_headers=aux.extra_headers,
+        temperature=aux.temperature,
+        top_p=model_settings.get("top_p"),
+        top_k=model_settings.get("top_k"),
+        model_max_context_tokens=model_settings.get("model_max_context_tokens"),
+        extra_body=model_settings.get("extra_body"),
+        max_retries=1,
+    )
+
+
+@dataclass(frozen=True)
+class AuxiliaryClients:
+    """The dedicated auxiliary model's clients (see ``create_auxiliary_llms``)."""
+
+    config: LLMConfig
+    llm: BaseChatModel
+    # Same model at ``auxiliary.summarization_reasoning_level``; None when that
+    # level is unset or equals the main client's.
+    summarization_llm: Optional[BaseChatModel]
+
+
+def create_auxiliary_llms(
+    aux: AuxiliaryConfig,
+    model_settings: Dict[str, Any],
+    limits: Optional[LimitsConfig] = None,
+) -> AuxiliaryClients:
+    """Build the dedicated auxiliary model's client and its summarization client.
+
+    The reasoning level is fixed when a client is built and delivered per
+    family by the factories, so a second level means a second client.
+    """
+    config = build_auxiliary_llm_config(aux, model_settings)
+    llm = create_llm(config, limits=limits)
+    level = aux.summarization_reasoning_level
+    summarization_llm = None
+    if level is not None and level != config.reasoning_level:
+        summarization_llm = create_llm(
+            dataclass_replace(config, reasoning_level=level), limits=limits
+        )
+    return AuxiliaryClients(config=config, llm=llm, summarization_llm=summarization_llm)
 
 
 # Output-token cap policy — see knowledge-base/knowledge/features/reasoning_aware_max_output_tokens.md.
