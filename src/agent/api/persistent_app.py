@@ -25,6 +25,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Sequence,
     Set,
     Tuple,
 )
@@ -8049,13 +8050,24 @@ async def _loop_on_turn_complete_body(
         )
 
 
-def _loop_archive_llm_call(prepared: Any, response: Any, metrics: dict) -> None:
+def _loop_archive_llm_call(
+    prepared: Any,
+    response: Any,
+    metrics: dict,
+    history_messages: Optional[Sequence[Any]] = None,
+) -> None:
     """Audit one main-LLM call to the llm_requests trail, in the background.
 
     Sessions previously wrote no llm_requests at all — job agents were
     auditable, session hangs were not (session_silent_failure_audit.md #14).
     The Mongo insert is synchronous, so it runs in a thread; failures are
     non-fatal by audit-trail contract.
+
+    ``history_messages`` is the request before the carrier fold (append-only
+    context injection, WP2 spec §F.6): ``llm_requests`` keeps ``prepared``,
+    the folded request the provider got, and the chat_history delta reads the
+    history, so a typed context entry is archived as context. None: the
+    delta reads ``prepared``.
     """
     if _session is None or _session_identity.thread_id is None:
         return
@@ -8085,6 +8097,7 @@ def _loop_archive_llm_call(prepared: Any, response: Any, metrics: dict) -> None:
                     "output_tokens": metrics.get("output_tokens"),
                     "cached_tokens": metrics.get("cached_tokens"),
                 },
+                history_messages=history_messages,
             )
         except Exception as e:
             logger.debug(f"llm_requests archive failed (non-fatal): {e}")
@@ -8867,8 +8880,12 @@ def _select_turn_messages(
     exact input id (stateless) or the latest HumanMessage (pinned). A
     stateless walk that finds no anchor reconciles zero rows — the
     incremental writes already hold the turn's content and the DB still
-    mints the boundary — rather than failing the settlement.
+    mints the boundary — rather than failing the settlement. A typed context
+    entry is a HumanMessage too, but never the turn's boundary: the pinned
+    walk saves it with the turn's rows and walks on to the input.
     """
+    from shared.runtime.core.context_entries import is_context_entry
+
     input_id = str(turn_input_message_id) if turn_input_message_id else None
     if authoritative_turn_boundary and any(
         turn_membership(msg) is not None for msg in messages
@@ -8887,10 +8904,10 @@ def _select_turn_messages(
             if str(getattr(msg, "id", "")) == input_id:
                 boundary_found = True
                 break
-        elif hasattr(msg, "type") and msg.type in (
+        elif getattr(msg, "type", None) in (
             "human",
             "HumanMessageChunk",
-        ):
+        ) and not is_context_entry(msg):
             boundary_found = True
             break
         to_save.append(msg)

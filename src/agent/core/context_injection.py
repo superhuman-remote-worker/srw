@@ -29,7 +29,8 @@ compaction evicted is absent and becomes eligible again (D4, D21).
 
 Pure: no I/O, no clock, no counters. The same history and sources always
 give byte-identical entries, and an entry's text carries no per-turn data
-(D11). Not wired into the graphs yet (WP2 sub-steps 2.4 and 2.5).
+(D11). The worker execute node (``graph.py``) and the session loop
+(``persistent_graph.py``) call it in ``append_only`` mode.
 """
 
 from __future__ import annotations
@@ -49,13 +50,14 @@ from typing import (
     Tuple,
 )
 
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from shared.runtime.core.context_entries import (
     INJECTION_KINDS,
     digest,
     entry_meta,
     is_append_only,
+    is_context_entry,
     knowledge_item_key,
     make_context_entry,
     memory_handle,
@@ -164,6 +166,17 @@ def guidance_item(entry: Mapping[str, Any]) -> Item:
 
 
 # --- Sources and plan ---------------------------------------------------------
+
+
+def max_memories_per_entry(config: Any) -> int:
+    """``memory.max_memories_per_entry`` (D29); 5 when the config has none.
+
+    A non-int (a ``MagicMock`` config in a test) reads as the default.
+    """
+    value = getattr(getattr(config, "memory", None), "max_memories_per_entry", None)
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return 5
 
 
 @dataclass
@@ -459,6 +472,21 @@ def _plan_turn_boundary(
     return make_context_entry("turn_boundary", body, section=section, turn=sources.turn)
 
 
+def _ends_in_open_tool_call(messages: Sequence[BaseMessage]) -> bool:
+    """Whether the carrier the entries would follow is an open tool call.
+
+    The carrier is the last non-entry message. An AIMessage with tool calls
+    there has no results yet, and the fold drops anything that sits between
+    a call and its results: entries appended now would count as present in
+    the history but never reach the provider.
+    """
+    for msg in reversed(messages):
+        if is_context_entry(msg):
+            continue
+        return isinstance(msg, AIMessage) and bool(getattr(msg, "tool_calls", None))
+    return False
+
+
 def plan_context_entries(
     messages: Sequence[BaseMessage],
     sources: ContextSources,
@@ -473,8 +501,17 @@ def plan_context_entries(
     ``max_memories`` is ``memory.max_memories_per_entry`` (D29). The result
     lists the entries in ``INJECTION_KINDS`` order. A kind whose renderer
     fails is skipped with a warning, so a broken source never fails the
-    request.
+    request. Nothing is planned while the history ends in a tool call
+    without results: the fold would drop the entries (an entry never sits
+    between a call and its results), so they would be recorded as present
+    without ever being sent. The next build, after the results, plans them.
     """
+    if _ends_in_open_tool_call(messages):
+        logger.warning(
+            "No context entries planned: the history ends in a tool call "
+            "without results, and entries after it would never be sent"
+        )
+        return Planned()
     presence = scan_presence(messages)
     planned = Planned()
     planners: Dict[str, Callable[[], Optional[HumanMessage]]] = {
@@ -514,6 +551,7 @@ __all__ = [
     "guidance_text",
     "is_append_only",
     "knowledge_item",
+    "max_memories_per_entry",
     "memory_item",
     "plan_context_entries",
     "scan_presence",

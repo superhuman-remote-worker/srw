@@ -80,6 +80,7 @@ from agent.core.context import (
 from agent.core.context_injection import (
     ContextSources,
     Planned,
+    max_memories_per_entry,
     plan_context_entries,
 )
 from shared.runtime.core.context_entries import (
@@ -1551,7 +1552,7 @@ def create_execute_node(
             delivered_guidance_ids=_delivered_guidance_ids,
             subagents=_subagents_state,
         )
-        _max_memories = _max_memories_per_entry(config)
+        _max_memories = max_memories_per_entry(config)
 
         def _plan_entries(history: List[BaseMessage]) -> Planned:
             """The entries this request appends after ``history`` (append_only)."""
@@ -3996,14 +3997,6 @@ def _active_subagents_state(tool_context: Optional["ToolContext"]) -> Optional[s
 def _active_subagents_block(tool_context: Optional["ToolContext"]) -> str:
     """One transient parent-tail status block, or ``""`` when none are live."""
     return _active_subagents_state(tool_context) or ""
-
-
-def _max_memories_per_entry(config: Any) -> int:
-    """``memory.max_memories_per_entry`` (D29); 5 when the config has none."""
-    value = getattr(getattr(config, "memory", None), "max_memories_per_entry", None)
-    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-        return value
-    return 5
 
 
 def _merge_local_subagent_deliveries(

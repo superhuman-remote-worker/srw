@@ -721,6 +721,48 @@ class TestWholePlan:
             ["tool output"] + [e.content for e in planned.entries]
         )
 
+    @pytest.mark.parametrize("trailing_entries", [0, 2], ids=["bare", "after-entries"])
+    def test_nothing_is_planned_after_an_open_tool_call(self, trailing_entries):
+        """An AIMessage with calls but no results is no carrier.
+
+        The fold drops anything between a call and its results, so entries
+        planned there would be recorded as present (and persisted) without
+        ever reaching the provider. Entries already stored after the open
+        call do not make it a carrier either.
+        """
+        history = base_history() + [
+            AIMessage(content="", tool_calls=[{"name": "t", "args": {}, "id": "c1"}])
+        ]
+        history += [
+            make_context_entry("memory", f"stale {n}", section="memory")
+            for n in range(trailing_entries)
+        ]
+
+        planned = plan(history, _all_sources())
+
+        assert planned.entries == []
+        assert planned.guidance_ids == []
+        assert planned.memory_appended == 0
+
+    def test_planning_resumes_once_the_results_are_in(self):
+        history = base_history() + [
+            AIMessage(content="", tool_calls=[{"name": "t", "args": {}, "id": "c1"}])
+        ]
+        assert plan(history, _all_sources()).entries == []
+
+        history.append(ToolMessage(content="out", tool_call_id="c1"))
+        planned = plan(history, _all_sources())
+
+        assert kinds(planned) == list(INJECTION_KINDS)
+        folded = fold_context_entries(history + planned.entries)
+        assert folded[-1].content.startswith("out\n\n<srw_context")
+
+    def test_a_text_answer_is_still_a_carrier(self):
+        """Only an open call blocks planning; after a text-only answer the
+        entries stand alone (the fold's degenerate case)."""
+        history = base_history() + [AIMessage(content="done")]
+        assert kinds(plan(history, _all_sources())) == list(INJECTION_KINDS)
+
     def test_a_failing_renderer_skips_only_its_kind(self, monkeypatch):
         from shared.runtime.services.recall_store import RecallStore
 

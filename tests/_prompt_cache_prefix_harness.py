@@ -1117,7 +1117,11 @@ async def run_session_scenario(
 
     Sessions never carried a todo list; ``"context"`` in ``sources`` switches
     on the charter, memory and knowledge, active subagents and the App Guide
-    turn boundary.
+    turn boundary. ``injection_mode`` is the session config's
+    ``context_management.injection_mode``: ``append_only`` plans from the
+    payload's ``InjectionBlock.records`` (memory and knowledge) with
+    ``memory.max_memories_per_entry = 5`` and appends each kind once (the
+    turn boundary once per user turn).
     """
     injections = "context" in sources
     import asyncio

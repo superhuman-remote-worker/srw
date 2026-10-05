@@ -53,11 +53,13 @@ knowledge-base/knowledge/plans/append_only_context_injection_plan_2026_10_05.md
   tail and keeps its strict xfail (the rollback mode is not fixed, only kept
   byte-identical); ``append_only-injected`` appends typed context entries
   once and folds them into their carrier (WP2, D27) and must pass for every
-  worker scenario. ``worker-memory-churn`` runs append_only only: seven
-  memories (two drip in past the per-entry cap) and a memory and the note
-  that change later (an "(updated; ...)" entry). Non-vacuity: the last
-  append_only worker request carries each kind the scenario injects the
-  expected number of times (memory and guidance exactly once without churn).
+  scenario, worker and session. ``worker-memory-churn`` runs append_only
+  only: seven memories (two drip in past the per-entry cap) and a memory and
+  the note that change later (an "(updated; ...)" entry). Non-vacuity: the
+  last append_only worker request carries each kind the scenario injects the
+  expected number of times (memory and guidance exactly once without churn);
+  the session's last request holds one App Guide turn boundary per user turn
+  (two), the charter, memory, knowledge and subagent status once each.
   ``todos-only`` and ``control`` carry no context sources, so they run once,
   in the default mode.
 - Markers. Cases that fail today are ``xfail(strict=True)`` with their cause:
@@ -103,10 +105,6 @@ WORKER_SCENARIOS = [s for s in SCENARIOS if s.startswith("worker")]
 # Scenarios that only make sense with append-only entries (the churn exists in
 # the store records, which legacy mode does not read).
 APPEND_ONLY_SCENARIOS = {"worker-memory-churn"}
-# append_only-injected cases whose wiring lands in a later sub-step.
-APPEND_ONLY_PENDING = {
-    "session-two-turns": "session wiring is WP2.5",
-}
 
 _WP2 = "fixed by WP2 (append-only carrier fold, D27)"
 INJECTION_CAUSES = {
@@ -223,16 +221,8 @@ def _case(scenario: str, variant: str, family: str, mode: str = "legacy"):
                 reason=INJECTION_CAUSES[scenario],
             )
         )
-    elif variant == "injected" and scenario in APPEND_ONLY_PENDING:
-        marks.append(
-            pytest.mark.xfail(
-                strict=True,
-                raises=PrefixViolation,
-                reason=APPEND_ONLY_PENDING[scenario],
-            )
-        )
     # ``todos-only`` carries no marker: WP1's gate, it must pass. Nor does
-    # ``append_only-injected`` on a worker scenario: WP2's gate.
+    # ``append_only-injected``, worker or session: WP2's gate.
     return pytest.param(
         scenario,
         variant,
@@ -336,6 +326,37 @@ def _assert_appended_once(scenario: str, last: Captured) -> None:
         assert text_occurrences(body, harness.KNOWLEDGE_BODY_REVISED) == 1
 
 
+def _assert_session_appended_once(last: Captured) -> None:
+    """Non-vacuity of the append_only session case: the context is there.
+
+    The last request of the second user turn holds every entry the session
+    appended, folded into its carrier: the App Guide turn boundary once per
+    user turn (D22), the charter, memory, knowledge and subagent status once
+    each (present since turn one, so never re-sent). Nothing of the legacy
+    per-call tail reaches it.
+    """
+    body = last.body
+    expected = {
+        "turn_boundary": 2,
+        "charter": 1,
+        "memory": 1,
+        "knowledge": 1,
+        "subagents": 1,
+    }
+    for kind, count in expected.items():
+        assert text_occurrences(body, _srw(kind)) == count, (kind, count)
+    assert text_occurrences(body, "<managed_product_guide_turn_boundary") == 2
+    assert text_occurrences(body, harness.CHARTER["content"]) == 1
+    assert text_occurrences(body, "<active_subagents>") == 1
+    for _memory_type, fact in harness.MEMORY_FACTS:
+        assert text_occurrences(body, fact) == 1
+    # The legacy tail renders memory as one block and the charter and memory
+    # as synthetic tool-call pairs; none of it reaches an append_only request.
+    assert text_occurrences(body, harness.MEMORY_TEXT) == 0
+    assert text_occurrences(body, "charter_inject_") == 0
+    assert text_occurrences(body, "memory_inject_") == 0
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scenario,variant,mode,family_id", CASES)
 async def test_request_starts_with_the_previous_request(
@@ -371,6 +392,8 @@ async def test_request_starts_with_the_previous_request(
     if variant == "injected" and mode == "append_only":
         if scenario in WORKER_SCENARIOS:
             _assert_appended_once(scenario, requests[-1])
+        else:
+            _assert_session_appended_once(requests[-1])
 
 
 @pytest.mark.asyncio
@@ -408,9 +431,39 @@ async def test_append_only_breakpoints_on_real_worker_requests(tmp_path, monkeyp
             assert messages[-1]["role"] == "tool"
 
 
+@pytest.mark.asyncio
+async def test_append_only_breakpoints_on_real_session_requests(tmp_path, monkeypatch):
+    """§H/O4 on the session's two turns through the Claude proxy.
+
+    Every append_only request carries a folded carrier (the turn's input
+    holds the turn-start entries), so each one marks the system prompt, the
+    newest assistant message once there is one, and the last message.
+    """
+    family = FAMILIES["openai-chat-claude-proxy"]
+    requests, found = await _run(
+        "session-two-turns",
+        family,
+        "injected",
+        tmp_path,
+        monkeypatch,
+        "append_only",
+    )
+    assert found == {}
+    assert len(requests) == len(harness.SESSION_SCRIPT)
+    for n, captured in enumerate(requests):
+        messages = captured.body["messages"]
+        marked = [i for i, m in enumerate(messages) if "cache_control" in m]
+        assistants = [i for i, m in enumerate(messages) if m["role"] == "assistant"]
+        expected = {0, len(messages) - 1}
+        if assistants:
+            expected.add(assistants[-1])
+        assert set(marked) == expected, (n, marked, expected)
+        assert len(marked) <= 4
+
+
 @pytest.mark.skip(
     reason=(
-        "MiniMax M3 (MiniMaxAI/MiniMax-M3@f0e1c1e04d40177e4673a22097036854f536e9c0) "
+        "MiniMax M3(MiniMaxAI/MiniMax-M3@f0e1c1e04d40177e4673a22097036854f536e9c0) "
         "is under the MiniMax Community License, a non-commercial grant whose "
         "commercial use needs attribution plus a notice to or authorization from "
         "MiniMax; its template is not vendored into this repository. The Q3 "

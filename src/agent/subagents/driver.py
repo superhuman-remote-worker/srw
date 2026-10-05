@@ -817,7 +817,12 @@ class SubagentDriver:
         self, prepared: Any, response: Any, metrics: Any, *args: Any, **kwargs: Any
     ) -> None:
         """Sync (the loop's contract): count the call, note truncation, and
-        write the ``llm_requests`` row in a thread under the PARENT job."""
+        write the ``llm_requests`` row in a thread under the PARENT job.
+
+        ``history_messages`` (keyword, append-only context injection): the
+        request before the carrier fold, forwarded so the chat delta archives
+        a typed context entry as context; absent on a request without
+        entries."""
         self.provider_calls += 1
         self._activity()
         try:
@@ -837,6 +842,12 @@ class SubagentDriver:
             getattr(self.build.config, "llm", None), "model", "unknown"
         )
         archive = self._archive_fn
+        history_messages = kwargs.get("history_messages")
+        extra: Dict[str, Any] = (
+            {"history_messages": history_messages}
+            if history_messages is not None
+            else {}
+        )
 
         def _do() -> None:
             try:
@@ -867,6 +878,7 @@ class SubagentDriver:
                         "output_tokens": metrics.get("output_tokens"),
                         "cached_tokens": metrics.get("cached_tokens"),
                     },
+                    **extra,
                 )
             except Exception as e:
                 logger.debug(

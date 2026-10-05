@@ -39,7 +39,18 @@ from agent.core.context import (
     repair_tool_pairing,
     scrub_history_tool_call_arguments,
 )
-from shared.runtime.core.context_entries import fold_context_entries, last_user_text
+from agent.core.context_injection import (
+    ContextSources,
+    max_memories_per_entry,
+    plan_context_entries,
+)
+from shared.runtime.core.context_entries import (
+    entry_kind,
+    fold_context_entries,
+    has_folded_carrier,
+    is_append_only,
+    last_user_text,
+)
 from shared.runtime.core.llm_retry import _classify_llm_error, _extract_rate_limit_delay
 from shared.runtime.core.loader import with_current_date
 from shared.runtime.core.message_markers import PERSIST_ROLE_KEY as _PERSIST_ROLE_KEY
@@ -170,23 +181,31 @@ def _charter_injection_enabled(config: Any) -> bool:
     )
 
 
-def _active_subagents_block(tool_context: Optional[Any]) -> str:
-    """Render one transient parent-tail status block, or ``""`` when idle.
+def _active_subagents_state(tool_context: Optional[Any]) -> Optional[str]:
+    """The active-subagent status block, as the append-only planner reads it.
 
-    The runtime mirror is deliberately best-effort prompt context.  Durable
-    child state remains in the subagent ledger, so a renderer failure must not
-    fail the parent turn or leak a half-updated message into session history.
+    None when there is no subagent runtime or rendering failed (the planner
+    leaves the section alone); ``""`` when none is live (the cleared
+    rendering, once, if the history still shows an older status). The
+    runtime mirror is deliberately best-effort prompt context.  Durable child
+    state remains in the subagent ledger, so a renderer failure must not fail
+    the parent turn or leak a half-updated message into session history.
     """
     runtime = getattr(tool_context, "subagent_runtime", None)
     render = getattr(runtime, "active_subagents_block", None)
     if not callable(render):
-        return ""
+        return None
     try:
         value = render()
     except Exception:
         logger.debug("Failed to render active subagent status", exc_info=True)
-        return ""
+        return None
     return str(value or "").strip()
+
+
+def _active_subagents_block(tool_context: Optional[Any]) -> str:
+    """Render one transient parent-tail status block, or ``""`` when idle."""
+    return _active_subagents_state(tool_context) or ""
 
 
 def _inject_context_pairs(
@@ -2184,6 +2203,14 @@ async def _execute_turn(
     # delegate_agent calls of this turn within the per-turn maximum, across
     # all its batches (enforced only for a session allowed to fan out).
     delegate_calls_admitted = 0
+    # Append-only context injection (WP2 spec §I, §F.5): read per turn, since
+    # a session hot-swaps its config between turns. ``legacy`` rebuilds the
+    # transient tail on every provider call exactly as before; ``append_only``
+    # appends charter, memory, knowledge, citation feedback, the subagent
+    # status and the App Guide turn boundary to the history once, as typed
+    # context entries persisted as ``role='context'`` rows, and folds them
+    # into their carrier.
+    append_only = is_append_only(config)
 
     def _adopt(msg: Any) -> Any:
         """Stamp a message this turn appends with the turn's membership."""
@@ -2312,6 +2339,16 @@ async def _execute_turn(
     knowledge_block = ""
     citation_feedback_block = ""
     charter_block = ""
+    # append_only: the store records behind each kind, in rank order (the
+    # planner's input, WP2 spec §C). The retrieval itself is unchanged; the
+    # turn-start payload serves every provider call of the turn.
+    memory_records: List[Any] = []
+    knowledge_records: List[Any] = []
+    knowledge_bindings: Optional[List[Any]] = None
+    knowledge_watermarks: Optional[Dict[str, Optional[str]]] = None
+    # None = no citation engine or the lookup failed (leave the section
+    # alone); [] = none failed (the cleared rendering, O6).
+    failed_citations: Optional[List[Any]] = None
 
     from agent.core.knowledge_injection import selected_knowledge_bindings
     from shared.runtime.core.skill_resolution import (
@@ -2385,6 +2422,11 @@ async def _execute_turn(
                 for message in block.messages
             ]
         for _block in _payload.blocks:
+            if append_only and _block.kind == "memory":
+                memory_records.extend(getattr(_block, "records", None) or [])
+            elif append_only and _block.kind == "knowledge" and not kb_bindings:
+                # Bound KBs come from the chunk retrieval below instead.
+                knowledge_records.extend(getattr(_block, "records", None) or [])
             if _block.kind == "memory" and _block.items:
                 logger.debug(
                     f"Memory injection: {len(_block.items)} memories retrieved"
@@ -2413,9 +2455,12 @@ async def _execute_turn(
             if memories:
                 from shared.runtime.services.recall_store import RecallStore as _RS
 
-                memory_block = _RS.assemble_memory_block(
-                    memories, model=getattr(config.llm, "model", None)
-                )
+                if append_only:
+                    memory_records = list(memories)
+                else:
+                    memory_block = _RS.assemble_memory_block(
+                        memories, model=getattr(config.llm, "model", None)
+                    )
                 logger.debug(f"Memory injection: {len(memories)} memories retrieved")
         except asyncio.TimeoutError:
             logger.warning("Memory retrieval timed out — skipping injection")
@@ -2447,12 +2492,17 @@ async def _execute_turn(
                 timeout=_RETRIEVAL_TIMEOUT,
             )
             if selection.notes:
-                knowledge_block = _KS.assemble_knowledge_block(
-                    selection.notes,
-                    model=getattr(config.llm, "model", None),
-                    bindings=selection.bindings,
-                    external_watermarks=selection.external_watermarks,
-                )
+                if append_only:
+                    knowledge_records = list(selection.notes)
+                    knowledge_bindings = list(selection.bindings or [])
+                    knowledge_watermarks = dict(selection.external_watermarks or {})
+                else:
+                    knowledge_block = _KS.assemble_knowledge_block(
+                        selection.notes,
+                        model=getattr(config.llm, "model", None),
+                        bindings=selection.bindings,
+                        external_watermarks=selection.external_watermarks,
+                    )
                 logger.debug(
                     "Knowledge injection: %s notes retrieved by binding=%s",
                     len(selection.notes),
@@ -2483,9 +2533,12 @@ async def _execute_turn(
                     KnowledgeStore as _KS,
                 )
 
-                knowledge_block = _KS.assemble_knowledge_block(
-                    kb_notes, model=getattr(config.llm, "model", None)
-                )
+                if append_only:
+                    knowledge_records = list(kb_notes)
+                else:
+                    knowledge_block = _KS.assemble_knowledge_block(
+                        kb_notes, model=getattr(config.llm, "model", None)
+                    )
                 logger.debug(f"Knowledge injection: {len(kb_notes)} notes retrieved")
         except asyncio.TimeoutError:
             logger.warning("Knowledge retrieval timed out — skipping injection")
@@ -2553,7 +2606,9 @@ async def _execute_turn(
                 _cit_engine.list_citations(verification_status="failed"),
                 timeout=_RETRIEVAL_TIMEOUT,
             )
-            if _failed_cites:
+            if append_only:
+                failed_citations = list(_failed_cites or [])
+            elif _failed_cites:
                 from agent.core.citation_feedback_injection import (
                     format_failed_citations,
                 )
@@ -2571,6 +2626,22 @@ async def _execute_turn(
                 type(e).__name__,
                 e,
             )
+
+    # append_only (WP2 spec §C): the turn-start payload as the planner's
+    # input. Every provider call of the turn plans against it after
+    # compaction, so what a compaction evicted is appended again (D4, D21)
+    # without a new retrieval (§E.5); only the subagent status is read per
+    # call, as the legacy tail read it. Sessions carry no supervisor guidance.
+    context_sources = ContextSources(
+        charter=charter_block,
+        memory_records=memory_records,
+        knowledge_records=knowledge_records,
+        knowledge_bindings=knowledge_bindings,
+        external_watermarks=knowledge_watermarks,
+        failed_citations=failed_citations,
+        turn_boundary=product_guide_turn_nudge,
+        turn=turn_id if turn_id > 0 else None,
+    )
 
     ended_by_sleep = False
 
@@ -2751,26 +2822,64 @@ async def _execute_turn(
         # below never touch the durable list.
         prepared = list(bounded)
 
-        # Transient context injection (memory / knowledge / MemoryManager
-        # seam). Anchored at the TAIL — after the conversation — so the stable
-        # history prefix stays byte-identical between turns and provider
-        # prompt caches reuse it (the block changes every turn; placed ahead
-        # of the history it broke the cache for the whole conversation each
-        # request). The anchor still satisfies providers that enforce
-        # function-call turn ordering (Gemini rejects a function-call turn not
-        # preceded by a user/function-response turn): it sits after the last
-        # Human/Tool message, which is normally the very end of the history.
-        # See _injection_anchor_index. The same message objects may be reused
-        # each inner-loop iteration; pair ids are only prefix-checked
-        # downstream.
-        _inject_context_pairs(
-            prepared,
-            manager_injection,
-            memory_block,
-            knowledge_block,
-            citation_feedback_block,
-            charter_block=charter_block,
-        )
+        if append_only:
+            # Append what is new or changed since the history last showed it
+            # (WP2 spec §C, §F.5). Only once the input is admitted: a context
+            # row never precedes the admission of the turn it belongs to
+            # (O15). Each entry is history from here on: stamped with the
+            # turn, appended to the durable list and persisted BEFORE the
+            # provider call (write first), so a restore replays exactly the
+            # bytes this request sends. Planned against the compacted history,
+            # so what a compaction evicted is appended again (D4).
+            if _provider_admission_closed():
+                return _closed_result()
+            if not await _admit_first_provider():
+                return _closed_result()
+            planned = plan_context_entries(
+                prepared,
+                replace(
+                    context_sources,
+                    subagents=_active_subagents_state(tool_context),
+                ),
+                model=getattr(config.llm, "model", None),
+                max_memories=max_memories_per_entry(config),
+            )
+            if planned.entries:
+                logger.info(
+                    "Context entries appended: %s (memories %d new/changed, "
+                    "%d already present)",
+                    [entry_kind(entry) for entry in planned.entries],
+                    planned.memory_appended,
+                    planned.memory_present,
+                )
+            for entry in planned.entries:
+                entry = _adopt(_ensure_msg_id(entry))
+                messages.append(entry)
+                prepared.append(entry)
+                messages_added += 1
+                await _persist(entry)
+        else:
+            # Transient context injection (memory / knowledge / MemoryManager
+            # seam). Anchored at the TAIL — after the conversation — so the
+            # stable history prefix stays byte-identical between turns and
+            # provider prompt caches reuse it (the block changes every turn;
+            # placed ahead of the history it broke the cache for the whole
+            # conversation each request). The anchor still satisfies
+            # providers that enforce function-call turn ordering (Gemini
+            # rejects a function-call turn not preceded by a
+            # user/function-response turn): it sits after the last Human/Tool
+            # message, which is normally the very end of the history. See
+            # _injection_anchor_index. The same message objects may be reused
+            # each inner-loop iteration; pair ids are only prefix-checked
+            # downstream.
+            _inject_context_pairs(
+                prepared,
+                manager_injection,
+                memory_block,
+                knowledge_block,
+                citation_feedback_block,
+                charter_block=charter_block,
+            )
 
         # Repair tool-call pairing before the LLM call. Compaction thrash, an
         # interrupted turn, or streamed parallel-tool corruption (langchain
@@ -2781,31 +2890,41 @@ async def _execute_turn(
         # repairs on restore (persistent_app). This is the equivalent guard for
         # the live turn loop, which previously had none.
         provider_attempt_input: Optional[List[BaseMessage]] = None
+        # The same request before the carrier fold: the archiver's chat delta
+        # reads it (WP2 spec §D 7c, §F.6).
+        provider_attempt_history: Optional[List[BaseMessage]] = None
         provider_attempt_started_at: Optional[float] = None
         completed_provider_attempts: list[
-            tuple[List[BaseMessage], AIMessage, dict, bool]
+            tuple[List[BaseMessage], AIMessage, dict, bool, List[BaseMessage]]
         ] = []
         archived_provider_attempts = 0
         published_provider_attempts = 0
         last_provider_metrics: Optional[dict] = None
 
         def _provider_input() -> List[BaseMessage]:
-            """Return repaired input plus freshly rendered transient tail."""
+            """Return repaired input plus freshly rendered transient tail.
 
-            nonlocal provider_attempt_input, provider_attempt_started_at
+            append_only has no per-call tail: the subagent status and the App
+            Guide boundary were appended as entries above when they changed.
+            """
+
+            nonlocal provider_attempt_input, provider_attempt_history
+            nonlocal provider_attempt_started_at
             messages[:] = repair_tool_pairing(messages)
             prepared[:] = scrub_history_tool_call_arguments(
                 repair_tool_pairing(prepared)
             )
             provider_messages = list(prepared)
-            _inject_context_pairs(
-                provider_messages,
-                [],
-                "",
-                "",
-                active_subagents_block=_active_subagents_block(tool_context),
-                product_guide_turn_boundary=product_guide_turn_nudge,
-            )
+            if not append_only:
+                _inject_context_pairs(
+                    provider_messages,
+                    [],
+                    "",
+                    "",
+                    active_subagents_block=_active_subagents_block(tool_context),
+                    product_guide_turn_boundary=product_guide_turn_nudge,
+                )
+            provider_attempt_history = provider_messages
             # Typed context entries ride their carriers (D27). The identity
             # while the history holds none, so legacy requests are unchanged.
             provider_messages = fold_context_entries(provider_messages)
@@ -2820,8 +2939,8 @@ async def _execute_turn(
         ) -> Optional[dict]:
             """Bind one completed response to its exact transient input."""
 
-            nonlocal provider_attempt_input, provider_attempt_started_at
-            nonlocal last_provider_metrics
+            nonlocal provider_attempt_input, provider_attempt_history
+            nonlocal provider_attempt_started_at, last_provider_metrics
             if (
                 attempt_response is None
                 or provider_attempt_input is None
@@ -2848,9 +2967,11 @@ async def _execute_turn(
                     attempt_response,
                     attempt_metrics or {"latency_ms": latency_ms},
                     attempt_metrics is not None,
+                    provider_attempt_history or provider_attempt_input,
                 )
             )
             provider_attempt_input = None
+            provider_attempt_history = None
             provider_attempt_started_at = None
             return attempt_metrics
 
@@ -2859,17 +2980,26 @@ async def _execute_turn(
 
             nonlocal archived_provider_attempts
             while archived_provider_attempts < len(completed_provider_attempts):
-                provider_input, attempt_response, metrics, _has_usage = (
+                provider_input, attempt_response, metrics, _has_usage, history = (
                     completed_provider_attempts[archived_provider_attempts]
                 )
                 archived_provider_attempts += 1
                 if callbacks.archive_llm_call is None:
                     continue
+                # The unfolded request goes along whenever the fold folded
+                # something (WP2 spec §F.6): the chat delta then archives an
+                # entry as context, not as part of its carrier; llm_requests
+                # keeps the folded request the provider got. A request without
+                # entries keeps the historical three-argument call.
+                extra: Dict[str, Any] = {}
+                if append_only or has_folded_carrier(provider_input):
+                    extra["history_messages"] = history
                 try:
                     callbacks.archive_llm_call(
                         provider_input,
                         attempt_response,
                         metrics,
+                        **extra,
                     )
                 except Exception as e:
                     logger.debug(f"LLM call archive failed (non-fatal): {e}")
@@ -2879,7 +3009,7 @@ async def _execute_turn(
 
             nonlocal published_provider_attempts
             while published_provider_attempts < len(completed_provider_attempts):
-                _provider_input_snapshot, _attempt_response, metrics, has_usage = (
+                _provider_input_snapshot, _attempt_response, metrics, has_usage, _ = (
                     completed_provider_attempts[published_provider_attempts]
                 )
                 published_provider_attempts += 1
