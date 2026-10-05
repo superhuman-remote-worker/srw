@@ -59,9 +59,14 @@ KNOWN_NUDGES: Dict[str, Set[str]] = {
     "memory_block_header_pinned": set(),
     "memory_block_header_retrieved": set(),
     "memory_block_footer": {"count", "tokens"},
+    "memory_entry_header": set(),
     # src/services/knowledge_store.py
     "knowledge_block_header": set(),
     "knowledge_block_footer": {"count", "tokens"},
+    # src/agent/core/citation_feedback_injection.py, src/agent/core/
+    # context_injection.py (append-only cleared renderings)
+    "citation_feedback_resolved": set(),
+    "active_subagents_none": set(),
     # src/persistent_graph.py
     "empty_response_recovery": set(),
     # src/tools/context.py, src/tools/registry.py, src/tools/workspace/files.py

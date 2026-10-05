@@ -13,7 +13,7 @@ the agent edits a citation (which resets it to ``pending`` → re-verifies) or
 removes it, it drops out of the injected block on the next turn.
 """
 
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
@@ -63,6 +63,18 @@ def format_failed_citations(
     if n > limit:
         lines.append(f"- … and {n - limit} more failed citation(s).")
     return "\n".join(lines)
+
+
+def format_citation_feedback_resolved(model: Optional[str] = None) -> str:
+    """The cleared rendering: no citation is failing verification any more.
+
+    Append-only injection (D21, O6) appends this once when the failed set
+    that an earlier entry reported becomes empty, so the model knows the
+    report above no longer applies.
+    """
+    from shared.runtime.services.guardrails import format_nudge
+
+    return format_nudge("citation_feedback_resolved", model=model)
 
 
 def create_citation_feedback_injection_messages(

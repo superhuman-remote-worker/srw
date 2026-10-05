@@ -2624,6 +2624,10 @@ class MemoryConfig:
     required: bool = False
     budget_tokens: int = 10000
     max_memories_per_injection: int = 150
+    # Append-only context injection (D29): at most this many new or changed
+    # memories per appended memory entry; the rest drip in on later requests
+    # while retrieval keeps returning them. No total cap.
+    max_memories_per_entry: int = 5
     observer_interval: int = 5
     assembler_interval: int = 7
     default_ttl: int = 10
@@ -3098,6 +3102,21 @@ def _parse_subagents_config(raw: Any, parent_llm: Any) -> SubagentsConfig:
     return SubagentsConfig(default=default, llm=llm, roster=roster)
 
 
+def _parse_max_memories_per_entry(value: Any) -> int:
+    """``memory.max_memories_per_entry``: a positive int (default 5, D29)."""
+    parsed: Optional[int] = None
+    if not isinstance(value, bool):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = None
+    if parsed is None or parsed < 1:
+        raise ValueError(
+            f"memory.max_memories_per_entry must be a positive integer, got {value!r}"
+        )
+    return parsed
+
+
 def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
     """Parse memory configuration from dict.
 
@@ -3178,6 +3197,9 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
         required=bool(data.get("required", False)),
         budget_tokens=data.get("budget_tokens", 10000),
         max_memories_per_injection=data.get("max_memories_per_injection", 150),
+        max_memories_per_entry=_parse_max_memories_per_entry(
+            data.get("max_memories_per_entry", 5)
+        ),
         observer_interval=data.get("observer_interval", 5),
         assembler_interval=data.get("assembler_interval", 7),
         default_ttl=data.get("default_ttl", 10),

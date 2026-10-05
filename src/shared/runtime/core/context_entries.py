@@ -126,6 +126,17 @@ def memory_handle(record_id: Any) -> str:
     return "m:" + hashlib.sha256(str(record_id).encode("utf-8")).hexdigest()[:6]
 
 
+# Rendered after an item whose key is already in the history with another
+# hash (D5): the new version is appended, the old one stays above it.
+UPDATED_ITEM_MARKER = "(updated; replaces the earlier version above)"
+
+
+def knowledge_item_key(record: Any) -> str:
+    """Presence key of a knowledge note (spec §A.3): ``kb:<kb>:<note_id>``."""
+    kb = getattr(record, "kb_id", None) or getattr(record, "project_id", None)
+    return f"kb:{kb}:{getattr(record, 'note_id', '')}"
+
+
 # --- Constructors and accessors (spec §A.8) -----------------------------------
 
 
@@ -424,6 +435,7 @@ __all__ = [
     "PERSIST_ROLE_CONTEXT",
     "SCHEMA_VERSION",
     "SRW_INJECTION_KEY",
+    "UPDATED_ITEM_MARKER",
     "context_entry_from_row",
     "digest",
     "entry_body",
@@ -435,6 +447,7 @@ __all__ = [
     "is_context_entry",
     "is_context_injection",
     "is_legacy_injection",
+    "knowledge_item_key",
     "last_user_text",
     "make_context_entry",
     "memory_handle",

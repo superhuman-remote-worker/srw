@@ -206,6 +206,10 @@ class InjectionBlock:
     #: Provenance of what got injected (ids/sources/scores) — feeds stats,
     #: the cockpit memory panel, and eventually the learned-scorer flywheel.
     items: List[Dict[str, Any]] = field(default_factory=list)
+    #: The store records behind the block (MemoryRecord/KnowledgeRecord), in
+    #: rank order. The append-only planner renders its own entries from
+    #: them; ``content``/``messages`` stay the legacy rendering.
+    records: List[Any] = field(default_factory=list)
 
 
 @dataclass

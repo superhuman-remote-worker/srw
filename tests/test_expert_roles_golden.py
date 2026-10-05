@@ -93,13 +93,15 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
     # auxiliary.summarization_reasoning_level (both roles; same value as the
     # dataclass default, so the effective compare needs no exclusion).
     # Append-only context injection WP2: the shared root states
-    # context_management.injection_mode (both roles; same value as the
-    # dataclass default, so the effective compare needs no exclusion).
+    # context_management.injection_mode and memory.max_memories_per_entry
+    # (both roles; same values as the dataclass defaults, so the effective
+    # compare needs no exclusion).
     "worker": (
         "delegation.max_concurrent",
         "delegation.run_in_background_default",
         "auxiliary.summarization_reasoning_level",
         "context_management.injection_mode",
+        "memory.max_memories_per_entry",
     ),
     # U3 WP1: the persistent loop reads limits.llm_inproc_retries (it was a
     # hard-coded 3); the overlay pins the historical 3 against the dataclass
@@ -109,6 +111,7 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
         "limits.llm_inproc_retries",
         "auxiliary.summarization_reasoning_level",
         "context_management.injection_mode",
+        "memory.max_memories_per_entry",
     ),
 }
 #: Keys later work packages DELETED from an overlay after the baseline was

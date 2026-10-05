@@ -276,6 +276,7 @@ class MemoryManager:
                         }
                         for s in group
                     ],
+                    records=records,
                 )
             )
         return blocks

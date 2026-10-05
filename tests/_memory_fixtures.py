@@ -22,10 +22,13 @@ PROJECT_ID = "12345678-1234-5678-1234-567812345678"
 # Golden snapshots of the rendered blocks for the fixture records below,
 # generated from the real assemblers pre-refactor (2026-06-11). They pin
 # the shared renderers against drift while the legacy path is frozen.
+# Append-only context injection 2e (D11, spec §G/O12) removed the per-turn
+# "pinned, N turns left" clause from the memory line; the pinned/retrieved
+# split and the footer stay.
 GOLDEN_MEMORY_BLOCK = (
     "--- Pinned Memories (TTL-active) ---\n"
     "\n"
-    "[1] (pinned, 3 turns left, importance: 0.8, phase 2, preference)\n"
+    "[1] (importance: 0.8, phase 2, preference)\n"
     "User prefers ruff with line length 88.\n"
     "\n"
     "--- Retrieved Memories (relevance-ranked) ---\n"

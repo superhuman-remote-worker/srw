@@ -38,7 +38,9 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from shared.runtime.core.context_entries import UPDATED_ITEM_MARKER
 
 logger = logging.getLogger(__name__)
 
@@ -1358,19 +1360,31 @@ class RecallStore:
     # =========================================================================
 
     @staticmethod
-    def format_memory(memory: MemoryRecord, index: int) -> str:
+    def format_memory(
+        memory: MemoryRecord,
+        index: int,
+        *,
+        handle: Optional[str] = None,
+        updated: bool = False,
+    ) -> str:
         """Format a single memory for injection.
+
+        The text is static (D11): it carries no per-turn data, so the same
+        memory renders to the same bytes whatever its remaining TTL.
+        Importance is a retrieval-time value frozen into the rendered text.
 
         Args:
             memory: MemoryRecord to format
-            index: Display index (1-based)
+            index: Display index (1-based), the label when no handle is given
+            handle: Display handle (``m:3f9a2c``, D30); labels the memory
+                as ``[m:3f9a2c]`` instead of its index
+            updated: Mark the memory as a newer version of one already in
+                the history (D5)
 
         Returns:
             Formatted memory string
         """
         meta_parts = []
-        if memory.remaining_turns is not None and memory.remaining_turns > 0:
-            meta_parts.append(f"pinned, {memory.remaining_turns} turns left")
         if memory.importance is not None:
             meta_parts.append(f"importance: {memory.importance:.1f}")
         if memory.source_phase is not None:
@@ -1378,8 +1392,41 @@ class RecallStore:
         if memory.memory_type and memory.memory_type != "factual":
             meta_parts.append(memory.memory_type)
 
+        label = handle if handle else index
         meta = f" ({', '.join(meta_parts)})" if meta_parts else ""
-        return f"[{index}]{meta}\n{memory.content}"
+        marker = f" {UPDATED_ITEM_MARKER}" if updated else ""
+        return f"[{label}]{meta}{marker}\n{memory.content}"
+
+    @classmethod
+    def render_memory_entry(
+        cls,
+        items: Sequence[Tuple[MemoryRecord, Optional[str], bool]],
+        model: Optional[str] = None,
+    ) -> str:
+        """Body of one append-only memory entry (append-only injection, D2).
+
+        Unlike :meth:`assemble_memory_block` there is no pinned/retrieved
+        split and no token footer: an appended entry stays in the history
+        unchanged, so it carries nothing that varies per turn (D11).
+
+        Args:
+            items: ``(memory, handle, updated)`` per memory, in rank order
+            model: Model id used to resolve the family's header nudge
+
+        Returns:
+            The entry body, or "" when there is nothing to render
+        """
+        if not items:
+            return ""
+
+        from shared.runtime.services.guardrails import format_nudge
+
+        parts = [format_nudge("memory_entry_header", model=model)]
+        for index, (memory, handle, updated) in enumerate(items, 1):
+            parts.append(
+                cls.format_memory(memory, index, handle=handle, updated=updated)
+            )
+        return "\n\n".join(parts)
 
     @classmethod
     def assemble_memory_block(
