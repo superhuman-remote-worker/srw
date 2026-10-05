@@ -1244,11 +1244,17 @@ An ordinary pinned target without that capability cannot acknowledge native
 use; the new gateway closes its channel if acknowledgement fails. This does
 not start a model turn or authorize workspace cleanup.
 
+Use the matching chart to configure the agent public-key projection. Updating
+only the image under an older chart keeps the orchestrator running, but leaves
+that projection unavailable and new agents unable to advertise this capability.
+
 For key rotation, configure both old and new public keys on all verifying
 participants before changing the gateway signer. Retain the old public key
 through the 30-second proof lifetime plus the five-second clock allowance after
 its last use. Check that running participants have received the new set before
 removing it.
+Recycle existing agent Pods when the configured key-name list changes; their
+environment and selected Secret items were fixed when they were created.
 
 | Value | Why it has no default |
 |---|---|
