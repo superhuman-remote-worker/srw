@@ -77,3 +77,55 @@ def build_digest_query_text(
         )
 
     return "\n".join(parts)
+
+
+#: Per-part cap of the exchange query (the user message and the answer).
+EXCHANGE_MAX_CHARS = 2000
+
+
+def _answer_text(msg: AIMessage) -> str:
+    """The text of an assistant message (text blocks of list content only)."""
+    content = msg.content
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return " ".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ).strip()
+    return ""
+
+
+def build_exchange_query_text(
+    messages: List[BaseMessage],
+    *,
+    max_chars_per_message: int = EXCHANGE_MAX_CHARS,
+) -> str:
+    """Query of a session's idle-time prefetch: the latest exchange (D24).
+
+    The newest user message (not injected context) and the assistant's
+    final answer after it, each capped at ``max_chars_per_message``,
+    joined by a blank line ("" when the history holds neither). The answer
+    is the newest AIMessage after that user message with text content;
+    tool results are payload, not intent, and stay out.
+    """
+    user_index: Optional[int] = None
+    for index in range(len(messages) - 1, -1, -1):
+        msg = messages[index]
+        if isinstance(msg, HumanMessage) and not is_context_injection(msg):
+            user_index = index
+            break
+    parts: List[str] = []
+    if user_index is not None:
+        parts.append(_message_text(messages[user_index]).strip())
+        for msg in reversed(messages[user_index + 1 :]):
+            if not isinstance(msg, AIMessage) or is_context_injection(msg):
+                continue
+            text = _answer_text(msg)
+            if text:
+                parts.append(text)
+                break
+    if max_chars_per_message > 0:
+        parts = [part[:max_chars_per_message] for part in parts]
+    return "\n\n".join(part for part in parts if part)

@@ -22,9 +22,13 @@ test_app_guide_compaction.py and test_persistent_subagent_prompt_state.py.
 from __future__ import annotations
 
 import asyncio
+import json
+import time
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
 import pytest
 from langchain_core.messages import (
@@ -54,6 +58,8 @@ from shared.runtime.core.message_markers import (
     stamp_turn_membership,
     turn_membership,
 )
+from shared.runtime.services.recall_store import MemoryRecord
+from shared.session_pending_memory import SESSION_PENDING_MEMORY_KEY
 from tests import _prompt_cache_prefix_harness as harness
 from tests._fake_chat_model import FakeChatModel, text_turn, tool_turn
 from tests._memory_fixtures import (
@@ -712,3 +718,348 @@ class TestAsyncRetrieval:
         assert session.errors
         assert session.llm.calls == []
         assert session.memory_service.retrieval_stats()["started"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Idle-time prefetch and the durable pending set (WP4; D24, D32, D33, B8, B9)
+# ---------------------------------------------------------------------------
+
+PREFETCHED = MemoryRecord(
+    id=UUID(int=101),
+    content="The deploy window is Friday 18:00 CET.",
+    importance=0.7,
+    token_count=9,
+)
+
+
+class ExchangeRetriever:
+    """Memory retriever that tells the idle-time prefetch from a turn's own
+    retrieval by the prefetch's request flags (no retries, no TTL tick).
+
+    ``gate_turn`` / ``gate_prefetch`` hold that kind of call until it is
+    cancelled. Records every request and each cancellation.
+    """
+
+    def __init__(
+        self,
+        *,
+        prefetch=(PREFETCHED,),
+        turn=(),
+        gate_turn: bool = False,
+        gate_prefetch: bool = False,
+    ) -> None:
+        self.prefetch = list(prefetch)
+        self.turn = list(turn)
+        self.gate_turn = gate_turn
+        self.gate_prefetch = gate_prefetch
+        self.requests: List[Any] = []
+        self.cancelled = 0
+
+    async def retrieve(self, req):
+        from agent.services.memory import Candidate
+
+        self.requests.append(req)
+        is_prefetch = req.retries is False
+        assert req.ttl_tick is not is_prefetch
+        if self.gate_prefetch if is_prefetch else self.gate_turn:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+        records = self.prefetch if is_prefetch else self.turn
+        return [
+            Candidate(kind="memory", text=m.content, token_count=9, record=m)
+            for m in records
+        ]
+
+    @property
+    def prefetch_queries(self) -> List[str]:
+        return [r.query_text for r in self.requests if r.retries is False]
+
+
+class PrefetchSession(Session):
+    """A session whose transport wires the idle-time prefetch.
+
+    ``metadata`` stands in for ``threads.metadata``; ``save_pending_memory``
+    writes the set as JSON (what the column holds) or clears it by id.
+    ``input_arrives(n)`` answers the n-th new-input check.
+    """
+
+    def __init__(
+        self,
+        script: List[Any],
+        *,
+        retriever: ExchangeRetriever,
+        budget: float = 1.0,
+        input_arrives: Callable[[int], bool] = lambda n: False,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(script, **kwargs)
+        self.retriever = retriever
+        self.memory_service = make_async_manager(retriever, job_id="thread-1")
+        self.config.memory.prefetch_budget_s = budget
+        self.metadata: Dict[str, Any] = dict(metadata or {})
+        self.input_arrives = input_arrives
+        self.input_checks = 0
+        self.clear_error: Optional[Exception] = None
+        self.stop_turn = False
+
+    async def _save(self, payload, expected_id) -> bool:
+        if payload is not None:
+            self.events.append(("save", "write"))
+            self.metadata[SESSION_PENDING_MEMORY_KEY] = json.loads(json.dumps(payload))
+            return True
+        self.events.append(("save", "clear"))
+        if self.clear_error is not None:
+            raise self.clear_error
+        stored = self.metadata.get(SESSION_PENDING_MEMORY_KEY)
+        if stored is not None and stored.get("id") == expected_id:
+            del self.metadata[SESSION_PENDING_MEMORY_KEY]
+        return True
+
+    async def _idle_input(self) -> bool:
+        self.input_checks += 1
+        return bool(self.input_arrives(self.input_checks))
+
+    async def _settled(self, turn_id: int) -> None:
+        self.events.append(("settled", turn_id))
+
+    def callbacks(self, inputs: tuple = ()) -> PersistentLoopCallbacks:
+        callbacks = replace(
+            super().callbacks(inputs),
+            idle_input_arrived=self._idle_input,
+            save_pending_memory=self._save,
+            on_turn_settled=self._settled,
+        )
+        if self.stop_turn:
+            callbacks.check_interrupt = MagicMock(return_value="hard")
+        return callbacks
+
+    def take_bundle(self, bundle: Dict[str, Any]) -> bool:
+        """A claim: the executor hands the bundle's set to the session."""
+        from agent.api.persistent_session import PersistentSession
+        from agent.api.turn_executor import claim_bundle_pending_memory
+
+        session = SimpleNamespace(
+            memory_service=self.memory_service, config=self.config, thread_id="t"
+        )
+        return PersistentSession.apply_pending_memory(
+            session, claim_bundle_pending_memory(bundle)
+        )
+
+    async def run(  # type: ignore[override]
+        self, *inputs: Any, stateless: bool = True, initial_turn_count: int = 0
+    ) -> None:
+        await run_persistent_loop(
+            llm_with_tools=self.llm,
+            tools=self.tools,
+            context_manager=self.context_manager,
+            config=self.config,
+            system_prompt=SYSTEM_PROMPT,
+            callbacks=self.callbacks(inputs),
+            messages=self.messages,
+            knowledge_store=self.knowledge_store,
+            project_ids=[harness.PROJECT_ID],
+            tool_context=self.tool_context,
+            memory_service=self.memory_service,
+            initial_turn_count=initial_turn_count,
+            defer_memory_extraction_to_outbox=stateless,
+        )
+        assert self.errors == []
+
+    def memory_entries(self) -> List[HumanMessage]:
+        return [e for e in self.entries() if entry_kind(e) == "memory"]
+
+
+def _bundle(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """A claim bundle: the stored set rides beside ``attach`` (B9)."""
+    bundle: Dict[str, Any] = {"attach": {"thread_id": "t"}}
+    if SESSION_PENDING_MEMORY_KEY in metadata:
+        bundle[SESSION_PENDING_MEMORY_KEY] = metadata[SESSION_PENDING_MEMORY_KEY]
+    return bundle
+
+
+class TestIdlePrefetch:
+    @pytest.mark.asyncio
+    async def test_pod_handoff_the_next_turns_first_request_gets_the_prefetch(self):
+        """Turn N on process A prefetches and saves the set; turn N+1 on
+        process B (a fresh attach whose bundle carries it) sends it with its
+        first request, while B's own turn retrieval has not finished."""
+        pod_a = PrefetchSession([text_turn("One.")], retriever=ExchangeRetriever())
+        await pod_a.run("Turn one?")
+
+        assert pod_a.retriever.prefetch_queries == ["Turn one?\n\nOne."]
+        stored = pod_a.metadata[SESSION_PENDING_MEMORY_KEY]
+        assert [m["content"] for m in stored["memory"]] == [PREFETCHED.content]
+        assert stored["turn"] == 1
+        # Stateless: saved before the settled edge, i.e. before the executor
+        # closes the interrupt window, detaches and completes the unit (B8).
+        assert pod_a.events.index(("save", "write")) < pod_a.events.index(
+            ("settled", 1)
+        )
+        assert pod_a.memory_entries() == []
+
+        pod_b = PrefetchSession(
+            [text_turn("Two.")],
+            retriever=ExchangeRetriever(prefetch=(), gate_turn=True),
+            metadata=pod_a.metadata,
+        )
+        pod_b.messages = list(pod_a.messages)  # restored history
+        assert pod_b.take_bundle(_bundle(pod_b.metadata)) is True
+
+        await pod_b.run("Turn two?", initial_turn_count=1)
+
+        (first,) = pod_b.llm.calls
+        assert _texts(first).count(_srw("memory")) == 1
+        assert _texts(first).count(PREFETCHED.content) == 1
+        assert len(pod_b.memory_entries()) == 1
+        # The memory went out as a persisted context row (write first) ...
+        assert "memory" in [entry_kind(m) for m in pod_b.persisted]
+        # ... and B's turn end cleared the drained set (clear second): its
+        # own turn retrieval was still running (cancelled, single flight)
+        # and its prefetch found nothing new.
+        assert pod_b.retriever.cancelled == 1
+        assert SESSION_PENDING_MEMORY_KEY not in pod_b.metadata
+        assert pod_b.events.index(("save", "clear")) < pod_b.events.index(
+            ("settled", 2)
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_replay_after_a_crash_between_write_and_clear_appends_nothing(
+        self,
+    ):
+        """The turn that drained the set dies before its clear lands; the
+        next process gets the same set again and the history already holds
+        it (D3), so nothing is appended twice."""
+        pod_a = PrefetchSession([text_turn("One.")], retriever=ExchangeRetriever())
+        await pod_a.run("Turn one?")
+        pod_b = PrefetchSession(
+            [text_turn("Two.")],
+            retriever=ExchangeRetriever(prefetch=(), gate_turn=True),
+            metadata=pod_a.metadata,
+        )
+        pod_b.messages = list(pod_a.messages)
+        pod_b.take_bundle(_bundle(pod_b.metadata))
+        pod_b.clear_error = ConnectionError("pod died before the clear")
+        await pod_b.run("Turn two?", initial_turn_count=1)
+        assert SESSION_PENDING_MEMORY_KEY in pod_b.metadata  # the clear failed
+        assert len(pod_b.memory_entries()) == 1
+
+        pod_c = PrefetchSession(
+            [text_turn("Three.")],
+            retriever=ExchangeRetriever(prefetch=(), gate_turn=True),
+            metadata=pod_b.metadata,
+        )
+        pod_c.messages = list(pod_b.messages)
+        assert pod_c.take_bundle(_bundle(pod_c.metadata)) is True
+
+        await pod_c.run("Turn three?", initial_turn_count=2)
+
+        (first,) = pod_c.llm.calls
+        assert _texts(first).count(_srw("memory")) == 1  # B's entry only
+        assert _texts(first).count(PREFETCHED.content) == 1
+        assert len(pod_c.memory_entries()) == 1
+        assert pod_c.memory_service.retrieval_stats()["prefetch_taken"] == 1
+        # C's turn end clears the replayed set.
+        assert SESSION_PENDING_MEMORY_KEY not in pod_c.metadata
+
+    @pytest.mark.asyncio
+    async def test_a_warm_reuse_takes_its_own_set_in_once(self):
+        session = PrefetchSession(
+            [text_turn("One."), text_turn("Two.")],
+            retriever=ExchangeRetriever(),
+        )
+        await session.run("Turn one?")
+        assert SESSION_PENDING_MEMORY_KEY in session.metadata
+
+        # The next claim reuses the warm session: the bundle carries the set
+        # it already holds, which is not taken a second time.
+        assert session.take_bundle(_bundle(session.metadata)) is False
+        await session.run("Turn two?", initial_turn_count=1)
+
+        first_of_turn_two = session.llm.calls[1]
+        assert _texts(first_of_turn_two).count(PREFETCHED.content) == 1
+        assert len(session.memory_entries()) == 1
+        # Turn two's prefetch found the same memory, already in the history:
+        # nothing new to store, and the drained set is cleared.
+        assert session.retriever.prefetch_queries == [
+            "Turn one?\n\nOne.",
+            "Turn two?\n\nTwo.",
+        ]
+        assert SESSION_PENDING_MEMORY_KEY not in session.metadata
+        stats = session.memory_service.retrieval_stats()
+        assert (stats["prefetch_ok"], stats["prefetch_empty"]) == (1, 1)
+        for prev, nxt in zip(session.llm.calls, session.llm.calls[1:]):
+            assert _view(nxt)[: len(prev)] == _view(prev)
+
+    @pytest.mark.asyncio
+    async def test_the_budget_ends_the_turn_without_a_prefetch(self):
+        session = PrefetchSession(
+            [text_turn("One.")],
+            retriever=ExchangeRetriever(gate_prefetch=True),
+            budget=0.1,
+        )
+
+        started = time.monotonic()
+        await session.run("Turn one?")
+
+        assert time.monotonic() - started < 1.0
+        assert session.retriever.cancelled == 1
+        assert session.metadata == {}
+        assert ("save", "write") not in session.events
+        assert session.memory_service.retrieval_stats()["prefetch_timed_out"] == 1
+
+    @pytest.mark.asyncio
+    async def test_new_input_cancels_the_prefetch(self):
+        session = PrefetchSession(
+            [text_turn("One.")],
+            retriever=ExchangeRetriever(gate_prefetch=True),
+            budget=30.0,
+            input_arrives=lambda n: n >= 2,
+        )
+
+        started = time.monotonic()
+        await session.run("Turn one?")
+
+        # One check before the start, one at the first poll (0.25 s).
+        assert session.input_checks == 2
+        assert time.monotonic() - started < 2.0
+        assert session.retriever.cancelled == 1
+        assert session.metadata == {}
+        assert session.memory_service.retrieval_stats()["prefetch_cancelled"] == 1
+
+    @pytest.mark.asyncio
+    async def test_pinned_runs_it_after_the_turn_settled(self):
+        session = PrefetchSession([text_turn("One.")], retriever=ExchangeRetriever())
+
+        await session.run("Turn one?", stateless=False)
+
+        assert session.events.index(("settled", 1)) < session.events.index(
+            ("save", "write")
+        )
+        assert SESSION_PENDING_MEMORY_KEY in session.metadata
+
+    @pytest.mark.asyncio
+    async def test_legacy_mode_neither_prefetches_nor_stores(self):
+        session = PrefetchSession(
+            [text_turn("One.")], retriever=ExchangeRetriever(), mode="legacy"
+        )
+
+        await session.run("Turn one?")
+
+        assert session.retriever.prefetch_queries == []
+        assert session.metadata == {}
+        assert session.input_checks == 0
+        assert not any(event == "save" for event, *_ in session.events)
+
+    @pytest.mark.asyncio
+    async def test_a_stopped_turn_ends_without_a_prefetch(self):
+        session = PrefetchSession([text_turn("One.")], retriever=ExchangeRetriever())
+        session.stop_turn = True
+
+        await session.run("Turn one?")
+
+        assert session.retriever.prefetch_queries == []
+        assert session.metadata == {}

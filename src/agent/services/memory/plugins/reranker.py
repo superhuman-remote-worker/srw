@@ -119,7 +119,7 @@ class RerankerScorer:
         return self._client
 
     async def _rerank(
-        self, query: str, documents: List[str]
+        self, query: str, documents: List[str], *, retries: bool = True
     ) -> List[Tuple[int, float]]:
         """Call the endpoint; return (index, relevance_score) pairs.
 
@@ -127,8 +127,10 @@ class RerankerScorer:
         attempts, exponential backoff from ``retry_backoff``); if they outlast
         the budget the call raises ``TransientScorerError`` for the manager to
         degrade this one turn. Structural failures raise immediately.
+        ``retries=False`` (``AssembleRequest.retries``, the session's
+        idle-time prefetch under its hard budget) makes one attempt only.
         """
-        attempts = self.retries + 1
+        attempts = self.retries + 1 if retries else 1
         last_exc: Optional[Exception] = None
         for attempt in range(attempts):
             if attempt:
@@ -186,7 +188,9 @@ class RerankerScorer:
             return items
 
         ranked = await self._rerank(
-            req.query_text, [item.candidate.text or "" for item in to_rank]
+            req.query_text,
+            [item.candidate.text or "" for item in to_rank],
+            retries=getattr(req, "retries", True) is not False,
         )
         if len(ranked) != len(to_rank):
             raise ValueError(

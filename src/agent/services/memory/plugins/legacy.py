@@ -95,12 +95,16 @@ class RecallTwoTierRetriever:
         if store is None:
             return []
 
-        try:
-            await _bounded(store.decrement_ttl(), self.timeout)
-        except Exception as e:
-            logger.warning(
-                "TTL decrement failed (non-fatal): %s: %s", type(e).__name__, e
-            )
+        # A read-only retrieval (the session's idle-time prefetch,
+        # ``AssembleRequest.ttl_tick=False``) leaves the TTL tier alone: the
+        # turn's own retrieval keeps the one tick per turn.
+        if getattr(req, "ttl_tick", True) is not False:
+            try:
+                await _bounded(store.decrement_ttl(), self.timeout)
+            except Exception as e:
+                logger.warning(
+                    "TTL decrement failed (non-fatal): %s: %s", type(e).__name__, e
+                )
 
         # No budget kwarg — the legacy call relies on the store's
         # constructed budget; passing req.budget_tokens here would change

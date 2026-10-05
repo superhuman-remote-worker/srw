@@ -302,6 +302,12 @@ class FakeSession:
         self.tool_context = SimpleNamespace(_stateless_subagent_recovery_active=False)
         # (batch_settle_contract, fanout) as each claim applied them.
         self.advertisements: List[Tuple[bool, bool]] = []
+        # The durable pending memory sets each claim handed over (WP4).
+        self.pending_sets: List[Any] = []
+
+    def apply_pending_memory(self, stored: Any) -> bool:
+        self.pending_sets.append(stored)
+        return True
 
     def set_shell_owner_token(self, token: int) -> None:
         self.shell_owner_tokens.append(token)
@@ -368,6 +374,7 @@ class Harness:
         pa._turn_start_external_hook = None
         pa._turn_complete_external_hook = None
         pa._turn_tool_execution_external_hook = None
+        pa._turn_idle_input_external_probe = None
         pa._interrupt_watcher_task = None
         pa._interrupt_watcher_stop = None
         pa._interrupt_owner_lease_token = None
@@ -752,6 +759,7 @@ _PA_SAVED_ATTRS = (
     "_turn_start_external_hook",
     "_turn_complete_external_hook",
     "_turn_tool_execution_external_hook",
+    "_turn_idle_input_external_probe",
     "_interrupt_watcher_task",
     "_interrupt_watcher_stop",
     "_interrupt_owner_lease_token",
@@ -3981,3 +3989,125 @@ class _BatchRuntime:
 
     def leave_foreground_for_successor(self) -> None:
         self.left_for_successor += 1
+
+
+# ---------------------------------------------------------------------------
+# The durable pending memory set and the idle-time input check (WP4)
+# ---------------------------------------------------------------------------
+
+
+def _pending_set(set_id: str) -> Dict[str, Any]:
+    return {
+        "v": 1,
+        "id": set_id,
+        "turn": 1,
+        "memory": [{"id": str(uuid4()), "content": "A remembered fact."}],
+        "knowledge": [],
+    }
+
+
+class TestPendingMemorySet:
+    """B9: the bundle carries the thread's pending memory set beside
+    ``attach``; a fresh attach and a warm reuse both hand it to the session
+    before any input is injected. B8: the claim installs the new-input check
+    the loop's end-of-turn prefetch polls."""
+
+    @pytest.mark.asyncio
+    async def test_fresh_and_warm_claims_take_the_set_beside_attach(self, harness):
+        unit = uuid4()
+        fetch = pa._orchestrator_client.get_claim_bundle
+        sets = iter([_pending_set("set-1"), _pending_set("set-2"), None])
+        order: List[str] = []
+
+        async def bundle(unit_id, lease_token):
+            data = await fetch(unit_id, lease_token)
+            stored = next(sets)
+            if stored is not None:
+                data["aoci_pending_memory"] = stored
+            return data
+
+        pa._orchestrator_client.get_claim_bundle = bundle
+        real_fake_loop = harness._fake_loop
+
+        async def loop():
+            order.append(f"inject after {len(pa._session.pending_sets)} sets")
+            await real_fake_loop()
+
+        harness._fake_loop = loop
+        for token, seq in ((1, 1), (2, 2), (3, 3)):
+            harness.db.pending_rows = [
+                {"id": str(uuid4()), "seq": seq, "content": f"turn {seq}"}
+            ]
+            await harness.executor._serve_claim(
+                make_claim(unit_id=unit, token=token, input_seq=seq)
+            )
+        await _finish(harness)
+
+        # One attach for three claims: the set changes at every turn end and
+        # never reaches the attach keywords or their fingerprint.
+        (attached,) = harness.calls["attach"]
+        assert "aoci_pending_memory" not in attached
+        (session,) = harness.sessions
+        assert [s["id"] for s in session.pending_sets] == ["set-1", "set-2"]
+        assert order == ["inject after 1 sets"]
+        assert len(harness.calls["complete"]) == 3
+
+    def test_the_bundle_parser_ignores_an_unreadable_set(self):
+        assert te.claim_bundle_pending_memory({"attach": {}}) is None
+        assert te.claim_bundle_pending_memory({"aoci_pending_memory": {"v": 9}}) is None
+        stored = _pending_set("set-1")
+        assert te.claim_bundle_pending_memory({"aoci_pending_memory": stored}) == stored
+        # Beside attach, never part of the fingerprint.
+        attach = te.claim_bundle_attach(
+            {"attach": {"thread_id": "t"}, "aoci_pending_memory": stored}
+        )
+        assert attach == {"thread_id": "t"}
+
+    @pytest.mark.asyncio
+    async def test_the_claim_installs_and_removes_the_new_input_check(self, harness):
+        unit = uuid4()
+        harness.db.pending_rows = [{"id": str(uuid4()), "seq": 5, "content": "hi"}]
+        claim = make_claim(unit_id=unit, token=7, input_seq=5, consumed_seq=3)
+        answers: List[bool] = []
+        input_seqs = iter([5, 6, None])
+        real_fetchval = harness.db.fetchval
+
+        async def fetchval(sql, *args):
+            if sql == te._LEASED_INPUT_SEQ_SQL:
+                harness.db.fetch_calls.append((sql, args))
+                return next(input_seqs)
+            return await real_fetchval(sql, *args)
+
+        harness.db.fetchval = fetchval
+        real_fake_loop = harness._fake_loop
+
+        async def loop():
+            probe = pa._turn_idle_input_external_probe
+            for _ in range(3):
+                answers.append(await probe())
+            await real_fake_loop()
+
+        harness._fake_loop = loop
+        await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        # Same seq as the served input: no new input. Higher: new input. No
+        # leased row: the lease is gone, which stops the prefetch too.
+        assert answers == [False, True, True]
+        probes = [
+            a for sql, a in harness.db.fetch_calls if sql == te._LEASED_INPUT_SEQ_SQL
+        ]
+        assert probes == [(unit, 7)] * 3
+        assert pa._turn_idle_input_external_probe is None
+        assert harness.calls["complete"]
+
+    @pytest.mark.asyncio
+    async def test_a_lost_lease_answers_without_a_query(self, harness):
+        claim = make_claim(token=4, input_seq=2)
+        harness.executor._lease.update(claim.unit_id, 4)
+        harness.executor._lease.mark_lost()
+
+        assert await harness.executor._idle_input_arrived(claim, 2) is True
+        assert not any(
+            sql == te._LEASED_INPUT_SEQ_SQL for sql, _ in harness.db.fetch_calls
+        )

@@ -478,6 +478,57 @@ async def test_memory_that_arrives_a_request_late_keeps_the_prefix(
     assert text_occurrences(last, UPDATED_ITEM_MARKER) == expected["updated"]
 
 
+PREFETCH_CASES = [
+    pytest.param(family, id=f"session-two-turns-append_only-prefetch-{family}")
+    for family in FAMILIES
+    if family not in SATURATED
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family_id", PREFETCH_CASES)
+async def test_the_idle_time_prefetch_reaches_turn_two_and_keeps_the_prefix(
+    family_id, tmp_path, monkeypatch
+):
+    """WP4 (D24, D32): the memory the idle-time prefetch found at the end of
+    turn one goes out with the first request of turn two, as an appended
+    entry; every request still starts with the previous one."""
+    _require_renderer(family_id)
+    family = FAMILIES[family_id]
+    scenario = "session-two-turns"
+    control = await _violations(scenario, family, "control", tmp_path, monkeypatch)
+
+    workdir = tmp_path / "append_only-prefetch"
+    workdir.mkdir()
+    requests, turn_ends = await run_scenario(
+        scenario,
+        family,
+        sources=VARIANTS["injected"],
+        workdir=workdir,
+        monkeypatch=monkeypatch,
+        injection_mode="append_only",
+        memory_prefetch=True,
+    )
+    found = prefix_violations(family, requests, turn_ends=turn_ends)
+    caused = {n: v for n, v in found.items() if n not in control}
+    if caused:
+        raise PrefixViolation(
+            f"{scenario} / {family_id}, append_only, idle-time prefetch:\n"
+            + "\n".join(caused.values())
+        )
+    with_fact = [
+        n
+        for n, r in enumerate(requests)
+        if text_occurrences(r.body, harness.PREFETCH_FACT)
+    ]
+    first_of_turn_two = max(turn_ends) + 1
+    assert with_fact[0] == first_of_turn_two
+    last = requests[-1].body
+    assert text_occurrences(last, harness.PREFETCH_FACT) == 1
+    # Turn one's memory entry and the prefetched one; the rest was present.
+    assert text_occurrences(last, _srw("memory")) == 2
+
+
 @pytest.mark.asyncio
 async def test_append_only_breakpoints_on_real_worker_requests(tmp_path, monkeypatch):
     """§H/O4 on the requests the worker really sends to Claude via the proxy.

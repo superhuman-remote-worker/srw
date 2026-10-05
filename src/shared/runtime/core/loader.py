@@ -2632,6 +2632,12 @@ class MemoryConfig:
     # memories per appended memory entry; the rest drip in on later requests
     # while retrieval keeps returning them. No total cap.
     max_memories_per_entry: int = 5
+    # Append-only context injection WP4 (D24, D33): the hard budget, in
+    # seconds, of a session's idle-time memory prefetch at the end of a turn
+    # (one retrieval with the latest exchange, no retries; on timeout the
+    # turn ends without one). It is slot time on the stateless lane. 0 turns
+    # the prefetch off.
+    prefetch_budget_s: float = 3.0
     observer_interval: int = 5
     assembler_interval: int = 7
     default_ttl: int = 10
@@ -3121,6 +3127,21 @@ def _parse_max_memories_per_entry(value: Any) -> int:
     return parsed
 
 
+def _parse_prefetch_budget(value: Any) -> float:
+    """``memory.prefetch_budget_s``: seconds >= 0 (default 3.0, WP4 D33)."""
+    parsed: Optional[float] = None
+    if not isinstance(value, bool):
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = None
+    if parsed is None or parsed != parsed or parsed < 0:
+        raise ValueError(
+            f"memory.prefetch_budget_s must be a number of seconds >= 0, got {value!r}"
+        )
+    return parsed
+
+
 def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
     """Parse memory configuration from dict.
 
@@ -3204,6 +3225,7 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
         max_memories_per_entry=_parse_max_memories_per_entry(
             data.get("max_memories_per_entry", 5)
         ),
+        prefetch_budget_s=_parse_prefetch_budget(data.get("prefetch_budget_s", 3.0)),
         observer_interval=data.get("observer_interval", 5),
         assembler_interval=data.get("assembler_interval", 7),
         default_ttl=data.get("default_ttl", 10),

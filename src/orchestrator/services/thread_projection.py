@@ -20,6 +20,7 @@ from orchestrator.services.container_provisioner import (
     WORKSPACE_RUNTIME_INCARNATION_KEY,
 )
 from orchestrator.services.job_projection import redact_nested_workspace_state
+from shared.session_pending_memory import SESSION_PENDING_MEMORY_KEY
 from shared.tool_catalog import TOOL_REGISTRY
 
 
@@ -94,6 +95,9 @@ def redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
         md["config_override"] = redact_config_override(md["config_override"])
     md.pop("_workspace_binding", None)
     md.pop("_stateless_workspace_process_zero_observation", None)
+    # The agent's pending memory set (append-only context injection WP4):
+    # internal turn-to-turn state of up to 32 KiB, never an owner field.
+    md.pop(SESSION_PENDING_MEMORY_KEY, None)
     thread["metadata"] = md
     # A stateless End or permanent Delete holds its marker until the exact
     # retirement settles; a retryable 503 leaves it pending until End,

@@ -679,6 +679,9 @@ CHURN_FACTS = MEMORY_FACTS + tuple(
     ("factual", f"Churn fact {i}: release step {i} is documented.") for i in range(3, 8)
 )
 MEMORY_REVISED = "The release checklist moved to docs/releasing.md."
+# What the session's idle-time prefetch after turn one finds (WP4, D24): a
+# memory no turn retrieval returns.
+PREFETCH_FACT = "Release notes are drafted on the Thursday before a release."
 CHURN_MEMORY_CHANGE_AT = 3  # assemble call (= worker request) of the memory change
 CHURN_NOTE_CHANGE_AT = 4  # assemble call of the note change
 
@@ -784,6 +787,11 @@ class RecordingMemoryManager:
         self.payload = self._payload(0)
         self._in_flight: Optional[Any] = None
         self._finished: Optional[Any] = None
+        # Idle-time prefetch (WP4): what the session's turn end found, the
+        # requests it ran with, and the stored set's id.
+        self.prefetch_requests: List[Any] = []
+        self._prefetched: Optional[Any] = None
+        self.durable_pending_id: Optional[str] = None
 
     def _payload(self, call: int) -> Any:
         from agent.core.knowledge_injection import create_knowledge_injection_messages
@@ -833,7 +841,53 @@ class RecordingMemoryManager:
 
     def take_retrieval(self) -> Optional[Any]:
         result, self._finished = self._finished, None
+        prefetched, self._prefetched = self._prefetched, None
+        if prefetched is not None:
+            from agent.services.memory.manager import merge_retrieval_results
+
+            result = (
+                prefetched
+                if result is None
+                else merge_retrieval_results(result, prefetched)
+            )
         return result
+
+    async def prefetch(self, req: Any, *, keep: Any = None, **_: Any) -> Any:
+        """The idle-time prefetch: finds :data:`PREFETCH_FACT` (WP4)."""
+        from agent.services.memory import (
+            InjectionBlock,
+            MemoryPayload,
+            PrefetchOutcome,
+            RetrievalResult,
+        )
+        from shared.runtime.services.recall_store import MemoryRecord
+
+        self.prefetch_requests.append(req)
+        record = MemoryRecord(
+            id=UUID(int=99),
+            content=PREFETCH_FACT,
+            memory_type="factual",
+            importance=0.5,
+            token_count=len(PREFETCH_FACT) // 4,
+        )
+        records = [r for r in [record] if keep is None or keep("memory", r)]
+        if not records:
+            return PrefetchOutcome(status="empty")
+        self._prefetched = RetrievalResult(
+            payload=MemoryPayload(
+                blocks=[InjectionBlock(kind="memory", records=records)]
+            ),
+            source="prefetch",
+            pending_id=f"set-{len(self.prefetch_requests)}",
+        )
+        return PrefetchOutcome(status="ok", memories=1, result=self._prefetched)
+
+    @property
+    def pending_prefetch(self) -> Optional[Any]:
+        return self._prefetched
+
+    def note_pending_saved(self, pending_id: Optional[str]) -> None:
+        self.durable_pending_id = pending_id
 
     def retrieval_stats(self) -> Dict[str, int]:
         return {"started": len(self.assemble_requests)}
@@ -1215,6 +1269,7 @@ async def run_session_scenario(
     injection_mode: str = "legacy",
     memory_lag: int = 0,
     memory_search: bool = True,
+    memory_prefetch: bool = False,
 ) -> List[Captured]:
     """Two user turns through the real ``run_persistent_loop`` (astream path).
 
@@ -1227,7 +1282,9 @@ async def run_session_scenario(
     turn boundary once per user turn). ``memory_lag=1`` makes the turn-one
     retrieval finish only when turn two starts its own. ``memory_search``
     binds the memory tool with the context sources, which brings the
-    up-front memory summary (D35) in append_only mode.
+    up-front memory summary (D35) in append_only mode. ``memory_prefetch``
+    wires the idle-time prefetch (WP4): turn one's end finds
+    :data:`PREFETCH_FACT`, which turn two's first request takes in.
     """
     injections = "context" in sources
     import asyncio
@@ -1270,6 +1327,9 @@ async def run_session_scenario(
         check_interrupt=MagicMock(return_value=None),
         persist_message=AsyncMock(),
     )
+    if memory_prefetch:
+        callbacks.idle_input_arrived = AsyncMock(return_value=False)
+        callbacks.save_pending_memory = AsyncMock(return_value=True)
     tool_context = SimpleNamespace(knowledge_bindings=[], citation_engine=None)
     kwargs: Dict[str, Any] = {}
     memory_service: Optional[RecordingMemoryManager] = None
@@ -1595,11 +1655,13 @@ async def run_scenario(
     monkeypatch: Any,
     injection_mode: str = "legacy",
     memory_lag: int = 0,
+    memory_prefetch: bool = False,
 ) -> Tuple[List[Captured], frozenset]:
     """Run one scenario; return the captured requests and the turn-end steps.
 
     ``memory_lag`` (append_only): how many requests late a memory retrieval
     result arrives; 0 serves each request from its own retrieval.
+    ``memory_prefetch`` (sessions): run the idle-time prefetch at turn end.
     """
     spec = dict(SCENARIOS[name])
     if spec.pop("kind") == "session":
@@ -1609,6 +1671,7 @@ async def run_scenario(
             monkeypatch=monkeypatch,
             injection_mode=injection_mode,
             memory_lag=memory_lag,
+            memory_prefetch=memory_prefetch,
         )
         return requests, frozenset(SESSION_TURN_ENDS)
     requests = await run_worker_scenario(

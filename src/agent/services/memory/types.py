@@ -177,6 +177,16 @@ class AssembleRequest:
     #: Main-LLM model name; the legacy block assemblers take it for token
     #: counting (RecallStore.assemble_memory_block(model=...)).
     model: Optional[str] = None
+    #: False: plugins make one attempt per call and never back off (the
+    #: reranker's transient-fault retries are off). The session's idle-time
+    #: prefetch runs under a hard budget of a few seconds (D33); a transient
+    #: fault then degrades that retrieval instead of retrying past it.
+    retries: bool = True
+    #: False: the retrieval is read-only and does not advance the TTL tier
+    #: (``recall_two_tier``'s decrement). The idle-time prefetch is an extra
+    #: retrieval per session turn; the turn's own retrieval keeps the one
+    #: tick per turn.
+    ttl_tick: bool = True
 
 
 @dataclass
@@ -289,16 +299,73 @@ class RetrievalResult:
     retrievals of one manager; ``finished_at`` is ``time.monotonic()`` at
     completion. ``degraded`` is the signature of a structural pipeline
     failure (D13); the payload is then empty.
+
+    ``source`` is ``"request"`` for a retrieval a request started and
+    ``"prefetch"`` for the session's idle-time prefetch (WP4, D24), which
+    waits as the conversation's pending set (D32). ``pending_id`` names that
+    set: it is stored with it in ``threads.metadata``, so a process that
+    receives the stored copy can tell whether it already holds or has
+    already taken in the same set.
     """
 
     payload: MemoryPayload = field(default_factory=MemoryPayload)
     seq: int = 0
     finished_at: float = field(default_factory=time.monotonic)
     degraded: Optional[str] = None
+    source: str = "request"
+    pending_id: Optional[str] = None
 
     def age_ms(self) -> float:
         """Milliseconds since the retrieval finished."""
         return (time.monotonic() - self.finished_at) * 1000.0
+
+    def records(self, kind: str) -> List[Any]:
+        """The store records of every block of ``kind``, in rank order."""
+        out: List[Any] = []
+        for block in self.payload.blocks:
+            if block.kind == kind:
+                out.extend(getattr(block, "records", None) or [])
+        return out
+
+
+#: Outcomes of :meth:`MemoryManager.prefetch` (WP4).
+PREFETCH_OK = "ok"  # finished in budget with records; held as the pending set
+PREFETCH_EMPTY = "empty"  # finished in budget, nothing new retrieved
+PREFETCH_CANCELLED = "cancelled"  # new input, an interrupt, or a failed probe
+PREFETCH_TIMEOUT = "timeout"  # the hard budget ran out first
+PREFETCH_DEGRADED = "degraded"  # structural pipeline failure (D13)
+PREFETCH_SKIPPED = "skipped"  # not run (closed manager, stuck retrieval)
+
+
+@dataclass
+class PrefetchOutcome:
+    """What one idle-time prefetch did (WP4, D33), for the log and the audit.
+
+    ``duration_ms`` is the time the prefetch took, from its first new-input
+    check to its end (cancelled and timed-out runs included); the session
+    loop reports the whole step, the save of the pending set included, as
+    its slot time. ``reason`` explains a cancel, a skip or an empty result
+    (``all_present``: everything retrieved was already in the history).
+    """
+
+    status: str
+    duration_ms: float = 0.0
+    memories: int = 0
+    knowledge: int = 0
+    reason: Optional[str] = None
+    errors: List[str] = field(default_factory=list)
+    result: Optional[RetrievalResult] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Audit/log view (no records)."""
+        return {
+            "status": self.status,
+            "duration_ms": round(self.duration_ms, 1),
+            "memories": self.memories,
+            "knowledge": self.knowledge,
+            "reason": self.reason,
+            "errors": list(self.errors),
+        }
 
 
 @dataclass

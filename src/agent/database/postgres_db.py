@@ -1814,6 +1814,100 @@ class PostgresDB:
         return [str(row["commit_sha"]) for row in rows]
 
     # ------------------------------------------------------------------
+    # Pending memory set of a session (append-only context injection WP4)
+    # ------------------------------------------------------------------
+
+    _SAVE_PENDING_MEMORY_SQL = """
+        UPDATE threads
+        SET metadata = jsonb_set(
+            COALESCE(metadata, '{}'::jsonb), ARRAY[$2::text], $3::jsonb, true
+        )
+        WHERE id = $1::uuid
+        RETURNING 1
+    """
+    _CLEAR_PENDING_MEMORY_SQL = """
+        UPDATE threads
+        SET metadata = metadata - $2::text
+        WHERE id = $1::uuid
+          AND metadata -> $2::text ->> 'id' = $3::text
+        RETURNING 1
+    """
+
+    async def save_thread_pending_memory(
+        self,
+        thread_id: str,
+        payload: Optional[Dict[str, Any]],
+        *,
+        expected_id: Optional[str] = None,
+    ) -> bool:
+        """Write or clear the session's durable pending memory set (D32).
+
+        ``payload`` (the serialized idle-time prefetch) is written under
+        ``SESSION_PENDING_MEMORY_KEY`` with one atomic ``jsonb_set``: every
+        other metadata key is left as it is, so no writer that owns another
+        key is overwritten. ``payload`` None removes the stored set only when
+        its id is ``expected_id`` (the set this turn took in); a newer set is
+        never cleared by an older turn.
+
+        Fenced like the turn's other writes: the thread row is locked first
+        (the repository's threads -> run_queue order), then a stateless
+        claimant proves its exact lease before the update, so a zombie never
+        writes after a steal. The pinned lane has no queue lease. Returns
+        True when the statement ran; False when the thread is gone. A lost
+        lease raises ``LeaseLostError``.
+        """
+        from shared.session_pending_memory import SESSION_PENDING_MEMORY_KEY
+
+        if payload is None and not expected_id:
+            return False
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM threads WHERE id = $1::uuid FOR UPDATE",
+                    thread_id,
+                )
+                if exists is None:
+                    return False
+                if lease is not None:
+                    await _require_run_queue_fence(conn, lease)
+                if payload is not None:
+                    await conn.fetchval(
+                        self._SAVE_PENDING_MEMORY_SQL,
+                        thread_id,
+                        SESSION_PENDING_MEMORY_KEY,
+                        json.dumps(payload),
+                    )
+                else:
+                    await conn.fetchval(
+                        self._CLEAR_PENDING_MEMORY_SQL,
+                        thread_id,
+                        SESSION_PENDING_MEMORY_KEY,
+                        str(expected_id),
+                    )
+        return True
+
+    async def get_thread_pending_memory(
+        self, thread_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """The session's stored pending memory set, if it holds a valid one.
+
+        Read by a pinned session at setup in a fresh process (the stateless
+        lane gets the set from its claim bundle).
+        """
+        from shared.session_pending_memory import (
+            SESSION_PENDING_MEMORY_KEY,
+            valid_pending_memory,
+        )
+
+        value = await self.fetchval(
+            "SELECT metadata -> $2::text FROM threads WHERE id = $1::uuid",
+            thread_id,
+            SESSION_PENDING_MEMORY_KEY,
+        )
+        return valid_pending_memory(value)
+
+    # ------------------------------------------------------------------
     # Durable persistent-session state (migration 0133)
     # ------------------------------------------------------------------
 

@@ -763,6 +763,14 @@ _turn_tool_execution_external_hook: Optional[Callable[[Tuple[str, int, int]], No
     None
 )
 
+# Idle-time memory prefetch seam for the stateless executor (append-only
+# context injection WP4, B8). Nothing tells a leased claim that new input
+# arrived, so the executor installs a per-claim check: has ``run_queue.
+# input_seq`` risen past the input this claim serves, under its exact lease
+# (a lost lease counts as yes). The loop's end-of-turn prefetch polls it and
+# stops. Pinned sessions leave it unset and check their input runtime.
+_turn_idle_input_external_probe: Optional[Callable[[], Awaitable[bool]]] = None
+
 # Phase 2 event-log cursor. Allocated synchronously by _broadcast, then queued
 # through one ordered writer so a later sequence can never become visible in
 # Postgres before an earlier queued sequence. Each DB-backed runtime attach
@@ -1156,6 +1164,8 @@ def _ensure_persistent_loop_started(
                 _session_input.defer_and_requeue_delivery
             ),
             settle_input_delivery=_session_input.settle_delivery,
+            idle_input_arrived=_loop_idle_input_arrived,
+            save_pending_memory=_loop_save_pending_memory,
         )
         # Tag the loop task — and the turn/aux tasks it spawns, which copy this
         # context at creation — with thread_id for log correlation.
@@ -7817,6 +7827,59 @@ async def _loop_on_turn_settled(turn_id: int) -> None:
     # run_queue disposition. Shutdown in that gap must retain the post-effect
     # classification. The executor clears the exact identity after its durable
     # complete/park/release CAS.
+
+
+async def _loop_idle_input_arrived() -> bool:
+    """Whether new input must stop the end-of-turn memory prefetch (WP4, B8).
+
+    Stateless: the executor's per-claim check (``run_queue.input_seq`` under
+    the exact lease); without one the prefetch never holds a slot. Pinned:
+    input the runtime already queued, else a durable delivery it can claim
+    now (the same reclaim the input wait runs every second; claiming early
+    only moves it into the queue the loop reads next).
+    """
+    if not _loop_provider_admission_open():
+        return True
+    probe = _turn_idle_input_external_probe
+    if probe is not None:
+        return bool(await probe())
+    if _stateless_mode():
+        return True
+    queue = _session_input.queue
+    if queue is None:
+        return True
+    if not queue.empty():
+        return True
+    await _session_input.reclaim_pending()
+    return not queue.empty()
+
+
+async def _loop_save_pending_memory(
+    payload: Optional[Dict[str, Any]], expected_id: Optional[str]
+) -> bool:
+    """Save or clear the thread's durable pending memory set (WP4, D32).
+
+    A fenced, atomic ``jsonb_set`` on ``threads.metadata`` through the
+    agent's own pool (the stateless lane proves its exact lease first, like
+    every turn write). ``payload`` None clears the stored set whose id is
+    ``expected_id``.
+    """
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
+        return False
+    return bool(
+        await asyncio.wait_for(
+            _session.postgres_conn.save_thread_pending_memory(
+                _session_identity.thread_id,
+                payload,
+                expected_id=expected_id,
+            ),
+            timeout=5.0,
+        )
+    )
 
 
 # Turn-complete reconcile: bounded attempts + per-attempt timeout. The

@@ -795,6 +795,22 @@ class PersistentLoopCallbacks:
     # intentionally insufficient because it also renders unbound tool errors.
     on_tool_execution_start: Optional[Callable[[str, str], Awaitable[None]]] = None
 
+    # Idle-time memory prefetch (append-only context injection WP4; D24,
+    # D32, D33). Both unset: no prefetch (tests, other transports).
+    # ``idle_input_arrived`` answers, while the prefetch runs after a turn,
+    # whether the thread has new input that must not wait for it (stateless:
+    # the claim's ``run_queue.input_seq`` rose under its lease; pinned: the
+    # input runtime holds or can claim a delivery). Truthy cancels it.
+    idle_input_arrived: Optional[Callable[[], Awaitable[Any]]] = None
+    # Save the conversation's pending memory set with the conversation
+    # (``threads.metadata``, atomic ``jsonb_set``, fenced like the turn's
+    # other writes): ``(payload, None)`` writes the set, ``(None,
+    # expected_id)`` clears the stored set with that id. True when the
+    # statement ran.
+    save_pending_memory: Optional[
+        Callable[[Optional[Dict[str, Any]], Optional[str]], Awaitable[bool]]
+    ] = None
+
     def __post_init__(self) -> None:
         # Back-compat: callers that still pass the deprecated on_vm_upgrade_needed
         # get it promoted to the generalized on_workspace_upgrade_needed the loop
@@ -2061,6 +2077,23 @@ async def run_persistent_loop(
                             f"Turn {turn_id}: workspace git push raised",
                             exc_info=True,
                         )
+            # Idle-time memory prefetch, stateless lane (WP4, D33, B8): the
+            # reply is out and the turn reconciled; the claim still holds its
+            # slot, its interrupt window and its workspace until the settled
+            # edge below, and new input cancels the step within one poll.
+            if defer_memory_extraction_to_outbox and _idle_prefetch_allowed(
+                result,
+                input_removed=input_delivery_removed_from_context,
+                priority_input=priority_user_input,
+                deferred_errors=deferred_errors,
+            ):
+                await _idle_memory_prefetch(
+                    memory_service=memory_service,
+                    config=config,
+                    messages=messages,
+                    callbacks=callbacks,
+                    turn_id=turn_id,
+                )
         finally:
             if callbacks.on_turn_settled is not None:
                 await callbacks.on_turn_settled(turn_id)
@@ -2096,6 +2129,24 @@ async def run_persistent_loop(
 
         if halt_after_turn:
             return
+
+        # Idle-time memory prefetch, pinned lane (WP4, D33): after the turn
+        # and its input delivery settled, before the loop parks for input. A
+        # pinned pod keeps its session; new input (accepted or claimable)
+        # cancels the step within one poll.
+        if not defer_memory_extraction_to_outbox and _idle_prefetch_allowed(
+            result,
+            input_removed=input_delivery_removed_from_context,
+            priority_input=priority_user_input,
+            deferred_errors=deferred_errors,
+        ):
+            await _idle_memory_prefetch(
+                memory_service=memory_service,
+                config=config,
+                messages=messages,
+                callbacks=callbacks,
+                turn_id=turn_id,
+            )
 
         logger.info(
             f"Turn {turn_id} complete: {tool_calls_this_turn} tool calls, "
@@ -2171,6 +2222,210 @@ async def _emit_reasoning_content(response, callbacks, *, message_id) -> bool:
         return False
     await callbacks.on_thinking(rc, message_id=message_id)
     return True
+
+
+#: ``memory.prefetch_budget_s`` when the config carries no number (WP4).
+_DEFAULT_PREFETCH_BUDGET_S = 3.0
+
+
+def _prefetch_budget_seconds(config: Any) -> float:
+    """``memory.prefetch_budget_s``; the default for a config without one."""
+    value = getattr(getattr(config, "memory", None), "prefetch_budget_s", None)
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+        return float(value)
+    return _DEFAULT_PREFETCH_BUDGET_S
+
+
+def _idle_prefetch_allowed(
+    result: Optional["TurnResult"],
+    *,
+    input_removed: bool,
+    priority_input: Any,
+    deferred_errors: Sequence[Any],
+) -> bool:
+    """Whether a finished turn ends with the idle-time prefetch (WP4).
+
+    Only a turn that ran to its answer: not one that failed, was stopped,
+    lost its admission or its input, and not when a reclaimed input is
+    already waiting to run next.
+    """
+    return (
+        result is not None
+        and not result.interrupted
+        and not result.admission_closed
+        and result.error is None
+        and not input_removed
+        and priority_input is None
+        and not deferred_errors
+    )
+
+
+def _absent_from(messages: List[BaseMessage]) -> Callable[[str, Any], bool]:
+    """``keep(kind, record)``: True when the history lacks the record as is.
+
+    The prefetch keeps only memories and notes the next request would
+    append (D3), so an unchanged set is neither stored nor taken in again.
+    """
+    from agent.core.context_injection import knowledge_item, memory_item, scan_presence
+
+    presence = scan_presence(messages)
+
+    def keep(kind: str, record: Any) -> bool:
+        if kind == "memory":
+            item = memory_item(record)
+        elif kind == "knowledge":
+            item = knowledge_item(record)
+        else:
+            return True
+        return presence.item_hash(kind, item) != item.hash
+
+    return keep
+
+
+async def _save_pending_memory_set(
+    memory_service: Any,
+    save: Callable[[Optional[Dict[str, Any]], Optional[str]], Awaitable[bool]],
+    turn_id: int,
+) -> str:
+    """Bring the durable pending set in line with the manager's (D32).
+
+    Write first, clear second: a new set is written over the stored one; a
+    stored set the turn took in is cleared only when no new set replaces
+    it. A replay after a crash in between is harmless (D3). Best-effort:
+    a failure is logged and the turn ends normally. Returns what happened.
+    """
+    from agent.services.memory.pending_set import serialize_pending_set
+
+    pending = getattr(memory_service, "pending_prefetch", None)
+    durable = getattr(memory_service, "durable_pending_id", None)
+    try:
+        if pending is not None:
+            if pending.pending_id == durable:
+                return "unchanged"
+            payload = serialize_pending_set(pending, turn=turn_id)
+            if payload is not None:
+                if await save(payload, None):
+                    memory_service.note_pending_saved(pending.pending_id)
+                    return "written"
+                return "not_written"
+        if durable is not None:
+            if await save(None, durable):
+                memory_service.note_pending_saved(None)
+                return "cleared"
+            return "not_cleared"
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning(
+            "Saving the pending memory set failed (non-fatal): %s: %s",
+            type(e).__name__,
+            e,
+        )
+        return "failed"
+    return "none"
+
+
+async def _idle_memory_prefetch(
+    *,
+    memory_service: Any,
+    config: Any,
+    messages: List[BaseMessage],
+    callbacks: "PersistentLoopCallbacks",
+    turn_id: int,
+) -> None:
+    """The last step of a session turn: retrieve in the idle time (WP4).
+
+    append_only only (D24, D32, D33). After the reply has been delivered
+    and the turn reconciled, one retrieval runs with the latest exchange
+    (the user's message and the final answer) as its query, under the hard
+    budget ``memory.prefetch_budget_s`` and without retries. New input (or
+    an interrupt, or a closing admission) cancels it at the next poll, so
+    the next turn waits at most one poll interval. A result becomes the
+    pending set the next turn's first request takes in, and is saved with
+    the conversation so another process can continue it; a set this turn
+    took in is cleared when nothing replaces it. The stateless lane runs
+    this before it settles the turn (the slot is still held, Stop still
+    works, the workspace is still attached); the pinned lane after.
+
+    The slot time is logged and audited (``memory_prefetch``). Never raises,
+    except a cancellation of the loop.
+    """
+    probe_input = callbacks.idle_input_arrived
+    save = callbacks.save_pending_memory
+    prefetch = getattr(memory_service, "prefetch", None)
+    if (
+        not is_append_only(config)
+        or memory_service is None
+        or probe_input is None
+        or save is None
+        or prefetch is None
+    ):
+        return
+    from agent.services.memory import AssembleRequest, PrefetchOutcome
+    from agent.services.memory.query import build_exchange_query_text
+    from agent.services.memory.types import PREFETCH_SKIPPED
+
+    started = time.monotonic()
+    budget = _prefetch_budget_seconds(config)
+
+    async def _should_cancel() -> Optional[str]:
+        event = callbacks.hard_interrupt_event
+        if event is not None and event.is_set():
+            return "interrupt"
+        peek = callbacks.peek_interrupt_cause
+        if peek is not None and peek() is not None:
+            return "interrupt"
+        gate = callbacks.before_provider_admission
+        if gate is not None and not gate():
+            return "admission_closed"
+        return "new_input" if await probe_input() else None
+
+    query = build_exchange_query_text(messages)
+    try:
+        if query:
+            outcome = await prefetch(
+                AssembleRequest(
+                    query_text=query,
+                    model=getattr(getattr(config, "llm", None), "model", None),
+                    retries=False,
+                    ttl_tick=False,
+                ),
+                budget_s=budget,
+                should_cancel=_should_cancel,
+                keep=_absent_from(messages),
+            )
+        else:
+            outcome = PrefetchOutcome(status=PREFETCH_SKIPPED, reason="no_exchange")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # pragma: no cover - prefetch contains its failures
+        logger.warning(
+            "Idle memory prefetch failed (non-fatal): %s: %s", type(e).__name__, e
+        )
+        return
+    saved = await _save_pending_memory_set(memory_service, save, turn_id)
+    slot_ms = (time.monotonic() - started) * 1000.0
+    logger.info(
+        "Idle memory prefetch: turn=%d status=%s reason=%s prefetch=%.0fms "
+        "slot=%.0fms memories=%d knowledge=%d pending_set=%s",
+        turn_id,
+        outcome.status,
+        outcome.reason,
+        outcome.duration_ms,
+        slot_ms,
+        outcome.memories,
+        outcome.knowledge,
+        saved,
+    )
+    audit = getattr(memory_service, "audit_prefetch", None)
+    if audit is not None:
+        audit(
+            outcome,
+            turn=turn_id,
+            budget_s=budget,
+            slot_ms=round(slot_ms, 1),
+            pending_set=saved,
+        )
 
 
 def _take_in_retrieval(
