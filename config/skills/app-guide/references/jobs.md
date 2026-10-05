@@ -59,7 +59,8 @@ Templates live under **Customize → Workspaces**. Built-in templates are read-o
 one to change it. A template can name any image. Images that aren't SRW's run without elevated
 privileges, so they get no cloud-folder mount unless your operator sets the Helm value
 `workspace.customImages.privileged`. Try a new image with a Job before using it in a
-Session.
+Session. To run work on your own tools, follow
+[Build your own workspace image](https://github.com/superhuman-remote-worker/srw/blob/main/docs/workspace-images.md).
 
 A template's tier is **Container**, eligible **VM (QEMU)**, or **Virtual (cloud files)**; the
 **None (no workspace)** entry has no template. Virtual keeps file tools but disables shell,

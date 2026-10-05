@@ -343,6 +343,8 @@ default template from the lookup above, unless it names a template.
 
 Any image may be used. It must implement the SRW workspace contract. The simplest
 way is to build `FROM` an SRW base image, which already does.
+[Build your own workspace image](../../docs/workspace-images.md) walks through it
+step by step.
 
 | The image provides | SRW needs it for |
 | --- | --- |
