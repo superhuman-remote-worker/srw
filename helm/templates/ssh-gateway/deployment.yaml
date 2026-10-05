@@ -1,6 +1,19 @@
 {{- if .Values.sshGateway.enabled }}
 {{- $gw := .Values.sshGateway -}}
 {{- include "srw.sshGatewayValidate" . -}}
+{{- $gatewayImage := default .Values.image.orchestrator $gw.image -}}
+{{- if $gw.image -}}
+{{- if not (kindIs "map" $gw.image) -}}
+{{- fail "sshGateway.image must be a complete image descriptor or null" -}}
+{{- end -}}
+{{- $_ := required "sshGateway.image.repository is required for an image override" $gw.image.repository -}}
+{{- if not (or $gw.image.tag $gw.image.digest) -}}
+{{- fail "sshGateway.image requires a tag or digest for an image override" -}}
+{{- end -}}
+{{- if not (has $gw.image.pullPolicy (list "Always" "IfNotPresent" "Never")) -}}
+{{- fail "sshGateway.image.pullPolicy must be Always, IfNotPresent or Never" -}}
+{{- end -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -55,10 +68,10 @@ spec:
       terminationGracePeriodSeconds: 120
       containers:
         - name: ssh-gateway
-          image: {{ include "srw.imageRef" (dict "image" .Values.image.orchestrator) | quote }}
-          imagePullPolicy: {{ .Values.image.orchestrator.pullPolicy }}
-          # Same image as the orchestrator, different entrypoint — the
-          # canvas-gateway pattern. `--factory` because ssh_gateway.py has no
+          image: {{ include "srw.imageRef" (dict "image" $gatewayImage) | quote }}
+          imagePullPolicy: {{ $gatewayImage.pullPolicy }}
+          # Uses the orchestrator image by default, with a separate pin for
+          # staged upgrades. `--factory` because ssh_gateway.py has no
           # module-level `app`: building one at import time would demand host
           # keys, a CA and a secret before uvicorn is even listening.
           command:

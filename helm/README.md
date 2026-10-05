@@ -1248,6 +1248,22 @@ Use the matching chart to configure the agent public-key projection. Updating
 only the image under an older chart keeps the orchestrator running, but leaves
 that projection unavailable and new agents unable to advertise this capability.
 
+During the staged upgrade, pin the gateway's previous immutable image with
+`sshGateway.image` while installing the new orchestrator relay/provisioner and
+agent image. This override is a complete image descriptor, for example:
+
+```yaml
+sshGateway:
+  image:
+    repository: ghcr.io/superhuman-remote-worker/srw-orchestrator
+    digest: sha256:<previous-gateway-digest>
+    pullPolicy: IfNotPresent
+```
+
+Once every target agent has its verification keys and advertises the capability,
+set `sshGateway.image: null` to move the gateway onto `image.orchestrator`.
+The default is null, so existing installs continue sharing the orchestrator pin.
+
 For key rotation, configure both old and new public keys on all verifying
 participants before changing the gateway signer. Retain the old public key
 through the 30-second proof lifetime plus the five-second clock allowance after

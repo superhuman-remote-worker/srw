@@ -209,12 +209,54 @@ def test_workspace_policy_does_not_admit_a_gateway_that_is_off(
 # ---------------------------------------------------------------------------
 
 
-def test_reuses_the_orchestrator_image(gateway: dict) -> None:
+def test_reuses_the_orchestrator_image(gateway: dict, orchestrator: dict) -> None:
     container = _container(gateway, "ssh-gateway")
+    relay = _container(orchestrator, "orchestrator")
     assert "orchestrator" in container["image"]
+    assert container["image"] == relay["image"]
+    assert container["imagePullPolicy"] == relay["imagePullPolicy"]
     assert container["command"][0] == "uvicorn"
     assert "orchestrator.ssh_gateway:create_app" in container["command"]
     assert "--factory" in container["command"]
+
+
+def test_gateway_can_stay_on_its_old_digest_during_relay_upgrade() -> None:
+    old_digest = "sha256:" + "a" * 64
+    new_digest = "sha256:" + "b" * 64
+    docs = _render(
+        *ENABLE,
+        "--set",
+        f"image.orchestrator.digest={new_digest}",
+        "--set",
+        "sshGateway.image.repository=ghcr.io/superhuman-remote-worker/srw-orchestrator",
+        "--set",
+        f"sshGateway.image.digest={old_digest}",
+        "--set",
+        "sshGateway.image.pullPolicy=IfNotPresent",
+    )
+    gateway = _container(_one(docs, "Deployment", "ssh-gateway"), "ssh-gateway")
+    relay = _container(_one(docs, "Deployment", "-orchestrator"), "orchestrator")
+    assert gateway["image"] == (
+        "ghcr.io/superhuman-remote-worker/srw-orchestrator@" + old_digest
+    )
+    assert relay["image"] == (
+        "ghcr.io/superhuman-remote-worker/srw-orchestrator@" + new_digest
+    )
+    assert gateway["imagePullPolicy"] == "IfNotPresent"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "sshGateway.image.tag=old",
+        "sshGateway.image.repository=ghcr.io/superhuman-remote-worker/srw-orchestrator",
+        "sshGateway.image=old",
+    ],
+)
+def test_incomplete_gateway_image_override_is_rejected(override: str) -> None:
+    result = _run(*ENABLE, "--set", override)
+    assert result.returncode != 0
+    assert "sshGateway.image" in result.stderr
 
 
 def test_runs_non_root_with_readonly_rootfs(gateway: dict) -> None:

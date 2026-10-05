@@ -1117,6 +1117,10 @@ auth:
 # to render rather than letting the operator find out as a crash-loop.
 sshGateway:
   enabled: false
+  # -- Optional full image descriptor (repository, tag or digest, pullPolicy).
+  # Null uses image.orchestrator. Pin the previous gateway digest while
+  # upgrading the relay and verifying agents; clear this after qualification.
+  image: null
   # -- Gateway pods. EVERY abuse cap the gateway enforces is PER POD, so this
   # value multiplies all of them.
   #
