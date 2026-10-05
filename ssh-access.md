@@ -80,6 +80,17 @@ shared account — doesn't go unnoticed.
 
 ## 2. Connect
 
+Successful SSH or SFTP channel use counts as the first client use of an ordinary
+pinned session. It keeps the startup watchdog from treating that session as
+abandoned, without sending agent input or starting a model turn. Opening a
+connection without a channel does not count.
+
+The gateway requires an acknowledgement from the exact current agent within
+five seconds, with at most two attempts. If that acknowledgement fails, it
+closes the channel and reports a temporary failure (exit status 75 when the
+client can receive it). A command may already have started before this failure;
+check its outcome before running it again. The gateway never replays it.
+
 ### The credential: a PAT, exchanged for a short-lived attach token
 
 Registering a key proves *identity*. Opening a connection also needs a short-lived

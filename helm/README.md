@@ -1194,8 +1194,11 @@ kubectl -n <ns> create secret generic srw-ssh-gateway-ca \
 
 1. **`sshGateway.hostKeySecret`** — one entry per name in `sshGateway.hostKeyNames`, and **both
    halves of each**. The private half is mounted into the gateway
-   (`SSH_GATEWAY_HOST_KEYS`); the `.pub` half is mounted into the **orchestrator**, which is
-   where `GET /api/ssh/host-keys` runs (`SSH_GATEWAY_PUBLIC_HOST_KEYS`). Both variables are
+   (`SSH_GATEWAY_HOST_KEYS`); only the `.pub` half is mounted into the
+   **orchestrator** and verifying pinned **agents** (`SSH_GATEWAY_PUBLIC_HOST_KEYS`).
+   The orchestrator serves `GET /api/ssh/host-keys`; both it and the agents verify
+   signed native first-use notices. Agents never receive the gateway private keys.
+   Both variables are
    rendered from that one `hostKeyNames` list, because when the served and published key sets
    drift a client sees a host-key mismatch indistinguishable from an active MITM. Omit the
    `.pub` halves and the orchestrator pod will not start — deliberately, because the
@@ -1233,6 +1236,18 @@ kubectl -n <ns> create secret generic srw-ssh-gateway-ca \
    ```
 
 ### Required values
+
+When upgrading native first-use support, roll out verifying agents with their
+public-key mounts first, then the orchestrator relay, and the gateway last.
+Check `native_workspace_first_use1: true` in the agent's `/ready` capabilities.
+An ordinary pinned target without that capability cannot acknowledge native
+use; the new gateway closes its channel if acknowledgement fails. This does
+not start a model turn or authorize workspace cleanup.
+
+For key rotation, configure both old and new public keys on all verifying
+participants before changing the gateway signer. Retain the old public key
+through the 30-second proof lifetime and check that running participants have
+received the new set before removing it.
 
 | Value | Why it has no default |
 |---|---|
