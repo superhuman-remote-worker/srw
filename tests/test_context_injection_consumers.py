@@ -31,6 +31,7 @@ from agent.subagents.fork import FORK_NOTICE, seed_fork_history
 from shared.orch_surface.formatters import _context_label, _format_chat_entry
 from shared.runtime.core.context_entries import (
     digest,
+    fold_context_entries,
     is_context_entry,
     make_context_entry,
 )
@@ -189,6 +190,103 @@ class TestArchiver:
 
         assert "content" in first[0]
         assert "content" not in second[0]
+
+
+def _folded_request():
+    history = [
+        SystemMessage(content="sys"),
+        HumanMessage(content="task"),
+        _calls("c1"),
+        ToolMessage(content="result", tool_call_id="c1"),
+        _memory_entry(),
+        _entry("guidance", "use staging"),
+    ]
+    return history, fold_context_entries(history)
+
+
+def _archive_request(archiver, messages, **kwargs):
+    archiver._writer.insert_llm_request.return_value = "req-1"
+    request_id = archiver.archive(
+        job_id="job-1",
+        agent_type="worker",
+        messages=messages,
+        response=AIMessage(content="next step"),
+        model="m",
+        **kwargs,
+    )
+    llm_row = archiver._writer.insert_llm_request.call_args[0][0]
+    chat_row = archiver._writer.insert_chat_entry.call_args[0][0]
+    return request_id, llm_row, chat_row
+
+
+class TestArchiveHistoryMessages:
+    """§D 7c: ``archive(history_messages=...)``. llm_requests keeps the folded
+    request the provider got; the chat_history delta reads the unfolded
+    history, so a folded entry is archived as context and never as part of
+    the tool result or user message it rode on."""
+
+    def test_history_drives_the_chat_delta_and_llm_requests_keep_the_fold(self):
+        history, folded = _folded_request()
+
+        request_id, llm_row, chat_row = _archive_request(
+            LLMArchiver(writer=MagicMock()), folded, history_messages=history
+        )
+
+        assert request_id == "req-1"
+        stored = llm_row["request"]["messages"]
+        assert len(stored) == len(folded) == 4
+        assert stored[-1]["content"] == folded[-1].content
+        assert '<srw_context kind="memory">' in stored[-1]["content"]
+        assert chat_row["request_id"] == "req-1"
+        humans = [i for i in chat_row["inputs"] if i["type"] in ("human", "tool")]
+        context = [i for i in chat_row["inputs"] if i["type"] == "context"]
+        assert [i["content"] for i in humans] == ["result"]
+        assert [c["kind"] for c in context] == ["memory", "guidance"]
+
+    def test_without_history_the_delta_reads_the_request(self):
+        """Callers that pass no history (legacy requests, which hold no
+        entries) archive exactly as before."""
+        history, folded = _folded_request()
+
+        _, _, chat_row = _archive_request(LLMArchiver(writer=MagicMock()), folded)
+
+        (tool_input,) = [i for i in chat_row["inputs"] if i["type"] == "tool"]
+        assert tool_input["content"] == folded[-1].content
+        assert not [i for i in chat_row["inputs"] if i["type"] == "context"]
+
+    def test_archive_llm_request_passes_the_history_through(self):
+        from unittest.mock import patch
+
+        from agent.core.archiver import archive_llm_request
+
+        history, folded = _folded_request()
+        archiver = MagicMock()
+        archiver.archive.return_value = "req-2"
+
+        with patch("agent.core.archiver.get_archiver", return_value=archiver):
+            assert (
+                archive_llm_request(
+                    job_id="job-1",
+                    agent_type="session",
+                    messages=folded,
+                    response=AIMessage(content="ok"),
+                    model="m",
+                    history_messages=history,
+                )
+                == "req-2"
+            )
+            archive_llm_request(
+                job_id="job-1",
+                agent_type="session",
+                messages=folded,
+                response=AIMessage(content="ok"),
+                model="m",
+            )
+
+        first, second = archiver.archive.call_args_list
+        assert first.kwargs["messages"] is folded
+        assert first.kwargs["history_messages"] is history
+        assert second.kwargs["history_messages"] is None
 
 
 # =============================================================================

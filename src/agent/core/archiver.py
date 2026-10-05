@@ -299,6 +299,7 @@ class LLMArchiver:
         model_kwargs: Optional[Dict[str, Any]] = None,
         call_type: str = "main",
         auxiliary_metadata: Optional[Dict[str, Any]] = None,
+        history_messages: Optional[Sequence[BaseMessage]] = None,
     ) -> Optional[str]:
         """Archive an LLM request/response.
 
@@ -319,6 +320,14 @@ class LLMArchiver:
                        "memory_assembly", "knowledge_curation", "vision")
             auxiliary_metadata: Optional call-type-specific context (task class,
                                trigger, iteration count, etc.)
+            history_messages: The request before the carrier fold
+                (append-only context injection, WP2 spec §D 7c): the
+                history with its typed context entries as separate
+                messages. ``llm_requests`` keeps ``messages``, the folded
+                request the provider got; the chat_history delta reads this
+                list, so an entry is archived as context, never as part of
+                the tool result or user message it was folded into. None:
+                the delta reads ``messages``.
 
         Returns:
             Inserted document ID, or None if archiving failed.
@@ -400,7 +409,7 @@ class LLMArchiver:
                 self._archive_chat_entry(
                     job_id=job_id,
                     agent_type=agent_type,
-                    messages=messages,
+                    messages=history_messages or messages,
                     response=response,
                     model=model,
                     latency_ms=latency_ms,
@@ -1112,10 +1121,13 @@ def archive_llm_request(
     model_kwargs: Optional[Dict[str, Any]] = None,
     call_type: str = "main",
     auxiliary_metadata: Optional[Dict[str, Any]] = None,
+    history_messages: Optional[Sequence[BaseMessage]] = None,
 ) -> Optional[str]:
     """Convenience function to archive an LLM request using default archiver.
 
-    See LLMArchiver.archive() for parameter details.
+    See LLMArchiver.archive() for parameter details (``history_messages``:
+    the unfolded request for the chat_history delta; None reads
+    ``messages``).
     """
     archiver = get_archiver()
     if archiver:
@@ -1134,5 +1146,6 @@ def archive_llm_request(
             model_kwargs=model_kwargs,
             call_type=call_type,
             auxiliary_metadata=auxiliary_metadata,
+            history_messages=history_messages,
         )
     return None

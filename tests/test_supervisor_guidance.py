@@ -877,6 +877,178 @@ class TestExecuteRendersGuidance:
         )
 
 
+class TestExecuteAppendsGuidanceOnce:
+    """append_only (WP2 spec §C, B7): guidance is a typed context entry,
+    appended to the history once and folded into the newest carrier. Both
+    lanes filter and record ``delivered_guidance_ids``; the pinned lane acks
+    after the answered request, the stateless lane leaves the ack to the
+    fenced saver."""
+
+    _state = TestExecuteRendersGuidance._state
+
+    @pytest.fixture(autouse=True)
+    def _clean_inbox(self):
+        saved = dict(dual_app._guidance_inbox)
+        dual_app._guidance_inbox.clear()
+        yield
+        dual_app._guidance_inbox.clear()
+        dual_app._guidance_inbox.update(saved)
+
+    def _append_only_execute(
+        self, workspace_manager, todo_manager, captured, *, tool_context=None
+    ):
+        from agent.graph import create_execute_node
+
+        async def fake_ainvoke(prepared, **kwargs):
+            captured.append(list(prepared))
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": "read_file", "args": {}, "id": "c1"}],
+            )
+
+        llm = MagicMock()
+        llm.ainvoke = AsyncMock(side_effect=fake_ainvoke)
+        config = MagicMock()
+        config.agent_id = "test-agent"
+        config.extra = {}
+        config.llm.model = "test-model"
+        config.llm.timeout = 10.0
+        config.llm.model_max_context_tokens = 100000
+        config.limits.model_max_context_tokens = 100000
+        config.limits.response_validation.enabled = False
+        config.context_management.max_summary_length = 500
+        config.context_management.injection_mode = "append_only"
+        config.memory.max_memories_per_entry = 5
+
+        context_mgr = MagicMock()
+        context_mgr.get_token_count.return_value = 50
+        context_mgr.config.compaction_threshold_tokens = 100000
+        context_mgr.config.summarization_threshold_tokens = 100000
+        context_mgr.config.keep_recent_messages = 10
+        context_mgr.should_summarize.return_value = False
+        context_mgr.ensure_within_limits = AsyncMock(
+            side_effect=lambda msgs, *a, **k: msgs
+        )
+        return create_execute_node(
+            llm_with_tools=llm,
+            todo_manager=todo_manager,
+            memory_manager=MagicMock(),
+            workspace_manager=workspace_manager,
+            config=config,
+            context_mgr=context_mgr,
+            retry_manager=MagicMock(),
+            auxiliary_llm=None,
+            summarization_prompt="",
+            tool_context=tool_context,
+            tool_names=["read_file"],
+        )
+
+    async def _execute(self, execute, state, ack):
+        with (
+            patch("agent.graph.get_phase_system_prompt", return_value="SYS"),
+            patch("agent.graph.get_archiver", return_value=None),
+            patch.object(dual_app, "ack_guidance", ack),
+        ):
+            return await execute(state)
+
+    @staticmethod
+    def _guidance_entries(messages):
+        from shared.runtime.core.context_entries import entry_kind
+
+        return [m for m in messages if entry_kind(m) == "guidance"]
+
+    @pytest.mark.asyncio
+    async def test_pinned_lane_appends_once_records_ids_and_acks(
+        self, workspace_manager, todo_manager
+    ):
+        dual_app._guidance_inbox["job-under-test"] = [
+            {"id": "g1", "text": "stop retrying X", "source": "officer"},
+            {"id": "g2", "text": "read file Z", "source": "officer"},
+        ]
+        captured = []
+        execute = self._append_only_execute(workspace_manager, todo_manager, captured)
+        ack = MagicMock()
+
+        result = await self._execute(execute, self._state(), ack)
+
+        (request,) = captured
+        carrier = request[-1]
+        assert carrier.content.startswith("hello\n\n")
+        assert carrier.content.count('<srw_context kind="guidance">') == 1
+        assert "stop retrying X" in carrier.content
+        assert "read file Z" in carrier.content
+        (entry,) = self._guidance_entries(result["messages"])
+        assert result["messages"][-1].tool_calls[0]["id"] == "c1"
+        assert result["messages"].index(entry) < len(result["messages"]) - 1
+        assert result["delivered_guidance_ids"] == ["g1", "g2"]
+        ack.assert_called_once_with(
+            "job-under-test", guidance_ids=["g1", "g2"], reply_threads=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_pinned_lane_filters_delivered_ids_and_re_acks(
+        self, workspace_manager, todo_manager
+    ):
+        """An entry the history already holds is not appended again; while
+        the inbox still lists it the pinned lane acks it again (a lost
+        fire-and-forget ack is retried, as the legacy re-render did)."""
+        dual_app._guidance_inbox["job-under-test"] = [
+            {"id": "g1", "text": "already delivered", "source": "officer"}
+        ]
+        captured = []
+        execute = self._append_only_execute(workspace_manager, todo_manager, captured)
+        state = self._state()
+        state["delivered_guidance_ids"] = ["g1"]
+        ack = MagicMock()
+
+        result = await self._execute(execute, state, ack)
+
+        assert not any("already delivered" in str(m.content) for m in captured[0])
+        assert not self._guidance_entries(result["messages"])
+        assert result["delivered_guidance_ids"] == ["g1"]
+        ack.assert_called_once_with(
+            "job-under-test", guidance_ids=["g1"], reply_threads=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_stateless_lane_records_ids_and_leaves_the_ack_to_the_saver(
+        self, workspace_manager, todo_manager
+    ):
+        from agent.tools.context import ToolContext
+
+        dual_app._guidance_inbox["job-under-test"] = [
+            {"id": "g1", "text": "read file Z", "source": "officer"}
+        ]
+        context = ToolContext(workspace_manager=workspace_manager)
+        context._stateless_worker = True
+        captured = []
+        execute = self._append_only_execute(
+            workspace_manager, todo_manager, captured, tool_context=context
+        )
+        ack = MagicMock()
+
+        result = await self._execute(execute, self._state(), ack)
+
+        assert captured[0][-1].content.count('<srw_context kind="guidance">') == 1
+        assert len(self._guidance_entries(result["messages"])) == 1
+        assert result["delivered_guidance_ids"] == ["g1"]
+        ack.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_guidance_still_writes_the_delivered_set(
+        self, workspace_manager, todo_manager
+    ):
+        captured = []
+        execute = self._append_only_execute(workspace_manager, todo_manager, captured)
+        ack = MagicMock()
+
+        result = await self._execute(execute, self._state(), ack)
+
+        assert result["delivered_guidance_ids"] == []
+        assert not self._guidance_entries(result["messages"])
+        ack.assert_not_called()
+
+
 # =============================================================================
 # Queued lane: drained replies reach visible context and clear
 # =============================================================================

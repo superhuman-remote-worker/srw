@@ -26,6 +26,11 @@ does (vLLM's preprocessing is reproduced in ``_vllm_conversation``).
 Which step of the script to answer is derived from the request itself (the
 number of distinct ``STEPnn`` markers it carries), so a retried request gets
 the same answer instead of advancing the script.
+
+``injection_mode`` (``context_management.injection_mode``, WP2) selects how the
+context reaches the request: ``legacy`` rebuilds the per-request tail,
+``append_only`` appends typed context entries to the history once and folds
+them into their carrier (D27).
 """
 
 from __future__ import annotations
@@ -45,6 +50,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
 import httpx
 from langchain_core.messages import (
@@ -657,10 +663,81 @@ GUIDANCE = [
 ]
 
 
-class RecordingMemoryManager:
-    """MemoryManager seam stub with a fixed memory + knowledge payload."""
+PROJECT_ID = "6f0c1b5e-7d64-4f43-9a52-0d6a3c3f1a11"
+KNOWLEDGE_TITLE = "Release process"
+KNOWLEDGE_BODY = "Releases are cut on Fridays after the smoke test."
+KNOWLEDGE_BODY_REVISED = "Releases are cut on Thursdays after the smoke test."
+MEMORY_FACTS = (
+    ("factual", "The release checklist lives in docs/release.md."),
+    ("procedural", "Summaries go to summary.md in the workspace root."),
+)
+# ``churn``: seven memories, so the per-entry cap (5, D29) leaves two to drip
+# in on the next request; later one memory and the note change (D5).
+CHURN_FACTS = MEMORY_FACTS + tuple(
+    ("factual", f"Churn fact {i}: release step {i} is documented.") for i in range(3, 8)
+)
+MEMORY_REVISED = "The release checklist moved to docs/releasing.md."
+CHURN_MEMORY_CHANGE_AT = 3  # assemble call (= worker request) of the memory change
+CHURN_NOTE_CHANGE_AT = 4  # assemble call of the note change
 
-    def __init__(self) -> None:
+
+def memory_records(*, churn: bool = False, call: int = 0) -> List[Any]:
+    """The memory rows behind the payload's memory block, in rank order."""
+    from shared.runtime.services.recall_store import MemoryRecord
+
+    facts = CHURN_FACTS if churn else MEMORY_FACTS
+    records = [
+        MemoryRecord(
+            id=UUID(int=index),
+            content=content,
+            memory_type=memory_type,
+            importance=0.5,
+            token_count=len(content) // 4,
+        )
+        for index, (memory_type, content) in enumerate(facts, 1)
+    ]
+    if churn and call >= CHURN_MEMORY_CHANGE_AT:
+        records[0] = dataclasses.replace(records[0], content=MEMORY_REVISED)
+    return records
+
+
+def knowledge_records(*, churn: bool = False, call: int = 0) -> List[Any]:
+    """The knowledge note behind the payload's knowledge block."""
+    from shared.runtime.services.knowledge_store import KnowledgeRecord
+
+    body = (
+        KNOWLEDGE_BODY_REVISED
+        if churn and call >= CHURN_NOTE_CHANGE_AT
+        else KNOWLEDGE_BODY
+    )
+    return [
+        KnowledgeRecord(
+            note_id="release",
+            project_id=UUID(PROJECT_ID),
+            title=KNOWLEDGE_TITLE,
+            note_type="process",
+            content=body,
+        )
+    ]
+
+
+class RecordingMemoryManager:
+    """MemoryManager seam stub with a memory + knowledge payload.
+
+    The rendered blocks (``content`` / ``messages``, what legacy mode
+    injects) are fixed. ``InjectionBlock.records`` carry the store rows
+    behind them (what append_only plans from, WP2 spec §C): fixed, or with
+    ``churn`` seven memories (a drip-feed past the per-entry cap) and a
+    memory and the note that change on later requests.
+    """
+
+    def __init__(self, *, churn: bool = False) -> None:
+        self.churn = churn
+        self.assemble_requests: List[Any] = []
+        self.captures: List[Any] = []
+        self.payload = self._payload(0)
+
+    def _payload(self, call: int) -> Any:
         from agent.core.knowledge_injection import create_knowledge_injection_messages
         from agent.core.memory_injection import create_memory_injection_messages
         from agent.services.memory import AssembleStats, InjectionBlock, MemoryPayload
@@ -672,6 +749,7 @@ class RecordingMemoryManager:
                 messages=list(create_memory_injection_messages(MEMORY_TEXT)),
                 token_count=40,
                 items=[{"record_id": "m1", "token_count": 40}],
+                records=memory_records(churn=self.churn, call=call),
             ),
             InjectionBlock(
                 kind="knowledge",
@@ -679,15 +757,13 @@ class RecordingMemoryManager:
                 messages=list(create_knowledge_injection_messages(KNOWLEDGE_TEXT)),
                 token_count=20,
                 items=[{"record_id": "k1", "token_count": 20}],
+                records=knowledge_records(churn=self.churn, call=call),
             ),
         ]
-        self.payload = MemoryPayload(
-            blocks=blocks, stats=AssembleStats(blocks=len(blocks))
-        )
-        self.assemble_requests: List[Any] = []
-        self.captures: List[Any] = []
+        return MemoryPayload(blocks=blocks, stats=AssembleStats(blocks=len(blocks)))
 
     async def assemble(self, req: Any) -> Any:
+        self.payload = self._payload(len(self.assemble_requests))
         self.assemble_requests.append(req)
         return self.payload
 
@@ -794,6 +870,8 @@ async def run_worker_scenario(
     monkeypatch: Any,
     safety_rebuild_at: Optional[int] = None,
     emergency_rebuild_at: Optional[int] = None,
+    churn: bool = False,
+    injection_mode: str = "legacy",
 ) -> List[Captured]:
     """Run the tactical tool loop through ``create_execute_node``.
 
@@ -814,6 +892,12 @@ async def run_worker_scenario(
 
     ``safety_rebuild_at`` makes request k take the Layer-1 safety rebuild;
     ``emergency_rebuild_at`` makes it take the Layer-0 emergency rebuild.
+    ``churn`` makes the memory seam return more memories than one entry
+    takes and change a memory and the note later (see
+    ``RecordingMemoryManager``). ``injection_mode`` is the worker's
+    ``context_management.injection_mode``. Supervisor guidance is pending on
+    two consecutive requests, as the heartbeat inbox keeps an entry until
+    the ack lands; ``delivered_guidance_ids`` is carried into state.
     """
     from shared.runtime.core.loader import create_llm, load_agent_config
     from shared.runtime.services.guardrails import format_nudge
@@ -842,6 +926,7 @@ async def run_worker_scenario(
     workspace.initialize()
     config = load_agent_config(WORKER_CONFIG_PATH)
     config.llm = llm_config
+    config.context_management.injection_mode = injection_mode
     todo = TodoManager(workspace, model_name=llm_config.model)
     todo.is_strategic_phase = False
     todo.phase_number = 2
@@ -874,14 +959,14 @@ async def run_worker_scenario(
     memory_service = None
     guidance_turns: set[int] = set()
     if context_on:
-        memory_service = RecordingMemoryManager()
+        memory_service = RecordingMemoryManager(churn=churn)
         ctx.citation_engine = SimpleNamespace(
             list_citations=AsyncMock(return_value=[_failed_citation()])
         )
         ctx.subagent_runtime = SimpleNamespace(
             active_subagents_block=lambda: ACTIVE_SUBAGENTS
         )
-        guidance_turns = {2}
+        guidance_turns = {2, 3}
 
     context_mgr = WorkerContextManager()
     node = create_execute_node(
@@ -931,6 +1016,8 @@ async def run_worker_scenario(
             state["messages"] = state["messages"] + new_messages
             state["iteration"] = result["iteration"]
             state["turn_count"] = result["turn_count"]
+            if "delivered_guidance_ids" in result:
+                state["delivered_guidance_ids"] = result["delivered_guidance_ids"]
             response = next(
                 m for m in reversed(new_messages) if isinstance(m, AIMessage)
             )
@@ -966,14 +1053,15 @@ async def run_worker_scenario(
 # Session scenario (persistent_graph.py run_persistent_loop)
 # ---------------------------------------------------------------------------
 
-PROJECT_ID = "6f0c1b5e-7d64-4f43-9a52-0d6a3c3f1a11"
 CHARTER = {
     "title": "Project charter",
     "content": "Standing orders: ship weekly; never touch production data.",
 }
 
 
-def _session_config(*, injections: bool, model: str) -> MagicMock:
+def _session_config(
+    *, injections: bool, model: str, injection_mode: str = "legacy"
+) -> MagicMock:
     """MagicMock config in the style of the persistent-graph tests."""
     from shared.runtime.core.skill_resolution import APP_GUIDE_LOADER_TOOL
 
@@ -998,7 +1086,9 @@ def _session_config(*, injections: bool, model: str) -> MagicMock:
     config.memory.observer_interval = 5
     config.memory.query = None
     config.memory.project_scoped = False
+    config.memory.max_memories_per_entry = 5
     config.context_management.max_summary_length = 10_000
+    config.context_management.injection_mode = injection_mode
     config.officer.enabled = False
     config.officer.conference = injections  # charter injection
     config.officer.max_actions_per_wake = 100
@@ -1017,7 +1107,11 @@ def _session_tool(name: str) -> MagicMock:
 
 
 async def run_session_scenario(
-    family: Family, *, sources: frozenset, monkeypatch: Any
+    family: Family,
+    *,
+    sources: frozenset,
+    monkeypatch: Any,
+    injection_mode: str = "legacy",
 ) -> List[Captured]:
     """Two user turns through the real ``run_persistent_loop`` (astream path).
 
@@ -1084,7 +1178,9 @@ async def run_session_scenario(
         llm_with_tools=llm_with_tools,
         tools=tools,
         context_manager=context_manager,
-        config=_session_config(injections=injections, model=family.model),
+        config=_session_config(
+            injections=injections, model=family.model, injection_mode=injection_mode
+        ),
         system_prompt="You are the SRW session assistant under test.",
         callbacks=callbacks,
         messages=[],
@@ -1360,11 +1456,17 @@ VARIANTS: Dict[str, frozenset] = {
     "control": frozenset(),
 }
 
+#: ``context_management.injection_mode`` values the gate runs.
+INJECTION_MODES = ("legacy", "append_only")
+
 # Request 2 is the one after the first todo change, mid-loop.
 SCENARIOS: Dict[str, Dict[str, Any]] = {
     "worker-tool-loop": {"kind": "worker"},
     "worker-safety-rebuild": {"kind": "worker", "safety_rebuild_at": 2},
     "worker-emergency-rebuild": {"kind": "worker", "emergency_rebuild_at": 2},
+    # The tool loop with memory and knowledge churn: a drip-feed past the
+    # per-entry cap, then a changed memory and a changed note (D5, D29).
+    "worker-memory-churn": {"kind": "worker", "churn": True},
     "session-two-turns": {"kind": "session"},
 }
 
@@ -1376,12 +1478,16 @@ async def run_scenario(
     sources: frozenset,
     workdir: Path,
     monkeypatch: Any,
+    injection_mode: str = "legacy",
 ) -> Tuple[List[Captured], frozenset]:
     """Run one scenario; return the captured requests and the turn-end steps."""
     spec = dict(SCENARIOS[name])
     if spec.pop("kind") == "session":
         requests = await run_session_scenario(
-            family, sources=sources, monkeypatch=monkeypatch
+            family,
+            sources=sources,
+            monkeypatch=monkeypatch,
+            injection_mode=injection_mode,
         )
         return requests, frozenset(SESSION_TURN_ENDS)
     requests = await run_worker_scenario(
@@ -1389,6 +1495,18 @@ async def run_scenario(
         sources=sources,
         workdir=workdir,
         monkeypatch=monkeypatch,
+        injection_mode=injection_mode,
         **spec,
     )
     return requests, frozenset()
+
+
+def text_occurrences(value: Any, needle: str) -> int:
+    """How often ``needle`` occurs in the string leaves of a request body."""
+    if isinstance(value, str):
+        return value.count(needle)
+    if isinstance(value, dict):
+        return sum(text_occurrences(v, needle) for v in value.values())
+    if isinstance(value, list):
+        return sum(text_occurrences(v, needle) for v in value)
+    return 0

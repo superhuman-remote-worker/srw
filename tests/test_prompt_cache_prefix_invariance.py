@@ -48,6 +48,18 @@ knowledge-base/knowledge/plans/append_only_context_injection_plan_2026_10_05.md
 - How to read a failure: each broken pair is reported as
   ``request N -> N+1``, with the first diverging list index and a short diff
   (API), or the first differing character offset with context (template).
+- Modes (``harness.INJECTION_MODES``, ``context_management.injection_mode``).
+  ``injected`` runs in both: ``legacy-injected`` rebuilds the per-request
+  tail and keeps its strict xfail (the rollback mode is not fixed, only kept
+  byte-identical); ``append_only-injected`` appends typed context entries
+  once and folds them into their carrier (WP2, D27) and must pass for every
+  worker scenario. ``worker-memory-churn`` runs append_only only: seven
+  memories (two drip in past the per-entry cap) and a memory and the note
+  that change later (an "(updated; ...)" entry). Non-vacuity: the last
+  append_only worker request carries each kind the scenario injects the
+  expected number of times (memory and guidance exactly once without churn).
+  ``todos-only`` and ``control`` carry no context sources, so they run once,
+  in the default mode.
 - Markers. Cases that fail today are ``xfail(strict=True)`` with their cause:
   ``injection: ...`` (fixed by WP2) or ``intrinsic: ...``. Strict is the
   point: when a work package fixes a case it XPASSes, which fails the run and
@@ -59,15 +71,18 @@ import hashlib
 
 import pytest
 
+from shared.runtime.core.context_entries import UPDATED_ITEM_MARKER, memory_handle
 from tests import _prompt_cache_prefix_harness as harness
 from tests._prompt_cache_prefix_harness import (
     FAMILIES,
+    INJECTION_MODES,
     SCENARIOS,
     VARIANTS,
     Captured,
     api_prefix_violation,
     prefix_violations,
     run_scenario,
+    text_occurrences,
     text_prefix_violation,
 )
 
@@ -85,6 +100,13 @@ class PrefixViolation(AssertionError):
 
 TEMPLATE_FAMILIES = [f for f in FAMILIES if FAMILIES[f].template is not None]
 WORKER_SCENARIOS = [s for s in SCENARIOS if s.startswith("worker")]
+# Scenarios that only make sense with append-only entries (the churn exists in
+# the store records, which legacy mode does not read).
+APPEND_ONLY_SCENARIOS = {"worker-memory-churn"}
+# append_only-injected cases whose wiring lands in a later sub-step.
+APPEND_ONLY_PENDING = {
+    "session-two-turns": "session wiring is WP2.5",
+}
 
 _WP2 = "fixed by WP2 (append-only carrier fold, D27)"
 INJECTION_CAUSES = {
@@ -171,8 +193,9 @@ INTRINSIC_CAUSES = {
 SATURATED = {"gemma-4", "minimax-m2"}
 
 
-def _case(scenario: str, variant: str, family: str):
+def _case(scenario: str, variant: str, family: str, mode: str = "legacy"):
     marks = []
+    label = f"{mode}-{variant}" if variant == "injected" else variant
     if variant == "control" and (scenario, family) in INTRINSIC_CAUSES:
         marks.append(
             pytest.mark.xfail(
@@ -192,7 +215,7 @@ def _case(scenario: str, variant: str, family: str):
                 )
             )
         )
-    elif variant == "injected":
+    elif variant == "injected" and mode == "legacy":
         marks.append(
             pytest.mark.xfail(
                 strict=True,
@@ -200,22 +223,47 @@ def _case(scenario: str, variant: str, family: str):
                 reason=INJECTION_CAUSES[scenario],
             )
         )
-    # ``todos-only`` carries no marker: WP1's gate, it must pass.
+    elif variant == "injected" and scenario in APPEND_ONLY_PENDING:
+        marks.append(
+            pytest.mark.xfail(
+                strict=True,
+                raises=PrefixViolation,
+                reason=APPEND_ONLY_PENDING[scenario],
+            )
+        )
+    # ``todos-only`` carries no marker: WP1's gate, it must pass. Nor does
+    # ``append_only-injected`` on a worker scenario: WP2's gate.
     return pytest.param(
-        scenario, variant, family, id=f"{scenario}-{variant}-{family}", marks=marks
+        scenario,
+        variant,
+        mode,
+        family,
+        id=f"{scenario}-{label}-{family}",
+        marks=marks,
     )
 
 
 def _variants(scenario: str) -> tuple:
+    if scenario in APPEND_ONLY_SCENARIOS:
+        return ("injected",)
     if scenario in WORKER_SCENARIOS:
         return ("injected", "todos-only", "control")
     return ("injected", "control")  # sessions never carried a todo list
 
 
+def _modes(scenario: str, variant: str) -> tuple:
+    if variant != "injected":
+        return ("legacy",)  # no context sources: both modes send the same
+    if scenario in APPEND_ONLY_SCENARIOS:
+        return ("append_only",)
+    return INJECTION_MODES
+
+
 CASES = [
-    _case(scenario, variant, family)
+    _case(scenario, variant, family, mode)
     for scenario in SCENARIOS
     for variant in _variants(scenario)
+    for mode in _modes(scenario, variant)
     for family in FAMILIES
 ]
 
@@ -230,8 +278,8 @@ def _require_renderer(family_id: str) -> None:
         pytest.importorskip("langchain_google_genai")
 
 
-async def _violations(scenario, family, variant, tmp_path, monkeypatch):
-    workdir = tmp_path / variant
+async def _run(scenario, family, variant, tmp_path, monkeypatch, mode="legacy"):
+    workdir = tmp_path / f"{mode}-{variant}"
     workdir.mkdir()
     requests, turn_ends = await run_scenario(
         scenario,
@@ -239,14 +287,59 @@ async def _violations(scenario, family, variant, tmp_path, monkeypatch):
         sources=VARIANTS[variant],
         workdir=workdir,
         monkeypatch=monkeypatch,
+        injection_mode=mode,
     )
-    return prefix_violations(family, requests, turn_ends=turn_ends)
+    return requests, prefix_violations(family, requests, turn_ends=turn_ends)
+
+
+async def _violations(scenario, family, variant, tmp_path, monkeypatch, mode="legacy"):
+    _, found = await _run(scenario, family, variant, tmp_path, monkeypatch, mode)
+    return found
+
+
+def _srw(kind: str) -> str:
+    return f'<srw_context kind="{kind}">'
+
+
+def _assert_appended_once(scenario: str, last: Captured) -> None:
+    """Non-vacuity of an append_only worker case: the context is there.
+
+    The last request holds every entry the run appended, folded into its
+    carrier, each exactly as often as it was appended: memory and guidance
+    once without churn; with churn three memory entries (five memories, the
+    two that dripped in, the changed one), each memory once by its handle
+    except the changed one, and two knowledge entries.
+    """
+    body = last.body
+    churn = SCENARIOS[scenario].get("churn", False)
+    expected = {
+        "memory": 3 if churn else 1,
+        "knowledge": 2 if churn else 1,
+        "citation": 1,
+        "guidance": 1,
+        "subagents": 1,
+    }
+    for kind, count in expected.items():
+        assert text_occurrences(body, _srw(kind)) == count, (kind, count)
+    guidance_text = harness.GUIDANCE[0]["text"]
+    assert text_occurrences(body, guidance_text) == 1
+    # Nothing of the legacy tail reaches an append_only request.
+    assert text_occurrences(body, harness.MEMORY_TEXT) == 0
+    assert text_occurrences(body, "[SUPERVISOR GUIDANCE]") == 1
+    facts = harness.CHURN_FACTS if churn else harness.MEMORY_FACTS
+    for index in range(1, len(facts) + 1):
+        handle = f"[{memory_handle(harness.UUID(int=index))}]"
+        assert text_occurrences(body, handle) == (2 if churn and index == 1 else 1)
+    assert text_occurrences(body, UPDATED_ITEM_MARKER) == (2 if churn else 0)
+    if churn:
+        assert text_occurrences(body, harness.MEMORY_REVISED) == 1
+        assert text_occurrences(body, harness.KNOWLEDGE_BODY_REVISED) == 1
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scenario,variant,family_id", CASES)
+@pytest.mark.parametrize("scenario,variant,mode,family_id", CASES)
 async def test_request_starts_with_the_previous_request(
-    scenario, variant, family_id, tmp_path, monkeypatch
+    scenario, variant, mode, family_id, tmp_path, monkeypatch
 ):
     _require_renderer(family_id)
     family = FAMILIES[family_id]
@@ -260,7 +353,7 @@ async def test_request_starts_with_the_previous_request(
             )
         return
 
-    found = await _violations(scenario, family, variant, tmp_path, monkeypatch)
+    requests, found = await _run(scenario, family, variant, tmp_path, monkeypatch, mode)
     # A pair the control already breaks is the control case's finding.
     caused = {n: v for n, v in found.items() if n not in control}
     if caused:
@@ -271,10 +364,48 @@ async def test_request_starts_with_the_previous_request(
             else ""
         )
         raise PrefixViolation(
-            f"{scenario} / {family_id}, {variant}:\n"
+            f"{scenario} / {family_id}, {mode}-{variant}:\n"
             + "\n".join(caused.values())
             + note
         )
+    if variant == "injected" and mode == "append_only":
+        if scenario in WORKER_SCENARIOS:
+            _assert_appended_once(scenario, requests[-1])
+
+
+@pytest.mark.asyncio
+async def test_append_only_breakpoints_on_real_worker_requests(tmp_path, monkeypatch):
+    """§H/O4 on the requests the worker really sends to Claude via the proxy.
+
+    Every append_only request carries folded carriers, so each one marks the
+    system prompt, the newest assistant message (it reads the entry the
+    previous request wrote) and the last message (it writes the next one).
+    """
+    family = FAMILIES["openai-chat-claude-proxy"]
+    requests, found = await _run(
+        "worker-tool-loop",
+        family,
+        "injected",
+        tmp_path,
+        monkeypatch,
+        "append_only",
+    )
+    assert found == {}
+    assert len(requests) == len(harness.WORKER_SCRIPT)
+    for n, captured in enumerate(requests):
+        messages = captured.body["messages"]
+        marked = [i for i, m in enumerate(messages) if "cache_control" in m]
+        assistants = [i for i, m in enumerate(messages) if m["role"] == "assistant"]
+        expected = {0, len(messages) - 1}
+        if assistants:
+            expected.add(assistants[-1])
+        assert messages[0]["role"] == "system"
+        assert set(marked) == expected, (n, marked, expected)
+        assert len(marked) <= 4
+        # The carrier the last message is: the newest tool result, with the
+        # entries of this request folded in after its own text (n >= 1).
+        if n:
+            assert messages[-1]["role"] == "tool"
 
 
 @pytest.mark.skip(
