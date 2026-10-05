@@ -2250,6 +2250,10 @@ class ToolsConfig:
     shell: List[str] = field(default_factory=list)
     evaluation: List[str] = field(default_factory=list)
     knowledge: List[str] = field(default_factory=list)
+    # The model's pull path into project memory (memory_search, append-only
+    # context injection D25/D34). Bound only while memory can serve it: see
+    # memory_tool_names_bindable / get_all_tool_names.
+    memory: List[str] = field(default_factory=list)
     webdav: List[str] = field(default_factory=list)
     email: List[str] = field(default_factory=list)
     mcp: List[str] = field(default_factory=list)
@@ -3445,6 +3449,7 @@ def load_agent_config(
         shell=tools_data.get("shell", tools_data.get("coding", [])),
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
+        memory=tools_data.get("memory", []),
         webdav=tools_data.get("webdav", []),
         email=tools_data.get("email", []),
         mcp=tools_data.get("mcp", []),
@@ -3715,6 +3720,7 @@ def load_agent_config_from_dict(
         shell=tools_data.get("shell", tools_data.get("coding", [])),
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
+        memory=tools_data.get("memory", []),
         webdav=tools_data.get("webdav", []),
         email=tools_data.get("email", []),
         mcp=tools_data.get("mcp", []),
@@ -6283,12 +6289,34 @@ def _tools_config_field_names() -> tuple[str, ...]:
     return tuple(f.name for f in dataclass_fields(ToolsConfig))
 
 
+def memory_tool_names_bindable(config: Any) -> frozenset[str]:
+    """The ``tools.memory`` names that can bind for ``config``.
+
+    A memory tool is served by the MemoryManager extension of the same name
+    (``memory.pipeline.extensions``; ``memory_search`` is the one today), so
+    it binds only while memory is enabled, the manager seam is on and that
+    extension is in the pipeline. Anything else would hand the model a tool
+    that can only answer "unavailable": a subagent child (memory off), a
+    rollback to the legacy direct-store path (manager off).
+    """
+    memory = getattr(config, "memory", None)
+    if getattr(memory, "enabled", False) is not True:
+        return frozenset()
+    if getattr(memory, "manager_enabled", False) is not True:
+        return frozenset()
+    extensions = getattr(getattr(memory, "pipeline", None), "extensions", None)
+    if not isinstance(extensions, (list, tuple)):
+        return frozenset()
+    return frozenset(name for name in extensions if isinstance(name, str))
+
+
 def get_all_tool_names(config: AgentConfig) -> List[str]:
     """Get all tool names from configuration.
 
     Applies shell mode aliasing: when mode=stateless, shell_execute is
     mapped to run_command (and vice versa for persistent mode). This
-    ensures backward compatibility with existing configs.
+    ensures backward compatibility with existing configs. ``tools.memory``
+    contributes only the names :func:`memory_tool_names_bindable` allows.
 
     Args:
         config: Agent configuration
@@ -6311,6 +6339,10 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
     # its drift is silent in the worst direction: a field the tuple forgets is
     # a category that parses, validates and grants nothing.
     for category in _tools_config_field_names():
+        if category == "memory":
+            bindable = memory_tool_names_bindable(config)
+            names.extend(n for n in _category_names(category) if n in bindable)
+            continue
         names.extend(_category_names(category))
 
     # Shell mode aliasing for backward compatibility

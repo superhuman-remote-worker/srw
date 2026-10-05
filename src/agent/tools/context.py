@@ -281,6 +281,13 @@ class ToolContext:
         default_factory=list
     )  # List[InstructionFileEntry]
     recall_store: Optional[Any] = None  # RecallStore instance (Memory Light)
+    memory_service: Optional[Any] = (
+        None  # The bound MemoryManager (agent.services.memory). Published by
+        # the worker (agent.py, after the graph build binds it) and the session
+        # (_setup_memory) once it exists, which is after tool loading; memory
+        # tools (memory_search) read it at call time and delegate to its
+        # extension_tools(). None: memory off, or not bound yet.
+    )
     shell_manager: Optional[Any] = None  # ShellManager (persistent terminal sessions)
     progress_committer: Optional[Any] = (
         None  # ProgressCommitter (src/core/progress_commit.py). Shared by the

@@ -181,6 +181,12 @@ tools:
     - kb_provenance
     - kb_unanswered
     - kb_export
+  # Memory tools — memory_search, the model's own lookup into project memory
+  # (src/agent/tools/memory/). Workers and sessions alike; bound only while
+  # memory.enabled, memory.manager.enabled and the memory_search entry of
+  # memory.pipeline.extensions are on.
+  memory:
+    - memory_search
   # Delegation tools - delegate_agent plus its background control plane
   # (src/agent/tools/delegation/); every name is bound only when the expert names it
   # here AND sets delegation.enabled. Children strip this whole category.
@@ -276,6 +282,8 @@ memory:
     policies:
       - gate                         # drop the non-qualifying tail (relative floor)
       - bounded                      # cap the survivors at max_items
+    extensions:
+      - memory_search                # the memory_search tool (tools.memory): hybrid search + the scorers/policies above, or one memory by handle
     # `writers` is role-owned: the worker's in-loop / phase-boundary / assembler
     # set versus the session's elapsed-gate / teardown set. Each overlay
     # declares its own.

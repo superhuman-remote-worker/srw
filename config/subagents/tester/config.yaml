@@ -56,6 +56,7 @@ spec:
             - list_citations
             - get_annotations
             - search_library
+          memory: []
           knowledge:
             - kb_read
             - kb_list

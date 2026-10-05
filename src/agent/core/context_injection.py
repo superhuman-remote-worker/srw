@@ -17,7 +17,8 @@ what the sources hold now. Three modes:
   absent is new; present with another hash it is changed and rendered with
   the "(updated; ...)" marker (D5). One entry per kind (D2); memory takes at
   most ``max_memories`` per entry and the rest drip in on later requests
-  (D29).
+  (D29). A memory the model fetched itself with ``memory_search`` is present
+  too, by its handle (D25, D30), so it is not pushed after the fetch.
 - **state** (charter, citation, subagents): the section's latest hash is
   compared with the hash of the current rendering. A cleared state appends
   the cleared rendering once (O6); an absent section with an empty state
@@ -50,7 +51,7 @@ from typing import (
     Tuple,
 )
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
 from shared.runtime.core.context_entries import (
     INJECTION_KINDS,
@@ -61,7 +62,9 @@ from shared.runtime.core.context_entries import (
     knowledge_item_key,
     make_context_entry,
     memory_handle,
+    memory_list_items,
 )
+from shared.tool_catalog.names import MEMORY_SEARCH_TOOL_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -92,21 +95,65 @@ class Presence:
     ``items`` maps ``(kind, key)`` to the hash of the newest entry that
     listed the item; ``sections`` maps a section (the kind, or
     ``turn_boundary:<turn>``) to the hash of its newest entry.
+    ``memory_handles`` maps a memory's display handle (D30) to the hash of
+    the newest copy the model has seen, pushed in an entry or pulled through
+    ``memory_search`` (D25): a pulled result names its memories only by
+    handle, so handles are what push and pull have in common.
     """
 
     items: Dict[Tuple[str, str], str] = field(default_factory=dict)
     sections: Dict[str, str] = field(default_factory=dict)
+    memory_handles: Dict[str, str] = field(default_factory=dict)
+
+    def item_hash(self, kind: str, item: "Item") -> Optional[str]:
+        """The hash the history holds for ``item``, None when it is absent.
+
+        A memory with a handle is looked up by handle first, so a memory the
+        model fetched with ``memory_search`` counts as present for the push.
+        """
+        if kind == "memory" and item.handle is not None:
+            pulled = self.memory_handles.get(item.handle)
+            if pulled is not None:
+                return pulled
+        return self.items.get((kind, item.key))
+
+
+def _pulled_memory_result(msg: BaseMessage, search_call_ids: Collection[str]) -> bool:
+    """Whether ``msg`` is the result of a ``memory_search`` call.
+
+    Worker tool results carry the tool's name; session results are stored
+    with only the call id, so the id is matched against the calls the
+    assistant made earlier in the same history.
+    """
+    if not isinstance(msg, ToolMessage):
+        return False
+    if getattr(msg, "name", None) == MEMORY_SEARCH_TOOL_NAME:
+        return True
+    return str(getattr(msg, "tool_call_id", "") or "") in search_call_ids
 
 
 def scan_presence(messages: Iterable[BaseMessage]) -> Presence:
     """Read the presence of every entry in ``messages`` (D3).
 
-    One pass; only typed entries are looked at. A later entry overrides an
-    earlier one for the same item or section, so a changed item counts with
-    its newest hash.
+    One pass over typed entries and ``memory_search`` results (D25): a
+    memory the model fetched is present by its handle and the hash of the
+    content it was shown, so the push does not repeat it. A later entry or
+    result overrides an earlier one for the same item or section, so a
+    changed item counts with its newest hash. Compaction removes both kinds
+    from the history, which makes their memories eligible again (D4).
     """
     presence = Presence()
+    search_call_ids: set[str] = set()
     for msg in messages:
+        if isinstance(msg, AIMessage):
+            for call in getattr(msg, "tool_calls", None) or ():
+                if call.get("name") == MEMORY_SEARCH_TOOL_NAME and call.get("id"):
+                    search_call_ids.add(str(call["id"]))
+            continue
+        if _pulled_memory_result(msg, search_call_ids):
+            for handle, item_hash in memory_list_items(msg.content):
+                presence.memory_handles[handle] = item_hash
+            continue
         meta = entry_meta(msg)
         if meta is None:
             continue
@@ -118,6 +165,9 @@ def scan_presence(messages: Iterable[BaseMessage]) -> Presence:
             if key is None or item_hash is None:
                 continue
             presence.items[(kind, str(key))] = str(item_hash)
+            handle = item.get("handle")
+            if kind == "memory" and handle:
+                presence.memory_handles[str(handle)] = str(item_hash)
         section = meta.get("section") or kind
         entry_hash = meta.get("hash")
         if entry_hash is not None:
@@ -260,7 +310,7 @@ def _select_changed(
         if item.key in seen:
             continue
         seen.add(item.key)
-        prior = presence.items.get((kind, item.key))
+        prior = presence.item_hash(kind, item)
         if prior == item.hash:
             present += 1
             continue

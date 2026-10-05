@@ -34,7 +34,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+import re
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from langchain_core.messages import (
     AIMessage,
@@ -124,6 +125,52 @@ def memory_handle(record_id: Any) -> str:
     The model sees it as ``[m:3f9a2c]``; the database id stays in kwargs.
     """
     return "m:" + hashlib.sha256(str(record_id).encode("utf-8")).hexdigest()[:6]
+
+
+_HANDLE_ARGUMENT = re.compile(r"\[?(?:m:)?([0-9a-f]{6})\]?")
+
+
+def normalize_memory_handle(value: Any) -> Optional[str]:
+    """``m:3f9a2c`` from the ways a model writes a handle, else None.
+
+    Accepts ``m:3f9a2c``, ``[m:3f9a2c]`` and the bare ``3f9a2c``, any case.
+    """
+    match = _HANDLE_ARGUMENT.fullmatch(str(value or "").strip().lower())
+    return f"m:{match.group(1)}" if match else None
+
+
+# A memory block as RecallStore.format_memory renders it with a handle label:
+# "[m:3f9a2c]", an optional " (meta...)" (and the updated marker) on the same
+# line, then the content. Blocks are joined by ENTRY_SEPARATOR, so a block
+# starts the text or follows a blank line.
+_MEMORY_BLOCK_HEADER = re.compile(r"(?:\A|\n\n)\[(m:[0-9a-f]{6})\](?: \([^\n]*\))?\n")
+
+
+def memory_list_items(content: Any) -> List[Tuple[str, str]]:
+    """``(handle, digest(content))`` of each handle-labelled memory in a text.
+
+    The inverse of ``RecallStore.render_memory_list`` (the ``memory_search``
+    result) and of the blocks of an appended memory entry: a block's content
+    runs from the line after its header to the blank line before the next
+    header, or to the end. The digest matches the presence hash of the row
+    (``digest(record.content)``) as long as the text reached the history
+    unchanged; a redacted or truncated block hashes differently and reads as
+    a changed memory, which costs at most one extra push. Text without handle
+    labels gives an empty list.
+    """
+    if isinstance(content, list):
+        content = "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in content
+        )
+    if not isinstance(content, str) or "[m:" not in content:
+        return []
+    matches = list(_MEMORY_BLOCK_HEADER.finditer(content))
+    items: List[Tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(content)
+        items.append((match.group(1), digest(content[match.end() : end])))
+    return items
 
 
 # Rendered after an item whose key is already in the history with another
@@ -451,5 +498,7 @@ __all__ = [
     "last_user_text",
     "make_context_entry",
     "memory_handle",
+    "memory_list_items",
+    "normalize_memory_handle",
     "wrap",
 ]

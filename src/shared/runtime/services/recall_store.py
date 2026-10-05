@@ -40,7 +40,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from shared.runtime.core.context_entries import UPDATED_ITEM_MARKER
+from shared.runtime.core.context_entries import (
+    ENTRY_SEPARATOR,
+    UPDATED_ITEM_MARKER,
+    memory_handle,
+    normalize_memory_handle,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1289,6 +1294,39 @@ class RecallStore:
                 )
                 return
 
+    async def get_by_handle(self, handle: str) -> Optional[MemoryRecord]:
+        """The valid memory in scope whose display handle is ``handle`` (D30).
+
+        A handle is ``m:`` plus the first 6 hex digits of sha256 of the row
+        id (``context_entries.memory_handle``). It is one-way, so the row is
+        found by recomputing it over the scope's currently valid rows. That
+        is 24 bits per scope; on a collision the newest row wins. ``handle``
+        may be written ``m:3f9a2c``, ``[m:3f9a2c]`` or ``3f9a2c``; anything
+        else finds nothing. A fetch counts as an access, like a search hit.
+        """
+        normalized = normalize_memory_handle(handle)
+        if normalized is None:
+            return None
+        scope_clause, scope_val = self._scope_where(1)
+        row = await self.db.fetchrow(
+            f"""
+            SELECT *
+            FROM memories
+            WHERE {scope_clause}
+              AND valid_to IS NULL
+              AND left(encode(sha256(convert_to(id::text, 'UTF8')), 'hex'), 6) = $2
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            scope_val,
+            normalized.removeprefix("m:"),
+        )
+        if not row:
+            return None
+        record = MemoryRecord.from_row(dict(row))
+        await self._record_access_stats([record.id])
+        return record
+
     async def retrieve(
         self,
         context_text: str,
@@ -1427,6 +1465,24 @@ class RecallStore:
                 cls.format_memory(memory, index, handle=handle, updated=updated)
             )
         return "\n\n".join(parts)
+
+    @classmethod
+    def render_memory_list(cls, memories: Sequence[MemoryRecord]) -> str:
+        """Memories as the ``memory_search`` tool returns them (D25, D30).
+
+        One :meth:`format_memory` block per memory, in rank order, labelled
+        by its display handle and joined like the blocks of an appended
+        memory entry: static text with no TTL or score (D11).
+        :func:`~shared.runtime.core.context_entries.memory_list_items` reads
+        the handles and content hashes back from the tool result, which is
+        how a fetched memory counts as present and is not pushed again (D3).
+        A memory without a row id has no handle and keeps its index label.
+        """
+        blocks = []
+        for index, memory in enumerate(memories, 1):
+            handle = memory_handle(memory.id) if memory.id is not None else None
+            blocks.append(cls.format_memory(memory, index, handle=handle))
+        return ENTRY_SEPARATOR.join(blocks)
 
     @classmethod
     def assemble_memory_block(

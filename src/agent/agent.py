@@ -1075,6 +1075,7 @@ class UniversalAgent:
                 tool_context=self._tool_context,
                 postgres_db=self.postgres_conn,
             )
+            self._publish_memory_service()
 
             # Execute graph
             # Use job_id as thread_id (new format), with fallback to legacy format for old jobs
@@ -2774,11 +2775,25 @@ class UniversalAgent:
             tool_context=self._tool_context,
             postgres_db=self.postgres_conn,
         )
+        self._publish_memory_service()
         logger.info(
             f"[{job_id}] Workspace upgraded to {target_tier}; graph rebuilt with "
             f"shell/git tools — resuming in process"
         )
         return True
+
+    def _publish_memory_service(self) -> None:
+        """Hand the graph's MemoryManager to the tools (``memory_search``).
+
+        The manager is bound inside the graph build, after the tools were
+        loaded and bound to the LLM, so memory tools resolve it at call time
+        from ``ToolContext.memory_service`` (append-only context injection,
+        D25/D34). None when memory or the manager seam is off.
+        """
+        if self._tool_context is not None:
+            self._tool_context.memory_service = getattr(
+                self._graph, "_srw_memory_service", None
+            )
 
     def _load_workspace_template(self) -> str:
         """Load the workspace.md template for the nested loop graph.

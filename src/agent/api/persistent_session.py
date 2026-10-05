@@ -3522,6 +3522,12 @@ class PersistentSession:
                         "the config or drop the plugin from memory.pipeline."
                     ) from e
 
+        # memory_search (append-only context injection, D25/D34) was bound with
+        # the other tools before this manager existed; it resolves the manager's
+        # extension from here at call time.
+        if self.tool_context is not None:
+            self.tool_context.memory_service = self.memory_service
+
         # Ingestion verdicts + bi-temporal supersede (overhaul Phase 4). Wired
         # onto the store independently of the manager cutover — a write-path
         # change behind memory.ingestion.enabled, used by legacy + seam writers.

@@ -789,6 +789,9 @@ def rebase_context(
     ctx.canvas_event_callback = None
     ctx.progress_committer = None
     ctx.citation_engine = None
+    # A child has no memory of its own (overlays/subagent.yaml): a memory
+    # tool a $ref'd expert names must not read through the parent's manager.
+    ctx.memory_service = None
     ctx._snapshot_callback = None
     ctx._freeze_request = None
     ctx._officer_sleep_request = None

@@ -18,7 +18,7 @@ WHY: Your context window is finite and you may lose information during compactio
 {% if has_tool("kb_write") -%}
 - Knowledge base — Persistent notes stored via kb_write/kb_search/kb_update. Injected every LLM call as transient messages. Your ground truth for facts, decisions, and discovered information. Write important state EARLY and OFTEN using kb_write, because conversation context can be compacted at any time.
 {% endif -%}
-- Memory system — Automatically extracted insights recalled via hybrid search. Injected every LLM call as transient messages. Persists across context compaction automatically.
+- Memory system — Automatically extracted insights recalled via hybrid search. Relevant memories arrive as context{% if has_tool("memory_search") %}; call memory_search to look up anything else from earlier work{% endif %}. Persists across context compaction automatically.
 - README.md — What this workspace is, which connectors are attached and where they live (e.g. repositories under repos/<name>/), and what input materials were provided. Read it first.
 - plan.md — Execution plan. Read when you need strategic context; it is NOT in your prompt.
 - todos.yaml — Current phase tasks. The list arrives at each phase start and with every todo tool result; `todo_list` shows it on demand. Work them in order, one at a time.

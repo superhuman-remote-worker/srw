@@ -37,6 +37,7 @@ from agent.tools.git import create_git_tools
 from agent.tools.graph import create_graph_tools
 from agent.tools.knowledge import create_knowledge_tools
 from agent.tools.loop import create_loop_tools
+from agent.tools.memory import create_memory_tools
 from agent.tools.mongodb import create_mongodb_tools
 from agent.tools.orchestrator import create_orchestrator_tools
 from agent.tools.orchestrator.catalog import create_catalog_tools
@@ -733,6 +734,19 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                         logger.debug(f"Loaded knowledge tool: {tool.name}")
             except Exception as e:
                 logger.warning(f"Could not load knowledge tools: {e}")
+
+    # Memory tools (memory_search). Bound by config name; at call time each one
+    # delegates to the same-named extension of the MemoryManager the graph
+    # publishes on ``context.memory_service``. Whether memory can serve it is
+    # decided before this point (get_all_tool_names), because a session binds
+    # its tools before its memory stores exist.
+    if "memory" in tools_by_category:
+        memory_tools = create_memory_tools(context)
+        requested = set(tools_by_category["memory"])
+        for tool in memory_tools:
+            if tool.name in requested:
+                all_tools.append(tool)
+                logger.debug(f"Loaded memory tool: {tool.name}")
 
     # Communication tools
     if "communication" in tools_by_category:
