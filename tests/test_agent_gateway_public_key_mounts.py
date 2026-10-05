@@ -184,6 +184,8 @@ def test_old_chart_new_image_import_keeps_orchestrator_bootable() -> None:
         f"{HOST_DIR}/../ssh_host_ed25519_key.pub",
         f"{HOST_DIR}/ssh_host_ed25519_key.pub.pub",
         f"{HOST_DIR}/ssh_host_rsa_key.pub",
+        f"{HOST_DIR}/{'a' * 250}.pub",
+        f"{HOST_DIR}/..rotation.pub",
         f"{HOST_DIR}/{'a' * 254}.pub",
         f"{HOST_DIR}/ssh_host_ed25519_key.pub,{HOST_DIR}/ssh_host_ed25519_key.pub",
         ",".join(f"{HOST_DIR}/ssh_host_ed25519_key_{i}.pub" for i in range(5)),
@@ -215,9 +217,26 @@ def test_dynamic_agent_rejects_blank_secret_metadata(
         "{ssh_host_ed25519_key,ssh_host_ed25519_key_b,ssh_host_ed25519_key_c,ssh_host_ed25519_key_d,ssh_host_ed25519_key_e}",
         "{ssh_host_ed25519_key,../ssh_host_ed25519_key_b}",
         "{ssh_host_ed25519_key,other.pub}",
+        "{" + "a" * 250 + "}",
+        "{..rotation}",
     ],
 )
 def test_chart_rejects_invalid_public_projection_names(names: str) -> None:
     rendered = _chart("--set", f"sshGateway.hostKeyNames={names}")
     assert rendered.returncode != 0
     assert "sshGateway.hostKeyNames" in rendered.stderr
+
+
+def test_public_key_suffix_fits_secret_key_length_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    basename = "a" * 249
+    monkeypatch.setenv("AGENT_SSH_GATEWAY_HOST_KEY_SECRET", "srw-ssh-gateway-hostkey")
+    monkeypatch.setenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", f"{HOST_DIR}/{basename}.pub")
+    manifest = _agent_manifest(AgentProvisioner(), "session", None)
+    volume = next(
+        v for v in manifest["spec"]["volumes"] if v["name"] == "ssh-gateway-host-keys"
+    )
+    assert volume["secret"]["items"][0]["key"] == basename + ".pub"
+    rendered = _chart("--set", "sshGateway.hostKeyNames={" + basename + "}")
+    assert rendered.returncode == 0, rendered.stderr

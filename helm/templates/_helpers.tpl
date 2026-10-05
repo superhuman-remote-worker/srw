@@ -1649,7 +1649,7 @@ Emits nothing.
 {{- if regexMatch "(?i)(rsa|ecdsa|dss|dsa)" . -}}
 {{- fail (printf "sshGateway.hostKeyNames entry %q is not an Ed25519 host key. _require_ed25519_host_key (services/ssh_gateway_config.py) raises on any algorithm that is not ssh-ed25519, so the gateway would refuse to start -- a crash-loop three files away from this value. Use ssh_host_ed25519_key. (Naming-convention tripwire only; the load-time check is the real enforcement.)" .) -}}
 {{- end -}}
-{{- if or (not (regexMatch "^[A-Za-z0-9._-]{1,253}$" .)) (eq . ".") (eq . "..") (hasSuffix ".pub" .) -}}
+{{- if or (not (regexMatch "^[A-Za-z0-9._-]{1,249}$" .)) (eq . ".") (hasPrefix ".." .) (hasSuffix ".pub" .) -}}
 {{- fail (printf "sshGateway.hostKeyNames entry %q must be a safe Secret key basename without a .pub suffix" .) -}}
 {{- end -}}
 {{- end -}}

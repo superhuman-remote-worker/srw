@@ -64,7 +64,8 @@ logger = logging.getLogger(__name__)
 _SSH_GATEWAY_PUBLIC_HOST_KEY_DIR = "/run/secrets/ssh-gateway/host"
 _SSH_GATEWAY_PUBLIC_HOST_KEY_PATTERN = re.compile(
     rf"{re.escape(_SSH_GATEWAY_PUBLIC_HOST_KEY_DIR)}/"
-    r"([A-Za-z0-9._-]{1,253})\.pub"
+    # Kubernetes Secret keys are at most 253 characters including the .pub suffix.
+    r"([A-Za-z0-9._-]{1,249})\.pub"
 )
 
 
@@ -87,7 +88,8 @@ def _agent_gateway_public_key_config() -> tuple[str, tuple[str, ...], tuple[str,
             )
         name = match.group(1)
         if (
-            name in {".", ".."}
+            name == "."
+            or name.startswith("..")
             or name.endswith(".pub")
             or re.search(r"(?i)(rsa|ecdsa|dss|dsa)", name)
         ):
