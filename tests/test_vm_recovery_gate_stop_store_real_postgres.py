@@ -511,7 +511,9 @@ async def test_false_purge_response_observes_only_exact_async_settlement(
             if reads == (4 if settlement == "late_receipt" else 3):
                 if settlement not in ("missing", "remaining", "recreated"):
                     async with app_pg.acquire() as conn:
-                        foreign_owner = uuid4() if settlement == "foreign_owner" else None
+                        foreign_owner = (
+                            uuid4() if settlement == "foreign_owner" else None
+                        )
                         if foreign_owner is not None:
                             await conn.execute(
                                 "INSERT INTO jobs(id,description,status,execution_lane) "

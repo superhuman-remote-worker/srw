@@ -1740,8 +1740,14 @@ async def test_orphan_uuid_checkpoints_prune_without_stranding_authority(
 @pytest.mark.parametrize(
     "mutated",
     [
-        "source", "digest", "pvc", "parent", "recovery", "prior_cleanup",
-        "prior_forged_checkpoint", "retired_owner",
+        "source",
+        "digest",
+        "pvc",
+        "parent",
+        "recovery",
+        "prior_cleanup",
+        "prior_forged_checkpoint",
+        "retired_owner",
     ],
 )
 async def test_orphan_checkpoint_exception_cannot_acquire_vm_or_retired_obligation(
@@ -1751,9 +1757,7 @@ async def test_orphan_checkpoint_exception_cannot_acquire_vm_or_retired_obligati
 
     job_id = uuid4()
     source = "terminal_checkpoint_prune"
-    digest = _checkpoint_prune_intent_digest(
-        str(job_id), {"mode": "delete_thread"}
-    )
+    digest = _checkpoint_prune_intent_digest(str(job_id), {"mode": "delete_thread"})
     if mutated == "recovery":
         await insert_recovery(app_pg, owner_id=job_id)
     elif mutated in {"prior_cleanup", "prior_forged_checkpoint", "retired_owner"}:
@@ -1775,7 +1779,9 @@ async def test_orphan_checkpoint_exception_cannot_acquire_vm_or_retired_obligati
                     if mutated == "prior_forged_checkpoint"
                     else "public_vm_delete",
                     uuid4(),
-                    "sha256:forged" if mutated == "prior_forged_checkpoint" else "sha256:former-cleanup",
+                    "sha256:forged"
+                    if mutated == "prior_forged_checkpoint"
+                    else "sha256:former-cleanup",
                 )
             else:
                 await conn.execute(
