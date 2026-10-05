@@ -23,13 +23,19 @@ def container_workspace_digest(thread: dict[str, Any]) -> str | None:
     try:
         if remote_target_is_vm_backed(thread):
             return None
-        target = resolve_remote_workspace_target(thread, bound_workspace_generation(thread))
+        target = resolve_remote_workspace_target(
+            thread, bound_workspace_generation(thread)
+        )
         binding = thread_metadata_object(thread).get("_workspace_binding")
-        if not isinstance(binding, dict) or not isinstance(binding.get("backing_id"), str):
+        if not isinstance(binding, dict) or not isinstance(
+            binding.get("backing_id"), str
+        ):
             return None
         material = json.dumps(
             {"binding": binding, "endpoint": target.pool_key},
-            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
         ).encode("ascii")
         return "sha256:" + hashlib.sha256(material).hexdigest()
     except (CanvasSSHError, TypeError, ValueError, UnicodeError):
@@ -67,7 +73,12 @@ async def describe_native_target(
         return None
     if backend == "container":
         digest = container_workspace_digest(thread)
-    elif backend == "vm" and remote_target_is_vm_backed(thread) and isinstance(vm_binding, str) and len(vm_binding) == 64:
+    elif (
+        backend == "vm"
+        and remote_target_is_vm_backed(thread)
+        and isinstance(vm_binding, str)
+        and len(vm_binding) == 64
+    ):
         try:
             int(vm_binding, 16)
         except ValueError:
@@ -78,13 +89,16 @@ async def describe_native_target(
     if digest is None:
         return None
     target = await prepare(
-        thread_id=thread_id, agent_id=agent_id,
-        runtime_generation=generation, attach_token=attach_token,
+        thread_id=thread_id,
+        agent_id=agent_id,
+        runtime_generation=generation,
+        attach_token=attach_token,
         required_capability="native_workspace_first_use1",
     )
     binding = getattr(target, "binding", None)
     if (
-        target is None or binding is None
+        target is None
+        or binding is None
         or binding.thread_id != thread_id
         or binding.agent_id != agent_id
         or binding.runtime_generation != generation

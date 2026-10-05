@@ -176,7 +176,9 @@ async def test_peer_cancellation_after_notice_closes_exact_started_process():
     async def notify():
         return True
 
-    task = asyncio.create_task(proxy_session(FakeProcess(), upstream, on_first_use=notify))
+    task = asyncio.create_task(
+        proxy_session(FakeProcess(), upstream, on_first_use=notify)
+    )
     await inner.waiting.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):

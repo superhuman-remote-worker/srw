@@ -151,7 +151,9 @@ async def test_orchestrator_request_timeout_is_configurable(monkeypatch):
 @pytest.mark.asyncio
 async def test_legacy_live_target_cannot_be_mistaken_for_stateless(monkeypatch):
     async def _get(*_args, **_kwargs):
-        return FakeResponse(200, _live_payload(execution_lane=None, no_boot_watchdog=None))
+        return FakeResponse(
+            200, _live_payload(execution_lane=None, no_boot_watchdog=None)
+        )
 
     import orchestrator.services.ssh_gateway_client as mod
 

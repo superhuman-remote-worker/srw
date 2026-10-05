@@ -15,7 +15,10 @@ from fastapi.responses import JSONResponse
 
 from agent.api.models import PinnedSessionRecipient, pinned_session_recipient_matches
 from shared.native_workspace_first_use import verify_native_first_use_proof
-from shared.persistent_input_delivery import InputDeliveryAuthorityLost, lock_runtime_authority
+from shared.persistent_input_delivery import (
+    InputDeliveryAuthorityLost,
+    lock_runtime_authority,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,18 +82,24 @@ async def apply_native_first_use(
         raise NativeFirstUseRefused("recipient_authority_mismatch") from exc
     if not pinned_session_recipient_matches(
         exact,
-        thread_id=proof["thread_id"], agent_id=agent_id,
-        pod_uid=pod_uid, process_generation=process_generation,
+        thread_id=proof["thread_id"],
+        agent_id=agent_id,
+        pod_uid=pod_uid,
+        process_generation=process_generation,
     ):
         raise NativeFirstUseRefused("recipient_authority_mismatch")
     current = identity.snapshot()
     life = (
-        proof["thread_id"], proof["runtime_generation"], proof["agent_id"],
+        proof["thread_id"],
+        proof["runtime_generation"],
+        proof["agent_id"],
         current.attach_token,
-        proof["pod_uid"], proof["process_generation"],
+        proof["pod_uid"],
+        proof["process_generation"],
     )
     if (
-        session is None or session.postgres_conn is None
+        session is None
+        or session.postgres_conn is None
         or identity.runtime_contract is not True
         or identity.thread_id != life[0]
         or identity.session_generation != life[1]
@@ -108,8 +117,11 @@ async def apply_native_first_use(
             async with conn.transaction():
                 await lock_runtime_authority(
                     conn,
-                    thread_id=life[0], agent_id=life[2], pod_uid=life[4],
-                    session_runtime_generation=life[1], runtime_attach_token=life[3],
+                    thread_id=life[0],
+                    agent_id=life[2],
+                    pod_uid=life[4],
+                    session_runtime_generation=life[1],
+                    runtime_attach_token=life[3],
                 )
                 # The shared guard holds the agent row FOR SHARE. Read the
                 # registration epoch under that lock before signaling.
@@ -123,7 +135,10 @@ async def apply_native_first_use(
                         metadata = json.loads(metadata)
                     except ValueError:
                         metadata = None
-                if not isinstance(metadata, dict) or metadata.get("dispatch_process_generation") != life[5]:
+                if (
+                    not isinstance(metadata, dict)
+                    or metadata.get("dispatch_process_generation") != life[5]
+                ):
                     raise NativeFirstUseRefused("stale_native_process")
                 # No await after this point: local timeout and retirement can
                 # only win before or after this synchronous check/latch pair.
@@ -158,7 +173,9 @@ async def apply_native_first_use(
     }
 
 
-def register_native_first_use_route(app: FastAPI, context: Callable[[], dict[str, Any]]) -> None:
+def register_native_first_use_route(
+    app: FastAPI, context: Callable[[], dict[str, Any]]
+) -> None:
     """Register the same exact handler on dedicated and dual Session apps."""
 
     @app.post("/session/native-first-use")

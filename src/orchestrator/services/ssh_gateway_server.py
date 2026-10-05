@@ -748,13 +748,21 @@ class GatewaySSHServer(asyncssh.SSHServer):
             return
         target = self._target
         if target is None or target.execution_lane not in {"pinned", "stateless"}:
-            self._refuse(process, "workspace native access needs a current target; reconnect in a moment", 75)
+            self._refuse(
+                process,
+                "workspace native access needs a current target; reconnect in a moment",
+                75,
+            )
             return
         if target.no_boot_watchdog:
             await proxy_session(process, upstream)
             return
         if target.native_recipient is None or self._context.native_first_use is None:
-            self._refuse(process, "workspace native confirmation is unavailable; reconnect in a moment", 75)
+            self._refuse(
+                process,
+                "workspace native confirmation is unavailable; reconnect in a moment",
+                75,
+            )
             return
 
         event_id = uuid.uuid4().hex
@@ -763,10 +771,13 @@ class GatewaySSHServer(asyncssh.SSHServer):
         def still_live() -> bool:
             channel = getattr(process, "_chan", None)
             return bool(
-                self._authenticated and not self._connection_closed
+                self._authenticated
+                and not self._connection_closed
                 and self._target is target
-                and self._conn is not None and not self._conn.is_closed()
-                and channel is not None and not channel.is_closing()
+                and self._conn is not None
+                and not self._conn.is_closed()
+                and channel is not None
+                and not channel.is_closing()
             )
 
         async def on_first_use() -> bool:

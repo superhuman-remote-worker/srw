@@ -24,11 +24,25 @@ _BINDING = re.compile(r"[0-9a-f]{64}\Z")
 _HANDLE = re.compile(r"s-[a-z0-9]{8,32}\Z")
 _SIGNED_FIELDS = frozenset(
     {
-        "domain", "action", "event_id", "connection_id", "channel_kind",
-        "handle", "fingerprint", "thread_id", "runtime_generation",
-        "agent_id", "pod_uid", "process_generation",
-        "session_identity_fingerprint", "backend", "workspace_digest",
-        "lease_id", "binding", "expires_at", "key_fingerprint",
+        "domain",
+        "action",
+        "event_id",
+        "connection_id",
+        "channel_kind",
+        "handle",
+        "fingerprint",
+        "thread_id",
+        "runtime_generation",
+        "agent_id",
+        "pod_uid",
+        "process_generation",
+        "session_identity_fingerprint",
+        "backend",
+        "workspace_digest",
+        "lease_id",
+        "binding",
+        "expires_at",
+        "key_fingerprint",
     }
 )
 
@@ -52,16 +66,32 @@ def _valid(payload: Any) -> bool:
         for name in ("event_id", "connection_id")
     ):
         return False
-    if not isinstance(payload["channel_kind"], str) or payload["channel_kind"] not in {"ssh_session", "sftp"}:
+    if not isinstance(payload["channel_kind"], str) or payload["channel_kind"] not in {
+        "ssh_session",
+        "sftp",
+    }:
         return False
-    if not isinstance(payload["handle"], str) or not _HANDLE.fullmatch(payload["handle"]):
+    if not isinstance(payload["handle"], str) or not _HANDLE.fullmatch(
+        payload["handle"]
+    ):
         return False
     fingerprint = payload["fingerprint"]
-    if not isinstance(fingerprint, str) or not 1 <= len(fingerprint) <= 128 or not fingerprint.isascii() or not fingerprint.isprintable():
+    if (
+        not isinstance(fingerprint, str)
+        or not 1 <= len(fingerprint) <= 128
+        or not fingerprint.isascii()
+        or not fingerprint.isprintable()
+    ):
         return False
     if any(
         not _canonical_uuid(payload[name])
-        for name in ("thread_id", "runtime_generation", "agent_id", "pod_uid", "process_generation")
+        for name in (
+            "thread_id",
+            "runtime_generation",
+            "agent_id",
+            "pod_uid",
+            "process_generation",
+        )
     ):
         return False
     if any(
@@ -74,28 +104,44 @@ def _valid(payload: Any) -> bool:
         if payload["lease_id"] != "" or payload["binding"] != "":
             return False
     elif backend == "vm":
-        if not _canonical_uuid(payload["lease_id"]) or not isinstance(payload["binding"], str) or not _BINDING.fullmatch(payload["binding"]):
+        if (
+            not _canonical_uuid(payload["lease_id"])
+            or not isinstance(payload["binding"], str)
+            or not _BINDING.fullmatch(payload["binding"])
+        ):
             return False
     else:
         return False
     if type(payload["expires_at"]) is not int or payload["expires_at"] <= 0:
         return False
     key_fingerprint = payload["key_fingerprint"]
-    if not isinstance(key_fingerprint, str) or not 1 <= len(key_fingerprint) <= 128 or not key_fingerprint.isascii() or not key_fingerprint.isprintable():
+    if (
+        not isinstance(key_fingerprint, str)
+        or not 1 <= len(key_fingerprint) <= 128
+        or not key_fingerprint.isascii()
+        or not key_fingerprint.isprintable()
+    ):
         return False
     signature = payload["signature"]
-    return bool(isinstance(signature, str) and re.fullmatch(r"[0-9a-f]{166}", signature))
+    return bool(
+        isinstance(signature, str) and re.fullmatch(r"[0-9a-f]{166}", signature)
+    )
 
 
 def _message(payload: dict[str, Any]) -> bytes:
     return json.dumps(
         {name: payload[name] for name in _SIGNED_FIELDS},
-        sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
     ).encode("ascii")
 
 
 def mint_native_first_use_proof(
-    key: asyncssh.SSHKey, *, now: float | None = None, **fields: Any,
+    key: asyncssh.SSHKey,
+    *,
+    now: float | None = None,
+    **fields: Any,
 ) -> dict[str, Any]:
     if key.get_algorithm() != "ssh-ed25519":
         raise ValueError("native first-use signer must be Ed25519")
@@ -114,7 +160,10 @@ def mint_native_first_use_proof(
 
 
 def verify_native_first_use_proof(
-    payload: object, public_keys: Sequence[str], *, now: float | None = None,
+    payload: object,
+    public_keys: Sequence[str],
+    *,
+    now: float | None = None,
 ) -> bool:
     if not _valid(payload):
         return False

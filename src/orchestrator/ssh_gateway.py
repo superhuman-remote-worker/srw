@@ -733,6 +733,7 @@ def _build_app() -> Starlette:
 
     vm_signer = asyncssh.read_private_key(config.host_key_paths[0])
     from orchestrator.services.ssh_gateway_client import post_native_first_use
+
     application.state.context = GatewayContext(
         config=config,
         ca=load_user_ca(config.user_ca_path),

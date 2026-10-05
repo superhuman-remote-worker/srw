@@ -235,7 +235,9 @@ async def prepare_pinned_session_mutation_target(
     if not (
         isinstance(capabilities, Mapping)
         and capabilities.get("pinned_session_recipient_binding") is True
-        and (required_capability is None or capabilities.get(required_capability) is True)
+        and (
+            required_capability is None or capabilities.get(required_capability) is True
+        )
         and observed_thread in {None, "", thread_id}
     ):
         return None

@@ -144,17 +144,24 @@ async def post_native_first_use(
 
     recipient = target.native_recipient
     if (
-        target.execution_lane != "pinned" or target.no_boot_watchdog
-        or recipient is None or not still_live()
+        target.execution_lane != "pinned"
+        or target.no_boot_watchdog
+        or recipient is None
+        or not still_live()
     ):
         return False
     try:
         proof = mint_native_first_use_proof(
             signer,
-            event_id=event_id, connection_id=connection_id,
-            channel_kind=channel_kind, handle=handle, fingerprint=fingerprint,
-            backend=target.backend, lease_id=target.lease_id or "",
-            binding=target.binding or "", **recipient,
+            event_id=event_id,
+            connection_id=connection_id,
+            channel_kind=channel_kind,
+            handle=handle,
+            fingerprint=fingerprint,
+            backend=target.backend,
+            lease_id=target.lease_id or "",
+            binding=target.binding or "",
+            **recipient,
         )
     except (TypeError, ValueError):
         return False
@@ -175,7 +182,8 @@ async def post_native_first_use(
             response = await asyncio.wait_for(
                 _http_post(
                     f"{config.orchestrator_url}/api/internal/ssh-native-first-use",
-                    headers=_audit_headers(config), json={"proof": proof},
+                    headers=_audit_headers(config),
+                    json={"proof": proof},
                     timeout=min(remaining, config.orchestrator_request_timeout),
                 ),
                 timeout=remaining,
@@ -409,13 +417,22 @@ def _is_valid_identifier(value: Any) -> bool:
     return isinstance(value, str) and bool(value)
 
 
-_NATIVE_RECIPIENT_FIELDS = frozenset({
-    "thread_id", "runtime_generation", "agent_id", "pod_uid",
-    "process_generation", "session_identity_fingerprint", "workspace_digest",
-})
+_NATIVE_RECIPIENT_FIELDS = frozenset(
+    {
+        "thread_id",
+        "runtime_generation",
+        "agent_id",
+        "pod_uid",
+        "process_generation",
+        "session_identity_fingerprint",
+        "workspace_digest",
+    }
+)
 
 
-def _native_target_fields(payload: dict[str, Any], thread_id: str) -> tuple[str, bool, dict[str, str] | None]:
+def _native_target_fields(
+    payload: dict[str, Any], thread_id: str
+) -> tuple[str, bool, dict[str, str] | None]:
     """An absent/old pinned descriptor is never an inferred no-watchdog lane."""
 
     lane = payload.get("execution_lane")
@@ -426,11 +443,22 @@ def _native_target_fields(payload: dict[str, Any], thread_id: str) -> tuple[str,
     if payload.get("no_boot_watchdog") == "officer":
         return "pinned", True, None
     recipient = payload.get("native_recipient")
-    if type(payload.get("native_first_use_contract")) is not int or payload["native_first_use_contract"] != 1 or not isinstance(recipient, dict) or set(recipient) != _NATIVE_RECIPIENT_FIELDS:
+    if (
+        type(payload.get("native_first_use_contract")) is not int
+        or payload["native_first_use_contract"] != 1
+        or not isinstance(recipient, dict)
+        or set(recipient) != _NATIVE_RECIPIENT_FIELDS
+    ):
         raise TargetUnavailable("stale_binding")
     if recipient.get("thread_id") != thread_id:
         raise TargetUnavailable("stale_binding")
-    for name in ("thread_id", "runtime_generation", "agent_id", "pod_uid", "process_generation"):
+    for name in (
+        "thread_id",
+        "runtime_generation",
+        "agent_id",
+        "pod_uid",
+        "process_generation",
+    ):
         value = recipient[name]
         try:
             if not isinstance(value, str) or str(UUID(value)) != value:
@@ -439,7 +467,10 @@ def _native_target_fields(payload: dict[str, Any], thread_id: str) -> tuple[str,
             raise TargetUnavailable("stale_binding") from exc
     for name in ("session_identity_fingerprint", "workspace_digest"):
         value = recipient[name]
-        if not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
+        ):
             raise TargetUnavailable("stale_binding")
     return "pinned", False, recipient
 
@@ -584,7 +615,9 @@ async def vm_access(
             raise TargetUnavailable("unreachable")
         UUID(payload["lease_id"])
         int(payload["binding"], 16)
-        lane, no_watchdog, native_recipient = _native_target_fields(payload, payload["thread_id"])
+        lane, no_watchdog, native_recipient = _native_target_fields(
+            payload, payload["thread_id"]
+        )
         return SshTarget(
             thread_id=payload["thread_id"],
             user_id=payload["user_id"],

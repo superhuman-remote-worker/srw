@@ -83,7 +83,10 @@ class ProxyProcess(asyncssh.SSHServerProcess):
 
 
 async def proxy_session(
-    process, upstream, *, on_first_use: Callable[[], Awaitable[bool]] | None = None,
+    process,
+    upstream,
+    *,
+    on_first_use: Callable[[], Awaitable[bool]] | None = None,
 ) -> None:
     """Open the matching upstream process and mirror it back down.
 
@@ -142,7 +145,9 @@ async def proxy_session(
             await _close_started_process(upstream_process)
             raise
         except Exception:
-            logger.warning("ssh gateway: native first-use acknowledgement failed", exc_info=True)
+            logger.warning(
+                "ssh gateway: native first-use acknowledgement failed", exc_info=True
+            )
             acknowledged = False
         if not acknowledged:
             # create_process may already have started a command. Close this

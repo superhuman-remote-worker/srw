@@ -35,7 +35,9 @@ def owner(*, session=None, officer=None, stateless=False):
     values.update(
         session=lambda: session,
         identity=lambda: identity,
-        orchestrator_client=lambda: SimpleNamespace(dispatch_process_generation="process"),
+        orchestrator_client=lambda: SimpleNamespace(
+            dispatch_process_generation="process"
+        ),
         officer_config=lambda: officer,
         stateless_mode=lambda: stateless,
         loop_task=lambda: None,
@@ -155,12 +157,18 @@ async def test_native_first_use_keeps_same_life_ready_without_ws_or_input():
         terminated.append(reason)
 
     runtime.terminate = terminate
+
     async def wait_forever(_poll):
         await asyncio.Event().wait()
 
     runtime.thread_status_watchdog = wait_forever
     runtime.start_watchdogs()
-    assert runtime.note_native_first_use(("captured", "generation", "agent", "attach", "pod", "process")) == "accepted"
+    assert (
+        runtime.note_native_first_use(
+            ("captured", "generation", "agent", "attach", "pod", "process")
+        )
+        == "accepted"
+    )
     runtime.start_watchdogs()  # A same-life restart must retain the accepted use.
     await asyncio.sleep(0.03)
     assert terminated == []
@@ -169,8 +177,10 @@ async def test_native_first_use_keeps_same_life_ready_without_ws_or_input():
 
 def test_native_notice_does_not_latch_no_watchdog_officer_or_stateless_life():
     life = ("captured", "generation", "agent", "attach", "pod", "process")
-    for runtime in (owner(session=object(), officer=object()),
-                    owner(session=object(), stateless=True)):
+    for runtime in (
+        owner(session=object(), officer=object()),
+        owner(session=object(), stateless=True),
+    ):
         runtime.ws_connected_event = asyncio.Event()
         assert runtime.note_native_first_use(life) is None
         assert not runtime.ws_connected_event.is_set()

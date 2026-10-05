@@ -14,19 +14,26 @@ import pytest
 import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
-from agent.api.native_workspace_first_use import NativeFirstUseRefused, apply_native_first_use
+from agent.api.native_workspace_first_use import (
+    NativeFirstUseRefused,
+    apply_native_first_use,
+)
 from orchestrator.database.postgres import PostgresDB
 from shared.native_workspace_first_use import mint_native_first_use_proof
 from shared.pinned_session_identity import pinned_session_ready_identity_fingerprint
 from tests.test_stateless_input_delivery_real_postgres import _seed_pinned_thread
 
-SCHEMA = Path(__file__).resolve().parents[1] / "src/orchestrator/database/schema_current.sql"
+SCHEMA = (
+    Path(__file__).resolve().parents[1] / "src/orchestrator/database/schema_current.sql"
+)
 
 
 @pytest.fixture(scope="module")
 def pg_dsn():
     with PostgresContainer("pgvector/pgvector:pg15") as container:
-        yield container.get_connection_url().replace("postgresql+psycopg2", "postgresql")
+        yield container.get_connection_url().replace(
+            "postgresql+psycopg2", "postgresql"
+        )
 
 
 @pytest_asyncio.fixture(scope="module")
@@ -57,7 +64,8 @@ async def native_life(db):
         await conn.execute(
             "UPDATE agents SET metadata=jsonb_build_object("
             "'dispatch_process_generation',$2::text) WHERE id=$1",
-            agent, process,
+            agent,
+            process,
         )
         await conn.execute(
             "UPDATE threads SET metadata=jsonb_set(metadata,"
@@ -68,27 +76,45 @@ async def native_life(db):
     generation = str(row["runtime_generation"])
     attach = str(row["runtime_attach_token"])
     fingerprint = pinned_session_ready_identity_fingerprint(
-        thread_id=str(thread), runtime_generation=generation,
-        agent_id=str(agent), runtime_attach_token=attach, pod_uid=pod,
+        thread_id=str(thread),
+        runtime_generation=generation,
+        agent_id=str(agent),
+        runtime_attach_token=attach,
+        pod_uid=pod,
     )
     signer = asyncssh.generate_private_key("ssh-ed25519")
     proof = mint_native_first_use_proof(
-        signer, event_id=uuid4().hex, connection_id=uuid4().hex,
-        channel_kind="ssh_session", handle="s-7f3a91c2", fingerprint="SHA256:user",
-        thread_id=str(thread), runtime_generation=generation, agent_id=str(agent),
-        pod_uid=pod, process_generation=process,
+        signer,
+        event_id=uuid4().hex,
+        connection_id=uuid4().hex,
+        channel_kind="ssh_session",
+        handle="s-7f3a91c2",
+        fingerprint="SHA256:user",
+        thread_id=str(thread),
+        runtime_generation=generation,
+        agent_id=str(agent),
+        pod_uid=pod,
+        process_generation=process,
         session_identity_fingerprint=fingerprint,
-        backend="container", workspace_digest="sha256:" + "b" * 64,
-        lease_id="", binding="",
+        backend="container",
+        workspace_digest="sha256:" + "b" * 64,
+        lease_id="",
+        binding="",
     )
     recipient = {
-        "expected_thread_id": str(thread), "expected_agent_id": str(agent),
-        "expected_pod_uid": pod, "expected_process_generation": process,
+        "expected_thread_id": str(thread),
+        "expected_agent_id": str(agent),
+        "expected_pod_uid": pod,
+        "expected_process_generation": process,
     }
     identity = SimpleNamespace(
-        thread_id=str(thread), session_generation=generation,
-        attach_token=attach, agent_id=str(agent), pod_uid=pod,
-        runtime_contract=True, fingerprint=lambda: fingerprint,
+        thread_id=str(thread),
+        session_generation=generation,
+        attach_token=attach,
+        agent_id=str(agent),
+        pod_uid=pod,
+        runtime_contract=True,
+        fingerprint=lambda: fingerprint,
     )
     identity.snapshot = lambda: identity
     observed = []
@@ -113,8 +139,10 @@ async def native_life(db):
     )
     kwargs = {
         "session": SimpleNamespace(postgres_conn=SimpleNamespace(acquire=acquire)),
-        "identity": identity, "termination": termination,
-        "agent_id": str(agent), "pod_uid": pod,
+        "identity": identity,
+        "termination": termination,
+        "agent_id": str(agent),
+        "pod_uid": pod,
         "process_generation": process,
         "public_keys": [signer.export_public_key().decode()],
     }
@@ -122,16 +150,23 @@ async def native_life(db):
 
 
 @pytest.mark.asyncio
-async def test_real_lock_latches_once_and_rejects_registered_process_and_attach_rotation(db):
+async def test_real_lock_latches_once_and_rejects_registered_process_and_attach_rotation(
+    db,
+):
     proof, recipient, kwargs, observed = await native_life(db)
-    assert (await apply_native_first_use(proof, recipient, **kwargs))["status"] == "accepted"
-    assert (await apply_native_first_use(proof, recipient, **kwargs))["status"] == "already_observed"
+    assert (await apply_native_first_use(proof, recipient, **kwargs))[
+        "status"
+    ] == "accepted"
+    assert (await apply_native_first_use(proof, recipient, **kwargs))[
+        "status"
+    ] == "already_observed"
     assert len(observed) == 2
     async with db.acquire() as conn:
         await conn.execute(
             "UPDATE agents SET metadata=jsonb_build_object("
             "'dispatch_process_generation',$2::text) WHERE id=$1",
-            UUID(proof["agent_id"]), str(uuid4()),
+            UUID(proof["agent_id"]),
+            str(uuid4()),
         )
     with pytest.raises(NativeFirstUseRefused, match="stale_native_process"):
         await apply_native_first_use(proof, recipient, **kwargs)
@@ -139,7 +174,8 @@ async def test_real_lock_latches_once_and_rejects_registered_process_and_attach_
     async with db.acquire() as conn:
         await conn.execute(
             "UPDATE threads SET runtime_attach_token=$2 WHERE id=$1",
-            UUID(proof["thread_id"]), uuid4(),
+            UUID(proof["thread_id"]),
+            uuid4(),
         )
     with pytest.raises(NativeFirstUseRefused, match="runtime_authority_lost"):
         await apply_native_first_use(proof, recipient, **kwargs)
@@ -155,7 +191,9 @@ async def test_blocked_guard_after_durable_retirement_refuses_without_latch(db):
                 "UPDATE threads SET status='ended' WHERE id=$1",
                 UUID(proof["thread_id"]),
             )
-            attempt = asyncio.create_task(apply_native_first_use(proof, recipient, **kwargs))
+            attempt = asyncio.create_task(
+                apply_native_first_use(proof, recipient, **kwargs)
+            )
             await asyncio.sleep(0.1)
             assert not attempt.done()
             assert observed == []
@@ -172,9 +210,12 @@ async def test_blocked_agent_lock_observes_committed_process_rotation(db):
             await blocker.execute(
                 "UPDATE agents SET metadata=jsonb_build_object("
                 "'dispatch_process_generation',$2::text) WHERE id=$1",
-                UUID(proof["agent_id"]), str(uuid4()),
+                UUID(proof["agent_id"]),
+                str(uuid4()),
             )
-            attempt = asyncio.create_task(apply_native_first_use(proof, recipient, **kwargs))
+            attempt = asyncio.create_task(
+                apply_native_first_use(proof, recipient, **kwargs)
+            )
             await asyncio.sleep(0.1)
             assert not attempt.done()
             assert observed == []

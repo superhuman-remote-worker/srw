@@ -15,15 +15,18 @@ async def test_stateless_and_officer_descriptors_are_explicit_no_watchdog_classe
 
     stateless = {"execution_lane": "stateless", "status": "active"}
     officer = {
-        "execution_lane": "pinned", "status": "active",
+        "execution_lane": "pinned",
+        "status": "active",
         "metadata": {"config_override": {"officer": {"enabled": True}}},
     }
     unknown = {"execution_lane": "pinned", "status": "active", "metadata": {}}
     assert await describe_native_target(stateless, prepare=impossible_target) == (
-        {"execution_lane": "stateless", "no_boot_watchdog": True}, None
+        {"execution_lane": "stateless", "no_boot_watchdog": True},
+        None,
     )
     assert await describe_native_target(officer, prepare=impossible_target) == (
-        {"execution_lane": "pinned", "no_boot_watchdog": "officer"}, None
+        {"execution_lane": "pinned", "no_boot_watchdog": "officer"},
+        None,
     )
     assert await describe_native_target(unknown, prepare=lambda **_: None) is None
 
@@ -32,11 +35,16 @@ async def test_stateless_and_officer_descriptors_are_explicit_no_watchdog_classe
 async def test_uuid_typed_db_row_describes_current_pinned_vm_recipient():
     thread_id, generation, agent_id, attach, pod, process = [uuid4() for _ in range(6)]
     binding = PinnedSessionBinding(
-        thread_id=str(thread_id), runtime_generation=str(generation),
-        agent_id=str(agent_id), runtime_attach_token=str(attach),
+        thread_id=str(thread_id),
+        runtime_generation=str(generation),
+        agent_id=str(agent_id),
+        runtime_attach_token=str(attach),
         agent_hostname="persistent-" + str(thread_id)[:12],
-        pod_namespace="default", pod_uid=str(pod), pod_ip="10.0.0.2",
-        pod_port=8001, agent_status="session",
+        pod_namespace="default",
+        pod_uid=str(pod),
+        pod_ip="10.0.0.2",
+        pod_port=8001,
+        agent_status="session",
     )
     calls = []
 
@@ -45,13 +53,19 @@ async def test_uuid_typed_db_row_describes_current_pinned_vm_recipient():
         return SimpleNamespace(binding=binding, process_generation=str(process))
 
     thread = {
-        "id": thread_id, "agent_id": agent_id,
-        "runtime_generation": generation, "runtime_attach_token": attach,
-        "execution_lane": "pinned", "status": "active",
+        "id": thread_id,
+        "agent_id": agent_id,
+        "runtime_generation": generation,
+        "runtime_attach_token": attach,
+        "execution_lane": "pinned",
+        "status": "active",
         "metadata": {"vm": {"status": "ready"}},
     }
     result = await describe_native_target(
-        thread, prepare=prepare, backend="vm", vm_binding="a" * 64,
+        thread,
+        prepare=prepare,
+        backend="vm",
+        vm_binding="a" * 64,
     )
     assert result is not None
     assert result[0]["native_recipient"]["thread_id"] == str(thread_id)

@@ -29,7 +29,9 @@ def test_agent_verifier_loads_selected_public_file_only(tmp_path, monkeypatch):
 
     selected.write_text(public + signer.export_private_key().decode(), encoding="ascii")
     assert configured_public_keys() == []
-    monkeypatch.setenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", str(selected) + ",/missing/key.pub")
+    monkeypatch.setenv(
+        "SSH_GATEWAY_PUBLIC_HOST_KEYS", str(selected) + ",/missing/key.pub"
+    )
     assert configured_public_keys() == []
 
 
@@ -38,16 +40,29 @@ async def test_exact_signed_notice_latches_once_inside_runtime_transaction(monke
     gateway = asyncssh.generate_private_key("ssh-ed25519")
     thread, generation, agent, attach, pod, process = [str(uuid4()) for _ in range(6)]
     fingerprint = pinned_session_ready_identity_fingerprint(
-        thread_id=thread, runtime_generation=generation, agent_id=agent,
-        runtime_attach_token=attach, pod_uid=pod,
+        thread_id=thread,
+        runtime_generation=generation,
+        agent_id=agent,
+        runtime_attach_token=attach,
+        pod_uid=pod,
     )
     proof = mint_native_first_use_proof(
-        gateway, event_id="a" * 32, connection_id="b" * 32,
-        channel_kind="ssh_session", handle="s-7f3a91c2", fingerprint="SHA256:user",
-        thread_id=thread, runtime_generation=generation, agent_id=agent,
-        pod_uid=pod, process_generation=process,
-        session_identity_fingerprint=fingerprint, backend="container",
-        workspace_digest="sha256:" + "c" * 64, lease_id="", binding="",
+        gateway,
+        event_id="a" * 32,
+        connection_id="b" * 32,
+        channel_kind="ssh_session",
+        handle="s-7f3a91c2",
+        fingerprint="SHA256:user",
+        thread_id=thread,
+        runtime_generation=generation,
+        agent_id=agent,
+        pod_uid=pod,
+        process_generation=process,
+        session_identity_fingerprint=fingerprint,
+        backend="container",
+        workspace_digest="sha256:" + "c" * 64,
+        lease_id="",
+        binding="",
     )
     active = False
 
@@ -71,8 +86,12 @@ async def test_exact_signed_notice_latches_once_inside_runtime_transaction(monke
     conn = SimpleNamespace(transaction=transaction, fetchrow=fetchrow)
     session = SimpleNamespace(postgres_conn=SimpleNamespace(acquire=acquire))
     identity = SimpleNamespace(
-        thread_id=thread, session_generation=generation, attach_token=attach,
-        agent_id=agent, pod_uid=pod, runtime_contract=True,
+        thread_id=thread,
+        session_generation=generation,
+        attach_token=attach,
+        agent_id=agent,
+        pod_uid=pod,
+        runtime_contract=True,
         fingerprint=lambda: fingerprint,
     )
     identity.snapshot = lambda: identity
@@ -84,32 +103,48 @@ async def test_exact_signed_notice_latches_once_inside_runtime_transaction(monke
         return "accepted" if len(observed) == 1 else "already_observed"
 
     termination = SimpleNamespace(
-        runtime_admission_closed=lambda: False, terminating=False,
+        runtime_admission_closed=lambda: False,
+        terminating=False,
         note_native_first_use=note,
     )
 
     async def lock(_conn, **_kwargs):
         assert active
 
-    monkeypatch.setattr("agent.api.native_workspace_first_use.lock_runtime_authority", lock)
+    monkeypatch.setattr(
+        "agent.api.native_workspace_first_use.lock_runtime_authority", lock
+    )
     args = dict(
-        session=session, identity=identity, termination=termination,
-        agent_id=agent, pod_uid=pod, process_generation=process,
+        session=session,
+        identity=identity,
+        termination=termination,
+        agent_id=agent,
+        pod_uid=pod,
+        process_generation=process,
         public_keys=[gateway.export_public_key().decode()],
     )
-    recipient = dict(expected_thread_id=thread, expected_agent_id=agent,
-                     expected_pod_uid=pod, expected_process_generation=process)
+    recipient = dict(
+        expected_thread_id=thread,
+        expected_agent_id=agent,
+        expected_pod_uid=pod,
+        expected_process_generation=process,
+    )
     first = await apply_native_first_use(proof, recipient, **args)
     second = await apply_native_first_use(proof, recipient, **args)
-    assert first == {"event_id": "a" * 32, "session_identity_fingerprint": fingerprint,
-                     "process_generation": process, "status": "accepted"}
+    assert first == {
+        "event_id": "a" * 32,
+        "session_identity_fingerprint": fingerprint,
+        "process_generation": process,
+        "status": "accepted",
+    }
     assert second["status"] == "already_observed"
     assert observed == [(thread, generation, agent, attach, pod, process)] * 2
 
 
 @pytest.mark.asyncio
 async def test_read_only_transaction_exit_failure_retains_verified_first_use_fact(
-    monkeypatch, tmp_path,
+    monkeypatch,
+    tmp_path,
 ):
     """A lost acknowledgement cannot roll back the lock-held local observation."""
 
@@ -117,24 +152,43 @@ async def test_read_only_transaction_exit_failure_retains_verified_first_use_fac
     thread, generation, agent, attach, pod, process = [str(uuid4()) for _ in range(6)]
     life = (thread, generation, agent, attach, pod, process)
     fingerprint = pinned_session_ready_identity_fingerprint(
-        thread_id=thread, runtime_generation=generation, agent_id=agent,
-        runtime_attach_token=attach, pod_uid=pod,
+        thread_id=thread,
+        runtime_generation=generation,
+        agent_id=agent,
+        runtime_attach_token=attach,
+        pod_uid=pod,
     )
     proof = mint_native_first_use_proof(
-        gateway, event_id="a" * 32, connection_id="b" * 32,
-        channel_kind="ssh_session", handle="s-7f3a91c2", fingerprint="SHA256:user",
-        thread_id=thread, runtime_generation=generation, agent_id=agent,
-        pod_uid=pod, process_generation=process,
-        session_identity_fingerprint=fingerprint, backend="container",
-        workspace_digest="sha256:" + "c" * 64, lease_id="", binding="",
+        gateway,
+        event_id="a" * 32,
+        connection_id="b" * 32,
+        channel_kind="ssh_session",
+        handle="s-7f3a91c2",
+        fingerprint="SHA256:user",
+        thread_id=thread,
+        runtime_generation=generation,
+        agent_id=agent,
+        pod_uid=pod,
+        process_generation=process,
+        session_identity_fingerprint=fingerprint,
+        backend="container",
+        workspace_digest="sha256:" + "c" * 64,
+        lease_id="",
+        binding="",
     )
     recipient = dict(
-        expected_thread_id=thread, expected_agent_id=agent,
-        expected_pod_uid=pod, expected_process_generation=process,
+        expected_thread_id=thread,
+        expected_agent_id=agent,
+        expected_pod_uid=pod,
+        expected_process_generation=process,
     )
     identity = SimpleNamespace(
-        thread_id=thread, session_generation=generation, attach_token=attach,
-        agent_id=agent, pod_uid=pod, runtime_contract=True,
+        thread_id=thread,
+        session_generation=generation,
+        attach_token=attach,
+        agent_id=agent,
+        pod_uid=pod,
+        runtime_contract=True,
         fingerprint=lambda: fingerprint,
         retirement_identity=lambda: (thread, generation, attach),
     )
@@ -176,10 +230,16 @@ async def test_read_only_transaction_exit_failure_retains_verified_first_use_fac
     async def lock(_conn, **_kwargs):
         assert active
 
-    monkeypatch.setattr("agent.api.native_workspace_first_use.lock_runtime_authority", lock)
+    monkeypatch.setattr(
+        "agent.api.native_workspace_first_use.lock_runtime_authority", lock
+    )
     args = dict(
-        session=session, identity=identity, termination=termination,
-        agent_id=agent, pod_uid=pod, process_generation=process,
+        session=session,
+        identity=identity,
+        termination=termination,
+        agent_id=agent,
+        pod_uid=pod,
+        process_generation=process,
         public_keys=[gateway.export_public_key().decode()],
     )
     with pytest.raises(NativeFirstUseRefused, match="native_authority_unavailable"):
@@ -189,7 +249,9 @@ async def test_read_only_transaction_exit_failure_retains_verified_first_use_fac
 
     # The same signed event can still get an idempotent receipt on retry.
     failing_exit[0] = False
-    assert (await apply_native_first_use(proof, recipient, **args))["status"] == "already_observed"
+    assert (await apply_native_first_use(proof, recipient, **args))[
+        "status"
+    ] == "already_observed"
     assert termination.native_first_use_identity == life
 
     # A successor process cannot use the predecessor's signed recipient.

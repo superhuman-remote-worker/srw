@@ -1410,7 +1410,9 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
 
         if _pod_state == PodState.WORKING and _current_job_id == request.job_id:
             acknowledgement = accepted_pinned_job_delivery(
-                request, _orchestrator_client, retry=True,
+                request,
+                _orchestrator_client,
+                retry=True,
             )
             return JobStartResponse(
                 job_id=request.job_id,
@@ -1436,7 +1438,9 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 )
             # Keep the delivery binding and local state change indivisible.
             acknowledgement = accepted_pinned_job_delivery(
-                request, _orchestrator_client, retry=False,
+                request,
+                _orchestrator_client,
+                retry=False,
             )
             _pod_state = PodState.WORKING
             _current_job_id = request.job_id
@@ -1579,12 +1583,15 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             raise HTTPException(503, "Agent is shutting down")
 
         from agent.api.pinned_delivery import (
-            accepted_pinned_job_delivery, resume_feedback_with_delegation,
+            accepted_pinned_job_delivery,
+            resume_feedback_with_delegation,
         )
 
         if _pod_state == PodState.WORKING and _current_job_id == request.job_id:
             acknowledgement = accepted_pinned_job_delivery(
-                request, _orchestrator_client, retry=True,
+                request,
+                _orchestrator_client,
+                retry=True,
             )
             return JobStartResponse(
                 job_id=request.job_id,
@@ -1609,14 +1616,18 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     f"Pod is in {_pod_state.value} state, cannot accept resume",
                 )
             acknowledgement = accepted_pinned_job_delivery(
-                request, _orchestrator_client, retry=False,
+                request,
+                _orchestrator_client,
+                retry=False,
             )
             _pod_state = PodState.WORKING
             _current_job_id = request.job_id
 
         _clear_stop()
         feedback, feedback_reason = resume_feedback_with_delegation(
-            request.feedback, request.feedback_reason, request.delegation_results,
+            request.feedback,
+            request.feedback_reason,
+            request.delegation_results,
         )
 
         async def _do_resume():
@@ -2069,10 +2080,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             if isinstance(request, dict)
             else None
         )
-        if (
-            expected is None
-            or pa._session_identity.fingerprint() != expected
-        ):
+        if expected is None or pa._session_identity.fingerprint() != expected:
             return JSONResponse(
                 {"error": "session_identity_mismatch", "retryable": True},
                 status_code=409,
@@ -2118,10 +2126,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             if isinstance(request, dict)
             else None
         )
-        if (
-            expected is None
-            or pa._session_identity.fingerprint() != expected
-        ):
+        if expected is None or pa._session_identity.fingerprint() != expected:
             return JSONResponse(
                 {"error": "session_identity_mismatch", "retryable": True},
                 status_code=409,
