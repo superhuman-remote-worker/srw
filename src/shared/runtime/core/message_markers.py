@@ -62,8 +62,9 @@ INSTRUCTION_PATH_KEY = "srw_instruction_path"
 # selects "this turn's rows" by membership instead of walking back to an
 # anchor message that a mid-turn compaction may have summarised away
 # (knowledge-base/knowledge/issues/stateless_turn_settlement_crashes_after_midturn_compaction.md).
-# In-memory only: ``_serialize_message_row`` does not persist
-# ``additional_kwargs``, and the stamp is never sent to a provider.
+# In-memory only: ``_serialize_message_row`` persists no ``additional_kwargs``
+# but a context entry's ``srw_injection`` schema, and the stamp is never sent
+# to a provider.
 TURN_MEMBERSHIP_KEY = "_srw_turn_id"
 
 # Compaction-view mark (sessions). A compaction rewrite that leaves a lossy

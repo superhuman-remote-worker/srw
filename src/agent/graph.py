@@ -72,6 +72,7 @@ from agent.core.context import (
     ContextManager,
     ContextConfig,
     ToolRetryManager,
+    keep_window_start,
     repair_tool_call_arguments,
     sanitize_message_history,
     scrub_history_tool_call_arguments,
@@ -1048,10 +1049,10 @@ def create_execute_node(
         if memory_service is not None and context_mgr.should_summarize(messages):
             from agent.services.memory import CaptureEvent
 
+            # The slice the summary will cover: the keep window counts
+            # non-entries, as compaction does (keep_window_start).
             keep_recent = context_mgr.config.keep_recent_messages
-            evicted = (
-                list(messages[:-keep_recent]) if keep_recent > 0 else list(messages)
-            )
+            evicted = list(messages[: keep_window_start(messages, keep_recent)])
             if evicted:
                 memory_service.capture_nowait(
                     CaptureEvent(

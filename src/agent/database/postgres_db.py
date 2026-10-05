@@ -32,6 +32,7 @@ from shared.row_identity import (
     _THREAD_MSG_ID_NS as _THREAD_MSG_ID_NS,
     _coerce_row_id as _coerce_row_id,
 )
+from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT
 
 try:
     import asyncpg
@@ -41,6 +42,14 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 QUERIES_DIR = Path(__file__).parent / "queries" / "postgres"
+
+# The one ``additional_kwargs`` read the resume history projection makes: a
+# typed context entry (``role='context'``) is rebuilt from its schema; every
+# other row keeps the HF-7 diet (see ``get_thread_messages_history``).
+_CONTEXT_ROW_KWARGS_PROJECTION = (
+    f"CASE WHEN message.role = '{PERSIST_ROLE_CONTEXT}' "
+    "THEN message.additional_kwargs END AS additional_kwargs"
+)
 
 
 def _active_run_queue_lease():
@@ -1348,6 +1357,10 @@ class PostgresDB:
         # every resume and never read (the rebuilt AIMessage doesn't carry them).
         # Select only what resume consumes. The seq / turn_number / created_at
         # ORDER BYs below don't require the column in the projection.
+        # One exception, scoped by role: a ``role='context'`` row (a typed
+        # context entry, append-only context injection) is rebuilt from its
+        # ``additional_kwargs.srw_injection`` schema, so the CASE fetches the
+        # column for those rows only and stays NULL for every other row.
         provider_projection = ", message.provider_raw" if include_provider_raw else ""
         params: List[Any] = [thread_id]
         # The turn that consumed a row: an admitted delivery records it, the
@@ -1384,7 +1397,8 @@ class PostgresDB:
             SELECT message.id, message.role, message.content,
                    message.tool_calls, message.tool_call_id,
                    message.turn_number,
-                   delivery.admitted_turn_number{provider_projection}
+                   delivery.admitted_turn_number,
+                   {_CONTEXT_ROW_KWARGS_PROJECTION}{provider_projection}
             FROM thread_messages AS message
             LEFT JOIN thread_input_deliveries AS delivery
               ON delivery.message_id = message.id{boundary_join}
@@ -1435,6 +1449,13 @@ class PostgresDB:
                     **(
                         {"provider_raw": _j(row["provider_raw"])}
                         if include_provider_raw
+                        else {}
+                    ),
+                    # Only a context row gets the key (the HF-7 diet holds
+                    # for the rest; see _CONTEXT_ROW_KWARGS_PROJECTION).
+                    **(
+                        {"additional_kwargs": _j(row.get("additional_kwargs"))}
+                        if row["role"] == PERSIST_ROLE_CONTEXT
                         else {}
                     ),
                 }
@@ -2032,6 +2053,12 @@ class PostgresDB:
     # loop re-saves its input row at turn start, and a recovery continuation
     # carries ``metrics.subagent_recovery`` written by the orchestrator
     # (parallel_subagents.md §6.5), which that re-save must not erase.
+    #
+    # ``additional_kwargs`` likewise keeps what is stored when the upsert
+    # brings none. A ``role='context'`` row's schema is what restore rebuilds
+    # the entry from (append-only context injection, WP2 spec §F), and a
+    # re-save of the same id without it — a reconcile pass, or a writer that
+    # never serializes kwargs — must not erase it.
     _THREAD_MESSAGE_UPSERT_SQL = """
         INSERT INTO thread_messages
             (id, thread_id, role, content, tool_calls, turn_number,
@@ -2054,7 +2081,9 @@ class PostgresDB:
             tool_results      = EXCLUDED.tool_results,
             provider          = EXCLUDED.provider,
             provider_raw      = EXCLUDED.provider_raw,
-            additional_kwargs = EXCLUDED.additional_kwargs,
+            additional_kwargs = COALESCE(
+                EXCLUDED.additional_kwargs, thread_messages.additional_kwargs
+            ),
             response_metadata = EXCLUDED.response_metadata
         RETURNING id, seq
     """

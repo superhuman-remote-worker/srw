@@ -141,6 +141,7 @@ from shared.cloud_push_tasks import (
     fail_bg_task,
 )
 from shared.subagent_lifecycle import SubagentLifecycleError
+from shared.runtime.core.context_entries import is_context_entry
 from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
 from shared.worker_errors import worker_error_cause, worker_workspace_exhaustion_cause
 from shared.workspace_recovery import (
@@ -726,7 +727,15 @@ def strip_restored_pending_humans(
     serves again. Its restored copy is stripped like a human one; the event
     is injected once, as the input of the turn that serves it.
 
-    Mutates ``messages`` in place; returns the number of messages removed.
+    A stripped input takes the run of typed context entries right after it
+    along (append-only context injection): they were appended for the turn
+    that input started and would otherwise fold into whatever message now
+    precedes them. The turn that serves the input again plans its own. The
+    tail matcher looks past a trailing run of entries to the input they
+    follow.
+
+    Mutates ``messages`` in place; returns the number of messages removed,
+    entries included.
     """
     if not messages or not pending_rows:
         return 0
@@ -746,25 +755,40 @@ def strip_restored_pending_humans(
     removed = 0
     if pending_ids:
         kept = []
+        stripping_entries = False
         for msg in messages:
+            if stripping_entries and is_context_entry(msg):
+                removed += 1
+                continue
+            stripping_entries = False
             msg_id = getattr(msg, "id", None)
             row = pending_ids.get(str(msg_id)) if msg_id is not None else None
-            if row is not None and getattr(msg, "type", None) == "human":
+            if (
+                row is not None
+                and getattr(msg, "type", None) == "human"
+                and not is_context_entry(msg)
+            ):
                 del pending_ids[str(msg_id)]
                 remaining.remove(row)
                 removed += 1
+                stripping_entries = True
                 continue
             kept.append(msg)
         messages[:] = kept
     while messages and remaining:
-        msg = messages[-1]
+        end = len(messages)
+        while end and is_context_entry(messages[end - 1]):
+            end -= 1
+        if not end:
+            break
+        msg = messages[end - 1]
         if getattr(msg, "type", None) != "human":
             break
         if _message_text(msg) != (remaining[-1].get("content") or ""):
             break
         remaining.pop()
-        messages.pop()
-        removed += 1
+        removed += len(messages) - (end - 1)
+        del messages[end - 1 :]
     return removed
 
 

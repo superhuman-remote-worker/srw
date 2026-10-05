@@ -32,6 +32,7 @@ from shared.runtime.core.loader import (
     load_config_from_resolved,
     resolve_model_settings,
 )
+from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT
 from shared.runtime.services.memory_prompts import resolve_memory_extraction_prompt
 from shared.runtime.services.auxiliary import AuxiliaryLLM, ExtractMemoriesTask
 from shared.runtime.services.embedding_service import EmbeddingService
@@ -300,6 +301,11 @@ def _messages_from_rows(rows: Sequence[Mapping[str, Any]]) -> tuple[BaseMessage,
     pending_tool_call_ids: list[str] = []
     for row in rows:
         role = str(row.get("role") or "")
+        if role == PERSIST_ROLE_CONTEXT:
+            # A typed context entry (memory, knowledge, guidance, ...) is
+            # harness context the turn was given, not conversation: memory is
+            # never extracted from it. It stays inside the frozen window.
+            continue
         if role not in _SUPPORTED_TURN_ROLES:
             raise SessionMemoryEffectPermanentError(
                 f"session transcript has unsupported turn role {role!r}"

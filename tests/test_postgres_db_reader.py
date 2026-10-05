@@ -1,9 +1,10 @@
+import json
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
 
-from agent.database.postgres_db import PostgresDB
+from agent.database.postgres_db import _CONTEXT_ROW_KWARGS_PROJECTION, PostgresDB
 
 
 @pytest.mark.asyncio
@@ -52,7 +53,9 @@ async def test_history_projects_only_resume_fields():
     tool_results/provider*/response_metadata/additional_kwargs/metrics/
     created_at). Those are never read on resume; the rebuilt AIMessage doesn't
     carry them. Stable message IDs are retained for exact subagent-call
-    correlation across recovery."""
+    correlation across recovery. The one allowed exception is
+    additional_kwargs for role='context' rows, through exactly one CASE
+    expression; a non-context row gets no additional_kwargs key."""
     db = PostgresDB.__new__(PostgresDB)  # bypass __init__/connection
     db.fetch = AsyncMock(
         return_value=[
@@ -84,6 +87,13 @@ async def test_history_projects_only_resume_fields():
     # projection clause between SELECT and FROM.)
     sql = " ".join(db.fetch.call_args[0][0].split())
     projection = sql.split("FROM")[0]
+    # Exactly one role-scoped read of additional_kwargs, and nothing else.
+    assert _CONTEXT_ROW_KWARGS_PROJECTION == (
+        "CASE WHEN message.role = 'context' "
+        "THEN message.additional_kwargs END AS additional_kwargs"
+    )
+    assert projection.count(_CONTEXT_ROW_KWARGS_PROJECTION) == 1
+    projection = projection.replace(_CONTEXT_ROW_KWARGS_PROJECTION, "")
     for dropped in (
         "reasoning",
         "tool_results",
@@ -95,6 +105,40 @@ async def test_history_projects_only_resume_fields():
         "created_at",
     ):
         assert dropped not in projection, f"resume reader must not fetch {dropped}"
+
+
+@pytest.mark.asyncio
+async def test_history_reads_additional_kwargs_for_context_rows_only():
+    """A context row hands its schema to restore; every other row keeps the
+    HF-7 shape (no additional_kwargs key), whatever the column holds."""
+    meta = {"v": 1, "kind": "memory", "section": "memory"}
+    db = PostgresDB.__new__(PostgresDB)
+    db.fetch = AsyncMock(
+        return_value=[
+            {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "role": "tool",
+                "content": "result",
+                "tool_calls": None,
+                "tool_call_id": "call_1",
+                "turn_number": 2,
+                "additional_kwargs": None,
+            },
+            {
+                "id": "00000000-0000-0000-0000-000000000002",
+                "role": "context",
+                "content": '<srw_context kind="memory">\nx\n</srw_context>',
+                "tool_calls": None,
+                "tool_call_id": None,
+                "turn_number": 2,
+                # asyncpg hands jsonb back as text without a codec.
+                "additional_kwargs": json.dumps({"srw_injection": meta}),
+            },
+        ]
+    )
+    rows = await db.get_thread_messages_history("t1")
+    assert "additional_kwargs" not in rows[0]
+    assert rows[1]["additional_kwargs"] == {"srw_injection": meta}
 
 
 @pytest.mark.asyncio

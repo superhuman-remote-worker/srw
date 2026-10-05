@@ -8464,9 +8464,16 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
     (predates the column); current rows carry it explicitly. Skips system
     rows — the loop adds a fresh system from the current config.
     ``role='summary'`` rows are already excluded by the DB query.
+    A ``role='context'`` row comes back as the typed context entry it was
+    (its stored text, never re-rendered) and folds into its carrier at the
+    next request build; an unreadable one is dropped, and the planner
+    re-injects what is still relevant.
     """
     import uuid as _uuid
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+    from shared.runtime.core.context_entries import context_entry_from_row
+    from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT
 
     restored: list = []
     pending_tool_call_ids: list[str] = []
@@ -8498,6 +8505,17 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
             # it can no longer see. (postgres_db's history query excludes only
             # 'summary' and 'error', so 'event' rows do reach here.)
             restored.append(HumanMessage(content=content, id=msg_id))
+
+        elif role == PERSIST_ROLE_CONTEXT:
+            # A typed context entry (append-only context injection). The
+            # history query reads additional_kwargs for these rows only.
+            entry = context_entry_from_row(
+                db_msg.get("content"), db_msg.get("additional_kwargs"), id=msg_id
+            )
+            if entry is None:
+                logger.debug("Dropping unreadable context row %s on restore", msg_id)
+            else:
+                restored.append(entry)
 
         elif role in ("ai", "assistant"):
             lc_tool_calls = []
@@ -9365,8 +9383,9 @@ async def _compact_session_manually(
     # "Summarize up to here" (session rewind's sibling action): map the
     # chosen message to keep_recent_override = the number of messages from
     # it (inclusive) to the end, counted on the same basis
-    # summarize_and_compact uses (injected context excluded — it is
-    # filtered before keep_recent applies).
+    # summarize_and_compact uses (injected context excluded — legacy pieces
+    # are filtered before keep_recent applies, typed entries ride with their
+    # carriers and are not counted, see keep_window_start).
     keep_recent_override = None
     if boundary_message_id:
         from shared.runtime.core.context_entries import is_context_injection

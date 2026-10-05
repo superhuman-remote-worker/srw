@@ -34,6 +34,7 @@ from agent.core.context import (
     ContextManager,
     extract_summary_text,
     is_compaction_summary,
+    keep_window_start,
     repair_tool_call_arguments,
     repair_tool_pairing,
     scrub_history_tool_call_arguments,
@@ -2648,10 +2649,10 @@ async def _execute_turn(
         ):
             from agent.services.memory import CaptureEvent
 
+            # The slice the summary will cover: the keep window counts
+            # non-entries, as compaction does (keep_window_start).
             keep_recent = context_manager.config.keep_recent_messages
-            evicted = (
-                list(messages[:-keep_recent]) if keep_recent > 0 else list(messages)
-            )
+            evicted = list(messages[: keep_window_start(messages, keep_recent)])
             if evicted:
                 memory_service.capture_nowait(
                     CaptureEvent(kind="pre_compaction", messages=evicted, phase=0)

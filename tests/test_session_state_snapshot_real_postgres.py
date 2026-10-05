@@ -147,3 +147,33 @@ async def test_a_turn_boundary_clears_every_running_call(db):
     assert snapshot is not None
     assert snapshot["running_tools"] == []
     assert snapshot["running_tool"] is None
+
+
+@pytest.mark.asyncio
+async def test_context_rows_count_toward_the_turn_count_fallback(db):
+    """Append-only context injection (WP2 spec §D 15b, O15): a
+    ``role='context'`` row is written only after provider admission of the
+    turn it serves, so it is an execution-produced row and the turn-count
+    fallback may read it. Queued input ahead of the served turn still does
+    not count."""
+    thread_id = await _thread_with_journal(db, [])
+    async with db.acquire() as conn:
+        for role, turn in (
+            ("human", 1),
+            ("ai", 1),
+            ("human", 2),  # the turn being served, admitted
+            ("context", 2),  # its entries, written after admission
+            ("human", 3),  # queued input ahead of it
+        ):
+            await conn.execute(
+                "INSERT INTO thread_messages (thread_id, role, content, "
+                "turn_number) VALUES ($1, $2, 'x', $3)",
+                thread_id,
+                role,
+                turn,
+            )
+
+    snapshot = await build_session_state_snapshot(db, str(thread_id))
+
+    assert snapshot is not None
+    assert snapshot["turn_count"] == 2
