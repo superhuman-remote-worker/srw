@@ -729,13 +729,24 @@ class RecordingMemoryManager:
     behind them (what append_only plans from, WP2 spec §C): fixed, or with
     ``churn`` seven memories (a drip-feed past the per-entry cap) and a
     memory and the note that change on later requests.
+
+    append_only retrieves asynchronously (WP3): ``start_retrieval`` /
+    ``take_retrieval`` model the manager's single-flight task. With
+    ``lag=0`` a retrieval has finished before the request that started it
+    takes its result in (the graphs start early and take in late), so each
+    request plans from its own payload, as the synchronous path did. With
+    ``lag=1`` it finishes only once the next request is being built: its
+    result reaches the request after the one that started it (D6, D8).
     """
 
-    def __init__(self, *, churn: bool = False) -> None:
+    def __init__(self, *, churn: bool = False, lag: int = 0) -> None:
         self.churn = churn
+        self.lag = lag
         self.assemble_requests: List[Any] = []
         self.captures: List[Any] = []
         self.payload = self._payload(0)
+        self._in_flight: Optional[Any] = None
+        self._finished: Optional[Any] = None
 
     def _payload(self, call: int) -> Any:
         from agent.core.knowledge_injection import create_knowledge_injection_messages
@@ -766,6 +777,29 @@ class RecordingMemoryManager:
         self.payload = self._payload(len(self.assemble_requests))
         self.assemble_requests.append(req)
         return self.payload
+
+    def start_retrieval(self, req: Any) -> bool:
+        from agent.services.memory import RetrievalResult
+
+        if self._in_flight is not None:
+            # lag=1: the retrieval started for the previous request has
+            # finished by the time this one is built.
+            self._finished, self._in_flight = self._in_flight, None
+        self.payload = self._payload(len(self.assemble_requests))
+        self.assemble_requests.append(req)
+        result = RetrievalResult(payload=self.payload, seq=len(self.assemble_requests))
+        if self.lag:
+            self._in_flight = result
+        else:
+            self._finished = result
+        return True
+
+    def take_retrieval(self) -> Optional[Any]:
+        result, self._finished = self._finished, None
+        return result
+
+    def retrieval_stats(self) -> Dict[str, int]:
+        return {"started": len(self.assemble_requests)}
 
     async def capture(self, event: Any) -> None:
         self.captures.append(event)
@@ -872,6 +906,7 @@ async def run_worker_scenario(
     emergency_rebuild_at: Optional[int] = None,
     churn: bool = False,
     injection_mode: str = "legacy",
+    memory_lag: int = 0,
 ) -> List[Captured]:
     """Run the tactical tool loop through ``create_execute_node``.
 
@@ -895,9 +930,11 @@ async def run_worker_scenario(
     ``churn`` makes the memory seam return more memories than one entry
     takes and change a memory and the note later (see
     ``RecordingMemoryManager``). ``injection_mode`` is the worker's
-    ``context_management.injection_mode``. Supervisor guidance is pending on
-    two consecutive requests, as the heartbeat inbox keeps an entry until
-    the ack lands; ``delivered_guidance_ids`` is carried into state.
+    ``context_management.injection_mode``; ``memory_lag`` how many requests
+    late an append_only retrieval result arrives (``RecordingMemoryManager``).
+    Supervisor guidance is pending on two consecutive requests, as the
+    heartbeat inbox keeps an entry until the ack lands;
+    ``delivered_guidance_ids`` is carried into state.
     """
     from shared.runtime.core.loader import create_llm, load_agent_config
     from shared.runtime.services.guardrails import format_nudge
@@ -959,7 +996,7 @@ async def run_worker_scenario(
     memory_service = None
     guidance_turns: set[int] = set()
     if context_on:
-        memory_service = RecordingMemoryManager(churn=churn)
+        memory_service = RecordingMemoryManager(churn=churn, lag=memory_lag)
         ctx.citation_engine = SimpleNamespace(
             list_citations=AsyncMock(return_value=[_failed_citation()])
         )
@@ -1112,6 +1149,7 @@ async def run_session_scenario(
     sources: frozenset,
     monkeypatch: Any,
     injection_mode: str = "legacy",
+    memory_lag: int = 0,
 ) -> List[Captured]:
     """Two user turns through the real ``run_persistent_loop`` (astream path).
 
@@ -1121,7 +1159,8 @@ async def run_session_scenario(
     ``context_management.injection_mode``: ``append_only`` plans from the
     payload's ``InjectionBlock.records`` (memory and knowledge) with
     ``memory.max_memories_per_entry = 5`` and appends each kind once (the
-    turn boundary once per user turn).
+    turn boundary once per user turn). ``memory_lag=1`` makes the turn-one
+    retrieval finish only when turn two starts its own.
     """
     injections = "context" in sources
     import asyncio
@@ -1173,7 +1212,7 @@ async def run_session_scenario(
         knowledge_store = MagicMock()
         knowledge_store.get_charter_note = AsyncMock(return_value=CHARTER)
         kwargs = {
-            "memory_service": RecordingMemoryManager(),
+            "memory_service": RecordingMemoryManager(lag=memory_lag),
             "knowledge_store": knowledge_store,
             "project_ids": [PROJECT_ID],
         }
@@ -1483,8 +1522,13 @@ async def run_scenario(
     workdir: Path,
     monkeypatch: Any,
     injection_mode: str = "legacy",
+    memory_lag: int = 0,
 ) -> Tuple[List[Captured], frozenset]:
-    """Run one scenario; return the captured requests and the turn-end steps."""
+    """Run one scenario; return the captured requests and the turn-end steps.
+
+    ``memory_lag`` (append_only): how many requests late a memory retrieval
+    result arrives; 0 serves each request from its own retrieval.
+    """
     spec = dict(SCENARIOS[name])
     if spec.pop("kind") == "session":
         requests = await run_session_scenario(
@@ -1492,6 +1536,7 @@ async def run_scenario(
             sources=sources,
             monkeypatch=monkeypatch,
             injection_mode=injection_mode,
+            memory_lag=memory_lag,
         )
         return requests, frozenset(SESSION_TURN_ENDS)
     requests = await run_worker_scenario(
@@ -1500,6 +1545,7 @@ async def run_scenario(
         workdir=workdir,
         monkeypatch=monkeypatch,
         injection_mode=injection_mode,
+        memory_lag=memory_lag,
         **spec,
     )
     return requests, frozenset()

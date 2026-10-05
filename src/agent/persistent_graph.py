@@ -2169,6 +2169,41 @@ async def _emit_reasoning_content(response, callbacks, *, message_id) -> bool:
     return True
 
 
+def _take_in_retrieval(
+    memory_service: Any, sources: ContextSources, *, bound_knowledge: bool
+) -> ContextSources:
+    """append_only (WP3, D8): the latest finished retrieval as planner input.
+
+    A finished result replaces the records the turn held so far and serves
+    the turn's later provider calls too, so a mid-turn compaction gets its
+    evicted memory appended again without a new retrieval (WP2 spec §E.5).
+    Its knowledge records are used only without bound KBs, which keep the
+    turn-start chunk retrieval. Nothing finished: the sources stay as they
+    are.
+    """
+    result = memory_service.take_retrieval()
+    if result is None:
+        return sources
+    memory: List[Any] = []
+    knowledge: List[Any] = []
+    for block in result.payload.blocks:
+        records = getattr(block, "records", None) or []
+        if block.kind == "memory":
+            memory.extend(records)
+        elif block.kind == "knowledge":
+            knowledge.extend(records)
+    logger.debug(
+        "Memory retrieval %s taken in %.0f ms after it finished: %d memories, %d notes",
+        result.seq,
+        result.age_ms(),
+        len(memory),
+        len(knowledge),
+    )
+    if bound_knowledge:
+        return replace(sources, memory_records=memory)
+    return replace(sources, memory_records=memory, knowledge_records=knowledge)
+
+
 async def _execute_turn(
     llm_with_tools: BaseChatModel,
     tool_map: Dict[str, Any],
@@ -2340,8 +2375,9 @@ async def _execute_turn(
     citation_feedback_block = ""
     charter_block = ""
     # append_only: the store records behind each kind, in rank order (the
-    # planner's input, WP2 spec §C). The retrieval itself is unchanged; the
-    # turn-start payload serves every provider call of the turn.
+    # planner's input, WP2 spec §C). With the memory manager they come from
+    # the asynchronous retrieval (WP3) and serve every later provider call
+    # of the turn; the direct-store reads below stay synchronous.
     memory_records: List[Any] = []
     knowledge_records: List[Any] = []
     knowledge_bindings: Optional[List[Any]] = None
@@ -2385,6 +2421,17 @@ async def _execute_turn(
     # tests/test_memory_persistent_equivalence.py). The per-store 5 s guard
     # lives in the manager's runtime (retrieval_timeout).
     manager_injection: List[BaseMessage] = []
+    # append_only (WP3, D6, D7, D10): the turn's retrieval runs off the
+    # request path, owned by the manager, with the query the turn-start
+    # retrieval always used; it is never awaited. Each provider call of the
+    # turn takes in the latest finished result before it plans (D8), and
+    # starts the turn's retrieval there if an earlier one was still in
+    # flight here (single flight). The first call goes out without memory
+    # when nothing has finished yet (D6); the idle-time prefetch is WP4.
+    # Without the manager (memory.manager.enabled false) the direct-store
+    # reads below stay synchronous in both modes.
+    turn_retrieval: Optional[Any] = None
+    turn_retrieval_started = False
     if memory_service is not None:
         if _provider_admission_closed():
             return _closed_result()
@@ -2404,37 +2451,36 @@ async def _execute_turn(
             )
         else:
             _query_text = build_persistent_query_text(messages)
-        _payload = await memory_service.assemble(
-            AssembleRequest(
-                query_text=_query_text,
-                model=getattr(config.llm, "model", None),
-            )
+        _request = AssembleRequest(
+            query_text=_query_text,
+            model=getattr(config.llm, "model", None),
         )
-        manager_injection = _payload.messages()
-        if kb_bindings:
-            # Multi-KB retrieval below owns the knowledge budget. Preserve the
-            # manager's memory messages while fencing its legacy note-level KB
-            # retriever to prevent duplicate native injection.
-            manager_injection = [
-                message
-                for block in _payload.blocks
-                if block.kind != "knowledge"
-                for message in block.messages
-            ]
-        for _block in _payload.blocks:
-            if append_only and _block.kind == "memory":
-                memory_records.extend(getattr(_block, "records", None) or [])
-            elif append_only and _block.kind == "knowledge" and not kb_bindings:
-                # Bound KBs come from the chunk retrieval below instead.
-                knowledge_records.extend(getattr(_block, "records", None) or [])
-            if _block.kind == "memory" and _block.items:
-                logger.debug(
-                    f"Memory injection: {len(_block.items)} memories retrieved"
-                )
-            elif _block.kind == "knowledge" and _block.items:
-                logger.debug(
-                    f"Knowledge injection: {len(_block.items)} notes retrieved"
-                )
+        if append_only:
+            turn_retrieval = _request
+            turn_retrieval_started = memory_service.start_retrieval(_request)
+        else:
+            _payload = await memory_service.assemble(_request)
+            manager_injection = _payload.messages()
+            if kb_bindings:
+                # Multi-KB retrieval below owns the knowledge budget. Preserve
+                # the manager's memory messages while fencing its legacy
+                # note-level KB retriever to prevent duplicate native
+                # injection.
+                manager_injection = [
+                    message
+                    for block in _payload.blocks
+                    if block.kind != "knowledge"
+                    for message in block.messages
+                ]
+            for _block in _payload.blocks:
+                if _block.kind == "memory" and _block.items:
+                    logger.debug(
+                        f"Memory injection: {len(_block.items)} memories retrieved"
+                    )
+                elif _block.kind == "knowledge" and _block.items:
+                    logger.debug(
+                        f"Knowledge injection: {len(_block.items)} notes retrieved"
+                    )
 
     if memory_service is None and recall_store:
         try:
@@ -2835,6 +2881,14 @@ async def _execute_turn(
                 return _closed_result()
             if not await _admit_first_provider():
                 return _closed_result()
+            if turn_retrieval is not None:
+                context_sources = _take_in_retrieval(
+                    memory_service, context_sources, bound_knowledge=bool(kb_bindings)
+                )
+                if not turn_retrieval_started:
+                    turn_retrieval_started = memory_service.start_retrieval(
+                        turn_retrieval
+                    )
             planned = plan_context_entries(
                 prepared,
                 replace(

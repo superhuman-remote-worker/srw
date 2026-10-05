@@ -50,7 +50,7 @@ import re
 import asyncio
 import time
 from copy import deepcopy
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 from uuid import UUID, uuid4
 
 from langchain_core.language_models import BaseChatModel
@@ -1203,7 +1203,7 @@ def create_execute_node(
         _manager_injection_messages = []
         _manager_memory_text = ""  # assembler's current_injection_text
         # append_only: the store records behind each kind (the planner's
-        # input), in rank order; the retrieval itself is unchanged.
+        # input), in rank order.
         _memory_records: List[Any] = []
         _knowledge_records: List[Any] = []
         _knowledge_bindings: Optional[List[Any]] = None
@@ -1211,6 +1211,73 @@ def create_execute_node(
         # append_only: the memory_inject audit fires after the plan, so it
         # can carry the appended / already-present counts.
         _deferred_memory_audits: List[Dict[str, Any]] = []
+        # append_only (WP3, D6-D8): whether this request started a retrieval.
+        _retrieval_started = False
+
+        def _take_in_manager_payload(
+            payload: Any, retrieval: Optional[Dict[str, Any]] = None
+        ) -> Tuple[List[BaseMessage], str]:
+            """One manager payload in: the planner's records, the
+            memory_inject audit, and the legacy injection messages and
+            memory text (returned). ``retrieval`` describes the asynchronous
+            run it came from (append_only) and rides on the audit."""
+            injection_messages = payload.messages()
+            if _kb_bindings:
+                # Bound KBs use the shared chunk-retrieval policy below. Keep
+                # manager-provided memories, but suppress its legacy note-level
+                # KB block so native notes are not injected twice.
+                injection_messages = [
+                    message
+                    for block in payload.blocks
+                    if block.kind != "knowledge"
+                    for message in block.messages
+                ]
+            memory_text = ""
+            for _mm_block in payload.blocks:
+                if _mm_block.kind == "memory":
+                    _memory_records.extend(getattr(_mm_block, "records", None) or [])
+                elif _mm_block.kind == "knowledge" and not _kb_bindings:
+                    # Bound KBs come from the chunk retrieval below instead.
+                    _knowledge_records.extend(getattr(_mm_block, "records", None) or [])
+                if _mm_block.kind == "memory" and _mm_block.items:
+                    memory_text = _mm_block.content
+                    logger.debug(
+                        f"[{job_id}] Memory injection: "
+                        f"{len(_mm_block.items)} memories retrieved"
+                    )
+                    # Audit memory injection (legacy data shape + the
+                    # manager's stats — the eval-harness/cockpit tap)
+                    inject_auditor = get_archiver()
+                    if inject_auditor:
+                        _audit_data = {
+                            "count": len(_mm_block.items),
+                            "total_tokens": _mm_block.token_count,
+                            "stats": payload.stats.to_dict(),
+                        }
+                        if retrieval is not None:
+                            _audit_data["retrieval"] = retrieval
+                        _memory_audit = dict(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="memory_inject",
+                            node_name="execute",
+                            iteration=iteration,
+                            data=_audit_data,
+                            metadata=state.get("metadata"),
+                            phase="strategic" if is_strategic else "tactical",
+                            phase_number=phase_number,
+                        )
+                        if append_only:
+                            _deferred_memory_audits.append(_memory_audit)
+                        else:
+                            inject_auditor.audit_step(**_memory_audit)
+                elif _mm_block.kind == "knowledge" and _mm_block.items:
+                    logger.debug(
+                        f"[{job_id}] Knowledge injection: "
+                        f"{len(_mm_block.items)} notes retrieved"
+                    )
+            return injection_messages, memory_text
+
         if memory_service is not None:
             from agent.services.memory import AssembleRequest, TaskFrame
             from agent.services.memory.plugins.legacy import build_worker_query_text
@@ -1235,65 +1302,26 @@ def create_execute_node(
                 )
             else:
                 _mm_query = build_worker_query_text(_mm_frame)
-            _manager_payload = await memory_service.assemble(
-                AssembleRequest(
-                    query_text=_mm_query,
-                    task_frame=_mm_frame,
-                    budget_tokens=config.memory.budget_tokens,
-                    model=config.llm.model,
-                )
+            _mm_request = AssembleRequest(
+                query_text=_mm_query,
+                task_frame=_mm_frame,
+                budget_tokens=config.memory.budget_tokens,
+                model=config.llm.model,
             )
-            _manager_injection_messages = _manager_payload.messages()
-            if _kb_bindings:
-                # Bound KBs use the shared chunk-retrieval policy below. Keep
-                # manager-provided memories, but suppress its legacy note-level
-                # KB block so native notes are not injected twice.
-                _manager_injection_messages = [
-                    message
-                    for block in _manager_payload.blocks
-                    if block.kind != "knowledge"
-                    for message in block.messages
-                ]
-            for _mm_block in _manager_payload.blocks:
-                if _mm_block.kind == "memory":
-                    _memory_records.extend(getattr(_mm_block, "records", None) or [])
-                elif _mm_block.kind == "knowledge" and not _kb_bindings:
-                    # Bound KBs come from the chunk retrieval below instead.
-                    _knowledge_records.extend(getattr(_mm_block, "records", None) or [])
-                if _mm_block.kind == "memory" and _mm_block.items:
-                    _manager_memory_text = _mm_block.content
-                    logger.debug(
-                        f"[{job_id}] Memory injection: "
-                        f"{len(_mm_block.items)} memories retrieved"
-                    )
-                    # Audit memory injection (legacy data shape + the
-                    # manager's stats — the eval-harness/cockpit tap)
-                    inject_auditor = get_archiver()
-                    if inject_auditor:
-                        _memory_audit = dict(
-                            job_id=job_id,
-                            agent_type=config.agent_id,
-                            step_type="memory_inject",
-                            node_name="execute",
-                            iteration=iteration,
-                            data={
-                                "count": len(_mm_block.items),
-                                "total_tokens": _mm_block.token_count,
-                                "stats": _manager_payload.stats.to_dict(),
-                            },
-                            metadata=state.get("metadata"),
-                            phase="strategic" if is_strategic else "tactical",
-                            phase_number=phase_number,
-                        )
-                        if append_only:
-                            _deferred_memory_audits.append(_memory_audit)
-                        else:
-                            inject_auditor.audit_step(**_memory_audit)
-                elif _mm_block.kind == "knowledge" and _mm_block.items:
-                    logger.debug(
-                        f"[{job_id}] Knowledge injection: "
-                        f"{len(_mm_block.items)} notes retrieved"
-                    )
+            if append_only:
+                # WP3 (D6, D7, D10): the retrieval runs off the request path,
+                # owned by the manager, with the query this request would
+                # have used; none starts while one is in flight. A finished
+                # result is taken in further down, after the other reads, so
+                # a fast retrieval can still serve this request; the planner
+                # checks it against the history at that moment (D8). Without
+                # the manager the direct-store reads below stay synchronous.
+                _retrieval_started = memory_service.start_retrieval(_mm_request)
+            else:
+                _manager_payload = await memory_service.assemble(_mm_request)
+                _manager_injection_messages, _manager_memory_text = (
+                    _take_in_manager_payload(_manager_payload)
+                )
 
         # Memory Light: decrement TTLs then retrieve relevant memories for injection
         _memory_block = [""]  # mutable container for closure access
@@ -1537,6 +1565,26 @@ def create_execute_node(
         # runtime (leave the section alone), "" = none running.
         _subagents_state = _active_subagents_state(tool_context)
         _active_subagents = _subagents_state or ""
+
+        # append_only (WP3, D8): take in the latest finished retrieval, as
+        # late in the build as possible. Nothing finished: this request goes
+        # out without new memory (D6) and the next one takes it in. The
+        # result is used for this request only; memory a compaction evicted
+        # comes back with the next result that still returns it (D4).
+        if append_only and memory_service is not None:
+            _drained = memory_service.take_retrieval()
+            if _drained is not None:
+                _take_in_manager_payload(
+                    _drained.payload,
+                    retrieval={
+                        "mode": "async",
+                        "seq": _drained.seq,
+                        "age_ms": round(_drained.age_ms(), 2),
+                        "started_this_request": _retrieval_started,
+                        "degraded": _drained.degraded,
+                        "counters": memory_service.retrieval_stats(),
+                    },
+                )
 
         # append_only (WP2 spec §C): what the harness holds now, as the
         # planner's input. Planned against the history after every
@@ -6264,6 +6312,7 @@ def build_phase_alternation_graph(
                 extraction_prompt=memory_extraction_prompt,
                 assembler_prompt=memory_assembler_prompt,
                 job_id=tool_context.job_id if tool_context else None,
+                agent_type=config.agent_id,
                 project_id=tool_context.project_id if tool_context else None,
                 project_ids=list(tool_context.project_ids) if tool_context else [],
                 retrieval_timeout=None,  # worker path runs unbounded (legacy)

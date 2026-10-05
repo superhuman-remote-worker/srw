@@ -42,6 +42,7 @@ capturing every request; a recording MemoryManager seam with a fixed payload;
 a real-typed fake ContextManager (the node does arithmetic on its values).
 """
 
+import asyncio
 import copy
 import json
 from datetime import datetime, timezone
@@ -108,9 +109,21 @@ from shared.runtime.core.workspace_injection import (
 )
 from agent.graph import create_execute_node
 from agent.managers import TodoManager
-from agent.services.memory import AssembleStats, InjectionBlock, MemoryPayload
+from agent.services.memory import (
+    AssembleStats,
+    InjectionBlock,
+    MemoryPayload,
+    MemoryPipelineError,
+    RetrievalResult,
+)
 from agent.tools.context import ToolContext
 from tests._fs_backend import FilesystemTestBackend
+from tests._memory_fixtures import (
+    BrokenScorer,
+    GatedRetriever,
+    make_async_manager,
+    settle_retrieval,
+)
 
 REPO_ROOT = Path(__file__).parent.parent
 WORKER_CONFIG_PATH = str(REPO_ROOT / "config" / "worker_base.yaml")
@@ -156,16 +169,36 @@ _EXECUTE_PATCHES = {
 
 
 class RecordingManager:
-    """MemoryManager seam stub: fixed payload, records every call."""
+    """MemoryManager seam stub: fixed payload, records every call.
+
+    append_only retrieves asynchronously (WP3): ``start_retrieval`` finishes
+    at once here, so the request that started a retrieval takes its result
+    in (the node starts early and takes in late), as with ``assemble``.
+    """
 
     def __init__(self, payload: MemoryPayload) -> None:
         self.payload = payload
         self.assemble_requests: List[Any] = []
         self.captures: List[Any] = []
+        self._finished: Optional[RetrievalResult] = None
 
-    async def assemble(self, req: Any) -> MemoryPayload:
+    def _next_payload(self, req: Any) -> MemoryPayload:
         self.assemble_requests.append(req)
         return self.payload
+
+    async def assemble(self, req: Any) -> MemoryPayload:
+        return self._next_payload(req)
+
+    def start_retrieval(self, req: Any) -> bool:
+        self._finished = RetrievalResult(payload=self._next_payload(req))
+        return True
+
+    def take_retrieval(self) -> Optional[RetrievalResult]:
+        result, self._finished = self._finished, None
+        return result
+
+    def retrieval_stats(self) -> dict:
+        return {"started": len(self.assemble_requests)}
 
     async def capture(self, event: Any) -> None:
         self.captures.append(event)
@@ -1012,7 +1045,7 @@ class SequenceManager(RecordingManager):
         super().__init__(payloads[0])
         self.payloads = list(payloads)
 
-    async def assemble(self, req: Any) -> MemoryPayload:
+    def _next_payload(self, req: Any) -> MemoryPayload:
         self.assemble_requests.append(req)
         index = min(len(self.assemble_requests), len(self.payloads)) - 1
         return self.payloads[index]
@@ -1453,3 +1486,188 @@ class TestAppendOnlyLayout:
         assert [e.extra["current_injection_text"] for e in turn_ends] == [
             first_entries[0].content
         ] * 2
+
+
+# ---------------------------------------------------------------------------
+# append_only: retrieval off the request path (WP3; D6-D8, D13)
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncRetrieval:
+    """The execute node starts the memory retrieval and never awaits it.
+
+    A real MemoryManager with a gated retriever: the test decides when a
+    retrieval finishes relative to the requests.
+    """
+
+    def _next_tool_result(self, state: dict, result: dict, call_id: str) -> None:
+        _apply_turn(state, result)
+        state["messages"].append(
+            ToolMessage(
+                content=f"contents of {call_id}.md",
+                tool_call_id=call_id,
+                name="read_file",
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_result_that_finishes_late_reaches_the_next_request(
+        self, append_env
+    ):
+        env = append_env
+        retriever = GatedRetriever(MEMORIES)
+        manager = env["service"] = make_async_manager(retriever)
+        llm = CapturingLLM(
+            responses=[_tool_call("c2"), _tool_call("c3"), _tool_call("c4")]
+        )
+        node = _make_node(env, llm)
+        state = _state()
+
+        # Request 1 starts the retrieval with its own query and goes out
+        # while it is still running: no memory, and it never waited (D6).
+        first = await _run(node, state)
+        await asyncio.sleep(0)  # the provider call a real request awaits
+        assert len(retriever.queries) == 1
+        assert "Do the task" in retriever.queries[0]
+        assert manager.retrieval_in_flight
+        assert _srw_count(llm.requests[0], "memory") == 0
+        self._next_tool_result(state, first, "c2")
+
+        # It finishes after request 1 was sent; request 2 takes it in (D8)
+        # and starts the next retrieval.
+        retriever.release()
+        await settle_retrieval(manager)
+        second = await _run(node, state)
+        await asyncio.sleep(0)
+        assert _srw_count(llm.requests[1], "memory") == 1
+        assert len(retriever.queries) == 2
+        self._next_tool_result(state, second, "c3")
+
+        # Request 3 while retrieval 2 runs: single flight starts nothing, no
+        # new entry; the memory entry is history and request 3 extends
+        # request 2 (D7, the cache rule).
+        await _run(node, state)
+        assert len(retriever.queries) == 2
+        assert _srw_count(llm.requests[2], "memory") == 1
+        previous = llm.requests[1]
+        assert _wire_all(llm.requests[2][: len(previous) - 1]) == _wire_all(
+            previous[:-1]
+        )
+        stats = manager.retrieval_stats()
+        assert stats["started"] == 2
+        assert stats["skipped_in_flight"] == 1
+        assert stats["drained"] == 1
+
+        await manager.close_background()
+        assert retriever.cancelled == 1
+
+    @pytest.mark.asyncio
+    async def test_a_fast_retrieval_serves_the_request_that_started_it(
+        self, append_env
+    ):
+        """The node starts early and takes in late: a retrieval that finishes
+        before the request is built serves that request."""
+        env = append_env
+        manager = env["service"] = make_async_manager(
+            GatedRetriever(MEMORIES, auto=True)
+        )
+        llm = CapturingLLM(responses=[_tool_call("c2")])
+
+        async def no_failed_citations(**_kwargs):
+            # The citation lookup between start and take-in yields to the
+            # loop, as every real read there does.
+            for _ in range(5):
+                await asyncio.sleep(0)
+            return []
+
+        env["ctx"].citation_engine = SimpleNamespace(list_citations=no_failed_citations)
+        node = _make_node(env, llm)
+
+        await _run(node, _state())
+
+        assert _srw_count(llm.requests[0], "memory") == 1
+        await manager.close_background()
+
+    @pytest.mark.asyncio
+    async def test_the_memory_inject_audit_carries_the_async_run(self, append_env):
+        env = append_env
+        retriever = GatedRetriever(MEMORIES)
+        manager = env["service"] = make_async_manager(retriever)
+        llm = CapturingLLM(responses=[_tool_call("c2"), _tool_call("c3")])
+        node = _make_node(env, llm)
+        state = _state()
+        auditor = MagicMock()
+
+        with patch("agent.graph.get_archiver", return_value=auditor):
+            patches = _patches()
+            for p in patches:
+                p.start()
+            try:
+                first = await node(state)
+                await asyncio.sleep(0)
+                self._next_tool_result(state, first, "c2")
+                retriever.release()
+                await settle_retrieval(manager)
+                await node(state)
+            finally:
+                for p in patches:
+                    p.stop()
+
+        injects = [
+            c.kwargs["data"]
+            for c in auditor.audit_step.call_args_list
+            if c.kwargs.get("step_type") == "memory_inject"
+        ]
+        # Only the request that took a result in audits it.
+        (data,) = injects
+        assert (data["count"], data["appended"], data["present"]) == (2, 2, 0)
+        assert data["stats"]["latency_ms"] >= 0
+        assert data["retrieval"]["mode"] == "async"
+        assert data["retrieval"]["seq"] == 1
+        assert data["retrieval"]["started_this_request"] is True
+        assert data["retrieval"]["degraded"] is None
+        assert data["retrieval"]["counters"]["drained"] == 1
+        await manager.close_background()
+
+    @pytest.mark.asyncio
+    async def test_a_structural_reranker_failure_leaves_the_request_alive(
+        self, append_env
+    ):
+        """D13: the failure is audited and counted, the requests go out."""
+        env = append_env
+        scorer = BrokenScorer(ValueError("rerank route returned HTML"))
+        manager = env["service"] = make_async_manager(
+            GatedRetriever(MEMORIES, auto=True), scorer=scorer, job_id=JOB_ID
+        )
+        llm = CapturingLLM(responses=[_tool_call("c2"), _tool_call("c3")])
+        node = _make_node(env, llm)
+        state = _state()
+        archiver = MagicMock()
+
+        with patch("agent.core.archiver.get_archiver", return_value=archiver):
+            first = await _run(node, state)
+            self._next_tool_result(state, first, "c2")
+            await settle_retrieval(manager)
+            second = await _run(node, state)
+            await settle_retrieval(manager)
+
+        assert not first.get("error") and not second.get("error")
+        assert len(llm.requests) == 2
+        assert all(_srw_count(r, "memory") == 0 for r in llm.requests)
+        assert manager.retrieval_stats()["degraded"] == 2
+        steps = [c.kwargs["step_type"] for c in archiver.audit_step.call_args_list]
+        assert steps == ["memory_pipeline_degraded"]
+        await manager.close_background()
+
+    @pytest.mark.asyncio
+    async def test_legacy_mode_still_awaits_and_fails_loud(self, env):
+        """Legacy keeps the synchronous assemble and "configured => required"."""
+        scorer = BrokenScorer(ValueError("rerank route returned HTML"))
+        manager = env["service"] = make_async_manager(
+            GatedRetriever(MEMORIES, auto=True), scorer=scorer
+        )
+        node = _make_node(env, CapturingLLM())
+
+        with pytest.raises(MemoryPipelineError):
+            await _run(node, _state())
+        assert manager.retrieval_stats()["started"] == 0

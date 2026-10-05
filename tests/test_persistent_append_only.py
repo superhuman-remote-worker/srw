@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.messages import (
@@ -56,6 +56,12 @@ from shared.runtime.core.message_markers import (
 )
 from tests import _prompt_cache_prefix_harness as harness
 from tests._fake_chat_model import FakeChatModel, text_turn, tool_turn
+from tests._memory_fixtures import (
+    BrokenScorer,
+    GatedRetriever,
+    make_async_manager,
+    settle_retrieval,
+)
 
 MODEL = "gpt-5.6-sol"
 SYSTEM_PROMPT = "You are the SRW session under test."
@@ -592,3 +598,117 @@ class TestPinnedReconcileWalk:
         )
 
         assert selected == turn
+
+
+# ---------------------------------------------------------------------------
+# Retrieval off the request path (WP3; D6-D8, D13)
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncRetrieval:
+    """The turn starts its retrieval without awaiting it; each provider call
+    takes in the latest finished result before it plans. A real
+    MemoryManager with a gated retriever decides when a retrieval finishes."""
+
+    @staticmethod
+    def _release_in_tool(session: Session, retriever: GatedRetriever, index: int):
+        """The read_file tool finishes retrieval ``index`` while it runs."""
+
+        async def run(args: Any) -> str:
+            retriever.release(index)
+            await settle_retrieval(session.memory_service)
+            return "ok: read_file"
+
+        session.tools[0].ainvoke = AsyncMock(side_effect=run)
+
+    @pytest.mark.asyncio
+    async def test_the_turn_start_retrieval_is_not_awaited_and_lands_mid_turn(
+        self,
+    ):
+        retriever = GatedRetriever()
+        session = Session(
+            [tool_turn("read_file", {"path": "notes.md"}, "c1"), text_turn("One.")]
+        )
+        session.memory_service = make_async_manager(retriever)
+        self._release_in_tool(session, retriever, 0)
+
+        await session.run("Turn one?")
+
+        assert retriever.queries == ["Turn one?"]
+        first, second = session.llm.calls
+        # The first call went out while the retrieval ran (D6) ...
+        assert _texts(first).count(_srw("memory")) == 0
+        assert _texts(first).count(_srw("charter")) == 1
+        # ... and the next call of the turn took the result in (D8, D26).
+        assert _texts(second).count(_srw("memory")) == 1
+        assert _view(second)[: len(first)] == _view(first)
+        assert [entry_kind(e) for e in session.entries()].count("memory") == 1
+        assert session.memory_service.retrieval_stats()["drained"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_retrieval_still_in_flight_defers_the_next_turns_start(self):
+        """Single flight across turns: turn two's retrieval starts at the
+        first call that finds none in flight, after taking turn one's in."""
+        retriever = GatedRetriever()
+        session = Session(
+            [
+                text_turn("One."),
+                tool_turn("read_file", {"path": "plan.md"}, "c2"),
+                text_turn("Two."),
+            ]
+        )
+        session.memory_service = make_async_manager(retriever)
+        self._release_in_tool(session, retriever, 0)
+
+        await session.run("Turn one?", "Turn two?")
+
+        # Turn two found turn one's retrieval running: no second start then.
+        # The call after the tool took turn one's result in and started turn
+        # two's retrieval with turn two's query.
+        assert retriever.queries == ["Turn one?", "Turn two?"]
+        calls = session.llm.calls
+        assert [_texts(c).count(_srw("memory")) for c in calls] == [0, 0, 1]
+        for prev, nxt in zip(calls, calls[1:]):
+            assert _view(nxt)[: len(prev)] == _view(prev)
+        stats = session.memory_service.retrieval_stats()
+        # Skipped at turn two's start and at its first call, both while turn
+        # one's retrieval still ran.
+        assert stats["skipped_in_flight"] == 2
+        assert stats["started"] == 2
+
+        await session.memory_service.close_background()
+        assert retriever.cancelled == 1
+
+    @pytest.mark.asyncio
+    async def test_a_structural_reranker_failure_leaves_the_turn_alive(self):
+        session = Session([text_turn("One."), text_turn("Two.")])
+        session.memory_service = make_async_manager(
+            GatedRetriever(auto=True),
+            scorer=BrokenScorer(ValueError("rerank route returned HTML")),
+            job_id="thread-1",
+        )
+        archiver = MagicMock()
+
+        with patch("agent.core.archiver.get_archiver", return_value=archiver):
+            await session.run("Turn one?", "Turn two?")
+
+        assert len(session.llm.calls) == 2
+        assert all(_texts(c).count(_srw("memory")) == 0 for c in session.llm.calls)
+        assert session.memory_service.retrieval_stats()["degraded"] == 2
+        steps = [c.kwargs["step_type"] for c in archiver.audit_step.call_args_list]
+        assert steps == ["memory_pipeline_degraded"]
+
+    @pytest.mark.asyncio
+    async def test_legacy_mode_still_fails_the_turn(self):
+        session = Session([text_turn("One.")], mode="legacy")
+        session.memory_service = make_async_manager(
+            GatedRetriever(auto=True),
+            scorer=BrokenScorer(ValueError("rerank route returned HTML")),
+        )
+
+        with pytest.raises(AssertionError):
+            await session.run("Turn one?")
+
+        assert session.errors
+        assert session.llm.calls == []
+        assert session.memory_service.retrieval_stats()["started"] == 0

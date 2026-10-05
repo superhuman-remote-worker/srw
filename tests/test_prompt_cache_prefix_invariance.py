@@ -62,6 +62,12 @@ knowledge-base/knowledge/plans/append_only_context_injection_plan_2026_10_05.md
   (two), the charter, memory, knowledge and subagent status once each.
   ``todos-only`` and ``control`` carry no context sources, so they run once,
   in the default mode.
+- Asynchronous retrieval (WP3, D6/D8). append_only retrieves memory off the
+  request path. In the main cases each retrieval has finished before the
+  request that started it takes results in, so every request plans from its
+  own retrieval. ``test_memory_that_arrives_a_request_late_keeps_the_prefix``
+  delivers every result one request late (the session's turn-one result in
+  turn two) and checks that the prefix still holds and the memory arrives.
 - Markers. Cases that fail today are ``xfail(strict=True)`` with their cause:
   ``injection: ...`` (fixed by WP2) or ``intrinsic: ...``. Strict is the
   point: when a work package fixes a case it XPASSes, which fails the run and
@@ -394,6 +400,67 @@ async def test_request_starts_with_the_previous_request(
             _assert_appended_once(scenario, requests[-1])
         else:
             _assert_session_appended_once(requests[-1])
+
+
+#: append_only with memory retrieved a request late (WP3, D6/D8): what the
+#: last request holds. The worker's first request goes out without memory
+#: and request 1 takes in request 0's retrieval; churn's later results land
+#: one request later too (the drip, then the changed memory; the note change
+#: of the last retrieval is never taken in). The session's turn-one
+#: retrieval finishes only when turn two starts, so the first request of
+#: turn two (request 3) carries memory and knowledge.
+LATE_EXPECTED = {
+    "worker-tool-loop": {"first": 1, "memory": 1, "knowledge": 1, "updated": 0},
+    "worker-memory-churn": {"first": 1, "memory": 3, "knowledge": 1, "updated": 1},
+    "session-two-turns": {"first": 3, "memory": 1, "knowledge": 1, "updated": 0},
+}
+LATE_CASES = [
+    pytest.param(scenario, family, id=f"{scenario}-append_only-late-{family}")
+    for scenario in LATE_EXPECTED
+    for family in FAMILIES
+    if family not in SATURATED
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario,family_id", LATE_CASES)
+async def test_memory_that_arrives_a_request_late_keeps_the_prefix(
+    scenario, family_id, tmp_path, monkeypatch
+):
+    """WP3: a retrieval that finishes after its request was sent reaches a
+    later request as an appended entry; every request still starts with
+    the previous one, and nothing is sent twice."""
+    _require_renderer(family_id)
+    family = FAMILIES[family_id]
+    control = await _violations(scenario, family, "control", tmp_path, monkeypatch)
+
+    workdir = tmp_path / "append_only-late"
+    workdir.mkdir()
+    requests, turn_ends = await run_scenario(
+        scenario,
+        family,
+        sources=VARIANTS["injected"],
+        workdir=workdir,
+        monkeypatch=monkeypatch,
+        injection_mode="append_only",
+        memory_lag=1,
+    )
+    found = prefix_violations(family, requests, turn_ends=turn_ends)
+    caused = {n: v for n, v in found.items() if n not in control}
+    if caused:
+        raise PrefixViolation(
+            f"{scenario} / {family_id}, append_only, memory a request late:\n"
+            + "\n".join(caused.values())
+        )
+    expected = LATE_EXPECTED[scenario]
+    with_memory = [
+        n for n, r in enumerate(requests) if text_occurrences(r.body, _srw("memory"))
+    ]
+    assert with_memory[0] == expected["first"]
+    last = requests[-1].body
+    assert text_occurrences(last, _srw("memory")) == expected["memory"]
+    assert text_occurrences(last, _srw("knowledge")) == expected["knowledge"]
+    assert text_occurrences(last, UPDATED_ITEM_MARKER) == expected["updated"]
 
 
 @pytest.mark.asyncio

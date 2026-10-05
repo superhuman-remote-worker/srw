@@ -32,7 +32,23 @@ class MemoryPipelineError(RuntimeError):
     half-working memory context. Retriever/policy stages keep containment (a
     transient DB blip yields fewer candidates, not a half-working session). See
     knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
+
+    ``stage`` and ``plugin`` name the failing stage (e.g. ``"scorer"``,
+    ``"reranker"``). In ``append_only`` mode retrieval runs off the request
+    path (WP3) and the manager reports this error instead of raising it
+    (D13); the two names make up its signature there.
     """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        stage: Optional[str] = None,
+        plugin: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.plugin = plugin
 
 
 class TransientScorerError(RuntimeError):
@@ -263,6 +279,29 @@ class MemoryPayload:
 
 
 @dataclass
+class RetrievalResult:
+    """One finished asynchronous retrieval (``append_only`` mode, WP3).
+
+    Retrieval runs off the request path (D6): a request starts it, and a
+    later request build takes the finished result in (D8) and plans from its
+    ``InjectionBlock.records``. ``payload.stats.latency_ms`` is the time the
+    read pipeline took, as in the synchronous path. ``seq`` numbers the
+    retrievals of one manager; ``finished_at`` is ``time.monotonic()`` at
+    completion. ``degraded`` is the signature of a structural pipeline
+    failure (D13); the payload is then empty.
+    """
+
+    payload: MemoryPayload = field(default_factory=MemoryPayload)
+    seq: int = 0
+    finished_at: float = field(default_factory=time.monotonic)
+    degraded: Optional[str] = None
+
+    def age_ms(self) -> float:
+        """Milliseconds since the retrieval finished."""
+        return (time.monotonic() - self.finished_at) * 1000.0
+
+
+@dataclass
 class MemoryRuntime:
     """Bind-time dependency bundle handed to every plugin factory.
 
@@ -287,6 +326,9 @@ class MemoryRuntime:
     extraction_prompt: Optional[str] = None
     assembler_prompt: Optional[str] = None
     job_id: Optional[str] = None
+    #: The expert's agent id; the manager's own audit rows carry it (the
+    #: append_only retrieval reports a degraded pipeline itself, D13).
+    agent_type: Optional[str] = None
     project_id: Optional[str] = None
     project_ids: List[str] = field(default_factory=list)
     #: Per-store-call timeout in seconds. None = unbounded (the legacy

@@ -11,11 +11,27 @@ raise into the graphs — memory is an enhancement, a broken plugin must
 not kill a turn — but every contained failure is logged with the
 exception type and recorded in AssembleStats.errors. Loud degradation,
 never silent.
+
+Asynchronous retrieval (``context_management.injection_mode: append_only``,
+WP3 of knowledge-base/knowledge/plans/append_only_context_injection_plan_2026_10_05.md;
+D6-D8, D10, D13, D32 of features/append_only_context_injection.md). The
+manager owns one retrieval task per conversation: ``start_retrieval`` runs
+``assemble`` off the request path (single flight: none starts while one is
+in flight), the finished result waits as the pending result, and the next
+request build takes it in with ``take_retrieval``. The pending result is the
+latest finished retrieval only: a newer one replaces an older one that was
+never taken in, because the planner checks every result against the history
+at that moment anyway. It lives in memory only (the durable copy in
+``threads.metadata`` is WP4). The task is cancelled and joined by
+``close_background`` and ``drain_background``. A structural pipeline failure
+no longer fails the turn there: it is logged at ERROR, audited
+(``memory_pipeline_degraded``) and counted, and that retrieval serves nothing.
 """
 
 import asyncio
 import logging
-from typing import Any, List, Optional, Set, Tuple
+import time
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from agent.services.memory.registry import resolve_memory_plugin
 from agent.services.memory.types import (
@@ -27,6 +43,7 @@ from agent.services.memory.types import (
     MemoryPayload,
     MemoryPipelineError,
     MemoryRuntime,
+    RetrievalResult,
     Scored,
     TransientScorerError,
     _StopWatch,
@@ -36,6 +53,38 @@ logger = logging.getLogger(__name__)
 
 #: (name, instance) — names kept for stats, errors, and status surfaces.
 NamedPlugin = Tuple[str, Any]
+
+#: Upper bound on one asynchronous retrieval. Single flight means a hung
+#: retrieval would stop every later one; past this it is cancelled and the
+#: next request starts a fresh one. Far above the reranker's own budget (10 s
+#: per attempt, 3 attempts, backoff) plus the store calls.
+ASYNC_RETRIEVAL_DEADLINE_S = 120.0
+
+#: Audit step written when an asynchronous retrieval meets a structural
+#: pipeline failure (D13). Custom step types follow ``memory_unavailable`` /
+#: ``kb_unavailable`` (agent.core.archiver.audit_unavailable).
+PIPELINE_DEGRADED_STEP = "memory_pipeline_degraded"
+
+#: Counters of :meth:`MemoryManager.retrieval_stats`.
+RETRIEVAL_COUNTERS = (
+    "started",
+    "skipped_in_flight",
+    "completed",
+    "drained",
+    "superseded",
+    "degraded",
+    "timed_out",
+    "cancelled",
+)
+
+
+def pipeline_failure_signature(error: MemoryPipelineError) -> str:
+    """``stage:plugin:CauseType`` of a structural failure (D13 dedupe key)."""
+    cause = error.__cause__ or error
+    return (
+        f"{error.stage or 'pipeline'}:{error.plugin or 'unknown'}:"
+        f"{type(cause).__name__}"
+    )
 
 
 class MemoryManager:
@@ -64,6 +113,15 @@ class MemoryManager:
         # Once a persistent-session claimant begins teardown, no detached
         # memory writer may be admitted behind its quiescence barrier.
         self._background_closed = False
+        # Asynchronous retrieval (append_only, WP3): at most one task in
+        # flight, and the latest finished result waiting to be taken in.
+        self._retrieval_task: Optional[asyncio.Task] = None
+        self._pending_retrieval: Optional[RetrievalResult] = None
+        self._retrieval_seq = 0
+        self._retrieval_counts: Dict[str, int] = dict.fromkeys(RETRIEVAL_COUNTERS, 0)
+        # Structural-failure signatures already audited in the current
+        # degraded episode; a successful retrieval ends the episode.
+        self._audited_degradations: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Binding
@@ -141,6 +199,8 @@ class MemoryManager:
         ⇒ required" — the caller fails the turn loud). See
         knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md
         and knowledge-base/knowledge/issues/reranker_transient_fault_hard_fails_job.md.
+        In append_only mode ``start_retrieval`` runs this off the request
+        path and reports that error instead of raising it (D13).
         """
         watch = _StopWatch()
         stats = AssembleStats()
@@ -181,7 +241,9 @@ class MemoryManager:
                     self._record_failure(stats, "scorer", name, e)
                     raise MemoryPipelineError(
                         f"required memory scorer '{name}' failed at runtime: "
-                        f"{type(e).__name__}: {e}"
+                        f"{type(e).__name__}: {e}",
+                        stage="scorer",
+                        plugin=name,
                     ) from e
 
             for name, policy in self._policies:
@@ -282,6 +344,183 @@ class MemoryManager:
         return blocks
 
     # ------------------------------------------------------------------
+    # Asynchronous retrieval (append_only, WP3)
+    # ------------------------------------------------------------------
+
+    @property
+    def retrieval_in_flight(self) -> bool:
+        """Whether a retrieval task is running."""
+        task = self._retrieval_task
+        return task is not None and not task.done()
+
+    def start_retrieval(self, req: AssembleRequest) -> bool:
+        """Start ``assemble(req)`` off the request path (D6, D7, D10).
+
+        Never awaits. Returns True when a retrieval started; False when one
+        is still in flight (single flight: this request's query is not run,
+        the next request may start one) or when teardown closed the manager.
+        The result waits for :meth:`take_retrieval`.
+        """
+        if self._background_closed:
+            return False
+        if self.retrieval_in_flight:
+            self._retrieval_counts["skipped_in_flight"] += 1
+            return False
+        self._retrieval_seq += 1
+        self._retrieval_counts["started"] += 1
+        task = asyncio.create_task(
+            self._run_retrieval(req, self._retrieval_seq),
+            name=f"memory-retrieval-{self._retrieval_seq}",
+        )
+        self._retrieval_task = task
+        task.add_done_callback(self._retrieval_settled)
+        return True
+
+    def take_retrieval(self) -> Optional[RetrievalResult]:
+        """Take in the pending retrieval result, if one has finished (D8).
+
+        Never awaits; the request build calls it. The result is the latest
+        finished retrieval and is handed out once. The caller plans from its
+        records against the history as it is now, so an older or repeated
+        result is harmless.
+        """
+        result, self._pending_retrieval = self._pending_retrieval, None
+        if result is not None:
+            self._retrieval_counts["drained"] += 1
+        return result
+
+    def retrieval_stats(self) -> Dict[str, int]:
+        """Counters of the asynchronous retrieval (status, audit rows)."""
+        return dict(self._retrieval_counts)
+
+    async def cancel_retrieval(self, timeout: float = 5.0) -> bool:
+        """Cancel and join the running retrieval; True if one was running.
+
+        Raises ``RuntimeError`` when the task ignores cancellation: it may
+        still write (the TTL tick of ``recall_two_tier``), so a teardown
+        barrier must not report quiescence.
+        """
+        task = self._retrieval_task
+        if task is None or task.done():
+            return False
+        task.cancel()
+        _, pending = await asyncio.wait({task}, timeout=max(0.0, timeout))
+        if pending:
+            raise RuntimeError("memory retrieval task ignored cancellation")
+        return True
+
+    async def _run_retrieval(self, req: AssembleRequest, seq: int) -> None:
+        """One retrieval; its result replaces any result not yet taken in."""
+        watch = _StopWatch()
+        degraded: Optional[str] = None
+        try:
+            payload = await asyncio.wait_for(
+                self.assemble(req), timeout=ASYNC_RETRIEVAL_DEADLINE_S
+            )
+        except MemoryPipelineError as e:
+            # D13: a structural failure no longer fails the turn. Loud
+            # (ERROR log, audit, counter); this retrieval serves nothing.
+            degraded = pipeline_failure_signature(e)
+            self._report_degraded(e, degraded)
+            payload = self._empty_payload(watch, f"pipeline: {e}")
+        except (asyncio.TimeoutError, TimeoutError):
+            self._retrieval_counts["timed_out"] += 1
+            logger.warning(
+                "Memory retrieval %d exceeded %gs and was cancelled; the "
+                "next request starts a new one",
+                seq,
+                ASYNC_RETRIEVAL_DEADLINE_S,
+            )
+            payload = self._empty_payload(watch, "retrieval: deadline exceeded")
+        else:
+            if self._audited_degradations:
+                logger.info(
+                    "Memory pipeline recovered after %s",
+                    sorted(self._audited_degradations),
+                )
+                self._audited_degradations.clear()
+        if self._pending_retrieval is not None:
+            self._retrieval_counts["superseded"] += 1
+        self._pending_retrieval = RetrievalResult(
+            payload=payload,
+            seq=seq,
+            finished_at=time.monotonic(),
+            degraded=degraded,
+        )
+        self._retrieval_counts["completed"] += 1
+
+    @staticmethod
+    def _empty_payload(watch: _StopWatch, error: str) -> MemoryPayload:
+        stats = AssembleStats(errors=[error])
+        stats.latency_ms = watch.elapsed_ms()
+        return MemoryPayload(blocks=[], stats=stats)
+
+    def _retrieval_settled(self, task: "asyncio.Task") -> None:
+        """Done callback: count a cancellation, retrieve the outcome."""
+        if self._retrieval_task is task:
+            self._retrieval_task = None
+        if task.cancelled():
+            self._retrieval_counts["cancelled"] += 1
+            return
+        error = task.exception()
+        if error is not None:
+            # _run_retrieval contains everything assemble can raise; this
+            # is a manager bug, never a reason to fail a turn.
+            logger.error(
+                "Memory retrieval task failed: %s: %s",
+                type(error).__name__,
+                error,
+            )
+
+    def _report_degraded(self, error: MemoryPipelineError, signature: str) -> None:
+        """D13: log, count and audit a structural failure without raising.
+
+        Every occurrence logs at ERROR and counts. The audit row is written
+        once per signature per degraded episode (until a retrieval succeeds),
+        so a broken reranker does not write one row per request.
+        """
+        self._retrieval_counts["degraded"] += 1
+        occurrences = self._audited_degradations.get(signature, 0) + 1
+        self._audited_degradations[signature] = occurrences
+        logger.error(
+            "Memory pipeline degraded (%s): %s — this retrieval serves no "
+            "memory; the turn continues (D13, occurrence %d)",
+            signature,
+            error,
+            occurrences,
+        )
+        if occurrences > 1:
+            return
+        job_id = self.runtime.job_id
+        if not job_id:
+            return
+        try:
+            from agent.core.archiver import get_archiver
+
+            archiver = get_archiver()
+            if archiver is None:
+                return
+            cause = error.__cause__ or error
+            archiver.audit_step(
+                job_id=str(job_id),
+                agent_type=self.runtime.agent_type or "",
+                step_type=PIPELINE_DEGRADED_STEP,
+                node_name="memory_retrieval",
+                iteration=0,
+                data={
+                    "component": f"{error.stage or 'pipeline'}:{error.plugin or 'unknown'}",
+                    "signature": signature,
+                    "error": str(cause),
+                    "error_type": type(cause).__name__,
+                    "retrieval": self.retrieval_stats(),
+                },
+            )
+        except Exception as e:  # pragma: no cover - audit never breaks retrieval
+            logger.debug(
+                "memory_pipeline_degraded audit failed: %s: %s", type(e).__name__, e
+            )
+
+    # ------------------------------------------------------------------
     # Write side
     # ------------------------------------------------------------------
 
@@ -346,7 +585,14 @@ class MemoryManager:
         by ``timeout`` — a hung aux endpoint must not wedge job completion; on
         timeout the still-running tasks stay detached (best-effort) and the job
         proceeds. ``capture()`` never raises, so gathering is always clean.
+
+        A running retrieval (append_only) is cancelled first: no later request
+        takes its result in. It is not counted in the return value.
         """
+        try:
+            await self.cancel_retrieval()
+        except RuntimeError as e:
+            logger.warning("drain_background: %s; leaving it detached", e)
         pending = [t for t in self._bg_tasks if not t.done()]
         if not pending:
             return 0
@@ -378,11 +624,23 @@ class MemoryManager:
         task can write RecallStore after a queue transition.  A task that
         suppresses cancellation is surfaced to the caller so the physical
         lease remains held for the reaper rather than exposing a successor.
+
+        The retrieval task (append_only) is cancelled at once, not drained:
+        it only reads, but its ``recall_two_tier`` TTL tick writes, so it is
+        joined like the captures and a retrieval that ignores cancellation
+        fails the barrier too. It is not counted in the return value.
         """
 
         self._background_closed = True
+        retrieval_stuck: Optional[RuntimeError] = None
+        try:
+            await self.cancel_retrieval(timeout=cancel_timeout)
+        except RuntimeError as e:
+            retrieval_stuck = e
         pending = {task for task in self._bg_tasks if not task.done()}
         if not pending:
+            if retrieval_stuck is not None:
+                raise retrieval_stuck
             return 0
         count = len(pending)
         _, pending = await asyncio.wait(pending, timeout=max(0.0, drain_timeout))
@@ -403,6 +661,8 @@ class MemoryManager:
             raise RuntimeError(
                 f"{len(pending)} memory background task(s) ignored cancellation"
             )
+        if retrieval_stuck is not None:
+            raise retrieval_stuck
         return count
 
     # ------------------------------------------------------------------

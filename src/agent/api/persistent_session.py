@@ -3478,6 +3478,7 @@ class PersistentSession:
                         extraction_prompt=self.memory_extraction_prompt,
                         assembler_prompt=None,  # persistent mode has no assembler
                         job_id=self.thread_id,
+                        agent_type=self.config.agent_id,
                         project_id=self.project_id,
                         project_ids=list(self.project_ids),
                         # The legacy persistent path bounds each store call at
