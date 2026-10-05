@@ -8,6 +8,7 @@ indistinguishable, and that only holds while the resolution and the opaque
 """
 
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 import os
@@ -302,16 +303,22 @@ async def get_ssh_target(
     ):
         raise opaque
 
-    result = await ssh_access.resolve_target(
-        thread_id=thread_id, user=user, dependencies=dependencies.operations
+    # Both the dial coordinates and native descriptor must originate in this
+    # same immutable-in-use source. A later read only checks its currency.
+    thread = await dependencies.store.get_thread(thread_id)
+    source_thread = deepcopy(thread)
+    result = ssh_access.resolve_target_from_thread(
+        thread=source_thread,
+        thread_id=thread_id,
+        user=user,
+        dependencies=dependencies.operations,
     )
     if (
         result.get("state") != "live"
         or dependencies.native_mutation_dependencies is None
     ):
         return result
-    thread = await dependencies.store.get_thread(thread_id)
-    description = await _native_description(thread, dependencies)
+    description = await _native_description(source_thread, dependencies)
     if description is None:
         return {
             **result,

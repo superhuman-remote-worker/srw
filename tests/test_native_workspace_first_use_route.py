@@ -1,5 +1,7 @@
 """The orchestrator relays only a current signed exact pinned notice."""
 
+import copy
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -10,11 +12,123 @@ import pytest
 from orchestrator.routers.ssh_access import (
     SshAccessDependencies,
     _native_workspace_current,
+    get_ssh_target,
     internal_ssh_native_first_use,
 )
 from orchestrator.services.native_workspace_first_use import container_workspace_digest
 from shared.pinned_session_identity import pinned_session_ready_identity_fingerprint
 from shared.native_workspace_first_use import mint_native_first_use_proof
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rotation",
+    ["none", "endpoint_and_pin", "backing_only", "runtime_identity"],
+)
+async def test_ssh_target_binds_native_descriptor_to_resolved_source(
+    monkeypatch, rotation
+):
+    """A channel opened on A must never be reported as native first use of B."""
+    thread_id, generation, agent_id, attach, pod, process, workspace_generation = [
+        str(uuid4()) for _ in range(7)
+    ]
+    source = {
+        "id": thread_id,
+        "execution_lane": "pinned",
+        "status": "active",
+        "agent_id": agent_id,
+        "runtime_generation": generation,
+        "runtime_attach_token": attach,
+        "runtime_retirement_token": None,
+        "metadata": {
+            "_workspace_binding": {
+                "kind": "remote",
+                "generation": workspace_generation,
+                "backing_id": str(uuid4()),
+                "ssh_host_key_fingerprint": "SHA256:old",
+            },
+            "workspace_container": {
+                "status": "ready",
+                "_canvas_workspace_generation": workspace_generation,
+                "ssh_host": "old-workspace",
+                "ssh_port": 22,
+            },
+        },
+    }
+    current = copy.deepcopy(source)
+    if rotation in {"endpoint_and_pin", "backing_only"}:
+        current["metadata"]["_workspace_binding"]["backing_id"] = str(uuid4())
+    if rotation == "endpoint_and_pin":
+        current["metadata"]["_workspace_binding"]["ssh_host_key_fingerprint"] = (
+            "SHA256:new"
+        )
+        current["metadata"]["workspace_container"]["ssh_host"] = "new-workspace"
+    if rotation == "runtime_identity":
+        current["runtime_generation"] = str(uuid4())
+        current["runtime_attach_token"] = str(uuid4())
+
+    reads = 0
+
+    async def get_thread(_thread_id):
+        nonlocal reads
+        reads += 1
+        return copy.deepcopy(source if reads == 1 else current)
+
+    async def prepare(**kwargs):
+        binding = SimpleNamespace(
+            **kwargs,
+            pod_uid=pod,
+            session_identity_fingerprint=pinned_session_ready_identity_fingerprint(
+                thread_id=kwargs["thread_id"],
+                runtime_generation=kwargs["runtime_generation"],
+                agent_id=kwargs["agent_id"],
+                runtime_attach_token=kwargs["attach_token"],
+                pod_uid=pod,
+            ),
+        )
+        binding.runtime_attach_token = kwargs["attach_token"]
+        return SimpleNamespace(binding=binding, process_generation=process)
+
+    store = SimpleNamespace(
+        get_thread=get_thread,
+        get_thread_id_by_ssh_handle=AsyncMock(return_value=thread_id),
+        resolve_user_by_ssh_fingerprint=AsyncMock(return_value={"id": str(uuid4())}),
+    )
+    dependencies = SshAccessDependencies(
+        store=store,
+        operations=SimpleNamespace(
+            store=store,
+            thread_is_vm_tier=lambda *_: False,
+            logger=logging.getLogger("tests.native_ssh_target"),
+        ),
+        require_internal=AsyncMock(),
+        user_can_access_ide_entity=AsyncMock(return_value=True),
+        native_mutation_dependencies=object(),
+    )
+    monkeypatch.setattr(
+        "orchestrator.routers.ssh_access.prepare_pinned_session_mutation_target",
+        prepare,
+    )
+
+    result = await get_ssh_target(
+        request=SimpleNamespace(),
+        handle="s-7f3a91c2",
+        fingerprint="SHA256:user",
+        dependencies=dependencies,
+    )
+    if rotation == "none":
+        assert result["state"] == "live"
+        assert result["pod_ip"] == "old-workspace"
+        assert result["host_key_fingerprint"] == "SHA256:old"
+        assert result["native_recipient"][
+            "workspace_digest"
+        ] == container_workspace_digest(source)
+        assert attach not in str(result)
+    else:
+        assert result["state"] == "stale_binding"
+        assert result["pod_ip"] is None
+        assert result["host_key_fingerprint"] is None
+        assert "native_recipient" not in result
 
 
 @pytest.mark.asyncio
