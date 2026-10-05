@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -133,6 +135,45 @@ def test_no_gateway_does_not_add_agent_keys(monkeypatch: pytest.MonkeyPatch) -> 
     assert "SSH_GATEWAY_PUBLIC_HOST_KEYS" not in {e["name"] for e in agent["env"]}
     assert "ssh-gateway-host-keys" not in {m["name"] for m in agent["volumeMounts"]}
     assert "ssh-gateway-host-keys" not in {v["name"] for v in pod["volumes"]}
+
+
+def test_old_chart_publication_paths_do_not_enable_agent_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new image can construct its provisioner under a gateway-enabled old chart."""
+    monkeypatch.setenv("SSH_GATEWAY_PUBLIC_HOST_KEYS", PUBLIC_KEYS)
+    monkeypatch.delenv("AGENT_SSH_GATEWAY_HOST_KEY_SECRET", raising=False)
+    provisioner = AgentProvisioner()
+    manifest = _agent_manifest(provisioner, "session", None)
+    pod = manifest["spec"]
+    agent = next(c for c in pod["containers"] if c["name"] == "agent")
+    assert "SSH_GATEWAY_PUBLIC_HOST_KEYS" not in {e["name"] for e in agent["env"]}
+    assert "ssh-gateway-host-keys" not in {m["name"] for m in agent["volumeMounts"]}
+    assert "ssh-gateway-host-keys" not in {v["name"] for v in pod["volumes"]}
+
+
+def test_old_chart_new_image_import_keeps_orchestrator_bootable() -> None:
+    """The module-level singleton must survive the old chart's publication env."""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(CHART.parent / "src")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["SSH_GATEWAY_PUBLIC_HOST_KEYS"] = PUBLIC_KEYS
+    env.pop("AGENT_SSH_GATEWAY_HOST_KEY_SECRET", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from orchestrator.services.agent_provisioner import agent_provisioner; "
+            "assert agent_provisioner._gateway_public_host_key_paths == (); "
+            "print('legacy-publication-only')",
+        ],
+        cwd=CHART.parent,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "legacy-publication-only"
 
 
 @pytest.mark.parametrize(

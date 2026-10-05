@@ -70,10 +70,12 @@ _SSH_GATEWAY_PUBLIC_HOST_KEY_PATTERN = re.compile(
 
 def _agent_gateway_public_key_config() -> tuple[str, tuple[str, ...], tuple[str, ...]]:
     """Resolve the public-only gateway key projection for provisioned Pods."""
-    secret_metadata = os.environ.get("AGENT_SSH_GATEWAY_HOST_KEY_SECRET", "")
-    path_list = os.environ.get("SSH_GATEWAY_PUBLIC_HOST_KEYS", "")
-    if not secret_metadata and not path_list:
+    secret_metadata = os.environ.get("AGENT_SSH_GATEWAY_HOST_KEY_SECRET")
+    # Older gateway-enabled charts publish host-key paths for the orchestrator
+    # endpoint but do not opt provisioned agents into the public-only mount.
+    if secret_metadata is None:
         return "", (), ()
+    path_list = os.environ.get("SSH_GATEWAY_PUBLIC_HOST_KEYS", "")
     secret_name = secret_metadata.strip()
     paths = tuple(path_list.split(","))
     names: list[str] = []
