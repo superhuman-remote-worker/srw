@@ -39,7 +39,12 @@ from agent.graph import (
     create_restore_from_feedback_node,
     hydrate_todo_manager_from_state,
 )
-from agent.managers.todo import TODO_LIST_RESTATEMENT_LEAD, TodoManager
+from agent.managers.todo import (
+    TODO_HEADLINE_MAX_CHARS,
+    TODO_LIST_RESTATEMENT_LEAD,
+    TodoManager,
+    todo_headline,
+)
 from agent.tools.context import ToolContext
 from agent.tools.core.todo import create_todo_tools
 from tests._fs_backend import FilesystemTestBackend
@@ -88,7 +93,7 @@ class TestTodoToolResults:
         rendering = mgr.format_for_injection()
         assert result == (
             "Completed: Read the brief\n"
-            "Next: Write the summary\n\n"
+            "Next: todo_2: Write the summary\n\n"
             f"{rendering}\n\n"
             "Recorded completion note: PASS: brief read"
         )
@@ -107,7 +112,7 @@ class TestTodoToolResults:
 
         assert result == (
             "Completed: Read the brief\n"
-            "Next: Write the summary\n\n"
+            "Next: todo_2: Write the summary\n\n"
             f"{mgr.format_for_injection()}"
         )
 
@@ -126,6 +131,32 @@ class TestTodoToolResults:
             "[PHASE_COMPLETE] All tasks in this phase are done."
         )
         assert "Pending:" not in mgr.format_for_injection()
+
+    def test_finished_todos_show_only_their_headline(self):
+        """A long multi-line body (the predefined strategic todos) appears in
+        full while pending; once completed, the list and the result head show
+        only its first line, so each completion does not repeat it."""
+        mgr = TodoManager(_offline_workspace())
+        body = "EXPLORE: understand the task.\n" + "Read every line. " * 200
+        mgr.add(body)
+        mgr.add("PLAN: write plan.md.\n" + "Phase table. " * 100)
+        assert body in mgr.format_for_injection()
+
+        result = _tools(mgr)["todo_complete"].invoke({"todo_id": "todo_1"})
+
+        rendering = mgr.format_for_injection()
+        assert "  - [x] todo_1: EXPLORE: understand the task." in rendering
+        assert "Read every line." not in rendering
+        assert result.startswith(
+            "Completed: EXPLORE: understand the task.\n"
+            "Next: todo_2: PLAN: write plan.md.\n\n"
+        )
+        assert result.count("Read every line.") == 0
+        assert result.count("Phase table.") == 100  # the pending body, once
+
+    def test_a_long_first_line_is_capped(self):
+        assert todo_headline("x" * 500) == "x" * (TODO_HEADLINE_MAX_CHARS - 1) + "…"
+        assert todo_headline("\n\n  a   b \nrest") == "a b"
 
     def test_the_rendering_carries_no_per_turn_data(self):
         """Rendered later, on another turn, after unrelated tool calls or after

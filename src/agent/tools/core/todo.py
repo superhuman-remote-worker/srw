@@ -21,6 +21,7 @@ from typing import Any, List
 
 from langchain_core.tools import tool
 
+from agent.managers.todo import todo_headline
 from agent.tools.context import ToolContext
 
 from shared.tool_catalog.definitions import (
@@ -263,15 +264,18 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             # A completion returns the full current list (D18): the list
             # enters the history where it changed, never per request.
             if completed_id:
+                # Headlines only: the list below carries the pending bodies.
                 if is_last:
                     head = (
-                        f"Completed: {completed_content}\n"
+                        f"Completed: {todo_headline(completed_content)}\n"
                         "All tasks complete! Ready for phase transition."
                     )
                 else:
                     remaining = todo_mgr.list_pending()
-                    head = f"Completed: {completed_content}" + (
-                        f"\nNext: {remaining[0].content}" if remaining else ""
+                    head = f"Completed: {todo_headline(completed_content)}" + (
+                        f"\nNext: {remaining[0].id}: {todo_headline(remaining[0].content)}"
+                        if remaining
+                        else ""
                     )
                 message = f"{head}\n\n{todo_mgr.format_for_injection()}"
 

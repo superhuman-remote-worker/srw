@@ -30,6 +30,26 @@ TODO_LIST_RESTATEMENT_LEAD = (
 )
 
 
+#: Longest headline shown for a todo that is no longer the current work.
+TODO_HEADLINE_MAX_CHARS = 240
+
+
+def todo_headline(content: str) -> str:
+    """First line of a todo, whitespace-collapsed and capped.
+
+    Completed todos, and the "Completed:"/"Next:" lines of a todo tool
+    result, show only this: the full body of a finished todo is already in
+    the history (the phase-start list) and the phase archive, and repeating
+    long strategic bodies in every todo result would grow the history by
+    several thousand tokens per completion.
+    """
+    first = next((line for line in content.splitlines() if line.strip()), "")
+    line = " ".join(first.split())
+    if len(line) > TODO_HEADLINE_MAX_CHARS:
+        line = f"{line[: TODO_HEADLINE_MAX_CHARS - 1].rstrip()}…"
+    return line
+
+
 def _message_text(message: Any) -> str:
     """Plain text of a message's content (str, or the text parts of a list)."""
     content = getattr(message, "content", "")
@@ -427,7 +447,7 @@ class TodoManager:
             lines.append("")
             lines.append("Completed:")
             for todo in completed:
-                lines.append(f"  - [x] {todo.id}: {todo.content}")
+                lines.append(f"  - [x] {todo.id}: {todo_headline(todo.content)}")
                 if todo is latest_noted_todo:
                     note = " | ".join(" ".join(item.split()) for item in todo.notes)
                     if len(note) > 1000:
