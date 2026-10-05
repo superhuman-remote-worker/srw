@@ -1,9 +1,9 @@
 """Prompt-cache prefix invariance: request N+1 must start with request N.
 
 Design: knowledge-base/knowledge/features/append_only_context_injection.md
-(§2.5 the cache rule, D27 carrier fold, D31 this gate); plan:
+(§2.5 the cache rule, D17-D19 todos, D27 carrier fold, D31 this gate); plan:
 knowledge-base/knowledge/plans/append_only_context_injection_plan_2026_10_05.md
-(WP0).
+(WP0, WP1).
 
 - The cache rule. GPT-5.6 and later (and the Codex subscription path) reuse a
   cache entry only at "the end of the latest user message or last tool
@@ -30,14 +30,18 @@ knowledge-base/knowledge/plans/append_only_context_injection_plan_2026_10_05.md
     request N must be a string prefix of request N+1. ``*-history`` families
     render request N without its generation prompt: that isolates history
     rewrites from a generation prompt the replay does not reproduce.
-- Variants. ``injected`` runs with every context injection live (memory and
-  knowledge, citation feedback, supervisor guidance, active subagents and the
-  todo list for the worker; charter, memory and knowledge, active subagents
-  and the App Guide turn boundary for the session). ``control`` switches all
-  of them off (the worker's todo message has no switch until WP1, so the
-  control drops it at the LLM boundary). A control failure is intrinsic to the
-  template or provider; an injected case counts only the pairs its control
-  does not already break, so each case has one cause.
+- Variants (``harness.VARIANTS``). ``injected`` runs with every context
+  injection live (memory and knowledge, citation feedback, supervisor
+  guidance, active subagents and the todo list for the worker; charter,
+  memory and knowledge, active subagents and the App Guide turn boundary for
+  the session). ``todos-only`` (worker only) runs with the todo list as the
+  one live source, in its WP1 form: the phase-start message and the
+  ``todo_complete`` results carry the full list, and nothing is re-sent per
+  request (D17-D19); it is WP1's gate. ``control`` switches all of them off,
+  each at its own source (no todo list, ``todo_complete`` answered like any
+  other tool). A control failure is intrinsic to the template or provider; a
+  ``todos-only`` or ``injected`` case counts only the pairs its control does
+  not already break, so each case has one cause.
 - The Layer-0 emergency rebuild is entered by raising ``ContextOverflowError``
   at the LLM boundary: no real client raises it today (``ReasoningChatOpenAI``
   answers a Layer-0 overflow with a synthetic HTTP 413 instead).
@@ -45,7 +49,7 @@ knowledge-base/knowledge/plans/append_only_context_injection_plan_2026_10_05.md
   ``request N -> N+1``, with the first diverging list index and a short diff
   (API), or the first differing character offset with context (template).
 - Markers. Cases that fail today are ``xfail(strict=True)`` with their cause:
-  ``injection: ...`` (fixed by WP1/WP2) or ``intrinsic: ...``. Strict is the
+  ``injection: ...`` (fixed by WP2) or ``intrinsic: ...``. Strict is the
   point: when a work package fixes a case it XPASSes, which fails the run and
   forces removing the marker. Only a ``PrefixViolation`` counts as the expected
   failure; any other error in the harness fails the test.
@@ -59,6 +63,7 @@ from tests import _prompt_cache_prefix_harness as harness
 from tests._prompt_cache_prefix_harness import (
     FAMILIES,
     SCENARIOS,
+    VARIANTS,
     Captured,
     api_prefix_violation,
     prefix_violations,
@@ -86,23 +91,21 @@ INJECTION_CAUSES = {
     "worker-tool-loop": (
         "injection: graph.py _inject_transient_messages rebuilds the per-turn "
         "tail on every request (memory + KB synthetic tool-call pairs, citation "
-        "feedback, supervisor guidance, <active_subagents>, <active_tasks> "
-        "todos last) and re-anchors it before the new tool results "
-        "(find_tail_injection_anchor), so request N+1 writes history where "
-        "request N had its tail; fixed by WP1 (todos leave the tail, D17) + WP2 "
-        "(append-only carrier fold, D27)"
+        "feedback, supervisor guidance, <active_subagents>) and re-anchors it "
+        "before the new tool results (find_tail_injection_anchor), so request "
+        f"N+1 writes history where request N had its tail; {_WP2} with D21 "
+        "append-on-change (the todo list left the tail in WP1, D17)"
     ),
     "worker-safety-rebuild": (
         "injection: as in the tool loop, and the Layer-1 safety rebuild in "
         "graph.py re-runs _inject_transient_messages on the rebuilt request; "
-        "fixed by WP1 + WP2, which must route the rebuild through the carrier "
-        "fold too"
+        f"{_WP2}, which must route the rebuild through the carrier fold too"
     ),
     "worker-emergency-rebuild": (
         "injection: as in the tool loop, and the Layer-0 emergency rebuild "
         "(graph.py, except ContextOverflowError) re-runs "
-        "_inject_transient_messages; fixed by WP1 + WP2, which must route the "
-        "rebuild through the carrier fold too"
+        f"_inject_transient_messages; {_WP2}, which must route the rebuild "
+        "through the carrier fold too"
     ),
     "session-two-turns": (
         "injection: persistent_graph.py _inject_context_pairs re-anchors the "
@@ -178,7 +181,7 @@ def _case(scenario: str, variant: str, family: str):
                 reason=INTRINSIC_CAUSES[(scenario, family)],
             )
         )
-    elif variant == "injected" and family in SATURATED:
+    elif variant != "control" and family in SATURATED:
         marks.append(
             pytest.mark.skip(
                 reason=(
@@ -197,15 +200,22 @@ def _case(scenario: str, variant: str, family: str):
                 reason=INJECTION_CAUSES[scenario],
             )
         )
+    # ``todos-only`` carries no marker: WP1's gate, it must pass.
     return pytest.param(
         scenario, variant, family, id=f"{scenario}-{variant}-{family}", marks=marks
     )
 
 
+def _variants(scenario: str) -> tuple:
+    if scenario in WORKER_SCENARIOS:
+        return ("injected", "todos-only", "control")
+    return ("injected", "control")  # sessions never carried a todo list
+
+
 CASES = [
     _case(scenario, variant, family)
     for scenario in SCENARIOS
-    for variant in ("injected", "control")
+    for variant in _variants(scenario)
     for family in FAMILIES
 ]
 
@@ -220,13 +230,13 @@ def _require_renderer(family_id: str) -> None:
         pytest.importorskip("langchain_google_genai")
 
 
-async def _violations(scenario, family, injections, tmp_path, monkeypatch, name):
-    workdir = tmp_path / name
+async def _violations(scenario, family, variant, tmp_path, monkeypatch):
+    workdir = tmp_path / variant
     workdir.mkdir()
     requests, turn_ends = await run_scenario(
         scenario,
         family,
-        injections=injections,
+        sources=VARIANTS[variant],
         workdir=workdir,
         monkeypatch=monkeypatch,
     )
@@ -241,9 +251,7 @@ async def test_request_starts_with_the_previous_request(
     _require_renderer(family_id)
     family = FAMILIES[family_id]
 
-    control = await _violations(
-        scenario, family, False, tmp_path, monkeypatch, "control"
-    )
+    control = await _violations(scenario, family, "control", tmp_path, monkeypatch)
     if variant == "control":
         if control:
             raise PrefixViolation(
@@ -252,11 +260,9 @@ async def test_request_starts_with_the_previous_request(
             )
         return
 
-    injected = await _violations(
-        scenario, family, True, tmp_path, monkeypatch, "injected"
-    )
+    found = await _violations(scenario, family, variant, tmp_path, monkeypatch)
     # A pair the control already breaks is the control case's finding.
-    caused = {n: v for n, v in injected.items() if n not in control}
+    caused = {n: v for n, v in found.items() if n not in control}
     if caused:
         note = (
             f"\n(pairs {sorted(control)} also break without injections; see the "
@@ -265,7 +271,7 @@ async def test_request_starts_with_the_previous_request(
             else ""
         )
         raise PrefixViolation(
-            f"{scenario} / {family_id}, injections on:\n"
+            f"{scenario} / {family_id}, {variant}:\n"
             + "\n".join(caused.values())
             + note
         )

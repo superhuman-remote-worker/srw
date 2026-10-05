@@ -28,7 +28,6 @@ from shared.runtime.core.injection_markers import (
     KNOWLEDGE_TOOL_CALL_ID_PREFIX,
     MEMORY_TOOL_CALL_ID_PREFIX,
 )
-from shared.runtime.core.workspace_injection import create_todos_human_message
 from shared.runtime.llm import reasoning_chat
 from shared.runtime.llm.reasoning_chat import mark_anthropic_cache_breakpoints
 
@@ -60,7 +59,6 @@ def _worker_request(with_tail: bool = True) -> list:
                 )
             )
             messages.append(ToolMessage(content=text, tool_call_id=call_id))
-        messages.append(create_todos_human_message("Completed: - [x] todo_1"))
     return messages
 
 
@@ -77,7 +75,7 @@ class TestMarkAnthropicCacheBreakpoints:
         out = mark_anthropic_cache_breakpoints(messages, payload)
 
         marked = [i for i, m in enumerate(out) if "cache_control" in m]
-        # 0 = system prompt, 3 = the real tool result; 4..8 are the tail.
+        # 0 = system prompt, 3 = the real tool result; 4..7 are the tail.
         assert marked == [0, 3]
         assert out[3]["cache_control"] == CC
 

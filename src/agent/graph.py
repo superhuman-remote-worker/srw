@@ -56,6 +56,7 @@ from uuid import UUID, uuid4
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
+    BaseMessage,
     HumanMessage,
     RemoveMessage,
     SystemMessage,
@@ -707,6 +708,9 @@ def create_init_strategic_todos_node(
             "to understand the task, create a plan, and prepare todos for execution.\n\n"
             "Your task brief is saved to `task_brief.md` in your workspace for reference."
         )
+        # The phase's todo list enters the history once, here; it is not
+        # re-sent with every request (append-only context injection, D17).
+        content_parts.append(todo_manager.format_for_injection())
         message = HumanMessage(content="\n\n".join(content_parts))
 
         return {
@@ -820,6 +824,17 @@ def create_execute_node(
     # See knowledge-base/knowledge/issues/gemma_tool_call_parser_loop.md.
     _no_tool_call_streak = [0]
     _no_tool_call_last_hash = [""]
+
+    def _restate_todo_list(retained: List[BaseMessage]) -> List[BaseMessage]:
+        """Compaction hook (D19): restate the todo list after the summary.
+
+        The list is not re-sent per request; it lives in the history (todo
+        tool results, phase-start messages). When a summary evicted its
+        latest rendering, the compacted history carries it once, seated
+        right after the summary, until the next compaction.
+        """
+        text = todo_manager.list_restatement(retained)
+        return [HumanMessage(content=text)] if text else []
 
     async def execute(state: UniversalAgentState) -> Dict[str, Any]:
         """Execute current todo using ReAct pattern."""
@@ -972,9 +987,11 @@ def create_execute_node(
         # compaction thresholds account for it. The prepared request is
         # system -> summaries -> history (incl. the protected phase block) ->
         # transient tail (memory, knowledge, citation feedback, supervisor
-        # guidance, todos last); tests/test_execute_prepared_layout.py pins
-        # that layout. The estimate is position-agnostic. It covers:
-        #   - the system prompt and the transient tail (todos + the memory and
+        # guidance, active subagents); tests/test_execute_prepared_layout.py
+        # pins that layout. The todo list is history, not tail: the todo tool
+        # results and the phase-start messages carry it (D17-D19). The
+        # estimate is position-agnostic. It covers:
+        #   - the system prompt and the transient tail (the memory and
         #     knowledge budgets) — outside `messages`, added after compaction;
         #     the citation-feedback and guidance pairs are small and unbudgeted;
         #   - once per phase, on its delivery turn only, the phase block just
@@ -988,9 +1005,6 @@ def create_execute_node(
         injection_overhead_tokens = context_mgr.get_token_count(
             [prepared_messages[0]]
         )  # system prompt
-        injection_overhead_tokens += (
-            len(todo_manager.format_for_injection()) // 4
-        )  # approximate
         if delivered_phase_blocks:
             injection_overhead_tokens += context_mgr.get_token_count(
                 delivered_phase_blocks
@@ -1057,6 +1071,7 @@ def create_execute_node(
                 auxiliary_llm,
                 summarization_prompt,
                 max_summary_length=config.context_management.max_summary_length,
+                restate_after_summary=_restate_todo_list,
             )
         finally:
             # Restore original thresholds
@@ -1134,9 +1149,11 @@ def create_execute_node(
         # 1. Summary SystemMessages first (context from before compaction)
         # 2. Rest of conversation (excluding regular SystemMessages)
         # 3. Transient injections at the tail (memories, knowledge, citation
-        #    feedback, supervisor guidance, then the todo list last). The
-        #    phase instruction block is NOT part of the tail: it is history
-        #    (delivered above, persisted in state).
+        #    feedback, supervisor guidance, active subagents). The phase
+        #    instruction block is NOT part of the tail: it is history
+        #    (delivered above, persisted in state). Neither is the todo list:
+        #    the todo tool results and the phase-start messages carry it, and
+        #    compaction restates it (D17-D19).
 
         # Step 1: Add summaries first
         for msg in messages:
@@ -1144,14 +1161,11 @@ def create_execute_node(
                 if "[Summary of prior work]" in msg.content:
                     prepared_messages.append(msg)
 
-        # Helper: inject all transient messages (todos, memories, knowledge, guidance)
+        # Helper: inject all transient messages (memories, knowledge, guidance)
         # Used both in normal path and safety rebuild to avoid code duplication
         from shared.runtime.core.workspace_injection import (
-            create_todos_human_message,
             find_tail_injection_anchor,
         )
-
-        todos_injection_content = todo_manager.format_for_injection()
 
         # MemoryManager seam read path (memory overhaul Phase 1 cutover).
         # When bound, one assemble() replaces the two direct-store retrieval
@@ -1458,7 +1472,7 @@ def create_execute_node(
         _active_subagents = _active_subagents_block(tool_context)
 
         def _inject_transient_messages(target_messages: list) -> None:
-            """Splice transient injections (memories, knowledge, guidance, todos) at the tail.
+            """Splice transient injections (memories, knowledge, guidance) at the tail.
 
             The block goes AFTER the conversation (see find_tail_injection_anchor):
             it changes every turn, and provider prompt caches match on a strict
@@ -1466,8 +1480,11 @@ def create_execute_node(
             the cache for the whole conversation on every request. At the tail
             only the block itself is re-processed.
 
-            Within the block the todo list goes LAST: it is the agent's current
-            "query", and models weight the end of the prompt highest.
+            Re-anchoring it before each new tool result still rewrites the
+            previous request's tail, so the block moves into the history part
+            by part (append-only context injection, D21; WP2). The todo list
+            already left it (D17): the todo tool results, the phase-start
+            messages and the post-compaction restatement carry it.
 
             Phase-start instruction blocks are NOT transient: they are
             delivered once into the working history (see the delivery step
@@ -1514,9 +1531,8 @@ def create_execute_node(
                 block.append(cit_ai)
                 block.append(cit_tool)
 
-            # Supervisor guidance: the last synthetic pair before the todo
-            # list, so mid-run steering is the freshest context short of the
-            # current tasks themselves.
+            # Supervisor guidance: the last synthetic pair of the block, so
+            # mid-run steering is the freshest synthetic context.
             if _guidance_block[0]:
                 from agent.core.guidance_injection import (
                     create_guidance_injection_messages,
@@ -1536,10 +1552,8 @@ def create_execute_node(
                     )
                 )
 
-            # Todo list as transient HumanMessage — last, so the request ends
-            # with the current tasks (query-at-end) and the synthetic tool-call
-            # pairs above stay sandwiched between real turns.
-            block.append(create_todos_human_message(todos_injection_content))
+            if not block:
+                return
 
             # Anchor after the last Human/Tool message (normally the very end;
             # keeps the synthetic function-call pairs Gemini-valid — a
@@ -1552,7 +1566,7 @@ def create_execute_node(
             if not isinstance(msg, SystemMessage):
                 prepared_messages.append(msg)
 
-        # Inject transient messages (memory, knowledge, guidance, todos)
+        # Inject transient messages (memory, knowledge, guidance, subagents)
         # AFTER the conversation: the stable history prefix stays byte-identical
         # across turns, so provider prompt caches reuse it instead of
         # re-processing the whole conversation every request.
@@ -1582,6 +1596,7 @@ def create_execute_node(
                 summarization_prompt,
                 max_summary_length=config.context_management.max_summary_length,
                 force=True,
+                restate_after_summary=_restate_todo_list,
             )
 
             # Separate RemoveMessage markers from actual messages
@@ -1609,7 +1624,9 @@ def create_execute_node(
                     prepared_messages.append(msg)
 
             # Re-inject ALL transient messages (memory + knowledge + guidance
-            # + todos) at the tail; the phase block is inside `messages`.
+            # + subagents) at the tail; the phase block and the todo list are
+            # inside `messages` (the list restated after the summary if the
+            # compaction evicted it).
             _inject_transient_messages(prepared_messages)
             logger.debug(
                 f"[{job_id}] Re-injected transient messages after safety compaction"
@@ -2342,6 +2359,7 @@ def create_execute_node(
                         summarization_prompt,
                         max_summary_length=config.context_management.max_summary_length,
                         force=True,
+                        restate_after_summary=_restate_todo_list,
                     )
 
                     # Separate RemoveMessage markers
@@ -3030,6 +3048,13 @@ def create_check_todos_node(
                 logger.warning(
                     f"[{job_id}] Reloaded {len(strategic_todos)} strategic todos after resume (phase {phase_number})"
                 )
+                # The reloaded list enters the history once (D17-D19).
+                restated = todo_manager.list_restatement(state.get("messages", []))
+                if restated:
+                    return {
+                        "phase_complete": False,
+                        "messages": [HumanMessage(content=restated)],
+                    }
                 return {"phase_complete": False}  # Continue with reloaded todos
 
             logger.warning(
@@ -4506,6 +4531,7 @@ def create_restore_todo_state_node(
                 "todo_next_id": todo_state["next_id"],
             }
             updates.update(_clear_completion_report_updates(state))
+            updates.update(_todo_list_restatement_update(todo_manager, state))
             return updates
 
         # Always clear stop flags on resume — the checkpoint may carry
@@ -4513,9 +4539,23 @@ def create_restore_todo_state_node(
         # check_goal to immediately stop the graph.
         updates = {"should_stop": False, "goal_achieved": False}
         updates.update(_clear_completion_report_updates(state))
+        updates.update(_todo_list_restatement_update(todo_manager, state))
         return updates
 
     return restore_todo_state
+
+
+def _todo_list_restatement_update(
+    todo_manager: TodoManager, state: UniversalAgentState
+) -> Dict[str, Any]:
+    """``messages`` update that restates the todo list on resume, if needed.
+
+    The list is not re-sent per request (D17); it lives in the history. A
+    resume can leave it absent: staged todos applied above, or a checkpoint
+    from before the list moved into the history. Then it is appended once.
+    """
+    restated = todo_manager.list_restatement(state.get("messages", []))
+    return {"messages": [HumanMessage(content=restated)]} if restated else {}
 
 
 def create_restore_from_feedback_node(
@@ -4639,14 +4679,12 @@ def create_restore_from_feedback_node(
         # Step 3: Create HumanMessage with formatted feedback. The banner
         # states the ACTUAL cause (see resume_reason above), never a blanket
         # "previously frozen for human review".
-        feedback_message = HumanMessage(
-            content=(
-                f"[FEEDBACK_RESUME] {resume_reason}\n\n"
-                f"## Feedback\n\n{feedback}\n\n"
-                f"The feedback has been saved to feedback.md for reference. "
-                f"Process the feedback using the strategic todos below, then create "
-                f"corrective tactical todos to address each feedback item."
-            )
+        feedback_text = (
+            f"[FEEDBACK_RESUME] {resume_reason}\n\n"
+            f"## Feedback\n\n{feedback}\n\n"
+            f"The feedback has been saved to feedback.md for reference. "
+            f"Process the feedback using the strategic todos below, then create "
+            f"corrective tactical todos to address each feedback item."
         )
 
         # Step 4a: Archive any in-flight todos from the checkpoint before the
@@ -4694,6 +4732,12 @@ def create_restore_from_feedback_node(
         todo_manager.set_todos_from_list(todo_list)
         todo_manager.is_strategic_phase = True
         todo_manager.phase_number = state.get("phase_number", 0)
+
+        # The resume todos enter the history once, "below" the feedback; the
+        # list is not re-sent with every request (D17-D19).
+        feedback_message = HumanMessage(
+            content=f"{feedback_text}\n\n{todo_manager.format_for_injection()}"
+        )
 
         # Export todo state for checkpointing
         todo_state = todo_manager.export_state()

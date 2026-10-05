@@ -11,7 +11,11 @@ the execute node (src/graph.py) sends is laid out as
           phase (WP1), which is history, not tail
     tail  the transient block, rebuilt every turn and anchored after the last
           Human/Tool message: memory pair -> knowledge pair -> citation-feedback
-          pair -> supervisor-guidance pair -> todo HumanMessage LAST
+          pair -> supervisor-guidance pair -> active-subagent status
+
+The todo list is never part of the tail (append-only context injection, D17):
+it is history, carried by the todo tool results and the phase-start messages,
+so the execute node never renders it into a request itself.
 
 "Prefix" is everything before the tail. Turn N+1's prefix is turn N's prefix
 followed by turn N's new state messages, byte for byte, so provider prompt
@@ -357,6 +361,7 @@ async def _run(node, state):
 
 
 def _is_todos(m: BaseMessage) -> bool:
+    """The legacy per-turn ``<active_tasks>`` message, no longer produced."""
     return isinstance(m, HumanMessage) and str(m.content).startswith(
         TODOS_INJECTION_CONTENT_PREFIX
     )
@@ -435,9 +440,7 @@ def _failed_citation(cid: int = 7) -> Citation:
 
 class TestPreparedLayout:
     @pytest.mark.asyncio
-    async def test_live_child_status_is_transient_and_immediately_before_todos(
-        self, env
-    ):
+    async def test_live_child_status_is_transient_and_last(self, env):
         _bind_tactical_phase_skill(env)
         block = (
             "<active_subagents>\n"
@@ -457,8 +460,8 @@ class TestPreparedLayout:
         active = next(
             m for m in request if str(m.content).startswith("<active_subagents>")
         )
-        assert request[-2] is active
-        assert _is_todos(request[-1])
+        assert request[-1] is active
+        assert not any(_is_todos(m) for m in request)
         assert active.additional_kwargs[PERSIST_ROLE_KEY] == PERSIST_ROLE_EVENT
         assert "do not poll" in active.content
         assert not any(
@@ -467,13 +470,12 @@ class TestPreparedLayout:
         env["ctx"].subagent_runtime.active_subagents_block.assert_called_once_with()
 
     @pytest.mark.asyncio
-    async def test_layout_is_system_summaries_history_block_then_tail_with_todos_last(
-        self, env
-    ):
+    async def test_layout_is_system_summaries_history_block_then_tail(self, env):
         """One request, read top to bottom: the one system prompt, the
         summaries, the history in state order, the phase block as the last
-        history message on its delivery turn, then the transient tail with
-        the todo list last. Nothing from the tail is returned to state."""
+        history message on its delivery turn, then the transient tail. There
+        is no todo message: the list is history (D17). Nothing from the tail
+        is returned to state."""
         _bind_tactical_phase_skill(env)
         # A ReAct turn: the reply carries a tool call (the graph goes to the
         # tools node next), so no todo-reminder nudge is appended to state.
@@ -505,7 +507,6 @@ class TestPreparedLayout:
             "memory",
             "knowledge",
             "knowledge",
-            "todos",
         ]
 
         # [0] is the ONE phase-agnostic prompt, rebuilt per turn;
@@ -536,21 +537,21 @@ class TestPreparedLayout:
         assert "UNIQUE TACTICAL PHASE BODY" in block.content
         assert block is result["messages"][0]  # delivered into state this turn
 
-        # The tail: memory pair, knowledge pair, todos LAST. Synthetic pairs
-        # are well-formed (AI tool_call + ToolMessage with the same id).
+        # The tail: memory pair, knowledge pair. Synthetic pairs are
+        # well-formed (AI tool_call + ToolMessage with the same id).
         assert [_kind(m) for m in tail] == [
             "memory",
             "memory",
             "knowledge",
             "knowledge",
-            "todos",
         ]
         for ai, tool in (tail[0:2], tail[2:4]):
             assert isinstance(ai, AIMessage) and isinstance(tool, ToolMessage)
             assert ai.tool_calls[0]["id"] == tool.tool_call_id
-        assert _is_todos(request[-1])
-        assert "Do the task" in request[-1].content
-        assert sum(_is_todos(m) for m in request) == 1
+        # No todo message, and the node never renders the list itself: it is
+        # in the history only where a todo tool or a phase start put it.
+        assert not any(_is_todos(m) for m in request)
+        assert not any("Do the task" in str(m.content) for m in request)
 
         # Transients never reach state; the delivery turn returns block + reply
         # (a no-tool-call reply with pending todos would add the reminder
@@ -602,9 +603,9 @@ class TestPreparedLayout:
         assert _wire_all(prefix2[len(prefix1) :]) == _wire_all(new_messages)
         assert len(req2) - len(req1) == len(new_messages)
 
-        # Same tail shape, rebuilt after the new messages, todos last both turns.
+        # Same tail shape, rebuilt after the new messages; no todo message.
         assert [_kind(m) for m in tail1] == [_kind(m) for m in tail2]
-        assert _is_todos(req1[-1]) and _is_todos(req2[-1])
+        assert not any(_is_todos(m) for m in req1 + req2)
         # Nothing changed between the turns, so the tail is byte-identical
         # too (deterministic injection ids) — but it sits at a new offset.
         assert _wire_all(tail1) == _wire_all(tail2)
@@ -617,11 +618,10 @@ class TestPreparedLayout:
         assert not any(_is_transient(m) for m in second["messages"])
 
     @pytest.mark.asyncio
-    async def test_supervisor_guidance_sits_before_todos(self, env, guidance_inbox):
-        """The guidance pair is the last synthetic pair of the tail —
-        after memory and knowledge, immediately before the todo list — so
-        mid-run steering is the freshest context short of the tasks. It is
-        transient (never in state) and acked after the turn."""
+    async def test_supervisor_guidance_is_the_last_tail_pair(self, env, guidance_inbox):
+        """The guidance pair is the last synthetic pair of the tail — after
+        memory and knowledge — so mid-run steering is the freshest synthetic
+        context. It is transient (never in state) and acked after the turn."""
         _bind_tactical_phase_skill(env)
         guidance_inbox[JOB_ID] = [
             {"id": "g1", "text": "stop retrying X", "source": "officer"},
@@ -643,9 +643,8 @@ class TestPreparedLayout:
             "knowledge",
             "guidance",
             "guidance",
-            "todos",
         ]
-        guid_ai, guid_tool, todos = tail[-3], tail[-2], tail[-1]
+        guid_ai, guid_tool = tail[-2], tail[-1]
         assert isinstance(guid_ai, AIMessage) and isinstance(guid_tool, ToolMessage)
         assert guid_ai.tool_calls[0]["name"] == "supervisor_guidance"
         assert guid_ai.tool_calls[0]["id"].startswith(GUIDANCE_TOOL_CALL_ID_PREFIX)
@@ -653,7 +652,7 @@ class TestPreparedLayout:
         assert guid_tool.content.startswith("[SUPERVISOR GUIDANCE]")
         assert "stop retrying X" in guid_tool.content
         assert "read file Z" in guid_tool.content
-        assert _is_todos(todos)
+        assert not any(_is_todos(m) for m in request)
         # One block, after the whole history (the phase block included).
         assert sum("[SUPERVISOR GUIDANCE]" in str(m.content) for m in request) == 1
         assert request.index(guid_ai) > request.index(prefix[-1])
@@ -667,8 +666,8 @@ class TestPreparedLayout:
     @pytest.mark.asyncio
     async def test_citation_feedback_pair_in_tail(self, env, guidance_inbox):
         """Failed-citation feedback is a transient pair in the tail: after the
-        memory and knowledge pairs, before the guidance pair and the todos —
-        re-derived from the engine each turn, never written to state."""
+        memory and knowledge pairs, before the guidance pair — re-derived from
+        the engine each turn, never written to state."""
         _bind_tactical_phase_skill(env)
         citation = _failed_citation()
         engine = SimpleNamespace(list_citations=AsyncMock(return_value=[citation]))
@@ -696,7 +695,6 @@ class TestPreparedLayout:
             "citation",
             "guidance",
             "guidance",
-            "todos",
         ]
         cit_ai, cit_tool = tail[4], tail[5]
         assert isinstance(cit_ai, AIMessage) and isinstance(cit_tool, ToolMessage)
@@ -713,10 +711,10 @@ class TestPreparedLayout:
         )
         engine.list_citations.assert_awaited_with(verification_status="failed")
 
-        # After the whole history (phase block included); before the todos.
+        # After the whole history (phase block included); before the guidance.
         assert req1.index(cit_ai) > req1.index(prefix[-1])
         assert is_protected_message(prefix[-1])
-        assert _is_todos(req1[-1])
+        assert is_guidance_injection_message(req1[-1])
 
         # Transient: re-derived on the next turn, absent from state both turns.
         assert sum(is_citation_feedback_injection_message(m) for m in req2) == 2
@@ -782,7 +780,7 @@ class TestInjectionOverheadAccounting:
     @pytest.mark.asyncio
     async def test_delivery_turn_adds_the_phase_block_once(self, env):
         """The compaction thresholds are lowered by the request overhead that
-        `messages` does not carry — system prompt, todo list, memory budget —
+        `messages` does not carry — system prompt, memory budget —
         plus, on the delivery turn only, the phase block just appended (the
         provider-anchored trigger predates it). The next turn drops the term;
         the originals are restored after every turn."""
@@ -816,7 +814,6 @@ class TestInjectionOverheadAccounting:
 
         common = (
             ctx.get_token_count([SystemMessage(content=SYSTEM_PROMPT)])
-            + len(env["todo"].format_for_injection()) // 4
             + env["config"].memory.budget_tokens  # recall_store present
         )
         original = FakeContextMgr.ORIGINAL_THRESHOLD
@@ -844,7 +841,6 @@ class TestInjectionOverheadAccounting:
 
         common = (
             ctx.get_token_count([SystemMessage(content=SYSTEM_PROMPT)])
-            + len(env["todo"].format_for_injection()) // 4
             + env["config"].memory.budget_tokens
         )
         assert ctx.thresholds_seen == [
@@ -853,3 +849,98 @@ class TestInjectionOverheadAccounting:
                 FakeContextMgr.ORIGINAL_THRESHOLD - common,
             )
         ]
+
+
+# ---------------------------------------------------------------------------
+# The todo list after compaction (D19)
+# ---------------------------------------------------------------------------
+
+
+class CompactingContextMgr(FakeContextMgr):
+    """Every ``ensure_within_limits`` call compacts to summary + the newest
+    message, seating whatever ``restate_after_summary`` returns in between —
+    the contract of ``ContextManager.summarize_and_compact``. ``overflow_once``
+    makes the first full-request count exceed every limit (the Layer-1 safety
+    rebuild)."""
+
+    def __init__(self, *, overflow_once: bool = False) -> None:
+        super().__init__()
+        self.hooks: List[Any] = []
+        self._overflow = overflow_once
+
+    def get_token_count(self, messages: List[Any]) -> int:
+        if self._overflow and len(messages) > 1:
+            self._overflow = False
+            return 10**9
+        return super().get_token_count(messages)
+
+    async def ensure_within_limits(
+        self, messages, *args, restate_after_summary=None, **kwargs
+    ):
+        await super().ensure_within_limits(messages, *args, **kwargs)
+        self.hooks.append(restate_after_summary)
+        summary = SystemMessage(content="[Summary of prior work]\nEarlier work.")
+        kept = list(messages[-1:])
+        restated = (
+            list(restate_after_summary([summary, *kept]))
+            if restate_after_summary
+            else []
+        )
+        markers = [RemoveMessage(id=m.id) for m in messages if m.id]
+        return markers + [summary, *restated, *kept]
+
+
+class OverflowOnceLLM(CapturingLLM):
+    """Raise ContextOverflowError once: the Layer-0 emergency compaction."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.raised = False
+
+    async def ainvoke(self, prepared, **kwargs):
+        from shared.runtime.llm.exceptions import ContextOverflowError
+
+        if not self.raised:
+            self.raised = True
+            raise ContextOverflowError(token_count=10**9, limit=128_000)
+        return await super().ainvoke(prepared, **kwargs)
+
+
+class TestTodoListRestatedAfterCompaction:
+    @pytest.mark.parametrize("path", ["threshold", "safety", "emergency"])
+    @pytest.mark.asyncio
+    async def test_every_execute_compaction_restates_the_list_once(self, env, path):
+        """The threshold compaction, the Layer-1 safety rebuild and the Layer-0
+        emergency rebuild all hand the todo-list hook to the compaction; the
+        restatement lands right after the summary in the request and is
+        returned to state, so it is history from then on (not a tail)."""
+        ctx = CompactingContextMgr(overflow_once=path == "safety")
+        env["context"] = ctx
+        llm = OverflowOnceLLM() if path == "emergency" else CapturingLLM()
+        node = _make_node(env, llm)
+        history = [
+            m.model_copy(update={"id": f"m{i}"}) for i, m in enumerate(_history())
+        ]
+
+        result = await _run(node, _state(history))
+
+        expected_calls = 1 if path == "threshold" else 2
+        assert len(ctx.hooks) == expected_calls
+        assert all(hook is not None for hook in ctx.hooks)
+        request = llm.requests[-1]
+        rendering = env["todo"].format_for_injection()
+        restated = [m for m in request if rendering in str(m.content)]
+        assert len(restated) == 1
+        assert isinstance(restated[0], HumanMessage)
+        assert [_kind(m) for m in request[:4]] == [
+            "system",
+            "summary",
+            "HumanMessage",  # the restated list
+            "HumanMessage",  # the kept window
+        ]
+        assert request[2] is restated[0]
+        state_messages = [
+            m for m in result["messages"] if not isinstance(m, RemoveMessage)
+        ]
+        assert any(m is restated[0] for m in state_messages)
+        assert not any(_is_todos(m) for m in request)

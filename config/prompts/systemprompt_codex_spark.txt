@@ -23,7 +23,7 @@ Your context window is finite. These systems are your persistent memory:
 - **Memory system** — Automatically extracted insights recalled via hybrid search. Persists across context compaction.
 - **README.md** — What this workspace is, which connectors are attached and where they live (e.g. repositories under repos/<name>/), and what input materials were provided. Read it first.
 - **plan.md** — Execution plan. Read when you need strategic context.
-- **todos.yaml** — Current phase tasks, injected every call. Work them in order.
+- **todos.yaml** — Current phase tasks. The list arrives at each phase start and with every todo tool result; `todo_list` shows it on demand. Work them in order.
 - **archive/** — Phase retrospectives and archived todos.
 - **tools/** — Per-tool documentation. Read tools/<tool_name>.md before first use.
 

@@ -49,6 +49,10 @@ from shared.runtime.core.message_markers import (
 
 logger = logging.getLogger(__name__)
 
+#: ``summarize_and_compact``'s ``restate_after_summary`` hook: retained
+#: history in, messages to seat right after the summary out.
+RestateAfterSummary = Callable[[List[BaseMessage]], List[BaseMessage]]
+
 
 def is_compaction_summary(message: BaseMessage) -> bool:
     """True for the ``[Summary of prior work]`` SystemMessage compaction writes."""
@@ -1296,6 +1300,7 @@ class ContextManager:
         force: bool = False,
         trigger: str = "auto",
         focus: Optional[str] = None,
+        restate_after_summary: Optional[RestateAfterSummary] = None,
     ) -> List[BaseMessage]:
         """Ensure messages are within configured limits, summarizing if needed.
 
@@ -1310,6 +1315,7 @@ class ContextManager:
             force: If True, summarize even if thresholds not exceeded
             trigger: ``auto`` | ``manual`` | ``resume`` — compaction event metadata
             focus: Optional user compaction focus (``/compact <focus>``)
+            restate_after_summary: Passed to ``summarize_and_compact``.
 
         Returns:
             Messages (possibly compacted) guaranteed to be within limits
@@ -1326,6 +1332,7 @@ class ContextManager:
                 max_summary_length,
                 trigger=trigger,
                 focus=focus,
+                restate_after_summary=restate_after_summary,
             )
 
             # Keep-window elision (session_silent_failure_audit.md #6): tool
@@ -1391,6 +1398,7 @@ class ContextManager:
                             keep_recent_override=next_keep,
                             trigger=trigger,
                             focus=focus,
+                            restate_after_summary=restate_after_summary,
                         )
                         conv_count = sum(
                             1
@@ -1857,6 +1865,7 @@ class ContextManager:
         keep_recent_override: Optional[int] = None,
         trigger: str = "auto",
         focus: Optional[str] = None,
+        restate_after_summary: Optional[RestateAfterSummary] = None,
     ) -> List[BaseMessage]:
         """Summarize older messages and compact the conversation.
 
@@ -1871,6 +1880,16 @@ class ContextManager:
             keep_recent_override: Override keep_recent_messages (for progressive compaction)
             trigger: ``auto`` | ``manual`` | ``resume`` — compaction event metadata
             focus: Optional user compaction focus (``/compact <focus>``)
+            restate_after_summary: Called with the retained history once a
+                summary is produced (system messages, summary, re-seated
+                protected blocks, kept window); the messages it returns are
+                seated after the summary and the protected blocks, before the
+                kept window. The worker restates its todo list here when the
+                kept window no longer shows it (append-only context
+                injection, D19): compaction rewrites the request prefix
+                anyway, so the restatement costs no extra cache miss and stays
+                put until the next compaction. Not called when nothing was
+                summarized.
 
         Returns:
             Compacted message list with summary prepended
@@ -2241,6 +2260,16 @@ class ContextManager:
             self._current_phase_key,
             preserve_identity=self.preserve_message_identity,
         )
+        if restate_after_summary is not None:
+            try:
+                restated = list(restate_after_summary(system_msgs + compacted_tail))
+            except Exception as e:  # never fail a compaction over a restatement
+                logger.warning(f"Compaction: restate_after_summary failed: {e}")
+                restated = []
+            if restated:
+                cut = len(compacted_tail) - len(fresh_recent)
+                compacted_tail[cut:cut] = restated
+                logger.info(f"Restated {len(restated)} message(s) after the summary")
 
         merged_summaries_info = (
             f", merged {len(old_summaries)} prior summaries" if old_summaries else ""

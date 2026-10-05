@@ -737,37 +737,6 @@ class WorkerContextManager:
         return messages
 
 
-def _is_todos_message(message: BaseMessage) -> bool:
-    from shared.runtime.core.workspace_injection import TODOS_INJECTION_CONTENT_PREFIX
-
-    return isinstance(message, HumanMessage) and str(message.content).startswith(
-        TODOS_INJECTION_CONTENT_PREFIX
-    )
-
-
-class DropTodosAtBoundary:
-    """Control variant only: remove the ``<active_tasks>`` message before the LLM.
-
-    The worker has no switch for the todo message; it is unconditional until
-    WP1 (D17) takes it out of the tail. Every other injection source of the
-    control is switched off at its own source. Dropping the todo message at
-    the LLM boundary, before provider conversion, gives the request WP1 will
-    produce for a job without memory, knowledge, citations, guidance or
-    subagents.
-    """
-
-    def __init__(self, bound: Any) -> None:
-        self._bound = bound
-        self.kwargs = getattr(bound, "kwargs", {})
-
-    async def ainvoke(self, messages: List[BaseMessage], *args: Any, **kwargs: Any):
-        kept = [m for m in messages if not _is_todos_message(m)]
-        return await self._bound.ainvoke(kept, *args, **kwargs)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._bound, name)
-
-
 class OverflowOnce:
     """Raise ``ContextOverflowError`` on the first attempt of one request.
 
@@ -820,7 +789,7 @@ def _failed_citation() -> Any:
 async def run_worker_scenario(
     family: Family,
     *,
-    injections: bool,
+    sources: frozenset,
     workdir: Path,
     monkeypatch: Any,
     safety_rebuild_at: Optional[int] = None,
@@ -830,14 +799,26 @@ async def run_worker_scenario(
 
     Between execute calls the harness does what the graph does: append the
     node's messages (the add_messages reducer) and run the tools node, here a
-    stand-in that answers each call (``todo_complete`` is the real tool, so the
-    todo change is real). ``check_todos`` does not touch ``messages``.
+    stand-in that answers each call. ``check_todos`` does not touch
+    ``messages``.
+
+    ``sources`` (see ``VARIANTS``) switches the injection sources on:
+    ``"todos"`` is the todo list in its post-WP1 form (D17-D19): the history
+    opens with the strategic->tactical phase-start message that carries the
+    list, and ``todo_complete`` is the real tool, so its results carry the
+    full updated list and the todo change is real. Without it the todo list
+    is empty and ``todo_complete`` is answered by the stand-in, so no todo
+    text reaches any request. ``"context"`` is the rest of the per-turn tail
+    (memory and knowledge, citation feedback, supervisor guidance, active
+    subagents), which WP2 moves into the history.
 
     ``safety_rebuild_at`` makes request k take the Layer-1 safety rebuild;
     ``emergency_rebuild_at`` makes it take the Layer-0 emergency rebuild.
     """
     from shared.runtime.core.loader import create_llm, load_agent_config
+    from shared.runtime.services.guardrails import format_nudge
 
+    from agent.core.phase import _with_todo_list
     from agent.core.workspace import WorkspaceManager
     from agent.graph import create_execute_node
     from agent.managers import TodoManager
@@ -845,11 +826,12 @@ async def run_worker_scenario(
     from agent.tools.core.todo import create_todo_tools
     from tests._fs_backend import FilesystemTestBackend
 
+    todos_on = "todos" in sources
+    context_on = "context" in sources
     provider = FakeProvider(WORKER_SCRIPT, family)
     provider.install(monkeypatch)
     llm_config = family.llm_config()
-    bound = bind_like_srw(create_llm(llm_config), llm_config, WORKER_TOOLS)
-    llm_with_tools = bound if injections else DropTodosAtBoundary(bound)
+    llm_with_tools = bind_like_srw(create_llm(llm_config), llm_config, WORKER_TOOLS)
     overflow = None
     if emergency_rebuild_at is not None:
         llm_with_tools = overflow = OverflowOnce(llm_with_tools, emergency_rebuild_at)
@@ -860,18 +842,38 @@ async def run_worker_scenario(
     workspace.initialize()
     config = load_agent_config(WORKER_CONFIG_PATH)
     config.llm = llm_config
-    todo = TodoManager(workspace)
+    todo = TodoManager(workspace, model_name=llm_config.model)
     todo.is_strategic_phase = False
     todo.phase_number = 2
-    todo.add("Read the brief")
-    todo.add("Write the summary")
+    history: List[BaseMessage] = [HumanMessage(content=TASK_BRIEF)]
     ctx = ToolContext(workspace_manager=workspace)
     ctx.todo_manager = todo
-    todo_tools = {tool.name: tool for tool in create_todo_tools(ctx)}
+    todo_tools: Dict[str, Any] = {}
+    if todos_on:
+        todo.add("Read the brief")
+        todo.add("Write the summary")
+        todo_tools = {tool.name: tool for tool in create_todo_tools(ctx)}
+        # What handle_transition appended when this tactical phase began.
+        history.append(
+            HumanMessage(
+                content=_with_todo_list(
+                    format_nudge(
+                        "phase_transition_strategic_to_tactical",
+                        model=llm_config.model,
+                        phase_number=2,
+                        phase_name="Summary",
+                        todo_count=2,
+                    ),
+                    todo,
+                    is_strategic=False,
+                    phase_number=2,
+                )
+            )
+        )
 
     memory_service = None
     guidance_turns: set[int] = set()
-    if injections:
+    if context_on:
         memory_service = RecordingMemoryManager()
         ctx.citation_engine = SimpleNamespace(
             list_citations=AsyncMock(return_value=[_failed_citation()])
@@ -899,7 +901,7 @@ async def run_worker_scenario(
     state: Dict[str, Any] = {
         "job_id": JOB_ID,
         "iteration": 0,
-        "messages": [HumanMessage(content=TASK_BRIEF)],
+        "messages": history,
         "is_strategic_phase": False,
         "phase_number": 2,
         "turn_count": 0,
@@ -953,8 +955,10 @@ async def run_worker_scenario(
         )
     if overflow is not None and not overflow.raised:
         raise AssertionError("the Layer-0 emergency rebuild did not run")
-    if injections and memory_service.assemble_requests == []:
+    if context_on and memory_service.assemble_requests == []:
         raise AssertionError("the memory seam was never consulted")
+    if todos_on and todo.all_complete() is not True:
+        raise AssertionError("the scripted todo changes did not run")
     return provider.requests
 
 
@@ -1013,9 +1017,15 @@ def _session_tool(name: str) -> MagicMock:
 
 
 async def run_session_scenario(
-    family: Family, *, injections: bool, monkeypatch: Any
+    family: Family, *, sources: frozenset, monkeypatch: Any
 ) -> List[Captured]:
-    """Two user turns through the real ``run_persistent_loop`` (astream path)."""
+    """Two user turns through the real ``run_persistent_loop`` (astream path).
+
+    Sessions never carried a todo list; ``"context"`` in ``sources`` switches
+    on the charter, memory and knowledge, active subagents and the App Guide
+    turn boundary.
+    """
+    injections = "context" in sources
     import asyncio
 
     from agent.persistent_graph import PersistentLoopCallbacks, run_persistent_loop
@@ -1343,6 +1353,13 @@ def prefix_violations(
     return found
 
 
+#: Injection sources each variant switches on (see ``run_worker_scenario``).
+VARIANTS: Dict[str, frozenset] = {
+    "injected": frozenset({"todos", "context"}),
+    "todos-only": frozenset({"todos"}),
+    "control": frozenset(),
+}
+
 # Request 2 is the one after the first todo change, mid-loop.
 SCENARIOS: Dict[str, Dict[str, Any]] = {
     "worker-tool-loop": {"kind": "worker"},
@@ -1356,7 +1373,7 @@ async def run_scenario(
     name: str,
     family: Family,
     *,
-    injections: bool,
+    sources: frozenset,
     workdir: Path,
     monkeypatch: Any,
 ) -> Tuple[List[Captured], frozenset]:
@@ -1364,12 +1381,12 @@ async def run_scenario(
     spec = dict(SCENARIOS[name])
     if spec.pop("kind") == "session":
         requests = await run_session_scenario(
-            family, injections=injections, monkeypatch=monkeypatch
+            family, sources=sources, monkeypatch=monkeypatch
         )
         return requests, frozenset(SESSION_TURN_ENDS)
     requests = await run_worker_scenario(
         family,
-        injections=injections,
+        sources=sources,
         workdir=workdir,
         monkeypatch=monkeypatch,
         **spec,

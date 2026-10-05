@@ -7,7 +7,11 @@ making it appear as if the agent already read certain files. This approach:
 2. Ensures injected content isn't included in summarization (re-injected fresh each turn)
 
 Handles injection of:
-- Todo lists (as transient HumanMessage)
+- Todo lists (as transient HumanMessage) — no longer produced: the worker's
+  todo list lives in the history (todo tool results, phase-start messages,
+  the post-compaction restatement; append-only context injection D17-D19).
+  ``create_todos_human_message`` and ``TODOS_INJECTION_CONTENT_PREFIX`` stay
+  so ``is_workspace_injection_message`` still recognises legacy rows
 - Phase instruction blocks delivered once at a concrete phase start — NOT
   transient: ``create_phase_instruction_message`` builds a persistent,
   protected HumanMessage (see src/shared/runtime/core/message_markers.py) that the graph
@@ -50,7 +54,7 @@ def content_hash_id(content: str) -> str:
 def find_tail_injection_anchor(messages: List[BaseMessage]) -> int:
     """Index at which to insert the transient injection block, at the tail.
 
-    Transient injections (todos, memory, knowledge, citation feedback,
+    Transient injections (memory, knowledge, citation feedback, guidance,
     instruction files) are placed AFTER the conversation, not before it:
     provider prompt caches match on a strict left-to-right prefix, so a
     block that changes every turn must sit below the stable history or it
@@ -75,14 +79,13 @@ def find_tail_injection_anchor(messages: List[BaseMessage]) -> int:
 
 
 def create_todos_human_message(todos_content: str) -> HumanMessage:
-    """Create a transient HumanMessage for todo list injection.
+    """Create the legacy transient ``<active_tasks>`` todo HumanMessage.
 
-    The message is placed at the very end of the request payload — after
-    the conversation and the other transient injections. The todo list is
-    the agent's current "query", and models weight the end of the prompt
-    highest (see Anthropic's long-context guidance: query at the end).
-    It gives the agent an up-to-date view of all todos (including
-    completed items) every turn.
+    Legacy: the worker graph no longer produces it. It used to be rebuilt at
+    the very end of every request, which rewrote the previous request's tail
+    and defeated prefix prompt caches (append-only context injection, D17).
+    Kept so tests and legacy rows keep one definition of the shape that
+    ``is_workspace_injection_message`` recognises.
 
     Args:
         todos_content: Formatted todo list from TodoManager.format_for_injection()
