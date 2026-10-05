@@ -47,6 +47,7 @@ from agent.api.orchestrator_client import (
 )
 from agent.api.session_contract import canonical_session_identity_fingerprint
 from agent.api.session_http import register_session_http_routes
+from agent.api.native_workspace_first_use import register_native_first_use_route
 from agent.api.session_websocket import register_session_websocket_routes
 from agent.agent import UniversalAgent
 from shared.runtime.core.loader import resolve_config_path
@@ -1202,6 +1203,9 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         version="2.0.0",
         lifespan=lifespan,
     )
+    import agent.api.persistent_app as pa
+
+    register_native_first_use_route(app, pa.native_first_use_context)
 
     # ===================================================================
     # Health endpoints
@@ -1279,6 +1283,8 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             }
             if _pinned_session_recipient_capable():
                 capabilities["pinned_session_recipient_binding"] = True
+            if pa._native_first_use_capable():
+                capabilities["native_workspace_first_use1"] = True
             return ReadyResponse(
                 ready=session_ready,
                 message="Session ready" if session_ready else "Session initializing",

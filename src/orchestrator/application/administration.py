@@ -18,6 +18,7 @@ from orchestrator.application import (
     controls as controls_composition,
     preparation as preparation_composition,
     projects as projects_composition,
+    sessions as sessions_composition,
 )
 from orchestrator.application.resources import ApplicationResources, bound
 from orchestrator.routers import (
@@ -330,6 +331,7 @@ def ssh_access_dependencies(
         user_can_access_ide_entity=access.user_can_access_ide_entity,
         vm_access_store=VMIdleAccessStore(resources.postgres_db),
         vm_provisioner=vm_provisioner_module.vm_provisioner,
+        native_mutation_dependencies=sessions_composition.pinned_session_mutation_target_dependencies(resources),
     )
 
 

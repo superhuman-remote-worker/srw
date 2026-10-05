@@ -62,6 +62,8 @@ def _live_payload(**overrides):
         "pod_port": 30022,
         "host_key_fingerprint": "SHA256:xyz",
         "state": "live",
+        "execution_lane": "stateless",
+        "no_boot_watchdog": True,
     }
     payload.update(overrides)
     return payload
@@ -111,6 +113,7 @@ async def test_live_target_is_returned(monkeypatch):
 
     assert isinstance(target, SshTarget)
     assert target.pod_port == 30022
+    assert target.execution_lane == "stateless"
 
     # Review 4.3: these used to be assertions *inside* the fake, which
     # resolve_target calls inside its own `except Exception` -- a failure
@@ -143,6 +146,19 @@ async def test_orchestrator_request_timeout_is_configurable(monkeypatch):
         _config(orchestrator_request_timeout=2.5), "s-7f3a91c2", "SHA256:abc"
     )
     assert calls == [2.5]
+
+
+@pytest.mark.asyncio
+async def test_legacy_live_target_cannot_be_mistaken_for_stateless(monkeypatch):
+    async def _get(*_args, **_kwargs):
+        return FakeResponse(200, _live_payload(execution_lane=None, no_boot_watchdog=None))
+
+    import orchestrator.services.ssh_gateway_client as mod
+
+    monkeypatch.setattr(mod, "_http_get", _get)
+    with pytest.raises(TargetUnavailable) as exc:
+        await resolve_target(_config(), "s-7f3a91c2", "SHA256:abc")
+    assert exc.value.state == "stale_binding"
 
 
 @pytest.mark.asyncio

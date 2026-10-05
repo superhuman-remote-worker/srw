@@ -57,7 +57,16 @@ async def test_verified_key_vm_shell_and_sftp_renew_then_close(tmp_path, monkeyp
             pod_ip="127.0.0.1", pod_port=guest_port,
             host_key_fingerprint=guest_pin, state="live", backend="vm",
             lease_id=str(uuid4()), binding="a" * 64,
+            execution_lane="pinned",
+            native_recipient={
+                "thread_id": str(uuid4()), "runtime_generation": str(uuid4()),
+                "agent_id": str(uuid4()), "pod_uid": str(uuid4()),
+                "process_generation": str(uuid4()),
+                "session_identity_fingerprint": "sha256:" + "b" * 64,
+                "workspace_digest": "sha256:" + "a" * 64,
+            },
         )
+        target.native_recipient["thread_id"] = target.thread_id
 
         async def resolver(*_):
             raise TargetUnavailable("vm_unsupported")
@@ -77,10 +86,17 @@ async def test_verified_key_vm_shell_and_sftp_renew_then_close(tmp_path, monkeyp
             calls.append("close")
             return True
 
+        async def native_first_use(target_arg, **kwargs):
+            assert target_arg is target
+            assert kwargs["still_live"]()
+            calls.append("native")
+            return True
+
         gateway = await asyncssh.create_server(
             lambda: GatewaySSHServer(_context(
                 ca=object(), limiter=_limiter(), resolve=resolver,
                 vm_admit=admit, vm_renew=renew, vm_close=close,
+                native_first_use=native_first_use,
             ), "127.0.0.1"),
             "127.0.0.1", 0,
             server_host_keys=[asyncssh.generate_private_key("ssh-ed25519")],

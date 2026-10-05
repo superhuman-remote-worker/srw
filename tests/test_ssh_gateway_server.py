@@ -90,6 +90,8 @@ def _target(**overrides) -> SshTarget:
         pod_port=22,
         host_key_fingerprint="SHA256:host",
         state="live",
+        execution_lane="stateless",
+        no_boot_watchdog=True,
     )
     base.update(overrides)
     return SshTarget(**base)

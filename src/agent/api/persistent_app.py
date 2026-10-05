@@ -38,6 +38,7 @@ from agent.api import session_transport as _session_transport
 from agent.api._session_auth import SessionAuthBindings
 from agent.api.session_canvas_control import CanvasControlChannel
 from agent.api.session_termination import SessionTerminationCoordinator, SessionTerminationPorts
+from agent.api.native_workspace_first_use import configured_public_keys, register_native_first_use_route
 from agent.api import session_workspace as _session_workspace
 from agent.api.session_attach import (
     SessionAttachCoordinator,
@@ -2168,6 +2169,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         version="1.0.0",
         lifespan=lifespan,
     )
+    register_native_first_use_route(app, native_first_use_context)
 
     # --- Health endpoints (same pattern as worker) ---
 
@@ -2257,6 +2259,8 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         }
         if _pinned_session_recipient_capable():
             capabilities["pinned_session_recipient_binding"] = True
+        if _native_first_use_capable():
+            capabilities["native_workspace_first_use1"] = True
         return JSONResponse(
             {
                 "ready": is_ready,
@@ -3858,6 +3862,30 @@ def _pinned_session_recipient_capable() -> bool:
         and str(
             getattr(_orchestrator_client, "dispatch_process_generation", None) or ""
         ).strip()
+    )
+
+
+def native_first_use_context() -> dict[str, Any]:
+    """Call-time exact pinned authority for dedicated and dual Session apps."""
+
+    return {
+        "session": _session,
+        "identity": _session_identity,
+        "termination": _session_termination,
+        "agent_id": _registered_pinned_agent_id(),
+        "pod_uid": environment_pod_uid(),
+        "process_generation": getattr(_orchestrator_client, "dispatch_process_generation", None),
+        "public_keys": configured_public_keys(),
+    }
+
+
+def _native_first_use_capable() -> bool:
+    return bool(
+        _pinned_session_recipient_capable()
+        and environment_pod_uid()
+        and configured_public_keys()
+        and not _stateless_mode()
+        and _officer_cfg() is None
     )
 
 
