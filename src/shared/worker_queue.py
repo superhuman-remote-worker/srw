@@ -492,7 +492,11 @@ async def get_worker_attempt_disposition(
 
 
 async def record_worker_bundle_authorized(
-    conn: Any, *, job_id: UUID | str, lease_token: int, authority_digest: str,
+    conn: Any,
+    *,
+    job_id: UUID | str,
+    lease_token: int,
+    authority_digest: str,
     vm_mode: str | None = None,
     vm_binding_required: bool | None = None,
 ) -> bool:
@@ -515,11 +519,15 @@ async def record_worker_bundle_authorized(
                     "authority_digest=$3 WHERE job_id=$1 AND lease_token=$2 "
                     "AND bundle_authorized_at IS NULL AND authority_digest IS NULL "
                     "AND refunded_at IS NULL AND recovery_id IS NULL RETURNING 1",
-                    _uuid(job_id), lease_token, authority_digest,
-                ) is not None
+                    _uuid(job_id),
+                    lease_token,
+                    authority_digest,
+                )
+                is not None
             )
         job = await conn.fetchrow(
-            "SELECT * FROM jobs WHERE id=$1 FOR SHARE", _uuid(job_id),
+            "SELECT * FROM jobs WHERE id=$1 FOR SHARE",
+            _uuid(job_id),
         )
         if job is None:
             return False
@@ -527,7 +535,9 @@ async def record_worker_bundle_authorized(
         # workers, including pre-contract legacy sandbox children. Only an
         # own root VM Job needs the new retained generation binding.
         try:
-            configured_backend = configured_workspace_backend(job.get("config_override"))
+            configured_backend = configured_workspace_backend(
+                job.get("config_override")
+            )
         except WorkspaceContractError:
             return False
         contract = _json_object(_json_object(job["context"]).get("_workspace_contract"))
@@ -543,15 +553,21 @@ async def record_worker_bundle_authorized(
             except WorkspaceContractError:
                 return False
             current_digest = workspace_runtime_authority_digest(
-                job, vm_mode=vm_mode or vm_mode_from_env(),
+                job,
+                vm_mode=vm_mode or vm_mode_from_env(),
             )
             vm = _json_object(_json_object(job["context"]).get("vm"))
-            if current_digest is None or current_digest != authority_digest or not (
-                vm.get("status") == "ready"
-                and vm.get("identity_authenticated") is True
-                and vm.get("identity_provision_generation") == vm.get("provision_generation")
-                and vm.get("vm_uid")
-                and vm.get("rootdisk_pvc_uid")
+            if (
+                current_digest is None
+                or current_digest != authority_digest
+                or not (
+                    vm.get("status") == "ready"
+                    and vm.get("identity_authenticated") is True
+                    and vm.get("identity_provision_generation")
+                    == vm.get("provision_generation")
+                    and vm.get("vm_uid")
+                    and vm.get("rootdisk_pvc_uid")
+                )
             ):
                 return False
             source = await conn.fetchrow(
@@ -560,8 +576,10 @@ async def record_worker_bundle_authorized(
                 "AND provision_generation=$2 AND state='succeeded' "
                 "AND observed_vm_uid=$3 AND observed_pvc_uid=$4 "
                 "AND creation_admission_id IS NOT NULL FOR SHARE",
-                _uuid(job_id), _uuid(vm["provision_generation"]),
-                _uuid(vm["vm_uid"]), _uuid(vm["rootdisk_pvc_uid"]),
+                _uuid(job_id),
+                _uuid(vm["provision_generation"]),
+                _uuid(vm["vm_uid"]),
+                _uuid(vm["rootdisk_pvc_uid"]),
             )
             if source is None:
                 return False
@@ -569,9 +587,13 @@ async def record_worker_bundle_authorized(
                 "INSERT INTO vm_job_worker_delivery_bindings "
                 "(job_id,lease_token,request_id,provision_generation,vm_uid,pvc_uid,"
                 "authority_digest) VALUES($1,$2,$3,$4,$5,$6,$7)",
-                _uuid(job_id), lease_token, source["request_id"],
-                source["provision_generation"], source["observed_vm_uid"],
-                source["observed_pvc_uid"], authority_digest,
+                _uuid(job_id),
+                lease_token,
+                source["request_id"],
+                source["provision_generation"],
+                source["observed_vm_uid"],
+                source["observed_pvc_uid"],
+                authority_digest,
             )
         return (
             await conn.fetchval(
@@ -1013,7 +1035,8 @@ async def claim_worker_batch(
             if (
                 job is not None
                 and (
-                    os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower() == "true"
+                    os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower()
+                    == "true"
                     or vm_context.get("_suspend_remote_io_closed")
                     or vm_context.get("idle_wake_operation_id")
                 )
@@ -1032,7 +1055,8 @@ async def claim_worker_batch(
                 await conn.fetchrow(_CLOSE_WORKER_PREFLIGHT_SQL, unit.unit_id, True)
                 await conn.execute(
                     "UPDATE run_queue SET attempts_since_completion=attempts_since_completion-1 "
-                    "WHERE unit_id=$1", unit.unit_id,
+                    "WHERE unit_id=$1",
+                    unit.unit_id,
                 )
                 return None
             behind_operator_pause = job is not None and (
@@ -1282,7 +1306,9 @@ async def hold_failed_container_worker_report(
 
     async with _connection(db) as conn:
         return await hold_container_worker_attempt(
-            conn, job_id=unit_id, lease_token=lease_token,
+            conn,
+            job_id=unit_id,
+            lease_token=lease_token,
             reason="typed_report_unaccepted",
         )
 

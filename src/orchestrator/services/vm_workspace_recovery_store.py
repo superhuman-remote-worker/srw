@@ -627,7 +627,10 @@ async def _vm_cleanup_resource_scope(conn, recovery_store, permit):
     if not isinstance(proof, Mapping) or not isinstance(proof.get("intent"), Mapping):
         return None
     intent = proof["intent"]
-    if intent.get("owner_kind") not in {"job", "thread"} or intent.get("source") == "vm_idle_release":
+    if (
+        intent.get("owner_kind") not in {"job", "thread"}
+        or intent.get("source") == "vm_idle_release"
+    ):
         return None
     if (
         proof.get("admission_id") != str(permit.admission_id)
@@ -638,7 +641,9 @@ async def _vm_cleanup_resource_scope(conn, recovery_store, permit):
     if intent["owner_kind"] == "thread":
         if intent.get("source") != "pinned_thread_retirement":
             return None
-        from orchestrator.services.vm_resource_thread_cleanup import thread_cleanup_scope
+        from orchestrator.services.vm_resource_thread_cleanup import (
+            thread_cleanup_scope,
+        )
 
         return await thread_cleanup_scope(conn, recovery_store, permit, proof)
     try:
@@ -650,7 +655,8 @@ async def _vm_cleanup_resource_scope(conn, recovery_store, permit):
     preliminary = await conn.fetchrow(
         "SELECT request_id,controller_configuration FROM vm_creation_retries "
         "WHERE job_id=$1 AND provision_generation=$2",
-        owner_id, generation,
+        owner_id,
+        generation,
     )
     if preliminary is None:
         return None
@@ -658,12 +664,17 @@ async def _vm_cleanup_resource_scope(conn, recovery_store, permit):
     if not isinstance(configuration, dict) or configuration.get("version") != 3:
         return None
     from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
-    from orchestrator.services.vm_resource_job_runtime import installed_job_resource_store
+    from orchestrator.services.vm_resource_job_runtime import (
+        installed_job_resource_store,
+    )
 
     creation = VMCreationRetryStore(recovery_store.db)
     job = await creation._scope(
-        conn, owner_id, pvc_uid,
-        own_admission=permit.admission_id, hold_queue=False,
+        conn,
+        owner_id,
+        pvc_uid,
+        own_admission=permit.admission_id,
+        hold_queue=False,
     )
     retry = await conn.fetchrow(
         "SELECT * FROM vm_creation_retries WHERE request_id=$1 FOR UPDATE",
@@ -677,14 +688,18 @@ async def _vm_cleanup_resource_scope(conn, recovery_store, permit):
         raise ResourceAdmissionError("resource_cleanup_identity_unproven")
     charge = await conn.fetchrow(
         "SELECT state FROM vm_resource_reservations WHERE request_id=$1 "
-        "ORDER BY revision DESC LIMIT 1", retry["request_id"],
+        "ORDER BY revision DESC LIMIT 1",
+        retry["request_id"],
     )
     if charge is None:
         raise ResourceAdmissionError("resource_cleanup_charge_unproven")
     if charge["state"] == "released":
         return None
     resource = await installed_job_resource_store(
-        conn, recovery_store.db, retry["controller_configuration"], fresh=False,
+        conn,
+        recovery_store.db,
+        retry["controller_configuration"],
+        fresh=False,
     )
     if resource is None:
         raise ResourceAdmissionError("resource_cleanup_policy_unproven")
@@ -702,11 +717,17 @@ async def prepare_vm_cleanup_resource(recovery_store, permit, *, _conn=None):
             return None
         resource, retry, job, cleanup, intent = scope
         return await resource.mark_cleanup_teardown_on_conn(
-            _conn, retry=retry, job=job, cleanup=cleanup, intent=intent,
+            _conn,
+            retry=retry,
+            job=job,
+            cleanup=cleanup,
+            intent=intent,
         )
     async with recovery_store.db.acquire() as conn, conn.transaction():
         return await prepare_vm_cleanup_resource(
-            recovery_store, permit, _conn=conn,
+            recovery_store,
+            permit,
+            _conn=conn,
         )
 
 
@@ -774,8 +795,12 @@ async def complete_vm_cleanup_permit(
             raise ResourceAdmissionError("resource_cleanup_identity_unproven")
         resource, retry, job, cleanup, intent = scope
         await resource.release_cleanup_compute_on_conn(
-            conn, retry=retry, job=job, cleanup=cleanup,
-            intent=intent, proof=evidence,
+            conn,
+            retry=retry,
+            job=job,
+            cleanup=cleanup,
+            intent=intent,
+            proof=evidence,
         )
 
 
@@ -1742,7 +1767,8 @@ class VMWorkspaceRecoveryStore:
                     "AND owner_id=$1 AND release_kind='pinned_job' "
                     "AND closed_at IS NULL LIMIT 1",
                     owner_id,
-                ) is not None
+                )
+                is not None
             ):
                 return CleanupPermit(allowed=False, reason="pinned_job_idle_owned")
         if source != "vm_idle_release":
@@ -1751,32 +1777,53 @@ class VMWorkspaceRecoveryStore:
             # edit already in flight wins with a bounded hold, and a cleanup
             # permit that won first is seen by new IDE operation admission.
             if owner_kind == "job":
-                await conn.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner_id)
+                await conn.fetchrow(
+                    "SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner_id
+                )
             elif owner_kind == "thread":
-                await conn.fetchrow("SELECT id FROM threads WHERE id=$1 FOR UPDATE", owner_id)
+                await conn.fetchrow(
+                    "SELECT id FROM threads WHERE id=$1 FOR UPDATE", owner_id
+                )
             if await conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases "
                 "WHERE owner_kind=$1 AND owner_id=$2 AND closed_at IS NULL "
                 "AND expires_at>clock_timestamp())",
-                owner_kind, owner_id,
+                owner_kind,
+                owner_id,
             ):
                 wake_scope = None
-                if owner_kind == "job" and source == "controller_vm_create" and parent_id is None:
-                    from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
+                if (
+                    owner_kind == "job"
+                    and source == "controller_vm_create"
+                    and parent_id is None
+                ):
+                    from orchestrator.services.vm_creation_retry_store import (
+                        VMCreationRetryStore,
+                    )
 
-                    wake_scope = await VMCreationRetryStore(self.db).idle_wake_access_scope_on_conn(
-                        conn, owner_id=owner_id, pvc_uid=pvc_uid,
-                        reservation_request_id=request_id, intent_digest=intent_digest,
+                    wake_scope = await VMCreationRetryStore(
+                        self.db
+                    ).idle_wake_access_scope_on_conn(
+                        conn,
+                        owner_id=owner_id,
+                        pvc_uid=pvc_uid,
+                        reservation_request_id=request_id,
+                        intent_digest=intent_digest,
                     )
                 if wake_scope is None or await conn.fetchval(
                     "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases "
                     "WHERE owner_kind=$1 AND owner_id=$2 AND closed_at IS NULL "
                     "AND expires_at>clock_timestamp() AND (wake_id IS DISTINCT FROM $3 "
                     "OR provision_generation IS DISTINCT FROM $4 OR vm_uid IS DISTINCT FROM $5))",
-                    owner_kind, owner_id, wake_scope["wake_id"],
-                    wake_scope["provision_generation"], wake_scope["vm_uid"],
+                    owner_kind,
+                    owner_id,
+                    wake_scope["wake_id"],
+                    wake_scope["provision_generation"],
+                    wake_scope["vm_uid"],
                 ):
-                    return CleanupPermit(allowed=False, reason="active_workspace_access")
+                    return CleanupPermit(
+                        allowed=False, reason="active_workspace_access"
+                    )
         if (
             owner_kind == "job"
             and source in {"completion_workspace_teardown", "kept_disk"}
@@ -1787,8 +1834,10 @@ class VMWorkspaceRecoveryStore:
                 "SELECT 1 FROM vm_idle_operations WHERE owner_kind='job' "
                 "AND owner_id=$1 AND ($2::uuid IS NULL OR pvc_uid=$2) "
                 "AND storage_disposition='retention_unknown' LIMIT 1",
-                owner_id, pvc_uid,
-            ) is not None
+                owner_id,
+                pvc_uid,
+            )
+            is not None
         ):
             return CleanupPermit(allowed=False, reason="terminal_retention_unknown")
         if (
@@ -2061,7 +2110,10 @@ class VMWorkspaceRecoveryStore:
                 return True
 
     async def settle_never_issued_job_terminal(
-        self, job_id: str, *, provision_generation: str,
+        self,
+        job_id: str,
+        *,
+        provision_generation: str,
     ) -> UUID:
         """Settle one cancelled Job's exact never-issued VM parent and projection.
 
@@ -2071,7 +2123,8 @@ class VMWorkspaceRecoveryStore:
         """
         from types import SimpleNamespace
         from orchestrator.services.vm_creation_preflight import (
-            _execution_binding, _preflight,
+            _execution_binding,
+            _preflight,
         )
         from shared.vm_creation_retry import canonical_request_digest
         from shared.vm_creation_issuance import canonical_configuration_digest
@@ -2082,36 +2135,47 @@ class VMWorkspaceRecoveryStore:
             if str(owner_id) != job_id or str(generation) != provision_generation:
                 raise ValueError
         except (TypeError, ValueError, AttributeError):
-            raise ResourceAdmissionError("job_vm_never_issued_source_unproven") from None
+            raise ResourceAdmissionError(
+                "job_vm_never_issued_source_unproven"
+            ) from None
         _, _, request_id, digest, _ = vm_cleanup_request_identity(
-            owner_kind="job", owner_id=owner_id,
+            owner_kind="job",
+            owner_id=owner_id,
             identity=SimpleNamespace(
                 provision_generation=str(generation),
-                vm_uid=None, rootdisk_pvc_uid=None,
+                vm_uid=None,
+                rootdisk_pvc_uid=None,
             ),
-            source="job_terminal_vm_release", purge_disk=True,
+            source="job_terminal_vm_release",
+            purge_disk=True,
         )
         async with self.db.acquire() as conn, conn.transaction():
             # The established recovery admission takes owner advisory/row
             # locks before the parent, then retry and waiter locks follow.
             permit = await self.acquire_cleanup_permit_on_conn(
-                conn, owner_kind="job", owner_id=owner_id, pvc_uid=None,
-                request_id=request_id, source="job_terminal_vm_release",
+                conn,
+                owner_kind="job",
+                owner_id=owner_id,
+                pvc_uid=None,
+                request_id=request_id,
+                source="job_terminal_vm_release",
                 intent_digest=digest,
             )
             if not permit.allowed or permit.admission_id is None:
                 raise ResourceAdmissionError("job_vm_never_issued_parent_unproven")
             parent = await conn.fetchrow(
-                "SELECT * FROM vm_workspace_cleanup_admissions "
-                "WHERE id=$1 FOR UPDATE", permit.admission_id,
+                "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
+                permit.admission_id,
             )
             job = await conn.fetchrow(
-                "SELECT * FROM jobs WHERE id=$1 FOR UPDATE", owner_id,
+                "SELECT * FROM jobs WHERE id=$1 FOR UPDATE",
+                owner_id,
             )
             retry = await conn.fetchrow(
                 "SELECT * FROM vm_creation_retries WHERE owner_kind='job' "
                 "AND job_id=$1 AND provision_generation=$2 FOR UPDATE",
-                owner_id, generation,
+                owner_id,
+                generation,
             )
             if retry is None:
                 raise ResourceAdmissionError("job_vm_never_issued_source_unproven")
@@ -2121,14 +2185,16 @@ class VMWorkspaceRecoveryStore:
             )
             queue = await conn.fetchrow(
                 "SELECT state FROM run_queue WHERE unit_id=$1 "
-                "AND unit_kind='worker_batch'", owner_id,
+                "AND unit_kind='worker_batch'",
+                owner_id,
             )
             execution = await conn.fetchrow(
                 "SELECT *, CASE WHEN resolved->'spec'->>'timeoutSeconds' IS NULL "
                 "THEN NULL ELSE created_at+((resolved->'spec'->>'timeoutSeconds')::double precision "
                 "* interval '1 second') END AS deadline "
                 "FROM srw_execution_specs WHERE work_kind='Job' AND work_id=$1 "
-                "FOR SHARE", owner_id,
+                "FOR SHARE",
+                owner_id,
             )
             # The source predicate below is about every generation. Block
             # mutations of existing child evidence while it is evaluated;
@@ -2136,17 +2202,20 @@ class VMWorkspaceRecoveryStore:
             # locked owner, including repository and execution writers.
             await conn.fetch(
                 "SELECT lease_token FROM worker_batch_attempts WHERE job_id=$1 "
-                "ORDER BY lease_token FOR SHARE", owner_id,
+                "ORDER BY lease_token FOR SHARE",
+                owner_id,
             )
             await conn.fetch(
                 "SELECT id FROM managed_repository_creation_intents "
                 "WHERE authority_kind='job' AND authority_id=$1 "
-                "ORDER BY id FOR SHARE", owner_id,
+                "ORDER BY id FOR SHARE",
+                owner_id,
             )
             await conn.fetch(
                 "SELECT id FROM managed_repository_authorities "
                 "WHERE authority_kind='job' AND authority_id=$1 "
-                "ORDER BY id FOR SHARE", owner_id,
+                "ORDER BY id FOR SHARE",
+                owner_id,
             )
             for table in (
                 "managed_repository_process_zero_receipts",
@@ -2155,24 +2224,28 @@ class VMWorkspaceRecoveryStore:
             ):
                 await conn.fetch(
                     f"SELECT id FROM {table} WHERE owner_kind='job' AND owner_id=$1 "
-                    "ORDER BY id FOR SHARE", owner_id,
+                    "ORDER BY id FOR SHARE",
+                    owner_id,
                 )
             await conn.fetch(
                 "SELECT a.execution_id,a.attempt FROM srw_execution_attempts a "
                 "JOIN srw_execution_specs x ON x.id=a.execution_id "
                 "WHERE x.work_kind='Job' AND x.work_id=$1 "
-                "ORDER BY a.execution_id,a.attempt FOR SHARE OF a", owner_id,
+                "ORDER BY a.execution_id,a.attempt FOR SHARE OF a",
+                owner_id,
             )
             await conn.fetch(
                 "SELECT b.execution_id,b.instance_id FROM srw_execution_workspace_bindings b "
                 "JOIN srw_execution_specs x ON x.id=b.execution_id "
                 "WHERE x.work_kind='Job' AND x.work_id=$1 "
-                "ORDER BY b.execution_id,b.instance_id FOR SHARE OF b", owner_id,
+                "ORDER BY b.execution_id,b.instance_id FOR SHARE OF b",
+                owner_id,
             )
             await conn.fetch(
                 "SELECT id FROM srw_workspace_instances WHERE owner_id=$1 "
                 "OR execution_id IN (SELECT id FROM srw_execution_specs "
-                "WHERE work_kind='Job' AND work_id=$1) ORDER BY id FOR SHARE", owner_id,
+                "WHERE work_kind='Job' AND work_id=$1) ORDER BY id FOR SHARE",
+                owner_id,
             )
             context = _json(job["context"]) if job is not None else None
             vm = context.get("vm") if isinstance(context, dict) else None
@@ -2190,7 +2263,10 @@ class VMWorkspaceRecoveryStore:
                     and parent["parent_admission_id"] is None
                     and parent["request_id"] == request_id
                     and parent["intent_digest"] == digest
-                    and (parent["completed_at"] is None or parent["outcome"] == "completed")
+                    and (
+                        parent["completed_at"] is None
+                        or parent["outcome"] == "completed"
+                    )
                     and job["status"] == "cancelled"
                     and job["execution_lane"] == "stateless"
                     and job["parent_job_id"] is None
@@ -2201,10 +2277,14 @@ class VMWorkspaceRecoveryStore:
                     and vm.get("provision_generation") == str(generation)
                     and await conn.fetchval(
                         "SELECT public.job_vm_creation_never_issued_predecessors($1,$2)",
-                        owner_id, str(generation),
-                    ) is True
-                    and queue is not None and queue["state"] == "done"
-                    and preflight is not None and preflight.get("state") == "admitted"
+                        owner_id,
+                        str(generation),
+                    )
+                    is True
+                    and queue is not None
+                    and queue["state"] == "done"
+                    and preflight is not None
+                    and preflight.get("state") == "admitted"
                     and preflight["request_id"] == str(retry["request_id"])
                     and preflight.get("expected_pvc_uid") is None
                     and retry["expected_pvc_uid"] is None
@@ -2219,7 +2299,7 @@ class VMWorkspaceRecoveryStore:
                     and preflight_request.get("preparation") is None
                     and preflight_request.get("workspace_storage") is None
                     and canonical_request_digest(preflight_request)
-                        == preflight["request_digest"]
+                    == preflight["request_digest"]
                     and isinstance(captured, dict)
                     and captured.get("version") == 1
                     and captured.get("provision_generation") == str(generation)
@@ -2229,39 +2309,52 @@ class VMWorkspaceRecoveryStore:
                     and captured.get("request") == _json(retry["canonical_request"])
                     and captured.get("request_digest") == retry["request_digest"]
                     and captured.get("controller_configuration")
-                        == _json(retry["controller_configuration"])
+                    == _json(retry["controller_configuration"])
                     and captured.get("controller_configuration_digest")
-                        == retry["controller_configuration_digest"]
+                    == retry["controller_configuration_digest"]
                     and canonical_request_digest(_json(retry["canonical_request"]))
-                        == retry["request_digest"]
-                    and canonical_configuration_digest(_json(retry["controller_configuration"]))
-                        == retry["controller_configuration_digest"]
-                    and _execution_binding(preflight) == {
-                        key: retry[key] for key in (
-                            "execution_id", "execution_revision",
-                            "execution_generation", "admission_deadline",
+                    == retry["request_digest"]
+                    and canonical_configuration_digest(
+                        _json(retry["controller_configuration"])
+                    )
+                    == retry["controller_configuration_digest"]
+                    and _execution_binding(preflight)
+                    == {
+                        key: retry[key]
+                        for key in (
+                            "execution_id",
+                            "execution_revision",
+                            "execution_generation",
+                            "admission_deadline",
                         )
                     }
                     and execution is not None
                     and execution["harness_adapter"] == "srw/v1"
-                    and all(execution[key] == retry[other] for key, other in (
-                        ("id", "execution_id"),
-                        ("revision", "execution_revision"),
-                        ("generation", "execution_generation"),
-                        ("deadline", "admission_deadline"),
-                    ))
+                    and all(
+                        execution[key] == retry[other]
+                        for key, other in (
+                            ("id", "execution_id"),
+                            ("revision", "execution_revision"),
+                            ("generation", "execution_generation"),
+                            ("deadline", "admission_deadline"),
+                        )
+                    )
                     and waiter is not None
                     and waiter["request_id"] == retry["request_id"]
                     and waiter["state"] == "cancelled"
                     and waiter["reason"] == "job_cancelled"
                     and await conn.fetchval(
                         "SELECT public.job_vm_creation_never_issued_source($1,$2)",
-                        owner_id, str(generation),
-                    ) is True
+                        owner_id,
+                        str(generation),
+                    )
+                    is True
                     and not await conn.fetchval(
                         "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
                         "WHERE owner_kind='job' AND owner_id=$1 AND id<>$2 "
-                        "AND completed_at IS NULL)", owner_id, parent["id"],
+                        "AND completed_at IS NULL)",
+                        owner_id,
+                        parent["id"],
                     )
                 )
             except (KeyError, TypeError, ValueError, AttributeError):
@@ -2273,12 +2366,14 @@ class VMWorkspaceRecoveryStore:
             # revokes the key and creation intent, so those mutable ledgers
             # cannot serve as the settlement-time audit on their own.
             pair_raw = await conn.fetchval(
-                "SELECT public.job_vm_repository_pair_evidence($1)", owner_id,
+                "SELECT public.job_vm_repository_pair_evidence($1)",
+                owner_id,
             )
             pair = _json(pair_raw) if pair_raw is not None else None
             receipt = await conn.fetchrow(
                 "SELECT * FROM vm_job_repository_settlement_receipts "
-                "WHERE cleanup_admission_id=$1 FOR SHARE", parent["id"],
+                "WHERE cleanup_admission_id=$1 FOR SHARE",
+                parent["id"],
             )
             if receipt is None:
                 await conn.execute(
@@ -2288,7 +2383,10 @@ class VMWorkspaceRecoveryStore:
                     "project_id,forge_key_id,key_generation,intent_generation,"
                     "clean_repo_url) "
                     "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
-                    parent["id"], retry["request_id"], owner_id, generation,
+                    parent["id"],
+                    retry["request_id"],
+                    owner_id,
+                    generation,
                     (UUID(pair["authority_id"]) if pair else None),
                     (UUID(pair["creation_intent_id"]) if pair else None),
                     (pair["repository_owner"] if pair else None),
@@ -2303,13 +2401,19 @@ class VMWorkspaceRecoveryStore:
                 receipt["request_id"] != retry["request_id"]
                 or receipt["job_id"] != owner_id
                 or receipt["provision_generation"] != generation
-                or _json(await conn.fetchval(
-                    "SELECT public.vm_job_repository_receipt_pair(r) "
-                    "FROM vm_job_repository_settlement_receipts r "
-                    "WHERE cleanup_admission_id=$1", parent["id"],
-                )) != pair
+                or _json(
+                    await conn.fetchval(
+                        "SELECT public.vm_job_repository_receipt_pair(r) "
+                        "FROM vm_job_repository_settlement_receipts r "
+                        "WHERE cleanup_admission_id=$1",
+                        parent["id"],
+                    )
+                )
+                != pair
             ):
-                raise ResourceAdmissionError("job_vm_repository_settlement_receipt_changed")
+                raise ResourceAdmissionError(
+                    "job_vm_repository_settlement_receipt_changed"
+                )
             if parent["completed_at"] is None:
                 settled = await conn.execute(
                     "UPDATE vm_workspace_cleanup_admissions SET "
@@ -2318,7 +2422,10 @@ class VMWorkspaceRecoveryStore:
                     "AND source='job_terminal_vm_release' AND request_id=$3 "
                     "AND intent_digest=$4 AND pvc_uid IS NULL "
                     "AND parent_admission_id IS NULL AND completed_at IS NULL",
-                    parent["id"], owner_id, request_id, digest,
+                    parent["id"],
+                    owner_id,
+                    request_id,
+                    digest,
                 )
                 if settled != "UPDATE 1":
                     raise ResourceAdmissionError("job_vm_never_issued_parent_unproven")
@@ -2331,7 +2438,8 @@ class VMWorkspaceRecoveryStore:
                 "AND context->'vm'->>'provision_generation'=$2 "
                 "AND context->'vm'->>'status'='waiting_creation_configuration' "
                 "AND public.job_vm_creation_never_issued_terminal_source($1,$2)",
-                owner_id, str(generation),
+                owner_id,
+                str(generation),
             )
             if projected != "UPDATE 1":
                 raise ResourceAdmissionError("job_vm_never_issued_projection_unproven")
@@ -4221,17 +4329,22 @@ class VMWorkspaceRecoveryStore:
                     resource_retry = await conn.fetchrow(
                         "SELECT * FROM vm_creation_retries WHERE job_id=$1 "
                         "AND provision_generation=$2 FOR UPDATE",
-                        operation["owner_id"], operation["provision_generation"],
+                        operation["owner_id"],
+                        operation["provision_generation"],
                     )
                     resource = await installed_job_resource_store(
-                        conn, self.db,
+                        conn,
+                        self.db,
                         resource_retry["controller_configuration"]
-                        if resource_retry is not None else None,
+                        if resource_retry is not None
+                        else None,
                         fresh=False,
                     )
                     if resource is not None:
                         await resource.append_recovery_successor_on_conn(
-                            conn, retry=resource_retry, operation=operation,
+                            conn,
+                            retry=resource_retry,
+                            operation=operation,
                             final_observation=final,
                         )
                 slot_released = await conn.fetchval(

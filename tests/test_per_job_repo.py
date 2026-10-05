@@ -223,7 +223,9 @@ class TestDeleteJobGiteaCleanup:
         [("managed_repository_cleanup_required", 503), ("unrelated_check", 500)],
     )
     async def test_delete_maps_only_repository_containment_race_to_retryable(
-        self, constraint, expected_status,
+        self,
+        constraint,
+        expected_status,
     ):
         job = {
             "id": "12345678-1111-2222-3333-444444444444",

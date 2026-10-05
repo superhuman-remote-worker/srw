@@ -69,7 +69,9 @@ from tests.test_vm_resource_whole_store_real_postgres import (
 db = _db_fixture
 
 
-async def _bind_own_created_repository(db, job_id, *, key_generation=3, intent_generation=7):
+async def _bind_own_created_repository(
+    db, job_id, *, key_generation=3, intent_generation=7
+):
     """Install the same durable own pair that root provisioning binds before VM use."""
     repo_name = f"job-{str(job_id)[:8]}"
     remote = f"http://gitea:3000/srw/{repo_name}.git"
@@ -79,7 +81,9 @@ async def _bind_own_created_repository(db, job_id, *, key_generation=3, intent_g
             "(repository_owner,repo_name,authority_kind,authority_id,access_mode,"
             "generation,status,repository_created_at) "
             "VALUES('srw',$1,'job',$2,'write',$3,'created',now()) RETURNING id",
-            repo_name, job_id, intent_generation,
+            repo_name,
+            job_id,
+            intent_generation,
         )
         authority_id = await conn.fetchval(
             "INSERT INTO managed_repository_authorities "
@@ -88,30 +92,39 @@ async def _bind_own_created_repository(db, job_id, *, key_generation=3, intent_g
             "public_key_fingerprint,private_key_ciphertext,forge_key_id,status,activated_at) "
             "VALUES('srw',$1,'job',$2,'write',$3,$4,$5,'ssh-ed25519 test',"
             "'SHA256:test','v1:test',91,'active',now()) RETURNING id",
-            repo_name, job_id, intent_id, key_generation, remote,
+            repo_name,
+            job_id,
+            intent_id,
+            key_generation,
+            remote,
         )
     assert await db.bind_job_managed_repository(
-        str(job_id), repo_name=repo_name, clean_url=remote,
+        str(job_id),
+        repo_name=repo_name,
+        clean_url=remote,
     )
     return authority_id, intent_id
 
 
 @pytest.mark.asyncio
 async def test_own_created_repository_never_issued_cancel_settles_and_keeps_pair(
-    db, monkeypatch,
+    db,
+    monkeypatch,
 ):
     retry, recovery, _ = await never_issued_cancel(db, monkeypatch)
     owner = retry["job_id"]
     authority_id, intent_id = await _bind_own_created_repository(db, owner)
     archive, _ = actual_archive(db, recovery, monkeypatch)
     assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
-        str(owner), timeout_seconds=0,
+        str(owner),
+        timeout_seconds=0,
     )
     pair = await db.fetchrow(
         "SELECT a.id AS authority_id,a.generation AS key_generation,a.status AS key_status,"
         "i.id AS intent_id,i.generation AS intent_generation,i.status AS intent_status "
         "FROM managed_repository_authorities a JOIN managed_repository_creation_intents i "
-        "ON i.id=a.creation_intent_id WHERE a.authority_id=$1", owner,
+        "ON i.id=a.creation_intent_id WHERE a.authority_id=$1",
+        owner,
     )
     assert pair["authority_id"] == authority_id
     assert pair["intent_id"] == intent_id
@@ -121,7 +134,8 @@ async def test_own_created_repository_never_issued_cancel_settles_and_keeps_pair
 
 @pytest.mark.asyncio
 async def test_normal_repository_provisioning_cancel_resume_cancel_keeps_own_pair(
-    db, monkeypatch,
+    db,
+    monkeypatch,
 ):
     monkeypatch.setenv("APP_ENCRYPTION_KEY", "M" * 32)
     crypto.reset_cipher_cache()
@@ -140,34 +154,53 @@ async def test_normal_repository_provisioning_cancel_resume_cancel_keeps_own_pai
     )
     try:
         created_url, intent = await create_managed_repository(
-            db, gitea, repo_name=repo_name, authority_kind="job",
-            authority_id=str(owner), project_id=None, access_mode="write",
+            db,
+            gitea,
+            repo_name=repo_name,
+            authority_kind="job",
+            authority_id=str(owner),
+            project_id=None,
+            access_mode="write",
         )
         authority = await ensure_managed_repository_authority(
-            db, gitea, repo_name=repo_name, authority_kind="job",
-            authority_id=str(owner), access_mode="write",
+            db,
+            gitea,
+            repo_name=repo_name,
+            authority_kind="job",
+            authority_id=str(owner),
+            access_mode="write",
             creation_intent_id=str(intent["id"]),
         )
         assert created_url == remote and authority["status"] == "active"
         assert await db.bind_job_managed_repository(
-            str(owner), repo_name=repo_name, clean_url=remote,
+            str(owner),
+            repo_name=repo_name,
+            clean_url=remote,
         )
         assert await revoke_managed_repository_authority(db, gitea, repo_name)
         authority = await ensure_managed_repository_authority(
-            db, gitea, repo_name=repo_name, authority_kind="job",
-            authority_id=str(owner), access_mode="write",
+            db,
+            gitea,
+            repo_name=repo_name,
+            authority_kind="job",
+            authority_id=str(owner),
+            access_mode="write",
             creation_intent_id=str(intent["id"]),
         )
         assert authority["generation"] == 2
         assert intent["generation"] == 1
         archive, _ = actual_archive(db, recovery, monkeypatch)
-        assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
-            str(owner), timeout_seconds=0,
+        assert await controls(
+            store=db, archive=archive
+        ).wait_for_stateless_cancel_settle(
+            str(owner),
+            timeout_seconds=0,
         )
         receipt = await db.fetchrow(
             "SELECT * FROM vm_job_repository_settlement_receipts "
             "WHERE job_id=$1 AND provision_generation=$2",
-            owner, retry["provision_generation"],
+            owner,
+            retry["provision_generation"],
         )
         assert receipt["authority_id"] == authority["id"]
         assert receipt["creation_intent_id"] == intent["id"]
@@ -175,33 +208,49 @@ async def test_normal_repository_provisioning_cancel_resume_cancel_keeps_own_pai
         assert (receipt["repository_owner"], receipt["repo_name"]) == ("srw", repo_name)
         assert receipt["forge_key_id"] == 92 and receipt["project_id"] is None
         assert await db.queue_stateless_job_for_resume(
-            str(owner), expected_status="cancelled",
+            str(owner),
+            expected_status="cancelled",
         )
         policy, _, _, _ = await environment(db)
         second, recovery, _ = await normal_never_issued_generation(
-            db, monkeypatch, owner=owner, policy=policy,
+            db,
+            monkeypatch,
+            owner=owner,
+            policy=policy,
         )
         archive, _ = actual_archive(db, recovery, monkeypatch)
-        assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
-            str(owner), timeout_seconds=0,
+        assert await controls(
+            store=db, archive=archive
+        ).wait_for_stateless_cancel_settle(
+            str(owner),
+            timeout_seconds=0,
         )
         assert second["provision_generation"] != retry["provision_generation"]
-        assert await db.fetchval(
-            "SELECT count(*) FROM managed_repository_authorities WHERE id=$1 "
-            "AND status='active' AND creation_intent_id=$2",
-            authority["id"], intent["id"],
-        ) == 1
+        assert (
+            await db.fetchval(
+                "SELECT count(*) FROM managed_repository_authorities WHERE id=$1 "
+                "AND status='active' AND creation_intent_id=$2",
+                authority["id"],
+                intent["id"],
+            )
+            == 1
+        )
         assert await revoke_and_delete_managed_repository(db, gitea, repo_name)
         assert await db.prepare_stateless_job_for_delete(str(owner))
         assert await db.delete_job(str(owner), prepared_stateless=True)
-        assert await db.fetchval(
-            "SELECT count(*) FROM vm_job_creation_terminal_packets WHERE job_id=$1",
-            owner,
-        ) == 2
+        assert (
+            await db.fetchval(
+                "SELECT count(*) FROM vm_job_creation_terminal_packets WHERE job_id=$1",
+                owner,
+            )
+            == 2
+        )
         retained = await db.fetchrow(
             "SELECT authority_id,creation_intent_id,key_generation,intent_generation "
             "FROM vm_job_repository_settlement_receipts WHERE job_id=$1 "
-            "AND provision_generation=$2", owner, retry["provision_generation"],
+            "AND provision_generation=$2",
+            owner,
+            retry["provision_generation"],
         )
         assert tuple(retained) == (authority["id"], intent["id"], 2, 1)
         packet = await db.fetchval(
@@ -212,8 +261,10 @@ async def test_normal_repository_provisioning_cancel_resume_cancel_keeps_own_pai
             packet = json.loads(packet)
         assert packet["repository_pair"]["authority_id"] == str(authority["id"])
         assert packet["repository_pair"]["creation_intent_id"] == str(intent["id"])
-        assert (packet["repository_pair"]["key_generation"],
-                packet["repository_pair"]["intent_generation"]) == (2, 1)
+        assert (
+            packet["repository_pair"]["key_generation"],
+            packet["repository_pair"]["intent_generation"],
+        ) == (2, 1)
         assert packet["repository_pair"]["forge_key_id"] == 92
     finally:
         crypto.reset_cipher_cache()
@@ -221,27 +272,36 @@ async def test_normal_repository_provisioning_cancel_resume_cancel_keeps_own_pai
 
 @pytest.mark.asyncio
 async def test_final_delete_retains_never_issued_vm_source_and_terminal_receipt(
-    db, monkeypatch,
+    db,
+    monkeypatch,
 ):
     retry, recovery, _ = await never_issued_cancel(db, monkeypatch)
     owner = retry["job_id"]
     archive, _ = actual_archive(db, recovery, monkeypatch)
     assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
-        str(owner), timeout_seconds=0,
+        str(owner),
+        timeout_seconds=0,
     )
     assert await db.prepare_stateless_job_for_delete(str(owner))
     result = await db.delete_job(
-        str(owner), prepared_stateless=True,
-        deletion_reason="authorized_api_delete", return_claim_state=True,
+        str(owner),
+        prepared_stateless=True,
+        deletion_reason="authorized_api_delete",
+        return_claim_state=True,
     )
     assert result["deleted"] is True
     assert await db.fetchval("SELECT count(*) FROM jobs WHERE id=$1", owner) == 0
-    assert await db.fetchval(
-        "SELECT count(*) FROM vm_creation_retries WHERE job_id=$1", owner,
-    ) == 1
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_creation_retries WHERE job_id=$1",
+            owner,
+        )
+        == 1
+    )
     audit = await db.fetchrow(
         "SELECT live_job_id,deleted_at,deletion_receipt FROM vm_job_creation_owners "
-        "WHERE job_id=$1", owner,
+        "WHERE job_id=$1",
+        owner,
     )
     assert audit["live_job_id"] is None and audit["deleted_at"]
     packet = json.loads(audit["deletion_receipt"])
@@ -262,59 +322,77 @@ async def test_final_delete_retains_never_issued_vm_source_and_terminal_receipt(
             "INSERT INTO vm_workspace_cleanup_admissions "
             "(id,owner_kind,owner_id,source,request_id,intent_digest) "
             "VALUES($1,'job',$2,'late_cleanup',$3,'sha256:late')",
-            uuid4(), owner, uuid4(),
+            uuid4(),
+            owner,
+            uuid4(),
         )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("late_delivery", ["worker_bundle", "execution_attempt"])
 async def test_late_delivery_after_settlement_blocks_logical_final_delete(
-    db, monkeypatch, late_delivery,
+    db,
+    monkeypatch,
+    late_delivery,
 ):
     retry, recovery, _ = await never_issued_cancel(db, monkeypatch)
     owner = retry["job_id"]
     archive, _ = actual_archive(db, recovery, monkeypatch)
     assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
-        str(owner), timeout_seconds=0,
+        str(owner),
+        timeout_seconds=0,
     )
     if late_delivery == "worker_bundle":
         await db.execute(
             "INSERT INTO worker_batch_attempts(job_id,lease_token,claimed_attempt,"
             "bundle_authorized_at,authority_digest) "
-            "VALUES($1,992,1,now(),'sha256:late-delivery')", owner,
+            "VALUES($1,992,1,now(),'sha256:late-delivery')",
+            owner,
         )
     else:
         await db.execute(
             "INSERT INTO srw_execution_attempts(execution_id,attempt,pod_name,phase) "
-            "VALUES($1,1,'late-execution-pod','Running')", retry["execution_id"],
+            "VALUES($1,1,'late-execution-pod','Running')",
+            retry["execution_id"],
         )
     assert await db.prepare_stateless_job_for_delete(str(owner))
     with pytest.raises(JobVMAuditNotReady):
         await db.delete_job(str(owner), prepared_stateless=True)
     assert await db.fetchval("SELECT count(*) FROM jobs WHERE id=$1", owner) == 1
-    assert await db.fetchval(
-        "SELECT count(*) FROM vm_job_creation_terminal_packets WHERE job_id=$1",
-        owner,
-    ) == 0
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_job_creation_terminal_packets WHERE job_id=$1",
+            owner,
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("unattributed_delivery", [None, "worker_bundle", "execution_attempt"])
+@pytest.mark.parametrize(
+    "unattributed_delivery", [None, "worker_bundle", "execution_attempt"]
+)
 async def test_logical_cancel_then_charged_physical_successor_final_disposition(
-    db, monkeypatch, unattributed_delivery,
+    db,
+    monkeypatch,
+    unattributed_delivery,
 ):
     first, recovery, _ = await never_issued_cancel(db, monkeypatch)
     owner = first["job_id"]
     archive, _ = actual_archive(db, recovery, monkeypatch)
     assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
-        str(owner), timeout_seconds=0,
+        str(owner),
+        timeout_seconds=0,
     )
     assert await db.queue_stateless_job_for_resume(
-        str(owner), expected_status="cancelled",
+        str(owner),
+        expected_status="cancelled",
     )
 
     policy, inventory, _, _ = await environment(db)
-    monkeypatch.setenv("VM_RESOURCE_ADMISSION_CONFIG", json.dumps(policy.policy_document))
+    monkeypatch.setenv(
+        "VM_RESOURCE_ADMISSION_CONFIG", json.dumps(policy.policy_document)
+    )
     from vm_controller import controller as controller_settings
 
     monkeypatch.setattr(controller_settings, "VM_NAMESPACE", "workers")
@@ -328,7 +406,8 @@ async def test_logical_cancel_then_charged_physical_successor_final_disposition(
     resolver = controller()
     resolver.template_text = shipped_template()
     second = await preflight.complete_resolution(
-        claim, resolve_creation_configuration(resolver, claim["request"]),
+        claim,
+        resolve_creation_configuration(resolver, claim["request"]),
     )
     assert second["provision_generation"] != first["provision_generation"]
     admitted = await policy.admit(request_id=str(second["request_id"]))
@@ -341,7 +420,9 @@ async def test_logical_cancel_then_charged_physical_successor_final_disposition(
             "job_id": str(owner),
             "provision_generation": str(second["provision_generation"]),
             "request_digest": second["request_digest"],
-            "controller_configuration_digest": second["controller_configuration_digest"],
+            "controller_configuration_digest": second[
+                "controller_configuration_digest"
+            ],
             "expected_pvc_uid": None,
         },
     )
@@ -351,31 +432,45 @@ async def test_logical_cancel_then_charged_physical_successor_final_disposition(
         "UPDATE vm_creation_retries SET state='succeeded',revision=revision+1,"
         "observed_vm_uid=$2,observed_pvc_uid=$3,resolved_at=clock_timestamp(),"
         "claim_token=NULL,claim_expires_at=NULL WHERE request_id=$1",
-        second["request_id"], vm_uid, pvc_uid,
+        second["request_id"],
+        vm_uid,
+        pvc_uid,
     )
     await db.execute(
         "UPDATE vm_workspace_cleanup_admissions SET completed_at=clock_timestamp(),"
-        "outcome='adopted' WHERE id=$1", authorized["admission_id"],
+        "outcome='adopted' WHERE id=$1",
+        authorized["admission_id"],
     )
     await db.execute(
         "UPDATE vm_resource_reservations SET state='active',vm_uid=$2,"
         "vmi_uid=$3,launcher_uid=$4 WHERE id=$1",
-        UUID(admitted["reservation_id"]), vm_uid, vmi_uid, launcher_uid,
+        UUID(admitted["reservation_id"]),
+        vm_uid,
+        vmi_uid,
+        launcher_uid,
     )
     await db.execute(
         "UPDATE jobs SET context=jsonb_build_object('vm',$2::jsonb),"
         "config_override=jsonb_build_object('workspace',jsonb_build_object('backend','vm')) "
         "WHERE id=$1",
-        owner, json.dumps({
-            "provision_generation": str(second["provision_generation"]),
-            "vm_uid": str(vm_uid), "vmi_uid": str(vmi_uid),
-            "active_pod_uid": str(launcher_uid),
-            "rootdisk_pvc_uid": str(pvc_uid), "status": "ready",
-            "provisioner": "vm", "identity_authenticated": True,
-            "identity_provision_generation": str(second["provision_generation"]),
-            "ssh_ready_source": "provisioner_probe", "ssh_host": "10.42.0.91",
-            "ssh_port": 22, "ssh_host_key_fingerprint": "SHA256:test",
-        }),
+        owner,
+        json.dumps(
+            {
+                "provision_generation": str(second["provision_generation"]),
+                "vm_uid": str(vm_uid),
+                "vmi_uid": str(vmi_uid),
+                "active_pod_uid": str(launcher_uid),
+                "rootdisk_pvc_uid": str(pvc_uid),
+                "status": "ready",
+                "provisioner": "vm",
+                "identity_authenticated": True,
+                "identity_provision_generation": str(second["provision_generation"]),
+                "ssh_ready_source": "provisioner_probe",
+                "ssh_host": "10.42.0.91",
+                "ssh_port": 22,
+                "ssh_host_key_fingerprint": "SHA256:test",
+            }
+        ),
     )
     async with db.acquire() as conn:
         await enqueue_worker_batch(conn, job_id=owner)
@@ -386,56 +481,87 @@ async def test_logical_cancel_then_charged_physical_successor_final_disposition(
     assert digest is not None
     async with db.acquire() as conn:
         assert not await VMWorkspaceRecoveryStore(db).record_bundle_authorized(
-            conn, job_id=owner, lease_token=worker.lease_token,
+            conn,
+            job_id=owner,
+            lease_token=worker.lease_token,
             authority_digest="stale-runtime-digest",
         )
-    assert await db.fetchval(
-        "SELECT count(*) FROM vm_job_worker_delivery_bindings WHERE job_id=$1", owner,
-    ) == 0
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_job_worker_delivery_bindings WHERE job_id=$1",
+            owner,
+        )
+        == 0
+    )
     with pytest.raises(asyncpg.CheckViolationError):
         await db.execute(
             "INSERT INTO vm_job_worker_delivery_bindings "
             "(job_id,lease_token,request_id,provision_generation,vm_uid,pvc_uid,authority_digest) "
             "VALUES($1,$2,$3,$4,$5,$6,$7)",
-            owner, worker.lease_token, first["request_id"],
-            first["provision_generation"], vm_uid, pvc_uid, digest,
+            owner,
+            worker.lease_token,
+            first["request_id"],
+            first["provision_generation"],
+            vm_uid,
+            pvc_uid,
+            digest,
         )
     with pytest.raises(asyncpg.CheckViolationError):
         await db.execute(
             "INSERT INTO vm_job_worker_delivery_bindings "
             "(job_id,lease_token,request_id,provision_generation,vm_uid,pvc_uid,authority_digest) "
             "VALUES($1,$2,$3,$4,$5,$6,$7)",
-            owner, worker.lease_token, second["request_id"],
-            second["provision_generation"], vm_uid, uuid4(), digest,
+            owner,
+            worker.lease_token,
+            second["request_id"],
+            second["provision_generation"],
+            vm_uid,
+            uuid4(),
+            digest,
         )
     async with db.acquire() as conn:
         assert await VMWorkspaceRecoveryStore(db).record_bundle_authorized(
-            conn, job_id=owner, lease_token=worker.lease_token,
+            conn,
+            job_id=owner,
+            lease_token=worker.lease_token,
             authority_digest=digest,
         )
-        assert await complete_worker_batch(
-            conn, unit_id=owner, lease_token=worker.lease_token,
-            consumed_seq=worker.unit.input_seq,
-        ) is not None
+        assert (
+            await complete_worker_batch(
+                conn,
+                unit_id=owner,
+                lease_token=worker.lease_token,
+                consumed_seq=worker.unit.input_seq,
+            )
+            is not None
+        )
     await db.execute(
         "INSERT INTO managed_repository_process_zero_receipts "
         "(owner_kind,owner_id,scope,provisioner,runtime_incarnation) "
         "VALUES('job',$1,'vm','vm',$2)",
-        owner, str(second["provision_generation"]),
+        owner,
+        str(second["provision_generation"]),
     )
     identity = VMTeardownIdentity(
         provision_generation=str(second["provision_generation"]),
-        vm_uid=str(vm_uid), rootdisk_pvc_uid=str(pvc_uid),
+        vm_uid=str(vm_uid),
+        rootdisk_pvc_uid=str(pvc_uid),
     )
     proof = {
-        "version": 1, "kind": "vm_cleanup_physical_stop",
+        "version": 1,
+        "kind": "vm_cleanup_physical_stop",
         "job_id": str(owner),
         "provision_generation": str(second["provision_generation"]),
-        "vm_uid": str(vm_uid), "vmi_uid": str(vmi_uid),
-        "launcher_uid": str(launcher_uid), "pvc_uid": str(pvc_uid),
-        "vm_absent": True, "vmi_absent": True, "launcher_absent": True,
+        "vm_uid": str(vm_uid),
+        "vmi_uid": str(vmi_uid),
+        "launcher_uid": str(launcher_uid),
+        "pvc_uid": str(pvc_uid),
+        "vm_absent": True,
+        "vmi_absent": True,
+        "launcher_absent": True,
         "same_generation_replacement": False,
-        "pvc_disposition": "purged", "controller_authenticated": True,
+        "pvc_disposition": "purged",
+        "controller_authenticated": True,
     }
     provisioner = SimpleNamespace(
         lifecycle_available=True,
@@ -443,59 +569,74 @@ async def test_logical_cancel_then_charged_physical_successor_final_disposition(
         release_vm_captured=AsyncMock(return_value=VMTeardownResult("completed", True)),
         attest_vm_cleanup_stop=AsyncMock(return_value=proof),
     )
-    vm_controls = JobControlOperations(SimpleNamespace(
-        vm_provisioner=provisioner,
-        recovery_store=VMWorkspaceRecoveryStore(db),
-    ))
+    vm_controls = JobControlOperations(
+        SimpleNamespace(
+            vm_provisioner=provisioner,
+            recovery_store=VMWorkspaceRecoveryStore(db),
+        )
+    )
     assert (await vm_controls.delete_vm(str(owner)))["status"] == "deleting"
     await db.execute(
         "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',"
-        "'\"deleted\"'::jsonb,true) WHERE id=$1", owner,
+        "'\"deleted\"'::jsonb,true) WHERE id=$1",
+        owner,
     )
     assert (await db.cancel_stateless_job(str(owner)))[0]
     physical = await db.fetchval(
-        "SELECT vm_job_terminal_packet_evidence($1)", second["request_id"],
+        "SELECT vm_job_terminal_packet_evidence($1)",
+        second["request_id"],
     )
     assert physical is not None
     if isinstance(physical, str):
         physical = json.loads(physical)
     assert physical["kind"] == "physical_stop"
-    assert await db.fetchval(
-        "SELECT job_vm_creation_never_issued_terminal_source($1,$2)",
-        owner, str(first["provision_generation"]),
-    ) is True
+    assert (
+        await db.fetchval(
+            "SELECT job_vm_creation_never_issued_terminal_source($1,$2)",
+            owner,
+            str(first["provision_generation"]),
+        )
+        is True
+    )
     if unattributed_delivery == "worker_bundle":
         await db.execute(
             "INSERT INTO worker_batch_attempts(job_id,lease_token,claimed_attempt,"
             "bundle_authorized_at,authority_digest) "
-            "VALUES($1,993,1,now(),'sha256:unattributed')", owner,
+            "VALUES($1,993,1,now(),'sha256:unattributed')",
+            owner,
         )
     elif unattributed_delivery == "execution_attempt":
         await db.execute(
             "INSERT INTO srw_execution_attempts(execution_id,attempt,pod_name,phase) "
-            "VALUES($1,2,'unattributed-pod','Running')", second["execution_id"],
+            "VALUES($1,2,'unattributed-pod','Running')",
+            second["execution_id"],
         )
     assert await db.prepare_stateless_job_for_delete(str(owner))
     if unattributed_delivery is not None:
         with pytest.raises(JobVMAuditNotReady):
             await db.delete_job(str(owner), prepared_stateless=True)
         assert await db.fetchval("SELECT count(*) FROM jobs WHERE id=$1", owner) == 1
-        assert await db.fetchval(
-            "SELECT count(*) FROM vm_job_creation_terminal_packets WHERE job_id=$1",
-            owner,
-        ) == 0
+        assert (
+            await db.fetchval(
+                "SELECT count(*) FROM vm_job_creation_terminal_packets WHERE job_id=$1",
+                owner,
+            )
+            == 0
+        )
         return
     assert await db.delete_job(str(owner), prepared_stateless=True)
     packets = await db.fetch(
         "SELECT request_id,terminal_kind FROM vm_job_creation_terminal_packets "
-        "WHERE job_id=$1", owner,
+        "WHERE job_id=$1",
+        owner,
     )
     assert {row["request_id"]: row["terminal_kind"] for row in packets} == {
         first["request_id"]: "never_issued",
         second["request_id"]: "physical_stop",
     }
     owner_receipt = await db.fetchval(
-        "SELECT deletion_receipt FROM vm_job_creation_owners WHERE job_id=$1", owner,
+        "SELECT deletion_receipt FROM vm_job_creation_owners WHERE job_id=$1",
+        owner,
     )
     if isinstance(owner_receipt, str):
         owner_receipt = json.loads(owner_receipt)
@@ -506,12 +647,19 @@ async def test_logical_cancel_then_charged_physical_successor_final_disposition(
         and attempt["bundle_authorized_at"] is not None
         for attempt in owner_receipt["worker_attempts"]
     )
-    assert owner_receipt["worker_delivery_bindings"][0]["request_id"] == str(second["request_id"])
-    assert owner_receipt["worker_delivery_bindings"][0]["lease_token"] == worker.lease_token
+    assert owner_receipt["worker_delivery_bindings"][0]["request_id"] == str(
+        second["request_id"]
+    )
+    assert (
+        owner_receipt["worker_delivery_bindings"][0]["lease_token"]
+        == worker.lease_token
+    )
     with pytest.raises(asyncpg.CheckViolationError):
         await db.execute(
             "UPDATE vm_job_worker_delivery_bindings SET authority_digest='tampered' "
-            "WHERE job_id=$1 AND lease_token=$2", owner, worker.lease_token,
+            "WHERE job_id=$1 AND lease_token=$2",
+            owner,
+            worker.lease_token,
         )
     physical_packet = await db.fetchval(
         "SELECT evidence FROM vm_job_creation_terminal_packets WHERE request_id=$1",
@@ -524,7 +672,8 @@ async def test_logical_cancel_then_charged_physical_successor_final_disposition(
         await db.execute(
             "UPDATE managed_repository_process_zero_receipts "
             "SET runtime_incarnation=$2 WHERE id=$1",
-            UUID(physical_packet["process_zero_receipt_ids"][0]), str(uuid4()),
+            UUID(physical_packet["process_zero_receipt_ids"][0]),
+            str(uuid4()),
         )
     with pytest.raises(asyncpg.CheckViolationError):
         await db.execute(
@@ -539,77 +688,97 @@ async def test_retired_logical_cleanup_parent_cannot_be_reparented(db, monkeypat
     owner = retry["job_id"]
     archive, _ = actual_archive(db, recovery, monkeypatch)
     assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
-        str(owner), timeout_seconds=0,
+        str(owner),
+        timeout_seconds=0,
     )
     assert await db.prepare_stateless_job_for_delete(str(owner))
     assert await db.delete_job(str(owner), prepared_stateless=True)
     other = uuid4()
     await db.execute(
-        "INSERT INTO jobs(id,description,status) VALUES($1,'other','created')", other,
+        "INSERT INTO jobs(id,description,status) VALUES($1,'other','created')",
+        other,
     )
     parent_id = await db.fetchval(
         "SELECT cleanup_admission_id FROM vm_job_creation_terminal_packets "
-        "WHERE request_id=$1", retry["request_id"],
+        "WHERE request_id=$1",
+        retry["request_id"],
     )
     with pytest.raises(asyncpg.CheckViolationError):
         await db.execute(
             "UPDATE vm_workspace_cleanup_admissions SET owner_id=$2 WHERE id=$1",
-            parent_id, other,
+            parent_id,
+            other,
         )
-    assert await db.fetchval(
-        "SELECT owner_id FROM vm_workspace_cleanup_admissions WHERE id=$1", parent_id,
-    ) == owner
+    assert (
+        await db.fetchval(
+            "SELECT owner_id FROM vm_workspace_cleanup_admissions WHERE id=$1",
+            parent_id,
+        )
+        == owner
+    )
     with pytest.raises(asyncpg.CheckViolationError):
         await db.execute(
             "UPDATE vm_resource_waiters SET job_id=$2 WHERE request_id=$1",
-            retry["request_id"], other,
+            retry["request_id"],
+            other,
         )
     with pytest.raises(asyncpg.CheckViolationError):
         await db.execute(
             "UPDATE srw_execution_specs SET work_id=$2 WHERE id=$1",
-            retry["execution_id"], other,
+            retry["execution_id"],
+            other,
         )
 
 
 @pytest.mark.asyncio
 async def test_final_delete_rollback_keeps_live_audit_link_and_no_packets(
-    db, monkeypatch,
+    db,
+    monkeypatch,
 ):
     retry, recovery, _ = await never_issued_cancel(db, monkeypatch)
     owner = retry["job_id"]
     archive, _ = actual_archive(db, recovery, monkeypatch)
     assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
-        str(owner), timeout_seconds=0,
+        str(owner),
+        timeout_seconds=0,
     )
     child = uuid4()
     await db.execute(
         "INSERT INTO jobs(id,parent_job_id,description,status) "
-        "VALUES($1,$2,'blocking child','created')", child, owner,
+        "VALUES($1,$2,'blocking child','created')",
+        child,
+        owner,
     )
     assert await db.prepare_stateless_job_for_delete(str(owner))
     with pytest.raises(asyncpg.ForeignKeyViolationError):
         await db.delete_job(str(owner), prepared_stateless=True)
     audit = await db.fetchrow(
         "SELECT live_job_id,deleted_at,deletion_receipt FROM vm_job_creation_owners "
-        "WHERE job_id=$1", owner,
+        "WHERE job_id=$1",
+        owner,
     )
     assert audit["live_job_id"] == owner
     assert audit["deleted_at"] is None and audit["deletion_receipt"] is None
-    assert await db.fetchval(
-        "SELECT count(*) FROM vm_job_creation_terminal_packets WHERE job_id=$1",
-        owner,
-    ) == 0
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_job_creation_terminal_packets WHERE job_id=$1",
+            owner,
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio
 async def test_final_delete_serializes_losing_cleanup_writer_and_freezes_packet(
-    db, monkeypatch,
+    db,
+    monkeypatch,
 ):
     retry, recovery, _ = await never_issued_cancel(db, monkeypatch)
     owner = retry["job_id"]
     archive, _ = actual_archive(db, recovery, monkeypatch)
     assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
-        str(owner), timeout_seconds=0,
+        str(owner),
+        timeout_seconds=0,
     )
     assert await db.prepare_stateless_job_for_delete(str(owner))
 
@@ -637,7 +806,8 @@ async def test_final_delete_serializes_losing_cleanup_writer_and_freezes_packet(
                     if await db.fetchval(
                         "SELECT EXISTS(SELECT 1 FROM pg_locks "
                         "WHERE locktype='advisory' AND objid=$1 "
-                        "AND granted=false)", barrier_key,
+                        "AND granted=false)",
+                        barrier_key,
                     ):
                         break
                     assert not delete_task.done()
@@ -646,16 +816,21 @@ async def test_final_delete_serializes_losing_cleanup_writer_and_freezes_packet(
                     pytest.fail("final Delete never reached the Job-row-held barrier")
                 async with db.acquire() as writer:
                     writer_pid = await writer.fetchval("SELECT pg_backend_pid()")
-                    writer_task = asyncio.create_task(writer.execute(
-                        "INSERT INTO vm_workspace_cleanup_admissions "
-                        "(id,owner_kind,owner_id,source,request_id,intent_digest) "
-                        "VALUES($1,'job',$2,'late_cleanup',$3,'sha256:late')",
-                        uuid4(), owner, uuid4(),
-                    ))
+                    writer_task = asyncio.create_task(
+                        writer.execute(
+                            "INSERT INTO vm_workspace_cleanup_admissions "
+                            "(id,owner_kind,owner_id,source,request_id,intent_digest) "
+                            "VALUES($1,'job',$2,'late_cleanup',$3,'sha256:late')",
+                            uuid4(),
+                            owner,
+                            uuid4(),
+                        )
+                    )
                     for _ in range(100):
                         if await db.fetchval(
                             "SELECT wait_event_type='Lock' FROM pg_stat_activity "
-                            "WHERE pid=$1", writer_pid,
+                            "WHERE pid=$1",
+                            writer_pid,
                         ):
                             break
                         assert not writer_task.done()
@@ -663,21 +838,28 @@ async def test_final_delete_serializes_losing_cleanup_writer_and_freezes_packet(
                     else:
                         pytest.fail("cleanup INSERT never waited on the locked Job")
                     await holder.execute(
-                        "SELECT pg_advisory_unlock($1::bigint)", barrier_key,
+                        "SELECT pg_advisory_unlock($1::bigint)",
+                        barrier_key,
                     )
                     assert await asyncio.wait_for(delete_task, timeout=5) is True
                     with pytest.raises(asyncpg.CheckViolationError):
                         await asyncio.wait_for(writer_task, timeout=5)
             finally:
-                await holder.execute("SELECT pg_advisory_unlock($1::bigint)", barrier_key)
+                await holder.execute(
+                    "SELECT pg_advisory_unlock($1::bigint)", barrier_key
+                )
     finally:
         await db.execute("DROP TRIGGER zz_m1_test_delete_barrier ON public.jobs")
         await db.execute("DROP FUNCTION public.m1_test_delete_barrier()")
     assert await db.fetchval("SELECT count(*) FROM jobs WHERE id=$1", owner) == 0
-    assert await db.fetchval(
-        "SELECT count(*) FROM vm_workspace_cleanup_admissions "
-        "WHERE owner_kind='job' AND owner_id=$1 AND source='late_cleanup'", owner,
-    ) == 0
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_workspace_cleanup_admissions "
+            "WHERE owner_kind='job' AND owner_id=$1 AND source='late_cleanup'",
+            owner,
+        )
+        == 0
+    )
     packet = await db.fetchval(
         "SELECT evidence FROM vm_job_creation_terminal_packets WHERE request_id=$1",
         retry["request_id"],
@@ -688,7 +870,8 @@ async def test_final_delete_serializes_losing_cleanup_writer_and_freezes_packet(
     with pytest.raises(asyncpg.CheckViolationError):
         await db.execute(
             "UPDATE vm_job_creation_terminal_packets "
-            "SET evidence='{}'::jsonb WHERE request_id=$1", retry["request_id"],
+            "SET evidence='{}'::jsonb WHERE request_id=$1",
+            retry["request_id"],
         )
     after = await db.fetchval(
         "SELECT evidence FROM vm_job_creation_terminal_packets WHERE request_id=$1",
@@ -699,13 +882,15 @@ async def test_final_delete_serializes_losing_cleanup_writer_and_freezes_packet(
 
 @pytest.mark.asyncio
 async def test_repository_writer_wins_job_lock_then_final_delete_holds(
-    db, monkeypatch,
+    db,
+    monkeypatch,
 ):
     retry, recovery, _ = await never_issued_cancel(db, monkeypatch)
     owner = retry["job_id"]
     archive, _ = actual_archive(db, recovery, monkeypatch)
     assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
-        str(owner), timeout_seconds=0,
+        str(owner),
+        timeout_seconds=0,
     )
     assert await db.prepare_stateless_job_for_delete(str(owner))
     repo_name = f"job-{str(owner)[:8]}"
@@ -715,7 +900,8 @@ async def test_repository_writer_wins_job_lock_then_final_delete_holds(
             "(repository_owner,repo_name,authority_kind,authority_id,access_mode,"
             "generation,status,repository_created_at) "
             "VALUES('srw',$1,'job',$2,'write',1,'created',now())",
-            repo_name, owner,
+            repo_name,
+            owner,
         )
         delete_task = asyncio.create_task(
             db.delete_job(str(owner), prepared_stateless=True)
@@ -728,10 +914,13 @@ async def test_repository_writer_wins_job_lock_then_final_delete_holds(
     ):
         await asyncio.wait_for(delete_task, timeout=5)
     assert await db.fetchval("SELECT count(*) FROM jobs WHERE id=$1", owner) == 1
-    assert await db.fetchval(
-        "SELECT count(*) FROM vm_job_creation_terminal_packets WHERE job_id=$1",
-        owner,
-    ) == 0
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_job_creation_terminal_packets WHERE job_id=$1",
+            owner,
+        )
+        == 0
+    )
     audit = await db.fetchrow(
         "SELECT live_job_id,deleted_at FROM vm_job_creation_owners WHERE job_id=$1",
         owner,
@@ -740,9 +929,13 @@ async def test_repository_writer_wins_job_lock_then_final_delete_holds(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("contradiction", ["unpaired", "wrong_remote", "bundle_delivered"])
+@pytest.mark.parametrize(
+    "contradiction", ["unpaired", "wrong_remote", "bundle_delivered"]
+)
 async def test_repository_pair_needs_exact_undelivered_history(
-    db, monkeypatch, contradiction,
+    db,
+    monkeypatch,
+    contradiction,
 ):
     retry, recovery, _ = await never_issued_cancel(db, monkeypatch)
     owner = retry["job_id"]
@@ -750,23 +943,30 @@ async def test_repository_pair_needs_exact_undelivered_history(
     if contradiction == "unpaired":
         await db.execute(
             "UPDATE managed_repository_authorities SET creation_intent_id=NULL "
-            "WHERE id=$1", authority_id,
+            "WHERE id=$1",
+            authority_id,
         )
     elif contradiction == "wrong_remote":
         await db.execute(
             "UPDATE managed_repository_authorities SET clean_repo_url=$2 WHERE id=$1",
-            authority_id, "http://gitea:3000/srw/other.git",
+            authority_id,
+            "http://gitea:3000/srw/other.git",
         )
     else:
         await db.execute(
             "INSERT INTO worker_batch_attempts(job_id,lease_token,claimed_attempt,"
             "bundle_authorized_at,authority_digest) "
-            "VALUES($1,991,1,now(),'sha256:delivered')", owner,
+            "VALUES($1,991,1,now(),'sha256:delivered')",
+            owner,
         )
     archive, _ = actual_archive(db, recovery, monkeypatch)
-    assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
-        str(owner), timeout_seconds=0,
-    ) is False
+    assert (
+        await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
+            str(owner),
+            timeout_seconds=0,
+        )
+        is False
+    )
     assert await db.fetchval("SELECT count(*) FROM jobs WHERE id=$1", owner) == 1
 
 
