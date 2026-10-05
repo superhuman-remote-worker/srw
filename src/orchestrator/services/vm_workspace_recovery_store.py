@@ -2148,6 +2148,15 @@ class VMWorkspaceRecoveryStore:
                 "WHERE authority_kind='job' AND authority_id=$1 "
                 "ORDER BY id FOR SHARE", owner_id,
             )
+            for table in (
+                "managed_repository_process_zero_receipts",
+                "managed_repository_workspace_creation_reservations",
+                "managed_repository_workspace_cleanup_intents",
+            ):
+                await conn.fetch(
+                    f"SELECT id FROM {table} WHERE owner_kind='job' AND owner_id=$1 "
+                    "ORDER BY id FOR SHARE", owner_id,
+                )
             await conn.fetch(
                 "SELECT a.execution_id,a.attempt FROM srw_execution_attempts a "
                 "JOIN srw_execution_specs x ON x.id=a.execution_id "
@@ -2159,6 +2168,11 @@ class VMWorkspaceRecoveryStore:
                 "JOIN srw_execution_specs x ON x.id=b.execution_id "
                 "WHERE x.work_kind='Job' AND x.work_id=$1 "
                 "ORDER BY b.execution_id,b.instance_id FOR SHARE OF b", owner_id,
+            )
+            await conn.fetch(
+                "SELECT id FROM srw_workspace_instances WHERE owner_id=$1 "
+                "OR execution_id IN (SELECT id FROM srw_execution_specs "
+                "WHERE work_kind='Job' AND work_id=$1) ORDER BY id FOR SHARE", owner_id,
             )
             context = _json(job["context"]) if job is not None else None
             vm = context.get("vm") if isinstance(context, dict) else None
@@ -2254,6 +2268,48 @@ class VMWorkspaceRecoveryStore:
                 source_valid = False
             if not source_valid:
                 raise ResourceAdmissionError("job_vm_never_issued_source_unproven")
+            # Freeze the exact non-secret repository pair (or explicit absence)
+            # before completing this logical parent. Normal final Delete later
+            # revokes the key and creation intent, so those mutable ledgers
+            # cannot serve as the settlement-time audit on their own.
+            pair_raw = await conn.fetchval(
+                "SELECT public.job_vm_repository_pair_evidence($1)", owner_id,
+            )
+            pair = _json(pair_raw) if pair_raw is not None else None
+            receipt = await conn.fetchrow(
+                "SELECT * FROM vm_job_repository_settlement_receipts "
+                "WHERE cleanup_admission_id=$1 FOR SHARE", parent["id"],
+            )
+            if receipt is None:
+                await conn.execute(
+                    "INSERT INTO vm_job_repository_settlement_receipts "
+                    "(cleanup_admission_id,request_id,job_id,provision_generation,"
+                    "authority_id,creation_intent_id,repository_owner,repo_name,"
+                    "project_id,forge_key_id,key_generation,intent_generation,"
+                    "clean_repo_url) "
+                    "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+                    parent["id"], retry["request_id"], owner_id, generation,
+                    (UUID(pair["authority_id"]) if pair else None),
+                    (UUID(pair["creation_intent_id"]) if pair else None),
+                    (pair["repository_owner"] if pair else None),
+                    (pair["repo_name"] if pair else None),
+                    (UUID(pair["project_id"]) if pair and pair["project_id"] else None),
+                    (pair["forge_key_id"] if pair else None),
+                    (pair["key_generation"] if pair else None),
+                    (pair["intent_generation"] if pair else None),
+                    (pair["clean_repo_url"] if pair else None),
+                )
+            elif (
+                receipt["request_id"] != retry["request_id"]
+                or receipt["job_id"] != owner_id
+                or receipt["provision_generation"] != generation
+                or _json(await conn.fetchval(
+                    "SELECT public.vm_job_repository_receipt_pair(r) "
+                    "FROM vm_job_repository_settlement_receipts r "
+                    "WHERE cleanup_admission_id=$1", parent["id"],
+                )) != pair
+            ):
+                raise ResourceAdmissionError("job_vm_repository_settlement_receipt_changed")
             if parent["completed_at"] is None:
                 settled = await conn.execute(
                     "UPDATE vm_workspace_cleanup_admissions SET "

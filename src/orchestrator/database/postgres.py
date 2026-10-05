@@ -4665,6 +4665,19 @@ class PostgresDB:
             "SELECT id FROM vm_workspace_cleanup_admissions "
             "WHERE owner_kind='job' AND owner_id=$1 ORDER BY id FOR SHARE", job_id,
         )
+        await conn.fetch(
+            "SELECT cleanup_admission_id FROM vm_job_repository_settlement_receipts "
+            "WHERE job_id=$1 ORDER BY cleanup_admission_id FOR SHARE", job_id,
+        )
+        for table in (
+            "managed_repository_process_zero_receipts",
+            "managed_repository_workspace_creation_reservations",
+            "managed_repository_workspace_cleanup_intents",
+        ):
+            await conn.fetch(
+                f"SELECT id FROM {table} WHERE owner_kind='job' AND owner_id=$1 "
+                "ORDER BY id FOR SHARE", job_id,
+            )
         retries = await conn.fetch(
             "SELECT request_id,provision_generation FROM vm_creation_retries "
             "WHERE owner_kind='job' AND job_id=$1 ORDER BY request_id FOR SHARE",
@@ -4738,6 +4751,11 @@ class PostgresDB:
             "JOIN srw_execution_specs execution ON execution.id=binding.execution_id "
             "WHERE execution.work_kind='Job' AND execution.work_id=$1 "
             "ORDER BY instance.id FOR SHARE OF instance", job_id,
+        )
+        await conn.fetch(
+            "SELECT id FROM srw_workspace_instances WHERE owner_id=$1 "
+            "OR execution_id IN (SELECT id FROM srw_execution_specs "
+            "WHERE work_kind='Job' AND work_id=$1) ORDER BY id FOR SHARE", job_id,
         )
         packets: list[dict[str, Any]] = []
         for retry in retries:

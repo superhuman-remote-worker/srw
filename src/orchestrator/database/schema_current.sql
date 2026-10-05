@@ -9812,6 +9812,54 @@ $$;
 
 
 --
+-- Name: guard_vm_job_repository_settlement_receipt(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_repository_settlement_receipt() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE parent public.vm_workspace_cleanup_admissions%ROWTYPE;
+        source public.vm_creation_retries%ROWTYPE;
+BEGIN
+    IF TG_OP='UPDATE' OR TG_OP='DELETE' THEN
+        RAISE EXCEPTION 'Job VM repository settlement receipt is immutable'
+            USING ERRCODE='23514';
+    END IF;
+    -- Parent-first is the settlement lock order. Final Delete holds a SHARE
+    -- lock on the parent, compatible with this reader, before its Job DELETE.
+    SELECT * INTO parent FROM public.vm_workspace_cleanup_admissions
+        WHERE id=NEW.cleanup_admission_id FOR SHARE;
+    PERFORM 1 FROM public.jobs WHERE id=NEW.job_id FOR SHARE;
+    SELECT * INTO source FROM public.vm_creation_retries
+        WHERE request_id=NEW.request_id;
+    IF parent.id IS NULL OR parent.owner_kind<>'job'
+       OR parent.owner_id IS DISTINCT FROM NEW.job_id
+       OR parent.source<>'job_terminal_vm_release'
+       OR parent.parent_admission_id IS NOT NULL OR parent.pvc_uid IS NOT NULL
+       OR parent.request_id IS DISTINCT FROM public.uuid_generate_v5(
+           public.uuid_ns_url(),
+           'vm-workspace-cleanup:job_terminal_vm_release:job:' ||
+           NEW.job_id::text || ':' || NEW.provision_generation::text || ':None:')
+       OR parent.completed_at IS NOT NULL
+       OR source.request_id IS NULL OR source.owner_kind<>'job'
+       OR source.job_id IS DISTINCT FROM NEW.job_id
+       OR source.provision_generation IS DISTINCT FROM NEW.provision_generation
+       OR source.state<>'settled' OR source.resolved_at IS NULL
+       OR NOT EXISTS (SELECT 1 FROM public.vm_job_creation_owners o
+           WHERE o.job_id=NEW.job_id AND o.live_job_id=NEW.job_id
+             AND o.deleted_at IS NULL)
+       OR NOT public.job_vm_never_issued_repository_safe(NEW.job_id)
+       OR public.vm_job_repository_receipt_pair(NEW)
+          IS DISTINCT FROM public.job_vm_repository_pair_evidence(NEW.job_id) THEN
+        RAISE EXCEPTION 'Job VM repository settlement receipt lacks exact live source'
+            USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: guard_vm_job_retained_execution(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -9832,6 +9880,16 @@ BEGIN
         SELECT x.work_id INTO old_job FROM public.srw_execution_workspace_bindings b
           JOIN public.srw_execution_specs x ON x.id=b.execution_id
           WHERE b.instance_id=OLD.id AND x.work_kind='Job' LIMIT 1;
+        IF old_job IS NULL AND EXISTS (
+            SELECT 1 FROM public.vm_job_creation_owners WHERE job_id=OLD.owner_id
+        ) THEN
+            old_job := OLD.owner_id;
+        END IF;
+        IF TG_OP='UPDATE' AND EXISTS (
+            SELECT 1 FROM public.vm_job_creation_owners WHERE job_id=NEW.owner_id
+        ) THEN
+            new_job := NEW.owner_id;
+        END IF;
     ELSE
         old_execution := OLD.execution_id;
         IF TG_OP='UPDATE' THEN new_execution := NEW.execution_id; END IF;
@@ -9866,9 +9924,38 @@ CREATE FUNCTION public.guard_vm_job_retained_ledger() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 DECLARE candidate jsonb;
+        old_candidate jsonb;
         owned_job uuid;
+        old_owned_job uuid;
         source_request uuid;
 BEGIN
+    IF TG_OP='UPDATE' THEN
+        old_candidate := to_jsonb(OLD);
+        IF TG_TABLE_NAME='vm_workspace_cleanup_admissions' THEN
+            IF old_candidate->>'owner_kind'='job' THEN
+                old_owned_job := (old_candidate->>'owner_id')::uuid;
+            END IF;
+        ELSIF TG_TABLE_NAME='vm_resource_cleanup_stop_receipts' THEN
+            old_owned_job := (old_candidate->>'job_id')::uuid;
+        ELSIF TG_TABLE_NAME='vm_resource_recovery_successors' THEN
+            old_owned_job := (old_candidate->>'owner_id')::uuid;
+        ELSIF TG_TABLE_NAME='vm_creation_retries'
+           OR TG_TABLE_NAME='vm_resource_waiters' THEN
+            IF old_candidate->>'owner_kind'='job' THEN
+                old_owned_job := (old_candidate->>'job_id')::uuid;
+            END IF;
+        ELSE
+            SELECT r.job_id INTO old_owned_job FROM public.vm_creation_retries r
+            WHERE r.request_id=(old_candidate->>'request_id')::uuid
+              AND r.owner_kind='job';
+        END IF;
+        IF NEW IS DISTINCT FROM OLD AND old_owned_job IS NOT NULL
+           AND EXISTS (SELECT 1 FROM public.vm_job_creation_owners
+               WHERE job_id=old_owned_job AND live_job_id IS NULL) THEN
+            RAISE EXCEPTION 'retired Job VM evidence is immutable'
+                USING ERRCODE='23514';
+        END IF;
+    END IF;
     candidate := CASE WHEN TG_OP='DELETE' THEN to_jsonb(OLD) ELSE to_jsonb(NEW) END;
     IF TG_TABLE_NAME='vm_workspace_cleanup_admissions' THEN
         IF candidate->>'owner_kind'='job' THEN owned_job := (candidate->>'owner_id')::uuid; END IF;
@@ -11333,10 +11420,10 @@ $$;
 
 
 --
--- Name: job_vm_never_issued_repository_safe(uuid); Type: FUNCTION; Schema: public; Owner: -
+-- Name: job_vm_never_issued_history_safe(uuid); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION public.job_vm_never_issued_repository_safe(requested_job uuid) RETURNS boolean
+CREATE FUNCTION public.job_vm_never_issued_history_safe(requested_job uuid) RETURNS boolean
     LANGUAGE sql STABLE
     AS $$
     SELECT EXISTS (
@@ -11370,6 +11457,21 @@ CREATE FUNCTION public.job_vm_never_issued_repository_safe(requested_job uuid) R
                   OR r.creation_carrier_uid IS NOT NULL OR r.disposition_carrier_uid IS NOT NULL
                   OR COALESCE(r.canonical_request->'preparation','null'::jsonb) <> 'null'::jsonb
                   OR COALESCE(r.canonical_request->'workspace_storage','null'::jsonb) <> 'null'::jsonb))
+    );
+$$;
+
+
+--
+-- Name: job_vm_never_issued_repository_safe(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.job_vm_never_issued_repository_safe(requested_job uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.jobs j
+        WHERE j.id=requested_job
+          AND public.job_vm_never_issued_history_safe(j.id)
           AND (
               (j.repo_name IS NULL AND j.context->>'git_remote_url' IS NULL
                AND NOT EXISTS (SELECT 1 FROM public.managed_repository_authorities a
@@ -11378,37 +11480,53 @@ CREATE FUNCTION public.job_vm_never_issued_repository_safe(requested_job uuid) R
                AND NOT EXISTS (SELECT 1 FROM public.managed_repository_creation_intents i
                    WHERE i.authority_kind='job' AND i.authority_id=j.id
                      AND i.status<>'deleted'))
-              OR EXISTS (
-                  SELECT 1 FROM public.managed_repository_authorities a
-                  JOIN public.managed_repository_creation_intents i
-                    ON i.id=a.creation_intent_id
-                  WHERE a.authority_kind='job' AND a.authority_id=j.id
-                    AND i.authority_kind='job' AND i.authority_id=j.id
-                    AND a.status='active' AND i.status='created'
-                    AND a.forge_key_id>0 AND a.activated_at IS NOT NULL
-                    AND i.repository_created_at IS NOT NULL
-                    AND a.access_mode='write' AND i.access_mode='write'
-                    AND a.generation>0 AND i.generation>0
-                    AND a.repository_owner=i.repository_owner
-                    AND a.repo_name=i.repo_name
-                    AND a.project_id IS NOT DISTINCT FROM i.project_id
-                    AND a.project_id IS NOT DISTINCT FROM j.project_id
-                    AND a.repo_name=j.repo_name
-                    AND a.repo_name='job-' || left(j.id::text,8)
-                    AND a.clean_repo_url=j.context->>'git_remote_url'
-                    AND NOT public.managed_repository_url_has_userinfo(a.clean_repo_url)
-                    AND right(a.clean_repo_url,length('/' || a.repository_owner ||
-                        '/' || a.repo_name || '.git'))='/' || a.repository_owner ||
-                        '/' || a.repo_name || '.git'
-                    AND (SELECT count(*) FROM public.managed_repository_authorities other
-                         WHERE other.authority_kind='job' AND other.authority_id=j.id
-                           AND other.status IN ('provisioning','active','revoking'))=1
-                    AND (SELECT count(*) FROM public.managed_repository_creation_intents other
-                         WHERE other.authority_kind='job' AND other.authority_id=j.id
-                           AND other.status<>'deleted')=1
-              )
+              OR public.job_vm_repository_pair_evidence(j.id) IS NOT NULL
           )
     );
+$$;
+
+
+--
+-- Name: job_vm_repository_pair_evidence(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.job_vm_repository_pair_evidence(requested_job uuid) RETURNS jsonb
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT jsonb_build_object(
+        'authority_id',a.id,'creation_intent_id',i.id,
+        'repository_owner',a.repository_owner,'repo_name',a.repo_name,
+        'project_id',a.project_id,'forge_key_id',a.forge_key_id,
+        'key_generation',a.generation,'intent_generation',i.generation,
+        'clean_repo_url',a.clean_repo_url)
+    FROM public.jobs j
+    JOIN public.managed_repository_authorities a
+      ON a.authority_kind='job' AND a.authority_id=j.id
+    JOIN public.managed_repository_creation_intents i
+      ON i.id=a.creation_intent_id
+    WHERE j.id=requested_job
+      AND i.authority_kind='job' AND i.authority_id=j.id
+      AND a.status='active' AND i.status='created'
+      AND a.forge_key_id>0 AND a.activated_at IS NOT NULL
+      AND i.repository_created_at IS NOT NULL
+      AND a.access_mode='write' AND i.access_mode='write'
+      AND a.generation>0 AND i.generation>0
+      AND a.repository_owner=i.repository_owner AND a.repo_name=i.repo_name
+      AND a.project_id IS NOT DISTINCT FROM i.project_id
+      AND a.project_id IS NOT DISTINCT FROM j.project_id
+      AND a.repo_name=j.repo_name
+      AND a.repo_name='job-' || left(j.id::text,8)
+      AND a.clean_repo_url=j.context->>'git_remote_url'
+      AND NOT public.managed_repository_url_has_userinfo(a.clean_repo_url)
+      AND right(a.clean_repo_url,length('/' || a.repository_owner ||
+          '/' || a.repo_name || '.git'))='/' || a.repository_owner ||
+          '/' || a.repo_name || '.git'
+      AND (SELECT count(*) FROM public.managed_repository_authorities other
+           WHERE other.authority_kind='job' AND other.authority_id=j.id
+             AND other.status IN ('provisioning','active','revoking'))=1
+      AND (SELECT count(*) FROM public.managed_repository_creation_intents other
+           WHERE other.authority_kind='job' AND other.authority_id=j.id
+             AND other.status<>'deleted')=1;
 $$;
 
 
@@ -11472,6 +11590,12 @@ BEGIN
         IF NEW.owner_kind='job' THEN owned_job := NEW.owner_id; END IF;
     ELSIF TG_TABLE_NAME='srw_execution_specs' THEN
         IF NEW.work_kind='Job' THEN owned_job := NEW.work_id; END IF;
+    ELSIF TG_TABLE_NAME='srw_workspace_instances' THEN
+        SELECT work_id INTO owned_job FROM public.srw_execution_specs
+        WHERE id=NEW.execution_id AND work_kind='Job';
+        IF owned_job IS NULL THEN
+            SELECT id INTO owned_job FROM public.jobs WHERE id=NEW.owner_id;
+        END IF;
     ELSE
         SELECT work_id INTO owned_job FROM public.srw_execution_specs
         WHERE id=NEW.execution_id AND work_kind='Job';
@@ -21006,6 +21130,51 @@ $$;
 
 
 --
+-- Name: vm_job_repository_settlement_receipts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_job_repository_settlement_receipts (
+    cleanup_admission_id uuid NOT NULL,
+    request_id uuid NOT NULL,
+    job_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    authority_id uuid,
+    creation_intent_id uuid,
+    repository_owner text,
+    repo_name text,
+    project_id uuid,
+    forge_key_id bigint,
+    key_generation bigint,
+    intent_generation bigint,
+    clean_repo_url text,
+    captured_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT vm_job_repository_settlement_receipts_check CHECK ((((authority_id IS NULL) AND (creation_intent_id IS NULL) AND (repository_owner IS NULL) AND (repo_name IS NULL) AND (project_id IS NULL) AND (forge_key_id IS NULL) AND (key_generation IS NULL) AND (intent_generation IS NULL) AND (clean_repo_url IS NULL)) OR ((authority_id IS NOT NULL) AND (creation_intent_id IS NOT NULL) AND (repository_owner IS NOT NULL) AND (repo_name IS NOT NULL) AND (forge_key_id IS NOT NULL) AND (forge_key_id > 0) AND (key_generation IS NOT NULL) AND (key_generation > 0) AND (intent_generation IS NOT NULL) AND (intent_generation > 0) AND (clean_repo_url IS NOT NULL))))
+);
+
+
+--
+-- Name: vm_job_repository_receipt_pair(public.vm_job_repository_settlement_receipts); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_repository_receipt_pair(receipt public.vm_job_repository_settlement_receipts) RETURNS jsonb
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT CASE WHEN receipt.authority_id IS NULL THEN NULL ELSE
+        jsonb_build_object(
+            'authority_id',receipt.authority_id,
+            'creation_intent_id',receipt.creation_intent_id,
+            'repository_owner',receipt.repository_owner,
+            'repo_name',receipt.repo_name,
+            'project_id',receipt.project_id,
+            'forge_key_id',receipt.forge_key_id,
+            'key_generation',receipt.key_generation,
+            'intent_generation',receipt.intent_generation,
+            'clean_repo_url',receipt.clean_repo_url)
+    END;
+$$;
+
+
+--
 -- Name: vm_job_terminal_packet_evidence(uuid); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -21014,6 +21183,7 @@ CREATE FUNCTION public.vm_job_terminal_packet_evidence(source_request uuid) RETU
     AS $$
 DECLARE r public.vm_creation_retries%ROWTYPE;
         a public.vm_workspace_cleanup_admissions%ROWTYPE;
+        repository_receipt public.vm_job_repository_settlement_receipts%ROWTYPE;
         stop_row public.vm_resource_cleanup_stop_receipts%ROWTYPE;
         reservation_count bigint;
 BEGIN
@@ -21024,6 +21194,12 @@ BEGIN
     END IF;
     IF public.job_vm_creation_never_issued_terminal_source(
         r.job_id,r.provision_generation::text) THEN
+        -- 0326 proves the settled retry and exact logical parent. Recheck
+        -- 0327's *historical* non-delivery at Delete without requiring the
+        -- repository to remain active after its normal revocation.
+        IF NOT public.job_vm_never_issued_history_safe(r.job_id) THEN
+            RETURN NULL;
+        END IF;
         SELECT * INTO a FROM public.vm_workspace_cleanup_admissions
         WHERE owner_kind='job' AND owner_id=r.job_id
           AND source='job_terminal_vm_release' AND pvc_uid IS NULL
@@ -21032,6 +21208,11 @@ BEGIN
             'vm-workspace-cleanup:job_terminal_vm_release:job:' || r.job_id::text ||
             ':' || r.provision_generation::text || ':None:');
         IF NOT FOUND THEN RETURN NULL; END IF;
+        SELECT * INTO repository_receipt
+        FROM public.vm_job_repository_settlement_receipts
+        WHERE cleanup_admission_id=a.id AND request_id=r.request_id
+          AND job_id=r.job_id AND provision_generation=r.provision_generation;
+        IF NOT FOUND THEN RETURN NULL; END IF;
         RETURN jsonb_build_object(
             'kind','never_issued','job_id',r.job_id,'request_id',r.request_id,
             'provision_generation',r.provision_generation,
@@ -21039,6 +21220,7 @@ BEGIN
             'execution_generation',r.execution_generation,
             'execution_chain',public.vm_job_execution_chain_evidence(r.execution_id),
             'cleanup_admission_id',a.id,'cleanup_intent_digest',a.intent_digest,
+            'repository_pair',public.vm_job_repository_receipt_pair(repository_receipt),
             'retry_reason',r.reason,'resolved_at',r.resolved_at);
     END IF;
     IF r.state<>'succeeded' OR r.observed_vm_uid IS NULL
@@ -31638,6 +31820,30 @@ ALTER TABLE ONLY public.vm_job_creation_terminal_packets
 
 
 --
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_re_job_id_provision_generation_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
+    ADD CONSTRAINT vm_job_repository_settlement_re_job_id_provision_generation_key UNIQUE (job_id, provision_generation);
+
+
+--
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_receipts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
+    ADD CONSTRAINT vm_job_repository_settlement_receipts_pkey PRIMARY KEY (cleanup_admission_id);
+
+
+--
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_receipts_request_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
+    ADD CONSTRAINT vm_job_repository_settlement_receipts_request_id_key UNIQUE (request_id);
+
+
+--
 -- Name: vm_remote_operation_leases vm_remote_operation_leases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -36154,6 +36360,13 @@ CREATE CONSTRAINT TRIGGER vm_job_creation_owner_terminal AFTER INSERT OR UPDATE 
 
 
 --
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_receipt_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_repository_settlement_receipt_immutable BEFORE INSERT OR DELETE OR UPDATE ON public.vm_job_repository_settlement_receipts FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_repository_settlement_receipt();
+
+
+--
 -- Name: srw_execution_attempts vm_job_retained_execution; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -38265,6 +38478,30 @@ ALTER TABLE ONLY public.vm_job_creation_terminal_packets
 
 ALTER TABLE ONLY public.vm_job_creation_terminal_packets
     ADD CONSTRAINT vm_job_creation_terminal_packets_request_id_fkey FOREIGN KEY (request_id) REFERENCES public.vm_creation_retries(request_id);
+
+
+--
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_receipts_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
+    ADD CONSTRAINT vm_job_repository_settlement_receipts_cleanup_admission_id_fkey FOREIGN KEY (cleanup_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_receipts_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
+    ADD CONSTRAINT vm_job_repository_settlement_receipts_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.vm_job_creation_owners(job_id);
+
+
+--
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_receipts_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
+    ADD CONSTRAINT vm_job_repository_settlement_receipts_request_id_fkey FOREIGN KEY (request_id) REFERENCES public.vm_creation_retries(request_id);
 
 
 --

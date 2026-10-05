@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 from uuid import UUID
 
+import asyncpg
 from fastapi import HTTPException
 from typing_extensions import NotRequired, TypedDict
 
@@ -412,6 +413,13 @@ class JobControlOperations:
                 status_code=503,
                 detail="VM Job terminal audit authority is incomplete; retry deletion",
             ) from exc
+        except asyncpg.CheckViolationError as exc:
+            if exc.constraint_name == "managed_repository_cleanup_required":
+                raise HTTPException(
+                    status_code=503,
+                    detail="Repository containment changed; retry deletion",
+                ) from exc
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
         except HTTPException:
             raise
         except Exception as exc:

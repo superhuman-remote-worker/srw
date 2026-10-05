@@ -40,6 +40,12 @@ BEGIN
         IF NEW.owner_kind='job' THEN owned_job := NEW.owner_id; END IF;
     ELSIF TG_TABLE_NAME='srw_execution_specs' THEN
         IF NEW.work_kind='Job' THEN owned_job := NEW.work_id; END IF;
+    ELSIF TG_TABLE_NAME='srw_workspace_instances' THEN
+        SELECT work_id INTO owned_job FROM public.srw_execution_specs
+        WHERE id=NEW.execution_id AND work_kind='Job';
+        IF owned_job IS NULL THEN
+            SELECT id INTO owned_job FROM public.jobs WHERE id=NEW.owner_id;
+        END IF;
     ELSE
         SELECT work_id INTO owned_job FROM public.srw_execution_specs
         WHERE id=NEW.execution_id AND work_kind='Job';
@@ -81,7 +87,7 @@ FOR EACH ROW EXECUTE FUNCTION public.lock_job_vm_nondelivery_insert();
 
 -- Repository creation and deploy-key rotation count independently. No
 -- credential ciphertext is copied into this proof or terminal packet.
-CREATE FUNCTION public.job_vm_never_issued_repository_safe(requested_job uuid)
+CREATE FUNCTION public.job_vm_never_issued_history_safe(requested_job uuid)
 RETURNS boolean LANGUAGE sql STABLE AS $predicate$
     SELECT EXISTS (
         SELECT 1 FROM public.jobs j
@@ -114,6 +120,55 @@ RETURNS boolean LANGUAGE sql STABLE AS $predicate$
                   OR r.creation_carrier_uid IS NOT NULL OR r.disposition_carrier_uid IS NOT NULL
                   OR COALESCE(r.canonical_request->'preparation','null'::jsonb) <> 'null'::jsonb
                   OR COALESCE(r.canonical_request->'workspace_storage','null'::jsonb) <> 'null'::jsonb))
+    );
+$predicate$;
+
+-- Capture only validated, non-secret identity. Deploy-key and creation-intent
+-- counters are intentionally independent.
+CREATE FUNCTION public.job_vm_repository_pair_evidence(requested_job uuid)
+RETURNS jsonb LANGUAGE sql STABLE AS $pair$
+    SELECT jsonb_build_object(
+        'authority_id',a.id,'creation_intent_id',i.id,
+        'repository_owner',a.repository_owner,'repo_name',a.repo_name,
+        'project_id',a.project_id,'forge_key_id',a.forge_key_id,
+        'key_generation',a.generation,'intent_generation',i.generation,
+        'clean_repo_url',a.clean_repo_url)
+    FROM public.jobs j
+    JOIN public.managed_repository_authorities a
+      ON a.authority_kind='job' AND a.authority_id=j.id
+    JOIN public.managed_repository_creation_intents i
+      ON i.id=a.creation_intent_id
+    WHERE j.id=requested_job
+      AND i.authority_kind='job' AND i.authority_id=j.id
+      AND a.status='active' AND i.status='created'
+      AND a.forge_key_id>0 AND a.activated_at IS NOT NULL
+      AND i.repository_created_at IS NOT NULL
+      AND a.access_mode='write' AND i.access_mode='write'
+      AND a.generation>0 AND i.generation>0
+      AND a.repository_owner=i.repository_owner AND a.repo_name=i.repo_name
+      AND a.project_id IS NOT DISTINCT FROM i.project_id
+      AND a.project_id IS NOT DISTINCT FROM j.project_id
+      AND a.repo_name=j.repo_name
+      AND a.repo_name='job-' || left(j.id::text,8)
+      AND a.clean_repo_url=j.context->>'git_remote_url'
+      AND NOT public.managed_repository_url_has_userinfo(a.clean_repo_url)
+      AND right(a.clean_repo_url,length('/' || a.repository_owner ||
+          '/' || a.repo_name || '.git'))='/' || a.repository_owner ||
+          '/' || a.repo_name || '.git'
+      AND (SELECT count(*) FROM public.managed_repository_authorities other
+           WHERE other.authority_kind='job' AND other.authority_id=j.id
+             AND other.status IN ('provisioning','active','revoking'))=1
+      AND (SELECT count(*) FROM public.managed_repository_creation_intents other
+           WHERE other.authority_kind='job' AND other.authority_id=j.id
+             AND other.status<>'deleted')=1;
+$pair$;
+
+CREATE FUNCTION public.job_vm_never_issued_repository_safe(requested_job uuid)
+RETURNS boolean LANGUAGE sql STABLE AS $predicate$
+    SELECT EXISTS (
+        SELECT 1 FROM public.jobs j
+        WHERE j.id=requested_job
+          AND public.job_vm_never_issued_history_safe(j.id)
           AND (
               (j.repo_name IS NULL AND j.context->>'git_remote_url' IS NULL
                AND NOT EXISTS (SELECT 1 FROM public.managed_repository_authorities a
@@ -122,35 +177,7 @@ RETURNS boolean LANGUAGE sql STABLE AS $predicate$
                AND NOT EXISTS (SELECT 1 FROM public.managed_repository_creation_intents i
                    WHERE i.authority_kind='job' AND i.authority_id=j.id
                      AND i.status<>'deleted'))
-              OR EXISTS (
-                  SELECT 1 FROM public.managed_repository_authorities a
-                  JOIN public.managed_repository_creation_intents i
-                    ON i.id=a.creation_intent_id
-                  WHERE a.authority_kind='job' AND a.authority_id=j.id
-                    AND i.authority_kind='job' AND i.authority_id=j.id
-                    AND a.status='active' AND i.status='created'
-                    AND a.forge_key_id>0 AND a.activated_at IS NOT NULL
-                    AND i.repository_created_at IS NOT NULL
-                    AND a.access_mode='write' AND i.access_mode='write'
-                    AND a.generation>0 AND i.generation>0
-                    AND a.repository_owner=i.repository_owner
-                    AND a.repo_name=i.repo_name
-                    AND a.project_id IS NOT DISTINCT FROM i.project_id
-                    AND a.project_id IS NOT DISTINCT FROM j.project_id
-                    AND a.repo_name=j.repo_name
-                    AND a.repo_name='job-' || left(j.id::text,8)
-                    AND a.clean_repo_url=j.context->>'git_remote_url'
-                    AND NOT public.managed_repository_url_has_userinfo(a.clean_repo_url)
-                    AND right(a.clean_repo_url,length('/' || a.repository_owner ||
-                        '/' || a.repo_name || '.git'))='/' || a.repository_owner ||
-                        '/' || a.repo_name || '.git'
-                    AND (SELECT count(*) FROM public.managed_repository_authorities other
-                         WHERE other.authority_kind='job' AND other.authority_id=j.id
-                           AND other.status IN ('provisioning','active','revoking'))=1
-                    AND (SELECT count(*) FROM public.managed_repository_creation_intents other
-                         WHERE other.authority_kind='job' AND other.authority_id=j.id
-                           AND other.status<>'deleted')=1
-              )
+              OR public.job_vm_repository_pair_evidence(j.id) IS NOT NULL
           )
     );
 $predicate$;

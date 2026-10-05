@@ -38,6 +38,104 @@ CREATE TABLE public.vm_job_creation_terminal_packets (
     UNIQUE (job_id,provision_generation)
 );
 
+-- One immutable settlement receipt per logical cleanup parent, including an
+-- explicit no-repository case. A later normal revoke may change the live key
+-- and intent ledgers, but it cannot erase what the settlement accepted.
+CREATE TABLE public.vm_job_repository_settlement_receipts (
+    cleanup_admission_id uuid PRIMARY KEY
+        REFERENCES public.vm_workspace_cleanup_admissions(id),
+    request_id uuid NOT NULL UNIQUE REFERENCES public.vm_creation_retries(request_id),
+    job_id uuid NOT NULL REFERENCES public.vm_job_creation_owners(job_id),
+    provision_generation uuid NOT NULL,
+    authority_id uuid,
+    creation_intent_id uuid,
+    repository_owner text,
+    repo_name text,
+    project_id uuid,
+    forge_key_id bigint,
+    key_generation bigint,
+    intent_generation bigint,
+    clean_repo_url text,
+    captured_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+    UNIQUE (job_id,provision_generation),
+    CHECK (
+        (authority_id IS NULL AND creation_intent_id IS NULL
+         AND repository_owner IS NULL AND repo_name IS NULL
+         AND project_id IS NULL AND forge_key_id IS NULL
+         AND key_generation IS NULL AND intent_generation IS NULL
+         AND clean_repo_url IS NULL)
+        OR
+        (authority_id IS NOT NULL AND creation_intent_id IS NOT NULL
+         AND repository_owner IS NOT NULL AND repo_name IS NOT NULL
+         AND forge_key_id IS NOT NULL AND forge_key_id>0
+         AND key_generation IS NOT NULL AND key_generation>0
+         AND intent_generation IS NOT NULL AND intent_generation>0
+         AND clean_repo_url IS NOT NULL)
+    )
+);
+
+CREATE FUNCTION public.vm_job_repository_receipt_pair(
+    receipt public.vm_job_repository_settlement_receipts
+) RETURNS jsonb LANGUAGE sql STABLE AS $body$
+    SELECT CASE WHEN receipt.authority_id IS NULL THEN NULL ELSE
+        jsonb_build_object(
+            'authority_id',receipt.authority_id,
+            'creation_intent_id',receipt.creation_intent_id,
+            'repository_owner',receipt.repository_owner,
+            'repo_name',receipt.repo_name,
+            'project_id',receipt.project_id,
+            'forge_key_id',receipt.forge_key_id,
+            'key_generation',receipt.key_generation,
+            'intent_generation',receipt.intent_generation,
+            'clean_repo_url',receipt.clean_repo_url)
+    END;
+$body$;
+
+CREATE FUNCTION public.guard_vm_job_repository_settlement_receipt()
+RETURNS trigger LANGUAGE plpgsql AS $guard$
+DECLARE parent public.vm_workspace_cleanup_admissions%ROWTYPE;
+        source public.vm_creation_retries%ROWTYPE;
+BEGIN
+    IF TG_OP='UPDATE' OR TG_OP='DELETE' THEN
+        RAISE EXCEPTION 'Job VM repository settlement receipt is immutable'
+            USING ERRCODE='23514';
+    END IF;
+    -- Parent-first is the settlement lock order. Final Delete holds a SHARE
+    -- lock on the parent, compatible with this reader, before its Job DELETE.
+    SELECT * INTO parent FROM public.vm_workspace_cleanup_admissions
+        WHERE id=NEW.cleanup_admission_id FOR SHARE;
+    PERFORM 1 FROM public.jobs WHERE id=NEW.job_id FOR SHARE;
+    SELECT * INTO source FROM public.vm_creation_retries
+        WHERE request_id=NEW.request_id;
+    IF parent.id IS NULL OR parent.owner_kind<>'job'
+       OR parent.owner_id IS DISTINCT FROM NEW.job_id
+       OR parent.source<>'job_terminal_vm_release'
+       OR parent.parent_admission_id IS NOT NULL OR parent.pvc_uid IS NOT NULL
+       OR parent.request_id IS DISTINCT FROM public.uuid_generate_v5(
+           public.uuid_ns_url(),
+           'vm-workspace-cleanup:job_terminal_vm_release:job:' ||
+           NEW.job_id::text || ':' || NEW.provision_generation::text || ':None:')
+       OR parent.completed_at IS NOT NULL
+       OR source.request_id IS NULL OR source.owner_kind<>'job'
+       OR source.job_id IS DISTINCT FROM NEW.job_id
+       OR source.provision_generation IS DISTINCT FROM NEW.provision_generation
+       OR source.state<>'settled' OR source.resolved_at IS NULL
+       OR NOT EXISTS (SELECT 1 FROM public.vm_job_creation_owners o
+           WHERE o.job_id=NEW.job_id AND o.live_job_id=NEW.job_id
+             AND o.deleted_at IS NULL)
+       OR NOT public.job_vm_never_issued_repository_safe(NEW.job_id)
+       OR public.vm_job_repository_receipt_pair(NEW)
+          IS DISTINCT FROM public.job_vm_repository_pair_evidence(NEW.job_id) THEN
+        RAISE EXCEPTION 'Job VM repository settlement receipt lacks exact live source'
+            USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$guard$;
+CREATE TRIGGER vm_job_repository_settlement_receipt_immutable
+BEFORE INSERT OR UPDATE OR DELETE ON public.vm_job_repository_settlement_receipts
+FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_repository_settlement_receipt();
+
 CREATE FUNCTION public.vm_job_execution_chain_evidence(source_execution uuid)
 RETURNS jsonb LANGUAGE sql STABLE AS $body$
     SELECT jsonb_build_object(
@@ -61,6 +159,7 @@ CREATE FUNCTION public.vm_job_terminal_packet_evidence(source_request uuid)
 RETURNS jsonb LANGUAGE plpgsql STABLE AS $body$
 DECLARE r public.vm_creation_retries%ROWTYPE;
         a public.vm_workspace_cleanup_admissions%ROWTYPE;
+        repository_receipt public.vm_job_repository_settlement_receipts%ROWTYPE;
         stop_row public.vm_resource_cleanup_stop_receipts%ROWTYPE;
         reservation_count bigint;
 BEGIN
@@ -71,6 +170,12 @@ BEGIN
     END IF;
     IF public.job_vm_creation_never_issued_terminal_source(
         r.job_id,r.provision_generation::text) THEN
+        -- 0326 proves the settled retry and exact logical parent. Recheck
+        -- 0327's *historical* non-delivery at Delete without requiring the
+        -- repository to remain active after its normal revocation.
+        IF NOT public.job_vm_never_issued_history_safe(r.job_id) THEN
+            RETURN NULL;
+        END IF;
         SELECT * INTO a FROM public.vm_workspace_cleanup_admissions
         WHERE owner_kind='job' AND owner_id=r.job_id
           AND source='job_terminal_vm_release' AND pvc_uid IS NULL
@@ -79,6 +184,11 @@ BEGIN
             'vm-workspace-cleanup:job_terminal_vm_release:job:' || r.job_id::text ||
             ':' || r.provision_generation::text || ':None:');
         IF NOT FOUND THEN RETURN NULL; END IF;
+        SELECT * INTO repository_receipt
+        FROM public.vm_job_repository_settlement_receipts
+        WHERE cleanup_admission_id=a.id AND request_id=r.request_id
+          AND job_id=r.job_id AND provision_generation=r.provision_generation;
+        IF NOT FOUND THEN RETURN NULL; END IF;
         RETURN jsonb_build_object(
             'kind','never_issued','job_id',r.job_id,'request_id',r.request_id,
             'provision_generation',r.provision_generation,
@@ -86,6 +196,7 @@ BEGIN
             'execution_generation',r.execution_generation,
             'execution_chain',public.vm_job_execution_chain_evidence(r.execution_id),
             'cleanup_admission_id',a.id,'cleanup_intent_digest',a.intent_digest,
+            'repository_pair',public.vm_job_repository_receipt_pair(repository_receipt),
             'retry_reason',r.reason,'resolved_at',r.resolved_at);
     END IF;
     IF r.state<>'succeeded' OR r.observed_vm_uid IS NULL
@@ -334,9 +445,38 @@ EXECUTE FUNCTION public.require_vm_job_audit_before_delete();
 CREATE FUNCTION public.guard_vm_job_retained_ledger()
 RETURNS trigger LANGUAGE plpgsql AS $guard$
 DECLARE candidate jsonb;
+        old_candidate jsonb;
         owned_job uuid;
+        old_owned_job uuid;
         source_request uuid;
 BEGIN
+    IF TG_OP='UPDATE' THEN
+        old_candidate := to_jsonb(OLD);
+        IF TG_TABLE_NAME='vm_workspace_cleanup_admissions' THEN
+            IF old_candidate->>'owner_kind'='job' THEN
+                old_owned_job := (old_candidate->>'owner_id')::uuid;
+            END IF;
+        ELSIF TG_TABLE_NAME='vm_resource_cleanup_stop_receipts' THEN
+            old_owned_job := (old_candidate->>'job_id')::uuid;
+        ELSIF TG_TABLE_NAME='vm_resource_recovery_successors' THEN
+            old_owned_job := (old_candidate->>'owner_id')::uuid;
+        ELSIF TG_TABLE_NAME='vm_creation_retries'
+           OR TG_TABLE_NAME='vm_resource_waiters' THEN
+            IF old_candidate->>'owner_kind'='job' THEN
+                old_owned_job := (old_candidate->>'job_id')::uuid;
+            END IF;
+        ELSE
+            SELECT r.job_id INTO old_owned_job FROM public.vm_creation_retries r
+            WHERE r.request_id=(old_candidate->>'request_id')::uuid
+              AND r.owner_kind='job';
+        END IF;
+        IF NEW IS DISTINCT FROM OLD AND old_owned_job IS NOT NULL
+           AND EXISTS (SELECT 1 FROM public.vm_job_creation_owners
+               WHERE job_id=old_owned_job AND live_job_id IS NULL) THEN
+            RAISE EXCEPTION 'retired Job VM evidence is immutable'
+                USING ERRCODE='23514';
+        END IF;
+    END IF;
     candidate := CASE WHEN TG_OP='DELETE' THEN to_jsonb(OLD) ELSE to_jsonb(NEW) END;
     IF TG_TABLE_NAME='vm_workspace_cleanup_admissions' THEN
         IF candidate->>'owner_kind'='job' THEN owned_job := (candidate->>'owner_id')::uuid; END IF;
@@ -418,6 +558,16 @@ BEGIN
         SELECT x.work_id INTO old_job FROM public.srw_execution_workspace_bindings b
           JOIN public.srw_execution_specs x ON x.id=b.execution_id
           WHERE b.instance_id=OLD.id AND x.work_kind='Job' LIMIT 1;
+        IF old_job IS NULL AND EXISTS (
+            SELECT 1 FROM public.vm_job_creation_owners WHERE job_id=OLD.owner_id
+        ) THEN
+            old_job := OLD.owner_id;
+        END IF;
+        IF TG_OP='UPDATE' AND EXISTS (
+            SELECT 1 FROM public.vm_job_creation_owners WHERE job_id=NEW.owner_id
+        ) THEN
+            new_job := NEW.owner_id;
+        END IF;
     ELSE
         old_execution := OLD.execution_id;
         IF TG_OP='UPDATE' THEN new_execution := NEW.execution_id; END IF;
