@@ -37,6 +37,7 @@ from typing import (
 )
 from uuid import UUID, uuid4
 
+
 from shared.helm_provenance import provenance_from_breadcrumb
 from shared.credential_connectors import CredentialConnectorAttachedError
 
@@ -154,7 +155,10 @@ from shared.container_recovery import (
     ContainerRecoveryCleanup,
     container_recovery_resume_allowed_sql,
 )
-from shared.worker_execution_hold import WORKER_EXECUTION_HOLD_KEY, worker_execution_held_sql
+from shared.worker_execution_hold import (
+    WORKER_EXECUTION_HOLD_KEY,
+    worker_execution_held_sql,
+)
 from shared.operator_pause_hold import (
     HELD_FEEDBACK_REASON,
     OPERATOR_PAUSE_HOLD_CONTEXT_KEY,
@@ -166,6 +170,11 @@ from shared.operator_pause_hold import (
     operator_pause_hold_present_sql,
 )
 from orchestrator.services.ssh_handles import is_valid_handle, mint_ssh_handle
+
+
+class JobVMAuditNotReady(RuntimeError):
+    """Final Job deletion lacks an exact terminal VM audit disposition."""
+
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +193,7 @@ async def _borrowed_creation_transaction():
 
 class _IdeRestoreAdmissionHeld(Exception):
     """Roll back an uncommitted IDE projection when creation is held."""
+
 
 # A same-name Kubernetes fence must outlive every non-watch API request that
 # could still commit the original create.  The deployment's documented
@@ -2226,7 +2236,9 @@ def _pinned_retirement_local_quiescence_matches(
         and context.get("agent_id") is None
         and context.get("runtime_attach_token") is None
     )
-    from shared.pinned_vm_creation_retirement import initial_vm_creation_retirement_source
+    from shared.pinned_vm_creation_retirement import (
+        initial_vm_creation_retirement_source,
+    )
 
     vm_creation_source = initial_vm_creation_retirement_source(context)
     vm_creation_zero = vm_creation_source is not None
@@ -2292,10 +2304,15 @@ def _pinned_retirement_local_quiescence_matches(
         and str(receipt.get("agent_id") or "") == str(context.get("agent_id") or "")
         and str(receipt.get("runtime_attach_token") or "")
         == str(context.get("runtime_attach_token") or "")
-        and (not vm_creation_zero or (
-            receipt.get("vm_creation_request_id") == vm_creation_source["request_id"]
-            and receipt.get("vm_creation_provision_generation") == vm_creation_source["provision_generation"]
-        ))
+        and (
+            not vm_creation_zero
+            or (
+                receipt.get("vm_creation_request_id")
+                == vm_creation_source["request_id"]
+                and receipt.get("vm_creation_provision_generation")
+                == vm_creation_source["provision_generation"]
+            )
+        )
         and str(receipt.get("settle_status") or "") == final_status
         and str(receipt.get("quiescence_protocol") or "") == expected_protocol
         and str(receipt.get("quiescence_actor") or "") in {"agent", "orchestrator"}
@@ -3228,7 +3245,10 @@ class PostgresDB:
         self._dedicated_advisory_lock_slot_groups = {
             domain: asyncio.Semaphore(dedicated_slots)
             for domain in (
-                "lifecycle", "datasource", "workspace", "workspace_observation_yield"
+                "lifecycle",
+                "datasource",
+                "workspace",
+                "workspace_observation_yield",
             )
         }
 
@@ -4597,6 +4617,248 @@ class PostgresDB:
         )
         return result
 
+    @staticmethod
+    async def _capture_vm_job_delete_audit(
+        conn: Any,
+        job_id: UUID,
+        *,
+        status: str,
+        deletion_reason: str,
+    ) -> None:
+        """Freeze every typed generation and cascaded terminal field before Delete."""
+        owner = await conn.fetchrow(
+            "SELECT * FROM vm_job_creation_owners WHERE job_id=$1 FOR UPDATE",
+            job_id,
+        )
+        if owner is None:
+            if await conn.fetchval(
+                "SELECT jsonb_typeof(context->'vm')='object' "
+                "AND context->'vm'<>'{}'::jsonb FROM jobs WHERE id=$1",
+                job_id,
+            ):
+                raise JobVMAuditNotReady(
+                    "VM Job has no classifiable creation source history"
+                )
+            return
+        if owner["live_job_id"] != job_id or owner["deleted_at"] is not None:
+            raise JobVMAuditNotReady("VM Job audit owner is already retired")
+        if status not in {"completed", "cancelled", "failed"}:
+            raise JobVMAuditNotReady("VM Job is not terminal")
+        if await conn.fetchval(
+            "SELECT execution_lane='stateless' FROM jobs WHERE id=$1",
+            job_id,
+        ):
+            if not await conn.fetchval(
+                "SELECT state='done' FROM run_queue WHERE unit_id=$1 "
+                "AND unit_kind='worker_batch'",
+                job_id,
+            ) or not await conn.fetchval(
+                "SELECT context->'_stateless_delete_pending'='true'::jsonb "
+                "FROM jobs WHERE id=$1",
+                job_id,
+            ):
+                raise JobVMAuditNotReady("VM Job worker queue is not closed")
+        if await conn.fetchval(
+            f"SELECT assigned_agent_id IS NOT NULL OR "
+            f"({_completion_control_active_sql('context')}) OR "
+            "context ? '_job_terminal_vm_cleanup' OR "
+            "COALESCE(context->'vm'->>'status','') NOT IN ('deleted','') "
+            "FROM jobs WHERE id=$1",
+            job_id,
+        ):
+            raise JobVMAuditNotReady("VM Job still has active workspace authority")
+        if await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE current_job_id=$1)",
+            job_id,
+        ):
+            raise JobVMAuditNotReady("VM Job still has an agent writer")
+        if await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM vm_workspace_recoveries WHERE owner_kind='job' "
+            "AND owner_id=$1 AND resolved_at IS NULL) OR "
+            "EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs WHERE job_id=$1 "
+            "AND resolved_at IS NULL) OR "
+            "EXISTS(SELECT 1 FROM vm_idle_access_leases WHERE owner_kind='job' "
+            "AND owner_id=$1 AND closed_at IS NULL) OR "
+            "EXISTS(SELECT 1 FROM vm_idle_operations WHERE owner_kind='job' "
+            "AND owner_id=$1 AND closed_at IS NULL) OR "
+            "EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
+            "WHERE owner_kind='job' AND owner_id=$1 AND completed_at IS NULL)",
+            job_id,
+        ):
+            raise JobVMAuditNotReady("VM Job cleanup or access remains open")
+        await conn.fetch(
+            "SELECT id FROM vm_workspace_cleanup_admissions "
+            "WHERE owner_kind='job' AND owner_id=$1 ORDER BY id FOR SHARE",
+            job_id,
+        )
+        await conn.fetch(
+            "SELECT cleanup_admission_id FROM vm_job_repository_settlement_receipts "
+            "WHERE job_id=$1 ORDER BY cleanup_admission_id FOR SHARE",
+            job_id,
+        )
+        for table in (
+            "managed_repository_process_zero_receipts",
+            "managed_repository_workspace_creation_reservations",
+            "managed_repository_workspace_cleanup_intents",
+        ):
+            await conn.fetch(
+                f"SELECT id FROM {table} WHERE owner_kind='job' AND owner_id=$1 "
+                "ORDER BY id FOR SHARE",
+                job_id,
+            )
+        retries = await conn.fetch(
+            "SELECT request_id,provision_generation FROM vm_creation_retries "
+            "WHERE owner_kind='job' AND job_id=$1 ORDER BY request_id FOR SHARE",
+            job_id,
+        )
+        if not retries:
+            raise JobVMAuditNotReady("VM Job audit owner has no source")
+        request_ids = [row["request_id"] for row in retries]
+        await conn.fetch(
+            "SELECT effect_nonce FROM vm_creation_effects WHERE request_id=ANY($1::uuid[]) "
+            "ORDER BY effect_nonce FOR SHARE",
+            request_ids,
+        )
+        await conn.fetch(
+            "SELECT id FROM vm_resource_reservations WHERE request_id=ANY($1::uuid[]) "
+            "ORDER BY id FOR SHARE",
+            request_ids,
+        )
+        await conn.fetch(
+            "SELECT request_id FROM vm_resource_waiters WHERE request_id=ANY($1::uuid[]) "
+            "ORDER BY request_id FOR SHARE",
+            request_ids,
+        )
+        await conn.fetch(
+            "SELECT reservation_id FROM vm_resource_cleanup_stop_receipts "
+            "WHERE job_id=$1 ORDER BY reservation_id FOR SHARE",
+            job_id,
+        )
+        await conn.fetch(
+            "SELECT reservation_id,ordinal FROM vm_resource_recovery_successors "
+            "WHERE owner_id=$1 ORDER BY reservation_id,ordinal FOR SHARE",
+            job_id,
+        )
+        attempts = await conn.fetch(
+            "SELECT to_jsonb(attempt) AS evidence FROM worker_batch_attempts attempt "
+            "WHERE job_id=$1 "
+            "ORDER BY lease_token FOR SHARE",
+            job_id,
+        )
+        deliveries = await conn.fetch(
+            "SELECT to_jsonb(delivery) AS evidence "
+            "FROM vm_job_worker_delivery_bindings delivery WHERE job_id=$1 "
+            "ORDER BY lease_token FOR SHARE",
+            job_id,
+        )
+        recoveries = await conn.fetch(
+            "SELECT to_jsonb(recovery) - 'prior_control_reference' "
+            "- 'prior_freeze_reference' AS evidence "
+            "FROM vm_workspace_recovery_jobs recovery "
+            "WHERE job_id=$1 ORDER BY recovery_id FOR SHARE",
+            job_id,
+        )
+        await conn.fetch(
+            "SELECT id FROM srw_execution_specs WHERE work_kind='Job' AND work_id=$1 "
+            "ORDER BY id FOR SHARE",
+            job_id,
+        )
+        await conn.fetch(
+            "SELECT revision.execution_id,revision.generation "
+            "FROM srw_execution_spec_revisions revision "
+            "JOIN srw_execution_specs execution ON execution.id=revision.execution_id "
+            "WHERE execution.work_kind='Job' AND execution.work_id=$1 "
+            "ORDER BY revision.execution_id,revision.generation FOR SHARE OF revision",
+            job_id,
+        )
+        await conn.fetch(
+            "SELECT attempt.execution_id,attempt.attempt "
+            "FROM srw_execution_attempts attempt "
+            "JOIN srw_execution_specs execution ON execution.id=attempt.execution_id "
+            "WHERE execution.work_kind='Job' AND execution.work_id=$1 "
+            "ORDER BY attempt.execution_id,attempt.attempt FOR SHARE OF attempt",
+            job_id,
+        )
+        await conn.fetch(
+            "SELECT binding.execution_id,binding.instance_id "
+            "FROM srw_execution_workspace_bindings binding "
+            "JOIN srw_execution_specs execution ON execution.id=binding.execution_id "
+            "WHERE execution.work_kind='Job' AND execution.work_id=$1 "
+            "ORDER BY binding.execution_id,binding.instance_id FOR SHARE OF binding",
+            job_id,
+        )
+        await conn.fetch(
+            "SELECT instance.id FROM srw_workspace_instances instance "
+            "JOIN srw_execution_workspace_bindings binding ON binding.instance_id=instance.id "
+            "JOIN srw_execution_specs execution ON execution.id=binding.execution_id "
+            "WHERE execution.work_kind='Job' AND execution.work_id=$1 "
+            "ORDER BY instance.id FOR SHARE OF instance",
+            job_id,
+        )
+        await conn.fetch(
+            "SELECT id FROM srw_workspace_instances WHERE owner_id=$1 "
+            "OR execution_id IN (SELECT id FROM srw_execution_specs "
+            "WHERE work_kind='Job' AND work_id=$1) ORDER BY id FOR SHARE",
+            job_id,
+        )
+        packets: list[dict[str, Any]] = []
+        for retry in retries:
+            raw = await conn.fetchval(
+                "SELECT vm_job_terminal_packet_evidence($1)",
+                retry["request_id"],
+            )
+            if raw is None:
+                raise JobVMAuditNotReady(
+                    f"VM Job generation {retry['provision_generation']} has no exact terminal proof"
+                )
+            packet = json.loads(raw) if isinstance(raw, str) else raw
+            packets.append(packet)
+            await conn.execute(
+                "INSERT INTO vm_job_creation_terminal_packets "
+                "(request_id,job_id,provision_generation,terminal_kind,cleanup_admission_id,evidence) "
+                "VALUES($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT(request_id) DO NOTHING",
+                retry["request_id"],
+                job_id,
+                retry["provision_generation"],
+                packet["kind"],
+                UUID(packet["cleanup_admission_id"]),
+                json.dumps(packet),
+            )
+        receipt = {
+            "version": 1,
+            "job_id": str(job_id),
+            "status": status,
+            "deletion_reason": deletion_reason,
+            "generations": packets,
+            "worker_attempts": [
+                json.loads(a["evidence"])
+                if isinstance(a["evidence"], str)
+                else a["evidence"]
+                for a in attempts
+            ],
+            "worker_delivery_bindings": [
+                json.loads(d["evidence"])
+                if isinstance(d["evidence"], str)
+                else d["evidence"]
+                for d in deliveries
+            ],
+            "workspace_recoveries": [
+                json.loads(r["evidence"])
+                if isinstance(r["evidence"], str)
+                else r["evidence"]
+                for r in recoveries
+            ],
+        }
+        result = await conn.execute(
+            "UPDATE vm_job_creation_owners SET deleted_at=transaction_timestamp(),"
+            "deletion_receipt=$2::jsonb WHERE job_id=$1 AND live_job_id=$1 "
+            "AND deleted_at IS NULL",
+            job_id,
+            json.dumps(receipt),
+        )
+        if result != "UPDATE 1":
+            raise JobVMAuditNotReady("VM Job audit tombstone changed")
+
     async def delete_job(
         self,
         job_id: str,
@@ -4664,6 +4926,30 @@ class PostgresDB:
                     "SELECT pg_advisory_xact_lock(hashtext($1))",
                     "srw-docker-workspace-pool",
                 )
+                # Cleanup takes VM owner/PVC advisory locks before the Job
+                # row. Join that order before final deletion locks the owner.
+                if await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_job_creation_owners WHERE job_id=$1)",
+                    uuid_val,
+                ):
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                        f"workspace-recovery:job:{uuid_val}",
+                    )
+                    pvc_rows = await conn.fetch(
+                        "SELECT DISTINCT pvc_uid FROM ("
+                        "SELECT observed_pvc_uid AS pvc_uid FROM vm_creation_retries "
+                        "WHERE owner_kind='job' AND job_id=$1 UNION "
+                        "SELECT pvc_uid FROM vm_workspace_cleanup_admissions "
+                        "WHERE owner_kind='job' AND owner_id=$1) s "
+                        "WHERE pvc_uid IS NOT NULL ORDER BY pvc_uid",
+                        uuid_val,
+                    )
+                    for pvc in pvc_rows:
+                        await conn.execute(
+                            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                            f"workspace-recovery-pvc:{pvc['pvc_uid']}",
+                        )
                 if prepared_stateless:
                     # Preserve both global lock orders: worker lifecycle is
                     # queue -> jobs, while Docker lease transitions are
@@ -4717,6 +5003,12 @@ class PostgresDB:
                     )
 
                     require_srw_runtime(deleting_job)
+                    await self._capture_vm_job_delete_audit(
+                        conn,
+                        uuid_val,
+                        status=str(deleting_job["status"]),
+                        deletion_reason=str(deletion_reason or "database_delete"),
+                    )
                     # Deletion is never a release. This update and the jobs
                     # DELETE share the transaction, so a fault cannot leave an
                     # audit tombstone for a job row that survived (or erase the
@@ -5144,9 +5436,13 @@ class PostgresDB:
                     # a new statement after the owner lock so an admission
                     # which committed while we waited cannot be missed by an
                     # UPDATE snapshot; abort before closing the queue.
-                    if await conn.fetchrow(
-                        "SELECT id FROM jobs WHERE id=$1 FOR UPDATE", job_uuid,
-                    ) is None:
+                    if (
+                        await conn.fetchrow(
+                            "SELECT id FROM jobs WHERE id=$1 FOR UPDATE",
+                            job_uuid,
+                        )
+                        is None
+                    ):
                         raise _CancelCASLostError
                     if await conn.fetchval(
                         "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases "
@@ -5458,7 +5754,10 @@ class PostgresDB:
         return bool(row["cleanup_pending"])
 
     async def list_terminal_vm_cleanup_jobs(
-        self, *, limit: int = 4, after_id: str | None = None,
+        self,
+        *,
+        limit: int = 4,
+        after_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Nominate shared stateless cancellation and terminal VM cleanup.
 
@@ -5540,13 +5839,18 @@ class PostgresDB:
                   )
                 ORDER BY j.id LIMIT $1
                 """,
-                max(1, min(int(limit), 25)), cursor,
+                max(1, min(int(limit), 25)),
+                cursor,
             )
         return [dict(row) for row in rows]
 
     async def bind_terminal_vm_cleanup_admission(
-        self, job_id: str, *, expected_generation: str,
-        admission_id: str, pvc_uid: str | None,
+        self,
+        job_id: str,
+        *,
+        expected_generation: str,
+        admission_id: str,
+        pvc_uid: str | None,
     ) -> bool:
         """Pin the selected terminal marker to its admitted exact parent."""
         try:
@@ -5577,12 +5881,18 @@ class PostgresDB:
                   )
                 RETURNING j.id
                 """,
-                owner_id, str(generation), str(parent_id), pvc_id,
+                owner_id,
+                str(generation),
+                str(parent_id),
+                pvc_id,
             )
         return row is not None
 
     async def complete_terminal_vm_cleanup_marker(
-        self, job_id: str, *, expected_generation: str,
+        self,
+        job_id: str,
+        *,
+        expected_generation: str,
     ) -> bool:
         """Close only the selected generation after its parent permit settled."""
         try:
@@ -5619,7 +5929,8 @@ class PostgresDB:
                   )
                 RETURNING j.id
                 """,
-                owner_id, str(generation),
+                owner_id,
+                str(generation),
             )
         return row is not None
 
@@ -5694,7 +6005,10 @@ class PostgresDB:
                 generation = vm["provision_generation"]
                 vm_uid = vm["vm_uid"]
                 pvc_uid = vm["rootdisk_pvc_uid"]
-                if not isinstance(generation, str) or str(UUID(generation)) != generation:
+                if (
+                    not isinstance(generation, str)
+                    or str(UUID(generation)) != generation
+                ):
                     return False
             except (KeyError, TypeError, ValueError, AttributeError):
                 return False
@@ -5703,14 +6017,17 @@ class PostgresDB:
                 # rechecks the full source under owner/retry/parent locks.
                 if not await conn.fetchval(
                     "SELECT public.job_vm_creation_never_issued_source($1,$2)",
-                    owner_id, generation,
+                    owner_id,
+                    generation,
                 ):
                     return False
             else:
                 try:
                     if (
-                        not isinstance(vm_uid, str) or str(UUID(vm_uid)) != vm_uid
-                        or not isinstance(pvc_uid, str) or str(UUID(pvc_uid)) != pvc_uid
+                        not isinstance(vm_uid, str)
+                        or str(UUID(vm_uid)) != vm_uid
+                        or not isinstance(pvc_uid, str)
+                        or str(UUID(pvc_uid)) != pvc_uid
                         or vm.get("identity_authenticated") is not True
                         or vm.get("identity_provision_generation") != generation
                     ):
@@ -5764,7 +6081,8 @@ class PostgresDB:
             if await conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
                 "WHERE owner_kind='job' AND owner_id=$1 AND completed_at IS NULL "
-                "AND source<>'job_terminal_vm_release')", owner_id,
+                "AND source<>'job_terminal_vm_release')",
+                owner_id,
             ):
                 return False
             return bool(
@@ -6577,7 +6895,9 @@ class PostgresDB:
             job_uuid = UUID(job_id)
             runtime = str(UUID(str(expected_workspace.get("_runtime_incarnation"))))
             agent_uuid = UUID(str(expected_agent_id)) if expected_agent_id else None
-            command_uuid = UUID(completion_command_id) if completion_command_id else None
+            command_uuid = (
+                UUID(completion_command_id) if completion_command_id else None
+            )
         except (TypeError, ValueError):
             return None
         async with self.transaction_scope():
@@ -6598,7 +6918,9 @@ class PostgresDB:
                 workspace = context.get("workspace_container") or {}
                 if not isinstance(workspace, dict):
                     return None
-                receipt = ContainerRecoveryCleanup.parse(workspace.get("recovery_cleanup"))
+                receipt = ContainerRecoveryCleanup.parse(
+                    workspace.get("recovery_cleanup")
+                )
                 if receipt is not None and receipt.command_id == str(command_uuid):
                     intent = await conn.fetchrow(
                         "SELECT * FROM managed_repository_workspace_cleanup_intents WHERE id=$1",
@@ -6612,7 +6934,10 @@ class PostgresDB:
                         or not isinstance(previous, dict)
                     ):
                         return None
-                    if receipt.phase == "settled" and intent["result_kind"] == "settled":
+                    if (
+                        receipt.phase == "settled"
+                        and intent["result_kind"] == "settled"
+                    ):
                         return dict(previous)
                     if (
                         not await conn.fetchval(
@@ -6639,7 +6964,10 @@ class PostgresDB:
                 ):
                     return None
                 try:
-                    if resolve_workspace_contract(dict(job)).assigned_backend != "sandbox":
+                    if (
+                        resolve_workspace_contract(dict(job)).assigned_backend
+                        != "sandbox"
+                    ):
                         return None
                 except WorkspaceContractError:
                     return None
@@ -6708,20 +7036,24 @@ class PostgresDB:
                         workspace.get("_creation_claim_token"),
                     ):
                         return None
-                    intent = await self.prepare_managed_repository_workspace_cleanup_intent(
-                        job_id,
-                        owner_kind="job",
-                        scope="workspace_container",
-                        runtime_incarnation=runtime,
-                        target_disposition="deleted",
-                        reclaim_shared_resources=False,
-                        resources_captured=False,
+                    intent = (
+                        await self.prepare_managed_repository_workspace_cleanup_intent(
+                            job_id,
+                            owner_kind="job",
+                            scope="workspace_container",
+                            runtime_incarnation=runtime,
+                            target_disposition="deleted",
+                            reclaim_shared_resources=False,
+                            resources_captured=False,
+                        )
                     )
                     if intent is None or intent.get("settled_at") is not None:
                         # Nested helpers may write before a refusal. Roll the
                         # entire owner transaction back instead of committing
                         # a partial cancellation or retirement projection.
-                        raise RuntimeError("workspace recovery cleanup admission refused")
+                        raise RuntimeError(
+                            "workspace recovery cleanup admission refused"
+                        )
                     receipt = ContainerRecoveryCleanup(
                         job_id,
                         str(command_uuid),
@@ -6731,7 +7063,9 @@ class PostgresDB:
                         int(intent["intent_generation"]),
                     )
                     if not receipt.matches_intent(intent):
-                        raise RuntimeError("workspace recovery cleanup authority changed")
+                        raise RuntimeError(
+                            "workspace recovery cleanup authority changed"
+                        )
                     updates.update(
                         recovery_cleanup=receipt.as_dict(),
                         recovery_attempt_command_id=str(command_uuid),
@@ -6879,7 +7213,10 @@ class PostgresDB:
                     UUID(receipt.job_id),
                     json.dumps(
                         {
-                            "recovery_cleanup": {**receipt.as_dict(), "phase": "settled"},
+                            "recovery_cleanup": {
+                                **receipt.as_dict(),
+                                "phase": "settled",
+                            },
                             "recovery_completion_outcome": outcome,
                         }
                     ),
@@ -6888,7 +7225,9 @@ class PostgresDB:
                 )
                 return outcome if changed else None
 
-    async def get_workspace_recovery_storage(self, job_id: str) -> Dict[str, Any] | None:
+    async def get_workspace_recovery_storage(
+        self, job_id: str
+    ) -> Dict[str, Any] | None:
         """Resolve the exact settled predecessor; context alone proves nothing."""
         try:
             job_uuid = UUID(job_id)
@@ -11010,9 +11349,8 @@ class PostgresDB:
         attested recipient supplied by the dispatcher.
         """
 
-        if (
-            not isinstance(recipient, PinnedJobRecipient)
-            or not re.fullmatch(r"sha256:[0-9a-f]{64}", projection_digest)
+        if not isinstance(recipient, PinnedJobRecipient) or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", projection_digest
         ):
             return None
         try:
@@ -11026,9 +11364,12 @@ class PostgresDB:
         except (ValueError, TypeError):
             return None
         async with self.acquire() as conn, conn.transaction():
-            job = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1 FOR UPDATE", job_uuid)
+            job = await conn.fetchrow(
+                "SELECT * FROM jobs WHERE id=$1 FOR UPDATE", job_uuid
+            )
             if (
-                job is None or job["execution_lane"] != "pinned"
+                job is None
+                or job["execution_lane"] != "pinned"
                 or job["status"] != "processing"
                 or job["assigned_agent_id"] != agent_uuid
                 or job["lease_expires_at"] is None
@@ -11045,7 +11386,8 @@ class PostgresDB:
             marker = context.get("_workspace_dispatch_authority")
             vm = context.get("vm")
             if (
-                not isinstance(marker, dict) or not isinstance(vm, dict)
+                not isinstance(marker, dict)
+                or not isinstance(vm, dict)
                 or marker.get("version") != 1
                 or marker.get("dispatch_kind") != "pinned"
                 or marker.get("assigned_backend") != "vm"
@@ -11065,15 +11407,19 @@ class PostgresDB:
             except (KeyError, ValueError, TypeError, AttributeError):
                 return None
             from orchestrator.services.vm_remote_operation import (
-                VMRemoteOperationUnavailable, _identity_from_row,
+                VMRemoteOperationUnavailable,
+                _identity_from_row,
             )
             from shared.workspace_contract import (
-                vm_mode_from_env, workspace_runtime_authority_digest,
+                vm_mode_from_env,
+                workspace_runtime_authority_digest,
             )
 
             try:
                 runtime_identity = _identity_from_row(
-                    dict(job), owner_kind="job", owner_id=job_id,
+                    dict(job),
+                    owner_kind="job",
+                    owner_id=job_id,
                     operation_kind="idle_policy",
                 )
             except VMRemoteOperationUnavailable:
@@ -11085,19 +11431,26 @@ class PostgresDB:
             ):
                 return None
             authority_digest = workspace_runtime_authority_digest(
-                dict(job), vm_mode=vm_mode_from_env(),
+                dict(job),
+                vm_mode=vm_mode_from_env(),
             )
             if authority_digest is None:
                 return None
             authority_digest = "sha256:" + authority_digest
-            identity_digest = "sha256:" + hashlib.sha256(
-                json.dumps(
-                    asdict(runtime_identity), sort_keys=True, separators=(",", ":"),
-                ).encode()
-            ).hexdigest()
+            identity_digest = (
+                "sha256:"
+                + hashlib.sha256(
+                    json.dumps(
+                        asdict(runtime_identity),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest()
+            )
             agent = await conn.fetchrow(
                 "SELECT id,hostname,pod_uid,status,current_job_id,metadata "
-                "FROM agents WHERE id=$1", agent_uuid,
+                "FROM agents WHERE id=$1",
+                agent_uuid,
             )
             if agent is None or not agent["hostname"] or not agent["pod_uid"]:
                 return None
@@ -11111,32 +11464,42 @@ class PostgresDB:
                 or agent["pod_uid"] != recipient.expected_pod_uid
                 or not (
                     (agent["status"] == "ready" and agent["current_job_id"] is None)
-                    or (agent["status"] == "working" and agent["current_job_id"] == job_uuid)
+                    or (
+                        agent["status"] == "working"
+                        and agent["current_job_id"] == job_uuid
+                    )
                 )
             ):
                 return None
             namespace = os.getenv(
-                "AGENT_NAMESPACE", os.getenv("WORKSPACE_NAMESPACE", "superhuman-remote-worker")
+                "AGENT_NAMESPACE",
+                os.getenv("WORKSPACE_NAMESPACE", "superhuman-remote-worker"),
             )
             if not namespace or len(namespace) > 63:
                 return None
-            marker_digest = "sha256:" + hashlib.sha256(
-                b"srw:pinned-job-marker:v1\0"
-                + json.dumps(marker, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()
+            marker_digest = (
+                "sha256:"
+                + hashlib.sha256(
+                    b"srw:pinned-job-marker:v1\0"
+                    + json.dumps(marker, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+            )
             existing = await conn.fetchrow(
                 "SELECT * FROM pinned_job_deliveries WHERE job_id=$1 "
-                "AND marker_digest=$2 FOR UPDATE", job_uuid, marker_digest,
+                "AND marker_digest=$2 FOR UPDATE",
+                job_uuid,
+                marker_digest,
             )
             if existing is not None:
                 if (
                     existing["agent_id"] != agent_uuid
                     or existing["projection_digest"] != projection_digest
                     or _json_object_or_empty(existing["consumed_context_digests"])
-                        != consumed_digests
+                    != consumed_digests
                     or existing["runtime_authority_digest"] != authority_digest
                     or existing["identity_digest"] != identity_digest
-                    or existing["process_generation"] != recipient.expected_process_generation
+                    or existing["process_generation"]
+                    != recipient.expected_process_generation
                     or existing["pod_uid"] != recipient.expected_pod_uid
                     or existing["provision_generation"] != generation
                     or existing["vm_uid"] != vm_uid
@@ -11155,13 +11518,25 @@ class PostgresDB:
                 "launcher_uid,pvc_uid) "
                 "VALUES($1,$2,$3::jsonb,$4,$5,$6::jsonb,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) "
                 "RETURNING *",
-                job_uuid, agent_uuid, json.dumps(marker), marker_digest,
-                projection_digest, json.dumps(consumed_digests),
-                authority_digest, identity_digest,
-                original_lease, job["lease_expires_at"],
-                recipient.expected_process_generation, agent["hostname"],
-                namespace, agent["pod_uid"], generation, vm_uid, vmi_uid,
-                launcher_uid, pvc_uid,
+                job_uuid,
+                agent_uuid,
+                json.dumps(marker),
+                marker_digest,
+                projection_digest,
+                json.dumps(consumed_digests),
+                authority_digest,
+                identity_digest,
+                original_lease,
+                job["lease_expires_at"],
+                recipient.expected_process_generation,
+                agent["hostname"],
+                namespace,
+                agent["pod_uid"],
+                generation,
+                vm_uid,
+                vmi_uid,
+                launcher_uid,
+                pvc_uid,
             )
             return dict(row)
 
@@ -11195,10 +11570,12 @@ class PostgresDB:
             return False
         async with self.acquire() as conn, conn.transaction():
             job = await conn.fetchrow(
-                "SELECT * FROM jobs WHERE id=$1 FOR UPDATE", job_uuid,
+                "SELECT * FROM jobs WHERE id=$1 FOR UPDATE",
+                job_uuid,
             )
             if (
-                job is None or job["execution_lane"] != "pinned"
+                job is None
+                or job["execution_lane"] != "pinned"
                 or job["assigned_agent_id"] != agent_uuid
             ):
                 return False
@@ -11211,10 +11588,12 @@ class PostgresDB:
                 delivery = await conn.fetchrow(
                     "SELECT * FROM pinned_job_deliveries "
                     "WHERE id=$1 AND job_id=$2 FOR UPDATE",
-                    delivery_uuid, job_uuid,
+                    delivery_uuid,
+                    job_uuid,
                 )
                 if (
-                    delivery is None or delivery["agent_id"] != agent_uuid
+                    delivery is None
+                    or delivery["agent_id"] != agent_uuid
                     or delivery["projection_digest"] != pinned_projection_digest
                 ):
                     return False
@@ -11230,9 +11609,11 @@ class PostgresDB:
                 else:
                     original_marker = delivery["original_dispatch_marker"]
                 if (
-                    marker != original_marker or not isinstance(vm, dict)
+                    marker != original_marker
+                    or not isinstance(vm, dict)
                     or vm.get("status") != "ready"
-                    or vm.get("provision_generation") != str(delivery["provision_generation"])
+                    or vm.get("provision_generation")
+                    != str(delivery["provision_generation"])
                     or vm.get("vm_uid") != str(delivery["vm_uid"])
                     or vm.get("vmi_uid") != str(delivery["vmi_uid"])
                     or vm.get("active_pod_uid") != str(delivery["launcher_uid"])
@@ -11240,32 +11621,41 @@ class PostgresDB:
                 ):
                     return False
                 from orchestrator.services.vm_remote_operation import (
-                    VMRemoteOperationUnavailable, _identity_from_row,
+                    VMRemoteOperationUnavailable,
+                    _identity_from_row,
                 )
                 from shared.workspace_contract import (
-                    vm_mode_from_env, workspace_runtime_authority_digest,
+                    vm_mode_from_env,
+                    workspace_runtime_authority_digest,
                 )
 
                 try:
                     runtime_identity = _identity_from_row(
-                        dict(job), owner_kind="job", owner_id=job_id,
+                        dict(job),
+                        owner_kind="job",
+                        owner_id=job_id,
                         operation_kind="idle_policy",
                     )
                 except VMRemoteOperationUnavailable:
                     return False
                 runtime_digest = workspace_runtime_authority_digest(
-                    dict(job), vm_mode=vm_mode_from_env(),
+                    dict(job),
+                    vm_mode=vm_mode_from_env(),
                 )
-                identity_digest = "sha256:" + hashlib.sha256(
-                    json.dumps(
-                        asdict(runtime_identity), sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode()
-                ).hexdigest()
+                identity_digest = (
+                    "sha256:"
+                    + hashlib.sha256(
+                        json.dumps(
+                            asdict(runtime_identity),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode()
+                    ).hexdigest()
+                )
                 if (
                     runtime_digest is None
                     or "sha256:" + runtime_digest
-                        != delivery["runtime_authority_digest"]
+                    != delivery["runtime_authority_digest"]
                     or identity_digest != delivery["identity_digest"]
                 ):
                     return False
@@ -11273,7 +11663,8 @@ class PostgresDB:
                     source = await conn.fetchrow(
                         "SELECT source_kind,source_id FROM pinned_job_wait_receipts "
                         "WHERE delivery_id=$1 AND job_id=$2 ORDER BY observed_at DESC LIMIT 1",
-                        delivery_uuid, job_uuid,
+                        delivery_uuid,
+                        job_uuid,
                     )
                     if source is None or delivery["accepted_at"] is None:
                         return False
@@ -11288,13 +11679,12 @@ class PostgresDB:
                         ):
                             return False
                     elif source["source_kind"] == "completion":
-                        if (
-                            job["status"] != "pending_review"
-                            or not await conn.fetchval(
-                                "SELECT 1 FROM job_completion_commands "
-                                "WHERE id=$1 AND job_id=$2 AND accepted_agent_id=$3",
-                                source["source_id"], job_uuid, agent_uuid,
-                            )
+                        if job["status"] != "pending_review" or not await conn.fetchval(
+                            "SELECT 1 FROM job_completion_commands "
+                            "WHERE id=$1 AND job_id=$2 AND accepted_agent_id=$3",
+                            source["source_id"],
+                            job_uuid,
+                            agent_uuid,
                         ):
                             return False
                     else:
@@ -11305,7 +11695,8 @@ class PostgresDB:
                         await conn.execute(
                             "UPDATE jobs SET context=COALESCE(context, '{}'::jsonb) "
                             "- $2::text[] WHERE id=$1",
-                            job_uuid, consumed_keys,
+                            job_uuid,
+                            consumed_keys,
                         )
                     return True
                 if job["status"] != "processing" or job["lease_expires_at"] is None:
@@ -11327,11 +11718,12 @@ class PostgresDB:
                 if isinstance(metadata, str):
                     metadata = json.loads(metadata)
                 if (
-                    agent is None or agent["hostname"] != delivery["pod_name"]
+                    agent is None
+                    or agent["hostname"] != delivery["pod_name"]
                     or agent["pod_uid"] != delivery["pod_uid"]
                     or not isinstance(metadata, dict)
                     or metadata.get("dispatch_process_generation")
-                        != delivery["process_generation"]
+                    != delivery["process_generation"]
                     or agent["current_job_id"] not in {None, job_uuid}
                 ):
                     return False
@@ -11340,7 +11732,8 @@ class PostgresDB:
                         "UPDATE pinned_job_deliveries SET accepted_at=clock_timestamp(),"
                         "accepted_via='post',accepted_lease_expires_at=$2 "
                         "WHERE id=$1 AND accepted_at IS NULL",
-                        delivery_uuid, job["lease_expires_at"],
+                        delivery_uuid,
+                        job["lease_expires_at"],
                     )
             else:
                 expected = pinned_resume_input_digests(context, consumed_context)
@@ -11359,7 +11752,9 @@ class PostgresDB:
                   AND NOT ({_completion_control_active_sql("context")})
                 RETURNING id
                 """,
-                job_uuid, agent_uuid, consumed_keys,
+                job_uuid,
+                agent_uuid,
+                consumed_keys,
             )
             return row is not None
 
@@ -16645,8 +17040,7 @@ class PostgresDB:
                     "_runtime_incarnation",
                 )
             )
-            or re.fullmatch(r"[0-9a-f]{64}", desired_manifest_digest or "")
-            is None
+            or re.fullmatch(r"[0-9a-f]{64}", desired_manifest_digest or "") is None
         ):
             return {"disposition": "definitively_denied"}
 
@@ -17036,8 +17430,7 @@ class PostgresDB:
                         or ide.get("status") != "restoring"
                         or ide.get("restore_type") != "k8s_container"
                         or ide.get("_restore_attempt_id") != str(expected_attempt)
-                        or ide.get("_creation_reservation_id")
-                        != str(active["id"])
+                        or ide.get("_creation_reservation_id") != str(active["id"])
                         or ide.get("_creation_claim_token")
                         != str(active["claim_token"])
                         or fingerprint.get("restore_attempt_id")
@@ -18164,7 +18557,11 @@ class PostgresDB:
                 table = "jobs" if owner_kind == "job" else "threads"
                 owner_status = await conn.fetchval(
                     f"SELECT status::text FROM {table} WHERE id = $1 "
-                    + (f"AND NOT {worker_execution_held_sql('context')} " if owner_kind == "job" else "")
+                    + (
+                        f"AND NOT {worker_execution_held_sql('context')} "
+                        if owner_kind == "job"
+                        else ""
+                    )
                     + "FOR UPDATE",
                     owner_uuid,
                 )
@@ -18236,7 +18633,11 @@ class PostgresDB:
             async with conn.transaction():
                 owner_status = await conn.fetchval(
                     f"SELECT status::text FROM {table} WHERE id = $1 "
-                    + (f"AND NOT {worker_execution_held_sql('context')} " if owner_kind == "job" else "")
+                    + (
+                        f"AND NOT {worker_execution_held_sql('context')} "
+                        if owner_kind == "job"
+                        else ""
+                    )
                     + "FOR UPDATE",
                     owner_uuid,
                 )
@@ -18320,7 +18721,11 @@ class PostgresDB:
             async with conn.transaction():
                 owner_status = await conn.fetchval(
                     f"SELECT status::text FROM {table} WHERE id = $1 "
-                    + (f"AND NOT {worker_execution_held_sql('context')} " if owner_kind == "job" else "")
+                    + (
+                        f"AND NOT {worker_execution_held_sql('context')} "
+                        if owner_kind == "job"
+                        else ""
+                    )
                     + "FOR UPDATE",
                     owner_uuid,
                 )
@@ -18529,7 +18934,11 @@ class PostgresDB:
             async with conn.transaction():
                 owner_status = await conn.fetchval(
                     f"SELECT status::text FROM {table} WHERE id = $1 "
-                    + (f"AND NOT {worker_execution_held_sql('context')} " if owner_kind == "job" else "")
+                    + (
+                        f"AND NOT {worker_execution_held_sql('context')} "
+                        if owner_kind == "job"
+                        else ""
+                    )
                     + "FOR UPDATE",
                     owner_uuid,
                 )
@@ -21339,11 +21748,13 @@ class PostgresDB:
                     owner_uuid,
                 )
                 if constrained is not None and (
-                    owner_kind != "job" or scope != "workspace_container"
+                    owner_kind != "job"
+                    or scope != "workspace_container"
                     or constrained.job_id != str(owner_uuid)
                     or owner is None
                     or not constrained.matches_owner(
-                        owner["owner_status"], _strict_json_object(owner["state"], label="context")
+                        owner["owner_status"],
+                        _strict_json_object(owner["state"], label="context"),
                     )
                     or await conn.fetchval(
                         f"SELECT ({_completion_control_active_sql('context')}) FROM jobs WHERE id=$1",
@@ -21398,7 +21809,9 @@ class PostgresDB:
                     expected_runtime,
                     intent_generation,
                 )
-                if intent is None or (constrained is not None and not constrained.matches_intent(intent)):
+                if intent is None or (
+                    constrained is not None and not constrained.matches_intent(intent)
+                ):
                     return False
                 if intent.get("result_kind") == "superseded":
                     return False
@@ -22417,8 +22830,12 @@ class PostgresDB:
         claim_token: int,
         pod_uid: str,
         observation: (
-            Unknown | BoundPodObserved | Unscheduled | ScheduledAt
-            | ReadyObservedAt | StartupAttention
+            Unknown
+            | BoundPodObserved
+            | Unscheduled
+            | ScheduledAt
+            | ReadyObservedAt
+            | StartupAttention
         ),
         *,
         budgets: StageBudgets | None = None,
@@ -22449,10 +22866,14 @@ class PostgresDB:
             if budgets is not None:
                 return False
         elif isinstance(observation, Unscheduled):
-            if observation.reason_code not in {
-                "scheduler_unschedulable",
-                "scheduling_other",
-            } or budgets is not None:
+            if (
+                observation.reason_code
+                not in {
+                    "scheduler_unschedulable",
+                    "scheduling_other",
+                }
+                or budgets is not None
+            ):
                 return False
         elif isinstance(observation, ScheduledAt):
             if budgets is not None and not isinstance(budgets, StageBudgets):
@@ -22461,13 +22882,17 @@ class PostgresDB:
             if budgets is not None:
                 return False
         elif isinstance(observation, StartupAttention):
-            if observation.reason_code not in {
-                "invalid_image",
-                "invalid_configuration",
-                "pull_deadline",
-                "readiness_deadline",
-                "ssh_deadline",
-            } or budgets is not None:
+            if (
+                observation.reason_code
+                not in {
+                    "invalid_image",
+                    "invalid_configuration",
+                    "pull_deadline",
+                    "readiness_deadline",
+                    "ssh_deadline",
+                }
+                or budgets is not None
+            ):
                 return False
         else:
             return False
@@ -22742,9 +23167,7 @@ class PostgresDB:
             or len(backing_id) > 512
             or "\x00" in backing_id
             or not isinstance(ssh_host_key_fingerprint, str)
-            or not re.fullmatch(
-                r"SHA256:[A-Za-z0-9+/]{43}", ssh_host_key_fingerprint
-            )
+            or not re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", ssh_host_key_fingerprint)
             or not isinstance(pod_ip, str)
             or not pod_ip
             or type(port) is not int
@@ -22769,12 +23192,9 @@ class PostgresDB:
                 if (
                     not isinstance(workspace, dict)
                     or workspace.get("provisioner") != "k8s"
-                    or workspace.get("status") not in {
-                        "creating", "pending", "created"
-                    }
+                    or workspace.get("status") not in {"creating", "pending", "created"}
                     or workspace.get("_runtime_incarnation") != str(runtime_uuid)
-                    or workspace.get("_creation_reservation_id")
-                    != str(receipt_uuid)
+                    or workspace.get("_creation_reservation_id") != str(receipt_uuid)
                     or workspace.get("_creation_claim_token")
                     != str(creation_claim_token)
                     or WORKER_EXECUTION_HOLD_KEY in context
@@ -24500,10 +24920,13 @@ class PostgresDB:
             parsed_thread = UUID(str(thread_id))
             parsed_runtime_generation = UUID(str(expected_runtime_generation))
             parsed_wake = (
-                UUID(str(wake_operation_id))
-                if wake_operation_id is not None else None
+                UUID(str(wake_operation_id)) if wake_operation_id is not None else None
             )
-            parsed_resume = UUID(str(retained_resume_id)) if retained_resume_id is not None else None
+            parsed_resume = (
+                UUID(str(retained_resume_id))
+                if retained_resume_id is not None
+                else None
+            )
             parsed_agent = (
                 UUID(str(expected_agent_id)) if expected_agent_id is not None else None
             )
@@ -24562,9 +24985,9 @@ class PostgresDB:
                     or request.get("job_id") != str(parsed_thread)
                     or request.get("provision_generation") != provision_generation
                     or canonical_request_digest(request)
-                        != creation_source["request_digest"]
+                    != creation_source["request_digest"]
                     or canonical_configuration_digest(configuration)
-                        != creation_source["controller_configuration_digest"]
+                    != creation_source["controller_configuration_digest"]
                     or (
                         configuration.get("network_profile_policy")
                         != {
@@ -24600,7 +25023,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             async with conn.transaction():
                 from orchestrator.services.vm_thread_retained_resume import (
-                    lock_owner_on_conn, operation_on_conn,
+                    lock_owner_on_conn,
+                    operation_on_conn,
                 )
 
                 await lock_owner_on_conn(conn, parsed_thread)
@@ -24631,19 +25055,28 @@ class PostgresDB:
                     return False
                 retained = None
                 if parsed_resume is not None:
-                    retained = await operation_on_conn(conn, parsed_resume, parsed_thread)
+                    retained = await operation_on_conn(
+                        conn, parsed_resume, parsed_thread
+                    )
                     if (
-                        retained is None or parsed_agent is None or parsed_attach is None
+                        retained is None
+                        or parsed_agent is None
+                        or parsed_attach is None
                         or retained["runtime_generation"] != parsed_runtime_generation
                         or retained["request_id"] != parsed_request_id
                         or str(retained["provision_generation"]) != provision_generation
-                        or parsed_wake is not None or poll or preparation_only
+                        or parsed_wake is not None
+                        or poll
+                        or preparation_only
                         or creation_source is None
-                        or request.get("vm_image") != retained["request"].get("vm_image")
-                        or request.get("network_profile") != retained["request"].get("network_profile")
+                        or request.get("vm_image")
+                        != retained["request"].get("vm_image")
+                        or request.get("network_profile")
+                        != retained["request"].get("network_profile")
                         or request.get("preparation") is not None
                         or request.get("initialization") is not None
-                        or (current_vm or {}).get("rootdisk_pvc_uid") != str(retained["pvc_uid"])
+                        or (current_vm or {}).get("rootdisk_pvc_uid")
+                        != str(retained["pvc_uid"])
                     ):
                         return False
                 if initial_creation is not None:
@@ -24652,8 +25085,11 @@ class PostgresDB:
                     # VM, retained-volume, retirement or restore authority.
                     if (
                         row["status"] != "created"
-                        or parsed_agent is None or parsed_attach is None
-                        or current_vm is not None or poll or parsed_wake is not None
+                        or parsed_agent is None
+                        or parsed_attach is None
+                        or current_vm is not None
+                        or poll
+                        or parsed_wake is not None
                         or metadata.get("_workspace_binding") is not None
                         or metadata.get("protected_cloud") not in (None, False)
                     ):
@@ -24666,16 +25102,21 @@ class PostgresDB:
                         return False
                     execution = await conn.fetchrow(
                         "SELECT * FROM srw_execution_specs WHERE work_kind='Session' "
-                        "AND work_id=$1 FOR SHARE", parsed_thread,
+                        "AND work_id=$1 FOR SHARE",
+                        parsed_thread,
                     )
                     if execution is None or (
                         str(execution["id"]) != initial_creation.get("execution_id")
-                        or execution["revision"] != initial_creation.get("execution_revision")
-                        or execution["generation"] != initial_creation.get("execution_generation")
+                        or execution["revision"]
+                        != initial_creation.get("execution_revision")
+                        or execution["generation"]
+                        != initial_creation.get("execution_generation")
                         or execution["harness_adapter"] != "srw/v1"
                     ):
                         return False
-                    from orchestrator.services.manifest_execution_snapshot import srw_snapshot_config
+                    from orchestrator.services.manifest_execution_snapshot import (
+                        srw_snapshot_config,
+                    )
 
                     _, initial_policy = srw_snapshot_config(dict(execution))
                     if (initial_policy.get("workspace") or {}).get("backend") != "vm":
@@ -24687,7 +25128,8 @@ class PostgresDB:
                         "OR EXISTS(SELECT 1 FROM thread_runtime_attach_abort_outcomes WHERE thread_id=$1) "
                         "OR EXISTS(SELECT 1 FROM thread_workspace_provision_intents WHERE thread_id=$1) "
                         "OR EXISTS(SELECT 1 FROM srw_execution_workspace_bindings WHERE execution_id=$2)",
-                        parsed_thread, execution["id"],
+                        parsed_thread,
+                        execution["id"],
                     ):
                         return False
                     if not preparation_only:
@@ -24707,7 +25149,8 @@ class PostgresDB:
                 )
                 if open_idle is not None:
                     if (
-                        parsed_wake is None or open_idle["id"] != parsed_wake
+                        parsed_wake is None
+                        or open_idle["id"] != parsed_wake
                         or open_idle["release_kind"] != "pinned_thread"
                         or open_idle["thread_terminal_intent_at"] is not None
                         or open_idle["phase"] not in {"waking", "wake_held"}
@@ -24716,18 +25159,18 @@ class PostgresDB:
                         or (current_vm or {}).get("status") != "suspended"
                         or (current_vm or {}).get("rootdisk") != "kept"
                         or str((current_vm or {}).get("provision_generation"))
-                            != str(open_idle["provision_generation"])
+                        != str(open_idle["provision_generation"])
                         or str((current_vm or {}).get("vm_uid"))
-                            != str(open_idle["vm_uid"])
+                        != str(open_idle["vm_uid"])
                         or str((current_vm or {}).get("rootdisk_pvc_uid"))
-                            != str(open_idle["pvc_uid"])
+                        != str(open_idle["pvc_uid"])
                         or provision_generation != str(open_idle["wake_generation"])
                         or proposed.get("idle_wake_operation_id")
-                            != str(open_idle["id"])
+                        != str(open_idle["id"])
                         or proposed.get("idle_wake_request_id")
-                            != str(open_idle["wake_request_id"])
+                        != str(open_idle["wake_request_id"])
                         or proposed.get("idle_predecessor_pvc_uid")
-                            != str(open_idle["pvc_uid"])
+                        != str(open_idle["pvc_uid"])
                     ):
                         return False
                     settled_retirement = await conn.fetchval(
@@ -24736,7 +25179,8 @@ class PostgresDB:
                         "AND runtime_generation=$2 AND retirement_token=$3 "
                         "AND disposition='suspended' AND permanent=false "
                         "AND outcome='settled')",
-                        parsed_thread, open_idle["thread_runtime_generation"],
+                        parsed_thread,
+                        open_idle["thread_runtime_generation"],
                         open_idle["thread_retirement_token"],
                     )
                     if not settled_retirement:
@@ -24745,9 +25189,15 @@ class PostgresDB:
                         inherited_profile_on_conn,
                     )
 
-                    inherited_ok, inherited_profile, inherited_image = await inherited_profile_on_conn(
-                        conn, thread_id=parsed_thread,
-                        operation=open_idle, vm=current_vm or {},
+                    (
+                        inherited_ok,
+                        inherited_profile,
+                        inherited_image,
+                    ) = await inherited_profile_on_conn(
+                        conn,
+                        thread_id=parsed_thread,
+                        operation=open_idle,
+                        vm=current_vm or {},
                     )
                     if not inherited_ok:
                         return False
@@ -24762,8 +25212,10 @@ class PostgresDB:
                     elif inherited_profile is not None:
                         return False
                 elif parsed_wake is not None or any(
-                    proposed.get(key) is not None for key in (
-                        "idle_wake_operation_id", "idle_wake_request_id",
+                    proposed.get(key) is not None
+                    for key in (
+                        "idle_wake_operation_id",
+                        "idle_wake_request_id",
                         "idle_predecessor_pvc_uid",
                     )
                 ):
@@ -24771,14 +25223,12 @@ class PostgresDB:
                 elif creation_source is not None and retained is None:
                     from shared.vm_network_profile import selected_profile
 
-                    if (
-                        request.get("network_profile") != selected_profile(
-                            request.get("vm_image"),
-                            prepared=(
-                                request.get("preparation") is not None
-                                or (current_vm or {}).get("rootdisk_pvc_uid") is not None
-                            ),
-                        )
+                    if request.get("network_profile") != selected_profile(
+                        request.get("vm_image"),
+                        prepared=(
+                            request.get("preparation") is not None
+                            or (current_vm or {}).get("rootdisk_pvc_uid") is not None
+                        ),
                     ):
                         return False
                 current_vm_status = str((current_vm or {}).get("status") or "")
@@ -24931,21 +25381,32 @@ class PostgresDB:
                         "expected_pvc_uid) VALUES($1,'thread',$2,$3,$4,$5,$6,"
                         + ("$13,$7,$14," if retained is not None else "$7,'initial',")
                         + "$8,$9::jsonb,$10,$11::jsonb,$12) RETURNING *",
-                        parsed_request_id, parsed_thread, parsed_runtime_generation,
-                        parsed_agent, parsed_attach, parsed_wake,
-                        UUID(provision_generation), creation_source["request_digest"],
+                        parsed_request_id,
+                        parsed_thread,
+                        parsed_runtime_generation,
+                        parsed_agent,
+                        parsed_attach,
+                        parsed_wake,
+                        UUID(provision_generation),
+                        creation_source["request_digest"],
                         json.dumps(request),
                         creation_source["controller_configuration_digest"],
                         json.dumps(configuration),
-                        retained["pvc_uid"] if retained is not None else (open_idle["pvc_uid"] if open_idle is not None else None),
+                        retained["pvc_uid"]
+                        if retained is not None
+                        else (open_idle["pvc_uid"] if open_idle is not None else None),
                         *((parsed_resume, "resume") if retained is not None else ()),
                     )
                     resource = await installed_job_resource_store(
-                        conn, self, configuration,
+                        conn,
+                        self,
+                        configuration,
                     )
                     if configuration["version"] == 3:
                         if resource is None:
-                            raise RuntimeError("Thread resource installation unavailable")
+                            raise RuntimeError(
+                                "Thread resource installation unavailable"
+                            )
                         await resource._write_thread_waiter_on_conn(conn, retry=source)
                 return True
 
@@ -27966,13 +28427,15 @@ class PostgresDB:
             # A flag stops new idle nominations, never the dispatch fence of
             # an already-admitted operation. After 0275, all pinned claims
             # share the agent-first lock order even when admission is off.
-            pinned_idle_claim = bool(await conn.fetchval(
-                "SELECT to_regclass('public.pinned_job_deliveries') IS NOT NULL"
-            ))
+            pinned_idle_claim = bool(
+                await conn.fetchval(
+                    "SELECT to_regclass('public.pinned_job_deliveries') IS NOT NULL"
+                )
+            )
             if (
                 not pinned_idle_claim
                 and os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower()
-                    == "true"
+                == "true"
             ):
                 return False
             if pinned_idle_claim:
@@ -27982,17 +28445,20 @@ class PostgresDB:
                 async with conn.transaction():
                     agent = await conn.fetchrow(
                         "SELECT status,current_job_id FROM agents "
-                        "WHERE id=$1 FOR UPDATE", agent_uuid,
+                        "WHERE id=$1 FOR UPDATE",
+                        agent_uuid,
                     )
                     if (
-                        agent is None or agent["status"] != "ready"
+                        agent is None
+                        or agent["status"] != "ready"
                         or agent["current_job_id"] is not None
                     ):
                         return False
                     if await conn.fetchval(
                         "SELECT EXISTS(SELECT 1 FROM vm_idle_operations "
                         "WHERE release_kind='pinned_job' AND closed_at IS NULL "
-                        "AND pinned_agent_id=$1)", agent_uuid,
+                        "AND pinned_agent_id=$1)",
+                        agent_uuid,
                     ):
                         return False
                     locked = await conn.fetchval(
@@ -28004,11 +28470,15 @@ class PostgresDB:
                     if completion_commands_enabled and await conn.fetchval(
                         "SELECT EXISTS (SELECT 1 "
                         "FROM job_completion_sweep_exclusions "
-                        "WHERE job_id=$1::uuid)", job_uuid,
+                        "WHERE job_id=$1::uuid)",
+                        job_uuid,
                     ):
                         return False
                     row = await conn.fetchrow(
-                        query, job_uuid, agent_uuid, JOB_LEASE_PICKUP_SECONDS,
+                        query,
+                        job_uuid,
+                        agent_uuid,
+                        JOB_LEASE_PICKUP_SECONDS,
                         *hold_args,
                     )
             elif not completion_commands_enabled:
@@ -32870,7 +33340,8 @@ class PostgresDB:
                     if expected_lane == "pinned" and await conn.fetchval(
                         "SELECT EXISTS(SELECT 1 FROM vm_idle_operations "
                         "WHERE owner_kind='job' AND owner_id=$1 "
-                        "AND closed_at IS NULL)", job_uuid,
+                        "AND closed_at IS NULL)",
+                        job_uuid,
                     ):
                         raise _Abort()
                     if completion_commands_enabled:
@@ -32910,7 +33381,9 @@ class PostgresDB:
                         )
 
                         pinned_delivery = await accept_pinned_report_on_conn(
-                            conn, job_id=job_uuid, agent_id=agent_uuid,
+                            conn,
+                            job_id=job_uuid,
+                            agent_id=agent_uuid,
                             delivery_id=pinned_delivery_id,
                             projection_digest=pinned_projection_digest,
                             process_generation=pinned_process_generation,
@@ -33022,10 +33495,15 @@ class PostgresDB:
                             record_pinned_wait_receipt_on_conn,
                         )
 
-                        if await record_pinned_wait_receipt_on_conn(
-                            conn, delivery=pinned_delivery,
-                            source_kind="route", source_id=route_uuid,
-                        ) is None:
+                        if (
+                            await record_pinned_wait_receipt_on_conn(
+                                conn,
+                                delivery=pinned_delivery,
+                                source_kind="route",
+                                source_id=route_uuid,
+                            )
+                            is None
+                        ):
                             raise _Abort()
                     # A human-addressed route is semantic wait evidence. An
                     # officer-only question is still autonomous work. Legacy
@@ -33717,8 +34195,7 @@ class PostgresDB:
         # pre-update jobs row, after the caller's queue lock, so a concurrent
         # human Resume cannot expose a worker while retirement is in flight.
         retirement_guard = (
-            " AND COALESCE(context->'vm'->>'retirement_cleanup_pending', '')"
-            " <> 'true'"
+            " AND COALESCE(context->'vm'->>'retirement_cleanup_pending', '') <> 'true'"
         )
         context_base = "COALESCE(context, '{}'::jsonb)"
         hold_guard = ""
@@ -34130,24 +34607,33 @@ class PostgresDB:
                     )
                     if idle_phase_source_snapshot is not None:
                         from orchestrator.services.vm_idle_phase_approval import (
-                            approval_source_snapshot, finalized_phase_source,
+                            approval_source_snapshot,
+                            finalized_phase_source,
                         )
                         from orchestrator.services.vm_remote_operation import (
-                            VMRemoteOperationUnavailable, _identity_from_row,
+                            VMRemoteOperationUnavailable,
+                            _identity_from_row,
                         )
-                        from shared.workspace_idle_policy import IdlePolicyError, read_episode
+                        from shared.workspace_idle_policy import (
+                            IdlePolicyError,
+                            read_episode,
+                        )
 
                         locked = await conn.fetchrow(
-                            "SELECT * FROM jobs WHERE id=$1 FOR UPDATE", job_uuid,
+                            "SELECT * FROM jobs WHERE id=$1 FOR UPDATE",
+                            job_uuid,
                         )
                         if (
                             locked is None
                             or completion_control_claim_id is None
-                            or approval_source_snapshot(dict(locked)) != idle_phase_source_snapshot
+                            or approval_source_snapshot(dict(locked))
+                            != idle_phase_source_snapshot
                             or await conn.fetchval(
                                 "SELECT 1 FROM vm_idle_operations WHERE owner_kind='job' "
-                                "AND owner_id=$1 AND closed_at IS NULL", job_uuid,
-                            ) is not None
+                                "AND owner_id=$1 AND closed_at IS NULL",
+                                job_uuid,
+                            )
+                            is not None
                         ):
                             raise _ResumeCASLostError
                         try:
@@ -34155,10 +34641,13 @@ class PostgresDB:
                             if isinstance(document, str):
                                 document = json.loads(document)
                             episode = read_episode(
-                                document, revision=locked["workspace_idle_revision"],
+                                document,
+                                revision=locked["workspace_idle_revision"],
                             )
                             identity = _identity_from_row(
-                                dict(locked), owner_kind="job", owner_id=job_id,
+                                dict(locked),
+                                owner_kind="job",
+                                owner_id=job_id,
                                 operation_kind="idle_policy",
                             )
                             context = locked["context"]
@@ -34171,17 +34660,25 @@ class PostgresDB:
                                 episode is None
                                 or episode.wait_kind != "human_approval"
                                 or await finalized_phase_source(
-                                    conn, job=locked, episode=episode,
+                                    conn,
+                                    job=locked,
+                                    episode=episode,
                                     generation=identity.workspace_generation,
                                     vm_uid=identity.vm_uid,
                                     launcher_uid=identity.launcher_pod_uid,
-                                    vmi_uid=vmi_uid, pvc_uid=pvc_uid,
-                                ) is None
+                                    vmi_uid=vmi_uid,
+                                    pvc_uid=pvc_uid,
+                                )
+                                is None
                             ):
                                 raise _ResumeCASLostError
                         except (
-                            IdlePolicyError, VMRemoteOperationUnavailable,
-                            KeyError, TypeError, ValueError, AttributeError,
+                            IdlePolicyError,
+                            VMRemoteOperationUnavailable,
+                            KeyError,
+                            TypeError,
+                            ValueError,
+                            AttributeError,
                         ) as exc:
                             raise _ResumeCASLostError from exc
                     if (
@@ -34200,7 +34697,11 @@ class PostgresDB:
                     )
                     if execution_held and lift_operator_pause_hold is not None:
                         raise _ResumeCASLostError
-                    if not execution_held and await reset_worker_batch_attempts(conn, job_id=job_uuid) is None:
+                    if (
+                        not execution_held
+                        and await reset_worker_batch_attempts(conn, job_id=job_uuid)
+                        is None
+                    ):
                         raise _ResumeCASLostError
                     if admitted.state == "parked" and not execution_held:
                         # This is an explicit human/operator resume, so it is a
@@ -40502,7 +41003,8 @@ class PostgresDB:
                 return receipt
 
     async def reserve_pinned_thread_idle_terminal_end(
-        self, thread_id: str,
+        self,
+        thread_id: str,
     ) -> str:
         """Serialize authorized permanent End with an admitted soft idle stop."""
         try:
@@ -40514,20 +41016,25 @@ class PostgresDB:
                 "SELECT status,runtime_generation,runtime_retirement_token,"
                 "runtime_retirement_permanent,runtime_retirement_context,"
                 "agent_id,runtime_attach_token,metadata FROM threads WHERE id=$1 "
-                "FOR UPDATE", owner_id,
+                "FOR UPDATE",
+                owner_id,
             )
             if thread is None:
                 return "missing"
             operation = await conn.fetchrow(
                 "SELECT * FROM vm_idle_operations WHERE owner_kind='thread' "
-                "AND owner_id=$1 AND closed_at IS NULL FOR UPDATE", owner_id,
+                "AND owner_id=$1 AND closed_at IS NULL FOR UPDATE",
+                owner_id,
             )
             if operation is None:
                 return "none"
             if operation["release_kind"] != "pinned_thread":
                 return "held"
             if operation["phase"] not in {
-                "releasing", "release_held", "suspended", "waking",
+                "releasing",
+                "release_held",
+                "suspended",
+                "waking",
                 "wake_held",
             }:
                 return "held"
@@ -40544,7 +41051,7 @@ class PostgresDB:
                     and thread["runtime_retirement_permanent"] is True
                     and isinstance(pending_context, dict)
                     and pending_context.get("generation")
-                        == str(thread["runtime_generation"])
+                    == str(thread["runtime_generation"])
                     and pending_context.get("settle_status") == "ended"
                 )
                 if (
@@ -40564,9 +41071,9 @@ class PostgresDB:
             elif (
                 thread["status"] != "awaiting_user"
                 or thread["runtime_generation"]
-                    != operation["thread_runtime_generation"]
+                != operation["thread_runtime_generation"]
                 or thread["runtime_retirement_token"]
-                    != operation["thread_retirement_token"]
+                != operation["thread_retirement_token"]
             ):
                 return "held"
             if operation["thread_terminal_intent_at"] is None:
@@ -40576,14 +41083,16 @@ class PostgresDB:
                     "thread_terminal_intent_generation=$2 "
                     "WHERE id=$1 AND thread_terminal_intent_at IS NULL "
                     "RETURNING thread_terminal_intent_at",
-                    operation["id"], thread["runtime_generation"],
+                    operation["id"],
+                    thread["runtime_generation"],
                 )
                 if stamped is None:
                     return "held"
                 mirrored = await conn.execute(
                     "UPDATE threads SET pinned_idle_terminal_intent_at=$2 "
                     "WHERE id=$1 AND pinned_idle_terminal_intent_at IS NULL",
-                    owner_id, stamped["thread_terminal_intent_at"],
+                    owner_id,
+                    stamped["thread_terminal_intent_at"],
                 )
                 if mirrored != "UPDATE 1":
                     raise RuntimeError("pinned idle terminal intent mirror lost")
@@ -40601,16 +41110,19 @@ class PostgresDB:
                 and vm.get("status") == "ready"
                 and vm.get("identity_authenticated") is True
                 and vm.get("identity_provision_generation")
-                    == str(operation["wake_generation"])
-                and vm.get("provision_generation")
-                    == str(operation["wake_generation"])
+                == str(operation["wake_generation"])
+                and vm.get("provision_generation") == str(operation["wake_generation"])
                 and vm.get("idle_wake_operation_id") == str(operation["id"])
-                and vm.get("idle_predecessor_pvc_uid")
-                    == str(operation["pvc_uid"])
+                and vm.get("idle_predecessor_pvc_uid") == str(operation["pvc_uid"])
                 and vm.get("rootdisk_pvc_uid") == str(operation["pvc_uid"])
-                and all(vm.get(key) for key in (
-                    "vm_uid", "vmi_uid", "active_pod_uid",
-                ))
+                and all(
+                    vm.get(key)
+                    for key in (
+                        "vm_uid",
+                        "vmi_uid",
+                        "active_pod_uid",
+                    )
+                )
             )
             unissued_successor = bool(
                 operation["phase"] in {"suspended", "waking", "wake_held"}
@@ -40620,15 +41132,18 @@ class PostgresDB:
                 and vm.get("status") == "suspended"
                 and vm.get("rootdisk") == "kept"
                 and vm.get("provision_generation")
-                    == str(operation["provision_generation"])
+                == str(operation["provision_generation"])
                 and vm.get("rootdisk_pvc_uid") == str(operation["pvc_uid"])
             )
             return (
                 "ready_for_destructive_retirement"
                 if joined_permanent
-                or (operation["phase"] == "suspended"
-                    and not operation["wake_requested"])
-                or issued_successor_ready or unissued_successor
+                or (
+                    operation["phase"] == "suspended"
+                    and not operation["wake_requested"]
+                )
+                or issued_successor_ready
+                or unissued_successor
                 else "waiting_for_release"
             )
 
@@ -40675,7 +41190,9 @@ class PostgresDB:
         ) as conn:
             async with conn.transaction():
                 if _connection is None:
-                    from orchestrator.services.vm_thread_retained_resume import lock_owner_on_conn
+                    from orchestrator.services.vm_thread_retained_resume import (
+                        lock_owner_on_conn,
+                    )
 
                     await lock_owner_on_conn(conn, parsed_thread_id)
                 row = await conn.fetchrow(
@@ -40807,7 +41324,9 @@ class PostgresDB:
                         source = existing_context.get("vm_creation_source")
                         if source is not None:
                             await self._cancel_retiring_thread_creation_on_conn(
-                                conn, parsed_thread_id, source,
+                                conn,
+                                parsed_thread_id,
+                                source,
                             )
                     return {
                         "state": "pending",
@@ -41470,8 +41989,12 @@ class PostgresDB:
                             # retired before its VM identity is observed.
                             # Lock it after the thread row so Begin and every
                             # effect grant serialize on the same source.
-                            from shared.vm_creation_retry import canonical_request_digest
-                            from shared.vm_creation_issuance import canonical_configuration_digest
+                            from shared.vm_creation_retry import (
+                                canonical_request_digest,
+                            )
+                            from shared.vm_creation_issuance import (
+                                canonical_configuration_digest,
+                            )
 
                             request_id = _canonical_uuid_text(
                                 vm_context.get("creation_request_id"),
@@ -41494,22 +42017,32 @@ class PostgresDB:
                                 "SELECT public.thread_vm_creation_cleanup_lineage(t,r) "
                                 "FROM threads t JOIN vm_creation_retries r ON r.thread_id=t.id "
                                 "WHERE t.id=$1 AND r.request_id=$2",
-                                parsed_thread_id, UUID(request_id),
+                                parsed_thread_id,
+                                UUID(request_id),
                             )
                             if not (
                                 creation["owner_kind"] == "thread"
                                 and creation["thread_id"] == parsed_thread_id
                                 and creation["job_id"] is None
-                                and cleanup_protocol in {"exact", "initial_attach_abort_v1", "retained_attach_abort_v1"}
+                                and cleanup_protocol
+                                in {
+                                    "exact",
+                                    "initial_attach_abort_v1",
+                                    "retained_attach_abort_v1",
+                                }
                                 and str(creation["provision_generation"])
                                 == str(vm_context["provision_generation"])
-                                and creation["state"] in {
-                                    "queued", "reconciling", "attention",
+                                and creation["state"]
+                                in {
+                                    "queued",
+                                    "reconciling",
+                                    "attention",
                                     "cancel_requested",
                                 }
                                 and isinstance(creation_request, dict)
                                 and creation_request.get("entity_type") == "thread"
-                                and creation_request.get("job_id") == str(parsed_thread_id)
+                                and creation_request.get("job_id")
+                                == str(parsed_thread_id)
                                 and creation_request.get("provision_generation")
                                 == str(creation["provision_generation"])
                                 and canonical_request_digest(creation_request)
@@ -41520,7 +42053,8 @@ class PostgresDB:
                                 == creation["controller_configuration_digest"]
                                 and (
                                     creation["observed_vm_uid"] is None
-                                    or creation.get("thread_retained_resume_id") is not None
+                                    or creation.get("thread_retained_resume_id")
+                                    is not None
                                     and await conn.fetchval(
                                         "SELECT public.valid_vm_thread_retained_resume_source(r) FROM vm_creation_retries r WHERE request_id=$1",
                                         creation["request_id"],
@@ -41535,27 +42069,49 @@ class PostgresDB:
                                 )
                             vm_creation_source = {
                                 "request_id": request_id,
-                                "provision_generation": str(creation["provision_generation"]),
+                                "provision_generation": str(
+                                    creation["provision_generation"]
+                                ),
                                 "request_digest": creation["request_digest"],
-                                "controller_configuration_digest": creation["controller_configuration_digest"],
-                                "thread_runtime_generation": str(creation["thread_runtime_generation"]),
+                                "controller_configuration_digest": creation[
+                                    "controller_configuration_digest"
+                                ],
+                                "thread_runtime_generation": str(
+                                    creation["thread_runtime_generation"]
+                                ),
                                 "cleanup_protocol": cleanup_protocol,
                                 "thread_agent_id": str(creation["thread_agent_id"])
-                                if creation["thread_agent_id"] is not None else None,
-                                "thread_attach_token": str(creation["thread_attach_token"])
-                                if creation["thread_attach_token"] is not None else None,
+                                if creation["thread_agent_id"] is not None
+                                else None,
+                                "thread_attach_token": str(
+                                    creation["thread_attach_token"]
+                                )
+                                if creation["thread_attach_token"] is not None
+                                else None,
                                 "captured_vm": vm_context,
-                                **({
-                                    "retained_resume_id": str(creation["thread_retained_resume_id"]),
-                                    "abort_lineage": json.loads(await conn.fetchval(
-                                        "SELECT public.vm_thread_retained_abort_path(op,$2::uuid)::text "
-                                        "FROM vm_thread_retained_resumes op WHERE id=$1",
-                                        creation["thread_retained_resume_id"], thread["runtime_generation"],
-                                    )),
-                                } if creation.get("thread_retained_resume_id") is not None else {}),
+                                **(
+                                    {
+                                        "retained_resume_id": str(
+                                            creation["thread_retained_resume_id"]
+                                        ),
+                                        "abort_lineage": json.loads(
+                                            await conn.fetchval(
+                                                "SELECT public.vm_thread_retained_abort_path(op,$2::uuid)::text "
+                                                "FROM vm_thread_retained_resumes op WHERE id=$1",
+                                                creation["thread_retained_resume_id"],
+                                                thread["runtime_generation"],
+                                            )
+                                        ),
+                                    }
+                                    if creation.get("thread_retained_resume_id")
+                                    is not None
+                                    else {}
+                                ),
                             }
                         else:
-                            _canonical_uuid_text(vm_context.get("vm_uid"), label="VM UID")
+                            _canonical_uuid_text(
+                                vm_context.get("vm_uid"), label="VM UID"
+                            )
                             _canonical_uuid_text(
                                 vm_context.get("rootdisk_pvc_uid"),
                                 label="VM rootdisk UID",
@@ -41821,7 +42377,9 @@ class PostgresDB:
                 # durable only at the irrevocable authorization edge.
                 if authorize_immediately and vm_creation_source is not None:
                     await self._cancel_retiring_thread_creation_on_conn(
-                        conn, parsed_thread_id, vm_creation_source,
+                        conn,
+                        parsed_thread_id,
+                        vm_creation_source,
                     )
                 return {
                     "state": "pending",
@@ -41932,21 +42490,33 @@ class PostgresDB:
                     "AND runtime_retirement_token=$3::uuid "
                     "AND runtime_retirement_context->>'settle_status'=$4 "
                     "RETURNING id,runtime_retirement_context",
-                    parsed_thread, parsed_generation, parsed_token, settle_status,
+                    parsed_thread,
+                    parsed_generation,
+                    parsed_token,
+                    settle_status,
                 )
                 if row is not None:
                     context = row["runtime_retirement_context"]
                     if isinstance(context, str):
                         context = json.loads(context)
-                    source = context.get("vm_creation_source") if isinstance(context, dict) else None
+                    source = (
+                        context.get("vm_creation_source")
+                        if isinstance(context, dict)
+                        else None
+                    )
                     if source is not None:
                         await self._cancel_retiring_thread_creation_on_conn(
-                            conn, parsed_thread, source,
+                            conn,
+                            parsed_thread,
+                            source,
                         )
         return row is not None
 
     async def _cancel_retiring_thread_creation_on_conn(
-        self, conn: Any, thread_id: UUID, source: Mapping[str, Any],
+        self,
+        conn: Any,
+        thread_id: UUID,
+        source: Mapping[str, Any],
     ) -> None:
         """Cancel only the immutable source captured by the current End."""
         changed = await conn.fetchval(
@@ -41959,7 +42529,8 @@ class PostgresDB:
             "AND provision_generation=$4::uuid "
             "AND request_digest=$5 AND controller_configuration_digest=$6 "
             "AND state IN ('queued','reconciling','attention') RETURNING request_id",
-            UUID(source["request_id"]), thread_id,
+            UUID(source["request_id"]),
+            thread_id,
             UUID(source["thread_runtime_generation"]),
             UUID(source["provision_generation"]),
             source["request_digest"],
@@ -41972,7 +42543,8 @@ class PostgresDB:
                 "AND thread_runtime_generation=$3::uuid "
                 "AND provision_generation=$4::uuid "
                 "AND request_digest=$5 AND controller_configuration_digest=$6",
-                UUID(source["request_id"]), thread_id,
+                UUID(source["request_id"]),
+                thread_id,
                 UUID(source["thread_runtime_generation"]),
                 UUID(source["provision_generation"]),
                 source["request_digest"],
@@ -41982,19 +42554,28 @@ class PostgresDB:
                 raise RuntimeError("retiring thread VM creation source changed")
 
     async def pinned_vm_creation_source_settled(
-        self, thread_id: str, *, runtime_generation: str, retirement_token: str,
+        self,
+        thread_id: str,
+        *,
+        runtime_generation: str,
+        retirement_token: str,
         require_initial_agent_zero: bool = False,
     ) -> bool:
         """Positive no-VM/disposition proof for this current authorized End."""
-        return bool(await self.fetchval(
-            "SELECT CASE WHEN $4::boolean THEN "
-            "public.pinned_vm_creation_agent_zero_source(t.id,t.runtime_generation,t.runtime_retirement_token) "
-            "ELSE public.thread_vm_creation_never_issued_source(t.id,"
-            "t.runtime_retirement_context->'vm_creation_source'->>'provision_generation') END "
-            "FROM threads t WHERE t.id=$1::uuid AND t.runtime_generation=$2::uuid "
-            "AND t.runtime_retirement_token=$3::uuid",
-            thread_id, runtime_generation, retirement_token, require_initial_agent_zero,
-        ))
+        return bool(
+            await self.fetchval(
+                "SELECT CASE WHEN $4::boolean THEN "
+                "public.pinned_vm_creation_agent_zero_source(t.id,t.runtime_generation,t.runtime_retirement_token) "
+                "ELSE public.thread_vm_creation_never_issued_source(t.id,"
+                "t.runtime_retirement_context->'vm_creation_source'->>'provision_generation') END "
+                "FROM threads t WHERE t.id=$1::uuid AND t.runtime_generation=$2::uuid "
+                "AND t.runtime_retirement_token=$3::uuid",
+                thread_id,
+                runtime_generation,
+                retirement_token,
+                require_initial_agent_zero,
+            )
+        )
 
     async def acknowledge_pinned_thread_local_quiescence(
         self,
@@ -42179,13 +42760,19 @@ class PostgresDB:
                     )
                     or ""
                 )
-                from shared.pinned_vm_creation_retirement import initial_vm_creation_retirement_source
+                from shared.pinned_vm_creation_retirement import (
+                    initial_vm_creation_retirement_source,
+                )
 
                 vm_creation_source = initial_vm_creation_retirement_source(context)
-                vm_creation_zero = vm_creation_source is not None and bool(await conn.fetchval(
-                    "SELECT public.pinned_vm_creation_agent_zero_source($1,$2,$3)",
-                    parsed_thread, parsed_generation, parsed_retirement,
-                ))
+                vm_creation_zero = vm_creation_source is not None and bool(
+                    await conn.fetchval(
+                        "SELECT public.pinned_vm_creation_agent_zero_source($1,$2,$3)",
+                        parsed_thread,
+                        parsed_generation,
+                        parsed_retirement,
+                    )
+                )
                 if workspace_provision_intent or vm_creation_zero:
                     expected_protocol = "agent_runtime_zero_v1"
                 elif workspace_backend == "sandbox":
@@ -42261,7 +42848,9 @@ class PostgresDB:
                 if vm_creation_zero:
                     receipt.update(
                         vm_creation_request_id=vm_creation_source["request_id"],
-                        vm_creation_provision_generation=vm_creation_source["provision_generation"],
+                        vm_creation_provision_generation=vm_creation_source[
+                            "provision_generation"
+                        ],
                     )
                 if existing is not None:
                     # Agent and orchestrator recovery may race after the exact
@@ -45678,7 +46267,9 @@ class PostgresDB:
 
                 await lock_manifest_execution_catalog(conn)
                 from orchestrator.services.vm_thread_retained_resume import (
-                    lock_owner_on_conn, predecessor_on_conn, record_resume_on_conn,
+                    lock_owner_on_conn,
+                    predecessor_on_conn,
+                    record_resume_on_conn,
                 )
 
                 await lock_owner_on_conn(conn, thread_id)
@@ -47002,23 +47593,35 @@ class PostgresDB:
         return [dict(row) for row in rows]
 
     async def request_pinned_thread_retirement_actuator(
-        self, thread_id: str, *, agent_id: str, pod_uid: str,
-        process_generation: str, runtime_generation: str,
-        runtime_attach_token: str, retirement_token: str, disposition: str,
-        permanent: bool, workspace_generation: str,
+        self,
+        thread_id: str,
+        *,
+        agent_id: str,
+        pod_uid: str,
+        process_generation: str,
+        runtime_generation: str,
+        runtime_attach_token: str,
+        retirement_token: str,
+        disposition: str,
+        permanent: bool,
+        workspace_generation: str,
         workspace_runtime_incarnation: str,
     ) -> dict[str, Any] | None:
         """Commit an authenticated exact local drain, never a zero receipt."""
         if disposition != "ended" or type(permanent) is not bool:
             return None
         marker = {
-            "kind": "vm_local_drain_complete_v1", "thread_id": str(thread_id),
-            "agent_id": str(agent_id), "pod_uid": str(pod_uid),
+            "kind": "vm_local_drain_complete_v1",
+            "thread_id": str(thread_id),
+            "agent_id": str(agent_id),
+            "pod_uid": str(pod_uid),
             "process_generation": str(process_generation),
             "runtime_generation": str(runtime_generation),
             "runtime_attach_token": str(runtime_attach_token),
-            "retirement_token": str(retirement_token), "disposition": disposition,
-            "permanent": permanent, "workspace_generation": str(workspace_generation),
+            "retirement_token": str(retirement_token),
+            "disposition": disposition,
+            "permanent": permanent,
+            "workspace_generation": str(workspace_generation),
             "workspace_runtime_incarnation": str(workspace_runtime_incarnation),
         }
         encoded = json.dumps(marker)
@@ -47026,24 +47629,29 @@ class PostgresDB:
             outcome = await conn.fetchval(
                 "SELECT 1 FROM thread_runtime_retirement_outcomes "
                 "WHERE thread_id=$1::uuid AND actuator_request=$2::jsonb",
-                thread_id, encoded,
+                thread_id,
+                encoded,
             )
             if outcome:
                 return {"status": "settled_or_superseded", "actuator_request": marker}
             owner = await conn.fetchrow(
-                "SELECT * FROM threads WHERE id=$1::uuid FOR UPDATE", thread_id,
+                "SELECT * FROM threads WHERE id=$1::uuid FOR UPDATE",
+                thread_id,
             )
             if owner is None:
                 return None
             # Lock the reciprocal process before the SQL guard rechecks it.
             await conn.fetchrow(
-                "SELECT id FROM agents WHERE id=$1::uuid FOR SHARE", agent_id,
+                "SELECT id FROM agents WHERE id=$1::uuid FOR SHARE",
+                agent_id,
             )
             existing = owner["runtime_retirement_actuator_request"]
             valid = await conn.fetchval(
                 "SELECT pinned_vm_actuator_request_valid(t,$2::jsonb,$3) "
                 "FROM threads t WHERE t.id=$1::uuid",
-                thread_id, encoded, existing is None,
+                thread_id,
+                encoded,
+                existing is None,
             )
             if not valid:
                 return None
@@ -47055,34 +47663,48 @@ class PostgresDB:
             else:
                 await conn.execute(
                     "UPDATE threads SET runtime_retirement_actuator_request=$2::jsonb "
-                    "WHERE id=$1::uuid", thread_id, encoded,
+                    "WHERE id=$1::uuid",
+                    thread_id,
+                    encoded,
                 )
         return {"status": "actuator_requested", "actuator_request": marker}
 
     async def request_pinned_pre_setup_retirement(
-        self, thread_id: str, *, runtime_generation: str, runtime_attach_token: str,
-        retirement_token: str, agent_id: str, pod_uid: str,
+        self,
+        thread_id: str,
+        *,
+        runtime_generation: str,
+        runtime_attach_token: str,
+        retirement_token: str,
+        agent_id: str,
+        pod_uid: str,
     ) -> bool:
         """Nominate exact cleanup only; the caller still owes outcome confirmation."""
         async with self.acquire() as conn:
             async with conn.transaction():
                 owner = await conn.fetchrow(
-                    "SELECT * FROM threads WHERE id=$1::uuid FOR UPDATE", UUID(thread_id)
+                    "SELECT * FROM threads WHERE id=$1::uuid FOR UPDATE",
+                    UUID(thread_id),
                 )
                 if owner is None:
                     return False
                 marker = {
-                    "kind": "agent_pre_setup_retirement_v1", "thread_id": thread_id,
-                    "agent_id": agent_id, "pod_uid": pod_uid,
+                    "kind": "agent_pre_setup_retirement_v1",
+                    "thread_id": thread_id,
+                    "agent_id": agent_id,
+                    "pod_uid": pod_uid,
                     "runtime_generation": runtime_generation,
                     "runtime_attach_token": runtime_attach_token,
-                    "retirement_token": retirement_token, "disposition": "ended",
+                    "retirement_token": retirement_token,
+                    "disposition": "ended",
                     "permanent": owner["runtime_retirement_permanent"],
                 }
                 encoded = json.dumps(marker, sort_keys=True, separators=(",", ":"))
                 valid = await conn.fetchval(
                     "SELECT pinned_pre_setup_retirement_request_valid(t,$2::jsonb,true) "
-                    "FROM threads t WHERE id=$1::uuid", UUID(thread_id), encoded,
+                    "FROM threads t WHERE id=$1::uuid",
+                    UUID(thread_id),
+                    encoded,
                 )
                 existing = owner["runtime_retirement_actuator_request"]
                 if isinstance(existing, str):
@@ -47092,25 +47714,37 @@ class PostgresDB:
                 if existing is None:
                     await conn.execute(
                         "UPDATE threads SET runtime_retirement_actuator_request=$2::jsonb "
-                        "WHERE id=$1::uuid", UUID(thread_id), encoded,
+                        "WHERE id=$1::uuid",
+                        UUID(thread_id),
+                        encoded,
                     )
                 return True
 
     async def current_pinned_vm_actuator_request(
-        self, thread_id: str, *, runtime_generation: str, retirement_token: str,
-        context: Mapping[str, Any], marker: Mapping[str, Any],
+        self,
+        thread_id: str,
+        *,
+        runtime_generation: str,
+        retirement_token: str,
+        context: Mapping[str, Any],
+        marker: Mapping[str, Any],
     ) -> bool:
         """Revalidate a worklist hint immediately before its first Pod effect."""
         async with self.acquire() as conn:
-            return bool(await conn.fetchval(
-                "SELECT pinned_vm_actuator_request_valid(t,t.runtime_retirement_actuator_request) "
-                "FROM threads t WHERE id=$1::uuid AND runtime_generation=$2::uuid "
-                "AND runtime_retirement_token=$3::uuid "
-                "AND runtime_retirement_context=$4::jsonb "
-                "AND runtime_retirement_actuator_request=$5::jsonb",
-                thread_id, runtime_generation, retirement_token,
-                json.dumps(dict(context)), json.dumps(dict(marker)),
-            ))
+            return bool(
+                await conn.fetchval(
+                    "SELECT pinned_vm_actuator_request_valid(t,t.runtime_retirement_actuator_request) "
+                    "FROM threads t WHERE id=$1::uuid AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token=$3::uuid "
+                    "AND runtime_retirement_context=$4::jsonb "
+                    "AND runtime_retirement_actuator_request=$5::jsonb",
+                    thread_id,
+                    runtime_generation,
+                    retirement_token,
+                    json.dumps(dict(context)),
+                    json.dumps(dict(marker)),
+                )
+            )
 
     async def list_retryable_pinned_retirements(
         self,

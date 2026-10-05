@@ -47,6 +47,7 @@ from agent.api.orchestrator_client import (
 )
 from agent.api.session_contract import canonical_session_identity_fingerprint
 from agent.api.session_http import register_session_http_routes
+from agent.api.native_workspace_first_use import register_native_first_use_route
 from agent.api.session_websocket import register_session_websocket_routes
 from agent.agent import UniversalAgent
 from shared.runtime.core.loader import resolve_config_path
@@ -1202,6 +1203,9 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         version="2.0.0",
         lifespan=lifespan,
     )
+    import agent.api.persistent_app as pa
+
+    register_native_first_use_route(app, pa.native_first_use_context)
 
     # ===================================================================
     # Health endpoints
@@ -1279,6 +1283,8 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             }
             if _pinned_session_recipient_capable():
                 capabilities["pinned_session_recipient_binding"] = True
+            if pa._native_first_use_capable():
+                capabilities["native_workspace_first_use1"] = True
             return ReadyResponse(
                 ready=session_ready,
                 message="Session ready" if session_ready else "Session initializing",
@@ -1404,7 +1410,9 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
 
         if _pod_state == PodState.WORKING and _current_job_id == request.job_id:
             acknowledgement = accepted_pinned_job_delivery(
-                request, _orchestrator_client, retry=True,
+                request,
+                _orchestrator_client,
+                retry=True,
             )
             return JobStartResponse(
                 job_id=request.job_id,
@@ -1430,7 +1438,9 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 )
             # Keep the delivery binding and local state change indivisible.
             acknowledgement = accepted_pinned_job_delivery(
-                request, _orchestrator_client, retry=False,
+                request,
+                _orchestrator_client,
+                retry=False,
             )
             _pod_state = PodState.WORKING
             _current_job_id = request.job_id
@@ -1573,12 +1583,15 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             raise HTTPException(503, "Agent is shutting down")
 
         from agent.api.pinned_delivery import (
-            accepted_pinned_job_delivery, resume_feedback_with_delegation,
+            accepted_pinned_job_delivery,
+            resume_feedback_with_delegation,
         )
 
         if _pod_state == PodState.WORKING and _current_job_id == request.job_id:
             acknowledgement = accepted_pinned_job_delivery(
-                request, _orchestrator_client, retry=True,
+                request,
+                _orchestrator_client,
+                retry=True,
             )
             return JobStartResponse(
                 job_id=request.job_id,
@@ -1603,14 +1616,18 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     f"Pod is in {_pod_state.value} state, cannot accept resume",
                 )
             acknowledgement = accepted_pinned_job_delivery(
-                request, _orchestrator_client, retry=False,
+                request,
+                _orchestrator_client,
+                retry=False,
             )
             _pod_state = PodState.WORKING
             _current_job_id = request.job_id
 
         _clear_stop()
         feedback, feedback_reason = resume_feedback_with_delegation(
-            request.feedback, request.feedback_reason, request.delegation_results,
+            request.feedback,
+            request.feedback_reason,
+            request.delegation_results,
         )
 
         async def _do_resume():
@@ -2063,10 +2080,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             if isinstance(request, dict)
             else None
         )
-        if (
-            expected is None
-            or pa._session_identity.fingerprint() != expected
-        ):
+        if expected is None or pa._session_identity.fingerprint() != expected:
             return JSONResponse(
                 {"error": "session_identity_mismatch", "retryable": True},
                 status_code=409,
@@ -2112,10 +2126,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             if isinstance(request, dict)
             else None
         )
-        if (
-            expected is None
-            or pa._session_identity.fingerprint() != expected
-        ):
+        if expected is None or pa._session_identity.fingerprint() != expected:
             return JSONResponse(
                 {"error": "session_identity_mismatch", "retryable": True},
                 status_code=409,

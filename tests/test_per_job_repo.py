@@ -7,9 +7,11 @@ from tests import b08_completion_helpers as b08_helpers
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import asyncpg
 import pytest
 from fastapi import HTTPException
 from orchestrator.services import subjob_output as subjob_output_module
+from orchestrator.database.postgres import JobVMAuditNotReady
 
 # main.py requires VECTOR_DB_URL at module level
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
@@ -182,6 +184,78 @@ class TestDeleteJobGiteaCleanup:
             connection = AsyncMock()
             vector_db.acquire.return_value.__aenter__.return_value = connection
             yield connection
+
+    @pytest.mark.asyncio
+    async def test_vm_terminal_audit_hold_is_retryable(self):
+        job = {
+            "id": "12345678-1111-2222-3333-444444444444",
+            "execution_lane": "stateless",
+            "repo_name": None,
+            "branch_name": None,
+            "parent_job_id": None,
+            "project_id": None,
+        }
+        with (
+            _patch_resource("postgres_db") as mock_db,
+            _patch_resource("gitea_client") as mock_gitea,
+            patch(SNAPSHOT_SERVICE) as mock_snapshots,
+            patch(
+                "orchestrator.services.thread_retirement.ThreadRetirementOperations.archive_and_cleanup_workspace",
+                new_callable=AsyncMock,
+            ),
+            _bypass_job_access_gate(job),
+        ):
+            mock_db.has_child_jobs = AsyncMock(return_value=False)
+            mock_db.prepare_stateless_job_for_delete = AsyncMock(return_value=True)
+            mock_db.delete_job = AsyncMock(
+                side_effect=JobVMAuditNotReady("VM Job terminal proof is pending")
+            )
+            mock_gitea.is_initialized = False
+            mock_snapshots.is_available = False
+            with pytest.raises(HTTPException) as refused:
+                await control_seams.delete_job(_stub_request(), str(job["id"]))
+        assert refused.value.status_code == 503
+        mock_db.delete_job.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("constraint", "expected_status"),
+        [("managed_repository_cleanup_required", 503), ("unrelated_check", 500)],
+    )
+    async def test_delete_maps_only_repository_containment_race_to_retryable(
+        self,
+        constraint,
+        expected_status,
+    ):
+        job = {
+            "id": "12345678-1111-2222-3333-444444444444",
+            "execution_lane": "stateless",
+            "repo_name": None,
+            "branch_name": None,
+            "parent_job_id": None,
+            "project_id": None,
+        }
+        refusal = asyncpg.CheckViolationError("repository contention")
+        refusal.constraint_name = constraint
+        with (
+            _patch_resource("postgres_db") as mock_db,
+            _patch_resource("gitea_client") as mock_gitea,
+            patch(SNAPSHOT_SERVICE) as mock_snapshots,
+            patch(
+                "orchestrator.services.thread_retirement.ThreadRetirementOperations.archive_and_cleanup_workspace",
+                new_callable=AsyncMock,
+            ),
+            _bypass_job_access_gate(job),
+        ):
+            mock_db.has_child_jobs = AsyncMock(return_value=False)
+            mock_db.prepare_stateless_job_for_delete = AsyncMock(return_value=True)
+            mock_db.delete_job = AsyncMock(side_effect=refusal)
+            mock_gitea.is_initialized = False
+            mock_snapshots.is_available = False
+            with pytest.raises(HTTPException) as refused:
+                await control_seams.delete_job(_stub_request(), str(job["id"]))
+        assert refused.value.status_code == expected_status
+        mock_db.delete_job.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_root_job_deletes_repo(self):

@@ -143,6 +143,9 @@ class _InventoryConnection:
                     "completion_outcome_kind": None,
                 }
             )
+        if sql.startswith("SELECT * FROM vm_job_creation_owners"):
+            # The inventory fixture represents Docker workspaces only.
+            return None
         if "AS workspace FROM threads" in sql:
             workspace = self.threads.get(str(args[0]))
             return (
@@ -196,6 +199,10 @@ class _InventoryConnection:
 
     async def fetchval(self, query: str, *args):
         sql = _compact(query)
+        if sql.startswith("SELECT EXISTS(SELECT 1 FROM vm_job_creation_owners"):
+            return False
+        if sql.startswith("SELECT jsonb_typeof(context->'vm')='object'"):
+            return False
         if "FROM managed_repository_process_zero_receipts" in sql:
             kind, owner_id, lease_id = args
             return (str(kind), str(owner_id), str(lease_id)) in (

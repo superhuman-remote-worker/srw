@@ -584,9 +584,11 @@ async def test_a_thread_that_vanished_between_lookups_is_the_same_opaque_404(har
 
 
 def _target_resolution_source() -> str:
-    """Both halves of what used to be one handler, scanned as one body."""
-    return inspect.getsource(ssh_access_routes.get_ssh_target) + inspect.getsource(
-        ssh_access_operations.resolve_target
+    """Route, store wrapper and shared projector scanned as one body."""
+    return (
+        inspect.getsource(ssh_access_routes.get_ssh_target)
+        + inspect.getsource(ssh_access_operations.resolve_target)
+        + inspect.getsource(ssh_access_operations.resolve_target_from_thread)
     )
 
 

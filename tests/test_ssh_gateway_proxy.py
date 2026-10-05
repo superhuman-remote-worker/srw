@@ -17,6 +17,7 @@ shape of the private asyncssh surface ``ProxyProcess.session_started`` reaches
 into, since nothing else here calls that override at all.
 """
 
+import asyncio
 import inspect
 import logging
 
@@ -47,6 +48,10 @@ class FakeUpstreamProcess:
         self.exit_status = exit_status
         self.exit_signal = exit_signal
         self.closed = False
+        self.close_requested = False
+
+    def close(self):
+        self.close_requested = True
 
     async def wait_closed(self):
         self.closed = True
@@ -117,6 +122,68 @@ class FakeProcess:
 
     def exit_with_signal(self, *args):
         self.exited_signal = args
+
+
+@pytest.mark.asyncio
+async def test_native_notice_occurs_only_after_upstream_process_exists():
+    process = FakeProcess()
+    upstream_process = FakeUpstreamProcess()
+    upstream = FakeUpstream(upstream_process)
+    events = []
+
+    async def notify():
+        assert upstream.create_kwargs["command"] == "ls"
+        events.append("notified")
+        return True
+
+    await proxy_session(process, upstream, on_first_use=notify)
+    assert events == ["notified"]
+    assert process.exited_with == 0
+
+
+@pytest.mark.asyncio
+async def test_unacknowledged_native_notice_closes_started_process_without_replay():
+    process = FakeProcess(command="touch /tmp/once")
+    upstream_process = FakeUpstreamProcess()
+    upstream = FakeUpstream(upstream_process)
+
+    async def refuse():
+        return False
+
+    await proxy_session(process, upstream, on_first_use=refuse)
+    assert upstream_process.close_requested
+    assert upstream_process.closed
+    assert process.exited_with == 75
+    assert upstream.create_kwargs["command"] == "touch /tmp/once"
+
+
+@pytest.mark.asyncio
+async def test_peer_cancellation_after_notice_closes_exact_started_process():
+    class WaitingProcess(FakeUpstreamProcess):
+        def __init__(self):
+            super().__init__()
+            self.waiting = asyncio.Event()
+
+        async def wait_closed(self):
+            self.waiting.set()
+            if not self.close_requested:
+                await asyncio.Event().wait()
+            self.closed = True
+
+    inner = WaitingProcess()
+    upstream = FakeUpstream(inner)
+
+    async def notify():
+        return True
+
+    task = asyncio.create_task(
+        proxy_session(FakeProcess(), upstream, on_first_use=notify)
+    )
+    await inner.waiting.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert inner.close_requested
 
 
 def test_only_sftp_is_allowed():

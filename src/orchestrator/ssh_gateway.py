@@ -732,6 +732,8 @@ def _build_app() -> Starlette:
     import asyncssh
 
     vm_signer = asyncssh.read_private_key(config.host_key_paths[0])
+    from orchestrator.services.ssh_gateway_client import post_native_first_use
+
     application.state.context = GatewayContext(
         config=config,
         ca=load_user_ca(config.user_ca_path),
@@ -743,6 +745,7 @@ def _build_app() -> Starlette:
         vm_admit=functools.partial(vm_access, config, vm_signer, action="admit"),
         vm_renew=functools.partial(vm_access, config, vm_signer, action="renew"),
         vm_close=functools.partial(vm_access, config, vm_signer, action="close"),
+        native_first_use=functools.partial(post_native_first_use, config, vm_signer),
     )
     return application
 

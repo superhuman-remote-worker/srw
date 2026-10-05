@@ -253,11 +253,17 @@ async def runtime_db(pg_url):
             owner_kind text, owner_id uuid, status text, quarantine_reason text,
             updated_at timestamptz
         );
+        -- Delete checks for VM history before enforcing harness ownership.
+        -- These generic/non-VM Jobs have no stable VM audit owner.
+        CREATE TABLE IF NOT EXISTS vm_job_creation_owners(
+            job_id uuid PRIMARY KEY, live_job_id uuid, deleted_at timestamptz
+        );
         -- Pinned resume paths fence on an open idle operation (0270).
         CREATE TABLE IF NOT EXISTS vm_idle_operations(
             owner_kind text NOT NULL, owner_id uuid NOT NULL, closed_at timestamptz
         );
-        TRUNCATE jobs, agents, srw_execution_specs, run_queue, vm_idle_operations;
+        TRUNCATE jobs, agents, srw_execution_specs, run_queue, vm_idle_operations,
+                 vm_job_creation_owners;
     """)
     async with db.acquire() as conn:
         await create_empty_container_recovery_ledger(conn)

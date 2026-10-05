@@ -8,12 +8,15 @@ indistinguishable, and that only holds while the resolution and the opaque
 """
 
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 import os
 from uuid import UUID
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from orchestrator.schemas.ssh_access import (
     SshAttachmentClose,
@@ -31,6 +34,17 @@ from orchestrator.security.auth import require_approved_user
 from orchestrator.services import ssh_access
 from orchestrator.services.ssh_handles import is_valid_handle
 from orchestrator.services.ssh_gateway_vm_access_proof import verify_vm_access_proof
+from orchestrator.services.native_workspace_first_use import (
+    container_workspace_digest,
+    describe_native_target,
+)
+from orchestrator.services.canvas_ssh import remote_target_is_vm_backed
+from orchestrator.services.pinned_session_mutation_target import (
+    prepare_pinned_session_mutation_target,
+    pinned_session_mutation_target_is_current,
+)
+from shared.native_workspace_first_use import verify_native_first_use_proof
+from shared.pinned_session_identity import pinned_session_ready_identity_fingerprint
 from orchestrator.services.vm_ssh_access_binding import vm_binding_digest
 
 router = APIRouter()
@@ -48,6 +62,7 @@ class SshAccessDependencies:
     )
     vm_access_store: Any = None
     vm_provisioner: Any = None
+    native_mutation_dependencies: Any = None
 
 
 def get_ssh_access_dependencies(request: Request) -> SshAccessDependencies:
@@ -288,9 +303,280 @@ async def get_ssh_target(
     ):
         raise opaque
 
-    return await ssh_access.resolve_target(
-        thread_id=thread_id, user=user, dependencies=dependencies.operations
+    # Both the dial coordinates and native descriptor must originate in this
+    # same immutable-in-use source. A later read only checks its currency.
+    thread = await dependencies.store.get_thread(thread_id)
+    source_thread = deepcopy(thread)
+    result = ssh_access.resolve_target_from_thread(
+        thread=source_thread,
+        thread_id=thread_id,
+        user=user,
+        dependencies=dependencies.operations,
     )
+    if (
+        result.get("state") != "live"
+        or dependencies.native_mutation_dependencies is None
+    ):
+        return result
+    description = await _native_description(source_thread, dependencies)
+    if description is None:
+        return {
+            **result,
+            "state": "stale_binding",
+            "pod_ip": None,
+            "pod_port": None,
+            "host_key_fingerprint": None,
+        }
+    if description[0].get("native_recipient") and not await _native_workspace_current(
+        {**description[0]["native_recipient"], "backend": "container"},
+        user,
+        dependencies,
+    ):
+        return {
+            **result,
+            "state": "stale_binding",
+            "pod_ip": None,
+            "pod_port": None,
+            "host_key_fingerprint": None,
+        }
+    return {**result, **description[0]}
+
+
+async def _native_description(
+    thread: dict[str, Any] | None,
+    dependencies: SshAccessDependencies,
+    *,
+    backend: str = "container",
+    vm_binding: str | None = None,
+) -> tuple[dict[str, Any], Any | None] | None:
+    if thread is None or dependencies.native_mutation_dependencies is None:
+        return None
+
+    async def prepare(**kwargs: Any) -> Any:
+        return await prepare_pinned_session_mutation_target(
+            dependencies=dependencies.native_mutation_dependencies, **kwargs
+        )
+
+    return await describe_native_target(
+        thread,
+        prepare=prepare,
+        backend=backend,
+        vm_binding=vm_binding,
+    )
+
+
+async def _native_workspace_current(
+    payload: dict[str, Any],
+    user: dict[str, Any],
+    dependencies: SshAccessDependencies,
+) -> bool:
+    """Re-read the remote backing, including a VM lease where applicable."""
+
+    thread = await dependencies.store.get_thread(payload["thread_id"])
+    if (
+        thread is None
+        or thread.get("execution_lane") != "pinned"
+        or thread.get("status") in {"ended", "suspended"}
+        or thread.get("runtime_retirement_token") is not None
+        or str(thread.get("agent_id")) != payload["agent_id"]
+        or str(thread.get("runtime_generation")) != payload["runtime_generation"]
+        or pinned_session_ready_identity_fingerprint(
+            thread_id=thread.get("id"),
+            runtime_generation=thread.get("runtime_generation"),
+            agent_id=thread.get("agent_id"),
+            runtime_attach_token=thread.get("runtime_attach_token"),
+            pod_uid=payload.get("pod_uid"),
+        )
+        != payload.get("session_identity_fingerprint")
+    ):
+        return False
+    if payload["backend"] == "container":
+        return (
+            not remote_target_is_vm_backed(thread)
+            and container_workspace_digest(thread) == payload["workspace_digest"]
+        )
+    if payload["backend"] == "vm":
+        return bool(
+            remote_target_is_vm_backed(thread)
+            and payload["workspace_digest"] == "sha256:" + payload["binding"]
+            and await _native_vm_lease_current(payload, user, dependencies)
+        )
+    return False
+
+
+async def _native_authorization_current(
+    payload: dict[str, Any],
+    user: dict[str, Any],
+    dependencies: SshAccessDependencies,
+) -> bool:
+    """Keep the signed handle and key bound to the same approved owner."""
+
+    try:
+        thread_id = await dependencies.store.get_thread_id_by_ssh_handle(
+            payload["handle"]
+        )
+        current_user = await dependencies.store.resolve_user_by_ssh_fingerprint(
+            payload["fingerprint"]
+        )
+        return bool(
+            thread_id
+            and str(thread_id) == payload["thread_id"]
+            and current_user
+            and str(current_user["id"]) == str(user["id"])
+            and await dependencies.user_can_access_ide_entity(
+                current_user, dependencies.store, thread_id
+            )
+        )
+    except Exception:
+        return False
+
+
+@router.post("/api/internal/ssh-native-first-use")
+async def internal_ssh_native_first_use(
+    request: Request,
+    *,
+    dependencies: SshAccessDependencies = Depends(get_ssh_access_dependencies),
+) -> JSONResponse:
+    """Verify gateway proof, current owner/workspace/process, then relay unchanged."""
+
+    await dependencies.require_internal(request)
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeError):
+        body = None
+    payload = (
+        body.get("proof") if isinstance(body, dict) and set(body) == {"proof"} else None
+    )
+    entries = dependencies.operations.host_keys.load(
+        os.environ.get("SSH_GATEWAY_PUBLIC_HOST_KEYS", "")
+    )
+    if not verify_native_first_use_proof(
+        payload, [entry["public_key"] for entry in entries]
+    ):
+        return JSONResponse({"error": "no_such_workspace"}, status_code=404)
+    assert isinstance(payload, dict)
+    if dependencies.native_mutation_dependencies is None:
+        return JSONResponse({"error": "native_relay_unavailable"}, status_code=503)
+    thread_id = await dependencies.store.get_thread_id_by_ssh_handle(payload["handle"])
+    user = await dependencies.store.resolve_user_by_ssh_fingerprint(
+        payload["fingerprint"]
+    )
+    if (
+        not thread_id
+        or not user
+        or str(thread_id) != payload["thread_id"]
+        or not await dependencies.user_can_access_ide_entity(
+            user, dependencies.store, thread_id
+        )
+    ):
+        return JSONResponse({"error": "no_such_workspace"}, status_code=404)
+    thread = await dependencies.store.get_thread(thread_id)
+    description = await _native_description(
+        thread,
+        dependencies,
+        backend=payload["backend"],
+        vm_binding=payload["binding"] or None,
+    )
+    if description is None:
+        return JSONResponse({"error": "stale_native_target"}, status_code=409)
+    descriptor, target = description
+    recipient = descriptor.get("native_recipient")
+    if (
+        descriptor.get("native_first_use_contract") != 1
+        or target is None
+        or target.binding is None
+        or recipient is None
+        or any(payload.get(name) != recipient.get(name) for name in recipient)
+    ):
+        return JSONResponse({"error": "stale_native_target"}, status_code=409)
+    if (
+        not await _native_authorization_current(payload, user, dependencies)
+        or not await pinned_session_mutation_target_is_current(
+            target,
+            dependencies=dependencies.native_mutation_dependencies,
+        )
+        or not await _native_workspace_current(payload, user, dependencies)
+    ):
+        return JSONResponse({"error": "stale_native_target"}, status_code=409)
+    address = f"http://{target.binding.pod_ip}:{target.binding.pod_port}/session/native-first-use"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            if (
+                not await _native_authorization_current(payload, user, dependencies)
+                or not await pinned_session_mutation_target_is_current(
+                    target,
+                    dependencies=dependencies.native_mutation_dependencies,
+                )
+                or not await _native_workspace_current(payload, user, dependencies)
+            ):
+                return JSONResponse({"error": "stale_native_target"}, status_code=409)
+            response = await client.post(
+                address, json={"proof": payload, "_recipient": target.recipient}
+            )
+    except Exception:
+        return JSONResponse({"error": "native_relay_unavailable"}, status_code=503)
+    if response.status_code != 200:
+        return JSONResponse(
+            {"error": "native_recipient_refused"},
+            status_code=409 if response.status_code in {403, 409} else 503,
+        )
+    try:
+        receipt = response.json()
+    except ValueError:
+        receipt = None
+    if (
+        not isinstance(receipt, dict)
+        or receipt
+        != {
+            "event_id": payload["event_id"],
+            "session_identity_fingerprint": payload["session_identity_fingerprint"],
+            "process_generation": payload["process_generation"],
+            "status": receipt.get("status") if isinstance(receipt, dict) else None,
+        }
+        or receipt["status"] not in {"accepted", "already_observed"}
+    ):
+        return JSONResponse({"error": "native_ack_mismatch"}, status_code=409)
+    if (
+        not await _native_authorization_current(payload, user, dependencies)
+        or not await pinned_session_mutation_target_is_current(
+            target,
+            dependencies=dependencies.native_mutation_dependencies,
+        )
+        or not await _native_workspace_current(payload, user, dependencies)
+    ):
+        return JSONResponse({"error": "stale_native_target"}, status_code=409)
+    return JSONResponse(receipt)
+
+
+async def _native_vm_lease_current(
+    payload: dict[str, Any],
+    user: dict[str, Any],
+    dependencies: SshAccessDependencies,
+) -> bool:
+    if dependencies.vm_access_store is None or dependencies.vm_provisioner is None:
+        return False
+    claimant = f"{user['id']}:{payload['connection_id']}"
+    lease = await dependencies.vm_access_store.inspect(
+        payload["lease_id"],
+        owner_kind="thread",
+        owner_id=payload["thread_id"],
+        kind="ssh",
+        claimant=claimant,
+    )
+    if lease is None:
+        return False
+    try:
+        proof = await dependencies.vm_provisioner.attest_workspace_runtime(
+            payload["thread_id"],
+            entity_type="thread",
+        )
+        return (
+            UUID(str(proof.vm_uid)) == lease["vm_uid"]
+            and UUID(str(proof.workspace_generation)) == lease["provision_generation"]
+            and vm_binding_digest(proof) == payload["binding"]
+        )
+    except Exception:
+        return False
 
 
 @router.post("/api/internal/ssh-vm-access/{action}")
@@ -429,7 +715,46 @@ async def internal_vm_ssh_access(
             claimant=claimant,
         )
         return {"state": "stale_binding"}
-    return {
+    description = None
+    if dependencies.native_mutation_dependencies is not None:
+        current_thread = await dependencies.store.get_thread(thread_id)
+        description = await _native_description(
+            current_thread,
+            dependencies,
+            backend="vm",
+            vm_binding=binding,
+        )
+        if description is None:
+            await access.close(
+                str(lease["id"]),
+                owner_kind="thread",
+                owner_id=thread_id,
+                kind="ssh",
+                claimant=claimant,
+            )
+            return {"state": "stale_binding"}
+        if description[0].get(
+            "native_recipient"
+        ) and not await _native_workspace_current(
+            {
+                **description[0]["native_recipient"],
+                "backend": "vm",
+                "binding": binding,
+                "lease_id": str(lease["id"]),
+                "connection_id": str(payload["connection_id"]),
+            },
+            user,
+            dependencies,
+        ):
+            await access.close(
+                str(lease["id"]),
+                owner_kind="thread",
+                owner_id=thread_id,
+                kind="ssh",
+                claimant=claimant,
+            )
+            return {"state": "stale_binding"}
+    result = {
         "state": "live",
         "thread_id": thread_id,
         "user_id": str(user["id"]),
@@ -439,6 +764,7 @@ async def internal_vm_ssh_access(
         "lease_id": str(lease["id"]),
         "binding": binding,
     }
+    return {**result, **description[0]} if description else result
 
 
 @router.post("/api/internal/ssh-keys/used")

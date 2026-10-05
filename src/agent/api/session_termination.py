@@ -95,6 +95,8 @@ class SessionTerminationCoordinator:
         self.termination_admission_fenced = False
         self.termination_fence_reason = None
         self.ws_connected_event = None
+        self.native_first_use_identity = None
+        self.boot_first_use_closed_identity = None
         self.watchdog_tasks = []
         self.terminating = False
         self.termination_task = None
@@ -118,6 +120,50 @@ class SessionTerminationCoordinator:
         self.retirement_admission_disposition = None
         self.retirement_admission_token = None
         self.retirement_admission_permanent = None
+        self.native_first_use_identity = None
+        self.boot_first_use_closed_identity = None
+
+    def native_life_identity(self) -> tuple[str, ...] | None:
+        """Read the complete attached life, including registered process epoch."""
+
+        identity = self._ports.identity().snapshot()
+        client = self._ports.orchestrator_client()
+        parts = (
+            identity.thread_id,
+            identity.session_generation,
+            identity.agent_id,
+            identity.attach_token,
+            identity.pod_uid,
+            getattr(client, "dispatch_process_generation", None),
+        )
+        if not all(isinstance(part, str) and part for part in parts):
+            return None
+        return parts
+
+    def note_native_first_use(self, identity: tuple[str, ...]) -> str | None:
+        """Latch first use synchronously after the caller holds runtime authority.
+
+        There must be no await between the caller's final local check and this
+        method: the boot timeout and all local retirement fences run on this
+        same event loop.
+        """
+
+        if (
+            identity != self.native_life_identity()
+            or self._ports.session() is None
+            or self._ports.officer_config() is not None
+            or self._ports.stateless_mode()
+            or self.ws_connected_event is None
+            or self.runtime_admission_closed()
+            or self.terminating
+            or self.boot_first_use_closed_identity == identity
+        ):
+            return None
+        if self.native_first_use_identity == identity:
+            return "already_observed"
+        self.native_first_use_identity = identity
+        self.ws_connected_event.set()
+        return "accepted"
 
     def track_session_side_task(self, task: asyncio.Task[Any]) -> asyncio.Task[Any]:
         self.session_side_tasks.add(task)
@@ -621,6 +667,12 @@ class SessionTerminationCoordinator:
             await asyncio.wait_for(self.ws_connected_event.wait(), timeout=timeout_s)
             return  # A client used this runtime — normal lifecycle takes over.
         except asyncio.TimeoutError:
+            identity = self.native_life_identity()
+            if identity is not None and self.native_first_use_identity == identity:
+                return
+            # Close native admission before the first await in termination.
+            # A later notice cannot resurrect a life after timeout won.
+            self.boot_first_use_closed_identity = identity
             self._logger.warning(
                 "No WebSocket connection or queued human input within %ds for thread %s — "
                 "exiting (likely abandoned during creation).",
@@ -817,7 +869,14 @@ class SessionTerminationCoordinator:
                 task.cancel()
         self.watchdog_tasks = []
 
+        identity = self.native_life_identity()
+        if self.native_first_use_identity != identity:
+            self.native_first_use_identity = None
+        if self.boot_first_use_closed_identity != identity:
+            self.boot_first_use_closed_identity = None
         self.ws_connected_event = asyncio.Event()
+        if identity is not None and self.native_first_use_identity == identity:
+            self.ws_connected_event.set()
         self.watchdog_tasks = [
             asyncio.create_task(
                 self.boot_ws_watchdog(self.session_boot_ws_timeout_s),

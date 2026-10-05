@@ -90,6 +90,8 @@ def _target(**overrides) -> SshTarget:
         pod_port=22,
         host_key_fingerprint="SHA256:host",
         state="live",
+        execution_lane="stateless",
+        no_boot_watchdog=True,
     )
     base.update(overrides)
     return SshTarget(**base)
@@ -154,9 +156,17 @@ async def test_vm_lease_only_after_auth_completed_and_closed_with_connection():
         calls.append(("close", kwargs))
         return True
 
-    server = _authenticated(GatewaySSHServer(_context(
-        limiter=_limiter(), resolve=resolver, vm_admit=admit, vm_close=close,
-    ), CLIENT_IP))
+    server = _authenticated(
+        GatewaySSHServer(
+            _context(
+                limiter=_limiter(),
+                resolve=resolver,
+                vm_admit=admit,
+                vm_close=close,
+            ),
+            CLIENT_IP,
+        )
+    )
     with pytest.raises(TargetUnavailable):
         await server._attached_target()
     assert calls == []
