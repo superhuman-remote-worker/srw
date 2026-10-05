@@ -43,6 +43,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
+from shared.runtime.core.context_entries import is_context_entry
 from shared.runtime.core.message_markers import PERSIST_ROLE_EVENT, PERSIST_ROLE_KEY
 from agent.persistent_graph import (
     PermissionOutcome,
@@ -968,7 +969,8 @@ class SubagentDriver:
         return self.messages[self._brief_start :]
 
     def _tail_kind(self) -> str:
-        msgs = self._brief_messages()
+        # A context entry rides the message before it; it is never the tail.
+        msgs = [m for m in self._brief_messages() if not is_context_entry(m)]
         if not msgs:
             return "none"
         last = msgs[-1]

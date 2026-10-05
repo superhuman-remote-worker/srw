@@ -4,7 +4,10 @@ Design: knowledge-base/knowledge/features/compaction_refactor_fidelity_and_fork_
 (F13, F14, F17, WP0).
 
 - Claude over the proxy gets explicit cache breakpoints on the system prompt and
-  on the last message before the per-turn injections, never on the injected tail.
+  on the last message before the per-turn injections, never on the injected tail
+  (the guidance pair, the active-subagent status and the App Guide turn boundary
+  included). With folded context entries (append-only, WP2 spec §H) the newest
+  assistant message and the last message are marked.
 - A conversation key (``LLMConfig.prompt_cache_key``) reaches the proxy as the
   ``X-Session-ID`` session-affinity header, and the Codex lane also forwards it
   as ``prompt_cache_key``.
@@ -23,7 +26,13 @@ import pytest
 import yaml
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
+from agent.core.guidance_injection import create_guidance_injection_messages
+from agent.core.knowledge_injection import create_charter_injection_messages
 from shared.runtime.core import loader
+from shared.runtime.core.context_entries import (
+    fold_context_entries,
+    make_context_entry,
+)
 from shared.runtime.core.injection_markers import (
     KNOWLEDGE_TOOL_CALL_ID_PREFIX,
     MEMORY_TOOL_CALL_ID_PREFIX,
@@ -102,6 +111,86 @@ class TestMarkAnthropicCacheBreakpoints:
         payload = _payload(messages)[:-1]
 
         assert mark_anthropic_cache_breakpoints(messages, payload) is payload
+
+    def test_guidance_and_subagents_tail_is_not_marked(self):
+        """The guidance pair and the active-subagent status are tail too."""
+        guid_ai, guid_tool = create_guidance_injection_messages("[SUPERVISOR GUIDANCE]")
+        messages = _worker_request() + [
+            guid_ai,
+            guid_tool,
+            HumanMessage(
+                content="<active_subagents>\n- sa-1 (explorer): running\n"
+                "</active_subagents>",
+                additional_kwargs={"_srw_persist_role": "event"},
+            ),
+        ]
+        payload = _payload(messages)
+        payload[0]["role"] = "system"
+
+        out = mark_anthropic_cache_breakpoints(messages, payload)
+
+        assert [i for i, m in enumerate(out) if "cache_control" in m] == [0, 3]
+
+    def test_app_guide_session_marks_the_user_message_not_the_boundary(self):
+        """B4: the App Guide turn boundary was taken for the last stable message."""
+        ch_ai, ch_tool = create_charter_injection_messages("[CHARTER]")
+        messages = [
+            SystemMessage(content="System prompt."),
+            HumanMessage(content="hello"),
+            AIMessage(content="hi"),
+            HumanMessage(content="what can this session do?"),
+            ch_ai,
+            ch_tool,
+            HumanMessage(
+                content='<managed_product_guide_turn_boundary current_bundle_sha256="'
+                + "a" * 64
+                + '">\nReturn to the request.\n</managed_product_guide_turn_boundary>'
+            ),
+        ]
+        payload = _payload(messages)
+        payload[0]["role"] = "system"
+
+        out = mark_anthropic_cache_breakpoints(messages, payload)
+
+        assert [i for i, m in enumerate(out) if "cache_control" in m] == [0, 3]
+
+    def test_append_only_marks_the_newest_answer_and_the_last_message(self):
+        """B6: before the newest carrier group, and the carrier itself (O4)."""
+        history = [
+            SystemMessage(content="System prompt."),
+            HumanMessage(content="# Task brief"),
+            make_context_entry("memory", "[m:3f9a2c] a fact", section="memory"),
+            AIMessage(
+                content="",
+                tool_calls=[{"id": "c1", "name": "read_file", "args": {"path": "a"}}],
+            ),
+            ToolMessage(content="file contents", tool_call_id="c1"),
+            make_context_entry("guidance", "use staging", section="guidance"),
+        ]
+        messages = fold_context_entries(history)
+        payload = _payload(messages)
+        payload[0]["role"] = "system"
+
+        out = mark_anthropic_cache_breakpoints(messages, payload)
+
+        # 0 = system, 2 = the newest assistant message, 3 = the folded result.
+        assert len(messages) == 4
+        assert [i for i, m in enumerate(out) if "cache_control" in m] == [0, 2, 3]
+
+    def test_append_only_without_an_answer_marks_the_last_message(self):
+        messages = fold_context_entries(
+            [
+                SystemMessage(content="System prompt."),
+                HumanMessage(content="first message"),
+                make_context_entry("charter", "orders", section="charter"),
+            ]
+        )
+        payload = _payload(messages)
+        payload[0]["role"] = "system"
+
+        out = mark_anthropic_cache_breakpoints(messages, payload)
+
+        assert [i for i, m in enumerate(out) if "cache_control" in m] == [0, 1]
 
 
 def _capture(monkeypatch):

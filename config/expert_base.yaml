@@ -229,6 +229,10 @@ context_management:
   summarization_template: summarization_prompt.txt
   reasoning_level: high  # Only injected when reasoning_method is "prompt" (gpt-oss)
   max_summary_length: 20000
+  # legacy: memory, knowledge, guidance, ... are rebuilt at the request tail
+  # every call. append_only: they are appended to the history once, when
+  # they change (append-only context injection, WP2). The rollback flag.
+  injection_mode: legacy
 
 research:
   # Proxy for accessing paywalled content (e.g., via SSH tunnel to university)

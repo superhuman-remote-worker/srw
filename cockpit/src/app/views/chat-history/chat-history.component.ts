@@ -9,14 +9,17 @@ import { AppIconButtonComponent } from '../../ui/icon-button';
 import { AppBadgeComponent, type BadgeTone } from '../../ui/badge';
 import { AppSpinnerComponent } from '../../ui/spinner';
 
-/** Transient-injection tool_call_id prefixes (src/core/*_injection.py).
- * Legacy chat rows stored the re-injected block verbatim as human/tool
- * inputs; these markers classify them into the collapsed context strip. */
+/** Transient-injection tool_call_id prefixes
+ * (src/shared/runtime/core/injection_markers.py). Legacy chat rows stored the
+ * re-injected block verbatim as human/tool inputs; these markers classify them
+ * into the collapsed context strip. */
 const INJECT_PREFIXES = [
   'instruction_inject_',
   'memory_inject_',
   'knowledge_inject_',
+  'charter_inject_',
   'citation_feedback_inject_',
+  'guidance_inject_',
 ] as const;
 
 /** One collapsed context-strip item (transient injection descriptor). */
@@ -1021,8 +1024,8 @@ export class ChatHistoryComponent {
   }
 }
 
-/** Legacy rows: injected knowledge/memory/instruction blocks stored as tool
- * inputs, recognizable by their synthetic tool_call_id prefix. */
+/** Legacy rows: injected knowledge/memory/charter/guidance/instruction blocks
+ * stored as tool inputs, recognizable by their synthetic tool_call_id prefix. */
 export function legacyInjectKind(input: ChatInput): string | null {
   if (input.type !== 'tool' || !input.tool_call_id) {
     return null;

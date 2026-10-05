@@ -1611,8 +1611,11 @@ class ContextManager:
         continue (pi's stated reason for the same format).
 
         System messages (the prompt, earlier summaries: those seed the fold),
-        workspace injections (re-injected after compaction) and protected
-        phase blocks (re-seated verbatim) are left out.
+        injected context (re-injected after compaction) and protected phase
+        blocks (re-seated verbatim) are left out. The exception is a typed
+        supervisor-guidance entry: it is delivered once and never re-injected,
+        so the summary keeps it as ``[Supervisor guidance]: ...`` (WP2 spec
+        O1).
 
         Args:
             messages: Messages to format
@@ -1620,8 +1623,10 @@ class ContextManager:
         Returns:
             List of formatted text parts
         """
-        from shared.runtime.core.workspace_injection import (
-            is_workspace_injection_message,
+        from shared.runtime.core.context_entries import (
+            entry_body,
+            entry_kind,
+            is_context_injection,
         )
 
         result_cap = self.config.summary_tool_result_chars
@@ -1665,7 +1670,12 @@ class ContextManager:
         # tool_call_id -> index in ``parts`` of the assistant turn that made it
         open_calls: Dict[str, int] = {}
         for msg in messages:
-            if is_workspace_injection_message(msg) or is_protected_message(msg):
+            if entry_kind(msg) == "guidance":
+                guidance = entry_body(msg).strip()
+                if guidance:
+                    parts.append(f"[Supervisor guidance]: {guidance}")
+                continue
+            if is_context_injection(msg) or is_protected_message(msg):
                 continue
             if isinstance(msg, SystemMessage):
                 continue

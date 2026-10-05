@@ -9365,13 +9365,11 @@ async def _compact_session_manually(
     # "Summarize up to here" (session rewind's sibling action): map the
     # chosen message to keep_recent_override = the number of messages from
     # it (inclusive) to the end, counted on the same basis
-    # summarize_and_compact uses (workspace injections excluded — they are
+    # summarize_and_compact uses (injected context excluded — it is
     # filtered before keep_recent applies).
     keep_recent_override = None
     if boundary_message_id:
-        from shared.runtime.core.workspace_injection import (
-            is_workspace_injection_message,
-        )
+        from shared.runtime.core.context_entries import is_context_injection
         from agent.database.postgres_db import _coerce_row_id
 
         target_uuid = str(_coerce_row_id(boundary_message_id))
@@ -9388,9 +9386,7 @@ async def _compact_session_manually(
                 "already be summarized",
             )
         keep_recent_override = sum(
-            1
-            for m in _session.messages[cut_index:]
-            if not is_workspace_injection_message(m)
+            1 for m in _session.messages[cut_index:] if not is_context_injection(m)
         )
 
     before_count = len(_session.messages)
@@ -11293,9 +11289,13 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
         )
         return None
     try:
-        # Grab first few exchanges for title generation
+        from shared.runtime.core.context_entries import is_context_injection
+
+        # Grab first few exchanges for title generation; injected context
+        # (memory, knowledge, ...) is not what the conversation is about.
+        conversation = [m for m in messages if not is_context_injection(m)]
         sample = []
-        for m in messages[:10]:
+        for m in conversation[:10]:
             content = getattr(m, "content", None)
             if isinstance(content, str) and content:
                 sample.append(_excerpt_for_title(content))

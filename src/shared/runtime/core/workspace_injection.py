@@ -25,6 +25,7 @@ from typing import List, Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
+from shared.runtime.core.context_entries import is_context_injection
 from shared.runtime.core.injection_markers import (
     INSTRUCTION_TOOL_CALL_ID_PREFIX as INSTRUCTION_TOOL_CALL_ID_PREFIX,
     TODOS_INJECTION_CONTENT_PREFIX as TODOS_INJECTION_CONTENT_PREFIX,
@@ -188,49 +189,7 @@ def create_instruction_tool_messages(
     return ai_message, tool_message
 
 
-def is_workspace_injection_message(message: BaseMessage) -> bool:
-    """Check if a message is part of a transient injection pair.
-
-    Used to identify and exclude instruction/todo/memory/knowledge injection
-    messages from summarization, since they will be re-injected fresh after
-    summarization.
-
-    Args:
-        message: A LangChain message object
-
-    Returns:
-        True if this message is a synthetic injection message
-    """
-    # Detect transient HumanMessage injections (todos)
-    if isinstance(message, HumanMessage):
-        content = getattr(message, "content", "")
-        if isinstance(content, str):
-            if content.startswith(TODOS_INJECTION_CONTENT_PREFIX):
-                return True
-
-    from shared.runtime.core.injection_markers import (
-        MEMORY_TOOL_CALL_ID_PREFIX,
-        CHARTER_TOOL_CALL_ID_PREFIX,
-        KNOWLEDGE_TOOL_CALL_ID_PREFIX,
-        CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX,
-    )
-
-    prefixes = (
-        INSTRUCTION_TOOL_CALL_ID_PREFIX,
-        MEMORY_TOOL_CALL_ID_PREFIX,
-        KNOWLEDGE_TOOL_CALL_ID_PREFIX,
-        CHARTER_TOOL_CALL_ID_PREFIX,
-        CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX,
-    )
-
-    if isinstance(message, ToolMessage):
-        tool_call_id = getattr(message, "tool_call_id", "")
-        return tool_call_id.startswith(prefixes)
-
-    if isinstance(message, AIMessage):
-        if hasattr(message, "tool_calls") and message.tool_calls:
-            for tc in message.tool_calls:
-                if tc.get("id", "").startswith(prefixes):
-                    return True
-
-    return False
+# The one predicate for "injected context, not conversation" lives in
+# context_entries (typed entries plus every legacy tail shape, guidance and
+# the App Guide boundary included). The old name stays importable.
+is_workspace_injection_message = is_context_injection

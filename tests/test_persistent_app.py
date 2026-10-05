@@ -2172,6 +2172,31 @@ class TestGenerateTitle:
         assert "msg 10" not in task.sample_text
 
     @pytest.mark.asyncio
+    async def test_injected_context_is_not_sampled(self):
+        """Injected context (memory, charter, App Guide boundary) is filtered
+        before the 10-message sample: it is not what the session is about."""
+        from agent.core.knowledge_injection import create_charter_injection_messages
+        from shared.runtime.core.context_entries import make_context_entry
+
+        charter_ai, charter_tool = create_charter_injection_messages("CHARTER_TEXT")
+        messages = [
+            HumanMessage(content="msg 0"),
+            make_context_entry("memory", "ENTRY_MEMORY", section="memory"),
+            charter_ai,
+            charter_tool,
+            HumanMessage(content="<managed_product_guide_turn_boundary>\nBOUNDARY"),
+        ] + [HumanMessage(content=f"msg {i}") for i in range(1, 12)]
+        aux = self._aux()
+
+        await _generate_title(messages, aux)
+
+        task = aux.chain.call_args[0][0]
+        assert "msg 0" in task.sample_text and "msg 9" in task.sample_text
+        assert "msg 10" not in task.sample_text
+        for injected in ("ENTRY_MEMORY", "CHARTER_TEXT", "BOUNDARY"):
+            assert injected not in task.sample_text
+
+    @pytest.mark.asyncio
     async def test_excerpts_long_content_on_word_boundary(self):
         """Long message bodies are excerpted (word-boundary + ellipsis), not
         chopped mid-word — the mid-word chop made the model reply "cut off"."""

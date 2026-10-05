@@ -437,15 +437,24 @@ def format_audit_bulk(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-# Transient-injection markers, mirrored from src/core/*_injection.py (the MCP
-# image doesn't ship src/): legacy chat_history rows stored the re-injected
-# block verbatim as human/tool inputs; newer rows store type="context"
-# descriptors. Both collapse to one [context] line per turn.
+# Injection markers, mirrored from src/shared/runtime/core/injection_markers.py
+# (this lightweight package may not import shared.runtime): legacy
+# chat_history rows stored the re-injected block verbatim as human/tool
+# inputs; newer rows store type="context" descriptors. Both collapse to one
+# [context] line per turn.
 _INJECT_KIND_BY_PREFIX = (
     ("instruction_inject_", "instruction"),
     ("memory_inject_", "memory"),
     ("knowledge_inject_", "knowledge"),
+    ("charter_inject_", "charter"),
     ("citation_feedback_inject_", "citation_feedback"),
+    ("guidance_inject_", "guidance"),
+)
+# Transient HumanMessages of the legacy tail, by content prefix.
+_INJECT_KIND_BY_HUMAN_PREFIX = (
+    ("<active_tasks>", "todos"),
+    ("<active_subagents>", "subagents"),
+    ("<managed_product_guide_turn_boundary", "turn_boundary"),
 )
 
 
@@ -456,8 +465,10 @@ def _context_label(msg: dict[str, Any]) -> str | None:
         return str(kind) if kind else "context"
     if msg.get("type") == "human":
         content = msg.get("content_preview") or msg.get("content") or ""
-        if isinstance(content, str) and content.startswith("<active_tasks>"):
-            return "todos"
+        if isinstance(content, str):
+            for prefix, k in _INJECT_KIND_BY_HUMAN_PREFIX:
+                if content.startswith(prefix):
+                    return k
         # Persistent phase instruction block (src/core/message_markers.py):
         # newer archivers store it as type="context" kind="phase_instruction";
         # this prefix catches a row stored verbatim by an older writer.
@@ -494,7 +505,7 @@ def _format_chat_entry(entry: dict[str, Any], turn_number: int) -> list[str]:
             preview = str(content)[:300]
         lines.append(f"[{role}]: {preview}")
     if context_kinds:
-        lines.append(f"[context]: {', '.join(context_kinds)} (re-injected each turn)")
+        lines.append(f"[context]: {', '.join(context_kinds)} (injected context)")
 
     # Response
     response = entry.get("response", {})

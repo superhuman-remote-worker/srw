@@ -48,6 +48,9 @@ from langchain_core.messages import BaseMessage
 # src/persistent_graph.py, which re-exports this name unchanged).
 PERSIST_ROLE_KEY = "_srw_persist_role"
 PERSIST_ROLE_EVENT = "event"
+# A typed context entry (src/shared/runtime/core/context_entries.py): folded
+# into its carrier at request build, never a user turn.
+PERSIST_ROLE_CONTEXT = "context"
 
 # Protected-message markers (see module docstring).
 PROTECTED_KEY = "srw_protected"
@@ -189,6 +192,7 @@ def unpin_turn_input(message: Any) -> Any:
 __all__ = [
     "COMPACTION_VIEW_KEY",
     "INSTRUCTION_PATH_KEY",
+    "PERSIST_ROLE_CONTEXT",
     "PERSIST_ROLE_EVENT",
     "PERSIST_ROLE_KEY",
     "PHASE_KEY",

@@ -17,10 +17,10 @@ from typing import Any, Dict, List, Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
+from shared.runtime.core.injection_markers import (
+    GUIDANCE_TOOL_CALL_ID_PREFIX as GUIDANCE_TOOL_CALL_ID_PREFIX,
+)
 from shared.runtime.core.workspace_injection import content_hash_id
-
-# Prefix for identifying synthetic guidance injection tool calls
-GUIDANCE_TOOL_CALL_ID_PREFIX = "guidance_inject_"
 
 
 def format_supervisor_guidance(entries: List[Dict[str, Any]]) -> str:

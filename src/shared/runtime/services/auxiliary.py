@@ -1832,6 +1832,20 @@ class AuxiliaryLLM:
 _MAX_OBSERVATION_WINDOW = 40
 
 
+def _observation_window(messages: List[BaseMessage]) -> List[BaseMessage]:
+    """The newest ``_MAX_OBSERVATION_WINDOW`` conversation messages.
+
+    Injected context is filtered BEFORE the count cap: it carries no new
+    fact, and persisted context entries would otherwise use up window slots.
+    """
+    from shared.runtime.core.context_entries import is_context_injection
+
+    messages = [m for m in messages if not is_context_injection(m)]
+    if len(messages) > _MAX_OBSERVATION_WINDOW:
+        messages = messages[-_MAX_OBSERVATION_WINDOW:]
+    return messages
+
+
 async def extract_and_store_memories(
     auxiliary_llm: "AuxiliaryLLM",
     recall_store,
@@ -1858,9 +1872,7 @@ async def extract_and_store_memories(
         Number of memories successfully stored
     """
     try:
-        # Cap the message window
-        if len(messages) > _MAX_OBSERVATION_WINDOW:
-            messages = messages[-_MAX_OBSERVATION_WINDOW:]
+        messages = _observation_window(messages)
 
         if not messages:
             return 0
@@ -2072,9 +2084,7 @@ async def assemble_memories(
         AssemblyResult on success, None on failure
     """
     try:
-        # Cap the message window
-        if len(messages) > _MAX_OBSERVATION_WINDOW:
-            messages = messages[-_MAX_OBSERVATION_WINDOW:]
+        messages = _observation_window(messages)
 
         if not messages:
             return None
@@ -2119,15 +2129,15 @@ async def assemble_memories(
 def _format_messages_for_extraction(messages: List[BaseMessage]) -> str:
     """Format messages into readable text for the extraction LLM.
 
-    Filters out injection messages (workspace, memory, instruction)
-    to focus on actual conversation content.
+    Filters out injected context (typed entries and the legacy tail) to
+    focus on actual conversation content.
     """
+    from shared.runtime.core.context_entries import is_context_injection
     from shared.runtime.core.message_markers import is_protected_message
-    from shared.runtime.core.workspace_injection import is_workspace_injection_message
 
     lines = []
     for msg in messages:
-        if is_workspace_injection_message(msg):
+        if is_context_injection(msg):
             continue
         if is_protected_message(msg):
             continue  # phase instruction block — guidance, not conversation

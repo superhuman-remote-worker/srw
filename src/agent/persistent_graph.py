@@ -38,6 +38,7 @@ from agent.core.context import (
     repair_tool_pairing,
     scrub_history_tool_call_arguments,
 )
+from shared.runtime.core.context_entries import fold_context_entries, last_user_text
 from shared.runtime.core.llm_retry import _classify_llm_error, _extract_rate_limit_delay
 from shared.runtime.core.loader import with_current_date
 from shared.runtime.core.message_markers import PERSIST_ROLE_KEY as _PERSIST_ROLE_KEY
@@ -2403,15 +2404,7 @@ async def _execute_turn(
         try:
             if _provider_admission_closed():
                 return _closed_result()
-            context_text = ""
-            for msg in reversed(messages):
-                if isinstance(msg, HumanMessage):
-                    context_text = (
-                        msg.content
-                        if isinstance(msg.content, str)
-                        else str(msg.content)
-                    )
-                    break
+            context_text = last_user_text(messages)
 
             memories = await asyncio.wait_for(
                 recall_store.retrieve(context_text), timeout=_RETRIEVAL_TIMEOUT
@@ -2441,15 +2434,7 @@ async def _execute_turn(
         try:
             if _provider_admission_closed():
                 return _closed_result()
-            kb_context = ""
-            for msg in reversed(messages):
-                if isinstance(msg, HumanMessage):
-                    kb_context = (
-                        msg.content
-                        if isinstance(msg.content, str)
-                        else str(msg.content)
-                    )
-                    break
+            kb_context = last_user_text(messages)
 
             from agent.core.knowledge_injection import retrieve_bound_knowledge
             from shared.runtime.services.knowledge_store import KnowledgeStore as _KS
@@ -2482,15 +2467,7 @@ async def _execute_turn(
         try:
             if _provider_admission_closed():
                 return _closed_result()
-            kb_context = ""
-            for msg in reversed(messages):
-                if isinstance(msg, HumanMessage):
-                    kb_context = (
-                        msg.content
-                        if isinstance(msg.content, str)
-                        else str(msg.content)
-                    )
-                    break
+            kb_context = last_user_text(messages)
 
             kb_notes = await asyncio.wait_for(
                 knowledge_store.hybrid_search(
@@ -2828,6 +2805,9 @@ async def _execute_turn(
                 active_subagents_block=_active_subagents_block(tool_context),
                 product_guide_turn_boundary=product_guide_turn_nudge,
             )
+            # Typed context entries ride their carriers (D27). The identity
+            # while the history holds none, so legacy requests are unchanged.
+            provider_messages = fold_context_entries(provider_messages)
             provider_attempt_input = provider_messages
             provider_attempt_started_at = time.monotonic()
             return provider_messages

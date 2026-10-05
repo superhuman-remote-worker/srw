@@ -20,7 +20,7 @@ from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator, Optional
 
 import httpx
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.outputs import ChatGenerationChunk
 from langchain_openai import ChatOpenAI
 from pydantic import PrivateAttr
@@ -954,22 +954,36 @@ def fold_system_messages(messages: list) -> list:
 
 
 def mark_anthropic_cache_breakpoints(messages: list, payload_messages: list) -> list:
-    """Put Anthropic cache breakpoints on the system prompt and the last stable message.
+    """Put Anthropic cache breakpoints on the system prompt and the stable history.
 
-    The per-turn injections (todos, memory, knowledge, ...) sit at the tail of
-    every request and change each turn. A breakpoint on the last message, which
-    is what the subscription proxy places when the caller sends none, writes
-    the cache entry inside that tail, so no later request can read it.
-    Breakpoints on the system prompt and on the last message before the
-    injections leave the history readable from cache on the next turn.
-    Measured through CLIProxyAPI on 2026-09-29: 81-84% of input cached with
-    these two markers, against a fixed ~2.6k tokens without.
+    ``messages`` is the request view (context entries already folded into
+    their carriers). Besides the system prompt it marks, by request shape
+    (WP2 spec §H):
+
+    - **legacy tail** (any legacy injection in the request): the per-turn
+      injections (memory, knowledge, guidance, the App Guide turn boundary,
+      ...) sit at the tail and change each turn. A breakpoint on the last
+      message, which is what the subscription proxy places when the caller
+      sends none, writes the cache entry inside that tail, so no later
+      request can read it. The last message that is not an injection is
+      marked instead. Measured through CLIProxyAPI on 2026-09-29: 81-84% of
+      input cached with these two markers, against a fixed ~2.6k tokens
+      without.
+    - **append-only** (a folded carrier in the request): nothing is rebuilt,
+      so the newest AIMessage (the message right before the newest carrier
+      group) reads the previous request's entry, and the last message writes
+      the next one. Three of Anthropic's four breakpoints.
+    - otherwise the last message.
 
     ``messages`` are the LangChain messages ``payload_messages`` were converted
     from. The conversion is one-to-one; on a length mismatch the indices cannot
     be mapped and the payload is returned unchanged. Returns a new list.
     """
-    from shared.runtime.core.workspace_injection import is_workspace_injection_message
+    from shared.runtime.core.context_entries import (
+        has_folded_carrier,
+        is_context_injection,
+        is_legacy_injection,
+    )
 
     if len(messages) != len(payload_messages):
         return payload_messages
@@ -981,16 +995,35 @@ def mark_anthropic_cache_breakpoints(messages: list, payload_messages: list) -> 
         ),
         None,
     )
-    last_stable_idx = next(
-        (
-            i
-            for i in range(len(messages) - 1, -1, -1)
-            if not is_workspace_injection_message(messages[i])
-        ),
-        None,
-    )
+    last_idx = len(messages) - 1 if messages else None
+    anchors: set = {system_idx}
+    if any(is_legacy_injection(m) for m in messages):
+        anchors.add(
+            next(
+                (
+                    i
+                    for i in range(len(messages) - 1, -1, -1)
+                    if not is_context_injection(messages[i])
+                ),
+                None,
+            )
+        )
+    elif has_folded_carrier(messages):
+        anchors.add(
+            next(
+                (
+                    i
+                    for i in range(len(messages) - 1, -1, -1)
+                    if isinstance(messages[i], AIMessage)
+                ),
+                None,
+            )
+        )
+        anchors.add(last_idx)
+    else:
+        anchors.add(last_idx)
     out = list(payload_messages)
-    for idx in {system_idx, last_stable_idx} - {None}:
+    for idx in anchors - {None}:
         out[idx] = {**out[idx], "cache_control": {"type": "ephemeral"}}
     return out
 

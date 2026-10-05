@@ -10786,6 +10786,47 @@ describe('PersistentChatService — usage.updated telemetry', () => {
     });
   });
 
+  describe("historyToTurns — injected context rows (role='context')", () => {
+    // Append-only context injection persists each injected block (memory,
+    // knowledge, guidance, ...) as its own thread_messages row with
+    // role='context'. The model sees it folded into the user message or tool
+    // result before it; the user never said it. Hiding goes by role, never
+    // by matching the text: an unknown role renders nothing.
+    it('renders neither a bubble nor a system line for a context row', () => {
+      const turns = historyToTurns([
+        {
+          id: '1',
+          role: 'human',
+          content: 'What did we decide about X?',
+          tool_calls: null,
+          turn_number: 1,
+          created_at: null,
+        },
+        {
+          id: '2',
+          role: 'context',
+          content: '<srw_context kind="memory">\n[m:3f9a2c] We decided Y.\n</srw_context>',
+          tool_calls: null,
+          turn_number: 1,
+          created_at: null,
+        },
+        {
+          id: '3',
+          role: 'ai',
+          content: 'We decided Y.',
+          tool_calls: null,
+          turn_number: 1,
+          created_at: null,
+        },
+      ] as never);
+      const users = turns.filter((t) => t.kind === 'user');
+      expect(users).toHaveLength(1);
+      expect((users[0] as { content: string }).content).toBe('What did we decide about X?');
+      expect(turns.filter((t) => t.kind === 'system')).toHaveLength(0);
+      expect(JSON.stringify(turns)).not.toContain('srw_context');
+    });
+  });
+
   describe('citation drift + snapshot fetch (Half-B v2)', () => {
     it('fetchCitationDrift GETs the by-citation drift endpoint and returns the result', async () => {
       const { service, mockHttp } = createService();

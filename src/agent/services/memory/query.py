@@ -23,6 +23,7 @@ from typing import List, Optional
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from agent.services.memory.types import TaskFrame
+from shared.runtime.core.context_entries import is_context_injection
 
 #: Defaults mirror QueryConfig (src/core/loader.py) — callers normally
 #: pass the configured values; these keep the function usable standalone.
@@ -45,8 +46,14 @@ def build_digest_query_text(
 
     Empty messages and a missing frame yield "" — same contract as the
     legacy builders (the read path still retrieves rather than skipping).
+    Injected context never feeds the query: retrieval would otherwise
+    search with its own earlier results.
     """
-    recent = [m for m in messages if isinstance(m, (HumanMessage, AIMessage))]
+    recent = [
+        m
+        for m in messages
+        if isinstance(m, (HumanMessage, AIMessage)) and not is_context_injection(m)
+    ]
     if window > 0:
         recent = recent[-window:]
     else:

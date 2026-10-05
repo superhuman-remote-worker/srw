@@ -76,6 +76,7 @@ from agent.core.context import (
     sanitize_message_history,
     scrub_history_tool_call_arguments,
 )
+from shared.runtime.core.context_entries import fold_context_entries
 from shared.runtime.core.message_markers import (
     PERSIST_ROLE_EVENT,
     PERSIST_ROLE_KEY,
@@ -1571,6 +1572,9 @@ def create_execute_node(
         # across turns, so provider prompt caches reuse it instead of
         # re-processing the whole conversation every request.
         _inject_transient_messages(prepared_messages)
+        # Typed context entries in the history ride their carriers (D27):
+        # the identity while there are none, so legacy requests are unchanged.
+        prepared_messages = fold_context_entries(prepared_messages)
 
         # Todo reminders are injected post-LLM-response (see below) so they
         # persist in conversation history and survive context compaction.
@@ -1628,6 +1632,7 @@ def create_execute_node(
             # inside `messages` (the list restated after the summary if the
             # compaction evicted it).
             _inject_transient_messages(prepared_messages)
+            prepared_messages = fold_context_entries(prepared_messages)
             logger.debug(
                 f"[{job_id}] Re-injected transient messages after safety compaction"
             )
@@ -2393,6 +2398,7 @@ def create_execute_node(
                     # `messages` and rode through the compaction (kept or
                     # re-seated after the summary).
                     _inject_transient_messages(prepared_messages)
+                    prepared_messages = fold_context_entries(prepared_messages)
 
                     # Merge remove markers
                     if emergency_remove_markers:
