@@ -212,6 +212,18 @@ async def insert_leased_job(
     return job_id, lease_token
 
 
+async def insert_cleanup_owner_job(app_pg) -> UUID:
+    """A cleanup admission for a Job needs a live owner, even without a retry."""
+    job_id = uuid4()
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, execution_lane) "
+            "VALUES ($1, 'cleanup owner', 'processing', 'stateless')",
+            job_id,
+        )
+    return job_id
+
+
 async def prepare_checkpoint_rows(
     app_pg, job_id: UUID, *, checkpoint_count: int
 ) -> None:
@@ -438,7 +450,7 @@ async def test_committed_hold_blocks_controller_cleanup_before_pin_publication(
 @pytest.mark.asyncio
 async def test_cleanup_replay_rejects_changed_resource_intent(app_pg) -> None:
     store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
-    owner_id = uuid4()
+    owner_id = await insert_cleanup_owner_job(app_pg)
     request_id = uuid4()
     first_pvc = uuid4()
     permit = await store.acquire_cleanup_permit(
@@ -479,7 +491,7 @@ async def test_cleanup_replay_binds_keep_vs_purge_and_returns_completed_outcome(
     app_pg,
 ) -> None:
     store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
-    owner_id = uuid4()
+    owner_id = await insert_cleanup_owner_job(app_pg)
     request_id = uuid4()
     pvc_uid = uuid4()
     keep_intent = "sha256:keep-exact-vm-and-pvc"
@@ -522,7 +534,7 @@ async def test_cleanup_replay_binds_keep_vs_purge_and_returns_completed_outcome(
 @pytest.mark.asyncio
 async def test_controller_cleanup_reservation_resumes_only_while_open(app_pg) -> None:
     store = VMWorkspaceRecoveryStore(app_pg, worker_id="controller-boundary")
-    owner_id = uuid4()
+    owner_id = await insert_cleanup_owner_job(app_pg)
     request_id = uuid4()
     intent_digest = "sha256:failed-dv-recreate-g1-old-dv-old-pvc"
     permit = await store.acquire_cleanup_permit(
@@ -591,6 +603,51 @@ async def test_controller_cleanup_reservation_resumes_only_while_open(app_pg) ->
     assert not completed.allowed
     assert completed.reason == "cleanup_request_already_completed"
     assert completed.completed_outcome == "recreated"
+
+
+@pytest.mark.asyncio
+async def test_first_cleanup_writer_rechecks_owner_created_during_job_lock_wait(
+    app_pg,
+) -> None:
+    job_id = await insert_cleanup_owner_job(app_pg)
+
+    async def insert_cleanup() -> UUID:
+        async with app_pg.acquire() as conn:
+            return await conn.fetchval(
+                "INSERT INTO vm_workspace_cleanup_admissions "
+                "(id,owner_kind,owner_id,source,request_id,intent_digest) "
+                "VALUES($1,'job',$2,'public_vm_delete',$3,$4) RETURNING id",
+                uuid4(),
+                job_id,
+                uuid4(),
+                "sha256:first-cleanup-owner-race",
+            )
+
+    async with app_pg.acquire() as blocker, blocker.transaction():
+        await blocker.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", job_id)
+        pending = asyncio.create_task(insert_cleanup())
+        for _ in range(100):
+            async with app_pg.acquire() as observer:
+                waiting = await observer.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity "
+                    "WHERE wait_event_type='Lock' "
+                    "AND query LIKE 'INSERT INTO vm_workspace_cleanup_admissions%')"
+                )
+            if waiting:
+                break
+            await asyncio.sleep(0.01)
+        assert waiting and not pending.done()
+        await blocker.execute(
+            "INSERT INTO vm_job_creation_owners(job_id,live_job_id) VALUES($1,$1)",
+            job_id,
+        )
+    admission_id = await asyncio.wait_for(pending, 3)
+    assert admission_id is not None
+    async with app_pg.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT live_job_id=$1 FROM vm_job_creation_owners WHERE job_id=$1",
+            job_id,
+        )
 
 
 @pytest.mark.asyncio
@@ -1680,6 +1737,82 @@ async def test_orphan_uuid_checkpoints_prune_without_stranding_authority(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutated",
+    [
+        "source", "digest", "pvc", "parent", "recovery", "prior_cleanup",
+        "prior_forged_checkpoint", "retired_owner",
+    ],
+)
+async def test_orphan_checkpoint_exception_cannot_acquire_vm_or_retired_obligation(
+    app_pg, mutated
+) -> None:
+    from orchestrator.database.postgres import _checkpoint_prune_intent_digest
+
+    job_id = uuid4()
+    source = "terminal_checkpoint_prune"
+    digest = _checkpoint_prune_intent_digest(
+        str(job_id), {"mode": "delete_thread"}
+    )
+    if mutated == "recovery":
+        await insert_recovery(app_pg, owner_id=job_id)
+    elif mutated in {"prior_cleanup", "prior_forged_checkpoint", "retired_owner"}:
+        async with app_pg.acquire() as conn, conn.transaction():
+            await conn.execute(
+                "INSERT INTO jobs(id,description,status,execution_lane) "
+                "VALUES($1,'former checkpoint owner','completed','stateless')",
+                job_id,
+            )
+            if mutated in {"prior_cleanup", "prior_forged_checkpoint"}:
+                await conn.execute(
+                    "INSERT INTO vm_workspace_cleanup_admissions "
+                    "(id,owner_kind,owner_id,source,request_id,intent_digest,"
+                    "completed_at,outcome) VALUES($1,'job',$2,$3,$4,$5,"
+                    "clock_timestamp(),'completed')",
+                    uuid4(),
+                    job_id,
+                    "terminal_checkpoint_prune"
+                    if mutated == "prior_forged_checkpoint"
+                    else "public_vm_delete",
+                    uuid4(),
+                    "sha256:forged" if mutated == "prior_forged_checkpoint" else "sha256:former-cleanup",
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO vm_job_creation_owners(job_id,live_job_id) VALUES($1,$1)",
+                    job_id,
+                )
+                receipt = {
+                    "job_id": str(job_id),
+                    "generations": [],
+                    "worker_attempts": [],
+                    "worker_delivery_bindings": [],
+                    "workspace_recoveries": [],
+                }
+                await conn.execute(
+                    "UPDATE vm_job_creation_owners SET deleted_at=clock_timestamp(),"
+                    "deletion_receipt=$2::jsonb WHERE job_id=$1",
+                    job_id,
+                    json.dumps(receipt),
+                )
+            await conn.execute("DELETE FROM jobs WHERE id=$1", job_id)
+    async with app_pg.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                "INSERT INTO vm_workspace_cleanup_admissions "
+                "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,"
+                "parent_admission_id) VALUES($1,'job',$2,$3,$4,$5,$6,$7)",
+                uuid4(),
+                job_id,
+                uuid4() if mutated == "pvc" else None,
+                "checkpoint_retention_prune:forged" if mutated == "source" else source,
+                uuid4(),
+                "sha256:forged" if mutated == "digest" else digest,
+                uuid4() if mutated == "parent" else None,
+            )
+
+
+@pytest.mark.asyncio
 async def test_retention_relaxed_policy_discovers_prior_generation(app_pg, monkeypatch):
     monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
     job_id, _ = await insert_leased_job(app_pg)
@@ -2230,6 +2363,7 @@ async def test_disabled_bundle_then_enabled_hold_never_refunds_executable_attemp
         protocol_claim_dependencies(), recovery_store=store
     )
     job_id = UUID(UNIT_ID)
+    vm = db._job["context"]["vm"]
     async with app_pg.acquire() as conn:
         await conn.execute(
             "INSERT INTO jobs (id,description,status,execution_lane,context,config_override) VALUES ($1,'disabled bundle','processing','stateless',$2::jsonb,$3::jsonb)",
@@ -2245,6 +2379,45 @@ async def test_disabled_bundle_then_enabled_hold_never_refunds_executable_attemp
         await conn.execute(
             "INSERT INTO worker_batch_attempts (job_id,lease_token,claimed_attempt) VALUES ($1,7,1)",
             job_id,
+        )
+        # A root VM bundle now binds to an exact succeeded creation source.
+        # Keep this source separate from the attempt being tested: the flag
+        # transition concerns refund accounting after a real VM bundle.
+        execution_id, admission_id = uuid4(), uuid4()
+        await conn.execute(
+            "INSERT INTO srw_execution_specs "
+            "(id,work_kind,work_id,document,resolved,revision,harness_adapter) "
+            "VALUES($1,'Job',$2,'{}','{}','bundle-source','srw/v1')",
+            execution_id,
+            job_id,
+        )
+        await conn.execute(
+            "INSERT INTO vm_workspace_cleanup_admissions "
+            "(id,owner_kind,owner_id,source,request_id,intent_digest,"
+            "completed_at,outcome) "
+            "VALUES($1,'job',$2,'controller_vm_create',$3,'sha256:bundle-source',"
+            "clock_timestamp(),'created')",
+            admission_id,
+            job_id,
+            uuid4(),
+        )
+        await conn.execute(
+            "INSERT INTO vm_creation_retries "
+            "(request_id,job_id,provision_generation,origin,request_digest,"
+            "canonical_request,controller_configuration_digest,execution_id,"
+            "execution_revision,execution_generation,creation_admission_id,state,"
+            "boot_counted,observed_vm_uid,observed_pvc_uid,ready_at,resolved_at) "
+            "VALUES($1,$2,$3,'initial',$4,'{}',$5,$6,'bundle-source',1,$7,"
+            "'succeeded',true,$8,$9,clock_timestamp(),clock_timestamp())",
+            uuid4(),
+            job_id,
+            UUID(vm["provision_generation"]),
+            "sha256:" + "a" * 64,
+            "sha256:" + "b" * 64,
+            execution_id,
+            admission_id,
+            UUID(vm["vm_uid"]),
+            UUID(vm["rootdisk_pvc_uid"]),
         )
         # Live stateless contract: pooled executors never register. The
         # bundle must authorize without an agents row; assert its absence
@@ -2277,7 +2450,7 @@ async def test_disabled_bundle_then_enabled_hold_never_refunds_executable_attemp
                 "code": "workspace_transport_unavailable",
             },
         )
-        assert hold.status_code == 200
+        assert hold.status_code == 200, hold.text
         assert hold.json()["recovery"]["action"] == "hold_committed"
     async with app_pg.acquire() as conn:
         attempt = await conn.fetchrow(

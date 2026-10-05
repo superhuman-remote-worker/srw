@@ -588,6 +588,10 @@ DECLARE candidate jsonb;
         owned_job uuid;
         old_owned_job uuid;
         source_request uuid;
+        owner_live uuid;
+        owner_deleted timestamptz;
+        checkpoint_keep text;
+        checkpoint_digest text;
 BEGIN
     IF TG_OP='UPDATE' THEN
         old_candidate := to_jsonb(OLD);
@@ -637,18 +641,71 @@ BEGIN
         RETURN NEW;
     END IF;
     IF TG_OP='INSERT' THEN
-        PERFORM 1 FROM public.jobs WHERE id=owned_job FOR SHARE;
-        IF NOT FOUND THEN RAISE EXCEPTION 'retired Job VM owner cannot acquire obligations' USING ERRCODE='23514'; END IF;
-        -- The first cleanup permit may precede its VM retry source. Its
-        -- INSERT is still serialized by the live Job; the retry creates the
-        -- stable audit owner before any terminal capture.
-        IF NOT EXISTS (SELECT 1 FROM public.vm_job_creation_owners
-            WHERE job_id=owned_job) THEN
+        -- An existing stable owner serializes with final Delete's tombstone.
+        -- Avoid locking the foreign Job while a waiter writer holds its policy
+        -- row: admission may need that policy before it can inspect the Job.
+        SELECT live_job_id,deleted_at INTO owner_live,owner_deleted
+          FROM public.vm_job_creation_owners WHERE job_id=owned_job FOR SHARE;
+        IF FOUND THEN
+            IF owner_live IS DISTINCT FROM owned_job OR owner_deleted IS NOT NULL THEN
+                RAISE EXCEPTION 'retired Job VM owner cannot acquire obligations' USING ERRCODE='23514';
+            END IF;
             RETURN NEW;
         END IF;
-        PERFORM 1 FROM public.vm_job_creation_owners
-            WHERE job_id=owned_job AND live_job_id=owned_job AND deleted_at IS NULL FOR SHARE;
+        -- A UUID checkpoint thread can outlive its Job without carrying any
+        -- VM/PVC obligation. Only the exact checkpoint producer's source and
+        -- digest qualify, and prior VM/recovery/cleanup history excludes it.
+        IF TG_TABLE_NAME='vm_workspace_cleanup_admissions'
+           AND candidate->>'owner_kind'='job'
+           AND candidate->>'pvc_uid' IS NULL
+           AND candidate->>'parent_admission_id' IS NULL THEN
+            IF candidate->>'source'='terminal_checkpoint_prune' THEN
+                checkpoint_digest := 'sha256:' || encode(sha256(convert_to(
+                    format('{"mode":"delete_thread","resource":"checkpoint_thread","thread_id":"%s"}',owned_job),
+                    'UTF8')),'hex');
+            ELSIF candidate->>'source' ~
+                ('^checkpoint_retention_prune:v1:thread:' || owned_job::text || ':keep:[1-9][0-9]*$') THEN
+                checkpoint_keep := split_part(candidate->>'source',':',6);
+                checkpoint_digest := 'sha256:' || encode(sha256(convert_to(
+                    format('{"keep_n":%s,"mode":"keep_last","resource":"checkpoint_thread","thread_id":"%s"}',
+                        checkpoint_keep,owned_job),'UTF8')),'hex');
+            END IF;
+            IF checkpoint_digest IS NOT NULL
+               AND candidate->>'intent_digest'=checkpoint_digest
+               AND NOT EXISTS (SELECT 1 FROM public.vm_creation_retries
+                   WHERE owner_kind='job' AND job_id=owned_job)
+               AND NOT EXISTS (SELECT 1 FROM public.vm_workspace_recoveries
+                   WHERE owner_kind='job' AND owner_id=owned_job)
+               AND NOT EXISTS (SELECT 1 FROM public.vm_workspace_recovery_jobs
+                   WHERE job_id=owned_job)
+               AND NOT EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions prior
+                   WHERE prior.owner_kind='job' AND prior.owner_id=owned_job
+                     AND (prior.pvc_uid IS NOT NULL OR prior.parent_admission_id IS NOT NULL
+                       OR prior.intent_digest IS DISTINCT FROM CASE
+                           WHEN prior.source='terminal_checkpoint_prune' THEN
+                               'sha256:' || encode(sha256(convert_to(
+                                   format('{"mode":"delete_thread","resource":"checkpoint_thread","thread_id":"%s"}',
+                                       owned_job),'UTF8')),'hex')
+                           WHEN prior.source ~ ('^checkpoint_retention_prune:v1:thread:' ||
+                               owned_job::text || ':keep:[1-9][0-9]*$') THEN
+                               'sha256:' || encode(sha256(convert_to(
+                                   format('{"keep_n":%s,"mode":"keep_last","resource":"checkpoint_thread","thread_id":"%s"}',
+                                       split_part(prior.source,':',6),owned_job),'UTF8')),'hex')
+                           ELSE NULL
+                       END))
+               AND NOT EXISTS (SELECT 1 FROM public.jobs WHERE id=owned_job) THEN
+                RETURN NEW;
+            END IF;
+        END IF;
+        -- The first ordinary cleanup permit may precede its VM retry. Lock
+        -- the live Job, then recheck for an owner created during that wait.
+        PERFORM 1 FROM public.jobs WHERE id=owned_job FOR SHARE;
         IF NOT FOUND THEN RAISE EXCEPTION 'retired Job VM owner cannot acquire obligations' USING ERRCODE='23514'; END IF;
+        SELECT live_job_id,deleted_at INTO owner_live,owner_deleted
+          FROM public.vm_job_creation_owners WHERE job_id=owned_job FOR SHARE;
+        IF FOUND AND (owner_live IS DISTINCT FROM owned_job OR owner_deleted IS NOT NULL) THEN
+            RAISE EXCEPTION 'retired Job VM owner cannot acquire obligations' USING ERRCODE='23514';
+        END IF;
     ELSIF (TG_OP='DELETE' OR NEW IS DISTINCT FROM OLD)
       AND EXISTS (SELECT 1 FROM public.vm_job_creation_owners
           WHERE job_id=owned_job AND live_job_id IS NULL) THEN
@@ -664,7 +721,7 @@ FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
 CREATE TRIGGER a_vm_job_retained_ledger
 BEFORE INSERT OR UPDATE OR DELETE ON public.vm_resource_reservations
 FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
-CREATE TRIGGER a_vm_job_retained_ledger
+CREATE TRIGGER z_vm_job_retained_ledger
 BEFORE INSERT OR UPDATE OR DELETE ON public.vm_resource_waiters
 FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
 CREATE TRIGGER a_vm_job_retained_ledger
