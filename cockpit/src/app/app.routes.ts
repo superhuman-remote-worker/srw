@@ -1,19 +1,5 @@
 import {Routes} from '@angular/router';
-import {JobsPageComponent} from './views/jobs/jobs-page.component';
-import {JobReviewPageComponent} from './views/job-review/job-review-page.component';
-import {CreatePageComponent} from './views/create/create-page.component';
-import {ProjectListPageComponent} from './views/projects/project-list.component';
-import {ProjectDetailPageComponent} from './views/project-detail/project-detail.component';
-import {ConferenceLauncherComponent} from './views/project-detail/conference-launcher.component';
-import {InboxPageComponent} from './views/inbox/inbox-page.component';
-import {MessageRedirectComponent} from './core/routing/message-redirect/message-redirect.component';
 import {ChatPageComponent} from './views/chat/chat-page.component';
-import {CanvasPopoutPageComponent} from './views/canvas/canvas-popout-page.component';
-import {SessionsPageComponent} from './views/sessions/sessions-page.component';
-import {SessionCreateComponent} from './views/session-create/session-create.component';
-import {ExpertsPageComponent} from './views/experts/experts-page.component';
-import {SkillsPageComponent} from './views/skills/skills-page.component';
-import {SkillEditorComponent} from './views/skills/skill-editor.component';
 import {authGuard} from './core/guards/auth.guard';
 import {adminGuard} from './core/guards/admin.guard';
 import {projectAccessGuard} from './core/guards/project-access.guard';
@@ -25,31 +11,35 @@ const loadSettings = () =>
 const loadExpertEditor = () =>
   import('./views/experts/expert-editor.component').then((m) => m.ExpertEditorComponent);
 
+const loadSkillEditor = () =>
+  import('./views/skills/skill-editor.component').then((m) => m.SkillEditorComponent);
+
 export const routes: Routes = [
   // Instant landing (knowledge-base/knowledge/features/instant_landing_session.md): the root is a
   // fresh draft chat — open composer, nothing created until the first send.
   // (Replaces the sessions-list redirect left by the builder removal, see
   // knowledge-base/knowledge/features/builder_to_sessions_consolidation.md.)
   { path: '', component: ChatPageComponent, canActivate: [authGuard], data: { draft: true } },
-    {path: 'sessions', component: SessionsPageComponent, canActivate: [authGuard]},
-    {path: 'sessions/new', component: SessionCreateComponent, canActivate: [authGuard]},
+    {path: 'sessions', loadComponent: () => import('./views/sessions/sessions-page.component').then((m) => m.SessionsPageComponent), canActivate: [authGuard]},
+    {path: 'sessions/new', loadComponent: () => import('./views/session-create/session-create.component').then((m) => m.SessionCreateComponent), canActivate: [authGuard]},
     {
       path: 'sessions/:threadId/canvas',
-      component: CanvasPopoutPageComponent,
+      loadComponent: () => import('./views/canvas/canvas-popout-page.component').then((m) => m.CanvasPopoutPageComponent),
       canActivate: [authGuard],
       data: {canvasPopout: true},
     },
+    // Eager like '': ChatPageComponent is the landing page, so a lazy wrapper would save nothing.
     {path: 'sessions/:threadId', component: ChatPageComponent, canActivate: [authGuard]},
     {path: 'chat', redirectTo: 'sessions'},
-  { path: 'jobs', component: JobsPageComponent, canActivate: [authGuard] },
-  { path: 'jobs/new', component: CreatePageComponent, canActivate: [authGuard] },
-  { path: 'jobs/review', component: JobReviewPageComponent, canActivate: [authGuard] },
-  { path: 'inbox', component: InboxPageComponent, canActivate: [authGuard] },
-  { path: 'projects', component: ProjectListPageComponent, canActivate: [authGuard] },
-  { path: 'projects/:id', component: ProjectDetailPageComponent, canActivate: [authGuard, projectAccessGuard] },
+  { path: 'jobs', loadComponent: () => import('./views/jobs/jobs-page.component').then((m) => m.JobsPageComponent), canActivate: [authGuard] },
+  { path: 'jobs/new', loadComponent: () => import('./views/create/create-page.component').then((m) => m.CreatePageComponent), canActivate: [authGuard] },
+  { path: 'jobs/review', loadComponent: () => import('./views/job-review/job-review-page.component').then((m) => m.JobReviewPageComponent), canActivate: [authGuard] },
+  { path: 'inbox', loadComponent: () => import('./views/inbox/inbox-page.component').then((m) => m.InboxPageComponent), canActivate: [authGuard] },
+  { path: 'projects', loadComponent: () => import('./views/projects/project-list.component').then((m) => m.ProjectListPageComponent), canActivate: [authGuard] },
+  { path: 'projects/:id', loadComponent: () => import('./views/project-detail/project-detail.component').then((m) => m.ProjectDetailPageComponent), canActivate: [authGuard, projectAccessGuard] },
   {
     path: 'projects/:id/officer/conference',
-    component: ConferenceLauncherComponent,
+    loadComponent: () => import('./views/project-detail/conference-launcher.component').then((m) => m.ConferenceLauncherComponent),
     canActivate: [authGuard, projectAccessGuard],
   },
   {
@@ -64,12 +54,12 @@ export const routes: Routes = [
       import('./views/contacts/contacts-page.component').then(m => m.ContactsPageComponent),
     canActivate: [authGuard],
   },
-  { path: 'experts', component: ExpertsPageComponent, canActivate: [authGuard] },
+  { path: 'experts', loadComponent: () => import('./views/experts/experts-page.component').then((m) => m.ExpertsPageComponent), canActivate: [authGuard] },
   { path: 'experts/new', loadComponent: loadExpertEditor, canActivate: [authGuard] },
   { path: 'experts/:id/edit', loadComponent: loadExpertEditor, canActivate: [authGuard] },
-  { path: 'skills', component: SkillsPageComponent, canActivate: [authGuard] },
-  { path: 'skills/new', component: SkillEditorComponent, canActivate: [authGuard] },
-  { path: 'skills/:id/edit', component: SkillEditorComponent, canActivate: [authGuard] },
+  { path: 'skills', loadComponent: () => import('./views/skills/skills-page.component').then((m) => m.SkillsPageComponent), canActivate: [authGuard] },
+  { path: 'skills/new', loadComponent: loadSkillEditor, canActivate: [authGuard] },
+  { path: 'skills/:id/edit', loadComponent: loadSkillEditor, canActivate: [authGuard] },
   // Slice A3: workspace templates, the fifth Customize tab. Lazy, like the
   // other Customize editors, so the chat bundle doesn't carry them.
   {
@@ -206,7 +196,7 @@ export const routes: Routes = [
 
   // Catch old email links: /jobs/{jobId}/messages/{threadId}
   // redirectTo can't transform path params to query params, so use a redirect component
-  { path: 'jobs/:jobId/messages/:threadId', component: MessageRedirectComponent },
+  { path: 'jobs/:jobId/messages/:threadId', loadComponent: () => import('./core/routing/message-redirect/message-redirect.component').then((m) => m.MessageRedirectComponent) },
 
   { path: '**', redirectTo: '' },
 ];

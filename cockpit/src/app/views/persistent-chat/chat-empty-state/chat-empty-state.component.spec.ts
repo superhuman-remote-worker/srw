@@ -82,7 +82,7 @@ describe('ChatEmptyStateComponent variants', () => {
 
   afterEach(() => TestBed.resetTestingModule());
 
-  function render(inputs: Record<string, unknown>): HTMLElement {
+  async function render(inputs: Record<string, unknown>): Promise<HTMLElement> {
     TestBed.overrideComponent(ChatEmptyStateComponent, {
       remove: {imports: [AppSelectComponent, AppButtonComponent, WorkspacePickerComponent]},
       add: {imports: [SelectStub, ButtonStub, WorkspacePickerStub]},
@@ -109,21 +109,24 @@ describe('ChatEmptyStateComponent variants', () => {
     const inst = fixture.componentInstance as unknown as Record<string, unknown>;
     for (const [k, v] of Object.entries(inputs)) inst[k] = () => v;
     fixture.detectChanges();
+    // The workspace picker sits in an @defer block; let it resolve and render.
+    await fixture.whenStable();
+    fixture.detectChanges();
     return fixture.nativeElement as HTMLElement;
   }
 
   const text = (root: HTMLElement) => (root.textContent ?? '').replace(/\s+/g, ' ').trim();
 
-  it('renders neither the connectors control nor the advanced link for "ready"', () => {
-    const root = render({variant: 'ready', suggestions: []});
+  it('renders neither the connectors control nor the advanced link for "ready"', async () => {
+    const root = await render({variant: 'ready', suggestions: []});
     expect(root.querySelector('.draft-connectors')).toBeNull();
     expect(root.querySelector('.draft-advanced')).toBeNull();
     // The other half of "two i18n keys": ready's own copy, not draft's.
     expect(text(root)).toContain('The agent is connected and listening');
   });
 
-  it('does not claim the agent is listening while typed creation needs attention', () => {
-    const root = render({variant: 'ready', suggestions: [], workspaceCreation: {
+  it('does not claim the agent is listening while typed creation needs attention', async () => {
+    const root = await render({variant: 'ready', suggestions: [], workspaceCreation: {
       stage: 'readiness', state: 'attention', reason_code: 'invalid_image',
       readiness_deadline_at: null,
     }});
@@ -131,8 +134,8 @@ describe('ChatEmptyStateComponent variants', () => {
     expect(text(root)).not.toContain('agent is connected and listening');
   });
 
-  it('renders both the connectors control and the advanced link for "draft"', () => {
-    const root = render({
+  it('renders both the connectors control and the advanced link for "draft"', async () => {
+    const root = await render({
       variant: 'draft',
       suggestions: [],
       connectorsEnabled: true,
@@ -144,8 +147,8 @@ describe('ChatEmptyStateComponent variants', () => {
     expect(text(root)).toContain('Default connectors (2)');
   });
 
-  it('still renders suggestion chips for either variant', () => {
-    const root = render({
+  it('still renders suggestion chips for either variant', async () => {
+    const root = await render({
       variant: 'ready',
       suggestions: [{icon: 'route', text: 'Review the manifest'}],
     });
@@ -153,8 +156,8 @@ describe('ChatEmptyStateComponent variants', () => {
     expect(chip?.textContent).toContain('Review the manifest');
   });
 
-  it('renders recovery controls without navigating away from retained messages', () => {
-    const root = render({
+  it('renders recovery controls without navigating away from retained messages', async () => {
+    const root = await render({
       variant: 'recovery', suggestions: [], connectorsEnabled: true,
       datasourceCount: 1,
     });
@@ -167,8 +170,8 @@ describe('ChatEmptyStateComponent variants', () => {
     expect(root.querySelector('.empty-mark')).toBeNull();
   });
 
-  it('keeps correction controls available when the new preview is refused', () => {
-    const root = render({
+  it('keeps correction controls available when the new preview is refused', async () => {
+    const root = await render({
       variant: 'recovery', suggestions: [], connectorsError: true,
     });
     expect(root.querySelector('app-workspace-picker')).not.toBeNull();
