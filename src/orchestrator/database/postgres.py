@@ -38,10 +38,6 @@ from typing import (
 from uuid import UUID, uuid4
 
 
-class JobVMAuditNotReady(RuntimeError):
-    """Final Job deletion lacks an exact terminal VM audit disposition."""
-
-
 from shared.helm_provenance import provenance_from_breadcrumb
 from shared.credential_connectors import CredentialConnectorAttachedError
 
@@ -174,6 +170,11 @@ from shared.operator_pause_hold import (
     operator_pause_hold_present_sql,
 )
 from orchestrator.services.ssh_handles import is_valid_handle, mint_ssh_handle
+
+
+class JobVMAuditNotReady(RuntimeError):
+    """Final Job deletion lacks an exact terminal VM audit disposition."""
+
 
 logger = logging.getLogger(__name__)
 
