@@ -318,6 +318,24 @@ class VMCreationPreflightStore:
         if not old:
             return {"expected_pvc_uid": None}
         pvc = old.get("rootdisk_pvc_uid")
+        if (
+            old.get("status") == "deleted"
+            and pvc is None
+            and old.get("vm_uid") is None
+            and old.get("vmi_uid") is None
+            and old.get("active_pod_uid") is None
+            and old.get("_runtime_incarnation") is None
+            and old.get("identity_authenticated") is False
+            and old.get("provision_attempts") == 0
+            and old.get("preparation_request") is None
+            and old.get("preparation") is None
+            and old.get("workspace_storage") is None
+            and await conn.fetchval(
+                "SELECT public.job_vm_creation_never_issued_terminal_source($1,$2)",
+                job["id"], old.get("provision_generation"),
+            )
+        ):
+            return {"expected_pvc_uid": None}
         if not pvc or old.get("identity_authenticated") is not True:
             raise VMCreationRetryConflict("creation_request_unproven")
         proposal = {

@@ -5694,18 +5694,29 @@ class PostgresDB:
                 generation = vm["provision_generation"]
                 vm_uid = vm["vm_uid"]
                 pvc_uid = vm["rootdisk_pvc_uid"]
-                if any(
-                    not isinstance(value, str) or str(UUID(value)) != value
-                    for value in (generation, vm_uid, pvc_uid)
-                ):
+                if not isinstance(generation, str) or str(UUID(generation)) != generation:
                     return False
             except (KeyError, TypeError, ValueError, AttributeError):
                 return False
-            if (
-                vm.get("identity_authenticated") is not True
-                or vm.get("identity_provision_generation") != generation
-            ):
-                return False
+            if vm_uid is None and pvc_uid is None:
+                # This selector issues no effect. The archive transaction
+                # rechecks the full source under owner/retry/parent locks.
+                if not await conn.fetchval(
+                    "SELECT public.job_vm_creation_never_issued_source($1,$2)",
+                    owner_id, generation,
+                ):
+                    return False
+            else:
+                try:
+                    if (
+                        not isinstance(vm_uid, str) or str(UUID(vm_uid)) != vm_uid
+                        or not isinstance(pvc_uid, str) or str(UUID(pvc_uid)) != pvc_uid
+                        or vm.get("identity_authenticated") is not True
+                        or vm.get("identity_provision_generation") != generation
+                    ):
+                        return False
+                except (ValueError, TypeError, AttributeError):
+                    return False
             if await conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases "
                 "WHERE owner_kind='job' AND owner_id=$1 AND closed_at IS NULL "
@@ -5720,7 +5731,7 @@ class PostgresDB:
                 "WHERE r.resolved_at IS NULL AND "
                 "((r.owner_kind='job' AND r.owner_id=$1) OR p.pvc_uid=$2))",
                 owner_id,
-                UUID(pvc_uid),
+                UUID(pvc_uid) if pvc_uid is not None else None,
             ):
                 return False
             if await conn.fetchval(
@@ -5750,6 +5761,12 @@ class PostgresDB:
                 "AND completed_at IS NULL ORDER BY admitted_at LIMIT 2",
                 owner_id,
             )
+            if await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
+                "WHERE owner_kind='job' AND owner_id=$1 AND completed_at IS NULL "
+                "AND source<>'job_terminal_vm_release')", owner_id,
+            ):
+                return False
             return bool(
                 len(parents) == 1
                 and parents[0]["owner_id"] == expected_owner
