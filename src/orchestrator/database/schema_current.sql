@@ -9760,6 +9760,7 @@ CREATE FUNCTION public.guard_vm_job_creation_owner() RETURNS trigger
     AS $$
 DECLARE expected_generations jsonb;
         expected_attempts jsonb;
+        expected_deliveries jsonb;
         expected_recoveries jsonb;
 BEGIN
     IF TG_OP='DELETE' THEN
@@ -9790,6 +9791,9 @@ BEGIN
         SELECT COALESCE(jsonb_agg(to_jsonb(attempt) ORDER BY lease_token),'[]'::jsonb)
           INTO expected_attempts FROM public.worker_batch_attempts attempt
           WHERE job_id=NEW.job_id;
+        SELECT COALESCE(jsonb_agg(to_jsonb(delivery) ORDER BY lease_token),'[]'::jsonb)
+          INTO expected_deliveries FROM public.vm_job_worker_delivery_bindings delivery
+          WHERE job_id=NEW.job_id;
         SELECT COALESCE(jsonb_agg(to_jsonb(recovery) - 'prior_control_reference'
             - 'prior_freeze_reference' ORDER BY recovery_id),'[]'::jsonb)
           INTO expected_recoveries FROM public.vm_workspace_recovery_jobs recovery
@@ -9798,6 +9802,7 @@ BEGIN
            OR NEW.deletion_receipt->>'job_id' IS DISTINCT FROM NEW.job_id::text
            OR NEW.deletion_receipt->'generations' IS DISTINCT FROM expected_generations
            OR NEW.deletion_receipt->'worker_attempts' IS DISTINCT FROM expected_attempts
+           OR NEW.deletion_receipt->'worker_delivery_bindings' IS DISTINCT FROM expected_deliveries
            OR NEW.deletion_receipt->'workspace_recoveries' IS DISTINCT FROM expected_recoveries THEN
             RAISE EXCEPTION 'Job VM audit tombstone lacks exact live owner' USING ERRCODE='23514';
         END IF;
@@ -9931,7 +9936,8 @@ DECLARE candidate jsonb;
 BEGIN
     IF TG_OP='UPDATE' THEN
         old_candidate := to_jsonb(OLD);
-        IF TG_TABLE_NAME='vm_workspace_cleanup_admissions' THEN
+        IF TG_TABLE_NAME='vm_workspace_cleanup_admissions'
+           OR TG_TABLE_NAME='managed_repository_process_zero_receipts' THEN
             IF old_candidate->>'owner_kind'='job' THEN
                 old_owned_job := (old_candidate->>'owner_id')::uuid;
             END IF;
@@ -9957,7 +9963,8 @@ BEGIN
         END IF;
     END IF;
     candidate := CASE WHEN TG_OP='DELETE' THEN to_jsonb(OLD) ELSE to_jsonb(NEW) END;
-    IF TG_TABLE_NAME='vm_workspace_cleanup_admissions' THEN
+    IF TG_TABLE_NAME='vm_workspace_cleanup_admissions'
+       OR TG_TABLE_NAME='managed_repository_process_zero_receipts' THEN
         IF candidate->>'owner_kind'='job' THEN owned_job := (candidate->>'owner_id')::uuid; END IF;
     ELSIF TG_TABLE_NAME='vm_resource_cleanup_stop_receipts' THEN
         owned_job := (candidate->>'job_id')::uuid;
@@ -10022,6 +10029,53 @@ BEGIN
        OR NEW.terminal_kind IS DISTINCT FROM exact->>'kind'
        OR NEW.cleanup_admission_id::text IS DISTINCT FROM exact->>'cleanup_admission_id' THEN
         RAISE EXCEPTION 'Job VM terminal packet lacks exact source' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_job_worker_delivery_binding(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_worker_delivery_binding() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP IN ('UPDATE','DELETE') THEN
+        RAISE EXCEPTION 'VM Job worker delivery binding is immutable' USING ERRCODE='23514';
+    END IF;
+    -- The application already holds the exact queue lease, then the Job and
+    -- retry. Do not acquire a queue lock after the Job in this trigger.
+    PERFORM 1 FROM public.jobs j WHERE j.id=NEW.job_id
+        AND j.context->'vm'->>'status'='ready'
+        AND j.context->'vm'->>'provision_generation'=NEW.provision_generation::text
+        AND j.context->'vm'->>'identity_provision_generation'=NEW.provision_generation::text
+        AND j.context->'vm'->>'vm_uid'=NEW.vm_uid::text
+        AND j.context->'vm'->>'rootdisk_pvc_uid'=NEW.pvc_uid::text
+        FOR SHARE;
+    IF NOT FOUND OR NOT EXISTS (
+        SELECT 1 FROM public.vm_job_creation_owners o
+        WHERE o.job_id=NEW.job_id AND o.live_job_id=NEW.job_id AND o.deleted_at IS NULL
+    ) OR NOT EXISTS (
+        SELECT 1 FROM public.run_queue q WHERE q.unit_id=NEW.job_id
+          AND q.unit_kind='worker_batch' AND q.state='leased'
+          AND q.lease_token=NEW.lease_token
+    ) OR NOT EXISTS (
+        SELECT 1 FROM public.worker_batch_attempts b
+        WHERE b.job_id=NEW.job_id AND b.lease_token=NEW.lease_token
+          AND b.bundle_authorized_at IS NULL AND b.authority_digest IS NULL
+          AND b.refunded_at IS NULL AND b.recovery_id IS NULL
+    ) OR NOT EXISTS (
+        SELECT 1 FROM public.vm_creation_retries r WHERE r.request_id=NEW.request_id
+          AND r.owner_kind='job' AND r.job_id=NEW.job_id
+          AND r.provision_generation=NEW.provision_generation AND r.state='succeeded'
+          AND r.observed_vm_uid=NEW.vm_uid AND r.observed_pvc_uid=NEW.pvc_uid
+          AND r.creation_admission_id IS NOT NULL
+    ) THEN
+        RAISE EXCEPTION 'VM Job worker delivery lacks exact live physical source'
+            USING ERRCODE='23514';
     END IF;
     RETURN NEW;
 END;
@@ -21130,6 +21184,72 @@ $$;
 
 
 --
+-- Name: vm_job_logical_final_history_safe(uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_logical_final_history_safe(requested_job uuid, requested_generation uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.jobs j
+        JOIN public.vm_creation_retries source
+          ON source.owner_kind='job' AND source.job_id=j.id
+         AND source.provision_generation=requested_generation
+        WHERE j.id=requested_job AND j.parent_job_id IS NULL
+          AND j.assigned_agent_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM public.worker_batch_attempts batch
+              WHERE batch.job_id=j.id AND (batch.bundle_authorized_at IS NOT NULL
+                  OR batch.authority_digest IS NOT NULL)
+                AND NOT EXISTS (
+                    SELECT 1 FROM public.vm_job_worker_delivery_bindings binding
+                    JOIN public.vm_creation_retries physical
+                      ON physical.request_id=binding.request_id
+                    WHERE binding.job_id=batch.job_id
+                      AND binding.lease_token=batch.lease_token
+                      AND binding.authority_digest=batch.authority_digest
+                      AND batch.bundle_authorized_at IS NOT NULL
+                      AND binding.provision_generation<>requested_generation
+                      AND physical.owner_kind='job' AND physical.job_id=j.id
+                      AND physical.provision_generation=binding.provision_generation
+                      AND physical.state='succeeded'
+                      AND physical.observed_vm_uid=binding.vm_uid
+                      AND physical.observed_pvc_uid=binding.pvc_uid
+                ))
+          AND NOT EXISTS (SELECT 1 FROM public.srw_execution_workspace_bindings b
+              JOIN public.srw_execution_specs x ON x.id=b.execution_id
+              WHERE x.work_kind='Job' AND x.work_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.srw_execution_attempts attempt
+              JOIN public.srw_execution_specs x ON x.id=attempt.execution_id
+              WHERE x.work_kind='Job' AND x.work_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.srw_workspace_instances instance
+              WHERE instance.owner_id=j.id OR instance.execution_id IN (
+                  SELECT x.id FROM public.srw_execution_specs x
+                  WHERE x.work_kind='Job' AND x.work_id=j.id))
+          AND NOT EXISTS (SELECT 1 FROM public.managed_repository_workspace_creation_reservations reservation
+              WHERE reservation.owner_kind='job' AND reservation.owner_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.managed_repository_workspace_cleanup_intents cleanup
+              WHERE cleanup.owner_kind='job' AND cleanup.owner_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.vm_creation_retries alien
+              WHERE alien.job_id=j.id AND alien.owner_kind<>'job')
+          AND NOT EXISTS (
+              SELECT 1 FROM public.managed_repository_process_zero_receipts p
+              WHERE p.owner_kind='job' AND p.owner_id=j.id
+                AND NOT (
+                    p.scope='vm' AND p.provisioner='vm'
+                    AND p.runtime_incarnation<>requested_generation::text
+                    AND EXISTS (
+                        SELECT 1 FROM public.vm_creation_retries physical
+                        WHERE physical.owner_kind='job' AND physical.job_id=j.id
+                          AND physical.provision_generation::text=p.runtime_incarnation
+                          AND physical.state='succeeded'
+                    )
+                )
+          )
+    );
+$$;
+
+
+--
 -- Name: vm_job_repository_settlement_receipts; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -21194,10 +21314,11 @@ BEGIN
     END IF;
     IF public.job_vm_creation_never_issued_terminal_source(
         r.job_id,r.provision_generation::text) THEN
-        -- 0326 proves the settled retry and exact logical parent. Recheck
-        -- 0327's *historical* non-delivery at Delete without requiring the
-        -- repository to remain active after its normal revocation.
-        IF NOT public.job_vm_never_issued_history_safe(r.job_id) THEN
+        -- 0326 proves this retry and logical parent. Other generations may
+        -- have their own exact physical packet; unattributed delivery history
+        -- cannot be assigned to those generations and remains a hold.
+        IF NOT public.vm_job_logical_final_history_safe(
+            r.job_id,r.provision_generation) THEN
             RETURN NULL;
         END IF;
         SELECT * INTO a FROM public.vm_workspace_cleanup_admissions
@@ -21294,6 +21415,11 @@ BEGIN
         'reservation_count',reservation_count,
         'effect_nonces',COALESCE((SELECT jsonb_agg(e.effect_nonce ORDER BY e.effect_nonce)
             FROM public.vm_creation_effects e WHERE e.request_id=r.request_id),'[]'::jsonb),
+        'process_zero_receipt_ids',COALESCE((SELECT jsonb_agg(p.id ORDER BY p.id)
+            FROM public.managed_repository_process_zero_receipts p
+            WHERE p.owner_kind='job' AND p.owner_id=r.job_id
+              AND p.scope='vm' AND p.provisioner='vm'
+              AND p.runtime_incarnation=r.provision_generation::text),'[]'::jsonb),
         'reservation_ids',COALESCE((SELECT jsonb_agg(v.id ORDER BY v.id)
             FROM public.vm_resource_reservations v WHERE v.request_id=r.request_id),'[]'::jsonb),
         'stop_reservation_id',stop_row.reservation_id,
@@ -28844,6 +28970,23 @@ CREATE TABLE public.vm_job_creation_terminal_packets (
 
 
 --
+-- Name: vm_job_worker_delivery_bindings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_job_worker_delivery_bindings (
+    job_id uuid NOT NULL,
+    lease_token bigint NOT NULL,
+    request_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    vm_uid uuid NOT NULL,
+    pvc_uid uuid NOT NULL,
+    authority_digest text NOT NULL,
+    captured_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT vm_job_worker_delivery_bindings_check CHECK (((lease_token > 0) AND (authority_digest <> ''::text)))
+);
+
+
+--
 -- Name: vm_remote_operation_claim_seq; Type: SEQUENCE; Schema: public; Owner: -
 --
 
@@ -31844,6 +31987,14 @@ ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
 
 
 --
+-- Name: vm_job_worker_delivery_bindings vm_job_worker_delivery_bindings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_worker_delivery_bindings
+    ADD CONSTRAINT vm_job_worker_delivery_bindings_pkey PRIMARY KEY (job_id, lease_token);
+
+
+--
 -- Name: vm_remote_operation_leases vm_remote_operation_leases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -34631,6 +34782,13 @@ CREATE TRIGGER a_vm_job_creation_owner BEFORE INSERT ON public.vm_creation_retri
 
 
 --
+-- Name: managed_repository_process_zero_receipts a_vm_job_retained_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_retained_ledger BEFORE DELETE OR UPDATE ON public.managed_repository_process_zero_receipts FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
+
+
+--
 -- Name: vm_creation_effects a_vm_job_retained_ledger; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -36406,6 +36564,13 @@ CREATE TRIGGER vm_job_retained_execution BEFORE DELETE OR UPDATE ON public.srw_w
 --
 
 CREATE TRIGGER vm_job_terminal_packet_immutable BEFORE INSERT OR DELETE OR UPDATE ON public.vm_job_creation_terminal_packets FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_terminal_packet();
+
+
+--
+-- Name: vm_job_worker_delivery_bindings vm_job_worker_delivery_binding_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_worker_delivery_binding_immutable BEFORE INSERT OR DELETE OR UPDATE ON public.vm_job_worker_delivery_bindings FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_worker_delivery_binding();
 
 
 --
@@ -38502,6 +38667,22 @@ ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
 
 ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
     ADD CONSTRAINT vm_job_repository_settlement_receipts_request_id_fkey FOREIGN KEY (request_id) REFERENCES public.vm_creation_retries(request_id);
+
+
+--
+-- Name: vm_job_worker_delivery_bindings vm_job_worker_delivery_bindings_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_worker_delivery_bindings
+    ADD CONSTRAINT vm_job_worker_delivery_bindings_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.vm_job_creation_owners(job_id);
+
+
+--
+-- Name: vm_job_worker_delivery_bindings vm_job_worker_delivery_bindings_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_worker_delivery_bindings
+    ADD CONSTRAINT vm_job_worker_delivery_bindings_request_id_fkey FOREIGN KEY (request_id) REFERENCES public.vm_creation_retries(request_id);
 
 
 --

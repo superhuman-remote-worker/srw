@@ -4711,6 +4711,11 @@ class PostgresDB:
             "WHERE job_id=$1 "
             "ORDER BY lease_token FOR SHARE", job_id,
         )
+        deliveries = await conn.fetch(
+            "SELECT to_jsonb(delivery) AS evidence "
+            "FROM vm_job_worker_delivery_bindings delivery WHERE job_id=$1 "
+            "ORDER BY lease_token FOR SHARE", job_id,
+        )
         recoveries = await conn.fetch(
             "SELECT to_jsonb(recovery) - 'prior_control_reference' "
             "- 'prior_freeze_reference' AS evidence "
@@ -4785,6 +4790,10 @@ class PostgresDB:
             "worker_attempts": [
                 json.loads(a["evidence"]) if isinstance(a["evidence"], str)
                 else a["evidence"] for a in attempts
+            ],
+            "worker_delivery_bindings": [
+                json.loads(d["evidence"]) if isinstance(d["evidence"], str)
+                else d["evidence"] for d in deliveries
             ],
             "workspace_recoveries": [
                 json.loads(r["evidence"]) if isinstance(r["evidence"], str)

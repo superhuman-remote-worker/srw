@@ -26,8 +26,10 @@ from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
 from orchestrator.services.vm_provisioner import (
     VMProvisioner,
     VMTeardownIdentity,
+    VMTeardownResult,
     _VMTeardownProbe,
 )
+from orchestrator.services.job_controls import JobControlOperations
 from orchestrator.services.vm_resource_waiter_maintenance import (
     VMResourceWaiterMaintenance,
 )
@@ -46,6 +48,12 @@ from tests.test_vm_resource_template import shipped_template
 from vm_controller.creation_configuration import resolve_creation_configuration
 from shared.vm_resource_admission import ResourceAdmissionError
 from shared.vm_creation_retry import canonical_request_digest
+from shared.worker_queue import (
+    claim_worker_batch,
+    complete_worker_batch,
+    enqueue_worker_batch,
+)
+from shared.workspace_contract import workspace_runtime_authority_digest
 from tests.test_job_terminal_vm_cleanup import controls
 from tests.test_vm_resource_whole_store_real_postgres import (
     db as _db_fixture,
@@ -288,6 +296,241 @@ async def test_late_delivery_after_settlement_blocks_logical_final_delete(
         "SELECT count(*) FROM vm_job_creation_terminal_packets WHERE job_id=$1",
         owner,
     ) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unattributed_delivery", [None, "worker_bundle", "execution_attempt"])
+async def test_logical_cancel_then_charged_physical_successor_final_disposition(
+    db, monkeypatch, unattributed_delivery,
+):
+    first, recovery, _ = await never_issued_cancel(db, monkeypatch)
+    owner = first["job_id"]
+    archive, _ = actual_archive(db, recovery, monkeypatch)
+    assert await controls(store=db, archive=archive).wait_for_stateless_cancel_settle(
+        str(owner), timeout_seconds=0,
+    )
+    assert await db.queue_stateless_job_for_resume(
+        str(owner), expected_status="cancelled",
+    )
+
+    policy, inventory, _, _ = await environment(db)
+    monkeypatch.setenv("VM_RESOURCE_ADMISSION_CONFIG", json.dumps(policy.policy_document))
+    from vm_controller import controller as controller_settings
+
+    monkeypatch.setattr(controller_settings, "VM_NAMESPACE", "workers")
+    monkeypatch.setattr(controller_settings, "VM_STORAGE_CLASS", "local")
+    monkeypatch.setattr(controller_settings, "VM_NODE_SELECTOR", {})
+    monkeypatch.setattr(controller_settings, "VM_TOLERATIONS", [])
+    request, fresh = candidate(owner)
+    preflight = VMCreationPreflightStore(db)
+    await preflight.begin(job_id=str(owner), request=request, fresh_context=fresh)
+    claim = (await preflight.claim_due(limit=1))[0]
+    resolver = controller()
+    resolver.template_text = shipped_template()
+    second = await preflight.complete_resolution(
+        claim, resolve_creation_configuration(resolver, claim["request"]),
+    )
+    assert second["provision_generation"] != first["provision_generation"]
+    admitted = await policy.admit(request_id=str(second["request_id"]))
+    assert admitted["action"] == "admitted"
+    creation_claim = (await VMCreationRetryStore(db).claim_due(limit=1))[0]
+    authorized = await VMCreationRetryStore(db).authorize_controller(
+        request_id=str(second["request_id"]),
+        claim_token=str(creation_claim["claim_token"]),
+        observed={
+            "job_id": str(owner),
+            "provision_generation": str(second["provision_generation"]),
+            "request_digest": second["request_digest"],
+            "controller_configuration_digest": second["controller_configuration_digest"],
+            "expected_pvc_uid": None,
+        },
+    )
+    assert authorized["allowed"]
+    vm_uid, vmi_uid, launcher_uid, pvc_uid = (uuid4() for _ in range(4))
+    await db.execute(
+        "UPDATE vm_creation_retries SET state='succeeded',revision=revision+1,"
+        "observed_vm_uid=$2,observed_pvc_uid=$3,resolved_at=clock_timestamp(),"
+        "claim_token=NULL,claim_expires_at=NULL WHERE request_id=$1",
+        second["request_id"], vm_uid, pvc_uid,
+    )
+    await db.execute(
+        "UPDATE vm_workspace_cleanup_admissions SET completed_at=clock_timestamp(),"
+        "outcome='adopted' WHERE id=$1", authorized["admission_id"],
+    )
+    await db.execute(
+        "UPDATE vm_resource_reservations SET state='active',vm_uid=$2,"
+        "vmi_uid=$3,launcher_uid=$4 WHERE id=$1",
+        UUID(admitted["reservation_id"]), vm_uid, vmi_uid, launcher_uid,
+    )
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_build_object('vm',$2::jsonb),"
+        "config_override=jsonb_build_object('workspace',jsonb_build_object('backend','vm')) "
+        "WHERE id=$1",
+        owner, json.dumps({
+            "provision_generation": str(second["provision_generation"]),
+            "vm_uid": str(vm_uid), "vmi_uid": str(vmi_uid),
+            "active_pod_uid": str(launcher_uid),
+            "rootdisk_pvc_uid": str(pvc_uid), "status": "ready",
+            "provisioner": "vm", "identity_authenticated": True,
+            "identity_provision_generation": str(second["provision_generation"]),
+            "ssh_ready_source": "provisioner_probe", "ssh_host": "10.42.0.91",
+            "ssh_port": 22, "ssh_host_key_fingerprint": "SHA256:test",
+        }),
+    )
+    async with db.acquire() as conn:
+        await enqueue_worker_batch(conn, job_id=owner)
+    worker = await claim_worker_batch(db, pod_name="normal-vm-worker")
+    assert worker is not None and worker.unit_id == owner
+    job = await db.fetchrow("SELECT * FROM jobs WHERE id=$1", owner)
+    digest = workspace_runtime_authority_digest(dict(job), vm_mode="same-cluster")
+    assert digest is not None
+    async with db.acquire() as conn:
+        assert not await VMWorkspaceRecoveryStore(db).record_bundle_authorized(
+            conn, job_id=owner, lease_token=worker.lease_token,
+            authority_digest="stale-runtime-digest",
+        )
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_job_worker_delivery_bindings WHERE job_id=$1", owner,
+    ) == 0
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.execute(
+            "INSERT INTO vm_job_worker_delivery_bindings "
+            "(job_id,lease_token,request_id,provision_generation,vm_uid,pvc_uid,authority_digest) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7)",
+            owner, worker.lease_token, first["request_id"],
+            first["provision_generation"], vm_uid, pvc_uid, digest,
+        )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.execute(
+            "INSERT INTO vm_job_worker_delivery_bindings "
+            "(job_id,lease_token,request_id,provision_generation,vm_uid,pvc_uid,authority_digest) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7)",
+            owner, worker.lease_token, second["request_id"],
+            second["provision_generation"], vm_uid, uuid4(), digest,
+        )
+    async with db.acquire() as conn:
+        assert await VMWorkspaceRecoveryStore(db).record_bundle_authorized(
+            conn, job_id=owner, lease_token=worker.lease_token,
+            authority_digest=digest,
+        )
+        assert await complete_worker_batch(
+            conn, unit_id=owner, lease_token=worker.lease_token,
+            consumed_seq=worker.unit.input_seq,
+        ) is not None
+    await db.execute(
+        "INSERT INTO managed_repository_process_zero_receipts "
+        "(owner_kind,owner_id,scope,provisioner,runtime_incarnation) "
+        "VALUES('job',$1,'vm','vm',$2)",
+        owner, str(second["provision_generation"]),
+    )
+    identity = VMTeardownIdentity(
+        provision_generation=str(second["provision_generation"]),
+        vm_uid=str(vm_uid), rootdisk_pvc_uid=str(pvc_uid),
+    )
+    proof = {
+        "version": 1, "kind": "vm_cleanup_physical_stop",
+        "job_id": str(owner),
+        "provision_generation": str(second["provision_generation"]),
+        "vm_uid": str(vm_uid), "vmi_uid": str(vmi_uid),
+        "launcher_uid": str(launcher_uid), "pvc_uid": str(pvc_uid),
+        "vm_absent": True, "vmi_absent": True, "launcher_absent": True,
+        "same_generation_replacement": False,
+        "pvc_disposition": "purged", "controller_authenticated": True,
+    }
+    provisioner = SimpleNamespace(
+        lifecycle_available=True,
+        capture_vm_teardown_identity=AsyncMock(return_value=identity),
+        release_vm_captured=AsyncMock(return_value=VMTeardownResult("completed", True)),
+        attest_vm_cleanup_stop=AsyncMock(return_value=proof),
+    )
+    vm_controls = JobControlOperations(SimpleNamespace(
+        vm_provisioner=provisioner,
+        recovery_store=VMWorkspaceRecoveryStore(db),
+    ))
+    assert (await vm_controls.delete_vm(str(owner)))["status"] == "deleting"
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',"
+        "'\"deleted\"'::jsonb,true) WHERE id=$1", owner,
+    )
+    assert (await db.cancel_stateless_job(str(owner)))[0]
+    physical = await db.fetchval(
+        "SELECT vm_job_terminal_packet_evidence($1)", second["request_id"],
+    )
+    assert physical is not None
+    if isinstance(physical, str):
+        physical = json.loads(physical)
+    assert physical["kind"] == "physical_stop"
+    assert await db.fetchval(
+        "SELECT job_vm_creation_never_issued_terminal_source($1,$2)",
+        owner, str(first["provision_generation"]),
+    ) is True
+    if unattributed_delivery == "worker_bundle":
+        await db.execute(
+            "INSERT INTO worker_batch_attempts(job_id,lease_token,claimed_attempt,"
+            "bundle_authorized_at,authority_digest) "
+            "VALUES($1,993,1,now(),'sha256:unattributed')", owner,
+        )
+    elif unattributed_delivery == "execution_attempt":
+        await db.execute(
+            "INSERT INTO srw_execution_attempts(execution_id,attempt,pod_name,phase) "
+            "VALUES($1,2,'unattributed-pod','Running')", second["execution_id"],
+        )
+    assert await db.prepare_stateless_job_for_delete(str(owner))
+    if unattributed_delivery is not None:
+        with pytest.raises(JobVMAuditNotReady):
+            await db.delete_job(str(owner), prepared_stateless=True)
+        assert await db.fetchval("SELECT count(*) FROM jobs WHERE id=$1", owner) == 1
+        assert await db.fetchval(
+            "SELECT count(*) FROM vm_job_creation_terminal_packets WHERE job_id=$1",
+            owner,
+        ) == 0
+        return
+    assert await db.delete_job(str(owner), prepared_stateless=True)
+    packets = await db.fetch(
+        "SELECT request_id,terminal_kind FROM vm_job_creation_terminal_packets "
+        "WHERE job_id=$1", owner,
+    )
+    assert {row["request_id"]: row["terminal_kind"] for row in packets} == {
+        first["request_id"]: "never_issued",
+        second["request_id"]: "physical_stop",
+    }
+    owner_receipt = await db.fetchval(
+        "SELECT deletion_receipt FROM vm_job_creation_owners WHERE job_id=$1", owner,
+    )
+    if isinstance(owner_receipt, str):
+        owner_receipt = json.loads(owner_receipt)
+    assert len(owner_receipt["worker_delivery_bindings"]) == 1
+    assert any(
+        attempt["lease_token"] == worker.lease_token
+        and attempt["authority_digest"] == digest
+        and attempt["bundle_authorized_at"] is not None
+        for attempt in owner_receipt["worker_attempts"]
+    )
+    assert owner_receipt["worker_delivery_bindings"][0]["request_id"] == str(second["request_id"])
+    assert owner_receipt["worker_delivery_bindings"][0]["lease_token"] == worker.lease_token
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.execute(
+            "UPDATE vm_job_worker_delivery_bindings SET authority_digest='tampered' "
+            "WHERE job_id=$1 AND lease_token=$2", owner, worker.lease_token,
+        )
+    physical_packet = await db.fetchval(
+        "SELECT evidence FROM vm_job_creation_terminal_packets WHERE request_id=$1",
+        second["request_id"],
+    )
+    if isinstance(physical_packet, str):
+        physical_packet = json.loads(physical_packet)
+    assert len(physical_packet["process_zero_receipt_ids"]) == 1
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.execute(
+            "UPDATE managed_repository_process_zero_receipts "
+            "SET runtime_incarnation=$2 WHERE id=$1",
+            UUID(physical_packet["process_zero_receipt_ids"][0]), str(uuid4()),
+        )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.execute(
+            "DELETE FROM managed_repository_process_zero_receipts WHERE id=$1",
+            UUID(physical_packet["process_zero_receipt_ids"][0]),
+        )
 
 
 @pytest.mark.asyncio

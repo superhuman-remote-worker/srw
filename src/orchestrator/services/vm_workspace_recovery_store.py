@@ -2757,12 +2757,16 @@ class VMWorkspaceRecoveryStore:
         job_id: UUID,
         lease_token: int,
         authority_digest: str,
+        vm_mode: str | None = None,
+        vm_binding_required: bool | None = None,
     ) -> bool:
         return await record_worker_bundle_authorized(
             conn,
             job_id=job_id,
             lease_token=lease_token,
             authority_digest=authority_digest,
+            vm_mode=vm_mode,
+            vm_binding_required=vm_binding_required,
         )
 
     async def list_retention_pin_commands(
