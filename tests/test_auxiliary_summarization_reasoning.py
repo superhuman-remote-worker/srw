@@ -1,10 +1,13 @@
-"""Summarization on a dedicated auxiliary model runs with thinking off.
+"""Summarization on a dedicated auxiliary model: thinking off, vendor sampling.
 
-``auxiliary.summarization_reasoning_level`` (default ``"off"``) gives the
-summarizer its own client of the same aux model; the other aux tasks keep the
-client's level. "off" is the family's off switch where it has one, else its
-lowest listed effort — sending no effort is not off, the provider's default
-applies. See knowledge-base/knowledge/issues/auxiliary_reasoning_level_not_configurable.md.
+``auxiliary.summarization_reasoning_level`` (default ``"off"``) and the
+family's sampling give the summarizer its own client of the same aux model;
+the other aux tasks keep the client's level and ``auxiliary.temperature``.
+"off" is the family's off switch where it has one, else its lowest listed
+effort — sending no effort is not off, the provider's default applies. The
+sampling is the family's ``settings`` values, with
+``settings.summarization_sampling`` on top (Gemma). See
+knowledge-base/knowledge/issues/auxiliary_reasoning_level_not_configurable.md.
 """
 
 from types import SimpleNamespace
@@ -19,13 +22,16 @@ from shared.runtime.core.loader import (
     LLMConfig,
     _create_codex_llm,
     _create_openai_llm,
+    _apply_settings_matrix,
     _create_openrouter_llm,
     _parse_auxiliary_config,
     build_auxiliary_llm_config,
     create_auxiliary_llms,
     get_project_root,
     load_agent_config,
+    resolve_model_settings,
     resolve_reasoning_plan,
+    summarization_sampling,
 )
 from shared.runtime.core.llm_retry import NO_RETRY
 from shared.runtime.services.auxiliary import (
@@ -181,7 +187,7 @@ class TestAuxiliaryBuilder:
         # The other aux tasks keep the client's level, unchanged by this work.
         assert cfg.reasoning_level == "high"
 
-    def _create(self, aux):
+    def _create(self, aux, settings=SETTINGS):
         created = []
 
         def fake_create_llm(cfg, limits=None):
@@ -191,7 +197,7 @@ class TestAuxiliaryBuilder:
         with patch(
             "shared.runtime.core.loader.create_llm", side_effect=fake_create_llm
         ):
-            return create_auxiliary_llms(aux, SETTINGS), created
+            return create_auxiliary_llms(aux, settings), created
 
     def test_summarization_client_is_the_same_model_with_thinking_off(self):
         clients, created = self._create(_aux())
@@ -211,6 +217,60 @@ class TestAuxiliaryBuilder:
         clients, created = self._create(_aux(summarization_reasoning_level="high"))
         assert len(created) == 1
         assert clients.summarization_llm is None
+
+    def test_summarizer_takes_the_family_temperature(self):
+        clients, created = self._create(_aux(), {**SETTINGS, "temperature": 1.0})
+        main, summary = created
+        assert main.temperature == 0.0  # auxiliary.temperature, other tasks
+        assert (summary.temperature, summary.top_p, summary.top_k) == (1.0, 0.95, 40)
+
+    def test_family_summarization_sampling_wins(self):
+        settings = {
+            **SETTINGS,
+            "temperature": 0.3,
+            "summarization_sampling": {"temperature": 1.0, "top_k": 64},
+        }
+        clients, created = self._create(_aux(), settings)
+        main, summary = created
+        assert (main.temperature, main.top_k) == (0.0, 40)
+        assert (summary.temperature, summary.top_p, summary.top_k) == (1.0, 0.95, 64)
+
+    def test_sampling_alone_still_builds_the_summarization_client(self):
+        clients, created = self._create(
+            _aux(summarization_reasoning_level=None), {**SETTINGS, "temperature": 1.0}
+        )
+        assert len(created) == 2
+        assert clients.summarization_llm.cfg.reasoning_level == "high"
+        assert clients.summarization_llm.cfg.temperature == 1.0
+
+
+class TestFamilySummarizationSampling:
+    """The bundled matrix values the summarizer gets per family."""
+
+    @pytest.mark.parametrize(
+        "model, expected",
+        [
+            # Google's values; the main model runs 0.3 for tool calling.
+            (
+                "RedHatAI/gemma-4-31B-it-FP8-Dynamic",
+                {"temperature": 1.0, "top_p": 0.95, "top_k": 64},
+            ),
+            ("MiniMax-M3", {"temperature": 1.0, "top_p": 0.95}),
+            ("gpt-5-mini", {"temperature": 1.0}),
+            ("muse-spark-1.3", {"temperature": 1.0, "top_p": 1.0}),
+        ],
+    )
+    def test_bundled_family_values(self, model, expected):
+        sampling = summarization_sampling(
+            resolve_model_settings(model, bundled_only=True)
+        )
+        assert sampling == expected
+
+    def test_the_main_model_does_not_receive_the_summarizer_key(self):
+        data = {"llm": {"model": "RedHatAI/gemma-4-31B-it-FP8-Dynamic"}}
+        _apply_settings_matrix(data, set(), None)
+        assert "summarization_sampling" not in data["llm"]
+        assert data["llm"]["temperature"] == 0.3
 
 
 def _mock_llm(name: str, *, result=None, error: Exception | None = None):
@@ -301,3 +361,5 @@ class TestWorkerWiresTheSummarizationClient:
         assert aux.llm.cfg.reasoning_level == "high"
         assert aux.summarization_llm.cfg.reasoning_level == "off"
         assert aux.summarization_llm.cfg.model == "MiniMax-M3"
+        assert aux.llm.cfg.temperature == 0.0
+        assert aux.summarization_llm.cfg.temperature == 1.0

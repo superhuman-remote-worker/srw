@@ -329,7 +329,8 @@ auxiliary:
   # Reasoning for the summarization calls of a dedicated aux model; the other
   # tasks keep the model's level. "off" = the family's off switch, else its
   # lowest effort; null = same level as the other tasks. Quote it: a bare
-  # off is a YAML boolean.
+  # off is a YAML boolean. Those calls also use the family's sampling from
+  # model_config_matrix.yaml, not `temperature` above.
   summarization_reasoning_level: "off"
   tasks:
     extract_memories:

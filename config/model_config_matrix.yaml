@@ -1027,6 +1027,9 @@ gemma:
     temperature: 0.3
     top_p: 0.95
     top_k: 64
+    # The auxiliary summarizer writes plain Markdown, no tool calls or JSON,
+    # so it gets Google's values instead of the tool-calling 0.3.
+    summarization_sampling: { temperature: 1.0, top_p: 0.95, top_k: 64 }
     # Partial mitigation for vllm#40080 — Gemma 4 + xgrammar JSON schema
     # enters infinite repetition loops. Values >1.0 discourage token repeats.
     # Kept mild (1.05) to avoid distorting legitimate repeated structure

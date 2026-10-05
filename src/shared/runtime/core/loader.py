@@ -1144,6 +1144,8 @@ def _apply_settings_matrix(
             continue
         if key == MATRIX_SESSION_MAX_CONCURRENT_KEY:
             continue  # routed to the delegation block above
+        if key == "summarization_sampling":
+            continue  # the aux summarizer's sampling (summarization_sampling())
         if key == "image_tokens":
             # Per-family image-token estimator config -> limits, not llm:
             # _parse_llm_config's closed constructor silently drops unknown
@@ -2689,10 +2691,12 @@ class AuxiliaryConfig:
     summarization_call_timeout: float = 240.0
     # Reasoning level of the dedicated aux model's summarization calls only;
     # the other tasks keep the client's level. "off" = the family's off switch,
-    # else its lowest effort (resolve_reasoning_plan). None = no separate
-    # client. Reasoning does not make summaries more faithful and can add
+    # else its lowest effort (resolve_reasoning_plan). None = the client's
+    # level. Reasoning does not make summaries more faithful and can add
     # hallucinations (compaction refactor Q5,
     # knowledge-base/knowledge/issues/auxiliary_reasoning_level_not_configurable.md).
+    # The summarization calls also use the family's sampling, not
+    # `temperature` (summarization_sampling()).
     summarization_reasoning_level: Optional[str] = "off"
     tasks: Dict[str, AuxiliaryTaskConfig] = field(
         default_factory=lambda: {
@@ -4290,9 +4294,29 @@ class AuxiliaryClients:
 
     config: LLMConfig
     llm: BaseChatModel
-    # Same model at ``auxiliary.summarization_reasoning_level``; None when that
-    # level is unset or equals the main client's.
+    # Same model at ``auxiliary.summarization_reasoning_level`` and the
+    # family's sampling (``summarization_sampling``); None when both match
+    # the main client's.
     summarization_llm: Optional[BaseChatModel]
+
+
+_SAMPLING_KEYS = ("temperature", "top_p", "top_k")
+
+
+def summarization_sampling(model_settings: Dict[str, Any]) -> Dict[str, Any]:
+    """The summarizer's sampling for a family: its vendor settings, not 0.0.
+
+    The family's own ``settings`` values, with ``settings.summarization_sampling``
+    on top for a family whose main-model values deviate from its vendor's for
+    tool calling (Gemma). ``auxiliary.temperature`` keeps serving the other
+    tasks. Temperature 0 on long inputs loops far more often (arXiv
+    2603.08274), and a retried pass gets the same output.
+    """
+    sampling = {k: model_settings[k] for k in _SAMPLING_KEYS if k in model_settings}
+    override = model_settings.get("summarization_sampling")
+    if isinstance(override, dict):
+        sampling.update({k: override[k] for k in _SAMPLING_KEYS if k in override})
+    return sampling
 
 
 def create_auxiliary_llms(
@@ -4302,17 +4326,20 @@ def create_auxiliary_llms(
 ) -> AuxiliaryClients:
     """Build the dedicated auxiliary model's client and its summarization client.
 
-    The reasoning level is fixed when a client is built and delivered per
-    family by the factories, so a second level means a second client.
+    Reasoning level and sampling are fixed when a client is built (and the
+    level is delivered per family by the factories), so the summarizer's own
+    level and sampling mean a second client.
     """
     config = build_auxiliary_llm_config(aux, model_settings)
     llm = create_llm(config, limits=limits)
-    level = aux.summarization_reasoning_level
+    summary_config = dataclass_replace(
+        config,
+        reasoning_level=aux.summarization_reasoning_level or config.reasoning_level,
+        **summarization_sampling(model_settings),
+    )
     summarization_llm = None
-    if level is not None and level != config.reasoning_level:
-        summarization_llm = create_llm(
-            dataclass_replace(config, reasoning_level=level), limits=limits
-        )
+    if summary_config != config:
+        summarization_llm = create_llm(summary_config, limits=limits)
     return AuxiliaryClients(config=config, llm=llm, summarization_llm=summarization_llm)
 
 
