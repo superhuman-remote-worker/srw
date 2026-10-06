@@ -1083,6 +1083,7 @@ class UniversalAgent:
                 tool_context=self._tool_context,
                 postgres_db=self.postgres_conn,
             )
+            self._retain_compiled_worker_checkpointer()
             self._publish_memory_service()
 
             # Execute graph
@@ -1863,6 +1864,52 @@ class UniversalAgent:
             cap,
         )
         return None
+
+    def _retain_compiled_worker_checkpointer(self) -> None:
+        """Keep the exact fenced saver actually installed by strict compile.
+
+        LangGraph derives a serializer allowlist by shallow-cloning its saver.
+        Only the same claim, connection, lock and write policy may replace our
+        source reference; terminal reporting still requires object identity.
+        """
+        if getattr(self, "_worker_lease_token", None) is None:
+            return
+        from agent.api.lease_context import LeaseLostError
+        from agent.core.fenced_checkpointer import FencedAsyncPostgresSaver
+
+        source = self._checkpointer
+        compiled = getattr(self._graph, "checkpointer", None)
+        if (
+            not isinstance(source, FencedAsyncPostgresSaver)
+            or type(compiled) is not type(source)
+            or getattr(source, "unit_id", None) != self._current_job_id
+            or getattr(source, "lease_token", None) != self._worker_lease_token
+            or getattr(compiled, "unit_id", None) != source.unit_id
+            or getattr(compiled, "lease_token", None) != source.lease_token
+        ):
+            raise LeaseLostError("Compiled worker checkpoint ownership is unproven")
+        if compiled is not source and (
+            not all(
+                hasattr(saver, field)
+                for saver in (source, compiled)
+                for field in (
+                    "conn",
+                    "lock",
+                    "post_commit",
+                    "retry_attempts",
+                    "retry_base_seconds",
+                )
+            )
+            or compiled.conn is not source.conn
+            or compiled.lock is not source.lock
+            or compiled.post_commit is not source.post_commit
+            or compiled.retry_attempts != source.retry_attempts
+            or compiled.retry_base_seconds != source.retry_base_seconds
+        ):
+            raise LeaseLostError("Compiled worker checkpoint ownership is unproven")
+        source._bound_handle()
+        compiled._bound_handle()
+        self._checkpointer = compiled
 
     async def checkpoint_worker_retry_exhaustion(
         self,
@@ -2913,6 +2960,7 @@ class UniversalAgent:
             tool_context=self._tool_context,
             postgres_db=self.postgres_conn,
         )
+        self._retain_compiled_worker_checkpointer()
         self._publish_memory_service()
         logger.info(
             f"[{job_id}] Workspace upgraded to {target_tier}; graph rebuilt with "

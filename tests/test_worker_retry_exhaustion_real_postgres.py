@@ -50,6 +50,7 @@ async def setup(db, pg_dsn, monkeypatch):
         pg_dsn, unit_id=str(job), lease_token=7
     )
     agent._graph = graph(agent._checkpointer)
+    agent._retain_compiled_worker_checkpointer()
     agent._worker_thread_config = {"configurable": {"thread_id": str(job)}}
     initial = outage()
     await agent._graph.ainvoke(initial, agent._worker_thread_config)
@@ -99,6 +100,7 @@ async def test_pg_committed_then_error_successor_replays_same_end_without_work(
             pg_dsn, unit_id=handle.unit_id, lease_token=8
         )
         agent._graph = graph(agent._checkpointer)
+        agent._retain_compiled_worker_checkpointer()
         terminal = await agent._arm_worker_batch(
             job_id=handle.unit_id,
             graph_input=None,
