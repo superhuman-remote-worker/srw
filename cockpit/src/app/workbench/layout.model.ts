@@ -60,8 +60,8 @@ export interface ComponentMetadata {
   type: ComponentType;
   /** Display name for panel header */
   displayName: string;
-  /** The Angular component class */
-  component: Type<unknown>;
+  /** Resolves the Angular component class. Loaded on first use, so panel code stays out of the initial bundle. */
+  load: () => Promise<Type<unknown>>;
   /** Optional icon class */
   icon?: string;
 }

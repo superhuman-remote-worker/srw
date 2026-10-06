@@ -1,5 +1,7 @@
 import {describe, expect, it} from 'vitest';
+import {Route} from '@angular/router';
 import {routes} from './app.routes';
+import {ChatPageComponent} from './views/chat/chat-page.component';
 import {authGuard} from './core/guards/auth.guard';
 import {adminGuard} from './core/guards/admin.guard';
 
@@ -145,5 +147,49 @@ describe('app.routes — workspace templates (Slice A3)', () => {
   it('declares workspaces/new before workspaces/:uid', () => {
     const paths = routes.map((r) => r.path);
     expect(paths.indexOf('workspaces/new')).toBeLessThan(paths.indexOf('workspaces/:uid'));
+  });
+});
+
+describe('app.routes — lazy pages', () => {
+  // The landing page IS ChatPageComponent, so it is in the initial bundle
+  // anyway; sessions/:threadId reuses it rather than adding an async hop.
+  const EAGER_TOP_LEVEL_PATHS = ['', 'sessions/:threadId'];
+
+  const walk = (list: Route[]): Route[] => list.flatMap((r) => [r, ...walk(r.children ?? [])]);
+  const all = walk(routes);
+
+  // Only a top-level route may carry `component`, and only the two Chat routes.
+  const eagerOffenders = (tree: Route[]): string[] =>
+    walk(tree)
+      .filter((r) => r.component)
+      .filter((r) => !(tree.includes(r) && EAGER_TOP_LEVEL_PATHS.includes(r.path ?? '\0') && r.component === ChatPageComponent))
+      .map((r) => r.path ?? '(pathless)');
+
+  it('gives only the landing page and the session view an eager component', () => {
+    const offenders = eagerOffenders(routes);
+    expect(offenders, `routes with an eager component: ${offenders.join(', ')}`).toEqual([]);
+  });
+
+  it('flags eager components that hide behind a reused path, a pathless route or nesting', () => {
+    const synthetic: Route[] = [
+      {path: '', component: ChatPageComponent},
+      {path: 'x', children: [{path: '', component: ChatPageComponent}]},
+      {component: ChatPageComponent, children: []},
+      {path: 'sessions/:threadId', component: class Other {}},
+    ];
+    expect(eagerOffenders(synthetic)).toEqual(['', '(pathless)', 'sessions/:threadId']);
+  });
+
+  it.each(EAGER_TOP_LEVEL_PATHS)("renders '%s' with ChatPageComponent", (path) => {
+    expect(routes.find((r) => r.path === path)?.component).toBe(ChatPageComponent);
+  });
+
+  it('resolves every loadComponent to a component class', async () => {
+    const lazy = all.filter((r) => r.loadComponent);
+    expect(lazy.length).toBeGreaterThan(0);
+    for (const route of lazy) {
+      const resolved = await (route.loadComponent as () => Promise<unknown>)();
+      expect(typeof resolved, `loadComponent of '${route.path}'`).toBe('function');
+    }
   });
 });

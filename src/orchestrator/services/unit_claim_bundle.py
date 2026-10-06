@@ -854,6 +854,10 @@ async def _assemble_claim_bundle(
                     job_id=UUID(unit_id),
                     lease_token=lease_token,
                     authority_digest=initial_runtime_digest,
+                    vm_mode=vm_provisioner.mode,
+                    vm_binding_required=(
+                        assigned_backend == "vm" and job.get("parent_job_id") is None
+                    ),
                 )
                 if not authorized:
                     raise HTTPException(403, "Lease validation failed")

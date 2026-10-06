@@ -17,18 +17,29 @@ from agent.api.session_termination import (
 )
 
 
-def owner(*, session=None):
+def owner(*, session=None, officer=None, stateless=False):
+    identity = SimpleNamespace(
+        thread_id="captured",
+        session_generation="generation",
+        attach_token="attach",
+        agent_id="agent",
+        pod_uid="pod",
+        runtime_contract=False,
+        retirement_identity=lambda: ("captured", None, None),
+    )
+    identity.snapshot = lambda: identity
     values = {
         field.name: lambda: None
         for field in dataclasses.fields(SessionTerminationPorts)
     }
     values.update(
         session=lambda: session,
-        identity=lambda: SimpleNamespace(
-            thread_id="captured",
-            runtime_contract=False,
-            retirement_identity=lambda: ("captured", None, None),
+        identity=lambda: identity,
+        orchestrator_client=lambda: SimpleNamespace(
+            dispatch_process_generation="process"
         ),
+        officer_config=lambda: officer,
+        stateless_mode=lambda: stateless,
         loop_task=lambda: None,
         session_type=SimpleNamespace,
         idle_timeout_error=TimeoutError,
@@ -133,3 +144,43 @@ async def test_side_task_cancellation_finally_is_joined_before_return():
     assert finalized.is_set()
     assert task.done()
     assert not runtime.session_side_tasks
+
+
+@pytest.mark.asyncio
+async def test_native_first_use_keeps_same_life_ready_without_ws_or_input():
+    """A native channel is first use for the existing boot watchdog."""
+    runtime = owner(session=object())
+    runtime.session_boot_ws_timeout_s = 0.01
+    terminated = []
+
+    async def terminate(reason):
+        terminated.append(reason)
+
+    runtime.terminate = terminate
+
+    async def wait_forever(_poll):
+        await asyncio.Event().wait()
+
+    runtime.thread_status_watchdog = wait_forever
+    runtime.start_watchdogs()
+    assert (
+        runtime.note_native_first_use(
+            ("captured", "generation", "agent", "attach", "pod", "process")
+        )
+        == "accepted"
+    )
+    runtime.start_watchdogs()  # A same-life restart must retain the accepted use.
+    await asyncio.sleep(0.03)
+    assert terminated == []
+    await runtime.stop_and_join_watchdogs()
+
+
+def test_native_notice_does_not_latch_no_watchdog_officer_or_stateless_life():
+    life = ("captured", "generation", "agent", "attach", "pod", "process")
+    for runtime in (
+        owner(session=object(), officer=object()),
+        owner(session=object(), stateless=True),
+    ):
+        runtime.ws_connected_event = asyncio.Event()
+        assert runtime.note_native_first_use(life) is None
+        assert not runtime.ws_connected_event.is_set()

@@ -8364,6 +8364,27 @@ $$;
 
 
 --
+-- Name: ensure_vm_job_creation_owner(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.ensure_vm_job_creation_owner() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.owner_kind<>'job' THEN RETURN NEW; END IF;
+    PERFORM 1 FROM public.jobs WHERE id=NEW.job_id FOR SHARE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Job VM source needs live Job' USING ERRCODE='23514'; END IF;
+    INSERT INTO public.vm_job_creation_owners(job_id,live_job_id)
+        VALUES(NEW.job_id,NEW.job_id) ON CONFLICT(job_id) DO NOTHING;
+    PERFORM 1 FROM public.vm_job_creation_owners
+      WHERE job_id=NEW.job_id AND live_job_id=NEW.job_id AND deleted_at IS NULL FOR SHARE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'retired Job VM owner cannot be relinked' USING ERRCODE='23514'; END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: ensure_vm_thread_creation_owner(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -9731,6 +9752,394 @@ END $$;
 
 
 --
+-- Name: guard_vm_job_creation_owner(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_creation_owner() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE expected_generations jsonb;
+        expected_attempts jsonb;
+        expected_deliveries jsonb;
+        expected_recoveries jsonb;
+BEGIN
+    IF TG_OP='DELETE' THEN
+        RAISE EXCEPTION 'Job VM audit owner is durable' USING ERRCODE='23514';
+    END IF;
+    IF TG_OP='INSERT' THEN
+        PERFORM 1 FROM public.jobs WHERE id=NEW.job_id FOR SHARE;
+        IF NOT FOUND OR NEW.live_job_id IS DISTINCT FROM NEW.job_id
+           OR NEW.deleted_at IS NOT NULL OR NEW.deletion_receipt IS NOT NULL THEN
+            RAISE EXCEPTION 'Job VM audit owner requires live Job' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF ROW(NEW.job_id,NEW.created_at) IS DISTINCT FROM ROW(OLD.job_id,OLD.created_at)
+       OR (OLD.live_job_id IS NULL AND NEW.live_job_id IS NOT NULL)
+       OR (NEW.live_job_id IS NOT NULL AND NEW.live_job_id IS DISTINCT FROM OLD.live_job_id)
+       OR (OLD.deleted_at IS NOT NULL AND
+           ROW(NEW.deleted_at,NEW.deletion_receipt) IS DISTINCT FROM
+           ROW(OLD.deleted_at,OLD.deletion_receipt))
+       OR (OLD.deleted_at IS NULL AND NEW.deleted_at IS NULL AND
+           NEW.deletion_receipt IS DISTINCT FROM OLD.deletion_receipt) THEN
+        RAISE EXCEPTION 'Job VM audit owner identity or tombstone changed' USING ERRCODE='23514';
+    END IF;
+    IF OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL THEN
+        SELECT COALESCE(jsonb_agg(evidence ORDER BY request_id),'[]'::jsonb)
+          INTO expected_generations FROM public.vm_job_creation_terminal_packets
+          WHERE job_id=NEW.job_id;
+        SELECT COALESCE(jsonb_agg(to_jsonb(attempt) ORDER BY lease_token),'[]'::jsonb)
+          INTO expected_attempts FROM public.worker_batch_attempts attempt
+          WHERE job_id=NEW.job_id;
+        SELECT COALESCE(jsonb_agg(to_jsonb(delivery) ORDER BY lease_token),'[]'::jsonb)
+          INTO expected_deliveries FROM public.vm_job_worker_delivery_bindings delivery
+          WHERE job_id=NEW.job_id;
+        SELECT COALESCE(jsonb_agg(to_jsonb(recovery) - 'prior_control_reference'
+            - 'prior_freeze_reference' ORDER BY recovery_id),'[]'::jsonb)
+          INTO expected_recoveries FROM public.vm_workspace_recovery_jobs recovery
+          WHERE job_id=NEW.job_id;
+        IF NEW.live_job_id IS DISTINCT FROM NEW.job_id
+           OR NEW.deletion_receipt->>'job_id' IS DISTINCT FROM NEW.job_id::text
+           OR NEW.deletion_receipt->'generations' IS DISTINCT FROM expected_generations
+           OR NEW.deletion_receipt->'worker_attempts' IS DISTINCT FROM expected_attempts
+           OR NEW.deletion_receipt->'worker_delivery_bindings' IS DISTINCT FROM expected_deliveries
+           OR NEW.deletion_receipt->'workspace_recoveries' IS DISTINCT FROM expected_recoveries THEN
+            RAISE EXCEPTION 'Job VM audit tombstone lacks exact live owner' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    IF OLD.live_job_id IS NOT NULL AND NEW.live_job_id IS NULL
+       AND OLD.deleted_at IS NULL THEN
+        RAISE EXCEPTION 'Job VM audit owner cannot detach before tombstone' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_job_repository_settlement_receipt(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_repository_settlement_receipt() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE parent public.vm_workspace_cleanup_admissions%ROWTYPE;
+        source public.vm_creation_retries%ROWTYPE;
+BEGIN
+    IF TG_OP='UPDATE' OR TG_OP='DELETE' THEN
+        RAISE EXCEPTION 'Job VM repository settlement receipt is immutable'
+            USING ERRCODE='23514';
+    END IF;
+    -- Parent-first is the settlement lock order. Final Delete holds a SHARE
+    -- lock on the parent, compatible with this reader, before its Job DELETE.
+    SELECT * INTO parent FROM public.vm_workspace_cleanup_admissions
+        WHERE id=NEW.cleanup_admission_id FOR SHARE;
+    PERFORM 1 FROM public.jobs WHERE id=NEW.job_id FOR SHARE;
+    SELECT * INTO source FROM public.vm_creation_retries
+        WHERE request_id=NEW.request_id;
+    IF parent.id IS NULL OR parent.owner_kind<>'job'
+       OR parent.owner_id IS DISTINCT FROM NEW.job_id
+       OR parent.source<>'job_terminal_vm_release'
+       OR parent.parent_admission_id IS NOT NULL OR parent.pvc_uid IS NOT NULL
+       OR parent.request_id IS DISTINCT FROM public.uuid_generate_v5(
+           public.uuid_ns_url(),
+           'vm-workspace-cleanup:job_terminal_vm_release:job:' ||
+           NEW.job_id::text || ':' || NEW.provision_generation::text || ':None:')
+       OR parent.completed_at IS NOT NULL
+       OR source.request_id IS NULL OR source.owner_kind<>'job'
+       OR source.job_id IS DISTINCT FROM NEW.job_id
+       OR source.provision_generation IS DISTINCT FROM NEW.provision_generation
+       OR source.state<>'settled' OR source.resolved_at IS NULL
+       OR NOT EXISTS (SELECT 1 FROM public.vm_job_creation_owners o
+           WHERE o.job_id=NEW.job_id AND o.live_job_id=NEW.job_id
+             AND o.deleted_at IS NULL)
+       OR NOT public.job_vm_never_issued_repository_safe(NEW.job_id)
+       OR public.vm_job_repository_receipt_pair(NEW)
+          IS DISTINCT FROM public.job_vm_repository_pair_evidence(NEW.job_id) THEN
+        RAISE EXCEPTION 'Job VM repository settlement receipt lacks exact live source'
+            USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_job_retained_execution(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_retained_execution() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE old_execution uuid;
+        new_execution uuid;
+        old_job uuid;
+        new_job uuid;
+BEGIN
+    IF TG_TABLE_NAME='srw_execution_specs' THEN
+        IF OLD.work_kind='Job' THEN old_job := OLD.work_id; END IF;
+        IF TG_OP='UPDATE' AND NEW.work_kind='Job' THEN new_job := NEW.work_id; END IF;
+    ELSIF TG_TABLE_NAME='srw_workspace_instances' THEN
+        old_execution := OLD.execution_id;
+        IF TG_OP='UPDATE' THEN new_execution := NEW.execution_id; END IF;
+        SELECT x.work_id INTO old_job FROM public.srw_execution_workspace_bindings b
+          JOIN public.srw_execution_specs x ON x.id=b.execution_id
+          WHERE b.instance_id=OLD.id AND x.work_kind='Job' LIMIT 1;
+        IF old_job IS NULL AND EXISTS (
+            SELECT 1 FROM public.vm_job_creation_owners WHERE job_id=OLD.owner_id
+        ) THEN
+            old_job := OLD.owner_id;
+        END IF;
+        IF TG_OP='UPDATE' AND EXISTS (
+            SELECT 1 FROM public.vm_job_creation_owners WHERE job_id=NEW.owner_id
+        ) THEN
+            new_job := NEW.owner_id;
+        END IF;
+    ELSE
+        old_execution := OLD.execution_id;
+        IF TG_OP='UPDATE' THEN new_execution := NEW.execution_id; END IF;
+    END IF;
+    IF old_job IS NULL AND old_execution IS NOT NULL THEN
+        SELECT work_id INTO old_job FROM public.srw_execution_specs
+          WHERE id=old_execution AND work_kind='Job';
+    END IF;
+    IF new_execution IS NOT NULL THEN
+        SELECT work_id INTO new_job FROM public.srw_execution_specs
+          WHERE id=new_execution AND work_kind='Job';
+    END IF;
+    IF (TG_OP='DELETE' OR NEW IS DISTINCT FROM OLD)
+       AND (EXISTS (SELECT 1 FROM public.vm_job_creation_owners
+               WHERE job_id=old_job AND live_job_id IS NULL)
+            OR EXISTS (SELECT 1 FROM public.vm_job_creation_owners
+               WHERE job_id=new_job AND live_job_id IS NULL)) THEN
+        RAISE EXCEPTION 'retired Job VM execution evidence is immutable'
+            USING ERRCODE='23514';
+    END IF;
+    IF TG_OP='DELETE' THEN RETURN OLD; END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_job_retained_ledger(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_retained_ledger() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE candidate jsonb;
+        old_candidate jsonb;
+        owned_job uuid;
+        old_owned_job uuid;
+        source_request uuid;
+        owner_live uuid;
+        owner_deleted timestamptz;
+        checkpoint_keep text;
+        checkpoint_digest text;
+BEGIN
+    IF TG_OP='UPDATE' THEN
+        old_candidate := to_jsonb(OLD);
+        IF TG_TABLE_NAME='vm_workspace_cleanup_admissions'
+           OR TG_TABLE_NAME='managed_repository_process_zero_receipts' THEN
+            IF old_candidate->>'owner_kind'='job' THEN
+                old_owned_job := (old_candidate->>'owner_id')::uuid;
+            END IF;
+        ELSIF TG_TABLE_NAME='vm_resource_cleanup_stop_receipts' THEN
+            old_owned_job := (old_candidate->>'job_id')::uuid;
+        ELSIF TG_TABLE_NAME='vm_resource_recovery_successors' THEN
+            old_owned_job := (old_candidate->>'owner_id')::uuid;
+        ELSIF TG_TABLE_NAME='vm_creation_retries'
+           OR TG_TABLE_NAME='vm_resource_waiters' THEN
+            IF old_candidate->>'owner_kind'='job' THEN
+                old_owned_job := (old_candidate->>'job_id')::uuid;
+            END IF;
+        ELSE
+            SELECT r.job_id INTO old_owned_job FROM public.vm_creation_retries r
+            WHERE r.request_id=(old_candidate->>'request_id')::uuid
+              AND r.owner_kind='job';
+        END IF;
+        IF NEW IS DISTINCT FROM OLD AND old_owned_job IS NOT NULL
+           AND EXISTS (SELECT 1 FROM public.vm_job_creation_owners
+               WHERE job_id=old_owned_job AND live_job_id IS NULL) THEN
+            RAISE EXCEPTION 'retired Job VM evidence is immutable'
+                USING ERRCODE='23514';
+        END IF;
+    END IF;
+    candidate := CASE WHEN TG_OP='DELETE' THEN to_jsonb(OLD) ELSE to_jsonb(NEW) END;
+    IF TG_TABLE_NAME='vm_workspace_cleanup_admissions'
+       OR TG_TABLE_NAME='managed_repository_process_zero_receipts' THEN
+        IF candidate->>'owner_kind'='job' THEN owned_job := (candidate->>'owner_id')::uuid; END IF;
+    ELSIF TG_TABLE_NAME='vm_resource_cleanup_stop_receipts' THEN
+        owned_job := (candidate->>'job_id')::uuid;
+    ELSIF TG_TABLE_NAME='vm_resource_recovery_successors' THEN
+        owned_job := (candidate->>'owner_id')::uuid;
+    ELSIF TG_TABLE_NAME='vm_creation_retries' OR TG_TABLE_NAME='vm_resource_waiters' THEN
+        IF candidate->>'owner_kind'='job' THEN owned_job := (candidate->>'job_id')::uuid; END IF;
+    ELSE
+        source_request := (candidate->>'request_id')::uuid;
+        SELECT r.job_id INTO owned_job FROM public.vm_creation_retries r
+            WHERE r.request_id=source_request AND r.owner_kind='job';
+    END IF;
+    IF owned_job IS NULL THEN
+        IF TG_OP='DELETE' THEN RETURN OLD; END IF;
+        RETURN NEW;
+    END IF;
+    IF TG_OP='INSERT' THEN
+        -- An existing stable owner serializes with final Delete's tombstone.
+        -- Avoid locking the foreign Job while a waiter writer holds its policy
+        -- row: admission may need that policy before it can inspect the Job.
+        SELECT live_job_id,deleted_at INTO owner_live,owner_deleted
+          FROM public.vm_job_creation_owners WHERE job_id=owned_job FOR SHARE;
+        IF FOUND THEN
+            IF owner_live IS DISTINCT FROM owned_job OR owner_deleted IS NOT NULL THEN
+                RAISE EXCEPTION 'retired Job VM owner cannot acquire obligations' USING ERRCODE='23514';
+            END IF;
+            RETURN NEW;
+        END IF;
+        -- A UUID checkpoint thread can outlive its Job without carrying any
+        -- VM/PVC obligation. Only the exact checkpoint producer's source and
+        -- digest qualify, and prior VM/recovery/cleanup history excludes it.
+        IF TG_TABLE_NAME='vm_workspace_cleanup_admissions'
+           AND candidate->>'owner_kind'='job'
+           AND candidate->>'pvc_uid' IS NULL
+           AND candidate->>'parent_admission_id' IS NULL THEN
+            IF candidate->>'source'='terminal_checkpoint_prune' THEN
+                checkpoint_digest := 'sha256:' || encode(sha256(convert_to(
+                    format('{"mode":"delete_thread","resource":"checkpoint_thread","thread_id":"%s"}',owned_job),
+                    'UTF8')),'hex');
+            ELSIF candidate->>'source' ~
+                ('^checkpoint_retention_prune:v1:thread:' || owned_job::text || ':keep:[1-9][0-9]*$') THEN
+                checkpoint_keep := split_part(candidate->>'source',':',6);
+                checkpoint_digest := 'sha256:' || encode(sha256(convert_to(
+                    format('{"keep_n":%s,"mode":"keep_last","resource":"checkpoint_thread","thread_id":"%s"}',
+                        checkpoint_keep,owned_job),'UTF8')),'hex');
+            END IF;
+            IF checkpoint_digest IS NOT NULL
+               AND candidate->>'intent_digest'=checkpoint_digest
+               AND NOT EXISTS (SELECT 1 FROM public.vm_creation_retries
+                   WHERE owner_kind='job' AND job_id=owned_job)
+               AND NOT EXISTS (SELECT 1 FROM public.vm_workspace_recoveries
+                   WHERE owner_kind='job' AND owner_id=owned_job)
+               AND NOT EXISTS (SELECT 1 FROM public.vm_workspace_recovery_jobs
+                   WHERE job_id=owned_job)
+               AND NOT EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions prior
+                   WHERE prior.owner_kind='job' AND prior.owner_id=owned_job
+                     AND (prior.pvc_uid IS NOT NULL OR prior.parent_admission_id IS NOT NULL
+                       OR prior.intent_digest IS DISTINCT FROM CASE
+                           WHEN prior.source='terminal_checkpoint_prune' THEN
+                               'sha256:' || encode(sha256(convert_to(
+                                   format('{"mode":"delete_thread","resource":"checkpoint_thread","thread_id":"%s"}',
+                                       owned_job),'UTF8')),'hex')
+                           WHEN prior.source ~ ('^checkpoint_retention_prune:v1:thread:' ||
+                               owned_job::text || ':keep:[1-9][0-9]*$') THEN
+                               'sha256:' || encode(sha256(convert_to(
+                                   format('{"keep_n":%s,"mode":"keep_last","resource":"checkpoint_thread","thread_id":"%s"}',
+                                       split_part(prior.source,':',6),owned_job),'UTF8')),'hex')
+                           ELSE NULL
+                       END))
+               AND NOT EXISTS (SELECT 1 FROM public.jobs WHERE id=owned_job) THEN
+                RETURN NEW;
+            END IF;
+        END IF;
+        -- The first ordinary cleanup permit may precede its VM retry. Lock
+        -- the live Job, then recheck for an owner created during that wait.
+        PERFORM 1 FROM public.jobs WHERE id=owned_job FOR SHARE;
+        IF NOT FOUND THEN RAISE EXCEPTION 'retired Job VM owner cannot acquire obligations' USING ERRCODE='23514'; END IF;
+        SELECT live_job_id,deleted_at INTO owner_live,owner_deleted
+          FROM public.vm_job_creation_owners WHERE job_id=owned_job FOR SHARE;
+        IF FOUND AND (owner_live IS DISTINCT FROM owned_job OR owner_deleted IS NOT NULL) THEN
+            RAISE EXCEPTION 'retired Job VM owner cannot acquire obligations' USING ERRCODE='23514';
+        END IF;
+    ELSIF (TG_OP='DELETE' OR NEW IS DISTINCT FROM OLD)
+      AND EXISTS (SELECT 1 FROM public.vm_job_creation_owners
+          WHERE job_id=owned_job AND live_job_id IS NULL) THEN
+        RAISE EXCEPTION 'retired Job VM evidence is immutable' USING ERRCODE='23514';
+    END IF;
+    IF TG_OP='DELETE' THEN RETURN OLD; END IF;
+    RETURN NEW;
+END;
+$_$;
+
+
+--
+-- Name: guard_vm_job_terminal_packet(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_terminal_packet() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE exact jsonb;
+BEGIN
+    IF TG_OP='UPDATE' OR TG_OP='DELETE' THEN
+        RAISE EXCEPTION 'Job VM terminal packet is immutable' USING ERRCODE='23514';
+    END IF;
+    PERFORM 1 FROM public.jobs WHERE id=NEW.job_id FOR SHARE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Job VM terminal packet needs live Job' USING ERRCODE='23514'; END IF;
+    PERFORM 1 FROM public.vm_job_creation_owners
+      WHERE job_id=NEW.job_id AND live_job_id=NEW.job_id AND deleted_at IS NULL FOR SHARE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Job VM audit owner is retired' USING ERRCODE='23514'; END IF;
+    exact := public.vm_job_terminal_packet_evidence(NEW.request_id);
+    IF exact IS NULL OR NEW.evidence IS DISTINCT FROM exact
+       OR NEW.job_id::text IS DISTINCT FROM exact->>'job_id'
+       OR NEW.provision_generation::text IS DISTINCT FROM exact->>'provision_generation'
+       OR NEW.terminal_kind IS DISTINCT FROM exact->>'kind'
+       OR NEW.cleanup_admission_id::text IS DISTINCT FROM exact->>'cleanup_admission_id' THEN
+        RAISE EXCEPTION 'Job VM terminal packet lacks exact source' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_job_worker_delivery_binding(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_job_worker_delivery_binding() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP IN ('UPDATE','DELETE') THEN
+        RAISE EXCEPTION 'VM Job worker delivery binding is immutable' USING ERRCODE='23514';
+    END IF;
+    -- The application already holds the exact queue lease, then the Job and
+    -- retry. Do not acquire a queue lock after the Job in this trigger.
+    PERFORM 1 FROM public.jobs j WHERE j.id=NEW.job_id
+        AND j.context->'vm'->>'status'='ready'
+        AND j.context->'vm'->>'provision_generation'=NEW.provision_generation::text
+        AND j.context->'vm'->>'identity_provision_generation'=NEW.provision_generation::text
+        AND j.context->'vm'->>'vm_uid'=NEW.vm_uid::text
+        AND j.context->'vm'->>'rootdisk_pvc_uid'=NEW.pvc_uid::text
+        FOR SHARE;
+    IF NOT FOUND OR NOT EXISTS (
+        SELECT 1 FROM public.vm_job_creation_owners o
+        WHERE o.job_id=NEW.job_id AND o.live_job_id=NEW.job_id AND o.deleted_at IS NULL
+    ) OR NOT EXISTS (
+        SELECT 1 FROM public.run_queue q WHERE q.unit_id=NEW.job_id
+          AND q.unit_kind='worker_batch' AND q.state='leased'
+          AND q.lease_token=NEW.lease_token
+    ) OR NOT EXISTS (
+        SELECT 1 FROM public.worker_batch_attempts b
+        WHERE b.job_id=NEW.job_id AND b.lease_token=NEW.lease_token
+          AND b.bundle_authorized_at IS NULL AND b.authority_digest IS NULL
+          AND b.refunded_at IS NULL AND b.recovery_id IS NULL
+    ) OR NOT EXISTS (
+        SELECT 1 FROM public.vm_creation_retries r WHERE r.request_id=NEW.request_id
+          AND r.owner_kind='job' AND r.job_id=NEW.job_id
+          AND r.provision_generation=NEW.provision_generation AND r.state='succeeded'
+          AND r.observed_vm_uid=NEW.vm_uid AND r.observed_pvc_uid=NEW.pvc_uid
+          AND r.creation_admission_id IS NOT NULL
+    ) THEN
+        RAISE EXCEPTION 'VM Job worker delivery lacks exact live physical source'
+            USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: guard_vm_resource_cleanup_stop_receipt(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -10845,6 +11254,394 @@ $$;
 
 
 --
+-- Name: job_vm_creation_never_issued_evidence(uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.job_vm_creation_never_issued_evidence(requested_job uuid, requested_generation text) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.jobs j
+        JOIN public.vm_creation_retries r ON r.job_id=j.id
+            AND r.owner_kind='job' AND r.provision_generation::text=requested_generation
+        JOIN public.vm_resource_waiters w ON w.request_id=r.request_id
+        WHERE j.id=requested_job
+          AND r.origin='initial' AND r.state='settled'
+          AND r.reason='creation_never_issued' AND r.resolved_at IS NOT NULL
+          AND r.expected_pvc_uid IS NULL AND r.observed_pvc_uid IS NULL
+          AND r.observed_vm_uid IS NULL AND r.ready_at IS NULL
+          AND r.boot_counted IS FALSE AND r.claim_token IS NULL
+          AND r.creation_admission_id IS NULL
+          AND r.creation_carrier_uid IS NULL AND r.creation_carrier_namespace IS NULL
+          AND r.disposition_carrier_uid IS NULL AND r.disposition_carrier_namespace IS NULL
+          AND r.cancellation_disposition IS NULL
+          AND r.cancellation_progress='{}'::jsonb
+          AND r.cancellation_completion='{}'::jsonb
+          AND r.predecessor_cleanup_admission_id IS NULL
+          AND r.predecessor_evidence='{}'::jsonb
+          AND jsonb_typeof(r.canonical_request)='object'
+          AND r.canonical_request->>'entity_type'='job'
+          AND r.canonical_request->>'job_id'=j.id::text
+          AND r.canonical_request->>'provision_generation'=requested_generation
+          AND COALESCE(r.canonical_request->'preparation','null'::jsonb)='null'::jsonb
+          AND COALESCE(r.canonical_request->'workspace_storage','null'::jsonb)='null'::jsonb
+          AND jsonb_typeof(r.controller_configuration)='object'
+          AND r.controller_configuration->'version'='3'::jsonb
+          AND w.owner_kind='job' AND w.job_id=j.id AND w.thread_id IS NULL
+          AND w.provision_generation=r.provision_generation
+          AND w.request_digest=r.request_digest AND w.state='cancelled'
+          AND w.reason='job_cancelled'
+          AND NOT EXISTS (SELECT 1 FROM public.vm_creation_effects e
+              WHERE e.request_id=r.request_id)
+          AND NOT EXISTS (SELECT 1 FROM public.vm_resource_reservations v
+              WHERE v.request_id=r.request_id)
+    );
+$$;
+
+
+--
+-- Name: job_vm_creation_never_issued_predecessors(uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.job_vm_creation_never_issued_predecessors(requested_job uuid, requested_generation text) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.jobs j
+        JOIN public.vm_creation_retries current_retry
+          ON current_retry.job_id=j.id
+         AND current_retry.owner_kind='job'
+         AND current_retry.provision_generation::text=requested_generation
+        WHERE j.id=requested_job
+          AND (
+            (COALESCE(j.context->'last_vm','null'::jsonb)
+                IN ('null'::jsonb,'{}'::jsonb)
+             AND NOT EXISTS (
+                 SELECT 1 FROM public.vm_creation_retries prior
+                 WHERE prior.job_id=j.id
+                   AND prior.provision_generation<>current_retry.provision_generation
+             ))
+            OR
+            (jsonb_typeof(j.context->'last_vm')='object'
+             AND j.context->'last_vm'->>'provision_generation' IS NOT NULL
+             AND j.context->'last_vm'->>'provision_generation'<>requested_generation
+             AND j.context->'last_vm'->>'status'='deleted'
+             AND j.context->'last_vm'->'identity_authenticated'='false'::jsonb
+             AND j.context->'last_vm'->'provision_attempts'='0'::jsonb
+             AND j.context->'last_vm'->>'identity_provision_generation' IS NULL
+             AND j.context->'last_vm'->>'vm_uid' IS NULL
+             AND j.context->'last_vm'->>'vmi_uid' IS NULL
+             AND j.context->'last_vm'->>'active_pod_uid' IS NULL
+             AND j.context->'last_vm'->>'_runtime_incarnation' IS NULL
+             AND j.context->'last_vm'->>'rootdisk_pvc_uid' IS NULL
+             AND j.context->'last_vm'->>'cloud_init_secret_uid' IS NULL
+             AND j.context->'last_vm'->>'ssh_host' IS NULL
+             AND j.context->'last_vm'->>'ssh_port' IS NULL
+             AND COALESCE(j.context->'last_vm'->'preparation_request','null'::jsonb)='null'::jsonb
+             AND COALESCE(j.context->'last_vm'->'preparation','null'::jsonb)='null'::jsonb
+             AND COALESCE(j.context->'last_vm'->'workspace_storage','null'::jsonb)='null'::jsonb
+             AND EXISTS (
+                 SELECT 1 FROM public.vm_creation_retries previous_retry
+                 WHERE previous_retry.job_id=j.id
+                   AND previous_retry.owner_kind='job'
+                   AND previous_retry.provision_generation::text=
+                       j.context->'last_vm'->>'provision_generation'
+                   AND previous_retry.provision_generation<>current_retry.provision_generation
+                   AND previous_retry.created_at<current_retry.created_at
+                   AND previous_retry.request_id=(
+                       SELECT latest.request_id FROM public.vm_creation_retries latest
+                       WHERE latest.job_id=j.id
+                         AND latest.provision_generation<>current_retry.provision_generation
+                       ORDER BY latest.created_at DESC,latest.request_id DESC LIMIT 1
+                   )
+                   AND j.context->'last_vm'->'creation_preflight'->>'request_id'=
+                       previous_retry.request_id::text
+                   AND j.context->'last_vm'->'creation_request'->>'provision_generation'=
+                       previous_retry.provision_generation::text
+                   AND j.context->'last_vm'->'creation_request'->'request'=
+                       previous_retry.canonical_request
+                   AND j.context->'last_vm'->'creation_request'->>'request_digest'=
+                       previous_retry.request_digest
+                   AND j.context->'last_vm'->'creation_request'->'controller_configuration'=
+                       previous_retry.controller_configuration
+                   AND j.context->'last_vm'->'creation_request'->>'controller_configuration_digest'=
+                       previous_retry.controller_configuration_digest
+                   AND public.job_vm_creation_never_issued_terminal_source(
+                       j.id,previous_retry.provision_generation::text)
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM public.vm_creation_retries other
+                 WHERE other.job_id=j.id
+                   AND other.provision_generation<>current_retry.provision_generation
+                   AND NOT public.job_vm_creation_never_issued_terminal_source(
+                       j.id,other.provision_generation::text)
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM public.vm_workspace_cleanup_admissions other_parent
+                 WHERE other_parent.owner_kind='job' AND other_parent.owner_id=j.id
+                   AND other_parent.source='job_terminal_vm_release'
+                   AND other_parent.request_id<>public.uuid_generate_v5(
+                       '6ba7b811-9dad-11d1-80b4-00c04fd430c8'::uuid,
+                       'vm-workspace-cleanup:job_terminal_vm_release:job:' ||
+                       j.id::text || ':' || requested_generation || ':None:'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM public.vm_creation_retries known
+                       WHERE known.job_id=j.id
+                         AND known.provision_generation<>
+                             current_retry.provision_generation
+                         AND other_parent.request_id=public.uuid_generate_v5(
+                             '6ba7b811-9dad-11d1-80b4-00c04fd430c8'::uuid,
+                             'vm-workspace-cleanup:job_terminal_vm_release:job:' ||
+                             j.id::text || ':' ||
+                             known.provision_generation::text || ':None:'
+                         )
+                         AND public.job_vm_creation_never_issued_terminal_source(
+                             j.id,known.provision_generation::text)
+                   )
+             ))
+          )
+    );
+$$;
+
+
+--
+-- Name: job_vm_creation_never_issued_source(uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.job_vm_creation_never_issued_source(requested_job uuid, requested_generation text) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $_$
+    SELECT public.job_vm_creation_never_issued_evidence(
+        requested_job, requested_generation
+    ) AND EXISTS (
+        SELECT 1 FROM public.jobs j
+        JOIN public.vm_creation_retries r ON r.job_id=j.id
+            AND r.owner_kind='job' AND r.provision_generation::text=requested_generation
+        WHERE j.id=requested_job AND j.status::text='cancelled'
+          AND j.execution_lane='stateless' AND j.parent_job_id IS NULL
+          AND j.assigned_agent_id IS NULL
+          AND j.context->'_stateless_cancel_cleanup_pending'='true'::jsonb
+          AND j.context->>'_vm_creation_pending'=r.request_id::text
+          AND j.context->'vm'->>'provision_generation'=requested_generation
+          AND j.context->'vm'->>'status'='waiting_creation_configuration'
+          AND j.context->'vm'->'provision_attempts'='0'::jsonb
+          AND j.context->'vm'->'identity_authenticated'='false'::jsonb
+          AND j.context->'vm'->>'identity_provision_generation' IS NULL
+          AND j.context->'vm'->>'vm_uid' IS NULL
+          AND j.context->'vm'->>'vmi_uid' IS NULL
+          AND j.context->'vm'->>'active_pod_uid' IS NULL
+          AND j.context->'vm'->>'_runtime_incarnation' IS NULL
+          AND j.context->'vm'->>'rootdisk_pvc_uid' IS NULL
+          AND j.context->'vm'->>'cloud_init_secret_uid' IS NULL
+          AND j.context->'vm'->>'ssh_host' IS NULL
+          AND j.context->'vm'->>'ssh_port' IS NULL
+          AND COALESCE(j.context->'vm'->'preparation_request','null'::jsonb)='null'::jsonb
+          AND COALESCE(j.context->'vm'->'preparation','null'::jsonb)='null'::jsonb
+          AND COALESCE(j.context->'vm'->'workspace_storage','null'::jsonb)='null'::jsonb
+          AND jsonb_typeof(j.context->'vm'->'creation_preflight')='object'
+          AND j.context->'vm'->'creation_preflight'->>'state'='admitted'
+          AND j.context->'vm'->'creation_preflight'->>'request_id'=r.request_id::text
+          AND j.context->'vm'->'creation_preflight'->>'job_id'=j.id::text
+          AND COALESCE(j.context->'vm'->'creation_preflight'->'expected_pvc_uid',
+              'null'::jsonb)='null'::jsonb
+          AND COALESCE(j.context->'vm'->'creation_preflight'->'predecessor_cleanup_admission_id',
+              'null'::jsonb)='null'::jsonb
+          AND COALESCE(j.context->'vm'->'creation_preflight'->'predecessor_evidence',
+              '{}'::jsonb)='{}'::jsonb
+          AND j.context->'vm'->'creation_preflight'->'request'->>'entity_type'='job'
+          AND j.context->'vm'->'creation_preflight'->'request'->>'job_id'=j.id::text
+          AND j.context->'vm'->'creation_preflight'->'request'->>'provision_generation'=requested_generation
+          AND COALESCE(j.context->'vm'->'creation_preflight'->'request'->'preparation',
+              'null'::jsonb)='null'::jsonb
+          AND COALESCE(j.context->'vm'->'creation_preflight'->'request'->'workspace_storage',
+              'null'::jsonb)='null'::jsonb
+          AND j.context->'vm'->'creation_preflight'->>'request_digest' ~ '^sha256:[0-9a-f]{64}$'
+          AND j.context->'vm'->'creation_preflight'->>'execution_id'=r.execution_id::text
+          AND j.context->'vm'->'creation_preflight'->>'execution_revision'=r.execution_revision
+          AND j.context->'vm'->'creation_preflight'->>'execution_generation'=r.execution_generation::text
+          AND jsonb_typeof(j.context->'vm'->'creation_request')='object'
+          AND j.context->'vm'->'creation_request'->'version'='1'::jsonb
+          AND j.context->'vm'->'creation_request'->>'provision_generation'=requested_generation
+          AND j.context->'vm'->'creation_request'->'initial_request'='true'::jsonb
+          AND j.context->'vm'->'creation_request'->'issuance_authority_bound'='false'::jsonb
+          AND j.context->'vm'->'creation_request'->'controller_configuration_authenticated'='true'::jsonb
+          AND j.context->'vm'->'creation_request'->'request'=r.canonical_request
+          AND j.context->'vm'->'creation_request'->>'request_digest'=r.request_digest
+          AND j.context->'vm'->'creation_request'->'controller_configuration'=r.controller_configuration
+          AND j.context->'vm'->'creation_request'->>'controller_configuration_digest'=r.controller_configuration_digest
+          AND public.job_vm_creation_never_issued_predecessors(j.id,requested_generation)
+          AND COALESCE(j.context->'workspace_container','null'::jsonb)='null'::jsonb
+          AND COALESCE(j.context->'ide_session','null'::jsonb)='null'::jsonb
+          AND NOT EXISTS (SELECT 1 FROM public.srw_execution_workspace_bindings binding
+              JOIN public.vm_creation_retries r ON r.execution_id=binding.execution_id
+              WHERE r.job_id=j.id AND r.provision_generation::text=requested_generation)
+          AND NOT EXISTS (SELECT 1 FROM public.vm_idle_operations idle
+              WHERE idle.owner_kind='job' AND idle.owner_id=j.id
+                AND idle.provision_generation::text=requested_generation)
+          AND NOT EXISTS (SELECT 1 FROM public.vm_idle_access_leases lease
+              WHERE lease.owner_kind='job' AND lease.owner_id=j.id
+                AND lease.closed_at IS NULL)
+          AND NOT EXISTS (SELECT 1 FROM public.vm_workspace_recoveries recovery
+              WHERE recovery.owner_kind='job' AND recovery.owner_id=j.id
+                AND recovery.resolved_at IS NULL)
+          AND NOT EXISTS (SELECT 1 FROM public.vm_workspace_recovery_jobs recovery_job
+              WHERE recovery_job.job_id=j.id AND recovery_job.resolved_at IS NULL)
+          AND public.job_vm_never_issued_repository_safe(j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.managed_repository_workspace_creation_reservations creation
+              WHERE creation.owner_kind='job' AND creation.owner_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.managed_repository_workspace_cleanup_intents cleanup
+              WHERE cleanup.owner_kind='job' AND cleanup.owner_id=j.id)
+    );
+$_$;
+
+
+--
+-- Name: job_vm_creation_never_issued_terminal_source(uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.job_vm_creation_never_issued_terminal_source(requested_job uuid, requested_generation text) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT public.job_vm_creation_never_issued_evidence(
+        requested_job, requested_generation
+    ) AND EXISTS (
+        SELECT 1 FROM public.vm_workspace_cleanup_admissions parent
+        WHERE parent.owner_kind='job' AND parent.owner_id=requested_job
+          AND parent.source='job_terminal_vm_release'
+          AND parent.parent_admission_id IS NULL AND parent.pvc_uid IS NULL
+          AND parent.completed_at IS NOT NULL AND parent.outcome='completed'
+          AND parent.request_id=public.uuid_generate_v5(
+              '6ba7b811-9dad-11d1-80b4-00c04fd430c8'::uuid,
+              'vm-workspace-cleanup:job_terminal_vm_release:job:' ||
+              requested_job::text || ':' || requested_generation || ':None:'
+          )
+          AND parent.intent_digest='sha256:' || pg_catalog.encode(
+              pg_catalog.sha256(pg_catalog.convert_to(
+                  '{"owner_id":"' || requested_job::text ||
+                  '","owner_kind":"job","provision_generation":"' ||
+                  requested_generation ||
+                  '","purge_disk":true,"pvc_uid":"","resource":"vm_workspace",' ||
+                  '"source":"job_terminal_vm_release","vm_uid":""}',
+                  'UTF8'
+              )), 'hex'
+          )
+    );
+$$;
+
+
+--
+-- Name: job_vm_never_issued_history_safe(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.job_vm_never_issued_history_safe(requested_job uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.jobs j
+        WHERE j.id=requested_job AND j.parent_job_id IS NULL
+          AND j.assigned_agent_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM public.worker_batch_attempts batch
+              WHERE batch.job_id=j.id AND (batch.bundle_authorized_at IS NOT NULL
+                  OR batch.authority_digest IS NOT NULL))
+          AND NOT EXISTS (SELECT 1 FROM public.srw_execution_workspace_bindings b
+              JOIN public.srw_execution_specs x ON x.id=b.execution_id
+              WHERE x.work_kind='Job' AND x.work_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.srw_execution_attempts attempt
+              JOIN public.srw_execution_specs x ON x.id=attempt.execution_id
+              WHERE x.work_kind='Job' AND x.work_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.srw_workspace_instances instance
+              WHERE instance.owner_id=j.id OR instance.execution_id IN (
+                  SELECT x.id FROM public.srw_execution_specs x
+                  WHERE x.work_kind='Job' AND x.work_id=j.id))
+          AND NOT EXISTS (SELECT 1 FROM public.managed_repository_workspace_creation_reservations reservation
+              WHERE reservation.owner_kind='job' AND reservation.owner_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.managed_repository_workspace_cleanup_intents cleanup
+              WHERE cleanup.owner_kind='job' AND cleanup.owner_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts receipt
+              WHERE receipt.owner_kind='job' AND receipt.owner_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.vm_creation_retries r
+              WHERE r.job_id=j.id AND (
+                  r.owner_kind<>'job' OR r.state<>'settled' OR r.ready_at IS NOT NULL
+                  OR r.expected_pvc_uid IS NOT NULL OR r.observed_pvc_uid IS NOT NULL
+                  OR r.observed_vm_uid IS NOT NULL OR r.creation_admission_id IS NOT NULL
+                  OR r.creation_carrier_uid IS NOT NULL OR r.disposition_carrier_uid IS NOT NULL
+                  OR COALESCE(r.canonical_request->'preparation','null'::jsonb) <> 'null'::jsonb
+                  OR COALESCE(r.canonical_request->'workspace_storage','null'::jsonb) <> 'null'::jsonb))
+    );
+$$;
+
+
+--
+-- Name: job_vm_never_issued_repository_safe(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.job_vm_never_issued_repository_safe(requested_job uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.jobs j
+        WHERE j.id=requested_job
+          AND public.job_vm_never_issued_history_safe(j.id)
+          AND (
+              (j.repo_name IS NULL AND j.context->>'git_remote_url' IS NULL
+               AND NOT EXISTS (SELECT 1 FROM public.managed_repository_authorities a
+                   WHERE a.authority_kind='job' AND a.authority_id=j.id
+                     AND a.status IN ('provisioning','active','revoking'))
+               AND NOT EXISTS (SELECT 1 FROM public.managed_repository_creation_intents i
+                   WHERE i.authority_kind='job' AND i.authority_id=j.id
+                     AND i.status<>'deleted'))
+              OR public.job_vm_repository_pair_evidence(j.id) IS NOT NULL
+          )
+    );
+$$;
+
+
+--
+-- Name: job_vm_repository_pair_evidence(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.job_vm_repository_pair_evidence(requested_job uuid) RETURNS jsonb
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT jsonb_build_object(
+        'authority_id',a.id,'creation_intent_id',i.id,
+        'repository_owner',a.repository_owner,'repo_name',a.repo_name,
+        'project_id',a.project_id,'forge_key_id',a.forge_key_id,
+        'key_generation',a.generation,'intent_generation',i.generation,
+        'clean_repo_url',a.clean_repo_url)
+    FROM public.jobs j
+    JOIN public.managed_repository_authorities a
+      ON a.authority_kind='job' AND a.authority_id=j.id
+    JOIN public.managed_repository_creation_intents i
+      ON i.id=a.creation_intent_id
+    WHERE j.id=requested_job
+      AND i.authority_kind='job' AND i.authority_id=j.id
+      AND a.status='active' AND i.status='created'
+      AND a.forge_key_id>0 AND a.activated_at IS NOT NULL
+      AND i.repository_created_at IS NOT NULL
+      AND a.access_mode='write' AND i.access_mode='write'
+      AND a.generation>0 AND i.generation>0
+      AND a.repository_owner=i.repository_owner AND a.repo_name=i.repo_name
+      AND a.project_id IS NOT DISTINCT FROM i.project_id
+      AND a.project_id IS NOT DISTINCT FROM j.project_id
+      AND a.repo_name=j.repo_name
+      AND a.repo_name='job-' || left(j.id::text,8)
+      AND a.clean_repo_url=j.context->>'git_remote_url'
+      AND NOT public.managed_repository_url_has_userinfo(a.clean_repo_url)
+      AND right(a.clean_repo_url,length('/' || a.repository_owner ||
+          '/' || a.repo_name || '.git'))='/' || a.repository_owner ||
+          '/' || a.repo_name || '.git'
+      AND (SELECT count(*) FROM public.managed_repository_authorities other
+           WHERE other.authority_kind='job' AND other.authority_id=j.id
+             AND other.status IN ('provisioning','active','revoking'))=1
+      AND (SELECT count(*) FROM public.managed_repository_creation_intents other
+           WHERE other.authority_kind='job' AND other.authority_id=j.id
+             AND other.status<>'deleted')=1;
+$$;
+
+
+--
 -- Name: lock_inventory_epoch_boundary_statement(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -10865,6 +11662,63 @@ BEGIN
             USING ERRCODE = '55000';
     END IF;
     RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: lock_job_repository_source_insert(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.lock_job_repository_source_insert() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.authority_kind='job' THEN
+        PERFORM 1 FROM public.jobs WHERE id=NEW.authority_id FOR SHARE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'managed repository Job owner is absent'
+                USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: lock_job_vm_nondelivery_insert(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.lock_job_vm_nondelivery_insert() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE owned_job uuid;
+BEGIN
+    IF TG_TABLE_NAME='managed_repository_process_zero_receipts'
+       OR TG_TABLE_NAME='managed_repository_workspace_creation_reservations'
+       OR TG_TABLE_NAME='managed_repository_workspace_cleanup_intents' THEN
+        IF NEW.owner_kind='job' THEN owned_job := NEW.owner_id; END IF;
+    ELSIF TG_TABLE_NAME='srw_execution_specs' THEN
+        IF NEW.work_kind='Job' THEN owned_job := NEW.work_id; END IF;
+    ELSIF TG_TABLE_NAME='srw_workspace_instances' THEN
+        SELECT work_id INTO owned_job FROM public.srw_execution_specs
+        WHERE id=NEW.execution_id AND work_kind='Job';
+        IF owned_job IS NULL THEN
+            SELECT id INTO owned_job FROM public.jobs WHERE id=NEW.owner_id;
+        END IF;
+    ELSE
+        SELECT work_id INTO owned_job FROM public.srw_execution_specs
+        WHERE id=NEW.execution_id AND work_kind='Job';
+    END IF;
+    IF owned_job IS NOT NULL THEN
+        PERFORM 1 FROM public.jobs WHERE id=owned_job FOR SHARE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'VM Job non-delivery source requires live owner'
+                USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN NEW;
 END;
 $$;
 
@@ -11515,10 +12369,14 @@ BEGIN
     ) THEN
         RETURN true;
     END IF;
-    RETURN requested_owner_kind = 'thread'
-       AND requested_scope = 'vm' AND requested_provisioner = 'vm'
-       AND public.thread_vm_creation_never_issued_source(
-           requested_owner_id, requested_runtime
+    RETURN requested_scope = 'vm' AND requested_provisioner = 'vm'
+       AND (
+           (requested_owner_kind = 'thread'
+            AND public.thread_vm_creation_never_issued_source(
+                requested_owner_id, requested_runtime))
+           OR (requested_owner_kind = 'job'
+            AND public.job_vm_creation_never_issued_terminal_source(
+                requested_owner_id, requested_runtime))
        );
 END;
 $_$;
@@ -13673,6 +14531,21 @@ BEGIN
             CONSTRAINT = 'stateless_runtime_generation_workspace_authority_pending',
             MESSAGE = 'Stateless runtime generation cannot rotate while workspace authority is pending';
     END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: prevent_vm_job_creation_owner_reuse(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.prevent_vm_job_creation_owner_reuse() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    PERFORM 1 FROM public.vm_job_creation_owners WHERE job_id=NEW.id FOR SHARE;
+    IF FOUND THEN RAISE EXCEPTION 'Job VM audit owner UUID cannot be reused' USING ERRCODE='23514'; END IF;
     RETURN NEW;
 END;
 $$;
@@ -16921,6 +17794,30 @@ COMMENT ON FUNCTION public.require_thread_lane_without_pending_input() IS 'Seria
 
 
 --
+-- Name: require_vm_job_audit_before_delete(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.require_vm_job_audit_before_delete() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM public.vm_job_creation_owners o WHERE o.job_id=OLD.id)
+       AND NOT EXISTS (SELECT 1 FROM public.vm_job_creation_owners o
+           WHERE o.job_id=OLD.id AND o.live_job_id=OLD.id
+             AND o.deleted_at IS NOT NULL AND o.deletion_receipt IS NOT NULL
+             AND (SELECT count(*) FROM public.vm_job_creation_terminal_packets p
+                  WHERE p.job_id=OLD.id)=
+                 (SELECT count(*) FROM public.vm_creation_retries r
+                  WHERE r.owner_kind='job' AND r.job_id=OLD.id)) THEN
+        RAISE EXCEPTION 'Job VM audit owner lacks exact terminal disposition'
+            USING ERRCODE='23514';
+    END IF;
+    RETURN OLD;
+END;
+$$;
+
+
+--
 -- Name: resource_inventory_snapshot_item_size_bytes(text, text, text, jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -19568,6 +20465,35 @@ $$;
 
 
 --
+-- Name: validate_vm_job_creation_owner_terminal(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_vm_job_creation_owner_terminal() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE owner_row public.vm_job_creation_owners%ROWTYPE;
+BEGIN
+    SELECT * INTO owner_row FROM public.vm_job_creation_owners WHERE job_id=NEW.job_id;
+    IF owner_row.live_job_id IS NULL THEN
+        IF owner_row.deleted_at IS NULL OR owner_row.deletion_receipt IS NULL
+           OR EXISTS (SELECT 1 FROM public.jobs WHERE id=owner_row.job_id)
+           OR (SELECT count(*) FROM public.vm_job_creation_terminal_packets p
+               WHERE p.job_id=owner_row.job_id)<>
+              (SELECT count(*) FROM public.vm_creation_retries r
+               WHERE r.owner_kind='job' AND r.job_id=owner_row.job_id) THEN
+            RAISE EXCEPTION 'Job VM audit deletion must retain every terminal source'
+                USING ERRCODE='23514';
+        END IF;
+    ELSIF owner_row.deleted_at IS NOT NULL OR owner_row.deletion_receipt IS NOT NULL THEN
+        RAISE EXCEPTION 'Job VM audit tombstone and deletion must commit together'
+            USING ERRCODE='23514';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+--
 -- Name: validate_vm_thread_cleanup_authority(public.vm_resource_thread_cleanup_authorities, boolean); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -20287,6 +21213,276 @@ CREATE FUNCTION public.vm_ide_heartbeat_cleanup_is_authorized(requested_owner_ki
       )
     , FALSE);
 $_$;
+
+
+--
+-- Name: vm_job_execution_chain_evidence(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_execution_chain_evidence(source_execution uuid) RETURNS jsonb
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT jsonb_build_object(
+        'execution_id',source_execution,
+        'revision_generations',COALESCE((
+            SELECT jsonb_agg(generation ORDER BY generation)
+            FROM public.srw_execution_spec_revisions
+            WHERE execution_id=source_execution), '[]'::jsonb),
+        'attempts',COALESCE((
+            SELECT jsonb_agg(attempt ORDER BY attempt)
+            FROM public.srw_execution_attempts
+            WHERE execution_id=source_execution), '[]'::jsonb),
+        'workspace_instance_ids',COALESCE((
+            SELECT jsonb_agg(instance_id ORDER BY instance_id)
+            FROM public.srw_execution_workspace_bindings
+            WHERE execution_id=source_execution), '[]'::jsonb)
+    );
+$$;
+
+
+--
+-- Name: vm_job_logical_final_history_safe(uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_logical_final_history_safe(requested_job uuid, requested_generation uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM public.jobs j
+        JOIN public.vm_creation_retries source
+          ON source.owner_kind='job' AND source.job_id=j.id
+         AND source.provision_generation=requested_generation
+        WHERE j.id=requested_job AND j.parent_job_id IS NULL
+          AND j.assigned_agent_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM public.worker_batch_attempts batch
+              WHERE batch.job_id=j.id AND (batch.bundle_authorized_at IS NOT NULL
+                  OR batch.authority_digest IS NOT NULL)
+                AND NOT EXISTS (
+                    SELECT 1 FROM public.vm_job_worker_delivery_bindings binding
+                    JOIN public.vm_creation_retries physical
+                      ON physical.request_id=binding.request_id
+                    WHERE binding.job_id=batch.job_id
+                      AND binding.lease_token=batch.lease_token
+                      AND binding.authority_digest=batch.authority_digest
+                      AND batch.bundle_authorized_at IS NOT NULL
+                      AND binding.provision_generation<>requested_generation
+                      AND physical.owner_kind='job' AND physical.job_id=j.id
+                      AND physical.provision_generation=binding.provision_generation
+                      AND physical.state='succeeded'
+                      AND physical.observed_vm_uid=binding.vm_uid
+                      AND physical.observed_pvc_uid=binding.pvc_uid
+                ))
+          AND NOT EXISTS (SELECT 1 FROM public.srw_execution_workspace_bindings b
+              JOIN public.srw_execution_specs x ON x.id=b.execution_id
+              WHERE x.work_kind='Job' AND x.work_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.srw_execution_attempts attempt
+              JOIN public.srw_execution_specs x ON x.id=attempt.execution_id
+              WHERE x.work_kind='Job' AND x.work_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.srw_workspace_instances instance
+              WHERE instance.owner_id=j.id OR instance.execution_id IN (
+                  SELECT x.id FROM public.srw_execution_specs x
+                  WHERE x.work_kind='Job' AND x.work_id=j.id))
+          AND NOT EXISTS (SELECT 1 FROM public.managed_repository_workspace_creation_reservations reservation
+              WHERE reservation.owner_kind='job' AND reservation.owner_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.managed_repository_workspace_cleanup_intents cleanup
+              WHERE cleanup.owner_kind='job' AND cleanup.owner_id=j.id)
+          AND NOT EXISTS (SELECT 1 FROM public.vm_creation_retries alien
+              WHERE alien.job_id=j.id AND alien.owner_kind<>'job')
+          AND NOT EXISTS (
+              SELECT 1 FROM public.managed_repository_process_zero_receipts p
+              WHERE p.owner_kind='job' AND p.owner_id=j.id
+                AND NOT (
+                    p.scope='vm' AND p.provisioner='vm'
+                    AND p.runtime_incarnation<>requested_generation::text
+                    AND EXISTS (
+                        SELECT 1 FROM public.vm_creation_retries physical
+                        WHERE physical.owner_kind='job' AND physical.job_id=j.id
+                          AND physical.provision_generation::text=p.runtime_incarnation
+                          AND physical.state='succeeded'
+                    )
+                )
+          )
+    );
+$$;
+
+
+--
+-- Name: vm_job_repository_settlement_receipts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_job_repository_settlement_receipts (
+    cleanup_admission_id uuid NOT NULL,
+    request_id uuid NOT NULL,
+    job_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    authority_id uuid,
+    creation_intent_id uuid,
+    repository_owner text,
+    repo_name text,
+    project_id uuid,
+    forge_key_id bigint,
+    key_generation bigint,
+    intent_generation bigint,
+    clean_repo_url text,
+    captured_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT vm_job_repository_settlement_receipts_check CHECK ((((authority_id IS NULL) AND (creation_intent_id IS NULL) AND (repository_owner IS NULL) AND (repo_name IS NULL) AND (project_id IS NULL) AND (forge_key_id IS NULL) AND (key_generation IS NULL) AND (intent_generation IS NULL) AND (clean_repo_url IS NULL)) OR ((authority_id IS NOT NULL) AND (creation_intent_id IS NOT NULL) AND (repository_owner IS NOT NULL) AND (repo_name IS NOT NULL) AND (forge_key_id IS NOT NULL) AND (forge_key_id > 0) AND (key_generation IS NOT NULL) AND (key_generation > 0) AND (intent_generation IS NOT NULL) AND (intent_generation > 0) AND (clean_repo_url IS NOT NULL))))
+);
+
+
+--
+-- Name: vm_job_repository_receipt_pair(public.vm_job_repository_settlement_receipts); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_repository_receipt_pair(receipt public.vm_job_repository_settlement_receipts) RETURNS jsonb
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT CASE WHEN receipt.authority_id IS NULL THEN NULL ELSE
+        jsonb_build_object(
+            'authority_id',receipt.authority_id,
+            'creation_intent_id',receipt.creation_intent_id,
+            'repository_owner',receipt.repository_owner,
+            'repo_name',receipt.repo_name,
+            'project_id',receipt.project_id,
+            'forge_key_id',receipt.forge_key_id,
+            'key_generation',receipt.key_generation,
+            'intent_generation',receipt.intent_generation,
+            'clean_repo_url',receipt.clean_repo_url)
+    END;
+$$;
+
+
+--
+-- Name: vm_job_terminal_packet_evidence(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_terminal_packet_evidence(source_request uuid) RETURNS jsonb
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE r public.vm_creation_retries%ROWTYPE;
+        a public.vm_workspace_cleanup_admissions%ROWTYPE;
+        repository_receipt public.vm_job_repository_settlement_receipts%ROWTYPE;
+        stop_row public.vm_resource_cleanup_stop_receipts%ROWTYPE;
+        reservation_count bigint;
+BEGIN
+    SELECT * INTO r FROM public.vm_creation_retries WHERE request_id=source_request;
+    IF NOT FOUND OR r.owner_kind<>'job' OR r.job_id IS NULL
+       OR r.resolved_at IS NULL THEN
+        RETURN NULL;
+    END IF;
+    IF public.job_vm_creation_never_issued_terminal_source(
+        r.job_id,r.provision_generation::text) THEN
+        -- 0326 proves this retry and logical parent. Other generations may
+        -- have their own exact physical packet; unattributed delivery history
+        -- cannot be assigned to those generations and remains a hold.
+        IF NOT public.vm_job_logical_final_history_safe(
+            r.job_id,r.provision_generation) THEN
+            RETURN NULL;
+        END IF;
+        SELECT * INTO a FROM public.vm_workspace_cleanup_admissions
+        WHERE owner_kind='job' AND owner_id=r.job_id
+          AND source='job_terminal_vm_release' AND pvc_uid IS NULL
+          AND completed_at IS NOT NULL AND outcome='completed'
+          AND request_id=public.uuid_generate_v5(public.uuid_ns_url(),
+            'vm-workspace-cleanup:job_terminal_vm_release:job:' || r.job_id::text ||
+            ':' || r.provision_generation::text || ':None:');
+        IF NOT FOUND THEN RETURN NULL; END IF;
+        SELECT * INTO repository_receipt
+        FROM public.vm_job_repository_settlement_receipts
+        WHERE cleanup_admission_id=a.id AND request_id=r.request_id
+          AND job_id=r.job_id AND provision_generation=r.provision_generation;
+        IF NOT FOUND THEN RETURN NULL; END IF;
+        RETURN jsonb_build_object(
+            'kind','never_issued','job_id',r.job_id,'request_id',r.request_id,
+            'provision_generation',r.provision_generation,
+            'execution_id',r.execution_id,'execution_revision',r.execution_revision,
+            'execution_generation',r.execution_generation,
+            'execution_chain',public.vm_job_execution_chain_evidence(r.execution_id),
+            'cleanup_admission_id',a.id,'cleanup_intent_digest',a.intent_digest,
+            'repository_pair',public.vm_job_repository_receipt_pair(repository_receipt),
+            'retry_reason',r.reason,'resolved_at',r.resolved_at);
+    END IF;
+    IF r.state<>'succeeded' OR r.observed_vm_uid IS NULL
+       OR r.observed_pvc_uid IS NULL OR r.creation_admission_id IS NULL
+       OR NOT EXISTS (SELECT 1 FROM public.managed_repository_process_zero_receipts p
+           WHERE p.owner_kind='job' AND p.owner_id=r.job_id AND p.scope='vm'
+             AND p.provisioner='vm'
+             AND p.runtime_incarnation=r.provision_generation::text)
+       OR EXISTS (SELECT 1 FROM public.vm_creation_effects e
+           WHERE e.request_id=r.request_id AND e.state='issued')
+       OR EXISTS (SELECT 1 FROM public.vm_resource_waiters w
+           WHERE w.request_id=r.request_id AND w.state<>'released')
+       OR EXISTS (SELECT 1 FROM public.vm_resource_reservations v
+           WHERE v.request_id=r.request_id AND v.state<>'released') THEN
+        RETURN NULL;
+    END IF;
+    -- A completed terminal parent is the typed physical/storage disposition;
+    -- identity includes the generation, VM, PVC and purge intent.
+    SELECT * INTO a FROM public.vm_workspace_cleanup_admissions
+    WHERE owner_kind='job' AND owner_id=r.job_id
+      AND source IN ('job_terminal_vm_release','public_vm_delete')
+      AND parent_admission_id IS NULL AND pvc_uid=r.observed_pvc_uid
+      AND request_id=public.uuid_generate_v5(public.uuid_ns_url(),
+          'vm-workspace-cleanup:' || source || ':job:' || r.job_id::text || ':' ||
+          r.provision_generation::text || ':' || r.observed_vm_uid::text || ':' ||
+          r.observed_pvc_uid::text)
+      AND completed_at IS NOT NULL AND outcome='completed'
+    ORDER BY completed_at DESC LIMIT 1;
+    IF NOT FOUND THEN RETURN NULL; END IF;
+    IF a.intent_digest IS DISTINCT FROM 'sha256:' || pg_catalog.encode(
+        pg_catalog.sha256(pg_catalog.convert_to(
+            '{"owner_id":"' || r.job_id::text ||
+            '","owner_kind":"job","provision_generation":"' ||
+            r.provision_generation::text ||
+            '","purge_disk":true,"pvc_uid":"' || r.observed_pvc_uid::text ||
+            '","resource":"vm_workspace","source":"' || a.source ||
+            '","vm_uid":"' || r.observed_vm_uid::text || '"}', 'UTF8'
+        )), 'hex') THEN
+        RETURN NULL;
+    END IF;
+    SELECT count(*) INTO reservation_count FROM public.vm_resource_reservations v
+        WHERE v.request_id=r.request_id;
+    IF reservation_count>0 THEN
+        IF reservation_count<>1 THEN RETURN NULL; END IF;
+        SELECT s.* INTO stop_row FROM public.vm_resource_cleanup_stop_receipts s
+        JOIN public.vm_resource_reservations v ON v.id=s.reservation_id
+        WHERE v.request_id=r.request_id AND v.state='released'
+          AND s.job_id=r.job_id AND s.request_id=r.request_id
+          AND s.provision_generation=r.provision_generation
+          AND s.vm_uid=r.observed_vm_uid AND s.pvc_uid=r.observed_pvc_uid
+          AND s.cleanup_admission_id=a.id AND s.intent_digest=a.intent_digest
+          AND s.stop_evidence->'vm_absent'='true'::jsonb
+          AND s.stop_evidence->'vmi_absent'='true'::jsonb
+          AND s.stop_evidence->'launcher_absent'='true'::jsonb
+          AND s.stop_evidence->>'pvc_disposition'='purged';
+        IF NOT FOUND THEN RETURN NULL; END IF;
+    ELSE
+        -- A missing charge is not evidence that physical stop or storage
+        -- purge occurred. Older uncharged paths remain live until they have
+        -- their own exact typed terminal witness.
+        RETURN NULL;
+    END IF;
+    RETURN jsonb_build_object(
+        'kind','physical_stop','job_id',r.job_id,'request_id',r.request_id,
+        'provision_generation',r.provision_generation,
+        'vm_uid',r.observed_vm_uid,'pvc_uid',r.observed_pvc_uid,
+        'execution_id',r.execution_id,'execution_revision',r.execution_revision,
+        'execution_generation',r.execution_generation,
+        'execution_chain',public.vm_job_execution_chain_evidence(r.execution_id),
+        'cleanup_admission_id',a.id,'cleanup_intent_digest',a.intent_digest,
+        'reservation_count',reservation_count,
+        'effect_nonces',COALESCE((SELECT jsonb_agg(e.effect_nonce ORDER BY e.effect_nonce)
+            FROM public.vm_creation_effects e WHERE e.request_id=r.request_id),'[]'::jsonb),
+        'process_zero_receipt_ids',COALESCE((SELECT jsonb_agg(p.id ORDER BY p.id)
+            FROM public.managed_repository_process_zero_receipts p
+            WHERE p.owner_kind='job' AND p.owner_id=r.job_id
+              AND p.scope='vm' AND p.provisioner='vm'
+              AND p.runtime_incarnation=r.provision_generation::text),'[]'::jsonb),
+        'reservation_ids',COALESCE((SELECT jsonb_agg(v.id ORDER BY v.id)
+            FROM public.vm_resource_reservations v WHERE v.request_id=r.request_id),'[]'::jsonb),
+        'stop_reservation_id',stop_row.reservation_id,
+        'retry_reason',r.reason,'resolved_at',r.resolved_at);
+END;
+$$;
 
 
 --
@@ -27799,6 +28995,55 @@ CREATE TABLE public.vm_idle_thread_access_continuations (
 
 
 --
+-- Name: vm_job_creation_owners; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_job_creation_owners (
+    job_id uuid NOT NULL,
+    live_job_id uuid,
+    deletion_receipt jsonb,
+    created_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    deleted_at timestamp with time zone,
+    CONSTRAINT vm_job_creation_owners_check CHECK (((live_job_id IS NULL) OR (live_job_id = job_id))),
+    CONSTRAINT vm_job_creation_owners_check1 CHECK (((deleted_at IS NULL) = (deletion_receipt IS NULL)))
+);
+
+
+--
+-- Name: vm_job_creation_terminal_packets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_job_creation_terminal_packets (
+    request_id uuid NOT NULL,
+    job_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    terminal_kind text NOT NULL,
+    cleanup_admission_id uuid NOT NULL,
+    evidence jsonb NOT NULL,
+    captured_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT vm_job_creation_terminal_packets_evidence_check CHECK ((jsonb_typeof(evidence) = 'object'::text)),
+    CONSTRAINT vm_job_creation_terminal_packets_terminal_kind_check CHECK ((terminal_kind = ANY (ARRAY['never_issued'::text, 'physical_stop'::text])))
+);
+
+
+--
+-- Name: vm_job_worker_delivery_bindings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_job_worker_delivery_bindings (
+    job_id uuid NOT NULL,
+    lease_token bigint NOT NULL,
+    request_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    vm_uid uuid NOT NULL,
+    pvc_uid uuid NOT NULL,
+    authority_digest text NOT NULL,
+    captured_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT vm_job_worker_delivery_bindings_check CHECK (((lease_token > 0) AND (authority_digest <> ''::text)))
+);
+
+
+--
 -- Name: vm_remote_operation_claim_seq; Type: SEQUENCE; Schema: public; Owner: -
 --
 
@@ -30743,6 +31988,70 @@ ALTER TABLE ONLY public.vm_idle_thread_access_continuations
 
 
 --
+-- Name: vm_job_creation_owners vm_job_creation_owners_live_job_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_creation_owners
+    ADD CONSTRAINT vm_job_creation_owners_live_job_id_key UNIQUE (live_job_id);
+
+
+--
+-- Name: vm_job_creation_owners vm_job_creation_owners_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_creation_owners
+    ADD CONSTRAINT vm_job_creation_owners_pkey PRIMARY KEY (job_id);
+
+
+--
+-- Name: vm_job_creation_terminal_packets vm_job_creation_terminal_packet_job_id_provision_generation_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_creation_terminal_packets
+    ADD CONSTRAINT vm_job_creation_terminal_packet_job_id_provision_generation_key UNIQUE (job_id, provision_generation);
+
+
+--
+-- Name: vm_job_creation_terminal_packets vm_job_creation_terminal_packets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_creation_terminal_packets
+    ADD CONSTRAINT vm_job_creation_terminal_packets_pkey PRIMARY KEY (request_id);
+
+
+--
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_re_job_id_provision_generation_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
+    ADD CONSTRAINT vm_job_repository_settlement_re_job_id_provision_generation_key UNIQUE (job_id, provision_generation);
+
+
+--
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_receipts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
+    ADD CONSTRAINT vm_job_repository_settlement_receipts_pkey PRIMARY KEY (cleanup_admission_id);
+
+
+--
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_receipts_request_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
+    ADD CONSTRAINT vm_job_repository_settlement_receipts_request_id_key UNIQUE (request_id);
+
+
+--
+-- Name: vm_job_worker_delivery_bindings vm_job_worker_delivery_bindings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_worker_delivery_bindings
+    ADD CONSTRAINT vm_job_worker_delivery_bindings_pkey PRIMARY KEY (job_id, lease_token);
+
+
+--
 -- Name: vm_remote_operation_leases vm_remote_operation_leases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -33453,6 +34762,132 @@ CREATE INDEX workspace_intervals_pending_idx ON public.workspace_intervals USING
 
 
 --
+-- Name: managed_repository_authorities a_job_repository_source_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_repository_source_insert BEFORE INSERT ON public.managed_repository_authorities FOR EACH ROW EXECUTE FUNCTION public.lock_job_repository_source_insert();
+
+
+--
+-- Name: managed_repository_creation_intents a_job_repository_source_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_repository_source_insert BEFORE INSERT ON public.managed_repository_creation_intents FOR EACH ROW EXECUTE FUNCTION public.lock_job_repository_source_insert();
+
+
+--
+-- Name: managed_repository_process_zero_receipts a_job_vm_nondelivery_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_vm_nondelivery_insert BEFORE INSERT ON public.managed_repository_process_zero_receipts FOR EACH ROW EXECUTE FUNCTION public.lock_job_vm_nondelivery_insert();
+
+
+--
+-- Name: managed_repository_workspace_cleanup_intents a_job_vm_nondelivery_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_vm_nondelivery_insert BEFORE INSERT ON public.managed_repository_workspace_cleanup_intents FOR EACH ROW EXECUTE FUNCTION public.lock_job_vm_nondelivery_insert();
+
+
+--
+-- Name: managed_repository_workspace_creation_reservations a_job_vm_nondelivery_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_vm_nondelivery_insert BEFORE INSERT ON public.managed_repository_workspace_creation_reservations FOR EACH ROW EXECUTE FUNCTION public.lock_job_vm_nondelivery_insert();
+
+
+--
+-- Name: srw_execution_attempts a_job_vm_nondelivery_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_vm_nondelivery_insert BEFORE INSERT ON public.srw_execution_attempts FOR EACH ROW EXECUTE FUNCTION public.lock_job_vm_nondelivery_insert();
+
+
+--
+-- Name: srw_execution_spec_revisions a_job_vm_nondelivery_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_vm_nondelivery_insert BEFORE INSERT ON public.srw_execution_spec_revisions FOR EACH ROW EXECUTE FUNCTION public.lock_job_vm_nondelivery_insert();
+
+
+--
+-- Name: srw_execution_specs a_job_vm_nondelivery_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_vm_nondelivery_insert BEFORE INSERT ON public.srw_execution_specs FOR EACH ROW EXECUTE FUNCTION public.lock_job_vm_nondelivery_insert();
+
+
+--
+-- Name: srw_execution_workspace_bindings a_job_vm_nondelivery_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_vm_nondelivery_insert BEFORE INSERT ON public.srw_execution_workspace_bindings FOR EACH ROW EXECUTE FUNCTION public.lock_job_vm_nondelivery_insert();
+
+
+--
+-- Name: srw_workspace_instances a_job_vm_nondelivery_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_job_vm_nondelivery_insert BEFORE INSERT ON public.srw_workspace_instances FOR EACH ROW EXECUTE FUNCTION public.lock_job_vm_nondelivery_insert();
+
+
+--
+-- Name: vm_creation_retries a_vm_job_creation_owner; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_creation_owner BEFORE INSERT ON public.vm_creation_retries FOR EACH ROW EXECUTE FUNCTION public.ensure_vm_job_creation_owner();
+
+
+--
+-- Name: managed_repository_process_zero_receipts a_vm_job_retained_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_retained_ledger BEFORE DELETE OR UPDATE ON public.managed_repository_process_zero_receipts FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
+
+
+--
+-- Name: vm_creation_effects a_vm_job_retained_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_retained_ledger BEFORE INSERT OR DELETE OR UPDATE ON public.vm_creation_effects FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
+
+
+--
+-- Name: vm_creation_retries a_vm_job_retained_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_retained_ledger BEFORE DELETE OR UPDATE ON public.vm_creation_retries FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
+
+
+--
+-- Name: vm_resource_cleanup_stop_receipts a_vm_job_retained_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_retained_ledger BEFORE INSERT OR DELETE OR UPDATE ON public.vm_resource_cleanup_stop_receipts FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
+
+
+--
+-- Name: vm_resource_recovery_successors a_vm_job_retained_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_retained_ledger BEFORE INSERT OR DELETE OR UPDATE ON public.vm_resource_recovery_successors FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
+
+
+--
+-- Name: vm_resource_reservations a_vm_job_retained_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_retained_ledger BEFORE INSERT OR DELETE OR UPDATE ON public.vm_resource_reservations FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
+
+
+--
+-- Name: vm_workspace_cleanup_admissions a_vm_job_retained_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER a_vm_job_retained_ledger BEFORE INSERT OR DELETE OR UPDATE ON public.vm_workspace_cleanup_admissions FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
+
+
+--
 -- Name: vm_creation_effects a_vm_thread_creation_terminal_ledger; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -35105,6 +36540,90 @@ CREATE TRIGGER vm_idle_thread_access_continuation_guard BEFORE INSERT OR DELETE 
 
 
 --
+-- Name: jobs vm_job_creation_audit_before_delete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_creation_audit_before_delete BEFORE DELETE ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.require_vm_job_audit_before_delete();
+
+
+--
+-- Name: vm_job_creation_owners vm_job_creation_owner_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_creation_owner_authority BEFORE INSERT OR DELETE OR UPDATE ON public.vm_job_creation_owners FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_creation_owner();
+
+
+--
+-- Name: jobs vm_job_creation_owner_reuse; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_creation_owner_reuse BEFORE INSERT ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.prevent_vm_job_creation_owner_reuse();
+
+
+--
+-- Name: vm_job_creation_owners vm_job_creation_owner_terminal; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER vm_job_creation_owner_terminal AFTER INSERT OR UPDATE ON public.vm_job_creation_owners DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.validate_vm_job_creation_owner_terminal();
+
+
+--
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_receipt_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_repository_settlement_receipt_immutable BEFORE INSERT OR DELETE OR UPDATE ON public.vm_job_repository_settlement_receipts FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_repository_settlement_receipt();
+
+
+--
+-- Name: srw_execution_attempts vm_job_retained_execution; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_execution BEFORE DELETE OR UPDATE ON public.srw_execution_attempts FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_execution();
+
+
+--
+-- Name: srw_execution_spec_revisions vm_job_retained_execution; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_execution BEFORE DELETE OR UPDATE ON public.srw_execution_spec_revisions FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_execution();
+
+
+--
+-- Name: srw_execution_specs vm_job_retained_execution; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_execution BEFORE DELETE OR UPDATE ON public.srw_execution_specs FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_execution();
+
+
+--
+-- Name: srw_execution_workspace_bindings vm_job_retained_execution; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_execution BEFORE DELETE OR UPDATE ON public.srw_execution_workspace_bindings FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_execution();
+
+
+--
+-- Name: srw_workspace_instances vm_job_retained_execution; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_retained_execution BEFORE DELETE OR UPDATE ON public.srw_workspace_instances FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_execution();
+
+
+--
+-- Name: vm_job_creation_terminal_packets vm_job_terminal_packet_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_terminal_packet_immutable BEFORE INSERT OR DELETE OR UPDATE ON public.vm_job_creation_terminal_packets FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_terminal_packet();
+
+
+--
+-- Name: vm_job_worker_delivery_bindings vm_job_worker_delivery_binding_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_job_worker_delivery_binding_immutable BEFORE INSERT OR DELETE OR UPDATE ON public.vm_job_worker_delivery_bindings FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_worker_delivery_binding();
+
+
+--
 -- Name: vm_resource_inventory_snapshots vm_resource_inventory_immutable; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -35172,6 +36691,13 @@ CREATE TRIGGER workspace_intervals_cutover_insert_lock BEFORE INSERT ON public.w
 --
 
 CREATE TRIGGER workspace_intervals_cutover_open_barrier BEFORE INSERT OR UPDATE ON public.workspace_intervals FOR EACH ROW EXECUTE FUNCTION public.enforce_legacy_workspace_cutover_barrier();
+
+
+--
+-- Name: vm_resource_waiters z_vm_job_retained_ledger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER z_vm_job_retained_ledger BEFORE INSERT OR DELETE OR UPDATE ON public.vm_resource_waiters FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_ledger();
 
 
 --
@@ -37089,11 +38615,11 @@ ALTER TABLE ONLY public.vm_creation_retries
 
 
 --
--- Name: vm_creation_retries vm_creation_retries_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: vm_creation_retries vm_creation_retries_job_audit_owner_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.vm_creation_retries
-    ADD CONSTRAINT vm_creation_retries_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id);
+    ADD CONSTRAINT vm_creation_retries_job_audit_owner_fkey FOREIGN KEY (job_id) REFERENCES public.vm_job_creation_owners(job_id);
 
 
 --
@@ -37142,6 +38668,78 @@ ALTER TABLE ONLY public.vm_idle_operations
 
 ALTER TABLE ONLY public.vm_idle_thread_access_continuations
     ADD CONSTRAINT vm_idle_thread_access_continuations_operation_id_fkey FOREIGN KEY (operation_id) REFERENCES public.vm_idle_operations(id);
+
+
+--
+-- Name: vm_job_creation_owners vm_job_creation_owners_live_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_creation_owners
+    ADD CONSTRAINT vm_job_creation_owners_live_job_id_fkey FOREIGN KEY (live_job_id) REFERENCES public.jobs(id) ON DELETE SET NULL;
+
+
+--
+-- Name: vm_job_creation_terminal_packets vm_job_creation_terminal_packets_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_creation_terminal_packets
+    ADD CONSTRAINT vm_job_creation_terminal_packets_cleanup_admission_id_fkey FOREIGN KEY (cleanup_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_job_creation_terminal_packets vm_job_creation_terminal_packets_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_creation_terminal_packets
+    ADD CONSTRAINT vm_job_creation_terminal_packets_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.vm_job_creation_owners(job_id);
+
+
+--
+-- Name: vm_job_creation_terminal_packets vm_job_creation_terminal_packets_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_creation_terminal_packets
+    ADD CONSTRAINT vm_job_creation_terminal_packets_request_id_fkey FOREIGN KEY (request_id) REFERENCES public.vm_creation_retries(request_id);
+
+
+--
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_receipts_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
+    ADD CONSTRAINT vm_job_repository_settlement_receipts_cleanup_admission_id_fkey FOREIGN KEY (cleanup_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_receipts_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
+    ADD CONSTRAINT vm_job_repository_settlement_receipts_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.vm_job_creation_owners(job_id);
+
+
+--
+-- Name: vm_job_repository_settlement_receipts vm_job_repository_settlement_receipts_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_repository_settlement_receipts
+    ADD CONSTRAINT vm_job_repository_settlement_receipts_request_id_fkey FOREIGN KEY (request_id) REFERENCES public.vm_creation_retries(request_id);
+
+
+--
+-- Name: vm_job_worker_delivery_bindings vm_job_worker_delivery_bindings_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_worker_delivery_bindings
+    ADD CONSTRAINT vm_job_worker_delivery_bindings_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.vm_job_creation_owners(job_id);
+
+
+--
+-- Name: vm_job_worker_delivery_bindings vm_job_worker_delivery_bindings_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_job_worker_delivery_bindings
+    ADD CONSTRAINT vm_job_worker_delivery_bindings_request_id_fkey FOREIGN KEY (request_id) REFERENCES public.vm_creation_retries(request_id);
 
 
 --

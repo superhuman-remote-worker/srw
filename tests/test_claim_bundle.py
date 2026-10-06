@@ -101,6 +101,15 @@ class FakeDB:
                 return None
             if "SELECT * FROM worker_batch_attempts" in sql:
                 return None
+            if "SELECT * FROM jobs WHERE id=$1 FOR SHARE" in sql:
+                return self._job or getattr(self, "jobs", {}).get(str(_args[0]))
+            if "FROM vm_creation_retries WHERE owner_kind='job'" in sql:
+                return {
+                    "request_id": UUID("99999999-9999-4999-8999-999999999999"),
+                    "provision_generation": _args[1],
+                    "observed_vm_uid": _args[2],
+                    "observed_pvc_uid": _args[3],
+                }
             raise AssertionError(f"unexpected fetchrow SQL: {sql}")
 
         self.conn.fetchrow = AsyncMock(side_effect=_fetchrow)
@@ -125,6 +134,7 @@ class FakeDB:
             raise AssertionError(f"unexpected fetchval SQL: {sql}")
 
         self.conn.fetchval = AsyncMock(side_effect=_fetchval)
+        self.conn.execute = AsyncMock(return_value="INSERT 0 1")
         self.datasource_lock_calls = []
         # Bundle assembly rechecks repository authority the same way it
         # rechecks the lease: nothing current here, so nothing to invalidate.
@@ -1042,7 +1052,10 @@ async def test_worker_vm_bundle_uses_attested_endpoint_and_stamps_host_key_pin(
         "execution_lane": "stateless",
         "config_override": {"workspace": {"backend": "vm"}},
         "context": _worker_vm_context(
-            _ready_worker_vm(),
+            _ready_worker_vm(
+                vm_uid="33333333-3333-4333-8333-333333333333",
+                rootdisk_pvc_uid="55555555-5555-4555-8555-555555555555",
+            ),
             worker_batch_target_wall_seconds=420,
         ),
     }

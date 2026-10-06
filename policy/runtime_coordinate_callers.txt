@@ -13,6 +13,7 @@
 #
 # <file>  <enclosing qualname>  <kind>  <callee>  <fingerprint>  #<ordinal>  <classification>
 
+src/orchestrator/routers/ssh_access.py  internal_ssh_native_first_use  http  client.post  f7f27122753e  #1  exact-runtime-recipient
 src/orchestrator/routers/thread_files.py  upload_files_to_thread  remote-effect  upload_files_to_attested_vm_workspace  8f1a01b30667  #1  fresh-k8s-attestation
 src/orchestrator/services/agent_cloud_mounts.py  _build_agent_cloud_mount  remote-effect  _build_rclone_mount_from_row  0e83b668f377  #1  local-only
 src/orchestrator/services/agent_cloud_mounts.py  _build_agent_cloud_mount  remote-effect  _build_rclone_session_mount  ee81a67b673b  #1  local-only
@@ -85,8 +86,8 @@ src/orchestrator/services/snapshot_service.py  SnapshotService.capture_vm_snapsh
 src/orchestrator/services/snapshot_service.py  SnapshotService.capture_vm_snapshot  remote-effect  create_owned_subprocess_exec  a2b4f48f9bae  #1  vm-authority
 src/orchestrator/services/snapshot_service.py  SnapshotService.capture_vm_snapshot  remote-effect  self.upload_snapshot  8d7e90952645  #1  vm-authority
 src/orchestrator/services/ssh_access.py  parse_ssh_gateway_host_keys  ssh  asyncssh.import_public_key  4fe182bafd50  #1  local-only
-src/orchestrator/services/ssh_gateway_client.py  resolve_target  ssh  SshTarget  2d5328ea1c45  #1  pinned-host-key
-src/orchestrator/services/ssh_gateway_client.py  vm_access  ssh  SshTarget  ebc2e15b9815  #1  pinned-host-key
+src/orchestrator/services/ssh_gateway_client.py  resolve_target  ssh  SshTarget  da2900af6d8b  #1  pinned-host-key
+src/orchestrator/services/ssh_gateway_client.py  vm_access  ssh  SshTarget  0b633dbd89f4  #1  pinned-host-key
 src/orchestrator/services/ssh_gateway_server.py  connect_upstream  socket  asyncssh.connect  463ff14e685e  #1  pinned-host-key
 src/orchestrator/services/ssh_gateway_server.py  connect_upstream  socket  asyncssh.connect  700676d97d8c  #1  pinned-host-key
 src/orchestrator/services/ssh_helpers.py  _scan_pinned_host_key  remote-effect  create_owned_subprocess_exec  5aba5e03ae48  #1  pinned-host-key

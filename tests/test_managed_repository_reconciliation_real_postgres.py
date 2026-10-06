@@ -1253,6 +1253,14 @@ async def test_forced_source_loss_after_authority_activation_is_contained(db):
 async def test_stored_repository_owner_drift_never_mutates_configured_namespace(db):
     job_id = uuid4()
     repo_name = f"job-{str(job_id)[:8]}"
+    # A newly reserved Job authority must have a live owner. The mismatch
+    # check below still runs before any forge operation or lifecycle cleanup.
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs(id,description,status,execution_lane) "
+            "VALUES($1,'repository owner drift','completed','pinned')",
+            job_id,
+        )
     authority = await db.reserve_managed_repository_authority(
         repository_owner="legacy-owner",
         repo_name=repo_name,

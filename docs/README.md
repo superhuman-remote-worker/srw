@@ -12,6 +12,7 @@ notes are intentionally not prerequisites for using the public repository.
 | Evaluate SRW on a Linux workstation | [Local Kubernetes with k3d](local-kubernetes.md) |
 | Prepare K3s on a shared server with separate volume storage | [K3s host preparation](k3s-host-preparation.md) |
 | Install on an existing cluster | [Helm chart guide](../helm/README.md) |
+| Run Jobs and Sessions on your own tools | [Build your own workspace image](workspace-images.md) |
 | Understand the runtime and data flow | [Architecture](architecture.md) |
 | Evaluate the isolation boundary | [Security model](security-model.md) |
 | Understand continuous project work | [Project loops](project-loops.md) |
@@ -26,6 +27,8 @@ notes are intentionally not prerequisites for using the public repository.
   secrets, external services, HA databases, upgrades, and VM workspaces.
 - [SSH access](../ssh-access.md) — connect a terminal or IDE to a live session
   workspace.
+- [Build your own workspace image](workspace-images.md) — add your tools to a
+  workspace image and run Jobs and Sessions on it.
 - [VM capacity diagnostics](vm-capacity.md) — interpret resource inventory,
   retained reservations and unavailable capacity.
 - [Expert configuration](../config/README.md) — configure agent roles, overlays,

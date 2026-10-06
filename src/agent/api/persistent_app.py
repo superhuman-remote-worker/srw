@@ -38,7 +38,14 @@ from fastapi.responses import JSONResponse
 from agent.api import session_transport as _session_transport
 from agent.api._session_auth import SessionAuthBindings
 from agent.api.session_canvas_control import CanvasControlChannel
-from agent.api.session_termination import SessionTerminationCoordinator, SessionTerminationPorts
+from agent.api.session_termination import (
+    SessionTerminationCoordinator,
+    SessionTerminationPorts,
+)
+from agent.api.native_workspace_first_use import (
+    configured_public_keys,
+    register_native_first_use_route,
+)
 from agent.api import session_workspace as _session_workspace
 from agent.api.session_attach import (
     SessionAttachCoordinator,
@@ -455,7 +462,9 @@ _session_attach = SessionAttachCoordinator(
         close_runtime_authorization=lambda: _close_runtime_authorization(),
         clear_canvas=lambda: _canvas_control.clear_all(),
         clear_subscribers=lambda: _subscribers.clear(),
-        side_tasks_active=lambda: any(not task.done() for task in _session_termination.session_side_tasks),
+        side_tasks_active=lambda: any(
+            not task.done() for task in _session_termination.session_side_tasks
+        ),
         quiesce_side_tasks=lambda: _session_termination.quiesce_session_side_tasks(),
         pending_drain_suspend=lambda: _session_termination.pending_drain_suspend,
         event_writer=lambda: _event_writer,
@@ -520,19 +529,28 @@ def _publish_draft_title(value: Any) -> None:
     global _draft_title_value
     _draft_title_value = value
 
+
 # Termination owns retirement, quiescence and its tasks; composition remains here
 # until R3.4. Each port names the collaborator read at invocation time.
 _session_termination = SessionTerminationCoordinator(
     SessionTerminationPorts(
         announced_permissions=lambda: _announced_permission_rows,
         attach=lambda: _session_attach,
-        await_pending_cloud_push=lambda *args, **kwargs: _await_pending_cloud_push(*args, **kwargs),
-        background_push_owns=lambda *args, **kwargs: _background_push_owns(*args, **kwargs),
+        await_pending_cloud_push=lambda *args, **kwargs: _await_pending_cloud_push(
+            *args, **kwargs
+        ),
+        background_push_owns=lambda *args, **kwargs: _background_push_owns(
+            *args, **kwargs
+        ),
         canvas_control=lambda: _canvas_control,
-        close_pinned_control_inbox=lambda *args, **kwargs: _close_pinned_control_inbox(*args, **kwargs),
+        close_pinned_control_inbox=lambda *args, **kwargs: _close_pinned_control_inbox(
+            *args, **kwargs
+        ),
         control_owner_agent_id=lambda: _control_owner_agent_id,
         event_writer=lambda: _event_writer,
-        handle_idle_archive=lambda *args, **kwargs: _handle_idle_archive(*args, **kwargs),
+        handle_idle_archive=lambda *args, **kwargs: _handle_idle_archive(
+            *args, **kwargs
+        ),
         heartbeat_task=lambda: _heartbeat_task,
         identity=lambda: _session_identity,
         idle_timeout_error=IdleTimeoutError,
@@ -544,27 +562,47 @@ _session_termination = SessionTerminationCoordinator(
         officer_config=lambda *args, **kwargs: _officer_cfg(*args, **kwargs),
         orchestrator_client=lambda: _orchestrator_client,
         permission_gates=lambda: _gates_in_flight,
-        publish_active_permission=lambda *args, **kwargs: _publish_active_permission(*args, **kwargs),
-        publish_draft_title=lambda *args, **kwargs: _publish_draft_title(*args, **kwargs),
-        publish_event_writer=lambda *args, **kwargs: _publish_event_writer(*args, **kwargs),
+        publish_active_permission=lambda *args, **kwargs: _publish_active_permission(
+            *args, **kwargs
+        ),
+        publish_draft_title=lambda *args, **kwargs: _publish_draft_title(
+            *args, **kwargs
+        ),
+        publish_event_writer=lambda *args, **kwargs: _publish_event_writer(
+            *args, **kwargs
+        ),
         publish_loop_task=lambda *args, **kwargs: _publish_loop_task(*args, **kwargs),
-        publish_runtime_authorization=lambda *args, **kwargs: _publish_runtime_authorization(*args, **kwargs),
+        publish_runtime_authorization=lambda *args,
+        **kwargs: _publish_runtime_authorization(*args, **kwargs),
         publish_session=lambda *args, **kwargs: _publish_session(*args, **kwargs),
-        registered_pinned_agent_id=lambda *args, **kwargs: _registered_pinned_agent_id(*args, **kwargs),
-        reset_journal_cursor=lambda *args, **kwargs: _reset_event_journal_cursor(*args, **kwargs),
+        registered_pinned_agent_id=lambda *args, **kwargs: _registered_pinned_agent_id(
+            *args, **kwargs
+        ),
+        reset_journal_cursor=lambda *args, **kwargs: _reset_event_journal_cursor(
+            *args, **kwargs
+        ),
         reset_turn_state=lambda *args, **kwargs: _reset_turn_state(*args, **kwargs),
-        retire_announced_permissions=lambda *args, **kwargs: _retire_announced_permission_rows(*args, **kwargs),
+        retire_announced_permissions=lambda *args,
+        **kwargs: _retire_announced_permission_rows(*args, **kwargs),
         session=lambda: _session,
         session_type=PersistentSession,
-        set_cloud_sync_retry_pending=lambda *args, **kwargs: _set_cloud_sync_retry_pending(*args, **kwargs),
-        set_pinned_control_admission=lambda *args, **kwargs: _set_pinned_control_admission(*args, **kwargs),
+        set_cloud_sync_retry_pending=lambda *args,
+        **kwargs: _set_cloud_sync_retry_pending(*args, **kwargs),
+        set_pinned_control_admission=lambda *args,
+        **kwargs: _set_pinned_control_admission(*args, **kwargs),
         stateless_mode=lambda *args, **kwargs: _stateless_mode(*args, **kwargs),
-        stop_control_watcher=lambda *args, **kwargs: _stop_thread_control_watcher(*args, **kwargs),
-        stop_interrupt_watcher=lambda *args, **kwargs: _stop_thread_interrupt_watcher(*args, **kwargs),
+        stop_control_watcher=lambda *args, **kwargs: _stop_thread_control_watcher(
+            *args, **kwargs
+        ),
+        stop_interrupt_watcher=lambda *args, **kwargs: _stop_thread_interrupt_watcher(
+            *args, **kwargs
+        ),
         subscribers=lambda: _subscribers,
         tool_inflight=lambda: _tool_inflight,
         turn_event_open=lambda: _turn_event_open,
-        update_thread_status=lambda *args, **kwargs: _update_thread_status(*args, **kwargs),
+        update_thread_status=lambda *args, **kwargs: _update_thread_status(
+            *args, **kwargs
+        ),
     ),
     logger=logger,
     termination_queue_sentinel=INTERRUPT_SENTINEL,
@@ -883,7 +921,11 @@ def _stateless_mode() -> bool:
 async def _safe_mark_stateless_natural_pause(*, require_untethered: bool) -> bool:
     """Best-effort durable presence oracle for stateless natural pauses."""
 
-    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         return False
     lease_token = _session_identity.stateless_lease_token()
     if lease_token is None:
@@ -1083,7 +1125,10 @@ def _protected_cloud_runtime_ready() -> bool:
 
 
 def _runtime_input_admission_open() -> bool:
-    return not _session_termination.runtime_admission_closed() and _protected_cloud_runtime_ready()
+    return (
+        not _session_termination.runtime_admission_closed()
+        and _protected_cloud_runtime_ready()
+    )
 
 
 def _session_ready() -> bool:
@@ -1317,12 +1362,7 @@ def _aux_health_for_heartbeat() -> Optional[Dict[str, Any]]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize persistent agent, register with orchestrator, start heartbeat."""
-    global \
-        _agent, \
-        _session, \
-        _orchestrator_client, \
-        _heartbeat_task, \
-        _started_at
+    global _agent, _session, _orchestrator_client, _heartbeat_task, _started_at
 
     _started_at = datetime.now()
     stateless = _stateless_mode()
@@ -1390,7 +1430,9 @@ async def lifespan(app: FastAPI):
                     )
                     if created_id:
                         _session_identity.bind_thread(created_id)
-                        logger.info(f"Auto-created thread: {_session_identity.thread_id}")
+                        logger.info(
+                            f"Auto-created thread: {_session_identity.thread_id}"
+                        )
                     else:
                         logger.warning(
                             "Failed to create thread — generating local UUID"
@@ -1444,7 +1486,9 @@ async def lifespan(app: FastAPI):
             # Exit cleanly so this orphan pod leaves the per-session Service
             # endpoints; the winning agent keeps serving and the orchestrator
             # does not rebind (the binding already exists). Does not return.
-            await _session_termination.exit_duplicate_provision(_session_identity.thread_id)
+            await _session_termination.exit_duplicate_provision(
+                _session_identity.thread_id
+            )
         except SessionEnded:
             await _session_termination.exit_session_ended(_session_identity.thread_id)
         except Exception as e:
@@ -1996,7 +2040,9 @@ def _llm_config_with_cache_key(llm_cfg: Any) -> Any:
         return llm_cfg
     import dataclasses
 
-    return dataclasses.replace(llm_cfg, prompt_cache_key=f"srw-thread-{_session_identity.thread_id}")
+    return dataclasses.replace(
+        llm_cfg, prompt_cache_key=f"srw-thread-{_session_identity.thread_id}"
+    )
 
 
 # A dedicated Pod (``--thread-id``; the provisioner stamps
@@ -2134,7 +2180,9 @@ def session_transport_bindings() -> SessionTransportBindings:
                 subscribe=lambda client_id: _subscribe(client_id),
                 unsubscribe=lambda client_id: _unsubscribe(client_id),
                 note_connection_arrived=lambda: _session_termination.signal_ws_connected(),
-                track_side_task=lambda task: _session_termination.track_session_side_task(task),
+                track_side_task=lambda task: _session_termination.track_session_side_task(
+                    task
+                ),
             ),
             welcome=SessionWelcomePorts(
                 durable_control_modes=lambda: _durable_session_control_modes(),
@@ -2179,6 +2227,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         version="1.0.0",
         lifespan=lifespan,
     )
+    register_native_first_use_route(app, native_first_use_context)
 
     # --- Health endpoints (same pattern as worker) ---
 
@@ -2216,7 +2265,9 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             0.0,
             float(os.environ.get("PERSISTENT_TERMINATION_DRAIN_SECONDS", "165")),
         )
-        parked = await _session_termination.wait_for_termination_quiescence(timeout_seconds)
+        parked = await _session_termination.wait_for_termination_quiescence(
+            timeout_seconds
+        )
         if not parked:
             logger.error(
                 "Persistent termination grace expired before the current turn "
@@ -2268,6 +2319,8 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         }
         if _pinned_session_recipient_capable():
             capabilities["pinned_session_recipient_binding"] = True
+        if _native_first_use_capable():
+            capabilities["native_workspace_first_use1"] = True
         return JSONResponse(
             {
                 "ready": is_ready,
@@ -2315,10 +2368,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             if isinstance(request, dict)
             else None
         )
-        if (
-            expected is None
-            or _session_identity.fingerprint() != expected
-        ):
+        if expected is None or _session_identity.fingerprint() != expected:
             return JSONResponse(
                 {"error": "session_identity_mismatch", "retryable": True},
                 status_code=409,
@@ -2383,10 +2433,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             if isinstance(request, dict)
             else None
         )
-        if (
-            expected is None
-            or _session_identity.fingerprint() != expected
-        ):
+        if expected is None or _session_identity.fingerprint() != expected:
             return JSONResponse(
                 {"error": "session_identity_mismatch", "retryable": True},
                 status_code=409,
@@ -2398,7 +2445,9 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         try:
             result = await _session_termination.terminate("rest_detach")
             if result == "actuator_requested":
-                return JSONResponse({"status": "ending", "thread_id": thread_id}, status_code=202)
+                return JSONResponse(
+                    {"status": "ending", "thread_id": thread_id}, status_code=202
+                )
             return JSONResponse(
                 {
                     "status": "detached",
@@ -2534,7 +2583,10 @@ async def _loop_runtime_authority_current(
     def local_authority_open() -> bool:
         return bool(
             not _session_termination.termination_admission_closed()
-            and (allow_retirement_settlement or not _session_termination.retirement_admission_closed())
+            and (
+                allow_retirement_settlement
+                or not _session_termination.retirement_admission_closed()
+            )
         )
 
     if not local_authority_open() or not _protected_cloud_runtime_ready():
@@ -2565,7 +2617,8 @@ async def _loop_runtime_authority_current(
             session is _session
             and authority is not None
             and authority_after == authority
-            and str(authority.parent_thread_id) == str(_session_identity.thread_id or "")
+            and str(authority.parent_thread_id)
+            == str(_session_identity.thread_id or "")
         )
         if current is not True and same_local_life:
             # Wake the executor immediately when the DB rejects a lease whose
@@ -2682,7 +2735,11 @@ def _subscribe(client_id: str) -> asyncio.Queue:
     queue = _session_transport.subscribe(
         _subscribers, client_id, maxsize=_SUBSCRIBER_QUEUE_MAXSIZE
     )
-    if was_empty and _orchestrator_client is not None and _session_identity.thread_id is not None:
+    if (
+        was_empty
+        and _orchestrator_client is not None
+        and _session_identity.thread_id is not None
+    ):
         _session_termination.track_session_side_task(
             asyncio.create_task(
                 _safe_set_thread_status("active"), name="phase5-revert-active"
@@ -2710,7 +2767,9 @@ async def _file_officer_wake(minutes: int, reason: str) -> None:
     try:
         if _orchestrator_client is None or _session_identity.thread_id is None:
             return
-        ok = await _orchestrator_client.file_officer_wake(_session_identity.thread_id, minutes, reason)
+        ok = await _orchestrator_client.file_officer_wake(
+            _session_identity.thread_id, minutes, reason
+        )
         if not ok:
             logger.warning(
                 "Officer wake filing rejected for thread %s "
@@ -3872,6 +3931,32 @@ def _pinned_session_recipient_capable() -> bool:
     )
 
 
+def native_first_use_context() -> dict[str, Any]:
+    """Call-time exact pinned authority for dedicated and dual Session apps."""
+
+    return {
+        "session": _session,
+        "identity": _session_identity,
+        "termination": _session_termination,
+        "agent_id": _registered_pinned_agent_id(),
+        "pod_uid": environment_pod_uid(),
+        "process_generation": getattr(
+            _orchestrator_client, "dispatch_process_generation", None
+        ),
+        "public_keys": configured_public_keys(),
+    }
+
+
+def _native_first_use_capable() -> bool:
+    return bool(
+        _pinned_session_recipient_capable()
+        and environment_pod_uid()
+        and configured_public_keys()
+        and not _stateless_mode()
+        and _officer_cfg() is None
+    )
+
+
 def _pinned_session_recipient_refusal(
     body: Any,
     *,
@@ -3998,7 +4083,9 @@ async def _finalize_durable_control(
                 lease_token=lease_token,
                 agent_id=agent_id,
                 runtime_generation=(
-                    _session_identity.session_generation if agent_id is not None else None
+                    _session_identity.session_generation
+                    if agent_id is not None
+                    else None
                 ),
                 runtime_attach_token=(
                     _session_identity.attach_token if agent_id is not None else None
@@ -4025,7 +4112,11 @@ async def _reconcile_durable_control_scalars(
 
     if (lease_token is None) == (agent_id is None):
         raise ValueError("exactly one control owner credential is required")
-    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         raise EventJournalUnavailable("control scalar reconciliation lost session")
 
     async with _session.postgres_conn.acquire() as conn:
@@ -4036,7 +4127,9 @@ async def _reconcile_durable_control_scalars(
                 lease_token=lease_token,
                 agent_id=agent_id,
                 runtime_generation=(
-                    _session_identity.session_generation if agent_id is not None else None
+                    _session_identity.session_generation
+                    if agent_id is not None
+                    else None
                 ),
                 runtime_attach_token=(
                     _session_identity.attach_token if agent_id is not None else None
@@ -4072,7 +4165,11 @@ async def _set_pinned_control_admission(
     the binding; database failures raise and must not be treated as closure.
     """
 
-    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         raise EventJournalUnavailable("control admission gate lost session")
     runtime_generation = _session_identity.session_generation
     runtime_attach_token = _session_identity.attach_token
@@ -4208,7 +4305,9 @@ async def _drain_thread_controls(
     if (lease_token is None) == (agent_id is None):
         raise ValueError("exactly one control owner credential is required")
 
-    runtime_generation = _session_identity.session_generation if agent_id is not None else None
+    runtime_generation = (
+        _session_identity.session_generation if agent_id is not None else None
+    )
     runtime_attach_token = (
         _session_identity.attach_token if agent_id is not None else None
     )
@@ -4218,7 +4317,11 @@ async def _drain_thread_controls(
     applied = 0
     async with _control_drain_lock:
         while True:
-            if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
+            if (
+                _session is None
+                or _session.postgres_conn is None
+                or _session_identity.thread_id is None
+            ):
                 return applied
             if lease_token is not None:
                 handle = _current_lease_var.get()
@@ -4577,7 +4680,11 @@ async def _start_thread_control_watcher(
             open_for_admission=False,
         )
     await _stop_thread_control_watcher()
-    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         raise EventJournalUnavailable("cannot start control owner without a session")
 
     _control_owner_lease_token = int(lease_token) if lease_token is not None else None
@@ -4677,7 +4784,11 @@ async def _finalize_durable_interrupt(
 
     from shared.thread_interrupts import finalize_interrupt_request
 
-    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         return "lost_owner"
     async with _session.postgres_conn.acquire() as conn:
         async with conn.transaction():
@@ -4715,7 +4826,11 @@ async def _drain_thread_interrupts(*, lease_token: int, target_turn_id: int) -> 
     applied_count = 0
     async with _interrupt_drain_lock:
         while True:
-            if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
+            if (
+                _session is None
+                or _session.postgres_conn is None
+                or _session_identity.thread_id is None
+            ):
                 return applied_count
             handle = _current_lease_var.get()
             if (
@@ -4859,7 +4974,11 @@ async def _rotate_thread_interrupt_recovery_epoch(*, lease_token: int) -> int:
 
     global _event_writer, _events_epoch, _next_seq
 
-    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         raise EventJournalUnavailable("interrupt epoch recovery lost its session")
     handle = _current_lease_var.get()
     if (
@@ -4990,7 +5109,11 @@ async def _reconcile_stale_thread_interrupts(
 
     reconciled = 0
     async with _interrupt_drain_lock:
-        if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
+        if (
+            _session is None
+            or _session.postgres_conn is None
+            or _session_identity.thread_id is None
+        ):
             return reconciled, None
         while True:
             handle = _current_lease_var.get()
@@ -5352,7 +5475,11 @@ async def _start_thread_interrupt_watcher_locked(
     global _interrupt_owner_lease_token, _interrupt_owner_turn_id
 
     await _stop_thread_interrupt_watcher_locked()
-    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         raise EventJournalUnavailable("cannot start interrupt owner without a session")
     _interrupt_owner_lease_token = int(lease_token)
     _interrupt_owner_turn_id = int(target_turn_id)
@@ -5474,7 +5601,11 @@ def _invalidate_session_recent_read(path: str) -> None:
 async def _current_canvas_for_control() -> dict[str, Any] | None:
     """Load authoritative Canvas state with the attached delegated owner."""
 
-    if _session is None or _session_identity.thread_id is None or _session.tool_context is None:
+    if (
+        _session is None
+        or _session_identity.thread_id is None
+        or _session.tool_context is None
+    ):
         return None
     context = _session.tool_context
     user_id = str(context.user_id or "").strip()
@@ -5826,7 +5957,11 @@ async def _insert_permission_request(
     tool_call_id: str, tool_name: str, tool_args: Dict[str, Any]
 ) -> Optional[str]:
     """INSERT a pending row and return its UUID. None on failure."""
-    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         return None
     try:
         async with _session.postgres_conn.acquire() as conn:
@@ -5944,7 +6079,11 @@ async def _has_terminal_permission_decision(tool_call_id: str) -> bool:
     the pre-batch behavior — the per-call gate path still inserts and gates
     — rather than blocking the announce.
     """
-    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         return False
     try:
         async with _session.postgres_conn.acquire() as conn:
@@ -6212,7 +6351,11 @@ async def _loop_announce_permission_batch(tool_calls: List[Dict[str, Any]]) -> N
         # ledger nothing can tell a row that was answered from one the turn
         # walked away from. Stamped with the announcing thread so a later
         # session in this same process can never sweep it.
-        _announced_permission_rows[tool_call_id] = (request_id, tool_name, _session_identity.thread_id)
+        _announced_permission_rows[tool_call_id] = (
+            request_id,
+            tool_name,
+            _session_identity.thread_id,
+        )
         requests.append(
             {
                 "id": tool_call_id,
@@ -6239,7 +6382,11 @@ async def _pending_permission_requests() -> List[Dict[str, Any]]:
     Soft-fails to ``[]``: a welcome frame must still go out if this lookup
     breaks.
     """
-    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         return []
     try:
         async with _session.postgres_conn.acquire() as conn:
@@ -6544,7 +6691,11 @@ async def _resolve_pending_permission(
     """UPDATE a pending permission row by id, or the most-recent-pending if
     no id given. Returns the resolved row dict or None if not found / no
     pending request matched."""
-    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         return None
     if decision not in ("approved", "denied"):
         return None
@@ -6657,7 +6808,10 @@ async def _loop_permission_check(
         # claim that row instead of inserting a second one for the same
         # tool_call_id (there is no unique constraint to stop a duplicate).
         claimed_request_id: Optional[str] = None
-        if _session.postgres_conn is not None and _session_identity.thread_id is not None:
+        if (
+            _session.postgres_conn is not None
+            and _session_identity.thread_id is not None
+        ):
             try:
                 async with _session.postgres_conn.acquire() as conn:
                     existing = await conn.fetchrow(
@@ -7530,7 +7684,9 @@ async def _retry_cloud_sync_start(turn_id: int) -> None:
         _cloud_sync_retry_pending = False
         return
     try:
-        ws_info = await _orchestrator_client.get_thread_workspace(_session_identity.thread_id)
+        ws_info = await _orchestrator_client.get_thread_workspace(
+            _session_identity.thread_id
+        )
     except Exception:
         return
     if not ws_info:
@@ -7703,7 +7859,9 @@ def _wire_session_aux_archiver() -> None:
         archiver = get_archiver()
         if archiver is not None:
             _session.auxiliary_llm.set_job_context(
-                archiver=archiver, job_id=_session_identity.thread_id, agent_type="persistent"
+                archiver=archiver,
+                job_id=_session_identity.thread_id,
+                agent_type="persistent",
             )
     except Exception as e:
         logger.debug(f"Could not wire session aux archiver (non-fatal): {e}")
@@ -7769,10 +7927,16 @@ async def _loop_on_workspace_commit(sha: str) -> None:
     Best-effort: a miss only degrades rewind code-restore granularity for
     this turn (the resolver falls back to the previous mapped commit).
     """
-    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         return
     try:
-        await _session.postgres_conn.record_turn_commit(_session_identity.thread_id, sha)
+        await _session.postgres_conn.record_turn_commit(
+            _session_identity.thread_id, sha
+        )
     except Exception:
         logger.warning("record_turn_commit failed (non-fatal)", exc_info=True)
 
@@ -8041,7 +8205,11 @@ async def _loop_on_turn_complete_body(
     # turn-start hook (e.g. workspace_sync.error) can tear down the WS before
     # the title frame is flushed, leaving the cockpit header stuck on
     # "Untitled Session" until a manual refetch.
-    if turn_id <= 3 and _session.postgres_conn and not _session_termination.termination_admission_closed():
+    if (
+        turn_id <= 3
+        and _session.postgres_conn
+        and not _session_termination.termination_admission_closed()
+    ):
         await _auto_title_after_first_turn()
 
     # Phase 1 of cloud_collaboration_model.md §9: push the agent's edits to
@@ -8181,7 +8349,11 @@ async def _loop_persist_message(msg: Any) -> bool:
     ``_session.turn_count`` for the turn number — the loop callback carries no
     turn id (same convention as ``_record_compaction``).
     """
-    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         return False
     try:
         await asyncio.wait_for(
@@ -8332,7 +8504,12 @@ async def _persist_compaction_checkpoint(
     or thread). On the stateless lane the row is fenced by the current lease
     (``save_thread_message``), so a lost lease raises ``LeaseLostError``.
     """
-    if not (summary_text and _session and _session.postgres_conn and _session_identity.thread_id):
+    if not (
+        summary_text
+        and _session
+        and _session.postgres_conn
+        and _session_identity.thread_id
+    ):
         return False
     turn = _session.turn_count
     # Type-guard: defensive against an unexpected turn_count type so an
@@ -8660,7 +8837,12 @@ async def _restore_session_messages() -> None:
     view (cockpit reads it via a separate orchestrator-side query); only the
     in-memory LLM context is bounded.
     """
-    if not _session or not _agent or not _agent.postgres_conn or not _session_identity.thread_id:
+    if (
+        not _session
+        or not _agent
+        or not _agent.postgres_conn
+        or not _session_identity.thread_id
+    ):
         return
 
     try:
@@ -8675,7 +8857,9 @@ async def _restore_session_messages() -> None:
             _session.config.context_management, "max_summary_length", 10000
         )
 
-        ckpt = await _agent.postgres_conn.get_latest_compaction_checkpoint(_session_identity.thread_id)
+        ckpt = await _agent.postgres_conn.get_latest_compaction_checkpoint(
+            _session_identity.thread_id
+        )
         boundary_turn = ckpt.get("boundary_turn") if ckpt else None
         boundary_seq = ckpt.get("boundary_seq") if ckpt else None
 
@@ -9099,7 +9283,11 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
     async def _err(message: str) -> None:
         await _ws_send(ws, "error", {"message": message, "request_id": request_id})
 
-    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         await _err("Session no longer active")
         return
     mode = data.get("mode", "conversation")
@@ -9150,7 +9338,11 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
         # out-of-band teardown (drain, watchdog, REST detach) to tear the
         # session down underneath us. Re-validate before touching anything
         # that assumes it's still alive.
-        if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
+        if (
+            _session is None
+            or _session.postgres_conn is None
+            or _session_identity.thread_id is None
+        ):
             await _err("Session no longer active")
             return
 
@@ -9172,7 +9364,9 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                     "unavailable (conversation-only rewind still works)"
                 )
                 return
-            restored_to_sha = await conn.resolve_restore_commit(_session_identity.thread_id, from_seq)
+            restored_to_sha = await conn.resolve_restore_commit(
+                _session_identity.thread_id, from_seq
+            )
             if not restored_to_sha:
                 await _err(
                     "No workspace checkpoint exists before this message — "
@@ -9208,7 +9402,9 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                 # would resolve to the abandoned tree instead of the one we
                 # just restored to.
                 try:
-                    await conn.record_turn_commit(_session_identity.thread_id, restore_commit_sha)
+                    await conn.record_turn_commit(
+                        _session_identity.thread_id, restore_commit_sha
+                    )
                 except Exception:
                     logger.warning(
                         "record_turn_commit failed after rewind restore (non-fatal)",
@@ -9274,7 +9470,9 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                 #     normal run with no stragglers sweeps 0 rows. Not a
                 #     second apply_rewind: that would append a duplicate
                 #     thread_rewinds ledger row for the same rewind.
-                stray_count = await conn.resweep_rewind(_session_identity.thread_id, from_seq)
+                stray_count = await conn.resweep_rewind(
+                    _session_identity.thread_id, from_seq
+                )
                 if stray_count > 0:
                     logger.warning(
                         "Rewind resweep caught %d stray row(s) written during "
@@ -9304,7 +9502,9 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                     if old_writer is not None:
                         _event_writer = None
                         await old_writer.close()
-                    _events_epoch = await _bump_event_journal_epoch(conn, _session_identity.thread_id)
+                    _events_epoch = await _bump_event_journal_epoch(
+                        conn, _session_identity.thread_id
+                    )
                     _next_seq = 0
                     new_writer = _OrderedPersistentEventWriter(
                         postgres_conn=conn,
@@ -9322,7 +9522,10 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                         "Rewind epoch bump failed — viewers repaint on next attach",
                         exc_info=True,
                     )
-                    if _event_writer is None and _session_identity.thread_id is not None:
+                    if (
+                        _event_writer is None
+                        and _session_identity.thread_id is not None
+                    ):
                         # Keep journaling alive under the still-current epoch
                         # rather than leaving the rest of the session
                         # unjournaled because the bump failed.
@@ -9333,7 +9536,9 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                                 epoch=_events_epoch,
                                 on_terminal_failure=_event_persistence_failed,
                                 pinned_agent_id=_registered_pinned_agent_id(),
-                                pinned_runtime_generation=(_session_identity.session_generation),
+                                pinned_runtime_generation=(
+                                    _session_identity.session_generation
+                                ),
                                 pinned_runtime_attach_token=(
                                     _session_identity.attach_token
                                 ),
@@ -9662,7 +9867,11 @@ async def _apply_compact_control(
     if lease_token is None:
         # Admission keeps compact off the pinned inbox (it has a socket verb).
         return "control.rejected", "rejected", "unsupported_control", {}
-    if _session is None or _session.postgres_conn is None or _session_identity.thread_id is None:
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
         raise ControlInboxBlocked(f"compaction lost its session: {request.id}")
 
     request_id = str(request.id)
@@ -10101,7 +10310,9 @@ async def _handle_config_update(
         # internal endpoint re-injects them per fetch.
         new_ds_payload: Optional[List[Dict[str, Any]]] = None
         if ds_update:
-            ws_info = await _orchestrator_client.get_thread_workspace(_session_identity.thread_id)
+            ws_info = await _orchestrator_client.get_thread_workspace(
+                _session_identity.thread_id
+            )
             if not isinstance(ws_info, dict):
                 await _send_error(
                     "Session connector update could not be applied",
@@ -10425,7 +10636,9 @@ async def _handle_archive(ws: WebSocket) -> None:
         # 2. Generate title if untitled
         if _session.postgres_conn:
             try:
-                thread = await _session.postgres_conn.get_thread(_session_identity.thread_id)
+                thread = await _session.postgres_conn.get_thread(
+                    _session_identity.thread_id
+                )
                 current = thread.get("title", "") if thread else ""
                 if (
                     not current
@@ -10453,10 +10666,14 @@ async def _handle_archive(ws: WebSocket) -> None:
         # a low-latency echo for the command issuer after settlement succeeds.
         result = await _session_termination.terminate("archive")
         if result == "actuator_requested":
-            await _ws_send(ws, "session.ending", {
-                "thread_id": archived_thread_id,
-                "session_runtime_generation": archived_runtime_generation,
-            })
+            await _ws_send(
+                ws,
+                "session.ending",
+                {
+                    "thread_id": archived_thread_id,
+                    "session_runtime_generation": archived_runtime_generation,
+                },
+            )
             return
         terminal_params = {
             "thread_id": archived_thread_id,
@@ -10568,9 +10785,12 @@ async def _update_thread_status(
                     identity = _session_identity.retirement_identity()
                     if (
                         identity is None
-                        or _session_termination.retirement_admission_identity != identity
-                        or _session_termination.retirement_admission_disposition != retirement_disposition
-                        or _session_termination.retirement_admission_permanent is not retirement_permanent
+                        or _session_termination.retirement_admission_identity
+                        != identity
+                        or _session_termination.retirement_admission_disposition
+                        != retirement_disposition
+                        or _session_termination.retirement_admission_permanent
+                        is not retirement_permanent
                         or runtime_retirement_token is None
                         or _session is None
                     ):
@@ -10815,7 +11035,9 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
         # 1. Generate title if untitled
         if _session.postgres_conn:
             try:
-                thread = await _session.postgres_conn.get_thread(_session_identity.thread_id)
+                thread = await _session.postgres_conn.get_thread(
+                    _session_identity.thread_id
+                )
                 current = thread.get("title", "") if thread else ""
                 if (
                     not current
@@ -11043,7 +11265,9 @@ async def _handle_workspace_upgrade(
             )
         else:
             ws_config = await _session_workspace.poll_workspace_ready(
-                _orchestrator_client, _session_identity.thread_id, timeout=300,
+                _orchestrator_client,
+                _session_identity.thread_id,
+                timeout=300,
                 session_runtime_generation=None,
             )
         if not ws_config or not ws_config.get("remote"):
@@ -11054,7 +11278,9 @@ async def _handle_workspace_upgrade(
             # `kubectl delete` (workspace_tier_upgrade.md Q7). Best-effort.
             if target_tier == "vm":
                 try:
-                    await _orchestrator_client.abort_thread_vm_upgrade(_session_identity.thread_id)
+                    await _orchestrator_client.abort_thread_vm_upgrade(
+                        _session_identity.thread_id
+                    )
                 except Exception as e:
                     logger.warning(
                         f"VM abort/teardown after failed upgrade ({_session_identity.thread_id}): {e}"
@@ -11170,7 +11396,9 @@ async def _handle_workspace_upgrade(
         #     a remount failure must not abort the otherwise-successful upgrade.
         #     See knowledge-base/knowledge/issues/workspace_upgrade_drops_cloud_mount.md.
         try:
-            _ws_info = await _orchestrator_client.get_thread_workspace(_session_identity.thread_id)
+            _ws_info = await _orchestrator_client.get_thread_workspace(
+                _session_identity.thread_id
+            )
             _fresh_cloud_mount = _ws_info.get("cloud_mount") if _ws_info else None
             if _fresh_cloud_mount:
                 if _session.cloud_mount_manager is not None:
@@ -11189,7 +11417,9 @@ async def _handle_workspace_upgrade(
                         },
                     )
         except Exception as e:
-            logger.warning(f"Cloud remount after upgrade failed ({_session_identity.thread_id}): {e}")
+            logger.warning(
+                f"Cloud remount after upgrade failed ({_session_identity.thread_id}): {e}"
+            )
 
         _session.resetup_tools_for_backend()
 
@@ -11230,7 +11460,9 @@ async def _handle_workspace_upgrade(
         )
 
     except Exception as e:
-        logger.exception(f"Workspace upgrade failed for thread {_session_identity.thread_id}")
+        logger.exception(
+            f"Workspace upgrade failed for thread {_session_identity.thread_id}"
+        )
         # A failure AFTER the vm was provisioned (e.g. the seed or swap step,
         # once vm_status was already ready) would otherwise leak the running VM —
         # only the poll-timeout path tore it down before. Tear it down here too
@@ -11238,7 +11470,9 @@ async def _handle_workspace_upgrade(
         # ready VM (workspace_tier_upgrade.md Q7).
         if target_tier == "vm" and _orchestrator_client is not None:
             try:
-                await _orchestrator_client.abort_thread_vm_upgrade(_session_identity.thread_id)
+                await _orchestrator_client.abort_thread_vm_upgrade(
+                    _session_identity.thread_id
+                )
             except Exception as ee:
                 logger.warning(
                     f"VM teardown after upgrade failure ({_session_identity.thread_id}): {ee}"
@@ -11527,9 +11761,15 @@ async def _write_title_if_placeholder(
     untouched. Returns True iff the title was written.
     """
     session = expected_session if expected_session is not None else _session
-    thread_id = expected_thread_id if expected_thread_id is not None else _session_identity.thread_id
+    thread_id = (
+        expected_thread_id
+        if expected_thread_id is not None
+        else _session_identity.thread_id
+    )
     generation = (
-        expected_generation if expected_generation is not None else _session_identity.attach_generation
+        expected_generation
+        if expected_generation is not None
+        else _session_identity.attach_generation
     )
     if not title or not session or not session.postgres_conn or not thread_id:
         return False
@@ -11601,7 +11841,11 @@ async def _early_title_from_prompt(
     global _draft_title_value
     try:
         session = expected_session if expected_session is not None else _session
-        thread_id = expected_thread_id if expected_thread_id is not None else _session_identity.thread_id
+        thread_id = (
+            expected_thread_id
+            if expected_thread_id is not None
+            else _session_identity.thread_id
+        )
         generation = (
             expected_generation
             if expected_generation is not None
@@ -11646,7 +11890,11 @@ async def _auto_title_after_first_turn() -> None:
     """
     global _draft_title_value
     try:
-        if not _session or not _session.postgres_conn or not _session_identity.thread_id:
+        if (
+            not _session
+            or not _session.postgres_conn
+            or not _session_identity.thread_id
+        ):
             return
         thread = await _session.postgres_conn.get_thread(_session_identity.thread_id)
         current = thread.get("title", "") if thread else ""

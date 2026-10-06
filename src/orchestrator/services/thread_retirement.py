@@ -2798,11 +2798,33 @@ async def archive_and_cleanup_workspace(
         ws_ctx = _get_container_context(job)
         vm_ctx = _get_vm_context(job)
 
+        never_issued_terminal = False
+        if (
+            job.get("status") == "cancelled"
+            and job.get("execution_lane") == "stateless"
+            and isinstance(raw_context, dict)
+            and raw_context.get("_stateless_cancel_cleanup_pending") is True
+            and isinstance(vm_ctx, dict)
+            and vm_ctx.get("status") == "waiting_creation_configuration"
+            and vm_ctx.get("preparation_request") is None
+            and vm_ctx.get("vm_uid") is None
+            and vm_ctx.get("rootdisk_pvc_uid") is None
+        ):
+            # No controller probe can prove this pre-configuration negative.
+            # The store commits the exact source and parent under the normal
+            # recovery locks; any ambiguity leaves the Cancel marker intact.
+            await recovery_store.settle_never_issued_job_terminal(
+                entity_id,
+                provision_generation=vm_ctx.get("provision_generation"),
+            )
+            never_issued_terminal = True
+            actions.append("never-issued vm generation settled")
+
         # A controller may have stopped the VM and marked its context deleting
         # before the parent admission/compute charge committed. Replay that
         # same exact terminal admission until authenticated absence settles it.
         pending_terminal_vm_cleanup = False
-        if vm_ctx and not _vm_needs_release(vm_ctx):
+        if vm_ctx and not never_issued_terminal and not _vm_needs_release(vm_ctx):
             async with postgres_db.acquire() as conn:
                 pending_terminal_vm_cleanup = bool(await conn.fetchval(
                     "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
@@ -2814,7 +2836,7 @@ async def archive_and_cleanup_workspace(
                 ))
 
         # VM cleanup (snapshot + delete)
-        if _vm_needs_release(vm_ctx) or pending_terminal_vm_cleanup:
+        if not never_issued_terminal and (_vm_needs_release(vm_ctx) or pending_terminal_vm_cleanup):
             if vm_provisioner.lifecycle_available:
                 teardown_identity = await vm_provisioner.capture_vm_teardown_identity(
                     entity_id

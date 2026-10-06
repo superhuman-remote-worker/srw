@@ -14,10 +14,12 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 from uuid import UUID
 
+import asyncpg
 from fastapi import HTTPException
 from typing_extensions import NotRequired, TypedDict
 
 from shared.operator_pause_hold import operator_pause_hold_present
+from orchestrator.database.postgres import JobVMAuditNotReady
 from orchestrator.services.manifest_runtime_ownership import (
     require_srw_runtime,
     uses_srw_runtime,
@@ -47,7 +49,9 @@ def _terminal_vm_needs_release(job: dict[str, Any]) -> bool:
         return False
     return bool(
         isinstance(context, dict)
-        and vm_needs_release(context.get("vm") if isinstance(context.get("vm"), dict) else None)
+        and vm_needs_release(
+            context.get("vm") if isinstance(context.get("vm"), dict) else None
+        )
     )
 
 
@@ -136,25 +140,32 @@ class JobControlOperations:
         """
         d = self.dependencies
         candidates = await d.store.list_terminal_vm_cleanup_jobs(
-            limit=limit, after_id=self._terminal_vm_cleanup_cursor,
+            limit=limit,
+            after_id=self._terminal_vm_cleanup_cursor,
         )
         if not candidates and self._terminal_vm_cleanup_cursor is not None:
             self._terminal_vm_cleanup_cursor = None
             candidates = await d.store.list_terminal_vm_cleanup_jobs(
-                limit=limit, after_id=None,
+                limit=limit,
+                after_id=None,
             )
         if not candidates:
             return 0
         self._terminal_vm_cleanup_cursor = str(candidates[-1]["id"])
         # Distinct rows have distinct per-Job locks. A slow snapshot must not
         # delay another candidate in this bounded batch.
-        return sum(await asyncio.gather(*(
-            self._reconcile_terminal_vm_cleanup_bounded(candidate)
-            for candidate in candidates
-        )))
+        return sum(
+            await asyncio.gather(
+                *(
+                    self._reconcile_terminal_vm_cleanup_bounded(candidate)
+                    for candidate in candidates
+                )
+            )
+        )
 
     async def _reconcile_terminal_vm_cleanup_bounded(
-        self, candidate: dict[str, Any],
+        self,
+        candidate: dict[str, Any],
     ) -> int:
         try:
             return await asyncio.wait_for(
@@ -186,15 +197,15 @@ class JobControlOperations:
                 if (
                     not isinstance(marker, dict)
                     or marker.get("version") != 1
-                    or marker.get("source") != (
-                        "cancel" if job["status"] == "cancelled" else "approve"
-                    )
+                    or marker.get("source")
+                    != ("cancel" if job["status"] == "cancelled" else "approve")
                     or not isinstance(vm, dict)
                     or marker.get("provision_generation")
-                        != vm.get("provision_generation")
+                    != vm.get("provision_generation")
                 ):
                     d.logger.warning(
-                        "Terminal Job VM cleanup marker changed for %s", job_id,
+                        "Terminal Job VM cleanup marker changed for %s",
+                        job_id,
                     )
                     return 0
             if (
@@ -205,7 +216,8 @@ class JobControlOperations:
                 if not await self.cascade_cancel_to_children(job_id):
                     return 0
                 if await self.wait_for_stateless_cancel_settle(
-                    job_id, timeout_seconds=0,
+                    job_id,
+                    timeout_seconds=0,
                 ):
                     return 1
                 return 0
@@ -214,7 +226,9 @@ class JobControlOperations:
                     return 0
                 fresh = await d.store.get_job(job_id)
                 if not fresh or fresh.get("status") not in {
-                    "completed", "failed", "cancelled",
+                    "completed",
+                    "failed",
+                    "cancelled",
                 }:
                     return 0
                 fresh_context = fresh.get("context") or {}
@@ -222,12 +236,17 @@ class JobControlOperations:
                     fresh_context = json.loads(fresh_context)
                 if not isinstance(fresh_context, dict):
                     return 0
-                if marker is not None and fresh_context.get(
-                    "_job_terminal_vm_cleanup"
-                ) != marker:
+                if (
+                    marker is not None
+                    and fresh_context.get("_job_terminal_vm_cleanup") != marker
+                ):
                     return 0
-                if marker is not None and await d.store.complete_terminal_vm_cleanup_marker(
-                    job_id, expected_generation=marker["provision_generation"],
+                if (
+                    marker is not None
+                    and await d.store.complete_terminal_vm_cleanup_marker(
+                        job_id,
+                        expected_generation=marker["provision_generation"],
+                    )
                 ):
                     # A completed exact parent may have survived a crash just
                     # before marker finalization. Never restart its teardown.
@@ -240,8 +259,12 @@ class JobControlOperations:
                         # Checkpoint pruning precedes workspace retirement.
                         await d.store.delete_checkpoint_thread(job_id)
                 await d.archive_and_cleanup_workspace(job_id)
-                if marker is not None and not await d.store.complete_terminal_vm_cleanup_marker(
-                    job_id, expected_generation=marker["provision_generation"],
+                if (
+                    marker is not None
+                    and not await d.store.complete_terminal_vm_cleanup_marker(
+                        job_id,
+                        expected_generation=marker["provision_generation"],
+                    )
                 ):
                     return 0
                 return 1
@@ -406,6 +429,18 @@ class JobControlOperations:
                     else "Job deleted. This job had no durable backlog-ticket claim."
                 ),
             }
+        except JobVMAuditNotReady as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="VM Job terminal audit authority is incomplete; retry deletion",
+            ) from exc
+        except asyncpg.CheckViolationError as exc:
+            if exc.constraint_name == "managed_repository_cleanup_required":
+                raise HTTPException(
+                    status_code=503,
+                    detail="Repository containment changed; retry deletion",
+                ) from exc
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
         except HTTPException:
             raise
         except Exception as exc:
@@ -737,7 +772,9 @@ class JobControlOperations:
                     else:
                         job = refreshed
                 if job.get("execution_lane") == "stateless":
-                    if _terminal_vm_needs_release(job) or _terminal_vm_cleanup_marked(job):
+                    if _terminal_vm_needs_release(job) or _terminal_vm_cleanup_marked(
+                        job
+                    ):
                         job["status"] = "cancelled"
                         await self._finish_cancel(job_id, job)
                         return {"status": "cancelled", "cleanup_pending": True}
@@ -787,8 +824,11 @@ class JobControlOperations:
                 assigned_agent_id = job.get("assigned_agent_id")
                 if assigned_agent_id:
                     await self._signal(
-                        job_id, str(assigned_agent_id), "cancel",
-                        reason="Cancelled via cockpit", timeout_seconds=5,
+                        job_id,
+                        str(assigned_agent_id),
+                        "cancel",
+                        reason="Cancelled via cockpit",
+                        timeout_seconds=5,
                     )
                 job["status"] = "cancelled"
                 await self._finish_cancel(job_id, job)

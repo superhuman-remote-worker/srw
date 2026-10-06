@@ -1194,8 +1194,11 @@ kubectl -n <ns> create secret generic srw-ssh-gateway-ca \
 
 1. **`sshGateway.hostKeySecret`** — one entry per name in `sshGateway.hostKeyNames`, and **both
    halves of each**. The private half is mounted into the gateway
-   (`SSH_GATEWAY_HOST_KEYS`); the `.pub` half is mounted into the **orchestrator**, which is
-   where `GET /api/ssh/host-keys` runs (`SSH_GATEWAY_PUBLIC_HOST_KEYS`). Both variables are
+   (`SSH_GATEWAY_HOST_KEYS`); only the `.pub` half is mounted into the
+   **orchestrator** and verifying pinned **agents** (`SSH_GATEWAY_PUBLIC_HOST_KEYS`).
+   The orchestrator serves `GET /api/ssh/host-keys`; both it and the agents verify
+   signed native first-use notices. Agents never receive the gateway private keys.
+   Both variables are
    rendered from that one `hostKeyNames` list, because when the served and published key sets
    drift a client sees a host-key mismatch indistinguishable from an active MITM. Omit the
    `.pub` halves and the orchestrator pod will not start — deliberately, because the
@@ -1233,6 +1236,41 @@ kubectl -n <ns> create secret generic srw-ssh-gateway-ca \
    ```
 
 ### Required values
+
+When upgrading native first-use support, roll out verifying agents with their
+public-key mounts first, then the orchestrator relay, and the gateway last.
+Check `native_workspace_first_use1: true` in the agent's `/ready` capabilities.
+An ordinary pinned target without that capability cannot acknowledge native
+use; the new gateway closes its channel if acknowledgement fails. This does
+not start a model turn or authorize workspace cleanup.
+
+Use the matching chart to configure the agent public-key projection. Updating
+only the image under an older chart keeps the orchestrator running, but leaves
+that projection unavailable and new agents unable to advertise this capability.
+
+During the staged upgrade, pin the gateway's previous immutable image with
+`sshGateway.image` while installing the new orchestrator relay/provisioner and
+agent image. This override is a complete image descriptor, for example:
+
+```yaml
+sshGateway:
+  image:
+    repository: ghcr.io/superhuman-remote-worker/srw-orchestrator
+    digest: sha256:<previous-gateway-digest>
+    pullPolicy: IfNotPresent
+```
+
+Once every target agent has its verification keys and advertises the capability,
+set `sshGateway.image: null` to move the gateway onto `image.orchestrator`.
+The default is null, so existing installs continue sharing the orchestrator pin.
+
+For key rotation, configure both old and new public keys on all verifying
+participants before changing the gateway signer. Retain the old public key
+through the 30-second proof lifetime plus the five-second clock allowance after
+its last use. Check that running participants have received the new set before
+removing it.
+Recycle existing agent Pods when the configured key-name list changes; their
+environment and selected Secret items were fixed when they were created.
 
 | Value | Why it has no default |
 |---|---|

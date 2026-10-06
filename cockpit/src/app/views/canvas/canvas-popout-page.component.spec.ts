@@ -28,10 +28,10 @@ describe('Canvas authenticated pop-out wrapper', () => {
     vi.useRealTimers();
   });
 
-  it('is reachable only through the authenticated session route', () => {
+  it('is reachable only through the authenticated session route', async () => {
     const route = routes.find(candidate => candidate.path === 'sessions/:threadId/canvas');
 
-    expect(route?.component).toBe(CanvasPopoutPageComponent);
+    expect(await route?.loadComponent?.()).toBe(CanvasPopoutPageComponent);
     expect(route?.canActivate).toContain(authGuard);
     expect(route?.data?.['canvasPopout']).toBe(true);
   });

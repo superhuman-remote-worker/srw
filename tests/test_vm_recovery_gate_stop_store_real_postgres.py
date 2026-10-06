@@ -511,15 +511,22 @@ async def test_false_purge_response_observes_only_exact_async_settlement(
             if reads == (4 if settlement == "late_receipt" else 3):
                 if settlement not in ("missing", "remaining", "recreated"):
                     async with app_pg.acquire() as conn:
+                        foreign_owner = (
+                            uuid4() if settlement == "foreign_owner" else None
+                        )
+                        if foreign_owner is not None:
+                            await conn.execute(
+                                "INSERT INTO jobs(id,description,status,execution_lane) "
+                                "VALUES($1,'foreign cleanup owner','processing','stateless')",
+                                foreign_owner,
+                            )
                         await conn.execute(
                             "INSERT INTO vm_workspace_cleanup_admissions"
                             "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,"
                             "completed_at,outcome) VALUES($1,'job',$2,$3,$4,$5,$6,"
                             "CASE WHEN $7::bool THEN clock_timestamp() ELSE NULL END,$8)",
                             uuid4(),
-                            uuid4()
-                            if settlement == "foreign_owner"
-                            else UUID(doc["job_id"]),
+                            foreign_owner or UUID(doc["job_id"]),
                             uuid4()
                             if settlement == "wrong_pvc"
                             else UUID(anchor["pvc"]),

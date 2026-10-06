@@ -47,8 +47,10 @@ export interface DisplayedSuggestion {
 
       @if (variant() === 'recovery') {
         <div class="draft-workspace">
-          <app-workspace-picker role="session" [projectId]="projectId()" [preview]="workspacePreview()"
-            [choice]="workspaceChoice()" (choiceChange)="workspaceChoiceChanged.emit($event)" />
+          @defer (on immediate) {
+            <app-workspace-picker role="session" [projectId]="projectId()" [preview]="workspacePreview()"
+              [choice]="workspaceChoice()" (choiceChange)="workspaceChoiceChanged.emit($event)" />
+          }
         </div>
       }
 
