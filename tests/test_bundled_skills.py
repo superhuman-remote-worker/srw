@@ -70,11 +70,16 @@ def test_verify_before_done_uses_shell_checks_only_when_available():
 
     assert "`run_command` with the test/build/lint command" in with_shell
     assert "`wc -w`" in with_shell
-    assert "This workspace has no command runner" not in with_shell
+    assert "this Expert does not include the shell tools" not in with_shell
 
     assert "run_command" not in without_shell
     assert "`wc -w`" not in without_shell
-    assert "This workspace has no command runner" in without_shell
+    assert "This workspace has no command runner" not in without_shell
+    flat = " ".join(without_shell.split())
+    assert "this Expert does not include the shell tools" in flat
+    assert "may well have a shell" in flat
+    assert "`job_complete` right away with confidence 0" in flat
+    assert "such as Engineer" in without_shell
     assert "call `file_exists` once" in without_shell
     assert "call `read_file` once" in without_shell
     assert "repeat an unchanged evidence bundle" in without_shell
@@ -83,6 +88,20 @@ def test_verify_before_done_uses_shell_checks_only_when_available():
     assert "use `git_diff` once" in with_git
     assert "instructions.md" in without_shell
     assert "completion_note" in without_shell
+    assert "{%" not in without_shell
+
+
+def test_strategic_phase_exits_early_only_without_a_shell():
+    md = (_SKILLS / "strategic-phase" / "SKILL.md").read_text(encoding="utf-8")
+
+    without_shell = render_instruction_content(md, ["read_file"])
+    with_shell = render_instruction_content(md, ["read_file", "run_command"])
+
+    assert "this Expert does not include the shell tools" in without_shell
+    assert "`job_complete` now with confidence 0" in without_shell
+    assert "such as Engineer" in without_shell
+    assert "this Expert does not include the shell tools" not in with_shell
+    assert "such as Engineer" not in with_shell
     assert "{%" not in without_shell
 
 

@@ -70,9 +70,16 @@ checks that produces that evidence:
   row counts match.
 {% endif %}
 {% else %}
-This workspace has no command runner. Use the file and domain tools that are
-actually available; do not invent a shell tool or emulate one with repeated
-searches.
+You have no tool that runs commands, because this Expert does not include the
+shell tools. That says nothing about the workspace: it may well have a shell and
+the programs the task names; you just cannot reach them. Use the file and domain
+tools that are actually available; do not invent a shell tool or emulate one
+with repeated searches.
+If the task explicitly asks you to execute commands or programs, do not work
+around it: call `job_complete` right away with confidence 0. The first sentence
+of the summary must say the commands were not run because this Expert has no
+shell tool, and that the Job should be run again with an Expert that has the
+shell tools, such as Engineer.
 {% if has_tool("file_exists") %}
 - Required paths → call `file_exists` once for each required artifact after its
   final write.
