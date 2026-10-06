@@ -14,7 +14,10 @@ from orchestrator.database.container_startup_stage import (
     StartupAttention,
     Unscheduled,
 )
-from orchestrator.services.container_provisioner import WorkspaceRuntimeAuthorityError
+from orchestrator.services.container_provisioner import (
+    WorkspaceRuntimeAuthorityError,
+    _pod_is_terminal_before_first_ready,
+)
 from orchestrator.services.container_startup_config import (
     startup_stage_activation_enabled,
 )
@@ -231,6 +234,55 @@ async def test_gate_off_legacy_does_not_adopt_and_existing_v1_continues(monkeypa
     p._core_api.read_namespaced_pod.side_effect = None
     assert await observe(p, db) is None
     assert isinstance(db.observations[0][0], Unscheduled)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate", ["true", None], ids=["gate-on", "existing-v1"])
+async def test_v1_observer_never_fails_an_exited_container_at_once(monkeypatch, gate):
+    """A v1 receipt stays accepted-pending; only the legacy wait may raise."""
+
+    if gate is None:
+        monkeypatch.delenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", gate)
+    db = StageDB()
+    if gate is None:
+        db._creation_reservation["startup_protocol_version"] = 1
+    exited = pod(scheduled=recent_schedule())
+    exited.spec.restart_policy = "Never"
+    exited.status.phase = "Succeeded"
+    (workspace,) = exited.status.container_statuses
+    workspace.ready = False
+    workspace.restart_count = 0
+    workspace.container_id = "containerd://exited-workspace"
+    workspace.state = SimpleNamespace(
+        waiting=None,
+        running=None,
+        terminated=SimpleNamespace(exit_code=0, reason="Completed"),
+    )
+    # The exact evidence the legacy wait would fail on.
+    assert _pod_is_terminal_before_first_ready(exited)
+    p = provider(db, exited)
+
+    assert (
+        await p._wait_for_ready(
+            Fixture._owner().pod_name,
+            timeout=120,
+            expected_owner=Fixture._owner(),
+            expected_runtime_incarnation=Fixture.RUNTIME,
+            expected_creation_generation=Fixture.GENERATION,
+            expected_network_tier="internet-only",
+            expected_pvc_name=None,
+            expected_seed_configmap=None,
+            startup_reservation=db._creation_reservation.copy(),
+            fail_on_exited_container=True,
+        )
+        is None
+    )
+    assert db._creation_reservation["startup_state"] == "starting"
+    assert not any(
+        isinstance(event, StartupAttention) for event, _, _ in db.observations
+    )
 
 
 @pytest.mark.asyncio

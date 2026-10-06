@@ -164,6 +164,26 @@ class WorkspaceImagePullError(RuntimeError):
     """A custom workspace image could not be pulled within its budget."""
 
 
+class WorkspaceContainerExitedError(RuntimeError):
+    """A fresh Job's workspace container exited before its Pod became Ready.
+
+    The message names the workspace container itself, so a Job's error shows
+    it as is (``MESSAGE_PREFIX``).
+    """
+
+    MESSAGE_PREFIX = "Workspace container exited with code "
+
+    def __init__(self, exit_code: int, reason: str | None = None) -> None:
+        self.exit_code = exit_code
+        self.reason = str(reason or "").strip()
+        detail = f" ({self.reason})" if self.reason else ""
+        super().__init__(
+            f"{self.MESSAGE_PREFIX}{exit_code}{detail} before it became ready. "
+            "A workspace image must keep running: build it FROM an SRW base "
+            "image and don't override its ENTRYPOINT or USER."
+        )
+
+
 class _WorkspaceCreationAuthorityLost(WorkspaceRuntimeAuthorityError):
     """Readiness observation outlived its exact durable creation claim."""
 
@@ -478,6 +498,20 @@ def _pod_is_terminal_before_first_ready(pod: Any) -> bool:
         and type(getattr(terminated, "exit_code", None)) is int
         and getattr(workspace, "restart_count", None) == 0
         and getattr(workspace, "container_id", None)
+    )
+
+
+def _workspace_container_exited_error(pod: Any) -> WorkspaceContainerExitedError:
+    """Describe the exit that ``_pod_is_terminal_before_first_ready`` proved."""
+
+    (workspace,) = [
+        item
+        for item in (getattr(pod.status, "container_statuses", None) or ())
+        if getattr(item, "name", None) == "workspace"
+    ]
+    terminated = workspace.state.terminated
+    return WorkspaceContainerExitedError(
+        terminated.exit_code, getattr(terminated, "reason", None)
     )
 
 
@@ -3241,6 +3275,13 @@ class ContainerProvisioner:
                 if _creation_reservation.get("operation_kind") == "create"
                 and (strict_stateless or owner.kind == "job")
                 else None
+            ),
+            # Only a fresh Job create fails on an exited container; Sessions,
+            # restores and reattaches over a kept volume keep today's wait.
+            fail_on_exited_container=(
+                owner.kind == "job"
+                and _creation_reservation.get("operation_kind") == "create"
+                and not pvc_reattach
             ),
         )
 
@@ -16418,6 +16459,7 @@ class ContainerProvisioner:
         authority_check: Callable[[], Awaitable[None]] | None = None,
         startup_reservation: Mapping[str, Any] | None = None,
         retained_creation: SessionCreationCandidate | None = None,
+        fail_on_exited_container: bool = False,
     ) -> Optional[str]:
         """Poll until the pod is ready and accepts the configured SSH key.
 
@@ -16432,6 +16474,11 @@ class ContainerProvisioner:
                 pulled: at once for an invalid reference, otherwise once the
                 pull budget is spent. While it is still pulling, the wait
                 extends up to that budget.
+            WorkspaceContainerExitedError: only with
+                ``fail_on_exited_container`` and only on the legacy
+                (unmarked, gate-off) wait: the exact Pod's workspace container
+                ran and stopped before the first Ready, so it can never become
+                Ready. The version-1 observer never raises it.
         """
         if (
             startup_reservation is not None
@@ -16546,6 +16593,13 @@ class ContainerProvisioner:
                         raise WorkspaceImagePullError(verdict.message)
                     if verdict.state == "pulling" and pull_deadline is not None:
                         deadline = max(deadline, pull_deadline)
+                if fail_on_exited_container and _pod_is_terminal_before_first_ready(
+                    pod
+                ):
+                    # restartPolicy Never: this exact Pod (identity fenced
+                    # above) ran its workspace container and stopped before
+                    # its first Ready, so waiting longer cannot help.
+                    raise _workspace_container_exited_error(pod)
                 if pod.status.phase == "Running" and pod.status.pod_ip:
                     # Check container readiness
                     if pod.status.container_statuses and all(
@@ -16639,6 +16693,8 @@ class ContainerProvisioner:
             except WorkspaceRuntimeAuthorityError:
                 raise
             except WorkspaceImagePullError:
+                raise
+            except WorkspaceContainerExitedError:
                 raise
             except Exception:
                 pass
@@ -17138,7 +17194,7 @@ class ContainerProvisioner:
         *,
         strict_stateless: bool,
     ) -> None:
-        """Give a Job its pull or admission error; never a lifecycle projection.
+        """Give a Job its pull, exit or admission error; never a lifecycle projection.
 
         Only ``error`` is written, and only while this reservation is current.
         Sessions log only (A1 refinement 1), and strict stateless creations
@@ -17149,7 +17205,7 @@ class ContainerProvisioner:
             return
         message = (
             str(exc)
-            if isinstance(exc, WorkspaceImagePullError)
+            if isinstance(exc, (WorkspaceImagePullError, WorkspaceContainerExitedError))
             else pod_admission_rejection(exc)
         )
         if message is None:

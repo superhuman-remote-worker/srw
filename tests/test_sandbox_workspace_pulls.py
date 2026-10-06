@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -12,6 +12,7 @@ from kubernetes.client.exceptions import ApiException
 from orchestrator.services import container_provisioner as provisioner_module
 from orchestrator.services.container_provisioner import (
     ContainerProvisioner,
+    WorkspaceContainerExitedError,
     WorkspaceImagePullError,
     WorkspaceRuntimeAuthorityError,
 )
@@ -441,7 +442,7 @@ async def test_only_a_custom_image_is_watched_for_pull_failures(
     assert (wait["timeout"], wait["pull_image"]) == (120, watched)
 
 
-async def create_pinned_session(monkeypatch, *, wait_for_ready=None):
+async def create_pinned_session(monkeypatch, *, wait_for_ready=None, observe=None):
     events = []
     db = _TemplatedPinnedDB(events)
     provisioner = ContainerProvisioner()
@@ -468,6 +469,9 @@ async def create_pinned_session(monkeypatch, *, wait_for_ready=None):
 
         def read_pulling(**kwargs):
             observed = read_pod(**kwargs)
+            if observe is not None:
+                observe(observed)
+                return observed
             (status,) = observed.status.container_statuses
             status.ready = False
             status.state.waiting = SimpleNamespace(
@@ -749,8 +753,21 @@ async def test_a_pull_failure_never_settles_on_a_pod_that_ever_ran(monkeypatch, 
         ),
         (WorkspaceOwner.job(JOB_ID), ApiException(status=403), False),
         (WorkspaceOwner.job(JOB_ID), RuntimeError("seed failed"), False),
+        # The container ran: never the never-started shortcut. The Job's
+        # terminal transition hands the open creation to cleanup instead.
+        (
+            WorkspaceOwner.job(JOB_ID),
+            WorkspaceContainerExitedError(0, "Completed"),
+            False,
+        ),
     ],
-    ids=["stateless-session", "pinned-session", "quota-rejection", "other-failure"],
+    ids=[
+        "stateless-session",
+        "pinned-session",
+        "quota-rejection",
+        "other-failure",
+        "container-exited",
+    ],
 )
 async def test_only_a_job_pull_failure_is_settled(owner, error, strict_stateless):
     provisioner = ContainerProvisioner()
@@ -968,3 +985,333 @@ async def test_deleting_a_job_keeps_ssh_retirement_for_any_other_live_pod(
         is None
     )
     provisioner.reconcile_workspace_cleanup_intent.assert_not_awaited()
+
+
+# -----------------------------------------------------------------------------
+# A fresh Job whose container exits before Ready fails with its exit code (D3)
+#
+# A workspace Pod is restartPolicy Never, so once its workspace container has
+# run and stopped before the first Ready, it can never become Ready. Without
+# startup-stage tracking the legacy wait used to time out into "creating" and
+# the Job waited forever. A fresh Job create opts in to failing at once; the
+# creation is not settled here (the container ran): the Job's terminal
+# transition hands the open creation to the ordinary cleanup protocol.
+# -----------------------------------------------------------------------------
+
+EXITED_ADVICE = (
+    "before it became ready. A workspace image must keep running: build it "
+    "FROM an SRW base image and don't override its ENTRYPOINT or USER."
+)
+
+
+def run_to_exit(observed, *, phase="Succeeded", exit_code=0, reason="Completed"):
+    """Make a scheduled Never Pod whose workspace container ran and stopped."""
+
+    spec = getattr(observed, "spec", None)
+    if spec is None:
+        spec = observed.spec = SimpleNamespace()
+    spec.restart_policy = "Never"
+    spec.node_name = "node-1"
+    spec.containers = [
+        SimpleNamespace(**item) if isinstance(item, dict) else item
+        for item in (getattr(spec, "containers", None) or [{"name": "workspace"}])
+    ]
+    observed.status.phase = phase
+    observed.status.pod_ip = None
+    observed.status.conditions = [
+        SimpleNamespace(type="Ready", status="False", reason="PodCompleted")
+    ]
+    observed.status.container_statuses = [
+        container_status(
+            container_id="containerd://exited-workspace",
+            state=SimpleNamespace(
+                waiting=None,
+                running=None,
+                terminated=SimpleNamespace(
+                    exit_code=exit_code, reason=reason, started_at=NOW
+                ),
+            ),
+        )
+    ]
+    observed.status.init_container_statuses = []
+    observed.status.ephemeral_container_statuses = []
+    return observed
+
+
+def exited_pod(**kwargs):
+    return run_to_exit(pod(None), **kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("phase", "exit_code", "reason", "message"),
+    [
+        (
+            "Succeeded",
+            0,
+            "Completed",
+            f"Workspace container exited with code 0 (Completed) {EXITED_ADVICE}",
+        ),
+        (
+            "Failed",
+            17,
+            "Error",
+            f"Workspace container exited with code 17 (Error) {EXITED_ADVICE}",
+        ),
+        (
+            "Failed",
+            17,
+            None,
+            f"Workspace container exited with code 17 {EXITED_ADVICE}",
+        ),
+        ("Failed", 17, "", f"Workspace container exited with code 17 {EXITED_ADVICE}"),
+    ],
+    ids=["succeeded-exit-0", "failed-exit-17", "no-reason", "empty-reason"],
+)
+@pytest.mark.parametrize("pull_image", [IMAGE, None], ids=["custom", "installation"])
+async def test_an_opted_in_wait_fails_once_the_container_exited(
+    phase, exit_code, reason, message, pull_image
+):
+    provisioner = provisioner_reading(
+        exited_pod(phase=phase, exit_code=exit_code, reason=reason)
+    )
+
+    with pytest.raises(WorkspaceContainerExitedError) as raised:
+        await provisioner._wait_for_ready(
+            "workspace-x",
+            timeout=5,
+            pull_image=pull_image,
+            fail_on_exited_container=True,
+        )
+
+    assert str(raised.value) == message
+    assert raised.value.exit_code == exit_code
+    assert raised.value.reason == (reason or "")
+    # One read is enough: the wait fails at once, not after its timeout.
+    assert provisioner._bounded_kubernetes_call.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_wait_that_did_not_opt_in_keeps_waiting_on_an_exited_container(
+    monkeypatch,
+):
+    # IDE Pods, pinned Sessions and every other direct caller keep today's
+    # wait: it times out and returns None.
+    provisioner = provisioner_reading(exited_pod())
+    fast_polls(monkeypatch)
+
+    assert (
+        await provisioner._wait_for_ready("workspace-x", timeout=0.1, pull_image=IMAGE)
+        is None
+    )
+
+
+def _unproven(change):
+    observed = exited_pod()
+    (workspace,) = observed.status.container_statuses
+    if change == "still-running-phase":
+        observed.status.phase = "Running"
+    elif change == "restart-policy-always":
+        observed.spec.restart_policy = "Always"
+    elif change == "unscheduled":
+        observed.spec.node_name = None
+    elif change == "ready-condition":
+        observed.status.conditions = [SimpleNamespace(type="Ready", status="True")]
+    elif change == "restarted":
+        workspace.restart_count = 1
+    elif change == "no-container-id":
+        workspace.container_id = None
+    elif change == "sidecar-running":
+        observed.status.init_container_statuses = [
+            container_status(
+                name="sidecar",
+                state=SimpleNamespace(
+                    waiting=None, running=SimpleNamespace(), terminated=None
+                ),
+            )
+        ]
+    return observed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    [
+        "still-running-phase",
+        "restart-policy-always",
+        "unscheduled",
+        "ready-condition",
+        "restarted",
+        "no-container-id",
+        "sidecar-running",
+    ],
+)
+async def test_only_an_exact_terminal_before_ready_pod_fails_the_wait(
+    monkeypatch, change
+):
+    provisioner = provisioner_reading(_unproven(change))
+    fast_polls(monkeypatch)
+
+    assert (
+        await provisioner._wait_for_ready(
+            "workspace-x",
+            timeout=0.1,
+            pull_image=IMAGE,
+            fail_on_exited_container=True,
+        )
+        is None
+    )
+
+
+def prepared_creation(owner, *, operation_kind="create", pvc_reattach=False):
+    strict = owner.kind == "session"
+    return provisioner_module._PreparedWorkspaceCreation(
+        owner=owner,
+        _creation_reservation=MappingProxyType(
+            {"id": "r", "claim_token": 1, "operation_kind": operation_kind}
+        ),
+        strict_stateless=strict,
+        stateless_creation_generation=(
+            "77777777-8888-4999-8aaa-bbbbbbbbbbbb" if strict else None
+        ),
+        pod_name=owner.pod_name,
+        runtime_incarnation=_TEST_POD_UID,
+        network_tier="internet-only",
+        pvc_name=None,
+        seed_cm=None,
+        pvc_reattach=pvc_reattach,
+        seed_needs_state=False,
+        mutation_authority=AsyncMock(return_value=True),
+        namespace="superhuman-remote-worker",
+        pull_image=IMAGE,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner", "operation_kind", "pvc_reattach", "opted_in"),
+    [
+        (WorkspaceOwner.job(JOB_ID), "create", False, True),
+        (WorkspaceOwner.job(JOB_ID), "create", True, False),
+        (WorkspaceOwner.job(JOB_ID), "restore", False, False),
+        (WorkspaceOwner.job(JOB_ID), "reattach", False, False),
+        (WorkspaceOwner.job(JOB_ID), "adopt", False, False),
+        (
+            WorkspaceOwner.session("66666666-7777-4888-8999-aaaaaaaaaaaa"),
+            "create",
+            False,
+            False,
+        ),
+    ],
+    ids=[
+        "job-fresh-create",
+        "job-create-over-kept-claim",
+        "job-restore",
+        "job-reattach",
+        "job-adopt",
+        "stateless-session",
+    ],
+)
+async def test_only_a_fresh_job_create_opts_in_to_failing_on_an_exit(
+    owner, operation_kind, pvc_reattach, opted_in
+):
+    provisioner = ContainerProvisioner()
+    provisioner._wait_for_ready = AsyncMock(return_value=None)
+
+    await provisioner._observe_prepared_workspace(
+        prepared_creation(
+            owner, operation_kind=operation_kind, pvc_reattach=pvc_reattach
+        )
+    )
+
+    wait = provisioner._wait_for_ready.await_args.kwargs
+    assert wait["fail_on_exited_container"] is opted_in
+
+
+@pytest.mark.asyncio
+async def test_a_job_whose_container_exits_before_ready_fails_with_the_exit_code(
+    monkeypatch,
+):
+    monkeypatch.delenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", raising=False)
+    provisioner = job_provisioner(monkeypatch, SandboxSettings(image=IMAGE))
+    cluster = {}
+
+    def create_pod(*, body, **_kwargs):
+        cluster["pod"] = _pod_from_manifest(body, phase="Pending")
+        cluster["pod"].spec.restart_policy = body["spec"]["restartPolicy"]
+        return cluster["pod"]
+
+    def read_pod(**_kwargs):
+        # The image's main process ran to completion: a plain base image, or
+        # an SRW image whose ENTRYPOINT was overridden.
+        return run_to_exit(cluster["pod"])
+
+    provisioner._core_api.create_namespaced_pod.side_effect = create_pod
+    provisioner._core_api.read_namespaced_pod.side_effect = read_pod
+    settle = provisioner._settle_failed_job_creation
+    provisioner._settle_failed_job_creation = AsyncMock(side_effect=settle)
+
+    assert await provisioner.create_workspace(WorkspaceOwner.job(JOB_ID)) is False
+
+    message = f"Workspace container exited with code 0 (Completed) {EXITED_ADVICE}"
+    updates = job_context_updates(provisioner)
+    assert updates[-1] == {"error": message}
+    assert not any(update.get("status") in {"failed", "ready"} for update in updates)
+    # The container ran, so the never-started settle refuses it: the creation
+    # stays open for the Job's terminal transition to hand off to cleanup.
+    (call,) = provisioner._settle_failed_job_creation.await_args_list
+    assert isinstance(call.args[2], WorkspaceContainerExitedError)
+    assert provisioner._db._creation_reservation["settled_at"] is None
+    assert provisioner._db._creation_reservation["phase"] == "runtime_bound"
+    provisioner._core_api.delete_namespaced_pod.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_job_container_exit_is_recorded_for_the_job():
+    provisioner = ContainerProvisioner()
+    provisioner._workspace_creation_reservation_is_current = AsyncMock(
+        return_value=True
+    )
+    provisioner._set_context = AsyncMock(return_value=True)
+    owner = WorkspaceOwner.job(JOB_ID)
+
+    await provisioner._record_creation_diagnostic(
+        owner,
+        {"id": "r"},
+        WorkspaceContainerExitedError(17, "Error"),
+        strict_stateless=False,
+    )
+
+    provisioner._set_context.assert_awaited_once_with(
+        owner,
+        {"error": f"Workspace container exited with code 17 (Error) {EXITED_ADVICE}"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_pinned_session_on_an_exited_container_still_ends_like_a_timeout(
+    monkeypatch, caplog
+):
+    caplog.set_level(logging.ERROR, logger=provisioner_module.__name__)
+    fast_polls(monkeypatch)
+    waits = []
+    real_wait = ContainerProvisioner._wait_for_ready
+
+    async def short_wait(self, *args, **kwargs):
+        waits.append(dict(kwargs))
+        return await real_wait(self, *args, **{**kwargs, "timeout": 0.1})
+
+    monkeypatch.setattr(ContainerProvisioner, "_wait_for_ready", short_wait)
+
+    exited, db, events = await create_pinned_session(monkeypatch, observe=run_to_exit)
+    monkeypatch.setattr(ContainerProvisioner, "_wait_for_ready", real_wait)
+    timed_out, timeout_db, timeout_events = await create_pinned_session(
+        monkeypatch, wait_for_ready=AsyncMock(return_value=None)
+    )
+
+    assert waits and not any(wait.get("fail_on_exited_container") for wait in waits)
+    assert (exited, timed_out) == (False, False)
+    assert "Workspace container exited" not in caplog.text
+    assert events == timeout_events
+    assert db.intent["status"] == timeout_db.intent["status"] == "planned"
+    assert db.workspace["status"] == timeout_db.workspace["status"] == "pending"

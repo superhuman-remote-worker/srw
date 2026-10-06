@@ -1274,6 +1274,111 @@ async def test_stateless_workspace_failure_uses_scanned_status_cas(monkeypatch):
     )
 
 
+_CONTAINER_EXITED = (
+    "Workspace container exited with code 0 (Completed) before it became ready. "
+    "A workspace image must keep running: build it FROM an SRW base image and "
+    "don't override its ENTRYPOINT or USER."
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("recorded", "error_message"),
+    [
+        # The exit message already names the workspace container.
+        (_CONTAINER_EXITED, _CONTAINER_EXITED),
+        # Every other recorded error keeps the shared prefix.
+        (
+            "Workspace image registry.example/x:1 could not be pulled: "
+            "InvalidImageName (bad ref)",
+            "Workspace container failed: Workspace image registry.example/x:1 "
+            "could not be pulled: InvalidImageName (bad ref)",
+        ),
+    ],
+    ids=["container-exited", "pull-failure"],
+)
+async def test_a_failed_first_creation_fails_the_job_with_its_recorded_error(
+    monkeypatch, recorded, error_message
+):
+    from orchestrator import main
+
+    # create_workspace leaves the Pod's context and its error, then returns
+    # False; the dispatcher's FAILED branch re-reads the Job for that error.
+    job = {
+        "id": JOB_ID,
+        "status": "created",
+        "execution_lane": "stateless",
+        "assigned_agent_id": None,
+        "context": {
+            "workspace_container": {
+                "status": "created",
+                "error": recorded,
+                "provisioner": "k8s",
+            }
+        },
+        "config_override": {"workspace": {"backend": "sandbox"}},
+        "priority": 0,
+        "user_id": None,
+        "parent_job_id": None,
+    }
+    monkeypatch.setattr(main.app.state.resources.settings, "auto_assign_enabled", False)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "stateless_worker_enabled", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_k8s_available", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module.container_provisioner, "_in_cluster", True
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "get_job_discovery_cutoff",
+        AsyncMock(return_value=datetime.now(timezone.utc)),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "get_admittable_stateless_jobs",
+        AsyncMock(return_value=[job]),
+    )
+    monkeypatch.setattr(
+        job_dispatcher,
+        "ensure_workspace",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                outcome=EnsureOutcome.FAILED,
+                status="failed",
+                mutation_required=False,
+            )
+        ),
+    )
+    update = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "update_job_status", update
+    )
+    monkeypatch.setattr(
+        main.app.state.resources,
+        "job_dispatch_state",
+        job_dispatcher.JobDispatchState(),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "get_job", AsyncMock(return_value=job)
+    )
+
+    await run_dispatch_and_wait(
+        dependencies=jobs_composition.job_dispatch_dependencies(
+            main.app.state.resources
+        )
+    )
+
+    update.assert_awaited_once_with(
+        JOB_ID,
+        status="failed",
+        error_message=error_message,
+        expected_status="created",
+    )
+
+
 @pytest.mark.asyncio
 async def test_dispatcher_waits_instead_of_failing_uidless_k8s_runtime(monkeypatch):
     from orchestrator import main

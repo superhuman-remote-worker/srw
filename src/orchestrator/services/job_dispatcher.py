@@ -28,6 +28,7 @@ from fastapi import HTTPException
 
 from orchestrator.database.dispatch_discovery import JobDiscoveryCursor, discovery_order
 from orchestrator.security.access import vm_workspaces_on_pod_network
+from orchestrator.services.container_provisioner import WorkspaceContainerExitedError
 from orchestrator.services.dispatch_guards import (
     VM_CAPACITY_POLL,
     VM_GOLDEN_POLL,
@@ -1147,7 +1148,13 @@ async def _preflight_job(
                         exc_info=True,
                     )
             error = failed_ctx.get("error")
-            if error:
+            if error and str(error).startswith(
+                WorkspaceContainerExitedError.MESSAGE_PREFIX
+            ):
+                # It already names the workspace container; the shared
+                # prefix would only repeat it.
+                msg = str(error)
+            elif error:
                 msg = f"Workspace container failed: {error}"
             else:
                 msg = (
