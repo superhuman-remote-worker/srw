@@ -11955,8 +11955,7 @@ class ContainerProvisioner:
                 or str(reservation.get("owner_id")) != job_id
                 or reservation.get("scope") != "ide"
                 or reservation.get("operation_kind") != "restore"
-                or reservation.get("desired_manifest_digest")
-                != creation_plan["digest"]
+                or reservation.get("desired_manifest_digest") != creation_plan["digest"]
                 or not isinstance(reservation.get("claimed_by"), str)
                 or type(reservation.get("claim_token")) is not int
                 or type(reservation.get("reservation_generation")) is not int
@@ -14787,7 +14786,9 @@ class ContainerProvisioner:
                                 allow_owner_unlabeled=False,
                                 expected_pod_name=pod_name,
                                 expected_component=(
-                                    "ide-session" if pod_name.startswith("ide-") else None
+                                    "ide-session"
+                                    if pod_name.startswith("ide-")
+                                    else None
                                 ),
                             )
                             if creation_reservation_id is not None:
@@ -14803,7 +14804,8 @@ class ContainerProvisioner:
                                     not isinstance(pod_annotations, dict)
                                     or pod_annotations.get(
                                         WORKSPACE_RUNTIME_CREATION_ANNOTATION
-                                    ) != expected_creation_generation
+                                    )
+                                    != expected_creation_generation
                                 )
                             ) or (
                                 expected_provision_attempt is not None
@@ -14811,7 +14813,9 @@ class ContainerProvisioner:
                                     not isinstance(pod_labels, dict)
                                     or pod_labels.get(WORKSPACE_PROVISION_ATTEMPT_LABEL)
                                     != expected_provision_attempt
-                                    or pod_labels.get(WORKSPACE_PROVISION_GENERATION_LABEL)
+                                    or pod_labels.get(
+                                        WORKSPACE_PROVISION_GENERATION_LABEL
+                                    )
                                     != expected_runtime_generation
                                 )
                             ):
@@ -14852,14 +14856,15 @@ class ContainerProvisioner:
                             creation_reservation_id=creation_reservation_id,
                         )
                         if body["metadata"].get("ownerReferences"):
-                            preserved_reference = body["metadata"][
-                                "ownerReferences"
-                            ][0]
-                            if self._exact_seed_configmap_pod_owner_reference(
-                                observed,
-                                pod_name=pod_name,
-                                runtime_incarnation=preserved_reference["uid"],
-                            ) != preserved_reference:
+                            preserved_reference = body["metadata"]["ownerReferences"][0]
+                            if (
+                                self._exact_seed_configmap_pod_owner_reference(
+                                    observed,
+                                    pod_name=pod_name,
+                                    runtime_incarnation=preserved_reference["uid"],
+                                )
+                                != preserved_reference
+                            ):
                                 raise WorkspaceRuntimeAuthorityError(
                                     "workspace seed ConfigMap Pod ownership changed"
                                 )
@@ -14874,7 +14879,9 @@ class ContainerProvisioner:
                                 allow_owner_unlabeled=False,
                                 expected_pod_name=pod_name,
                                 expected_component=(
-                                    "ide-session" if pod_name.startswith("ide-") else None
+                                    "ide-session"
+                                    if pod_name.startswith("ide-")
+                                    else None
                                 ),
                             )
                             if current_uid != preserved_reference["uid"]:
@@ -14896,7 +14903,8 @@ class ContainerProvisioner:
                                     not isinstance(current_annotations, dict)
                                     or current_annotations.get(
                                         WORKSPACE_RUNTIME_CREATION_ANNOTATION
-                                    ) != expected_creation_generation
+                                    )
+                                    != expected_creation_generation
                                 )
                             ) or (
                                 expected_provision_attempt is not None
@@ -14904,10 +14912,12 @@ class ContainerProvisioner:
                                     not isinstance(current_labels, dict)
                                     or current_labels.get(
                                         WORKSPACE_PROVISION_ATTEMPT_LABEL
-                                    ) != expected_provision_attempt
+                                    )
+                                    != expected_provision_attempt
                                     or current_labels.get(
                                         WORKSPACE_PROVISION_GENERATION_LABEL
-                                    ) != expected_runtime_generation
+                                    )
+                                    != expected_runtime_generation
                                 )
                             ):
                                 raise WorkspaceRuntimeAuthorityError(
@@ -15507,8 +15517,7 @@ class ContainerProvisioner:
             _resource_field(reference, "api_version", "apiVersion") != "v1"
             or _resource_field(reference, "kind") != "Pod"
             or _resource_field(reference, "name") != pod_name
-            or str(_resource_field(reference, "uid") or "")
-            != runtime_incarnation
+            or str(_resource_field(reference, "uid") or "") != runtime_incarnation
             or _resource_field(reference, "controller") is not True
         ):
             raise WorkspaceRuntimeAuthorityError(
@@ -15522,7 +15531,8 @@ class ContainerProvisioner:
             "controller": True,
             "blockOwnerDeletion": _resource_field(
                 reference, "block_owner_deletion", "blockOwnerDeletion"
-            ) is True,
+            )
+            is True,
         }
 
     def _build_pod_manifest(

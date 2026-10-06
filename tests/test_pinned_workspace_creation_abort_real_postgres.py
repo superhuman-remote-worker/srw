@@ -33,10 +33,16 @@ async def _creating(db, monkeypatch, *, published=False):
     provider = start.pull._provisioner(monkeypatch, db, cluster)
     if published:
         from kubernetes.client.exceptions import ApiException
+
         original_pod = cluster.create_namespaced_pod
 
         def fail_original_pod(**kwargs):
-            if kwargs["body"]["metadata"]["labels"].get("srw.io/workspace-provision-fence") != "true":
+            if (
+                kwargs["body"]["metadata"]["labels"].get(
+                    "srw.io/workspace-provision-fence"
+                )
+                != "true"
+            ):
                 raise ApiException(status=503)
             return original_pod(**kwargs)
 
@@ -122,7 +128,9 @@ def _prevention_base_release():
 async def test_recorded_abort_recovers_old_partial_creation_without_rebinding(
     db, monkeypatch
 ):
-    ids, generation, cluster, provider, task, resume = await _creating(db, monkeypatch, published=True)
+    ids, generation, cluster, provider, task, resume = await _creating(
+        db, monkeypatch, published=True
+    )
     try:
         old_release = _prevention_base_release()
         released = await old_release(
@@ -161,10 +169,15 @@ async def test_recorded_abort_recovers_old_partial_creation_without_rebinding(
     )
     assert await db.get_thread(ids["thread"]) is None
     # Immutable cleanup expectations survive the deletion they authorize.
-    assert await db.fetchval(
-        "SELECT public.pinned_retirement_external_cleanup_expected($1::jsonb,$2::uuid,$3::uuid)",
-        json.dumps(retirement["context"], default=str), retirement["generation"], retirement["token"]
-    ) is not None
+    assert (
+        await db.fetchval(
+            "SELECT public.pinned_retirement_external_cleanup_expected($1::jsonb,$2::uuid,$3::uuid)",
+            json.dumps(retirement["context"], default=str),
+            retirement["generation"],
+            retirement["token"],
+        )
+        is not None
+    )
     after = await db.fetchrow(
         "SELECT * FROM thread_workspace_provision_intents WHERE attempt_id=$1",
         before["attempt_id"],
@@ -196,7 +209,9 @@ class PartialCluster(start.PinnedPullCluster):
 
 
 async def _stranded(db, monkeypatch, *, published=True):
-    ids, generation, cluster, provider, task, resume = await _creating(db, monkeypatch, published=published)
+    ids, generation, cluster, provider, task, resume = await _creating(
+        db, monkeypatch, published=published
+    )
     try:
         assert (
             await _prevention_base_release()(
@@ -365,22 +380,35 @@ async def test_missing_causal_fence_receipt_cannot_settle_partial_creation(
 
 
 @pytest.mark.asyncio
-async def test_unpublished_existing_pvc_is_not_adopted_from_name_and_labels(db, monkeypatch):
+async def test_unpublished_existing_pvc_is_not_adopted_from_name_and_labels(
+    db, monkeypatch
+):
     ids, _, cluster, provider = await _stranded(db, monkeypatch, published=False)
     original_uid = cluster.objects["pvc"].metadata.uid
     retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
     assert retirement["state"] == "pending"
     assert await db.authorize_pinned_thread_retirement(
-        ids["thread"], token=retirement["token"], generation=retirement["generation"], settle_status="ended"
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
     )
     intent = await db.revoke_pinned_thread_workspace_provision_intent(
-        ids["thread"], expected_runtime_generation=retirement["generation"],
+        ids["thread"],
+        expected_runtime_generation=retirement["generation"],
         expected_retirement_token=retirement["token"],
-        expected_attempt_id=retirement["context"]["workspace_provision_intent"]["attempt_id"]
+        expected_attempt_id=retirement["context"]["workspace_provision_intent"][
+            "attempt_id"
+        ],
     )
     assert intent["pvc_uid"] is None
-    assert await provider.fence_pinned_workspace_provision_intent(
-        intent, permanent=True, expected_retirement_token=retirement["token"],
-        expected_retirement_generation=retirement["generation"]
-    ) is None
+    assert (
+        await provider.fence_pinned_workspace_provision_intent(
+            intent,
+            permanent=True,
+            expected_retirement_token=retirement["token"],
+            expected_retirement_generation=retirement["generation"],
+        )
+        is None
+    )
     assert cluster.objects["pvc"].metadata.uid == original_uid
