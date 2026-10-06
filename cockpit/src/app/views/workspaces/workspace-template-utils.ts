@@ -9,6 +9,7 @@ export const DISPLAY_NAME = 'srw.io/display-name';
 export const DESCRIPTION = 'srw.io/description';
 const NAME_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const QUANTITY_PATTERN = /^[1-9][0-9]*(Mi|Gi|Ti)$/;
+const CPU_PATTERN = /^(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)$/;
 const SHELL = ['/bin/sh', '-c'];
 const MAX_SETUP_STEPS = 32;
 
@@ -121,7 +122,7 @@ export function toDocument(value: TemplateFormValue, preserved: PreservedParts):
     if (preserved.spec.cache) environment.cache = preserved.spec.cache;
     spec.environment = environment;
   }
-  if (preserved.spec.initialize) spec.initialize = clone(preserved.spec.initialize);
+  if (value.backend !== 'virtual' && preserved.spec.initialize) spec.initialize = clone(preserved.spec.initialize);
   else if (value.backend === 'vm') {
     const steps = setupSteps(value.setupLines);
     if (steps.length) spec.initialize = steps;
@@ -152,14 +153,14 @@ export function validateTemplateForm(v: TemplateFormValue): Partial<Record<FormF
   if (v.backend !== 'virtual') {
     if (!v.image.trim()) e.image = 'workspaces.errors.image';
     const cpu = Number(v.cpu);
-    if (v.cpu.trim() && !(cpu > 0)) e.cpu = 'workspaces.errors.cpu';
+    if (v.cpu.trim() && !(CPU_PATTERN.test(v.cpu.trim()) && cpu > 0)) e.cpu = 'workspaces.errors.cpu';
     else if (v.cpu.trim() && v.backend === 'vm' && !Number.isInteger(cpu)) e.cpu = 'workspaces.errors.cpuWhole';
     for (const f of ['memory', 'storage'] as const) {
       if (v[f].trim() && !QUANTITY_PATTERN.test(v[f].trim())) e[f] = 'workspaces.errors.quantity';
     }
     if (v.backend === 'sandbox') {
       const req = Number(v.requestCpu);
-      if (v.requestCpu.trim() && (!(req > 0) || (v.cpu.trim() && req > cpu))) e.requestCpu = 'workspaces.errors.requestCpu';
+      if (v.requestCpu.trim() && (!(CPU_PATTERN.test(v.requestCpu.trim()) && req > 0) || (v.cpu.trim() && req > cpu))) e.requestCpu = 'workspaces.errors.requestCpu';
       if (v.requestMemory.trim()) {
         const reqMi = quantityMi(v.requestMemory);
         if (Number.isNaN(reqMi)) e.requestMemory = 'workspaces.errors.quantity';

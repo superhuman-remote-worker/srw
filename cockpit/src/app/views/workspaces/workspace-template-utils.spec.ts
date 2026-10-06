@@ -83,6 +83,22 @@ describe('workspace template form round trip', () => {
   });
 });
 
+describe('initialize steps across tiers', () => {
+  it('keeps initialize steps of a container template verbatim', () => {
+    const d = doc({initialize: [{command: ['make', 'bootstrap']}, {command: ['/bin/sh', '-c', 'echo hi']}]});
+    const {value, preserved} = fromDocument(d);
+    expect(preserved.hasAny).toBe(true);
+    expect(toDocument(value, preserved)).toEqual(d);
+  });
+
+  it('drops preserved initialize steps when the backend becomes virtual', () => {
+    const d = doc({initialize: [{command: ['make', 'bootstrap']}]});
+    const {value, preserved} = fromDocument(d);
+    expect(toDocument(value, preserved).spec.initialize).toEqual([{command: ['make', 'bootstrap']}]);
+    expect(toDocument({...value, backend: 'virtual'}, preserved).spec.initialize).toBeUndefined();
+  });
+});
+
 describe('validateTemplateForm', () => {
   const ok = {...emptyFormValue(ACCOUNT_ME), name: 'lean', image: 'ghcr.io/me/lean:1'};
   it('accepts a minimal container template', () => expect(validateTemplateForm(ok)).toEqual({}));
@@ -92,6 +108,17 @@ describe('validateTemplateForm', () => {
     [{memory: '1Gi', requestMemory: '2Gi'}, 'requestMemory'],
   ])('flags %o on %s', (change, field) => {
     expect(Object.keys(validateTemplateForm({...ok, ...change}))).toContain(field);
+  });
+  it.each(['0x10', '1e2', 'Infinity', '-1', '1.', 'abc'])('rejects CPU value %s', (cpu) => {
+    expect(validateTemplateForm({...ok, cpu})).toHaveProperty('cpu', 'workspaces.errors.cpu');
+    expect(validateTemplateForm({...ok, requestCpu: cpu})).toHaveProperty('requestCpu', 'workspaces.errors.requestCpu');
+  });
+  it.each(['0.5', '2', '.5'])('accepts CPU value %s', (cpu) => {
+    expect(validateTemplateForm({...ok, cpu: '4', requestCpu: cpu})).toEqual({});
+    expect(validateTemplateForm({...ok, cpu})).toEqual({});
+  });
+  it('rejects hex, exponent and Infinity CPU values', () => {
+    for (const cpu of ['0x10', '1e2', 'Infinity']) expect(validateTemplateForm({...ok, cpu})).toHaveProperty('cpu');
   });
   it('requires whole CPUs for VMs', () => {
     expect(validateTemplateForm({...ok, backend: 'vm', cpu: '1.5'})).toHaveProperty('cpu', 'workspaces.errors.cpuWhole');
