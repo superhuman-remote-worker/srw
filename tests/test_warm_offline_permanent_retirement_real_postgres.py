@@ -34,3 +34,38 @@ async def test_exact_offline_warm_actor_permanent_retirement_settles(db, monkeyp
         "SELECT status,thread_id FROM agents WHERE id=$1::uuid", life["agent"]
     )
     assert actor is None or (actor["status"], actor["thread_id"]) == ("offline", None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("local_receipt", [False, True])
+async def test_offline_warm_status_never_supplies_missing_physical_proof(
+    db, monkeypatch, local_receipt
+):
+    from tests import test_pinned_permanent_warm_release_real_postgres as warm
+
+    life, _, _ = await warm._bound_warm_thread(db, monkeypatch)
+    retirement = await db.begin_pinned_thread_retirement(life["thread"], permanent=True)
+    if local_receipt:
+        await warm.fixtures._authorize_and_ack(db, life, retirement)
+    else:
+        assert await db.authorize_pinned_thread_retirement(
+            life["thread"],
+            token=retirement["token"],
+            generation=retirement["generation"],
+            settle_status="ended",
+        )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE agents SET last_heartbeat=now()-interval '1 day' WHERE id=$1::uuid",
+            UUID(life["agent"]),
+        )
+    assert await db.mark_stale_agents_offline(timeout_minutes=3)
+    with pytest.raises(
+        RuntimeError, match="permanent pinned delete lacks physical quiescence"
+    ):
+        await db.delete_thread(
+            life["thread"],
+            expected_runtime_retirement_token=retirement["token"],
+            expected_runtime_generation=retirement["generation"],
+        )
+    assert await db.get_thread(life["thread"]) is not None

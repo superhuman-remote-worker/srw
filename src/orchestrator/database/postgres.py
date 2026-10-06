@@ -47374,7 +47374,13 @@ class PostgresDB:
                             detached = await conn.execute(
                                 "UPDATE agents SET thread_id=NULL,status='draining' "
                                 "WHERE id=$1::uuid AND thread_id=$2::uuid "
-                                "AND status='session' AND current_job_id IS NULL "
+                                # Heartbeat expiry can mark this exact actor offline
+                                # after its proven stop, before terminal settlement.
+                                # The transaction above independently validates the
+                                # immutable process-zero/external-cleanup receipts;
+                                # this status never supplies either proof or a pool slot.
+                                "AND status IN ('session','offline') "
+                                "AND current_job_id IS NULL "
                                 "AND hostname=$3 AND pod_uid=$4",
                                 UUID(expected_inverse_agent),
                                 thread_uuid,
