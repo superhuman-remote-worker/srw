@@ -244,6 +244,18 @@ export function heldForReviewReason(
   return reason || null;
 }
 
+/**
+ * Why a Job failed, when the server said so (e.g. its workspace image could
+ * not be pulled). VM-creation messages already render above.
+ */
+export function failureReason(
+  job: Pick<JobSummary, 'status' | 'error_message' | 'vm_creation'> | null,
+): string | null {
+  if (!job || job.status !== 'failed' || job.vm_creation) return null;
+  const reason = (job.error_message ?? '').trim();
+  return reason || null;
+}
+
 @Component({
   selector: 'app-job-detail-panel',
   standalone: true,
@@ -353,6 +365,12 @@ export function heldForReviewReason(
       @if (workspaceCreation(); as creation) {
         <section class="recovery-detail" [class.attention]="creation.state === 'attention'" role="status">
           <strong>{{ workspaceCreationMessageKey(creation) | transloco }}</strong>
+        </section>
+      }
+      @if (!workspaceCreation() && failureReason(job()); as failed) {
+        <section class="recovery-detail attention held-detail">
+          <strong>{{ 'jobs.detail.failureReason' | transloco }}</strong>
+          <span>{{ failed }}</span>
         </section>
       }
       @if (heldForReviewReason(job()); as held) {
@@ -979,6 +997,7 @@ export class JobDetailPanelComponent {
 
   protected readonly formatCount = formatCount;
   protected readonly heldForReviewReason = heldForReviewReason;
+  protected readonly failureReason = failureReason;
   protected readonly formatUsd = formatUsd;
   protected readonly shortId = shortJobId;
   protected readonly isTerminal = isTerminalJobStatus;

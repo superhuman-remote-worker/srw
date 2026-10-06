@@ -927,6 +927,7 @@
       "costUnpriced": "Metered, but no rate card covers these models — tokens are exact, cost is unknown.",
       "duration": "Duration",
       "expert": "Expert",
+      "failureReason": "Why it failed",
       "heldForReview": "Held for review",
       "loading": "Loading details…",
       "model": "Model",

@@ -8,6 +8,7 @@ import {
   formatCount,
   formatDurationSeconds,
   formatUsd,
+  failureReason,
   heldForReviewReason,
   jobModelLabel,
   liveSubjobCount,
@@ -787,5 +788,23 @@ describe('prompt clamp', () => {
   it('renders no description block at all when the job has no prompt', () => {
     const root = render('').nativeElement as HTMLElement;
     expect(root.querySelector('.description-block')).toBeNull();
+  });
+});
+
+describe('failure reason', () => {
+  const reason = 'Workspace image `x:1` could not be pulled: not found';
+
+  it('names why a failed job failed', () => {
+    expect(failureReason({status: 'failed', error_message: ` ${reason}\n`})).toBe(reason);
+  });
+
+  it('stays silent for blanks, other statuses, and VM-creation failures', () => {
+    expect(failureReason({status: 'failed', error_message: null})).toBeNull();
+    expect(failureReason({status: 'failed', error_message: '  '})).toBeNull();
+    expect(failureReason({status: 'running', error_message: reason})).toBeNull();
+    expect(failureReason({status: 'pending_review', error_message: reason})).toBeNull();
+    expect(failureReason(null)).toBeNull();
+    const vm = {state: 'attention'} as never;
+    expect(failureReason({status: 'failed', error_message: reason, vm_creation: vm})).toBeNull();
   });
 });

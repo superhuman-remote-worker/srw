@@ -927,6 +927,7 @@
       "costUnpriced": "Erfasst, aber für diese Modelle gibt es keine Preisliste — Tokens sind exakt, die Kosten unbekannt.",
       "duration": "Dauer",
       "expert": "Experte",
+      "failureReason": "Warum es fehlgeschlagen ist",
       "heldForReview": "Zur Prüfung angehalten",
       "loading": "Details werden geladen…",
       "model": "Modell",
