@@ -166,7 +166,7 @@ with the updated tools. Changing the model, tools, or connectors can reset the
 conversation's prompt cache, making the next response slower. A checked group
 is a request to load its tools, not proof that every operation is ready.
 
-Expert, attached projects, and Protected Cloud mode remain creation-time
+Expert, project, and Protected Cloud mode remain creation-time
 choices. Connector-specific live limits are in `datasources`.
 
 ## Diagnose a missing capability

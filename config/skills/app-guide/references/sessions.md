@@ -17,9 +17,10 @@ the agent works, you see everything as it happens. **Assistant** is the initial
 application session default, but an explicit selection, project default,
 personal default, or operator-chosen application default can replace it.
 
-Start one from **Sessions → New Session**: pick a title, projects to attach,
-an expert, and adjust the agent settings (model, permission mode, tools,
-connectors) if the defaults don't fit. Eligible deployments also offer a
+Start one from **Sessions → New Session**: pick a title, a **Project** (a
+session has one project or none; choose **No project** for none), an expert,
+and adjust the agent settings (model, permission mode, tools, connectors) if
+the defaults don't fit. Eligible deployments also offer a
 creation-time **Protected cloud** checkbox for staging changes to a
 non-default Nextcloud project; use its focused guide before relying on it.
 
@@ -134,7 +135,7 @@ start a new session with the needed workspace instead. Use the focused
 controls, and `canvas-and-browser` for browser setup and shared login.
 
 Workspace changes are upgrade-only; use a new session to move down to Virtual
-or None. Expert, projects, and Protected Cloud mode are set at creation.
+or None. Expert, project, and Protected Cloud mode are set at creation.
 Most eligible connectors can be added or removed live; some attachments are
 fixed for the session. Read `datasources` for attachment limits. Session
 Settings changes this conversation; account defaults for future sessions
