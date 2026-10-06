@@ -111,13 +111,13 @@ const APPLY_DEBOUNCE_MS = 400;
             [liveTier]="workspaceTier()"
             [tierReachability]="tierReachability()"
             [upgradeInProgress]="chat.workspaceUpgradeInProgress()"
+            [expertName]="expertLabel()"
+            [projectName]="projectLabel()"
+            [lockedConfig]="lockedConfig()"
             (change)="onSettingsChange()"
             (retryDatasources)="retryDatasourceLoad()"
             (tierChangeRequested)="onTierPicked($event)"
           />
-
-          <!-- Set-at-creation surfaces, shown for honesty (criterion 7) -->
-          <p class="fixed-note">{{ 'chat.settingsPane.fixedNote' | transloco }}</p>
         </div>
       </div>
 
@@ -173,13 +173,6 @@ const APPLY_DEBOUNCE_MS = 400;
         padding: 12px;
         min-height: 0;
       }
-      .fixed-note {
-        display: block;
-        margin-top: 16px;
-        font-size: 11px;
-        line-height: 1.4;
-        color: var(--text-muted);
-      }
       .upgrade-body {
         margin: 0 0 10px;
         font-size: 13px;
@@ -233,6 +226,13 @@ export class SettingsPaneComponent {
     readonly lockedDatasourceIds = computed(() =>
         this.pickerDatasources().filter((ds) => ds.type === 'kb').map((ds) => ds.id),
     );
+    /** Set-at-creation facts the pane shows locked (criterion 7): the
+     *  session's Expert and project names, and its frozen resolved config so
+     *  locked settings show the values the session really runs with. */
+    readonly expertLabel = signal('');
+    readonly projectLabel = signal('');
+    readonly lockedConfig = signal<Record<string, unknown> | null>(null);
+    private labelRequestSerial = 0;
     /** Thread id the pane last prefilled for (re-prefill on session switch). */
     private prefilledThread: string | null = null;
     /** Desired state actually dispatched last — the diff baseline. */
@@ -364,11 +364,16 @@ export class SettingsPaneComponent {
         });
     }
 
-    /** Scroll the model control into view (status-chip entry point). */
+    /** Scroll the model control into view (status-chip entry point). The
+     *  Expert section may be collapsed, so open it first and scroll once it
+     *  has rendered. */
     scrollToModel(): void {
-        this.paneRoot()?.nativeElement
-            .querySelector('app-model-group')
-            ?.scrollIntoView({block: 'start', behavior: 'smooth'});
+        this.settings()?.revealModel();
+        setTimeout(() => {
+            this.paneRoot()?.nativeElement
+                .querySelector('app-model-group')
+                ?.scrollIntoView({block: 'start', behavior: 'smooth'});
+        });
     }
 
     onSettingsChange(): void {
@@ -399,6 +404,9 @@ export class SettingsPaneComponent {
         this.threadOverride.set({});
         this.attachedIds.set([]);
         this.pickerDatasources.set([]);
+        this.expertLabel.set('');
+        this.projectLabel.set('');
+        this.lockedConfig.set(null);
         // Honest "unknown" while loading: the tools surface degrades to its
         // static list until the server answers, so nothing is shown as
         // measured that has not been measured.
@@ -452,6 +460,43 @@ export class SettingsPaneComponent {
             const projectIds = ((thread?.['project_ids'] ?? []) as string[]).map(String);
             this.datasourceProjectIds = projectIds;
             this.loadEligibleDatasources(threadId, ids, projectIds);
+            this.loadLockedFacts(threadId, thread, metadata, projectIds);
+        });
+    }
+
+    /** Names and frozen values for the locked rows. Display only: none of it
+     *  reaches the diff baseline, so a slow or failed read changes nothing
+     *  but what the locked rows can say. */
+    private loadLockedFacts(
+        threadId: string,
+        thread: Record<string, unknown> | null,
+        metadata: Record<string, unknown>,
+        projectIds: string[],
+    ): void {
+        const serial = ++this.labelRequestSerial;
+        const current = () => serial === this.labelRequestSerial && this.chat.threadId() === threadId;
+        const expertId = (metadata['expert_id'] as string | undefined)
+            ?? (metadata['expert_based_on'] as string | undefined)
+            ?? (thread?.['config_name'] as string | undefined)
+            ?? null;
+        if (expertId) {
+            this.expertLabel.set(expertId);
+            this.api.getExperts(undefined, {showAll: true}).subscribe((experts) => {
+                if (!current()) return;
+                const match = experts.find((e) => e.id === expertId || e.name === expertId);
+                if (match) this.expertLabel.set(match.display_name);
+            });
+        }
+        // `project_ids` is the derived list view and can be empty for a
+        // single-project session; the `project_id` column is the source.
+        const projectId = projectIds[0] ?? (thread?.['project_id'] as string | undefined) ?? null;
+        if (projectId) {
+            this.api.getProject(projectId).subscribe((project) => {
+                if (current() && project) this.projectLabel.set(project.name);
+            });
+        }
+        this.api.getThreadResolvedConfig(threadId).subscribe((config) => {
+            if (current()) this.lockedConfig.set(config);
         });
     }
 

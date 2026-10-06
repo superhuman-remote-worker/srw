@@ -19,6 +19,9 @@ import {PinOnInteractDirective} from './pin-on-interact.directive';
 import {allowedEnumOptions} from './capability-gates';
 import type {GrantCatalog} from '../../core/models/api.model';
 
+/** See ExecutionGroupComponent.section. */
+export type ExecutionSection = 'all' | 'task' | 'taskMore' | 'expert' | 'workspace';
+
 /**
  * Execution settings group: autonomy, scholar, critic, project memory.
  * In session mode, shows permission mode instead of autonomy.
@@ -28,11 +31,13 @@ import type {GrantCatalog} from '../../core/models/api.model';
   standalone: true,
   imports: [FormsModule, TranslocoPipe, AppIconComponent, PinOnInteractDirective],
   template: `
-    <div class="settings-group">
-      <div class="group-label">{{ 'agentSettings.execution.group' | transloco }}</div>
+    <div class="settings-group" [class.sectioned]="section() !== 'all'">
+      @if (section() === 'all') {
+        <div class="group-label">{{ 'agentSettings.execution.group' | transloco }}</div>
+      }
 
       <!-- Autonomy (job) or Permission Mode (session) -->
-      @if (mode() === 'job') {
+      @if (has('task') && mode() === 'job') {
         <div class="field-row" [class.modified]="autonomy() !== null">
           <label class="field-label">{{ 'agentSettings.execution.autonomy' | transloco }}</label>
           <div class="field-control">
@@ -55,7 +60,7 @@ import type {GrantCatalog} from '../../core/models/api.model';
           </div>
           <span class="field-hint">{{ effectiveAutonomyDesc() }}</span>
         </div>
-      } @else {
+      } @else if (has('task')) {
         <div class="field-row" [class.modified]="permissionMode() !== null">
           <label class="field-label">{{ 'agentSettings.execution.permissionMode' | transloco }}</label>
           <div class="field-control">
@@ -85,7 +90,7 @@ import type {GrantCatalog} from '../../core/models/api.model';
            not a setting: it always displays the running tier, unreachable
            tiers carry their reason, and picking one emits intent for the host
            to confirm and dispatch. -->
-      @if (mode() === 'live' && liveTier()) {
+      @if (has('workspace') && mode() === 'live' && liveTier()) {
         <div class="field-row">
           <label class="field-label">{{ 'agentSettings.execution.workspaceBackend' | transloco }}</label>
           @if (anyTierReachable()) {
@@ -117,7 +122,7 @@ import type {GrantCatalog} from '../../core/models/api.model';
         </div>
       }
 
-      @if (mode() !== 'live' && showWorkspaceBackend()) {
+      @if (has('workspace') && mode() !== 'live' && showWorkspaceBackend()) {
         <div class="field-row" [class.modified]="workspaceBackend() !== null">
           <label class="field-label">{{ workspaceBackendLabel() | transloco }}</label>
           <div class="field-control">
@@ -148,7 +153,7 @@ import type {GrantCatalog} from '../../core/models/api.model';
 
       <!-- Narration mode (live sessions only — a runtime chat concept, not a
            creation-form field; applied via the dedicated narration.set verb) -->
-      @if (mode() === 'live') {
+      @if (has('task') && mode() === 'live') {
         <div class="field-row" [class.modified]="narrationMode() !== null">
           <label class="field-label">{{ 'agentSettings.execution.narration' | transloco }}</label>
           <div class="field-control">
@@ -167,23 +172,28 @@ import type {GrantCatalog} from '../../core/models/api.model';
         </div>
       }
 
-      <!-- Image quality (jobs + session creation; not in the live honored set) -->
-      @if (mode() !== 'live') {
+      <!-- Image quality (jobs + session creation; not in the live honored set,
+           so a sectioned live host shows it locked instead of hiding it) -->
+      @if (has('expert') && (mode() !== 'live' || section() === 'expert')) {
         <div class="field-row" [class.modified]="imageQuality() !== null">
-          <label class="field-label">{{ 'agentSettings.execution.imageQuality' | transloco }}</label>
+          <label class="field-label">{{ 'agentSettings.execution.imageQuality' | transloco }}
+            @if (mode() === 'live') {
+              <span class="locked-note">{{ 'agentSettings.locked.atCreation' | transloco }}</span>
+            }
+          </label>
           <div class="field-control">
             <select
               class="form-input"
               [ngModel]="imageQuality() ?? resolvedImageQuality()"
               appPinOnInteract (pin)="pinValue(imageQuality, resolvedImageQuality())"
               (ngModelChange)="onImageQualityChange($event)"
-              [disabled]="disabled()"
+              [disabled]="disabled() || mode() === 'live'"
             >
               @for (q of imageQualityTiers; track q.value) {
                 <option [value]="q.value">{{ 'agentSettings.imageQuality.' + q.value + '.label' | transloco }}</option>
               }
             </select>
-            @if (imageQuality() !== null) {
+            @if (imageQuality() !== null && mode() !== 'live') {
               <button type="button" class="reset-btn" (click)="imageQuality.set(null)" [title]="'agentSettings.common.resetToDefault' | transloco">
                 <app-icon size="xs">close</app-icon>
               </button>
@@ -194,7 +204,7 @@ import type {GrantCatalog} from '../../core/models/api.model';
       }
 
       <!-- Scholar toggle -->
-      @if (mode() === 'job') {
+      @if (has('taskMore') && mode() === 'job') {
         <div class="field-row toggle-row" [class.modified]="scholar() !== null">
           <label class="toggle-label">
             <input
@@ -214,7 +224,7 @@ import type {GrantCatalog} from '../../core/models/api.model';
       }
 
       <!-- Critic toggle + rounds -->
-      @if (mode() === 'job') {
+      @if (has('taskMore') && mode() === 'job') {
         <div class="field-row toggle-row" [class.modified]="critic() !== null || criticRounds() !== null">
           <label class="toggle-label">
             <input
@@ -247,7 +257,7 @@ import type {GrantCatalog} from '../../core/models/api.model';
       }
 
       <!-- Project memory toggle -->
-      @if (mode() === 'job' && showProjectMemory()) {
+      @if (has('taskMore') && mode() === 'job' && showProjectMemory()) {
         <div class="field-row toggle-row" [class.modified]="projectMemory() !== null">
           <label class="toggle-label">
             <input
@@ -270,6 +280,14 @@ import type {GrantCatalog} from '../../core/models/api.model';
   styles: [`
     .settings-group {
       margin-bottom: 20px;
+    }
+    .settings-group.sectioned {
+      margin-bottom: 0;
+    }
+    .locked-note {
+      margin-left: 6px;
+      font-weight: 400;
+      color: var(--text-muted);
     }
     .group-label {
       font-size: 11px;
@@ -404,7 +422,7 @@ export class ExecutionGroupComponent {
     // Creation forms only: a live session already running on a VM is a fact,
     // not a proposal, and the form has no business second-guessing it.
     effect(() => {
-      if (this.mode() === 'live' || !this.showWorkspaceBackend()) return;
+      if (this.mode() === 'live' || !this.showWorkspaceBackend() || !this.has('workspace')) return;
       if (this.canUseVm()) return;
       if (this.effectiveBackend() === 'vm') {
         this.workspaceBackend.set('sandbox');
@@ -436,6 +454,19 @@ export class ExecutionGroupComponent {
   /** False when a create form's workspace picker owns the choice (Slice A3):
    *  the row, the VM snap and the backend override all stay out of the way. */
   showWorkspaceBackend = input(true);
+  /** Which rows this instance renders and writes. `all` is the single-group
+   *  layout the Expert editor uses; the creation forms and the live pane mount
+   *  one instance per section: `task` (autonomy or permission mode, live
+   *  narration), `taskMore` (scholar, critic, project memory), `expert`
+   *  (image quality) and `workspace` (the tier row). */
+  section = input<ExecutionSection>('all');
+
+  /** True when this instance owns the given section's rows. */
+  has(section: Exclude<ExecutionSection, 'all'>): boolean {
+    const own = this.section();
+    return own === 'all' || own === section;
+  }
+
   /** The row's label key. The Expert editor passes
    *  'agentSettings.execution.workspaceRecommended', because an Expert only recommends. */
   workspaceBackendLabel = input('agentSettings.execution.workspaceBackend');
@@ -616,16 +647,24 @@ export class ExecutionGroupComponent {
 
   /** Number of fields that differ from defaults. */
   readonly modifiedCount = computed(() => {
+    this.section();
     let count = 0;
-    if (this.autonomy() !== null) count++;
-    if (this.permissionMode() !== null) count++;
-    if (this.narrationMode() !== null) count++;
-    if (this.scholar() !== null) count++;
-    if (this.critic() !== null) count++;
-    if (this.criticRounds() !== null) count++;
-    if (this.projectMemory() !== null) count++;
-    if (this.imageQuality() !== null) count++;
-    if (this.workspaceBackend() !== null) count++;
+    if (this.has('task')) {
+      if (this.mode() === 'job') {
+        if (this.autonomy() !== null) count++;
+      } else {
+        if (this.permissionMode() !== null) count++;
+        if (this.narrationMode() !== null) count++;
+      }
+    }
+    if (this.has('taskMore')) {
+      if (this.scholar() !== null) count++;
+      if (this.critic() !== null) count++;
+      if (this.criticRounds() !== null) count++;
+      if (this.projectMemory() !== null) count++;
+    }
+    if (this.has('expert') && this.imageQuality() !== null) count++;
+    if (this.has('workspace') && this.workspaceBackend() !== null) count++;
     return count;
   });
 
@@ -716,20 +755,22 @@ export class ExecutionGroupComponent {
     const o: Record<string, unknown> = {};
 
     if (this.mode() === 'job') {
-      if (this.autonomy() !== null) o['autonomy'] = this.autonomy();
-      const s = this.scholar();
-      if (s !== null) o['scholar'] = { enabled: s };
-      const c = this.critic();
-      const r = this.criticRounds();
-      if (c !== null || r !== null) {
-        o['verification'] = {
-          enabled: c ?? this.resolvedCritic(),
-          max_rounds: r ?? this.resolvedCriticRounds(),
-        };
+      if (this.has('task') && this.autonomy() !== null) o['autonomy'] = this.autonomy();
+      if (this.has('taskMore')) {
+        const s = this.scholar();
+        if (s !== null) o['scholar'] = { enabled: s };
+        const c = this.critic();
+        const r = this.criticRounds();
+        if (c !== null || r !== null) {
+          o['verification'] = {
+            enabled: c ?? this.resolvedCritic(),
+            max_rounds: r ?? this.resolvedCriticRounds(),
+          };
+        }
+        const pm = this.projectMemory();
+        if (pm !== null) o['memory'] = { project_scoped: pm };
       }
-      const pm = this.projectMemory();
-      if (pm !== null) o['memory'] = { project_scoped: pm };
-    } else {
+    } else if (this.has('task')) {
       const interactive: Record<string, unknown> = {};
       if (this.permissionMode() !== null) interactive['permission_mode'] = this.permissionMode();
       if (this.narrationMode() !== null) interactive['narration_mode'] = this.narrationMode();
@@ -737,8 +778,11 @@ export class ExecutionGroupComponent {
     }
 
     // Image quality is a top-level knob honored by both worker and persistent
-    // agents, so it applies regardless of mode.
-    if (this.imageQuality() !== null) o['image_quality'] = this.imageQuality();
+    // agents, so it applies regardless of mode — but never from the live pane,
+    // where it is shown locked.
+    if (this.has('expert') && this.mode() !== 'live' && this.imageQuality() !== null) {
+      o['image_quality'] = this.imageQuality();
+    }
 
     // Workspace backend. The rest of the `workspace` fragment (VM sizing, file
     // limits, git versioning) stays in the Advanced accordion; the host deep-
@@ -747,7 +791,7 @@ export class ExecutionGroupComponent {
     // Never in live mode: there the tier moves through the upgrade verb, and
     // letting it ride the pane's debounced config.update would be a second,
     // silent writer of the same fact.
-    if (this.mode() !== 'live' && this.showWorkspaceBackend() && this.workspaceBackend() !== null) {
+    if (this.has('workspace') && this.mode() !== 'live' && this.showWorkspaceBackend() && this.workspaceBackend() !== null) {
       o['workspace'] = {backend: this.workspaceBackend()};
     }
 

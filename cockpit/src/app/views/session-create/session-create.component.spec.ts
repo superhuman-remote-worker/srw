@@ -43,6 +43,8 @@ function stubApi(
     getProject: vi.fn().mockReturnValue(of(null)),
     listWorkspaceTemplates: vi.fn().mockReturnValue(of({resources: []})),
     getProjectWorkspaceDefaults: vi.fn().mockReturnValue(of(null)),
+    // No readable template: the form keeps the selector + overrides request.
+    getExpertTemplate: vi.fn().mockReturnValue(of(null)),
   };
 }
 

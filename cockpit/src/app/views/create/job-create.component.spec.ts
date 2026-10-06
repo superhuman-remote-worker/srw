@@ -378,6 +378,101 @@ describe('JobCreateComponent project picker', () => {
     });
   });
 
+  // creation_ui_expert_workspace_connectors.md D2: no overrides on a baseline.
+  const TEMPLATE = {
+    runtimeConfig: {
+      config_name: 'worker_base',
+      asset_name: 'developer',
+      config: {llm: {model: 'opus-5-5', reasoning_level: 'high'}, tools: {shell: ['run_command']}},
+      prompts: {persona: 'You write code.', instructions: 'Ship small changes.'},
+    },
+    workspacePreference: {backend: 'sandbox'},
+  };
+
+  function expertSettings(options: {changed: boolean; instructionsModified?: boolean}) {
+    return {
+      vmSizingValid: () => true,
+      hasExpertChanges: () => options.changed,
+      getExpertOverrides: () => ({llm: {model: 'sonnet-5-5'}, tools: {browser: true}}),
+      getTaskOverrides: () => ({autonomy: 'full'}),
+      getOverrides: () => ({autonomy: 'full', llm: {model: 'sonnet-5-5'}, tools: {browser: true}}),
+      getInstructions: () => 'Edited instructions',
+      instructionsTab: {isModified: () => options.instructionsModified ?? false},
+      getSelectedDatasourceIds: () => ['connector-1'],
+      resetAll: vi.fn(),
+    } as unknown as JobCreateComponent['agentSettings'];
+  }
+
+  it('a changed template is sent as a complete inline copy, settings beside it', async () => {
+    const {component, api} = setup(null);
+    component.formData.description = 'Fix the flaky test';
+    component.selectedExpert.set({id: 'developer', storage_kind: 'bundled'} as Expert);
+    component.expertTemplate.set(TEMPLATE);
+    component.agentSettings = expertSettings({changed: true, instructionsModified: true});
+
+    await component.onSubmit();
+
+    const request = api.createJob.mock.calls.at(-1)![0];
+    expect(request).not.toHaveProperty('config_name');
+    expect(request).not.toHaveProperty('expert_id');
+    expect(request).not.toHaveProperty('instructions');
+    expect(request.expert_based_on).toBe('developer');
+    expect(request.expert).toEqual({inline: {
+      runtime: {adapter: 'srw/v1', config: {
+        config_name: 'worker_base',
+        asset_name: 'developer',
+        config: {llm: {model: 'sonnet-5-5', reasoning_level: 'high'}, tools: {shell: ['run_command'], browser: true}},
+        prompts: {persona: 'You write code.', instructions: 'Edited instructions'},
+      }},
+      workspacePreference: {backend: 'sandbox'},
+    }});
+    expect(request.config_override).toEqual({autonomy: 'full'});
+  });
+
+  it('an untouched template sends its selector and only the job-level settings', async () => {
+    const {component, api} = setup(null);
+    component.formData.description = 'Fix the flaky test';
+    component.selectedExpert.set({id: 'developer', storage_kind: 'bundled'} as Expert);
+    component.expertTemplate.set(TEMPLATE);
+    component.agentSettings = expertSettings({changed: false});
+
+    await component.onSubmit();
+
+    const request = api.createJob.mock.calls.at(-1)![0];
+    expect(request.config_name).toBe('developer');
+    expect(request).not.toHaveProperty('expert');
+    expect(request).not.toHaveProperty('instructions');
+    expect(request.config_override).toEqual({autonomy: 'full'});
+  });
+
+  it('without a readable template a changed template falls back to selector + overrides', async () => {
+    const {component, api} = setup(null);
+    component.formData.description = 'Fix the flaky test';
+    component.selectedExpert.set({id: 'developer', storage_kind: 'bundled'} as Expert);
+    component.agentSettings = expertSettings({changed: true});
+
+    await component.onSubmit();
+
+    const request = api.createJob.mock.calls.at(-1)![0];
+    expect(request.config_name).toBe('developer');
+    expect(request.config_override).toEqual({autonomy: 'full', llm: {model: 'sonnet-5-5'}, tools: {browser: true}});
+    expect(request.instructions).toBe('Edited instructions');
+  });
+
+  it('the manifest view shows the same request as a Job document', () => {
+    const {component} = setup(null);
+    component.formData.description = 'Fix the flaky test';
+    component.selectedExpert.set({id: 'developer', storage_kind: 'bundled'} as Expert);
+    component.expertTemplate.set(TEMPLATE);
+    component.agentSettings = expertSettings({changed: true});
+    component.toggleManifest();
+    const yaml = component.manifestText();
+    expect(yaml).toContain('kind: Job');
+    expect(yaml).toContain('inline:');
+    expect(yaml).toContain('adapter: srw/v1');
+    expect(yaml).toContain('text: Fix the flaky test');
+  });
+
   it('sends the picked template in the preview and the create, never config_override.workspace', async () => {
     const {component, api} = setup(null);
     const choice = {kind: 'ref' as const, ref: {name: 'container-minimal', scope: {kind: 'Catalog' as const, name: 'shared'}}, backend: 'sandbox' as const, label: 'container-minimal'};

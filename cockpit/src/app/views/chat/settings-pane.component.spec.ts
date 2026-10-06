@@ -98,6 +98,10 @@ function createPane(options: {
     getSessionToolGroups: vi
       .fn()
       .mockReturnValue(options.toolGroups$ ?? of(options.toolGroups ?? null)),
+    // Locked-row facts: display only, never part of the diff.
+    getExperts: vi.fn().mockReturnValue(of([])),
+    getProject: vi.fn().mockReturnValue(of(null)),
+    getThreadResolvedConfig: vi.fn().mockReturnValue(of(null)),
   };
   const capabilities = {
     grants: signal(options.grants ?? null),
@@ -201,6 +205,9 @@ function createPaneWithRealToolsGroup(toolGroups: SessionToolGroupsResponse) {
     ),
     getEligibleDatasources: vi.fn().mockReturnValue(of([])),
     getSessionToolGroups: vi.fn().mockReturnValue(of(toolGroups)),
+    getExperts: vi.fn().mockReturnValue(of([])),
+    getProject: vi.fn().mockReturnValue(of(null)),
+    getThreadResolvedConfig: vi.fn().mockReturnValue(of(null)),
   };
   const capabilities = {
     grants: signal(null),
@@ -376,6 +383,9 @@ describe('SettingsPaneComponent locked-on categories, from the DOM', () => {
       ),
       getEligibleDatasources: vi.fn().mockReturnValue(of([])),
       getSessionToolGroups: vi.fn().mockReturnValue(of(toolGroups)),
+      getExperts: vi.fn().mockReturnValue(of([])),
+      getProject: vi.fn().mockReturnValue(of(null)),
+      getThreadResolvedConfig: vi.fn().mockReturnValue(of(null)),
     };
 
     TestBed.configureTestingModule({

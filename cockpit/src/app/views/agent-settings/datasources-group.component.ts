@@ -138,17 +138,51 @@ export function allDatasourcesSelected(
   template: `
     @if (!loading() && datasources().length > 0) {
       <div class="settings-group">
-        <div class="group-header">
-          <span class="group-label">{{ 'agentSettings.datasources.group' | transloco }}</span>
-          <button
-            type="button"
-            class="select-all-btn"
-            (click)="toggleAll()"
-            [disabled]="disabled() || error() || selectableDatasources().length === 0"
-          >{{ (allSelected() ? 'agentSettings.common.deselectAll' : 'agentSettings.common.selectAll') | transloco }}</button>
-        </div>
+        @if (showHeader()) {
+          <div class="group-header">
+            <span class="group-label">{{ 'agentSettings.datasources.group' | transloco }}</span>
+            <button
+              type="button"
+              class="select-all-btn"
+              (click)="toggleAll()"
+              [disabled]="disabled() || error() || selectableDatasources().length === 0"
+            >{{ (allSelected() ? 'agentSettings.common.deselectAll' : 'agentSettings.common.selectAll') | transloco }}</button>
+          </div>
+        }
+        @if (searchable()) {
+          <div class="ds-toolbar">
+            <div class="ds-search">
+              <app-icon size="sm" class="ds-search-icon">search</app-icon>
+              <input
+                type="search"
+                class="ds-search-input"
+                [value]="query()"
+                (input)="query.set($any($event.target).value)"
+                [placeholder]="'agentSettings.datasources.searchPlaceholder' | transloco"
+                [attr.aria-label]="'agentSettings.datasources.searchLabel' | transloco"
+              >
+            </div>
+            <div class="ds-filter" role="group" [attr.aria-label]="'agentSettings.datasources.filterLabel' | transloco">
+              <button type="button" class="ds-filter-btn" [attr.aria-pressed]="!onlyAttached()" (click)="onlyAttached.set(false)">
+                {{ 'agentSettings.datasources.filterAll' | transloco }}
+              </button>
+              <button type="button" class="ds-filter-btn" [attr.aria-pressed]="onlyAttached()" (click)="onlyAttached.set(true)">
+                {{ 'agentSettings.datasources.filterAttached' | transloco:{ n: selectedList().length } }}
+              </button>
+            </div>
+          </div>
+          <div class="ds-count-row">
+            <span class="ds-count">{{ 'agentSettings.datasources.countLine' | transloco:{ n: selectedList().length, total: datasources().length } }}</span>
+            <button
+              type="button"
+              class="select-all-btn"
+              (click)="toggleAll()"
+              [disabled]="disabled() || error() || selectableDatasources().length === 0"
+            >{{ (allSelected() ? 'agentSettings.common.deselectAll' : 'agentSettings.common.selectAll') | transloco }}</button>
+          </div>
+        }
         <div class="ds-picker">
-          @for (ds of datasources(); track ds.id) {
+          @for (ds of visibleDatasources(); track ds.id) {
             <label
               class="ds-option"
               [class.selected]="isChecked(ds)"
@@ -198,6 +232,11 @@ export function allDatasourcesSelected(
               }
             </label>
           }
+          @if (searchable() && visibleDatasources().length === 0) {
+            <div class="ds-empty">
+              {{ (query().trim() ? 'agentSettings.datasources.noMatch' : 'agentSettings.datasources.noneAttached') | transloco:{ query: query().trim() } }}
+            </div>
+          }
         </div>
         @if (error()) {
           <div class="ds-error" role="alert">
@@ -210,9 +249,11 @@ export function allDatasourcesSelected(
       </div>
     } @else if (loading()) {
       <div class="settings-group">
-        <div class="group-header">
-          <span class="group-label">{{ 'agentSettings.datasources.group' | transloco }}</span>
-        </div>
+        @if (showHeader()) {
+          <div class="group-header">
+            <span class="group-label">{{ 'agentSettings.datasources.group' | transloco }}</span>
+          </div>
+        }
         <div class="ds-loading">
           <app-spinner size="sm" />
 
@@ -221,9 +262,11 @@ export function allDatasourcesSelected(
       </div>
     } @else if (error()) {
       <div class="settings-group">
-        <div class="group-header">
-          <span class="group-label">{{ 'agentSettings.datasources.group' | transloco }}</span>
-        </div>
+        @if (showHeader()) {
+          <div class="group-header">
+            <span class="group-label">{{ 'agentSettings.datasources.group' | transloco }}</span>
+          </div>
+        }
         <div class="ds-error" role="alert">
           <span>{{ 'agentSettings.datasources.loadFailed' | transloco }}</span>
           <button type="button" class="select-all-btn" (click)="retry.emit()">
@@ -231,6 +274,8 @@ export function allDatasourcesSelected(
           </button>
         </div>
       </div>
+    } @else if (searchable()) {
+      <p class="ds-empty">{{ 'agentSettings.datasources.noneAvailable' | transloco }}</p>
     }
   `,
   styles: [`
@@ -356,6 +401,88 @@ export function allDatasourcesSelected(
       color: var(--text-muted, var(--text-muted));
       padding: 8px 0;
     }
+    .ds-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .ds-search {
+      position: relative;
+      flex: 1 1 14rem;
+      min-width: 0;
+    }
+    .ds-search-icon {
+      position: absolute;
+      left: 10px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--text-muted);
+      pointer-events: none;
+    }
+    .ds-search-input {
+      box-sizing: border-box;
+      width: 100%;
+      min-height: 36px;
+      padding: 6px 10px 6px 32px;
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-control);
+      background: var(--surface-0);
+      color: var(--text-primary);
+      font: inherit;
+      font-size: 13px;
+    }
+    .ds-search-input:focus {
+      outline: none;
+      border-color: var(--accent-color);
+      box-shadow: 0 0 0 3px var(--ring);
+    }
+    .ds-filter {
+      display: inline-flex;
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-control);
+      overflow: hidden;
+    }
+    .ds-filter-btn {
+      min-height: 36px;
+      padding: 0 12px;
+      border: 0;
+      background: var(--surface-0);
+      color: var(--text-secondary);
+      font: inherit;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .ds-filter-btn + .ds-filter-btn {
+      border-left: 1px solid var(--border-color);
+    }
+    .ds-filter-btn[aria-pressed="true"] {
+      background: var(--accent-color);
+      color: var(--on-accent);
+    }
+    .ds-filter-btn:focus-visible {
+      outline: none;
+      box-shadow: inset 0 0 0 2px var(--ring);
+    }
+    .ds-count-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .ds-count {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .ds-empty {
+      margin: 0;
+      padding: 10px 2px;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
     .ds-error {
       display: flex;
       align-items: center;
@@ -400,6 +527,17 @@ export class DatasourcesGroupComponent {
    * changes are out of scope; live_session_settings.md Slice B).
    */
   lockedIds = input<string[]>([]);
+  /** Show the uppercase group label. Off inside the three-section host, whose
+   *  Connectors section already titles it. */
+  showHeader = input(true);
+  /** Show the search box and the All / Attached filter — a production system
+   *  accumulates far more connectors than a flat checkbox list can carry. */
+  searchable = input(false);
+
+  /** Search text and the Attached-only filter. Presentation only: a filtered
+   *  row keeps its selection, and nothing here reaches `getSelectedIds`. */
+  readonly query = signal('');
+  readonly onlyAttached = signal(false);
 
   change = output<void>();
   retry = output<void>();
@@ -438,6 +576,28 @@ export class DatasourcesGroupComponent {
     const init = this.initialSelectedIds();
     return init === null ? null : new Set(init);
   }
+
+  /** The connectors that would be attached, in list order — what the
+   *  section's one-line summary names. Same rule as `getSelectedIds`. */
+  readonly selectedList = computed<Datasource[]>(() => {
+    const ids = new Set(selectedDatasourceIds(
+      this.datasources(), this.selection(), this.isLiteBackend(), this.defaultIds(),
+      this.datasourceDefaultsEnabled(),
+    ));
+    return this.datasources().filter(d => ids.has(d.id));
+  });
+
+  /** Rows after the search text and the Attached-only filter. */
+  readonly visibleDatasources = computed<Datasource[]>(() => {
+    const needle = this.query().trim().toLowerCase();
+    const attached = this.onlyAttached() ? new Set(this.selectedList().map(d => d.id)) : null;
+    return this.datasources().filter(ds => {
+      if (attached && !attached.has(ds.id)) return false;
+      if (!needle) return true;
+      return [ds.name, ds.type, ds.description ?? '']
+        .some(text => (text || '').toString().toLowerCase().includes(needle));
+    });
+  });
 
   /** Datasources the user can actually toggle (not lite-excluded, not locked). */
   readonly selectableDatasources = computed<Datasource[]>(() =>

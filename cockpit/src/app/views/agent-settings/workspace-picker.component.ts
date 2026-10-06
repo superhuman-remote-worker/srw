@@ -55,7 +55,7 @@ let nextPickerId = 0;
     AppSelectComponent, WorkspaceTemplateFormComponent,
   ],
   template: `
-    <app-form-field [label]="'agentSettings.workspacePicker.label' | transloco" [hint]="summary()" [error]="problem()">
+    <app-form-field [label]="labelKey() | transloco" [hint]="summary()" [error]="problem()">
       <app-button formFieldAction variant="ghost" size="sm" [disabled]="disabled()" (clicked)="openCustomize()">
         {{ 'agentSettings.workspacePicker.customize' | transloco }}
       </app-button>
@@ -113,6 +113,9 @@ export class WorkspacePickerComponent {
   readonly recommendation = input<'none' | 'virtual' | 'sandbox' | 'vm' | null>(null);
   readonly recommendedBy = input('');
   readonly disabled = input(false);
+  /** The field label. Inside the creation forms' Workspace section the
+   *  section already says "Workspace", so they label the field "Template". */
+  readonly labelKey = input('agentSettings.workspacePicker.label');
   readonly choice = model<WorkspaceChoice>({kind: 'default'});
 
   readonly shared = signal<WorkspaceTemplateItem[]>([]);

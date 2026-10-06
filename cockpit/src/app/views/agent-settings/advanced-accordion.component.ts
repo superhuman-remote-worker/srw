@@ -36,17 +36,21 @@ function validVmSizeGiB(value: number | null): value is number {
   standalone: true,
     imports: [FormsModule, TranslocoPipe, AppIconComponent, AppTooltipDirective, PinOnInteractDirective],
   template: `
-    <div class="advanced-container">
+    <div class="advanced-container" [class.flat]="flat()">
       <!-- Inference Parameters -->
-      <div class="accordion-section" [class.expanded]="expanded().has('inference')">
-        <button type="button" class="accordion-header" (click)="toggleSection('inference')">
-          <app-icon size="md" class="accordion-icon">{{ expanded().has('inference') ? 'expand_less' : 'expand_more' }}</app-icon>
+      <div class="accordion-section" [class.expanded]="isOpen('inference')">
+        @if (!flat()) {
+        <button type="button" class="accordion-header" (click)="toggleSection('inference')" [attr.aria-expanded]="isOpen('inference')">
+          <app-icon size="md" class="accordion-icon">{{ isOpen('inference') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.inference' | transloco }}
           @if (inferenceModifiedCount() > 0) {
             <span class="modified-badge">{{ inferenceModifiedCount() }}</span>
           }
         </button>
-        @if (expanded().has('inference')) {
+        } @else {
+          <h4 class="flat-heading">{{ 'advanced.sections.inference' | transloco }}</h4>
+        }
+        @if (isOpen('inference')) {
           <div class="accordion-body">
             <!-- One model runs the whole job since U1, so there is ONE
                  inference section (the per-phase strategic/tactical pair is
@@ -168,12 +172,16 @@ function validVmSizeGiB(value: number | null): value is number {
       </div>
 
       <!-- Limits & Safety -->
-      <div class="accordion-section" [class.expanded]="expanded().has('limits')">
-        <button type="button" class="accordion-header" (click)="toggleSection('limits')">
-          <app-icon size="md" class="accordion-icon">{{ expanded().has('limits') ? 'expand_less' : 'expand_more' }}</app-icon>
+      <div class="accordion-section" [class.expanded]="isOpen('limits')">
+        @if (!flat()) {
+        <button type="button" class="accordion-header" (click)="toggleSection('limits')" [attr.aria-expanded]="isOpen('limits')">
+          <app-icon size="md" class="accordion-icon">{{ isOpen('limits') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.limits' | transloco }}
         </button>
-        @if (expanded().has('limits')) {
+        } @else {
+          <h4 class="flat-heading">{{ 'advanced.sections.limits' | transloco }}</h4>
+        }
+        @if (isOpen('limits')) {
           <div class="accordion-body">
             <div class="field-row" [class.modified]="messageCountThreshold() !== null">
               <label class="field-label">{{ 'advanced.labels.messageCountThreshold' | transloco }}</label>
@@ -228,12 +236,16 @@ function validVmSizeGiB(value: number | null): value is number {
       </div>
 
       <!-- Memory Tuning -->
-      <div class="accordion-section" [class.expanded]="expanded().has('memory')">
-        <button type="button" class="accordion-header" (click)="toggleSection('memory')">
-          <app-icon size="md" class="accordion-icon">{{ expanded().has('memory') ? 'expand_less' : 'expand_more' }}</app-icon>
+      <div class="accordion-section" [class.expanded]="isOpen('memory')">
+        @if (!flat()) {
+        <button type="button" class="accordion-header" (click)="toggleSection('memory')" [attr.aria-expanded]="isOpen('memory')">
+          <app-icon size="md" class="accordion-icon">{{ isOpen('memory') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.memory' | transloco }}
         </button>
-        @if (expanded().has('memory')) {
+        } @else {
+          <h4 class="flat-heading">{{ 'advanced.sections.memory' | transloco }}</h4>
+        }
+        @if (isOpen('memory')) {
           <div class="accordion-body">
             <div class="field-row toggle-row" [class.modified]="memoryEnabled() !== null">
               <label class="toggle-label">
@@ -264,12 +276,16 @@ function validVmSizeGiB(value: number | null): value is number {
       </div>
 
       <!-- Context Management -->
-      <div class="accordion-section" [class.expanded]="expanded().has('context')">
-        <button type="button" class="accordion-header" (click)="toggleSection('context')">
-          <app-icon size="md" class="accordion-icon">{{ expanded().has('context') ? 'expand_less' : 'expand_more' }}</app-icon>
+      <div class="accordion-section" [class.expanded]="isOpen('context')">
+        @if (!flat()) {
+        <button type="button" class="accordion-header" (click)="toggleSection('context')" [attr.aria-expanded]="isOpen('context')">
+          <app-icon size="md" class="accordion-icon">{{ isOpen('context') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.context' | transloco }}
         </button>
-        @if (expanded().has('context')) {
+        } @else {
+          <h4 class="flat-heading">{{ 'advanced.sections.context' | transloco }}</h4>
+        }
+        @if (isOpen('context')) {
           <div class="accordion-body">
             <div class="field-row toggle-row" [class.modified]="compactOnArchive() !== null">
               <label class="toggle-label">
@@ -300,12 +316,16 @@ function validVmSizeGiB(value: number | null): value is number {
       </div>
 
       <!-- Workspace -->
-      <div class="accordion-section" [class.expanded]="expanded().has('workspace')">
-        <button type="button" class="accordion-header" (click)="toggleSection('workspace')">
-          <app-icon size="md" class="accordion-icon">{{ expanded().has('workspace') ? 'expand_less' : 'expand_more' }}</app-icon>
+      <div class="accordion-section" [class.expanded]="isOpen('workspace')">
+        @if (!flat()) {
+        <button type="button" class="accordion-header" (click)="toggleSection('workspace')" [attr.aria-expanded]="isOpen('workspace')">
+          <app-icon size="md" class="accordion-icon">{{ isOpen('workspace') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.workspace' | transloco }}
         </button>
-        @if (expanded().has('workspace')) {
+        } @else {
+          <h4 class="flat-heading">{{ 'advanced.sections.workspace' | transloco }}</h4>
+        }
+        @if (isOpen('workspace')) {
           <div class="accordion-body">
             <!-- The backend selector itself is a level-1 control, in the
                  Settings tab's EXECUTION group. This section keeps the tuning
@@ -400,12 +420,16 @@ function validVmSizeGiB(value: number | null): value is number {
       </div>
 
       <!-- Shell -->
-      <div class="accordion-section" [class.expanded]="expanded().has('shell')">
-        <button type="button" class="accordion-header" (click)="toggleSection('shell')">
-          <app-icon size="md" class="accordion-icon">{{ expanded().has('shell') ? 'expand_less' : 'expand_more' }}</app-icon>
+      <div class="accordion-section" [class.expanded]="isOpen('shell')">
+        @if (!flat()) {
+        <button type="button" class="accordion-header" (click)="toggleSection('shell')" [attr.aria-expanded]="isOpen('shell')">
+          <app-icon size="md" class="accordion-icon">{{ isOpen('shell') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.shell' | transloco }}
         </button>
-        @if (expanded().has('shell')) {
+        } @else {
+          <h4 class="flat-heading">{{ 'advanced.sections.shell' | transloco }}</h4>
+        }
+        @if (isOpen('shell')) {
           <div class="accordion-body">
             <div class="field-row" [class.modified]="shellMode() !== null">
               <label class="field-label">{{ 'advanced.labels.mode' | transloco }}</label>
@@ -469,12 +493,16 @@ function validVmSizeGiB(value: number | null): value is number {
       </div>
 
       <!-- Research -->
-      <div class="accordion-section" [class.expanded]="expanded().has('research')">
-        <button type="button" class="accordion-header" (click)="toggleSection('research')">
-          <app-icon size="md" class="accordion-icon">{{ expanded().has('research') ? 'expand_less' : 'expand_more' }}</app-icon>
+      <div class="accordion-section" [class.expanded]="isOpen('research')">
+        @if (!flat()) {
+        <button type="button" class="accordion-header" (click)="toggleSection('research')" [attr.aria-expanded]="isOpen('research')">
+          <app-icon size="md" class="accordion-icon">{{ isOpen('research') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.research' | transloco }}
         </button>
-        @if (expanded().has('research')) {
+        } @else {
+          <h4 class="flat-heading">{{ 'advanced.sections.research' | transloco }}</h4>
+        }
+        @if (isOpen('research')) {
           <div class="accordion-body">
             <div class="field-row toggle-row" [class.modified]="proxyEnabled() !== null">
               <label class="toggle-label">
@@ -493,12 +521,16 @@ function validVmSizeGiB(value: number | null): value is number {
       </div>
 
       <!-- Auxiliary LLM -->
-      <div class="accordion-section" [class.expanded]="expanded().has('auxiliary')">
-        <button type="button" class="accordion-header" (click)="toggleSection('auxiliary')">
-          <app-icon size="md" class="accordion-icon">{{ expanded().has('auxiliary') ? 'expand_less' : 'expand_more' }}</app-icon>
+      <div class="accordion-section" [class.expanded]="isOpen('auxiliary')">
+        @if (!flat()) {
+        <button type="button" class="accordion-header" (click)="toggleSection('auxiliary')" [attr.aria-expanded]="isOpen('auxiliary')">
+          <app-icon size="md" class="accordion-icon">{{ isOpen('auxiliary') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.auxiliary' | transloco }}
         </button>
-        @if (expanded().has('auxiliary')) {
+        } @else {
+          <h4 class="flat-heading">{{ 'advanced.sections.auxiliary' | transloco }}</h4>
+        }
+        @if (isOpen('auxiliary')) {
           <div class="accordion-body">
             <div class="field-row toggle-row" [class.modified]="auxEnabled() !== null">
               <label class="toggle-label">
@@ -549,12 +581,16 @@ function validVmSizeGiB(value: number | null): value is number {
 
       <!-- Session-specific: idle timeout -->
       @if (mode() === 'session') {
-        <div class="accordion-section" [class.expanded]="expanded().has('session')">
-          <button type="button" class="accordion-header" (click)="toggleSection('session')">
-            <app-icon size="md" class="accordion-icon">{{ expanded().has('session') ? 'expand_less' : 'expand_more' }}</app-icon>
+        <div class="accordion-section" [class.expanded]="isOpen('session')">
+          @if (!flat()) {
+          <button type="button" class="accordion-header" (click)="toggleSection('session')" [attr.aria-expanded]="isOpen('session')">
+            <app-icon size="md" class="accordion-icon">{{ isOpen('session') ? 'expand_less' : 'expand_more' }}</app-icon>
             {{ 'advanced.sections.session' | transloco }}
           </button>
-          @if (expanded().has('session')) {
+          } @else {
+            <h4 class="flat-heading">{{ 'advanced.sections.session' | transloco }}</h4>
+          }
+          @if (isOpen('session')) {
             <div class="accordion-body">
               <div class="field-row" [class.modified]="idleTimeout() !== null">
                 <label class="field-label">{{ 'advanced.labels.idleTimeout' | transloco }}</label>
@@ -623,6 +659,51 @@ function validVmSizeGiB(value: number | null): value is number {
     .accordion-body {
       padding: 12px 14px;
       background: var(--panel-bg, var(--panel-bg));
+    }
+    /* Flat: plain headings, and the fields flow into as many columns as the
+       width allows — the same component sits in a page column and in a
+       narrow side pane. */
+    .advanced-container.flat {
+      gap: 16px;
+    }
+    .flat .accordion-section,
+    .flat .accordion-section.expanded {
+      border: 0;
+      border-radius: 0;
+      overflow: visible;
+    }
+    .flat-heading {
+      margin: 0 0 8px;
+      padding-bottom: 4px;
+      border-bottom: 1px solid var(--border-hairline);
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-muted);
+    }
+    .flat .accordion-body {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0 16px;
+      padding: 0;
+      background: transparent;
+    }
+    .flat .accordion-body > .field-row,
+    .flat .accordion-body > .shared-params > .field-row {
+      flex: 1 1 14rem;
+      min-width: 0;
+    }
+    .flat .accordion-body > .lite-hint {
+      flex: 1 1 100%;
+    }
+    .flat .shared-params {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0 16px;
+      flex: 1 1 100%;
+      padding-top: 0;
+      border-top: 0;
     }
     .shared-params {
       padding-top: 8px;
@@ -758,6 +839,11 @@ export class AdvancedAccordionComponent {
    *  in ExecutionGroupComponent; this section reads it to grey the tools a lite
    *  tier cannot run and to scope what its own `getOverrides()` emits. */
   backendOverride = input<string | null>(null);
+  /** Render every section open under a plain heading instead of as a
+   *  collapsible accordion — the three-section host already puts this whole
+   *  component behind one "More settings" disclosure, and a second level of
+   *  collapsing inside it would be a third level overall. */
+  flat = input(false);
   /** False when a create form's workspace picker owns the workspace (Slice A3):
    *  templates carry their sizes, so the legacy VM sizing neither shows nor emits. */
   vmSizing = input(true);
@@ -928,6 +1014,10 @@ export class AdvancedAccordionComponent {
   });
 
   // ===== Event handlers =====
+  isOpen(section: string): boolean {
+    return this.flat() || this.expanded().has(section);
+  }
+
   toggleSection(section: string): void {
     const next = new Set(this.expanded());
     if (next.has(section)) {

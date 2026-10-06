@@ -978,6 +978,13 @@ export class ToolsGroupComponent {
     )
   );
 
+  /** What is switched on, for a one-line summary: categories in the `on`
+   *  state and the tools they hold (0 when the server reported no counts). */
+  readonly onSummary = computed(() => {
+    const on = this.rows().filter((row) => this.rowState(row) === 'on');
+    return {categories: on.length, tools: on.reduce((n, row) => n + (row.toolCount || 0), 0)};
+  });
+
   readonly modifiedCount = computed(() => {
     let count = this.rows().filter((row) => !row.pristine).length;
     // A locked row is `pristine` by construction (its switch cannot move), so
@@ -996,9 +1003,16 @@ export class ToolsGroupComponent {
    *  reason: the creation forms re-read the preview on every change, so
    *  without it the preview answering the cap edit re-anchored and wiped it. */
   hasToolEdits(): boolean {
-    return this.requestedAdditions().size > 0
-      || this.delegationCap() !== null
-      || this.rows().some((row) => !row.pristine);
+    if (this.requestedAdditions().size > 0 || this.delegationCap() !== null) return true;
+    // Measured against the last ANCHOR, not the server's latest answer. Rows
+    // compare to the answer on screen, and when a config prefill anchors after
+    // an answer has landed (the expert detail arriving after the preview), the
+    // stale answer made untouched rows look edited — and the next preview was
+    // then refused the re-anchor that would have fixed them.
+    const user = this.userDisabled();
+    const base = this.anchoredBaseline();
+    if (user && base) return user.size !== base.size || [...user].some((key) => !base.has(key));
+    return this.rows().some((row) => !row.pristine);
   }
 
   // --- Resolved defaults ---

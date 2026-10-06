@@ -25,6 +25,8 @@ import {
     DatasourceTestResult,
     DatasourceUpdateRequest,
     EligibleDatasource,
+    ExpertExportBundle,
+    ExpertTemplateSource,
     LinkableDatasourceProjectsResponse,
     LinkableProjectDatasourceFilters,
     LinkableProjectDatasourcesResponse,
@@ -712,6 +714,40 @@ export class ApiService {
     const params = type ? new HttpParams().set('type', type) : undefined;
     return this.http.get<Expert[]>(`${this.baseUrl}/experts`, {params}).pipe(
       catchError(() => of([])),
+    );
+  }
+
+  /**
+   * The authored content a create form copies when the user changes an Expert
+   * template (creation_ui_expert_workspace_connectors.md D2).
+   *
+   * The manifest resource's `spec.runtime.config` is the source: it keeps the
+   * installed asset and `config_name` a bundled Expert needs. The export
+   * endpoint 409s for every Expert carrying an `asset_name` (all bundled
+   * ones), so it is only the fallback for an Expert with no resource. Null
+   * when neither can be read — the form then sends selector + overrides.
+   */
+  getExpertTemplate(expert: {id: string; manifest_uid?: string | null}): Observable<ExpertTemplateSource | null> {
+    type ResourceBody = {resource?: {spec?: {
+      runtime?: {config?: ExpertTemplateSource['runtimeConfig']};
+      workspacePreference?: {backend: string} | null;
+    }}};
+    if (expert.manifest_uid) {
+      return this.http.get<ResourceBody>(`${this.baseUrl}/resources/${encodeURIComponent(expert.manifest_uid)}`).pipe(
+        map((body) => {
+          const spec = body?.resource?.spec;
+          const runtimeConfig = spec?.runtime?.config;
+          if (!runtimeConfig || typeof runtimeConfig.config !== 'object' || runtimeConfig.config === null) return null;
+          return {runtimeConfig, workspacePreference: spec?.workspacePreference ?? null};
+        }),
+        catchError(() => of(null)),
+      );
+    }
+    return this.http.get<ExpertExportBundle>(`${this.baseUrl}/experts/${encodeURIComponent(expert.id)}/export`).pipe(
+      map((bundle) => (bundle && typeof bundle.config === 'object'
+        ? {runtimeConfig: {config: bundle.config ?? {}, prompts: bundle.prompts ?? {}}}
+        : null)),
+      catchError(() => of(null)),
     );
   }
 
@@ -1993,6 +2029,25 @@ export class ApiService {
                     console.error(`Failed to get thread ${threadId}:`, error);
                     return of(null);
                 }),
+            );
+    }
+
+    /**
+     * The session's frozen resolved agent config (redacted), for the live
+     * settings pane's locked fields. Null when the endpoint is unavailable (older
+     * orchestrator), the session predates execution snapshots, or the read
+     * fails — the pane then says it cannot show those values.
+     */
+    getThreadResolvedConfig(threadId: string): Observable<Record<string, unknown> | null> {
+        return this.http
+            .get<{config?: {agent?: Record<string, unknown>} | null}>(
+                `${this.baseUrl}/persistent/threads/${threadId}/resolved-config`,
+            )
+            .pipe(
+                // The frozen blob wraps the agent config with prompts, skills
+                // and render metadata; the settings read config paths.
+                map((body) => body?.config?.agent ?? null),
+                catchError(() => of(null)),
             );
     }
 

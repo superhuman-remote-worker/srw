@@ -232,9 +232,7 @@ PUBLIC_JOB_CREATE_FIELDS = (
     "document_path",
     "document_dir",
     "expert",
-    # "expert_based_on" is accepted but published together with the
-    # Cockpit's JobCreateRequest field (creation UI slice S3); the projection
-    # test holds the two lists equal.
+    "expert_based_on",
     "config_name",
     "expert_id",
     "config_override",

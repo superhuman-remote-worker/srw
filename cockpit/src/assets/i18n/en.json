@@ -3449,6 +3449,72 @@
     }
   },
   "agentSettings": {
+      "manifest": {
+        "title": "Manifest",
+        "jobTitle": "Job manifest: what Create sends",
+        "sessionTitle": "Session execution: what Start sends",
+        "show": "View as manifest",
+        "hide": "Hide manifest"
+      },
+      "sections": {
+        "task": {
+          "title": "Task",
+          "more": "More options"
+        },
+        "session": {
+          "title": "Session"
+        },
+        "expert": {
+          "title": "Expert",
+          "question": "Who should your AI be?",
+          "unnamed": "Default expert",
+          "basedOn": "Based on {{name}} · {{n}} changed. This run gets its own full copy.",
+          "resetToTemplate": "Reset to template",
+          "more": "More settings",
+          "moreChanged": "· {{n}} changed",
+          "reasoning": "reasoning {{level}}",
+          "tools": "{{n}} tools",
+          "toolGroups": "{{n}} tool groups",
+          "subagents": "subagents"
+        },
+        "workspace": {
+          "title": "Workspace",
+          "question": "What environment will it work in?"
+        },
+        "connectors": {
+          "title": "Connectors",
+          "question": "What should it have access to?",
+          "none": "None attached",
+          "summary": "{{n}} attached · {{names}}",
+          "summaryMore": "{{n}} attached · {{names}} +{{more}} more"
+        },
+        "chip": {
+          "partlyLocked": "Some settings locked",
+          "changes": "{{n}} changed",
+          "template": "Template",
+          "upgradeOnly": "Upgrade only",
+          "default": "Default",
+          "custom": "Custom",
+          "none": "None",
+          "addOrRemove": "Add or remove",
+          "changed": "Changed",
+          "defaults": "Defaults"
+        }
+      },
+      "locked": {
+        "atCreation": "Fixed at creation",
+        "project": "Project",
+        "templateAndResources": "Template and resources",
+        "templateAndResourcesHint": "The tier above can be upgraded. Image and resources stay as created.",
+        "moreLive": "These were fixed when the session started.",
+        "moreUnavailable": "The values this session was started with could not be loaded."
+      },
+      "expertPicker": {
+        "label": "Start from a template",
+        "hint": "Picking one fills in everything below. Changes stay with this run.",
+        "loading": "Loading experts…",
+        "empty": "No experts available."
+      },
     "common": {
       "resetToDefault": "Reset to default",
       "noApiKey": "no API key",
@@ -3456,6 +3522,15 @@
       "deselectAll": "Deselect all"
     },
     "datasources": {
+        "searchPlaceholder": "Search by name or type",
+        "searchLabel": "Search connectors",
+        "filterLabel": "Show",
+        "filterAll": "All",
+        "filterAttached": "Attached ({{n}})",
+        "countLine": "{{n}} of {{total}} attached",
+        "noMatch": "No connectors match “{{query}}”.",
+        "noneAttached": "No connectors attached.",
+        "noneAvailable": "No connectors are available to you yet.",
       "group": "Connectors",
       "loading": "Loading connectors...",
       "loadFailed": "Connectors could not be loaded for this project context. Creation is disabled.",
@@ -3469,6 +3544,7 @@
       "credentialsUnavailable": "This credential connector is no longer available. End this session and start another to change its connectors."
     },
     "workspacePicker": {
+      "templateLabel": "Template",
       "label": "Workspace",
       "default": "Default: {{what}} ({{layer}})",
       "defaultUnknown": "Default (project or installation)",

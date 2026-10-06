@@ -3449,6 +3449,72 @@
     }
   },
   "agentSettings": {
+      "manifest": {
+        "title": "Manifest",
+        "jobTitle": "Job-Manifest: was „Erstellen“ sendet",
+        "sessionTitle": "Session-Ausführung: was „Starten“ sendet",
+        "show": "Als Manifest anzeigen",
+        "hide": "Manifest ausblenden"
+      },
+      "sections": {
+        "task": {
+          "title": "Aufgabe",
+          "more": "Weitere Optionen"
+        },
+        "session": {
+          "title": "Session"
+        },
+        "expert": {
+          "title": "Expert",
+          "question": "Wer soll deine KI sein?",
+          "unnamed": "Standard-Expert",
+          "basedOn": "Basiert auf {{name}} · {{n}} geändert. Dieser Lauf bekommt eine eigene vollständige Kopie.",
+          "resetToTemplate": "Auf Vorlage zurücksetzen",
+          "more": "Weitere Einstellungen",
+          "moreChanged": "· {{n}} geändert",
+          "reasoning": "Reasoning {{level}}",
+          "tools": "{{n}} Tools",
+          "toolGroups": "{{n}} Tool-Gruppen",
+          "subagents": "Subagents"
+        },
+        "workspace": {
+          "title": "Workspace",
+          "question": "In welcher Umgebung soll sie arbeiten?"
+        },
+        "connectors": {
+          "title": "Connectors",
+          "question": "Worauf soll sie Zugriff haben?",
+          "none": "Keine verbunden",
+          "summary": "{{n}} verbunden · {{names}}",
+          "summaryMore": "{{n}} verbunden · {{names}} +{{more}} weitere"
+        },
+        "chip": {
+          "partlyLocked": "Teilweise gesperrt",
+          "changes": "{{n}} geändert",
+          "template": "Vorlage",
+          "upgradeOnly": "Nur Upgrade",
+          "default": "Standard",
+          "custom": "Angepasst",
+          "none": "Keiner",
+          "addOrRemove": "Hinzufügen oder entfernen",
+          "changed": "Geändert",
+          "defaults": "Standard"
+        }
+      },
+      "locked": {
+        "atCreation": "Beim Erstellen festgelegt",
+        "project": "Projekt",
+        "templateAndResources": "Vorlage und Ressourcen",
+        "templateAndResourcesHint": "Die Stufe oben lässt sich upgraden. Image und Ressourcen bleiben wie erstellt.",
+        "moreLive": "Diese wurden beim Start der Session festgelegt.",
+        "moreUnavailable": "Die Werte, mit denen diese Session gestartet wurde, konnten nicht geladen werden."
+      },
+      "expertPicker": {
+        "label": "Mit einer Vorlage beginnen",
+        "hint": "Die Auswahl füllt alles darunter aus. Änderungen gelten nur für diesen Lauf.",
+        "loading": "Experts werden geladen…",
+        "empty": "Keine Experts verfügbar."
+      },
     "common": {
       "resetToDefault": "Auf Standard zurücksetzen",
       "noApiKey": "kein API-Schlüssel",
@@ -3456,6 +3522,15 @@
       "deselectAll": "Alle abwählen"
     },
     "datasources": {
+        "searchPlaceholder": "Nach Name oder Typ suchen",
+        "searchLabel": "Connectors durchsuchen",
+        "filterLabel": "Anzeigen",
+        "filterAll": "Alle",
+        "filterAttached": "Verbunden ({{n}})",
+        "countLine": "{{n}} von {{total}} verbunden",
+        "noMatch": "Keine Connectors passen zu „{{query}}“.",
+        "noneAttached": "Keine Connectors verbunden.",
+        "noneAvailable": "Dir stehen noch keine Connectors zur Verfügung.",
       "group": "Konnektoren",
       "loading": "Konnektoren werden geladen…",
       "loadFailed": "Konnektoren konnten für diesen Projektkontext nicht geladen werden. Die Erstellung ist deaktiviert.",
@@ -3469,6 +3544,7 @@
       "credentialsUnavailable": "Dieser Zugangsdaten-Konnektor ist nicht mehr verfügbar. Beende diese Sitzung und starte eine neue, um ihre Konnektoren zu ändern."
     },
     "workspacePicker": {
+      "templateLabel": "Vorlage",
       "label": "Workspace",
       "default": "Standard: {{what}} ({{layer}})",
       "defaultUnknown": "Standard (Projekt oder Installation)",

@@ -80,6 +80,8 @@ export interface Expert {
   /** 'worker' | 'session' — the expert's identity role (a library entry
    *  reports its `$extends` chain root, `worker` by default). */
   expert_type?: string;
+  /** The Expert's manifest resource — what a changed template is copied from. */
+  manifest_uid?: string | null;
 }
 
 // ---- Subagent roster (`config.subagents`, universal_experts_and_subagents.md §1.1) ----
@@ -2389,6 +2391,33 @@ export interface Job {
  * Public job-create projection owned by orchestrator.schemas.job_create.
  * Keep view state and internal delegation/identity commands outside this type.
  */
+/** An Expert template's authored content, as a create form copies it when the
+ *  user changes the template: the SRW runtime private config of its manifest
+ *  resource (`spec.runtime.config`) — `config_name`, `asset_name`, the authored
+ *  `config` fragment, `prompts`, `layers` — never the merged result. */
+export interface ExpertTemplateSource {
+  runtimeConfig: {
+    config_name?: string;
+    asset_name?: string;
+    config: Record<string, unknown>;
+    prompts?: Record<string, unknown>;
+    layers?: unknown[];
+  };
+  workspacePreference?: {backend: string} | null;
+}
+
+/** The portable bundle `GET /api/experts/{id}/export` returns: an Expert's
+ *  authored fragment, never its merged result. */
+export interface ExpertExportBundle {
+  name?: string;
+  display_name?: string;
+  description?: string;
+  expert_type?: string;
+  tags?: string[];
+  config: Record<string, unknown>;
+  prompts: Record<string, unknown>;
+}
+
 export interface JobCreateRequest {
   workspace?: Record<string, unknown> | null;
   description: string;
@@ -2397,8 +2426,12 @@ export interface JobCreateRequest {
   instructions_upload_id?: string;
   document_path?: string;
   document_dir?: string;
-  /** Unified selector: bundled expert ID or DB expert UUID; omission uses the server default. */
-  expert?: string;
+  /** Unified selector: bundled expert ID or DB expert UUID; omission uses the server default.
+   *  Or a complete inline Expert (`{inline: ExpertSpec}`) when the form changed a template —
+   *  creation_ui_expert_workspace_connectors.md D2. */
+  expert?: string | {inline: Record<string, unknown>};
+  /** Display-only provenance for an inline Expert: the template it was copied from. */
+  expert_based_on?: string;
   /** Legacy bundled/deployment-config alias. Conflicting expert selectors are refused. */
   config_name?: string;
   /** Legacy DB-expert UUID alias; resolves over worker_base, not another bundled expert. */
