@@ -1,7 +1,7 @@
 import {Component, OnInit, computed, inject, signal} from '@angular/core';
 import {Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
-import {catchError, of} from 'rxjs';
+import {Subscription, catchError, of} from 'rxjs';
 import {ApiService} from '../../core/services/api.service';
 import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
@@ -181,6 +181,7 @@ export class WorkspaceTemplatesListComponent implements OnInit {
     mine: signal<ScopeState>(EMPTY),
     project: signal<ScopeState>(EMPTY),
   };
+  private readonly inflight: Partial<Record<ScopeKey, Subscription>> = {};
   readonly pendingDelete = signal<WorkspaceTemplateItem | null>(null);
   readonly errorMessage = signal('');
 
@@ -208,7 +209,10 @@ export class WorkspaceTemplatesListComponent implements OnInit {
     if (!name) return;
     const state = this.states[key];
     state.set({items: [], loading: true, error: false});
-    this.api.listWorkspaceTemplatesStrict(kind, name).subscribe({
+    this.errorMessage.set('');
+    // A newer request for the same scope supersedes this one, so a late response can't overwrite it.
+    this.inflight[key]?.unsubscribe();
+    this.inflight[key] = this.api.listWorkspaceTemplatesStrict(kind, name).subscribe({
       next: (list) => state.set({items: ordered(list.resources), loading: false, error: false}),
       error: () => state.set({items: [], loading: false, error: true}),
     });
@@ -244,6 +248,7 @@ export class WorkspaceTemplatesListComponent implements OnInit {
   confirmDelete(): void {
     const item = this.pendingDelete();
     if (!item) return;
+    this.errorMessage.set('');
     this.api.deleteResource(item.uid, item.resourceVersion).subscribe({
       next: () => {
         this.pendingDelete.set(null);
@@ -251,6 +256,8 @@ export class WorkspaceTemplatesListComponent implements OnInit {
       },
       error: (err) => {
         this.pendingDelete.set(null);
+        // Reload first: a retry clears the banner, and the stale row may be why the delete failed.
+        this.retry(this.scopeOf(item));
         const d = (err as {error?: {detail?: unknown}})?.error?.detail;
         this.errorMessage.set(typeof d === 'string' ? d : this.transloco.translate('workspaces.errors.deleteFailed'));
       },

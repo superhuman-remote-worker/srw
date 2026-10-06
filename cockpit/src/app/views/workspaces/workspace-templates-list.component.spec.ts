@@ -3,7 +3,7 @@ import {Injector, runInInjectionContext, signal} from '@angular/core';
 import {Router} from '@angular/router';
 import {HttpErrorResponse} from '@angular/common/http';
 import {TranslocoService} from '@jsverse/transloco';
-import {of, throwError} from 'rxjs';
+import {Subject, of, throwError} from 'rxjs';
 import {WorkspaceTemplatesListComponent} from './workspace-templates-list.component';
 import {ApiService} from '../../core/services/api.service';
 import {UserService} from '../../core/services/user.service';
@@ -82,6 +82,36 @@ describe('WorkspaceTemplatesListComponent', () => {
     c.confirmDelete();
     expect(api.deleteResource).toHaveBeenCalledWith('uid-lean', 2);
     expect(api.listWorkspaceTemplatesStrict).toHaveBeenCalledWith('Account', 'me');
+  });
+
+  it('shows the server detail, reloads the scope and clears the banner on the next delete', () => {
+    const mine = t('lean', {kind: 'Account', name: USER});
+    const {c, api} = create({'Account/me': {resources: [mine]}});
+    api.deleteResource.mockReturnValueOnce(throwError(() => new HttpErrorResponse({status: 409, error: {detail: 'In use by a Project'}})));
+    c.askDelete(mine);
+    api.listWorkspaceTemplatesStrict.mockClear();
+    c.confirmDelete();
+    expect(c.errorMessage()).toBe('In use by a Project');
+    expect(c.pendingDelete()).toBeNull();
+    expect(api.listWorkspaceTemplatesStrict).toHaveBeenCalledWith('Account', 'me');
+
+    c.askDelete(mine);
+    c.confirmDelete();
+    expect(c.errorMessage()).toBe('');
+  });
+
+  it('ignores a superseded Project listing', () => {
+    const {c, api} = create({});
+    const first = new Subject<{resources: WorkspaceTemplateItem[]}>();
+    const second = new Subject<{resources: WorkspaceTemplateItem[]}>();
+    api.listWorkspaceTemplatesStrict.mockReset();
+    api.listWorkspaceTemplatesStrict.mockReturnValueOnce(first).mockReturnValueOnce(second);
+    c.selectProject('p-1');
+    c.selectProject('p-2');
+    second.next({resources: [t('b', {kind: 'Project', name: 'p-2'})]});
+    first.next({resources: [t('a', {kind: 'Project', name: 'p-1'})]});
+    const group = c.groups().find((g) => g.key === 'project');
+    expect(group?.items.map((i) => i.resource.metadata.name)).toEqual(['b']);
   });
 
   it('duplicates through router state', () => {
