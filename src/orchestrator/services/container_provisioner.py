@@ -26,9 +26,16 @@ from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from http.client import RemoteDisconnected
 from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Literal, Optional
 from uuid import UUID, uuid4
+from urllib3.exceptions import (
+    ConnectTimeoutError,
+    MaxRetryError,
+    ProtocolError,
+    ReadTimeoutError,
+)
 from shared.container_recovery import ContainerRecoveryCleanup
 from shared.workspace_recovery import WorkspaceRecoveryCode
 
@@ -3012,15 +3019,47 @@ class ContainerProvisioner:
                     )
                     return False
             else:
-                (
-                    created_pod,
-                    reused_existing_pod,
-                ) = await self._create_pod_resolving_teardown(
-                    pod_manifest,
-                    pod_name,
-                    owner=owner,
-                    mutation_authority=mutation_authority,
-                )
+                try:
+                    (
+                        created_pod,
+                        reused_existing_pod,
+                    ) = await self._create_pod_resolving_teardown(
+                        pod_manifest,
+                        pod_name,
+                        owner=owner,
+                        mutation_authority=mutation_authority,
+                    )
+                except (
+                    TimeoutError,
+                    ConnectionError,
+                    RemoteDisconnected,
+                    ConnectTimeoutError,
+                    ReadTimeoutError,
+                    MaxRetryError,
+                    ProtocolError,
+                ):
+                    if (
+                        owner.kind != "job"
+                        or stateless_creation_generation is not None
+                        or _creation_reservation.get("operation_kind") != "create"
+                    ):
+                        raise
+                    # An ordinary Job's accepted CREATE can lose only its
+                    # response.  This is a read of that exact issued effect,
+                    # not a second create or a deterministic-name adoption.
+                    created_pod = await self._read_ambiguous_job_create_pod(
+                        owner,
+                        _creation_reservation,
+                        _creation_plan,
+                        pod_name=pod_name,
+                        network_tier=network_tier,
+                        workspace_image=workspace_image,
+                        pvc_name=pvc_name,
+                        seed_cm=seed_cm,
+                    )
+                    if created_pod is None:
+                        return False
+                    reused_existing_pod = False
                 if created_pod is None:
                     return False
                 runtime_incarnation = self._require_workspace_pod_owner(
@@ -3363,11 +3402,20 @@ class ContainerProvisioner:
                         name=pvc_name,
                         namespace=self._namespace,
                     )
-                    self._require_stateless_pvc_identity(
+                    ready_claim_uid = self._require_stateless_pvc_identity(
                         ready_claim,
                         owner=owner,
                         pvc_name=pvc_name,
+                        # Recovery may retain a PVC from an older storage
+                        # class. The immutable captured UID is the authority.
+                        allow_any_storage_class=True,
                     )
+                    if ready_claim_uid != str(
+                        _creation_reservation.get("pvc_uid") or ""
+                    ):
+                        raise WorkspaceRuntimeAuthorityError(
+                            "workspace PVC UID changed"
+                        )
                     ready_service = await self._bounded_kubernetes_call(
                         self._core_api.read_namespaced_service,
                         name=owner.pod_name,
@@ -16059,6 +16107,152 @@ class ContainerProvisioner:
         if self._fuse_enabled if fuse_enabled is None else fuse_enabled:
             capabilities.append("SYS_ADMIN")
         return capabilities
+
+    async def _read_ambiguous_job_create_pod(
+        self,
+        owner: WorkspaceOwner,
+        reservation: dict[str, Any],
+        plan: dict[str, Any],
+        *,
+        pod_name: str,
+        network_tier: str,
+        workspace_image: str,
+        pvc_name: str | None,
+        seed_cm: str | None,
+    ) -> Any | None:
+        """Read one issued ordinary Job CREATE after an ambiguous transport loss.
+
+        The owner/scope mutation guard is still held by the caller. A returned
+        Pod is not published here: the existing database UID authorization CAS
+        must still win against Cancel, expiry and claim rotation.
+        """
+
+        if owner.kind != "job" or not isinstance(plan, dict):
+            return None
+        generation = reservation.get("reservation_generation")
+        token = reservation.get("claim_token")
+        effects = reservation.get("external_effects")
+        # The default asyncpg jsonb codec returns text in the live row.
+        if isinstance(effects, str):
+            try:
+                effects = json.loads(effects)
+            except json.JSONDecodeError:
+                return None
+        pod_effect = effects.get("pod") if isinstance(effects, dict) else None
+        if (
+            reservation.get("owner_kind") != "job"
+            or str(reservation.get("owner_id")) != owner.id
+            or reservation.get("scope") != "workspace_container"
+            or reservation.get("operation_kind") != "create"
+            or reservation.get("phase") != "mutating"
+            or reservation.get("settled_at") is not None
+            or reservation.get("cancel_requested_at") is not None
+            or reservation.get("external_mutation_started_at") is None
+            or reservation.get("runtime_incarnation") is not None
+            or reservation.get("pod_uid") is not None
+            or reservation.get("service_uid") is not None
+            or type(generation) is not int
+            or generation <= 0
+            or type(token) is not int
+            or token <= 0
+            or not isinstance(pod_effect, dict)
+            or not pod_effect.get("issued_at")
+            or type(pod_effect.get("claim_token")) is not int
+            or pod_effect["claim_token"] != token
+            or pod_effect.get("observed_uid") is not None
+            or plan.get("digest") != reservation.get("desired_manifest_digest")
+            or not isinstance(workspace_image, str)
+            or workspace_image != plan.get("image")
+            or network_tier != plan.get("network_tier")
+            or pod_name != owner.pod_name
+            or (pvc_name is None) != (reservation.get("pvc_uid") is None)
+            or (seed_cm is None) != (reservation.get("seed_configmap_uid") is None)
+        ):
+            return None
+
+        try:
+            # No read by name is useful after the current claimant is lost.
+            if not await self._workspace_creation_reservation_is_current(
+                owner, reservation, scope="workspace_container"
+            ):
+                return None
+            pod = await self._bounded_kubernetes_call(
+                self._core_api.read_namespaced_pod,
+                name=pod_name,
+                namespace=self._namespace,
+            )
+            self._require_workspace_pod_owner(
+                pod,
+                owner=owner,
+                allow_owner_unlabeled=False,
+                expected_network_tier=network_tier,
+            )
+            self._require_workspace_creation_reservation_annotation(
+                pod, reservation_id=str(reservation["id"])
+            )
+            annotations = getattr(getattr(pod, "metadata", None), "annotations", None)
+            if (
+                not isinstance(annotations, dict)
+                or annotations.get(WORKSPACE_RUNTIME_CREATION_ANNOTATION) is not None
+            ):
+                return None
+            self._require_stateless_pod_storage_binding(
+                pod,
+                owner=owner,
+                expected_pvc_name=pvc_name,
+                expected_seed_configmap=seed_cm,
+            )
+            containers = getattr(getattr(pod, "spec", None), "containers", None)
+            if (
+                not isinstance(containers, (list, tuple))
+                or len(
+                    [
+                        container
+                        for container in containers
+                        if _resource_field(container, "name") == "workspace"
+                        and _resource_field(container, "image") == workspace_image
+                    ]
+                )
+                != 1
+            ):
+                return None
+            if pvc_name is not None:
+                claim = await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_persistent_volume_claim,
+                    name=pvc_name,
+                    namespace=self._namespace,
+                )
+                pvc_uid = self._require_stateless_pvc_identity(
+                    claim,
+                    owner=owner,
+                    pvc_name=pvc_name,
+                    # A retained recovery PVC can have a historical class;
+                    # its captured immutable UID, not current config, binds it.
+                    allow_any_storage_class=True,
+                )
+                if pvc_uid != str(reservation["pvc_uid"]):
+                    return None
+            if seed_cm is not None:
+                seed = await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_config_map,
+                    name=seed_cm,
+                    namespace=self._namespace,
+                )
+                seed_uid = self._require_stateless_seed_configmap_identity(
+                    seed,
+                    owner=owner,
+                    pod_name=pod_name,
+                    creation_reservation_id=str(reservation["id"]),
+                )
+                if seed_uid != str(reservation["seed_configmap_uid"]):
+                    return None
+            if not await self._workspace_creation_reservation_is_current(
+                owner, reservation, scope="workspace_container"
+            ):
+                return None
+            return pod
+        except Exception:
+            return None
 
     async def _create_pod_resolving_teardown(
         self,
