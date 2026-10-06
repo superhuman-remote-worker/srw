@@ -17,7 +17,7 @@ pg_dsn = authority.pg_dsn
 _schema_applied = start._schema_applied
 
 
-async def _creating(db, monkeypatch):
+async def _creating(db, monkeypatch, *, published=False):
     ids = await authority._seed(db, protected_agent_pod=True, workspace_claim=False)
     await db.execute(
         "DELETE FROM project_officers WHERE thread_id=$1::uuid", ids["thread"]
@@ -29,18 +29,33 @@ async def _creating(db, monkeypatch):
     )
     thread = await db.get_thread(ids["thread"])
     generation = str(thread["runtime_generation"])
-    cluster = start.PinnedPullCluster()
+    cluster = PartialCluster()
     provider = start.pull._provisioner(monkeypatch, db, cluster)
+    if published:
+        from kubernetes.client.exceptions import ApiException
+        original_pod = cluster.create_namespaced_pod
+
+        def fail_original_pod(**kwargs):
+            if kwargs["body"]["metadata"]["labels"].get("srw.io/workspace-provision-fence") != "true":
+                raise ApiException(status=503)
+            return original_pod(**kwargs)
+
+        monkeypatch.setattr(cluster, "create_namespaced_pod", fail_original_pod)
     returned, resume = asyncio.Event(), asyncio.Event()
-    original = provider._create_pvc
+    method = "_create_seed_configmap" if published else "_create_pvc"
+    original = getattr(provider, method)
 
     async def create(*args, **kwargs):
+        if published:
+            returned.set()
+            await resume.wait()
+            return await original(*args, **kwargs)
         result = await original(*args, **kwargs)
         returned.set()
         await resume.wait()
         return result
 
-    monkeypatch.setattr(provider, "_create_pvc", create)
+    monkeypatch.setattr(provider, method, create)
     task = asyncio.create_task(provider.create_pinned_thread_workspace(ids["thread"]))
     await asyncio.wait_for(returned.wait(), 10)
     return ids, generation, cluster, provider, task, resume
@@ -107,7 +122,7 @@ def _prevention_base_release():
 async def test_recorded_abort_recovers_old_partial_creation_without_rebinding(
     db, monkeypatch
 ):
-    ids, generation, cluster, provider, task, resume = await _creating(db, monkeypatch)
+    ids, generation, cluster, provider, task, resume = await _creating(db, monkeypatch, published=True)
     try:
         old_release = _prevention_base_release()
         released = await old_release(
@@ -132,7 +147,7 @@ async def test_recorded_abort_recovers_old_partial_creation_without_rebinding(
         "SELECT * FROM thread_runtime_attach_abort_outcomes WHERE thread_id=$1::uuid",
         ids["thread"],
     )
-    assert before["pvc_uid"] is None and "pvc" in cluster.objects
+    assert before["pvc_uid"] == cluster.objects["pvc"].metadata.uid
     assert str(before["runtime_generation"]) == generation
     current = await db.get_thread(ids["thread"])
     assert str(current["runtime_generation"]) == str(abort["successor_generation"])
@@ -150,7 +165,7 @@ async def test_recorded_abort_recovers_old_partial_creation_without_rebinding(
         before["attempt_id"],
     )
     assert after["runtime_generation"] == before["runtime_generation"]
-    assert after["pvc_uid"] is None and after["status"] == "fenced"
+    assert after["pvc_uid"] == before["pvc_uid"] and after["status"] == "fenced"
     assert (
         await db.fetchrow(
             "SELECT * FROM thread_runtime_attach_abort_outcomes WHERE thread_id=$1::uuid",
@@ -158,3 +173,209 @@ async def test_recorded_abort_recovers_old_partial_creation_without_rebinding(
         )
         == abort
     )
+
+
+class PartialCluster(start.PinnedPullCluster):
+    def create_namespaced_pod(self, *, body, **kwargs):
+        pod = super().create_namespaced_pod(body=body, **kwargs)
+        spec = body["spec"]
+        pod.spec.scheduler_name = spec.get("schedulerName")
+        pod.spec.node_name = spec.get("nodeName")
+        pod.spec.restart_policy = spec.get("restartPolicy")
+        pod.spec.automount_service_account_token = spec.get(
+            "automountServiceAccountToken"
+        )
+        for container in pod.spec.containers:
+            container.volume_mounts = None
+        return pod
+
+
+async def _stranded(db, monkeypatch, *, published=True):
+    ids, generation, cluster, provider, task, resume = await _creating(db, monkeypatch, published=published)
+    try:
+        assert (
+            await _prevention_base_release()(
+                ids["agent"],
+                ids["thread"],
+                expected_runtime_generation=generation,
+                expected_attach_token=ids["attach_token"],
+                expected_agent_pod_uid="old-pod",
+                local_runtime_quiesced=True,
+                local_quiescence_protocol="agent_attach_not_started_v1",
+                dependencies=SimpleNamespace(store=db),
+            )
+            == "released"
+        )
+    finally:
+        resume.set()
+        assert await task is False
+    return ids, generation, cluster, provider
+
+
+@pytest.mark.asyncio
+async def test_stranded_intent_does_not_retire_a_bound_successor(db, monkeypatch):
+    from uuid import uuid4
+
+    ids, _, cluster, _ = await _stranded(db, monkeypatch)
+    replacement, _ = await authority._bind_replacement_agent(
+        db,
+        thread_id=ids["thread"],
+        pod_uid=str(uuid4()),
+        pod_name="successor-" + str(uuid4())[:12],
+    )
+    before = dict(cluster.objects)
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert retirement["state"] == "malformed"
+    assert str((await db.get_thread(ids["thread"]))["agent_id"]) == replacement
+    assert cluster.objects == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "replacement_uid",
+        "replacement_generation",
+        "replacement_attempt",
+        "unreadable",
+        "inert_scheduled",
+        "inert_mount",
+        "possible_writer",
+    ],
+)
+async def test_partial_retirement_refuses_ambiguous_or_replacement_resources(
+    db, monkeypatch, fault
+):
+    from uuid import uuid4
+    from kubernetes.client.exceptions import ApiException
+    from orchestrator.services.container_provisioner import (
+        WORKSPACE_PROVISION_GENERATION_LABEL,
+        WORKSPACE_PROVISION_ATTEMPT_LABEL,
+    )
+
+    ids, _, cluster, provider = await _stranded(db, monkeypatch)
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert retirement["state"] == "pending"
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    intent = await db.revoke_pinned_thread_workspace_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=retirement["generation"],
+        expected_retirement_token=retirement["token"],
+        expected_attempt_id=retirement["context"]["workspace_provision_intent"][
+            "attempt_id"
+        ],
+    )
+    if fault in {"replacement_uid", "replacement_generation", "replacement_attempt"}:
+        # A foreign UID cannot be adopted solely from matching name/labels.
+        if fault == "replacement_uid":
+            cluster.objects["pvc"].metadata.uid = str(uuid4())
+        else:
+            key = (
+                WORKSPACE_PROVISION_GENERATION_LABEL
+                if fault == "replacement_generation"
+                else WORKSPACE_PROVISION_ATTEMPT_LABEL
+            )
+            cluster.objects["pvc"].metadata.labels[key] = str(uuid4())
+    if fault == "unreadable":
+
+        def unreadable(**_):
+            raise ApiException(status=503)
+
+        monkeypatch.setattr(cluster, "read_namespaced_pod", unreadable)
+    if fault in {"inert_scheduled", "inert_mount", "possible_writer"}:
+        original = cluster.create_namespaced_pod
+
+        def create(**kwargs):
+            pod = original(**kwargs)
+            if fault == "inert_scheduled":
+                pod.spec.node_name = "worker"
+            elif fault == "inert_mount":
+                pod.spec.volumes = [{"name": "writer"}]
+            else:
+                pod.metadata.labels.pop("srw.io/workspace-provision-fence", None)
+                pod.metadata.labels["app"] = "srw-workspace"
+            return pod
+
+        monkeypatch.setattr(cluster, "create_namespaced_pod", create)
+    fences = await provider.fence_pinned_workspace_provision_intent(
+        intent,
+        permanent=True,
+        expected_retirement_token=retirement["token"],
+        expected_retirement_generation=retirement["generation"],
+    )
+    assert fences is None
+    assert (
+        await db.clear_pinned_retirement_physical_runtime_endpoint(
+            ids["thread"],
+            runtime_generation=retirement["generation"],
+            retirement_token=retirement["token"],
+            completed_external_cleanup_protocol="workspace_provision_fence_v1",
+        )
+        is False
+    )
+    assert await db.get_thread(ids["thread"]) is not None
+
+
+@pytest.mark.asyncio
+async def test_missing_causal_fence_receipt_cannot_settle_partial_creation(
+    db, monkeypatch
+):
+    import asyncpg
+    from uuid import uuid4
+
+    ids, _, _, _ = await _stranded(db, monkeypatch)
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    attempt = retirement["context"]["workspace_provision_intent"]["attempt_id"]
+    assert await db.revoke_pinned_thread_workspace_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=retirement["generation"],
+        expected_retirement_token=retirement["token"],
+        expected_attempt_id=attempt,
+    )
+    with pytest.raises(
+        asyncpg.CheckViolationError, match="issued Pod identity is unresolved"
+    ):
+        await db.fence_pinned_thread_workspace_provision_intent(
+            ids["thread"],
+            expected_runtime_generation=retirement["generation"],
+            expected_retirement_token=retirement["token"],
+            expected_attempt_id=attempt,
+            fence_pod_uid=str(uuid4()),
+            fence_pvc_uid=str(uuid4()),
+            fence_configmap_uid=None,
+            fence_service_uid=str(uuid4()),
+            permanent=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_unpublished_existing_pvc_is_not_adopted_from_name_and_labels(db, monkeypatch):
+    ids, _, cluster, provider = await _stranded(db, monkeypatch, published=False)
+    original_uid = cluster.objects["pvc"].metadata.uid
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert retirement["state"] == "pending"
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"], token=retirement["token"], generation=retirement["generation"], settle_status="ended"
+    )
+    intent = await db.revoke_pinned_thread_workspace_provision_intent(
+        ids["thread"], expected_runtime_generation=retirement["generation"],
+        expected_retirement_token=retirement["token"],
+        expected_attempt_id=retirement["context"]["workspace_provision_intent"]["attempt_id"]
+    )
+    assert intent["pvc_uid"] is None
+    assert await provider.fence_pinned_workspace_provision_intent(
+        intent, permanent=True, expected_retirement_token=retirement["token"],
+        expected_retirement_generation=retirement["generation"]
+    ) is None
+    assert cluster.objects["pvc"].metadata.uid == original_uid
