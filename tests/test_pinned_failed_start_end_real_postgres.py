@@ -197,7 +197,10 @@ async def _retire_unbound(db, provider, thread_id, *, permanent):
         expected_attempt_id=attempt,
     )
     fences = await provider.fence_pinned_workspace_provision_intent(
-        current, permanent=permanent, expected_retirement_token=retirement["token"]
+        current,
+        permanent=permanent,
+        expected_retirement_token=retirement["token"],
+        expected_retirement_generation=retirement["generation"],
     )
     assert fences is not None
     assert await db.fence_pinned_thread_workspace_provision_intent(

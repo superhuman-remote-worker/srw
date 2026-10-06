@@ -135,7 +135,7 @@ async def _release(
     agent,
     *,
     prior=None,
-    fetchvals=(False, False),
+    fetchvals=(False, False, False),
     execute_results=("UPDATE 1", "UPDATE 1", "INSERT 0 1"),
     **kwargs,
 ):

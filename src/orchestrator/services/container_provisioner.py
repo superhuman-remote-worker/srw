@@ -4020,6 +4020,7 @@ class ContainerProvisioner:
                 )
             else:
                 pvc_labels = {owner.label_key: owner.id}
+                create_receipt = {}
                 if strict_pinned:
                     pvc_labels.update(
                         {
@@ -4029,12 +4030,23 @@ class ContainerProvisioner:
                             ),
                         }
                     )
+
+                    async def record_created_pvc(uid: str) -> bool:
+                        return await self._db.record_pinned_workspace_provision_create_receipt(
+                            owner.id,
+                            runtime_generation=pinned_runtime_generation,
+                            attempt_id=pinned_attempt_id,
+                            resource_uid=uid,
+                        )
+
+                    create_receipt["created_receipt"] = record_created_pvc
                 pvc_status = await self._create_pvc(
                     pvc_name,
                     size=profile.storage or self._pvc_size,
                     # Owner label lets the backstop reaper resolve PVC → owner.
                     labels=pvc_labels,
                     expected_owner=owner,
+                    **create_receipt,
                 )
             if not pvc_status:
                 logger.error(
@@ -11158,6 +11170,7 @@ class ContainerProvisioner:
         runtime_generation: str,
         attempt_id: str,
         network_tier: str,
+        refuse_original: bool = False,
     ) -> str | None:
         creators = {
             "pod": self._core_api.create_namespaced_pod,
@@ -11235,7 +11248,7 @@ class ContainerProvisioner:
                 observed_uid = str(observed.get("uid") or "")
                 if state == "exact_fence" and observed_uid:
                     return observed_uid
-                if state != "exact_original" or not observed_uid:
+                if refuse_original or state != "exact_original" or not observed_uid:
                     return None
                 if not await self._delete_workspace_provision_resource_exact(
                     resource=resource,
@@ -11269,6 +11282,7 @@ class ContainerProvisioner:
         *,
         permanent: bool,
         expected_retirement_token: str | None = None,
+        expected_retirement_generation: str | None = None,
     ) -> dict[str, str | None] | None:
         """Close every potential create from one revoked pinned attempt."""
 
@@ -11279,6 +11293,7 @@ class ContainerProvisioner:
         except (TypeError, ValueError):
             return None
         namespace = str(intent.get("namespace") or "").strip()
+        retirement_generation = expected_retirement_generation or runtime_generation
         network_tier = str(intent.get("network_tier") or "").strip()
         if not namespace or not network_tier:
             return None
@@ -11303,7 +11318,7 @@ class ContainerProvisioner:
                 return None
             current = await self._db.revoke_pinned_thread_workspace_provision_intent(
                 thread_id,
-                expected_runtime_generation=runtime_generation,
+                expected_runtime_generation=retirement_generation,
                 expected_retirement_token=expected_retirement_token,
                 expected_attempt_id=attempt_id,
             )
@@ -11345,11 +11360,78 @@ class ContainerProvisioner:
                 intent, expected_retirement_token=expected_retirement_token
             ):
                 return None
-            if not intent.get("pod_uid") and not (
+            partial_create = not intent.get("pod_uid") and not (
                 intent.get("retained_source_attempt_id") is not None
                 and intent.get("creation_effects_admitted_at") is None
-            ):
-                return None
+            )
+            if partial_create:
+                # Atomic inert-name ownership closes any late CREATE. Missing
+                # publication alone proves nothing: refuse a present unknown
+                # original (possible writer), foreign UID or unreadable state.
+                # An ordinary partial create may purge only; soft retention
+                # needs durable issued storage authority.
+                if not permanent:
+                    return None
+                create_receipt = (
+                    await self._db.get_pinned_workspace_provision_create_receipt(
+                        thread_id,
+                        runtime_generation=runtime_generation,
+                        attempt_id=attempt_id,
+                    )
+                )
+                if create_receipt:
+                    issued = str(intent.get("pvc_uid") or "")
+                    observed = str(create_receipt.get("resource_uid") or "")
+                    if issued and issued != observed:
+                        return None
+                    retained["pvc"] = observed
+                # The abort lineage identifies the old request, not an
+                # unpublished resource. Never turn matching names and labels
+                # into authority over a present PVC, Service or ConfigMap.
+                for resource in ("pvc", "service", "seed_configmap"):
+                    if not names[resource]:
+                        continue
+                    observed = await self._workspace_provision_resource_authority(
+                        owner=owner,
+                        resource=resource,
+                        name=names[resource],
+                        namespace=namespace,
+                        runtime_generation=runtime_generation,
+                        attempt_id=attempt_id,
+                        network_tier=network_tier,
+                    )
+                    recorded_uid = str(
+                        intent.get(f"{resource}_uid") or retained.get(resource) or ""
+                    )
+                    if observed.get("state") == "exact_original":
+                        if not recorded_uid or observed.get("uid") != recorded_uid:
+                            return None
+                    elif observed.get("state") not in {"exact_absent", "exact_fence"}:
+                        return None
+                fence_uid = await self._fence_workspace_provision_resource(
+                    owner=owner,
+                    resource="pod",
+                    name=names["pod"],
+                    namespace=namespace,
+                    runtime_generation=runtime_generation,
+                    attempt_id=attempt_id,
+                    network_tier=network_tier,
+                    refuse_original=True,
+                )
+                if not fence_uid or not await self._inert_workspace_fence_is_exact(
+                    namespace=namespace,
+                    name=names["pod"],
+                    uid=fence_uid,
+                ):
+                    return None
+                if not await self._db.record_pinned_workspace_inert_fence(
+                    thread_id,
+                    retirement_generation=retirement_generation,
+                    retirement_token=expected_retirement_token,
+                    attempt_id=attempt_id,
+                    fence_pod_uid=fence_uid,
+                ):
+                    return None
             if not permanent:
                 # Issued storage UIDs are durable authority even though this
                 # failed-start attempt never published an authenticated binding.
@@ -11474,6 +11556,38 @@ class ContainerProvisioner:
                 return None
             fences[fence_field] = fence_uid
         return fences
+
+    async def _inert_workspace_fence_is_exact(
+        self, *, namespace: str, name: str, uid: str
+    ) -> bool:
+        """Attest an unschedulable, mount-free Pod; labels alone are not zero."""
+        try:
+            pod = await self._bounded_kubernetes_call(
+                self._core_api.read_namespaced_pod,
+                name=name,
+                namespace=namespace,
+            )
+            spec = pod.spec
+            containers = list(spec.containers or [])
+            return bool(
+                pod.metadata.uid == uid
+                and pod.metadata.name == name
+                and pod.metadata.namespace == namespace
+                and pod.metadata.deletion_timestamp is None
+                and spec.scheduler_name == "srw-retirement-fence"
+                and spec.node_name is None
+                and spec.restart_policy == "Never"
+                and spec.automount_service_account_token is False
+                and not spec.volumes
+                and not spec.init_containers
+                and not spec.ephemeral_containers
+                and len(containers) == 1
+                and containers[0].name == "fence"
+                and containers[0].command == ["/bin/sh", "-c", "exit 0"]
+                and not containers[0].volume_mounts
+            )
+        except Exception:
+            return False
 
     async def _retained_pinned_resource_is_exact(
         self,
@@ -12037,8 +12151,7 @@ class ContainerProvisioner:
                 or str(reservation.get("owner_id")) != job_id
                 or reservation.get("scope") != "ide"
                 or reservation.get("operation_kind") != "restore"
-                or reservation.get("desired_manifest_digest")
-                != creation_plan["digest"]
+                or reservation.get("desired_manifest_digest") != creation_plan["digest"]
                 or not isinstance(reservation.get("claimed_by"), str)
                 or type(reservation.get("claim_token")) is not int
                 or type(reservation.get("reservation_generation")) is not int
@@ -13485,6 +13598,7 @@ class ContainerProvisioner:
         creation_reservation_id: str | None = None,
         mutation_authority: Callable[[], Awaitable[bool]] | None = None,
         expected_retained_pvc_uid: str | None = None,
+        created_receipt: Callable[[str], Awaitable[bool]] | None = None,
     ) -> Optional[str]:
         """Create a PVC for workspace data. Idempotent.
 
@@ -13585,6 +13699,16 @@ class ContainerProvisioner:
                         expected_owner.id,
                         authority_error,
                     )
+                    return None
+            if created_receipt is not None:
+                metadata = getattr(created, "metadata", None)
+                uid = str(getattr(metadata, "uid", "") or "")
+                if (
+                    not uid
+                    or getattr(metadata, "name", None) != pvc_name
+                    or getattr(metadata, "namespace", None) != self._namespace
+                    or not await created_receipt(uid)
+                ):
                     return None
             logger.info(
                 "PVC created: %s (storageClass=%s)", pvc_name, resolved_storage_class
@@ -14869,7 +14993,9 @@ class ContainerProvisioner:
                                 allow_owner_unlabeled=False,
                                 expected_pod_name=pod_name,
                                 expected_component=(
-                                    "ide-session" if pod_name.startswith("ide-") else None
+                                    "ide-session"
+                                    if pod_name.startswith("ide-")
+                                    else None
                                 ),
                             )
                             if creation_reservation_id is not None:
@@ -14885,7 +15011,8 @@ class ContainerProvisioner:
                                     not isinstance(pod_annotations, dict)
                                     or pod_annotations.get(
                                         WORKSPACE_RUNTIME_CREATION_ANNOTATION
-                                    ) != expected_creation_generation
+                                    )
+                                    != expected_creation_generation
                                 )
                             ) or (
                                 expected_provision_attempt is not None
@@ -14893,7 +15020,9 @@ class ContainerProvisioner:
                                     not isinstance(pod_labels, dict)
                                     or pod_labels.get(WORKSPACE_PROVISION_ATTEMPT_LABEL)
                                     != expected_provision_attempt
-                                    or pod_labels.get(WORKSPACE_PROVISION_GENERATION_LABEL)
+                                    or pod_labels.get(
+                                        WORKSPACE_PROVISION_GENERATION_LABEL
+                                    )
                                     != expected_runtime_generation
                                 )
                             ):
@@ -14934,14 +15063,15 @@ class ContainerProvisioner:
                             creation_reservation_id=creation_reservation_id,
                         )
                         if body["metadata"].get("ownerReferences"):
-                            preserved_reference = body["metadata"][
-                                "ownerReferences"
-                            ][0]
-                            if self._exact_seed_configmap_pod_owner_reference(
-                                observed,
-                                pod_name=pod_name,
-                                runtime_incarnation=preserved_reference["uid"],
-                            ) != preserved_reference:
+                            preserved_reference = body["metadata"]["ownerReferences"][0]
+                            if (
+                                self._exact_seed_configmap_pod_owner_reference(
+                                    observed,
+                                    pod_name=pod_name,
+                                    runtime_incarnation=preserved_reference["uid"],
+                                )
+                                != preserved_reference
+                            ):
                                 raise WorkspaceRuntimeAuthorityError(
                                     "workspace seed ConfigMap Pod ownership changed"
                                 )
@@ -14956,7 +15086,9 @@ class ContainerProvisioner:
                                 allow_owner_unlabeled=False,
                                 expected_pod_name=pod_name,
                                 expected_component=(
-                                    "ide-session" if pod_name.startswith("ide-") else None
+                                    "ide-session"
+                                    if pod_name.startswith("ide-")
+                                    else None
                                 ),
                             )
                             if current_uid != preserved_reference["uid"]:
@@ -14978,7 +15110,8 @@ class ContainerProvisioner:
                                     not isinstance(current_annotations, dict)
                                     or current_annotations.get(
                                         WORKSPACE_RUNTIME_CREATION_ANNOTATION
-                                    ) != expected_creation_generation
+                                    )
+                                    != expected_creation_generation
                                 )
                             ) or (
                                 expected_provision_attempt is not None
@@ -14986,10 +15119,12 @@ class ContainerProvisioner:
                                     not isinstance(current_labels, dict)
                                     or current_labels.get(
                                         WORKSPACE_PROVISION_ATTEMPT_LABEL
-                                    ) != expected_provision_attempt
+                                    )
+                                    != expected_provision_attempt
                                     or current_labels.get(
                                         WORKSPACE_PROVISION_GENERATION_LABEL
-                                    ) != expected_runtime_generation
+                                    )
+                                    != expected_runtime_generation
                                 )
                             ):
                                 raise WorkspaceRuntimeAuthorityError(
@@ -15589,8 +15724,7 @@ class ContainerProvisioner:
             _resource_field(reference, "api_version", "apiVersion") != "v1"
             or _resource_field(reference, "kind") != "Pod"
             or _resource_field(reference, "name") != pod_name
-            or str(_resource_field(reference, "uid") or "")
-            != runtime_incarnation
+            or str(_resource_field(reference, "uid") or "") != runtime_incarnation
             or _resource_field(reference, "controller") is not True
         ):
             raise WorkspaceRuntimeAuthorityError(
@@ -15604,7 +15738,8 @@ class ContainerProvisioner:
             "controller": True,
             "blockOwnerDeletion": _resource_field(
                 reference, "block_owner_deletion", "blockOwnerDeletion"
-            ) is True,
+            )
+            is True,
         }
 
     def _build_pod_manifest(

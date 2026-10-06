@@ -654,10 +654,15 @@ class PinnedRetirementOperations:
             and str(receipt.get("agent_id") or "") == str(context.get("agent_id") or "")
             and str(receipt.get("runtime_attach_token") or "")
             == str(context.get("runtime_attach_token") or "")
-            and (not vm_creation_zero or (
-                receipt.get("vm_creation_request_id") == vm_creation_source["request_id"]
-                and receipt.get("vm_creation_provision_generation") == vm_creation_source["provision_generation"]
-            ))
+            and (
+                not vm_creation_zero
+                or (
+                    receipt.get("vm_creation_request_id")
+                    == vm_creation_source["request_id"]
+                    and receipt.get("vm_creation_provision_generation")
+                    == vm_creation_source["provision_generation"]
+                )
+            )
             and str(receipt.get("settle_status") or "")
             == str(context.get("settle_status") or "")
             and expected_protocol is not None
@@ -1538,7 +1543,20 @@ class PinnedRetirementOperations:
         if not (
             attempt_id == str(intent.get("attempt_id") or "")
             and thread_id == str(context.get("thread_id") or "")
-            and generation == str(retirement.get("generation") or "")
+            and (
+                generation == str(retirement.get("generation") or "")
+                or (
+                    intent.get("retirement_runtime_generation")
+                    == str(retirement.get("generation") or "")
+                    and isinstance(intent.get("attach_abort_path"), list)
+                    and 2 <= len(intent["attach_abort_path"]) <= 17
+                    and intent["attach_abort_path"][0] == generation
+                    and intent["attach_abort_path"][-1]
+                    == str(retirement.get("generation") or "")
+                    and bool(retirement.get("permanent"))
+                    and not intent.get("pod_uid")
+                )
+            )
             and str(intent.get("namespace") or "")
             and str(intent.get("pod_name") or "")
             and str(intent.get("network_tier") or "")
@@ -1582,6 +1600,7 @@ class PinnedRetirementOperations:
             current,
             permanent=permanent,
             expected_retirement_token=token,
+            expected_retirement_generation=generation,
         )
         if not isinstance(fences, Mapping):
             raise RuntimeError("workspace provision name fencing is retryable")
@@ -1736,7 +1755,10 @@ class PinnedRetirementOperations:
         )
 
     async def _settle_vm_creation_source(
-        self, retirement: Mapping[str, Any], *, require_initial_agent_zero: bool = False,
+        self,
+        retirement: Mapping[str, Any],
+        *,
+        require_initial_agent_zero: bool = False,
     ) -> bool:
         """Resolve only terminal issuance debt before proving the current actor zero."""
         context = retirement.get("context") or {}
@@ -1755,35 +1777,48 @@ class PinnedRetirementOperations:
             captured = await handoff_identity(self.dependencies.store, retirement)
             if captured is not None:
                 cleanup = await self._admit_vm_cleanup(
-                    thread_id, captured, purge_disk=bool(retirement.get("permanent")),
+                    thread_id,
+                    captured,
+                    purge_disk=bool(retirement.get("permanent")),
                     retirement=retirement,
                 )
                 if cleanup is None:
                     return False
                 disposition = completed_cleanup_outcome(cleanup)
                 if disposition is None:
-                    stopped = await self.dependencies.vm_provisioner.release_vm_captured(
-                        thread_id, captured, entity_type="thread",
-                        purge_disk=bool(retirement.get("permanent")), capture_snapshot=False,
-                        **vm_cleanup_kwargs(cleanup),
+                    stopped = (
+                        await self.dependencies.vm_provisioner.release_vm_captured(
+                            thread_id,
+                            captured,
+                            entity_type="thread",
+                            purge_disk=bool(retirement.get("permanent")),
+                            capture_snapshot=False,
+                            **vm_cleanup_kwargs(cleanup),
+                        )
                     )
                     disposition = stopped.disposition
                 await self._complete_vm_cleanup(cleanup, disposition)
                 if disposition != "completed":
                     return False
-        if await self.dependencies.store.pinned_vm_creation_source_settled(thread_id, **identity):
+        if await self.dependencies.store.pinned_vm_creation_source_settled(
+            thread_id, **identity
+        ):
             return await self._purge_cancelled_resume_disk(retirement)
         from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
 
         # Issued/unknown effects and source pins remain pending for the exact
         # disposition controller. A completed disposition is checked above;
         # it must not be replayed through the never-issued-only API.
-        result = await VMCreationRetryStore(self.dependencies.store).settle_never_issued(
+        result = await VMCreationRetryStore(
+            self.dependencies.store
+        ).settle_never_issued(
             request_id=str(source["request_id"]),
         )
         return (
             result.get("settled") is True
-            and await self.dependencies.store.pinned_vm_creation_source_settled(thread_id, **identity)
+            and await self.dependencies.store.pinned_vm_creation_source_settled(
+                thread_id, **identity
+            )
             and await self._purge_cancelled_resume_disk(retirement)
         )
 
@@ -1792,28 +1827,40 @@ class PinnedRetirementOperations:
         if not retirement.get("permanent") or not source.get("retained_resume_id"):
             return True
         from orchestrator.services.vm_thread_retained_resume import (
-            clear_terminal_vm_projection, terminal_disk_identity,
+            clear_terminal_vm_projection,
+            terminal_disk_identity,
         )
 
         captured = await terminal_disk_identity(self.dependencies.store, retirement)
         # An observed VM follows its own existing 0295 stop/purge above.
         if captured is None:
-            return await clear_terminal_vm_projection(self.dependencies.store, retirement)
+            return await clear_terminal_vm_projection(
+                self.dependencies.store, retirement
+            )
         thread_id = retirement["context"]["thread_id"]
         permit = await self._admit_vm_cleanup(
-            thread_id, captured, purge_disk=True, retirement=retirement,
+            thread_id,
+            captured,
+            purge_disk=True,
+            retirement=retirement,
         )
         if permit is None:
             return False
         disposition = completed_cleanup_outcome(permit)
         if disposition is None:
             result = await self.dependencies.vm_provisioner.release_vm_captured(
-                thread_id, captured, entity_type="thread", purge_disk=True,
-                capture_snapshot=False, **vm_cleanup_kwargs(permit),
+                thread_id,
+                captured,
+                entity_type="thread",
+                purge_disk=True,
+                capture_snapshot=False,
+                **vm_cleanup_kwargs(permit),
             )
             disposition = result.disposition
         await self._complete_vm_cleanup(permit, disposition)
-        return disposition == "completed" and await clear_terminal_vm_projection(self.dependencies.store, retirement)
+        return disposition == "completed" and await clear_terminal_vm_projection(
+            self.dependencies.store, retirement
+        )
 
     async def captured_agent_is_terminal(self, retirement: Mapping[str, Any]) -> bool:
         """Probe only the fully authorized captured life; perform no effects."""
@@ -1891,10 +1938,13 @@ class PinnedRetirementOperations:
                 return False
         if not (
             current
-            and str(current.get("runtime_generation") or "") == str(retirement.get("generation") or "")
-            and str(current.get("runtime_retirement_token") or "") == str(retirement.get("token") or "")
+            and str(current.get("runtime_generation") or "")
+            == str(retirement.get("generation") or "")
+            and str(current.get("runtime_retirement_token") or "")
+            == str(retirement.get("token") or "")
             and current.get("runtime_retirement_authorized_at") is not None
-            and bool(current.get("runtime_retirement_permanent")) == bool(retirement.get("permanent"))
+            and bool(current.get("runtime_retirement_permanent"))
+            == bool(retirement.get("permanent"))
             and current_context == context
         ):
             return False
@@ -1943,7 +1993,8 @@ class PinnedRetirementOperations:
         vm_creation_zero = initial_vm_creation_retirement_source(context) is not None
         if vm_creation_zero:
             if not await self._settle_vm_creation_source(
-                retirement, require_initial_agent_zero=True,
+                retirement,
+                require_initial_agent_zero=True,
             ):
                 return False
             # The shape helper permits only nonphysical repository labels;
@@ -2149,12 +2200,16 @@ class PinnedRetirementOperations:
                         attach_token=str(context.get("runtime_attach_token") or ""),
                         stopped_pod_uid=next(iter(captured_pods))[1],
                     )
-                if receipt is None and (virtual_binding_agent_zero_only or lite_agent_zero_only):
+                if receipt is None and (
+                    virtual_binding_agent_zero_only or lite_agent_zero_only
+                ):
                     # All containers of the captured Pod were proven stopped
                     # above. Unadmitted durable input remains owed; partial
                     # provider admissions remain immutable effect evidence.
                     receipt = await self.dependencies.store.acknowledge_abrupt_pinned_actor_exit(
-                        thread_id, runtime_generation=generation, retirement_token=token,
+                        thread_id,
+                        runtime_generation=generation,
+                        retirement_token=token,
                         agent_id=str(context.get("agent_id") or ""),
                         attach_token=str(context.get("runtime_attach_token") or ""),
                         stopped_pod_uid=next(iter(captured_pods))[1],

@@ -368,7 +368,7 @@ async def _release(
     *,
     prior=None,
     warm_binding=None,
-    fetchvals=(False, False),
+    fetchvals=(False, False, False),
     execute_results=("UPDATE 1", "UPDATE 1", "INSERT 0 1"),
     deps_overrides=None,
     **kwargs,

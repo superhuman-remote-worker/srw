@@ -620,6 +620,18 @@ async def release_session_attach_binding(
                 if admitted_input or admitted_control:
                     return "unsafe"
 
+                # Local pre-setup zero says nothing about an external workspace
+                # create already admitted by this thread. Reservation and UID
+                # publication take the same thread lock: either publication
+                # settles first, or the captured life stays bound for normal
+                # retirement. Never rotate away from an unresolved obligation.
+                if await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM thread_workspace_provision_intents "
+                    "WHERE thread_id=$1::uuid AND status IN ('planned','revoking','fenced'))",
+                    thread_id,
+                ):
+                    return "unsafe"
+
                 successor_generation = str(uuid4())
                 receipt = {
                     "version": 1,

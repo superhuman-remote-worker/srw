@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0329_validate_vm_job_creation_audit_owners.sql"
+    / "src/orchestrator/database/migrations/app/0331_pinned_pvc_create_response_receipts.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

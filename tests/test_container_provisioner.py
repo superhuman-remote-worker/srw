@@ -252,6 +252,15 @@ class _PinnedWorkspaceIntentDB:
         self.published[kwargs["resource"]] = kwargs["resource_uid"]
         return True
 
+    async def record_pinned_workspace_provision_create_receipt(
+        self, thread_id, **kwargs
+    ):
+        assert thread_id == self.THREAD_ID
+        assert kwargs["runtime_generation"] == self.GENERATION
+        assert kwargs["attempt_id"] == self.intent["attempt_id"]
+        self.events.append(("receipt", kwargs))
+        return True
+
     async def complete_pinned_thread_workspace_provision_intent(
         self, thread_id, **kwargs
     ):
@@ -770,6 +779,9 @@ class TestPinnedWorkspaceProvisionIntentFlow:
         names = [event[0] for event in events]
         assert names.index("reserve") < names.index("create-pvc")
         assert names.index("create-pvc") < names.index("create-configmap")
+        assert (
+            names.index("create-pvc") < names.index("receipt") < names.index("publish")
+        )
         assert names.index("create-configmap") < names.index("create-pod")
         assert names.index("create-pod") < names.index("create-service")
         assert names.index("create-service") < names.index("complete")
@@ -7466,9 +7478,7 @@ class TestWorkspaceNamedResourceAuthority:
         assert body["metadata"]["labels"][self.OWNER.label_key] == self.OWNER.id
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "reference_case", ("exact", "foreign", "pod_replaced")
-    )
+    @pytest.mark.parametrize("reference_case", ("exact", "foreign", "pod_replaced"))
     async def test_seed_conflict_keeps_only_exact_pod_owner_reference(
         self, reference_case
     ):
@@ -7897,9 +7907,7 @@ class TestIdePodResourceAuthority:
             new=AsyncMock(side_effect=AssertionError("unexpected second reservation")),
         ):
             assert (
-                await p.create_ide_pod(
-                    self.JOB_ID, creation_reservation=receipt
-                )
+                await p.create_ide_pod(self.JOB_ID, creation_reservation=receipt)
                 is None
             )
         passed = p._create_ide_pod_reserved.await_args.kwargs
@@ -7949,9 +7957,7 @@ class TestIdePodResourceAuthority:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("foreign_reference", (False, True))
-    async def test_live_409_repairs_only_exact_unowned_seed(
-        self, foreign_reference
-    ):
+    async def test_live_409_repairs_only_exact_unowned_seed(self, foreign_reference):
         class _Conflict(Exception):
             status = 409
 
@@ -7961,9 +7967,7 @@ class TestIdePodResourceAuthority:
         p._create_seed_configmap.return_value = seed_name
         p._adopt_configmap = type(p)._adopt_configmap.__get__(p)
         p._core_api.create_namespaced_pod.side_effect = _Conflict()
-        p._core_api.read_namespaced_pod.return_value = self._pod(
-            p, seed_name=seed_name
-        )
+        p._core_api.read_namespaced_pod.return_value = self._pod(p, seed_name=seed_name)
         seed = self._seed(p)
         seed.metadata.owner_references = []
         if foreign_reference:
@@ -7998,7 +8002,6 @@ class TestIdePodResourceAuthority:
             assert result == "10.42.0.30"
             assert len(seed.metadata.owner_references) == 1
             assert seed.metadata.owner_references[0].uid == self.RUNTIME
-
 
     @pytest.mark.asyncio
     async def test_live_409_malformed_storage_refuses_without_seed_cleanup(self):
