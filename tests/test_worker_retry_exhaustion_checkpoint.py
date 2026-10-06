@@ -44,8 +44,7 @@ class MemoryFencedSaver(FencedAsyncPostgresSaver):
     """Use real local lease binding with memory storage; SQL fence is tested on PG."""
 
     def __init__(self, job, token):
-        self.unit_id = job
-        self.lease_token = token
+        super().__init__(object(), unit_id=job, lease_token=token)
         self.memory = InMemorySaver()
         self.serde = self.memory.serde
         self.writes = 0
@@ -98,6 +97,7 @@ async def bind_checkpoint_agent(agent, claim, final, executor):
     agent._worker_lease_token = claim.lease_token
     agent._checkpointer = saver
     agent._graph = graph(saver)
+    UniversalAgent._retain_compiled_worker_checkpointer(agent)
     agent._worker_thread_config = {"configurable": {"thread_id": job}}
     agent.checkpoint_worker_retry_exhaustion = MethodType(
         UniversalAgent.checkpoint_worker_retry_exhaustion, agent
@@ -117,6 +117,7 @@ async def setup_agent(state=None):
     agent._worker_lease_token = token
     agent._checkpointer = MemoryFencedSaver(job, token)
     agent._graph = graph(agent._checkpointer)
+    agent._retain_compiled_worker_checkpointer()
     agent._worker_thread_config = {"configurable": {"thread_id": job}}
     state = state or outage()
     await agent._graph.ainvoke(state, agent._worker_thread_config)
@@ -252,6 +253,8 @@ async def test_new_giveup_is_distinct_durable_and_replays_byte_identically():
         agent._worker_lease_token = 8
         agent._checkpointer = successor
         agent._graph = graph(successor)
+        agent._retain_compiled_worker_checkpointer()
+        successor = agent._checkpointer
         reloaded = await agent.checkpoint_worker_retry_exhaustion(
             job_id=handle.unit_id, lease_token=8, terminal_state=exhausted
         )

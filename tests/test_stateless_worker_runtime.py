@@ -2560,6 +2560,7 @@ async def test_last_recoverable_attempt_reports_visible_terminal_give_up(
         from tests.test_worker_retry_exhaustion_checkpoint import bind_checkpoint_agent
 
         checkpoint_reset = await bind_checkpoint_agent(agent, claim, final, executor)
+        assert agent._checkpointer is agent._graph.checkpointer
     try:
         await executor._serve_worker_claim(claim)
     finally:
@@ -2659,6 +2660,7 @@ async def test_giveup_checkpoint_ambiguity_never_starts_http_or_parks(
         monkeypatch, claim, final
     )
     reset = await bind_checkpoint_agent(agent, claim, final, executor)
+    assert agent._checkpointer is agent._graph.checkpointer
     update = agent._graph.aupdate_state
     read = agent._graph.aget_state
     reads = 0
