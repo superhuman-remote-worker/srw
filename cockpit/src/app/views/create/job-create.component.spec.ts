@@ -416,8 +416,7 @@ describe('JobCreateComponent project picker', () => {
     const NOT_GRANTED = 'jobs.create.noShellNoteNoGrant';
 
     function noteFor(choice: WorkspaceChoice, tp: SessionToolGroupsResponse | null, grants: Record<string, unknown> | null = null) {
-      const {component, api} = setup(null);
-      api.previewToolGroups.mockReturnValue(of(tp));
+      const {component} = setup(null);
       component.workspaceChoice.set(choice);
       component.toolPreview.set(tp);
       (component.capabilities as unknown as {grants: ReturnType<typeof signal>}).grants.set(grants);
@@ -445,6 +444,24 @@ describe('JobCreateComponent project picker', () => {
     it('is hidden for the virtual tier and for none', () => {
       expect(noteFor({...REF, backend: 'virtual' as never}, preview('off', 'virtual'))).toBeNull();
       expect(noteFor({kind: 'none'}, preview('off'))).toBeNull();
+    });
+
+    it('is hidden while the preview for a new choice or Expert is loading', () => {
+      const {component} = setup(null);
+      component.workspaceChoice.set(REF);
+      component.toolPreview.set(preview('off'));
+      expect(component.noShellNoteKey()).toBe(GRANTED);
+      component.loadingWorkspacePreview.set(true);
+      expect(component.noShellNoteKey()).toBeNull();
+      component.loadingWorkspacePreview.set(false);
+      component.isLoadingExpertDetail.set(true);
+      expect(component.noShellNoteKey()).toBeNull();
+    });
+
+    it('is hidden when the user switched Shell off themselves', () => {
+      const tp = preview('off');
+      tp.categories!['shell'].decided_by = 'request';
+      expect(noteFor(REF, tp)).toBeNull();
     });
 
     it('is hidden until a preview names the shell category', () => {

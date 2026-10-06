@@ -1412,12 +1412,16 @@ export class JobCreateComponent implements OnInit {
    *  A note only: it never blocks submit. Default is skipped on purpose (Helm makes most
    *  installations' default Job workspace a container, so it would show on every Job). */
   readonly noShellNoteKey = computed<string | null>(() => {
+    // While a preview (or the Expert detail that triggers one) is loading, the signal still
+    // holds the previous Expert's answer; saying "no shell" about that would be false.
+    if (this.loadingWorkspacePreview() || this.isLoadingExpertDetail()) return null;
     const kind = this.workspaceChoice().kind;
     if (kind !== 'ref' && kind !== 'inline') return null;
     const backend = this.pickerBackend();
     if (backend !== 'sandbox' && backend !== 'vm') return null;
     const shell = this.toolPreview()?.categories?.['shell'];
-    if (!shell || shell.state === 'on') return null;
+    // 'request': the user switched Shell off themselves, so it isn't a property of the Expert.
+    if (!shell || shell.state === 'on' || shell.decided_by === 'request') return null;
     return hasGrant(this.capabilities.grants() ?? null, 'shell_tools')
       ? 'jobs.create.noShellNoteGranted'
       : 'jobs.create.noShellNoteNoGrant';
