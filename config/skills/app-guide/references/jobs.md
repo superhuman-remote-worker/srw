@@ -68,7 +68,8 @@ browser, and git tools. None also disables file tools. Container and VM are the 
 tiers; their exact tools still depend on the expert and grants.
 
 To run commands in a workspace, for example to try an image, pick an Expert with the shell
-tools, such as Engineer; General Worker has none.
+tools, such as Engineer; General Worker has none. A non-admin also needs the
+`shell_tools` grant from an administrator.
 
 ## Choose the review cadence
 
