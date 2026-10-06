@@ -1,7 +1,7 @@
 {
   "date": "2026-10-06",
   "slice": "templates follow-ups",
-  "commit": "78bd8302b on develop (fixes under test: 2c6a84984, 39f1b1c60, 84c7e00ed, d51dfd94c, 87df35e19, 6f4a82a5c, 5a6d5489e, dd7e1c5eb, 4e0646727)",
+  "commit": "78bd8302b on develop (fixes under test: 2c6a84984, 39f1b1c60, 84c7e00ed, d51dfd94c, 87df35e19, 6f4a82a5c, 5a6d5489e, dd7e1c5eb, 4e0646727); A2-recheck on 1f9f9f342",
   "stack": "local k3d (k3d-srw/srw), Tilt-built; agent srw-agent:tilt-7d95e8f8445d8a93; workspace base srw-workspace-minimal:tilt-7e7d19b52f06906a; CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED=false",
   "caller": "REST via orchestrator pod (X-Internal-Key + X-MCP-User-Id impersonating admin 6ed1b6f4-4931-461f-ba92-1d98f062af10); cockpit https://localhost as test/test via Node Playwright",
   "image": {
@@ -63,6 +63,18 @@
       "how": "template form CPU=0x10, Name=zz-cpu-check, Save",
       "observed": "No error on blur; on Save form stays on /workspaces/new with 'CPU must be a number above 0'; no zz-cpu-check template created (live/c4-*.png)",
       "result": "pass"
+    },
+    {
+      "step": "A2-recheck exit-code failure on the final code (1f9f9f342: opt-in only from the job dispatcher)",
+      "how": "template d3-exit-check re-applied (same digest sha256:ad349e5e…); POST /api/jobs on it; then DELETE; then DELETE /api/resources/<uid>?expected_version=1",
+      "observed": "Job b699f673-b842-4077-9ba5-a0a0dd0ea48b failed ~10 s after creation with error_message 'Workspace container exited with code 0 (Completed) before it became ready. A workspace image must keep running SRW's SSH server: build it FROM an SRW base image and don't override its ENTRYPOINT or USER.'; DELETE 200 on the first try; template deleted",
+      "result": "pass"
+    },
+    {
+      "step": "B shell-less trial Job (controller, on the agent image that carries d51dfd94c's skills)",
+      "how": "POST /api/jobs with no Expert (General Worker) on built-in container-minimal: 'Run these commands in the workspace shell and report their exact output: uname -a; python3 --version'",
+      "observed": "run 1 (d4048903…) failed after 20 s, unrelated: \"No memory extension named 'memory_search' is registered. Available extensions: <none registered>\" — not reproduced; run 2 (f93f5be6…) reached the agent (srw-agent-j-03f180c5, image srw-agent:tilt-7d95e8f8445d8a93) but every LLM call failed: local MiniMax key HTTP 402 insufficient_balance; Job failed as a deterministic LLM rejection. Both Jobs deleted, workspaces gone.",
+      "result": "not run (local LLM out of credit) — owed on dev after the push"
     }
   ],
   "envNotes": "Stale agent image blocked Part B. Orchestrator pod unchanged since 08:47Z during the run. A pending srw-garage-bootstrap pod and three old Failed ws-thread pods are unrelated.",
