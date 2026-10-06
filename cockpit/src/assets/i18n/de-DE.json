@@ -904,7 +904,7 @@
       "priorityHigh": "Hoch (unterbricht niedrigere)",
       "cloudStorageLabel": "Cloud-Speicher-Zugriff",
       "noShellNoteGranted": "Dieser Experte hat keine Shell-Tools, daher kann der Auftrag in diesem Arbeitsbereich keine Befehle ausführen. Um ein Image zu testen, wählen Sie einen Experten mit Shell-Tools, zum Beispiel Engineer.",
-      "noShellNoteNoGrant": "Dieser Experte hat keine Shell-Tools, daher kann der Auftrag in diesem Arbeitsbereich keine Befehle ausführen. Experten mit Shell-Tools benötigen die Shell-Berechtigung Ihres Administrators.",
+      "noShellNoteNoGrant": "Dieser Experte hat keine Shell-Tools, daher kann der Auftrag in diesem Arbeitsbereich keine Befehle ausführen. Experten mit Shell-Tools benötigen die Freigabe „shell_tools“ Ihres Administrators.",
       "cloudStorageInherit": "Vom Projekt erben",
       "cloudStorageReadonly": "Nur lesen",
       "cloudStorageReadwrite": "Lesen & Schreiben",
@@ -927,7 +927,6 @@
       "costUnpriced": "Erfasst, aber für diese Modelle gibt es keine Preisliste — Tokens sind exakt, die Kosten unbekannt.",
       "duration": "Dauer",
       "expert": "Experte",
-      "failureReason": "Warum es fehlgeschlagen ist",
       "heldForReview": "Zur Prüfung angehalten",
       "loading": "Details werden geladen…",
       "model": "Modell",
@@ -2615,7 +2614,7 @@
       "title": "Das ist keines der SRW-Images.",
       "unprivileged": "Es läuft ohne erhöhte Rechte, sofern Ihr Betreiber es nicht erlaubt; daher gibt es keinen eingebundenen Cloud-Ordner und keine geschützte Cloud.",
       "digest": "Legen Sie einen Digest fest (image@sha256:…) statt eines Tags, damit jeder Lauf dasselbe Image verwendet.",
-      "jobFirst": "Testen Sie ein neues Image zuerst mit einem Job. Ein Job zeigt, warum sein Arbeitsbereich nicht gestartet ist; eine Sitzung unter Umständen nicht."
+      "jobFirst": "Testen Sie ein neues Image zuerst mit einem Job. Ein Job zeigt mehr darüber, warum sein Arbeitsbereich nicht gestartet ist; eine Sitzung unter Umständen nicht."
     },
     "errors": {
       "name": "1-63 Kleinbuchstaben, Ziffern oder Bindestriche; Anfang und Ende ein Buchstabe oder eine Ziffer.",

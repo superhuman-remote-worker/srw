@@ -369,7 +369,7 @@ export function failureReason(
       }
       @if (!workspaceCreation() && failureReason(job()); as failed) {
         <section class="recovery-detail attention held-detail">
-          <strong>{{ 'jobs.detail.failureReason' | transloco }}</strong>
+          <strong>{{ 'jobs.failureReason' | transloco }}</strong>
           <span>{{ failed }}</span>
         </section>
       }
@@ -694,6 +694,11 @@ export function failureReason(
       }
       .recovery-detail.attention {
         border-color: var(--warning);
+      }
+      .held-detail span {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        min-width: 0;
       }
       .usage-block {
         display: flex;
