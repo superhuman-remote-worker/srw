@@ -1,0 +1,74 @@
+{
+  "date": "2026-10-06",
+  "slice": "Templates follow-ups (2026-10-06 batch): dev re-check after the push",
+  "commit": "159337372 (orchestrator, agents and cockpit from CI develop run #1174)",
+  "stack": "shared dev (kubectl context main, namespace superhuman-remote-worker), Helm release superhuman-remote-worker-deployment rev 1111, chart srw-dev-0.0.1174, appVersion sha-1593373; orchestrator and srw-agent sha-1593373, cockpit sha-7f1d7d4 (the batch's last cockpit commit 7f1d7d47a)",
+  "approval": "Owner approved the dev re-check, including Jobs on shared dev, on 2026-10-06 ('yes on all 5 decisions')",
+  "caller": "REST through orchestrator pod srw-orchestrator-795b898475-dn85b with X-Internal-Key + X-MCP-User-Id (helper /tmp/srw_dev.py from templates_slice_a_deferred_tests 'Calling the dev API', removed afterwards), impersonating the owner's dev admin 52b14734-ed8c-464b-a045-4de8c36a18f1; cockpit checks in the owner's logged-in browser at cockpit.srw.works (DOM reads; screenshots render black on dev)",
+  "preChecks": {
+    "flags": "orchestrator env CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED=true, STATELESS_SESSION_ENABLED=true, WORKSPACE_IMAGE_PULL_TIMEOUT_SECONDS=600",
+    "code": "orchestrator container_provisioner.py contains WorkspaceContainerExitedError; agent /app/config/skills/strategic-phase/SKILL.md and verify-before-done/SKILL.md contain 'such as Engineer' and the request_workspace_upgrade branch (X1, 87df35e19 + 068fda438)",
+    "model": "Jobs ran with config_override {llm: {model: gpt-6-sol}, scholar: {enabled: false}}"
+  },
+  "checks": [
+    {
+      "check": "shell-less live trial (X1 Part B, owed from local k3d)",
+      "how": "POST /api/jobs, no expert (General Worker, the application default), workspace {template: {ref: container-minimal, Catalog/shared}}, description 'run `uname -a` and `python3 --version` in this workspace's shell and report their exact output'",
+      "result": "pass",
+      "observed": {
+        "job": "373af9cf-9fab-45e7-924e-3c38836d4264 created 12:01:37Z; workspace Pod Running ~25 s after create; pending_review 12:04:34Z",
+        "firstAction": "the first model call (iteration 0, 12:02:36Z) was job_complete; no shell attempt, no 'NOT EXECUTED' list. The remaining main calls were read_file, job_complete and todo_complete (completion bookkeeping); 7 main iterations in total",
+        "completionReport": "summary 'The commands were not run because this Expert has no shell tool, and the Job should be run again with an Expert that has the shell tools, such as Engineer. I cannot report exact output for `uname -a` or `python3 --version` without executing them.'; confidence 0.0; notes 'Command execution is unavailable in this Expert; no outputs were fabricated.'"
+      }
+    },
+    {
+      "check": "exit image with startup-stage tracking on (D3 on dev's flag-on path)",
+      "how": "POST /api/manifests/apply Mine template tf-dev-exit (sandbox, docker.io/library/python:3.12-slim, 1 CPU / 2Gi / 10Gi); POST /api/jobs bound to it by ref",
+      "result": "pass (expected flag-on behaviour; the default-path failure is proven on local k3d)",
+      "observed": {
+        "job": "62800d2b-07f4-4559-b5bf-c5aa4c8147c0 created 12:01:32Z",
+        "pod": "workspace-62800d2b-07f: python3 exited at once, terminated exit 0 'Completed' at 12:01:59Z, phase Succeeded",
+        "receipt": "version 1, readiness/starting/scheduled from scheduled_at 12:01:45Z; the Job stayed created with no error_message (the legacy exit failure is not used for version-1 receipts, as designed)",
+        "attention": "readiness/attention/readiness_deadline at 12:11:46Z (scheduled_at + 600 s pull budget)",
+        "cockpit": "Jobs list row: 'Workspace needs attention: it didn't become ready in time. If it uses your own image, check that the image keeps running: build it FROM an SRW base image and don't override its ENTRYPOINT or USER.' (the batch's new readinessDeadline copy)"
+      }
+    },
+    {
+      "check": "one project per Session (S1, backend half)",
+      "how": "POST /api/persistent/threads/preview as the admin",
+      "result": "pass",
+      "observed": {
+        "twoProjects": "project_ids [personal a9eae0b7…, 34bd0f38…] → 422 {detail: 'A Session can belong to one project at most. Pick one project, or none.'}",
+        "oneProject": "[a9eae0b7…] → 200, project_ids [a9eae0b7…], workspace_backend virtual",
+        "sameTwice": "[a9eae0b7…, a9eae0b7…] → 200, deduplicated to one"
+      }
+    },
+    {
+      "check": "New Job no-shell note (C2)",
+      "how": "cockpit /jobs/new, owner browser",
+      "result": "pass",
+      "observed": "General Worker + Container (minimal): 'This Expert has no shell tools, so the Job can't run commands in this workspace. To try an image, pick an Expert with the shell tools, such as Engineer.' (granted variant; the admin has the shell grant). Engineer selected: note gone. General Worker again: note back. Workspace back to 'Default: Container · container-full (installation default)': note gone (explicit container/VM picks only, by design)"
+    },
+    {
+      "check": "workspace template form labels and strict CPU (minors)",
+      "how": "cockpit /workspaces/new",
+      "result": "pass",
+      "observed": {
+        "labels": "12 labels each resolve through for= to one control (Name, Save to, Display name, Description, Tier, Image, CPU, Memory, Disk, guaranteed CPU/memory, pull policy); no unlabeled input, select or textarea",
+        "cpu": "Name zz-cpu-check, Image busybox, CPU '0x10', Save → stays on /workspaces/new with 'CPU must be a number above 0.'; no zz-cpu-check template exists afterwards (Account listing)",
+        "customImageNotice": "'Try a new image with a Job first. A Job shows more about why its workspace didn't start; a Session may not.'"
+      }
+    },
+    {
+      "check": "Job detail panel failure reason (C3)",
+      "how": "Jobs list, Failed filter, expand the row of a failed Job (9792db96…, another stream's Job, failed 12:06Z)",
+      "result": "pass",
+      "observed": "the panel shows a 'Reason' block with the Job's error_message ('Deterministic LLM request rejection — …'); the reason span computes white-space pre-wrap and overflow-wrap anywhere"
+    }
+  ],
+  "notRun": [
+    "MCP early refusal of two projects (create_persistent_thread): its early refusal is covered by tests (test_mcp*.py); the REST funnel it calls refused above",
+    "the default-path (flag-off) exit failure: dev has startup-stage tracking on; proven on local k3d (k3d-templates-followups-2026-10-06.json)"
+  ],
+  "cleanup": "both Jobs cancelled (200) and deleted (200 on the first try); no workspace Pod, PVC or Service left; template tf-dev-exit deleted (200); helper and bodies removed from the orchestrator pod"
+}
