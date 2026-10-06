@@ -1125,6 +1125,10 @@ async def _preflight_job(
             suspension=dependencies.workspace_suspension,
             current_status=container_status,
             recreate_missing=mutation,
+            # This caller fails the Job on FAILED, so a Job create whose
+            # container exits before Ready may fail at once and leave its
+            # creation open for the Job's terminal cleanup.
+            fail_on_exited_container=True,
         )
         if res.mutation_required:
             raise _MutationRequired

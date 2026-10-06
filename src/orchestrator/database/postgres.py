@@ -20235,10 +20235,15 @@ class PostgresDB:
 
         With ``allow_existing_terminal_intent`` the creation closes onto the
         sole cleanup intent its owner's terminal transition already admitted.
-        For a Job that owner is cancelled or failed: both are terminal, both
-        are admitted by ``terminal_owner_transition`` with a fingerprint whose
-        ``owner_status`` must match, and the caller opts in only with exact
-        Pod evidence (``_cancelled_creation_may_reuse_terminal_intent``).
+        For a Job that owner is cancelled or failed; both intents come from
+        ``terminal_owner_transition``. The caller opts in from exact Pod
+        evidence and, for a failed Job, the Job's status
+        (``_cancelled_creation_may_reuse_terminal_intent``). That decision
+        holds only because the caller holds the owner/scope workspace mutation
+        guard, which the terminal-owner trigger try-locks, so the owner's
+        terminal status cannot change between that read and this lock. Do not
+        rely on the intent fingerprint instead: the trigger rewrites its
+        ``owner_status`` on every terminal transition.
         """
 
         if type(allow_existing_terminal_intent) is not bool:

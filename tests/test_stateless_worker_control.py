@@ -1276,8 +1276,8 @@ async def test_stateless_workspace_failure_uses_scanned_status_cas(monkeypatch):
 
 _CONTAINER_EXITED = (
     "Workspace container exited with code 0 (Completed) before it became ready. "
-    "A workspace image must keep running: build it FROM an SRW base image and "
-    "don't override its ENTRYPOINT or USER."
+    "A workspace image must keep running SRW's SSH server: build it FROM an SRW "
+    "base image and don't override its ENTRYPOINT or USER."
 )
 
 
@@ -1341,17 +1341,14 @@ async def test_a_failed_first_creation_fails_the_job_with_its_recorded_error(
         "get_admittable_stateless_jobs",
         AsyncMock(return_value=[job]),
     )
-    monkeypatch.setattr(
-        job_dispatcher,
-        "ensure_workspace",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                outcome=EnsureOutcome.FAILED,
-                status="failed",
-                mutation_required=False,
-            )
-        ),
+    ensure = AsyncMock(
+        return_value=SimpleNamespace(
+            outcome=EnsureOutcome.FAILED,
+            status="failed",
+            mutation_required=False,
+        )
     )
+    monkeypatch.setattr(job_dispatcher, "ensure_workspace", ensure)
     update = AsyncMock(return_value=False)
     monkeypatch.setattr(
         main.app.state.resources.postgres_db, "update_job_status", update
@@ -1371,6 +1368,9 @@ async def test_a_failed_first_creation_fails_the_job_with_its_recorded_error(
         )
     )
 
+    # The dispatcher fails the Job on FAILED, so it alone opts in to failing
+    # a Job create at once on an exited container.
+    assert ensure.await_args.kwargs["fail_on_exited_container"] is True
     update.assert_awaited_once_with(
         JOB_ID,
         status="failed",

@@ -94,6 +94,7 @@ async def _create(
     stateless_creation_generation: str | None = None,
     allow_stateless_create: bool = False,
     pinned_runtime_lock_held: bool = False,
+    fail_on_exited_container: bool = False,
 ) -> "EnsureResult":
     try:
         return await _create_or_yield(
@@ -102,6 +103,7 @@ async def _create(
             stateless_creation_generation=stateless_creation_generation,
             allow_stateless_create=allow_stateless_create,
             pinned_runtime_lock_held=pinned_runtime_lock_held,
+            fail_on_exited_container=fail_on_exited_container,
         )
     except SessionWorkspaceObservationYielded:
         return EnsureResult(EnsureOutcome.PENDING, status="pending")
@@ -114,6 +116,7 @@ async def _create_or_yield(
     stateless_creation_generation: str | None = None,
     allow_stateless_create: bool = False,
     pinned_runtime_lock_held: bool = False,
+    fail_on_exited_container: bool = False,
 ) -> "EnsureResult":
     strict_kwargs: dict[str, Any] = {}
     if stateless_creation_generation is not None:
@@ -121,6 +124,8 @@ async def _create_or_yield(
             "stateless_creation_generation": stateless_creation_generation,
             "allow_stateless_create": allow_stateless_create,
         }
+    if fail_on_exited_container and owner.kind == "job":
+        strict_kwargs["fail_on_exited_container"] = True
     if owner.kind == "session" and stateless_creation_generation is None:
         pinned_create = getattr(provisioner, "create_pinned_thread_workspace", None)
         if not callable(pinned_create):
@@ -365,6 +370,7 @@ async def ensure_workspace(
     stateless_creation_refused: bool = False,
     pinned_runtime_lock_held: bool = False,
     recreate_missing: bool = True,
+    fail_on_exited_container: bool = False,
 ) -> "EnsureResult":
     """Idempotently drive owner's workspace toward 'ready'. Owner-agnostic
     extraction of the job dispatcher's container branch (main.py).
@@ -385,6 +391,9 @@ async def ensure_workspace(
       probe for compatibility. ``recreate_missing=False`` lets the dispatcher
       defer that legacy fallback to its bounded mutation lane; it does not
       alter the strict incarnation or creation-authority paths above it.
+    * ``fail_on_exited_container`` is only for a caller that fails the Job on
+      FAILED (the dispatcher): a Job create whose container exits before
+      Ready then reports FAILED at once. Other callers keep the legacy wait.
     """
     s = current_status
     if stateless_creation_refused:
@@ -443,6 +452,7 @@ async def ensure_workspace(
             stateless_creation_generation=stateless_creation_generation,
             allow_stateless_create=allow_stateless_create,
             pinned_runtime_lock_held=pinned_runtime_lock_held,
+            fail_on_exited_container=fail_on_exited_container,
         )
     if require_runtime_incarnation and s in ("suspended", "restoring"):
         # Stateless restore is authorized only by the exact-true marker handled
@@ -522,6 +532,7 @@ async def ensure_workspace(
                     stateless_creation_generation=stateless_creation_generation,
                     allow_stateless_create=allow_stateless_create,
                     pinned_runtime_lock_held=pinned_runtime_lock_held,
+                    fail_on_exited_container=fail_on_exited_container,
                 )
         return EnsureResult(EnsureOutcome.READY, status="ready")
     # Unknown / unexpected status — wait (the dispatcher skips and retries).

@@ -28,7 +28,7 @@ async def test_ready_job_displaces_only_queued_hint_at_100_owned_limit(
     store = SnapshotStore(pinned=jobs, agents=[{"id": "agent", "metadata": {}}])
     started = []
 
-    async def create(owner):
+    async def create(owner, **_kwargs):
         started.append(owner.id)
         await asyncio.Event().wait()
 
@@ -63,7 +63,7 @@ async def test_queued_mutation_becoming_ready_uses_ready_lane(no_dispatcher_erro
     store = SnapshotStore(pinned=jobs, agents=[{"id": "agent", "metadata": {}}])
     started = []
 
-    async def create(owner):
+    async def create(owner, **_kwargs):
         started.append(owner.id)
         await asyncio.Event().wait()
 
@@ -92,7 +92,7 @@ async def test_urgent_mutation_displaces_queued_hint_and_runs_at_next_slot(
     gates = {job["id"]: asyncio.Event() for job in jobs}
     started = []
 
-    async def create(owner):
+    async def create(owner, **_kwargs):
         started.append(owner.id)
         await gates[owner.id].wait()
         return False
@@ -125,7 +125,7 @@ async def test_new_runtime_clears_exact_missing_pod_deferral(no_dispatcher_error
     started = []
     live = False
 
-    async def create(owner):
+    async def create(owner, **_kwargs):
         started.append(owner.id)
         await asyncio.Event().wait()
 
@@ -168,7 +168,7 @@ async def test_ready_discovery_becoming_missing_before_preflight_cannot_create_o
     gates = {job["id"]: asyncio.Event() for job in jobs}
     started = []
 
-    async def create(owner):
+    async def create(owner, **_kwargs):
         started.append(owner.id)
         await gates[owner.id].wait()
         return False
@@ -200,7 +200,7 @@ async def test_ready_inherited_child_progresses_with_two_mutations_saturated(
     store.jobs.update({job["id"]: job for job in slow})
     started = []
 
-    async def create(owner):
+    async def create(owner, **_kwargs):
         started.append(owner.id)
         await asyncio.Event().wait()
 

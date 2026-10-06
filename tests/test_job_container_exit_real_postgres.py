@@ -38,8 +38,8 @@ _schema_applied = fixtures._schema_applied
 
 EXITED = (
     "Workspace container exited with code 0 (Completed) before it became ready. "
-    "A workspace image must keep running: build it FROM an SRW base image and "
-    "don't override its ENTRYPOINT or USER."
+    "A workspace image must keep running SRW's SSH server: build it FROM an SRW "
+    "base image and don't override its ENTRYPOINT or USER."
 )
 
 
@@ -117,8 +117,13 @@ async def test_a_failed_job_whose_container_exited_is_cleaned_up_and_deletable(
     p._settle_failed_job_creation = AsyncMock(side_effect=settle_failed)
 
     # The dispatcher's first ensure: a real create and the real legacy wait.
+    # It fails the Job on FAILED, so it opts in.
     result = await ensure_workspace(
-        owner, provisioner=p, suspension=SimpleNamespace(), current_status=None
+        owner,
+        provisioner=p,
+        suspension=SimpleNamespace(),
+        current_status=None,
+        fail_on_exited_container=True,
     )
     assert result.outcome is EnsureOutcome.FAILED
 
@@ -313,8 +318,13 @@ async def test_a_failed_job_whose_container_exited_can_be_deleted_before_any_swe
 
     monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
 
+    # The dispatcher's ensure: it fails the Job on FAILED, so it opts in.
     result = await ensure_workspace(
-        owner, provisioner=p, suspension=SimpleNamespace(), current_status=None
+        owner,
+        provisioner=p,
+        suspension=SimpleNamespace(),
+        current_status=None,
+        fail_on_exited_container=True,
     )
     assert result.outcome is EnsureOutcome.FAILED
     await db.update_job_status(str(job), status="failed", error_message=EXITED)
@@ -326,5 +336,71 @@ async def test_a_failed_job_whose_container_exited_can_be_deleted_before_any_swe
     assert (await fixtures._workspace(db, job))["status"] == "deleted"
     assert await fixtures._open_authority(db, job) == {"reservations": 0, "intents": 0}
     p.attest_workspace_runtime.assert_not_awaited()
+    async with db.acquire() as conn:
+        await conn.execute("DELETE FROM jobs WHERE id=$1", job)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("creator", ["tier-upgrade", "scholar-parent"])
+async def test_a_creator_that_leaves_the_job_running_settles_and_the_job_deletes_later(
+    db, monkeypatch, creator
+):
+    """Review regression: no opt-in, so an exited Pod settles; nothing leaks.
+
+    A tier upgrade (a detached ``create_workspace``) and a scholar provisioning
+    its parent (``ensure_workspace``) don't fail the Job when creation returns
+    False. Had they failed at once, the creation would stay open and, once the
+    Job completed, its intent and creation would refuse each other forever.
+    """
+
+    monkeypatch.delenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", raising=False)
+    job = await fixtures._job(db)
+    owner = WorkspaceOwner.job(str(job))
+    cluster = ExitingCluster()
+    p = fixtures._provisioner(monkeypatch, db, cluster)
+    waits = []
+    real_wait = type(p)._wait_for_ready
+
+    async def short_legacy_wait(self, *args, **kwargs):
+        # Production arguments; only the 120 s readiness budget is shortened.
+        waits.append(dict(kwargs))
+        return await real_wait(self, *args, **{**kwargs, "timeout": 0.3})
+
+    monkeypatch.setattr(type(p), "_wait_for_ready", short_legacy_wait)
+
+    if creator == "tier-upgrade":
+        assert await p.create_workspace(owner) is True
+    else:
+        result = await ensure_workspace(
+            owner, provisioner=p, suspension=SimpleNamespace(), current_status=None
+        )
+        assert result.outcome is EnsureOutcome.PENDING
+
+    assert [wait["fail_on_exited_container"] for wait in waits] == [False]
+    workspace = await fixtures._workspace(db, job)
+    assert workspace["status"] == "creating"
+    assert "error" not in workspace
+    receipt = await _reservation(db, job)
+    assert (receipt["phase"], receipt["settled_at"] is not None) == ("settled", True)
+    assert await fixtures._open_authority(db, job) == {"reservations": 0, "intents": 0}
+
+    # The Job later completes (the reviewer's case): its terminal transition
+    # admits an ordinary cleanup, and one sweep retires the exited Pod.
+    await db.update_job_status(str(job), status="completed")
+    assert await fixtures._open_authority(db, job) == {"reservations": 0, "intents": 1}
+    p.attest_workspace_runtime = AsyncMock(
+        side_effect=AssertionError("an exited Pod has no SSH endpoint")
+    )
+    counts = await p.reconcile_pending_workspace_cleanup_intents(limit=25)
+    assert counts["settled"] == 1
+    assert cluster.objects == {}
+    assert (await fixtures._workspace(db, job))["status"] == "deleted"
+    assert await fixtures._open_authority(db, job) == {"reservations": 0, "intents": 0}
+
+    monkeypatch.setattr(provisioner_module, "container_provisioner", p)
+    import orchestrator.main as main
+
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    assert await control_seams.archive_and_cleanup_workspace(str(job)) == []
     async with db.acquire() as conn:
         await conn.execute("DELETE FROM jobs WHERE id=$1", job)

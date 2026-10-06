@@ -172,15 +172,23 @@ class WorkspaceContainerExitedError(RuntimeError):
     """
 
     MESSAGE_PREFIX = "Workspace container exited with code "
+    # The cluster stopped the container; the image advice would misdirect.
+    INFRASTRUCTURE_REASONS = frozenset(
+        {"OOMKilled", "Evicted", "ContainerStatusUnknown"}
+    )
 
     def __init__(self, exit_code: int, reason: str | None = None) -> None:
         self.exit_code = exit_code
         self.reason = str(reason or "").strip()
         detail = f" ({self.reason})" if self.reason else ""
+        advice = (
+            ""
+            if self.reason in self.INFRASTRUCTURE_REASONS
+            else " A workspace image must keep running SRW's SSH server: build it "
+            "FROM an SRW base image and don't override its ENTRYPOINT or USER."
+        )
         super().__init__(
-            f"{self.MESSAGE_PREFIX}{exit_code}{detail} before it became ready. "
-            "A workspace image must keep running: build it FROM an SRW base "
-            "image and don't override its ENTRYPOINT or USER."
+            f"{self.MESSAGE_PREFIX}{exit_code}{detail} before it became ready.{advice}"
         )
 
 
@@ -510,9 +518,11 @@ def _workspace_container_exited_error(pod: Any) -> WorkspaceContainerExitedError
         if getattr(item, "name", None) == "workspace"
     ]
     terminated = workspace.state.terminated
-    return WorkspaceContainerExitedError(
-        terminated.exit_code, getattr(terminated, "reason", None)
-    )
+    reason = getattr(terminated, "reason", None)
+    if getattr(pod.status, "reason", None) == "Evicted":
+        # Eviction is reported on the Pod, not on its terminated container.
+        reason = "Evicted"
+    return WorkspaceContainerExitedError(terminated.exit_code, reason)
 
 
 def _container_never_started(container: Any) -> bool:
@@ -1145,8 +1155,16 @@ class ContainerProvisioner:
         allow_stateless_create: bool = False,
         operation_kind: Literal["create", "restore", "reattach", "adopt"] = "create",
         operation_id: str | None = None,
+        fail_on_exited_container: bool = False,
     ) -> bool:
-        """Create under one durable DB reservation held across Kubernetes I/O."""
+        """Create under one durable DB reservation held across Kubernetes I/O.
+
+        ``fail_on_exited_container`` is for a caller that fails the Job when
+        this returns False (the dispatcher): a fresh Job create whose container
+        exits before Ready then returns False at once and leaves its creation
+        open for the Job's terminal cleanup. Every other caller keeps the
+        legacy readiness timeout, which settles the creation.
+        """
 
         if not self._k8s_available or self._db is None:
             return False
@@ -1250,6 +1268,7 @@ class ContainerProvisioner:
                 _creation_reservation=reservation,
                 _creation_plan=creation_plan,
                 _creation_profile=profile,
+                fail_on_exited_container=fail_on_exited_container,
             )
         else:
             # The reservation is durable before any Kubernetes side effect.  The
@@ -2340,7 +2359,11 @@ class ContainerProvisioner:
         return await self._complete_prepared_workspace(prepared, pod_ip=pod_ip)
 
     async def _create_job_workspace_reserved(
-        self, owner: WorkspaceOwner, **kwargs: Any
+        self,
+        owner: WorkspaceOwner,
+        *,
+        fail_on_exited_container: bool = False,
+        **kwargs: Any,
     ) -> bool:
         """Keep real writes joined, allowing owner Cancel during observation."""
         async with self._workspace_mutation_guard(
@@ -2354,7 +2377,9 @@ class ContainerProvisioner:
         pod_ip = None
         readiness_error = None
         try:
-            pod_ip = await self._observe_prepared_workspace(prepared)
+            pod_ip = await self._observe_prepared_workspace(
+                prepared, fail_on_exited_container=fail_on_exited_container
+            )
         except _WorkspaceCreationAuthorityLost:
             return False
         except Exception as exc:
@@ -3221,6 +3246,8 @@ class ContainerProvisioner:
         self,
         prepared: _PreparedWorkspaceCreation,
         observation_check: SessionCreationObservationBudget | None = None,
+        *,
+        fail_on_exited_container: bool = False,
     ) -> str | None:
         owner = prepared.owner
         _creation_reservation = prepared._creation_reservation
@@ -3276,10 +3303,13 @@ class ContainerProvisioner:
                 and (strict_stateless or owner.kind == "job")
                 else None
             ),
-            # Only a fresh Job create fails on an exited container; Sessions,
-            # restores and reattaches over a kept volume keep today's wait.
+            # Only a fresh Job create whose caller fails the Job on False (the
+            # dispatcher) fails on an exited container. Sessions, restores,
+            # reattaches over a kept volume, and creators that leave the Job
+            # running (tier upgrade, a scholar's parent) keep today's wait.
             fail_on_exited_container=(
-                owner.kind == "job"
+                fail_on_exited_container
+                and owner.kind == "job"
                 and _creation_reservation.get("operation_kind") == "create"
                 and not pvc_reattach
             ),

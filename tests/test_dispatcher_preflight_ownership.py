@@ -67,7 +67,7 @@ async def test_two_mutations_saturated_ready_lane_progresses_and_queue_rotates(
     gates = {job["id"]: asyncio.Event() for job in jobs[:5]}
     started = []
 
-    async def create(owner):
+    async def create(owner, **_kwargs):
         started.append(owner.id)
         await gates[owner.id].wait()
         return False
@@ -103,7 +103,7 @@ async def test_ready_missing_pod_defers_creation_until_mutation_slot_is_free(
     gates = {job["id"]: asyncio.Event() for job in jobs}
     started = []
 
-    async def create(owner):
+    async def create(owner, **_kwargs):
         started.append(owner.id)
         await gates[owner.id].wait()
         return False
@@ -176,7 +176,7 @@ async def test_trigger_storm_coalesces_and_shutdown_joins_started_sdk_call(monke
         started.set()
         assert release.wait(5)
 
-    async def create(owner):
+    async def create(owner, **_kwargs):
         async with lock:
             await ContainerProvisioner._bounded_kubernetes_call(sdk_call)
         return False
@@ -223,7 +223,7 @@ async def test_pending_memory_bound_includes_active_operations():
     entered, release = asyncio.Event(), asyncio.Event()
     jobs = [sandbox(str(i)) for i in range(150)]
 
-    async def create(_):
+    async def create(_, **_kwargs):
         entered.set()
         await release.wait()
         return False
@@ -369,7 +369,7 @@ async def test_leader_loop_exit_drains_preflight_and_reacquisition_can_schedule(
     monkeypatch.setattr(leader_election, "is_leader", leader)
     entered, stopped = asyncio.Event(), asyncio.Event()
 
-    async def create(_):
+    async def create(_, **_kwargs):
         entered.set()
         try:
             await asyncio.Event().wait()
@@ -415,7 +415,7 @@ async def test_leadership_loss_joins_sdk_before_reacquisition(monkeypatch):
         started.set()
         assert release.wait(5)
 
-    async def create(_):
+    async def create(_, **_kwargs):
         async with lock:
             await ContainerProvisioner._bounded_kubernetes_call(sdk_call)
         return False

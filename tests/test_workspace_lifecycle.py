@@ -714,3 +714,73 @@ async def test_ensure_ready_trusts_db_when_provisioner_has_no_probe():
     )
     assert res.outcome == EnsureOutcome.READY
     prov.create_workspace.assert_not_called()
+
+
+# =============================================================================
+# D3: only a caller that fails the Job on FAILED (the dispatcher) opts a Job
+# create in to failing on an exited container; every other creator keeps the
+# legacy readiness timeout, which settles the creation.
+# =============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("current_status", "pod_live"),
+    [(None, None), ("deleted", None), ("ready", False)],
+    ids=["fresh", "deleted", "ready-drift"],
+)
+@pytest.mark.parametrize("opted_in", [True, False], ids=["dispatcher", "other"])
+async def test_only_an_opted_in_job_create_is_asked_to_fail_on_an_exit(
+    current_status, pod_live, opted_in
+):
+    prov = AsyncMock()
+    prov.create_workspace = AsyncMock(return_value=True)
+    prov.workspace_pod_live = AsyncMock(return_value=pod_live)
+    owner = _WO.job("j1")
+
+    res = await ensure_workspace(
+        owner,
+        provisioner=prov,
+        suspension=AsyncMock(),
+        current_status=current_status,
+        **({"fail_on_exited_container": True} if opted_in else {}),
+    )
+
+    assert res.outcome == EnsureOutcome.PENDING
+    if opted_in:
+        prov.create_workspace.assert_awaited_once_with(
+            owner, fail_on_exited_container=True
+        )
+    else:
+        prov.create_workspace.assert_awaited_once_with(owner)
+
+
+@pytest.mark.asyncio
+async def test_a_session_create_never_forwards_the_exit_opt_in():
+    prov = AsyncMock()
+    prov.create_workspace = AsyncMock(return_value=True)
+    prov.create_pinned_thread_workspace = AsyncMock(return_value=True)
+
+    await ensure_workspace(
+        _WO.session("t1"),
+        provisioner=prov,
+        suspension=AsyncMock(),
+        current_status=None,
+        fail_on_exited_container=True,
+    )
+    await ensure_workspace(
+        _WO.session("t2"),
+        provisioner=prov,
+        suspension=AsyncMock(),
+        current_status=None,
+        stateless_creation_generation=CREATION_GENERATION,
+        allow_stateless_create=True,
+        fail_on_exited_container=True,
+    )
+
+    prov.create_pinned_thread_workspace.assert_awaited_once_with("t1")
+    prov.create_workspace.assert_awaited_once_with(
+        _WO.session("t2"),
+        stateless_creation_generation=CREATION_GENERATION,
+        allow_stateless_create=True,
+    )

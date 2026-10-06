@@ -999,8 +999,9 @@ async def test_deleting_a_job_keeps_ssh_retirement_for_any_other_live_pod(
 # -----------------------------------------------------------------------------
 
 EXITED_ADVICE = (
-    "before it became ready. A workspace image must keep running: build it "
-    "FROM an SRW base image and don't override its ENTRYPOINT or USER."
+    "before it became ready. A workspace image must keep running SRW's SSH "
+    "server: build it FROM an SRW base image and don't override its "
+    "ENTRYPOINT or USER."
 )
 
 
@@ -1212,26 +1213,29 @@ def prepared_creation(owner, *, operation_kind="create", pvc_reattach=False):
         "stateless-session",
     ],
 )
+@pytest.mark.parametrize(
+    "caller_opted_in", [True, False], ids=["dispatcher", "other-creator"]
+)
 async def test_only_a_fresh_job_create_opts_in_to_failing_on_an_exit(
-    owner, operation_kind, pvc_reattach, opted_in
+    owner, operation_kind, pvc_reattach, opted_in, caller_opted_in
 ):
+    # Only the dispatcher, which fails the Job when creation returns False,
+    # asks for it; a tier upgrade or a scholar's parent creation never does.
     provisioner = ContainerProvisioner()
     provisioner._wait_for_ready = AsyncMock(return_value=None)
 
     await provisioner._observe_prepared_workspace(
         prepared_creation(
             owner, operation_kind=operation_kind, pvc_reattach=pvc_reattach
-        )
+        ),
+        **({"fail_on_exited_container": True} if caller_opted_in else {}),
     )
 
     wait = provisioner._wait_for_ready.await_args.kwargs
-    assert wait["fail_on_exited_container"] is opted_in
+    assert wait["fail_on_exited_container"] is (opted_in and caller_opted_in)
 
 
-@pytest.mark.asyncio
-async def test_a_job_whose_container_exits_before_ready_fails_with_the_exit_code(
-    monkeypatch,
-):
+def exiting_job_provisioner(monkeypatch):
     monkeypatch.delenv("CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED", raising=False)
     provisioner = job_provisioner(monkeypatch, SandboxSettings(image=IMAGE))
     cluster = {}
@@ -1250,8 +1254,50 @@ async def test_a_job_whose_container_exits_before_ready_fails_with_the_exit_code
     provisioner._core_api.read_namespaced_pod.side_effect = read_pod
     settle = provisioner._settle_failed_job_creation
     provisioner._settle_failed_job_creation = AsyncMock(side_effect=settle)
+    return provisioner
 
-    assert await provisioner.create_workspace(WorkspaceOwner.job(JOB_ID)) is False
+
+@pytest.mark.asyncio
+async def test_a_job_create_without_the_opt_in_keeps_the_legacy_timeout_and_settle(
+    monkeypatch,
+):
+    # A tier upgrade or a scholar's parent creation doesn't fail the Job on
+    # False, so it must not leave the creation open: it times out into
+    # "creating" and settles the creation on its Pod, exactly as before D3.
+    provisioner = exiting_job_provisioner(monkeypatch)
+    fast_polls(monkeypatch)
+    waits = []
+    real_wait = ContainerProvisioner._wait_for_ready
+
+    async def short_wait(self, *args, **kwargs):
+        waits.append(dict(kwargs))
+        return await real_wait(self, *args, **{**kwargs, "timeout": 0.1})
+
+    monkeypatch.setattr(ContainerProvisioner, "_wait_for_ready", short_wait)
+
+    assert await provisioner.create_workspace(WorkspaceOwner.job(JOB_ID)) is True
+
+    assert [wait["fail_on_exited_container"] for wait in waits] == [False]
+    updates = job_context_updates(provisioner)
+    assert updates[-1] == {"status": "creating"}
+    assert not any("error" in update for update in updates)
+    provisioner._settle_failed_job_creation.assert_not_awaited()
+    assert provisioner._db._creation_reservation["phase"] == "settled"
+    provisioner._core_api.delete_namespaced_pod.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_job_whose_container_exits_before_ready_fails_with_the_exit_code(
+    monkeypatch,
+):
+    provisioner = exiting_job_provisioner(monkeypatch)
+
+    assert (
+        await provisioner.create_workspace(
+            WorkspaceOwner.job(JOB_ID), fail_on_exited_container=True
+        )
+        is False
+    )
 
     message = f"Workspace container exited with code 0 (Completed) {EXITED_ADVICE}"
     updates = job_context_updates(provisioner)
@@ -1315,3 +1361,31 @@ async def test_a_pinned_session_on_an_exited_container_still_ends_like_a_timeout
     assert events == timeout_events
     assert db.intent["status"] == timeout_db.intent["status"] == "planned"
     assert db.workspace["status"] == timeout_db.workspace["status"] == "pending"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("container_reason", "pod_reason", "shown"),
+    [
+        ("OOMKilled", None, "OOMKilled"),
+        ("ContainerStatusUnknown", None, "ContainerStatusUnknown"),
+        ("Error", "Evicted", "Evicted"),
+    ],
+    ids=["oom-killed", "status-unknown", "evicted"],
+)
+async def test_a_cluster_stopped_container_gets_no_image_advice(
+    container_reason, pod_reason, shown
+):
+    # The cluster, not the image, stopped it: don't blame the image.
+    exited = exited_pod(phase="Failed", exit_code=137, reason=container_reason)
+    exited.status.reason = pod_reason
+    provisioner = provisioner_reading(exited)
+
+    with pytest.raises(WorkspaceContainerExitedError) as raised:
+        await provisioner._wait_for_ready(
+            "workspace-x", timeout=5, pull_image=IMAGE, fail_on_exited_container=True
+        )
+
+    assert str(raised.value) == (
+        f"Workspace container exited with code 137 ({shown}) before it became ready."
+    )

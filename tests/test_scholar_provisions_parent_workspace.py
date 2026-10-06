@@ -269,6 +269,33 @@ class TestProvisionParentWorkspaceForScholar:
         assert not wire["merge"]  # not promoted
 
     @pytest.mark.asyncio
+    async def test_parent_creation_keeps_the_legacy_wait_on_an_exited_container(
+        self, monkeypatch, scholar_job, wire
+    ):
+        # A failed parent creation fails only the scholar; the parent keeps
+        # running. So it never opts in to failing on an exited container: the
+        # creation must time out and settle instead of staying open (D3).
+        parent = {"id": "parent-uuid", "context": {}, "config_override": {}}
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db,
+            "get_job",
+            AsyncMock(return_value=parent),
+        )
+        ensure = AsyncMock(return_value=_ensure(EnsureOutcome.PENDING, "creating"))
+        monkeypatch.setattr(workspace_lifecycle_module, "ensure_workspace", ensure)
+
+        await job_workspace_authority_module.provision_parent_workspace_for_scholar(
+            scholar_job,
+            "parent-uuid",
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        )
+
+        ensure.assert_awaited_once()
+        assert not ensure.await_args.kwargs.get("fail_on_exited_container")
+
+    @pytest.mark.asyncio
     async def test_missing_parent_returns_fail_without_provisioning(
         self, monkeypatch, scholar_job, wire
     ):
