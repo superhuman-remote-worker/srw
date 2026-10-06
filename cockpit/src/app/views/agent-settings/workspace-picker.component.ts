@@ -15,7 +15,7 @@ import {AppInputComponent} from '../../ui/input';
 import {AppSelectComponent} from '../../ui/select';
 import {WorkspaceTemplateFormComponent} from '../workspaces/workspace-template-form.component';
 import {
-  FormField, PreservedParts, TemplateFormValue, displayName, emptyFormValue, fromDocument, itemKey,
+  FormField, PreservedParts, errorField, TemplateFormValue, displayName, emptyFormValue, fromDocument, itemKey,
   recommendedChoice, refChoice, shortImage, sizeSummary, srwImages, toDocument, validateTemplateForm,
 } from '../workspaces/workspace-template-utils';
 
@@ -43,10 +43,10 @@ function builtinsFirst(items: WorkspaceTemplateItem[]): WorkspaceTemplateItem[] 
     displayName(a.resource).localeCompare(displayName(b.resource)));
 }
 
-/** The create forms' workspace choice (spec §4). Loads the templates it offers
- *  and the Project's defaults itself, so every create surface embeds it the same way. */
 let nextPickerId = 0;
 
+/** The create forms' workspace choice (spec §4). Loads the templates it offers
+ *  and the Project's defaults itself, so every create surface embeds it the same way. */
 @Component({
   selector: 'app-workspace-picker',
   standalone: true,
@@ -123,6 +123,8 @@ export class WorkspacePickerComponent {
   private touched = false;
   private readonly projectChanges = new Subject<string | null>();
   private readonly autoPicked = signal(false);
+  /** False while a Project's defaults are loading, so Default isn't judged on partial data. */
+  private readonly defaultsSettled = signal(true);
 
   readonly customizing = signal(false);
   readonly draft = signal<TemplateFormValue>(emptyFormValue(ACCOUNT_ME));
@@ -150,7 +152,7 @@ export class WorkspacePickerComponent {
     const option = (i: WorkspaceTemplateItem): PickerOption => {
       const vm = i.resource.spec.backend === 'vm';
       const tier = this.transloco.translate(`workspaces.tier.${modeOf(i.resource.spec.backend) === 'container' ? 'container' : i.resource.spec.backend}`);
-      const unavailable = vm && !this.vmAllowed() ? ` (${this.transloco.translate(this.vmReasonKey() || 'workspaces.vm.notAllowed')})` : '';
+      const unavailable = vm && !this.vmAllowed() ? ` (${this.transloco.translate(this.vmReasonKey() || 'workspaces.vm.notAllowed').replace(/\.$/, '')})` : '';
       const spec = i.resource.spec;
       const image = spec.environment?.image;
       const label = [displayName(i.resource), tier, sizeSummary(spec), image ? shortImage(image) : ''].filter(Boolean).join(' · ');
@@ -241,10 +243,14 @@ export class WorkspacePickerComponent {
     ).subscribe((l) => this.projectItems.set(l));
     this.projectChanges.pipe(
       switchMap((id) => (id ? this.api.getProjectWorkspaceDefaults(id).pipe(catchError(() => of(null))) : of(null))),
-    ).subscribe((d) => this.defaults.set(d));
+    ).subscribe((d) => {
+      this.defaults.set(d);
+      this.defaultsSettled.set(true);
+    });
     effect(() => {
       this.recommendation();
       this.defaults();
+      this.defaultsSettled();
       this.shared();
       this.vmAllowed();
       untracked(() => this.applyRecommendation());
@@ -267,6 +273,7 @@ export class WorkspacePickerComponent {
     if (c.kind === 'ref' && c.ref.scope.kind === 'Project' && c.ref.scope.name !== id) this.choice.set({kind: 'default'});
     this.projectItems.set([]);
     this.defaults.set(null);
+    this.defaultsSettled.set(!id);
   }
 
   /** The template Default resolves to, looked up in the loaded items. */
@@ -291,6 +298,7 @@ export class WorkspacePickerComponent {
   /** Preselect the Expert's recommendation unless the user chose by hand. */
   applyRecommendation(): void {
     if (this.touched) return;
+    if (this.projectId() && !this.defaultsSettled()) return;
     const rec = recommendedChoice(this.recommendation(), {
       role: this.role(), defaults: this.defaults(), shared: this.shared(), vmAllowed: this.vmAllowed(),
     });
@@ -301,6 +309,12 @@ export class WorkspacePickerComponent {
       this.choice.set({kind: 'default'});
       this.autoPicked.set(false);
     }
+  }
+
+  /** Forget the user's manual pick, so the next Expert's recommendation is auto-picked again. */
+  reset(): void {
+    this.touched = false;
+    this.autoPicked.set(false);
   }
 
   select(value: string | null): void {
@@ -353,6 +367,7 @@ export class WorkspacePickerComponent {
   saveToMine(): void {
     this.draftTried.set(true);
     this.nameError.set('');
+    this.draftErrors.set({});
     const errors = validateTemplateForm(this.draft());
     if (Object.keys(errors).length) {
       if (errors.name) this.nameError.set(this.transloco.translate(errors.name));
@@ -388,8 +403,9 @@ export class WorkspacePickerComponent {
           const message = typeof d === 'string' ? d
             : d && typeof d === 'object' && 'message' in d ? String((d as {message: unknown}).message)
             : this.transloco.translate('workspaces.errors.saveFailed');
-          this.draftErrors.set({form: message});
-          this.nameError.set(message);
+          const field = errorField(d && typeof d === 'object' ? (d as {path?: string}).path : undefined);
+          if (field === 'name' || field === 'form') this.nameError.set(message);
+          else this.draftErrors.set({[field]: message});
         },
       });
   }

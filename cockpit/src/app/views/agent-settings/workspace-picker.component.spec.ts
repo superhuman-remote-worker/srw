@@ -1,6 +1,7 @@
-import {describe, expect, it, vi} from 'vitest';
+import {beforeAll, describe, expect, it, vi} from 'vitest';
 import {TestBed} from '@angular/core/testing';
-import {signal} from '@angular/core';
+import {Component, EventEmitter, Input, Output, signal, ɵresolveComponentResources} from '@angular/core';
+import {TranslocoPipe, TranslocoTestingModule} from '@jsverse/transloco';
 import {TranslocoService} from '@jsverse/transloco';
 import {Subject, of, throwError} from 'rxjs';
 import {HttpErrorResponse} from '@angular/common/http';
@@ -76,6 +77,103 @@ describe('WorkspacePickerComponent', () => {
     expect(noGrant.c.groups()[0].options.find((o) => o.value.endsWith('/vm-full'))?.disabled).toBe(true);
     const killSwitch = create({projectId: 'p-1', defaults: DEFAULTS({vm_available: false})});
     expect(killSwitch.c.vmAllowed()).toBe(false);
+  });
+
+  it('labels a disabled VM template with its reason', () => {
+    const {c} = create({canUseVm: false});
+    const label = c.groups()[0].options.find((o) => o.value.endsWith('/vm-full'))!.label;
+    expect(label).toContain('(workspaces.vm.notAllowed)');
+    expect(label).not.toContain('.)');
+    // A real sentence ends in a period; the label must not double it.
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({providers: [
+      WorkspacePickerComponent,
+      {provide: ApiService, useValue: {
+        listWorkspaceTemplates: vi.fn().mockImplementation((kind: string) => of({resources: kind === 'Catalog' ? SHARED : []})),
+        getProjectWorkspaceDefaults: vi.fn(),
+      }},
+      {provide: UserService, useValue: {currentUser: signal({id: USER, is_admin: false, can_use_vm: false}), currentUserId: signal(USER)}},
+      {provide: TranslocoService, useValue: {translate: (k: string) => k === 'workspaces.vm.notAllowed' ? "VMs aren't enabled on this installation." : k}},
+    ]});
+    const d = TestBed.inject(WorkspacePickerComponent);
+    TestBed.tick();
+    TestBed.tick();
+    const text = d.groups()[0].options.find((o) => o.value.endsWith('/vm-full'))!.label;
+    expect(text).toContain("(VMs aren't enabled on this installation)");
+    expect(text).not.toContain('.)');
+  });
+
+  it('falls back to Default when the Project changes under a Project template', () => {
+    const {c} = create({projectId: 'p-1'});
+    c.choice.set({kind: 'ref', ref: {name: 'web', scope: {kind: 'Project', name: 'p-1'}}, backend: 'sandbox', label: 'web'});
+    (c as unknown as {onProjectChange(id: string | null): void}).onProjectChange('p-2');
+    expect(c.choice()).toEqual({kind: 'default'});
+    c.choice.set({kind: 'ref', ref: {name: 'lean', scope: {kind: 'Account', name: USER}}, backend: 'sandbox', label: 'lean'});
+    (c as unknown as {onProjectChange(id: string | null): void}).onProjectChange('p-3');
+    expect(c.choice().kind).toBe('ref');
+  });
+
+  it('reports a missing Project template through problem()', () => {
+    const {c} = create({projectId: 'p-1', defaults: DEFAULTS({template_problems: {container: 'Template web was not found'}})});
+    expect(c.problem()).toBe('Template web was not found');
+    c.select('none');
+    expect(c.problem()).toBe('');
+  });
+
+  it('auto-picks again after reset()', () => {
+    const {c} = create({recommendation: 'vm'});
+    c.select('default');
+    c.applyRecommendation();
+    expect(c.choice()).toEqual({kind: 'default'});
+    c.reset();
+    c.applyRecommendation();
+    expect(c.choice()).toMatchObject({kind: 'ref', ref: {name: 'vm-full'}});
+    expect(c.recommendationNote()).toContain('agentSettings.workspacePicker.recommended');
+  });
+
+  it('waits for the Project defaults before auto-picking the recommendation', () => {
+    const defaults$ = new Subject<ProjectWorkspaceDefaults>();
+    TestBed.resetTestingModule();
+    const api = {
+      listWorkspaceTemplates: vi.fn().mockImplementation((kind: string) => of({resources: kind === 'Catalog' ? SHARED : []})),
+      getProjectWorkspaceDefaults: vi.fn().mockReturnValue(defaults$),
+    };
+    TestBed.configureTestingModule({providers: [
+      WorkspacePickerComponent, {provide: ApiService, useValue: api},
+      {provide: UserService, useValue: {currentUser: signal({id: USER, is_admin: false, can_use_vm: true}), currentUserId: signal(USER)}},
+      {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+    ]});
+    const c = TestBed.inject(WorkspacePickerComponent);
+    Object.defineProperty(c, 'projectId', {value: () => 'p-1'});
+    Object.defineProperty(c, 'recommendation', {value: () => 'vm'});
+    const emitted: unknown[] = [];
+    c.choice.subscribe((v) => emitted.push(v));
+    TestBed.tick();
+    TestBed.tick();
+    expect(c.choice()).toEqual({kind: 'default'});
+    expect(emitted).toEqual([]);
+    defaults$.next(DEFAULTS());
+    TestBed.tick();
+    expect(c.choice()).toMatchObject({kind: 'ref', ref: {name: 'vm-full'}});
+  });
+
+  it('settles the defaults wait when the load fails', () => {
+    TestBed.resetTestingModule();
+    const api = {
+      listWorkspaceTemplates: vi.fn().mockImplementation((kind: string) => of({resources: kind === 'Catalog' ? SHARED : []})),
+      getProjectWorkspaceDefaults: vi.fn().mockReturnValue(throwError(() => new Error('x'))),
+    };
+    TestBed.configureTestingModule({providers: [
+      WorkspacePickerComponent, {provide: ApiService, useValue: api},
+      {provide: UserService, useValue: {currentUser: signal({id: USER, is_admin: false, can_use_vm: true}), currentUserId: signal(USER)}},
+      {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+    ]});
+    const c = TestBed.inject(WorkspacePickerComponent);
+    Object.defineProperty(c, 'projectId', {value: () => 'p-1'});
+    Object.defineProperty(c, 'recommendation', {value: () => 'vm'});
+    TestBed.tick();
+    TestBed.tick();
+    expect(c.choice()).toMatchObject({kind: 'ref', ref: {name: 'vm-full'}});
   });
 
   it('turns a selection into the matching choice', () => {
@@ -200,6 +298,31 @@ describe('WorkspacePickerComponent', () => {
     expect(c.customizing()).toBe(true);
   });
 
+  it.each([
+    {path: '/spec/environment/image', field: 'image'},
+    {path: '/spec/resources/cpu', field: 'cpu'},
+  ])('shows a 422 on $field under that field, not the name', ({path, field}) => {
+    const {c, api} = create();
+    api.checkWorkspaceRecipe.mockReturnValue(throwError(() => new HttpErrorResponse({status: 422, error: {detail: {path, message: 'bad value'}}})));
+    c.select('ref:Catalog/shared/container-full');
+    c.openCustomize();
+    c.draft.update((v) => ({...v, name: 'my-lean'}));
+    c.saveToMine();
+    expect(c.draftErrors()).toEqual({[field]: 'bad value'});
+    expect(c.nameError()).toBe('');
+    expect(c.saving()).toBe(false);
+  });
+
+  it('keeps a form-level 422 under the name', () => {
+    const {c, api} = create();
+    api.checkWorkspaceRecipe.mockReturnValue(throwError(() => new HttpErrorResponse({status: 422, error: {detail: 'Nope'}})));
+    c.openCustomize();
+    c.draft.update((v) => ({...v, name: 'my-lean'}));
+    c.saveToMine();
+    expect(c.nameError()).toBe('Nope');
+    expect(c.draftErrors()).toEqual({});
+  });
+
   it('blocks Enter from submitting an enclosing form, except in a textarea', () => {
     const {c} = create();
     const press = (el: HTMLElement) => {
@@ -257,5 +380,87 @@ describe('WorkspacePickerComponent', () => {
     expect(d.groups().map((g) => g.labelKey)).toEqual([
       'agentSettings.workspacePicker.group.shared', 'agentSettings.workspacePicker.group.project',
     ]);
+  });
+});
+
+// This vitest pipeline does not bind signal inputs on the real ui components, so these
+// stubs (decorator inputs) render the native `for` / `id` attributes the real ones do.
+@Component({selector: 'app-form-field', standalone: true,
+  template: '<label class="app-form-field__label" [attr.for]="forId || null">{{ label }}</label><ng-content />'})
+class StubFormField {
+  @Input() label = '';
+  @Input() forId = '';
+  @Input() hint = '';
+  @Input() error = '';
+}
+@Component({selector: 'app-input', standalone: true, template: '<input [attr.id]="inputId || null" />'})
+class StubInput {
+  @Input() value = '';
+  @Input() inputId = '';
+  @Output() valueChange = new EventEmitter<string>();
+}
+@Component({selector: 'app-dialog', standalone: true, template: '<ng-content />'})
+class StubDialog {
+  @Input() open = false;
+  @Input() size = '';
+  @Input() title = '';
+  @Output() closed = new EventEmitter<void>();
+}
+@Component({selector: 'app-button', standalone: true, template: '<ng-content />'})
+class StubButton {
+  @Input() variant = '';
+  @Input() size = '';
+  @Input() disabled = false;
+  @Input() loading = false;
+  @Output() clicked = new EventEmitter<void>();
+}
+@Component({selector: 'app-select', standalone: true, template: '<select><ng-content /></select>'})
+class StubSelect {
+  @Input() value: string | null = null;
+  @Input() disabled = false;
+  @Input() ariaLabel = '';
+  @Output() changed = new EventEmitter<string | null>();
+}
+@Component({selector: 'app-workspace-template-form', standalone: true, template: ''})
+class StubTemplateForm {
+  @Input() purpose = '';
+  @Input() value: unknown;
+  @Input() vmAllowed = false;
+  @Input() vmUnavailableReasonKey = '';
+  @Input() srwImages: unknown;
+  @Input() showErrors = false;
+  @Input() serverErrors: unknown;
+  @Output() valueChange = new EventEmitter<unknown>();
+}
+
+describe('WorkspacePickerComponent rendering', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  it('associates the Save as label with the name input', () => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      imports: [WorkspacePickerComponent, TranslocoTestingModule.forRoot({langs: {en: {}}, translocoConfig: {availableLangs: ['en'], defaultLang: 'en'}})],
+      providers: [
+        {provide: ApiService, useValue: {
+          listWorkspaceTemplates: vi.fn().mockReturnValue(of({resources: []})),
+          getProjectWorkspaceDefaults: vi.fn().mockReturnValue(of(null)),
+        }},
+        {provide: UserService, useValue: {currentUser: signal({id: USER, is_admin: false, can_use_vm: true}), currentUserId: signal(USER)}},
+      ],
+    });
+    TestBed.overrideComponent(WorkspacePickerComponent, {
+      set: {imports: [TranslocoPipe, StubFormField, StubInput, StubDialog, StubButton, StubSelect, StubTemplateForm]},
+    });
+    const fixture = TestBed.createComponent(WorkspacePickerComponent);
+    fixture.detectChanges();
+    const root = fixture.nativeElement as HTMLElement;
+    const label = Array.from(root.querySelectorAll<HTMLLabelElement>('label.app-form-field__label'))
+      .find((l) => l.textContent?.includes('saveName'));
+    expect(label, 'Save as label').toBeDefined();
+    expect(label!.htmlFor).not.toBe('');
+    const control = root.querySelector(`[id="${label!.htmlFor}"]`);
+    expect(control?.tagName).toBe('INPUT');
   });
 });
