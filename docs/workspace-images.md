@@ -258,8 +258,13 @@ project template, write `scope: {kind: Project, name: <project UUID>}`.
   `create_project_job` or `create_persistent_thread`. SRW looks the name up in
   the project, then in your own templates, then in Shared.
 
-**Try a new image with a Job first.** A Job reports why its image failed and
-cleans up after itself; a Session doesn't. See
+**Try a new image with a Job first.** A Job shows more about why its workspace
+didn't start; see [When it doesn't start](#when-it-doesnt-start). A Session may
+show nothing. On a default installation a container Session has no workspace
+status line at all. Where your operator runs Sessions on stateless executors
+(`agent.stateless.enabled`) without startup-stage tracking, it keeps saying
+"Checking workspace scheduling; the result is not yet confirmed." You can still
+End a Session whose image can't be pulled. See
 [When a workspace can't start](../examples/manifests/container-workspace-templates.md#when-a-workspace-cant-start).
 To have the trial Job run your tools, give it an Expert with a shell, such as
 **Engineer**: pick it under **Agent Expert** on New Job, or pass
@@ -280,8 +285,8 @@ have your tools either. See
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| The Job stays **Created** and never starts, with no error message. Where your installation reports container startup stages (see below), the Jobs list says "Workspace needs attention: readiness exceeded its startup boundary." once the startup limit has passed: for your own image, `workspace.imagePullTimeoutSeconds` (600 seconds by default). | The container exited or never opened SSH, for example because the image replaces the base's `ENTRYPOINT` or `USER`, or isn't built `FROM` an SRW base. SRW doesn't yet report this case with a clearer message. | Rebuild `FROM` a base without those settings, and run step 3 before you push. |
-| The Job fails with "Workspace image `<ref>` could not be pulled: `<reason>`". Where your installation reports startup stages, the Jobs list says "Workspace needs attention: image pull exceeded its startup boundary." instead, or "Workspace needs attention: its image is invalid." for a malformed reference. | The reference is wrong, the pull secret is missing, or the nodes can't reach the registry. | Check the reference from step 4 and the registry access. See [When a workspace can't start](../examples/manifests/container-workspace-templates.md#when-a-workspace-cant-start). |
+| The Job stays **Created** and never starts, with no error message. Without startup-stage tracking (the default), the Jobs list says "Checking an older workspace creation; completion evidence is unavailable." after about two minutes. Where your installation reports container startup stages (see below), it says "Workspace needs attention: it didn't become ready in time. If it uses your own image, check that the image keeps running: build it FROM an SRW base image and don't override its ENTRYPOINT or USER." once the startup limit has passed: for your own image, `workspace.imagePullTimeoutSeconds` (600 seconds by default). | The container exited or never opened SSH, for example because the image replaces the base's `ENTRYPOINT` or `USER`, or isn't built `FROM` an SRW base. Without startup-stage tracking, SRW doesn't name the cause. | Cancel the Job. Rebuild `FROM` a base without those settings, and run step 3 before you push. |
+| The Job fails with "Workspace image `<ref>` could not be pulled: `<reason>`". Where your installation reports startup stages, the Job stays **Created** instead and the Jobs list says "Workspace needs attention: its image didn't finish pulling in time. Check the image reference and that the cluster can pull from its registry.", or "Workspace needs attention: its image is invalid." for a malformed reference. | The reference is wrong, the pull secret is missing, or the nodes can't reach the registry. | Check the reference from step 4 and the registry access. Where startup stages are reported, Cancel the Job. See [When a workspace can't start](../examples/manifests/container-workspace-templates.md#when-a-workspace-cant-start). |
 | `/cloud` is empty; your cloud folder isn't mounted. | Images that aren't SRW's run unprivileged, without the FUSE mount. | Your operator adds your image's repository to `workspace.images.trustedRepositories`. `workspace.customImages.privileged: true` gives every custom image that profile, which is one step from root on the node; it suits only an installation that trusts everyone who can author templates. See [Privilege](../examples/manifests/container-workspace-templates.md#privilege). |
 | "command not found" for a tool your Dockerfile installed. | It was installed under `/home/agent-host`, which the workspace volume hides, for example by `pip` or `npm` without unsetting `PIP_TARGET` or `npm_config_prefix`. | Install system-wide, as in step 2. |
 

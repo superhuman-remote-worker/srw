@@ -420,8 +420,13 @@ RUN env -u npm_config_prefix npm install -g <package>
 
 ## When a workspace can't start
 
-**Test a new image with a Job first.** A Job reports why its image failed and
-cleans up after itself; a Session doesn't (see below).
+**Test a new image with a Job first.** A Job reports more about why its
+workspace didn't start. A Session may report nothing: a pinned container Session
+(the default lane) has no workspace status, and a stateless Session without
+startup-stage tracking keeps showing "Checking workspace scheduling; the result
+is not yet confirmed." End still works for a Session whose image can't be
+pulled (see below). Startup-stage tracking is Helm
+`orchestrator.containerStartupStageAuthority.enabled`, off by default.
 
 - **How pull failures are classified.** These rules apply to custom images. A
   pod using the installation image keeps the plain 120-second readiness wait.
@@ -431,12 +436,19 @@ cleans up after itself; a Session doesn't (see below).
   - A pod the cluster itself rejects (a `ResourceQuota` or `LimitRange` 403)
     fails at once with the cluster's own message.
 - **Jobs.**
-  - A Job fails with "Workspace image `<ref>` could not be pulled: `<reason>`".
+  - Without startup-stage tracking, a Job fails with "Workspace image `<ref>`
+    could not be pulled: `<reason>`".
   - On a Job's first creation on a fresh volume, its pod, service and volume are
     then cleaned up within about a minute. A restored Job, or one recreated over
     a kept volume, keeps them.
   - Deleting the Job during that minute may return 503 once; retry and it
     succeeds.
+  - With startup-stage tracking, the Job doesn't fail by itself. It stays
+    **Created** and the Jobs list shows "Workspace needs attention: its image is
+    invalid." at once for a malformed reference, or "Workspace needs attention:
+    its image didn't finish pulling in time. Check the image reference and that
+    the cluster can pull from its registry." once the pull budget has passed.
+    Cancel it.
 - **Workspace preparation is bounded.** Each orchestrator admits two workspace
   mutations and two independent Ready checks at a time. A pulling image or busy
   workspace mutation lock keeps its own operation pending while discovered
@@ -488,12 +500,20 @@ cleans up after itself; a Session doesn't (see below).
   capped by the physical deadline plus that same SSH budget, so repeated Ready
   transitions cannot extend it indefinitely. Missing or malformed timestamps
   hold recovery; a new observation never starts a new budget.
-- **Other start failures give no message.** When a templated Job's pod never
-  becomes ready for another reason, its workspace stays `creating` and the Job
-  waits with no error. Examples:
+- **Other start failures give no error.** When a templated Job's pod never
+  becomes ready for another reason, the Job stays **Created** with no error
+  until you cancel it or its execution deadline passes. Examples:
   - an image without the workspace contract, whose container exits or never
     opens sshd;
   - resources no node can fit, when no `LimitRange` rejects them.
+
+  Without startup-stage tracking, its workspace stays `creating` and the Jobs
+  list shows "Checking an older workspace creation; completion evidence is
+  unavailable." With it, the Jobs list names the stage: a scheduling wait while
+  no node fits, or "Workspace needs attention: it didn't become ready in time.
+  If it uses your own image, check that the image keeps running: build it FROM
+  an SRW base image and don't override its ENTRYPOINT or USER." once a
+  scheduled pod's readiness budget has passed.
 
   Check the pod's status and events with `kubectl describe pod
   workspace-<first 12 characters of the Job ID>` in the workspace namespace.

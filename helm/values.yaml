@@ -175,7 +175,7 @@ orchestrator:
   # its process-zero/maintenance fence.
   workspaceCleanupReconciliationEnabled: false
   # -- Admit container startup v1 receipts only after the capable bridge and
-  # migrations 0306/0307 are deployed and all pre-bridge orchestrator processes
+  # migrations 0309/0310 are deployed and all pre-bridge orchestrator processes
   # and their in-flight creators are gone. Disable to stop new adoption;
   # existing v1 work continues. Roll back only to a v1-capable image.
   containerStartupStageAuthority:
@@ -2790,9 +2790,10 @@ workspace:
     vm: ""
   # -- How long a custom workspace image may take to pull before a Job fails
   # with the pull error. The installation image is prewarmed and unaffected.
-  # Job containers are dispatched one at a time, so while a custom image is
-  # still pulling — or failing with back-off — this bounds how long a slow or
-  # unpullable image can hold up dispatch of other Jobs.
+  # The Job dispatcher runs at most two workspace creations at once, so two
+  # slow or unpullable custom images can delay other new Job workspaces for up
+  # to this budget. orchestrator.containerStartupStageAuthority.enabled frees
+  # the slot after one observation.
   imagePullTimeoutSeconds: 600
   # -- Access mode for the shared workspace PVC. Production uses
   # ReadWriteMany (Longhorn). Single-node clusters with RWO-only storage
