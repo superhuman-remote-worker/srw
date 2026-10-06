@@ -61,7 +61,7 @@ async def _retire_exact_candidates(
     pvc_name: str | None,
     assert_current: Callable[[], Awaitable[None]],
     agent_provisioner: Any,
-    aborted_attempts: frozenset[str] = frozenset(),
+    nonrestartable_attempts: frozenset[str] = frozenset(),
 ) -> None:
     """Retire each proven candidate on its own; report what remains.
 
@@ -107,7 +107,7 @@ async def _retire_exact_candidates(
             known_successor_uids=successors,
             **(
                 {"require_nonrestartable": True}
-                if str(intent["attempt_id"]) in aborted_attempts
+                if str(intent["attempt_id"]) in nonrestartable_attempts
                 else {}
             ),
         ):
@@ -375,6 +375,11 @@ async def retire_soft_ended_agent_pod(
                 pvc_name=str(claim["pvc_name"]) if claim is not None else None,
                 assert_current=assert_current,
                 agent_provisioner=agent_provisioner,
+                nonrestartable_attempts=(
+                    frozenset({str(hint["attempt_id"])})
+                    if claim is None
+                    else frozenset()
+                ),
             )
         except RuntimeError:
             return False
@@ -456,7 +461,7 @@ async def retire_aborted_unclaimed_agent_pod(
                 pvc_name=None,
                 assert_current=assert_released_life,
                 agent_provisioner=agent_provisioner,
-                aborted_attempts=frozenset({str(hint["attempt_id"])}),
+                nonrestartable_attempts=frozenset({str(hint["attempt_id"])}),
             )
         except RuntimeError:
             return False
@@ -624,5 +629,5 @@ async def retire_historical_unclaimed_agent_pods(
         pvc_name=None,
         assert_current=assert_current,
         agent_provisioner=agent_provisioner,
-        aborted_attempts=frozenset(aborted_attempts),
+        nonrestartable_attempts=frozenset(aborted_attempts),
     )

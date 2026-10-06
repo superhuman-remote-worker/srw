@@ -63,6 +63,16 @@ def _json(value):
 class SelfEndK8sApi(ClaimantK8sApi):
     """Claimant model that also installs Pods without an agent PVC."""
 
+    def __init__(self):
+        super().__init__()
+        self.pod_delete_requests = []
+
+    def delete_namespaced_pod(self, *, name, namespace, body=None, **kwargs):
+        self.pod_delete_requests.append((namespace, name, body))
+        return super().delete_namespaced_pod(
+            name=name, namespace=namespace, body=body, **kwargs
+        )
+
     def install_life(self, life):
         self.install_old_pod(
             namespace=NAMESPACE,
@@ -87,6 +97,7 @@ class SelfEndK8sApi(ClaimantK8sApi):
             init_containers=[],
             ephemeral_containers=[],
             volumes=volumes,
+            restart_policy="Never",
         )
         pod.status.container_statuses[0].name = "agent"
         return pod
@@ -427,7 +438,15 @@ async def test_completed_soft_ended_claimless_reaper_releases_exact_finalizer(st
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "fault", ["missing_proof", "rebound_actor", "wrong_label", "nonterminal"]
+    "fault",
+    [
+        "missing_proof",
+        "rebound_actor",
+        "wrong_label",
+        "nonterminal",
+        "unexpected_pvc",
+        "restartable",
+    ],
 )
 async def test_completed_soft_ended_claimless_reaper_refuses_without_exact_authority(
     stack, fault
@@ -459,11 +478,18 @@ async def test_completed_soft_ended_claimless_reaper_refuses_without_exact_autho
         pod.metadata.labels["srw.io/provision-attempt"] = str(uuid4())
     elif fault == "nonterminal":
         pod.status.container_statuses[0].state.terminated = None
+    elif fault == "unexpected_pvc":
+        pod.spec.volumes = [NS(persistent_volume_claim=NS(claim_name="foreign-pvc"))]
+        pod.metadata.deletion_timestamp = None
+    elif fault == "restartable":
+        pod.spec.restart_policy = "Always"
+        pod.metadata.deletion_timestamp = None
 
     assert (await provider.reap_pods())["completed"] == 0
     assert _pod(stack, life) is pod
     assert pod.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
     assert not stack.k8s.removed_pods
+    assert stack.k8s.pod_delete_requests == []
 
 
 @pytest.mark.asyncio
