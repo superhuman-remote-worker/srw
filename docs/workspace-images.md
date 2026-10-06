@@ -263,7 +263,10 @@ cleans up after itself; a Session doesn't. See
 [When a workspace can't start](../examples/manifests/container-workspace-templates.md#when-a-workspace-cant-start).
 To have the trial Job run your tools, give it an Expert with a shell, such as
 **Engineer**: pick it under **Agent Expert** on New Job, or pass
-`expert="engineer"` over MCP.
+`expert="engineer"` over MCP. A non-admin needs the `shell_tools` capability
+grant from an administrator to use an Expert with the shell tools. A personal or
+Project default Expert can be set to Engineer, so you don't have to pick it each
+time.
 
 The agent runs your tools through its shell, so only an Expert with a shell can
 use them. The shipped default Expert for Jobs, **General Worker**, has none; a
