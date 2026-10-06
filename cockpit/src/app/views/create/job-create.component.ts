@@ -14,6 +14,7 @@ import {UserService} from '../../core/services/user.service';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {EffectiveModels, EligibleDatasource, Expert, ExpertDefaultsResponse, ExpertDetail, JobCreateRequest, Project} from '../../core/models/api.model';
 import {FilePreview, UploadStatus} from '../../core/models/file.model';
+import {hasGrant} from '../agent-settings/capability-gates';
 import {AgentSettingsComponent} from '../agent-settings/agent-settings.component';
 import {PRIORITY_LEVELS, resolveEffectiveModels} from '../agent-settings/agent-settings.types';
 import {ModelService} from '../../core/services/model.service';
@@ -293,7 +294,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
             </app-form-field>
           }
 
-          <!-- Agent Settings (tabbed: Settings / Instructions / Advanced) -->
+          <!-- Workspace (the picker owns tier and template) -->
           <app-workspace-picker
             role="job"
             [projectId]="selectedProjectId()"
@@ -304,6 +305,10 @@ import {AppTooltipDirective} from '../../ui/tooltip';
             [choice]="workspaceChoice()"
             (choiceChange)="onWorkspaceChoice($event)"
           />
+          @if (noShellNoteKey(); as noteKey) {
+            <span class="field-warning" data-testid="no-shell-note">{{ noteKey | transloco }}</span>
+          }
+          <!-- Agent Settings (tabbed: Settings / Instructions / Advanced) -->
           <app-agent-settings
             mode="job"
             [workspacePicker]="true"
@@ -1167,6 +1172,7 @@ export class JobCreateComponent implements OnInit {
 
   @ViewChild('fileInput') fileInput!: ElementRef<HTMLInputElement>;
   @ViewChild(AgentSettingsComponent) agentSettings!: AgentSettingsComponent;
+  @ViewChild(WorkspacePickerComponent) picker?: WorkspacePickerComponent;
 
   constructor() {
     // Mirror artifact form-state (expert prefill / user edits) into the
@@ -1401,6 +1407,21 @@ export class JobCreateComponent implements OnInit {
   ));
   readonly workspaceChoice = signal<WorkspaceChoice>({kind: 'default'});
   readonly pickerBackend = computed(() => choiceBackend(this.workspaceChoice(), this.toolPreview()?.workspace));
+
+  /** Why a hand-picked container/VM workspace can't run commands for this Expert, or null.
+   *  A note only: it never blocks submit. Default is skipped on purpose (Helm makes most
+   *  installations' default Job workspace a container, so it would show on every Job). */
+  readonly noShellNoteKey = computed<string | null>(() => {
+    const kind = this.workspaceChoice().kind;
+    if (kind !== 'ref' && kind !== 'inline') return null;
+    const backend = this.pickerBackend();
+    if (backend !== 'sandbox' && backend !== 'vm') return null;
+    const shell = this.toolPreview()?.categories?.['shell'];
+    if (!shell || shell.state === 'on') return null;
+    return hasGrant(this.capabilities.grants() ?? null, 'shell_tools')
+      ? 'jobs.create.noShellNoteGranted'
+      : 'jobs.create.noShellNoteNoGrant';
+  });
 
   onWorkspaceChoice(choice: WorkspaceChoice): void {
     this.workspaceChoice.set(choice);
@@ -1778,6 +1799,7 @@ export class JobCreateComponent implements OnInit {
     this.expertDetail.set(null);
     this.selectedPriority.set(5);
     this.workspaceChoice.set({kind: 'default'});
+    this.picker?.reset();
     this.cloudStorageOverride.set('inherit');
     this.agentSettings?.resetAll();
     this.selectDefaultProject(this.projects());

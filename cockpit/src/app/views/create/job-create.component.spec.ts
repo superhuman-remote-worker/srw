@@ -4,6 +4,8 @@ import { TestBed } from '@angular/core/testing';
 import { ActivatedRoute, Router, convertToParamMap } from '@angular/router';
 import { of, throwError } from 'rxjs';
 import { Expert, JobCreateRequest, Project } from '../../core/models/api.model';
+import { SessionToolGroupsResponse } from '../../core/services/api.service';
+import { WorkspaceChoice } from '../../core/models/workspace-template.model';
 import { ApiService } from '../../core/services/api.service';
 import { CapabilitiesService } from '../../core/services/capabilities.service';
 import { ErrorMessageService } from '../../core/services/error-message.service';
@@ -388,6 +390,72 @@ describe('JobCreateComponent project picker', () => {
     const request = api.createJob.mock.calls.at(-1)![0];
     expect(request.workspace).toEqual(previewBody.workspace);
     expect(request.config_override?.['workspace']).toBeUndefined();
+  });
+
+  it('resetForm sets the workspace choice back to Default and resets the picker', () => {
+    const {component} = setup(null);
+    const reset = vi.fn();
+    component.picker = {reset} as unknown as JobCreateComponent['picker'];
+    component.workspaceChoice.set({kind: 'none'});
+    component.resetForm();
+    expect(component.workspaceChoice()).toEqual({kind: 'default'});
+    expect(reset).toHaveBeenCalledOnce();
+  });
+
+  describe('no-shell note', () => {
+    const REF = {
+      kind: 'ref' as const, ref: {name: 'container-full', scope: {kind: 'Catalog' as const, name: 'shared'}},
+      backend: 'sandbox' as const, label: 'container-full',
+    };
+    const preview = (shell: 'on' | 'off' | 'unavailable' | null, backend = 'sandbox') => ({
+      thread_id: '', source: 'resolved', tool_groups: null,
+      workspace: {backend, source: 'default', binding: null},
+      categories: shell ? {shell: {state: shell, reason: null, settable: true, decided_by: 'config', tools: []}} : {},
+    }) as unknown as SessionToolGroupsResponse;
+    const GRANTED = 'jobs.create.noShellNoteGranted';
+    const NOT_GRANTED = 'jobs.create.noShellNoteNoGrant';
+
+    function noteFor(choice: WorkspaceChoice, tp: SessionToolGroupsResponse | null, grants: Record<string, unknown> | null = null) {
+      const {component, api} = setup(null);
+      api.previewToolGroups.mockReturnValue(of(tp));
+      component.workspaceChoice.set(choice);
+      component.toolPreview.set(tp);
+      (component.capabilities as unknown as {grants: ReturnType<typeof signal>}).grants.set(grants);
+      return component.noShellNoteKey();
+    }
+
+    it('is shown for a shell-less Expert and a picked container template', () => {
+      expect(noteFor(REF, preview('off'))).toBe(GRANTED);
+      expect(noteFor(REF, preview('unavailable'))).toBe(GRANTED);
+    });
+
+    it('is shown for a picked inline recipe and a picked VM template', () => {
+      expect(noteFor({kind: 'inline', spec: {backend: 'sandbox'}}, preview('off'))).toBe(GRANTED);
+      expect(noteFor({...REF, backend: 'vm'}, preview('off', 'vm'))).toBe(GRANTED);
+    });
+
+    it('is hidden for the Default choice', () => {
+      expect(noteFor({kind: 'default'}, preview('off'))).toBeNull();
+    });
+
+    it('is hidden for an Expert whose preview has a shell', () => {
+      expect(noteFor(REF, preview('on'))).toBeNull();
+    });
+
+    it('is hidden for the virtual tier and for none', () => {
+      expect(noteFor({...REF, backend: 'virtual' as never}, preview('off', 'virtual'))).toBeNull();
+      expect(noteFor({kind: 'none'}, preview('off'))).toBeNull();
+    });
+
+    it('is hidden until a preview names the shell category', () => {
+      expect(noteFor(REF, null)).toBeNull();
+      expect(noteFor(REF, preview(null))).toBeNull();
+    });
+
+    it('names the administrator when the user lacks the shell_tools grant', () => {
+      expect(noteFor(REF, preview('off'), {shell_tools: false})).toBe(NOT_GRANTED);
+      expect(noteFor(REF, preview('off'), {shell_tools: true})).toBe(GRANTED);
+    });
   });
 
   it('omits workspace entirely for the default choice', async () => {

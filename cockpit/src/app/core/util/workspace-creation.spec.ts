@@ -17,8 +17,8 @@ describe('typed workspace creation copy', () => {
     [view('readiness', 'starting', 'scheduled'), 'Starting the scheduled workspace'],
     [view('readiness', 'attention', 'invalid_image'), 'image is invalid'],
     [view('readiness', 'attention', 'invalid_configuration'), 'configuration is invalid'],
-    [view('readiness', 'attention', 'pull_deadline'), 'image pull exceeded'],
-    [view('readiness', 'attention', 'readiness_deadline'), 'readiness exceeded'],
+    [view('readiness', 'attention', 'pull_deadline'), 'finish pulling in time'],
+    [view('readiness', 'attention', 'readiness_deadline'), 'become ready in time'],
     [view('readiness', 'attention', 'ssh_deadline'), 'SSH authentication grace expired'],
     [view('scheduling', 'waiting_capacity', 'insufficient_capacity'), 'insufficient capacity'],
   ] as const)('renders safe English and German copy for %j', (creation, fragment) => {

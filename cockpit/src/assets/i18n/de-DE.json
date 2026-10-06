@@ -660,8 +660,8 @@
     "starting": "Der eingeplante Arbeitsbereich wird gestartet.",
     "invalidImage": "Arbeitsbereich benötigt Aufmerksamkeit: Das Image ist ungültig.",
     "invalidConfiguration": "Arbeitsbereich benötigt Aufmerksamkeit: Die Konfiguration ist ungültig.",
-    "pullDeadline": "Arbeitsbereich benötigt Aufmerksamkeit: Das Laden des Images hat die Startgrenze überschritten.",
-    "readinessDeadline": "Arbeitsbereich benötigt Aufmerksamkeit: Die Bereitschaft hat die Startgrenze überschritten.",
+    "pullDeadline": "Arbeitsbereich benötigt Aufmerksamkeit: Das Image wurde nicht rechtzeitig fertig geladen. Prüfen Sie die Image-Referenz und ob der Cluster aus der zugehörigen Registry laden kann.",
+    "readinessDeadline": "Arbeitsbereich benötigt Aufmerksamkeit: Er wurde nicht rechtzeitig bereit. Wenn er Ihr eigenes Image verwendet, prüfen Sie, ob das Image weiterläuft: Bauen Sie es FROM einem SRW-Basis-Image und überschreiben Sie weder ENTRYPOINT noch USER.",
     "sshDeadline": "Arbeitsbereich benötigt Aufmerksamkeit: Die Frist für die SSH-Authentifizierung ist abgelaufen.",
     "legacyHeld": "Eine ältere Arbeitsbereichserstellung wird geprüft; ein Abschlussnachweis fehlt."
   },
@@ -903,6 +903,8 @@
       "priorityNormal": "Normal (Standard)",
       "priorityHigh": "Hoch (unterbricht niedrigere)",
       "cloudStorageLabel": "Cloud-Speicher-Zugriff",
+      "noShellNoteGranted": "Dieser Experte hat keine Shell-Tools, daher kann der Job in diesem Arbeitsbereich keine Befehle ausführen. Um ein Image zu testen, wählen Sie einen Experten mit Shell-Tools, zum Beispiel Engineer.",
+      "noShellNoteNoGrant": "Dieser Experte hat keine Shell-Tools, daher kann der Job in diesem Arbeitsbereich keine Befehle ausführen. Experten mit Shell-Tools benötigen die Shell-Berechtigung Ihres Administrators.",
       "cloudStorageInherit": "Vom Projekt erben",
       "cloudStorageReadonly": "Nur lesen",
       "cloudStorageReadwrite": "Lesen & Schreiben",
@@ -2612,7 +2614,7 @@
       "title": "Das ist keines der SRW-Images.",
       "unprivileged": "Es läuft ohne erhöhte Rechte, sofern Ihr Betreiber es nicht erlaubt; daher gibt es keinen eingebundenen Cloud-Ordner und keine geschützte Cloud.",
       "digest": "Legen Sie einen Digest fest (image@sha256:…) statt eines Tags, damit jeder Lauf dasselbe Image verwendet.",
-      "jobFirst": "Testen Sie ein neues Image zuerst mit einem Job: Eine Sitzung, deren Image nicht geladen werden kann, lässt sich noch nicht beenden."
+      "jobFirst": "Testen Sie ein neues Image zuerst mit einem Job. Ein Job zeigt, warum sein Arbeitsbereich nicht gestartet ist; eine Sitzung unter Umständen nicht."
     },
     "errors": {
       "name": "1-63 Kleinbuchstaben, Ziffern oder Bindestriche; Anfang und Ende ein Buchstabe oder eine Ziffer.",

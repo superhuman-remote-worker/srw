@@ -660,8 +660,8 @@
     "starting": "Starting the scheduled workspace.",
     "invalidImage": "Workspace needs attention: its image is invalid.",
     "invalidConfiguration": "Workspace needs attention: its configuration is invalid.",
-    "pullDeadline": "Workspace needs attention: image pull exceeded its startup boundary.",
-    "readinessDeadline": "Workspace needs attention: readiness exceeded its startup boundary.",
+    "pullDeadline": "Workspace needs attention: its image didn't finish pulling in time. Check the image reference and that the cluster can pull from its registry.",
+    "readinessDeadline": "Workspace needs attention: it didn't become ready in time. If it uses your own image, check that the image keeps running: build it FROM an SRW base image and don't override its ENTRYPOINT or USER.",
     "sshDeadline": "Workspace needs attention: SSH authentication grace expired.",
     "legacyHeld": "Checking an older workspace creation; completion evidence is unavailable."
   },
@@ -903,6 +903,8 @@
       "priorityNormal": "Normal (default)",
       "priorityHigh": "High (preempts lower)",
       "cloudStorageLabel": "Cloud Storage Access",
+      "noShellNoteGranted": "This Expert has no shell tools, so the Job can't run commands in this workspace. To try an image, pick an Expert with the shell tools, such as Engineer.",
+      "noShellNoteNoGrant": "This Expert has no shell tools, so the Job can't run commands in this workspace. Experts with the shell tools need the shell permission from your administrator.",
       "cloudStorageInherit": "Inherit from project",
       "cloudStorageReadonly": "Read Only",
       "cloudStorageReadwrite": "Read & Write",
@@ -2612,7 +2614,7 @@
       "title": "This isn't one of SRW's images.",
       "unprivileged": "It runs without elevated privileges unless your operator allows it, so there is no cloud-folder mount and no protected cloud.",
       "digest": "Pin a digest (image@sha256:…) rather than a tag, so every run uses the same image.",
-      "jobFirst": "Try a new image with a Job first: a Session whose image can't be pulled can't be ended yet."
+      "jobFirst": "Try a new image with a Job first. A Job shows why its workspace didn't start; a Session may not."
     },
     "errors": {
       "name": "Use 1-63 lowercase letters, digits or hyphens, starting and ending with a letter or digit.",
