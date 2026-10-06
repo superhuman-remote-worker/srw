@@ -272,6 +272,12 @@ class SubagentRuntime:
         self._semaphore = LiveConcurrencyLimit(cap_source, fallback=4)
         self._writer_guard = SharedWriterGuard()
         self._handles: set[str] = set()
+        # Handles whose child leaves nothing to settle: its strict terminal
+        # receipt committed, or ``_spawn`` returned before any durable row was
+        # opened. ``quiesce`` without parent authority may close a life whose
+        # every minted handle is here; a minted handle missing from it may
+        # still have a build or durable create in flight.
+        self._settled_handles: set[str] = set()
         self._worktree_index = 0
         self._batch_size = 1
         # Set by ``stop_foreground_batch`` for the current batch only;
@@ -614,6 +620,7 @@ class SubagentRuntime:
                 await self._await_successor_cancellation(call)
             if self._foreground_stop is not None:
                 # Queued behind the cap when the turn was stopped.
+                self._settled_handles.add(handle)
                 return stopped_not_started_text()
             budgets = ChildBudgets.from_entry(entry, name)
             try:
@@ -634,6 +641,7 @@ class SubagentRuntime:
                     budgets=budgets,
                 )
             except SpawnRefused as refused:
+                self._settled_handles.add(handle)
                 return f"Error: {refused}"
             except asyncio.CancelledError:
                 raise
@@ -645,6 +653,7 @@ class SubagentRuntime:
                     exc,
                     exc_info=True,
                 )
+                self._settled_handles.add(handle)
                 return (
                     f"Error: subagent {handle} ({name}) could not be started — "
                     f"{type(exc).__name__}: {exc}"
@@ -652,6 +661,7 @@ class SubagentRuntime:
 
             if not self._accepting:
                 await build.release()
+                self._settled_handles.add(handle)
                 return "Error: subagent runtime is quiescing; child was not started"
             if self._foreground_left_for_successor:
                 # Handed over while its environment was being built: no row.
@@ -660,6 +670,7 @@ class SubagentRuntime:
             if self._foreground_stop is not None:
                 # Stopped while its environment was being built: no row yet.
                 await build.release()
+                self._settled_handles.add(handle)
                 return stopped_not_started_text()
 
             messages = None
@@ -2277,7 +2288,7 @@ class SubagentRuntime:
             async with self._state_lock:
                 if (
                     self._recovery_complete
-                    and not self._handles
+                    and self._handles <= self._settled_handles
                     and not self._active
                     and not self._inflight
                     and not self._background
@@ -2289,9 +2300,12 @@ class SubagentRuntime:
                 ):
                     # Public End can revoke parent effect authority before
                     # the local watchdog runs. After orphan recovery, a life
-                    # that never reserved a child has no evidence to commit.
-                    # Close locally without ledger writes or notifications;
-                    # Resume still requires exact current parent authority.
+                    # whose every minted handle settled (terminal receipt
+                    # committed, or refused before any durable row) has no
+                    # evidence to commit; one that never reserved a child is
+                    # the empty case. Close locally without ledger writes or
+                    # notifications; Resume still requires exact current
+                    # parent authority.
                     return
             # A failed proof is ambiguous: the exact owner may be gone, or
             # the authority store may be transiently unavailable before the
@@ -2685,6 +2699,7 @@ class SubagentRuntime:
             raise
         else:
             self._foreground_terminal_pending.pop(handle, None)
+            self._settled_handles.add(handle)
 
     async def _ledger_update(self, subagent_id: str, **fields: Any) -> None:
         if self._persistence_abandoned:
