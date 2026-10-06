@@ -64,11 +64,25 @@
       "how": "Jobs list, Failed filter, expand the row of a failed Job (9792db96…, another stream's Job, failed 12:06Z)",
       "result": "pass",
       "observed": "the panel shows a 'Reason' block with the Job's error_message ('Deterministic LLM request rejection — …'); the reason span computes white-space pre-wrap and overflow-wrap anywhere"
+    },
+    {
+      "check": "T3 VM half: the defaults chain hands out vm-full and the VM gets 8 CPU / 16Gi / 30Gi (A2b; owner approved one VM)",
+      "how": "POST /api/projects a2b-vm-check (b69b7601-ad9e-44b5-b6aa-78a6ff7eacd0); PUT /api/projects/{id}/workspace-defaults {jobs: vm, sessions/container/vm: null}; POST /api/jobs with no workspace, expert engineer (so the shell can measure in the guest), description 'run nproc, free -g and df -h / once each'",
+      "result": "pass",
+      "observed": {
+        "defaults": "effective.jobs {mode: vm, source: project}; effective.vm {template_name: vm-full, source: builtin}; vm_available true",
+        "job": "a3493892-d08e-4b61-ab5c-05bfecf017f1: workspace_contract assigned vm (assignment_source resolved_config); context.workspace_sources {tier: project, template: builtin, template_name: vm-full}; config_override.workspace {backend: vm, vm: {image: ghcr.io/superhuman-remote-worker/srw-agent-vm-base:sha-6b9a1ad, cpu_cores: 8, memory: 16Gi, disk_size: 30Gi}}",
+        "image": "equals the VM controller's DEFAULT_VM_IMAGE ghcr.io/superhuman-remote-worker/srw-agent-vm-base:sha-6b9a1ad",
+        "objects": "VirtualMachine domain.cpu.cores 8, memory.guest 16Gi; VMI on node8, cores 8, guestAtBoot/guestCurrent 16Gi; DataVolume request 30Gi (longhorn-ephemeral-vm), PVC 32564Mi; launcher requests cpu 2, memory 16708Mi; disk.img 31,403,802,624 bytes on a 32G filesystem",
+        "timeline": "created 12:15:34Z; VMI Pending 12:16, Running ~12:20:30; vm ready ~12:21; processing 12:22; pending_review 12:26:34Z",
+        "inGuest": "nproc → 8; free -g → Mem total 15 (a 16Gi guest less kernel reservations); df -h / → /dev/vda1 28G (6.1G used); all exit 0 (job audit, shell_execute results)"
+      },
+      "cleanup": "PUT cancel 200 {cancelled, cleanup_pending: true} 12:27:28Z; snapshot uploaded 12:28:25Z; vm-controller 'Deleting VM … rootdisk=purge' then the orchestrator logged 'VM controller rejected delete … captured rootdisk cleanup is still reconciling' and 'VM exact teardown remains retry_pending'. VM, VMI, DataVolume, PVC, PV and VolumeSnapshot are all gone by 12:29Z (checked across namespaces). DELETE /api/jobs: 500 'strict checkpoint prune blocked by workspace recovery authority' once (12:29:22Z; snapshot objects and the Gitea repo were deleted on that call), then 503 'VM Job terminal audit authority is incomplete; retry deletion' on every try until 12:43Z; context.vm.status stays retiring_process_zero; one vm_creation_retries row. Same as the 10-04 D4 Job: knowledge/issues/cancelled_vm_jobs_cannot_be_deleted_vm_creation_retries_fk.md (reliability stream, M1). The Job row and the scratch Project a2b-vm-check are left in place for that stream; no compute or storage remains."
     }
   ],
   "notRun": [
     "MCP early refusal of two projects (create_persistent_thread): its early refusal is covered by tests (test_mcp*.py); the REST funnel it calls refused above",
     "the default-path (flag-off) exit failure: dev has startup-stage tracking on; proven on local k3d (k3d-templates-followups-2026-10-06.json)"
   ],
-  "cleanup": "both Jobs cancelled (200) and deleted (200 on the first try); no workspace Pod, PVC or Service left; template tf-dev-exit deleted (200); helper and bodies removed from the orchestrator pod"
+  "cleanup": "both Jobs cancelled (200) and deleted (200 on the first try); no workspace Pod, PVC or Service left; template tf-dev-exit deleted (200); helper and bodies removed from the orchestrator pod; T3: see its check (Job a3493892… and Project a2b-vm-check left for the reliability stream; no VM resources remain)"
 }
