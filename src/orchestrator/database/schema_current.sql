@@ -5527,6 +5527,41 @@ $$;
 
 
 --
+-- Name: enforce_pinned_workspace_inert_fence_receipt(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_pinned_workspace_inert_fence_receipt() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE t public.threads%ROWTYPE; intent public.thread_workspace_provision_intents%ROWTYPE;
+BEGIN
+ IF TG_OP<>'INSERT' THEN
+   RAISE EXCEPTION 'partial workspace inert fence receipt is immutable'
+    USING ERRCODE='23514',CONSTRAINT='pinned_workspace_inert_fence_authority';
+ END IF;
+ SELECT * INTO t FROM public.threads WHERE id=NEW.thread_id FOR UPDATE;
+ SELECT * INTO intent FROM public.thread_workspace_provision_intents WHERE attempt_id=NEW.attempt_id FOR SHARE;
+ IF t.id IS NULL OR intent.attempt_id IS NULL OR intent.thread_id<>t.id
+   OR t.execution_lane<>'pinned' OR t.runtime_generation<>NEW.retirement_runtime_generation
+   OR t.runtime_retirement_token IS DISTINCT FROM NEW.retirement_token
+   OR t.runtime_retirement_authorized_at IS NULL
+   OR intent.cleanup_retirement_token IS DISTINCT FROM NEW.retirement_token
+   OR intent.runtime_generation<>NEW.source_runtime_generation
+   OR intent.status<>'revoking' OR intent.pod_uid IS NOT NULL
+   OR intent.namespace<>NEW.namespace OR intent.pod_name<>NEW.pod_name
+   OR NOT public.pinned_workspace_provision_capture_is_current(t.id,t.runtime_generation,
+          t.runtime_retirement_context->'workspace_provision_intent')
+   OR t.runtime_retirement_context->'workspace_provision_intent'->>'attempt_id'<>NEW.attempt_id::text
+   OR NEW.observed_at IS DISTINCT FROM transaction_timestamp() THEN
+   RAISE EXCEPTION 'partial workspace fence lacks exact retirement authority'
+    USING ERRCODE='23514',CONSTRAINT='pinned_workspace_inert_fence_authority';
+ END IF;
+ RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: enforce_pinned_workspace_provision_stop_receipt(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -5650,7 +5685,8 @@ BEGIN
        OR NEW.purge_completed_at IS DISTINCT FROM OLD.purge_completed_at THEN
         captured := t.runtime_retirement_context->'workspace_provision_intent';
         IF t.id IS NULL OR t.execution_lane <> 'pinned'
-           OR t.runtime_generation IS DISTINCT FROM NEW.runtime_generation
+           OR NOT public.pinned_workspace_provision_capture_is_current(t.id,t.runtime_generation,captured)
+           OR captured->>'runtime_generation' IS DISTINCT FROM NEW.runtime_generation::text
            OR t.runtime_retirement_token IS DISTINCT FROM NEW.cleanup_retirement_token
            OR t.runtime_retirement_authorized_at IS NULL
            OR captured->>'attempt_id' IS DISTINCT FROM NEW.attempt_id::text
@@ -5717,7 +5753,14 @@ BEGIN
     IF OLD.status='revoking' AND NEW.status='fenced'
        AND NEW.cleanup_disposition IS NOT NULL AND NEW.pod_uid IS NULL
        AND NOT (NEW.retained_source_attempt_id IS NOT NULL
-                AND NEW.creation_effects_admitted_at IS NULL) THEN
+                AND NEW.creation_effects_admitted_at IS NULL)
+       AND NOT EXISTS (SELECT 1 FROM public.thread_workspace_provision_inert_fence_receipts proof
+         WHERE proof.attempt_id=NEW.attempt_id AND proof.thread_id=NEW.thread_id
+           AND proof.source_runtime_generation=NEW.runtime_generation
+           AND proof.retirement_runtime_generation=t.runtime_generation
+           AND proof.retirement_token=NEW.cleanup_retirement_token
+           AND proof.namespace=NEW.namespace AND proof.pod_name=NEW.pod_name
+           AND proof.fence_pod_uid=NEW.fence_pod_uid) THEN
         RAISE EXCEPTION 'workspace issued Pod identity is unresolved'
           USING ERRCODE='23514', CONSTRAINT='pinned_workspace_retention_authority';
     END IF;
@@ -13507,8 +13550,8 @@ BEGIN
             '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
         OR workspace_intent->>'thread_id'
             IS DISTINCT FROM retirement_context->>'thread_id'
-        OR workspace_intent->>'runtime_generation'
-            IS DISTINCT FROM runtime_generation::text
+        OR NOT public.pinned_workspace_provision_capture_shape_is_current(
+            (retirement_context->>'thread_id')::uuid,runtime_generation,workspace_intent)
         OR NULLIF(workspace_intent->>'namespace', '') IS NULL
         OR NULLIF(workspace_intent->>'pod_name', '') IS NULL
         OR NULLIF(workspace_intent->>'network_tier', '') IS NULL
@@ -13721,7 +13764,7 @@ CREATE FUNCTION public.pinned_retirement_workspace_provision_intent_retired(subj
              AND COALESCE(captured_intent->>'attempt_id', '') ~
                 '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
              AND captured_intent->>'thread_id' = subject_thread_id::text
-             AND captured_intent->>'runtime_generation' = runtime_generation::text
+             AND public.pinned_workspace_provision_capture_is_current(subject_thread_id,runtime_generation,captured_intent)
              AND NULLIF(captured_intent->>'namespace', '') IS NOT NULL
              AND NULLIF(captured_intent->>'pod_name', '') IS NOT NULL
              AND NULLIF(captured_intent->>'network_tier', '') IS NOT NULL
@@ -13745,7 +13788,7 @@ CREATE FUNCTION public.pinned_retirement_workspace_provision_intent_retired(subj
                   FROM public.thread_workspace_provision_intents intent
                  WHERE intent.attempt_id::text = captured_intent->>'attempt_id'
                    AND intent.thread_id = subject_thread_id
-                   AND intent.runtime_generation = runtime_generation
+                   AND intent.runtime_generation::text = captured_intent->>'runtime_generation'
                    AND intent.status IN ('fenced', 'retired')
                    AND (NOT require_all_resource_fences
                         OR intent.cleanup_disposition IS NULL
@@ -13946,6 +13989,88 @@ CREATE FUNCTION public.pinned_vm_initial_creation_agent_zero_source(requested_th
           AND public.thread_vm_creation_never_issued_source(t.id,
               t.runtime_retirement_context->'vm_creation_source'->>'provision_generation'));
 $$;
+
+
+--
+-- Name: pinned_workspace_provision_abort_path(uuid, uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_workspace_provision_abort_path(subject uuid, current_generation uuid, source_attempt uuid) RETURNS uuid[]
+    LANGUAGE sql STABLE
+    AS $$
+ WITH RECURSIVE path AS (
+   SELECT intent.runtime_generation AS generation,
+          ARRAY[intent.runtime_generation] AS generations, 0 AS depth
+     FROM public.thread_workspace_provision_intents intent
+    WHERE intent.thread_id=subject AND intent.attempt_id=source_attempt
+      AND intent.created_agent_id IS NOT NULL AND intent.created_attach_token IS NOT NULL
+      AND intent.pod_uid IS NULL AND intent.retained_source_attempt_id IS NULL
+   UNION ALL
+   SELECT abort.successor_generation, path.generations||abort.successor_generation, path.depth+1
+     FROM path JOIN public.thread_runtime_attach_abort_outcomes abort
+       ON abort.thread_id=subject AND abort.runtime_generation=path.generation
+    WHERE path.depth<16 AND abort.successor_generation<>ALL(path.generations)
+      AND abort.release_kind='process_zero'
+      AND abort.quiescence_protocol='agent_attach_not_started_v1'
+      AND abort.workspace_generation IS NULL AND abort.workspace_runtime_incarnation IS NULL
+      AND (path.depth>0 OR EXISTS (
+         SELECT 1 FROM public.thread_workspace_provision_intents intent
+          WHERE intent.attempt_id=source_attempt AND intent.created_agent_id=abort.agent_id
+            AND intent.created_attach_token=abort.runtime_attach_token))
+ ) SELECT generations FROM path WHERE generation=current_generation AND depth>0;
+$$;
+
+
+--
+-- Name: pinned_workspace_provision_capture_is_current(uuid, uuid, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_workspace_provision_capture_is_current(subject uuid, current_generation uuid, captured jsonb) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $_$
+ SELECT COALESCE(
+   captured->>'thread_id'=subject::text AND (
+     (captured->>'runtime_generation'=current_generation::text
+       AND NOT (captured ? 'retirement_runtime_generation') AND NOT (captured ? 'attach_abort_path'))
+     OR (captured->>'runtime_generation'<>current_generation::text
+       AND captured->>'retirement_runtime_generation'=current_generation::text
+       AND captured->>'attempt_id' ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+       AND captured->'attach_abort_path'=to_jsonb(public.pinned_workspace_provision_abort_path(
+           subject,current_generation,(captured->>'attempt_id')::uuid))
+       AND (captured->'attach_abort_path'->>0)=captured->>'runtime_generation'
+       AND jsonb_array_length(captured->'attach_abort_path') BETWEEN 2 AND 17
+       AND captured->>'pod_uid' IS NULL
+       AND EXISTS (SELECT 1 FROM public.threads t WHERE t.id=subject
+         AND t.runtime_generation=current_generation AND t.agent_id IS NULL
+         AND t.runtime_attach_token IS NULL AND t.control_admission_agent_id IS NULL
+         AND t.runtime_retirement_permanent=true)
+     )
+   ), false);
+$_$;
+
+
+--
+-- Name: pinned_workspace_provision_capture_shape_is_current(uuid, uuid, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_workspace_provision_capture_shape_is_current(subject uuid, current_generation uuid, captured jsonb) RETURNS boolean
+    LANGUAGE sql IMMUTABLE
+    AS $_$
+ SELECT COALESCE(captured->>'thread_id'=subject::text AND (
+  (captured->>'runtime_generation'=current_generation::text
+   AND NOT (captured ? 'retirement_runtime_generation') AND NOT (captured ? 'attach_abort_path'))
+  OR (captured->>'runtime_generation'<>current_generation::text
+   AND captured->>'retirement_runtime_generation'=current_generation::text
+   AND captured->>'pod_uid' IS NULL
+   AND CASE WHEN jsonb_typeof(captured->'attach_abort_path')='array' THEN
+     jsonb_array_length(captured->'attach_abort_path') BETWEEN 2 AND 17
+     AND captured->'attach_abort_path'->>0=captured->>'runtime_generation'
+     AND captured->'attach_abort_path'->>-1=current_generation::text
+     AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(captured->'attach_abort_path') value
+       WHERE value !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+   ELSE false END
+  )),false);
+$_$;
 
 
 --
@@ -28374,6 +28499,26 @@ COMMENT ON TABLE public.thread_turn_commits IS 'Workspace state after transcript
 
 
 --
+-- Name: thread_workspace_provision_inert_fence_receipts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_workspace_provision_inert_fence_receipts (
+    attempt_id uuid NOT NULL,
+    thread_id uuid NOT NULL,
+    source_runtime_generation uuid NOT NULL,
+    retirement_runtime_generation uuid NOT NULL,
+    retirement_token uuid NOT NULL,
+    namespace text NOT NULL,
+    pod_name text NOT NULL,
+    fence_pod_uid text NOT NULL,
+    protocol text NOT NULL,
+    observed_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT thread_workspace_provision_inert_fence_rece_fence_pod_uid_check CHECK ((length(fence_pod_uid) > 0)),
+    CONSTRAINT thread_workspace_provision_inert_fence_receipts_protocol_check CHECK ((protocol = 'inert_pod_name_fence_v1'::text))
+);
+
+
+--
 -- Name: thread_workspace_provision_intents; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -31594,6 +31739,14 @@ ALTER TABLE ONLY public.thread_session_tasks
 
 ALTER TABLE ONLY public.thread_turn_commits
     ADD CONSTRAINT thread_turn_commits_pkey PRIMARY KEY (thread_id, seq);
+
+
+--
+-- Name: thread_workspace_provision_inert_fence_receipts thread_workspace_provision_inert_fence_receipts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_workspace_provision_inert_fence_receipts
+    ADD CONSTRAINT thread_workspace_provision_inert_fence_receipts_pkey PRIMARY KEY (attempt_id);
 
 
 --
@@ -36148,6 +36301,13 @@ CREATE CONSTRAINT TRIGGER trg_officer_ticket_delivery_writer AFTER INSERT ON pub
 
 
 --
+-- Name: thread_workspace_provision_inert_fence_receipts trg_pinned_workspace_inert_fence_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_pinned_workspace_inert_fence_authority BEFORE INSERT OR DELETE OR UPDATE ON public.thread_workspace_provision_inert_fence_receipts FOR EACH ROW EXECUTE FUNCTION public.enforce_pinned_workspace_inert_fence_receipt();
+
+
+--
 -- Name: thread_workspace_provision_stop_receipts trg_pinned_workspace_provision_stop_authority; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -38452,6 +38612,14 @@ ALTER TABLE ONLY public.thread_session_runtime_state
 
 ALTER TABLE ONLY public.thread_session_tasks
     ADD CONSTRAINT thread_session_tasks_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: thread_workspace_provision_inert_fence_receipts thread_workspace_provision_inert_fence_receipts_attempt_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_workspace_provision_inert_fence_receipts
+    ADD CONSTRAINT thread_workspace_provision_inert_fence_receipts_attempt_id_fkey FOREIGN KEY (attempt_id) REFERENCES public.thread_workspace_provision_intents(attempt_id);
 
 
 --

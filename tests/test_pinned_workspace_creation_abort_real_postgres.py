@@ -412,3 +412,71 @@ async def test_unpublished_existing_pvc_is_not_adopted_from_name_and_labels(
         is None
     )
     assert cluster.objects["pvc"].metadata.uid == original_uid
+
+
+@pytest.mark.asyncio
+async def test_upgrade_preserves_recorded_abort_and_retires_exact_published_storage(
+    pg_dsn, monkeypatch, tmp_path
+):
+    import asyncpg
+    from uuid import uuid4
+    from urllib.parse import urlsplit, urlunsplit
+    from orchestrator.database.postgres import PostgresDB
+    from orchestrator.database.migrate import run_migrations
+
+    old = tmp_path / "before"
+    old.mkdir()
+    migrations = (
+        Path(__file__).resolve().parents[1] / "src/orchestrator/database/migrations/app"
+    )
+    for path in migrations.glob("*.sql"):
+        if path.name != "0330_pinned_partial_creation_abort_retirement.sql":
+            (old / path.name).write_bytes(path.read_bytes())
+    database = "r33c_upgrade_" + uuid4().hex
+    parts = urlsplit(pg_dsn)
+    dsn = urlunsplit(parts._replace(path="/" + database))
+    admin = await asyncpg.connect(pg_dsn)
+    await admin.execute(f'CREATE DATABASE "{database}"')
+    store = PostgresDB(connection_string=dsn, min_connections=1, max_connections=2)
+    try:
+        async with asyncpg.create_pool(dsn, min_size=1, max_size=2) as pool:
+            await run_migrations(pool, old)
+        monkeypatch.setenv("EXPERTS_DB_ENABLED", "false")
+        monkeypatch.setenv("APP_ENCRYPTION_KEY", "P" * 32)
+        await store.connect()
+        ids, _, cluster, provider = await _stranded(store, monkeypatch)
+        before = await store.fetchrow(
+            "SELECT * FROM thread_runtime_attach_abort_outcomes WHERE thread_id=$1::uuid",
+            ids["thread"],
+        )
+        ledger = await store.fetch(
+            "SELECT filename,checksum FROM schema_migrations ORDER BY filename"
+        )
+        async with asyncpg.create_pool(dsn, min_size=1, max_size=2) as pool:
+            await run_migrations(pool, migrations)
+            await run_migrations(pool, migrations)
+        after = await store.fetch(
+            "SELECT filename,checksum FROM schema_migrations WHERE filename<>$1 ORDER BY filename",
+            "0330_pinned_partial_creation_abort_retirement.sql",
+        )
+        assert ledger == after
+        await start._retire_unbound(store, provider, ids["thread"], permanent=True)
+        assert await store.get_thread(ids["thread"]) is None
+        # Original resources are gone. The ordinary recycler owns post-horizon
+        # removal of the recorded inert name fences; do not skip that horizon.
+        assert cluster.objects
+        assert all(
+            obj.metadata.labels.get("srw.io/workspace-provision-fence") == "true"
+            for obj in cluster.objects.values()
+        )
+        assert (
+            await store.fetchrow(
+                "SELECT * FROM thread_runtime_attach_abort_outcomes WHERE thread_id=$1::uuid",
+                ids["thread"],
+            )
+            == before
+        )
+    finally:
+        await store.disconnect()
+        await admin.execute(f'DROP DATABASE "{database}" WITH (FORCE)')
+        await admin.close()

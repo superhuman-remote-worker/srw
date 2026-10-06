@@ -1543,7 +1543,20 @@ class PinnedRetirementOperations:
         if not (
             attempt_id == str(intent.get("attempt_id") or "")
             and thread_id == str(context.get("thread_id") or "")
-            and generation == str(retirement.get("generation") or "")
+            and (
+                generation == str(retirement.get("generation") or "")
+                or (
+                    intent.get("retirement_runtime_generation")
+                    == str(retirement.get("generation") or "")
+                    and isinstance(intent.get("attach_abort_path"), list)
+                    and 2 <= len(intent["attach_abort_path"]) <= 17
+                    and intent["attach_abort_path"][0] == generation
+                    and intent["attach_abort_path"][-1]
+                    == str(retirement.get("generation") or "")
+                    and bool(retirement.get("permanent"))
+                    and not intent.get("pod_uid")
+                )
+            )
             and str(intent.get("namespace") or "")
             and str(intent.get("pod_name") or "")
             and str(intent.get("network_tier") or "")
@@ -1587,6 +1600,7 @@ class PinnedRetirementOperations:
             current,
             permanent=permanent,
             expected_retirement_token=token,
+            expected_retirement_generation=generation,
         )
         if not isinstance(fences, Mapping):
             raise RuntimeError("workspace provision name fencing is retryable")

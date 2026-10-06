@@ -2449,8 +2449,22 @@ def _pinned_retirement_external_cleanup_expected(
         if (
             str(workspace_intent.get("thread_id"))
             != str(context.get("thread_id") or "")
-            or str(workspace_intent.get("runtime_generation"))
-            != str(runtime_generation)
+            or not (
+                str(workspace_intent.get("runtime_generation"))
+                == str(runtime_generation)
+                or (
+                    workspace_intent.get("retirement_runtime_generation")
+                    == str(runtime_generation)
+                    and isinstance(workspace_intent.get("attach_abort_path"), list)
+                    and 2 <= len(workspace_intent["attach_abort_path"]) <= 17
+                    and workspace_intent["attach_abort_path"][0]
+                    == workspace_intent["runtime_generation"]
+                    and workspace_intent["attach_abort_path"][-1]
+                    == str(runtime_generation)
+                    and not workspace_intent.get("pod_uid")
+                    and not context.get("agent_id")
+                )
+            )
             or (workspace_intent.get("created_agent_id") is None)
             != (workspace_intent.get("created_attach_token") is None)
             or workspace_intent.get("status") not in {"planned", "fenced", "retired"}
@@ -24334,9 +24348,14 @@ class PostgresDB:
                 if not (
                     isinstance(captured, dict)
                     and str(captured.get("attempt_id") or "") == str(parsed_attempt)
-                    and str(captured.get("runtime_generation") or "")
-                    == str(parsed_generation)
-                    and str(intent["runtime_generation"]) == str(parsed_generation)
+                    and str(intent["runtime_generation"])
+                    == str(captured.get("runtime_generation") or "")
+                    and await conn.fetchval(
+                        "SELECT public.pinned_workspace_provision_capture_is_current($1,$2,$3::jsonb)",
+                        parsed_thread,
+                        parsed_generation,
+                        json.dumps(captured, default=str),
+                    )
                 ):
                     return None
                 disposition = (
@@ -24398,6 +24417,75 @@ class PostgresDB:
                 refreshed["cleanup_disposition"] = disposition
                 refreshed["cleanup_retirement_token"] = parsed_retirement
                 return refreshed
+
+    async def record_pinned_workspace_inert_fence(
+        self,
+        thread_id: str,
+        *,
+        retirement_generation: str,
+        retirement_token: str,
+        attempt_id: str,
+        fence_pod_uid: str,
+    ) -> bool:
+        """Record the adapter's causal inert-name barrier, not missing UID zero."""
+        try:
+            thread, generation, token, attempt = (
+                UUID(str(value))
+                for value in (
+                    thread_id,
+                    retirement_generation,
+                    retirement_token,
+                    attempt_id,
+                )
+            )
+        except (ValueError, TypeError):
+            return False
+        if not isinstance(fence_pod_uid, str) or not fence_pod_uid.strip():
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT runtime_retirement_context FROM threads WHERE id=$1 "
+                    "AND runtime_generation=$2 AND runtime_retirement_token=$3 "
+                    "AND runtime_retirement_authorized_at IS NOT NULL FOR UPDATE",
+                    thread,
+                    generation,
+                    token,
+                )
+                if row is None:
+                    return False
+                captured = _strict_json_object(
+                    row["runtime_retirement_context"], label="retirement context"
+                ).get("workspace_provision_intent")
+                if not isinstance(captured, dict) or captured.get("attempt_id") != str(
+                    attempt
+                ):
+                    return False
+                await conn.execute(
+                    "INSERT INTO thread_workspace_provision_inert_fence_receipts "
+                    "(attempt_id,thread_id,source_runtime_generation,retirement_runtime_generation,"
+                    "retirement_token,namespace,pod_name,fence_pod_uid,protocol) "
+                    "SELECT attempt_id,thread_id,runtime_generation,$3,$4,namespace,pod_name,$5,'inert_pod_name_fence_v1' "
+                    "FROM thread_workspace_provision_intents WHERE attempt_id=$1 AND thread_id=$2 "
+                    "ON CONFLICT DO NOTHING",
+                    attempt,
+                    thread,
+                    generation,
+                    token,
+                    fence_pod_uid,
+                )
+                return bool(
+                    await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM thread_workspace_provision_inert_fence_receipts "
+                        "WHERE attempt_id=$1 AND thread_id=$2 AND retirement_runtime_generation=$3 "
+                        "AND retirement_token=$4 AND fence_pod_uid=$5)",
+                        attempt,
+                        thread,
+                        generation,
+                        token,
+                        fence_pod_uid,
+                    )
+                )
 
     async def pinned_workspace_provision_stop_is_current(
         self,
@@ -24630,9 +24718,14 @@ class PostgresDB:
                     isinstance(metadata, dict)
                     and isinstance(captured, dict)
                     and str(captured.get("attempt_id") or "") == str(parsed_attempt)
-                    and str(captured.get("runtime_generation") or "")
-                    == str(parsed_generation)
-                    and str(intent["runtime_generation"]) == str(parsed_generation)
+                    and str(intent["runtime_generation"])
+                    == str(captured.get("runtime_generation") or "")
+                    and await conn.fetchval(
+                        "SELECT public.pinned_workspace_provision_capture_is_current($1,$2,$3::jsonb)",
+                        parsed_thread,
+                        parsed_generation,
+                        json.dumps(captured, default=str),
+                    )
                     and isinstance(previous_binding, dict)
                     and dict(captured.get("previous_binding") or {})
                     == dict(previous_binding)
@@ -24768,7 +24861,7 @@ class PostgresDB:
                         str(workspace.get("_workspace_provision_attempt") or "")
                         == str(parsed_attempt)
                         and str(workspace.get("_workspace_provision_generation") or "")
-                        == str(parsed_generation)
+                        == str(intent["runtime_generation"])
                     )
                     if not binding_unchanged:
                         return False
@@ -41702,6 +41795,7 @@ class PostgresDB:
                     "_workspace_provision_generation"
                 )
                 marker_attempt: UUID | None = None
+                workspace_abort_path = None
                 if marker_attempt_raw is not None:
                     try:
                         marker_attempt = UUID(str(marker_attempt_raw))
@@ -41710,8 +41804,21 @@ class PostgresDB:
                             "state": "malformed",
                             "reason": "workspace_provision_intent_malformed",
                         }
+                    if str(marker_generation_raw or "") != generation:
+                        # Capture old creation authority, never reinterpret it
+                        # as this generation or release a bound successor.
+                        if permanent and thread.get("agent_id") is None:
+                            workspace_abort_path = await conn.fetchval(
+                                "SELECT public.pinned_workspace_provision_abort_path($1,$2,$3)",
+                                parsed_thread_id,
+                                UUID(generation),
+                                marker_attempt,
+                            )
                     if (
-                        str(marker_generation_raw or "") != generation
+                        (
+                            str(marker_generation_raw or "") != generation
+                            and not workspace_abort_path
+                        )
                         or workspace_context.get("status") != "pending"
                         or workspace_context.get("provisioner") != "k8s"
                         or any(
@@ -41815,11 +41922,19 @@ class PostgresDB:
                             "reason": "workspace_provision_intent_malformed",
                         }
                     if not (
-                        intent_generation == generation
+                        (
+                            intent_generation == generation
+                            or (
+                                workspace_abort_path
+                                and intent_generation == str(marker_generation_raw)
+                                and str(workspace_abort_path[0]) == intent_generation
+                            )
+                        )
                         and isinstance(previous_binding, dict)
                         and dict(previous_binding) == workspace_binding_context
                         and (
                             str(workspace_intent_row["status"]) != "planned"
+                            or workspace_abort_path
                             or (
                                 (
                                     created_agent_text is None
@@ -41893,6 +42008,13 @@ class PostgresDB:
                     workspace_provision_intent["previous_binding"] = dict(
                         previous_binding
                     )
+                    if workspace_abort_path:
+                        workspace_provision_intent.update(
+                            retirement_runtime_generation=generation,
+                            attach_abort_path=[
+                                str(value) for value in workspace_abort_path
+                            ],
+                        )
                 if (
                     agent
                     and agent_pod_context
