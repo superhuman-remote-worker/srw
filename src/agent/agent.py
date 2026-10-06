@@ -1882,18 +1882,37 @@ class UniversalAgent:
 
         saver = self._checkpointer
         config = getattr(self, "_worker_thread_config", None)
-        if (
-            self._current_job_id != job_id
-            or self._worker_lease_token != lease_token
-            or not isinstance(saver, FencedAsyncPostgresSaver)
-            or saver.unit_id != job_id
-            or saver.lease_token != lease_token
-            or self._graph is None
-            or self._graph.checkpointer is not saver
-            or not isinstance(config, dict)
-            or config.get("configurable", {}).get("thread_id") != job_id
-        ):
-            raise LeaseLostError("Worker give-up checkpoint ownership is unproven")
+        # Fixed predicate names diagnose a refused binding without exposing
+        # owner identifiers, lease tokens, saver details or configuration.
+        failed = []
+        if self._current_job_id != job_id:
+            failed.append("current_job")
+        if self._worker_lease_token != lease_token:
+            failed.append("current_token")
+        if not isinstance(saver, FencedAsyncPostgresSaver):
+            failed.append("fenced_saver")
+        else:
+            if getattr(saver, "unit_id", None) != job_id:
+                failed.append("saver_job")
+            if getattr(saver, "lease_token", None) != lease_token:
+                failed.append("saver_token")
+        if self._graph is None:
+            failed.append("graph_present")
+        elif getattr(self._graph, "checkpointer", None) is not saver:
+            failed.append("graph_saver")
+        if not isinstance(config, dict):
+            failed.append("thread_config")
+        else:
+            configurable = config.get("configurable")
+            if (
+                not isinstance(configurable, dict)
+                or configurable.get("thread_id") != job_id
+            ):
+                failed.append("thread_id")
+        if failed:
+            raise LeaseLostError(
+                "Worker give-up checkpoint ownership is unproven: " + ",".join(failed)
+            )
         saver._bound_handle()
         snapshot = await self._graph.aget_state(config)
         values = dict(snapshot.values or {})
