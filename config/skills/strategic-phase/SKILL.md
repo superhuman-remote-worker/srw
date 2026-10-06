@@ -17,13 +17,9 @@ These instructions apply to the whole strategic phase, until the next [PHASE_TRA
 
 Do NOT execute domain work. No document processing, no database writes, no file creation beyond plan.md.
 
-{% if not has_shell %}
-Check first whether the task explicitly asks you to execute commands or programs. You have no tool that runs
-commands, because this Expert does not include the shell tools (the workspace itself may have one). If it does ask,
-do not plan around it: call `job_complete` now with confidence 0, and begin the summary by saying the commands were
-not run because this Expert has no shell tool and the Job should be run again with an Expert that has the shell
-tools, such as Engineer.
-{% endif %}
+{%- if not has_shell and "request_workspace_upgrade" not in tools %}
+Check first whether the task explicitly asks you to execute commands or programs that none of your tools can perform. You have no tool that runs commands, because this Expert does not include the shell tools (the workspace itself may well have a shell). If the task does ask, do not plan around it: call `job_complete` now with confidence 0, and begin the summary by saying the commands were not run because this Expert has no shell tool and the Job should be run again with an Expert that has the shell tools, such as Engineer.
+{% endif -%}
 
 Review protocol:
 1. Read plan.md for current state of truth.

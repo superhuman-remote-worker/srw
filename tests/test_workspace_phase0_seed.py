@@ -93,9 +93,13 @@ class TestBoundSkillCapabilityRendering:
             (
                 ["run_command", "file_exists", "read_file"],
                 "`wc -w`",
-                "no command runner",
+                "you have no tool that runs commands",
             ),
-            (["file_exists", "read_file"], "no command runner", "run_command"),
+            (
+                ["file_exists", "read_file"],
+                "have no tool that runs commands",
+                "run_command",
+            ),
         ],
     )
     def test_verify_skill_is_rendered_for_loaded_tools(
@@ -210,7 +214,9 @@ class TestBoundSkillCapabilityRendering:
         agent._deploy_instruction_files(["shell_read", "cancel_command", "read_file"])
 
         rendered = ws.read_file("skills/verify-before-done/SKILL.md")
-        assert "no command runner" in rendered.lower()
+        assert "you have no tool that runs commands" in " ".join(
+            rendered.lower().split()
+        )
         assert "shell_execute" not in rendered
         assert "run_command" not in rendered
 

@@ -78,8 +78,6 @@ def test_verify_before_done_uses_shell_checks_only_when_available():
     flat = " ".join(without_shell.split())
     assert "this Expert does not include the shell tools" in flat
     assert "may well have a shell" in flat
-    assert "`job_complete` right away with confidence 0" in flat
-    assert "such as Engineer" in without_shell
     assert "call `file_exists` once" in without_shell
     assert "call `read_file` once" in without_shell
     assert "repeat an unchanged evidence bundle" in without_shell
@@ -91,18 +89,61 @@ def test_verify_before_done_uses_shell_checks_only_when_available():
     assert "{%" not in without_shell
 
 
-def test_strategic_phase_exits_early_only_without_a_shell():
+def _flat(text):
+    return " ".join(text.split())
+
+
+_CONTAINER_NO_SHELL = [
+    "read_file",
+    "file_exists",
+    "job_complete",
+]  # General Worker-like
+_VIRTUAL_ENGINEER = _CONTAINER_NO_SHELL + ["request_workspace_upgrade"]
+
+
+def test_strategic_phase_exits_early_only_when_the_expert_lacks_the_shell():
     md = (_SKILLS / "strategic-phase" / "SKILL.md").read_text(encoding="utf-8")
 
-    without_shell = render_instruction_content(md, ["read_file"])
-    with_shell = render_instruction_content(md, ["read_file", "run_command"])
+    expert = _flat(render_instruction_content(md, _CONTAINER_NO_SHELL))
+    with_shell = render_instruction_content(md, _CONTAINER_NO_SHELL + ["run_command"])
+    tier = render_instruction_content(md, _VIRTUAL_ENGINEER)
 
-    assert "this Expert does not include the shell tools" in without_shell
-    assert "`job_complete` now with confidence 0" in without_shell
-    assert "such as Engineer" in without_shell
-    assert "this Expert does not include the shell tools" not in with_shell
-    assert "such as Engineer" not in with_shell
-    assert "{%" not in without_shell
+    assert "this Expert does not include the shell tools" in expert
+    assert "`job_complete` now with confidence 0" in expert
+    assert "such as Engineer" in expert
+    assert "none of your tools can perform" in expert
+    for other in (with_shell, tier):
+        assert "this Expert does not include the shell tools" not in other
+        assert "such as Engineer" not in other
+    assert "{%" not in expert
+
+
+def test_verify_before_done_blames_the_tier_when_an_upgrade_tool_is_bound():
+    md = (_SKILLS / "verify-before-done" / "SKILL.md").read_text(encoding="utf-8")
+
+    tier = _flat(render_instruction_content(md, _VIRTUAL_ENGINEER))
+    expert = _flat(render_instruction_content(md, _CONTAINER_NO_SHELL))
+
+    assert "This workspace has no command runner" in tier
+    assert "request_workspace_upgrade" in tier
+    assert "such as Engineer" not in tier
+    assert "confidence 0" not in tier
+
+    assert "this Expert does not include the shell tools" in expert
+    assert "request_workspace_upgrade" not in expert
+    assert "call `job_complete` with confidence 0" in expert
+    assert "completion_note" in expert
+    assert "such as Engineer" in expert
+
+
+def test_verify_before_done_does_not_blame_expert_when_shell_helpers_are_bound():
+    md = (_SKILLS / "verify-before-done" / "SKILL.md").read_text(encoding="utf-8")
+    rendered = _flat(
+        render_instruction_content(md, ["shell_read", "cancel_command", "job_complete"])
+    )
+    assert "You have no tool that runs commands." in rendered
+    assert "this Expert does not include" not in rendered
+    assert "such as Engineer" not in rendered
 
 
 def test_verify_before_done_reports_when_no_artifact_checker_is_available():
