@@ -516,9 +516,13 @@ pulled (see below). Startup-stage tracking is Helm
   - an image without the workspace contract whose container keeps running but
     never opens sshd;
   - a container that exits, when startup-stage tracking is on, or the Job was
-    restored or recreated over a kept volume, or the workspace was requested
-    while the Job runs;
+    restored or recreated over a kept volume;
   - resources no node can fit, when no `LimitRange` rejects them.
+
+  A workspace requested after the Job has started (a tier upgrade, or a scholar
+  preparing its parent's workspace) whose container exits doesn't change the
+  Job's status either: the Job keeps its status and the new workspace stays
+  `creating`.
 
   Without startup-stage tracking, its workspace stays `creating` and the Jobs
   list shows "Checking an older workspace creation; completion evidence is
