@@ -2529,8 +2529,9 @@ async def test_recoverable_end_releases_without_reporting(worker_runtime, monkey
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("workspace_recovery", [False, True])
+@pytest.mark.parametrize("sealed_report", [False, True])
 async def test_last_recoverable_attempt_reports_visible_terminal_give_up(
-    worker_runtime, monkeypatch, workspace_recovery
+    worker_runtime, monkeypatch, workspace_recovery, sealed_report
 ):
     claim = _claim(input_seq=4, prior="processing", attempts=5, max_attempts=5)
     final = {
@@ -2541,6 +2542,10 @@ async def test_last_recoverable_attempt_reports_visible_terminal_give_up(
         },
         "error": {"type": "llm_unavailable", "recoverable": True},
     }
+    if sealed_report:
+        from agent.graph import checkpoint_completion_report
+
+        final.update(checkpoint_completion_report(final))
     executor, agent, client, _, rotate, complete, release = _install(
         monkeypatch, claim, final
     )
@@ -2550,7 +2555,16 @@ async def test_last_recoverable_attempt_reports_visible_terminal_give_up(
         client.backend = "vm"
         client.report_workspace_recovery.return_value = _recovery_receipt(claim)
 
-    await executor._serve_worker_claim(claim)
+    checkpoint_reset = None
+    if sealed_report and not workspace_recovery:
+        from tests.test_worker_retry_exhaustion_checkpoint import bind_checkpoint_agent
+
+        checkpoint_reset = await bind_checkpoint_agent(agent, claim, final, executor)
+    try:
+        await executor._serve_worker_claim(claim)
+    finally:
+        if checkpoint_reset is not None:
+            turn_executor.current_lease.reset(checkpoint_reset)
 
     if workspace_recovery:
         client.report_completion.assert_not_awaited()
@@ -2566,6 +2580,12 @@ async def test_last_recoverable_attempt_reports_visible_terminal_give_up(
     assert reported["error"]["recoverable"] is False
     assert reported["freeze_data"]["freeze_type"] == "worker_retry_exhausted"
     assert reported["freeze_data"]["attempts"] == 5
+    wire, _ = turn_executor.StatelessTurnExecutor._worker_completion_wire_payload(
+        reported
+    )
+    assert wire["error"]["type"] == "worker_retry_exhausted"
+    assert wire["error"]["recoverable"] is False
+    assert wire["freeze_data"]["freeze_type"] == "worker_retry_exhausted"
     complete.assert_awaited_once()
     rotate.assert_not_awaited()
     release.assert_not_awaited()
@@ -2619,6 +2639,73 @@ async def test_last_pregraph_driver_failure_reports_visible_terminal_give_up(
     rotate.assert_not_awaited()
     release.assert_not_awaited()
     assert agent.cleanup_calls == [False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stage", ["before_commit", "after_commit", "readback", "lease_loss", "binding"]
+)
+async def test_giveup_checkpoint_ambiguity_never_starts_http_or_parks(
+    worker_runtime, monkeypatch, stage
+):
+    from tests.test_worker_retry_exhaustion_checkpoint import (
+        bind_checkpoint_agent,
+        outage,
+    )
+
+    claim = _claim(input_seq=4, prior="processing", attempts=5, max_attempts=5)
+    final = outage()
+    executor, agent, client, _, rotate, complete, release = _install(
+        monkeypatch, claim, final
+    )
+    reset = await bind_checkpoint_agent(agent, claim, final, executor)
+    update = agent._graph.aupdate_state
+    read = agent._graph.aget_state
+    reads = 0
+
+    async def ambiguous_update(*args, **kwargs):
+        if stage == "after_commit":
+            await update(*args, **kwargs)
+        elif stage == "lease_loss":
+            executor._lease.mark_lost()
+            raise turn_executor.LeaseLostError("injected lost lease")
+        raise TimeoutError("injected checkpoint ambiguity")
+
+    async def unavailable_readback(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise TimeoutError("injected checkpoint read-back ambiguity")
+        return await read(*args, **kwargs)
+
+    if stage == "binding":
+        agent._worker_thread_config = None
+    elif stage == "readback":
+        agent._graph.aget_state = unavailable_readback
+    else:
+        agent._graph.aupdate_state = ambiguous_update
+    try:
+        await executor._serve_worker_claim(claim)
+        client.report_completion.assert_not_awaited()
+        complete.assert_not_awaited()
+        rotate.assert_not_awaited()
+        assert executor._worker_terminal_report_generation is None
+        assert executor._worker_exhaustion_checkpoint_generation == (
+            str(claim.unit_id),
+            claim.lease_token,
+        )
+        if stage == "lease_loss":
+            release.assert_not_awaited()
+        else:
+            release.assert_awaited_once_with(
+                executor._db,
+                unit_id=claim.unit_id,
+                lease_token=claim.lease_token,
+                park_on_exhaustion=False,
+            )
+        assert agent.cleanup_calls == [True]
+    finally:
+        turn_executor.current_lease.reset(reset)
 
 
 @pytest.mark.asyncio

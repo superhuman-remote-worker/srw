@@ -1197,6 +1197,7 @@ class StatelessTurnExecutor:
         self._worker_preempted = asyncio.Event()
         self._worker_preempt_status: Optional[str] = None
         self._worker_terminal_report_generation: tuple[str, int] | None = None
+        self._worker_exhaustion_checkpoint_generation: tuple[str, int] | None = None
         self._worker_container_report_uncertain = False
         self._worker_node_interrupted = False
         self._worker_completion_accepted_generation: tuple[str, int] | None = None
@@ -1898,6 +1899,7 @@ class StatelessTurnExecutor:
         self._worker_preempted = asyncio.Event()
         self._worker_preempt_status = None
         self._worker_terminal_report_generation = None
+        self._worker_exhaustion_checkpoint_generation = None
         self._worker_container_report_uncertain = False
         self._worker_node_interrupted = False
         self._worker_completion_accepted_generation = None
@@ -2008,13 +2010,18 @@ class StatelessTurnExecutor:
                 unit_id,
                 int(token),
             )
-            if report_started:
+            checkpoint_started = self._worker_exhaustion_checkpoint_generation == (
+                unit_id,
+                int(token),
+            )
+            if report_started or checkpoint_started:
                 if await self._hold_unaccepted_container_report(claim):
                     with contextlib.suppress(Exception):
                         await self._cleanup_worker_runtime(preserve_shell=True)
                     timing["outcome"] = "held:worker_execution_outcome_unknown"
                     return
-                # Once an HTTP report has begun, correction 8 owns every
+                # Once durable give-up sealing or an HTTP report has begun,
+                # correction 8 owns every
                 # ambiguous tail failure. Never issue a second report from
                 # this generation and never park it: preserve runtime state,
                 # release with backoff, and let a successor consume or
@@ -2034,11 +2041,19 @@ class StatelessTurnExecutor:
                     return
                 await self._release_worker_claim(
                     claim,
-                    reason="terminal_report_failed",
+                    reason=(
+                        "terminal_report_failed"
+                        if report_started
+                        else "giveup_checkpoint_unproven"
+                    ),
                     park_on_exhaustion=False,
                     timing=timing,
                 )
-                timing["outcome"] = "released:terminal_report_failed"
+                timing["outcome"] = (
+                    "released:terminal_report_failed"
+                    if report_started
+                    else "released:giveup_checkpoint_unproven"
+                )
                 return
             if str(self._lease.unit_id or "") != unit_id or int(
                 self._lease.lease_token
@@ -2455,6 +2470,19 @@ class StatelessTurnExecutor:
         unit = claim.unit
         job_id = str(unit.unit_id)
         token = unit.lease_token
+        if (
+            isinstance(final_state.get("error"), dict)
+            and final_state["error"].get("type") == "worker_retry_exhausted"
+            and isinstance(final_state.get("completion_report_payload"), dict)
+        ):
+            # A save may commit before its caller observes success. Mark this
+            # generation before sealing so an ambiguous checkpoint failure
+            # cannot fall back to a second, synthetic HTTP completion report.
+            self._worker_exhaustion_checkpoint_generation = (job_id, int(token))
+            agent = _pa()._agent
+            final_state = await agent.checkpoint_worker_retry_exhaustion(
+                job_id=job_id, lease_token=token, terminal_state=final_state
+            )
         wire_payload, payload_source = self._worker_completion_wire_payload(final_state)
         if wire_payload.get("should_stop") is not True:
             # Fail closed before marking this generation as report-started.

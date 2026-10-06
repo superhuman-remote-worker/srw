@@ -13,6 +13,9 @@ Key Features:
 """
 
 import asyncio
+from copy import deepcopy
+import hashlib
+import json
 import logging
 import math
 import os
@@ -22,6 +25,7 @@ from dataclasses import asdict, replace as _dc_replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
+from uuid import UUID
 
 import aiosqlite
 from langchain_core.language_models import BaseChatModel
@@ -54,6 +58,7 @@ from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
 from agent.graph import (
     WORKER_BATCH_MIN_WALL_SECONDS,
     build_phase_alternation_graph,
+    checkpoint_completion_report,
     hydrate_todo_manager_from_state,
     run_graph_with_streaming,
 )
@@ -355,6 +360,7 @@ class UniversalAgent:
         # Non-None only while the stateless worker driver owns an immutable
         # worker_batch lease.  The saver and remote shell both bind to it.
         self._worker_lease_token: Optional[int] = None
+        self._worker_thread_config: Optional[Dict[str, Any]] = None
         self._defer_job_cleanup = False
         self._worker_checkpoint_post_commit = None
         self._worker_env_restore: Dict[str, Optional[str]] = {}
@@ -911,11 +917,13 @@ class UniversalAgent:
             ):
                 raise ValueError("worker batch target must be positive")
             self._worker_lease_token = int(worker_lease_token)
+            self._worker_thread_config = None
             self._defer_job_cleanup = bool(defer_cleanup)
             self._worker_checkpoint_post_commit = worker_checkpoint_post_commit
             self._worker_shell_admission_retired = False
         else:
             self._worker_lease_token = None
+            self._worker_thread_config = None
             self._defer_job_cleanup = False
             self._worker_checkpoint_post_commit = None
 
@@ -1086,6 +1094,8 @@ class UniversalAgent:
                 },
                 "recursion_limit": 1000000,  # Effectively unlimited
             }
+            if stateless_worker:
+                self._worker_thread_config = deepcopy(thread_config)
 
             # Check if we should resume from phase snapshot or use checkpoint directly
             # Graceful stops (cancel/pause/review) have a valid checkpoint.db with current todos,
@@ -1738,6 +1748,11 @@ class UniversalAgent:
             )
             prior_cause = worker_error_cause(error)
             return {
+                **{
+                    key: values[key]
+                    for key in ("client_report_id", "completion_report_payload")
+                    if key in values
+                },
                 "job_id": job_id,
                 "should_stop": True,
                 "goal_achieved": False,
@@ -1848,6 +1863,109 @@ class UniversalAgent:
             cap,
         )
         return None
+
+    async def checkpoint_worker_retry_exhaustion(
+        self,
+        *,
+        job_id: str,
+        lease_token: int,
+        terminal_state: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Seal a native give-up at END before reporting its distinct operation.
+
+        The prior report remains provenance (identity + payload digest); it is
+        never reused for changed semantics. A successor adopts the durable new
+        pair rather than minting another identity or executing graph work.
+        """
+        from agent.api.lease_context import LeaseLostError
+        from agent.core.fenced_checkpointer import FencedAsyncPostgresSaver
+
+        saver = self._checkpointer
+        config = getattr(self, "_worker_thread_config", None)
+        if (
+            self._current_job_id != job_id
+            or self._worker_lease_token != lease_token
+            or not isinstance(saver, FencedAsyncPostgresSaver)
+            or saver.unit_id != job_id
+            or saver.lease_token != lease_token
+            or self._graph is None
+            or self._graph.checkpointer is not saver
+            or not isinstance(config, dict)
+            or config.get("configurable", {}).get("thread_id") != job_id
+        ):
+            raise LeaseLostError("Worker give-up checkpoint ownership is unproven")
+        saver._bound_handle()
+        snapshot = await self._graph.aget_state(config)
+        values = dict(snapshot.values or {})
+        payload = values.get("completion_report_payload")
+        report_id = values.get("client_report_id")
+        fields = {"should_stop", "goal_achieved", "error", "freeze_data"}
+        if (
+            snapshot.next
+            or not isinstance(payload, dict)
+            or set(payload) != fields
+            or not isinstance(report_id, str)
+            or str(UUID(report_id)) != report_id
+        ):
+            raise RuntimeError("Worker give-up requires a sealed canonical END")
+
+        freeze = payload.get("freeze_data")
+        freeze_type = freeze.get("freeze_type") if isinstance(freeze, dict) else None
+        error = payload.get("error")
+        recoverable = bool(
+            (isinstance(error, dict) and error.get("recoverable") is True)
+            or freeze_type in AUTO_CONTINUE_FREEZE_TYPES
+        )
+        human_freeze = bool(
+            freeze_type and freeze_type not in AUTO_CONTINUE_FREEZE_TYPES
+        )
+        if payload.get("goal_achieved") is True or (
+            payload.get("should_stop") is True and (human_freeze or not recoverable)
+        ):
+            # Includes an already durable give-up, genuine success and human
+            # ENDs. Preserve their exact operation, including above the cap.
+            saver._bound_handle()
+            return values
+        if report_id != terminal_state.get("client_report_id"):
+            raise RuntimeError("Worker give-up source report changed")
+        terminal_error = terminal_state.get("error")
+        terminal_freeze = terminal_state.get("freeze_data")
+        if (
+            terminal_state.get("should_stop") is not True
+            or terminal_state.get("goal_achieved") is not False
+            or not isinstance(terminal_error, dict)
+            or terminal_error.get("type") != "worker_retry_exhausted"
+            or terminal_error.get("recoverable") is not False
+            or not isinstance(terminal_freeze, dict)
+            or terminal_freeze.get("freeze_type") != "worker_retry_exhausted"
+        ):
+            raise RuntimeError("Worker give-up report is unproven")
+        updates = {key: deepcopy(terminal_state[key]) for key in fields}
+        updates["freeze_data"].update(
+            prior_client_report_id=report_id,
+            prior_report_payload_sha256=hashlib.sha256(
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    allow_nan=False,
+                ).encode()
+            ).hexdigest(),
+            prior_freeze=deepcopy(freeze),
+        )
+        updates.update(client_report_id=None, completion_report_payload=None)
+        updates.update(checkpoint_completion_report(updates))
+        await self._graph.aupdate_state(
+            config, updates, as_node="checkpoint_completion_report"
+        )
+        persisted = await self._graph.aget_state(config)
+        if persisted.next or any(
+            persisted.values.get(key) != value for key, value in updates.items()
+        ):
+            raise RuntimeError("Worker give-up checkpoint read-back is unproven")
+        saver._bound_handle()
+        return dict(persisted.values)
 
     async def _make_checkpointer(self, job_id: str) -> None:
         """Create the LangGraph checkpointer for this job per CHECKPOINTER_BACKEND.
@@ -2196,6 +2314,7 @@ class UniversalAgent:
         self._tool_context = None
         self._tools = None
         self._graph = None
+        self._worker_thread_config = None
         self._worker_checkpoint_post_commit = None
         self._defer_job_cleanup = False
 
