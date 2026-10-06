@@ -1,0 +1,70 @@
+{
+  "date": "2026-10-06",
+  "slice": "templates follow-ups",
+  "commit": "78bd8302b on develop (fixes under test: 2c6a84984, 39f1b1c60, 84c7e00ed, d51dfd94c, 87df35e19, 6f4a82a5c, 5a6d5489e, dd7e1c5eb, 4e0646727)",
+  "stack": "local k3d (k3d-srw/srw), Tilt-built; agent srw-agent:tilt-7d95e8f8445d8a93; workspace base srw-workspace-minimal:tilt-7e7d19b52f06906a; CONTAINER_STARTUP_STAGE_AUTHORITY_ENABLED=false",
+  "caller": "REST via orchestrator pod (X-Internal-Key + X-MCP-User-Id impersonating admin 6ed1b6f4-4931-461f-ba92-1d98f062af10); cockpit https://localhost as test/test via Node Playwright",
+  "image": {
+    "built": "localhost:5005/d3-exit-check:1.0 (FROM minimal base, ENTRYPOINT [\"true\"])",
+    "digest": "sha256:ad349e5e5d1d5a6ec3b3123a284a654dda53c50187297205ecc404cd24ee00a3",
+    "templateRef": "srw-registry:5000/d3-exit-check@sha256:ad349e5e5d1d5a6ec3b3123a284a654dda53c50187297205ecc404cd24ee00a3"
+  },
+  "checks": [
+    {
+      "step": "A2 exit-code failure",
+      "how": "template d3-exit-check (Mine, 1cpu/2Gi/10Gi); POST /api/jobs on it",
+      "observed": "Job a9665feb-0b6c-409a-9619-1b9e42005682 created 09:11:05Z -> failed 09:11:15Z (~10 s). error_message: 'Workspace container exited with code 0 (Completed) before it became ready. A workspace image must keep running: build it FROM an SRW base image and don't override its ENTRYPOINT or USER.' Pod workspace-a9665feb-0b6: phase Succeeded, terminated exitCode 0 reason Completed",
+      "result": "pass"
+    },
+    {
+      "step": "A4 cockpit",
+      "how": "Playwright /jobs list, click row -> detail panel (before delete); screenshots live/a-jobs-list.png, live/a-job-detail.png (scratchpad)",
+      "observed": "List row shows 'Reason: Workspace container exited with code 0 ...'; detail panel shows 'Why it failed' with the full message",
+      "result": "pass"
+    },
+    {
+      "step": "A3 delete + cleanup",
+      "how": "DELETE /api/jobs/<id>; kubectl get pod,pvc,svc | grep a9665feb-0b6",
+      "observed": "First DELETE 503 'Workspace authority retirement is incomplete'; retry 5 s later 200 deleted. Pod, PVC, Service gone by the next check (<1 min)",
+      "result": "pass (one transient 503, as briefed)"
+    },
+    {
+      "step": "B1 precondition",
+      "how": "md5 config/skills/verify-before-done/SKILL.md vs /app/config/skills/... in deploy/srw-agent-stateless; polled 11:13-11:43 CEST",
+      "observed": "repo 7da427db... vs image 26f75b00... for 30 min; AGENT_IMAGE unchanged srw-agent:tilt-7d95e8f8445d8a93 (built before 87df35e19)",
+      "result": "NOT RUN (stale image)"
+    },
+    {
+      "step": "B2/B3 shell-less trial Job",
+      "how": "-",
+      "observed": "not run",
+      "result": "not run"
+    },
+    {
+      "step": "C1 labels",
+      "how": "/workspaces/new, getByLabel(...)",
+      "observed": "Name, Display name, Description, Image, Memory/Disk/CPU (exact), Tier, Save to each resolve to one INPUT/SELECT (substring 'CPU' and 'Memory' also match Guaranteed CPU/memory; 'Name' also matches Display name). Real labels: 'Name *', 'Image *' (exact match needs the asterisk)",
+      "result": "pass"
+    },
+    {
+      "step": "C2 custom-image notice",
+      "how": "fill Image=python:3.12-slim",
+      "observed": "Notice contains exactly: Try a new image with a Job first. A Job shows why its workspace didn't start; a Session may not. (screenshot live/c2-custom-image-notice.png)",
+      "result": "pass"
+    },
+    {
+      "step": "C3 Job form note",
+      "how": "/jobs/new; Workspace select (aria-label Workspace)",
+      "observed": "Default expert + Default picker: no note. Pick Container (minimal): 'This Expert has no shell tools, so the Job can't run commands in this workspace. To try an image, pick an Expert with the shell tools, such as Engineer.' Switch Expert to Engineer (picker still container-minimal): note gone. Picker back to Default: no note. Form not submitted. Screenshots live/c3-*.png. Caveat: the final 'back to Default' step was done with Engineer still selected, not the default Expert; default+Default was checked as the initial state",
+      "result": "pass"
+    },
+    {
+      "step": "C4 CPU 0x10",
+      "how": "template form CPU=0x10, Name=zz-cpu-check, Save",
+      "observed": "No error on blur; on Save form stays on /workspaces/new with 'CPU must be a number above 0'; no zz-cpu-check template created (live/c4-*.png)",
+      "result": "pass"
+    }
+  ],
+  "envNotes": "Stale agent image blocked Part B. Orchestrator pod unchanged since 08:47Z during the run. A pending srw-garage-bootstrap pod and three old Failed ws-thread pods are unrelated.",
+  "cleanup": "Job deleted; template d3-exit-check deleted (200); podman image localhost:5005/d3-exit-check:1.0 removed locally; pushed image d3-exit-check@sha256:ad349e5e... left in the local registry"
+}
