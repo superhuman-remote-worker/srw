@@ -443,6 +443,13 @@ pulled (see below). Startup-stage tracking is Helm
     a kept volume, keeps them.
   - Deleting the Job during that minute may return 503 once; retry and it
     succeeds.
+  - Without startup-stage tracking, a Job's first creation whose container
+    exits before it becomes ready fails with "Workspace container exited with
+    code `<code>` (`<reason>`) before it became ready. A workspace image must
+    keep running: build it FROM an SRW base image and don't override its
+    ENTRYPOINT or USER." Its pod, service and volume are then cleaned up the
+    same way. A restored Job, or one recreated over a kept volume, keeps waiting
+    instead (see below).
   - With startup-stage tracking, the Job doesn't fail by itself. It stays
     **Created** and the Jobs list shows "Workspace needs attention: its image is
     invalid." at once for a malformed reference, or "Workspace needs attention:
@@ -503,8 +510,10 @@ pulled (see below). Startup-stage tracking is Helm
 - **Other start failures give no error.** When a templated Job's pod never
   becomes ready for another reason, the Job stays **Created** with no error
   until you cancel it or its execution deadline passes. Examples:
-  - an image without the workspace contract, whose container exits or never
-    opens sshd;
+  - an image without the workspace contract whose container keeps running but
+    never opens sshd;
+  - a container that exits, when startup-stage tracking is on or the Job was
+    restored or recreated over a kept volume;
   - resources no node can fit, when no `LimitRange` rejects them.
 
   Without startup-stage tracking, its workspace stays `creating` and the Jobs
