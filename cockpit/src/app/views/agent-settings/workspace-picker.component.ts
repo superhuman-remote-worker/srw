@@ -45,6 +45,8 @@ function builtinsFirst(items: WorkspaceTemplateItem[]): WorkspaceTemplateItem[] 
 
 /** The create forms' workspace choice (spec §4). Loads the templates it offers
  *  and the Project's defaults itself, so every create surface embeds it the same way. */
+let nextPickerId = 0;
+
 @Component({
   selector: 'app-workspace-picker',
   standalone: true,
@@ -83,8 +85,8 @@ function builtinsFirst(items: WorkspaceTemplateItem[]): WorkspaceTemplateItem[] 
       <app-workspace-template-form purpose="inline" [value]="draft()" (valueChange)="draft.set($event)"
         [vmAllowed]="vmAllowed()" [vmUnavailableReasonKey]="vmReasonKey()" [srwImages]="images()"
         [showErrors]="draftTried()" [serverErrors]="draftErrors()" />
-      <app-form-field [label]="'agentSettings.workspacePicker.saveName' | transloco" [error]="nameError()">
-        <app-input [value]="draft().name" (valueChange)="patchDraft({name: $event})" />
+      <app-form-field [forId]="saveNameId" [label]="'agentSettings.workspacePicker.saveName' | transloco" [error]="nameError()">
+        <app-input [inputId]="saveNameId" [value]="draft().name" (valueChange)="patchDraft({name: $event})" />
       </app-form-field>
       </div>
       <div appDialogActions>
@@ -100,6 +102,7 @@ function builtinsFirst(items: WorkspaceTemplateItem[]): WorkspaceTemplateItem[] 
   `],
 })
 export class WorkspacePickerComponent {
+  protected readonly saveNameId = `srw-workspace-picker-save-name-${nextPickerId++}`;
   private readonly api = inject(ApiService);
   private readonly transloco = inject(TranslocoService);
   private readonly users = inject(UserService);

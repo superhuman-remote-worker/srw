@@ -27,6 +27,7 @@ export type InputSize = 'sm' | 'md' | 'lg';
   template: `
     <input
       #inputEl
+      [attr.id]="inputId() || null"
       class="app-input__field"
       [type]="type()"
       [value]="value()"
@@ -64,6 +65,8 @@ export class AppInputComponent {
   invalid = input<boolean>(false);
   fullWidth = input<boolean>(true);
   ariaLabel = input<string>('');
+  /** `id` of the native control, so an `<app-form-field [forId]>` label can point at it. */
+  inputId = input<string>('');
   autocomplete = input<string>('');
   inputmode = input<string>('');
   /** Optional <datalist> id for combobox-style preset suggestions (free entry still allowed). */

@@ -27,13 +27,13 @@ let nextFormId = 0;
       }
       @if (purpose() === 'resource') {
         <div class="row">
-          <app-form-field [label]="'workspaces.form.name' | transloco" [required]="true"
+          <app-form-field [forId]="id('name')" [label]="'workspaces.form.name' | transloco" [required]="true"
             [hint]="'workspaces.form.nameHint' | transloco" [error]="fieldError('name')">
-            <app-input [value]="value().name" [disabled]="readOnly() || identityLocked()"
+            <app-input [inputId]="id('name')" [value]="value().name" [disabled]="readOnly() || identityLocked()"
               (valueChange)="patch({name: $event})" />
           </app-form-field>
-          <app-form-field [label]="'workspaces.form.saveTo' | transloco">
-            <app-select [value]="scopeKey()" [disabled]="readOnly() || identityLocked()" (changed)="setScope($event)">
+          <app-form-field [forId]="id('saveTo')" [label]="'workspaces.form.saveTo' | transloco">
+            <app-select [inputId]="id('saveTo')" [value]="scopeKey()" [disabled]="readOnly() || identityLocked()" (changed)="setScope($event)">
               @for (o of scopeOptions(); track o.key) {
                 <option [value]="o.key">{{ o.label }}</option>
               }
@@ -41,26 +41,26 @@ let nextFormId = 0;
           </app-form-field>
         </div>
         <div class="row">
-          <app-form-field [label]="'workspaces.form.displayName' | transloco">
-            <app-input [value]="value().displayName" [disabled]="readOnly()" (valueChange)="patch({displayName: $event})" />
+          <app-form-field [forId]="id('displayName')" [label]="'workspaces.form.displayName' | transloco">
+            <app-input [inputId]="id('displayName')" [value]="value().displayName" [disabled]="readOnly()" (valueChange)="patch({displayName: $event})" />
           </app-form-field>
-          <app-form-field [label]="'workspaces.form.description' | transloco">
-            <app-input [value]="value().description" [disabled]="readOnly()" (valueChange)="patch({description: $event})" />
+          <app-form-field [forId]="id('description')" [label]="'workspaces.form.description' | transloco">
+            <app-input [inputId]="id('description')" [value]="value().description" [disabled]="readOnly()" (valueChange)="patch({description: $event})" />
           </app-form-field>
         </div>
       }
-      <app-form-field [label]="'workspaces.form.tier' | transloco" [error]="fieldError('backend')"
+      <app-form-field [forId]="id('tier')" [label]="'workspaces.form.tier' | transloco" [error]="fieldError('backend')"
         [hint]="vmAllowed() ? '' : (vmUnavailableReasonKey() | transloco)">
-        <app-select [value]="value().backend" [disabled]="readOnly()" (changed)="setBackend($event)">
+        <app-select [inputId]="id('tier')" [value]="value().backend" [disabled]="readOnly()" (changed)="setBackend($event)">
           <option value="sandbox">{{ 'workspaces.tier.container' | transloco }}</option>
           <option value="vm" [disabled]="!vmAllowed()">{{ 'workspaces.tier.vm' | transloco }}</option>
           <option value="virtual">{{ 'workspaces.tier.virtual' | transloco }}</option>
         </app-select>
       </app-form-field>
       @if (value().backend !== 'virtual') {
-        <app-form-field [label]="'workspaces.form.image' | transloco" [required]="true"
+        <app-form-field [forId]="id('image')" [label]="'workspaces.form.image' | transloco" [required]="true"
           [hint]="'workspaces.form.imageHint' | transloco" [error]="fieldError('image')">
-          <app-input [value]="value().image" [list]="listId" [disabled]="readOnly()" (valueChange)="patch({image: $event})" />
+          <app-input [inputId]="id('image')" [value]="value().image" [list]="listId" [disabled]="readOnly()" (valueChange)="patch({image: $event})" />
           <datalist [id]="listId">
             @for (i of suggestedImages(); track i) {
               <option [value]="i"></option>
@@ -78,29 +78,29 @@ let nextFormId = 0;
           </div>
         }
         <div class="row three">
-          <app-form-field [label]="'workspaces.form.cpu' | transloco" [error]="fieldError('cpu')">
-            <app-input [value]="value().cpu" inputmode="decimal" [disabled]="readOnly()" (valueChange)="patch({cpu: $event})" />
+          <app-form-field [forId]="id('cpu')" [label]="'workspaces.form.cpu' | transloco" [error]="fieldError('cpu')">
+            <app-input [inputId]="id('cpu')" [value]="value().cpu" inputmode="decimal" [disabled]="readOnly()" (valueChange)="patch({cpu: $event})" />
           </app-form-field>
-          <app-form-field [label]="'workspaces.form.memory' | transloco" [hint]="'workspaces.form.quantityHint' | transloco" [error]="fieldError('memory')">
-            <app-input [value]="value().memory" placeholder="4Gi" [disabled]="readOnly()" (valueChange)="patch({memory: $event})" />
+          <app-form-field [forId]="id('memory')" [label]="'workspaces.form.memory' | transloco" [hint]="'workspaces.form.quantityHint' | transloco" [error]="fieldError('memory')">
+            <app-input [inputId]="id('memory')" [value]="value().memory" placeholder="4Gi" [disabled]="readOnly()" (valueChange)="patch({memory: $event})" />
           </app-form-field>
-          <app-form-field [label]="'workspaces.form.storage' | transloco" [hint]="'workspaces.form.quantityHint' | transloco" [error]="fieldError('storage')">
-            <app-input [value]="value().storage" placeholder="20Gi" [disabled]="readOnly()" (valueChange)="patch({storage: $event})" />
+          <app-form-field [forId]="id('storage')" [label]="'workspaces.form.storage' | transloco" [hint]="'workspaces.form.quantityHint' | transloco" [error]="fieldError('storage')">
+            <app-input [inputId]="id('storage')" [value]="value().storage" placeholder="20Gi" [disabled]="readOnly()" (valueChange)="patch({storage: $event})" />
           </app-form-field>
         </div>
         <details class="advanced">
           <summary>{{ 'workspaces.form.advanced' | transloco }}</summary>
           @if (value().backend === 'sandbox') {
             <div class="row">
-              <app-form-field [label]="'workspaces.form.requestCpu' | transloco" [hint]="'workspaces.form.requestHint' | transloco" [error]="fieldError('requestCpu')">
-                <app-input [value]="value().requestCpu" inputmode="decimal" [disabled]="readOnly()" (valueChange)="patch({requestCpu: $event})" />
+              <app-form-field [forId]="id('requestCpu')" [label]="'workspaces.form.requestCpu' | transloco" [hint]="'workspaces.form.requestHint' | transloco" [error]="fieldError('requestCpu')">
+                <app-input [inputId]="id('requestCpu')" [value]="value().requestCpu" inputmode="decimal" [disabled]="readOnly()" (valueChange)="patch({requestCpu: $event})" />
               </app-form-field>
-              <app-form-field [label]="'workspaces.form.requestMemory' | transloco" [error]="fieldError('requestMemory')">
-                <app-input [value]="value().requestMemory" placeholder="1Gi" [disabled]="readOnly()" (valueChange)="patch({requestMemory: $event})" />
+              <app-form-field [forId]="id('requestMemory')" [label]="'workspaces.form.requestMemory' | transloco" [error]="fieldError('requestMemory')">
+                <app-input [inputId]="id('requestMemory')" [value]="value().requestMemory" placeholder="1Gi" [disabled]="readOnly()" (valueChange)="patch({requestMemory: $event})" />
               </app-form-field>
             </div>
-            <app-form-field [label]="'workspaces.form.pullPolicy' | transloco" [error]="fieldError('pullPolicy')">
-              <app-select [value]="value().pullPolicy" [disabled]="readOnly()" (changed)="patch({pullPolicy: pullPolicyOf($event)})">
+            <app-form-field [forId]="id('pullPolicy')" [label]="'workspaces.form.pullPolicy' | transloco" [error]="fieldError('pullPolicy')">
+              <app-select [inputId]="id('pullPolicy')" [value]="value().pullPolicy" [disabled]="readOnly()" (changed)="patch({pullPolicy: pullPolicyOf($event)})">
                 <option value="">{{ 'workspaces.form.pullPolicyDefault' | transloco }}</option>
                 <option value="IfNotPresent">IfNotPresent</option>
                 <option value="Always">Always</option>
@@ -109,8 +109,8 @@ let nextFormId = 0;
             </app-form-field>
           }
           @if (value().backend === 'vm') {
-            <app-form-field [label]="'workspaces.form.setupSteps' | transloco" [hint]="'workspaces.form.setupStepsHint' | transloco" [error]="fieldError('setupLines')">
-              <app-textarea [value]="value().setupLines" [rows]="5" [disabled]="readOnly()" (valueChange)="patch({setupLines: $event})" />
+            <app-form-field [forId]="id('setupLines')" [label]="'workspaces.form.setupSteps' | transloco" [hint]="'workspaces.form.setupStepsHint' | transloco" [error]="fieldError('setupLines')">
+              <app-textarea [inputId]="id('setupLines')" [value]="value().setupLines" [rows]="5" [disabled]="readOnly()" (valueChange)="patch({setupLines: $event})" />
             </app-form-field>
           }
         </details>
@@ -143,13 +143,18 @@ export class WorkspaceTemplateFormComponent {
   readonly serverErrors = input<Partial<Record<FormField, string>>>({});
   readonly showErrors = input(false);
 
+  /** One id per field, unique per form instance, so each label can point at its control. */
+  protected id(field: string): string {
+    return `${this.listId}-${field}`;
+  }
+
   protected readonly listId = `srw-workspace-images-${nextFormId++}`;
   readonly errors = computed(() => validateTemplateForm(this.value()));
   readonly valid = computed(() => Object.keys(this.errors()).length === 0);
   readonly suggestedImages = computed(() => this.srwImages()[this.value().backend] ?? []);
   readonly customImage = computed(() => {
     const v = this.value();
-    return v.backend !== 'virtual' && v.image.trim() !== '' && !isSrwImage(v.image, this.suggestedImages());
+    return v.backend !== 'virtual' && v.image.trim() !== '' && this.suggestedImages().length > 0 && !isSrwImage(v.image, this.suggestedImages());
   });
   protected readonly scopeKey = computed(() => `${this.value().scope.kind}/${this.value().scope.name}`);
 

@@ -48,6 +48,7 @@ export function syncOnOptionChange(
   template: `
     <select
       #selectEl
+      [attr.id]="inputId() || null"
       class="app-select__field"
       [disabled]="disabled()"
       [required]="required()"
@@ -84,6 +85,8 @@ export class AppSelectComponent<T = string> implements AfterViewInit {
   invalid = input<boolean>(false);
   fullWidth = input<boolean>(true);
   ariaLabel = input<string>('');
+  /** `id` of the native control, so an `<app-form-field [forId]>` label can point at it. */
+  inputId = input<string>('');
 
   changed = output<T | null>();
   focused = output<FocusEvent>();
