@@ -56,6 +56,7 @@ from agent.services.memory import (
     MemoryRuntime,
 )
 from agent.tools.context import ToolContext
+from shared.runtime.core.message_markers import is_compaction_summary
 from tests._fs_backend import FilesystemTestBackend
 from tests._memory_fixtures import (
     PROJECT_ID,
@@ -765,11 +766,7 @@ class TestWorkerExecuteWiring:
 
         summarised = await mgr.summarize_and_compact(history, _mock_aux())
         kept = [m for m in summarised if not isinstance(m, RemoveMessage)]
-        summary_idx = next(
-            i
-            for i, m in enumerate(kept)
-            if isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
-        )
+        summary_idx = next(i for i, m in enumerate(kept) if is_compaction_summary(m))
         blocks = protected(kept)
         assert len(blocks) == 1
         assert kept.index(blocks[0]) == summary_idx + 1

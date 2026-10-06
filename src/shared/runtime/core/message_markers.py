@@ -21,6 +21,8 @@ apart on the spelling:
   region it sat in is summarised — provided its phase key is the current
   one. Today's only producer is the worker's ``phase_start`` binding
   (``src/core/workspace_injection.create_phase_instruction_message``).
+- ``COMPACTION_SUMMARY_KEY`` — the compaction summary, handed back as a
+  ``HumanMessage`` but runtime-authored (``is_compaction_summary``).
 
 Marker contract (``additional_kwargs`` of a phase instruction block)::
 
@@ -51,6 +53,14 @@ PERSIST_ROLE_EVENT = "event"
 # A typed context entry (src/shared/runtime/core/context_entries.py): folded
 # into its carrier at request build, never a user turn.
 PERSIST_ROLE_CONTEXT = "context"
+
+# Compaction summary marker. The summary is handed back as a HumanMessage
+# (the role the vendor harnesses use) and recognized by this key, never by its
+# text: a request copy can carry folded context entries after it. Histories
+# from before the change hold a SystemMessage that starts with
+# LEGACY_SUMMARY_PREFIX; is_compaction_summary accepts both forms.
+COMPACTION_SUMMARY_KEY = "srw_compaction_summary"
+LEGACY_SUMMARY_PREFIX = "[Summary of prior work]"
 
 # Protected-message markers (see module docstring).
 PROTECTED_KEY = "srw_protected"
@@ -182,6 +192,24 @@ def pin_turn_input(message: Any) -> Any:
     return message
 
 
+def is_compaction_summary(message: Any) -> bool:
+    """True for a compaction summary: the marked hand-back or the legacy form.
+
+    The legacy form is a ``SystemMessage`` whose text starts with
+    ``LEGACY_SUMMARY_PREFIX``. It is runtime-authored, not a user turn, so
+    consumers looking for "what the user said" must skip it.
+    """
+    kwargs = getattr(message, "additional_kwargs", None)
+    if isinstance(kwargs, dict) and kwargs.get(COMPACTION_SUMMARY_KEY):
+        return True
+    content = getattr(message, "content", None)
+    return (
+        getattr(message, "type", None) == "system"
+        and isinstance(content, str)
+        and content.startswith(LEGACY_SUMMARY_PREFIX)
+    )
+
+
 def unpin_turn_input(message: Any) -> Any:
     """Remove the pin :func:`pin_turn_input` set; leaves other pins alone."""
     kwargs = getattr(message, "additional_kwargs", None)
@@ -191,8 +219,10 @@ def unpin_turn_input(message: Any) -> Any:
 
 
 __all__ = [
+    "COMPACTION_SUMMARY_KEY",
     "COMPACTION_VIEW_KEY",
     "INSTRUCTION_PATH_KEY",
+    "LEGACY_SUMMARY_PREFIX",
     "PERSIST_ROLE_CONTEXT",
     "PERSIST_ROLE_EVENT",
     "PERSIST_ROLE_KEY",
@@ -200,6 +230,7 @@ __all__ = [
     "PROTECTED_KEY",
     "PROTECTED_TURN_INPUT",
     "TURN_MEMBERSHIP_KEY",
+    "is_compaction_summary",
     "is_compaction_view",
     "is_pinned_for_phase",
     "is_protected_message",

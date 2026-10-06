@@ -27,7 +27,6 @@ from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
     RemoveMessage,
-    SystemMessage,
     ToolMessage,
 )
 
@@ -48,6 +47,7 @@ from agent.managers.todo import (
 from agent.tools.context import ToolContext
 from agent.tools.core.todo import create_todo_tools
 from tests._fs_backend import FilesystemTestBackend
+from shared.runtime.core.message_markers import is_compaction_summary
 
 
 def _offline_workspace() -> MagicMock:
@@ -475,8 +475,7 @@ class TestCompactionRestatesTheList:
         )
 
         kept = [m for m in result if not isinstance(m, RemoveMessage)]
-        assert isinstance(kept[0], SystemMessage)
-        assert kept[0].content.startswith("[Summary of prior work]")
+        assert is_compaction_summary(kept[0])
         restated = kept[1]
         assert isinstance(restated, HumanMessage) and restated.id is None
         assert restated.content == (

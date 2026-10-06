@@ -31,7 +31,6 @@ from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
     RemoveMessage,
-    SystemMessage,
     ToolMessage,
 )
 
@@ -51,6 +50,7 @@ from shared.runtime.core.context_entries import (
     make_context_entry,
 )
 from shared.runtime.core.injection_markers import MEMORY_TOOL_CALL_ID_PREFIX
+from shared.runtime.core.message_markers import is_compaction_summary
 
 MEMORY_BODY = "[m:3f9a2c] The brief lives in docs/brief.md."
 KNOWLEDGE_BODY = "Note: summaries are capped at 300 words."
@@ -306,8 +306,7 @@ class TestWorkerCompaction:
         result = await _manager().summarize_and_compact(history, aux)
 
         kept = [m for m in result if not isinstance(m, RemoveMessage)]
-        assert isinstance(kept[0], SystemMessage)
-        assert kept[0].content.startswith("[Summary of prior work]")
+        assert is_compaction_summary(kept[0])
         assert [type(m) for m in kept[1:]] == [AIMessage, ToolMessage, HumanMessage]
         copy = kept[-1]
         assert is_context_entry(copy) and copy.id is None  # appended fresh
@@ -414,7 +413,7 @@ class TestRestateAfterSummaryWithEntries:
         )
 
         kept = [m for m in result if not isinstance(m, RemoveMessage)]
-        assert isinstance(kept[0], SystemMessage)
+        assert is_compaction_summary(kept[0])
         restated = kept[1]
         assert restated.content.startswith(TODO_LIST_RESTATEMENT_LEAD)
         assert not is_context_entry(restated)  # never an entry, never folded

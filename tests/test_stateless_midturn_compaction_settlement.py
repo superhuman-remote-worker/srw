@@ -26,13 +26,14 @@ from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 
 from agent.api.persistent_app import _save_turn_ai_messages
 from agent.core.context import ContextConfig, ContextManager
 from agent.core.thread_messages import _serialize_message_row
 from agent.persistent_graph import PersistentLoopCallbacks, run_persistent_loop
 from shared.row_identity import _coerce_row_id
+from shared.runtime.core.message_markers import is_compaction_summary
 
 THREAD_ID = "11111111-2222-3333-4444-555555555555"
 INPUT_ID = "66666666-7777-8888-9999-000000000000"
@@ -283,11 +284,7 @@ class TestMidTurnCompactionSettlement:
     async def test_turn_settles_after_a_summary_covered_its_input(self):
         transcript, messages, _manager = await _run_one_compacting_turn()
 
-        summary_at = next(
-            i
-            for i, m in enumerate(messages)
-            if isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
-        )
+        summary_at = next(i for i, m in enumerate(messages) if is_compaction_summary(m))
         # The input sat in the summarised region; its pin re-seated it
         # verbatim right after the recap, with its accepted id.
         assert messages[summary_at + 1].id == INPUT_ID

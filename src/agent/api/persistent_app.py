@@ -8757,7 +8757,23 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
             # on the next pod recycle, and the session would answer a question
             # it can no longer see. (postgres_db's history query excludes only
             # 'summary' and 'error', so 'event' rows do reach here.)
-            restored.append(HumanMessage(content=content, id=msg_id))
+            # A compaction summary saved as a row (a forked child's seed) gets
+            # its marker back; rows persist no additional_kwargs.
+            from agent.core.context import (
+                SUMMARY_LEAD_IN,
+                make_summary_message,
+                summary_text,
+            )
+
+            if isinstance(content, str) and content.startswith(SUMMARY_LEAD_IN):
+                restored.append(
+                    make_summary_message(
+                        summary_text(HumanMessage(content=content)),
+                        message_id=msg_id,
+                    )
+                )
+            else:
+                restored.append(HumanMessage(content=content, id=msg_id))
 
         elif role == PERSIST_ROLE_CONTEXT:
             # A typed context entry (append-only context injection). The
@@ -8847,7 +8863,6 @@ async def _restore_session_messages() -> None:
 
     try:
         import uuid as _uuid
-        from langchain_core.messages import SystemMessage
 
         from agent.llm.response_guards import strip_removal_markers
 
@@ -8893,9 +8908,10 @@ async def _restore_session_messages() -> None:
                     f"boundary or a runaway tail) — bounded, but old context may drop"
                 )
 
-            summary_msg = SystemMessage(
-                content=f"[Summary of prior work]\n{ckpt['summary']}",
-                id=str(_uuid.uuid4()),
+            from agent.core.context import make_summary_message
+
+            summary_msg = make_summary_message(
+                ckpt["summary"], message_id=str(_uuid.uuid4())
             )
             restored: list = [summary_msg, *_db_rows_to_lc_messages(db_messages)]
 
@@ -9132,6 +9148,7 @@ def _select_turn_messages(
     walk saves it with the turn's rows and walks on to the input.
     """
     from shared.runtime.core.context_entries import is_context_entry
+    from shared.runtime.core.message_markers import is_compaction_summary
 
     input_id = str(turn_input_message_id) if turn_input_message_id else None
     if authoritative_turn_boundary and any(
@@ -9147,6 +9164,10 @@ def _select_turn_messages(
     to_save: List[Any] = []
     boundary_found = False
     for msg in reversed(messages):
+        if is_compaction_summary(msg):
+            # Runtime-authored and saved as the compaction checkpoint, never a
+            # turn row; a HumanMessage, but not the turn's boundary.
+            continue
         if authoritative_turn_boundary:
             if str(getattr(msg, "id", "")) == input_id:
                 boundary_found = True
