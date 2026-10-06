@@ -2789,7 +2789,9 @@ workspace:
     container: ""
     vm: ""
   # -- How long a custom workspace image may take to pull before a Job fails
-  # with the pull error. The installation image is prewarmed and unaffected.
+  # with the pull error (with startup-stage tracking, before the Job shows that
+  # its image didn't finish pulling in time). The installation image is
+  # prewarmed and unaffected.
   # The Job dispatcher runs at most two workspace creations at once, so two
   # slow or unpullable custom images can delay other new Job workspaces for up
   # to this budget. orchestrator.containerStartupStageAuthority.enabled frees
