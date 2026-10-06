@@ -20231,7 +20231,15 @@ class PostgresDB:
         runtime_incarnation: str,
         allow_existing_terminal_intent: bool = False,
     ) -> dict[str, Any] | None:
-        """Atomically hand one cancelled, exact runtime to cleanup authority."""
+        """Atomically hand one cancelled, exact runtime to cleanup authority.
+
+        With ``allow_existing_terminal_intent`` the creation closes onto the
+        sole cleanup intent its owner's terminal transition already admitted.
+        For a Job that owner is cancelled or failed: both are terminal, both
+        are admitted by ``terminal_owner_transition`` with a fingerprint whose
+        ``owner_status`` must match, and the caller opts in only with exact
+        Pod evidence (``_cancelled_creation_may_reuse_terminal_intent``).
+        """
 
         if type(allow_existing_terminal_intent) is not bool:
             return None
@@ -20418,8 +20426,12 @@ class PostgresDB:
                     # and admit this exact runtime's cleanup in one transaction.
                     # Preserve that sole cleanup generation; closing creation
                     # lets its ordinary guarded capture/termination continue.
-                    # The caller opts in only after proving a never-started
-                    # retained Pod with fresh storage under the mutation guard.
+                    # The caller opts in only with exact Pod evidence and fresh
+                    # storage under the mutation guard. A Job's owner may be
+                    # cancelled or failed: a creation that failed after its Pod
+                    # ran (it exited before Ready) leaves the same open,
+                    # cancelled creation and terminal intent, and the caller
+                    # accepts such a Job only once its Pod shows process zero.
                     try:
                         fingerprint = _strict_json_object(
                             pending.get("lifecycle_fingerprint"),
@@ -20436,7 +20448,11 @@ class PostgresDB:
                         )
                         or scope != "workspace_container"
                         or owner.get("owner_status")
-                        != ("cancelled" if owner_kind == "job" else "ended")
+                        not in (
+                            ("cancelled", "failed")
+                            if owner_kind == "job"
+                            else ("ended",)
+                        )
                         or reservation.get("operation_kind") != "create"
                         or current_runtime != runtime
                         or raw_runtime.get("status") != "retiring_process_zero"

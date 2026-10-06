@@ -8550,6 +8550,17 @@ class ContainerProvisioner:
         stopped_job = phase in {"Failed", "Succeeded"} and _pod_has_exact_process_zero(
             pod
         )
+        if owner.kind == "job" and not stopped_job:
+            # A failed Job reuses its terminal intent only with exact
+            # process-zero evidence: its creation failed on a stopped Pod (one
+            # that exited before Ready). Its live or never-started Pod stays
+            # held exactly as before a failed Job could hand off at all.
+            try:
+                job = await self._db.get_job(owner.id)
+            except Exception:
+                return False
+            if not job or str(job.get("status") or "") == "failed":
+                return False
         if (
             owner.kind == "job"
             and reservation.get("cancel_target_disposition") == "deleted"
