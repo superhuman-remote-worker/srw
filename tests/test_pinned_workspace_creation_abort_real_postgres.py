@@ -160,6 +160,11 @@ async def test_recorded_abort_recovers_old_partial_creation_without_rebinding(
         == generation
     )
     assert await db.get_thread(ids["thread"]) is None
+    # Immutable cleanup expectations survive the deletion they authorize.
+    assert await db.fetchval(
+        "SELECT public.pinned_retirement_external_cleanup_expected($1::jsonb,$2::uuid,$3::uuid)",
+        json.dumps(retirement["context"], default=str), retirement["generation"], retirement["token"]
+    ) is not None
     after = await db.fetchrow(
         "SELECT * FROM thread_workspace_provision_intents WHERE attempt_id=$1",
         before["attempt_id"],
