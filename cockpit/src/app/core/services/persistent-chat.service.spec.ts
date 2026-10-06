@@ -1724,6 +1724,29 @@ describe('PersistentChatService — createAndConnect()', () => {
   });
 });
 
+describe('PersistentChatService — draft create passes the VM flag', () => {
+  async function createFromDraft(choice: any) {
+    const {service} = createService();
+    const spy = vi.spyOn(service, 'createAndConnect').mockResolvedValue('thread-new');
+    service.draftDefaultsLoading.set(false);
+    service.draftDefaultsError.set(false);
+    service.draftDatasourceIds.set([]);
+    service.draftWorkspaceChoice.set(choice);
+    await (service as any)._createFromDraftSession('hello');
+    return spy;
+  }
+
+  it('passes vm:true to createAndConnect for a VM draft', async () => {
+    const spy = await createFromDraft({kind: 'ref', ref: {name: 'vm-full', scope: {kind: 'Catalog', name: 'shared'}}, backend: 'vm', label: 'vm-full'});
+    expect(spy.mock.calls[0][1]).toEqual({vm: true});
+  });
+
+  it('passes vm:false to createAndConnect for a container draft', async () => {
+    const spy = await createFromDraft({kind: 'ref', ref: {name: 'container-full', scope: {kind: 'Catalog', name: 'shared'}}, backend: 'sandbox', label: 'container-full'});
+    expect(spy.mock.calls[0][1]).toEqual({vm: false});
+  });
+});
+
 describe('PersistentChatService — resume navigation safety', () => {
   it('does not reconnect the resumed thread after navigation to another thread', async () => {
     const { service, mockHttp, sseInstances } = createService();
@@ -9966,6 +9989,17 @@ describe('PersistentChatService — usage.updated telemetry', () => {
     expect(ctx.service.usage()).toBeNull();
     // A null-threaded value must never match the draft's null threadId.
     expect(ctx.service.currentUsage()).toBeNull();
+  });
+
+  it("enterDraftSession clears the previous draft's project and workspace preview", async () => {
+    const ctx = await connectWithUsage('thread-old', {turn: 1, input_tokens: 10_000, output_tokens: 40});
+    ctx.service.draftProjectId.set('project-old');
+    ctx.service.draftWorkspacePreview.set({backend: 'vm', source: 'default', binding: null});
+
+    ctx.service.enterDraftSession();
+
+    expect(ctx.service.draftProjectId()).toBeNull();
+    expect(ctx.service.draftWorkspacePreview()).toBeNull();
   });
 
   it('starts a new thread’s accumulation from zero, not the old thread’s total', async () => {

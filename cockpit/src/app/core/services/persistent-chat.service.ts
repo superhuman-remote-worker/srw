@@ -2514,6 +2514,11 @@ export class PersistentChatService {
     this.creatingFromDraft = false;
     this.draftConnectorsEnabled.set(true);
     this.draftWorkspaceChoice.set({kind: 'default'});
+    // The previous draft's Project and workspace preview must not show on the new landing.
+    // (retryDraftDefaults must NOT reset draftProjectId: a Project template choice retries,
+    // and the picker would drop the choice when the Project id went null.)
+    this.draftProjectId.set(null);
+    this.draftWorkspacePreview.set(null);
     this.isDraftSession.set(true);
     // Resolve the default project and compatible connector defaults as one
     // fail-closed context. The composer remains usable for drafting, but
