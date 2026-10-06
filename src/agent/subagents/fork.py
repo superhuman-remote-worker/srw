@@ -3,8 +3,9 @@
 A pure function over a message list. The seed is the parent's DURABLE
 ``messages`` (the compacted list — never a prepared/transient copy):
 
-1. preserve every durable ``SystemMessage`` (a leading one is normally the
-   compacted ``[Summary of prior work]``; the parent's prompt is not durable);
+1. preserve every durable ``SystemMessage`` (the parent's prompt is not
+   durable; a leading one is a legacy compaction summary) and the compaction
+   summary's user-role hand-back, which steps 2 and 3 leave alone;
 2. drop protected phase blocks (``is_protected_message``), injected context
    (``is_context_injection``: the parent's context entries are the parent's;
    the child's own builds inject what it needs) and ``RemoveMessage``

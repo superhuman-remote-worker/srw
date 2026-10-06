@@ -2129,16 +2129,21 @@ async def assemble_memories(
 def _format_messages_for_extraction(messages: List[BaseMessage]) -> str:
     """Format messages into readable text for the extraction LLM.
 
-    Filters out injected context (typed entries and the legacy tail) to
-    focus on actual conversation content.
+    Filters out injected context (typed entries and the legacy tail) and the
+    compaction summary to focus on actual conversation content.
     """
     from shared.runtime.core.context_entries import is_context_injection
-    from shared.runtime.core.message_markers import is_protected_message
+    from shared.runtime.core.message_markers import (
+        is_compaction_summary,
+        is_protected_message,
+    )
 
     lines = []
     for msg in messages:
         if is_context_injection(msg):
             continue
+        if is_compaction_summary(msg):
+            continue  # derived from turns already extracted, not a user turn
         if is_protected_message(msg):
             continue  # phase instruction block — guidance, not conversation
 

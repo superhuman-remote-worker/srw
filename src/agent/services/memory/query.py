@@ -24,6 +24,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from agent.services.memory.types import TaskFrame
 from shared.runtime.core.context_entries import is_context_injection
+from shared.runtime.core.message_markers import is_compaction_summary
 
 #: Defaults mirror QueryConfig (src/core/loader.py) — callers normally
 #: pass the configured values; these keep the function usable standalone.
@@ -104,7 +105,8 @@ def build_exchange_query_text(
 ) -> str:
     """Query of a session's idle-time prefetch: the latest exchange (D24).
 
-    The newest user message (not injected context) and the assistant's
+    The newest user message (not injected context, not the compaction
+    summary) and the assistant's
     final answer after it, each capped at ``max_chars_per_message``,
     joined by a blank line ("" when the history holds neither). The answer
     is the newest AIMessage after that user message with text content;
@@ -113,7 +115,11 @@ def build_exchange_query_text(
     user_index: Optional[int] = None
     for index in range(len(messages) - 1, -1, -1):
         msg = messages[index]
-        if isinstance(msg, HumanMessage) and not is_context_injection(msg):
+        if (
+            isinstance(msg, HumanMessage)
+            and not is_context_injection(msg)
+            and not is_compaction_summary(msg)
+        ):
             user_index = index
             break
     parts: List[str] = []

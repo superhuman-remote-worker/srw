@@ -58,6 +58,7 @@ from shared.runtime.core.injection_markers import (
 from shared.runtime.core.message_markers import (
     PERSIST_ROLE_CONTEXT,
     PERSIST_ROLE_KEY,
+    is_compaction_summary,
 )
 
 logger = logging.getLogger(__name__)
@@ -363,11 +364,17 @@ def is_context_injection(msg: Any) -> bool:
 def last_user_text(messages: Sequence[BaseMessage]) -> str:
     """Text of the newest HumanMessage that is not injected context.
 
-    List (multimodal) content is string-coerced, as the retrieval query
-    builders always did; "" when there is none.
+    The compaction summary is a HumanMessage too, but runtime-authored: it is
+    skipped, or a worker compacting mid-phase would query memory with the
+    whole summary. List (multimodal) content is string-coerced, as the
+    retrieval query builders always did; "" when there is none.
     """
     for msg in reversed(messages):
-        if isinstance(msg, HumanMessage) and not is_context_injection(msg):
+        if (
+            isinstance(msg, HumanMessage)
+            and not is_context_injection(msg)
+            and not is_compaction_summary(msg)
+        ):
             content = msg.content
             return content if isinstance(content, str) else str(content)
     return ""

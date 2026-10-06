@@ -42,6 +42,11 @@ from shared.runtime.core.image_tokens import (
     split_text_and_images,
 )
 from shared.runtime.core.message_markers import (
+    COMPACTION_SUMMARY_KEY,
+    LEGACY_SUMMARY_PREFIX,
+    PERSIST_ROLE_EVENT,
+    PERSIST_ROLE_KEY,
+    is_compaction_summary,
     is_pinned_for_phase,
     is_protected_message,
     mark_compaction_view,
@@ -55,34 +60,69 @@ logger = logging.getLogger(__name__)
 RestateAfterSummary = Callable[[List[BaseMessage]], List[BaseMessage]]
 
 
-def is_compaction_summary(message: BaseMessage) -> bool:
-    """True for the ``[Summary of prior work]`` SystemMessage compaction writes."""
-    content = getattr(message, "content", None)
-    return (
-        isinstance(message, SystemMessage)
-        and isinstance(content, str)
-        and content.startswith("[Summary of prior work]")
+# The hand-back around a compaction summary: one Claude-style wrapper for every
+# family (owner, 2026-10-06), our own text in Claude Code's shape: a lead-in,
+# the summary, a continue line, all in one user message ahead of the kept
+# messages. Per-family wrappers are deferred
+# (knowledge-base/knowledge/features/compaction_keep_policy_and_handback_formats.md).
+SUMMARY_LEAD_IN = (
+    "Earlier turns of this conversation were compacted to free up context. "
+    "The summary below records them; the messages after it continue the "
+    "conversation verbatim."
+)
+SUMMARY_CONTINUE = (
+    "Continue from where the work stopped. Do not acknowledge or recap this "
+    "summary; pick up the current task directly."
+)
+
+
+def make_summary_message(
+    summary: str, *, message_id: Optional[str] = None
+) -> HumanMessage:
+    """The compaction summary as the user-role hand-back, marked as such.
+
+    ``PERSIST_ROLE_EVENT`` keeps a stray persist from writing it as a user
+    bubble; the transcript shows the summary through its ``role='summary'``
+    checkpoint row instead.
+    """
+    return HumanMessage(
+        content=f"{SUMMARY_LEAD_IN}\n\n{summary.strip()}\n\n{SUMMARY_CONTINUE}",
+        additional_kwargs={
+            COMPACTION_SUMMARY_KEY: True,
+            PERSIST_ROLE_KEY: PERSIST_ROLE_EVENT,
+        },
+        id=message_id,
     )
 
 
-def extract_summary_text(messages: List[BaseMessage]) -> Optional[str]:
-    """Return the most recent '[Summary of prior work]' summary content with the
-    prefix stripped, or None when no summary is present.
+def summary_text(message: BaseMessage) -> str:
+    """The summary inside a compaction summary message, wrapper removed.
 
-    The summary is written by ``summarize_and_compact`` as a
-    ``SystemMessage(content=f"[Summary of prior work]\\n{summary}")``. Callers use
-    this to surface the summary for the compaction display banner after
-    ``ensure_within_limits`` / ``summarize_and_compact`` runs.
+    Accepts the hand-back of :func:`make_summary_message` and the legacy
+    ``[Summary of prior work]`` SystemMessage. A request copy may carry folded
+    context after the continue line; everything from that line on is dropped.
     """
-    prefix = "[Summary of prior work]"
+    content = getattr(message, "content", "")
+    text = content if isinstance(content, str) else str(content)
+    if text.startswith(LEGACY_SUMMARY_PREFIX):
+        return text[len(LEGACY_SUMMARY_PREFIX) :].strip()
+    if text.startswith(SUMMARY_LEAD_IN):
+        text = text[len(SUMMARY_LEAD_IN) :]
+        end = text.rfind(SUMMARY_CONTINUE)
+        if end >= 0:
+            text = text[:end]
+    return text.strip()
+
+
+def extract_summary_text(messages: List[BaseMessage]) -> Optional[str]:
+    """The newest compaction summary's text, wrapper removed, or None.
+
+    Callers use this to surface the summary for the compaction display banner
+    after ``ensure_within_limits`` / ``summarize_and_compact`` runs.
+    """
     for m in reversed(messages):
-        content = getattr(m, "content", None)
-        if (
-            isinstance(m, SystemMessage)
-            and isinstance(content, str)
-            and prefix in content
-        ):
-            return content.split(prefix, 1)[1].strip()
+        if is_compaction_summary(m):
+            return summary_text(m)
     return None
 
 
@@ -151,7 +191,7 @@ def place_pinned_after_summary(
     """``[summary, *re-seated protected blocks, *kept]`` — the compacted tail.
 
     The current phase's instruction block goes immediately after the
-    ``[Summary of prior work]`` message and before the kept window, so the
+    compaction summary and before the kept window, so the
     model reads "what happened" and then "how this phase works" ahead of
     the live turns. See :func:`select_pinned_for_reseat` for the rule.
     """
@@ -196,9 +236,14 @@ def _count_non_entries(messages: List[BaseMessage]) -> int:
 
 
 def _conversation_count(messages: List[BaseMessage]) -> int:
-    """Conversation messages: no system message, removal marker or entry."""
+    """Conversation messages: no system message, removal marker, entry or summary."""
     return _count_non_entries(
-        [m for m in messages if not isinstance(m, (SystemMessage, RemoveMessage))]
+        [
+            m
+            for m in messages
+            if not isinstance(m, (SystemMessage, RemoveMessage))
+            and not is_compaction_summary(m)
+        ]
     )
 
 
@@ -1715,7 +1760,7 @@ class ContextManager:
                 continue
             if is_context_injection(msg) or is_protected_message(msg):
                 continue
-            if isinstance(msg, SystemMessage):
+            if isinstance(msg, SystemMessage) or is_compaction_summary(msg):
                 continue
             if isinstance(msg, HumanMessage):
                 # Image-safe: list content (a multimodal re-delivery) becomes
@@ -1969,23 +2014,21 @@ class ContextManager:
             else self.config.keep_recent_messages
         )
 
-        # Separate system messages into:
+        # Separate:
         # 1. Regular system messages (keep in output)
-        # 2. Old summary messages (incorporate into new summary, then discard)
-        # Old summaries are identified by the "[Summary of prior work]" prefix
+        # 2. Old summaries, marked hand-backs or legacy SystemMessages
+        #    (incorporate into the new summary, then discard)
+        # 3. The conversation
+        old_summaries = [m for m in messages if is_compaction_summary(m)]
         system_msgs = [
             m
             for m in messages
-            if isinstance(m, SystemMessage)
-            and "[Summary of prior work]" not in m.content
-        ]
-        old_summaries = [
-            m
-            for m in messages
-            if isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
+            if isinstance(m, SystemMessage) and not is_compaction_summary(m)
         ]
         original_conversation = [
-            m for m in messages if not isinstance(m, SystemMessage)
+            m
+            for m in messages
+            if not isinstance(m, SystemMessage) and not is_compaction_summary(m)
         ]
 
         # Backstop for runaway-generation poisoning: any single AIMessage
@@ -2168,10 +2211,7 @@ class ContextManager:
         # re-formatted as messages.
         seed_summary: Optional[str] = None
         if old_summaries:
-            seed_summary = "\n\n".join(
-                m.content.replace("[Summary of prior work]\n", "", 1)
-                for m in old_summaries
-            )
+            seed_summary = "\n\n".join(summary_text(m) for m in old_summaries)
 
         # Generate summary
         summary = await self.summarize_conversation(
@@ -2229,9 +2269,9 @@ class ContextManager:
                 return _substitution_only_result()
             return messages
 
-        # Create summary as SystemMessage (best practice per OpenAI/LangChain)
-        # SystemMessage signals "background context" rather than user dialogue
-        summary_msg = SystemMessage(content=f"[Summary of prior work]\n{summary}")
+        # The summary goes back as a user message in the hand-back wrapper,
+        # ahead of the kept messages (compaction refactor D9 / WP9).
+        summary_msg = make_summary_message(summary)
 
         # Generate removal markers for:
         # 1. ALL conversation messages (summarized + recent) - recent are re-added as fresh copies

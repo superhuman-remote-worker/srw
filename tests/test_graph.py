@@ -49,6 +49,7 @@ from agent.core.phase import (  # noqa: E402
     validate_todos_yaml,
     TodosYamlValidationError,
 )
+from shared.runtime.core.message_markers import is_compaction_summary  # noqa: E402
 
 
 @pytest.fixture
@@ -981,7 +982,6 @@ class TestArchivePhaseNode:
             AIMessage,
             HumanMessage,
             RemoveMessage,
-            SystemMessage,
         )
 
         from agent.core.context import ContextConfig, ContextManager
@@ -1075,11 +1075,7 @@ class TestArchivePhaseNode:
         )
         assert not any("TACTICAL GUIDANCE" in str(m.content) for m in kept)
         # ...while the generic pin is re-seated right after the summary.
-        summary_idx = next(
-            i
-            for i, m in enumerate(kept)
-            if isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
-        )
+        summary_idx = next(i for i, m in enumerate(kept) if is_compaction_summary(m))
         assert kept[summary_idx + 1].content == "GENERIC PIN"
         assert is_protected_message(kept[summary_idx + 1])
         assert kept[summary_idx + 1].id is None

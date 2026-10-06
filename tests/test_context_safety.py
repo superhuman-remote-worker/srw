@@ -34,6 +34,7 @@ from agent.core.summarizer import (
     SummarizationFailed,
     is_overflow_error,
 )
+from shared.runtime.core.message_markers import is_compaction_summary
 
 
 # =============================================================================
@@ -907,10 +908,7 @@ class TestCompactionRunCounter:
         assert context_manager.compaction_runs == 0
         result = await context_manager.summarize_and_compact(messages, mock_llm)
         assert context_manager.compaction_runs == 1
-        assert any(
-            isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
-            for m in result
-        )
+        assert any(is_compaction_summary(m) for m in result)
 
     @pytest.mark.asyncio
     async def test_no_increment_when_nothing_to_summarize(
@@ -1125,11 +1123,7 @@ class TestKeepWindowElision:
         )
 
         assert context_manager.compaction_runs == 1
-        assert not any(
-            isinstance(m, SystemMessage)
-            and "[Summary of prior work]" in (m.content or "")
-            for m in result
-        )
+        assert not any(is_compaction_summary(m) for m in result)
         assert any(
             isinstance(m, ToolMessage)
             and "[tool result truncated by compaction" in (m.content or "")
@@ -1240,11 +1234,7 @@ class TestKeepWindowElision:
         result = await context_manager.summarize_and_compact(messages, mock_llm)
 
         assert [m.content for m in observed] == [m.content for m in messages]
-        assert any(
-            isinstance(m, SystemMessage)
-            and "[Summary of prior work]" in (m.content or "")
-            for m in result
-        )
+        assert any(is_compaction_summary(m) for m in result)
 
 
 # =============================================================================
@@ -1462,11 +1452,7 @@ class TestCompactionBoundaryId:
             messages=msgs, auxiliary=mock_llm
         )
         # Compaction actually happened (summary present).
-        assert any(
-            isinstance(m, SystemMessage)
-            and "[Summary of prior work]" in (m.content or "")
-            for m in result
-        )
+        assert any(is_compaction_summary(m) for m in result)
         assert context_manager._last_compaction_boundary_id == "m4"
 
     @pytest.mark.asyncio
@@ -1532,11 +1518,7 @@ class TestPinnedAfterSummary:
     def _split(result):
         kept = [m for m in result if not isinstance(m, RemoveMessage)]
         removed = {m.id for m in result if isinstance(m, RemoveMessage)}
-        summary_idx = next(
-            i
-            for i, m in enumerate(kept)
-            if isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
-        )
+        summary_idx = next(i for i, m in enumerate(kept) if is_compaction_summary(m))
         return kept, removed, summary_idx
 
     @pytest.mark.asyncio
@@ -1721,7 +1703,12 @@ class TestPreserveMessageIdentity:
         result = await manager.summarize_and_compact(messages, mock_llm)
 
         assert manager.compaction_runs == 1
-        tail = [m for m in result if not isinstance(m, (SystemMessage, RemoveMessage))]
+        tail = [
+            m
+            for m in result
+            if not isinstance(m, (SystemMessage, RemoveMessage))
+            and not is_compaction_summary(m)
+        ]
         assert tail
         assert all(any(m is original for original in messages) for m in tail)
         assert all(m.id and turn_membership(m) == 4 for m in tail)
@@ -1740,7 +1727,12 @@ class TestPreserveMessageIdentity:
         messages = self._history()
         result = await manager.summarize_and_compact(messages, mock_llm)
 
-        tail = [m for m in result if not isinstance(m, (SystemMessage, RemoveMessage))]
+        tail = [
+            m
+            for m in result
+            if not isinstance(m, (SystemMessage, RemoveMessage))
+            and not is_compaction_summary(m)
+        ]
         assert tail
         assert all(m.id is None for m in tail)
         assert not any(any(m is original for original in messages) for m in tail)
@@ -1764,11 +1756,7 @@ class TestPreserveMessageIdentity:
         result = await manager.summarize_and_compact(messages, mock_llm)
 
         kept = [m for m in result if not isinstance(m, RemoveMessage)]
-        summary_at = next(
-            i
-            for i, m in enumerate(kept)
-            if isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
-        )
+        summary_at = next(i for i, m in enumerate(kept) if is_compaction_summary(m))
         assert kept[summary_at + 1] is turn_input
         assert turn_input.id == "msg-0"
         # The pin is the loop's, removed when the turn ends; other pins stay.

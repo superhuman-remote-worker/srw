@@ -136,10 +136,36 @@ async def test_own_created_repository_never_issued_cancel_settles_and_keeps_pair
 async def test_normal_repository_provisioning_cancel_resume_cancel_keeps_own_pair(
     db,
     monkeypatch,
+    tmp_path,
 ):
+    from tests.test_job_control_operations import _operations
+
+    monkeypatch.setenv("VM_CREATION_RETRY_ENABLED", "true")
     monkeypatch.setenv("APP_ENCRYPTION_KEY", "M" * 32)
     crypto.reset_cipher_cache()
-    retry, recovery, _ = await never_issued_cancel(db, monkeypatch)
+    resolved = {
+        "spec": {
+            "timeoutSeconds": 3600,
+            "execution": {
+                "expert": {
+                    "inline": {
+                        "runtime": {
+                            "config": {
+                                "format": "srw/resolved-config-v1",
+                                "resolved": {"agent": {}},
+                                "policy": {"workspace": {"backend": "vm"}},
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    }
+    retry, recovery, _ = await never_issued_cancel(
+        db,
+        monkeypatch,
+        execution_resolved=resolved,
+    )
     owner = retry["job_id"]
     repo_name = f"job-{str(owner)[:8]}"
     remote = f"http://gitea:3000/srw/{repo_name}.git"
@@ -207,9 +233,43 @@ async def test_normal_repository_provisioning_cancel_resume_cancel_keeps_own_pai
         assert (receipt["key_generation"], receipt["intent_generation"]) == (2, 1)
         assert (receipt["repository_owner"], receipt["repo_name"]) == ("srw", repo_name)
         assert receipt["forge_key_id"] == 92 and receipt["project_id"] is None
-        assert await db.queue_stateless_job_for_resume(
+        # Exercise the public control path, including creation classification
+        # and the queue-first stale-workspace CAS, rather than bypassing both.
+        operations = _operations(tmp_path, store=db)
+        operations.dependencies.resume_missing_workspace.return_value = "vm"
+        before_retry = dict(
+            await db.fetchrow(
+                "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+                retry["request_id"],
+            )
+        )
+        result = await operations.resume_job_internal(
             str(owner),
-            expected_status="cancelled",
+            user=None,
+            job=await db.get_job(str(owner)),
+        )
+        assert result["status"] == "queued"
+        resumed = await db.get_job(str(owner))
+        assert resumed["status"] == "paused"
+        resumed_context = json.loads(resumed["context"])
+        assert "vm" not in resumed_context
+        assert "_vm_creation_pending" not in resumed_context
+        assert resumed_context["last_vm"]["status"] == "deleted"
+        assert (
+            dict(
+                await db.fetchrow(
+                    "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+                    retry["request_id"],
+                )
+            )
+            == before_retry
+        )
+        assert (
+            await db.fetchval(
+                "SELECT state FROM run_queue WHERE unit_id=$1",
+                owner,
+            )
+            == "done"
         )
         policy, _, _, _ = await environment(db)
         second, recovery, _ = await normal_never_issued_generation(
@@ -1093,11 +1153,23 @@ async def test_0325_upgrade_preserves_applied_ledger_and_thread_predicate(
             await admin.close()
 
 
-async def never_issued_cancel(db, monkeypatch, *, existing_parent=False):
+async def never_issued_cancel(
+    db,
+    monkeypatch,
+    *,
+    existing_parent=False,
+    execution_resolved=None,
+):
     """Use real admission, Cancel, and retry settlement with no create effect."""
     monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
     policy, inventory, _, _ = await environment(db)
-    retry = await waiter(db, policy, inventory, lane="stateless")
+    retry = await waiter(
+        db,
+        policy,
+        inventory,
+        lane="stateless",
+        execution_resolved=execution_resolved,
+    )
     owner = retry["job_id"]
     generation = retry["provision_generation"]
     row = await db.fetchrow(

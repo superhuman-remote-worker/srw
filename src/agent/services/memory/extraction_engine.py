@@ -156,20 +156,25 @@ class MemoryExtractionEngine:
         """Low-loss ``messages -> List[str]`` formatter (§3.3).
 
         Filters injected context (typed entries and the legacy tail; it
-        carries no durable fact) and empties, but — unlike the summary and
+        carries no durable fact), the compaction summary and empties, but — unlike the summary and
         interval-extraction formatters — does **not** truncate tool results.
         The planner's oversized-part hard-split handles a giant tool result
         instead; truncating here would drop exactly the durable detail this
         feature exists to capture.
         """
         from shared.runtime.core.context_entries import is_context_injection
-        from shared.runtime.core.message_markers import is_protected_message
+        from shared.runtime.core.message_markers import (
+            is_compaction_summary,
+            is_protected_message,
+        )
         from shared.runtime.services.auxiliary import _get_message_role
 
         parts: List[str] = []
         for msg in messages:
             if is_context_injection(msg):
                 continue
+            if is_compaction_summary(msg):
+                continue  # derived from turns already extracted, not a user turn
             if is_protected_message(msg):
                 continue  # phase instruction block — guidance, not a fact
             content = getattr(msg, "content", "")

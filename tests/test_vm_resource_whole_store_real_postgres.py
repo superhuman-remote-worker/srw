@@ -111,25 +111,43 @@ async def environment(
     ), inventory, value, demand
 
 
-async def waiter(db, store, inventory, *, user_id=None, lane="pinned",
-                 request_options=None):
+async def waiter(
+    db,
+    store,
+    inventory,
+    *,
+    user_id=None,
+    lane="pinned",
+    request_options=None,
+    execution_resolved=None,
+):
     config = whole_launcher_configuration()
     config.update(namespace="workers", storage_class="local")
     resource = config["resource_admission"]
     profile = resource["template_profile"]
-    profile.update(storage_class="local", guest_vcpus=8, guest_memory_bytes=16 * 1024**3)
+    profile.update(
+        storage_class="local", guest_vcpus=8, guest_memory_bytes=16 * 1024**3
+    )
     resource["cluster_id"] = inventory.cluster_id
     resource["policy_digest"] = inventory.policy_digest
     resource["launcher_prediction"]["vector"] = predict_launcher(
-        store.launcher_profile, guest_vcpus=8, guest_memory_bytes=16 * 1024**3,
+        store.launcher_profile,
+        guest_vcpus=8,
+        guest_memory_bytes=16 * 1024**3,
     ).to_six_dict()
     resource["host_mapping"]["vector"] = store.cost.cost(8, "16Gi").to_six_dict()
     job, generation, proposal = await admitted_job(
-        db, lane=lane, controller_configuration=config,
+        db,
+        lane=lane,
+        controller_configuration=config,
         request_options=request_options,
+        execution_resolved=execution_resolved,
     )
     if user_id is not None:
-        await db.execute("INSERT INTO users(id,display_name) VALUES($1,'whole-owner') ON CONFLICT DO NOTHING", user_id)
+        await db.execute(
+            "INSERT INTO users(id,display_name) VALUES($1,'whole-owner') ON CONFLICT DO NOTHING",
+            user_id,
+        )
         await db.execute("UPDATE jobs SET user_id=$2 WHERE id=$1", job, user_id)
     async with db.acquire() as conn, conn.transaction():
         return await VMCreationRetryStore(

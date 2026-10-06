@@ -539,3 +539,95 @@ async def test_quiesce_retries_failed_foreground_terminal_receipt(
     assert runtime._foreground_terminal_pending == {}
     await runtime.resume()
     assert runtime._accepting is True
+
+
+class _ListingSessionLedger(StrictSessionLedger):
+    """Adds the empty durable live-list that orphan recovery needs."""
+
+    async def list_live(self, parent_id: str) -> list[dict[str, Any]]:
+        del parent_id
+        return []
+
+
+def _revoke_parent_authority(runtime: SubagentRuntime) -> None:
+    """Public End revoked the parent's authority before the local watchdog."""
+    runtime.host.settlement_authority_fn = AsyncMock(return_value=False)
+    runtime.host.effect_authority_fn = AsyncMock(return_value=False)
+
+
+@pytest.mark.asyncio
+async def test_owner_end_quiesces_a_runtime_whose_child_settled(tmp_path):
+    """A session that delegated once must still close after owner End.
+
+    k3d 2026-10-06: an ended session that had run one foreground child reached
+    the warm idle TTL detach; quiesce raised "cannot prove exact settlement
+    authority" because the spent handle was still recorded, the termination
+    never completed and the stateless pod stayed unready until deleted.
+    """
+    ctx, _ = make_parent(tmp_path)
+    ledger = _ListingSessionLedger()
+    runtime = _runtime(
+        ctx,
+        ledger,
+        lambda config, limits: FakeChatModel([text_turn("finished evidence")]),
+    )
+    assert await runtime.recover_orphans() == []
+    assert "finished evidence" in await runtime.run_foreground(call())
+    writes = len(ledger.updates)
+    _revoke_parent_authority(runtime)
+    runtime._notify_changed = AsyncMock()
+
+    await runtime.quiesce("owner End already authorized")
+
+    assert runtime._accepting is False
+    assert len(ledger.updates) == writes
+    runtime._notify_changed.assert_not_awaited()
+    with pytest.raises(RuntimeError, match="exact parent authority"):
+        await runtime.resume()
+
+
+@pytest.mark.asyncio
+async def test_owner_end_quiesces_after_a_child_failed_before_its_row(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    ctx, _ = make_parent(tmp_path)
+    ledger = _ListingSessionLedger()
+
+    async def fail_build(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("environment unavailable")
+
+    monkeypatch.setattr(runtime_mod, "build_child", fail_build)
+    runtime = _runtime(
+        ctx, ledger, lambda config, limits: FakeChatModel([text_turn("unused")])
+    )
+    assert await runtime.recover_orphans() == []
+    assert "could not be started" in await runtime.run_foreground(call())
+    assert ledger.opened == []
+    _revoke_parent_authority(runtime)
+
+    await runtime.quiesce("owner End already authorized")
+
+    assert runtime._accepting is False
+
+
+@pytest.mark.asyncio
+async def test_owner_end_never_hides_an_uncommitted_terminal_receipt(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    ctx, _ = make_parent(tmp_path)
+    ledger = _ListingSessionLedger()
+    ledger.fail_terminal = True
+    _capture_builds(monkeypatch)
+    runtime = _runtime(
+        ctx, ledger, lambda config, limits: FakeChatModel([text_turn("finished")])
+    )
+    assert await runtime.recover_orphans() == []
+    with pytest.raises(TerminalFailure, match="terminal lifecycle unavailable"):
+        await runtime.run_foreground(call())
+    _revoke_parent_authority(runtime)
+
+    with pytest.raises(RuntimeError, match="exact settlement authority"):
+        await runtime.quiesce("owner End already authorized")
+    assert runtime._foreground_terminal_pending

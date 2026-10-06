@@ -34960,6 +34960,31 @@ class PostgresDB:
             async with self.acquire() as conn:
                 async with conn.transaction():
                     await hold_worker_batch_for_preflight(conn, job_id=job_uuid)
+                    if workspace_context_key == "vm":
+                        # Take the Job lock before evaluating terminal proof.
+                        # A route classification made before this lock can be
+                        # stale after a concurrent Cancel/Delete or admission.
+                        locked = await conn.fetchrow(
+                            "SELECT context FROM jobs WHERE id=$1 FOR UPDATE",
+                            job_uuid,
+                        )
+                        locked_context = (
+                            _json_object_or_empty(locked["context"]) if locked else {}
+                        )
+                        if "_vm_creation_pending" in (locked_context or {}):
+                            from orchestrator.services.vm_creation_resume import (
+                                settled_never_issued_resume_allowed,
+                            )
+
+                            if not await settled_never_issued_resume_allowed(
+                                conn, job_uuid
+                            ):
+                                raise _ResumeCASLostError
+                            await conn.execute(
+                                "UPDATE jobs SET context=context-'_vm_creation_pending' "
+                                "WHERE id=$1",
+                                job_uuid,
+                            )
                     if (
                         completion_commands_enabled
                         and await self._completion_resume_blocked_on_conn(

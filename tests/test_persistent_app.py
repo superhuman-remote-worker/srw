@@ -52,6 +52,8 @@ from agent.api.persistent_app import (
 )
 from agent.api.session_attach import session_backend_is_lite, session_backend_is_vm
 from agent.api.session_workspace import poll_workspace_ready
+from agent.core.context import summary_text
+from shared.runtime.core.message_markers import is_compaction_summary
 
 
 async def _handle_api_interrupt(request):
@@ -737,17 +739,16 @@ class TestRestoreFromCheckpoint:
             f"Path A must pass since_turn=boundary_turn; kwargs={kwargs}"
         )
 
-        # First in-memory message is the canonical summary SystemMessage; the
-        # exact "[Summary of prior work]\n" prefix lets a later live compaction
-        # merge this restored summary rather than duplicate it
-        # (src/core/context.py:1468).
+        # First in-memory message is the summary hand-back (a marked
+        # HumanMessage); the marker lets a later live compaction merge this
+        # restored summary rather than duplicate it.
         msgs = mock_session.messages
         assert len(msgs) == 3, (
             f"want [summary, user, ai]; got {[type(m).__name__ for m in msgs]}"
         )
-        assert isinstance(msgs[0], SystemMessage)
-        assert msgs[0].content.startswith("[Summary of prior work]\n")
-        assert "We did A, B, C." in msgs[0].content
+        assert isinstance(msgs[0], HumanMessage)
+        assert is_compaction_summary(msgs[0])
+        assert summary_text(msgs[0]) == "We did A, B, C."
         assert isinstance(msgs[1], HumanMessage)
         assert isinstance(msgs[2], AIMessage)
 

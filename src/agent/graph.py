@@ -72,6 +72,7 @@ from agent.core.context import (
     ContextManager,
     ContextConfig,
     ToolRetryManager,
+    is_compaction_summary,
     keep_window_start,
     repair_tool_call_arguments,
     sanitize_message_history,
@@ -1170,7 +1171,9 @@ def create_execute_node(
 
         # Add full conversation history in specific order (stable prefix first,
         # per-turn transients last — prompt-cache friendly):
-        # 1. Summary SystemMessages first (context from before compaction)
+        # 1. Legacy summary SystemMessages first (checkpoints from before the
+        #    summary became a user message; the current hand-back is a
+        #    HumanMessage and leads the conversation in step 3 by itself)
         # 2. Rest of conversation (excluding regular SystemMessages)
         # 3. Transient injections at the tail (memories, knowledge, citation
         #    feedback, supervisor guidance, active subagents). The phase
@@ -1183,11 +1186,10 @@ def create_execute_node(
         #    history message, and returned to state, so the next request
         #    starts with this one byte for byte (D1, D21, D27).
 
-        # Step 1: Add summaries first
+        # Step 1: Add legacy summaries first
         for msg in messages:
-            if isinstance(msg, SystemMessage):
-                if "[Summary of prior work]" in msg.content:
-                    prepared_messages.append(msg)
+            if isinstance(msg, SystemMessage) and is_compaction_summary(msg):
+                prepared_messages.append(msg)
 
         # Helper: inject all transient messages (memories, knowledge, guidance)
         # Used both in normal path and safety rebuild to avoid code duplication
@@ -1788,11 +1790,10 @@ def create_execute_node(
             if system_msg and isinstance(system_msg, SystemMessage):
                 prepared_messages.append(system_msg)
 
-            # Add compacted conversation (including summary SystemMessages)
+            # Add compacted conversation (legacy summary SystemMessages first)
             for msg in messages:
-                if isinstance(msg, SystemMessage):
-                    if "[Summary of prior work]" in msg.content:
-                        prepared_messages.append(msg)
+                if isinstance(msg, SystemMessage) and is_compaction_summary(msg):
+                    prepared_messages.append(msg)
 
             for msg in messages:
                 if not isinstance(msg, SystemMessage):
@@ -2658,7 +2659,7 @@ def create_execute_node(
 
                     for msg in messages:
                         if isinstance(msg, SystemMessage):
-                            if "[Summary of prior work]" in msg.content:
+                            if is_compaction_summary(msg):
                                 prepared_messages.append(msg)
                         else:
                             prepared_messages.append(msg)

@@ -90,9 +90,9 @@ logger = logging.getLogger(__name__)
 def _holds_system_prompt(message: BaseMessage) -> bool:
     """Whether ``message`` is the loop's system-prompt slot (``messages[0]``).
 
-    A compaction summary is a SystemMessage too, and is what a checkpoint
-    restore puts first; it must never be mistaken for (or overwritten as) the
-    prompt.
+    A legacy compaction summary is a SystemMessage too (the current one is a
+    HumanMessage) and can be what a checkpoint restore puts first; it must
+    never be mistaken for (or overwritten as) the prompt.
     """
     return isinstance(message, SystemMessage) and not is_compaction_summary(message)
 

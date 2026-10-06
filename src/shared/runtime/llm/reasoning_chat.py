@@ -926,8 +926,9 @@ def fold_system_messages(messages: list) -> list:
 
     For chat templates that accept a single leading system turn — Qwen3.x
     raises ``System message must be at the beginning.`` on any other — while
-    SRW places the compaction summary as a second system message and may add
-    system nudges mid-history. The leading run of system messages merges into
+    SRW may add system nudges mid-history (and histories from before the
+    compaction summary became a user message hold it as a second system
+    message). The leading run of system messages merges into
     one; each later system message becomes a user turn where it stands, so the
     messages before it (and the provider's cached prefix) are unchanged.
     Returns a new list; the input dicts are not mutated.
