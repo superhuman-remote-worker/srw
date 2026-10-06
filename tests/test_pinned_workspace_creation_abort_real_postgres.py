@@ -110,6 +110,30 @@ async def test_creation_return_before_abort_retains_publication_authority(
     assert retirement["state"] == "pending", json.dumps(retirement, default=str)
 
 
+@pytest.mark.asyncio
+async def test_end_before_uid_publication_retains_exact_create_response(db, monkeypatch):
+    ids, generation, cluster, _, task, resume = await _creating(db, monkeypatch)
+    try:
+        retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+        assert retirement["state"] == "pending"
+    finally:
+        resume.set()
+        assert await task is False
+    # Ready publication correctly refuses a retiring life. The actual CREATE
+    # response still has to survive as cleanup authority for its source attempt.
+    attempt = retirement["context"]["workspace_provision_intent"]["attempt_id"]
+    exists = await db.fetchval(
+        "SELECT to_regclass('public.thread_workspace_provision_create_receipts') IS NOT NULL"
+    )
+    assert exists, "End abandoned the CREATE response before Ready publication"
+    row = await db.fetchrow(
+        "SELECT * FROM thread_workspace_provision_create_receipts WHERE attempt_id=$1::uuid AND resource='pvc'",
+        attempt
+    )
+    assert row["resource_uid"] == cluster.objects["pvc"].metadata.uid
+    assert str(row["runtime_generation"]) == generation
+
+
 def _prevention_base_release():
     """Execute the exact old owner, rather than manufacturing stranded rows."""
     from orchestrator.services import session_attach_binding
