@@ -53,6 +53,9 @@ class FakeUpstreamProcess:
     def close(self):
         self.close_requested = True
 
+    async def redirect(self, **kwargs):
+        pass
+
     async def wait_closed(self):
         self.closed = True
 
@@ -155,6 +158,26 @@ async def test_unacknowledged_native_notice_closes_started_process_without_repla
     assert upstream_process.closed
     assert process.exited_with == 75
     assert upstream.create_kwargs["command"] == "touch /tmp/once"
+
+
+@pytest.mark.asyncio
+async def test_failed_native_output_forwarding_closes_started_command():
+    class FailedRedirectProcess(FakeUpstreamProcess):
+        async def redirect(self, **kwargs):
+            raise BrokenPipeError("downstream disconnected during forwarding")
+
+    process = FakeProcess(command="touch /tmp/once")
+    inner = FailedRedirectProcess()
+    upstream = FakeUpstream(inner)
+
+    async def notify():
+        raise AssertionError("a disconnected output channel must not admit native use")
+
+    await proxy_session(process, upstream, on_first_use=notify)
+    assert inner.close_requested
+    assert inner.closed
+    assert process.exited_with == 75
+    assert b"command may already have started" in b"".join(process.stderr.written)
 
 
 @pytest.mark.asyncio
