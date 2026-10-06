@@ -404,6 +404,69 @@ async def test_self_ended_claimless_life_records_its_exact_retired_pod(stack):
 
 
 @pytest.mark.asyncio
+async def test_completed_soft_ended_claimless_reaper_releases_exact_finalizer(stack):
+    ids = await _thread(stack.db)
+    life = await _bind_life(stack, ids, with_claim=False)
+    await _agent_settles_soft_end(stack, life)
+    pod = stack.k8s.exit_and_reap(life)
+    pod.metadata.name = life["pod_name"]
+    stack.k8s.list_namespaced_pod = lambda **_kwargs: NS(
+        items=list(stack.k8s.pods.values())
+    )
+    provider = agent_provisioner_module.agent_provisioner
+    provider._db = stack.db
+
+    await provider.reap_pods()
+    await provider.reap_pods()
+
+    assert _pod(stack, life) is None
+    assert stack.k8s.removed_pods == [life["pod_uid"]]
+    assert stack.k8s.deleted_pvcs == []
+    assert (await stack.db.get_thread(ids["thread"]))["status"] == "ended"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault", ["missing_proof", "rebound_actor", "wrong_label", "nonterminal"]
+)
+async def test_completed_soft_ended_claimless_reaper_refuses_without_exact_authority(
+    stack, fault
+):
+    ids = await _thread(stack.db)
+    life = await _bind_life(stack, ids, with_claim=False)
+    await _agent_settles_soft_end(stack, life)
+    pod = stack.k8s.exit_and_reap(life)
+    pod.metadata.name = life["pod_name"]
+    stack.k8s.list_namespaced_pod = lambda **_kwargs: NS(
+        items=list(stack.k8s.pods.values())
+    )
+    provider = agent_provisioner_module.agent_provisioner
+    provider._db = stack.db
+    if fault == "missing_proof":
+        async with stack.db.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SET LOCAL session_replication_role='replica'")
+                await conn.execute(
+                    "UPDATE thread_runtime_retirement_outcomes "
+                    "SET retired_agent_pod=NULL WHERE thread_id=$1::uuid",
+                    life["thread"],
+                )
+    elif fault == "rebound_actor":
+        await stack.db.execute(
+            "UPDATE agents SET status='ready' WHERE id=$1::uuid", life["agent"]
+        )
+    elif fault == "wrong_label":
+        pod.metadata.labels["srw.io/provision-attempt"] = str(uuid4())
+    elif fault == "nonterminal":
+        pod.status.container_statuses[0].state.terminated = None
+
+    assert (await provider.reap_pods())["completed"] == 0
+    assert _pod(stack, life) is pod
+    assert pod.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
+    assert not stack.k8s.removed_pods
+
+
+@pytest.mark.asyncio
 async def test_self_ended_claim_bearing_proof_is_unchanged(stack):
     ids = await _thread(stack.db)
     life = await _bind_life(stack, ids, with_claim=True)

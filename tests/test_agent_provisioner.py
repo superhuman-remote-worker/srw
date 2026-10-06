@@ -447,6 +447,21 @@ class TestReapPods:
         assert p._core_api.delete_namespaced_pod.call_count == 2
 
     @pytest.mark.asyncio
+    async def test_protected_completed_pod_waits_when_database_is_unavailable(self):
+        p, _ = _make_provisioner()
+        p._db = None
+        pod = _make_pod("srw-agent-s-protected", phase="Succeeded", purpose="session")
+        pod.metadata.finalizers = [PINNED_AUTHORITY_FINALIZER]
+        p._core_api.list_namespaced_pod.return_value.items = [pod]
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.reap_pods()
+        assert result["completed"] == 0
+        p._core_api.delete_namespaced_pod.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_reaps_stale_running_pods(self):
         p, conn = _make_provisioner()
         conn.fetch.return_value = [

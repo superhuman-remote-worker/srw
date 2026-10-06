@@ -202,9 +202,7 @@ async def _bind_used_generation(db, ids):
     return identity, claim
 
 
-async def _scenario(
-    db, monkeypatch, *, retain_old_agent=False, acknowledge_current=True
-):
+async def _settled_soft_scenario(db, monkeypatch, *, retain_old_agent=False):
     ids = {key: str(uuid4()) for key in ("user", "thread")}
     await db.execute(
         "INSERT INTO users (id,display_name,email) VALUES ($1::uuid,'owner',$2)",
@@ -277,6 +275,16 @@ async def _scenario(
         assert await db.delete_agent(old["agent"])
     k8s.mark_terminal("agents-a", old["pod_name"])
     old_pod.metadata.deletion_timestamp = "now"
+    return ids, old, claim, k8s, provider
+
+
+async def _scenario(
+    db, monkeypatch, *, retain_old_agent=False, acknowledge_current=True
+):
+    ids, old, claim, k8s, provider = await _settled_soft_scenario(
+        db, monkeypatch, retain_old_agent=retain_old_agent
+    )
+    old_pod = k8s.pods[("agents-a", old["pod_name"])]
 
     assert await db.resume_thread(ids["thread"])
     current, reused_claim = await _bind_used_generation(db, ids)
@@ -300,6 +308,152 @@ async def _scenario(
     assert old_pod.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
     assert k8s.removed_pods == [current["pod_uid"]]
     return old, current, permanent, k8s, provider
+
+
+@pytest.mark.asyncio
+async def test_completed_soft_ended_claimant_reaper_releases_finalizer_and_retains_pvc(
+    db, monkeypatch
+):
+    ids, old, claim, k8s, provider = await _settled_soft_scenario(db, monkeypatch)
+    pod = k8s.pods[("agents-a", old["pod_name"])]
+    pod.metadata.name = old["pod_name"]
+    k8s.list_namespaced_pod = lambda **_kwargs: NS(items=list(k8s.pods.values()))
+    provider._db = db
+    provider._namespace = "agents-a"
+
+    await provider.reap_pods()
+    await provider.reap_pods()
+
+    assert ("agents-a", old["pod_name"]) not in k8s.pods
+    assert k8s.removed_pods == [old["pod_uid"]]
+    assert ("agents-a", claim["pvc_name"]) in k8s.pvcs
+    assert k8s.deleted_pvcs == []
+    assert await db.get_thread(ids["thread"]) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing_proof",
+        "conflicting_claim_proof",
+        "rebound_actor",
+        "current_generation",
+        "foreign_uid",
+        "wrong_label",
+        "wrong_pvc",
+        "nonterminal",
+    ],
+)
+async def test_soft_ended_claimant_reaper_refuses_unproven_or_live_pod(
+    db, monkeypatch, fault
+):
+    _, old, claim, k8s, provider = await _settled_soft_scenario(
+        db, monkeypatch, retain_old_agent=fault == "rebound_actor"
+    )
+    pod = k8s.pods[("agents-a", old["pod_name"])]
+    pod.metadata.name = old["pod_name"]
+    k8s.list_namespaced_pod = lambda **_kwargs: NS(items=list(k8s.pods.values()))
+    provider._db = db
+    provider._namespace = "agents-a"
+    if fault in {"missing_proof", "conflicting_claim_proof"}:
+        async with db.acquire() as conn:
+            async with conn.transaction():
+                proof = _json(
+                    (
+                        await conn.fetchrow(
+                            "SELECT retired_agent_pod FROM "
+                            "thread_runtime_retirement_outcomes "
+                            "WHERE thread_id=$1::uuid",
+                            old["thread"],
+                        )
+                    )["retired_agent_pod"]
+                )
+                await conn.execute("SET LOCAL session_replication_role='replica'")
+                await conn.execute(
+                    "UPDATE thread_runtime_retirement_outcomes "
+                    "SET retired_agent_pod=$2::jsonb WHERE thread_id=$1::uuid",
+                    old["thread"],
+                    None
+                    if fault == "missing_proof"
+                    else json.dumps({**proof, "pvc_uid": "another-pvc-uid"}),
+                )
+    elif fault == "rebound_actor":
+        await db.execute(
+            "UPDATE agents SET status='ready' WHERE id=$1::uuid", old["agent"]
+        )
+    elif fault == "current_generation":
+        async with db.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SET LOCAL session_replication_role='replica'")
+                await conn.execute(
+                    "UPDATE threads SET status='active' WHERE id=$1::uuid",
+                    old["thread"],
+                )
+    elif fault == "foreign_uid":
+        pod.metadata.uid = str(uuid4())
+    elif fault == "wrong_label":
+        pod.metadata.labels["srw.io/provision-attempt"] = str(uuid4())
+    elif fault == "wrong_pvc":
+        pod.spec.volumes[0].persistent_volume_claim.claim_name = "another-claim"
+    elif fault == "nonterminal":
+        pod.status.container_statuses[0].state.terminated = None
+
+    assert (await provider.reap_pods())["completed"] == 0
+    assert k8s.pods[("agents-a", old["pod_name"])] is pod
+    assert pod.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
+    assert not k8s.removed_pods
+    assert ("agents-a", claim["pvc_name"]) in k8s.pvcs
+    assert not k8s.deleted_pvcs
+
+
+@pytest.mark.asyncio
+async def test_soft_ended_claimant_reaper_retries_resource_version_refusal(
+    db, monkeypatch
+):
+    _, old, claim, k8s, provider = await _settled_soft_scenario(db, monkeypatch)
+    pod = k8s.pods[("agents-a", old["pod_name"])]
+    pod.metadata.name = old["pod_name"]
+    k8s.list_namespaced_pod = lambda **_kwargs: NS(items=list(k8s.pods.values()))
+    provider._db = db
+    provider._namespace = "agents-a"
+    patch = k8s.patch_namespaced_pod
+
+    def refuse_once(**kwargs):
+        k8s.patch_namespaced_pod = patch
+        raise authority_fixtures._K8sError(409)
+
+    k8s.patch_namespaced_pod = refuse_once
+    assert (await provider.reap_pods())["completed"] == 0
+    assert pod.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
+    assert (await provider.reap_pods())["completed"] == 1
+    assert ("agents-a", old["pod_name"]) not in k8s.pods
+    assert ("agents-a", claim["pvc_name"]) in k8s.pvcs
+
+
+@pytest.mark.asyncio
+async def test_soft_ended_claimant_reaper_preserves_resumed_same_pvc_actor(
+    db, monkeypatch
+):
+    ids, old, claim, k8s, provider = await _settled_soft_scenario(db, monkeypatch)
+    assert await db.resume_thread(ids["thread"])
+    current, reused_claim = await _bind_used_generation(db, ids)
+    assert reused_claim["claim_id"] == claim["claim_id"]
+    k8s.install_claimant(current, claim)
+    for (namespace, name), pod in k8s.pods.items():
+        assert namespace == "agents-a"
+        pod.metadata.name = name
+    k8s.list_namespaced_pod = lambda **_kwargs: NS(items=list(k8s.pods.values()))
+    provider._db = db
+    provider._namespace = "agents-a"
+
+    assert (await provider.reap_pods())["completed"] == 1
+    assert ("agents-a", old["pod_name"]) not in k8s.pods
+    assert ("agents-a", current["pod_name"]) in k8s.pods
+    assert ("agents-a", claim["pvc_name"]) in k8s.pvcs
+    assert k8s.deleted_pvcs == []
+    thread = await db.get_thread(ids["thread"])
+    assert str(thread["agent_id"]) == current["agent"]
 
 
 @pytest.mark.asyncio
