@@ -386,6 +386,7 @@ GET    /api/persistent/threads/{thread_id}/logs                                 
 GET    /api/persistent/threads/{thread_id}/messages                                     pat=chat:read       gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/queue                                        pat=chat:read       gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/queue/retry                                  pat=chat:write      gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/resolved-config                              pat=chat:read       gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/resume                                       pat=chat:write      gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/rewinds                                      pat=chat:write      gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/rewinds/by-client-request/{client_request_id} pat=chat:read       gated:require_thread_owner

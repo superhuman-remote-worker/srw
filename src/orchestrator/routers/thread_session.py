@@ -28,6 +28,7 @@ from orchestrator.services import session_tool_view
 from orchestrator.services.deployment_gates import require_pinned_status_identity
 from orchestrator.services.grant_enforcement import GrantDenied
 from orchestrator.services.session_class_policy import require_stateless_workspace
+from orchestrator.services.session_resolved_config import read_session_resolved_config
 from orchestrator.services.session_runtime_admission import (
     protected_cloud_marker_state,
 )
@@ -357,6 +358,37 @@ async def submit_thread_control(
             else None
         ),
     }
+
+
+@router.get("/api/persistent/threads/{thread_id}/resolved-config")
+async def get_thread_resolved_config(
+    thread_id: str,
+    request: Request,
+    response: Response,
+    *,
+    dependencies: ThreadSessionDependencies = Depends(get_thread_session_dependencies),
+) -> dict[str, Any]:
+    """The session's frozen configuration, read-only (auth: owner).
+
+    Serves the current generation of the configuration frozen at creation and
+    republished by each settings update, so the live settings pane can show
+    the real values of settings that can no longer change. Nothing is
+    re-resolved, and the response never carries credentials or transport
+    (endpoints, ``env_keys``, workspace connection details).
+
+    Response: ``{"thread_id", "source", "config", "expert_based_on"}``.
+    ``source`` is ``snapshot`` (``config`` is the frozen blob:
+    ``agent``/``prompts``/``instructions``/``model_family``/``resolved_at``),
+    ``legacy`` (a session created before snapshots; ``config`` is null) or
+    ``unavailable`` (a snapshot this harness cannot read; ``config`` is null).
+    ``expert_based_on`` is the display-only template an inline expert was
+    copied from, else null.
+    """
+    _user, thread = await dependencies.require_thread_owner(
+        request, dependencies.store, thread_id
+    )
+    response.headers["Cache-Control"] = "private, no-store"
+    return await read_session_resolved_config(dependencies.store, thread)
 
 
 @router.get("/api/persistent/threads/{thread_id}/tool-groups")
