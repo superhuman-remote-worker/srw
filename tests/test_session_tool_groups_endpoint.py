@@ -782,3 +782,59 @@ class TestRosterReport:
         result = await _call(user_a, fake_db, _thread(), fake_request, experts=False)
         assert result["source"] == "legacy"
         assert result["subagents"] == {"default": None, "roster": []}
+
+
+# =============================================================================
+# Inline Expert — the frozen snapshot decides
+# =============================================================================
+
+
+class TestInlineExpertSession:
+    """A session created with an inline Expert has no ``expert_id`` to
+    re-resolve: its Expert exists only in the frozen execution snapshot.
+    Re-resolving the bare session base predicted the base's tools instead of
+    the ones the user chose (creation_ui_expert_workspace_connectors.md D2)."""
+
+    @staticmethod
+    def _snapshot_policy(tools: dict) -> tuple[dict, dict]:
+        return {"agent": {"tools": tools}}, {"tools": tools, "delegation": {}}
+
+    @pytest.mark.asyncio
+    async def test_predicts_from_the_frozen_policy(self, user_a, fake_db, fake_request):
+        # The base ships canvas ON; the inline Expert turned it off.
+        policy_tools = {"canvas": [], "job_control": []}
+        thread = _thread(metadata={"expert_selection_source": "inline"})
+        with (
+            patch(
+                f"{_TOOL_VIEW}.read_execution",
+                AsyncMock(return_value={"harness_adapter": "srw/v1"}),
+            ),
+            patch(
+                f"{_TOOL_VIEW}.srw_snapshot_config",
+                MagicMock(return_value=self._snapshot_policy(policy_tools)),
+            ),
+        ):
+            result = await _call(user_a, fake_db, thread, fake_request)
+
+        assert result["source"] == "resolved"
+        assert result["tool_groups"]["canvas"] is False
+
+    @pytest.mark.asyncio
+    async def test_without_a_snapshot_the_usual_resolve_answers(
+        self, user_a, fake_db, fake_request
+    ):
+        thread = _thread(metadata={"expert_selection_source": "inline"})
+        with patch(f"{_TOOL_VIEW}.read_execution", AsyncMock(return_value=None)):
+            result = await _call(user_a, fake_db, thread, fake_request)
+
+        assert result["source"] == "resolved"
+        assert result["tool_groups"]["canvas"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_catalogue_expert_never_reads_the_snapshot(
+        self, user_a, fake_db, fake_request
+    ):
+        read = AsyncMock()
+        with patch(f"{_TOOL_VIEW}.read_execution", read):
+            await _call(user_a, fake_db, _thread(), fake_request)
+        read.assert_not_called()

@@ -29,13 +29,22 @@ from orchestrator.services.config_overrides import (
     refuse_execution_owned_workspace_keys,
 )
 from orchestrator.services.deployment_gates import is_experts_db_enabled
+from orchestrator.services.manifest_execution_snapshot import (
+    read_execution,
+    srw_snapshot_config,
+)
 from orchestrator.services.session_tool_policy import (
+    apply_delegation_gate,
     legacy_session_tool_policy,
     merged_session_tool_policy,
 )
 from shared.runtime.core.loader import canonical_config_name
 from shared.runtime.core.tool_policy import enumerate_only_members
-from shared.runtime.core.tool_report import compose_tool_view, tool_groups_from_view
+from shared.runtime.core.tool_report import (
+    compose_tool_view,
+    layer_provenance,
+    tool_groups_from_view,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +95,32 @@ async def session_tool_grants(
         return None
 
 
+async def _inline_expert_tool_policy(
+    store: Any, thread_id: str
+) -> tuple[dict[str, Any], dict[str, str], dict[str, Any] | None] | None:
+    """The predicted toolset of a session created with an inline Expert.
+
+    Such a session has no catalogue Expert to re-resolve (no
+    ``metadata.expert_id``): its complete Expert exists only in the frozen
+    execution snapshot. Re-resolving the bare session base instead predicted
+    the base's tools, not the ones the user chose and the agent will bind. The
+    snapshot's merged policy is what the agent's attach reads, and every live
+    settings update publishes a new generation of it. None when there is no
+    snapshot to read (the caller keeps its usual resolve).
+    """
+    from shared.runtime.core.subagent_roster import roster_summary
+
+    snapshot = await read_execution(store, "Session", thread_id)
+    if snapshot is None:
+        return None
+    _blob, policy = srw_snapshot_config(snapshot)
+    tools = policy.get("tools")
+    configured: dict[str, Any] = dict(tools) if isinstance(tools, dict) else {}
+    apply_delegation_gate(configured, policy.get("delegation"))
+    provenance = layer_provenance([("expert", {"tools": configured})])
+    return configured, provenance, roster_summary(policy.get("subagents"))
+
+
 async def thread_tool_groups(
     thread_id: str,
     thread: dict[str, Any],
@@ -133,51 +168,59 @@ async def thread_tool_groups(
     else:
         try:
             expert_id = metadata.get("expert_id")
-            expert_row = (
-                await store.get_expert_by_id(str(expert_id)) if expert_id else None
-            )
-            project_id = str(thread["project_id"]) if thread.get("project_id") else None
-            project_overrides = None
-            if project_id and expert_id:
-                link = await store.get_project_expert_link(
-                    project_id=project_id, expert_id=str(expert_id)
+            inline = None
+            if not expert_id and metadata.get("expert_selection_source") == "inline":
+                inline = await _inline_expert_tool_policy(store, thread_id)
+            if inline is not None:
+                configured, provenance, roster = inline
+            else:
+                expert_row = (
+                    await store.get_expert_by_id(str(expert_id)) if expert_id else None
                 )
-                if link:
-                    project_overrides = link.get("config_override") or None
-                    if isinstance(project_overrides, str):
-                        project_overrides = json.loads(project_overrides)
-            # Owner-correct, same as session_tool_grants above: an admin
-            # viewing another user's thread must see THAT owner's
-            # acknowledged grants, not their own (see _acknowledged_grant_strip
-            # and the resume-time owner-vs-caller fix it mirrors).
-            grant_strip = await dependencies.acknowledged_grant_strip(
-                metadata,
-                user_id=str(thread["user_id"]) if thread.get("user_id") else None,
-                project_id=project_id,
-            )
-            # The same roster rows the attach prefetches: a DB `$ref` entry
-            # the resolve cannot see is dropped, and the pane would then
-            # report a roster the agent does bind as missing.
-            db_refs = await dependencies.prefetch_roster_refs(
-                expert_row=expert_row,
-                overrides=[project_overrides, request_override],
-                user_id=str(thread["user_id"]) if thread.get("user_id") else None,
-                project_ids=[project_id] if project_id else [],
-            )
-            capture: dict[str, Any] = {}
-            configured, provenance = await asyncio.to_thread(
-                merged_session_tool_policy,
-                base_config_name=base,
-                expert_row=expert_row,
-                project_overrides=project_overrides,
-                request_override=request_override,
-                grant_strip=grant_strip,
-                db_refs=db_refs,
-                capture=capture,
-            )
-            roster = roster_summary(
-                (capture.get("merged_fragment") or {}).get("subagents")
-            )
+                project_id = (
+                    str(thread["project_id"]) if thread.get("project_id") else None
+                )
+                project_overrides = None
+                if project_id and expert_id:
+                    link = await store.get_project_expert_link(
+                        project_id=project_id, expert_id=str(expert_id)
+                    )
+                    if link:
+                        project_overrides = link.get("config_override") or None
+                        if isinstance(project_overrides, str):
+                            project_overrides = json.loads(project_overrides)
+                # Owner-correct, same as session_tool_grants above: an admin
+                # viewing another user's thread must see THAT owner's
+                # acknowledged grants, not their own (see _acknowledged_grant_strip
+                # and the resume-time owner-vs-caller fix it mirrors).
+                grant_strip = await dependencies.acknowledged_grant_strip(
+                    metadata,
+                    user_id=str(thread["user_id"]) if thread.get("user_id") else None,
+                    project_id=project_id,
+                )
+                # The same roster rows the attach prefetches: a DB `$ref` entry
+                # the resolve cannot see is dropped, and the pane would then
+                # report a roster the agent does bind as missing.
+                db_refs = await dependencies.prefetch_roster_refs(
+                    expert_row=expert_row,
+                    overrides=[project_overrides, request_override],
+                    user_id=str(thread["user_id"]) if thread.get("user_id") else None,
+                    project_ids=[project_id] if project_id else [],
+                )
+                capture: dict[str, Any] = {}
+                configured, provenance = await asyncio.to_thread(
+                    merged_session_tool_policy,
+                    base_config_name=base,
+                    expert_row=expert_row,
+                    project_overrides=project_overrides,
+                    request_override=request_override,
+                    grant_strip=grant_strip,
+                    db_refs=db_refs,
+                    capture=capture,
+                )
+                roster = roster_summary(
+                    (capture.get("merged_fragment") or {}).get("subagents")
+                )
         except Exception:
             logger.exception("Tool-group resolve failed for thread %s", thread_id)
             source = "error"
