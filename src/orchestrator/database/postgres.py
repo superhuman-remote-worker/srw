@@ -24418,6 +24418,77 @@ class PostgresDB:
                 refreshed["cleanup_retirement_token"] = parsed_retirement
                 return refreshed
 
+    async def record_pinned_workspace_provision_create_receipt(
+        self,
+        thread_id: str,
+        *,
+        runtime_generation: str,
+        attempt_id: str,
+        resource_uid: str,
+    ) -> bool:
+        """Persist the trusted adapter's actual PVC CREATE response, not a GET."""
+        try:
+            thread, generation, attempt, uid = (
+                UUID(str(value))
+                for value in (thread_id, runtime_generation, attempt_id, resource_uid)
+            )
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                source = await conn.fetchrow(
+                    "SELECT * FROM thread_workspace_provision_intents "
+                    "WHERE thread_id=$1 AND attempt_id=$2 AND runtime_generation=$3 FOR UPDATE",
+                    thread,
+                    attempt,
+                    generation,
+                )
+                if source is None or source["status"] not in {"planned", "revoking"}:
+                    return False
+                await conn.execute(
+                    "INSERT INTO thread_workspace_provision_create_receipts "
+                    "(attempt_id,resource,thread_id,runtime_generation,namespace,resource_name,resource_uid,protocol) "
+                    "VALUES($1,'pvc',$2,$3,$4,$5,$6,'kubernetes_create_response_v1') "
+                    "ON CONFLICT DO NOTHING",
+                    attempt,
+                    thread,
+                    generation,
+                    source["namespace"],
+                    source["pvc_name"],
+                    str(uid),
+                )
+                return bool(
+                    await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM thread_workspace_provision_create_receipts "
+                        "WHERE attempt_id=$1 AND resource='pvc' AND resource_uid=$2)",
+                        attempt,
+                        str(uid),
+                    )
+                )
+
+    async def get_pinned_workspace_provision_create_receipt(
+        self, thread_id: str, *, runtime_generation: str, attempt_id: str
+    ) -> dict[str, Any] | None:
+        try:
+            thread, generation, attempt = (
+                UUID(str(value))
+                for value in (thread_id, runtime_generation, attempt_id)
+            )
+        except (TypeError, ValueError):
+            return None
+        row = await self.fetchrow(
+            "SELECT receipt.* FROM thread_workspace_provision_create_receipts receipt "
+            "JOIN thread_workspace_provision_intents source ON source.attempt_id=receipt.attempt_id "
+            "AND source.thread_id=receipt.thread_id AND source.runtime_generation=receipt.runtime_generation "
+            "AND source.namespace=receipt.namespace AND source.pvc_name=receipt.resource_name "
+            "WHERE receipt.thread_id=$1 AND receipt.runtime_generation=$2 "
+            "AND receipt.attempt_id=$3 AND receipt.resource='pvc'",
+            thread,
+            generation,
+            attempt,
+        )
+        return dict(row) if row else None
+
     async def record_pinned_workspace_inert_fence(
         self,
         thread_id: str,

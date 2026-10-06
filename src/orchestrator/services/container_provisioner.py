@@ -3949,6 +3949,7 @@ class ContainerProvisioner:
                 )
             else:
                 pvc_labels = {owner.label_key: owner.id}
+                create_receipt = {}
                 if strict_pinned:
                     pvc_labels.update(
                         {
@@ -3958,12 +3959,23 @@ class ContainerProvisioner:
                             ),
                         }
                     )
+
+                    async def record_created_pvc(uid: str) -> bool:
+                        return await self._db.record_pinned_workspace_provision_create_receipt(
+                            owner.id,
+                            runtime_generation=pinned_runtime_generation,
+                            attempt_id=pinned_attempt_id,
+                            resource_uid=uid,
+                        )
+
+                    create_receipt["created_receipt"] = record_created_pvc
                 pvc_status = await self._create_pvc(
                     pvc_name,
                     size=profile.storage or self._pvc_size,
                     # Owner label lets the backstop reaper resolve PVC → owner.
                     labels=pvc_labels,
                     expected_owner=owner,
+                    **create_receipt,
                 )
             if not pvc_status:
                 logger.error(
@@ -11278,6 +11290,19 @@ class ContainerProvisioner:
                 # needs durable issued storage authority.
                 if not permanent:
                     return None
+                create_receipt = (
+                    await self._db.get_pinned_workspace_provision_create_receipt(
+                        thread_id,
+                        runtime_generation=runtime_generation,
+                        attempt_id=attempt_id,
+                    )
+                )
+                if create_receipt:
+                    issued = str(intent.get("pvc_uid") or "")
+                    observed = str(create_receipt.get("resource_uid") or "")
+                    if issued and issued != observed:
+                        return None
+                    retained["pvc"] = observed
                 # The abort lineage identifies the old request, not an
                 # unpublished resource. Never turn matching names and labels
                 # into authority over a present PVC, Service or ConfigMap.
@@ -11293,7 +11318,9 @@ class ContainerProvisioner:
                         attempt_id=attempt_id,
                         network_tier=network_tier,
                     )
-                    recorded_uid = str(intent.get(f"{resource}_uid") or "")
+                    recorded_uid = str(
+                        intent.get(f"{resource}_uid") or retained.get(resource) or ""
+                    )
                     if observed.get("state") == "exact_original":
                         if not recorded_uid or observed.get("uid") != recorded_uid:
                             return None
@@ -13489,6 +13516,7 @@ class ContainerProvisioner:
         creation_reservation_id: str | None = None,
         mutation_authority: Callable[[], Awaitable[bool]] | None = None,
         expected_retained_pvc_uid: str | None = None,
+        created_receipt: Callable[[str], Awaitable[bool]] | None = None,
     ) -> Optional[str]:
         """Create a PVC for workspace data. Idempotent.
 
@@ -13589,6 +13617,16 @@ class ContainerProvisioner:
                         expected_owner.id,
                         authority_error,
                     )
+                    return None
+            if created_receipt is not None:
+                metadata = getattr(created, "metadata", None)
+                uid = str(getattr(metadata, "uid", "") or "")
+                if (
+                    not uid
+                    or getattr(metadata, "name", None) != pvc_name
+                    or getattr(metadata, "namespace", None) != self._namespace
+                    or not await created_receipt(uid)
+                ):
                     return None
             logger.info(
                 "PVC created: %s (storageClass=%s)", pvc_name, resolved_storage_class

@@ -5527,6 +5527,32 @@ $$;
 
 
 --
+-- Name: enforce_pinned_workspace_create_receipt(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_pinned_workspace_create_receipt() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE source public.thread_workspace_provision_intents%ROWTYPE;
+BEGIN
+ IF TG_OP<>'INSERT' THEN
+  RAISE EXCEPTION 'workspace CREATE receipt is immutable' USING ERRCODE='23514',CONSTRAINT='pinned_workspace_create_receipt_authority';
+ END IF;
+ SELECT * INTO source FROM public.thread_workspace_provision_intents WHERE attempt_id=NEW.attempt_id FOR SHARE;
+ IF source.attempt_id IS NULL OR source.thread_id<>NEW.thread_id
+   OR source.runtime_generation<>NEW.runtime_generation OR source.namespace<>NEW.namespace
+   OR source.pvc_name IS DISTINCT FROM NEW.resource_name
+   OR source.status NOT IN ('planned','revoking') OR source.retained_source_attempt_id IS NOT NULL
+   OR (source.pvc_uid IS NOT NULL AND source.pvc_uid<>NEW.resource_uid)
+   OR NEW.observed_at IS DISTINCT FROM transaction_timestamp() THEN
+  RAISE EXCEPTION 'PVC CREATE receipt lacks exact source intent' USING ERRCODE='23514',CONSTRAINT='pinned_workspace_create_receipt_authority';
+ END IF;
+ RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: enforce_pinned_workspace_inert_fence_receipt(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -28499,6 +28525,26 @@ COMMENT ON TABLE public.thread_turn_commits IS 'Workspace state after transcript
 
 
 --
+-- Name: thread_workspace_provision_create_receipts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_workspace_provision_create_receipts (
+    attempt_id uuid NOT NULL,
+    resource text NOT NULL,
+    thread_id uuid NOT NULL,
+    runtime_generation uuid NOT NULL,
+    namespace text NOT NULL,
+    resource_name text NOT NULL,
+    resource_uid text NOT NULL,
+    protocol text NOT NULL,
+    observed_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT thread_workspace_provision_create_receipts_protocol_check CHECK ((protocol = 'kubernetes_create_response_v1'::text)),
+    CONSTRAINT thread_workspace_provision_create_receipts_resource_check CHECK ((resource = 'pvc'::text)),
+    CONSTRAINT thread_workspace_provision_create_receipts_resource_uid_check CHECK ((resource_uid ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'::text))
+);
+
+
+--
 -- Name: thread_workspace_provision_inert_fence_receipts; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -31739,6 +31785,14 @@ ALTER TABLE ONLY public.thread_session_tasks
 
 ALTER TABLE ONLY public.thread_turn_commits
     ADD CONSTRAINT thread_turn_commits_pkey PRIMARY KEY (thread_id, seq);
+
+
+--
+-- Name: thread_workspace_provision_create_receipts thread_workspace_provision_create_receipts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_workspace_provision_create_receipts
+    ADD CONSTRAINT thread_workspace_provision_create_receipts_pkey PRIMARY KEY (attempt_id, resource);
 
 
 --
@@ -36301,6 +36355,13 @@ CREATE CONSTRAINT TRIGGER trg_officer_ticket_delivery_writer AFTER INSERT ON pub
 
 
 --
+-- Name: thread_workspace_provision_create_receipts trg_pinned_workspace_create_receipt_authority; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_pinned_workspace_create_receipt_authority BEFORE INSERT OR DELETE OR UPDATE ON public.thread_workspace_provision_create_receipts FOR EACH ROW EXECUTE FUNCTION public.enforce_pinned_workspace_create_receipt();
+
+
+--
 -- Name: thread_workspace_provision_inert_fence_receipts trg_pinned_workspace_inert_fence_authority; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -38612,6 +38673,14 @@ ALTER TABLE ONLY public.thread_session_runtime_state
 
 ALTER TABLE ONLY public.thread_session_tasks
     ADD CONSTRAINT thread_session_tasks_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: thread_workspace_provision_create_receipts thread_workspace_provision_create_receipts_attempt_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_workspace_provision_create_receipts
+    ADD CONSTRAINT thread_workspace_provision_create_receipts_attempt_id_fkey FOREIGN KEY (attempt_id) REFERENCES public.thread_workspace_provision_intents(attempt_id);
 
 
 --

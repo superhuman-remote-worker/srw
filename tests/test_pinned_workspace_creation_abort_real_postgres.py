@@ -17,7 +17,7 @@ pg_dsn = authority.pg_dsn
 _schema_applied = start._schema_applied
 
 
-async def _creating(db, monkeypatch, *, published=False):
+async def _creating(db, monkeypatch, *, published=False, receipts=True, writer=False):
     ids = await authority._seed(db, protected_agent_pod=True, workspace_claim=False)
     await db.execute(
         "DELETE FROM project_officers WHERE thread_id=$1::uuid", ids["thread"]
@@ -31,7 +31,7 @@ async def _creating(db, monkeypatch, *, published=False):
     generation = str(thread["runtime_generation"])
     cluster = PartialCluster()
     provider = start.pull._provisioner(monkeypatch, db, cluster)
-    if published:
+    if published and not writer:
         from kubernetes.client.exceptions import ApiException
 
         original_pod = cluster.create_namespaced_pod
@@ -47,6 +47,16 @@ async def _creating(db, monkeypatch, *, published=False):
             return original_pod(**kwargs)
 
         monkeypatch.setattr(cluster, "create_namespaced_pod", fail_original_pod)
+    if not receipts:
+        # The prior producer generation never invoked the new optional receipt
+        # port. Rehearse its actual create operation; do not edit database rows.
+        prior_create = provider._create_pvc
+
+        async def create_without_receipt(*args, **kwargs):
+            kwargs.pop("created_receipt", None)
+            return await prior_create(*args, **kwargs)
+
+        monkeypatch.setattr(provider, "_create_pvc", create_without_receipt)
     returned, resume = asyncio.Event(), asyncio.Event()
     method = "_create_seed_configmap" if published else "_create_pvc"
     original = getattr(provider, method)
@@ -111,10 +121,14 @@ async def test_creation_return_before_abort_retains_publication_authority(
 
 
 @pytest.mark.asyncio
-async def test_end_before_uid_publication_retains_exact_create_response(db, monkeypatch):
+async def test_end_before_uid_publication_retains_exact_create_response(
+    db, monkeypatch
+):
     ids, generation, cluster, _, task, resume = await _creating(db, monkeypatch)
     try:
-        retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+        retirement = await db.begin_pinned_thread_retirement(
+            ids["thread"], permanent=True
+        )
         assert retirement["state"] == "pending"
     finally:
         resume.set()
@@ -128,7 +142,7 @@ async def test_end_before_uid_publication_retains_exact_create_response(db, monk
     assert exists, "End abandoned the CREATE response before Ready publication"
     row = await db.fetchrow(
         "SELECT * FROM thread_workspace_provision_create_receipts WHERE attempt_id=$1::uuid AND resource='pvc'",
-        attempt
+        attempt,
     )
     assert row["resource_uid"] == cluster.objects["pvc"].metadata.uid
     assert str(row["runtime_generation"]) == generation
@@ -232,9 +246,9 @@ class PartialCluster(start.PinnedPullCluster):
         return pod
 
 
-async def _stranded(db, monkeypatch, *, published=True):
+async def _stranded(db, monkeypatch, *, published=True, receipts=True, writer=False):
     ids, generation, cluster, provider, task, resume = await _creating(
-        db, monkeypatch, published=published
+        db, monkeypatch, published=published, receipts=receipts, writer=writer
     )
     try:
         assert (
@@ -407,7 +421,9 @@ async def test_missing_causal_fence_receipt_cannot_settle_partial_creation(
 async def test_unpublished_existing_pvc_is_not_adopted_from_name_and_labels(
     db, monkeypatch
 ):
-    ids, _, cluster, provider = await _stranded(db, monkeypatch, published=False)
+    ids, _, cluster, provider = await _stranded(
+        db, monkeypatch, published=False, receipts=False
+    )
     original_uid = cluster.objects["pvc"].metadata.uid
     retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
     assert retirement["state"] == "pending"
@@ -454,7 +470,10 @@ async def test_upgrade_preserves_recorded_abort_and_retires_exact_published_stor
         Path(__file__).resolve().parents[1] / "src/orchestrator/database/migrations/app"
     )
     for path in migrations.glob("*.sql"):
-        if path.name != "0330_pinned_partial_creation_abort_retirement.sql":
+        if path.name not in {
+            "0330_pinned_partial_creation_abort_retirement.sql",
+            "0331_pinned_pvc_create_response_receipts.sql",
+        }:
             (old / path.name).write_bytes(path.read_bytes())
     database = "r33c_upgrade_" + uuid4().hex
     parts = urlsplit(pg_dsn)
@@ -468,7 +487,7 @@ async def test_upgrade_preserves_recorded_abort_and_retires_exact_published_stor
         monkeypatch.setenv("EXPERTS_DB_ENABLED", "false")
         monkeypatch.setenv("APP_ENCRYPTION_KEY", "P" * 32)
         await store.connect()
-        ids, _, cluster, provider = await _stranded(store, monkeypatch)
+        ids, _, cluster, provider = await _stranded(store, monkeypatch, receipts=False)
         before = await store.fetchrow(
             "SELECT * FROM thread_runtime_attach_abort_outcomes WHERE thread_id=$1::uuid",
             ids["thread"],
@@ -480,8 +499,9 @@ async def test_upgrade_preserves_recorded_abort_and_retires_exact_published_stor
             await run_migrations(pool, migrations)
             await run_migrations(pool, migrations)
         after = await store.fetch(
-            "SELECT filename,checksum FROM schema_migrations WHERE filename<>$1 ORDER BY filename",
+            "SELECT filename,checksum FROM schema_migrations WHERE filename NOT IN ($1,$2) ORDER BY filename",
             "0330_pinned_partial_creation_abort_retirement.sql",
+            "0331_pinned_pvc_create_response_receipts.sql",
         )
         assert ledger == after
         await start._retire_unbound(store, provider, ids["thread"], permanent=True)
@@ -504,3 +524,121 @@ async def test_upgrade_preserves_recorded_abort_and_retires_exact_published_stor
         await store.disconnect()
         await admin.execute(f'DROP DATABASE "{database}" WITH (FORCE)')
         await admin.close()
+
+
+@pytest.mark.asyncio
+async def test_recorded_abort_recovery_uses_actual_create_receipt_when_ready_uid_is_missing(
+    db, monkeypatch
+):
+    ids, generation, cluster, provider = await _stranded(
+        db, monkeypatch, published=False
+    )
+    before = await db.fetchrow(
+        "SELECT * FROM thread_workspace_provision_intents WHERE thread_id=$1::uuid",
+        ids["thread"],
+    )
+    receipt = await db.fetchrow(
+        "SELECT * FROM thread_workspace_provision_create_receipts WHERE attempt_id=$1",
+        before["attempt_id"],
+    )
+    assert (
+        before["pvc_uid"] is None
+        and receipt["resource_uid"] == cluster.objects["pvc"].metadata.uid
+    )
+    assert str(receipt["runtime_generation"]) == generation
+    await start._retire_unbound(db, provider, ids["thread"], permanent=True)
+    assert await db.get_thread(ids["thread"]) is None
+    assert (
+        await db.fetchrow(
+            "SELECT * FROM thread_workspace_provision_create_receipts WHERE attempt_id=$1",
+            before["attempt_id"],
+        )
+        == receipt
+    )
+
+
+@pytest.mark.asyncio
+async def test_unpublished_original_pod_cannot_be_deleted_as_an_inert_name_fence(
+    db, monkeypatch
+):
+    ids, _, cluster, provider = await _stranded(db, monkeypatch, writer=True)
+    original = cluster.objects["pod"]
+    assert original.metadata.deletion_timestamp is None
+    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert retirement["state"] == "pending"
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    intent = await db.revoke_pinned_thread_workspace_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=retirement["generation"],
+        expected_retirement_token=retirement["token"],
+        expected_attempt_id=retirement["context"]["workspace_provision_intent"][
+            "attempt_id"
+        ],
+    )
+    assert intent["pod_uid"] is None
+    assert (
+        await provider.fence_pinned_workspace_provision_intent(
+            intent,
+            permanent=True,
+            expected_retirement_token=retirement["token"],
+            expected_retirement_generation=retirement["generation"],
+        )
+        is None
+    )
+    assert original.metadata.deletion_timestamp is None
+    assert cluster.pod_deletes == 0
+
+
+@pytest.mark.asyncio
+async def test_create_receipt_repeats_idempotently_and_refuses_changed_source_or_uid(
+    db, monkeypatch
+):
+    import asyncpg
+    from uuid import uuid4
+
+    ids, generation, cluster, _, task, resume = await _creating(db, monkeypatch)
+    try:
+        intent = await db.fetchrow(
+            "SELECT * FROM thread_workspace_provision_intents WHERE thread_id=$1::uuid",
+            ids["thread"],
+        )
+        receipt = await db.fetchrow(
+            "SELECT * FROM thread_workspace_provision_create_receipts WHERE attempt_id=$1",
+            intent["attempt_id"],
+        )
+        kwargs = dict(
+            runtime_generation=generation,
+            attempt_id=str(intent["attempt_id"]),
+            resource_uid=cluster.objects["pvc"].metadata.uid,
+        )
+        assert await db.record_pinned_workspace_provision_create_receipt(
+            ids["thread"], **kwargs
+        )
+        for key in ["runtime_generation", "attempt_id"]:
+            assert not await db.record_pinned_workspace_provision_create_receipt(
+                ids["thread"], **{**kwargs, key: str(uuid4())}
+            )
+        assert not await db.record_pinned_workspace_provision_create_receipt(
+            ids["thread"], **{**kwargs, "resource_uid": str(uuid4())}
+        )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await db.execute(
+                "UPDATE thread_workspace_provision_create_receipts SET resource_uid=$2 WHERE attempt_id=$1",
+                intent["attempt_id"],
+                str(uuid4()),
+            )
+        assert (
+            await db.fetchrow(
+                "SELECT * FROM thread_workspace_provision_create_receipts WHERE attempt_id=$1",
+                intent["attempt_id"],
+            )
+            == receipt
+        )
+    finally:
+        resume.set()
+        await task
