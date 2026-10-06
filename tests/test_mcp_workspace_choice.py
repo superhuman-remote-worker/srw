@@ -147,6 +147,13 @@ async def test_unknown_name_points_to_manifest_list():
         },
         {"instanceRef": {"uid": "x"}},
         {"template": {"ref": {"name": "a"}}, "extra": 1},
+        {
+            "template": {
+                "ref": {"name": "a", "scope": {"kind": "Catalog", "name": "shared"}},
+                "inline": {"backend": "sandbox"},
+            }
+        },
+        {"template": {"ref": "a"}},
         "  ",
         42,
     ],
@@ -154,6 +161,24 @@ async def test_unknown_name_points_to_manifest_list():
 async def test_other_shapes_are_refused(value):
     with pytest.raises(WorkspaceArgumentError, match="manifest_apply"):
         await workspace_field(_FakeLister({}), value, project_id=None)
+
+
+@pytest.mark.asyncio
+async def test_json_string_is_treated_as_an_unknown_template_name():
+    # A JSON-encoded dict is not parsed: the whole string is looked up as a name.
+    with pytest.raises(
+        WorkspaceArgumentError, match="manifest_list kind=WorkspaceTemplate"
+    ):
+        await workspace_field(
+            _FakeLister({}), '{"template": {"ref": {"name": "a"}}}', project_id=None
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_failing_lookup_is_not_skipped():
+    lister = _FakeLister({("Account", "me"): 500})
+    with pytest.raises(httpx.HTTPStatusError):
+        await workspace_field(lister, "x", project_id=None)
 
 
 @pytest.mark.asyncio
