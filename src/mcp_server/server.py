@@ -2461,7 +2461,8 @@ async def create_persistent_thread(
         config_name: Agent config to use (default: "session_base")
         permission_mode: Tool approval mode (supervised, auto_accept, autonomous)
         project_id: The session's project UUID. A session has one project or
-            none; omit for none.
+            none; omit for none (a project-scoped MCP token uses its own
+            project).
         project_ids: Deprecated, prefer project_id. At most one project UUID;
             a second project is refused.
         datasource_ids: Connector selection. Omit to use automatic defaults;
@@ -2480,6 +2481,8 @@ async def create_persistent_thread(
     client = _get_client()
     # Same rule and words as the orchestrator's 422, checked here first so the
     # workspace lookup below never searches without the session's project.
+    # Unlike the server, this runs before the token-scope 403 on purpose: both
+    # checks read only the caller's own input, so neither order leaks anything.
     if len({*(project_ids or []), *([project_id] if project_id else [])}) > 1:
         return (
             "Refusing to create the session: A Session can belong to one "

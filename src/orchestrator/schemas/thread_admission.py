@@ -56,7 +56,7 @@ class ThreadCreateRequest(BaseModel):
         None,
         description=(
             "The Session's project UUID. A Session has one project or none; "
-            "omit for none."
+            "omit for none (a project-scoped MCP token uses its own project)."
         ),
     )
     project_ids: list[str] | None = Field(

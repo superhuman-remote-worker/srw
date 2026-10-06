@@ -410,7 +410,7 @@ class TestAsyncCockpitClientPersistentThreads:
                 title="Research Session",
                 permission_mode="autonomous",
                 project_id="proj-1",
-                project_ids=["proj-1", "proj-2"],
+                project_ids=["proj-1"],
                 datasource_ids=[],
                 model="openai/gpt-4",
                 temperature=0.7,
@@ -421,7 +421,7 @@ class TestAsyncCockpitClientPersistentThreads:
             assert body["title"] == "Research Session"
             assert body["permission_mode"] == "autonomous"
             assert body["project_id"] == "proj-1"
-            assert body["project_ids"] == ["proj-1", "proj-2"]
+            assert body["project_ids"] == ["proj-1"]
             assert body["datasource_ids"] == []
             assert "use_datasource_defaults" not in body
             assert body["model"] == "openai/gpt-4"
@@ -810,6 +810,13 @@ class TestMcpPersistentThreadTools:
             "Refusing to create the session: A Session can belong to one "
             "project at most. Pick one project, or none."
         )
+        # The MCP image cannot import orchestrator code, so the words are
+        # repeated there; this keeps them equal to the server's 422 detail.
+        from orchestrator.services.thread_project_authorization import (
+            ONE_PROJECT_PER_SESSION_DETAIL,
+        )
+
+        assert result.endswith(ONE_PROJECT_PER_SESSION_DETAIL)
         mock_client.create_persistent_thread.assert_not_awaited()
         mock_client.list_manifest_resources.assert_not_awaited()
 

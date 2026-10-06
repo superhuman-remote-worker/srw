@@ -3269,6 +3269,9 @@ class AsyncCockpitClient:
     ) -> dict[str, Any]:
         """Create a new persistent thread.
 
+        A session has one project or none: pass ``project_id``.
+        ``project_ids`` is deprecated and takes at most one project.
+
         ``datasource_ids`` is tri-state at the MCP boundary: an omitted field
         arrives here as the internal ``None`` sentinel and requests automatic
         defaults, while ``[]`` attaches no connectors and IDs request exactly

@@ -5,7 +5,8 @@ Extracted verbatim from ``orchestrator.main`` (R1.B06 lane B, census group
 repository scope, so this module is an authorization boundary and not a lookup
 helper.
 
-Four properties are load-bearing and move unchanged:
+Five properties are load-bearing. The first four moved unchanged; the fifth
+came with the one-project rule:
 
 * **Classification ranks below authorization.** ``archived`` is a lifecycle
   verdict; a caller with no membership still learns only ``revoked``, never
@@ -25,6 +26,10 @@ Four properties are load-bearing and move unchanged:
   membership grant.** Omission means that project; naming a different or
   additional one is refused before project or connector policy could widen the
   request.
+* **A new Session has one project or none.** More than one distinct project
+  is a 422 (``ONE_PROJECT_PER_SESSION_DETAIL``), checked after the MCP token
+  scope so a scoped token still gets its 403. Only creation checks it; older
+  multi-project Sessions still read, resume and take config updates.
 
 Every collaborator arrives per invocation through
 :class:`ThreadProjectAuthorizationDependencies`; ``store`` is main's
@@ -47,6 +52,10 @@ from orchestrator.security.access import (
 from orchestrator.services.config_drift import (
     acknowledged_drift_ids,
     strip_acknowledged,
+)
+
+ONE_PROJECT_PER_SESSION_DETAIL = (
+    "A Session can belong to one project at most. Pick one project, or none."
 )
 
 
@@ -198,11 +207,6 @@ async def revalidate_thread_project_ids(
     return await authorize_thread_project_ids(
         owner, selected, dependencies=dependencies
     )
-
-
-ONE_PROJECT_PER_SESSION_DETAIL = (
-    "A Session can belong to one project at most. Pick one project, or none."
-)
 
 
 def thread_creation_project_ids(
