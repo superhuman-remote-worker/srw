@@ -55,6 +55,7 @@ from orchestrator.services import (
     job_start_bundle,
     job_workspace_authority,
     job_workspace_runtime,
+    manifest_experts,
     project_loop_spawn as project_loop_spawn_service,
     session_tool_policy,
     subjob_completion as subjob_completion_operations,
@@ -413,6 +414,7 @@ def job_admission_config_dependencies(
             expert_type="worker",
         ),
         preview_expert_refusals=partial(preview_expert_refusals, resources.postgres_db),
+        srw_image=partial(manifest_experts.trusted_srw_image, resources.postgres_db),
     )
 
 

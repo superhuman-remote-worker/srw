@@ -40,6 +40,7 @@ from orchestrator.services import (
     job_datasource_selection,
     job_dispatcher,
     managed_repository_authority,
+    manifest_experts,
     officer_conference as officer_conference_service,
     officer_post_policy as officer_post_policy_service,
     officer_post_views as officer_post_view_service,
@@ -665,6 +666,12 @@ def thread_admission_dependencies(
             resources,
         ),
         redact_thread_metadata=thread_projection_operations.redact_thread_metadata,
+        bundled_expert_exists=functools.partial(
+            jobs_composition.bundled_job_expert_exists, resources
+        ),
+        srw_image=functools.partial(
+            manifest_experts.trusted_srw_image, resources.postgres_db
+        ),
     )
 
 

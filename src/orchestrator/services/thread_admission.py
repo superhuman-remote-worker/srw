@@ -70,6 +70,7 @@ from orchestrator.database.postgres import (
     DatasourceMaterializationAuthorizationError,
     DatasourcePolicyConflictError,
 )
+from orchestrator.schemas.inline_expert import InlineExpertSelection
 from orchestrator.schemas.thread_admission import ThreadCreateRequest
 from orchestrator.security.access import redact_config_override
 from orchestrator.services.config_overrides import validated_config_name
@@ -117,6 +118,7 @@ from orchestrator.services.workspace_binding import (
 )
 from orchestrator.services.workspace_tier_policy import backend_from_override
 from shared.backend_kinds import LITE_BACKENDS
+from shared.expert_reference import ExpertReferenceConflict, resolve_expert_selection
 from shared.runtime.core.loader import canonical_config_name
 
 logger = logging.getLogger(__name__)
@@ -251,6 +253,12 @@ class ThreadAdmissionDependencies:
     send_session_attach: Callable[..., Awaitable[bool]]
     provision_or_assign: Callable[..., Awaitable[None]]
     redact_thread_metadata: Callable[[dict[str, Any]], dict[str, Any]]
+
+    # *Expert selection*: whether a bundled `expert` slug is in the catalogue,
+    # and the installed SRW harness image an inline expert's explicit image
+    # must equal (the image the execution snapshot records).
+    bundled_expert_exists: Callable[[str], bool]
+    srw_image: Callable[[], str]
 
     def project_dependencies(self) -> ThreadProjectAuthorizationDependencies:
         """Dependencies for the sibling project-policy module."""
@@ -508,14 +516,63 @@ async def resolve_thread_creation_plan(
         str(user["id"]), all_user_settings or {}
     )
 
+    # `expert` supersedes the deprecated aliases. A string goes through the
+    # job funnel's resolver so every "two experts in one call" refusal reads
+    # the same; an inline Expert is a complete definition that is never
+    # combined with, or layered over, a catalogue selection.
+    inline_expert = (
+        request_body.expert.inline
+        if isinstance(request_body.expert, InlineExpertSelection)
+        else None
+    )
+    requested_config_name = request_body.config_name
+    requested_expert_id = request_body.expert_id
+    if request_body.expert is not None:
+        try:
+            expert_choice = resolve_expert_selection(
+                expert=None if inline_expert is not None else request_body.expert,
+                config_name=request_body.config_name,
+                expert_id=request_body.expert_id,
+                role="session",
+            )
+        except ExpertReferenceConflict as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if inline_expert is not None and expert_choice.kind != "default":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "An inline expert cannot be combined with config_name or "
+                    "expert_id; select one expert source."
+                ),
+            )
+        if (
+            inline_expert is None
+            and expert_choice.kind == "bundled"
+            and not dependencies.bundled_expert_exists(expert_choice.config_name)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unknown expert '{expert_choice.config_name}'. Use "
+                    "list_experts (GET /api/experts) to see the selectable "
+                    "experts; pass a bundled expert id or a DB expert UUID."
+                ),
+            )
+        requested_config_name = (
+            expert_choice.config_name
+            if expert_choice.kind == "bundled"
+            else "session_base"
+        )
+        requested_expert_id = expert_choice.expert_id
+
     # Write boundary: threads.config_name is read back by /resume, by the
     # Officer recycler and by the magic-link wake, all of which provision
     # from a fire-and-forget task with no request left to answer. Refuse a
     # value none of them could ever boot, here, before the INSERT.
     config_name = canonical_config_name(
-        validated_config_name(request_body.config_name) or "session_base"
+        validated_config_name(requested_config_name) or "session_base"
     )
-    if request_body.expert_id and config_name != "session_base":
+    if requested_expert_id and config_name != "session_base":
         raise HTTPException(
             status_code=400,
             detail=(
@@ -523,22 +580,31 @@ async def resolve_thread_creation_plan(
                 "config_name; select one expert source"
             ),
         )
-    selected_expert_id = request_body.expert_id
+    selected_expert_id = requested_expert_id
     selected_expert_row: dict[str, Any] | None = None
     project_expert_override: dict[str, Any] | None = None
     selection = None
+    if inline_expert is not None:
+        from orchestrator.services.inline_expert import admit_inline_expert
+
+        # Validated before the create-time policy resolve below, so that view
+        # and the INSERT's snapshot read the same gated definition.
+        selected_expert_row = admit_inline_expert(
+            inline_expert, role="session", trusted_image=dependencies.srw_image()
+        )
     try:
         if (
-            dependencies.is_experts_db_enabled()
+            inline_expert is None
+            and dependencies.is_experts_db_enabled()
             and await dependencies.user_experts_enabled()
-            and (request_body.expert_id or config_name == "session_base")
+            and (requested_expert_id or config_name == "session_base")
         ):
             selection = await resolve_root_expert(
                 dependencies.store,
                 expert_type="session",
                 user_id=str(user["id"]),
                 project_id=primary_project_id,
-                explicit_expert_id=request_body.expert_id,
+                explicit_expert_id=requested_expert_id,
                 is_admin=bool(user.get("is_admin")),
             )
             selected_expert_row = selection.expert
@@ -831,6 +897,12 @@ async def resolve_thread_creation_plan(
         metadata_patch["expert_selection_source"] = (
             selection.source if selection else "explicit"
         )
+    elif inline_expert is not None:
+        # No identity to persist: the definition itself is frozen by the
+        # INSERT's snapshot. The template it was copied from is display-only.
+        metadata_patch["expert_selection_source"] = "inline"
+        if request_body.expert_based_on:
+            metadata_patch["expert_based_on"] = request_body.expert_based_on
     if request_body.protected_cloud:
         metadata_patch["protected_cloud"] = True
     trusted_seed = request_body._trusted_seed
@@ -887,6 +959,8 @@ async def resolve_thread_creation_plan(
     )
     if workspace_selection is not None:
         create_kwargs["workspace_selection"] = workspace_selection
+    if inline_expert is not None:
+        create_kwargs["expert_row"] = selected_expert_row
     if trusted_seed is not None:
         create_kwargs["initial_event"] = trusted_seed.opening_event
     # A review branch is attach authority, not decorative metadata. Commit

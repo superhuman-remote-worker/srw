@@ -4247,6 +4247,7 @@ class PostgresDB:
         delivery_contract: Mapping[str, Any] | None = None,
         execution_manifest: Mapping[str, Any] | None = None,
         workspace_selection: Mapping[str, Any] | None = None,
+        expert_row: Mapping[str, Any] | None = None,
         conn: Any = None,
     ) -> Dict[str, Any]:
         """Create a new job.
@@ -4315,6 +4316,9 @@ class PostgresDB:
             delivery_contract: Server-prepared immutable contract, including
                 exact attached PR bindings. Raw callers may select semantic
                 deliverables through context, but cannot author this proof.
+            expert_row: An admission-validated inline Expert definition
+                (``services.inline_expert``). The execution snapshot freezes it
+                instead of a catalogue Expert; never combined with expert_id.
             conn: Optional caller-owned connection ALREADY inside a transaction.
                 Officer admission needs its stable post lock, ticket-claim
                 check, lineage capacity count and this INSERT to be one atomic
@@ -4604,6 +4608,7 @@ class PostgresDB:
                 else None,
                 config_name=config_name,
                 expert_id=expert_id,
+                expert_row=dict(expert_row) if expert_row is not None else None,
                 config_override=config_override,
                 workspace_selection=dict(workspace_selection)
                 if workspace_selection is not None
@@ -35932,6 +35937,7 @@ class PostgresDB:
         initial_event: str | None = None,
         execution_manifest: Mapping[str, Any] | None = None,
         workspace_selection: Mapping[str, Any] | None = None,
+        expert_row: Mapping[str, Any] | None = None,
     ) -> str:
         """Create a thread with its complete connector selection in one row.
 
@@ -35946,6 +35952,10 @@ class PostgresDB:
         opening context visible before any attach can restore the thread.
         Unknown lanes or malformed creation authority fail closed before
         touching the database.
+
+        ``expert_row`` is an admission-validated inline Expert definition. The
+        session snapshot freezes it in place of ``metadata.expert_id``, which an
+        inline session never carries.
         """
         if execution_lane not in ("pinned", "stateless"):
             raise ValueError(f"Unsupported thread execution lane: {execution_lane!r}")
@@ -36151,6 +36161,7 @@ class PostgresDB:
                     else None,
                     config_name=config_name,
                     expert_id=metadata.get("expert_id"),
+                    expert_row=dict(expert_row) if expert_row is not None else None,
                     config_override=snapshot_override,
                     workspace_selection=dict(workspace_selection)
                     if workspace_selection is not None

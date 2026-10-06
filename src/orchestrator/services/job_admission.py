@@ -162,6 +162,7 @@ async def admit_job(
                 context=officer.context,
                 config_name=config.config_name,
                 expert_id=config.expert_id,
+                expert_row=config.expert_row,
                 config_override=officer.config_override,
                 requested_workspace_backend=config.requested_workspace_backend,
                 workspace_selection=workspace_selection,

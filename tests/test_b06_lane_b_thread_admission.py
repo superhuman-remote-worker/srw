@@ -144,6 +144,8 @@ def _deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         send_session_attach=AsyncMock(return_value=True),
         provision_or_assign=AsyncMock(),
         redact_thread_metadata=MagicMock(side_effect=lambda t: t),
+        bundled_expert_exists=MagicMock(return_value=True),
+        srw_image=MagicMock(return_value="installed:1"),
     )
     fields.update(over)
     return ta.ThreadAdmissionDependencies(**fields)
@@ -779,6 +781,187 @@ class TestCreationPlan:
         plan = await _plan(body, _deps())
         assert plan.create_kwargs["initial_event"] == "hello"
         assert plan.create_kwargs["initial_metadata"]["review_delivery"] == {"job": "j"}
+
+
+# =============================================================================
+# Expert selection: the unified `expert` field and inline experts (creation UI
+# slice S2)
+# =============================================================================
+
+DB_EXPERT = "66666666-6666-4666-8666-666666666666"
+
+
+def _inline(**private: Any) -> dict[str, Any]:
+    return {
+        "inline": {
+            "runtime": {
+                "adapter": "srw/v1",
+                "config": {
+                    "config": {"interactive": {"permission_mode": "auto_accept"}},
+                    "prompts": {"persona": "A terse pair programmer."},
+                    **private,
+                },
+            }
+        }
+    }
+
+
+def _experts_on(monkeypatch, **over: Any) -> tuple[Any, AsyncMock]:
+    resolver = AsyncMock(
+        return_value=ExpertSelection(
+            expert={"id": DB_EXPERT, "config": {}}, source="explicit"
+        )
+    )
+    monkeypatch.setattr(ta, "resolve_root_expert", resolver)
+    deps = _deps(
+        is_experts_db_enabled=MagicMock(return_value=True),
+        user_experts_enabled=AsyncMock(return_value=True),
+        **over,
+    )
+    return deps, resolver
+
+
+class TestExpertSelection:
+    @pytest.mark.asyncio
+    async def test_an_inline_expert_is_frozen_without_identity_or_default(
+        self, monkeypatch
+    ):
+        deps, resolver = _experts_on(monkeypatch)
+        plan = await _plan(
+            ThreadCreateRequest(expert=_inline(), expert_based_on="assistant"), deps
+        )
+
+        resolver.assert_not_awaited()
+        assert plan.config_name == "session_base"
+        assert plan.create_kwargs["config_name"] == "session_base"
+        row = plan.create_kwargs["expert_row"]
+        assert row["expert_type"] == "session"
+        assert row["prompts"] == {"persona": "A terse pair programmer."}
+        assert "id" not in row and "manifest_uid" not in row
+        metadata = plan.create_kwargs["initial_metadata"]
+        assert "expert_id" not in metadata
+        assert metadata["expert_selection_source"] == "inline"
+        assert metadata["expert_based_on"] == "assistant"
+        # The create-time policy resolve read the inline definition: its
+        # permission mode reaches the materialized thread column.
+        assert plan.effective_create_config["interactive"]["permission_mode"] == (
+            "auto_accept"
+        )
+        assert plan.create_kwargs["permission_mode"] == "auto_accept"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "selector",
+        [{"expert_id": DB_EXPERT}, {"config_name": "scholar"}],
+        ids=["expert_id", "config_name"],
+    )
+    async def test_an_inline_expert_cannot_be_combined_with_a_selector(
+        self, monkeypatch, selector
+    ):
+        deps, resolver = _experts_on(monkeypatch)
+        with pytest.raises(HTTPException) as exc:
+            await _plan(ThreadCreateRequest(expert=_inline(), **selector), deps)
+        assert exc.value.status_code == 400
+        assert "inline expert" in exc.value.detail
+        resolver.assert_not_awaited()
+        deps.resolve_session_account_defaults.assert_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "change,status,fragment",
+        [
+            ({"image": "example.invalid/other:1"}, 422, "installed harness"),
+            ({"config": {"prompts": {"system": "x"}}}, 422, "Unknown prompt keys"),
+            (
+                {"config": {"config": {"llm": {"base_url": "https://evil"}}}},
+                422,
+                "credential",
+            ),
+        ],
+    )
+    async def test_inline_gates_refuse_before_the_policy_resolve(
+        self, monkeypatch, change, status, fragment
+    ):
+        deps, resolver = _experts_on(monkeypatch)
+        expert = _inline()
+        runtime = expert["inline"]["runtime"]
+        if "config" in change:
+            runtime["config"].update(change["config"])
+        else:
+            runtime.update(change)
+        resolve = MagicMock(side_effect=AssertionError("resolved an unvetted expert"))
+        monkeypatch.setattr(ta, "resolve_config", resolve)
+        with pytest.raises(HTTPException) as exc:
+            await _plan(ThreadCreateRequest(expert=expert), deps)
+        assert exc.value.status_code == status
+        assert fragment in str(exc.value.detail)
+        resolve.assert_not_called()
+        deps.store.create_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_uuid_expert_selects_the_db_expert(self, monkeypatch):
+        deps, resolver = _experts_on(monkeypatch)
+        plan = await _plan(
+            ThreadCreateRequest(expert=DB_EXPERT, expert_based_on="ignored"), deps
+        )
+        assert resolver.await_args.kwargs["explicit_expert_id"] == DB_EXPERT
+        metadata = plan.create_kwargs["initial_metadata"]
+        assert metadata["expert_id"] == DB_EXPERT
+        assert "expert_based_on" not in metadata
+        assert "expert_row" not in plan.create_kwargs
+
+    @pytest.mark.asyncio
+    async def test_a_bundled_expert_slug_selects_the_bundled_expert(self, monkeypatch):
+        deps, resolver = _experts_on(monkeypatch)
+        plan = await _plan(ThreadCreateRequest(expert="assistant"), deps)
+        resolver.assert_not_awaited()
+        deps.bundled_expert_exists.assert_called_once_with("assistant")
+        assert plan.config_name == "assistant"
+        assert "expert_row" not in plan.create_kwargs
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_bundled_expert_slug_is_refused(self, monkeypatch):
+        deps, _ = _experts_on(
+            monkeypatch, bundled_expert_exists=MagicMock(return_value=False)
+        )
+        with pytest.raises(HTTPException) as exc:
+            await _plan(ThreadCreateRequest(expert="no-such-expert"), deps)
+        assert exc.value.status_code == 400
+        assert "Unknown expert" in exc.value.detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            {"expert": "assistant", "expert_id": DB_EXPERT},
+            {"expert": DB_EXPERT, "config_name": "assistant"},
+            {"expert": "assistant", "config_name": "scholar"},
+        ],
+    )
+    async def test_two_experts_in_one_request_are_refused(self, monkeypatch, fields):
+        deps, resolver = _experts_on(monkeypatch)
+        with pytest.raises(HTTPException) as exc:
+            await _plan(ThreadCreateRequest(**fields), deps)
+        assert exc.value.status_code == 400
+        resolver.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_session_base_spelling_is_not_a_choice(self, monkeypatch):
+        deps, resolver = _experts_on(monkeypatch)
+        await _plan(
+            ThreadCreateRequest(expert="session_base", expert_id=DB_EXPERT), deps
+        )
+        assert resolver.await_args.kwargs["explicit_expert_id"] == DB_EXPERT
+
+    @pytest.mark.asyncio
+    async def test_commit_hands_the_inline_definition_to_the_insert(self):
+        deps = _deps()
+        body = ThreadCreateRequest(expert=_inline())
+        plan = await _plan(body, deps)
+        await ta.commit_thread_creation(plan, body, USER, dependencies=deps)
+        kwargs = deps.store.create_thread.await_args.kwargs
+        assert kwargs["expert_row"] is plan.create_kwargs["expert_row"]
+        assert "expert_id" not in kwargs["initial_metadata"]
 
 
 # =============================================================================

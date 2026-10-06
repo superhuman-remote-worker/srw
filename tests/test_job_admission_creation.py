@@ -643,3 +643,23 @@ async def test_concurrent_creations_keep_bound_stores_and_callbacks_isolated(
     other.trigger_dispatch.assert_called_once_with()
     assert other.store.create_job.await_args.kwargs["origin"] == "other-origin"
     assert deps.store.create_job.await_args.kwargs["origin"] == "session"
+
+
+@pytest.mark.asyncio
+async def test_an_inline_expert_row_reaches_the_insert_on_both_funnels(
+    inputs, officer, deps
+):
+    row = {
+        "expert_type": "worker",
+        "config": {"llm": {"model": "inline-model"}},
+        "prompts": {},
+        "harness_config_layers": [],
+        "harness_asset_name": None,
+        "harness_config_name": None,
+    }
+    await create(replace(inputs, expert_id=None, expert_row=row), deps)
+    assert deps.store.create_job.await_args.kwargs["expert_row"] is row
+    assert deps.store.create_job.await_args.kwargs["expert_id"] is None
+
+    await create(replace(officer, expert_id=None, expert_row=row), deps)
+    assert deps.admit_officer.await_args.kwargs["job_kwargs"]["expert_row"] is row

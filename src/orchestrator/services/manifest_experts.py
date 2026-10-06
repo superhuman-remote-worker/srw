@@ -44,6 +44,19 @@ def installed_srw_image() -> str:
     )
 
 
+def trusted_srw_image(store: Any) -> str:
+    """The installed image an explicit inline SRW ``image`` must equal.
+
+    The same source ``prepare_srw_snapshot`` records in the execution: the
+    image the application bound to its store at startup, else the operator
+    setting. Admission and the snapshot therefore agree on what is installed.
+    """
+    image = getattr(store, "manifest_runtime_image", None)
+    if isinstance(image, str) and image.strip():
+        return image
+    return installed_srw_image()
+
+
 def _object(value: Any) -> dict[str, Any]:
     if isinstance(value, str):
         value = json.loads(value)

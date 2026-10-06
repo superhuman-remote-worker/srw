@@ -35,6 +35,11 @@ from pydantic import (
     model_validator,
 )
 
+from orchestrator.schemas.inline_expert import (
+    EXPERT_BASED_ON_DESCRIPTION,
+    InlineExpertSelection,
+)
+
 
 @dataclass(frozen=True)
 class TrustedThreadSeed:
@@ -51,7 +56,28 @@ class ThreadCreateRequest(BaseModel):
     # fallback in this file already says "session_base". The old
     # "defaults" default silently put bare API threads on the WORKER yaml
     # (knowledge-base/knowledge/issues/session_config_name_plumbing.md, hole A).
-    config_name: str = Field("session_base", description="Agent config to use")
+    config_name: str = Field(
+        "session_base",
+        description=(
+            "DEPRECATED alias for `expert` (bundled experts only). Also still "
+            "the way to name a non-catalogue deployment config."
+        ),
+    )
+    expert: str | InlineExpertSelection | None = Field(
+        None,
+        description=(
+            "Which expert runs this session: a bundled expert id or a DB expert "
+            "UUID, exactly as GET /api/experts lists them, or a complete inline "
+            'definition, {"inline": ExpertSpec} with an srw/v1 runtime, which '
+            "is frozen with the session and has no catalogue identity. Omit to "
+            "accept the project, personal or deployment default. Supersedes "
+            "config_name and expert_id, which cannot be combined with an "
+            "inline expert."
+        ),
+    )
+    expert_based_on: str | None = Field(
+        None, description=EXPERT_BASED_ON_DESCRIPTION, max_length=200
+    )
     project_id: str | None = Field(
         None,
         description=(
@@ -87,9 +113,9 @@ class ThreadCreateRequest(BaseModel):
     expert_id: str | None = Field(
         None,
         description=(
-            "DB-backed expert UUID for this session. Preferred over config_name "
-            "for expert selection — stored in metadata.expert_id and resolved "
-            "into the session config at attach. config_name stays the base."
+            "DEPRECATED alias for `expert` (DB-backed expert UUID only). Stored "
+            "in metadata.expert_id; the expert is resolved and frozen into the "
+            "session's configuration at creation."
         ),
     )
     model: str | None = Field(

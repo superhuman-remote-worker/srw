@@ -166,9 +166,97 @@ def test_actual_composed_operations_keep_ids_and_publish_public_request_schema()
         schema = operation["requestBody"]["content"]["application/json"]["schema"]
         assert INTERNAL.isdisjoint(schema["properties"])
         assert schema["properties"]["datasource_ids"]["type"] == "array"
+        # The inline expert is documented in place, never as a root $defs ref.
+        assert "#/$defs/" not in str(schema)
         assert set(operation["responses"]) == {"200", "422"}
         # Creation still returns its redacted row without newly filtering fields.
         response = operation["responses"]["200"]["content"]["application/json"][
             "schema"
         ]
         assert response["type"] == "object" and response["additionalProperties"] is True
+
+
+# --------------------------------------------------------------------------- #
+# Inline experts (creation UI slice S2)
+# --------------------------------------------------------------------------- #
+
+INLINE_EXPERT = {
+    "inline": {
+        "runtime": {
+            "adapter": "srw/v1",
+            "config": {
+                "config_name": "worker_base",
+                "asset_name": "developer",
+                "config": {"llm": {"model": "gpt-4o"}},
+                "prompts": {"instructions": "Edited."},
+                "layers": [{"llm": {"temperature": 0.1}}],
+            },
+        },
+        "workspacePreference": {"backend": "sandbox"},
+    }
+}
+
+
+def test_expert_takes_an_unchanged_selector_or_a_complete_inline_definition():
+    from orchestrator.schemas.inline_expert import InlineExpertSelection
+
+    assert JobCreate(description="bundled", expert="developer").expert == "developer"
+    uuid = "33333333-3333-4333-8333-333333333333"
+    assert JobCreate(description="db", expert=uuid).expert == uuid
+    command = JobCreate(
+        description="inline", expert=INLINE_EXPERT, expert_based_on="developer"
+    )
+    assert isinstance(command.expert, InlineExpertSelection)
+    assert command.expert_based_on == "developer"
+    runtime = command.expert.inline.runtime.model_dump(exclude_unset=True)
+    # Unset keys stay absent so admission can tell an omitted image apart.
+    assert "image" not in runtime
+    assert runtime["config"] == INLINE_EXPERT["inline"]["runtime"]["config"]
+
+
+@pytest.mark.parametrize(
+    "expert",
+    [
+        {"ref": {"name": "developer"}},
+        {**INLINE_EXPERT, "ref": {"name": "developer"}},
+        {"inline": {"runtime": {"config": {}}}},
+        {"inline": {"runtime": {"adapter": "other/v1"}}},
+        {"inline": {"runtime": {"adapter": "srw/v1", "command": ["sh"]}}},
+        {"inline": {"runtime": {"adapter": "srw/v1", "env": {"A": "b"}}}},
+        {"inline": {"runtime": {"adapter": "srw/v1", "config": {"extra": 1}}}},
+        {"inline": {"runtime": {"adapter": "srw/v1", "config": {"config": []}}}},
+        {
+            "inline": {
+                "runtime": {"adapter": "srw/v1"},
+                "workspacePreference": {"backend": "cluster"},
+            }
+        },
+    ],
+)
+def test_malformed_inline_experts_are_validation_errors(expert):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        JobCreate(description="refused", expert=expert)
+
+
+def test_public_schema_documents_the_inline_expert_without_dangling_refs():
+    import json
+
+    schema = public_job_create_schema()
+    encoded = json.dumps(schema)
+    # Embedded verbatim in OpenAPI, where "#/$defs" would not resolve.
+    assert "$defs" not in encoded and "$ref" not in encoded
+    branches = schema["properties"]["expert"]["anyOf"]
+    assert {"type": "string"} in branches
+    inline = next(branch for branch in branches if branch.get("type") == "object")
+    assert inline["required"] == ["inline"]
+    runtime = inline["properties"]["inline"]["properties"]["runtime"]
+    assert "srw/v1" in json.dumps(runtime["properties"]["adapter"])
+    assert set(runtime["properties"]["config"]["properties"]) == {
+        "config_name",
+        "asset_name",
+        "config",
+        "prompts",
+        "layers",
+    }

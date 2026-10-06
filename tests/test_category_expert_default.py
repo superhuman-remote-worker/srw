@@ -163,6 +163,7 @@ def harness(monkeypatch):
             user_experts_enabled=AsyncMock(return_value=True),
             resolve_worker_expert=AsyncMock(return_value=state.selection),
             preview_expert_refusals=preview,
+            srw_image=Mock(return_value="installed:1"),
         )
 
     def officer_deps():

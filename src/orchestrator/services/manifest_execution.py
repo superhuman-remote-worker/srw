@@ -203,6 +203,7 @@ class ManifestExecutionService:
             if dependency not in snapshot["dependencies"]:
                 snapshot["dependencies"].append(deepcopy(dependency))
         if adapter == "srw/v1":
+            from orchestrator.services.inline_expert import srw_expert_row
             from orchestrator.services.manifest_execution_snapshot import (
                 prepare_srw_snapshot,
             )
@@ -239,13 +240,7 @@ class ManifestExecutionService:
                 project_ids=[project_id] if project_id else [],
                 config_name=config_name,
                 expert_id=None,
-                expert_row={
-                    "expert_type": "worker",
-                    "config": deepcopy(private.get("config", {})),
-                    "prompts": deepcopy(private.get("prompts", {})),
-                    "harness_config_layers": deepcopy(private.get("layers", [])),
-                    "harness_asset_name": private.get("asset_name"),
-                },
+                expert_row=srw_expert_row(private, expert_type="worker"),
                 config_override=config_override,
                 description=spec.get("task", {}).get("text", ""),
                 datasource_ids=datasource_ids,

@@ -39,6 +39,12 @@ from orchestrator.services import runtime_actor as runtime_actor_module
 from orchestrator.services import workspace_tier_policy as workspace_tier_policy_module
 import httpx
 
+from tests._shipped_expert_catalog import (
+    authored_runtime_config,
+    serve_shipped_catalog,
+    shipped_catalog,
+)
+
 
 USER = "11111111-1111-4111-8111-111111111111"
 WORK = "22222222-2222-4222-8222-222222222222"
@@ -287,6 +293,40 @@ async def test_thread_snapshot_captures_complete_initial_metadata_in_insert_tran
     assert str(connection.jobs[0]["id"]) == thread_id
     assert connection.jobs[0]["metadata"]["expert_id"] == WORK
     assert connection.catalog_locks == 1
+
+
+@pytest.mark.asyncio
+async def test_job_insert_forwards_an_inline_expert_to_its_snapshot(monkeypatch):
+    connection = Connection()
+    db = database(connection)
+    capture = AsyncMock(side_effect=HTTPException(409, "stop after capture"))
+    monkeypatch.setattr(snapshots, "capture_execution", capture)
+    row = {"expert_type": "worker", "config": {"llm": {"model": "inline"}}}
+    with pytest.raises(HTTPException):
+        await db.create_job(description="Task", job_id=WORK, expert_row=row)
+    kwargs = capture.await_args.kwargs
+    assert kwargs["expert_row"] == row and kwargs["expert_row"] is not row
+    assert kwargs["expert_id"] is None
+    assert connection.jobs == []
+
+
+@pytest.mark.asyncio
+async def test_thread_insert_forwards_an_inline_expert_to_its_snapshot(monkeypatch):
+    connection = Connection()
+    db = database(connection)
+    row = {"expert_type": "session", "config": {"llm": {"model": "inline"}}}
+
+    async def capture(*args, **kwargs):
+        assert connection.in_transaction
+        assert kwargs["expert_row"] == row
+        assert kwargs["expert_id"] is None
+        return {}
+
+    monkeypatch.setattr(snapshots, "capture_execution", capture)
+    await db.create_thread(
+        initial_metadata={"expert_selection_source": "inline"}, expert_row=row
+    )
+    assert connection.jobs[0]["metadata"]["expert_selection_source"] == "inline"
 
 
 @pytest.mark.asyncio
@@ -1176,3 +1216,281 @@ async def test_migration_preview_is_read_only_and_apply_preserves_lifecycle():
     assert "private-model" not in encoded and "private-prompt" not in encoded
     await migrate_batch(db, apply=True, kind="Job", limit=1)
     assert len(connection.revisions) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Inline Experts (creation UI slice S2). A creation request may carry the
+# complete authored definition instead of a catalogue selector. Built from the
+# selected Expert's authored fragment, it must freeze exactly what selecting
+# that Expert freezes. The only legitimate difference is provenance: a selected
+# Expert pins its own resource revision in ``dependencies``; an inline Expert
+# is owned by its work and pins only what it references (its roster).
+# --------------------------------------------------------------------------- #
+
+INSTALLED_IMAGE = "installed:1"
+DB_EXPERT = "44444444-4444-4444-8444-444444444444"
+DB_EXPERT_RESOURCE = "55555555-5555-4555-8555-555555555555"
+_SHIPPED_EXPERTS = sorted(
+    name for name in shipped_catalog() if not name.startswith("subagent-")
+)
+
+
+@pytest.fixture
+def frozen_render_time(monkeypatch):
+    """Both renders carry the same ``resolved_at`` render timestamp.
+
+    It is the one field that legitimately differs between two renders made a
+    few milliseconds apart; fixing it lets the comparison include the task
+    document and its content revision byte for byte.
+    """
+    render = config_resolver_module.serialize_resolved_config
+
+    def fixed_time(*args, **kwargs):
+        return {**render(*args, **kwargs), "resolved_at": "2026-10-06T12:00:00+00:00"}
+
+    monkeypatch.setattr(config_resolver_module, "serialize_resolved_config", fixed_time)
+
+
+def _parity_db(**extra):
+    return SimpleNamespace(
+        manifest_runtime_image=INSTALLED_IMAGE,
+        get_user_settings=AsyncMock(return_value={"default_model": "gpt-4o"}),
+        resolve_default_for_capability=AsyncMock(return_value=None),
+        get_system_setting=AsyncMock(return_value={"value": {"enabled": True}}),
+        get_user=AsyncMock(return_value={"id": USER, "is_admin": True}),
+        **extra,
+    )
+
+
+def _inline_row(runtime_config, *, role):
+    """The row admission builds from ``{"inline": {"runtime": ...}}``."""
+    from orchestrator.schemas.inline_expert import InlineExpertSelection
+    from orchestrator.services.inline_expert import admit_inline_expert
+
+    selection = InlineExpertSelection.model_validate(
+        {
+            "inline": {
+                "runtime": {"adapter": "srw/v1", "config": deepcopy(runtime_config)}
+            }
+        }
+    )
+    return admit_inline_expert(
+        selection.inline, role=role, trusted_image=INSTALLED_IMAGE
+    )
+
+
+async def _freeze(db, kind, **selection):
+    return await snapshots.prepare_srw_snapshot(
+        db,
+        work_kind=kind,
+        work_id=WORK,
+        owner_id=USER,
+        project_ids=[],
+        description="Parity check",
+        config_override={"workspace": {"backend": "virtual"}},
+        datasource_ids=[],
+        policy_revisions={},
+        **selection,
+    )
+
+
+def _assert_same_frozen_execution(selected, inline, *, expert_resource):
+    """Everything delivered is identical; only the Expert's own pin differs.
+
+    Compared: the rendered blob and the policy the PDP checks (inside
+    ``document``/``resolved``), the config and asset names, the task document,
+    its content ``revision`` and the adapter. Excluded: the selected Expert's
+    own ``dependencies`` entry, which is catalogue provenance an inline copy
+    by definition does not have. Roster references are pinned identically.
+    """
+    own = selected["dependencies"][0]
+    assert own["uid"] == expert_resource["id"]
+    assert own["revision"] == expert_resource["revision"]
+    assert inline["dependencies"] == selected["dependencies"][1:]
+    assert all(dep["uid"] != expert_resource["id"] for dep in inline["dependencies"])
+    assert inline.keys() == selected.keys()
+    for key in selected.keys() - {"dependencies"}:
+        assert inline[key] == selected[key], key
+
+
+def _role_base(kind):
+    return "session_base" if kind == "Session" else "worker_base"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", _SHIPPED_EXPERTS)
+async def test_inline_copy_of_a_bundled_expert_freezes_what_its_selector_freezes(
+    monkeypatch, frozen_render_time, name
+):
+    catalog = serve_shipped_catalog(monkeypatch)
+    resource = catalog[name]
+    annotations = resource["document"]["metadata"]["annotations"]
+    kind = "Session" if annotations["srw.io/expert-type"] == "session" else "Job"
+    db = _parity_db()
+
+    # Selector: what job/session admission passes for expert="<name>".
+    selected = await _freeze(db, kind, config_name=name, expert_id=None)
+    # Inline: the authored resource's runtime config, verbatim, plus the role
+    # base admission persists for an Expert without catalogue identity.
+    inline = await _freeze(
+        db,
+        kind,
+        config_name=_role_base(kind),
+        expert_id=None,
+        expert_row=_inline_row(
+            authored_runtime_config(name),
+            role="session" if kind == "Session" else "worker",
+        ),
+    )
+    _assert_same_frozen_execution(selected, inline, expert_resource=resource)
+
+
+@pytest.mark.asyncio
+async def test_parity_covers_a_materialized_roster(monkeypatch, frozen_render_time):
+    """The developer's roster is resolved from the Catalog in both forms."""
+    catalog = serve_shipped_catalog(monkeypatch)
+    db = _parity_db()
+    inline = await _freeze(
+        db,
+        "Job",
+        config_name="worker_base",
+        expert_id=None,
+        expert_row=_inline_row(authored_runtime_config("developer"), role="worker"),
+    )
+    blob, _ = snapshots.srw_snapshot_config(inline)
+    assert set(blob["agent"]["subagents"]["roster"]) >= {"explorer", "implementer"}
+    assert {
+        "uid": catalog["subagent-explorer"]["id"],
+        "revision": "sha256:" + "1" * 64,
+    } in (inline["dependencies"])
+
+
+@pytest.mark.asyncio
+async def test_inline_copy_of_a_worker_expert_in_a_session_matches_its_selector(
+    monkeypatch, frozen_render_time
+):
+    """A cross-role pick re-roots the same way whichever form it arrives in."""
+    catalog = serve_shipped_catalog(monkeypatch)
+    db = _parity_db()
+    selected = await _freeze(db, "Session", config_name="developer", expert_id=None)
+    inline = await _freeze(
+        db,
+        "Session",
+        config_name="session_base",
+        expert_id=None,
+        expert_row=_inline_row(authored_runtime_config("developer"), role="session"),
+    )
+    _assert_same_frozen_execution(
+        selected, inline, expert_resource=catalog["developer"]
+    )
+
+
+def _db_expert(role):
+    from orchestrator.services.manifest_experts import (
+        expert_manifest,
+        project_expert_resource,
+    )
+
+    row = {
+        "id": DB_EXPERT,
+        "name": "careful-reviewer",
+        "display_name": "Careful reviewer",
+        "description": "Reviews twice.",
+        "icon": "rate_review",
+        "color": "#336699",
+        "tags": ["review"],
+        "expert_type": role,
+        "owner_id": USER,
+        "is_global": False,
+        "config": {
+            "llm": {"model": "gpt-4o", "temperature": 0.2},
+            "tools": {"research": ["web_search"], "citation": []},
+            "workspace": {"git_versioning": False},
+            "subagents": {"roster": {"explorer": {"$ref": "subagents/explorer"}}},
+        },
+        "prompts": {
+            "persona": "A careful, terse reviewer.",
+            "instructions": "Check every claim twice.",
+        },
+    }
+    document = expert_manifest(row)
+    resource = {
+        "id": DB_EXPERT_RESOURCE,
+        "document": document,
+        "revision": "sha256:" + "2" * 64,
+        "resource_version": 3,
+    }
+    return project_expert_resource(row, resource), resource
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["Job", "Session"])
+@pytest.mark.parametrize("source", ["export", "resource"])
+async def test_inline_copy_of_a_db_expert_freezes_what_its_id_freezes(
+    monkeypatch, frozen_render_time, kind, source
+):
+    from orchestrator.services.expert_catalog import db_expert_to_bundle_src
+    from shared.runtime.core.expert_resolution import to_export_bundle
+
+    serve_shipped_catalog(monkeypatch)
+    role = "session" if kind == "Session" else "worker"
+    projected, resource = _db_expert(role)
+    db = _parity_db(get_expert_by_id=AsyncMock(return_value=deepcopy(projected)))
+    selected = await _freeze(
+        db, kind, config_name=_role_base(kind), expert_id=DB_EXPERT
+    )
+
+    if source == "export":
+        # GET /api/experts/{id}/export -> {config, prompts, ...}: the cockpit
+        # copies the two authored fields into runtime.config.
+        bundle = to_export_bundle(db_expert_to_bundle_src(projected))
+        runtime_config = {"config": bundle["config"], "prompts": bundle["prompts"]}
+    else:
+        # GET /api/resources/{manifest_uid} -> document.spec.runtime.config.
+        runtime_config = resource["document"]["spec"]["runtime"]["config"]
+    inline = await _freeze(
+        db,
+        kind,
+        config_name=_role_base(kind),
+        expert_id=None,
+        expert_row=_inline_row(runtime_config, role=role),
+    )
+    _assert_same_frozen_execution(selected, inline, expert_resource=resource)
+
+
+@pytest.mark.asyncio
+async def test_a_changed_inline_expert_is_what_gets_frozen(monkeypatch):
+    serve_shipped_catalog(monkeypatch)
+    db = _parity_db()
+    authored = authored_runtime_config("developer")
+    changed = deepcopy(authored)
+    changed["config"]["llm"] = {**changed["config"].get("llm", {}), "model": "o3"}
+    changed["config"]["tools"]["research"] = []
+    changed["prompts"] = {"instructions": "Edited in the creation form."}
+
+    unchanged_blob, unchanged_policy = snapshots.srw_snapshot_config(
+        await _freeze(
+            db,
+            "Job",
+            config_name="worker_base",
+            expert_id=None,
+            expert_row=_inline_row(authored, role="worker"),
+        )
+    )
+    blob, policy = snapshots.srw_snapshot_config(
+        await _freeze(
+            db,
+            "Job",
+            config_name="worker_base",
+            expert_id=None,
+            expert_row=_inline_row(changed, role="worker"),
+        )
+    )
+    assert unchanged_blob["agent"]["llm"]["model"] == "gpt-4o"
+    assert unchanged_policy["tools"]["research"]
+    assert blob["agent"]["llm"]["model"] == "o3"
+    assert policy["llm"]["model"] == "o3"
+    assert policy["tools"]["research"] == []
+    assert blob["prompts"]["instructions"] == "Edited in the creation form."
+    # The authored reasoning level the form did not touch survives the copy.
+    assert blob["agent"]["llm"]["reasoning_level"] == "high"

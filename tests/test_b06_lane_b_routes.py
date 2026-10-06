@@ -130,6 +130,8 @@ def _admission_deps(**over: Any) -> ta.ThreadAdmissionDependencies:
         send_session_attach=AsyncMock(return_value=True),
         provision_or_assign=AsyncMock(),
         redact_thread_metadata=MagicMock(side_effect=lambda t: t),
+        bundled_expert_exists=MagicMock(return_value=True),
+        srw_image=MagicMock(return_value="installed:1"),
     )
     fields.update(over)
     return ta.ThreadAdmissionDependencies(**fields)
@@ -503,6 +505,70 @@ class TestCreate:
         assert (
             response.json()["detail"]["code"] == "protected_cloud_unsupported_workspace"
         )
+
+
+class TestInlineExpertWire:
+    """`expert` accepts a selector or ``{"inline": ExpertSpec}`` on both routes."""
+
+    INLINE = {
+        "inline": {
+            "runtime": {
+                "adapter": "srw/v1",
+                "config": {
+                    "config": {"llm": {"temperature": 0.3}},
+                    "prompts": {"persona": "Plain."},
+                },
+            }
+        }
+    }
+
+    @pytest.mark.parametrize(
+        "path", ["/api/persistent/threads", "/api/persistent/threads/preview"]
+    )
+    def test_an_inline_expert_is_accepted(self, path):
+        deps = _admission_deps()
+        response = _client(admission=deps).post(
+            path, json={"expert": self.INLINE, "expert_based_on": "assistant"}
+        )
+        assert response.status_code == 200, response.text
+        if path.endswith("/preview"):
+            deps.store.create_thread.assert_not_awaited()
+            return
+        kwargs = deps.store.create_thread.await_args.kwargs
+        assert kwargs["expert_row"]["config"] == {"llm": {"temperature": 0.3}}
+        assert kwargs["initial_metadata"]["expert_based_on"] == "assistant"
+
+    @pytest.mark.parametrize(
+        "body,status",
+        [
+            ({"expert_id": "66666666-6666-4666-8666-666666666666"}, 400),
+            ({"config_name": "scholar"}, 400),
+        ],
+    )
+    def test_an_inline_expert_beside_a_selector_is_400(self, body, status):
+        deps = _admission_deps()
+        response = _client(admission=deps).post(
+            "/api/persistent/threads", json={"expert": self.INLINE, **body}
+        )
+        assert response.status_code == status
+        deps.store.create_thread.assert_not_awaited()
+
+    def test_a_foreign_image_is_refused(self):
+        expert = json.loads(json.dumps(self.INLINE))
+        expert["inline"]["runtime"]["image"] = "example.invalid/other:1"
+        deps = _admission_deps()
+        response = _client(admission=deps).post(
+            "/api/persistent/threads", json={"expert": expert}
+        )
+        assert response.status_code == 422
+        assert "installed harness" in response.text
+        deps.store.create_thread.assert_not_awaited()
+
+    def test_a_custom_launch_envelope_is_a_validation_error(self):
+        expert = json.loads(json.dumps(self.INLINE))
+        expert["inline"]["runtime"]["command"] = ["sh", "-c", "id"]
+        response = _client().post("/api/persistent/threads", json={"expert": expert})
+        assert response.status_code == 422
 
 
 class TestList:

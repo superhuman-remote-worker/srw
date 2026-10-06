@@ -10,6 +10,10 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, WithJsonSchema, field_validator, model_validator
 
+from orchestrator.schemas.inline_expert import (
+    EXPERT_BASED_ON_DESCRIPTION,
+    InlineExpertSelection,
+)
 from orchestrator.services.job_create_ingress import (
     _SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS,
     _strip_raw_repository_authority,
@@ -37,15 +41,21 @@ class JobCreate(BaseModel):
     document_dir: str | None = Field(
         None, description="Directory containing documents (deprecated)"
     )
-    expert: str | None = Field(
+    expert: str | InlineExpertSelection | None = Field(
         None,
         description=(
             "Which expert runs this job. One selector for the whole catalogue: "
             "either a bundled expert id ('developer') or a DB expert UUID, "
-            "exactly as GET /api/experts lists them. Omit to accept the "
-            "deployment's configured default worker. Supersedes config_name "
-            "and expert_id, which remain as deprecated single-store aliases."
+            "exactly as GET /api/experts lists them. Or a complete inline "
+            'definition, {"inline": ExpertSpec} with an srw/v1 runtime, which '
+            "is frozen with the job and has no catalogue identity. Omit to "
+            "accept the deployment's configured default worker. Supersedes "
+            "config_name and expert_id, which remain as deprecated single-store "
+            "aliases and cannot be combined with an inline expert."
         ),
+    )
+    expert_based_on: str | None = Field(
+        None, description=EXPERT_BASED_ON_DESCRIPTION, max_length=200
     )
     config_name: str = Field(
         "worker_base",
@@ -222,6 +232,9 @@ PUBLIC_JOB_CREATE_FIELDS = (
     "document_path",
     "document_dir",
     "expert",
+    # "expert_based_on" is accepted but published together with the
+    # Cockpit's JobCreateRequest field (creation UI slice S3); the projection
+    # test holds the two lists equal.
     "config_name",
     "expert_id",
     "config_override",
@@ -239,9 +252,34 @@ PUBLIC_JOB_CREATE_FIELDS = (
 )
 
 
+def _inline_local_definitions(schema: dict[str, Any]) -> dict[str, Any]:
+    """Expand ``#/$defs/...`` references so the projection is self-contained.
+
+    The projection is embedded verbatim in the OpenAPI document, where a
+    ``#/$defs`` pointer would resolve against the document root and dangle.
+    The nested models (the inline expert) are small and acyclic.
+    """
+    definitions = schema.pop("$defs", {})
+
+    def expand(node: Any) -> Any:
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/$defs/"):
+                target = expand(definitions[ref.removeprefix("#/$defs/")])
+                rest = {key: expand(value) for key, value in node.items()}
+                rest.pop("$ref")
+                return {**target, **rest}
+            return {key: expand(value) for key, value in node.items()}
+        if isinstance(node, list):
+            return [expand(value) for value in node]
+        return node
+
+    return expand(schema)
+
+
 def public_job_create_schema() -> dict[str, Any]:
     """Describe accepted public inputs while keeping internal parsing intact."""
-    schema = JobCreate.model_json_schema()
+    schema = _inline_local_definitions(JobCreate.model_json_schema())
     schema["title"] = "PublicJobCreate"
     schema["description"] = (
         "Public job creation. Expert resolution, connector selection, capability "

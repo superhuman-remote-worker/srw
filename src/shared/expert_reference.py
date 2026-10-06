@@ -21,6 +21,8 @@ from typing import Any, Literal
 from uuid import UUID
 
 __all__ = [
+    "BASE_SESSION_ALIASES",
+    "BASE_SESSION_CONFIG",
     "BASE_WORKER_ALIASES",
     "BASE_WORKER_CONFIG",
     "ExpertChoice",
@@ -39,6 +41,13 @@ BASE_WORKER_CONFIG = "worker_base"
 #: base; kept as a literal set so this module stays stdlib-pure
 #: (tests/test_unified_expert_selection.py asserts the two never drift).
 BASE_WORKER_ALIASES = frozenset({BASE_WORKER_CONFIG, "default", "defaults"})
+
+#: The session counterparts: the base every session profile extends and the
+#: spellings of it that mean no choice (the loader's aliases again).
+BASE_SESSION_CONFIG = "session_base"
+BASE_SESSION_ALIASES = frozenset(
+    {BASE_SESSION_CONFIG, "persistent_default", "persistent_defaults"}
+)
 
 
 class ExpertReferenceConflict(ValueError):
@@ -86,6 +95,7 @@ def resolve_expert_selection(
     expert: str | None = None,
     config_name: str | None = None,
     expert_id: str | None = None,
+    role: Literal["worker", "session"] = "worker",
 ) -> ExpertChoice:
     """Resolve one expert reference into the pair job creation persists.
 
@@ -104,12 +114,20 @@ def resolve_expert_selection(
     * nothing named -> ``(worker_base, None)``, leaving the deployment's
       configured default (``application_expert_defaults``) in charge.
 
+    ``role="session"`` answers for session creation: the base is
+    ``session_base`` and its spellings are the absence of a choice.
+
     Precedence between ``expert`` and an alias is deliberately *none*: an
     alias that repeats the same reference is accepted, one that names a
     different expert raises :class:`ExpertReferenceConflict`. Silently
     dropping one of two stated experts is the failure mode this seam exists
     to remove.
     """
+    base, aliases, work = (
+        (BASE_SESSION_CONFIG, BASE_SESSION_ALIASES, "session")
+        if role == "session"
+        else (BASE_WORKER_CONFIG, BASE_WORKER_ALIASES, "job")
+    )
     reference = _clean(expert)
     alias_expert_id = _clean(expert_id)
     alias_config = _clean(config_name)
@@ -117,9 +135,9 @@ def resolve_expert_selection(
     # same string has to mean the same thing in whichever parameter it lands,
     # or `expert="worker_base"` would be a refusal while the identical
     # `config_name="worker_base"` is the default every caller already sends.
-    if alias_config in BASE_WORKER_ALIASES:
+    if alias_config in aliases:
         alias_config = None
-    if reference in BASE_WORKER_ALIASES:
+    if reference in aliases:
         reference = None
 
     if reference is None:
@@ -131,18 +149,16 @@ def resolve_expert_selection(
                 "shows both kinds in one catalogue."
             )
         if alias_expert_id:
-            return ExpertChoice(
-                BASE_WORKER_CONFIG, alias_expert_id, "db", alias_expert_id
-            )
+            return ExpertChoice(base, alias_expert_id, "db", alias_expert_id)
         if alias_config:
             return ExpertChoice(alias_config, None, "bundled", alias_config)
-        return ExpertChoice(BASE_WORKER_CONFIG, None, "default", None)
+        return ExpertChoice(base, None, "default", None)
 
     if looks_like_expert_uuid(reference):
         if alias_config:
             raise ExpertReferenceConflict(
                 f"expert={reference!r} is a database expert and "
-                f"config_name={alias_config!r} is a bundled one; a job runs "
+                f"config_name={alias_config!r} is a bundled one; a {work} runs "
                 "one expert. Drop the deprecated config_name."
             )
         if alias_expert_id and alias_expert_id != reference:
@@ -150,13 +166,13 @@ def resolve_expert_selection(
                 f"expert={reference!r} and the deprecated "
                 f"expert_id={alias_expert_id!r} name different experts."
             )
-        return ExpertChoice(BASE_WORKER_CONFIG, reference, "db", reference)
+        return ExpertChoice(base, reference, "db", reference)
 
     if alias_expert_id:
         raise ExpertReferenceConflict(
             f"expert={reference!r} is a bundled expert and the deprecated "
-            f"expert_id={alias_expert_id!r} is a database one; a job runs one "
-            "expert. Drop expert_id — expert accepts either kind."
+            f"expert_id={alias_expert_id!r} is a database one; a {work} runs "
+            "one expert. Drop expert_id — expert accepts either kind."
         )
     if alias_config and alias_config != reference:
         raise ExpertReferenceConflict(

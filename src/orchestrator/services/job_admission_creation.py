@@ -116,6 +116,8 @@ class JobAdmissionCreationInputs:
     officer_preparation: OfficerAdmissionPreparation | None
     ticket_ready_at: datetime | None
     workspace_selection: dict[str, Any] | None = None
+    # A validated inline Expert definition; frozen by the INSERT's snapshot.
+    expert_row: dict[str, Any] | None = None
 
 
 async def create_admitted_job(
@@ -173,6 +175,8 @@ async def create_admitted_job(
     }
     if inputs.workspace_selection is not None:
         create_kwargs["workspace_selection"] = inputs.workspace_selection
+    if inputs.expert_row is not None:
+        create_kwargs["expert_row"] = inputs.expert_row
     if inputs.officer_preparation is not None:
         try:
             result = await dependencies.admit_officer(
