@@ -200,6 +200,11 @@ async def revalidate_thread_project_ids(
     )
 
 
+ONE_PROJECT_PER_SESSION_DETAIL = (
+    "A Session can belong to one project at most. Pick one project, or none."
+)
+
+
 def thread_creation_project_ids(
     request_body: ThreadCreateRequest, user: dict[str, Any]
 ) -> list[str]:
@@ -209,6 +214,13 @@ def thread_creation_project_ids(
     merely another membership grant. Omission therefore means that project,
     while an attempt to name a different or additional project fails before
     project or datasource policy resolution can widen the request.
+
+    A new Session belongs to one project or none (owner decision 2026-09-24,
+    knowledge-base/knowledge/features/single_project_sessions.md). More than
+    one distinct project is a 422, checked after the token scope so a scoped
+    token still learns only the scope's 403. Every create path (REST create
+    and preview, MCP, review Sessions, Officers) goes through here; reads,
+    resume and config updates of older multi-project Sessions do not.
     """
     requested = list(request_body.project_ids or [])
     if request_body.project_id and str(request_body.project_id) not in requested:
@@ -216,16 +228,18 @@ def thread_creation_project_ids(
     requested = list(dict.fromkeys(str(value) for value in requested))
 
     scoped_project = mcp_scope_project_id(user)
-    if scoped_project is None:
-        return requested
+    if scoped_project is not None:
+        scoped_project_id = str(scoped_project)
+        if requested and requested != [scoped_project_id]:
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied by MCP token scope",
+            )
+        return [scoped_project_id]
 
-    scoped_project_id = str(scoped_project)
-    if requested and requested != [scoped_project_id]:
-        raise HTTPException(
-            status_code=403,
-            detail="Access denied by MCP token scope",
-        )
-    return [scoped_project_id]
+    if len(requested) > 1:
+        raise HTTPException(status_code=422, detail=ONE_PROJECT_PER_SESSION_DETAIL)
+    return requested
 
 
 async def thread_has_knowledge_scope(
@@ -251,6 +265,7 @@ async def thread_has_knowledge_scope(
 
 
 __all__ = [
+    "ONE_PROJECT_PER_SESSION_DETAIL",
     "ProjectVerdict",
     "ThreadProjectAuthorizationDependencies",
     "ThreadProjectStore",

@@ -52,9 +52,19 @@ class ThreadCreateRequest(BaseModel):
     # "defaults" default silently put bare API threads on the WORKER yaml
     # (knowledge-base/knowledge/issues/session_config_name_plumbing.md, hole A).
     config_name: str = Field("session_base", description="Agent config to use")
-    project_id: str | None = Field(None, description="(Legacy) Single project to scope")
+    project_id: str | None = Field(
+        None,
+        description=(
+            "The Session's project UUID. A Session has one project or none; "
+            "omit for none."
+        ),
+    )
     project_ids: list[str] | None = Field(
-        None, description="List of project UUIDs to scope"
+        None,
+        description=(
+            "Deprecated: use project_id. At most one project UUID; more than "
+            "one distinct project is refused with 422."
+        ),
     )
     datasource_ids: list[str] | None = Field(
         None, description="Explicit connector IDs to attach to this thread"

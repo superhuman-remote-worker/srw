@@ -126,6 +126,15 @@ class TestRevalidate:
         get_user.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_a_legacy_two_project_session_still_revalidates_both(self):
+        """Sessions created before the one-project rule keep resuming: the
+        rule lives in thread_creation_project_ids, not on this path."""
+        deps = _deps()
+        assert await revalidate_thread_project_ids(
+            {"id": "t", "user_id": "u-1", "metadata": {}}, [P1, P2], dependencies=deps
+        ) == [P1, P2]
+
+    @pytest.mark.asyncio
     async def test_vanished_owner_fails_closed_with_the_generic_403(self):
         deps = _deps(get_user=AsyncMock(return_value=None))
         with pytest.raises(HTTPException) as exc:
@@ -177,14 +186,42 @@ class TestRevalidate:
         assert exc.value.status_code == 403
 
 
+ONE_PROJECT_DETAIL = (
+    "A Session can belong to one project at most. Pick one project, or none."
+)
+
+
 class TestCreationProjectIds:
+    def test_no_project_is_allowed(self):
+        assert thread_creation_project_ids(ThreadCreateRequest(), USER) == []
+        body = ThreadCreateRequest(project_ids=[])
+        assert thread_creation_project_ids(body, USER) == []
+
+    def test_one_project_is_allowed(self):
+        body = ThreadCreateRequest(project_ids=[P1])
+        assert thread_creation_project_ids(body, USER) == [P1]
+
     def test_legacy_project_id_is_appended_once(self):
         body = ThreadCreateRequest(project_ids=[P1], project_id=P1)
         assert thread_creation_project_ids(body, USER) == [P1]
 
-    def test_legacy_project_id_widens_the_list(self):
-        body = ThreadCreateRequest(project_ids=[P1], project_id=P2)
-        assert thread_creation_project_ids(body, USER) == [P1, P2]
+    def test_two_projects_are_refused_with_the_rule(self):
+        body = ThreadCreateRequest(project_ids=[P1, P2])
+        with pytest.raises(HTTPException) as exc:
+            thread_creation_project_ids(body, USER)
+        assert exc.value.status_code == 422
+        assert exc.value.detail == ONE_PROJECT_DETAIL
+
+    def test_legacy_project_id_cannot_add_a_second_project(self):
+        body = ThreadCreateRequest(project_ids=[P2], project_id=P1)
+        with pytest.raises(HTTPException) as exc:
+            thread_creation_project_ids(body, USER)
+        assert exc.value.status_code == 422
+        assert exc.value.detail == ONE_PROJECT_DETAIL
+
+    def test_a_repeated_project_counts_once(self):
+        body = ThreadCreateRequest(project_ids=[P1, P1])
+        assert thread_creation_project_ids(body, USER) == [P1]
 
     def test_mcp_scope_binds_on_omission(self):
         user = {"id": "u", "scopes": [f"project:{P1}"]}
@@ -198,9 +235,14 @@ class TestCreationProjectIds:
         assert exc.value.detail == "Access denied by MCP token scope"
 
     def test_mcp_scope_refuses_an_additional_project(self):
+        """The token-scope 403 outranks the one-project 422: a scoped token
+        naming its own project plus another learns only that the scope
+        refused it."""
         user = {"id": "u", "scopes": [f"project:{P1}"]}
-        with pytest.raises(HTTPException):
+        with pytest.raises(HTTPException) as exc:
             thread_creation_project_ids(ThreadCreateRequest(project_ids=[P1, P2]), user)
+        assert exc.value.status_code == 403
+        assert exc.value.detail == "Access denied by MCP token scope"
 
 
 class TestKnowledgeScope:

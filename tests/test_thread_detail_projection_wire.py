@@ -145,6 +145,27 @@ def test_detail_route_mints_a_missing_handle_and_projects_mounts() -> None:
     ]
 
 
+def test_detail_route_still_reads_a_legacy_two_project_session() -> None:
+    """New Sessions take one project at most, but one created before that
+    rule keeps both project mounts and still opens."""
+    other_project = "33333333-4444-4555-8666-777777777777"
+    store = _Store()
+    store.list_thread_mounts.return_value = [
+        *store.list_thread_mounts.return_value,
+        {
+            "id": 2,
+            "mount_kind": "project",
+            "target_path": "/workspace/projects/other",
+            "source_kind": "project",
+            "source_ref": other_project,
+            "backend_id": None,
+        },
+    ]
+    response = _client(store).get(f"/api/persistent/threads/{THREAD_ID}")
+    assert response.status_code == 200
+    assert response.json()["project_ids"] == [PROJECT_ID, other_project]
+
+
 def test_detail_route_reads_one_allowlisted_startup_view_after_owner_gate() -> None:
     store = _Store()
     view = {

@@ -789,6 +789,47 @@ class TestMcpPersistentThreadTools:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "projects",
+        [
+            {"project_ids": ["proj-1", "proj-2"]},
+            {"project_id": "proj-1", "project_ids": ["proj-2"]},
+        ],
+        ids=["two_project_ids", "project_id_plus_another"],
+    )
+    async def test_create_persistent_thread_refuses_a_second_project(
+        self, mock_client, projects
+    ):
+        """Refused before the workspace lookup, which would otherwise search
+        without a project and could report a misleading 'no such template'."""
+        create_persistent_thread = _mcp_server_mod.create_persistent_thread
+
+        result = await create_persistent_thread(workspace="my-template", **projects)
+
+        assert result == (
+            "Refusing to create the session: A Session can belong to one "
+            "project at most. Pick one project, or none."
+        )
+        mock_client.create_persistent_thread.assert_not_awaited()
+        mock_client.list_manifest_resources.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_persistent_thread_same_project_in_both_fields_is_one(
+        self, mock_client
+    ):
+        create_persistent_thread = _mcp_server_mod.create_persistent_thread
+        mock_client.create_persistent_thread.return_value = {
+            "thread_id": "tid-3",
+            "status": "created",
+        }
+
+        await create_persistent_thread(project_id="proj-1", project_ids=["proj-1"])
+
+        kwargs = mock_client.create_persistent_thread.await_args.kwargs
+        assert kwargs["project_id"] == "proj-1"
+        assert kwargs["project_ids"] == ["proj-1"]
+
+    @pytest.mark.asyncio
     async def test_create_persistent_thread_error(self, mock_client):
         create_persistent_thread = _mcp_server_mod.create_persistent_thread
 

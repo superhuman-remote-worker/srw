@@ -2460,8 +2460,10 @@ async def create_persistent_thread(
         title: Human-readable session title
         config_name: Agent config to use (default: "session_base")
         permission_mode: Tool approval mode (supervised, auto_accept, autonomous)
-        project_id: Single project UUID to scope (legacy)
-        project_ids: List of project UUIDs to scope
+        project_id: The session's project UUID. A session has one project or
+            none; omit for none.
+        project_ids: Deprecated, prefer project_id. At most one project UUID;
+            a second project is refused.
         datasource_ids: Connector selection. Omit to use automatic defaults;
             pass [] for none, or IDs for exactly that authorized selection.
         model: LLM model override (e.g. "RedHatAI/gemma-4-31B-it-FP8-Dynamic")
@@ -2476,9 +2478,14 @@ async def create_persistent_thread(
         Created thread ID and status
     """
     client = _get_client()
-    single_project = project_id or (
-        project_ids[0] if project_ids and len(project_ids) == 1 else None
-    )
+    # Same rule and words as the orchestrator's 422, checked here first so the
+    # workspace lookup below never searches without the session's project.
+    if len({*(project_ids or []), *([project_id] if project_id else [])}) > 1:
+        return (
+            "Refusing to create the session: A Session can belong to one "
+            "project at most. Pick one project, or none."
+        )
+    single_project = project_id or (project_ids[0] if project_ids else None)
     try:
         workspace_supplied, workspace_binding = await workspace_field(
             client, workspace, project_id=single_project

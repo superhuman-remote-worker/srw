@@ -36,6 +36,9 @@ GENERATION = "22222222-2222-4222-8222-222222222222"
 PROJECT = "33333333-3333-4333-8333-333333333333"
 OTHER_PROJECT = "44444444-4444-4444-8444-444444444444"
 USER = {"id": "55555555-5555-4555-8555-555555555555", "is_admin": False}
+ONE_PROJECT_DETAIL = (
+    "A Session can belong to one project at most. Pick one project, or none."
+)
 
 
 @pytest.fixture(autouse=True)
@@ -418,7 +421,9 @@ class TestCreationPlan:
         assert plan.officer_requested is False
 
     @pytest.mark.asyncio
-    async def test_legacy_primary_does_not_hide_multiple_effective_projects(self):
+    async def test_a_legacy_primary_cannot_smuggle_a_second_project_into_an_officer(
+        self,
+    ):
         body = ThreadCreateRequest(
             project_id=PROJECT,
             project_ids=[PROJECT, OTHER_PROJECT],
@@ -430,9 +435,58 @@ class TestCreationPlan:
         with pytest.raises(HTTPException) as exc:
             await _plan(body, deps)
 
-        assert exc.value.status_code == 400
-        assert "exactly one project" in exc.value.detail
+        assert exc.value.status_code == 422
+        assert exc.value.detail == ONE_PROJECT_DETAIL
         deps.store.create_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("entrypoint", ["preview", "create"])
+    @pytest.mark.parametrize(
+        "projects",
+        [
+            {"project_ids": [PROJECT, OTHER_PROJECT]},
+            {"project_id": PROJECT, "project_ids": [OTHER_PROJECT]},
+        ],
+        ids=["two_project_ids", "project_id_plus_another"],
+    )
+    async def test_two_projects_are_refused_before_any_account_work(
+        self, monkeypatch, entrypoint, projects
+    ):
+        deps = _deps()
+        monkeypatch.setattr(
+            admission_router, "get_thread_admission_dependencies", lambda _request: deps
+        )
+        body = ThreadCreateRequest(**projects)
+
+        with pytest.raises(HTTPException) as exc:
+            if entrypoint == "preview":
+                await admission_router.preview_thread_creation(body, MagicMock())
+            else:
+                await admission_router.create_thread(body, MagicMock())
+
+        assert exc.value.status_code == 422
+        assert exc.value.detail == ONE_PROJECT_DETAIL
+        deps.authorize_thread_project_ids.assert_not_awaited()
+        deps.store.get_user_settings.assert_not_awaited()
+        deps.resolve_session_account_defaults.assert_not_awaited()
+        deps.store.create_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_one_project_is_the_primary_and_the_only_mount_source(self):
+        """A one-project Session gets that project as threads.project_id and
+        mounts exactly it: the server adds no personal project beside it."""
+        body = ThreadCreateRequest(project_ids=[OTHER_PROJECT])
+        rows = [{"mount_kind": "project", "source_ref": OTHER_PROJECT}]
+        deps = _deps(build_thread_mount_rows=AsyncMock(return_value=rows))
+
+        plan = await _plan(body, deps)
+        await ta.commit_thread_creation(plan, body, USER, dependencies=deps)
+
+        assert plan.effective_project_ids == [OTHER_PROJECT]
+        assert plan.primary_project_id == OTHER_PROJECT
+        assert plan.create_kwargs["project_id"] == OTHER_PROJECT
+        deps.build_thread_mount_rows.assert_awaited_once_with([OTHER_PROJECT])
+        deps.store.replace_thread_mounts.assert_awaited_once_with(THREAD, rows)
 
     @pytest.mark.asyncio
     async def test_scope_is_authorized_before_any_account_work(self):

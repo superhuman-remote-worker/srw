@@ -483,14 +483,16 @@ async def resolve_thread_creation_plan(
     VM availability and capability grants.
     """
     # Project scope is needed for both selection precedence and grant
-    # resolution, so authorize it before choosing the expert.
+    # resolution, so authorize it before choosing the expert. A new Session
+    # has one project or none: thread_creation_project_ids refuses a second
+    # one with 422 before any lookup.
     requested_project_ids = thread_creation_project_ids(request_body, user)
     effective_project_ids = await dependencies.authorize_thread_project_ids(
         user, requested_project_ids
     )
-    # A project default/config override is safe only with one unambiguous
-    # primary project. The legacy project_id field explicitly identifies
-    # that primary; otherwise a multi-project session skips this layer.
+    # The Session's one project, if any, is its primary: threads.project_id
+    # and the Project layer of the defaults chain (experts, workspace,
+    # config). project_id and project_ids name the same project here.
     primary_project_id = (
         str(request_body.project_id)
         if request_body.project_id
@@ -658,8 +660,8 @@ async def resolve_thread_creation_plan(
         )
     # Agent attach requires one project for every enabled background Officer,
     # including an Officer selected by an account or Expert default. Check the
-    # canonical authorized set: a legacy primary project_id can coexist with
-    # additional project_ids and must not make a multi-project Officer valid.
+    # canonical authorized set; with a second project already refused above,
+    # this catches the projectless Officer.
     _officer_requested = materialized_session_class["enabled"]
     if _officer_requested and len(effective_project_ids) != 1:
         raise HTTPException(
@@ -718,8 +720,9 @@ async def resolve_thread_creation_plan(
     # incarnation at a time. Refuse BEFORE provisioning — the atomic
     # registration claim after the INSERT below is the authority; this
     # early check just avoids creating a thread we would immediately
-    # have to stand down. The project-count gate above excludes unbound and
-    # multi-project Officers before any post lookup or provisioning.
+    # have to stand down. The project gates above (one project at most, and
+    # an Officer needs exactly one) exclude unbound and multi-project
+    # Officers before any post lookup or provisioning.
     _explicit_officer_commission = (
         request_body._officer_post_config_snapshot is not None
     )
