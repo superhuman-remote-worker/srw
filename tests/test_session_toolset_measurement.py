@@ -32,6 +32,10 @@ from shared.runtime.core.tool_report import (
     report_categories,
 )
 from orchestrator.application import transport as transport_composition
+from tests._shipped_expert_catalog import (
+    authored_runtime_config,
+    serve_shipped_catalog,
+)
 
 _AGENT_ROW = {"id": "agent-1", "pod_ip": "10.0.0.9", "pod_port": 8001}
 
@@ -1517,3 +1521,139 @@ async def test_a_recommendation_replaces_the_installation_default_binding(
         "sources": {"tier": "explicit", "template": "explicit"},
         "template_name": None,
     }
+
+
+class TestPreviewTakesAnInlineExpert:
+    """The creation form previews a changed template as the inline copy it sends.
+
+    Built from the selected Expert's authored definition, the copy must predict
+    the same categories as the selector, so an unchanged form never shows a
+    different toolset depending on how its expert is about to be sent.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _shipped_catalog(self, monkeypatch):
+        """Roster references resolve against the Catalog a fresh install seeds."""
+        serve_shipped_catalog(monkeypatch)
+
+    @staticmethod
+    def _authored(name):
+        return authored_runtime_config(name)
+
+    @staticmethod
+    def _inline(runtime_config, **runtime):
+        return {
+            "inline": {
+                "runtime": {"adapter": "srw/v1", "config": runtime_config, **runtime}
+            }
+        }
+
+    async def _preview(self, user, db, req, body, *, experts=True):
+        with (
+            patch("orchestrator.security.auth.require_approved_user", _approved(user)),
+            patch("orchestrator.main.app.state.resources.postgres_db", db),
+            patch(
+                f"{_TOOL_VIEW}.is_experts_db_enabled",
+                MagicMock(return_value=experts),
+            ),
+            patch(
+                "orchestrator.services.grant_enforcement.user_experts_enabled",
+                AsyncMock(return_value=experts),
+            ),
+            patch(
+                "orchestrator.services.grant_enforcement.resolve_runner_grants",
+                AsyncMock(return_value=None),
+            ),
+        ):
+            return await _preview_tool_groups(body, req)
+
+    @staticmethod
+    def _bound(result):
+        return {
+            name: (view["state"], tuple(view["tools"]))
+            for name, view in result["categories"].items()
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "expert_type,name",
+        [("worker", "developer"), ("session", "assistant"), ("session", "developer")],
+    )
+    async def test_inline_copy_predicts_the_selectors_categories(
+        self, user_a, fake_db, fake_request, expert_type, name
+    ):
+        selected = await self._preview(
+            user_a,
+            fake_db,
+            fake_request,
+            ToolGroupPreviewRequest(expert_type=expert_type, config_name=name),
+        )
+        inline = await self._preview(
+            user_a,
+            fake_db,
+            fake_request,
+            ToolGroupPreviewRequest(
+                expert_type=expert_type, expert=self._inline(self._authored(name))
+            ),
+        )
+        assert inline["source"] == selected["source"] == "resolved"
+        assert self._bound(inline) == self._bound(selected)
+        assert inline["tool_groups"] == selected["tool_groups"]
+        assert inline["subagents"] == selected["subagents"]
+
+    @pytest.mark.asyncio
+    async def test_a_disabled_category_in_the_copy_is_predicted_off(
+        self, user_a, fake_db, fake_request
+    ):
+        authored = self._authored("developer")
+        authored["config"]["tools"]["research"] = []
+        result = await self._preview(
+            user_a,
+            fake_db,
+            fake_request,
+            ToolGroupPreviewRequest(
+                expert_type="worker", expert=self._inline(authored)
+            ),
+        )
+        assert result["categories"]["research"]["tools"] == []
+
+    @pytest.mark.asyncio
+    async def test_an_inline_expert_is_resolved_even_on_the_legacy_gate(
+        self, user_a, fake_db, fake_request
+    ):
+        """Creation freezes an inline expert through the resolved path regardless."""
+        result = await self._preview(
+            user_a,
+            fake_db,
+            fake_request,
+            ToolGroupPreviewRequest(expert=self._inline(self._authored("assistant"))),
+            experts=False,
+        )
+        assert result["source"] == "resolved"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "fields,status",
+        [
+            ({"expert_id": "33333333-3333-4333-8333-333333333333"}, 400),
+            ({"config_name": "scholar"}, 400),
+            ({"image": "example.invalid/other:1"}, 422),
+        ],
+    )
+    async def test_conflicts_and_foreign_images_are_refused(
+        self, user_a, fake_db, fake_request, fields, status
+    ):
+        from fastapi import HTTPException
+
+        runtime = {"image": fields.pop("image")} if "image" in fields else {}
+        with pytest.raises(HTTPException) as exc:
+            await self._preview(
+                user_a,
+                fake_db,
+                fake_request,
+                ToolGroupPreviewRequest(
+                    expert=self._inline(self._authored("assistant"), **runtime),
+                    **fields,
+                ),
+            )
+        assert exc.value.status_code == status

@@ -53,6 +53,9 @@ class SessionToolViewDependencies:
     session_config_dependencies: Callable[
         [], session_config_resolution.SessionConfigDependencies
     ]
+    #: The installed SRW harness image an inline expert's explicit image must
+    #: equal (the one creation's execution snapshot records).
+    srw_image: Callable[[], str]
 
 
 async def session_tool_grants(
@@ -239,11 +242,28 @@ async def preview_tool_groups(
 
     expert_row = None
     project_overrides = None
+    inline = body.expert.inline if body.expert is not None else None
+    if inline is not None:
+        # The same definition, gates and refusals creation applies: the
+        # preview answers for exactly the expert the create request will carry.
+        if body.expert_id or base != default_base:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "An inline expert cannot be combined with config_name or "
+                    "expert_id; select one expert source."
+                ),
+            )
+        from orchestrator.services.inline_expert import admit_inline_expert
+
+        expert_row = admit_inline_expert(
+            inline, role=body.expert_type, trusted_image=dependencies.srw_image()
+        )
     legacy = (
         not is_experts_db_enabled() or not await dependencies.user_experts_enabled()
     )
     try:
-        if body.expert_id and not legacy:
+        if body.expert_id and not legacy and inline is None:
             expert_row = await store.get_expert_by_id(str(body.expert_id))
             if body.project_id:
                 link = await store.get_project_expert_link(
@@ -322,7 +342,9 @@ async def preview_tool_groups(
     # means there is no expert layer to merge — the resolved path already answers
     # that correctly. Routing a worker preview through the session legacy policy
     # would predict appended session groups for a job that cannot hold them.
-    use_legacy = legacy and not is_worker
+    # An inline expert is frozen into the created work by the resolved path
+    # whatever the experts gates say, so its prediction is never the legacy one.
+    use_legacy = legacy and not is_worker and inline is None
     from shared.runtime.core.subagent_roster import roster_summary
 
     roster: dict[str, Any] = roster_summary(None)

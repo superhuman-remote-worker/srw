@@ -7,6 +7,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
 
+from orchestrator.schemas.inline_expert import InlineExpertSelection
+
 
 class ThreadControlRequest(BaseModel):
     """Strict public envelope for the durable control-inbox subset."""
@@ -91,6 +93,10 @@ class ToolGroupPreviewRequest(BaseModel):
 
     config_name: Optional[str] = None
     expert_id: Optional[str] = None
+    #: A complete inline Expert, as the create request would carry it. It is
+    #: the expert layer of the prediction; never combined with expert_id or a
+    #: non-base config_name.
+    expert: Optional[InlineExpertSelection] = None
     project_id: Optional[str] = None
     config_override: Optional[dict[str, Any]] = None
     workspace: Optional[dict[str, Any]] = None

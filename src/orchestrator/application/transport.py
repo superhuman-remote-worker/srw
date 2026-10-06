@@ -31,6 +31,7 @@ from orchestrator.services import (
     container_provisioner as container_provisioner_module,
     email,
     grant_enforcement,
+    manifest_experts,
     notification_service as notification_service_module,
     persistent_provisioner as persistent_provisioner_module,
     pinned_forwarding as pinned_forwarding_operations,
@@ -78,6 +79,9 @@ def session_tool_view_dependencies(
         ),
         session_config_dependencies=functools.partial(
             preparation_composition.session_config_dependencies, resources
+        ),
+        srw_image=functools.partial(
+            manifest_experts.trusted_srw_image, resources.postgres_db
         ),
     )
 
