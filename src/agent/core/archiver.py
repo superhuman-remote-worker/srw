@@ -299,6 +299,7 @@ class LLMArchiver:
         model_kwargs: Optional[Dict[str, Any]] = None,
         call_type: str = "main",
         auxiliary_metadata: Optional[Dict[str, Any]] = None,
+        history_messages: Optional[Sequence[BaseMessage]] = None,
     ) -> Optional[str]:
         """Archive an LLM request/response.
 
@@ -319,6 +320,14 @@ class LLMArchiver:
                        "memory_assembly", "knowledge_curation", "vision")
             auxiliary_metadata: Optional call-type-specific context (task class,
                                trigger, iteration count, etc.)
+            history_messages: The request before the carrier fold
+                (append-only context injection, WP2 spec §D 7c): the
+                history with its typed context entries as separate
+                messages. ``llm_requests`` keeps ``messages``, the folded
+                request the provider got; the chat_history delta reads this
+                list, so an entry is archived as context, never as part of
+                the tool result or user message it was folded into. None:
+                the delta reads ``messages``.
 
         Returns:
             Inserted document ID, or None if archiving failed.
@@ -400,7 +409,7 @@ class LLMArchiver:
                 self._archive_chat_entry(
                     job_id=job_id,
                     agent_type=agent_type,
-                    messages=messages,
+                    messages=history_messages or messages,
                     response=response,
                     model=model,
                     latency_ms=latency_ms,
@@ -511,13 +520,15 @@ class LLMArchiver:
         This stores only the new messages (inputs that triggered this response)
         and the LLM response, enabling a clean sequential view of conversations.
 
-        The payload also carries the transient tail-injection block (todos,
-        memory, knowledge, citation feedback, instruction files — re-injected
-        fresh every request, see workspace_injection.py). Those are excluded
-        from the delta scan — with them included, the "last AIMessage" was the
-        synthetic injection pair and the real tool results were dropped while
-        the full injected block was re-stored on every turn (99% of
-        chat_history bytes). Instead each injection is archived as a compact
+        The payload also carries injected context: the legacy transient tail
+        (memory, knowledge, charter, citation feedback, supervisor guidance,
+        active subagents, the App Guide turn boundary, instruction files;
+        re-injected fresh every request) and typed context entries
+        (``shared.runtime.core.context_entries``). The delta starts after the
+        last AIMessage that is not a legacy injection: anchoring on a
+        synthetic pair's AIMessage dropped the real tool results while the
+        full injected block was re-stored on every turn (99% of chat_history
+        bytes). Within the delta each injection is archived as a compact
         ``type="context"`` descriptor (kind/hash/chars/preview), with full
         content only on the turn its hash changes; the full payload is always
         in llm_requests via request_id.
@@ -534,36 +545,33 @@ class LLMArchiver:
             phase: Current phase ("strategic" or "tactical")
             phase_number: Current phase number
         """
-        from shared.runtime.core.message_markers import is_protected_message
-        from shared.runtime.core.workspace_injection import (
-            is_workspace_injection_message,
+        from shared.runtime.core.context_entries import (
+            is_context_injection,
+            is_legacy_injection,
         )
+        from shared.runtime.core.message_markers import is_protected_message
 
         try:
-            # Partition the payload: real conversation vs transient injections.
-            real_messages: List[BaseMessage] = []
-            injected: List[BaseMessage] = []
-            for msg in messages:
-                if isinstance(msg, SystemMessage):
-                    continue
-                if is_workspace_injection_message(msg):
-                    injected.append(msg)
-                else:
-                    real_messages.append(msg)
+            conversation = [m for m in messages if not isinstance(m, SystemMessage)]
 
-            # Find new inputs: real messages after the last real AIMessage
-            # These are the messages that triggered this response
+            # Find new inputs: the messages after the last real AIMessage
+            # (a legacy synthetic pair's AIMessage is not one). These are the
+            # messages that triggered this response.
             last_ai_idx = -1
-            for i, msg in enumerate(real_messages):
-                if isinstance(msg, AIMessage):
+            for i, msg in enumerate(conversation):
+                if isinstance(msg, AIMessage) and not is_legacy_injection(msg):
                     last_ai_idx = i
 
-            # A protected phase instruction block is history (it persists in
-            # state), but it is not a user turn: on its delivery turn it is
-            # archived as a context descriptor, never as a human bubble.
+            # Within the delta, injected context and a protected phase
+            # instruction block (history, persisted in state, but not a user
+            # turn) are archived as context descriptors, never as inputs.
+            injected: List[BaseMessage] = []
             delivered_context: List[BaseMessage] = []
             new_inputs = []
-            for msg in real_messages[last_ai_idx + 1 :]:
+            for msg in conversation[last_ai_idx + 1 :]:
+                if is_context_injection(msg):
+                    injected.append(msg)
+                    continue
                 if is_protected_message(msg):
                     delivered_context.append(msg)
                     continue
@@ -662,25 +670,36 @@ class LLMArchiver:
         of this job, so per-turn rows stay small while every change point
         remains reconstructable from chat_history alone.
         """
-        from agent.core.citation_feedback_injection import (
+        from shared.runtime.core.context_entries import entry_kind
+        from shared.runtime.core.injection_markers import (
+            ACTIVE_SUBAGENTS_CONTENT_PREFIX,
+            CHARTER_TOOL_CALL_ID_PREFIX,
             CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX,
+            GUIDANCE_TOOL_CALL_ID_PREFIX,
+            INSTRUCTION_TOOL_CALL_ID_PREFIX,
+            KNOWLEDGE_TOOL_CALL_ID_PREFIX,
+            MEMORY_TOOL_CALL_ID_PREFIX,
+            PRODUCT_GUIDE_TURN_BOUNDARY_CONTENT_PREFIX,
+            TODOS_INJECTION_CONTENT_PREFIX,
         )
-        from agent.core.knowledge_injection import KNOWLEDGE_TOOL_CALL_ID_PREFIX
-        from agent.core.memory_injection import MEMORY_TOOL_CALL_ID_PREFIX
         from shared.runtime.core.message_markers import (
             is_protected_message,
             protected_path,
         )
-        from shared.runtime.core.workspace_injection import (
-            INSTRUCTION_TOOL_CALL_ID_PREFIX,
-            content_hash_id,
-        )
+        from shared.runtime.core.workspace_injection import content_hash_id
 
         kind_by_prefix = (
             (INSTRUCTION_TOOL_CALL_ID_PREFIX, "instruction"),
             (MEMORY_TOOL_CALL_ID_PREFIX, "memory"),
             (KNOWLEDGE_TOOL_CALL_ID_PREFIX, "knowledge"),
+            (CHARTER_TOOL_CALL_ID_PREFIX, "charter"),
             (CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX, "citation_feedback"),
+            (GUIDANCE_TOOL_CALL_ID_PREFIX, "guidance"),
+        )
+        human_kind_by_prefix = (
+            (TODOS_INJECTION_CONTENT_PREFIX, "todos"),
+            (ACTIVE_SUBAGENTS_CONTENT_PREFIX, "subagents"),
+            (PRODUCT_GUIDE_TURN_BOUNDARY_CONTENT_PREFIX, "turn_boundary"),
         )
 
         # Bound the per-job hash cache (worker --loop reuses the process).
@@ -701,15 +720,23 @@ class LLMArchiver:
         entries: List[Dict[str, Any]] = []
         for msg in injected:
             label: Optional[str] = None
+            typed_kind = entry_kind(msg)
             if is_protected_message(msg):
                 # Persistent phase instruction block (src/core/message_markers):
                 # labelled by the artifact path it delivers. Mirrored in
                 # src/shared/orch_surface/formatters.py::_context_label.
                 kind = "phase_instruction"
                 label = protected_path(msg)
+            elif typed_kind is not None:
+                # Typed context entry: the kind is in its metadata; the
+                # citation entry keeps the legacy pair's descriptor kind.
+                kind = "citation_feedback" if typed_kind == "citation" else typed_kind
             elif isinstance(msg, HumanMessage):
-                # Only the todos block is injected as a transient HumanMessage.
-                kind = "todos"
+                content_text = msg.content if isinstance(msg.content, str) else ""
+                kind = next(
+                    (k for p, k in human_kind_by_prefix if content_text.startswith(p)),
+                    "other",
+                )
             elif isinstance(msg, ToolMessage):
                 tcid = getattr(msg, "tool_call_id", "") or ""
                 kind = next(
@@ -1094,10 +1121,13 @@ def archive_llm_request(
     model_kwargs: Optional[Dict[str, Any]] = None,
     call_type: str = "main",
     auxiliary_metadata: Optional[Dict[str, Any]] = None,
+    history_messages: Optional[Sequence[BaseMessage]] = None,
 ) -> Optional[str]:
     """Convenience function to archive an LLM request using default archiver.
 
-    See LLMArchiver.archive() for parameter details.
+    See LLMArchiver.archive() for parameter details (``history_messages``:
+    the unfolded request for the chat_history delta; None reads
+    ``messages``).
     """
     archiver = get_archiver()
     if archiver:
@@ -1116,5 +1146,6 @@ def archive_llm_request(
             model_kwargs=model_kwargs,
             call_type=call_type,
             auxiliary_metadata=auxiliary_metadata,
+            history_messages=history_messages,
         )
     return None

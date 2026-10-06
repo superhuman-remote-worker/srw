@@ -25,6 +25,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Sequence,
     Set,
     Tuple,
 )
@@ -800,6 +801,14 @@ _turn_tool_execution_external_hook: Optional[Callable[[Tuple[str, int, int]], No
     None
 )
 
+# Idle-time memory prefetch seam for the stateless executor (append-only
+# context injection WP4, B8). Nothing tells a leased claim that new input
+# arrived, so the executor installs a per-claim check: has ``run_queue.
+# input_seq`` risen past the input this claim serves, under its exact lease
+# (a lost lease counts as yes). The loop's end-of-turn prefetch polls it and
+# stops. Pinned sessions leave it unset and check their input runtime.
+_turn_idle_input_external_probe: Optional[Callable[[], Awaitable[bool]]] = None
+
 # Phase 2 event-log cursor. Allocated synchronously by _broadcast, then queued
 # through one ordered writer so a later sequence can never become visible in
 # Postgres before an earlier queued sequence. Each DB-backed runtime attach
@@ -1200,6 +1209,8 @@ def _ensure_persistent_loop_started(
                 _session_input.defer_and_requeue_delivery
             ),
             settle_input_delivery=_session_input.settle_delivery,
+            idle_input_arrived=_loop_idle_input_arrived,
+            save_pending_memory=_loop_save_pending_memory,
         )
         # Tag the loop task — and the turn/aux tasks it spawns, which copy this
         # context at creation — with thread_id for log correlation.
@@ -7982,6 +7993,59 @@ async def _loop_on_turn_settled(turn_id: int) -> None:
     # complete/park/release CAS.
 
 
+async def _loop_idle_input_arrived() -> bool:
+    """Whether new input must stop the end-of-turn memory prefetch (WP4, B8).
+
+    Stateless: the executor's per-claim check (``run_queue.input_seq`` under
+    the exact lease); without one the prefetch never holds a slot. Pinned:
+    input the runtime already queued, else a durable delivery it can claim
+    now (the same reclaim the input wait runs every second; claiming early
+    only moves it into the queue the loop reads next).
+    """
+    if not _loop_provider_admission_open():
+        return True
+    probe = _turn_idle_input_external_probe
+    if probe is not None:
+        return bool(await probe())
+    if _stateless_mode():
+        return True
+    queue = _session_input.queue
+    if queue is None:
+        return True
+    if not queue.empty():
+        return True
+    await _session_input.reclaim_pending()
+    return not queue.empty()
+
+
+async def _loop_save_pending_memory(
+    payload: Optional[Dict[str, Any]], expected_id: Optional[str]
+) -> bool:
+    """Save or clear the thread's durable pending memory set (WP4, D32).
+
+    A fenced, atomic ``jsonb_set`` on ``threads.metadata`` through the
+    agent's own pool (the stateless lane proves its exact lease first, like
+    every turn write). ``payload`` None clears the stored set whose id is
+    ``expected_id``.
+    """
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
+        return False
+    return bool(
+        await asyncio.wait_for(
+            _session.postgres_conn.save_thread_pending_memory(
+                _session_identity.thread_id,
+                payload,
+                expected_id=expected_id,
+            ),
+            timeout=5.0,
+        )
+    )
+
+
 # Turn-complete reconcile: bounded attempts + per-attempt timeout. The
 # reconcile is an idempotent upsert transaction (ON CONFLICT (id); the memory
 # effect is minted-or-reused), so a retry after a timeout or a dropped
@@ -8217,13 +8281,24 @@ async def _loop_on_turn_complete_body(
         )
 
 
-def _loop_archive_llm_call(prepared: Any, response: Any, metrics: dict) -> None:
+def _loop_archive_llm_call(
+    prepared: Any,
+    response: Any,
+    metrics: dict,
+    history_messages: Optional[Sequence[Any]] = None,
+) -> None:
     """Audit one main-LLM call to the llm_requests trail, in the background.
 
     Sessions previously wrote no llm_requests at all — job agents were
     auditable, session hangs were not (session_silent_failure_audit.md #14).
     The Mongo insert is synchronous, so it runs in a thread; failures are
     non-fatal by audit-trail contract.
+
+    ``history_messages`` is the request before the carrier fold (append-only
+    context injection, WP2 spec §F.6): ``llm_requests`` keeps ``prepared``,
+    the folded request the provider got, and the chat_history delta reads the
+    history, so a typed context entry is archived as context. None: the
+    delta reads ``prepared``.
     """
     if _session is None or _session_identity.thread_id is None:
         return
@@ -8253,6 +8328,7 @@ def _loop_archive_llm_call(prepared: Any, response: Any, metrics: dict) -> None:
                     "output_tokens": metrics.get("output_tokens"),
                     "cached_tokens": metrics.get("cached_tokens"),
                 },
+                history_messages=history_messages,
             )
         except Exception as e:
             logger.debug(f"llm_requests archive failed (non-fatal): {e}")
@@ -8641,9 +8717,16 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
     (predates the column); current rows carry it explicitly. Skips system
     rows — the loop adds a fresh system from the current config.
     ``role='summary'`` rows are already excluded by the DB query.
+    A ``role='context'`` row comes back as the typed context entry it was
+    (its stored text, never re-rendered) and folds into its carrier at the
+    next request build; an unreadable one is dropped, and the planner
+    re-injects what is still relevant.
     """
     import uuid as _uuid
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+    from shared.runtime.core.context_entries import context_entry_from_row
+    from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT
 
     restored: list = []
     pending_tool_call_ids: list[str] = []
@@ -8675,6 +8758,17 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
             # it can no longer see. (postgres_db's history query excludes only
             # 'summary' and 'error', so 'event' rows do reach here.)
             restored.append(HumanMessage(content=content, id=msg_id))
+
+        elif role == PERSIST_ROLE_CONTEXT:
+            # A typed context entry (append-only context injection). The
+            # history query reads additional_kwargs for these rows only.
+            entry = context_entry_from_row(
+                db_msg.get("content"), db_msg.get("additional_kwargs"), id=msg_id
+            )
+            if entry is None:
+                logger.debug("Dropping unreadable context row %s on restore", msg_id)
+            else:
+                restored.append(entry)
 
         elif role in ("ai", "assistant"):
             lc_tool_calls = []
@@ -9033,8 +9127,12 @@ def _select_turn_messages(
     exact input id (stateless) or the latest HumanMessage (pinned). A
     stateless walk that finds no anchor reconciles zero rows — the
     incremental writes already hold the turn's content and the DB still
-    mints the boundary — rather than failing the settlement.
+    mints the boundary — rather than failing the settlement. A typed context
+    entry is a HumanMessage too, but never the turn's boundary: the pinned
+    walk saves it with the turn's rows and walks on to the input.
     """
+    from shared.runtime.core.context_entries import is_context_entry
+
     input_id = str(turn_input_message_id) if turn_input_message_id else None
     if authoritative_turn_boundary and any(
         turn_membership(msg) is not None for msg in messages
@@ -9053,10 +9151,10 @@ def _select_turn_messages(
             if str(getattr(msg, "id", "")) == input_id:
                 boundary_found = True
                 break
-        elif hasattr(msg, "type") and msg.type in (
+        elif getattr(msg, "type", None) in (
             "human",
             "HumanMessageChunk",
-        ):
+        ) and not is_context_entry(msg):
             boundary_found = True
             break
         to_save.append(msg)
@@ -9570,13 +9668,12 @@ async def _compact_session_manually(
     # "Summarize up to here" (session rewind's sibling action): map the
     # chosen message to keep_recent_override = the number of messages from
     # it (inclusive) to the end, counted on the same basis
-    # summarize_and_compact uses (workspace injections excluded — they are
-    # filtered before keep_recent applies).
+    # summarize_and_compact uses (injected context excluded — legacy pieces
+    # are filtered before keep_recent applies, typed entries ride with their
+    # carriers and are not counted, see keep_window_start).
     keep_recent_override = None
     if boundary_message_id:
-        from shared.runtime.core.workspace_injection import (
-            is_workspace_injection_message,
-        )
+        from shared.runtime.core.context_entries import is_context_injection
         from agent.database.postgres_db import _coerce_row_id
 
         target_uuid = str(_coerce_row_id(boundary_message_id))
@@ -9593,9 +9690,7 @@ async def _compact_session_manually(
                 "already be summarized",
             )
         keep_recent_override = sum(
-            1
-            for m in _session.messages[cut_index:]
-            if not is_workspace_injection_message(m)
+            1 for m in _session.messages[cut_index:] if not is_context_injection(m)
         )
 
     before_count = len(_session.messages)
@@ -10348,25 +10443,15 @@ async def _handle_config_update(
         # carry the new credentials, so we replace _session.auxiliary_llm
         # with a session-scoped instance.
         if effective_override.get("auxiliary"):
-            from shared.runtime.core.loader import LLMConfig, resolve_model_settings
+            from shared.runtime.core.loader import (
+                create_auxiliary_llms,
+                resolve_model_settings,
+            )
             from shared.runtime.services.auxiliary import AuxiliaryLLM
 
             aux_cfg = new_config.auxiliary
             model_settings = resolve_model_settings(
                 aux_cfg.model, new_config._deployment_dir
-            )
-            aux_llm_config = LLMConfig(
-                model=aux_cfg.model,
-                base_url=aux_cfg.base_url,
-                api_key=aux_cfg.api_key,
-                provider=aux_cfg.provider,
-                extra_headers=aux_cfg.extra_headers,
-                temperature=aux_cfg.temperature,
-                top_p=model_settings.get("top_p"),
-                top_k=model_settings.get("top_k"),
-                model_max_context_tokens=model_settings.get("model_max_context_tokens"),
-                extra_body=model_settings.get("extra_body"),
-                max_retries=1,
             )
             aux_structured_output_method = model_settings.get(
                 "structured_output_method", "json_schema"
@@ -10375,9 +10460,12 @@ async def _handle_config_update(
             fallback_settings = resolve_model_settings(
                 fallback_model, new_config._deployment_dir
             )
-            aux_inner = create_llm(aux_llm_config, new_config.limits)
+            aux_clients = create_auxiliary_llms(
+                aux_cfg, model_settings, new_config.limits
+            )
             _session.auxiliary_llm = AuxiliaryLLM(
-                llm=aux_inner,
+                llm=aux_clients.llm,
+                summarization_llm=aux_clients.summarization_llm,
                 max_iterations=aux_cfg.max_iterations,
                 timeout=aux_cfg.timeout,
                 max_context_tokens=model_settings.get("model_max_context_tokens"),
@@ -11534,9 +11622,13 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
         )
         return None
     try:
-        # Grab first few exchanges for title generation
+        from shared.runtime.core.context_entries import is_context_injection
+
+        # Grab first few exchanges for title generation; injected context
+        # (memory, knowledge, ...) is not what the conversation is about.
+        conversation = [m for m in messages if not is_context_injection(m)]
         sample = []
-        for m in messages[:10]:
+        for m in conversation[:10]:
             content = getattr(m, "content", None)
             if isinstance(content, str) and content:
                 sample.append(_excerpt_for_title(content))

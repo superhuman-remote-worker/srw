@@ -493,6 +493,47 @@ async def test_session_bundle_advertises_batch_settle_beside_attach(monkeypatch)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("stored", "carried"),
+    [
+        ({"v": 1, "id": "set-1", "memory": [{"content": "m"}]}, True),
+        ({"v": 2, "id": "set-1"}, False),  # another version: ignored
+        (None, False),
+    ],
+)
+async def test_session_bundle_carries_the_pending_memory_set_beside_attach(
+    monkeypatch, stored, carried
+):
+    """Append-only context injection WP4 (D32, B9): the thread's pending
+    memory set rides beside ``attach``. Inside it would change the attach
+    fingerprint at every turn end and force a re-attach; beside it, a warm
+    session gets it too."""
+    from orchestrator import main as orch_main
+
+    thread = _thread()
+    if stored is not None:
+        thread["metadata"] = {**thread["metadata"], "aoci_pending_memory": stored}
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=thread)
+    _patch(monkeypatch, orch_main, db)
+
+    out = await unit_claim_bundle.claim_bundle_for_unit(
+        UNIT_ID,
+        lease_token=7,
+        pod_name=POD_NAME,
+        pod_uid=POD_UID,
+        dependencies=sessions_composition.unit_claim_bundle_dependencies(
+            orch_main.app.state.resources
+        ),
+    )
+
+    assert "aoci_pending_memory" not in out["attach"]
+    if carried:
+        assert out["aoci_pending_memory"] == stored
+    else:
+        assert "aoci_pending_memory" not in out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("lanes", "expected"),
     [
         (frozenset(), False),

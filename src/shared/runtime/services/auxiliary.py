@@ -1156,6 +1156,9 @@ class AuxiliaryLLM:
             from its settings at construction. Budgeting authority for the
             SummarizationEngine and the chain() pre-flight guard. None
             disables the guard (window unknown).
+        summarization_llm: The same support model at the summarization
+            reasoning level (``auxiliary.summarization_reasoning_level``).
+            Serves :class:`SummarizeTask`; None = ``llm`` serves it too.
     """
 
     def __init__(
@@ -1171,8 +1174,10 @@ class AuxiliaryLLM:
         agent_type: Optional[str] = None,
         max_context_tokens: Optional[int] = None,
         fallback_llm: Optional[BaseChatModel] = None,
+        summarization_llm: Optional[BaseChatModel] = None,
     ):
         self.llm = llm
+        self.summarization_llm = summarization_llm
         self.structured_output_method = structured_output_method or "json_schema"
         self.fallback_structured_output_method = (
             fallback_structured_output_method or self.structured_output_method
@@ -1246,9 +1251,13 @@ class AuxiliaryLLM:
         method: Optional[str] = None,
         fallback_method: Optional[str] = None,
         retry_policy: Optional[RetryPolicy] = None,
+        primary_llm: Optional[BaseChatModel] = None,
     ):
         """Invoke ``build_runnable(llm).ainvoke(invoke_arg)`` on the dedicated aux
         model; on failure, retry the aux model, then fall back to the main model.
+
+        ``primary_llm`` replaces ``self.llm`` as the aux client for this call
+        (the summarization client); the fallback is unchanged.
 
         ``build_runnable`` maps an LLM to the runnable to invoke (identity for a
         raw ``ainvoke``, ``.with_structured_output(...)`` for chain mode,
@@ -1282,6 +1291,7 @@ class AuxiliaryLLM:
         """
         _timeout = timeout if timeout is not None else self.timeout
         _policy = retry_policy if retry_policy is not None else _AUX_RETRY
+        primary = primary_llm if primary_llm is not None else self.llm
         method = method or self.structured_output_method
         fallback_method = fallback_method or self.fallback_structured_output_method
         try:
@@ -1289,7 +1299,7 @@ class AuxiliaryLLM:
             # attempt gets its own timeout budget rather than sharing a spent one.
             result = await invoke_with_retry(
                 lambda: self._invoke_provider(
-                    build_runnable(self.llm, method), invoke_arg, _timeout
+                    build_runnable(primary, method), invoke_arg, _timeout
                 ),
                 policy=_policy,
                 description=f"aux '{task_name}' on model '{self.health.model}'",
@@ -1302,7 +1312,7 @@ class AuxiliaryLLM:
                     )
                 except Exception:
                     parsed = await self._recover_via_raw_invoke(
-                        self.llm,
+                        primary,
                         invoke_arg,
                         structured_schema,
                         timeout=_timeout,
@@ -1321,7 +1331,7 @@ class AuxiliaryLLM:
             raise
         except ValidationError as primary_exc:
             parsed = await self._recover_via_raw_invoke(
-                self.llm,
+                primary,
                 invoke_arg,
                 structured_schema,
                 timeout=_timeout,
@@ -1336,7 +1346,7 @@ class AuxiliaryLLM:
             parsed = None
             if structured_schema is not None and self.fallback_llm is None:
                 parsed = await self._recover_via_raw_invoke(
-                    self.llm,
+                    primary,
                     invoke_arg,
                     structured_schema,
                     timeout=_timeout,
@@ -1589,6 +1599,9 @@ class AuxiliaryLLM:
                 task_name=task.__class__.__name__,
                 timeout=timeout if timeout is not None else self.timeout,
                 retry_policy=retry_policy,
+                primary_llm=(
+                    self.summarization_llm if isinstance(task, SummarizeTask) else None
+                ),
             ),
             task=task,
             messages=messages,
@@ -1819,6 +1832,20 @@ class AuxiliaryLLM:
 _MAX_OBSERVATION_WINDOW = 40
 
 
+def _observation_window(messages: List[BaseMessage]) -> List[BaseMessage]:
+    """The newest ``_MAX_OBSERVATION_WINDOW`` conversation messages.
+
+    Injected context is filtered BEFORE the count cap: it carries no new
+    fact, and persisted context entries would otherwise use up window slots.
+    """
+    from shared.runtime.core.context_entries import is_context_injection
+
+    messages = [m for m in messages if not is_context_injection(m)]
+    if len(messages) > _MAX_OBSERVATION_WINDOW:
+        messages = messages[-_MAX_OBSERVATION_WINDOW:]
+    return messages
+
+
 async def extract_and_store_memories(
     auxiliary_llm: "AuxiliaryLLM",
     recall_store,
@@ -1845,9 +1872,7 @@ async def extract_and_store_memories(
         Number of memories successfully stored
     """
     try:
-        # Cap the message window
-        if len(messages) > _MAX_OBSERVATION_WINDOW:
-            messages = messages[-_MAX_OBSERVATION_WINDOW:]
+        messages = _observation_window(messages)
 
         if not messages:
             return 0
@@ -2059,9 +2084,7 @@ async def assemble_memories(
         AssemblyResult on success, None on failure
     """
     try:
-        # Cap the message window
-        if len(messages) > _MAX_OBSERVATION_WINDOW:
-            messages = messages[-_MAX_OBSERVATION_WINDOW:]
+        messages = _observation_window(messages)
 
         if not messages:
             return None
@@ -2106,15 +2129,15 @@ async def assemble_memories(
 def _format_messages_for_extraction(messages: List[BaseMessage]) -> str:
     """Format messages into readable text for the extraction LLM.
 
-    Filters out injection messages (workspace, memory, instruction)
-    to focus on actual conversation content.
+    Filters out injected context (typed entries and the legacy tail) to
+    focus on actual conversation content.
     """
+    from shared.runtime.core.context_entries import is_context_injection
     from shared.runtime.core.message_markers import is_protected_message
-    from shared.runtime.core.workspace_injection import is_workspace_injection_message
 
     lines = []
     for msg in messages:
-        if is_workspace_injection_message(msg):
+        if is_context_injection(msg):
             continue
         if is_protected_message(msg):
             continue  # phase instruction block — guidance, not conversation

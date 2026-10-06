@@ -125,6 +125,10 @@ from shared.run_queue import (
     transient_release_backoff_seconds,
 )
 from shared.session_permission_retirement import retire_stale_stateless_permissions
+from shared.session_pending_memory import (
+    SESSION_PENDING_MEMORY_KEY,
+    valid_pending_memory,
+)
 from shared.session_subagent_batch import (
     SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
     SESSION_SUBAGENT_FANOUT_KEY,
@@ -141,6 +145,7 @@ from shared.cloud_push_tasks import (
     fail_bg_task,
 )
 from shared.subagent_lifecycle import SubagentLifecycleError
+from shared.runtime.core.context_entries import is_context_entry
 from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
 from shared.worker_errors import worker_error_cause, worker_workspace_exhaustion_cause
 from shared.workspace_recovery import (
@@ -302,6 +307,20 @@ SELECT GREATEST(COALESCE(consumed_seq, -1), $4::bigint)
    AND lease_token = $2
    AND leased_by = $3
    AND input_delivery_capable_lease_token = $2
+"""
+
+# The idle-time memory prefetch at the end of a session turn (append-only
+# context injection WP4, B8) asks whether new input arrived. Admission bumps
+# ``input_seq`` on the leased row and sends no signal, so the step polls it
+# under the exact lease. COALESCE keeps "no row" (the lease is gone: NULL)
+# apart from a row without input yet (-1).
+_LEASED_INPUT_SEQ_SQL = """
+SELECT COALESCE(input_seq, -1)
+  FROM run_queue
+ WHERE unit_id = $1
+   AND unit_kind = 'session_turn'
+   AND state = 'leased'
+   AND lease_token = $2
 """
 
 # Skip-if-answered runs before attach and may complete the unit only when no
@@ -666,6 +685,19 @@ def claim_bundle_advertisement(attach: Mapping[str, Any]) -> Tuple[Any, Any]:
     )
 
 
+def claim_bundle_pending_memory(bundle: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """The thread's durable pending memory set the claim bundle carries.
+
+    Append-only context injection WP4 (D32, B9): the orchestrator reads
+    ``threads.metadata`` for every claim anyway and puts the set beside
+    ``attach``, never inside it, so a set written at every turn end never
+    changes the attach fingerprint. A fresh attach and a warm reuse both
+    take it from here. ``None`` when absent or unreadable.
+    """
+
+    return valid_pending_memory(bundle.get(SESSION_PENDING_MEMORY_KEY))
+
+
 def completed_input_checkpoint(
     target: Mapping[str, Any], *, claim_consumed_seq: Optional[int]
 ) -> Optional[int]:
@@ -726,7 +758,15 @@ def strip_restored_pending_humans(
     serves again. Its restored copy is stripped like a human one; the event
     is injected once, as the input of the turn that serves it.
 
-    Mutates ``messages`` in place; returns the number of messages removed.
+    A stripped input takes the run of typed context entries right after it
+    along (append-only context injection): they were appended for the turn
+    that input started and would otherwise fold into whatever message now
+    precedes them. The turn that serves the input again plans its own. The
+    tail matcher looks past a trailing run of entries to the input they
+    follow.
+
+    Mutates ``messages`` in place; returns the number of messages removed,
+    entries included.
     """
     if not messages or not pending_rows:
         return 0
@@ -746,25 +786,40 @@ def strip_restored_pending_humans(
     removed = 0
     if pending_ids:
         kept = []
+        stripping_entries = False
         for msg in messages:
+            if stripping_entries and is_context_entry(msg):
+                removed += 1
+                continue
+            stripping_entries = False
             msg_id = getattr(msg, "id", None)
             row = pending_ids.get(str(msg_id)) if msg_id is not None else None
-            if row is not None and getattr(msg, "type", None) == "human":
+            if (
+                row is not None
+                and getattr(msg, "type", None) == "human"
+                and not is_context_entry(msg)
+            ):
                 del pending_ids[str(msg_id)]
                 remaining.remove(row)
                 removed += 1
+                stripping_entries = True
                 continue
             kept.append(msg)
         messages[:] = kept
     while messages and remaining:
-        msg = messages[-1]
+        end = len(messages)
+        while end and is_context_entry(messages[end - 1]):
+            end -= 1
+        if not end:
+            break
+        msg = messages[end - 1]
         if getattr(msg, "type", None) != "human":
             break
         if _message_text(msg) != (remaining[-1].get("content") or ""):
             break
         remaining.pop()
-        messages.pop()
-        removed += 1
+        removed += len(messages) - (end - 1)
+        del messages[end - 1 :]
     return removed
 
 
@@ -3818,6 +3873,7 @@ class StatelessTurnExecutor:
             pa._turn_start_external_hook = None
             pa._turn_complete_external_hook = None
             pa._turn_tool_execution_external_hook = None
+            pa._turn_idle_input_external_probe = None
             settled = self._settled_claim == (str(claim.unit_id), int(token))
             self._settled_claim = None
             shutdown_retry = self._shutdown_retry_claim == (unit_id, int(token))
@@ -4132,6 +4188,10 @@ class StatelessTurnExecutor:
             pa._session_attach.apply_subagent_advertisement(
                 *claim_bundle_advertisement(attach)
             )
+            # The durable pending memory set (WP4, D32/B9): the idle-time
+            # prefetch of an earlier turn, maybe on another pod. Before any
+            # input is injected, so the turn's first request takes it in.
+            self._apply_pending_memory(pa, bundle, unit_id)
 
         # A claim may beat the reaper's post-steal journal transaction. Close
         # that abandoned generation and settle its exact interrupted input
@@ -4370,6 +4430,14 @@ class StatelessTurnExecutor:
         pa._turn_complete_external_hook = lambda _turn_id: turn_done.set()
         pa._turn_tool_execution_external_hook = (
             lambda identity: self._record_claim_tool_effect(claim, identity)
+        )
+        # WP4 (B8): the end-of-turn memory prefetch stops when input newer
+        # than this claim's target reaches the queue row, or the lease goes.
+        served_seq = max(
+            int(target["seq"]), consumed_seq if consumed_seq is not None else -1
+        )
+        pa._turn_idle_input_external_probe = lambda: self._idle_input_arrived(
+            claim, served_seq
         )
         if not pa._ensure_persistent_loop_started("stateless_claim"):
             await self._detach_cached_session("loop_not_ready")
@@ -5047,6 +5115,43 @@ class StatelessTurnExecutor:
         if turn_done.is_set():
             return "turn_done"
         return "loop_died"
+
+    def _apply_pending_memory(
+        self, pa: Any, bundle: Mapping[str, Any], unit_id: str
+    ) -> None:
+        """Hand the bundle's pending memory set to the session (WP4, B9).
+
+        Best-effort: an unreadable set or a session without the seam is
+        skipped; the next retrieval finds the same memories again.
+        """
+        stored = claim_bundle_pending_memory(bundle)
+        apply = getattr(pa._session, "apply_pending_memory", None)
+        if stored is None or apply is None:
+            return
+        try:
+            apply(stored)
+        except Exception:
+            logger.warning(
+                "pending memory set not applied for unit %s (non-fatal)",
+                unit_id,
+                exc_info=True,
+            )
+
+    async def _idle_input_arrived(self, claim: ClaimedUnit, served_seq: int) -> bool:
+        """Whether the end-of-turn memory prefetch must stop (WP4, B8).
+
+        True when ``run_queue.input_seq`` rose past the input this claim
+        serves, or the exact lease is gone (no prefetch may hold a slot
+        this claim no longer owns). Each check is one indexed read.
+        """
+        if self._lease.lost.is_set():
+            return True
+        input_seq = await self._db.fetchval(
+            _LEASED_INPUT_SEQ_SQL, claim.unit_id, int(claim.lease_token)
+        )
+        if input_seq is None:
+            return True
+        return int(input_seq) > int(served_seq)
 
     def _activate_lease(self, unit_id: Any, lease_token: int) -> None:
         """Install a new exact claimant and retire prior effect evidence."""
@@ -5939,6 +6044,7 @@ class StatelessTurnExecutor:
         pa._turn_complete_external_hook = None
         pa._turn_start_external_hook = None
         pa._turn_tool_execution_external_hook = None
+        pa._turn_idle_input_external_probe = None
         if pa._session is None:
             # A failed attach can leave _thread_id set with no session
             # (dual_app precedent) — clear it so the next claim starts clean.

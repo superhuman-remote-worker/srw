@@ -545,6 +545,7 @@ class PersistentSession:
 
         # 9. Set up memory (RecallStore) if enabled
         self._setup_memory(postgres_conn, vector_conn)
+        await self._hydrate_pending_memory()
         self._refresh_runtime_facts()
         _steps["memory"] = time.perf_counter() - _t
 
@@ -2054,6 +2055,75 @@ class PersistentSession:
                 )
         return changed
 
+    def apply_pending_memory(self, stored: Any) -> bool:
+        """Take the thread's durable pending memory set in (WP4, D32).
+
+        ``stored`` is the set saved in ``threads.metadata`` at the end of an
+        earlier turn (the idle-time prefetch), as the stateless claim bundle
+        carries it beside ``attach`` (B9) or the pinned setup reads it. It
+        becomes the memory manager's pending set, which the first provider
+        call of the next turn takes in. A set the manager already holds or
+        has taken in is not taken again (a warm session at its next claim).
+        append_only only; returns True when the set was taken in.
+        """
+        if stored is None or self.memory_service is None:
+            return False
+        from shared.runtime.core.context_entries import is_append_only
+
+        if not is_append_only(self.config):
+            return False
+        seed = getattr(self.memory_service, "seed_prefetch", None)
+        if seed is None:
+            return False
+        from agent.services.memory.pending_set import deserialize_pending_set
+
+        result = deserialize_pending_set(stored)
+        if result is None:
+            return False
+        taken = bool(seed(result))
+        if taken:
+            logger.info(
+                "Pending memory set %s taken in for thread %s: %d memories, %d notes",
+                result.pending_id,
+                self.thread_id,
+                len(result.records("memory")),
+                len(result.records("knowledge")),
+            )
+        return taken
+
+    async def _hydrate_pending_memory(self) -> None:
+        """Pinned setup: read the durable pending memory set (WP4, D32).
+
+        A pinned session in a fresh process continues the set the previous
+        process saved. The stateless lane gets it from the claim bundle at
+        every claim instead (B9), so it reads nothing here.
+        """
+        if (
+            self.shell_owner_token is not None
+            or self.memory_service is None
+            or self.postgres_conn is None
+        ):
+            return
+        from shared.runtime.core.context_entries import is_append_only
+
+        if not is_append_only(self.config):
+            return
+        reader = getattr(self.postgres_conn, "get_thread_pending_memory", None)
+        if reader is None:
+            return
+        try:
+            stored = await reader(self.thread_id)
+        except Exception as e:
+            logger.warning(
+                "Could not read the pending memory set of thread %s "
+                "(non-fatal): %s: %s",
+                self.thread_id,
+                type(e).__name__,
+                e,
+            )
+            return
+        self.apply_pending_memory(stored)
+
     def refresh_delegation_description(self) -> bool:
         """Rebuild the tools when the bound ``delegate_agent`` description no
         longer matches the live config. Returns True when it rebuilt.
@@ -3478,6 +3548,7 @@ class PersistentSession:
                         extraction_prompt=self.memory_extraction_prompt,
                         assembler_prompt=None,  # persistent mode has no assembler
                         job_id=self.thread_id,
+                        agent_type=self.config.agent_id,
                         project_id=self.project_id,
                         project_ids=list(self.project_ids),
                         # The legacy persistent path bounds each store call at
@@ -3520,6 +3591,12 @@ class PersistentSession:
                         "not resolve its transport (e.g. the reranker endpoint). Fix "
                         "the config or drop the plugin from memory.pipeline."
                     ) from e
+
+        # memory_search (append-only context injection, D25/D34) was bound with
+        # the other tools before this manager existed; it resolves the manager's
+        # extension from here at call time.
+        if self.tool_context is not None:
+            self.tool_context.memory_service = self.memory_service
 
         # Ingestion verdicts + bi-temporal supersede (overhaul Phase 4). Wired
         # onto the store independently of the manager cutover — a write-path

@@ -64,6 +64,10 @@ from orchestrator.services.stateless_workspace_gate import (
 )
 from orchestrator.services.vm_provisioner import vm_provisioner
 from shared.runtime.core.loader import canonical_config_name
+from shared.session_pending_memory import (
+    SESSION_PENDING_MEMORY_KEY,
+    pending_memory_from_metadata,
+)
 from shared.session_retirement import STATELESS_STOP_KEYS, stateless_stop_markers
 from shared.session_subagent_batch import (
     SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT,
@@ -961,6 +965,7 @@ async def _assemble_claim_bundle(
     )
 
     lease_still_current = False
+    pending_memory: dict[str, Any] | None = None
     async with dependencies.db.acquire() as conn:
         async with conn.transaction():
             final_thread = await conn.fetchrow(
@@ -1052,6 +1057,10 @@ async def _assemble_claim_bundle(
                         claimant_uid,
                     )
                     lease_still_current = bool(stamped)
+                    # Read under the same row lock as the claim stamp: the
+                    # set the previous turn saved (only a lease holder
+                    # writes it, and this claim now holds the lease).
+                    pending_memory = pending_memory_from_metadata(final_metadata)
     if not lease_still_current:
         raise HTTPException(status_code=403, detail="Lease validation failed")
     _t_end = time.perf_counter()
@@ -1065,7 +1074,7 @@ async def _assemble_claim_bundle(
         _t_end - _t_start,
     )
 
-    return {
+    bundle: dict[str, Any] = {
         "unit_id": unit_id,
         "thread_id": unit_id,
         "unit_kind": UNIT_KIND_SESSION_TURN,
@@ -1090,3 +1099,12 @@ async def _assemble_claim_bundle(
         ),
         "attach": attach,
     }
+    if pending_memory is not None:
+        # The thread's pending memory set (append-only context injection
+        # WP4, D32/B9): the idle-time prefetch an earlier turn saved, for the
+        # first request of this turn on whichever pod claims it. Beside
+        # ``attach``, never inside it: the set changes at every turn end and
+        # must not change the attach fingerprint (a warm session reads it
+        # from here too, since a warm turn re-reads nothing else).
+        bundle[SESSION_PENDING_MEMORY_KEY] = pending_memory
+    return bundle

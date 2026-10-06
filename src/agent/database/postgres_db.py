@@ -32,6 +32,7 @@ from shared.row_identity import (
     _THREAD_MSG_ID_NS as _THREAD_MSG_ID_NS,
     _coerce_row_id as _coerce_row_id,
 )
+from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT
 
 try:
     import asyncpg
@@ -41,6 +42,14 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 QUERIES_DIR = Path(__file__).parent / "queries" / "postgres"
+
+# The one ``additional_kwargs`` read the resume history projection makes: a
+# typed context entry (``role='context'``) is rebuilt from its schema; every
+# other row keeps the HF-7 diet (see ``get_thread_messages_history``).
+_CONTEXT_ROW_KWARGS_PROJECTION = (
+    f"CASE WHEN message.role = '{PERSIST_ROLE_CONTEXT}' "
+    "THEN message.additional_kwargs END AS additional_kwargs"
+)
 
 
 def _active_run_queue_lease():
@@ -1348,6 +1357,10 @@ class PostgresDB:
         # every resume and never read (the rebuilt AIMessage doesn't carry them).
         # Select only what resume consumes. The seq / turn_number / created_at
         # ORDER BYs below don't require the column in the projection.
+        # One exception, scoped by role: a ``role='context'`` row (a typed
+        # context entry, append-only context injection) is rebuilt from its
+        # ``additional_kwargs.srw_injection`` schema, so the CASE fetches the
+        # column for those rows only and stays NULL for every other row.
         provider_projection = ", message.provider_raw" if include_provider_raw else ""
         params: List[Any] = [thread_id]
         # The turn that consumed a row: an admitted delivery records it, the
@@ -1384,7 +1397,8 @@ class PostgresDB:
             SELECT message.id, message.role, message.content,
                    message.tool_calls, message.tool_call_id,
                    message.turn_number,
-                   delivery.admitted_turn_number{provider_projection}
+                   delivery.admitted_turn_number,
+                   {_CONTEXT_ROW_KWARGS_PROJECTION}{provider_projection}
             FROM thread_messages AS message
             LEFT JOIN thread_input_deliveries AS delivery
               ON delivery.message_id = message.id{boundary_join}
@@ -1435,6 +1449,13 @@ class PostgresDB:
                     **(
                         {"provider_raw": _j(row["provider_raw"])}
                         if include_provider_raw
+                        else {}
+                    ),
+                    # Only a context row gets the key (the HF-7 diet holds
+                    # for the rest; see _CONTEXT_ROW_KWARGS_PROJECTION).
+                    **(
+                        {"additional_kwargs": _j(row.get("additional_kwargs"))}
+                        if row["role"] == PERSIST_ROLE_CONTEXT
                         else {}
                     ),
                 }
@@ -1793,6 +1814,100 @@ class PostgresDB:
         return [str(row["commit_sha"]) for row in rows]
 
     # ------------------------------------------------------------------
+    # Pending memory set of a session (append-only context injection WP4)
+    # ------------------------------------------------------------------
+
+    _SAVE_PENDING_MEMORY_SQL = """
+        UPDATE threads
+        SET metadata = jsonb_set(
+            COALESCE(metadata, '{}'::jsonb), ARRAY[$2::text], $3::jsonb, true
+        )
+        WHERE id = $1::uuid
+        RETURNING 1
+    """
+    _CLEAR_PENDING_MEMORY_SQL = """
+        UPDATE threads
+        SET metadata = metadata - $2::text
+        WHERE id = $1::uuid
+          AND metadata -> $2::text ->> 'id' = $3::text
+        RETURNING 1
+    """
+
+    async def save_thread_pending_memory(
+        self,
+        thread_id: str,
+        payload: Optional[Dict[str, Any]],
+        *,
+        expected_id: Optional[str] = None,
+    ) -> bool:
+        """Write or clear the session's durable pending memory set (D32).
+
+        ``payload`` (the serialized idle-time prefetch) is written under
+        ``SESSION_PENDING_MEMORY_KEY`` with one atomic ``jsonb_set``: every
+        other metadata key is left as it is, so no writer that owns another
+        key is overwritten. ``payload`` None removes the stored set only when
+        its id is ``expected_id`` (the set this turn took in); a newer set is
+        never cleared by an older turn.
+
+        Fenced like the turn's other writes: the thread row is locked first
+        (the repository's threads -> run_queue order), then a stateless
+        claimant proves its exact lease before the update, so a zombie never
+        writes after a steal. The pinned lane has no queue lease. Returns
+        True when the statement ran; False when the thread is gone. A lost
+        lease raises ``LeaseLostError``.
+        """
+        from shared.session_pending_memory import SESSION_PENDING_MEMORY_KEY
+
+        if payload is None and not expected_id:
+            return False
+        lease = _active_run_queue_lease_for_thread(thread_id)
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM threads WHERE id = $1::uuid FOR UPDATE",
+                    thread_id,
+                )
+                if exists is None:
+                    return False
+                if lease is not None:
+                    await _require_run_queue_fence(conn, lease)
+                if payload is not None:
+                    await conn.fetchval(
+                        self._SAVE_PENDING_MEMORY_SQL,
+                        thread_id,
+                        SESSION_PENDING_MEMORY_KEY,
+                        json.dumps(payload),
+                    )
+                else:
+                    await conn.fetchval(
+                        self._CLEAR_PENDING_MEMORY_SQL,
+                        thread_id,
+                        SESSION_PENDING_MEMORY_KEY,
+                        str(expected_id),
+                    )
+        return True
+
+    async def get_thread_pending_memory(
+        self, thread_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """The session's stored pending memory set, if it holds a valid one.
+
+        Read by a pinned session at setup in a fresh process (the stateless
+        lane gets the set from its claim bundle).
+        """
+        from shared.session_pending_memory import (
+            SESSION_PENDING_MEMORY_KEY,
+            valid_pending_memory,
+        )
+
+        value = await self.fetchval(
+            "SELECT metadata -> $2::text FROM threads WHERE id = $1::uuid",
+            thread_id,
+            SESSION_PENDING_MEMORY_KEY,
+        )
+        return valid_pending_memory(value)
+
+    # ------------------------------------------------------------------
     # Durable persistent-session state (migration 0133)
     # ------------------------------------------------------------------
 
@@ -2032,6 +2147,12 @@ class PostgresDB:
     # loop re-saves its input row at turn start, and a recovery continuation
     # carries ``metrics.subagent_recovery`` written by the orchestrator
     # (parallel_subagents.md §6.5), which that re-save must not erase.
+    #
+    # ``additional_kwargs`` likewise keeps what is stored when the upsert
+    # brings none. A ``role='context'`` row's schema is what restore rebuilds
+    # the entry from (append-only context injection, WP2 spec §F), and a
+    # re-save of the same id without it — a reconcile pass, or a writer that
+    # never serializes kwargs — must not erase it.
     _THREAD_MESSAGE_UPSERT_SQL = """
         INSERT INTO thread_messages
             (id, thread_id, role, content, tool_calls, turn_number,
@@ -2054,7 +2175,9 @@ class PostgresDB:
             tool_results      = EXCLUDED.tool_results,
             provider          = EXCLUDED.provider,
             provider_raw      = EXCLUDED.provider_raw,
-            additional_kwargs = EXCLUDED.additional_kwargs,
+            additional_kwargs = COALESCE(
+                EXCLUDED.additional_kwargs, thread_messages.additional_kwargs
+            ),
             response_metadata = EXCLUDED.response_metadata
         RETURNING id, seq
     """

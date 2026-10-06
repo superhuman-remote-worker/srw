@@ -5,7 +5,9 @@ A pure function over a message list. The seed is the parent's DURABLE
 
 1. preserve every durable ``SystemMessage`` (a leading one is normally the
    compacted ``[Summary of prior work]``; the parent's prompt is not durable);
-2. drop protected phase blocks (``is_protected_message``) and ``RemoveMessage``
+2. drop protected phase blocks (``is_protected_message``), injected context
+   (``is_context_injection``: the parent's context entries are the parent's;
+   the child's own builds inject what it needs) and ``RemoveMessage``
    markers;
 3. drop a trailing assistant message with open tool calls (the loop's
    ``repair_tool_pairing`` would strip it anyway; dropping keeps the durable
@@ -38,6 +40,7 @@ from agent.core.context import (
     repair_tool_pairing,
     sanitize_history_for_provider_boundary,
 )
+from shared.runtime.core.context_entries import is_context_injection
 from shared.runtime.core.message_markers import (
     PERSIST_ROLE_EVENT,
     PERSIST_ROLE_KEY,
@@ -295,7 +298,7 @@ def seed_fork_history(
     for message in parent_messages or []:
         if not isinstance(message, BaseMessage) or _is_remove_marker(message):
             continue
-        if is_protected_message(message):
+        if is_protected_message(message) or is_context_injection(message):
             continue
         seed.append(copy.deepcopy(message))
     while (

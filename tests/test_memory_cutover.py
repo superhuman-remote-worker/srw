@@ -592,18 +592,19 @@ class TestWorkerExecuteWiring:
         # Second turn: nothing re-delivered, ledger untouched.
         assert "phase_instruction_injections" not in second
         assert not any(is_protected_message(m) for m in second["messages"])
-        # It is history: it sits before the transient tail (todos last).
-        todo_idx = next(
-            i
-            for i, m in enumerate(requests[1])
-            if isinstance(m, HumanMessage)
-            and str(m.content).startswith(TODOS_INJECTION_CONTENT_PREFIX)
-        )
+        # It is history: it sits before the transient tail (the memory pair
+        # payload; the todo list is no longer part of the tail, D17).
+        payload_idx = requests[1].index(env["service"].payload.messages()[0])
         block_idx = next(
             i for i, m in enumerate(requests[1]) if is_protected_message(m)
         )
-        assert block_idx < todo_idx
+        assert block_idx < payload_idx
         assert requests[1][block_idx] is state["messages"][1]
+        assert not any(
+            str(m.content).startswith(TODOS_INJECTION_CONTENT_PREFIX)
+            for request in requests
+            for m in request
+        )
 
         # Phase 4 gets its own block; phase 2's stays in uncompacted history.
         assert len(_phase_blocks(requests[2], "4:tactical")) == 1
@@ -858,18 +859,16 @@ class TestWorkerExecuteWiring:
         assert req.model == env["config"].llm.model
 
         # -- transient block spliced at the tail (after the conversation, for
-        # prompt-cache prefix stability): payload pairs first, todos message
-        # LAST (query-at-end)
+        # prompt-cache prefix stability): the payload pairs end the request;
+        # no todo message (the list is history, D17)
         prepared = env["llm"].ainvoke.call_args[0][0]
-        todo_idx = next(
-            i
-            for i, m in enumerate(prepared)
-            if isinstance(m, HumanMessage)
-            and str(m.content).startswith(TODOS_INJECTION_CONTENT_PREFIX)
-        )
         payload_msgs = service.payload.messages()
-        assert todo_idx == len(prepared) - 1
-        assert prepared[todo_idx - len(payload_msgs) : todo_idx] == payload_msgs
+        assert prepared[-len(payload_msgs) :] == payload_msgs
+        assert not any(
+            isinstance(m, HumanMessage)
+            and str(m.content).startswith(TODOS_INJECTION_CONTENT_PREFIX)
+            for m in prepared
+        )
 
         # -- legacy direct-store path skipped entirely
         env["ctx"].recall_store.decrement_ttl.assert_not_called()

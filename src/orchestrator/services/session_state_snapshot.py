@@ -212,7 +212,11 @@ async def build_session_state_snapshot(
             # Input rows are durable before execution. Multiple queued humans
             # can therefore carry numbers ahead of the turn the loop is
             # currently serving. Only execution-produced rows are a safe
-            # fallback when this epoch has no turn lifecycle event.
+            # fallback when this epoch has no turn lifecycle event. A
+            # ``role='context'`` row (a typed context entry) counts as one:
+            # the loop writes it only after provider admission of the turn it
+            # serves, never ahead of it (append-only context injection, WP2
+            # spec O15).
             persisted_turn_count = int(
                 await conn.fetchval(
                     "SELECT COALESCE(MAX(turn_number), 0) "

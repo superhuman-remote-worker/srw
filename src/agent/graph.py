@@ -50,12 +50,13 @@ import re
 import asyncio
 import time
 from copy import deepcopy
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 from uuid import UUID, uuid4
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
+    BaseMessage,
     HumanMessage,
     RemoveMessage,
     SystemMessage,
@@ -71,9 +72,22 @@ from agent.core.context import (
     ContextManager,
     ContextConfig,
     ToolRetryManager,
+    keep_window_start,
     repair_tool_call_arguments,
     sanitize_message_history,
     scrub_history_tool_call_arguments,
+)
+from agent.core.context_injection import (
+    ContextSources,
+    Planned,
+    max_memories_per_entry,
+    plan_context_entries,
+)
+from agent.core.memory_summary import conversation_memory_summary
+from shared.runtime.core.context_entries import (
+    entry_kind,
+    fold_context_entries,
+    is_append_only,
 )
 from shared.runtime.core.message_markers import (
     PERSIST_ROLE_EVENT,
@@ -707,6 +721,9 @@ def create_init_strategic_todos_node(
             "to understand the task, create a plan, and prepare todos for execution.\n\n"
             "Your task brief is saved to `task_brief.md` in your workspace for reference."
         )
+        # The phase's todo list enters the history once, here; it is not
+        # re-sent with every request (append-only context injection, D17).
+        content_parts.append(todo_manager.format_for_injection())
         message = HumanMessage(content="\n\n".join(content_parts))
 
         return {
@@ -821,6 +838,17 @@ def create_execute_node(
     _no_tool_call_streak = [0]
     _no_tool_call_last_hash = [""]
 
+    def _restate_todo_list(retained: List[BaseMessage]) -> List[BaseMessage]:
+        """Compaction hook (D19): restate the todo list after the summary.
+
+        The list is not re-sent per request; it lives in the history (todo
+        tool results, phase-start messages). When a summary evicted its
+        latest rendering, the compacted history carries it once, seated
+        right after the summary, until the next compaction.
+        """
+        text = todo_manager.list_restatement(retained)
+        return [HumanMessage(content=text)] if text else []
+
     async def execute(state: UniversalAgentState) -> Dict[str, Any]:
         """Execute current todo using ReAct pattern."""
         job_id = state.get("job_id", "unknown")
@@ -830,6 +858,12 @@ def create_execute_node(
         phase_number = state.get("phase_number", 0)
         phase_name = "strategic" if is_strategic else "tactical"
         turn_count = state.get("turn_count", 0)
+        # Append-only context injection (WP2 spec §I): read once per call. In
+        # ``legacy`` mode the transient tail is rebuilt per request exactly as
+        # before; in ``append_only`` mode memory, knowledge, citation
+        # feedback, guidance and the subagent status are appended to the
+        # history once, as typed entries, and folded into their carrier.
+        append_only = is_append_only(config)
 
         # Update tool context for phase-aware behavior (e.g., multimodal override)
         if tool_context is not None:
@@ -972,9 +1006,11 @@ def create_execute_node(
         # compaction thresholds account for it. The prepared request is
         # system -> summaries -> history (incl. the protected phase block) ->
         # transient tail (memory, knowledge, citation feedback, supervisor
-        # guidance, todos last); tests/test_execute_prepared_layout.py pins
-        # that layout. The estimate is position-agnostic. It covers:
-        #   - the system prompt and the transient tail (todos + the memory and
+        # guidance, active subagents); tests/test_execute_prepared_layout.py
+        # pins that layout. The todo list is history, not tail: the todo tool
+        # results and the phase-start messages carry it (D17-D19). The
+        # estimate is position-agnostic. It covers:
+        #   - the system prompt and the transient tail (the memory and
         #     knowledge budgets) — outside `messages`, added after compaction;
         #     the citation-feedback and guidance pairs are small and unbudgeted;
         #   - once per phase, on its delivery turn only, the phase block just
@@ -985,12 +1021,13 @@ def create_execute_node(
         #     is invisible to the trigger for one turn. When the local estimate
         #     dominates instead, the block counts twice on that one turn,
         #     bounded by the 50% floor below.
+        # In append_only mode (spec §D row 6) there is no rebuilt tail: the
+        # entries already appended are history inside `messages`, and the
+        # ones appended this request are small and capped per entry, so the
+        # memory-budget and knowledge terms are dropped.
         injection_overhead_tokens = context_mgr.get_token_count(
             [prepared_messages[0]]
         )  # system prompt
-        injection_overhead_tokens += (
-            len(todo_manager.format_for_injection()) // 4
-        )  # approximate
         if delivered_phase_blocks:
             injection_overhead_tokens += context_mgr.get_token_count(
                 delivered_phase_blocks
@@ -998,12 +1035,13 @@ def create_execute_node(
 
         # Add memory injection budget overhead
         recall_store = tool_context.recall_store if tool_context else None
-        if recall_store:
+        if recall_store and not append_only:
             injection_overhead_tokens += config.memory.budget_tokens
 
         # Add knowledge injection budget overhead (~2500 tokens for 5 notes)
         if (
-            tool_context
+            not append_only
+            and tool_context
             and tool_context.has_knowledge()
             and (tool_context.project_id or _kb_bindings)
         ):
@@ -1033,10 +1071,10 @@ def create_execute_node(
         if memory_service is not None and context_mgr.should_summarize(messages):
             from agent.services.memory import CaptureEvent
 
+            # The slice the summary will cover: the keep window counts
+            # non-entries, as compaction does (keep_window_start).
             keep_recent = context_mgr.config.keep_recent_messages
-            evicted = (
-                list(messages[:-keep_recent]) if keep_recent > 0 else list(messages)
-            )
+            evicted = list(messages[: keep_window_start(messages, keep_recent)])
             if evicted:
                 memory_service.capture_nowait(
                     CaptureEvent(
@@ -1057,6 +1095,7 @@ def create_execute_node(
                 auxiliary_llm,
                 summarization_prompt,
                 max_summary_length=config.context_management.max_summary_length,
+                restate_after_summary=_restate_todo_list,
             )
         finally:
             # Restore original thresholds
@@ -1134,9 +1173,15 @@ def create_execute_node(
         # 1. Summary SystemMessages first (context from before compaction)
         # 2. Rest of conversation (excluding regular SystemMessages)
         # 3. Transient injections at the tail (memories, knowledge, citation
-        #    feedback, supervisor guidance, then the todo list last). The
-        #    phase instruction block is NOT part of the tail: it is history
-        #    (delivered above, persisted in state).
+        #    feedback, supervisor guidance, active subagents). The phase
+        #    instruction block is NOT part of the tail: it is history
+        #    (delivered above, persisted in state). Neither is the todo list:
+        #    the todo tool results and the phase-start messages carry it, and
+        #    compaction restates it (D17-D19).
+        #    append_only has no tail: what is new or changed is appended
+        #    after the history as typed context entries, folded into the last
+        #    history message, and returned to state, so the next request
+        #    starts with this one byte for byte (D1, D21, D27).
 
         # Step 1: Add summaries first
         for msg in messages:
@@ -1144,14 +1189,11 @@ def create_execute_node(
                 if "[Summary of prior work]" in msg.content:
                     prepared_messages.append(msg)
 
-        # Helper: inject all transient messages (todos, memories, knowledge, guidance)
+        # Helper: inject all transient messages (memories, knowledge, guidance)
         # Used both in normal path and safety rebuild to avoid code duplication
         from shared.runtime.core.workspace_injection import (
-            create_todos_human_message,
             find_tail_injection_anchor,
         )
-
-        todos_injection_content = todo_manager.format_for_injection()
 
         # MemoryManager seam read path (memory overhaul Phase 1 cutover).
         # When bound, one assemble() replaces the two direct-store retrieval
@@ -1161,6 +1203,82 @@ def create_execute_node(
         _manager_payload = None
         _manager_injection_messages = []
         _manager_memory_text = ""  # assembler's current_injection_text
+        # append_only: the store records behind each kind (the planner's
+        # input), in rank order.
+        _memory_records: List[Any] = []
+        _knowledge_records: List[Any] = []
+        _knowledge_bindings: Optional[List[Any]] = None
+        _knowledge_watermarks: Optional[Dict[str, Optional[str]]] = None
+        # append_only: the memory_inject audit fires after the plan, so it
+        # can carry the appended / already-present counts.
+        _deferred_memory_audits: List[Dict[str, Any]] = []
+        # append_only (WP3, D6-D8): whether this request started a retrieval.
+        _retrieval_started = False
+
+        def _take_in_manager_payload(
+            payload: Any, retrieval: Optional[Dict[str, Any]] = None
+        ) -> Tuple[List[BaseMessage], str]:
+            """One manager payload in: the planner's records, the
+            memory_inject audit, and the legacy injection messages and
+            memory text (returned). ``retrieval`` describes the asynchronous
+            run it came from (append_only) and rides on the audit."""
+            injection_messages = payload.messages()
+            if _kb_bindings:
+                # Bound KBs use the shared chunk-retrieval policy below. Keep
+                # manager-provided memories, but suppress its legacy note-level
+                # KB block so native notes are not injected twice.
+                injection_messages = [
+                    message
+                    for block in payload.blocks
+                    if block.kind != "knowledge"
+                    for message in block.messages
+                ]
+            memory_text = ""
+            for _mm_block in payload.blocks:
+                if _mm_block.kind == "memory":
+                    _memory_records.extend(getattr(_mm_block, "records", None) or [])
+                elif _mm_block.kind == "knowledge" and not _kb_bindings:
+                    # Bound KBs come from the chunk retrieval below instead.
+                    _knowledge_records.extend(getattr(_mm_block, "records", None) or [])
+                if _mm_block.kind == "memory" and _mm_block.items:
+                    memory_text = _mm_block.content
+                    logger.debug(
+                        f"[{job_id}] Memory injection: "
+                        f"{len(_mm_block.items)} memories retrieved"
+                    )
+                    # Audit memory injection (legacy data shape + the
+                    # manager's stats — the eval-harness/cockpit tap)
+                    inject_auditor = get_archiver()
+                    if inject_auditor:
+                        _audit_data = {
+                            "count": len(_mm_block.items),
+                            "total_tokens": _mm_block.token_count,
+                            "stats": payload.stats.to_dict(),
+                        }
+                        if retrieval is not None:
+                            _audit_data["retrieval"] = retrieval
+                        _memory_audit = dict(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="memory_inject",
+                            node_name="execute",
+                            iteration=iteration,
+                            data=_audit_data,
+                            metadata=state.get("metadata"),
+                            phase="strategic" if is_strategic else "tactical",
+                            phase_number=phase_number,
+                        )
+                        if append_only:
+                            _deferred_memory_audits.append(_memory_audit)
+                        else:
+                            inject_auditor.audit_step(**_memory_audit)
+                elif _mm_block.kind == "knowledge" and _mm_block.items:
+                    logger.debug(
+                        f"[{job_id}] Knowledge injection: "
+                        f"{len(_mm_block.items)} notes retrieved"
+                    )
+            return injection_messages, memory_text
+
         if memory_service is not None:
             from agent.services.memory import AssembleRequest, TaskFrame
             from agent.services.memory.plugins.legacy import build_worker_query_text
@@ -1185,56 +1303,26 @@ def create_execute_node(
                 )
             else:
                 _mm_query = build_worker_query_text(_mm_frame)
-            _manager_payload = await memory_service.assemble(
-                AssembleRequest(
-                    query_text=_mm_query,
-                    task_frame=_mm_frame,
-                    budget_tokens=config.memory.budget_tokens,
-                    model=config.llm.model,
-                )
+            _mm_request = AssembleRequest(
+                query_text=_mm_query,
+                task_frame=_mm_frame,
+                budget_tokens=config.memory.budget_tokens,
+                model=config.llm.model,
             )
-            _manager_injection_messages = _manager_payload.messages()
-            if _kb_bindings:
-                # Bound KBs use the shared chunk-retrieval policy below. Keep
-                # manager-provided memories, but suppress its legacy note-level
-                # KB block so native notes are not injected twice.
-                _manager_injection_messages = [
-                    message
-                    for block in _manager_payload.blocks
-                    if block.kind != "knowledge"
-                    for message in block.messages
-                ]
-            for _mm_block in _manager_payload.blocks:
-                if _mm_block.kind == "memory" and _mm_block.items:
-                    _manager_memory_text = _mm_block.content
-                    logger.debug(
-                        f"[{job_id}] Memory injection: "
-                        f"{len(_mm_block.items)} memories retrieved"
-                    )
-                    # Audit memory injection (legacy data shape + the
-                    # manager's stats — the eval-harness/cockpit tap)
-                    inject_auditor = get_archiver()
-                    if inject_auditor:
-                        inject_auditor.audit_step(
-                            job_id=job_id,
-                            agent_type=config.agent_id,
-                            step_type="memory_inject",
-                            node_name="execute",
-                            iteration=iteration,
-                            data={
-                                "count": len(_mm_block.items),
-                                "total_tokens": _mm_block.token_count,
-                                "stats": _manager_payload.stats.to_dict(),
-                            },
-                            metadata=state.get("metadata"),
-                            phase="strategic" if is_strategic else "tactical",
-                            phase_number=phase_number,
-                        )
-                elif _mm_block.kind == "knowledge" and _mm_block.items:
-                    logger.debug(
-                        f"[{job_id}] Knowledge injection: "
-                        f"{len(_mm_block.items)} notes retrieved"
-                    )
+            if append_only:
+                # WP3 (D6, D7, D10): the retrieval runs off the request path,
+                # owned by the manager, with the query this request would
+                # have used; none starts while one is in flight. A finished
+                # result is taken in further down, after the other reads, so
+                # a fast retrieval can still serve this request; the planner
+                # checks it against the history at that moment (D8). Without
+                # the manager the direct-store reads below stay synchronous.
+                _retrieval_started = memory_service.start_retrieval(_mm_request)
+            else:
+                _manager_payload = await memory_service.assemble(_mm_request)
+                _manager_injection_messages, _manager_memory_text = (
+                    _take_in_manager_payload(_manager_payload)
+                )
 
         # Memory Light: decrement TTLs then retrieve relevant memories for injection
         _memory_block = [""]  # mutable container for closure access
@@ -1259,16 +1347,18 @@ def create_execute_node(
                 if memories:
                     from shared.runtime.services.recall_store import RecallStore as _RS
 
-                    _memory_block[0] = _RS.assemble_memory_block(
-                        memories, model=config.llm.model
-                    )
+                    _memory_records = list(memories)
+                    if not append_only:
+                        _memory_block[0] = _RS.assemble_memory_block(
+                            memories, model=config.llm.model
+                        )
                     logger.debug(
                         f"[{job_id}] Memory injection: {len(memories)} memories retrieved"
                     )
                     # Audit memory injection
                     inject_auditor = get_archiver()
                     if inject_auditor:
-                        inject_auditor.audit_step(
+                        _memory_audit = dict(
                             job_id=job_id,
                             agent_type=config.agent_id,
                             step_type="memory_inject",
@@ -1282,6 +1372,10 @@ def create_execute_node(
                             phase="strategic" if is_strategic else "tactical",
                             phase_number=phase_number,
                         )
+                        if append_only:
+                            _deferred_memory_audits.append(_memory_audit)
+                        else:
+                            inject_auditor.audit_step(**_memory_audit)
             except Exception as e:
                 logger.warning(f"[{job_id}] Memory retrieval failed (non-fatal): {e}")
 
@@ -1315,12 +1409,16 @@ def create_execute_node(
                     kb_context_text,
                 )
                 if selection.notes:
-                    _knowledge_block[0] = _KS.assemble_knowledge_block(
-                        selection.notes,
-                        model=config.llm.model,
-                        bindings=selection.bindings,
-                        external_watermarks=selection.external_watermarks,
-                    )
+                    _knowledge_records = list(selection.notes)
+                    _knowledge_bindings = list(selection.bindings or [])
+                    _knowledge_watermarks = dict(selection.external_watermarks or {})
+                    if not append_only:
+                        _knowledge_block[0] = _KS.assemble_knowledge_block(
+                            selection.notes,
+                            model=config.llm.model,
+                            bindings=selection.bindings,
+                            external_watermarks=selection.external_watermarks,
+                        )
                     logger.debug(
                         f"[{job_id}] Knowledge injection: "
                         f"{len(selection.notes)} notes retrieved "
@@ -1376,9 +1474,11 @@ def create_execute_node(
                     match_count=5,
                 )
                 if kb_notes:
-                    _knowledge_block[0] = _KS.assemble_knowledge_block(
-                        kb_notes, model=config.llm.model
-                    )
+                    _knowledge_records = list(kb_notes)
+                    if not append_only:
+                        _knowledge_block[0] = _KS.assemble_knowledge_block(
+                            kb_notes, model=config.llm.model
+                        )
                     logger.debug(
                         f"[{job_id}] Knowledge injection: {len(kb_notes)} notes retrieved"
                     )
@@ -1393,6 +1493,9 @@ def create_execute_node(
         # edits/removes the citation. Only runs after citation activity (the
         # engine is lazily created on first cite/source registration).
         _citation_feedback_block = [""]
+        # append_only: None = no engine or the lookup failed (leave the
+        # section alone); [] = none failed (the cleared rendering, O6).
+        _failed_citations: Optional[List[Any]] = None
         _cit_engine = (
             getattr(tool_context, "citation_engine", None) if tool_context else None
         )
@@ -1401,7 +1504,8 @@ def create_execute_node(
                 _failed_cites = await _cit_engine.list_citations(
                     verification_status="failed"
                 )
-                if _failed_cites:
+                _failed_citations = list(_failed_cites or [])
+                if _failed_cites and not append_only:
                     from agent.core.citation_feedback_injection import (
                         format_failed_citations,
                     )
@@ -1431,8 +1535,11 @@ def create_execute_node(
             for value in state.get("delivered_guidance_ids") or []
             if value is not None
         }
-        _guidance_entries = _get_pending_supervisor_guidance(job_id)
-        if _stateless_steering:
+        _pending_guidance = _get_pending_supervisor_guidance(job_id)
+        _guidance_entries = _pending_guidance
+        # append_only filters delivered ids on BOTH lanes (spec §C, B7): an
+        # appended guidance entry stays in the history, so it is shown once.
+        if _stateless_steering or append_only:
             _guidance_entries = [
                 entry
                 for entry in _guidance_entries
@@ -1441,7 +1548,7 @@ def create_execute_node(
             ]
         _absorbed_guidance_ids: set[str] = set()
         _guidance_block = [""]
-        if _guidance_entries:
+        if _guidance_entries and not append_only:
             from agent.core.guidance_injection import format_supervisor_guidance
 
             _guidance_block[0] = format_supervisor_guidance(_guidance_entries)
@@ -1454,11 +1561,80 @@ def create_execute_node(
         # Background children publish a process-local mirror only after their
         # durable terminal+delivery transaction commits.  This status block is
         # a latency/visibility aid, never durability: it is rebuilt at the
-        # prompt-cache tail and never enters graph state.
-        _active_subagents = _active_subagents_block(tool_context)
+        # prompt-cache tail and never enters graph state. In append_only mode
+        # it is appended when it changes instead (D21): None = no subagent
+        # runtime (leave the section alone), "" = none running.
+        _subagents_state = _active_subagents_state(tool_context)
+        _active_subagents = _subagents_state or ""
+
+        # append_only (WP3, D8): take in the latest finished retrieval, as
+        # late in the build as possible. Nothing finished: this request goes
+        # out without new memory (D6) and the next one takes it in. The
+        # result is used for this request only; memory a compaction evicted
+        # comes back with the next result that still returns it (D4).
+        if append_only and memory_service is not None:
+            _drained = memory_service.take_retrieval()
+            if _drained is not None:
+                _take_in_manager_payload(
+                    _drained.payload,
+                    retrieval={
+                        "mode": "async",
+                        "seq": _drained.seq,
+                        "age_ms": round(_drained.age_ms(), 2),
+                        "started_this_request": _retrieval_started,
+                        "degraded": _drained.degraded,
+                        "counters": memory_service.retrieval_stats(),
+                    },
+                )
+
+        # append_only (WP2 spec §C): what the harness holds now, as the
+        # planner's input. Planned against the history after every
+        # compaction (normal, Layer-1, Layer-0), so whatever a compaction
+        # evicted is absent there and appended again (D4, D21). The memory
+        # summary (D35) is loaded once per job runtime, only with
+        # memory_search bound, and not at all while the history holds it.
+        _context_sources = ContextSources(
+            memory_summary=(
+                await conversation_memory_summary(
+                    memory_service,
+                    messages,
+                    tool_names=tool_names,
+                    model=config.llm.model,
+                )
+                if append_only
+                else ""
+            ),
+            memory_records=_memory_records,
+            knowledge_records=_knowledge_records,
+            knowledge_bindings=_knowledge_bindings,
+            external_watermarks=_knowledge_watermarks,
+            failed_citations=_failed_citations,
+            guidance=_guidance_entries,
+            delivered_guidance_ids=_delivered_guidance_ids,
+            subagents=_subagents_state,
+        )
+        _max_memories = max_memories_per_entry(config)
+
+        def _plan_entries(history: List[BaseMessage]) -> Planned:
+            """The entries this request appends after ``history`` (append_only)."""
+            return plan_context_entries(
+                history,
+                _context_sources,
+                model=config.llm.model,
+                max_memories=_max_memories,
+            )
+
+        # Entries appended by this call, in request order. They follow the
+        # history in the request (folded into its tail carrier) and reach
+        # state after the kept window and before the response. A rebuild
+        # (Layer-1 / Layer-0) re-plans against the compacted history and
+        # replaces them: the request they were planned for was never sent
+        # (Layer-1) or was rejected (Layer-0).
+        planned = Planned()
+        appended_entries: List[BaseMessage] = []
 
         def _inject_transient_messages(target_messages: list) -> None:
-            """Splice transient injections (memories, knowledge, guidance, todos) at the tail.
+            """Splice transient injections (memories, knowledge, guidance) at the tail.
 
             The block goes AFTER the conversation (see find_tail_injection_anchor):
             it changes every turn, and provider prompt caches match on a strict
@@ -1466,8 +1642,11 @@ def create_execute_node(
             the cache for the whole conversation on every request. At the tail
             only the block itself is re-processed.
 
-            Within the block the todo list goes LAST: it is the agent's current
-            "query", and models weight the end of the prompt highest.
+            Re-anchoring it before each new tool result still rewrites the
+            previous request's tail, so the block moves into the history part
+            by part (append-only context injection, D21; WP2). The todo list
+            already left it (D17): the todo tool results, the phase-start
+            messages and the post-compaction restatement carry it.
 
             Phase-start instruction blocks are NOT transient: they are
             delivered once into the working history (see the delivery step
@@ -1514,9 +1693,8 @@ def create_execute_node(
                 block.append(cit_ai)
                 block.append(cit_tool)
 
-            # Supervisor guidance: the last synthetic pair before the todo
-            # list, so mid-run steering is the freshest context short of the
-            # current tasks themselves.
+            # Supervisor guidance: the last synthetic pair of the block, so
+            # mid-run steering is the freshest synthetic context.
             if _guidance_block[0]:
                 from agent.core.guidance_injection import (
                     create_guidance_injection_messages,
@@ -1536,10 +1714,8 @@ def create_execute_node(
                     )
                 )
 
-            # Todo list as transient HumanMessage — last, so the request ends
-            # with the current tasks (query-at-end) and the synthetic tool-call
-            # pairs above stay sandwiched between real turns.
-            block.append(create_todos_human_message(todos_injection_content))
+            if not block:
+                return
 
             # Anchor after the last Human/Tool message (normally the very end;
             # keeps the synthetic function-call pairs Gemini-valid — a
@@ -1552,11 +1728,24 @@ def create_execute_node(
             if not isinstance(msg, SystemMessage):
                 prepared_messages.append(msg)
 
-        # Inject transient messages (memory, knowledge, guidance, todos)
-        # AFTER the conversation: the stable history prefix stays byte-identical
-        # across turns, so provider prompt caches reuse it instead of
-        # re-processing the whole conversation every request.
-        _inject_transient_messages(prepared_messages)
+        if append_only:
+            # Append what is new or changed since the history last showed it,
+            # after the compacted history (WP2 spec §C, §E.5).
+            planned = _plan_entries(messages)
+            appended_entries = list(planned.entries)
+            prepared_messages.extend(appended_entries)
+        else:
+            # Inject transient messages (memory, knowledge, guidance,
+            # subagents) AFTER the conversation: the stable history prefix
+            # stays byte-identical across turns, so provider prompt caches
+            # reuse it instead of re-processing the whole conversation every
+            # request.
+            _inject_transient_messages(prepared_messages)
+        # The unfolded request: the archiver's chat delta reads it (§D 7c).
+        prepared_history = list(prepared_messages)
+        # Typed context entries in the history ride their carriers (D27):
+        # the identity while there are none, so legacy requests are unchanged.
+        prepared_messages = fold_context_entries(prepared_messages)
 
         # Todo reminders are injected post-LLM-response (see below) so they
         # persist in conversation history and survive context compaction.
@@ -1582,6 +1771,7 @@ def create_execute_node(
                 summarization_prompt,
                 max_summary_length=config.context_management.max_summary_length,
                 force=True,
+                restate_after_summary=_restate_todo_list,
             )
 
             # Separate RemoveMessage markers from actual messages
@@ -1608,9 +1798,20 @@ def create_execute_node(
                 if not isinstance(msg, SystemMessage):
                     prepared_messages.append(msg)
 
-            # Re-inject ALL transient messages (memory + knowledge + guidance
-            # + todos) at the tail; the phase block is inside `messages`.
-            _inject_transient_messages(prepared_messages)
+            if append_only:
+                # Re-plan against the compacted history: what the forced
+                # compaction evicted is absent there and goes in again.
+                planned = _plan_entries(messages)
+                appended_entries = list(planned.entries)
+                prepared_messages.extend(appended_entries)
+            else:
+                # Re-inject ALL transient messages (memory + knowledge +
+                # guidance + subagents) at the tail; the phase block and the
+                # todo list are inside `messages` (the list restated after the
+                # summary if the compaction evicted it).
+                _inject_transient_messages(prepared_messages)
+            prepared_history = list(prepared_messages)
+            prepared_messages = fold_context_entries(prepared_messages)
             logger.debug(
                 f"[{job_id}] Re-injected transient messages after safety compaction"
             )
@@ -1631,6 +1832,29 @@ def create_execute_node(
 
             logger.info(
                 f"[{job_id}] Safety compaction complete: now at {total_tokens} tokens"
+            )
+
+        # append_only: the memory_inject audit fires under the same condition
+        # as in legacy mode, once the plan of the request about to go out is
+        # known, with how many memories it appended and how many the history
+        # already held unchanged (the WP3 latency series stays comparable).
+        if _deferred_memory_audits:
+            inject_auditor = get_archiver()
+            if inject_auditor:
+                for _memory_audit in _deferred_memory_audits:
+                    _memory_audit["data"] = {
+                        **_memory_audit["data"],
+                        "appended": planned.memory_appended,
+                        "present": planned.memory_present,
+                    }
+                    inject_auditor.audit_step(**_memory_audit)
+        if append_only and (planned.entries or planned.guidance_ids):
+            logger.info(
+                f"[{job_id}] Context entries appended: "
+                f"{[entry_kind(e) for e in planned.entries]} "
+                f"(memories {planned.memory_appended} new/changed, "
+                f"{planned.memory_present} already present; "
+                f"guidance {len(planned.guidance_ids)})"
             )
 
         # Audit LLM call (will be updated with response via update_llm_response)
@@ -1704,7 +1928,31 @@ def create_execute_node(
                 # pinned lane keeps its historical fire-and-forget ack. A
                 # stateless worker records the ids in this execute-node update;
                 # its fenced saver acks only after that checkpoint commits.
-                if _guidance_entries:
+                if append_only:
+                    # An appended guidance entry is history from now on, so
+                    # both lanes record it as delivered (spec §C, B7). The
+                    # pinned lane acks every pending entry the history now
+                    # holds, not only the ones appended this turn: with the
+                    # delivered filter a lost fire-and-forget ack would
+                    # otherwise never be retried (legacy re-rendered and
+                    # re-acked until the heartbeat dropped the entry; this
+                    # keeps that cadence without re-rendering).
+                    _absorbed_guidance_ids.update(planned.guidance_ids)
+                    if not _stateless_steering:
+                        _now_delivered = (
+                            _delivered_guidance_ids | _absorbed_guidance_ids
+                        )
+                        _ack_ids = sorted(
+                            {
+                                str(entry["id"])
+                                for entry in _pending_guidance
+                                if entry.get("id")
+                                and str(entry["id"]) in _now_delivered
+                            }
+                        )
+                        if _ack_ids:
+                            _ack_supervisor_guidance(job_id, guidance_ids=_ack_ids)
+                elif _guidance_entries:
                     _turn_guidance_ids = {
                         str(entry["id"])
                         for entry in _guidance_entries
@@ -2047,23 +2295,38 @@ def create_execute_node(
                                     phase_number=phase_number,
                                 )
 
+                            # The request went out and was answered, so this
+                            # call's entries are history like on the success
+                            # path (append_only; [] in legacy mode).
                             if context_was_compacted:
                                 result_messages = (
                                     remove_markers
                                     + messages
+                                    + appended_entries
                                     + [ai_summary, human_feedback]
                                 )
                             else:
-                                result_messages = delivered_phase_blocks + [
-                                    ai_summary,
-                                    human_feedback,
-                                ]
+                                result_messages = (
+                                    delivered_phase_blocks
+                                    + appended_entries
+                                    + [ai_summary, human_feedback]
+                                )
 
                             return {
                                 "messages": result_messages,
                                 "iteration": iteration + 1,
                                 "error": None,
                                 **phase_ledger_update,
+                                **(
+                                    {
+                                        "delivered_guidance_ids": sorted(
+                                            _delivered_guidance_ids
+                                            | _absorbed_guidance_ids
+                                        )
+                                    }
+                                    if append_only
+                                    else {}
+                                ),
                             }
 
                         # Streak > 3: fall through to error
@@ -2123,6 +2386,7 @@ def create_execute_node(
                         job_id=job_id,
                         agent_type=config.agent_id,
                         messages=prepared_messages,
+                        history_messages=prepared_history,
                         response=response,
                         model=phase_model,
                         latency_ms=latency_ms,
@@ -2202,6 +2466,19 @@ def create_execute_node(
                 extraction_triggered = False
                 assembly_triggered = False
                 recall_store_exec = tool_context.recall_store if tool_context else None
+                # What the model has in front of it as memory, for the
+                # assembler (spec §D row 23): legacy mode re-renders one block
+                # per request; append_only has the memory entries the history
+                # holds, the ones appended this request included.
+                current_memory_text = (
+                    "\n\n".join(
+                        str(m.content)
+                        for m in [*messages, *appended_entries]
+                        if entry_kind(m) == "memory"
+                    )
+                    if append_only
+                    else None
+                )
 
                 # Manager path (memory overhaul Phase 1): one fire-and-forget
                 # turn_end capture replaces the two create_tasks below. The
@@ -2221,7 +2498,13 @@ def create_execute_node(
                                 messages=messages,
                                 phase=phase_number,
                                 turn_count=new_turn_count,
-                                extra={"current_injection_text": _manager_memory_text},
+                                extra={
+                                    "current_injection_text": (
+                                        current_memory_text
+                                        if current_memory_text is not None
+                                        else _manager_memory_text
+                                    )
+                                },
                             )
                         )
                     )
@@ -2286,7 +2569,11 @@ def create_execute_node(
                                 auxiliary_llm=auxiliary_llm,
                                 recall_store=recall_store_exec,
                                 messages=messages,
-                                current_injection_text=_memory_block[0],
+                                current_injection_text=(
+                                    current_memory_text
+                                    if current_memory_text is not None
+                                    else _memory_block[0]
+                                ),
                                 memory_assembler_prompt=memory_assembler_prompt,
                             )
                         )
@@ -2302,7 +2589,8 @@ def create_execute_node(
                     result_update["last_observed_turn"] = new_turn_count
                 if assembly_triggered:
                     result_update["last_assembled_turn"] = new_turn_count
-                if _absorbed_guidance_ids:
+                if _absorbed_guidance_ids or append_only:
+                    # append_only writes the set on every turn (spec §C).
                     result_update["delivered_guidance_ids"] = sorted(
                         _delivered_guidance_ids | _absorbed_guidance_ids
                     )
@@ -2311,13 +2599,19 @@ def create_execute_node(
                 # (the phase block is inside `messages`: kept in the window or
                 # re-seated after the summary), otherwise append the block(s)
                 # delivered this turn + the response (add_messages reducer).
+                # The context entries this request appended (append_only; []
+                # in legacy mode) go between them: after the kept window and
+                # before the response, where the request had them, and before
+                # the response because routing reads messages[-1] (B5).
                 if context_was_compacted:
                     # Include RemoveMessage markers so state reducer removes old messages
-                    result_messages = remove_markers + messages + [response]
+                    result_messages = (
+                        remove_markers + messages + appended_entries + [response]
+                    )
                     if injected_reminder:
                         result_messages.append(injected_reminder)
                     return {"messages": result_messages, **result_update}
-                result_messages = delivered_phase_blocks + [response]
+                result_messages = delivered_phase_blocks + appended_entries + [response]
                 if injected_reminder:
                     result_messages.append(injected_reminder)
                 return {"messages": result_messages, **result_update}
@@ -2342,6 +2636,7 @@ def create_execute_node(
                         summarization_prompt,
                         max_summary_length=config.context_management.max_summary_length,
                         force=True,
+                        restate_after_summary=_restate_todo_list,
                     )
 
                     # Separate RemoveMessage markers
@@ -2373,8 +2668,17 @@ def create_execute_node(
                     # transient block after emergency compaction. The phase
                     # instruction block needs no rebuild: it is inside
                     # `messages` and rode through the compaction (kept or
-                    # re-seated after the summary).
-                    _inject_transient_messages(prepared_messages)
+                    # re-seated after the summary). append_only re-plans
+                    # against the compacted history instead; the rejected
+                    # request's entries were never consumed.
+                    if append_only:
+                        planned = _plan_entries(messages)
+                        appended_entries = list(planned.entries)
+                        prepared_messages.extend(appended_entries)
+                    else:
+                        _inject_transient_messages(prepared_messages)
+                    prepared_history = list(prepared_messages)
+                    prepared_messages = fold_context_entries(prepared_messages)
 
                     # Merge remove markers
                     if emergency_remove_markers:
@@ -2486,21 +2790,41 @@ def create_execute_node(
 
                         # Return feedback messages — graph continues normally
                         # Route: execute → check_todos (no tool_calls) → pending todos → execute
+                        # The provider processed the request (it generated
+                        # the failed call), so this call's context entries
+                        # (append_only; [] in legacy mode) are history like on
+                        # the success path: the next request starts with this
+                        # one. Guidance appended here counts as delivered; the
+                        # pinned lane acks it after the next answered request.
                         if context_was_compacted:
                             result_messages = (
-                                remove_markers + messages + [ai_summary, human_feedback]
+                                remove_markers
+                                + messages
+                                + appended_entries
+                                + [ai_summary, human_feedback]
                             )
                         else:
-                            result_messages = delivered_phase_blocks + [
-                                ai_summary,
-                                human_feedback,
-                            ]
+                            result_messages = (
+                                delivered_phase_blocks
+                                + appended_entries
+                                + [ai_summary, human_feedback]
+                            )
 
                         return {
                             "messages": result_messages,
                             "iteration": iteration + 1,
                             "error": None,
                             **phase_ledger_update,
+                            **(
+                                {
+                                    "delivered_guidance_ids": sorted(
+                                        _delivered_guidance_ids
+                                        | set(planned.guidance_ids)
+                                    )
+                                }
+                                if append_only
+                                else {}
+                            ),
                         }
 
                     # Streak > 3: fall through to standard retry exhaustion
@@ -3030,6 +3354,13 @@ def create_check_todos_node(
                 logger.warning(
                     f"[{job_id}] Reloaded {len(strategic_todos)} strategic todos after resume (phase {phase_number})"
                 )
+                # The reloaded list enters the history once (D17-D19).
+                restated = todo_manager.list_restatement(state.get("messages", []))
+                if restated:
+                    return {
+                        "phase_complete": False,
+                        "messages": [HumanMessage(content=restated)],
+                    }
                 return {"phase_complete": False}  # Continue with reloaded todos
 
             logger.warning(
@@ -3705,18 +4036,28 @@ def _get_queued_replies(job_id: str) -> List[Dict[str, Any]]:
         return []
 
 
-def _active_subagents_block(tool_context: Optional["ToolContext"]) -> str:
-    """One transient parent-tail status block, or ``""`` when none are live."""
+def _active_subagents_state(tool_context: Optional["ToolContext"]) -> Optional[str]:
+    """The active-subagent status block, as the append-only planner reads it.
+
+    None when there is no subagent runtime or rendering failed (the planner
+    leaves the section alone); ``""`` when none is live (the cleared
+    rendering, once, if the history still shows an older status).
+    """
     runtime = getattr(tool_context, "subagent_runtime", None)
     render = getattr(runtime, "active_subagents_block", None)
     if not callable(render):
-        return ""
+        return None
     try:
         value = render()
     except Exception:
         logger.debug("Failed to render active subagent status", exc_info=True)
-        return ""
+        return None
     return str(value or "").strip()
+
+
+def _active_subagents_block(tool_context: Optional["ToolContext"]) -> str:
+    """One transient parent-tail status block, or ``""`` when none are live."""
+    return _active_subagents_state(tool_context) or ""
 
 
 def _merge_local_subagent_deliveries(
@@ -4506,6 +4847,7 @@ def create_restore_todo_state_node(
                 "todo_next_id": todo_state["next_id"],
             }
             updates.update(_clear_completion_report_updates(state))
+            updates.update(_todo_list_restatement_update(todo_manager, state))
             return updates
 
         # Always clear stop flags on resume — the checkpoint may carry
@@ -4513,9 +4855,23 @@ def create_restore_todo_state_node(
         # check_goal to immediately stop the graph.
         updates = {"should_stop": False, "goal_achieved": False}
         updates.update(_clear_completion_report_updates(state))
+        updates.update(_todo_list_restatement_update(todo_manager, state))
         return updates
 
     return restore_todo_state
+
+
+def _todo_list_restatement_update(
+    todo_manager: TodoManager, state: UniversalAgentState
+) -> Dict[str, Any]:
+    """``messages`` update that restates the todo list on resume, if needed.
+
+    The list is not re-sent per request (D17); it lives in the history. A
+    resume can leave it absent: staged todos applied above, or a checkpoint
+    from before the list moved into the history. Then it is appended once.
+    """
+    restated = todo_manager.list_restatement(state.get("messages", []))
+    return {"messages": [HumanMessage(content=restated)]} if restated else {}
 
 
 def create_restore_from_feedback_node(
@@ -4639,14 +4995,12 @@ def create_restore_from_feedback_node(
         # Step 3: Create HumanMessage with formatted feedback. The banner
         # states the ACTUAL cause (see resume_reason above), never a blanket
         # "previously frozen for human review".
-        feedback_message = HumanMessage(
-            content=(
-                f"[FEEDBACK_RESUME] {resume_reason}\n\n"
-                f"## Feedback\n\n{feedback}\n\n"
-                f"The feedback has been saved to feedback.md for reference. "
-                f"Process the feedback using the strategic todos below, then create "
-                f"corrective tactical todos to address each feedback item."
-            )
+        feedback_text = (
+            f"[FEEDBACK_RESUME] {resume_reason}\n\n"
+            f"## Feedback\n\n{feedback}\n\n"
+            f"The feedback has been saved to feedback.md for reference. "
+            f"Process the feedback using the strategic todos below, then create "
+            f"corrective tactical todos to address each feedback item."
         )
 
         # Step 4a: Archive any in-flight todos from the checkpoint before the
@@ -4694,6 +5048,12 @@ def create_restore_from_feedback_node(
         todo_manager.set_todos_from_list(todo_list)
         todo_manager.is_strategic_phase = True
         todo_manager.phase_number = state.get("phase_number", 0)
+
+        # The resume todos enter the history once, "below" the feedback; the
+        # list is not re-sent with every request (D17-D19).
+        feedback_message = HumanMessage(
+            content=f"{feedback_text}\n\n{todo_manager.format_for_injection()}"
+        )
 
         # Export todo state for checkpointing
         todo_state = todo_manager.export_state()
@@ -5965,6 +6325,7 @@ def build_phase_alternation_graph(
                 extraction_prompt=memory_extraction_prompt,
                 assembler_prompt=memory_assembler_prompt,
                 job_id=tool_context.job_id if tool_context else None,
+                agent_type=config.agent_id,
                 project_id=tool_context.project_id if tool_context else None,
                 project_ids=list(tool_context.project_ids) if tool_context else [],
                 retrieval_timeout=None,  # worker path runs unbounded (legacy)

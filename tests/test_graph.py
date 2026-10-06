@@ -21,6 +21,7 @@ project_root = Path(__file__).parent.parent
 from agent.core.workspace import WorkspaceManager  # noqa: E402
 from agent.core.state import create_initial_state  # noqa: E402
 from agent.managers import TodoManager, PlanManager, MemoryManager  # noqa: E402
+from agent.managers.todo import TODO_LIST_RESTATEMENT_LEAD  # noqa: E402
 from tests._fs_backend import FilesystemTestBackend  # noqa: E402
 from agent.graph import (  # noqa: E402
     WORKER_BATCH_MIN_WALL_SECONDS,
@@ -649,6 +650,12 @@ class TestRestoreTodoStateNode:
 
         result = node(state)
 
+        # The history does not show the list, so the resume restates it once
+        # (append-only context injection, D17-D19).
+        (restated,) = result.pop("messages")
+        assert restated.content.startswith(TODO_LIST_RESTATEMENT_LEAD)
+        assert managers["todo"].format_for_injection() in restated.content
+
         # Node always clears stop flags on resume
         assert result == {
             "should_stop": False,
@@ -725,6 +732,48 @@ class TestRestoreTodoStateNode:
         assert result["is_strategic_phase"] is False
         assert result["should_stop"] is False
         assert managers["todo"].is_strategic_phase is False
+        # The applied list enters the history once, as the tactical list.
+        (restated,) = result["messages"]
+        assert "Current Tasks — Phase 1 (Tactical)" in restated.content
+        assert "todo_1: Staged Task 1" in restated.content
+
+    def test_no_restatement_when_the_history_shows_the_list(self, managers):
+        """A resume whose history already carries the current rendering (a
+        todo tool result, a phase-start message) appends nothing."""
+        from agent.graph import create_restore_todo_state_node
+
+        todos = [
+            {
+                "id": "todo_1",
+                "content": "Task 1",
+                "status": "pending",
+                "priority": "medium",
+                "notes": [],
+            }
+        ]
+        managers["todo"].restore_state(
+            {"todos": todos, "phase_number": 3, "is_strategic_phase": False}
+        )
+        shown = ToolMessage(
+            content=f"Completed: x\n\n{managers['todo'].format_for_injection()}",
+            tool_call_id="c1",
+            name="todo_complete",
+        )
+        node = create_restore_todo_state_node(managers["todo"])
+
+        result = node(
+            {
+                "job_id": "test-123",
+                "phase_number": 3,
+                "is_strategic_phase": False,
+                "todos": todos,
+                "staged_todos": [],
+                "todo_next_id": 2,
+                "messages": [shown],
+            }
+        )
+
+        assert "messages" not in result
 
     def test_restores_staged_todos_with_active_todos(self, managers):
         """Test that staged todos are preserved when active todos also exist.
@@ -762,7 +811,11 @@ class TestRestoreTodoStateNode:
 
         result = node(state)
 
-        # Should clear stop flags but not trigger phase-boundary resume
+        # Should clear stop flags but not trigger phase-boundary resume (the
+        # active list is restated: the history does not show it)
+        (restated,) = result.pop("messages")
+        assert "Active Task" in restated.content
+        assert "Staged Task" not in restated.content
         assert result == {"should_stop": False, "goal_achieved": False}
         # Staged todos should remain staged
         assert managers["todo"].has_staged_todos()

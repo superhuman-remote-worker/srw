@@ -43,6 +43,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
+from shared.runtime.core.context_entries import is_context_entry
 from shared.runtime.core.message_markers import PERSIST_ROLE_EVENT, PERSIST_ROLE_KEY
 from agent.persistent_graph import (
     PermissionOutcome,
@@ -816,7 +817,12 @@ class SubagentDriver:
         self, prepared: Any, response: Any, metrics: Any, *args: Any, **kwargs: Any
     ) -> None:
         """Sync (the loop's contract): count the call, note truncation, and
-        write the ``llm_requests`` row in a thread under the PARENT job."""
+        write the ``llm_requests`` row in a thread under the PARENT job.
+
+        ``history_messages`` (keyword, append-only context injection): the
+        request before the carrier fold, forwarded so the chat delta archives
+        a typed context entry as context; absent on a request without
+        entries."""
         self.provider_calls += 1
         self._activity()
         try:
@@ -836,6 +842,12 @@ class SubagentDriver:
             getattr(self.build.config, "llm", None), "model", "unknown"
         )
         archive = self._archive_fn
+        history_messages = kwargs.get("history_messages")
+        extra: Dict[str, Any] = (
+            {"history_messages": history_messages}
+            if history_messages is not None
+            else {}
+        )
 
         def _do() -> None:
             try:
@@ -866,6 +878,7 @@ class SubagentDriver:
                         "output_tokens": metrics.get("output_tokens"),
                         "cached_tokens": metrics.get("cached_tokens"),
                     },
+                    **extra,
                 )
             except Exception as e:
                 logger.debug(
@@ -968,7 +981,8 @@ class SubagentDriver:
         return self.messages[self._brief_start :]
 
     def _tail_kind(self) -> str:
-        msgs = self._brief_messages()
+        # A context entry rides the message before it; it is never the tail.
+        msgs = [m for m in self._brief_messages() if not is_context_entry(m)]
         if not msgs:
             return "none"
         last = msgs[-1]

@@ -33,6 +33,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
+from shared.runtime.core.context_entries import is_context_entry, is_legacy_injection
 from shared.runtime.core.image_tokens import (
     content_to_summary_text,
     estimate_image_block_tokens,
@@ -48,6 +49,10 @@ from shared.runtime.core.message_markers import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: ``summarize_and_compact``'s ``restate_after_summary`` hook: retained
+#: history in, messages to seat right after the summary out.
+RestateAfterSummary = Callable[[List[BaseMessage]], List[BaseMessage]]
 
 
 def is_compaction_summary(message: BaseMessage) -> bool:
@@ -161,12 +166,51 @@ def place_pinned_after_summary(
     return [summary_msg, *pinned, *kept]
 
 
+def keep_window_start(conversation: List[BaseMessage], keep_n: int) -> int:
+    """Index from which ``conversation[i:]`` holds ``keep_n`` non-entries.
+
+    The keep window of a compaction is counted in conversation messages;
+    typed context entries (append-only context injection) ride along with
+    their carrier and are not counted (WP2 spec §E.2, O7). The window starts
+    on the ``keep_n``-th non-entry from the end, so the entries after it stay
+    with their carriers and the entries before it go with the summarized
+    region. Without entries this is ``len(conversation) - keep_n``; 0 when
+    the conversation holds fewer non-entries, ``len(conversation)`` when
+    ``keep_n`` is not positive.
+    """
+    if keep_n <= 0:
+        return len(conversation)
+    seen = 0
+    for index in range(len(conversation) - 1, -1, -1):
+        if is_context_entry(conversation[index]):
+            continue
+        seen += 1
+        if seen == keep_n:
+            return index
+    return 0
+
+
+def _count_non_entries(messages: List[BaseMessage]) -> int:
+    """Messages that are not typed context entries (the message-count basis)."""
+    return sum(1 for m in messages if not is_context_entry(m))
+
+
+def _conversation_count(messages: List[BaseMessage]) -> int:
+    """Conversation messages: no system message, removal marker or entry."""
+    return _count_non_entries(
+        [m for m in messages if not isinstance(m, (SystemMessage, RemoveMessage))]
+    )
+
+
 def find_safe_slice_start(messages: List[BaseMessage], target_start: int) -> int:
     """Find a safe starting index that doesn't orphan ToolMessages.
 
     When slicing messages, we must ensure that if we include a ToolMessage,
     we also include its corresponding AIMessage with the tool_call.
     This function adjusts the start index backwards if needed.
+
+    A typed context entry belongs to its carrier (the nearest earlier
+    non-entry), so a start on an entry first steps back to the carrier.
 
     Args:
         messages: Full message list
@@ -184,6 +228,8 @@ def find_safe_slice_start(messages: List[BaseMessage], target_start: int) -> int
     # If the message at target_start is a ToolMessage, we need to find
     # the preceding AIMessage that contains the tool_call
     adjusted_start = target_start
+    while adjusted_start > 0 and is_context_entry(messages[adjusted_start]):
+        adjusted_start -= 1
 
     # Check if we're starting at or near ToolMessages that would be orphaned
     # Walk backwards to find a safe boundary
@@ -212,6 +258,10 @@ def find_safe_slice_start(messages: List[BaseMessage], target_start: int) -> int
                         # AIMessage without tool_calls - safe boundary
                         break
                     elif isinstance(prev_msg, HumanMessage):
+                        if is_context_entry(prev_msg):
+                            # An entry stored between one batch's results
+                            # is not a boundary; keep looking for the call.
+                            continue
                         # Human message - safe boundary
                         break
                 else:
@@ -1262,8 +1312,9 @@ class ContextManager:
 
         Summarization is triggered when:
         1. Token count exceeds summarization_threshold_tokens, OR
-        2. Message count exceeds message_count_threshold AND
-           token count exceeds message_count_min_tokens
+        2. Message count (typed context entries excluded) exceeds
+           message_count_threshold AND token count exceeds
+           message_count_min_tokens
 
         Args:
             messages: Current message history
@@ -1272,7 +1323,9 @@ class ContextManager:
             True if summarization threshold exceeded
         """
         token_count = self._trigger_token_count(messages)
-        message_count = len(messages)
+        # Typed context entries ride with their carriers and do not count
+        # toward the message-count rule (WP2 spec O7).
+        message_count = _count_non_entries(messages)
 
         # Original threshold: high token count
         if token_count > self.config.summarization_threshold_tokens:
@@ -1296,6 +1349,7 @@ class ContextManager:
         force: bool = False,
         trigger: str = "auto",
         focus: Optional[str] = None,
+        restate_after_summary: Optional[RestateAfterSummary] = None,
     ) -> List[BaseMessage]:
         """Ensure messages are within configured limits, summarizing if needed.
 
@@ -1310,6 +1364,7 @@ class ContextManager:
             force: If True, summarize even if thresholds not exceeded
             trigger: ``auto`` | ``manual`` | ``resume`` — compaction event metadata
             focus: Optional user compaction focus (``/compact <focus>``)
+            restate_after_summary: Passed to ``summarize_and_compact``.
 
         Returns:
             Messages (possibly compacted) guaranteed to be within limits
@@ -1326,6 +1381,7 @@ class ContextManager:
                 max_summary_length,
                 trigger=trigger,
                 focus=focus,
+                restate_after_summary=restate_after_summary,
             )
 
             # Keep-window elision (session_silent_failure_audit.md #6): tool
@@ -1347,17 +1403,10 @@ class ContextManager:
             # retry with progressively smaller keep_recent windows
             if force:
                 keep_recent = self.config.keep_recent_messages
-                # Count conversation messages (non-system, non-RemoveMessage)
-                prev_conv_count = sum(
-                    1
-                    for m in messages
-                    if not isinstance(m, (SystemMessage, RemoveMessage))
-                )
-                conv_count = sum(
-                    1
-                    for m in result
-                    if not isinstance(m, (SystemMessage, RemoveMessage))
-                )
+                # Count conversation messages (non-system, non-RemoveMessage,
+                # not a typed context entry: the keep-window basis)
+                prev_conv_count = _conversation_count(messages)
+                conv_count = _conversation_count(result)
                 # If first compaction didn't reduce, skip progressive loop
                 # (e.g., summary was larger than original — further retries won't help)
                 if conv_count >= prev_conv_count:
@@ -1391,12 +1440,9 @@ class ContextManager:
                             keep_recent_override=next_keep,
                             trigger=trigger,
                             focus=focus,
+                            restate_after_summary=restate_after_summary,
                         )
-                        conv_count = sum(
-                            1
-                            for m in result
-                            if not isinstance(m, (SystemMessage, RemoveMessage))
-                        )
+                        conv_count = _conversation_count(result)
                         keep_recent = next_keep
                         # Break if compaction didn't reduce messages further
                         if conv_count >= prev_conv_count:
@@ -1603,8 +1649,11 @@ class ContextManager:
         continue (pi's stated reason for the same format).
 
         System messages (the prompt, earlier summaries: those seed the fold),
-        workspace injections (re-injected after compaction) and protected
-        phase blocks (re-seated verbatim) are left out.
+        injected context (re-injected after compaction) and protected phase
+        blocks (re-seated verbatim) are left out. The exception is a typed
+        supervisor-guidance entry: it is delivered once and never re-injected,
+        so the summary keeps it as ``[Supervisor guidance]: ...`` (WP2 spec
+        O1).
 
         Args:
             messages: Messages to format
@@ -1612,8 +1661,10 @@ class ContextManager:
         Returns:
             List of formatted text parts
         """
-        from shared.runtime.core.workspace_injection import (
-            is_workspace_injection_message,
+        from shared.runtime.core.context_entries import (
+            entry_body,
+            entry_kind,
+            is_context_injection,
         )
 
         result_cap = self.config.summary_tool_result_chars
@@ -1657,7 +1708,12 @@ class ContextManager:
         # tool_call_id -> index in ``parts`` of the assistant turn that made it
         open_calls: Dict[str, int] = {}
         for msg in messages:
-            if is_workspace_injection_message(msg) or is_protected_message(msg):
+            if entry_kind(msg) == "guidance":
+                guidance = entry_body(msg).strip()
+                if guidance:
+                    parts.append(f"[Supervisor guidance]: {guidance}")
+                continue
+            if is_context_injection(msg) or is_protected_message(msg):
                 continue
             if isinstance(msg, SystemMessage):
                 continue
@@ -1857,6 +1913,7 @@ class ContextManager:
         keep_recent_override: Optional[int] = None,
         trigger: str = "auto",
         focus: Optional[str] = None,
+        restate_after_summary: Optional[RestateAfterSummary] = None,
     ) -> List[BaseMessage]:
         """Summarize older messages and compact the conversation.
 
@@ -1871,23 +1928,39 @@ class ContextManager:
             keep_recent_override: Override keep_recent_messages (for progressive compaction)
             trigger: ``auto`` | ``manual`` | ``resume`` — compaction event metadata
             focus: Optional user compaction focus (``/compact <focus>``)
+            restate_after_summary: Called with the retained history once a
+                summary is produced (system messages, summary, re-seated
+                protected blocks, kept window); the messages it returns are
+                seated after the summary and the protected blocks, before the
+                kept window. The worker restates its todo list here when the
+                kept window no longer shows it (append-only context
+                injection, D19): compaction rewrites the request prefix
+                anyway, so the restatement costs no extra cache miss and stays
+                put until the next compaction. Not called when nothing was
+                summarized.
+
+        Typed context entries (append-only context injection) are history:
+        they go through the same summarized/kept split as the messages they
+        ride on (WP2 spec §E). In the summarized region the worker evicts
+        them with a ``RemoveMessage`` like everything else and the session
+        drops them with the region; the summarizer never reads them (except
+        supervisor guidance). In the kept window they stay with their
+        carriers, kwargs intact. The keep window is counted in non-entries
+        (:func:`keep_window_start`).
 
         Returns:
             Compacted message list with summary prepended
         """
-        from shared.runtime.core.workspace_injection import (
-            is_workspace_injection_message,
-        )
-
         # Reset the boundary marker; only a real compaction (final return below)
         # sets it. A no-op / skipped compaction leaves it None so the transport
         # falls back to boundary_turn rather than recording a stale boundary_seq.
         self._last_compaction_boundary_id = None
         self.last_compaction_failed = False
 
-        # Filter out workspace injection messages BEFORE processing
-        # They are transient and will be re-injected fresh after summarization
-        messages = [m for m in messages if not is_workspace_injection_message(m)]
+        # Filter out the legacy transient injections BEFORE processing: they
+        # are never in durable state and are re-injected fresh after
+        # summarization. Typed entries are history and stay (see above).
+        messages = [m for m in messages if not is_legacy_injection(m)]
 
         # Determine effective keep_recent value
         effective_keep_recent = (
@@ -2053,7 +2126,7 @@ class ContextManager:
             replacement = fresh_messages or sanitized_conversation
             return markers + system_msgs + replacement
 
-        if len(conversation) <= effective_keep_recent:
+        if _count_non_entries(conversation) <= effective_keep_recent:
             if oversized_count > 0:
                 capped_conversation, _, _ = _cap_keep_window_tool_results(conversation)
                 return _substitution_only_result(
@@ -2076,8 +2149,10 @@ class ContextManager:
             ]
             return markers + system_msgs + capped_conversation
 
-        # Find safe slice point that doesn't orphan ToolMessages
-        target_start = len(conversation) - effective_keep_recent
+        # Find safe slice point that doesn't orphan ToolMessages. The window
+        # holds ``effective_keep_recent`` non-entries plus the entries that
+        # ride on them.
+        target_start = keep_window_start(conversation, effective_keep_recent)
         safe_start = find_safe_slice_start(conversation, target_start)
 
         # Messages to summarize (older ones) and recent messages to keep
@@ -2241,6 +2316,16 @@ class ContextManager:
             self._current_phase_key,
             preserve_identity=self.preserve_message_identity,
         )
+        if restate_after_summary is not None:
+            try:
+                restated = list(restate_after_summary(system_msgs + compacted_tail))
+            except Exception as e:  # never fail a compaction over a restatement
+                logger.warning(f"Compaction: restate_after_summary failed: {e}")
+                restated = []
+            if restated:
+                cut = len(compacted_tail) - len(fresh_recent)
+                compacted_tail[cut:cut] = restated
+                logger.info(f"Restated {len(restated)} message(s) after the summary")
 
         merged_summaries_info = (
             f", merged {len(old_summaries)} prior summaries" if old_summaries else ""

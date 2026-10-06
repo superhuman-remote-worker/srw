@@ -13,6 +13,8 @@ import logging
 from typing import Any, Dict, Optional
 
 from shared.runtime.llm.reasoning_chat import extract_reasoning_text_from_block
+from shared.runtime.core.context_entries import SRW_INJECTION_KEY
+from shared.runtime.core.message_markers import PERSIST_ROLE_CONTEXT
 from shared.runtime.core.message_markers import PERSIST_ROLE_KEY as _PERSIST_ROLE_KEY
 
 logger = logging.getLogger(__name__)
@@ -90,6 +92,10 @@ def _serialize_message_row(
     the turn-level ``metrics`` and approval ``tool_decisions`` and updates the
     same row. ``seq`` is assigned once on first insert and preserved across the
     update, so it stays a stable cursor.
+
+    Only a ``role='context'`` row (a typed context entry) carries
+    ``additional_kwargs``, and only its ``srw_injection`` schema; every other
+    row leaves the column to the upsert, which keeps what is stored.
     """
     raw_type = getattr(msg, "type", "unknown")
     role = _ROLE_MAP.get(raw_type, raw_type)
@@ -127,7 +133,7 @@ def _serialize_message_row(
         )
     # Attach metrics only to AI messages (not tool results)
     msg_metrics = metrics if role == "ai" else None
-    return {
+    row: Dict[str, Any] = {
         "id": getattr(msg, "id", None),
         "role": role,
         "content": content,
@@ -137,6 +143,14 @@ def _serialize_message_row(
         "tool_call_id": tool_call_id,
         "thinking": thinking,
     }
+    if role == PERSIST_ROLE_CONTEXT:
+        # A typed context entry: restore rebuilds it from its schema, so that
+        # one key is persisted (and read back for 'context' rows only). The
+        # rest of additional_kwargs (turn stamp, persist role) stays in memory.
+        meta = getattr(msg, "additional_kwargs", {}).get(SRW_INJECTION_KEY)
+        if isinstance(meta, dict):
+            row["additional_kwargs"] = {SRW_INJECTION_KEY: meta}
+    return row
 
 
 async def _persist_one_message(

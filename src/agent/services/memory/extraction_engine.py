@@ -155,21 +155,20 @@ class MemoryExtractionEngine:
     def _format(self, messages: List[BaseMessage]) -> List[str]:
         """Low-loss ``messages -> List[str]`` formatter (§3.3).
 
-        Filters workspace-injection messages (they carry no durable fact) and
-        empties, but — unlike the summary and interval-extraction formatters —
-        does **not** truncate tool results. The planner's oversized-part
-        hard-split handles a giant tool result instead; truncating here would
-        drop exactly the durable detail this feature exists to capture.
+        Filters injected context (typed entries and the legacy tail; it
+        carries no durable fact) and empties, but — unlike the summary and
+        interval-extraction formatters — does **not** truncate tool results.
+        The planner's oversized-part hard-split handles a giant tool result
+        instead; truncating here would drop exactly the durable detail this
+        feature exists to capture.
         """
+        from shared.runtime.core.context_entries import is_context_injection
         from shared.runtime.core.message_markers import is_protected_message
-        from shared.runtime.core.workspace_injection import (
-            is_workspace_injection_message,
-        )
         from shared.runtime.services.auxiliary import _get_message_role
 
         parts: List[str] = []
         for msg in messages:
-            if is_workspace_injection_message(msg):
+            if is_context_injection(msg):
                 continue
             if is_protected_message(msg):
                 continue  # phase instruction block — guidance, not a fact

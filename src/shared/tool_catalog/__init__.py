@@ -40,6 +40,7 @@ for _metadata_group in (
     _definitions.SHELL_TOOLS_METADATA,
     _definitions.EVALUATION_TOOLS_METADATA,
     _definitions.KNOWLEDGE_TOOLS_METADATA,
+    _definitions.MEMORY_TOOLS_METADATA,
     _definitions.COMMUNICATION_TOOLS_METADATA,
     _definitions.ORCHESTRATOR_TOOLS_METADATA,
     _definitions.PROJECT_TOOLS_METADATA,

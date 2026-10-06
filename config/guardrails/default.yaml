@@ -332,11 +332,37 @@ nudges:
   # {tokens} (already-formatted, e.g. "150")
   memory_block_footer: "--- End Memories ({count}, ~{tokens} tokens) ---"
 
+  # Sites: RecallStore.render_memory_entry (append-only context injection).
+  # Heads one appended memory entry. The entry stays in the history as is, so
+  # this text must carry no per-turn data (no counts, TTLs or token totals).
+  memory_entry_header: "Recalled memories from earlier work, as background for the current task (harness context, not a user message):"
+
+  # Sites: RecallStore.render_memory_summary (append-only context injection,
+  # D35). The up-front memory summary: given once per conversation and kept
+  # in the history unchanged, so no per-turn data (its counts are computed
+  # once at conversation start). Placeholders: {count} (e.g. "42 memories").
+  memory_summary_header: "Project memory overview (harness context, not a user message): {count} from earlier jobs and sessions."
+  # The summary's last line; the summary is given only while memory_search is
+  # bound.
+  memory_summary_hint: "Relevant memories arrive on their own as context. To look up anything else from earlier work, such as a past decision, a fix or a preference, call memory_search with a short query."
+
   # ----- src/shared/runtime/services/knowledge_store.py -----
 
   knowledge_block_header: "--- Project Knowledge ---"
   # Placeholders: {count} (number of notes), {tokens} (already-formatted)
   knowledge_block_footer: "--- End Knowledge ({count} notes, ~{tokens} tokens) ---"
+
+  # ----- append-only context injection: cleared renderings -----
+
+  # Sites: src/agent/core/citation_feedback_injection.py
+  # format_citation_feedback_resolved. Appended once when the failed-citation
+  # set an earlier entry reported is empty again.
+  citation_feedback_resolved: "Citation verification: no citation is failing verification any more. The earlier failed-citation report no longer applies."
+
+  # Sites: src/agent/core/context_injection.py format_active_subagents_none.
+  # Appended once when the background subagents an earlier entry listed have
+  # all finished.
+  active_subagents_none: "No background subagents are active any more. The earlier subagent status list no longer applies."
 
   # ----- src/agent/persistent_graph.py -----
 

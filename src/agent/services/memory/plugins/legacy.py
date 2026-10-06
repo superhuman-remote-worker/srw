@@ -18,7 +18,7 @@ import logging
 import uuid
 from typing import Any, Awaitable, List, Optional
 
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import BaseMessage
 
 from agent.services.memory.registry import register_memory_plugin
 from agent.services.memory.types import (
@@ -27,6 +27,7 @@ from agent.services.memory.types import (
     MemoryRuntime,
     TaskFrame,
 )
+from shared.runtime.core.context_entries import last_user_text
 
 logger = logging.getLogger(__name__)
 
@@ -62,12 +63,10 @@ def build_persistent_query_text(messages: List[BaseMessage]) -> str:
     The most recent HumanMessage's content, string-coerced (multimodal
     content lists become their str() form, exactly as the legacy scan
     does); empty string when no HumanMessage exists — the legacy path
-    still retrieves with "" rather than skipping.
+    still retrieves with "" rather than skipping. Injected context is
+    skipped, so retrieval never queries with its own earlier results.
     """
-    for msg in reversed(messages):
-        if isinstance(msg, HumanMessage):
-            return msg.content if isinstance(msg.content, str) else str(msg.content)
-    return ""
+    return last_user_text(messages)
 
 
 class RecallTwoTierRetriever:
@@ -96,12 +95,16 @@ class RecallTwoTierRetriever:
         if store is None:
             return []
 
-        try:
-            await _bounded(store.decrement_ttl(), self.timeout)
-        except Exception as e:
-            logger.warning(
-                "TTL decrement failed (non-fatal): %s: %s", type(e).__name__, e
-            )
+        # A read-only retrieval (the session's idle-time prefetch,
+        # ``AssembleRequest.ttl_tick=False``) leaves the TTL tier alone: the
+        # turn's own retrieval keeps the one tick per turn.
+        if getattr(req, "ttl_tick", True) is not False:
+            try:
+                await _bounded(store.decrement_ttl(), self.timeout)
+            except Exception as e:
+                logger.warning(
+                    "TTL decrement failed (non-fatal): %s: %s", type(e).__name__, e
+                )
 
         # No budget kwarg — the legacy call relies on the store's
         # constructed budget; passing req.budget_tokens here would change

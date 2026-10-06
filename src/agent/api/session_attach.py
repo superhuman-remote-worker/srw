@@ -1438,8 +1438,7 @@ class SessionAttachCoordinator:
             and effective_config.auxiliary.model
         ):
             from shared.runtime.core.loader import (
-                LLMConfig,
-                create_llm,
+                create_auxiliary_llms,
                 resolve_model_settings,
             )
             from shared.runtime.services.auxiliary import AuxiliaryLLM
@@ -1448,19 +1447,6 @@ class SessionAttachCoordinator:
             model_settings = resolve_model_settings(
                 aux_cfg.model, effective_config._deployment_dir
             )
-            aux_llm_config = LLMConfig(
-                model=aux_cfg.model,
-                base_url=aux_cfg.base_url,
-                api_key=aux_cfg.api_key,
-                provider=aux_cfg.provider,
-                extra_headers=aux_cfg.extra_headers,
-                temperature=aux_cfg.temperature,
-                top_p=model_settings.get("top_p"),
-                top_k=model_settings.get("top_k"),
-                model_max_context_tokens=model_settings.get("model_max_context_tokens"),
-                extra_body=model_settings.get("extra_body"),
-                max_retries=1,
-            )
             aux_structured_output_method = model_settings.get(
                 "structured_output_method", "json_schema"
             )
@@ -1468,9 +1454,12 @@ class SessionAttachCoordinator:
             fallback_settings = resolve_model_settings(
                 fallback_model, effective_config._deployment_dir
             )
-            aux_inner = create_llm(aux_llm_config, effective_config.limits)
+            aux_clients = create_auxiliary_llms(
+                aux_cfg, model_settings, effective_config.limits
+            )
             auxiliary_llm = AuxiliaryLLM(
-                llm=aux_inner,
+                llm=aux_clients.llm,
+                summarization_llm=aux_clients.summarization_llm,
                 max_iterations=aux_cfg.max_iterations,
                 timeout=aux_cfg.timeout,
                 max_context_tokens=model_settings.get("model_max_context_tokens"),

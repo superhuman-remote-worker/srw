@@ -174,9 +174,12 @@ class TestPopulation:
         # read-only standalone too); 187 with U3 WP5's six entries (44 explicit
         # group declarations, including the reviewer/verifier inspection group);
         # 192 with the engineer expert (shell, research, delegation, citation,
-        # graph — engineer_expert.md).
-        assert len(_DECLARATIONS) == 192, (
-            f"expected 192 raw declarations, got {len(_DECLARATIONS)}"
+        # graph — engineer_expert.md); 201 with the memory group
+        # (memory_search, append-only context injection WP5a): expert_base
+        # grants it, the subagent overlay and the seven library entries
+        # restate it empty (a child has no memory of its own).
+        assert len(_DECLARATIONS) == 201, (
+            f"expected 201 raw declarations, got {len(_DECLARATIONS)}"
         )
 
     def test_every_shipped_declaration_is_already_a_list(self):
@@ -673,10 +676,13 @@ class TestCategoryVocabularyAgreement:
         # run_command/shell_execute aliasing rewrites the shell probe; `git` is
         # suppressed by ToolsConfig.__post_init__ because this probe config also
         # carries shell tools (asserted separately below, so the field keeps its
-        # plumbing coverage). Every other probe must survive verbatim.
-        assert {n for n in names if n not in ("shell", "git")} <= {
+        # plumbing coverage); `memory` binds only names a bound memory
+        # extension serves (memory_tool_names_bindable, also asserted below).
+        # Every other probe must survive verbatim.
+        assert {n for n in names if n not in ("shell", "git", "memory")} <= {
             g.removeprefix("probe_") for g in got
         }
+        assert "probe_memory" not in got
 
         # git still has to reach get_all_tool_names on the path where it is
         # bound at all — otherwise this exemption would hide a broken field.
@@ -684,6 +690,20 @@ class TestCategoryVocabularyAgreement:
         without_shell["shell"] = []
         cfg = load_agent_config_from_dict(_minimal(tools=without_shell))
         assert "probe_git" in set(get_all_tool_names(cfg))
+
+        # Same for memory: with memory, the manager seam and a same-named
+        # extension on, the field reaches the list.
+        cfg = load_agent_config_from_dict(
+            _minimal(
+                tools=names,
+                memory={
+                    "enabled": True,
+                    "manager": {"enabled": True},
+                    "pipeline": {"extensions": ["probe_memory"]},
+                },
+            )
+        )
+        assert "probe_memory" in set(get_all_tool_names(cfg))
 
     def test_schema_json_tools_properties_match_the_registry(self):
         schema = json.loads((_REPO_ROOT / "config" / "schema.json").read_text())

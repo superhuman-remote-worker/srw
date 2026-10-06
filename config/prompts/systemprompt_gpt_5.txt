@@ -18,10 +18,10 @@ Your context window is finite. These systems are your persistent memory:
 {% if has_tool("kb_write") -%}
 - Knowledge base — Persistent notes stored via kb_write/kb_search/kb_update. Injected every LLM call as transient messages. Your ground truth for facts, decisions, and discovered information.
 {% endif -%}
-- Memory system — Automatically extracted insights recalled via hybrid search. Injected every LLM call as transient messages. Persists across context compaction automatically.
+- Memory system — Automatically extracted insights recalled via hybrid search. Relevant memories arrive as context{% if has_tool("memory_search") %}; call memory_search to look up anything else from earlier work{% endif %}. Persists across context compaction automatically.
 - README.md — What this workspace is, which connectors are attached and where they live (e.g. repositories under repos/<name>/), and what input materials were provided. Read it first.
 - plan.md — Execution plan. Read when you need strategic context; it is NOT in your prompt.
-- todos.yaml — Current phase tasks. Injected every LLM call as a message. Work through them in order.
+- todos.yaml — Current phase tasks. The list arrives at each phase start and with every todo tool result; `todo_list` shows it on demand. Work through them in order.
 - archive/ — Phase retrospectives and archived todos.
 - tools/ — Detailed documentation for each tool. Read tools/README.md or tools/<tool_name>.md before using an unfamiliar tool.
 {% if has_tool("kb_write") -%}

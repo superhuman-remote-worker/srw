@@ -11,7 +11,11 @@ the execute node (src/graph.py) sends is laid out as
           phase (WP1), which is history, not tail
     tail  the transient block, rebuilt every turn and anchored after the last
           Human/Tool message: memory pair -> knowledge pair -> citation-feedback
-          pair -> supervisor-guidance pair -> todo HumanMessage LAST
+          pair -> supervisor-guidance pair -> active-subagent status
+
+The todo list is never part of the tail (append-only context injection, D17):
+it is history, carried by the todo tool results and the phase-start messages,
+so the execute node never renders it into a request itself.
 
 "Prefix" is everything before the tail. Turn N+1's prefix is turn N's prefix
 followed by turn N's new state messages, byte for byte, so provider prompt
@@ -23,19 +27,30 @@ schema per job (``phase_tool_schemas["strategic"] is
 phase_tool_schemas["tactical"]``) and the bound description set does not
 change between turns — the "tool schemas" half of the cache-prefix claim.
 
+That is the ``legacy`` injection mode. In ``append_only`` mode
+(``context_management.injection_mode``, append-only context injection WP2)
+there is no tail: the request is system -> summaries -> history, and the
+context that is new or changed since the history last showed it is appended
+as typed entries after the history, folded into the last history message
+(its carrier). The entries reach state between the history and the response,
+so the next request starts with this one byte for byte
+(``TestAppendOnlyLayout``).
+
 Harness modelled on tests/test_memory_cutover.py::TestWorkerExecuteWiring: a
 real AgentConfig, WorkspaceManager, TodoManager and ToolContext; a fake LLM
 capturing every request; a recording MemoryManager seam with a fixed payload;
 a real-typed fake ContextManager (the node does arithmetic on its values).
 """
 
+import asyncio
 import copy
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, List, Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
+from uuid import UUID
 
 import pytest
 from langchain_core.messages import (
@@ -63,7 +78,20 @@ from agent.core.knowledge_injection import (
     create_knowledge_injection_messages,
     is_knowledge_injection_message,
 )
+from shared.runtime.core.context_entries import (
+    FOLDED_KEY,
+    UPDATED_ITEM_MARKER,
+    digest,
+    entry_kind,
+    entry_meta,
+    is_context_entry,
+    is_legacy_injection,
+    make_context_entry,
+    memory_handle,
+)
 from shared.runtime.core.loader import InstructionFileEntry, load_agent_config
+from shared.runtime.services.knowledge_store import KnowledgeRecord
+from shared.runtime.services.recall_store import MemoryRecord
 from agent.core.memory_injection import (
     create_memory_injection_messages,
     is_memory_injection_message,
@@ -81,9 +109,21 @@ from shared.runtime.core.workspace_injection import (
 )
 from agent.graph import create_execute_node
 from agent.managers import TodoManager
-from agent.services.memory import AssembleStats, InjectionBlock, MemoryPayload
+from agent.services.memory import (
+    AssembleStats,
+    InjectionBlock,
+    MemoryPayload,
+    MemoryPipelineError,
+    RetrievalResult,
+)
 from agent.tools.context import ToolContext
 from tests._fs_backend import FilesystemTestBackend
+from tests._memory_fixtures import (
+    BrokenScorer,
+    GatedRetriever,
+    make_async_manager,
+    settle_retrieval,
+)
 
 REPO_ROOT = Path(__file__).parent.parent
 WORKER_CONFIG_PATH = str(REPO_ROOT / "config" / "worker_base.yaml")
@@ -129,16 +169,36 @@ _EXECUTE_PATCHES = {
 
 
 class RecordingManager:
-    """MemoryManager seam stub: fixed payload, records every call."""
+    """MemoryManager seam stub: fixed payload, records every call.
+
+    append_only retrieves asynchronously (WP3): ``start_retrieval`` finishes
+    at once here, so the request that started a retrieval takes its result
+    in (the node starts early and takes in late), as with ``assemble``.
+    """
 
     def __init__(self, payload: MemoryPayload) -> None:
         self.payload = payload
         self.assemble_requests: List[Any] = []
         self.captures: List[Any] = []
+        self._finished: Optional[RetrievalResult] = None
 
-    async def assemble(self, req: Any) -> MemoryPayload:
+    def _next_payload(self, req: Any) -> MemoryPayload:
         self.assemble_requests.append(req)
         return self.payload
+
+    async def assemble(self, req: Any) -> MemoryPayload:
+        return self._next_payload(req)
+
+    def start_retrieval(self, req: Any) -> bool:
+        self._finished = RetrievalResult(payload=self._next_payload(req))
+        return True
+
+    def take_retrieval(self) -> Optional[RetrievalResult]:
+        result, self._finished = self._finished, None
+        return result
+
+    def retrieval_stats(self) -> dict:
+        return {"started": len(self.assemble_requests)}
 
     async def capture(self, event: Any) -> None:
         self.captures.append(event)
@@ -330,6 +390,8 @@ def _apply_turn(state: dict, result: dict) -> None:
     state["turn_count"] = result["turn_count"]
     if "phase_instruction_injections" in result:
         state["phase_instruction_injections"] = result["phase_instruction_injections"]
+    if "delivered_guidance_ids" in result:
+        state["delivered_guidance_ids"] = result["delivered_guidance_ids"]
 
 
 def _patches():
@@ -357,6 +419,7 @@ async def _run(node, state):
 
 
 def _is_todos(m: BaseMessage) -> bool:
+    """The legacy per-turn ``<active_tasks>`` message, no longer produced."""
     return isinstance(m, HumanMessage) and str(m.content).startswith(
         TODOS_INJECTION_CONTENT_PREFIX
     )
@@ -435,9 +498,7 @@ def _failed_citation(cid: int = 7) -> Citation:
 
 class TestPreparedLayout:
     @pytest.mark.asyncio
-    async def test_live_child_status_is_transient_and_immediately_before_todos(
-        self, env
-    ):
+    async def test_live_child_status_is_transient_and_last(self, env):
         _bind_tactical_phase_skill(env)
         block = (
             "<active_subagents>\n"
@@ -457,8 +518,8 @@ class TestPreparedLayout:
         active = next(
             m for m in request if str(m.content).startswith("<active_subagents>")
         )
-        assert request[-2] is active
-        assert _is_todos(request[-1])
+        assert request[-1] is active
+        assert not any(_is_todos(m) for m in request)
         assert active.additional_kwargs[PERSIST_ROLE_KEY] == PERSIST_ROLE_EVENT
         assert "do not poll" in active.content
         assert not any(
@@ -467,13 +528,12 @@ class TestPreparedLayout:
         env["ctx"].subagent_runtime.active_subagents_block.assert_called_once_with()
 
     @pytest.mark.asyncio
-    async def test_layout_is_system_summaries_history_block_then_tail_with_todos_last(
-        self, env
-    ):
+    async def test_layout_is_system_summaries_history_block_then_tail(self, env):
         """One request, read top to bottom: the one system prompt, the
         summaries, the history in state order, the phase block as the last
-        history message on its delivery turn, then the transient tail with
-        the todo list last. Nothing from the tail is returned to state."""
+        history message on its delivery turn, then the transient tail. There
+        is no todo message: the list is history (D17). Nothing from the tail
+        is returned to state."""
         _bind_tactical_phase_skill(env)
         # A ReAct turn: the reply carries a tool call (the graph goes to the
         # tools node next), so no todo-reminder nudge is appended to state.
@@ -505,7 +565,6 @@ class TestPreparedLayout:
             "memory",
             "knowledge",
             "knowledge",
-            "todos",
         ]
 
         # [0] is the ONE phase-agnostic prompt, rebuilt per turn;
@@ -536,21 +595,21 @@ class TestPreparedLayout:
         assert "UNIQUE TACTICAL PHASE BODY" in block.content
         assert block is result["messages"][0]  # delivered into state this turn
 
-        # The tail: memory pair, knowledge pair, todos LAST. Synthetic pairs
-        # are well-formed (AI tool_call + ToolMessage with the same id).
+        # The tail: memory pair, knowledge pair. Synthetic pairs are
+        # well-formed (AI tool_call + ToolMessage with the same id).
         assert [_kind(m) for m in tail] == [
             "memory",
             "memory",
             "knowledge",
             "knowledge",
-            "todos",
         ]
         for ai, tool in (tail[0:2], tail[2:4]):
             assert isinstance(ai, AIMessage) and isinstance(tool, ToolMessage)
             assert ai.tool_calls[0]["id"] == tool.tool_call_id
-        assert _is_todos(request[-1])
-        assert "Do the task" in request[-1].content
-        assert sum(_is_todos(m) for m in request) == 1
+        # No todo message, and the node never renders the list itself: it is
+        # in the history only where a todo tool or a phase start put it.
+        assert not any(_is_todos(m) for m in request)
+        assert not any("Do the task" in str(m.content) for m in request)
 
         # Transients never reach state; the delivery turn returns block + reply
         # (a no-tool-call reply with pending todos would add the reminder
@@ -602,9 +661,9 @@ class TestPreparedLayout:
         assert _wire_all(prefix2[len(prefix1) :]) == _wire_all(new_messages)
         assert len(req2) - len(req1) == len(new_messages)
 
-        # Same tail shape, rebuilt after the new messages, todos last both turns.
+        # Same tail shape, rebuilt after the new messages; no todo message.
         assert [_kind(m) for m in tail1] == [_kind(m) for m in tail2]
-        assert _is_todos(req1[-1]) and _is_todos(req2[-1])
+        assert not any(_is_todos(m) for m in req1 + req2)
         # Nothing changed between the turns, so the tail is byte-identical
         # too (deterministic injection ids) — but it sits at a new offset.
         assert _wire_all(tail1) == _wire_all(tail2)
@@ -617,11 +676,10 @@ class TestPreparedLayout:
         assert not any(_is_transient(m) for m in second["messages"])
 
     @pytest.mark.asyncio
-    async def test_supervisor_guidance_sits_before_todos(self, env, guidance_inbox):
-        """The guidance pair is the last synthetic pair of the tail —
-        after memory and knowledge, immediately before the todo list — so
-        mid-run steering is the freshest context short of the tasks. It is
-        transient (never in state) and acked after the turn."""
+    async def test_supervisor_guidance_is_the_last_tail_pair(self, env, guidance_inbox):
+        """The guidance pair is the last synthetic pair of the tail — after
+        memory and knowledge — so mid-run steering is the freshest synthetic
+        context. It is transient (never in state) and acked after the turn."""
         _bind_tactical_phase_skill(env)
         guidance_inbox[JOB_ID] = [
             {"id": "g1", "text": "stop retrying X", "source": "officer"},
@@ -643,9 +701,8 @@ class TestPreparedLayout:
             "knowledge",
             "guidance",
             "guidance",
-            "todos",
         ]
-        guid_ai, guid_tool, todos = tail[-3], tail[-2], tail[-1]
+        guid_ai, guid_tool = tail[-2], tail[-1]
         assert isinstance(guid_ai, AIMessage) and isinstance(guid_tool, ToolMessage)
         assert guid_ai.tool_calls[0]["name"] == "supervisor_guidance"
         assert guid_ai.tool_calls[0]["id"].startswith(GUIDANCE_TOOL_CALL_ID_PREFIX)
@@ -653,7 +710,7 @@ class TestPreparedLayout:
         assert guid_tool.content.startswith("[SUPERVISOR GUIDANCE]")
         assert "stop retrying X" in guid_tool.content
         assert "read file Z" in guid_tool.content
-        assert _is_todos(todos)
+        assert not any(_is_todos(m) for m in request)
         # One block, after the whole history (the phase block included).
         assert sum("[SUPERVISOR GUIDANCE]" in str(m.content) for m in request) == 1
         assert request.index(guid_ai) > request.index(prefix[-1])
@@ -667,8 +724,8 @@ class TestPreparedLayout:
     @pytest.mark.asyncio
     async def test_citation_feedback_pair_in_tail(self, env, guidance_inbox):
         """Failed-citation feedback is a transient pair in the tail: after the
-        memory and knowledge pairs, before the guidance pair and the todos —
-        re-derived from the engine each turn, never written to state."""
+        memory and knowledge pairs, before the guidance pair — re-derived from
+        the engine each turn, never written to state."""
         _bind_tactical_phase_skill(env)
         citation = _failed_citation()
         engine = SimpleNamespace(list_citations=AsyncMock(return_value=[citation]))
@@ -696,7 +753,6 @@ class TestPreparedLayout:
             "citation",
             "guidance",
             "guidance",
-            "todos",
         ]
         cit_ai, cit_tool = tail[4], tail[5]
         assert isinstance(cit_ai, AIMessage) and isinstance(cit_tool, ToolMessage)
@@ -713,10 +769,10 @@ class TestPreparedLayout:
         )
         engine.list_citations.assert_awaited_with(verification_status="failed")
 
-        # After the whole history (phase block included); before the todos.
+        # After the whole history (phase block included); before the guidance.
         assert req1.index(cit_ai) > req1.index(prefix[-1])
         assert is_protected_message(prefix[-1])
-        assert _is_todos(req1[-1])
+        assert is_guidance_injection_message(req1[-1])
 
         # Transient: re-derived on the next turn, absent from state both turns.
         assert sum(is_citation_feedback_injection_message(m) for m in req2) == 2
@@ -782,7 +838,7 @@ class TestInjectionOverheadAccounting:
     @pytest.mark.asyncio
     async def test_delivery_turn_adds_the_phase_block_once(self, env):
         """The compaction thresholds are lowered by the request overhead that
-        `messages` does not carry — system prompt, todo list, memory budget —
+        `messages` does not carry — system prompt, memory budget —
         plus, on the delivery turn only, the phase block just appended (the
         provider-anchored trigger predates it). The next turn drops the term;
         the originals are restored after every turn."""
@@ -816,7 +872,6 @@ class TestInjectionOverheadAccounting:
 
         common = (
             ctx.get_token_count([SystemMessage(content=SYSTEM_PROMPT)])
-            + len(env["todo"].format_for_injection()) // 4
             + env["config"].memory.budget_tokens  # recall_store present
         )
         original = FakeContextMgr.ORIGINAL_THRESHOLD
@@ -844,7 +899,6 @@ class TestInjectionOverheadAccounting:
 
         common = (
             ctx.get_token_count([SystemMessage(content=SYSTEM_PROMPT)])
-            + len(env["todo"].format_for_injection()) // 4
             + env["config"].memory.budget_tokens
         )
         assert ctx.thresholds_seen == [
@@ -853,3 +907,767 @@ class TestInjectionOverheadAccounting:
                 FakeContextMgr.ORIGINAL_THRESHOLD - common,
             )
         ]
+
+
+# ---------------------------------------------------------------------------
+# The todo list after compaction (D19)
+# ---------------------------------------------------------------------------
+
+
+class CompactingContextMgr(FakeContextMgr):
+    """Every ``ensure_within_limits`` call compacts to summary + the newest
+    message, seating whatever ``restate_after_summary`` returns in between —
+    the contract of ``ContextManager.summarize_and_compact``. ``overflow_once``
+    makes the first full-request count exceed every limit (the Layer-1 safety
+    rebuild)."""
+
+    def __init__(self, *, overflow_once: bool = False) -> None:
+        super().__init__()
+        self.hooks: List[Any] = []
+        self._overflow = overflow_once
+
+    def get_token_count(self, messages: List[Any]) -> int:
+        if self._overflow and len(messages) > 1:
+            self._overflow = False
+            return 10**9
+        return super().get_token_count(messages)
+
+    async def ensure_within_limits(
+        self, messages, *args, restate_after_summary=None, **kwargs
+    ):
+        await super().ensure_within_limits(messages, *args, **kwargs)
+        self.hooks.append(restate_after_summary)
+        summary = SystemMessage(content="[Summary of prior work]\nEarlier work.")
+        kept = list(messages[-1:])
+        restated = (
+            list(restate_after_summary([summary, *kept]))
+            if restate_after_summary
+            else []
+        )
+        markers = [RemoveMessage(id=m.id) for m in messages if m.id]
+        return markers + [summary, *restated, *kept]
+
+
+class OverflowOnceLLM(CapturingLLM):
+    """Raise ContextOverflowError once: the Layer-0 emergency compaction."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.raised = False
+
+    async def ainvoke(self, prepared, **kwargs):
+        from shared.runtime.llm.exceptions import ContextOverflowError
+
+        if not self.raised:
+            self.raised = True
+            raise ContextOverflowError(token_count=10**9, limit=128_000)
+        return await super().ainvoke(prepared, **kwargs)
+
+
+class TestTodoListRestatedAfterCompaction:
+    @pytest.mark.parametrize("path", ["threshold", "safety", "emergency"])
+    @pytest.mark.asyncio
+    async def test_every_execute_compaction_restates_the_list_once(self, env, path):
+        """The threshold compaction, the Layer-1 safety rebuild and the Layer-0
+        emergency rebuild all hand the todo-list hook to the compaction; the
+        restatement lands right after the summary in the request and is
+        returned to state, so it is history from then on (not a tail)."""
+        ctx = CompactingContextMgr(overflow_once=path == "safety")
+        env["context"] = ctx
+        llm = OverflowOnceLLM() if path == "emergency" else CapturingLLM()
+        node = _make_node(env, llm)
+        history = [
+            m.model_copy(update={"id": f"m{i}"}) for i, m in enumerate(_history())
+        ]
+
+        result = await _run(node, _state(history))
+
+        expected_calls = 1 if path == "threshold" else 2
+        assert len(ctx.hooks) == expected_calls
+        assert all(hook is not None for hook in ctx.hooks)
+        request = llm.requests[-1]
+        rendering = env["todo"].format_for_injection()
+        restated = [m for m in request if rendering in str(m.content)]
+        assert len(restated) == 1
+        assert isinstance(restated[0], HumanMessage)
+        assert [_kind(m) for m in request[:4]] == [
+            "system",
+            "summary",
+            "HumanMessage",  # the restated list
+            "HumanMessage",  # the kept window
+        ]
+        assert request[2] is restated[0]
+        state_messages = [
+            m for m in result["messages"] if not isinstance(m, RemoveMessage)
+        ]
+        assert any(m is restated[0] for m in state_messages)
+        assert not any(_is_todos(m) for m in request)
+
+
+# ---------------------------------------------------------------------------
+# append_only: entries appended once and folded into their carrier (WP2 2.4)
+# ---------------------------------------------------------------------------
+
+SUBAGENTS_BLOCK = (
+    "<active_subagents>\n- probe-ab12 (explorer): running\n"
+    "Reports push automatically as evidence; do not poll.\n</active_subagents>"
+)
+MEMORIES = [
+    MemoryRecord(id=UUID(int=1), content="Deploys go through Fleet.", token_count=6),
+    MemoryRecord(id=UUID(int=2), content="Never touch production data.", token_count=7),
+]
+NOTE = KnowledgeRecord(
+    note_id="release",
+    project_id=UUID(int=9),
+    title="Release",
+    note_type="process",
+    content="Releases are cut on Fridays.",
+)
+ENTRY_KINDS = ["memory", "knowledge", "citation", "guidance", "subagents"]
+
+
+def make_records_payload(memories=MEMORIES, notes=(NOTE,)) -> MemoryPayload:
+    """``make_payload`` plus the store records behind its blocks.
+
+    Legacy mode injects the blocks' rendered pairs; append_only plans from
+    ``InjectionBlock.records``.
+    """
+    payload = make_payload()
+    payload.blocks[0].records = list(memories)
+    payload.blocks[1].records = list(notes)
+    return payload
+
+
+class SequenceManager(RecordingManager):
+    """One payload per ``assemble`` call, in order; the last one repeats."""
+
+    def __init__(self, payloads: List[MemoryPayload]) -> None:
+        super().__init__(payloads[0])
+        self.payloads = list(payloads)
+
+    def _next_payload(self, req: Any) -> MemoryPayload:
+        self.assemble_requests.append(req)
+        index = min(len(self.assemble_requests), len(self.payloads)) - 1
+        return self.payloads[index]
+
+
+class ToggleCompactingContextMgr(CompactingContextMgr):
+    """Compacts (like ``CompactingContextMgr``) only while ``compact`` is set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.compact = False
+
+    async def ensure_within_limits(
+        self, messages, *args, restate_after_summary=None, **kwargs
+    ):
+        if not self.compact:
+            return await FakeContextMgr.ensure_within_limits(
+                self, messages, *args, **kwargs
+            )
+        return await super().ensure_within_limits(
+            messages, *args, restate_after_summary=restate_after_summary, **kwargs
+        )
+
+
+@pytest.fixture
+def append_env(env):
+    env["config"].context_management.injection_mode = "append_only"
+    env["service"] = RecordingManager(make_records_payload())
+    return env
+
+
+def _all_sources(env, guidance_inbox) -> None:
+    """Citation feedback, a live child and one guidance entry, on top of the
+    memory and knowledge payload."""
+    env["ctx"].citation_engine = SimpleNamespace(
+        list_citations=AsyncMock(return_value=[_failed_citation()])
+    )
+    env["ctx"].subagent_runtime = SimpleNamespace(
+        active_subagents_block=MagicMock(return_value=SUBAGENTS_BLOCK)
+    )
+    guidance_inbox[JOB_ID] = [
+        {"id": "g1", "text": "stop retrying X", "source": "officer"}
+    ]
+
+
+def _tool_call(call_id: str) -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "read_file", "args": {"path": f"{call_id}.md"}, "id": call_id}
+        ],
+    )
+
+
+def _srw_count(request: List[BaseMessage], kind: str) -> int:
+    needle = f'<srw_context kind="{kind}">'
+    return sum(str(m.content).count(needle) for m in request)
+
+
+def _with_ids(messages: List[BaseMessage], prefix: str) -> List[BaseMessage]:
+    """State copies with ids, as the add_messages reducer assigns them."""
+    return [
+        m if m.id else m.model_copy(update={"id": f"{prefix}{i}"})
+        for i, m in enumerate(messages)
+    ]
+
+
+def _entries(messages: List[BaseMessage]) -> List[BaseMessage]:
+    return [m for m in messages if is_context_entry(m)]
+
+
+class TestAppendOnlyLayout:
+    @pytest.mark.asyncio
+    async def test_entries_ride_the_carrier_and_reach_state_before_the_response(
+        self, append_env, guidance_inbox
+    ):
+        """One request: system, summaries, the history in state order. The
+        context comes after the history as typed entries in INJECTION_KINDS
+        order, folded into the last history message (here the phase block
+        delivered this turn); no synthetic pair, no extra turn, no tail. The
+        entries are returned between the block and the response."""
+        env = append_env
+        _bind_tactical_phase_skill(env)
+        _all_sources(env, guidance_inbox)
+        llm = CapturingLLM(responses=[_tool_call("c2")])
+        node = _make_node(env, llm)
+        state = _state()
+        ack = MagicMock()
+
+        with patch.object(dual_app, "ack_guidance", ack):
+            result = await _run(node, state)
+
+        (request,) = llm.requests
+        assert [_kind(m) for m in request] == [
+            "system",
+            "summary",
+            "HumanMessage",
+            "AIMessage",
+            "ToolMessage",
+            "HumanMessage",
+            "phase_block",
+        ]
+        assert not any(is_legacy_injection(m) for m in request)
+        assert not any(is_context_entry(m) for m in request)
+        expected_history = [
+            m for m in state["messages"] if not isinstance(m, SystemMessage)
+        ]
+        assert _wire_all(request[2:-1]) == _wire_all(expected_history)
+
+        # State: the block, the entries, the response (routing reads [-1]).
+        block, *entries, response = result["messages"]
+        assert is_protected_message(block)
+        assert [entry_kind(e) for e in entries] == ENTRY_KINDS
+        assert response.tool_calls[0]["id"] == "c2"
+
+        # The carrier: a copy of the block with the entries' stored text
+        # appended; the stored block itself is untouched.
+        carrier = request[-1]
+        assert carrier.content == "\n\n".join(
+            [block.content] + [e.content for e in entries]
+        )
+        assert carrier.additional_kwargs[FOLDED_KEY] == ENTRY_KINDS
+        assert FOLDED_KEY not in block.additional_kwargs
+        assert all(_srw_count(request, kind) == 1 for kind in ENTRY_KINDS)
+
+        # Memory: shown by handle, the row ids only in the metadata (D30).
+        memory = entries[0]
+        assert [i["key"] for i in entry_meta(memory)["items"]] == [
+            str(UUID(int=1)),
+            str(UUID(int=2)),
+        ]
+        assert f"[{memory_handle(UUID(int=1))}]" in memory.content
+        assert str(UUID(int=1)) not in memory.content
+
+        # Guidance: once, without the legacy "may repeat" notice; delivered.
+        guidance = entries[3]
+        assert "stop retrying X" in guidance.content
+        assert "may repeat" not in guidance.content
+        assert result["delivered_guidance_ids"] == ["g1"]
+        ack.assert_called_once_with(JOB_ID, guidance_ids=["g1"], reply_threads=None)
+
+    @pytest.mark.asyncio
+    async def test_unchanged_context_is_not_sent_again(
+        self, append_env, guidance_inbox
+    ):
+        """Turn N+1 starts with turn N's whole request, entries included, and
+        appends nothing while nothing changed. Guidance still pending in the
+        inbox is filtered by the delivered ids, not shown again; the pinned
+        lane re-acks it after the answered turn until the heartbeat drops it
+        (the legacy ack cadence)."""
+        env = append_env
+        _all_sources(env, guidance_inbox)
+        llm = CapturingLLM(responses=[_tool_call("c2"), _tool_call("c3")])
+        node = _make_node(env, llm)
+        state = _state()
+        ack = MagicMock()
+
+        with patch.object(dual_app, "ack_guidance", ack):
+            first = await _run(node, state)
+            _apply_turn(state, first)
+            tool_reply = ToolMessage(
+                content="contents of c2.md", tool_call_id="c2", name="read_file"
+            )
+            state["messages"].append(tool_reply)
+            second = await _run(node, state)
+
+        req1, req2 = llm.requests
+        assert _wire_all(req2[: len(req1)]) == _wire_all(req1)
+        assert _wire_all(req2[len(req1) :]) == _wire_all(
+            [first["messages"][-1], tool_reply]
+        )
+        assert [entry_kind(e) for e in _entries(first["messages"])] == ENTRY_KINDS
+        (response,) = second["messages"]
+        assert response.tool_calls[0]["id"] == "c3"
+        assert all(_srw_count(req2, kind) == 1 for kind in ENTRY_KINDS)
+        assert second["delivered_guidance_ids"] == ["g1"]
+        assert (
+            ack.call_args_list
+            == [call(JOB_ID, guidance_ids=["g1"], reply_threads=None)] * 2
+        )
+
+    @pytest.mark.asyncio
+    async def test_new_and_changed_items_append_after_the_earlier_entries(
+        self, append_env
+    ):
+        """A changed memory (same row, new text) and a new one go out as one
+        new entry on the newest carrier; the earlier entry stays where it
+        was, so the earlier request is still the prefix (D1, D2, D5)."""
+        env = append_env
+        revised = MemoryRecord(
+            id=UUID(int=1), content="Deploys go through Fleet and Helm.", token_count=8
+        )
+        env["service"] = SequenceManager(
+            [
+                make_records_payload(memories=MEMORIES[:1]),
+                make_records_payload(memories=[revised, MEMORIES[1]]),
+            ]
+        )
+        llm = CapturingLLM(responses=[_tool_call("c2"), _tool_call("c3")])
+        node = _make_node(env, llm)
+        state = _state()
+
+        first = await _run(node, state)
+        _apply_turn(state, first)
+        state["messages"].append(
+            ToolMessage(
+                content="contents of c2.md", tool_call_id="c2", name="read_file"
+            )
+        )
+        second = await _run(node, state)
+
+        req1, req2 = llm.requests
+        assert _wire_all(req2[: len(req1)]) == _wire_all(req1)
+        (memory,) = _entries(second["messages"])
+        assert entry_kind(memory) == "memory"
+        assert [i["key"] for i in entry_meta(memory)["items"]] == [
+            str(UUID(int=1)),
+            str(UUID(int=2)),
+        ]
+        assert memory.content.count(UPDATED_ITEM_MARKER) == 1
+        assert "Fleet and Helm" in memory.content
+        assert _srw_count(req2, "memory") == 2
+        assert _srw_count(req2, "knowledge") == 1
+        assert req2[-1].additional_kwargs[FOLDED_KEY] == ["memory"]
+
+    @pytest.mark.asyncio
+    async def test_layer1_rebuild_replans_against_the_forced_compaction(
+        self, append_env
+    ):
+        """The Layer-1 safety rebuild re-plans on the history its forced
+        compaction left: the request carries one set of entries (not the
+        normal path's plus the rebuild's), planned after compaction evicted
+        the memory entry that sat in the history before."""
+        env = append_env
+        ctx = CompactingContextMgr(overflow_once=True)
+        env["context"] = ctx
+        llm = CapturingLLM(responses=[_tool_call("c2")])
+        node = _make_node(env, llm)
+        prior = make_context_entry(
+            "memory",
+            "[m:older] Deploys go through Fleet.",
+            section="memory",
+            items=[
+                {
+                    "key": str(UUID(int=1)),
+                    "hash": digest(MEMORIES[0].content),
+                    "handle": memory_handle(UUID(int=1)),
+                }
+            ],
+        )
+        history = _history()
+        history.insert(-1, prior)  # after the tool result, before the notice
+        history = _with_ids(history, "m")
+        prior_id = next(m.id for m in history if is_context_entry(m))
+
+        result = await _run(node, _state(history))
+
+        assert len(ctx.hooks) == 2  # the normal compaction + the forced one
+        (request,) = llm.requests
+        assert _srw_count(request, "memory") == 1
+        assert _srw_count(request, "knowledge") == 1
+        assert "[m:older]" not in "".join(str(m.content) for m in request)
+        carrier = request[-1]
+        assert carrier.content.startswith("[PHASE_TRANSITION]")
+        assert carrier.additional_kwargs[FOLDED_KEY] == ["memory", "knowledge"]
+
+        state_messages = [
+            m for m in result["messages"] if not isinstance(m, RemoveMessage)
+        ]
+        assert [_kind(m) for m in state_messages] == [
+            "summary",
+            "HumanMessage",  # the restated todo list
+            "HumanMessage",  # the kept window
+            "HumanMessage",  # the memory entry
+            "HumanMessage",  # the knowledge entry
+            "AIMessage",
+        ]
+        memory, knowledge = _entries(state_messages)
+        assert [entry_kind(memory), entry_kind(knowledge)] == ["memory", "knowledge"]
+        # Both memories: the plan no longer saw the evicted prior entry.
+        assert [i["key"] for i in entry_meta(memory)["items"]] == [
+            str(UUID(int=1)),
+            str(UUID(int=2)),
+        ]
+        removed = {m.id for m in result["messages"] if isinstance(m, RemoveMessage)}
+        assert prior_id in removed
+
+    @pytest.mark.asyncio
+    async def test_layer0_rebuild_replans_against_the_emergency_compaction(
+        self, append_env
+    ):
+        env = append_env
+        env["context"] = CompactingContextMgr()
+        llm = OverflowOnceLLM()
+        llm._responses.append(_tool_call("c2"))
+        node = _make_node(env, llm)
+
+        result = await _run(node, _state(_with_ids(_history(), "m")))
+
+        assert llm.raised
+        (request,) = llm.requests  # the retry; the first attempt never left
+        assert _srw_count(request, "memory") == 1
+        assert request[-1].additional_kwargs[FOLDED_KEY] == ["memory", "knowledge"]
+        state_messages = [
+            m for m in result["messages"] if not isinstance(m, RemoveMessage)
+        ]
+        assert [entry_kind(m) for m in state_messages[-3:-1]] == [
+            "memory",
+            "knowledge",
+        ]
+        assert state_messages[-1].tool_calls[0]["id"] == "c2"
+        assert len(_entries(state_messages)) == 2
+
+    @pytest.mark.asyncio
+    async def test_compaction_evicts_an_entry_and_it_is_appended_again(
+        self, append_env, guidance_inbox
+    ):
+        """D4: a compaction evicts the entries with the summarized region
+        (RemoveMessage); the next plan finds them absent and appends them
+        again on the newest carrier. Delivered guidance is not appended
+        again (the summary keeps it, O1)."""
+        env = append_env
+        _all_sources(env, guidance_inbox)
+        ctx = ToggleCompactingContextMgr()
+        env["context"] = ctx
+        llm = CapturingLLM(responses=[AIMessage(content="done"), _tool_call("c3")])
+        node = _make_node(env, llm)
+        state = _state(_with_ids(_history(), "m"))
+
+        with patch.object(dual_app, "ack_guidance", MagicMock()):
+            first = await _run(node, state)
+            new = _with_ids(first["messages"], "t1-")
+            _apply_turn(state, {**first, "messages": new})
+            # A text-only answer with todos pending leaves the reminder last.
+            reminder = state["messages"][-1]
+            assert isinstance(reminder, HumanMessage)
+            ctx.compact = True
+            second = await _run(node, state)
+
+        first_entries = _entries(new)
+        assert [entry_kind(e) for e in first_entries] == ENTRY_KINDS
+        removed = {m.id for m in second["messages"] if isinstance(m, RemoveMessage)}
+        assert {e.id for e in first_entries} <= removed
+
+        req2 = llm.requests[-1]
+        assert [_kind(m) for m in req2] == [
+            "system",
+            "summary",
+            "HumanMessage",  # the restated todo list
+            "HumanMessage",  # the kept reminder, carrying the entries again
+        ]
+        assert req2[-1].content.startswith(reminder.content)
+        again = ["memory", "knowledge", "citation", "subagents"]
+        assert req2[-1].additional_kwargs[FOLDED_KEY] == again
+        assert _srw_count(req2, "guidance") == 0
+        state_messages = [
+            m for m in second["messages"] if not isinstance(m, RemoveMessage)
+        ]
+        assert [entry_kind(e) for e in _entries(state_messages)] == again
+        assert second["delivered_guidance_ids"] == ["g1"]
+
+    @pytest.mark.asyncio
+    async def test_overhead_drops_the_memory_and_knowledge_terms(self, append_env):
+        """§D row 6: there is no rebuilt tail, so only the system prompt (and
+        the phase block on its delivery turn) lowers the thresholds."""
+        env = append_env
+        env["ctx"].knowledge_store = MagicMock()
+        env["ctx"].project_id = str(UUID(int=9))
+        ctx = env["context"]
+        node = _make_node(env, CapturingLLM())
+
+        await _run(node, _state())
+
+        system = ctx.get_token_count([SystemMessage(content=SYSTEM_PROMPT)])
+        original = FakeContextMgr.ORIGINAL_THRESHOLD
+        assert ctx.thresholds_seen == [(original - system, original - system)]
+
+    @pytest.mark.asyncio
+    async def test_archive_audit_and_assembler_text(self, append_env):
+        """The archiver gets the folded request (llm_requests) and the
+        unfolded history (the chat delta, §D 7c); memory_inject carries the
+        appended / already-present counts; the assembler's
+        current_injection_text is the memory entries the history holds."""
+        import asyncio
+
+        env = append_env
+        llm = CapturingLLM(responses=[_tool_call("c2"), _tool_call("c3")])
+        node = _make_node(env, llm)
+        auditor = MagicMock()
+        state = _state()
+
+        with patch("agent.graph.get_archiver", return_value=auditor):
+            patches = _patches()
+            for p in patches:
+                p.start()
+            try:
+                first = await node(state)
+                _apply_turn(state, first)
+                state["messages"].append(
+                    ToolMessage(
+                        content="contents of c2.md",
+                        tool_call_id="c2",
+                        name="read_file",
+                    )
+                )
+                await node(state)
+                for _ in range(3):
+                    await asyncio.sleep(0)
+            finally:
+                for p in patches:
+                    p.stop()
+
+        first_entries = _entries(first["messages"])
+        archived = [c.kwargs for c in auditor.archive.call_args_list]
+        assert [a["messages"] for a in archived] == llm.requests
+        assert archived[0]["messages"][-1].additional_kwargs[FOLDED_KEY] == [
+            "memory",
+            "knowledge",
+        ]
+        # The unfolded history: the entries are their own messages, at the
+        # end on the turn they were appended and in place after that.
+        assert archived[0]["history_messages"][-2:] == first_entries
+        assert not _entries(archived[0]["history_messages"][:-2])
+        assert _entries(archived[1]["history_messages"]) == first_entries
+        assert not is_context_entry(archived[1]["history_messages"][-1])
+
+        injects = [
+            c.kwargs["data"]
+            for c in auditor.audit_step.call_args_list
+            if c.kwargs.get("step_type") == "memory_inject"
+        ]
+        assert [(d["count"], d["appended"], d["present"]) for d in injects] == [
+            (1, 2, 0),
+            (1, 0, 2),
+        ]
+
+        turn_ends = [e for e in env["service"].captures if e.kind == "turn_end"]
+        assert [e.extra["current_injection_text"] for e in turn_ends] == [
+            first_entries[0].content
+        ] * 2
+
+
+# ---------------------------------------------------------------------------
+# append_only: retrieval off the request path (WP3; D6-D8, D13)
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncRetrieval:
+    """The execute node starts the memory retrieval and never awaits it.
+
+    A real MemoryManager with a gated retriever: the test decides when a
+    retrieval finishes relative to the requests.
+    """
+
+    def _next_tool_result(self, state: dict, result: dict, call_id: str) -> None:
+        _apply_turn(state, result)
+        state["messages"].append(
+            ToolMessage(
+                content=f"contents of {call_id}.md",
+                tool_call_id=call_id,
+                name="read_file",
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_result_that_finishes_late_reaches_the_next_request(
+        self, append_env
+    ):
+        env = append_env
+        retriever = GatedRetriever(MEMORIES)
+        manager = env["service"] = make_async_manager(retriever)
+        llm = CapturingLLM(
+            responses=[_tool_call("c2"), _tool_call("c3"), _tool_call("c4")]
+        )
+        node = _make_node(env, llm)
+        state = _state()
+
+        # Request 1 starts the retrieval with its own query and goes out
+        # while it is still running: no memory, and it never waited (D6).
+        first = await _run(node, state)
+        await asyncio.sleep(0)  # the provider call a real request awaits
+        assert len(retriever.queries) == 1
+        assert "Do the task" in retriever.queries[0]
+        assert manager.retrieval_in_flight
+        assert _srw_count(llm.requests[0], "memory") == 0
+        self._next_tool_result(state, first, "c2")
+
+        # It finishes after request 1 was sent; request 2 takes it in (D8)
+        # and starts the next retrieval.
+        retriever.release()
+        await settle_retrieval(manager)
+        second = await _run(node, state)
+        await asyncio.sleep(0)
+        assert _srw_count(llm.requests[1], "memory") == 1
+        assert len(retriever.queries) == 2
+        self._next_tool_result(state, second, "c3")
+
+        # Request 3 while retrieval 2 runs: single flight starts nothing, no
+        # new entry; the memory entry is history and request 3 extends
+        # request 2 (D7, the cache rule).
+        await _run(node, state)
+        assert len(retriever.queries) == 2
+        assert _srw_count(llm.requests[2], "memory") == 1
+        previous = llm.requests[1]
+        assert _wire_all(llm.requests[2][: len(previous) - 1]) == _wire_all(
+            previous[:-1]
+        )
+        stats = manager.retrieval_stats()
+        assert stats["started"] == 2
+        assert stats["skipped_in_flight"] == 1
+        assert stats["drained"] == 1
+
+        await manager.close_background()
+        assert retriever.cancelled == 1
+
+    @pytest.mark.asyncio
+    async def test_a_fast_retrieval_serves_the_request_that_started_it(
+        self, append_env
+    ):
+        """The node starts early and takes in late: a retrieval that finishes
+        before the request is built serves that request."""
+        env = append_env
+        manager = env["service"] = make_async_manager(
+            GatedRetriever(MEMORIES, auto=True)
+        )
+        llm = CapturingLLM(responses=[_tool_call("c2")])
+
+        async def no_failed_citations(**_kwargs):
+            # The citation lookup between start and take-in yields to the
+            # loop, as every real read there does.
+            for _ in range(5):
+                await asyncio.sleep(0)
+            return []
+
+        env["ctx"].citation_engine = SimpleNamespace(list_citations=no_failed_citations)
+        node = _make_node(env, llm)
+
+        await _run(node, _state())
+
+        assert _srw_count(llm.requests[0], "memory") == 1
+        await manager.close_background()
+
+    @pytest.mark.asyncio
+    async def test_the_memory_inject_audit_carries_the_async_run(self, append_env):
+        env = append_env
+        retriever = GatedRetriever(MEMORIES)
+        manager = env["service"] = make_async_manager(retriever)
+        llm = CapturingLLM(responses=[_tool_call("c2"), _tool_call("c3")])
+        node = _make_node(env, llm)
+        state = _state()
+        auditor = MagicMock()
+
+        with patch("agent.graph.get_archiver", return_value=auditor):
+            patches = _patches()
+            for p in patches:
+                p.start()
+            try:
+                first = await node(state)
+                await asyncio.sleep(0)
+                self._next_tool_result(state, first, "c2")
+                retriever.release()
+                await settle_retrieval(manager)
+                await node(state)
+            finally:
+                for p in patches:
+                    p.stop()
+
+        injects = [
+            c.kwargs["data"]
+            for c in auditor.audit_step.call_args_list
+            if c.kwargs.get("step_type") == "memory_inject"
+        ]
+        # Only the request that took a result in audits it.
+        (data,) = injects
+        assert (data["count"], data["appended"], data["present"]) == (2, 2, 0)
+        assert data["stats"]["latency_ms"] >= 0
+        assert data["retrieval"]["mode"] == "async"
+        assert data["retrieval"]["seq"] == 1
+        assert data["retrieval"]["started_this_request"] is True
+        assert data["retrieval"]["degraded"] is None
+        assert data["retrieval"]["counters"]["drained"] == 1
+        await manager.close_background()
+
+    @pytest.mark.asyncio
+    async def test_a_structural_reranker_failure_leaves_the_request_alive(
+        self, append_env
+    ):
+        """D13: the failure is audited and counted, the requests go out."""
+        env = append_env
+        scorer = BrokenScorer(ValueError("rerank route returned HTML"))
+        manager = env["service"] = make_async_manager(
+            GatedRetriever(MEMORIES, auto=True), scorer=scorer, job_id=JOB_ID
+        )
+        llm = CapturingLLM(responses=[_tool_call("c2"), _tool_call("c3")])
+        node = _make_node(env, llm)
+        state = _state()
+        archiver = MagicMock()
+
+        with patch("agent.core.archiver.get_archiver", return_value=archiver):
+            first = await _run(node, state)
+            self._next_tool_result(state, first, "c2")
+            await settle_retrieval(manager)
+            second = await _run(node, state)
+            await settle_retrieval(manager)
+
+        assert not first.get("error") and not second.get("error")
+        assert len(llm.requests) == 2
+        assert all(_srw_count(r, "memory") == 0 for r in llm.requests)
+        assert manager.retrieval_stats()["degraded"] == 2
+        steps = [c.kwargs["step_type"] for c in archiver.audit_step.call_args_list]
+        assert steps == ["memory_pipeline_degraded"]
+        await manager.close_background()
+
+    @pytest.mark.asyncio
+    async def test_legacy_mode_still_awaits_and_fails_loud(self, env):
+        """Legacy keeps the synchronous assemble and "configured => required"."""
+        scorer = BrokenScorer(ValueError("rerank route returned HTML"))
+        manager = env["service"] = make_async_manager(
+            GatedRetriever(MEMORIES, auto=True), scorer=scorer
+        )
+        node = _make_node(env, CapturingLLM())
+
+        with pytest.raises(MemoryPipelineError):
+            await _run(node, _state())
+        assert manager.retrieval_stats()["started"] == 0

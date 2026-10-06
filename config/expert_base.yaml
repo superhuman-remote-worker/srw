@@ -181,6 +181,12 @@ tools:
     - kb_provenance
     - kb_unanswered
     - kb_export
+  # Memory tools — memory_search, the model's own lookup into project memory
+  # (src/agent/tools/memory/). Workers and sessions alike; bound only while
+  # memory.enabled, memory.manager.enabled and the memory_search entry of
+  # memory.pipeline.extensions are on.
+  memory:
+    - memory_search
   # Delegation tools - delegate_agent plus its background control plane
   # (src/agent/tools/delegation/); every name is bound only when the expert names it
   # here AND sets delegation.enabled. Children strip this whole category.
@@ -229,6 +235,10 @@ context_management:
   summarization_template: summarization_prompt.txt
   reasoning_level: high  # Only injected when reasoning_method is "prompt" (gpt-oss)
   max_summary_length: 20000
+  # legacy: memory, knowledge, guidance, ... are rebuilt at the request tail
+  # every call. append_only: they are appended to the history once, when
+  # they change (append-only context injection, WP2). The rollback flag.
+  injection_mode: legacy
 
 research:
   # Proxy for accessing paywalled content (e.g., via SSH tunnel to university)
@@ -245,6 +255,7 @@ memory:
   required: false                  # When true, a memory-dependent job pauses for bounded re-dispatch instead of running blind if memory/KB fail to init (self-improvement loop sets this)
   budget_tokens: 4000              # Max tokens for memory injection per LLM call (P-4 A/B, strategy doc §14); the session overlay raises it
   max_memories_per_injection: 50   # Cap on number of memories injected; the session overlay raises it
+  max_memories_per_entry: 5        # context_management.injection_mode append_only: new/changed memories per appended entry; the rest drip in on later requests (D29)
   observer_interval: 5             # Run observer every N turns
   assembler_interval: 7            # Run assembler every N turns (TTL curation)
   default_ttl: 10                  # Default TTL in turns for new memories (guaranteed injection)
@@ -271,6 +282,8 @@ memory:
     policies:
       - gate                         # drop the non-qualifying tail (relative floor)
       - bounded                      # cap the survivors at max_items
+    extensions:
+      - memory_search                # the memory_search tool (tools.memory): hybrid search + the scorers/policies above, or one memory by handle
     # `writers` is role-owned: the worker's in-loop / phase-boundary / assembler
     # set versus the session's elapsed-gate / teardown set. Each overlay
     # declares its own.
@@ -326,6 +339,12 @@ auxiliary:
   # Per fold-call budget for conversation summarization (each pass is one
   # bounded call — src/agent/core/summarizer.py)
   summarization_call_timeout: 240
+  # Reasoning for the summarization calls of a dedicated aux model; the other
+  # tasks keep the model's level. "off" = the family's off switch, else its
+  # lowest effort; null = same level as the other tasks. Quote it: a bare
+  # off is a YAML boolean. Those calls also use the family's sampling from
+  # model_config_matrix.yaml, not `temperature` above.
+  summarization_reasoning_level: "off"
   tasks:
     extract_memories:
       enabled: true

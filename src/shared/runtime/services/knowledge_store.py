@@ -46,6 +46,10 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from shared.backlog_tags import strip_machine_tags
+from shared.runtime.core.context_entries import (
+    UPDATED_ITEM_MARKER,
+    knowledge_item_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2947,7 +2951,10 @@ class KnowledgeStore:
 
     @staticmethod
     def format_note(
-        note: KnowledgeRecord, index: int, source_alias: Optional[str] = None
+        note: KnowledgeRecord,
+        index: int,
+        source_alias: Optional[str] = None,
+        updated: bool = False,
     ) -> str:
         """Format a single note for context injection.
 
@@ -2955,6 +2962,8 @@ class KnowledgeStore:
             note: KnowledgeRecord to format
             index: Display index (1-based)
             source_alias: Optional qualified KB alias for multi-KB injection
+            updated: Mark the note as a newer version of one already in the
+                history (append-only injection, D5)
 
         Returns:
             Formatted note string
@@ -2972,6 +2981,8 @@ class KnowledgeStore:
         arms = getattr(note, "matched_arms", None)
         if isinstance(arms, list) and arms:
             links += f" ⟨{'+'.join(arms)}⟩"
+        if updated:
+            links += f" {UPDATED_ITEM_MARKER}"
 
         # Truncate content for injection
         content = note.content
@@ -2994,6 +3005,7 @@ class KnowledgeStore:
         model: Optional[str] = None,
         bindings: Optional[List[Any]] = None,
         external_watermarks: Optional[Dict[str, Optional[str]]] = None,
+        updated_keys: Optional[Iterable[str]] = None,
     ) -> str:
         """Assemble formatted knowledge block for context injection.
 
@@ -3003,6 +3015,9 @@ class KnowledgeStore:
                 / footer. Falls through to the default family if None.
             bindings: Optional authorized KB bindings used to source-label notes.
             external_watermarks: External alias → indexed commit used by retrieval.
+            updated_keys: Presence keys (``knowledge_item_key``) of notes that
+                replace an earlier version already in the history; they get
+                the "(updated; ...)" marker (append-only injection, D5).
 
         Returns:
             Formatted knowledge block string
@@ -3013,12 +3028,20 @@ class KnowledgeStore:
         from shared.runtime.services.guardrails import format_nudge
 
         binding_by_id = {str(binding.kb_id): binding for binding in (bindings or [])}
+        updated = set(updated_keys or ())
         lines = [format_nudge("knowledge_block_header", model=model), ""]
         for i, note in enumerate(notes, 1):
             kb_id = getattr(note, "kb_id", None) or getattr(note, "project_id", None)
             binding = binding_by_id.get(str(kb_id))
             source_alias = binding.alias if binding is not None else None
-            lines.append(cls.format_note(note, i, source_alias=source_alias))
+            lines.append(
+                cls.format_note(
+                    note,
+                    i,
+                    source_alias=source_alias,
+                    updated=knowledge_item_key(note) in updated,
+                )
+            )
             lines.append("")
 
         tokens_est = sum(len(n.content) // 4 for n in notes)

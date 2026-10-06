@@ -11,14 +11,47 @@ raise into the graphs — memory is an enhancement, a broken plugin must
 not kill a turn — but every contained failure is logged with the
 exception type and recorded in AssembleStats.errors. Loud degradation,
 never silent.
+
+Asynchronous retrieval (``context_management.injection_mode: append_only``,
+WP3 of knowledge-base/knowledge/plans/append_only_context_injection_plan_2026_10_05.md;
+D6-D8, D10, D13, D32 of features/append_only_context_injection.md). The
+manager owns one retrieval task per conversation: ``start_retrieval`` runs
+``assemble`` off the request path (single flight: none starts while one is
+in flight), the finished result waits as the pending result, and the next
+request build takes it in with ``take_retrieval``. The pending result is the
+latest finished retrieval only: a newer one replaces an older one that was
+never taken in, because the planner checks every result against the history
+at that moment anyway. It lives in memory only (the durable copy in
+``threads.metadata`` is WP4). The task is cancelled and joined by
+``close_background`` and ``drain_background``. A structural pipeline failure
+no longer fails the turn there: it is logged at ERROR, audited
+(``memory_pipeline_degraded``) and counted, and that retrieval serves nothing.
+
+Idle-time prefetch (sessions, WP4; D24, D32, D33). At the end of a session
+turn, after the reply, ``prefetch`` runs one retrieval with the latest
+exchange as its query under a hard budget, without retries, and stops as
+soon as new input arrives. Its result is the conversation's pending set: it
+waits in its own slot, and the next ``take_retrieval`` hands it out together
+with the latest request retrieval (one set, merged by record). The caller
+saves the set with the conversation so another process can continue it
+(``seed_prefetch`` takes the stored copy back).
 """
 
 import asyncio
+import dataclasses
 import logging
-from typing import Any, List, Optional, Set, Tuple
+import time
+import uuid
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from agent.services.memory.registry import resolve_memory_plugin
 from agent.services.memory.types import (
+    PREFETCH_CANCELLED,
+    PREFETCH_DEGRADED,
+    PREFETCH_EMPTY,
+    PREFETCH_OK,
+    PREFETCH_SKIPPED,
+    PREFETCH_TIMEOUT,
     AssembleRequest,
     AssembleStats,
     Candidate,
@@ -27,6 +60,8 @@ from agent.services.memory.types import (
     MemoryPayload,
     MemoryPipelineError,
     MemoryRuntime,
+    PrefetchOutcome,
+    RetrievalResult,
     Scored,
     TransientScorerError,
     _StopWatch,
@@ -36,6 +71,134 @@ logger = logging.getLogger(__name__)
 
 #: (name, instance) — names kept for stats, errors, and status surfaces.
 NamedPlugin = Tuple[str, Any]
+
+#: Upper bound on one asynchronous retrieval. Single flight means a hung
+#: retrieval would stop every later one; past this it is cancelled and the
+#: next request starts a fresh one. Far above the reranker's own budget (10 s
+#: per attempt, 3 attempts, backoff) plus the store calls.
+ASYNC_RETRIEVAL_DEADLINE_S = 120.0
+
+#: Audit step written when an asynchronous retrieval meets a structural
+#: pipeline failure (D13). Custom step types follow ``memory_unavailable`` /
+#: ``kb_unavailable`` (agent.core.archiver.audit_unavailable).
+PIPELINE_DEGRADED_STEP = "memory_pipeline_degraded"
+
+#: Audit step of one idle-time prefetch (WP4): the slot time it added and
+#: what it did, so "a few seconds at most" (D33) can be checked per turn.
+PREFETCH_STEP = "memory_prefetch"
+
+#: How often a running prefetch asks whether new input arrived (B8). New
+#: input therefore waits at most about this long for the slot.
+PREFETCH_POLL_INTERVAL_S = 0.25
+
+#: Upper bound on one new-input check. A check that takes longer cancels
+#: the prefetch: the step must never hold the slot it cannot account for.
+PREFETCH_PROBE_TIMEOUT_S = 1.0
+
+#: Counters of :meth:`MemoryManager.retrieval_stats`.
+RETRIEVAL_COUNTERS = (
+    "started",
+    "skipped_in_flight",
+    "completed",
+    "drained",
+    "superseded",
+    "degraded",
+    "timed_out",
+    "cancelled",
+    # Idle-time prefetch (WP4): runs started, outcomes, and how many pending
+    # sets a request took in.
+    "prefetch_started",
+    "prefetch_ok",
+    "prefetch_empty",
+    "prefetch_cancelled",
+    "prefetch_timed_out",
+    "prefetch_degraded",
+    "prefetch_skipped",
+    "prefetch_taken",
+)
+
+_PREFETCH_COUNTER = {
+    PREFETCH_OK: "prefetch_ok",
+    PREFETCH_EMPTY: "prefetch_empty",
+    PREFETCH_CANCELLED: "prefetch_cancelled",
+    PREFETCH_TIMEOUT: "prefetch_timed_out",
+    PREFETCH_DEGRADED: "prefetch_degraded",
+    PREFETCH_SKIPPED: "prefetch_skipped",
+}
+
+
+def _record_key(kind: str, record: Any) -> str:
+    """Identity of a retrieved record across two retrievals (merge dedupe)."""
+    if kind == "knowledge":
+        from shared.runtime.core.context_entries import knowledge_item_key
+
+        return knowledge_item_key(record)
+    record_id = getattr(record, "id", None)
+    if record_id is not None:
+        return f"id:{record_id}"
+    return "text:" + str(getattr(record, "content", "") or "")
+
+
+def merge_retrieval_results(
+    newer: RetrievalResult, prefetched: RetrievalResult
+) -> RetrievalResult:
+    """One pending set from a request retrieval and an idle-time prefetch.
+
+    The newer retrieval's records come first, in its rank order (its query
+    is the current request); the prefetch's records it does not hold follow
+    in theirs. Only ``records`` are merged: the planner renders its entries
+    from them, the legacy ``content``/``messages`` are not used in
+    append_only mode. The result keeps the newer retrieval's seq and stats.
+    """
+    blocks: List[InjectionBlock] = []
+    kinds: List[str] = []
+    for block in [*newer.payload.blocks, *prefetched.payload.blocks]:
+        if block.kind not in kinds:
+            kinds.append(block.kind)
+    for kind in kinds:
+        records: List[Any] = []
+        seen: Set[str] = set()
+        for record in [*newer.records(kind), *prefetched.records(kind)]:
+            key = _record_key(kind, record)
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append(record)
+        first = next(
+            (
+                b
+                for b in [*newer.payload.blocks, *prefetched.payload.blocks]
+                if b.kind == kind
+            ),
+            None,
+        )
+        blocks.append(
+            InjectionBlock(
+                kind=kind,
+                content=first.content if first is not None else "",
+                messages=list(first.messages) if first is not None else [],
+                token_count=sum(getattr(r, "token_count", 0) or 0 for r in records),
+                items=list(first.items) if first is not None else [],
+                records=records,
+            )
+        )
+    return RetrievalResult(
+        payload=MemoryPayload(blocks=blocks, stats=newer.payload.stats),
+        seq=newer.seq,
+        finished_at=newer.finished_at,
+        degraded=newer.degraded,
+        source="merged",
+        pending_id=prefetched.pending_id,
+    )
+
+
+def pipeline_failure_signature(error: MemoryPipelineError) -> str:
+    """``stage:plugin:CauseType`` of a structural failure (D13 dedupe key)."""
+    cause = error.__cause__ or error
+    return (
+        f"{error.stage or 'pipeline'}:{error.plugin or 'unknown'}:"
+        f"{type(cause).__name__}"
+    )
 
 
 class MemoryManager:
@@ -64,6 +227,24 @@ class MemoryManager:
         # Once a persistent-session claimant begins teardown, no detached
         # memory writer may be admitted behind its quiescence barrier.
         self._background_closed = False
+        # Asynchronous retrieval (append_only, WP3): at most one task in
+        # flight, and the latest finished result waiting to be taken in.
+        self._retrieval_task: Optional[asyncio.Task] = None
+        self._pending_retrieval: Optional[RetrievalResult] = None
+        self._retrieval_seq = 0
+        self._retrieval_counts: Dict[str, int] = dict.fromkeys(RETRIEVAL_COUNTERS, 0)
+        # Structural-failure signatures already audited in the current
+        # degraded episode; a successful retrieval ends the episode.
+        self._audited_degradations: Dict[str, int] = {}
+        # Idle-time prefetch (sessions, WP4): the pending set waiting for the
+        # next request, the id of the last set a request took in, and the id
+        # of the set the conversation's durable copy holds (as far as this
+        # process knows; None = nothing stored).
+        self._prefetched: Optional[RetrievalResult] = None
+        self._taken_prefetch_id: Optional[str] = None
+        self._durable_pending_id: Optional[str] = None
+        # Strong refs to the audit-row writes (run in a thread, never awaited).
+        self._audit_tasks: Set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------
     # Binding
@@ -141,6 +322,8 @@ class MemoryManager:
         ⇒ required" — the caller fails the turn loud). See
         knowledge-base/knowledge/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md
         and knowledge-base/knowledge/issues/reranker_transient_fault_hard_fails_job.md.
+        In append_only mode ``start_retrieval`` runs this off the request
+        path and reports that error instead of raising it (D13).
         """
         watch = _StopWatch()
         stats = AssembleStats()
@@ -181,7 +364,9 @@ class MemoryManager:
                     self._record_failure(stats, "scorer", name, e)
                     raise MemoryPipelineError(
                         f"required memory scorer '{name}' failed at runtime: "
-                        f"{type(e).__name__}: {e}"
+                        f"{type(e).__name__}: {e}",
+                        stage="scorer",
+                        plugin=name,
                     ) from e
 
             for name, policy in self._policies:
@@ -276,9 +461,478 @@ class MemoryManager:
                         }
                         for s in group
                     ],
+                    records=records,
                 )
             )
         return blocks
+
+    # ------------------------------------------------------------------
+    # Asynchronous retrieval (append_only, WP3)
+    # ------------------------------------------------------------------
+
+    @property
+    def retrieval_in_flight(self) -> bool:
+        """Whether a retrieval task is running."""
+        task = self._retrieval_task
+        return task is not None and not task.done()
+
+    def start_retrieval(self, req: AssembleRequest) -> bool:
+        """Start ``assemble(req)`` off the request path (D6, D7, D10).
+
+        Never awaits. Returns True when a retrieval started; False when one
+        is still in flight (single flight: this request's query is not run,
+        the next request may start one) or when teardown closed the manager.
+        The result waits for :meth:`take_retrieval`.
+        """
+        if self._background_closed:
+            return False
+        if self.retrieval_in_flight:
+            self._retrieval_counts["skipped_in_flight"] += 1
+            return False
+        self._retrieval_seq += 1
+        self._retrieval_counts["started"] += 1
+        task = asyncio.create_task(
+            self._run_retrieval(req, self._retrieval_seq),
+            name=f"memory-retrieval-{self._retrieval_seq}",
+        )
+        self._retrieval_task = task
+        task.add_done_callback(self._retrieval_settled)
+        return True
+
+    def take_retrieval(self) -> Optional[RetrievalResult]:
+        """Take in the pending retrieval result, if one has finished (D8).
+
+        Never awaits; the request build calls it. The result is the latest
+        finished retrieval and is handed out once. The caller plans from its
+        records against the history as it is now, so an older or repeated
+        result is harmless.
+
+        A pending idle-time prefetch (WP4) is handed out with it: alone, or
+        merged with a request retrieval that finished too
+        (:func:`merge_retrieval_results`), so neither replaces the other.
+        """
+        result, self._pending_retrieval = self._pending_retrieval, None
+        prefetched, self._prefetched = self._prefetched, None
+        if prefetched is not None:
+            self._taken_prefetch_id = prefetched.pending_id
+            self._retrieval_counts["prefetch_taken"] += 1
+            result = (
+                prefetched
+                if result is None
+                else merge_retrieval_results(result, prefetched)
+            )
+        if result is not None:
+            self._retrieval_counts["drained"] += 1
+        return result
+
+    def retrieval_stats(self) -> Dict[str, int]:
+        """Counters of the asynchronous retrieval (status, audit rows)."""
+        return dict(self._retrieval_counts)
+
+    async def cancel_retrieval(self, timeout: float = 5.0) -> bool:
+        """Cancel and join the running retrieval; True if one was running.
+
+        Raises ``RuntimeError`` when the task ignores cancellation: it may
+        still write (the TTL tick of ``recall_two_tier``), so a teardown
+        barrier must not report quiescence.
+        """
+        task = self._retrieval_task
+        if task is None or task.done():
+            return False
+        task.cancel()
+        _, pending = await asyncio.wait({task}, timeout=max(0.0, timeout))
+        if pending:
+            raise RuntimeError("memory retrieval task ignored cancellation")
+        return True
+
+    async def _run_retrieval(self, req: AssembleRequest, seq: int) -> None:
+        """One retrieval; its result replaces any result not yet taken in."""
+        watch = _StopWatch()
+        degraded: Optional[str] = None
+        try:
+            payload = await asyncio.wait_for(
+                self.assemble(req), timeout=ASYNC_RETRIEVAL_DEADLINE_S
+            )
+        except MemoryPipelineError as e:
+            # D13: a structural failure no longer fails the turn. Loud
+            # (ERROR log, audit, counter); this retrieval serves nothing.
+            degraded = pipeline_failure_signature(e)
+            self._report_degraded(e, degraded)
+            payload = self._empty_payload(watch, f"pipeline: {e}")
+        except (asyncio.TimeoutError, TimeoutError):
+            self._retrieval_counts["timed_out"] += 1
+            logger.warning(
+                "Memory retrieval %d exceeded %gs and was cancelled; the "
+                "next request starts a new one",
+                seq,
+                ASYNC_RETRIEVAL_DEADLINE_S,
+            )
+            payload = self._empty_payload(watch, "retrieval: deadline exceeded")
+        else:
+            if self._audited_degradations:
+                logger.info(
+                    "Memory pipeline recovered after %s",
+                    sorted(self._audited_degradations),
+                )
+                self._audited_degradations.clear()
+        if self._pending_retrieval is not None:
+            self._retrieval_counts["superseded"] += 1
+        self._pending_retrieval = RetrievalResult(
+            payload=payload,
+            seq=seq,
+            finished_at=time.monotonic(),
+            degraded=degraded,
+        )
+        self._retrieval_counts["completed"] += 1
+
+    # ------------------------------------------------------------------
+    # Idle-time prefetch and the pending set (sessions, WP4)
+    # ------------------------------------------------------------------
+
+    @property
+    def pending_prefetch(self) -> Optional[RetrievalResult]:
+        """The prefetched pending set no request has taken in yet."""
+        return self._prefetched
+
+    @property
+    def durable_pending_id(self) -> Optional[str]:
+        """Id of the set the conversation's durable copy holds, if any."""
+        return self._durable_pending_id
+
+    def note_pending_saved(self, pending_id: Optional[str]) -> None:
+        """Record what the durable copy now holds (None: it was cleared)."""
+        self._durable_pending_id = pending_id
+
+    def seed_prefetch(self, result: RetrievalResult) -> bool:
+        """Hold a pending set read back from the durable copy (D32).
+
+        The next request takes it in like a fresh prefetch. A set this
+        manager already holds or has already taken in is not taken again
+        (a warm session reading its own set back), and a set it holds wins
+        over the stored one: it is at least as recent. Returns True when the
+        stored set became the pending set.
+        """
+        pending_id = result.pending_id
+        if not pending_id:
+            return False
+        self._durable_pending_id = pending_id
+        if self._background_closed:
+            return False
+        if self._prefetched is not None or self._taken_prefetch_id == pending_id:
+            return False
+        self._prefetched = result
+        return True
+
+    async def prefetch(
+        self,
+        req: AssembleRequest,
+        *,
+        budget_s: float,
+        should_cancel: Optional[Callable[[], Awaitable[Any]]] = None,
+        poll_interval_s: float = PREFETCH_POLL_INTERVAL_S,
+        keep: Optional[Callable[[str, Any], bool]] = None,
+    ) -> PrefetchOutcome:
+        """One retrieval in the idle time after a session turn (D24, D33).
+
+        Runs ``assemble(req)`` under a hard budget of ``budget_s`` seconds.
+        Every ``poll_interval_s`` (and once before it starts) it awaits
+        ``should_cancel()``; a truthy answer (a string names the reason)
+        cancels the retrieval, so new input never waits for it longer than
+        one poll interval (B8). A check that fails or takes longer than
+        :data:`PREFETCH_PROBE_TIMEOUT_S` cancels it too. On timeout the
+        retrieval is cancelled and nothing is kept. Callers pass
+        ``req.retries=False``: no backoff runs inside the budget.
+
+        Single flight (D7): a request retrieval still running is cancelled
+        first; its query is older than the exchange. The prefetch task is
+        the manager's retrieval task while it runs, so teardown
+        (``close_background``) cancels it like any retrieval.
+
+        ``keep(kind, record)``, when given, filters the records first (the
+        session drops what its history already holds unchanged, so the
+        pending set carries only what the next request would append).
+
+        A result with records becomes the pending set (replacing an older
+        prefetch never taken in) under a fresh ``pending_id``. A structural
+        pipeline failure is reported as in the asynchronous path (D13) and
+        serves nothing. Never raises, except a cancellation of the caller.
+        """
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + max(0.0, float(budget_s))
+
+        def _outcome(status: str, **fields: Any) -> PrefetchOutcome:
+            self._retrieval_counts[_PREFETCH_COUNTER[status]] += 1
+            return PrefetchOutcome(
+                status=status,
+                duration_ms=(loop.time() - started) * 1000.0,
+                **fields,
+            )
+
+        if self._background_closed:
+            return _outcome(PREFETCH_SKIPPED, reason="closed")
+        if budget_s <= 0:
+            return _outcome(PREFETCH_SKIPPED, reason="disabled")
+        reason = await self._prefetch_probe(should_cancel, deadline)
+        if reason is not None:
+            return _outcome(PREFETCH_CANCELLED, reason=reason)
+        if self.retrieval_in_flight:
+            try:
+                await self.cancel_retrieval(
+                    timeout=max(0.0, min(1.0, deadline - loop.time()))
+                )
+            except RuntimeError:
+                return _outcome(PREFETCH_SKIPPED, reason="retrieval_stuck")
+
+        self._retrieval_seq += 1
+        seq = self._retrieval_seq
+        self._retrieval_counts["prefetch_started"] += 1
+        task = asyncio.create_task(self.assemble(req), name=f"memory-prefetch-{seq}")
+        self._retrieval_task = task
+        task.add_done_callback(self._prefetch_settled)
+
+        status: Optional[str] = None
+        try:
+            while not task.done():
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    status = PREFETCH_TIMEOUT
+                    reason = "budget"
+                    break
+                await asyncio.wait({task}, timeout=min(poll_interval_s, remaining))
+                if task.done():
+                    break
+                reason = await self._prefetch_probe(should_cancel, deadline)
+                if reason is not None:
+                    status = PREFETCH_CANCELLED
+                    break
+        finally:
+            if not task.done():
+                task.cancel()
+                # Bounded join: a retrieval that ignores cancellation stays
+                # the retrieval task, so teardown still sees it.
+                await asyncio.wait({task}, timeout=1.0)
+
+        if status is not None:
+            if status == PREFETCH_TIMEOUT:
+                logger.info(
+                    "Memory prefetch %d exceeded its %.1fs budget and was "
+                    "cancelled; the turn ends without one",
+                    seq,
+                    budget_s,
+                )
+            return _outcome(status, reason=reason)
+        if task.cancelled():
+            # Teardown cancelled it under us.
+            return _outcome(PREFETCH_CANCELLED, reason="cancelled")
+        error = task.exception()
+        if isinstance(error, MemoryPipelineError):
+            signature = pipeline_failure_signature(error)
+            self._report_degraded(error, signature)
+            return _outcome(PREFETCH_DEGRADED, reason=signature)
+        if error is not None:  # pragma: no cover - assemble contains the rest
+            logger.error(
+                "Memory prefetch %d failed: %s: %s", seq, type(error).__name__, error
+            )
+            return _outcome(PREFETCH_SKIPPED, reason=f"error: {type(error).__name__}")
+
+        payload: MemoryPayload = task.result()
+        if self._audited_degradations:
+            logger.info(
+                "Memory pipeline recovered after %s", sorted(self._audited_degradations)
+            )
+            self._audited_degradations.clear()
+        dropped = 0
+        if keep is not None:
+            try:
+                blocks = []
+                for block in payload.blocks:
+                    kept = [r for r in block.records if keep(block.kind, r)]
+                    dropped += len(block.records) - len(kept)
+                    blocks.append(dataclasses.replace(block, records=kept))
+                payload = MemoryPayload(blocks=blocks, stats=payload.stats)
+            except Exception as e:
+                # Keep everything: the planner checks presence again anyway.
+                dropped = 0
+                logger.warning(
+                    "Memory prefetch filter failed (%s: %s); keeping every record",
+                    type(e).__name__,
+                    e,
+                )
+        result = RetrievalResult(
+            payload=payload,
+            seq=seq,
+            finished_at=time.monotonic(),
+            source="prefetch",
+            pending_id=uuid.uuid4().hex,
+        )
+        memories = len(result.records("memory"))
+        knowledge = len(result.records("knowledge"))
+        errors = list(payload.stats.errors)
+        if not (memories or knowledge):
+            return _outcome(
+                PREFETCH_EMPTY,
+                reason="all_present" if dropped else None,
+                errors=errors,
+            )
+        if self._prefetched is not None:
+            self._retrieval_counts["superseded"] += 1
+        self._prefetched = result
+        return _outcome(
+            PREFETCH_OK,
+            memories=memories,
+            knowledge=knowledge,
+            errors=errors,
+            result=result,
+        )
+
+    async def _prefetch_probe(
+        self,
+        should_cancel: Optional[Callable[[], Awaitable[Any]]],
+        deadline: float,
+    ) -> Optional[str]:
+        """Why the prefetch must stop now (new input, an interrupt), or None."""
+        if should_cancel is None:
+            return None
+        remaining = deadline - asyncio.get_running_loop().time()
+        timeout = max(0.05, min(PREFETCH_PROBE_TIMEOUT_S, remaining))
+        try:
+            answer = await asyncio.wait_for(should_cancel(), timeout=timeout)
+        except asyncio.CancelledError:
+            raise
+        except (asyncio.TimeoutError, TimeoutError):
+            return "probe_timeout"
+        except Exception as e:
+            logger.warning(
+                "Memory prefetch input check failed (%s: %s); cancelling it",
+                type(e).__name__,
+                e,
+            )
+            return "probe_failed"
+        if not answer:
+            return None
+        return answer if isinstance(answer, str) else "new_input"
+
+    def _prefetch_settled(self, task: "asyncio.Task") -> None:
+        """Done callback of the prefetch task: release single flight."""
+        if self._retrieval_task is task:
+            self._retrieval_task = None
+        if not task.cancelled():
+            task.exception()  # retrieved by prefetch(); silences the warning
+
+    def audit_prefetch(self, outcome: PrefetchOutcome, **data: Any) -> None:
+        """Write the ``memory_prefetch`` audit row off the request path.
+
+        The archiver writes synchronously, so the row is written in a
+        thread and never awaited: the audit adds no slot time.
+        """
+        job_id = self.runtime.job_id
+        if not job_id:
+            return
+        payload = {**outcome.to_dict(), **data, "retrieval": self.retrieval_stats()}
+        iteration = data.get("turn")
+        agent_type = self.runtime.agent_type or ""
+
+        def _write() -> None:
+            try:
+                from agent.core.archiver import get_archiver
+
+                archiver = get_archiver()
+                if archiver is None:
+                    return
+                archiver.audit_step(
+                    job_id=str(job_id),
+                    agent_type=agent_type,
+                    step_type=PREFETCH_STEP,
+                    node_name="memory_prefetch",
+                    iteration=int(iteration) if isinstance(iteration, int) else 0,
+                    data=payload,
+                    latency_ms=int(outcome.duration_ms),
+                )
+            except Exception as e:  # pragma: no cover - audit never breaks a turn
+                logger.debug(
+                    "memory_prefetch audit failed: %s: %s", type(e).__name__, e
+                )
+
+        try:
+            task = asyncio.get_running_loop().create_task(
+                asyncio.to_thread(_write), name="memory-prefetch-audit"
+            )
+        except RuntimeError:  # pragma: no cover - no running loop
+            return
+        self._audit_tasks.add(task)
+        task.add_done_callback(self._audit_tasks.discard)
+
+    @staticmethod
+    def _empty_payload(watch: _StopWatch, error: str) -> MemoryPayload:
+        stats = AssembleStats(errors=[error])
+        stats.latency_ms = watch.elapsed_ms()
+        return MemoryPayload(blocks=[], stats=stats)
+
+    def _retrieval_settled(self, task: "asyncio.Task") -> None:
+        """Done callback: count a cancellation, retrieve the outcome."""
+        if self._retrieval_task is task:
+            self._retrieval_task = None
+        if task.cancelled():
+            self._retrieval_counts["cancelled"] += 1
+            return
+        error = task.exception()
+        if error is not None:
+            # _run_retrieval contains everything assemble can raise; this
+            # is a manager bug, never a reason to fail a turn.
+            logger.error(
+                "Memory retrieval task failed: %s: %s",
+                type(error).__name__,
+                error,
+            )
+
+    def _report_degraded(self, error: MemoryPipelineError, signature: str) -> None:
+        """D13: log, count and audit a structural failure without raising.
+
+        Every occurrence logs at ERROR and counts. The audit row is written
+        once per signature per degraded episode (until a retrieval succeeds),
+        so a broken reranker does not write one row per request.
+        """
+        self._retrieval_counts["degraded"] += 1
+        occurrences = self._audited_degradations.get(signature, 0) + 1
+        self._audited_degradations[signature] = occurrences
+        logger.error(
+            "Memory pipeline degraded (%s): %s — this retrieval serves no "
+            "memory; the turn continues (D13, occurrence %d)",
+            signature,
+            error,
+            occurrences,
+        )
+        if occurrences > 1:
+            return
+        job_id = self.runtime.job_id
+        if not job_id:
+            return
+        try:
+            from agent.core.archiver import get_archiver
+
+            archiver = get_archiver()
+            if archiver is None:
+                return
+            cause = error.__cause__ or error
+            archiver.audit_step(
+                job_id=str(job_id),
+                agent_type=self.runtime.agent_type or "",
+                step_type=PIPELINE_DEGRADED_STEP,
+                node_name="memory_retrieval",
+                iteration=0,
+                data={
+                    "component": f"{error.stage or 'pipeline'}:{error.plugin or 'unknown'}",
+                    "signature": signature,
+                    "error": str(cause),
+                    "error_type": type(cause).__name__,
+                    "retrieval": self.retrieval_stats(),
+                },
+            )
+        except Exception as e:  # pragma: no cover - audit never breaks retrieval
+            logger.debug(
+                "memory_pipeline_degraded audit failed: %s: %s", type(e).__name__, e
+            )
 
     # ------------------------------------------------------------------
     # Write side
@@ -345,7 +999,14 @@ class MemoryManager:
         by ``timeout`` — a hung aux endpoint must not wedge job completion; on
         timeout the still-running tasks stay detached (best-effort) and the job
         proceeds. ``capture()`` never raises, so gathering is always clean.
+
+        A running retrieval (append_only) is cancelled first: no later request
+        takes its result in. It is not counted in the return value.
         """
+        try:
+            await self.cancel_retrieval()
+        except RuntimeError as e:
+            logger.warning("drain_background: %s; leaving it detached", e)
         pending = [t for t in self._bg_tasks if not t.done()]
         if not pending:
             return 0
@@ -377,11 +1038,23 @@ class MemoryManager:
         task can write RecallStore after a queue transition.  A task that
         suppresses cancellation is surfaced to the caller so the physical
         lease remains held for the reaper rather than exposing a successor.
+
+        The retrieval task (append_only) is cancelled at once, not drained:
+        it only reads, but its ``recall_two_tier`` TTL tick writes, so it is
+        joined like the captures and a retrieval that ignores cancellation
+        fails the barrier too. It is not counted in the return value.
         """
 
         self._background_closed = True
+        retrieval_stuck: Optional[RuntimeError] = None
+        try:
+            await self.cancel_retrieval(timeout=cancel_timeout)
+        except RuntimeError as e:
+            retrieval_stuck = e
         pending = {task for task in self._bg_tasks if not task.done()}
         if not pending:
+            if retrieval_stuck is not None:
+                raise retrieval_stuck
             return 0
         count = len(pending)
         _, pending = await asyncio.wait(pending, timeout=max(0.0, drain_timeout))
@@ -402,6 +1075,8 @@ class MemoryManager:
             raise RuntimeError(
                 f"{len(pending)} memory background task(s) ignored cancellation"
             )
+        if retrieval_stuck is not None:
+            raise retrieval_stuck
         return count
 
     # ------------------------------------------------------------------

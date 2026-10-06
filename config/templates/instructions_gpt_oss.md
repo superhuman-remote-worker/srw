@@ -39,7 +39,7 @@ You alternate between two phases:
 ### Key Files
 
 - `plan.md` - Execution plan and progress tracker
-- `todos.yaml` - Current task list (injected every call)
+- `todos.yaml` - Current task list (returned by the todo tools; `todo_list` shows it)
 - `sources/` - Source documents and input materials
 - `output/` - Deliverables and results
 - `archive/` - Phase retrospectives and archived todos

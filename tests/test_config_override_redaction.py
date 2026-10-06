@@ -203,12 +203,14 @@ class TestRedactThreadMetadataShape:
                     "_stateless_workspace_process_zero_observation": {
                         "runtime_incarnation": "server-owned"
                     },
+                    "aoci_pending_memory": {"v": 1, "id": "set-1", "memory": []},
                     "keep": True,
                 },
             }
         )
         assert "_workspace_binding" not in out["metadata"]
         assert "_stateless_workspace_process_zero_observation" not in out["metadata"]
+        assert "aoci_pending_memory" not in out["metadata"]
         assert out["metadata"]["keep"] is True
 
     def test_runtime_retirement_authority_is_redacted_to_safe_state(self):

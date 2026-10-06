@@ -89,12 +89,38 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
     # WP3: the roster runtime knobs on DelegationConfig (schema + overlay
     # values; the dataclass defaults are identical, so the effective-config
     # identity below holds without an exclusion).
-    "worker": ("delegation.max_concurrent", "delegation.run_in_background_default"),
+    # Summarizer thinking off: the shared root states
+    # auxiliary.summarization_reasoning_level (both roles; same value as the
+    # dataclass default, so the effective compare needs no exclusion).
+    # Append-only context injection WP2: the shared root states
+    # context_management.injection_mode and memory.max_memories_per_entry
+    # (both roles; same values as the dataclass defaults, so the effective
+    # compare needs no exclusion).
+    # Append-only context injection WP5a: the shared root binds memory_search
+    # (a new category, tools.memory) and its memory.pipeline.extensions entry,
+    # both roles (D34). Both differ from the dataclass defaults ([]), so the
+    # effective compare strips them on both sides.
+    "worker": (
+        "delegation.max_concurrent",
+        "delegation.run_in_background_default",
+        "auxiliary.summarization_reasoning_level",
+        "context_management.injection_mode",
+        "memory.max_memories_per_entry",
+        "tools.memory",
+        "memory.pipeline.extensions",
+    ),
     # U3 WP1: the persistent loop reads limits.llm_inproc_retries (it was a
     # hard-coded 3); the overlay pins the historical 3 against the dataclass
     # default of 5, so the effective compare strips it too (see
     # ``_without_effective_additions``).
-    "session": ("limits.llm_inproc_retries",),
+    "session": (
+        "limits.llm_inproc_retries",
+        "auxiliary.summarization_reasoning_level",
+        "context_management.injection_mode",
+        "memory.max_memories_per_entry",
+        "tools.memory",
+        "memory.pipeline.extensions",
+    ),
 }
 #: Keys later work packages DELETED from an overlay after the baseline was
 #: frozen (role -> dotted paths, with the WP that removed them) — the mirror

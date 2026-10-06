@@ -4,9 +4,12 @@ Used by tests/test_memory_worker_equivalence.py and
 tests/test_memory_persistent_equivalence.py — same fixture records, store
 mocks, golden block snapshots, and message normalization on both sides so
 the worker and persistent parity suites pin the identical transplanted
-pipeline. Not a test module (underscore prefix, like _fs_backend.py).
+pipeline. The asynchronous retrieval helpers (``GatedRetriever`` and
+friends) serve tests/test_memory_async_retrieval.py and the append_only
+graph suites. Not a test module (underscore prefix, like _fs_backend.py).
 """
 
+import asyncio
 import uuid as uuid_module
 from unittest.mock import AsyncMock
 
@@ -22,10 +25,13 @@ PROJECT_ID = "12345678-1234-5678-1234-567812345678"
 # Golden snapshots of the rendered blocks for the fixture records below,
 # generated from the real assemblers pre-refactor (2026-06-11). They pin
 # the shared renderers against drift while the legacy path is frozen.
+# Append-only context injection 2e (D11, spec §G/O12) removed the per-turn
+# "pinned, N turns left" clause from the memory line; the pinned/retrieved
+# split and the footer stay.
 GOLDEN_MEMORY_BLOCK = (
     "--- Pinned Memories (TTL-active) ---\n"
     "\n"
-    "[1] (pinned, 3 turns left, importance: 0.8, phase 2, preference)\n"
+    "[1] (importance: 0.8, phase 2, preference)\n"
     "User prefers ruff with line length 88.\n"
     "\n"
     "--- Retrieved Memories (relevance-ranked) ---\n"
@@ -108,6 +114,89 @@ def make_kb_mock(notes=None):
     kb = AsyncMock()
     kb.hybrid_search.return_value = list(notes or [])
     return kb
+
+
+# ---------------------------------------------------------------------------
+# Asynchronous retrieval (append_only, WP3)
+# ---------------------------------------------------------------------------
+
+
+class GatedRetriever:
+    """Memory retriever whose every call waits until the test releases it.
+
+    Drives the manager's off-request-path retrieval deterministically: a
+    call is in flight until ``release()``; ``auto`` releases each call at
+    once. Records the query of every call and how many were cancelled.
+    """
+
+    def __init__(self, memories=None, *, auto: bool = False):
+        self.memories = list(make_memories() if memories is None else memories)
+        self.auto = auto
+        self.queries = []
+        self.gates = []
+        self.cancelled = 0
+
+    async def retrieve(self, req):
+        from agent.services.memory import Candidate
+
+        self.queries.append(req.query_text)
+        gate = asyncio.Event()
+        self.gates.append(gate)
+        if self.auto:
+            gate.set()
+        try:
+            await gate.wait()
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        return [
+            Candidate(
+                kind="memory",
+                text=memory.content,
+                token_count=memory.token_count or 0,
+                record=memory,
+            )
+            for memory in self.memories
+        ]
+
+    def release(self, index: int = -1) -> None:
+        self.gates[index].set()
+
+
+class BrokenScorer:
+    """A scorer that fails structurally (``ValueError``) or transiently."""
+
+    def __init__(self, error: Exception):
+        self.error = error
+        self.calls = 0
+
+    async def score(self, req, items):
+        self.calls += 1
+        if self.error is None:
+            return items
+        raise self.error
+
+
+def make_async_manager(retriever, *, scorer=None, job_id="job-async", agent_type=None):
+    """A MemoryManager with one retriever (and optionally one scorer)."""
+    from agent.services.memory import MemoryManager, MemoryRuntime
+
+    return MemoryManager(
+        MemoryRuntime(job_id=job_id, agent_type=agent_type),
+        retrievers=[("gated", retriever)],
+        scorers=[("reranker", scorer)] if scorer is not None else None,
+    )
+
+
+async def settle_retrieval(manager, rounds: int = 100) -> None:
+    """Yield to the loop until the manager's retrieval task is done."""
+    for _ in range(rounds):
+        if not manager.retrieval_in_flight:
+            # One more turn so the done callback has run too.
+            await asyncio.sleep(0)
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("the memory retrieval did not settle")
 
 
 def _id_prefix(call_id):

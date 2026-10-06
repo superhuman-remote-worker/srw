@@ -11,6 +11,7 @@ from shared.orch_surface.jobs import registry_metadata
 
 from shared.tool_catalog.names import (
     APP_GUIDE_LOADER_TOOL,
+    MEMORY_SEARCH_TOOL_NAME,
     PRODUCT_CAPABILITIES_TOOL_NAME,
 )
 
@@ -701,6 +702,25 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "description": "Regenerate the OKF index.md for a knowledge base",
         "category": "knowledge",
         "short_description": "Regenerate index.md (grouped links by type).",
+        "phases": ["strategic", "tactical"],
+    },
+}
+
+
+# memory/__init__. The bound tool delegates to the ``memory_search`` extension
+# of the session's or job's MemoryManager (``memory.pipeline.extensions``);
+# ``get_all_tool_names`` binds it only while that extension can run.
+MEMORY_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
+    MEMORY_SEARCH_TOOL_NAME: {
+        "module": "memory",
+        "function": "memory_search",
+        "description": (
+            "Search the project's long-term memory (facts, decisions, "
+            "preferences and fixes from earlier jobs and sessions) for "
+            "something the conversation does not already hold"
+        ),
+        "category": "memory",
+        "short_description": "Search project memory for earlier facts and decisions.",
         "phases": ["strategic", "tactical"],
     },
 }

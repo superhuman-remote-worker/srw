@@ -1050,6 +1050,60 @@
             }
           ]
         },
+        "memory": {
+          "description": "Project memory tools (src/agent/tools/memory/): memory_search, the model's own lookup into the memories that are otherwise pushed as context. Bound only while memory.enabled, memory.manager.enabled and the same-named memory.pipeline.extensions entry are on. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "memory_search"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
         "mcp": {
           "description": "MCP datasource tools, discovered at runtime; no static registry membership, so `true` resolves to the '*' sentinel expanded after MCP discovery. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "oneOf": [

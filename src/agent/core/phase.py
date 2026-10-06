@@ -1691,6 +1691,27 @@ def push_evidence_snapshot(
         return False
 
 
+def _with_todo_list(
+    text: str,
+    todo_manager: "TodoManager",
+    *,
+    is_strategic: bool,
+    phase_number: int,
+) -> str:
+    """Append the incoming phase's todo list to its phase-start message.
+
+    The list is not re-sent with every request (append-only context
+    injection, D17-D19); it enters the history once, here, where it changes.
+    The manager's phase fields are synced first so the rendering matches what
+    ``TodoManager.format_for_injection`` returns for the rest of the phase
+    (``handle_transition`` sets the same values after a successful
+    transition), which is what ``TodoManager.list_restatement`` looks for.
+    """
+    todo_manager.is_strategic_phase = is_strategic
+    todo_manager.phase_number = phase_number
+    return f"{text}\n\n{todo_manager.format_for_injection()}"
+
+
 def on_strategic_phase_complete(
     state: "UniversalAgentState",
     workspace: "WorkspaceManager",
@@ -1713,7 +1734,7 @@ def on_strategic_phase_complete(
     3. This function checks for staged todos and applies them
 
     On success:
-    - Injects phase boundary marker message
+    - Injects phase boundary marker message carrying the new todo list
     - Applies staged todos to TodoManager
     - Flips to tactical phase
     - Increments phase_number
@@ -1811,12 +1832,17 @@ def on_strategic_phase_complete(
 
     model = config.llm.model if (config and config.llm) else None
     phase_marker = HumanMessage(
-        content=format_nudge(
-            "phase_transition_strategic_to_tactical",
-            model=model,
+        content=_with_todo_list(
+            format_nudge(
+                "phase_transition_strategic_to_tactical",
+                model=model,
+                phase_number=phase_number + 1,
+                phase_name=phase_name,
+                todo_count=todo_count,
+            ),
+            todo_manager,
+            is_strategic=False,
             phase_number=phase_number + 1,
-            phase_name=phase_name,
-            todo_count=todo_count,
         )
     )
 
@@ -1847,7 +1873,7 @@ def on_tactical_phase_complete(
     It transitions to strategic phase with predefined todos.
 
     On success:
-    - Injects phase boundary marker message
+    - Injects phase boundary marker message carrying the new todo list
     - Loads predefined strategic todos
     - Flips to strategic phase
     - Increments phase_number
@@ -1906,9 +1932,14 @@ def on_tactical_phase_complete(
 
     model = config.llm.model if (config and config.llm) else None
     phase_marker = HumanMessage(
-        content=format_nudge(
-            "phase_transition_tactical_to_strategic",
-            model=model,
+        content=_with_todo_list(
+            format_nudge(
+                "phase_transition_tactical_to_strategic",
+                model=model,
+                phase_number=phase_number + 1,
+            ),
+            todo_manager,
+            is_strategic=True,
             phase_number=phase_number + 1,
         )
     )

@@ -35,6 +35,7 @@ from shared.runtime.core.loader import (
     LLMConfig,
     load_agent_config,
     load_config_from_resolved,
+    create_auxiliary_llms,
     create_llm,
     get_all_tool_names,
     resolve_config_path,
@@ -628,22 +629,10 @@ class UniversalAgent:
             model_settings = resolve_model_settings(
                 aux_config.model, self.config._deployment_dir
             )
-            # AuxiliaryConfig fields (temperature) take precedence;
-            # settings matrix provides top_p, top_k, model_max_context_tokens
-            aux_llm_config = LLMConfig(
-                model=aux_config.model,
-                base_url=aux_config.base_url,
-                api_key=aux_config.api_key,
-                provider=aux_config.provider,
-                extra_headers=aux_config.extra_headers,
-                temperature=aux_config.temperature,
-                top_p=model_settings.get("top_p"),
-                top_k=model_settings.get("top_k"),
-                model_max_context_tokens=model_settings.get("model_max_context_tokens"),
-                extra_body=model_settings.get("extra_body"),
-                max_retries=1,
-            )
-            aux_llm = create_llm(aux_llm_config, limits=limits)
+            aux_clients = create_auxiliary_llms(aux_config, model_settings, limits)
+            aux_llm_config = aux_clients.config
+            aux_llm = aux_clients.llm
+            aux_summarization_llm = aux_clients.summarization_llm
             aux_window = aux_llm_config.model_max_context_tokens or main_window
             # Drop-in fallback for a dead/unreachable dedicated aux model: the
             # summarization LLM (main working model). Keeps compaction + memory
@@ -654,7 +643,8 @@ class UniversalAgent:
                 f"Created auxiliary LLM: {aux_config.model}"
                 f" (settings matrix: top_p={aux_llm_config.top_p},"
                 f" top_k={aux_llm_config.top_k},"
-                f" max_ctx={aux_llm_config.model_max_context_tokens})"
+                f" max_ctx={aux_llm_config.model_max_context_tokens};"
+                f" summarization reasoning={aux_config.summarization_reasoning_level})"
             )
             aux_structured_output_method = model_settings.get(
                 "structured_output_method", "json_schema"
@@ -666,6 +656,7 @@ class UniversalAgent:
             # aux already IS the main model — nothing to fall back to.
             aux_fallback = None
             aux_fallback_method = None
+            aux_summarization_llm = None
             aux_structured_output_method = summarization_structured_output_method
             logger.info("AuxiliaryLLM: reusing summarization LLM")
 
@@ -677,6 +668,7 @@ class UniversalAgent:
             fallback_llm=aux_fallback,
             structured_output_method=aux_structured_output_method,
             fallback_structured_output_method=aux_fallback_method,
+            summarization_llm=aux_summarization_llm,
         )
         self._wire_aux_job_context(_prev_aux, self._auxiliary_llm)
 
@@ -1083,6 +1075,7 @@ class UniversalAgent:
                 tool_context=self._tool_context,
                 postgres_db=self.postgres_conn,
             )
+            self._publish_memory_service()
 
             # Execute graph
             # Use job_id as thread_id (new format), with fallback to legacy format for old jobs
@@ -2782,11 +2775,25 @@ class UniversalAgent:
             tool_context=self._tool_context,
             postgres_db=self.postgres_conn,
         )
+        self._publish_memory_service()
         logger.info(
             f"[{job_id}] Workspace upgraded to {target_tier}; graph rebuilt with "
             f"shell/git tools — resuming in process"
         )
         return True
+
+    def _publish_memory_service(self) -> None:
+        """Hand the graph's MemoryManager to the tools (``memory_search``).
+
+        The manager is bound inside the graph build, after the tools were
+        loaded and bound to the LLM, so memory tools resolve it at call time
+        from ``ToolContext.memory_service`` (append-only context injection,
+        D25/D34). None when memory or the manager seam is off.
+        """
+        if self._tool_context is not None:
+            self._tool_context.memory_service = getattr(
+                self._graph, "_srw_memory_service", None
+            )
 
     def _load_workspace_template(self) -> str:
         """Load the workspace.md template for the nested loop graph.
