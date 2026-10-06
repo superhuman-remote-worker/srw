@@ -264,7 +264,7 @@ show nothing. On a default installation a container Session has no workspace
 status line at all. Where your operator runs Sessions on stateless executors
 (`agent.stateless.enabled`) without startup-stage tracking, it keeps saying
 "Checking workspace scheduling; the result is not yet confirmed." You can still
-End a Session whose image can't be pulled. See
+End a Session whose image can't be pulled when it first starts. See
 [When a workspace can't start](../examples/manifests/container-workspace-templates.md#when-a-workspace-cant-start).
 To have the trial Job run your tools, give it an Expert with a shell, such as
 **Engineer**: pick it under **Agent Expert** on New Job, or pass

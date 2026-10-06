@@ -425,7 +425,7 @@ workspace didn't start. A Session may report nothing: a pinned container Session
 (the default lane) has no workspace status, and a stateless Session without
 startup-stage tracking keeps showing "Checking workspace scheduling; the result
 is not yet confirmed." End still works for a Session whose image can't be
-pulled (see below). Startup-stage tracking is Helm
+pulled when it first starts (see below). Startup-stage tracking is Helm
 `orchestrator.containerStartupStageAuthority.enabled`, off by default.
 
 - **How pull failures are classified.** These rules apply to custom images. A
