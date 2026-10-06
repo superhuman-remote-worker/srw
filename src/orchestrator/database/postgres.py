@@ -20258,6 +20258,11 @@ class PostgresDB:
         terminal status cannot change between that read and this lock. Do not
         rely on the intent fingerprint instead: the trigger rewrites its
         ``owner_status`` on every terminal transition.
+
+        The same exact Pod/fresh storage opt-in permits a new retirement-only
+        projection for a cancelled stateless Job whose accepted CREATE reply
+        was lost before UID publication. SQL verifies the complete old/new
+        projection and current claim; ordinary creation authority stays revoked.
         """
 
         if type(allow_existing_terminal_intent) is not bool:
@@ -20536,6 +20541,26 @@ class PostgresDB:
                     }
                 )
                 state[state_key] = raw_runtime
+                unbound_job_retirement = (
+                    owner_kind == "job"
+                    and scope == "workspace_container"
+                    and current_runtime is None
+                )
+                if unbound_job_retirement and (
+                    not allow_existing_terminal_intent
+                    or not await conn.fetchval(
+                        "SELECT managed_repo_cancelled_creation_retirement_is_authorized_now("
+                        "$1,$2,$3,$4::jsonb,$5::jsonb)",
+                        owner_kind,
+                        owner_uuid,
+                        scope,
+                        json.dumps(
+                            _strict_json_object(owner.get("state"), label=json_column)
+                        ),
+                        json.dumps(state),
+                    )
+                ):
+                    return None
                 updated = await conn.execute(
                     f"UPDATE {table} SET {json_column} = $2::jsonb, "
                     f"{timestamp_column} = CURRENT_TIMESTAMP WHERE id = $1",
@@ -20586,10 +20611,12 @@ class PostgresDB:
                     "SET settled_at = now(), phase = 'aborted', "
                     "result_kind = 'aborted' WHERE id = $1 "
                     "AND settled_at IS NULL AND claimed_by = $2 "
-                    "AND claim_token = $3 AND expires_at > now()",
+                    "AND claim_token = $3 AND expires_at > now() "
+                    "AND (NOT $4::boolean OR expires_at > clock_timestamp())",
                     reservation["id"],
                     claimant,
                     claim_token,
+                    unbound_job_retirement,
                 )
                 if closed != "UPDATE 1":
                     raise RuntimeError("cancelled creation handoff was lost")
