@@ -10,7 +10,7 @@ import {SidebarToggleComponent} from '../sidebar-toggle/sidebar-toggle.component
  *
  * Real links rather than the app-tab-nav tablist: each tab is a page, so it
  * should open in a new tab, show its URL and be bookmarkable. The bar also
- * owns the page's sidebar toggle — it is the top edge of all four pages, so
+ * owns the page's sidebar toggle — it is the top edge of all five pages, so
  * the list headers below it no longer carry one.
  */
 @Component({
@@ -103,7 +103,7 @@ export class CustomizeTabsComponent {
     {path: '/contacts', labelKey: 'nav.contacts'},
   ];
 
-  /** On a bar too narrow for all four tabs, the one the user is on must not
+  /** On a bar too narrow for all five tabs, the one the user is on must not
    *  be the one scrolled out of sight. `nearest` leaves a tab that is already
    *  visible — and the page's vertical scroll — where they are. */
   protected revealIfActive(active: boolean, link: HTMLElement): void {
