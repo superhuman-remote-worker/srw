@@ -25,6 +25,9 @@ from orchestrator.services.manifest_runtime_ownership import (
     uses_srw_runtime,
 )
 from orchestrator.services.vm_workspace_policy import vm_needs_release
+from orchestrator.services.completion_teardown_replay import (
+    CancelledContainerCompletionReplay,
+)
 
 TERMINAL_VM_CLEANUP_TIMEOUT_SECONDS = 900
 
@@ -118,6 +121,9 @@ class JobControlDependencies:
     gitea_client: Any
     revoke_and_delete_managed_repository: Callable[..., Awaitable[bool]]
     vector_db: Any
+    replay_completion_workspace_teardown: (
+        Callable[[CancelledContainerCompletionReplay], Awaitable[bool]] | None
+    ) = None
 
 
 class JobControlOperations:
@@ -681,12 +687,34 @@ class JobControlOperations:
                                 ) is True
                             if prior_vm_cleanup:
                                 await d.archive_and_cleanup_workspace(job_id)
+                            prior_completion_cleanup = False
+                            select_completion = getattr(
+                                d.store, "cancelled_container_completion_replay", None
+                            )
+                            replay_completion = getattr(
+                                d, "replay_completion_workspace_teardown", None
+                            )
+                            if not prior_vm_cleanup and select_completion is not None:
+                                completion_replay = await select_completion(job_id)
+                                if completion_replay is not None:
+                                    if (
+                                        replay_completion is None
+                                        or await replay_completion(completion_replay)
+                                        is not True
+                                    ):
+                                        raise RuntimeError(
+                                            "original completion teardown remains pending"
+                                        )
+                                    prior_completion_cleanup = True
                             settled = await d.store.finalize_cancelled_stateless_job(
                                 job_id
                             )
                         if settled:
                             try:
-                                if not prior_vm_cleanup:
+                                if (
+                                    not prior_vm_cleanup
+                                    and not prior_completion_cleanup
+                                ):
                                     await d.archive_and_cleanup_workspace(job_id)
                             except Exception as exc:
                                 d.logger.warning(

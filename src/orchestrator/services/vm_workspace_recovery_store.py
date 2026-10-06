@@ -1666,6 +1666,87 @@ class VMWorkspaceRecoveryStore:
                     purge_successor=purge_successor,
                 )
 
+    async def acquire_cancelled_container_completion_replay(
+        self, replay: Any
+    ) -> CleanupPermit:
+        """Reacquire only the selected original S36 after current queue proof."""
+        from orchestrator.services.completion_teardown_replay import (
+            CancelledContainerCompletionReplay,
+            lock_completion_replay_owner,
+            select_cancelled_container_completion_replay,
+        )
+
+        if not isinstance(replay, CancelledContainerCompletionReplay):
+            return CleanupPermit(
+                allowed=False, reason="completion_replay_identity_changed"
+            )
+        async with self.db.acquire() as conn, conn.transaction():
+            await lock_completion_replay_owner(conn, replay)
+            if (
+                await select_cancelled_container_completion_replay(
+                    conn, replay.job_id, expected=replay, allow_completed=True
+                )
+                is None
+            ):
+                return CleanupPermit(
+                    allowed=False, reason="completion_replay_identity_changed"
+                )
+            permit = await self.acquire_cleanup_permit_on_conn(
+                conn,
+                owner_kind="job",
+                owner_id=replay.job_id,
+                pvc_uid=None,
+                request_id=replay.request_id,
+                source="completion_workspace_teardown",
+                intent_digest=replay.intent_digest,
+                revalidate_completed=True,
+            )
+            if permit.admission_id != replay.admission_id:
+                return CleanupPermit(
+                    allowed=False, reason="completion_replay_identity_changed"
+                )
+            return permit
+
+    async def complete_cancelled_container_completion_replay(self, replay: Any) -> bool:
+        """Acknowledge the original S36 only after archive and current proof."""
+        from orchestrator.services.completion_teardown_replay import (
+            CancelledContainerCompletionReplay,
+            lock_completion_replay_owner,
+            select_cancelled_container_completion_replay,
+        )
+
+        if not isinstance(replay, CancelledContainerCompletionReplay):
+            return False
+        async with self.db.acquire() as conn, conn.transaction():
+            await lock_completion_replay_owner(conn, replay)
+            if (
+                await select_cancelled_container_completion_replay(
+                    conn, replay.job_id, expected=replay, allow_completed=True
+                )
+                is None
+            ):
+                return False
+            row = await conn.fetchrow(
+                "SELECT completed_at,outcome FROM vm_workspace_cleanup_admissions "
+                "WHERE id=$1 AND owner_kind='job' AND owner_id=$2 "
+                "AND source='completion_workspace_teardown' AND request_id=$3 "
+                "AND intent_digest=$4 AND pvc_uid IS NULL AND parent_admission_id IS NULL FOR UPDATE",
+                replay.admission_id,
+                replay.job_id,
+                replay.request_id,
+                replay.intent_digest,
+            )
+            if row is None:
+                return False
+            if row["completed_at"] is not None:
+                return row["outcome"] == "completed"
+            await conn.execute(
+                "UPDATE vm_workspace_cleanup_admissions "
+                "SET completed_at=clock_timestamp(),outcome='completed' WHERE id=$1",
+                replay.admission_id,
+            )
+            return True
+
     async def acquire_cleanup_permit_on_conn(
         self,
         conn: Any,

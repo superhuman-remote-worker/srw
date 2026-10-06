@@ -20,6 +20,9 @@ from orchestrator.services.vm_workspace_recovery_store import (
     prepare_vm_cleanup_resource,
 )
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+from orchestrator.services.completion_teardown_replay import (
+    CancelledContainerCompletionReplay,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +102,7 @@ async def run_completion_workspace_teardown(
     effect_runner: Any | None,
     *,
     dependencies: CompletionEffectDependencies,
+    cancelled_container_replay: CancelledContainerCompletionReplay | None = None,
 ) -> dict[str, Any]:
     """Run S36 under its durable report-order/admission authorization.
 
@@ -153,14 +157,31 @@ async def run_completion_workspace_teardown(
                 "resource": resource,
                 "source": "completion_workspace_teardown",
             }
-            permit = await recovery_store.acquire_cleanup_permit(
-                owner_kind="job",
-                owner_id=UUID(job_id),
-                pvc_uid=parsed_pvc_uid,
-                request_id=request_id,
-                source="completion_workspace_teardown",
-                intent_digest=cleanup_intent_digest(resource_intent),
-            )
+            if cancelled_container_replay is not None:
+                if (
+                    effect_runner is not None
+                    or resource != "legacy_workspace"
+                    or job_id != str(cancelled_container_replay.job_id)
+                    or request_id != cancelled_container_replay.request_id
+                    or cleanup_intent_digest(resource_intent)
+                    != cancelled_container_replay.intent_digest
+                    or parsed_pvc_uid is not None
+                ):
+                    raise RuntimeError("completion teardown replay identity changed")
+                permit = (
+                    await recovery_store.acquire_cancelled_container_completion_replay(
+                        cancelled_container_replay
+                    )
+                )
+            else:
+                permit = await recovery_store.acquire_cleanup_permit(
+                    owner_kind="job",
+                    owner_id=UUID(job_id),
+                    pvc_uid=parsed_pvc_uid,
+                    request_id=request_id,
+                    source="completion_workspace_teardown",
+                    intent_digest=cleanup_intent_digest(resource_intent),
+                )
             if not permit.allowed:
                 raise RuntimeError(
                     "workspace teardown held for unresolved workspace recovery"
@@ -173,6 +194,19 @@ async def run_completion_workspace_teardown(
             return bound
 
         async def _complete_destructive_cleanup(permit: Any, outcome: str) -> None:
+            if cancelled_container_replay is not None:
+                if (
+                    outcome != "completed"
+                    or getattr(permit, "admission_id", None)
+                    != cancelled_container_replay.admission_id
+                    or not await recovery_store.complete_cancelled_container_completion_replay(
+                        cancelled_container_replay
+                    )
+                ):
+                    raise RuntimeError(
+                        "completion teardown replay acknowledgement refused"
+                    )
+                return
             admission_id = getattr(permit, "admission_id", None)
             if admission_id is not None:
                 intent = (getattr(permit, "parent_cleanup", None) or {}).get("intent")
@@ -631,9 +665,38 @@ async def run_completion_workspace_teardown(
     return output
 
 
+async def replay_cancelled_container_completion_teardown(
+    replay: CancelledContainerCompletionReplay,
+    *,
+    dependencies: CompletionEffectDependencies,
+) -> bool:
+    """Replay only the selected S36, then verify its durable exact outcome."""
+    if not isinstance(replay, CancelledContainerCompletionReplay):
+        return False
+    result = await run_completion_workspace_teardown(
+        str(replay.job_id),
+        None,
+        dependencies=dependencies,
+        cancelled_container_replay=replay,
+    )
+    if result.get("teardown_disposition") != "completed":
+        return False
+    permit = (
+        await dependencies.recovery_store.acquire_cancelled_container_completion_replay(
+            replay
+        )
+    )
+    return bool(
+        permit.allowed
+        and permit.admission_id == replay.admission_id
+        and completed_cleanup_outcome(permit) == "completed"
+    )
+
+
 __all__ = [
     "CompletionEffectDependencies",
     "completion_effect_dedup_key",
     "run_completion_effect",
     "run_completion_workspace_teardown",
+    "replay_cancelled_container_completion_teardown",
 ]

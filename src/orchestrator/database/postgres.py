@@ -25,6 +25,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Optional,
     Any,
     List,
@@ -36,6 +37,11 @@ from typing import (
     Sequence,
 )
 from uuid import UUID, uuid4
+
+if TYPE_CHECKING:
+    from orchestrator.services.completion_teardown_replay import (
+        CancelledContainerCompletionReplay,
+    )
 
 
 from shared.helm_provenance import provenance_from_breadcrumb
@@ -5947,6 +5953,24 @@ class PostgresDB:
                 str(generation),
             )
         return row is not None
+
+    async def cancelled_container_completion_replay(
+        self, job_id: str
+    ) -> "CancelledContainerCompletionReplay | None":
+        """Select an exact original S36; this read grants no cleanup effect."""
+        try:
+            owner_id = UUID(job_id)
+        except (TypeError, ValueError, AttributeError):
+            return None
+        from orchestrator.services.completion_teardown_replay import (
+            select_cancelled_container_completion_replay,
+        )
+
+        async with (
+            self.acquire() as conn,
+            conn.transaction(isolation="repeatable_read", readonly=True),
+        ):
+            return await select_cancelled_container_completion_replay(conn, owner_id)
 
     async def quiesce_cancelled_stateless_vm_parent(self, job_id: str) -> bool:
         """Select only this Cancel's open VM parent after its worker is done.

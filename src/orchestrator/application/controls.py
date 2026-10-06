@@ -501,6 +501,14 @@ def job_mutation_operations(
                 managed_repository_authority.revoke_and_delete_managed_repository
             ),
             vector_db=resources.vector_db,
+            replay_completion_workspace_teardown=lambda replay: (
+                completion_composition.completion_effect_operations.replay_cancelled_container_completion_teardown(
+                    replay,
+                    dependencies=completion_composition.completion_effect_dependencies(
+                        resources
+                    ),
+                )
+            ),
         )
     )
 
