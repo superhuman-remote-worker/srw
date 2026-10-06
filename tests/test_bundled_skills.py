@@ -116,6 +116,11 @@ def test_strategic_phase_exits_early_only_when_the_expert_lacks_the_shell():
         assert "this Expert does not include the shell tools" not in other
         assert "such as Engineer" not in other
     assert "{%" not in expert
+    for other in (with_shell, tier):
+        assert "plan.md.\n\nReview protocol:" in other
+    raw = render_instruction_content(md, _CONTAINER_NO_SHELL)
+    assert "plan.md.\n\nCheck first" in raw
+    assert "such as Engineer.\n\nReview protocol:" in raw
 
 
 def test_verify_before_done_blames_the_tier_when_an_upgrade_tool_is_bound():
