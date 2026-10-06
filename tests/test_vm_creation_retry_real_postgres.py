@@ -39,8 +39,13 @@ CONFIG_DIGEST = "sha256:" + "a" * 64
 
 
 async def admitted_job(
-    db, *, lane="pinned", timeout=3600, controller_configuration=None,
+    db,
+    *,
+    lane="pinned",
+    timeout=3600,
+    controller_configuration=None,
     request_options=None,
+    execution_resolved=None,
 ):
     job, generation, execution = uuid4(), uuid4(), uuid4()
     async with db.acquire() as conn:
@@ -60,12 +65,16 @@ async def admitted_job(
             "VALUES($1,'Job',$2,'{}',$3::jsonb,'revision-1','srw/v1')",
             execution,
             job,
-            json.dumps({"spec": {"timeoutSeconds": timeout}}),
+            json.dumps(execution_resolved or {"spec": {"timeoutSeconds": timeout}}),
         )
     request_values = {
-        "job_id": str(job), "agent_config": "worker_base",
-        "vm_image": "pinned:image", "cpu_cores": 8, "memory": "16Gi",
-        "description": "retry", "network_tier": "restricted",
+        "job_id": str(job),
+        "agent_config": "worker_base",
+        "vm_image": "pinned:image",
+        "cpu_cores": 8,
+        "memory": "16Gi",
+        "description": "retry",
+        "network_tier": "restricted",
         "provision_generation": str(generation),
     }
     request_values.update(request_options or {})
