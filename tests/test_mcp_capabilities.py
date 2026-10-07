@@ -229,20 +229,12 @@ def test_priority_job_project_and_connector_schema_drift_is_closed() -> None:
         assert "default_config_override" in properties
 
     connector = tools["create_datasource"]["inputSchema"]["properties"]
-    assert set(connector["type"]["enum"]) == {
-        "generic",
-        "repository",
-        "kb",
-        "postgresql",
-        "neo4j",
-        "mongodb",
-        "webdav",
-        "email",
-        "mcp",
-        "kubeconfig",
-        "ssh_key",
-        "generic_file",
-    }
+    # Every type the API accepts, from the driver specs; ``credentials`` was
+    # once missing from a hand-kept copy.
+    from shared.runtime.core.datasource_catalog import DATASOURCE_TYPE_IDS
+
+    assert connector["type"]["enum"] == list(DATASOURCE_TYPE_IDS)
+    assert "credentials" in connector["type"]["enum"]
     assert {
         "config",
         "is_global",

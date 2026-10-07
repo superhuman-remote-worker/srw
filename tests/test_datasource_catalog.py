@@ -53,6 +53,14 @@ def test_datasource_catalog_matches_agent_consumers():
     assert tool_types == set(DATASOURCE_TOOL_MAP)
 
 
+def test_datasource_catalog_matches_the_mcp_server():
+    import typing
+
+    from mcp_server.server import DatasourceType
+
+    assert typing.get_args(DatasourceType) == DATASOURCE_TYPE_IDS
+
+
 def test_orchestrator_validation_consumes_the_catalog():
     # Create accepts exactly the types the installed drivers serve, and the
     # built-in drivers serve the catalogue's types in catalogue order.

@@ -775,6 +775,7 @@
     ],
     "mcp_server_datasource_type": [
       "generic",
+      "credentials",
       "repository",
       "kb",
       "postgresql",
@@ -786,7 +787,6 @@
       "kubeconfig",
       "ssh_key",
       "generic_file"
-    ],
-    "pinned_defect": "D1 fixes (L1 §6 #6): the MCP server's DatasourceType lacks 'credentials', so MCP clients cannot create credential connectors"
+    ]
   }
 }

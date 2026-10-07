@@ -226,11 +226,6 @@ def test_type_inventory_matches_golden(golden):
                 datasource_setup.CREDENTIAL_FILE_TYPES
             ),
             "mcp_server_datasource_type": list(typing.get_args(DatasourceType)),
-            "pinned_defect": (
-                "D1 fixes (L1 §6 #6): the MCP server's DatasourceType lacks "
-                "'credentials', so MCP clients cannot create credential "
-                "connectors"
-            ),
         },
     )
 

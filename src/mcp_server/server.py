@@ -22,6 +22,7 @@ from fastmcp import FastMCP
 from starlette.responses import JSONResponse
 
 # Shared-surface imports resolve through the installed package in every environment.
+from shared.connectors import LEGACY_TYPE_IDS
 from shared.expert_reference import (
     ExpertReferenceConflict,
     resolve_expert_selection,
@@ -35,20 +36,9 @@ from shared.orch_surface.workspace_choice import (
 )
 from shared.sudo_command_line import render_sudo_command_line
 
-DatasourceType = Literal[
-    "generic",
-    "repository",
-    "kb",
-    "postgresql",
-    "neo4j",
-    "mongodb",
-    "webdav",
-    "email",
-    "mcp",
-    "kubeconfig",
-    "ssh_key",
-    "generic_file",
-]
+# Derived from the built-in driver specs, so the MCP tools offer every type the
+# API accepts (a hand-kept copy here once lacked ``credentials``).
+DatasourceType = Literal[LEGACY_TYPE_IDS]  # type: ignore[valid-type]
 DatasourceScopeMode = Literal["all", "projects"]
 DatasourceVisibility = Literal["public", "private"]
 DatasourceOwnership = Literal["mine", "shared"]
@@ -1812,8 +1802,8 @@ async def create_datasource(
 ) -> str:
     """Create a new connector.
 
-    Supports generic, repository, kb, PostgreSQL, Neo4j, MongoDB, WebDAV,
-    email, MCP, and credential-file connectors. New connectors are canonical
+    Supports generic, credentials, repository, kb, PostgreSQL, Neo4j, MongoDB,
+    WebDAV, email, MCP, and credential-file connectors. New connectors are canonical
     user-owned resources; job-scoped connector creation is no longer
     supported. Global publication is controlled separately by is_global and
     requires the server-side public_datasources capability.
