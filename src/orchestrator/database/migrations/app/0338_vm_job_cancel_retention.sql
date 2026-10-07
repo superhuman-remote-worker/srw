@@ -44,6 +44,29 @@ FOR EACH ROW EXECUTE FUNCTION public.guard_vm_job_retained_disk_purge_row();
 
 ALTER TABLE public.vm_pre_ssh_stop_intents ADD COLUMN retention_preflight jsonb;
 
+-- xmin can identify a subtransaction, including a RELEASED savepoint whose
+-- outer transaction has not committed. Capture the top-level xid8 instead;
+-- existing rows receive this migration transaction's stamp. The existing
+-- append-only triggers protect both stamps after insertion.
+ALTER TABLE public.vm_job_retained_disk_purge_authorities
+    ADD COLUMN admitted_xact_id xid8 NOT NULL DEFAULT pg_current_xact_id();
+ALTER TABLE public.vm_job_retained_disk_purge_predecessors
+    ADD COLUMN admitted_xact_id xid8 NOT NULL DEFAULT pg_current_xact_id();
+CREATE FUNCTION public.stamp_vm_job_retained_purge_transaction() RETURNS trigger
+LANGUAGE plpgsql AS $body$
+BEGIN
+    -- Always overwrite caller input, including an explicitly supplied old ID.
+    NEW.admitted_xact_id := pg_current_xact_id();
+    RETURN NEW;
+END;
+$body$;
+CREATE TRIGGER vm_job_retained_purge_authority_transaction
+BEFORE INSERT ON public.vm_job_retained_disk_purge_authorities
+FOR EACH ROW EXECUTE FUNCTION public.stamp_vm_job_retained_purge_transaction();
+CREATE TRIGGER vm_job_retained_purge_predecessor_transaction
+BEFORE INSERT ON public.vm_job_retained_disk_purge_predecessors
+FOR EACH ROW EXECUTE FUNCTION public.stamp_vm_job_retained_purge_transaction();
+
 -- Called while holding owner/PVC and queue/Job locks. Read every current writer
 -- boundary; a missing or malformed optional binding is never treated as bound
 -- authority, while SQL NULL and JSON null both mean absent.
@@ -341,8 +364,12 @@ BEGIN
             JOIN public.vm_job_retained_disk_purge_predecessors p USING (cleanup_admission_id)
             WHERE d.cleanup_admission_id=purge_id AND d.job_id=a.job_id AND d.pvc_uid=a.pvc_uid
               AND p.old_cleanup_admission_id=a.cleanup_admission_id
+              -- MVCC makes a visible row from another top-level transaction
+              -- committed. Same-transaction chains never issue physical work,
+              -- even after one or more nested savepoints have been released.
               AND (cleanup_source<>'controller_rootdisk_delete'
-                   OR (d.xmin::text::bigint<>txid_current() AND p.xmin::text::bigint<>txid_current()))
+                   OR (d.admitted_xact_id<>pg_current_xact_id()
+                       AND p.admitted_xact_id<>pg_current_xact_id()))
         ) THEN RETURN false; END IF;
         PERFORM public.validate_vm_job_retained_disk_purge(purge_id,false);
     END LOOP;

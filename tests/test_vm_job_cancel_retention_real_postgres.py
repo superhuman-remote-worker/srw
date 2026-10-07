@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -623,6 +624,56 @@ async def test_typed_delete_bootstraps_then_commits_complete_chain(db, monkeypat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("release_savepoint", [False, True])
+async def test_typed_purge_savepoint_cannot_issue_child_before_outer_commit(
+    db, release_savepoint
+):
+    from orchestrator.services.vm_job_retained_disk_purge import (
+        acquire_job_retained_disk_purge,
+    )
+
+    state = await positive_retention(db)
+    await settle_sql(db, state)
+    before = await authority_rows(db, state)
+    async with db.acquire() as conn:
+
+        class BorrowedConnection:
+            @asynccontextmanager
+            async def acquire(self):
+                yield conn
+
+        outer = conn.transaction()
+        await outer.start()
+        try:
+            savepoint = conn.transaction()
+            await savepoint.start()
+            store = VMWorkspaceRecoveryStore(BorrowedConnection())
+            purge = await acquire_job_retained_disk_purge(
+                store, job_id=state["job_id"], identity=state["identity"]
+            )
+            assert purge.allowed
+            if release_savepoint:
+                await savepoint.commit()
+            assert await conn.fetchval(
+                "SELECT a.admitted_xact_id=pg_current_xact_id() "
+                "AND p.admitted_xact_id=pg_current_xact_id() "
+                "FROM vm_job_retained_disk_purge_authorities a "
+                "JOIN vm_job_retained_disk_purge_predecessors p "
+                "USING(cleanup_admission_id) WHERE a.cleanup_admission_id=$1",
+                purge.admission_id,
+            )
+            state["cleanup_permit"] = purge
+            with pytest.raises(asyncpg.CheckViolationError):
+                await child(conn, state, direct=True)
+        finally:
+            await outer.rollback()
+    assert await authority_rows(db, state) == before
+    assert not await db.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM vm_job_retained_disk_purge_authorities)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_purge_bootstrap_without_authority_or_link_rolls_back(db):
     from orchestrator.services.vm_workspace_recovery_store import (
         vm_cleanup_request_identity,
@@ -848,9 +899,11 @@ async def test_typed_purge_bootstrap_cannot_commit_or_issue_an_incomplete_chain(
                 await conn.execute(
                     "INSERT INTO vm_job_retained_disk_purge_authorities "
                     "(cleanup_admission_id,job_id,final_request_id,provision_generation,"
-                    "vm_uid,vmi_uid,launcher_uid,pvc_uid,binding_kind,cleanup_request_id,intent_digest) "
+                    "vm_uid,vmi_uid,launcher_uid,pvc_uid,binding_kind,cleanup_request_id,intent_digest,"
+                    "admitted_xact_id) "
                     "SELECT $1,job_id,creation_request_id,provision_generation,vm_uid,vmi_uid,"
-                    "launcher_uid,pvc_uid,'unbound',$2,$3 FROM vm_job_cancel_retention_authorities "
+                    "launcher_uid,pvc_uid,'unbound',$2,$3,'1'::xid8 "
+                    "FROM vm_job_cancel_retention_authorities "
                     "WHERE cleanup_admission_id=$4",
                     purge.admission_id,
                     request,
@@ -861,9 +914,10 @@ async def test_typed_purge_bootstrap_cannot_commit_or_issue_an_incomplete_chain(
                 await conn.execute(
                     "INSERT INTO vm_job_retained_disk_purge_predecessors "
                     "(cleanup_admission_id,source_request_id,old_cleanup_admission_id,"
-                    "reservation_id,reservation_revision,stop_evidence_digest) "
+                    "reservation_id,reservation_revision,stop_evidence_digest,admitted_xact_id) "
                     "SELECT $1,s.request_id,s.cleanup_admission_id,s.reservation_id,v.revision,"
-                    "'sha256:'||encode(sha256(convert_to(s.stop_evidence::text,'UTF8')),'hex') "
+                    "'sha256:'||encode(sha256(convert_to(s.stop_evidence::text,'UTF8')),'hex'),"
+                    "'1'::xid8 "
                     "FROM vm_resource_cleanup_stop_receipts s JOIN vm_resource_reservations v "
                     "ON v.id=s.reservation_id WHERE s.cleanup_admission_id=$2",
                     purge.admission_id,
@@ -871,6 +925,15 @@ async def test_typed_purge_bootstrap_cannot_commit_or_issue_an_incomplete_chain(
                 )
                 assert await conn.fetchval(
                     "SELECT public.validate_vm_job_retained_disk_purge($1,false)",
+                    purge.admission_id,
+                )
+                # Neither row can forge a prior transaction's authority.
+                assert await conn.fetchval(
+                    "SELECT a.admitted_xact_id=pg_current_xact_id() "
+                    "AND p.admitted_xact_id=pg_current_xact_id() "
+                    "FROM vm_job_retained_disk_purge_authorities a "
+                    "JOIN vm_job_retained_disk_purge_predecessors p "
+                    "USING(cleanup_admission_id) WHERE a.cleanup_admission_id=$1",
                     purge.admission_id,
                 )
                 # Even a locally complete chain must commit before an effect child.
