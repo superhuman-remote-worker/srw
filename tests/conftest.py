@@ -62,6 +62,23 @@ def _isolate_encryption_cipher_cache():
     _encryption_crypto.reset_cipher_cache()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_pinned_write_fence():
+    """Keep the agent's process-wide pinned transcript fence per-test.
+
+    ``persistent_app``'s session identity arms
+    ``agent.api.pinned_write_fence.PROCESS_PINNED_WRITE_FENCE`` whenever a
+    test drives an attach that adopts a runtime generation. Left armed, it
+    fences every later lease-less ``save_thread_message(s)`` in the same xdist
+    worker on a life that does not exist, an order-dependent failure far from
+    its cause.
+    """
+    yield
+    module = sys.modules.get("agent.api.pinned_write_fence")
+    if module is not None:
+        module.PROCESS_PINNED_WRITE_FENCE.reset()
+
+
 from orchestrator.services import notification_catalog as _notification_catalog  # noqa: E402
 
 _NOTIFICATION_REGISTRIES = (

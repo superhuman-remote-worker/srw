@@ -38,6 +38,7 @@ from typing import Any, Callable, Optional
 from uuid import UUID, uuid4
 
 from agent.api.lease_context import LeaseHandle
+from agent.api.pinned_write_fence import PinnedWriteFence, PinnedWriteIdentity
 from agent.api.session_contract import ProtectedCloudUnavailable, WorkspaceNotReady
 from shared.pinned_session_identity import pinned_session_ready_identity_fingerprint
 
@@ -102,7 +103,8 @@ class SessionIdentityPorts:
     mirror the adopted generation (it may be ``None``). ``identity_replaced``
     runs whenever an adoption or a clear changes the identity, so latches
     scoped to one exact life (the retirement admission mirror) never survive
-    into the next.
+    into the next. ``write_fence`` is the process cell the DB layer fences
+    pinned transcript writes on; only the composed runtime passes it.
     """
 
     agent_id: Callable[[], Optional[str]]
@@ -111,6 +113,7 @@ class SessionIdentityPorts:
     stateless_mode: Callable[[], bool]
     orchestrator_client: Callable[[], Any]
     identity_replaced: Callable[[], None]
+    write_fence: Optional[PinnedWriteFence] = None
 
 
 def environment_pod_uid() -> Optional[str]:
@@ -316,6 +319,7 @@ class SessionIdentityRuntime:
         self._session_generation = canonical_generation
         self._attach_token = canonical_token
         self._runtime_contract = contract_advertised
+        self._arm_write_fence()
         self._ports.identity_replaced()
         client = self._ports.orchestrator_client()
         if client is not None and canonical_generation is not None:
@@ -327,13 +331,47 @@ class SessionIdentityRuntime:
             ):
                 raise WorkspaceNotReady("Pinned runtime identity could not be adopted")
 
+    def _arm_write_fence(self) -> None:
+        """Hand the adopted pinned life to the DB layer's transcript fence.
+
+        Without an exact generation (an orchestrator that predates the
+        contract) or on the stateless lane, which fences on its lease, the
+        cell is unarmed and writes stay unfenced, as the pinned event journal
+        does. A missing agent id or attach token arms an identity the fence
+        refuses, again as the event journal does. Arming never fails an
+        adoption: an unreadable agent id is a missing one.
+        """
+
+        fence = getattr(self._ports, "write_fence", None)
+        if fence is None:
+            return
+        if self._ports.stateless_mode() or self._session_generation is None:
+            fence.arm(None)
+            return
+        try:
+            agent_id = self._ports.agent_id()
+        except Exception:
+            agent_id = None
+        fence.arm(
+            PinnedWriteIdentity(
+                agent_id=agent_id,
+                runtime_generation=self._session_generation,
+                attach_token=self._attach_token,
+            )
+        )
+
     def clear(
         self,
         *,
         expected_generation: str | None = None,
         expected_attach_token: str | None = None,
     ) -> bool:
-        """Clear only a captured generation, never a successor's authority."""
+        """Clear only a captured generation, never a successor's authority.
+
+        The transcript write fence keeps the cleared life: a write that
+        outlives it is fenced on that life and refused, never let through
+        unfenced. The next :meth:`adopt` replaces it.
+        """
 
         if (
             expected_generation is not None

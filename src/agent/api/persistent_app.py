@@ -121,6 +121,7 @@ from agent.services.workspace_undo import (
 )
 from agent.api.lease_context import LeaseLostError
 from agent.api.lease_context import current_lease as _current_lease_var
+from agent.api.pinned_write_fence import PROCESS_PINNED_WRITE_FENCE
 from shared import event_journal as _event_journal
 from shared.pinned_session_identity import PINNED_SESSION_READY_IDENTITY_CONTRACT
 from shared.thread_presence import (
@@ -185,6 +186,8 @@ _session_identity = SessionIdentityRuntime(
         stateless_mode=lambda: _stateless_mode(),
         orchestrator_client=lambda: _orchestrator_client,
         identity_replaced=lambda: _session_termination.reset_retirement_admission_mirror(),
+        # Pinned transcript writes are fenced on the adopted life (P2).
+        write_fence=PROCESS_PINNED_WRITE_FENCE,
     )
 )
 

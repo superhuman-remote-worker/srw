@@ -77,8 +77,8 @@ def _active_run_queue_lease_for_thread(thread_id: str):
     thread B.  The comparison happens before acquiring a connection so this
     mismatch is a fail-closed, zero-SQL path.
 
-    No active handle means the pinned lane and preserves its historical
-    unfenced behavior.
+    No active handle means the pinned lane, whose transcript writers fence on
+    the armed pinned life instead (:func:`_active_pinned_write_identity`).
     """
 
     lease = _active_run_queue_lease()
@@ -140,6 +140,92 @@ async def _require_run_queue_fence(conn, lease) -> None:
         raise LeaseLostError(
             f"run_queue lease lost for unit {unit_id} (token {lease_token})"
         )
+
+
+def _active_pinned_write_identity():
+    """The pinned life this process's transcript writes are fenced on.
+
+    ``None`` when the process cell is unarmed: no exact runtime generation was
+    adopted (the rolling-deploy exception the pinned event journal keeps), or
+    the process is stateless. Only consulted when no run_queue lease is held.
+    Imported lazily for the same reason as :func:`_active_run_queue_lease`.
+    """
+    try:
+        from agent.api.pinned_write_fence import current_pinned_write_identity
+    except Exception:  # pragma: no cover - defensive (partial installs)
+        return None
+    return current_pinned_write_identity()
+
+
+# The pinned event journal's fence (``_LOCK_PINNED_EVENT_THREAD_SQL`` and
+# ``_LOCK_PINNED_CONTROL_AGENT_SQL`` in ``agent.api.persistent_app``) without
+# its event epoch: the thread row at mutation strength, matching the exact
+# agent, runtime generation and attach token of one life that no retirement
+# has closed, then the reciprocal agent row. The order is retirement's and
+# admission's (thread, agent, then the write), and the thread lock is taken
+# at the strength the activity bump needs, so the write never upgrades it.
+_PINNED_WRITE_THREAD_LOCK_SQL = """
+    SELECT 1 FROM threads
+    WHERE id = $1::uuid
+      AND execution_lane = 'pinned'
+      AND agent_id = $2::uuid
+      AND runtime_generation = $3::uuid
+      AND runtime_attach_token = $4::uuid
+      AND runtime_retirement_token IS NULL
+      AND status IN ('created', 'active', 'awaiting_user', 'suspended')
+    FOR NO KEY UPDATE
+"""
+_PINNED_WRITE_AGENT_LOCK_SQL = """
+    SELECT 1 FROM agents
+    WHERE id = $1::uuid AND thread_id = $2::uuid
+    FOR SHARE
+"""
+
+
+async def _require_pinned_write_fence(conn, thread_id: str, identity) -> None:
+    """Prove the armed pinned life still owns ``thread_id`` inside a write tx.
+
+    The caller's transaction then inserts and bumps activity under these
+    locks, so a retirement or rebind either waits for the write or commits
+    first and makes this refuse. A refusal raises
+    :class:`~agent.api.pinned_write_fence.PinnedWriteRefused` (a
+    ``LeaseLostError``): the transaction rolls back and nothing lands.
+    """
+    from agent.api.pinned_write_fence import PinnedWriteRefused
+
+    refused = None
+    if not identity.agent_id or not identity.attach_token:
+        refused = "incomplete pinned identity"
+    elif (
+        await conn.fetchval(
+            _PINNED_WRITE_THREAD_LOCK_SQL,
+            thread_id,
+            identity.agent_id,
+            identity.runtime_generation,
+            identity.attach_token,
+        )
+        is None
+    ):
+        refused = "thread no longer bound to this life"
+    elif (
+        await conn.fetchval(_PINNED_WRITE_AGENT_LOCK_SQL, identity.agent_id, thread_id)
+        is None
+    ):
+        refused = "agent no longer bound to the thread"
+    if refused is None:
+        return
+    logger.warning(
+        "pinned transcript fence refused (%s): thread=%s agent=%s "
+        "generation=%s attach_token=%s",
+        refused,
+        thread_id,
+        identity.agent_id,
+        identity.runtime_generation,
+        identity.attach_token,
+    )
+    raise PinnedWriteRefused(
+        f"pinned runtime life is not current for thread {thread_id}: {refused}"
+    )
 
 
 class PostgresDB:
@@ -2330,6 +2416,11 @@ class PostgresDB:
           back the row's monotonic insertion order, so a compaction can record
           ``boundary_seq`` without a follow-up read.
 
+        Fenced on both lanes: a stateless write on its exact run_queue lease
+        (``LeaseLostError``), a pinned write on the armed pinned life
+        (``PinnedWriteRefused``, a ``LeaseLostError``). A refused write rolls
+        back whole.
+
         Mirrors the orchestrator's column set and the ``threads`` activity bump.
         ``tool_call_id`` is set only on role='tool' rows; ``thinking`` only on
         role='ai' rows with reasoning. The component columns (reasoning,
@@ -2368,10 +2459,19 @@ class PostgresDB:
             return row
 
         lease = _active_run_queue_lease_for_thread(thread_id)
+        pinned = _active_pinned_write_identity() if lease is None else None
         async with self.acquire() as conn:
-            if lease is None:
-                # Pinned lane: today's exact behavior (autocommit statements).
+            if lease is None and pinned is None:
+                # Unarmed pinned lane (no exact runtime generation adopted):
+                # the historical autocommit statements.
                 row = await _write(conn)
+            elif lease is None:
+                # Pinned lane: the thread row locked on this exact life, then
+                # the agent row, then the upsert and activity bump, in one
+                # transaction (P2). A replaced or retiring life writes nothing.
+                async with conn.transaction():
+                    await _require_pinned_write_fence(conn, thread_id, pinned)
+                    row = await _write(conn)
             else:
                 # Public End, admission, and reaper retirement lock the thread
                 # before its queue row.  Establish the message FK's parent-row
@@ -2711,7 +2811,8 @@ class PostgresDB:
         the final transcript. A stale claimant therefore commits neither, and
         an idempotent reconcile returns the same producer identity. A later
         project/mount edit cannot redirect the captured destination. Pinned
-        callers have no lease context and preserve the transcript-only path.
+        callers have no lease context and keep the transcript-only path,
+        fenced on the armed pinned life like :meth:`save_thread_message`.
 
         An empty message list remains a no-op except for the stateless producer
         path: even a turn that emitted no AI/tool row must durably mint its
@@ -2721,6 +2822,7 @@ class PostgresDB:
             return None
 
         lease = _active_run_queue_lease_for_thread(thread_id)
+        pinned = _active_pinned_write_identity() if lease is None else None
         should_mint_effect = lease is not None and bool(turn_input_message_id)
         if not messages and not should_mint_effect:
             # In particular, preserve the pinned lane's historical empty-batch
@@ -2783,9 +2885,12 @@ class PostgresDB:
         async with self.acquire() as conn:
             async with conn.transaction():
                 # Match public End's threads -> run_queue order before any
-                # batch FK/upsert or activity mutation. Pinned lane (no lease
-                # context) keeps today's exact transaction shape.
+                # batch FK/upsert or activity mutation. The pinned lane locks
+                # the thread on its armed life, then the agent row (P2); an
+                # unarmed pinned lane keeps the historical transaction shape.
                 memory_parent = None
+                if pinned is not None:
+                    await _require_pinned_write_fence(conn, thread_id, pinned)
                 if lease is not None:
                     # The authoritative final reconcile captures its memory
                     # tenancy while the thread row is locked, before the exact
