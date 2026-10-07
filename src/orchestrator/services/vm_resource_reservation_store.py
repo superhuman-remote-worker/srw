@@ -547,7 +547,37 @@ class VMResourceReservationStore:
         ):
             raise ResourceAdmissionError("resource_reservation_changed")
 
-    async def bind_ready_on_conn(self, conn, *, retry, vm, job_id, generation):
+    async def bind_observed_runtime_on_conn(
+        self, conn, *, retry, vm, job_id, generation
+    ):
+        """Charge one signed, physically running Job launcher before SSH Ready.
+
+        This does not release the creation hold or admit worker execution. An
+        oversized launcher remains reserved with its measured high-water so
+        exact teardown can still retire it without granting new capacity.
+        """
+        if (
+            retry["owner_kind"] != "job"
+            or retry["job_id"] != UUID(job_id)
+            or retry["provision_generation"] != UUID(generation)
+            or retry["reason"] != "creation_adopted"
+            or retry["ready_at"] is not None
+            or vm.get("status") not in {
+                "created", "provisioning", "starting", "ssh_pending", "running",
+            }
+            or vm.get("ssh_verified_at") is not None
+            or vm.get("active_pod_uid") is not None
+        ):
+            return False
+        return await self.bind_ready_on_conn(
+            conn, retry=retry, vm=vm, job_id=job_id, generation=generation,
+            observed_before_ready=True,
+        )
+
+    async def bind_ready_on_conn(
+        self, conn, *, retry, vm, job_id, generation,
+        observed_before_ready=False,
+    ):
         """Bind one genuine signed-inventory launcher before owner Ready commits.
 
         The caller already owns the Job lock and its Ready identity CAS. A
@@ -607,6 +637,8 @@ class VMResourceReservationStore:
             successor["successor_launcher_uid"] if successor
             else reservation["launcher_uid"]
         )
+        if observed_before_ready and successor is not None:
+            return False
         now = await conn.fetchval("SELECT clock_timestamp()")
         if not snapshot["complete"] or not snapshot_is_fresh(
             snapshot, received_at=observation["received_at"], now=now,
@@ -616,6 +648,21 @@ class VMResourceReservationStore:
         vm_uid = vm.get("vm_uid")
         vmi_uid = vm.get("vmi_uid")
         launcher_uid = vm.get("active_pod_uid")
+        if observed_before_ready:
+            # The controller has authenticated the VM/VMI but cannot name the
+            # launcher before its SSH probe. Only a singular signed inventory
+            # Pod linked to this exact reservation and VMI may fill that gap.
+            candidates = [pod["uid"] for pod in snapshot["pods"] if (
+                pod["reservation_id"] == str(reservation["id"])
+                and pod["vmi_uid"] == vmi_uid
+                and pod["provision_generation"] == generation
+                and pod["node_uid"] == str(reservation["node_uid"])
+                and pod["node_name"] == reservation["node_name"]
+                and not pod["terminal"] and not pod["deleting"]
+            )]
+            if len(candidates) != 1:
+                return False
+            launcher_uid = candidates[0]
         pvc_uid = vm.get("rootdisk_pvc_uid")
         if not all(isinstance(value, str) for value in (
             vm_uid, vmi_uid, launcher_uid, pvc_uid,
@@ -642,6 +689,7 @@ class VMResourceReservationStore:
             or actual_vm["name"] != "agent-vm-" + job_id
             or actual_vm["deleting"]
             or actual_vmi["vm_uid"] != vm_uid
+            or observed_before_ready and actual_vmi["phase"] != "Running"
             or actual_vmi["node_uid"] != node_uid
             or actual_vmi["node_name"] != reservation["node_name"]
             or actual_vmi["deleting"]
@@ -688,7 +736,7 @@ class VMResourceReservationStore:
             high.ephemeral_storage_bytes, high.tun_devices,
             high.vhost_net_devices, fits,
         )
-        return fits
+        return True if observed_before_ready else fits
 
     async def release_never_issued_on_conn(
         self, conn, *, retry, disposition_complete=False,
@@ -1090,7 +1138,8 @@ class VMResourceReservationStore:
         if charge is None or (
             charge["resource_version"] != 2
             or charge["vm_uid"] != retry["observed_vm_uid"]
-            or charge["state"] not in {"active", "warm", "teardown"}
+            or charge["state"] not in {"reserved", "active", "warm", "teardown"}
+            or charge["vmi_uid"] is None or charge["launcher_uid"] is None
         ):
             raise ResourceAdmissionError("resource_cleanup_charge_unproven")
         successor = await conn.fetchrow(
@@ -1105,7 +1154,15 @@ class VMResourceReservationStore:
         if (
             vmi is None or launcher is None
             or vm.get("vmi_uid") != str(vmi)
-            or vm.get("active_pod_uid") != str(launcher)
+            or (
+                vm.get("active_pod_uid") != str(launcher)
+                and not (
+                    vm.get("active_pod_uid") is None
+                    and retry["ready_at"] is None
+                    and retry["reason"] == "creation_adopted"
+                    and successor is None
+                )
+            )
         ):
             raise ResourceAdmissionError("resource_cleanup_successor_changed")
         return charge, vmi, launcher
@@ -1118,7 +1175,7 @@ class VMResourceReservationStore:
         )
         if cleanup["completed_at"] is not None and cleanup["outcome"] != "completed":
             raise ResourceAdmissionError("resource_cleanup_outcome_changed")
-        if charge["state"] in {"active", "warm"}:
+        if charge["state"] in {"reserved", "active", "warm"}:
             await conn.execute(
                 "UPDATE vm_resource_reservations SET state='teardown' WHERE id=$1",
                 charge["id"],

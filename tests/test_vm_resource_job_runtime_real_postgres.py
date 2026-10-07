@@ -1408,6 +1408,335 @@ async def test_ready_binding_uses_exact_pod_and_keeps_overreserve_high_water(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "oversized,invalid",
+    [
+        (False, None),
+        (True, None),
+        (False, "owner"),
+        (False, "generation"),
+        (False, "vm_uid"),
+        (False, "reservation"),
+        (False, "duplicate_launcher"),
+        (False, "stale"),
+        (False, "terminal_launcher"),
+        (False, "deleting_launcher"),
+        (False, "bound_conflict"),
+        (False, "old_owner_pod"),
+    ],
+)
+async def test_adopted_vm_binds_signed_physical_runtime_before_guest_ready(
+    db, oversized, invalid
+):
+    """An unready real launcher still occupies its exact reserved VM slot."""
+    policy, inventory, original, demand = await environment(db, installation_count=2)
+    retry = await waiter(db, policy, inventory, lane="stateless", user_id=uuid4())
+    admitted = await policy.admit(request_id=str(retry["request_id"]))
+    claim = (await VMCreationRetryStore(db).claim_due(limit=1))[0]
+    vm_uid, vmi_uid, launcher_uid, pvc_uid = (str(uuid4()) for _ in range(4))
+    await VMCreationRetryStore(db).authorize_controller(
+        request_id=str(retry["request_id"]),
+        claim_token=str(claim["claim_token"]),
+        observed={
+            "job_id": str(claim["job_id"]),
+            "provision_generation": str(claim["provision_generation"]),
+            "request_digest": claim["request_digest"],
+            "controller_configuration_digest": claim["controller_configuration_digest"],
+            "expected_pvc_uid": None,
+        },
+    )
+    await db.execute(
+        "UPDATE vm_creation_retries SET state='succeeded',reason='creation_adopted',"
+        "boot_counted=TRUE,revision=revision+1,"
+        "observed_vm_uid=$2,observed_pvc_uid=$3,resolved_at=clock_timestamp(),"
+        "claim_token=NULL,claim_expires_at=NULL WHERE request_id=$1",
+        retry["request_id"],
+        vm_uid,
+        pvc_uid,
+    )
+    job_id, generation = str(claim["job_id"]), str(claim["provision_generation"])
+    sample = deepcopy(original)
+    sample["vms"] = [
+        {
+            "uid": vm_uid,
+            "name": "agent-vm-" + job_id,
+            "owner_kind": "job",
+            "owner_id": job_id,
+            "provision_generation": generation,
+            "deleting": False,
+        }
+    ]
+    sample["vmis"] = [
+        {
+            "uid": vmi_uid,
+            "name": "agent-vm-" + job_id,
+            "vm_uid": vm_uid,
+            "node_uid": admitted["node_uid"],
+            "node_name": admitted["node_name"],
+            "phase": "Running",
+            "deleting": False,
+        }
+    ]
+    sample["pods"] = [
+        {
+            "uid": launcher_uid,
+            "namespace": "workers",
+            "name": "virt-launcher-unready",
+            "node_uid": admitted["node_uid"],
+            "node_name": admitted["node_name"],
+            "terminal": False,
+            "deleting": False,
+            "requests": demand.to_six_dict(),
+            "vmi_uid": vmi_uid,
+            "reservation_id": admitted["reservation_id"],
+            "provision_generation": generation,
+        }
+    ]
+    sample["pods"][0]["requests"]["cpu_millicores"] += int(oversized)
+    if invalid == "owner":
+        sample["vms"][0]["owner_id"] = str(uuid4())
+    elif invalid == "generation":
+        sample["vms"][0]["provision_generation"] = str(uuid4())
+    elif invalid == "reservation":
+        sample["pods"][0]["reservation_id"] = str(uuid4())
+    elif invalid == "duplicate_launcher":
+        duplicate = deepcopy(sample["pods"][0])
+        duplicate["uid"] = str(uuid4())
+        duplicate["name"] = "virt-launcher-second"
+        sample["pods"].append(duplicate)
+    elif invalid == "terminal_launcher":
+        sample["pods"][0]["terminal"] = True
+    elif invalid == "deleting_launcher":
+        sample["pods"][0]["deleting"] = True
+    sample["snapshot_id"] = str(uuid4())
+    sample["sequence"] += 1
+    sample["started_at"] = sample["finished_at"] = datetime.now(
+        timezone.utc
+    ).isoformat()
+    await publish(inventory, sample)
+    if invalid == "stale":
+        inventory.stale_after_seconds = 1
+        import asyncio
+
+        await asyncio.sleep(1.1)
+    conflicting_vm_uid = str(uuid4()) if invalid == "bound_conflict" else None
+    if conflicting_vm_uid is not None:
+        await db.execute(
+            "UPDATE vm_resource_reservations SET vm_uid=$2 WHERE id=$1",
+            admitted["reservation_id"],
+            conflicting_vm_uid,
+        )
+
+    if invalid is None or invalid == "old_owner_pod":
+        # Exercise the actual authenticated observation path, not a test-only
+        # call to the binding primitive. Guest port 22 is still unready.
+        from orchestrator.services.vm_provisioning_phases import (
+            VMProvisioningPhaseStore,
+        )
+        from tests.test_vm_provisioning_phases import running
+
+        context = json.loads(
+            await db.fetchval(
+                "SELECT context FROM jobs WHERE id=$1",
+                claim["job_id"],
+            )
+        )
+        context["vm"].update(
+            {
+                "status": "created",
+                "provision_generation": generation,
+                "vm_uid": vm_uid,
+                "vmi_uid": vmi_uid,
+                "rootdisk_pvc_uid": pvc_uid,
+                "namespace": "workers",
+                "creation_request_id": str(retry["request_id"]),
+            }
+        )
+        context["_vm_creation_pending"] = str(retry["request_id"])
+        if invalid == "old_owner_pod":
+            context["vm"]["active_pod_uid"] = str(uuid4())
+        await db.execute(
+            "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
+            claim["job_id"],
+            json.dumps(context),
+        )
+        observed = running(
+            owner_id=job_id,
+            namespace="workers",
+            provision_generation=generation,
+            vm_uid=vm_uid,
+            vmi_uid=vmi_uid,
+            rootdisk_pvc_uid=pvc_uid,
+        )
+        phase = VMProvisioningPhaseStore(db)
+        token = await phase.capture(job_id, generation)
+        assert (
+            await phase.apply_status(
+                token,
+                {
+                    "status": "created",
+                    "provision_generation": generation,
+                    "vm_uid": vm_uid,
+                    "vmi_uid": vmi_uid,
+                    "rootdisk_pvc_uid": pvc_uid,
+                    "namespace": "workers",
+                    "vm_name": "agent-vm-" + job_id,
+                    "provisioning": observed,
+                },
+            )
+            == "observed"
+        )
+        after_phase = json.loads(
+            await db.fetchval(
+                "SELECT context FROM jobs WHERE id=$1",
+                claim["job_id"],
+            )
+        )
+        assert after_phase["vm"]["status"] == "created"
+        assert after_phase["vm"].get("ssh_verified_at") is None
+        assert after_phase["vm"].get("active_pod_uid") == context["vm"].get(
+            "active_pod_uid"
+        )
+        assert after_phase["_vm_creation_pending"] == str(retry["request_id"])
+    elif invalid is not None:
+        async with db.acquire() as conn, conn.transaction():
+            await conn.fetchrow(
+                "SELECT id FROM jobs WHERE id=$1 FOR UPDATE", claim["job_id"]
+            )
+            source = await conn.fetchrow(
+                "SELECT * FROM vm_creation_retries WHERE request_id=$1 FOR UPDATE",
+                retry["request_id"],
+            )
+            assert not await policy.bind_observed_runtime_on_conn(
+                conn,
+                retry=source,
+                vm={
+                    "status": "created",
+                    "vm_uid": str(uuid4()) if invalid == "vm_uid" else vm_uid,
+                    "vmi_uid": vmi_uid,
+                    "rootdisk_pvc_uid": pvc_uid,
+                    "ssh_verified_at": None,
+                },
+                job_id=job_id,
+                generation=generation,
+            )
+    if invalid is not None:
+        current_vm_uid = await db.fetchval(
+            "SELECT vm_uid FROM vm_resource_reservations WHERE id=$1",
+            admitted["reservation_id"],
+        )
+        assert (str(current_vm_uid) if current_vm_uid else None) == conflicting_vm_uid
+        return
+    row = await db.fetchrow(
+        "SELECT state,vm_uid,vmi_uid,launcher_uid FROM vm_resource_reservations "
+        "WHERE id=$1",
+        admitted["reservation_id"],
+    )
+    assert (
+        row["state"],
+        str(row["vm_uid"]),
+        str(row["vmi_uid"]),
+        str(row["launcher_uid"]),
+    ) == (
+        "reserved" if oversized else "active",
+        vm_uid,
+        vmi_uid,
+        launcher_uid,
+    )
+    assert (
+        await db.fetchval(
+            "SELECT ready_at FROM vm_creation_retries WHERE request_id=$1",
+            retry["request_id"],
+        )
+        is None
+    )
+    from orchestrator.services.vm_resource_capacity import vm_capacity_snapshot
+
+    capacity = await vm_capacity_snapshot(db)
+    cluster = next(
+        c for c in capacity["clusters"] if c["cluster_id"] == inventory.cluster_id
+    )
+    measured = {
+        **demand.to_six_dict(),
+        "cpu_millicores": demand.cpu_millicores + int(oversized),
+    }
+    assert cluster["totals"]["bound_reserved" if oversized else "active"] == measured
+    assert cluster["totals"]["external"] == dict.fromkeys(demand.to_six_dict(), 0)
+
+    # No SSH or Ready receipt exists. The exact existing cleanup permit must
+    # still admit safe teardown, including a physically oversized launcher.
+    context = json.loads(
+        await db.fetchval(
+            "SELECT context FROM jobs WHERE id=$1",
+            claim["job_id"],
+        )
+    )
+    context["vm"].update(
+        {
+            "status": "created",
+            "provision_generation": generation,
+            "vm_uid": vm_uid,
+            "vmi_uid": vmi_uid,
+            "rootdisk_pvc_uid": pvc_uid,
+            "identity_authenticated": True,
+            "identity_provision_generation": generation,
+            "creation_request_id": str(retry["request_id"]),
+        }
+    )
+    await db.execute(
+        "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
+        claim["job_id"],
+        json.dumps(context),
+    )
+    await db.execute(
+        "UPDATE vm_workspace_cleanup_admissions SET "
+        "completed_at=clock_timestamp(),outcome='adopted' "
+        "WHERE id=(SELECT creation_admission_id FROM vm_creation_retries "
+        "WHERE request_id=$1)",
+        retry["request_id"],
+    )
+    from orchestrator.services.vm_workspace_recovery_store import (
+        acquire_vm_cleanup_permit,
+    )
+
+    permit = await acquire_vm_cleanup_permit(
+        VMWorkspaceRecoveryStore(db),
+        owner_kind="job",
+        owner_id=job_id,
+        identity=VMTeardownIdentity(generation, vm_uid, pvc_uid),
+        source="dispatcher_vm_recycle",
+        purge_disk=False,
+    )
+    assert permit.allowed
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE id=$1",
+            admitted["reservation_id"],
+        )
+        == "teardown"
+    )
+    after_cleanup = await vm_capacity_snapshot(db)
+    teardown_cluster = next(
+        c for c in after_cleanup["clusters"] if c["cluster_id"] == inventory.cluster_id
+    )
+    assert teardown_cluster["totals"]["teardown"] == measured
+    assert teardown_cluster["totals"]["external"] == dict.fromkeys(measured, 0)
+    if not oversized:
+        # A different owner may spend the second slot while this exact
+        # never-Ready launcher remains charged through teardown.
+        healthy = await waiter(
+            db,
+            policy,
+            inventory,
+            lane="stateless",
+            user_id=uuid4(),
+        )
+        assert (await policy.admit(request_id=str(healthy["request_id"])))[
+            "action"
+        ] == "admitted"
+
+
+@pytest.mark.asyncio
 async def test_never_issued_cancel_releases_held_reservation_in_same_settlement(db):
     policy, inventory, _, _ = await environment(db)
     retry = await waiter(db, policy, inventory)

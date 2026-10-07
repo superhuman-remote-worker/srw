@@ -624,12 +624,15 @@ class VMProvisioningPhaseStore:
                 # The ordinary retained-rootdisk lane has no workspace_storage
                 # field. Its separate A1 authority still pins first PVC binding.
                 creation = await conn.fetchrow(
-                    "SELECT expected_pvc_uid::text FROM vm_creation_retries "
-                    "WHERE job_id=$1 AND provision_generation=$2",
+                    "SELECT * FROM vm_creation_retries "
+                    "WHERE job_id=$1 AND provision_generation=$2 FOR UPDATE",
                     token.job_id,
                     UUID(token.generation),
                 )
-                expected_pvc = creation["expected_pvc_uid"] if creation else None
+                expected_pvc = (
+                    str(creation["expected_pvc_uid"])
+                    if creation and creation["expected_pvc_uid"] else None
+                )
                 if expected_pvc is not None and expected_pvc != status.get(
                     "rootdisk_pvc_uid"
                 ):
@@ -705,6 +708,44 @@ class VMProvisioningPhaseStore:
                                 if identity_updates[field] != status.get(field):
                                     return "held"
                                 updates[field] = identity_updates[field]
+                        if (
+                            disposition == "observed" and phase["phase"] == "boot"
+                            and creation is not None
+                            and _object(creation["controller_configuration"]).get("version") == 3
+                        ):
+                            # Signed controller status identifies the VM/VMI;
+                            # fresh signed inventory alone identifies its Pod.
+                            # Binding physical occupancy does not promote Ready
+                            # or release the creation hold.
+                            from orchestrator.services.vm_resource_job_runtime import (
+                                installed_job_resource_store,
+                            )
+                            from shared.vm_resource_admission import ResourceAdmissionError
+                            from shared.vm_resource_inventory import InventoryError
+
+                            try:
+                                resource = await installed_job_resource_store(
+                                    conn, self.db, creation["controller_configuration"],
+                                    fresh=False,
+                                )
+                                if resource is not None:
+                                    await resource.bind_observed_runtime_on_conn(
+                                        conn, retry=creation,
+                                        vm={
+                                            "status": status.get("status"),
+                                            "vm_uid": status.get("vm_uid"),
+                                            "vmi_uid": status.get("vmi_uid"),
+                                            "rootdisk_pvc_uid": status.get("rootdisk_pvc_uid"),
+                                            "ssh_verified_at": vm.get("ssh_verified_at"),
+                                            "active_pod_uid": vm.get("active_pod_uid"),
+                                        },
+                                        job_id=str(token.job_id),
+                                        generation=token.generation,
+                                    )
+                            except (ResourceAdmissionError, InventoryError):
+                                # No inferred occupancy or execution authority:
+                                # a later authenticated observation can retry.
+                                pass
                 updates["provisioning_attention_reason"] = reason
                 await conn.execute(
                     "UPDATE jobs SET context=jsonb_set(context,'{vm}',context->'vm' || $2::jsonb), "
