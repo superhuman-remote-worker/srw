@@ -175,6 +175,9 @@ def test_repository_and_ssh_key_identities_load_without_touching_disk(
     for command, secret in backend.commands:
         assert not any(key in command for key in private_keys)
         assert not secret or secret.decode() in private_keys
+        if secret:
+            # A connector's static key expires on its own if never retired.
+            assert "ssh-add -t 604800 -" in command
     _no_private_key_on_disk(home)
     for authority, fingerprint in fingerprints.items():
         socket_path = workspace_ssh_identity_socket(str(home), authority)

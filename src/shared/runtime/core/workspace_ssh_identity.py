@@ -31,6 +31,7 @@ from uuid import UUID
 from shared.runtime.core.managed_repository import (
     _SSH_AGENT_RETIRE_PROGRAM,
     RESERVED_SSH_HOST_PREFIX,
+    SSH_AGENT_KEY_LIFETIME_SECONDS,
     ManagedRepositoryMaterializationError,
     _backend_managed_home,
     _backend_runtime_authority,
@@ -502,6 +503,9 @@ def _identity_command(
         workspace_generation=runtime_workspace_generation,
         runtime_incarnation=runtime_incarnation,
         config_content=config,
+        # A user's static key: if every retirement owner fails, the agent
+        # still forgets it. Each attach or batch re-adds it.
+        key_lifetime_seconds=SSH_AGENT_KEY_LIFETIME_SECONDS,
     )
     return "set -eu; umask 077; " + publish_known_hosts + launch
 

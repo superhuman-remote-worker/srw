@@ -694,6 +694,10 @@ def test_workspace_materialization_never_places_private_key_in_command_or_file()
     assert materialize_command.index("present") < materialize_command.index(
         f"Host {payload['alias']}"
     )
+    # The workspace repository's key has no lifetime: a pinned job or an
+    # idle-forever session that never re-attaches must keep pushing.
+    assert "ssh-add -t" not in materialize_command
+    assert "then cat >/dev/null; else" in materialize_command
 
 
 def test_workspace_materialization_wipes_untransferred_keys_on_early_failure(

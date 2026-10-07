@@ -30,9 +30,10 @@ _SSH_CONFIG_VALUE = re.compile(r"^[^\s%#\"'\\]{1,4096}$")
 #: block wins, so a declared host spelled like an alias would take it over.
 RESERVED_SSH_HOST_PREFIX = "srw-repo-"
 
-#: Lifetime of a key in a dedicated workspace ``ssh-agent`` (``ssh-add -t``).
-#: Every materialization re-adds a proven resident's key, which restarts the
-#: clock, so only an agent nobody retired outlives it.
+#: Lifetime (``ssh-add -t``) of a connector identity's key in its workspace
+#: ``ssh-agent``. Every materialization re-adds a proven resident's key, which
+#: restarts the clock, so only an agent nobody retired outlives it. Managed
+#: repository keys carry none (see the launch command).
 SSH_AGENT_KEY_LIFETIME_SECONDS = 7 * 24 * 60 * 60
 
 
@@ -828,15 +829,17 @@ def managed_repository_agent_launch_command(
     workspace_generation: str | None = None,
     runtime_incarnation: str | None = None,
     config_content: str | None = None,
-    key_lifetime_seconds: int = SSH_AGENT_KEY_LIFETIME_SECONDS,
+    key_lifetime_seconds: int | None = None,
 ) -> str:
     """Retire one predecessor and launch/record one exact replacement agent.
 
     ``expected_fingerprint`` alone proves locally that the agent holds exactly
     that key, which is all an identity without a repository can prove;
-    ``probe_url`` additionally proves forge access and requires it. The key is
-    loaded with ``ssh-add -t key_lifetime_seconds`` and a fingerprint-proven
-    reuse re-adds it, restarting that lifetime.
+    ``probe_url`` additionally proves forge access and requires it.
+    ``key_lifetime_seconds`` loads the key with ``ssh-add -t``, and a
+    fingerprint-proven reuse re-adds it, restarting that lifetime. Managed
+    repositories leave it unset: their key must outlive any pinned job or
+    idle-forever session that never re-attaches, and the forge revokes it.
     """
 
     slug = _authority_slug(authority_id)
@@ -848,7 +851,7 @@ def managed_repository_agent_launch_command(
         raise ManagedRepositoryMaterializationError(
             "managed_repository_credential_invalid"
         )
-    if (
+    if key_lifetime_seconds is not None and (
         isinstance(key_lifetime_seconds, bool)
         or not isinstance(key_lifetime_seconds, int)
         or key_lifetime_seconds < 1
@@ -966,13 +969,20 @@ def managed_repository_agent_launch_command(
             f"chmod 600 {shlex.quote(config_path)}; "
         )
     successful_suffix = "" if keep_rollback_trap else "; trap - EXIT"
-    load_key = (
-        f"SSH_AUTH_SOCK={shlex.quote(socket_path)} "
-        f"ssh-add -t {int(key_lifetime_seconds)} - >/dev/null 2>&1"
+    lifetime = (
+        f"-t {int(key_lifetime_seconds)} " if key_lifetime_seconds is not None else ""
     )
-    # Without an expected fingerprint a reused resident cannot be proven to
-    # hold this very key, so its stdin is drained rather than added.
-    reuse_key = load_key if expected_fingerprint is not None else "cat >/dev/null"
+    load_key = (
+        f"SSH_AUTH_SOCK={shlex.quote(socket_path)} ssh-add {lifetime}- >/dev/null 2>&1"
+    )
+    # A reused resident is re-added only to restart a lifetime, and only when
+    # the fingerprint proves it holds this very key; otherwise stdin is
+    # drained, as before lifetimes existed.
+    reuse_key = (
+        load_key
+        if key_lifetime_seconds is not None and expected_fingerprint is not None
+        else "cat >/dev/null"
+    )
     proof_suffix = ""
     if expected_fingerprint is not None:
         proof_suffix = f"; {local_key_proof} || exit 86"
