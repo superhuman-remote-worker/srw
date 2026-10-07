@@ -35,12 +35,13 @@ def test_session_subagent_fanout_lanes_reach_the_orchestrator_and_roll_it() -> N
     reaches the orchestrator from the ConfigMap, and a change replaces the
     orchestrator even without Reloader, because it is read once at startup.
 
-    WP6: the chart enables the stateless lane by default; an empty value is
-    the rollback. Pinned stays off until R3.3c (D5)."""
+    WP6 enabled the stateless lane by default and the pinned-lane plan's P7
+    (parallel_subagents §14.2) the pinned lane; "stateless" turns the pinned
+    lane off and an empty value turns both off."""
     if shutil.which("helm") is None:
         pytest.skip("helm is not installed")
     values = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
-    assert values["orchestrator"]["sessionSubagentFanoutLanes"] == "stateless"
+    assert values["orchestrator"]["sessionSubagentFanoutLanes"] == "stateless,pinned"
 
     def _render(*extra: str):
         output = subprocess.run(
@@ -86,7 +87,7 @@ def test_session_subagent_fanout_lanes_reach_the_orchestrator_and_roll_it() -> N
         )
 
     on, ref, on_annotations = _render()
-    assert on == "stateless"
+    assert on == "stateless,pinned"
     assert ref["key"] == "SESSION_SUBAGENT_FANOUT_LANES"
     # The rollback: an operator override of "" turns every lane off.
     off, _, off_annotations = _render(
@@ -95,6 +96,12 @@ def test_session_subagent_fanout_lanes_reach_the_orchestrator_and_roll_it() -> N
     assert off == ""
     checksum_key = "checksum/session-subagent-fanout-lanes"
     assert off_annotations[checksum_key] != on_annotations[checksum_key]
+    # Turning only the pinned lane off is its own rollout.
+    stateless_only, _, stateless_annotations = _render(
+        "--set-string", "orchestrator.sessionSubagentFanoutLanes=stateless"
+    )
+    assert stateless_only == "stateless"
+    assert stateless_annotations[checksum_key] != on_annotations[checksum_key]
     _, _, without_reloader = _render("--set", "reloader.enabled=false")
     assert without_reloader[checksum_key] == on_annotations[checksum_key]
 
