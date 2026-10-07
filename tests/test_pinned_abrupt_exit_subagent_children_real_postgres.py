@@ -20,6 +20,11 @@ import pytest
 from orchestrator import main
 from orchestrator.application import controls
 from shared.persistent_input_delivery import message_row_id, transition_input_delivery
+from shared.session_subagent_batch import (
+    RECOVERY_METRICS_KEY,
+    batch_continuation_text,
+    not_started_result_text,
+)
 from tests import test_lite_pinned_actor_exit_real_postgres as lite
 from tests import test_persistent_recycler_real_postgres as fixtures
 from orchestrator.services import stale_agent_detector as detector
@@ -334,8 +339,11 @@ def _retired_state(state, cause):
         return ("ended", "completed", "completed")
     if state == "agent_interrupted":
         return ("ended", "interrupted", "interrupted:parent_restart")
-    if state in {"running", "queued"} and cause == "runtime_lost":
+    if state == "running" and cause == "runtime_lost":
         return ("ended", "interrupted", "interrupted:parent_restart")
+    if state == "queued" and cause == "runtime_lost":
+        # It never ran: the settle reports it NOT STARTED.
+        return ("ended", "interrupted", "interrupted:not_started")
     return ("ended", "cancelled", "cancelled:parent_retired")
 
 
@@ -474,7 +482,7 @@ async def _tool_results(db, thread_id):
     return [
         dict(row)
         for row in await db.fetch(
-            "SELECT tool_call_id, content FROM thread_messages "
+            "SELECT tool_call_id, content, metrics FROM thread_messages "
             "WHERE thread_id=$1::uuid AND role='tool' AND rewound_at IS NULL "
             "ORDER BY seq",
             thread_id,
@@ -492,6 +500,50 @@ async def _continuations(db, thread_id):
             thread_id,
         )
     ]
+
+
+async def _continuation_text(db, delivery_id):
+    return await db.fetchval(
+        "SELECT m.content FROM thread_input_deliveries d "
+        "JOIN thread_messages m ON m.id=d.message_id WHERE d.delivery_id=$1::uuid",
+        delivery_id,
+    )
+
+
+def _recovery_class(row):
+    metrics = row["metrics"]
+    metrics = json.loads(metrics) if isinstance(metrics, str) else metrics
+    return metrics[RECOVERY_METRICS_KEY]["class"]
+
+
+def _plan_members(plan):
+    """What the successor names: every member, text only where asked."""
+
+    return [
+        {
+            "thread_id": call["thread_id"],
+            "runtime_generation": call["runtime_generation"],
+            "subagent_status": call["subagent_status"],
+            "outcome": call["outcome"],
+            "message": (
+                f"replayed result of {call['handle']}"
+                if call["needs_message"]
+                else None
+            ),
+        }
+        for call in plan["calls"]
+        if call["needs_entry"]
+    ]
+
+
+#: What the settle reports per state a dead runtime's retirement left
+#: (cause ``runtime_lost``): the result marker class, and the count it adds.
+_RECOVERED_AS = {
+    "running": "interrupted",
+    "queued": "not_started",
+    "completed": "completed",
+    "agent_interrupted": "interrupted",
+}
 
 
 @pytest.mark.asyncio
@@ -530,23 +582,19 @@ async def test_successor_recovers_the_batch_its_lost_runtime_left(
     )
     assert plan["supersedes_input_seq"] == source_seq
     # Every call has a child that ended without a result reaching the parent.
+    # The wire class stays ``ended`` (the successor states the stored facts);
+    # the child that never ran needs no text: the server writes NOT STARTED.
     assert [call["class"] for call in plan["calls"]] == ["ended"] * len(children)
     assert [call["thread_id"] for call in plan["calls"]] == children
-    assert all(call["needs_entry"] and call["needs_message"] for call in plan["calls"])
+    assert all(call["needs_entry"] for call in plan["calls"])
+    assert [call["needs_message"] for call in plan["calls"]] == [
+        state != "queued" for state in BATCHES[batch]
+    ]
     assert [call["outcome"] for call in plan["calls"]] == [
         _retired_state(state, "runtime_lost")[2] for state in BATCHES[batch]
     ]
 
-    members = [
-        {
-            "thread_id": call["thread_id"],
-            "runtime_generation": call["runtime_generation"],
-            "subagent_status": call["subagent_status"],
-            "outcome": call["outcome"],
-            "message": f"replayed result of {call['handle']}",
-        }
-        for call in plan["calls"]
-    ]
+    members = _plan_members(plan)
     settle = dict(
         parent_thread_id=ids["thread"],
         parent_authority=authority,
@@ -560,10 +608,31 @@ async def test_successor_recovers_the_batch_its_lost_runtime_left(
     assert [row["tool_call_id"] for row in results] == [
         call["tool_call_id"] for call in plan["calls"]
     ]
-    assert [row["content"] for row in results] == [m["message"] for m in members]
+    assert [row["content"] for row in results] == [
+        m["message"] or not_started_result_text() for m in members
+    ]
+    # Reported as they were at the restart: never as finished.
+    assert [_recovery_class(row) for row in results] == [
+        _RECOVERED_AS[state] for state in BATCHES[batch]
+    ]
     [continuation] = await _continuations(db, ids["thread"])
     assert str(continuation["delivery_id"]) == plan["delivery_id"]
     assert continuation["supersedes_input_seq"] == source_seq
+    text = await _continuation_text(db, continuation["delivery_id"])
+    states = BATCHES[batch]
+    assert text == batch_continuation_text(
+        calls=len(states),
+        interrupted=states.count("running"),
+        not_started=states.count("queued"),
+        declined=0,
+        retired=0,
+    )
+    if batch == "interrupted_batch":
+        assert "No delegated task of this turn finished." in text
+    else:
+        assert "1 of 4 delegated tasks finished and its result is above." in text
+    assert "2 were interrupted and 1 never started; each is marked." in text
+    assert "All " not in text
     assert (
         await db.fetchval(
             "SELECT state FROM thread_input_deliveries WHERE delivery_id=$1::uuid",
@@ -654,6 +723,31 @@ async def test_the_settle_keeps_a_child_its_runtime_already_ended(
         "ended",
         "ended" if cause == "runtime_lost" else "retired",
     ]
+
+    # The handed-over child is reported interrupted, not finished.
+    result = await db.settle_session_subagent_batch(
+        parent_thread_id=ids["thread"],
+        parent_authority=authority,
+        parent_input_message_id=plan["parent_input_message_id"],
+        parent_iteration=plan["parent_iteration"],
+        members=_plan_members(plan),
+    )
+    assert result["result"] == "applied"
+    results = await _tool_results(db, ids["thread"])
+    assert [_recovery_class(row) for row in results] == [
+        "interrupted",
+        "interrupted" if cause == "runtime_lost" else "retired",
+    ]
+    [continuation] = await _continuations(db, ids["thread"])
+    assert await _continuation_text(db, continuation["delivery_id"]) == (
+        batch_continuation_text(
+            calls=2,
+            interrupted=2 if cause == "runtime_lost" else 1,
+            not_started=0,
+            declined=0,
+            retired=0 if cause == "runtime_lost" else 1,
+        )
+    )
 
 
 @pytest.mark.asyncio

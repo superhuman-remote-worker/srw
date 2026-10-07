@@ -56,9 +56,15 @@ from orchestrator.database.dispatch_discovery import (
     JobDiscoveryCursor,
     discovery_page_bounds,
 )
-from shared.session_subagent_batch import CALL_ENDED, CALL_LIVE
+from shared.session_subagent_batch import (
+    CALL_ENDED,
+    CALL_LIVE,
+    CALL_NOT_STARTED,
+    not_started_result_text,
+)
 from orchestrator.database.session_subagent_recovery import (
     PARENT_RESTART_ERROR,
+    PARENT_RESTART_NOT_STARTED_OUTCOME,
     PARENT_RESTART_OUTCOME,
     PARENT_RESTART_STATUS,
     advance_recovery_watermark,
@@ -36824,7 +36830,10 @@ class PostgresDB:
         ``interrupted:parent_restart`` instead of ``cancelled:parent_retired``.
         That keeps it on the live list's ended branch until its result reaches
         the parent, so the successor's batch settle answers the interrupted
-        turn. Background children keep their retirement event either way.
+        turn. One still ``queued`` never ran: it ends
+        ``interrupted:not_started`` (same status and error), and the settle
+        reports it NOT STARTED. Background children keep their retirement
+        event either way.
         Only ``created``/``active`` rows are touched; a child its own runtime
         already ended keeps its terminal facts.
         """
@@ -36851,7 +36860,7 @@ class PostgresDB:
             """
             SELECT id, runtime_generation, subagent_handle, subagent_type,
                    total_turns, total_tokens, report_path, metadata,
-                   parent_tool_call_id
+                   parent_tool_call_id, subagent_status
               FROM threads
              WHERE kind = 'subagent'
                AND parent_job_id IS NULL
@@ -36880,6 +36889,11 @@ class PostgresDB:
                 and not background
                 and child.get("parent_tool_call_id") is not None
             )
+            interrupted_outcome = (
+                PARENT_RESTART_NOT_STARTED_OUTCOME
+                if str(child.get("subagent_status") or "") == "queued"
+                else PARENT_RESTART_OUTCOME
+            )
             changed = await conn.execute(
                 """
                 UPDATE threads
@@ -36901,7 +36915,7 @@ class PostgresDB:
                 generation,
                 PARENT_RESTART_ERROR if interrupted else cancellation_error,
                 PARENT_RESTART_STATUS if interrupted else "cancelled",
-                (PARENT_RESTART_OUTCOME if interrupted else "cancelled:parent_retired"),
+                (interrupted_outcome if interrupted else "cancelled:parent_retired"),
             )
             if changed != "UPDATE 1":
                 raise RuntimeError("session child retirement lost a locked generation")
@@ -38627,7 +38641,25 @@ class PostgresDB:
 
                 if frame_only:
                     # The member's text becomes the call's result; nothing
-                    # is queued. The source was consumed above.
+                    # is queued. The source was consumed above. A child its
+                    # parent's restart ended unsettled is reported as it was
+                    # then: interrupted, or (still queued) never started.
+                    restart_outcome = (
+                        str(child.get("subagent_outcome") or "")
+                        if already_terminal
+                        and str(child["subagent_status"] or "") == PARENT_RESTART_STATUS
+                        else ""
+                    )
+                    if restart_outcome == PARENT_RESTART_NOT_STARTED_OUTCOME:
+                        result_class = CALL_NOT_STARTED
+                        reply_message = not_started_result_text()
+                    elif (
+                        not already_terminal
+                        or restart_outcome == PARENT_RESTART_OUTCOME
+                    ):
+                        result_class = CALL_LIVE
+                    else:
+                        result_class = CALL_ENDED
                     await write_recovered_result(
                         conn,
                         parent_thread_id=parent_uuid,
@@ -38635,7 +38667,7 @@ class PostgresDB:
                         parent_iteration=int(parent_iteration or 0),
                         tool_call_id=call_id,
                         content=reply_message,
-                        call_class=CALL_ENDED if already_terminal else CALL_LIVE,
+                        call_class=result_class,
                         thread_id=str(child_uuid),
                         handle=child.get("subagent_handle"),
                         subagent_type=child.get("subagent_type"),

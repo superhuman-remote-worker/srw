@@ -57,6 +57,12 @@ _RETIRED_OUTCOME = "cancelled:parent_retired"
 PARENT_RESTART_STATUS = "interrupted"
 PARENT_RESTART_OUTCOME = "interrupted:parent_restart"
 PARENT_RESTART_ERROR = "the parent runtime restarted"
+#: The same end for a child that was still ``queued`` (it never ran): status
+#: ``interrupted``, this outcome, the same error. A writer that ends a child
+#: for its parent's restart without settling it (the lost-runtime retirement,
+#: P4's graceful hand-over) records which of the two it was; the settle then
+#: reports it NOT STARTED instead of INTERRUPTED.
+PARENT_RESTART_NOT_STARTED_OUTCOME = "interrupted:not_started"
 _PARENT_RESTART_STATUS = PARENT_RESTART_STATUS
 _PARENT_RESTART_OUTCOME = PARENT_RESTART_OUTCOME
 
@@ -673,11 +679,53 @@ class DelegationCall:
             self.child_live or self.call_class == CALL_ENDED
         )
 
+    def _ended_for_restart(self, outcome: str) -> bool:
+        child = self.child or {}
+        return (
+            self.call_class == CALL_ENDED
+            and str(child.get("subagent_status") or "") == PARENT_RESTART_STATUS
+            and str(child.get("subagent_outcome") or "") == outcome
+        )
+
+    @property
+    def interrupted_by_restart(self) -> bool:
+        """Ended unfinished for its parent's restart, its result not delivered.
+
+        A retirement of a lost runtime (P0b) or a graceful hand-over (P4)
+        ended the running child; nothing settled it yet (an ``ended`` call has
+        no result and no recovery stamp). It is reported exactly like a child
+        that was still live at the crash. The wire class stays ``ended``, so
+        the successor states the stored facts.
+        """
+
+        return self._ended_for_restart(PARENT_RESTART_OUTCOME)
+
+    @property
+    def never_started(self) -> bool:
+        """Ended for its parent's restart while still ``queued``: it never ran.
+
+        Reported NOT STARTED with the server's text, like a call queued behind
+        the cap that never got a child row; the successor names the child (it
+        is a live-list candidate) but supplies no text.
+        """
+
+        return self._ended_for_restart(PARENT_RESTART_NOT_STARTED_OUTCOME)
+
+    @property
+    def result_class(self) -> str:
+        """The call class whose result an undelivered call gets (§5.4)."""
+
+        if self.interrupted_by_restart:
+            return CALL_LIVE
+        if self.never_started:
+            return CALL_NOT_STARTED
+        return self.call_class
+
     @property
     def needs_message(self) -> bool:
         """The successor supplies the text of this call's result."""
 
-        return self.call_class in {CALL_ENDED, CALL_LIVE}
+        return self.result_class in {CALL_ENDED, CALL_LIVE}
 
     def view(self) -> dict[str, Any]:
         child = self.child or {}
@@ -1043,9 +1091,8 @@ def _validate_members(
             if not str(member.message or "").strip():
                 raise ValueError("a delivered session child needs a message")
         elif member.message is not None:
-            raise ValueError(
-                "a session child whose result is durable must not carry a message"
-            )
+            # Its result is durable, or the server writes it (never started).
+            raise ValueError("a session child that needs no text must not carry one")
 
 
 def _delivery_view(delivery: Mapping[str, Any]) -> dict[str, Any]:
@@ -1294,15 +1341,19 @@ async def settle_session_subagent_batch(
             member = by_child.get(UUID(str(child["id"]))) if child else None
             subagent_status = child.get("subagent_status") if child else None
             report_path = child.get("report_path") if child else None
-            if call.call_class in {CALL_ENDED, CALL_LIVE}:
+            # A child its parent's restart ended unsettled counts as the
+            # class it had at the restart: interrupted, or never started.
+            result_class = call.result_class
+            if result_class in {CALL_ENDED, CALL_LIVE}:
                 if member is None:  # step 6 proved every such child is named
                     raise RuntimeError("batch settle lost a named member")
                 content = str(member.message)
-                if call.call_class == CALL_LIVE:
+                if result_class == CALL_LIVE:
                     interrupted += 1
+                if call.call_class == CALL_LIVE:
                     subagent_status = member.subagent_status
                     report_path = member.report_path or report_path
-            elif call.call_class == CALL_RETIRED:
+            elif result_class == CALL_RETIRED:
                 retired += 1
                 content = retired_result_text(
                     handle=str(child.get("subagent_handle") or ""),
@@ -1310,7 +1361,7 @@ async def settle_session_subagent_batch(
                     turns=int(child.get("total_turns") or 0),
                     tokens=int(child.get("total_tokens") or 0),
                 )
-            elif call.call_class == CALL_DECLINED:
+            elif result_class == CALL_DECLINED:
                 content = DECLINED_RESULT_TEXT
             else:
                 not_started += 1
@@ -1323,7 +1374,7 @@ async def settle_session_subagent_batch(
                 parent_iteration=parent_iteration,
                 tool_call_id=call.tool_call_id,
                 content=content,
-                call_class=call.call_class,
+                call_class=result_class,
                 thread_id=view["thread_id"],
                 handle=view["handle"],
                 subagent_type=view["subagent_type"],
@@ -1444,6 +1495,7 @@ async def settle_session_subagent_batch(
 
 __all__ = [
     "PARENT_RESTART_ERROR",
+    "PARENT_RESTART_NOT_STARTED_OUTCOME",
     "PARENT_RESTART_OUTCOME",
     "PARENT_RESTART_STATUS",
     "BatchMember",

@@ -489,10 +489,12 @@ def _members(plan: dict) -> list[dict[str, Any]]:
             "runtime_generation": call["runtime_generation"],
         }
         if call["class"] == "ended":
+            # The stored facts; text only where the plan asks for it (not for
+            # a child its parent's restart ended before it started).
             member.update(
                 subagent_status=call["subagent_status"],
                 outcome=call["outcome"],
-                message=_report(call),
+                message=_report(call) if call["needs_message"] else None,
             )
         else:
             member.update(
@@ -1839,6 +1841,127 @@ async def test_retired_members_are_reported_as_cancelled(pg_dsn: str) -> None:
             "cancelled:parent_retired"
         )
         await _assert_invariants(pool, orchestrator, seed, authority, settled=True)
+    finally:
+        await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_children_a_lost_runtime_ended_count_as_they_were_at_the_restart(
+    pg_dsn: str,
+) -> None:
+    """P0b/P4: the retirement of a lost pinned runtime (or a graceful
+    hand-over) ends its unfinished foreground children itself, without
+    settling them: ``interrupted:parent_restart`` for one that ran,
+    ``interrupted:not_started`` for one still queued. The settle reports them
+    as they were at the restart, as if still live: interrupted, and NOT
+    STARTED, never as finished."""
+
+    pool = await _fresh_pool(pg_dsn)
+    try:
+        orchestrator = _orchestrator_db(pool)
+        seed = await _seed(
+            pool,
+            orchestrator,
+            ["completed", "running", "running", "none"],
+            lane="pinned",
+        )
+        completed, running, queued, never = seed.call_ids
+        async with pool.acquire() as conn:
+            # The third child was still queued behind the cap.
+            await conn.execute(
+                "UPDATE threads SET status='created', subagent_status='queued' "
+                "WHERE id=$1",
+                UUID(seed.children[queued]["thread_id"]),
+            )
+            async with conn.transaction():
+                assert (
+                    await orchestrator._terminalize_live_session_subagents_for_retirement(
+                        conn,
+                        parent_thread_id=seed.session,
+                        execution_lane="pinned",
+                        disposition="ended",
+                        touch_parent_activity=False,
+                        runtime_lost=True,
+                    )
+                    == {"terminalized": 2, "deliveries": 0}
+                )
+        assert [
+            (row["subagent_status"], row["subagent_outcome"])
+            for row in [await _child(pool, seed, call) for call in seed.children]
+        ] == [
+            ("completed", "completed"),
+            ("interrupted", "interrupted:parent_restart"),
+            ("interrupted", "interrupted:not_started"),
+        ]
+        plan = await _plan(orchestrator, seed, seed.authority)
+        # The wire classes do not change: the successor states stored facts.
+        assert [call["class"] for call in plan["calls"]] == [
+            "ended",
+            "ended",
+            "ended",
+            "not_started",
+        ]
+        assert [call["needs_entry"] for call in plan["calls"]] == [
+            True,
+            True,
+            True,
+            False,
+        ]
+        assert [call["needs_message"] for call in plan["calls"]] == [
+            True,
+            True,
+            False,
+            False,
+        ]
+
+        result = await _settle(orchestrator, seed, seed.authority, _members(plan))
+
+        assert result["result"] == "applied"
+        rows = {row["tool_call_id"]: row for row in await _tool_rows(pool, seed)}
+        assert rows[completed]["content"] == _report(plan["calls"][0])
+        assert rows[running]["content"] == _report(plan["calls"][1])
+        assert rows[queued]["content"] == not_started_result_text()
+        assert rows[never]["content"] == not_started_result_text()
+        assert [_metrics(rows[call])["class"] for call in seed.call_ids] == [
+            "completed",
+            "interrupted",
+            "not_started",
+            "not_started",
+        ]
+        assert [_metrics(rows[call])["subagent_status"] for call in seed.call_ids] == [
+            "completed",
+            "interrupted",
+            "interrupted",
+            None,
+        ]
+        (continuation,) = await _continuations(pool, seed)
+        assert continuation["content"] == batch_continuation_text(
+            calls=4, interrupted=1, not_started=2, declined=0, retired=0
+        )
+        assert (
+            "1 of 4 delegated tasks finished and its result is above. "
+            "1 was interrupted and 2 never started; each is marked."
+        ) in continuation["content"]
+        assert _metrics(continuation) == {
+            "version": 1,
+            "kind": "continuation",
+            "supersedes_input_seq": seed.input_seq,
+            "calls": 4,
+            "finished": 1,
+            "interrupted": 1,
+            "not_started": 2,
+            "declined": 0,
+            "retired": 0,
+        }
+        for call_id in seed.children:
+            child = await _child(pool, seed, call_id)
+            assert child["stamp"] == str(child["runtime_generation"])
+        await _assert_invariants(pool, orchestrator, seed, seed.authority, settled=True)
+
+        before = await _snapshot(pool, seed)
+        again = await _settle(orchestrator, seed, seed.authority, _members(plan))
+        assert again["result"] == "idempotent"
+        assert await _snapshot(pool, seed) == before
     finally:
         await pool.close()
 
