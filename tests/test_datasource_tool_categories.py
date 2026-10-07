@@ -457,6 +457,58 @@ class TestProcessDatasourcesConnectionRouting:
             )
             assert connections["postgresql"].ds_name == "rw", order
 
+    @pytest.mark.parametrize("ds_type", ["neo4j", "webdav", "mongodb"])
+    def test_the_replaced_read_only_connection_is_closed(self, ds_type, monkeypatch):
+        """The read-write connection takes the slot; the read-only one it
+        replaces (and its parent client) is closed, not leaked."""
+        import agent.core.datasource_setup as mod
+        from unittest.mock import MagicMock
+
+        opened = {}
+
+        def _fake_create(ds):
+            conn = MagicMock(name=f"conn-{ds['name']}")
+            client = MagicMock(name=f"client-{ds['name']}")
+            opened[ds["name"]] = (conn, client)
+            return conn, client
+
+        monkeypatch.setattr(mod, "create_datasource_connection", _fake_create)
+        connections, clients, _ = mod.process_datasources(
+            [
+                _ds(ds_type, read_only=False, name="rw"),
+                _ds(ds_type, read_only=True, name="ro"),
+            ]
+        )
+        ro_conn, ro_client = opened["ro"]
+        rw_conn, rw_client = opened["rw"]
+        assert connections[ds_type] is rw_conn
+        assert clients[ds_type] is rw_client
+        ro_conn.close.assert_called_once_with()
+        ro_client.close.assert_called_once_with()
+        rw_conn.close.assert_not_called()
+        rw_client.close.assert_not_called()
+
+    def test_a_failed_replacement_keeps_the_open_connection(self, monkeypatch):
+        import agent.core.datasource_setup as mod
+        from unittest.mock import MagicMock
+
+        ro_conn = MagicMock(name="conn-ro")
+
+        def _fake_create(ds):
+            if ds["name"] == "rw":
+                raise ConnectionError("refused")
+            return ro_conn, None
+
+        monkeypatch.setattr(mod, "create_datasource_connection", _fake_create)
+        connections, _, _ = mod.process_datasources(
+            [
+                _ds("neo4j", read_only=False, name="rw"),
+                _ds("neo4j", read_only=True, name="ro"),
+            ]
+        )
+        assert connections["neo4j"] is ro_conn
+        ro_conn.close.assert_not_called()
+
 
 class TestDatasourceIndexNotes:
     """The README.md connector list must describe working access paths — the

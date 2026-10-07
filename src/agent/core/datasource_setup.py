@@ -135,6 +135,16 @@ def process_datasources(
         ds_type = ds["type"]
         try:
             conn, client = create_datasource_connection(ds)
+            # The slot holds one connection per type: close the one this
+            # replaces (a read-only link's, when a read-write one follows),
+            # or it stays open with nothing left to close it.
+            replaced = datasources_dict.get(ds_type)
+            if replaced is not None:
+                replaced_client = client_registry.pop(ds_type, None)
+                close_datasource_connections(
+                    {ds_type: replaced},
+                    {ds_type: replaced_client} if replaced_client else {},
+                )
             datasources_dict[ds_type] = conn
             if client:
                 client_registry[ds_type] = client
