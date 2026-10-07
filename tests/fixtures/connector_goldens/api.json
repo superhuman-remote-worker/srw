@@ -1808,7 +1808,7 @@
     },
     "status": 400,
     "body": {
-      "detail": "Invalid SSH key: SSH private key is too short — expected BEGIN/body/END lines"
+      "detail": "Invalid SSH key: expected an unencrypted OpenSSH or PEM private key"
     },
     "calls": []
   },
@@ -6350,7 +6350,7 @@
     },
     "status": 400,
     "body": {
-      "detail": "Invalid SSH key: SSH private key is too short — expected BEGIN/body/END lines"
+      "detail": "Invalid SSH key: expected an unencrypted OpenSSH or PEM private key"
     },
     "calls": []
   },

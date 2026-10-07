@@ -722,7 +722,7 @@
       "details": {
         "host": "git.example.test",
         "port": 2222,
-        "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH",
+        "host_key": "[git.example.test]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH",
         "host_key_fingerprint": "SHA256:gNSIRW+2Iyiuvsdp/bgjy38bvWHw6wQm3tuoXrl3WjQ",
         "host_key_pinned": false,
         "host_key_matches_pin": null
@@ -748,7 +748,7 @@
       "details": {
         "host": "git.example.test",
         "port": 2222,
-        "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH",
+        "host_key": "[git.example.test]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH",
         "host_key_fingerprint": "SHA256:gNSIRW+2Iyiuvsdp/bgjy38bvWHw6wQm3tuoXrl3WjQ",
         "host_key_pinned": true,
         "host_key_matches_pin": true
@@ -774,7 +774,7 @@
       "details": {
         "host": "git.example.test",
         "port": 2222,
-        "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH",
+        "host_key": "[git.example.test]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH",
         "host_key_fingerprint": "SHA256:gNSIRW+2Iyiuvsdp/bgjy38bvWHw6wQm3tuoXrl3WjQ",
         "host_key_pinned": true,
         "host_key_matches_pin": false
@@ -811,7 +811,7 @@
     "status": 200,
     "body": {
       "status": "error",
-      "message": "Invalid SSH key: SSH private key is too short — expected BEGIN/body/END lines"
+      "message": "Invalid SSH key: expected an unencrypted OpenSSH or PEM private key"
     },
     "probe_calls": []
   },
