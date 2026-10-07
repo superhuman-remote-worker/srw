@@ -348,6 +348,20 @@ async def test_owed_event_is_served_again_once_and_answered_once(db):
 
 
 @pytest.mark.asyncio
+async def test_the_current_process_own_admission_is_a_turn_in_flight(db):
+    life, event = await _killed_admitted_event(db)
+
+    # The same process (a retried pass, a reclaim during the turn) never
+    # takes back its own admission.
+    assert await _reserve(db, life) == NOTHING
+    row = await _delivery(db, event["delivery_id"])
+    assert (row["state"], row["claim_generation"]) == (
+        "admitted",
+        event["claim_generation"],
+    )
+
+
+@pytest.mark.asyncio
 async def test_answered_event_is_settled_not_served_again(db):
     life, event = await _killed_admitted_event(db)
     # The turn's final answer is durable; the process died before the settle.
