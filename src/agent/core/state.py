@@ -11,11 +11,71 @@ systems and file-based artifacts (plan.md, notes/), while state fields
 control loop flow.
 """
 
-from typing import Annotated, Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Mapping, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from typing_extensions import TypedDict
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
+
+
+# Hidden dispatch fields that are pure credential transport. Their consumers
+# pop them before the graph starts; dropping them here is the backstop.
+_CREDENTIAL_METADATA_KEYS = ("managed_repository_credentials",)
+# Metadata lists whose entries carry a plaintext ``credentials`` object (Git
+# tokens, SSH keys, env values, credential-file contents) and a URL that may
+# embed userinfo.
+_CREDENTIAL_ENTRY_URLS = {"datasources": "connection_url", "repositories": "repo_url"}
+
+
+def _url_without_userinfo(value: Any) -> Any:
+    """Drop ``user:secret@`` from a URL; a malformed one is dropped whole."""
+    if not isinstance(value, str) or "@" not in value:
+        return value
+    try:
+        parts = urlsplit(value)
+        if not parts.scheme or "@" not in parts.netloc:
+            return value
+        netloc = parts.netloc.rpartition("@")[2]
+        return urlunsplit(parts._replace(netloc=netloc))
+    except ValueError:
+        return ""
+
+
+def checkpoint_safe_metadata(
+    metadata: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Return job metadata without its connector credentials.
+
+    Graph state is persisted by the checkpointer (shared Postgres by default
+    and always for stateless workers, pod-local SQLite in the legacy mode), so
+    secret material must never become state. Each ``datasources`` and ``repositories`` entry
+    loses its ``credentials`` and the userinfo of its URL; the other fields
+    stay. The runtime reads credentials from the dispatch payload it holds in
+    process memory (``UniversalAgent._job_metadata``), never from state, and
+    every resume or claim delivers that payload again. The input is not
+    mutated: the runtime shares its entry dicts.
+    """
+    if not metadata:
+        return {}
+    safe = {
+        key: value
+        for key, value in metadata.items()
+        if key not in _CREDENTIAL_METADATA_KEYS
+    }
+    for list_key, url_key in _CREDENTIAL_ENTRY_URLS.items():
+        entries = safe.get(list_key)
+        if not isinstance(entries, list):
+            continue
+        cleaned = []
+        for entry in entries:
+            if isinstance(entry, Mapping):
+                entry = {k: v for k, v in entry.items() if k != "credentials"}
+                if url_key in entry:
+                    entry[url_key] = _url_without_userinfo(entry[url_key])
+            cleaned.append(entry)
+        safe[list_key] = cleaned
+    return safe
 
 
 class CompletionReportPayload(TypedDict):
@@ -231,7 +291,9 @@ def create_initial_state(
     Args:
         job_id: Unique job identifier
         workspace_path: Path to job workspace
-        metadata: Optional job-specific data
+        metadata: Optional job-specific data. Stored through
+            :func:`checkpoint_safe_metadata`, so connector credentials never
+            reach the checkpoint.
 
     Returns:
         Initial UniversalAgentState ready for graph invocation
@@ -288,7 +350,7 @@ def create_initial_state(
         worker_batch_iteration_cap=None,
         worker_resume_id=None,
         # Metadata
-        metadata=metadata or {},
+        metadata=checkpoint_safe_metadata(metadata),
         # Context management
         context_stats=None,
         tool_retry_state=None,
