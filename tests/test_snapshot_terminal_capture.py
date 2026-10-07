@@ -322,6 +322,12 @@ def test_strict_archive_omits_connector_credentials_and_keeps_user_ssh(
             ".ssh/known_hosts": "example ssh-ed25519 AAAA\n",
             ".ssh/repository-notes": "user file with a similar name\n",
             "workspace/repos/project/state.txt": "undo-authority",
+            ".cache/srw/rclone/t1/workspace/rclone.conf": "pass = obscured\n",
+            ".cache/srw/rclone/t1/workspace/bearer.token": "bearer\n",
+            ".cache/srw/rclone/t1/workspace/bearer.token.new.0a1b": "bearer\n",
+            ".cache/srw/rclone/t1/workspace/.bearer.token.Xy12AbCd": "bearer\n",
+            ".cache/srw/rclone/t1/workspace/bearer-helper.sh": "exec cat token\n",
+            ".cache/srw/rclone/t1/workspace/vfs-cache/vfs/r/notes.md": "cached\n",
         }
         for relative, content in fixture.items():
             path = home / relative
@@ -348,7 +354,11 @@ def test_strict_archive_omits_connector_credentials_and_keeps_user_ssh(
     assert not [m for m in listing if "/.srw-credentials" in m]
     assert not [m for m in listing if "/.ssh/srw-managed" in m]
     assert not [m for m in listing if "/.ssh/repo_" in m]
+    assert not [m for m in listing if m.endswith("/rclone.conf")]
+    assert not [m for m in listing if "bearer.token" in m]
     for kept in (
+        ".cache/srw/rclone/t1/workspace/bearer-helper.sh",
+        ".cache/srw/rclone/t1/workspace/vfs-cache/vfs/r/notes.md",
         ".ssh/config",
         ".ssh/id_ed25519",
         ".ssh/known_hosts",
@@ -806,3 +816,64 @@ async def test_failed_recapture_keeps_an_available_snapshot() -> None:
     last = service._set_snapshot_context.await_args_list[-1].args[1]
     assert last["status"] == "available"
     assert "rc=255" in last["last_capture_error"]
+
+
+@pytest.mark.parametrize("auth_type", ["basic", "keycloak_client_credentials"])
+def test_every_mount_start_rewrites_the_excluded_rclone_files(auth_type) -> None:
+    """A home restored without rclone.conf and bearer.token still mounts.
+
+    The snapshot excludes both files; every mount start recreates the state
+    directory, writes the bearer token (Keycloak auth) and creates the rclone
+    config before rclone first reads either.
+    """
+    from types import SimpleNamespace
+
+    from shared.runtime.services.cloud_mount import RcloneMountManager
+
+    home = "/home/agent-host"
+    backend = SimpleNamespace(
+        resolve_home_path=lambda relative: f"{home}/{relative}",
+        claim_resource_fenced=False,
+        root=f"{home}/workspace",
+    )
+    auth = (
+        {"type": "basic", "password": "reader-secret"}
+        if auth_type == "basic"
+        else {
+            "type": auth_type,
+            "issuer": "https://auth.example.test/realms/srw",
+            "client_id": "srw-agent",
+            "client_secret": "client-secret",
+        }
+    )
+    mount = {
+        "mount_id": "m1",
+        "workspace_name": "workspace",
+        "target_path": "/cloud/workspace",
+        "source": {
+            "type": "webdav",
+            "config": {"url": "https://cloud.example.test/dav", "user": "reader"},
+        },
+        "auth": auth,
+    }
+    manager = RcloneMountManager(
+        thread_id="t1",
+        cloud_cfg={"driver": "rclone", "mounts": [mount]},
+        workspace_backend=backend,
+        workspace_root=Path(f"{home}/workspace"),
+    )
+    state = manager._state_for_mount(mount, 0)
+    script = manager._mount_script(
+        mount, state, initial_token=None if auth_type == "basic" else "bearer"
+    )
+
+    # The layout the snapshot fixtures above exclude.
+    assert state.config_path == f"{home}/.cache/srw/rclone/t1/workspace/rclone.conf"
+    assert state.token_path == f"{home}/.cache/srw/rclone/t1/workspace/bearer.token"
+    mkdir = script.index(f"mkdir -p {state.state_dir} ")
+    create = script.index(f"rclone --config {state.config_path} config create")
+    first_read = script.index(f"rclone --config {state.config_path} cat")
+    assert mkdir < create < first_read
+    if auth_type != "basic":
+        token = script.index(f"cat > {state.token_path} <<")
+        assert mkdir < token < create

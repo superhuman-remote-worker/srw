@@ -34,7 +34,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import paramiko
 import pytest
 
-from orchestrator.services.snapshot_service import SnapshotService  # noqa: E402
+from orchestrator.services.snapshot_service import (  # noqa: E402
+    CREDENTIAL_EXCLUDE_PATTERNS,
+    SnapshotService,
+)
 from orchestrator.services.ssh_helpers import (  # noqa: E402
     EXTRACT_HOME_REMOTE_CMD,
     EXTRACT_REMOTE_CMD,
@@ -894,6 +897,8 @@ class TestCaptureVmSnapshotAcceptGate:
         assert "--exclude=.srw-credentials " in remote_cmd
         assert "--exclude=.ssh/srw-managed " in remote_cmd
         assert "--exclude=.ssh/repo_* " in remote_cmd
+        for pattern in CREDENTIAL_EXCLUDE_PATTERNS:
+            assert f"{pattern} " in remote_cmd
         assert "--exclude=.ssh " not in remote_cmd
         assert remote_cmd.count("'") == 2
 
@@ -922,6 +927,12 @@ class TestCaptureVmSnapshotAcceptGate:
                 ".ssh/id_ed25519": "user-private-key\n",
                 ".ssh/known_hosts": "example ssh-ed25519 AAAA\n",
                 "workspace/notes.md": "kept\n",
+                ".cache/srw/rclone/t1/workspace/rclone.conf": "pass = obscured\n",
+                ".cache/srw/rclone/t1/workspace/bearer.token": "bearer\n",
+                ".cache/srw/rclone/t1/workspace/bearer.token.new.0a1b": "bearer\n",
+                ".cache/srw/rclone/t1/workspace/.bearer.token.Xy12AbCd": "bearer\n",
+                ".cache/srw/rclone/t1/workspace/bearer-helper.sh": "exec cat token\n",
+                ".cache/srw/rclone/t1/workspace/vfs-cache/vfs/r/notes.md": "cached\n",
             }
             for relative, content in fixture.items():
                 path = os.path.join(home, relative)
@@ -964,6 +975,14 @@ class TestCaptureVmSnapshotAcceptGate:
         assert not [m for m in listing if "/.srw-credentials" in m]
         assert not [m for m in listing if "/.ssh/srw-managed" in m]
         assert not [m for m in listing if "/.ssh/repo_" in m]
-        for kept in (".ssh/config", ".ssh/id_ed25519", ".ssh/known_hosts"):
+        assert not [m for m in listing if m.endswith("/rclone.conf")]
+        assert not [m for m in listing if "bearer.token" in m]
+        for kept in (
+            ".ssh/config",
+            ".ssh/id_ed25519",
+            ".ssh/known_hosts",
+            ".cache/srw/rclone/t1/workspace/bearer-helper.sh",
+            ".cache/srw/rclone/t1/workspace/vfs-cache/vfs/r/notes.md",
+        ):
             assert any(m.endswith(f"agent-host/{kept}") for m in listing), kept
         assert any(m.endswith("agent-host/workspace/notes.md") for m in listing)

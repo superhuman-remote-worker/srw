@@ -1002,9 +1002,12 @@ class DockerProvisioner:
             )
             + "; "
             "rm -rf -- /home/agent-host/.ssh/srw-managed; "
+            # Connector env files and legacy repository keys of the last lease.
+            "rm -rf -- /home/agent-host/.srw-credentials /home/agent-host/.ssh/repo_*; "
             "rm -rf -- /home/agent-host/workspace; "
             "install -d -m 700 /home/agent-host/workspace; "
             "test ! -e /home/agent-host/.ssh/srw-managed; "
+            "test ! -e /home/agent-host/.srw-credentials; "
             "test -d /home/agent-host/workspace; "
             "test ! -L /home/agent-host/workspace; "
             'test -z "$(find /home/agent-host/workspace -mindepth 1 '

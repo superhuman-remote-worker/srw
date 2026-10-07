@@ -3436,6 +3436,11 @@ async def test_trusted_dev_cleanup_requires_and_pins_inventory_identity(
     assert "ssh-add -D" not in connection.command
     assert "rm -rf -- /home/agent-host/.ssh/srw-managed" in connection.command
     assert "test ! -e /home/agent-host/.ssh/srw-managed" in connection.command
+    assert (
+        "rm -rf -- /home/agent-host/.srw-credentials /home/agent-host/.ssh/repo_*;"
+        in connection.command
+    )
+    assert "test ! -e /home/agent-host/.srw-credentials" in connection.command
     assert "rm -rf -- /home/agent-host/workspace" in connection.command
     assert "install -d -m 700 /home/agent-host/workspace" in connection.command
     assert "test ! -L /home/agent-host/workspace" in connection.command
