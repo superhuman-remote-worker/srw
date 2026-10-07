@@ -65,6 +65,48 @@ timeline, facts (thread id, killed pods, lease tokens) and the verdict. The
 test sessions are ended afterwards (`DELETE /api/persistent/threads/{id}
 ?force=true`, not permanent) unless --keep-sessions.
 
+Pinned lane (P6, parallel_subagents.md §14.2), `--lane pinned`:
+
+  The session is an Officer conference (`officer.conference: true`, one per
+  project, owned by the user) with a sandbox workspace: pinned by rule, its
+  own agent pod (label srw.io/thread-id), its inputs pinned deliveries. The
+  parent is HEAD's `--expert` sent as an inline Expert on `--model` that
+  authors `llm.parallel_tool_calls: true` (muse-spark-1.3 is false in the
+  matrix, so the parent would never fan out; see pinned_expert_runtime).
+
+  --pk0  Live preflight: lane, image (P3 code), attach advertisement
+         fanout=True, the offer and cap, a 2-call batch whose children overlap.
+  --pk1  4 calls, cap 2: waves, one answer, one tool row per call; measures
+         the batch and the pod's memory.
+  --pk2  Kill when one child ended, two sleep and one is queued. `kill -9` of
+         the agent process from the k3d node (default; no SIGTERM, no preStop,
+         like an OOM kill) or `--pinned-kill force-delete`. The stale-agent
+         detector retires the runtime (P0: no refused receipt; P0b: children
+         interrupted:parent_restart, cause runtime_lost); no parent result
+         before Resume (P2); Resume; the successor settles one result per
+         call, one continuation, the source settled, one answer.
+  --pk3  As PK2 with a plain `kubectl delete pod` (180 s grace): the batch is
+         handed over (P4 log, no parent result), the session ends (or
+         suspends: recorded), and Resume settles as in PK2.
+  --pk4  PK2, then the successor is killed while the continuation's answer
+         streams; the next runtime serves the admitted continuation exactly
+         once (P3: log, admission_count 2), one answer.
+  --pk5  The switch turned off under a live pinned session: the gate edits
+         only `sessionSubagentFanoutLanes` in deployment/values-local.yaml,
+         waits for the orchestrator restart and a heartbeat (>=60 s), then a
+         2-call request is refused (both calls, no child); the pod logs the
+         re-applied advertisement. Restores the value and checks fanout=True.
+  --pk6  A person's End mid-batch cancels the children (D4); Resume settles
+         nothing.
+
+  A viewer is held by default: one cockpit-like WebSocket subscriber on the
+  session's current pod (class Viewer). Headless (`--no-viewer`), a pinned
+  session reads awaiting_user mid-turn, the detector then settles a lost
+  runtime `suspended` and the gate revives it with `prepare` instead of
+  Resume (seen 2026-10-07: that path wedged, see the P6 record). An End that
+  retries "subagent quiesce cannot prove exact settlement authority" is
+  recorded and the session's pod deleted so the retirement can settle.
+
 Uses the disposable k3d `test` account; set SRW_K3D_TEST_PASSWORD if its
 password was changed. The password travels over stdin into the orchestrator
 pod, which mints the token and makes the request; no credential is placed on
@@ -75,6 +117,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import copy
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -211,6 +254,72 @@ OTHER_GATES = (
 LOCK_PATH = Path(tempfile.gettempdir()) / "srw-parallel-subagents-k3d-gate.lock"
 SCENARIOS = ("k1", "k2", "k3", "k4", "measure")
 _SECRETS: list[str] = []
+
+# ---------------------------------------------------------------------------
+# PINNED LANE (P6, parallel_subagents.md §14.2). `--lane pinned` selects it.
+#   The switch must name `pinned` too:
+#       orchestrator:
+#         sessionSubagentFanoutLanes: "stateless,pinned"
+#   PK5 edits that one key of the gitignored values file itself (and restores
+#   it); Tilt re-applies the chart and the orchestrator restarts.
+# ---------------------------------------------------------------------------
+PINNED_SCENARIOS = ("pk0", "pk1", "pk2", "pk3", "pk4", "pk5", "pk6")
+PINNED_LANE = "pinned"
+PINNED_CONTAINER = "agent"
+PINNED_THREAD_LABEL = "srw.io/thread-id"
+ORCHESTRATOR_SELECTOR = (
+    "app.kubernetes.io/component=orchestrator,app.kubernetes.io/instance=srw"
+)
+# The k3d node container; `kill -9` of the agent process from here is the
+# crash (an OOM kill), with no SIGTERM and no preStop (see PinnedRun.kill).
+K3D_NODE = "k3d-srw-server-0"
+VALUES_LOCAL = ROOT / "deployment" / "values-local.yaml"
+_VALUES_LANES = re.compile(r'^(\s*sessionSubagentFanoutLanes:\s*)"([^"]*)"\s*$', re.M)
+# A served image older than P3 lacks this function (the brief's image check).
+PINNED_IMAGE_MARKER = (
+    "src/shared/persistent_input_delivery.py",
+    "reserve_stale_pinned_admissions",
+)
+PINNED_AGENT_FILES = AGENT_FILES + [
+    "src/agent/api/session_attach.py",
+    "src/agent/api/session_termination.py",
+]
+PINNED_ORCHESTRATOR_FILES = ORCHESTRATOR_FILES + [
+    "src/orchestrator/services/stale_agent_detector.py",
+    "src/orchestrator/services/thread_retirement.py",
+    "src/orchestrator/services/pinned_retirement.py",
+    "src/orchestrator/services/agent_registration.py",
+    "src/orchestrator/services/thread_resume.py",
+]
+# Agent and orchestrator log lines the pinned scenarios read (sources).
+# session_attach: the attach advertisement and the heartbeat re-apply (P5).
+ADVERTISEMENT_RE = re.compile(
+    r"Session delegation advertisement: thread=(?P<thread>\S+) "
+    r"batch_settle=(?P<settle>\w+) fanout=(?P<fanout>\w+) source=(?P<source>\w+)"
+)
+REAPPLIED_RE = re.compile(
+    r"Session delegation advertisement re-applied: thread=(?P<thread>\S+) "
+    r"batch_settle=(?P<settle>\w+) fanout=(?P<fanout>\w+)"
+)
+# batch_recovery: the successor's batch settle at attach.
+BATCH_SETTLED_LOG = "settled as one batch"
+# subagents.runtime (P4): a child ended for the successor at the fence.
+HANDOVER_LOG = "for the successor (parent shutting down)"
+# session attach (P3): stale admissions settled / served again / parked.
+STALE_ADMISSION_RE = re.compile(
+    r"Stale pinned admissions for thread (?P<thread>\S+): (?P<counts>[^\n]*?)"
+    r"(?P<served>\d+) served again, (?P<parked>\d+) parked"
+)
+# pinned_retirement (P0): the exit receipt refused; must never appear.
+RECEIPT_REFUSED_LOG = "Pinned retirement receipt refused"
+# subagents.runtime.quiesce: End cannot settle the runtime's children (seen
+# after a recovery: the recovered handles are never marked settled).
+QUIESCE_WEDGE_LOG = "subagent quiesce cannot prove exact settlement authority"
+# stale_agent_detector step 3: the detector retired an offline runtime.
+DETECTOR_RETIRED_LOG = "offline pinned runtime(s) through exact End"
+PARENT_RESTART_OUTCOME = "interrupted:parent_restart"
+PARENT_RESTART_NOT_STARTED_OUTCOME = "interrupted:not_started"
+PERSON_END_OUTCOME = "cancelled:parent_retired"
 
 
 class GateError(RuntimeError):
@@ -389,10 +498,10 @@ class Api:
 # ---------------------------------------------------------------------------
 
 
-def executor_pods(*, running_only=True):
-    data = json.loads(
-        command(K + ["get", "pods", "-l", EXECUTOR_SELECTOR, "-o", "json"])
-    )
+def executor_pods(*, running_only=True, selector=EXECUTOR_SELECTOR):
+    """Pods matching ``selector`` (default: the stateless executor pool; the
+    pinned mode passes a session's ``srw.io/thread-id`` label)."""
+    data = json.loads(command(K + ["get", "pods", "-l", selector, "-o", "json"]))
     pods = []
     for item in data["items"]:
         status = item.get("status") or {}
@@ -704,19 +813,32 @@ class LogCollector(threading.Thread):
     a restarted container); counts prefer the snapshot, so nothing is counted
     twice."""
 
-    def __init__(self, directory: Path):
+    def __init__(
+        self, directory: Path, selector=EXECUTOR_SELECTOR, container=EXECUTOR_CONTAINER
+    ):
         super().__init__(daemon=True)
         self.directory = directory
         self.since = rfc3339_now()
         self.stop_event = threading.Event()
         self.procs = {}
+        # A label selector, or a callable returning one (None: nothing yet;
+        # the pinned mode learns its thread id only after the create).
+        self.selector = selector
+        self.container = container
+
+    def _selector(self):
+        return self.selector() if callable(self.selector) else self.selector
+
+    def _pods(self):
+        selector = self._selector()
+        return executor_pods(running_only=False, selector=selector) if selector else []
 
     def _follow(self, name):
         path = self.directory / f"{name}.followed.log"
         handle = open(path, "a")
         proc = subprocess.Popen(
             K
-            + ["logs", "-f", name, "-c", EXECUTOR_CONTAINER]
+            + ["logs", "-f", name, "-c", self.container]
             + [f"--since-time={self.since}"],
             stdout=handle,
             stderr=subprocess.DEVNULL,
@@ -727,7 +849,7 @@ class LogCollector(threading.Thread):
         self.directory.mkdir(parents=True, exist_ok=True)
         while True:
             try:
-                for pod in executor_pods(running_only=False):
+                for pod in self._pods():
                     name, current = pod["name"], self.procs.get(pod["name"])
                     if pod["phase"] != "Running":
                         continue
@@ -752,13 +874,13 @@ class LogCollector(threading.Thread):
                     proc.kill()
             handle.close()
         try:
-            existing = {p["name"]: p for p in executor_pods(running_only=False)}
+            existing = {p["name"]: p for p in self._pods()}
         except GateError:
             existing = {}
         for name in set(self.procs) | set(existing):
             if name not in existing:
                 continue
-            base = K + ["logs", name, "-c", EXECUTOR_CONTAINER]
+            base = K + ["logs", name, "-c", self.container]
             try:
                 text = command(base + [f"--since-time={self.since}"], timeout=60)
                 (self.directory / f"{name}.snapshot.log").write_text(text + "\n")
@@ -777,19 +899,27 @@ class LogCollector(threading.Thread):
 class MemorySampler(threading.Thread):
     """cgroup memory of every running executor pod, every ``interval`` s."""
 
-    def __init__(self, path: Path, interval: float):
+    def __init__(
+        self,
+        path: Path,
+        interval: float,
+        selector=EXECUTOR_SELECTOR,
+        container=EXECUTOR_CONTAINER,
+    ):
         super().__init__(daemon=True)
         self.path = path
         self.interval = interval
         self.stop_event = threading.Event()
         self.samples = []
+        self.selector = selector
+        self.container = container
 
     def sample_once(self):
-        for pod in executor_pods():
+        for pod in executor_pods(selector=self.selector):
             try:
                 out = command(
                     K
-                    + ["exec", pod["name"], "-c", EXECUTOR_CONTAINER, "--", "sh", "-c"]
+                    + ["exec", pod["name"], "-c", self.container, "--", "sh", "-c"]
                     + [
                         f"cat {CGROUP}/memory.current; "
                         f"cat {CGROUP}/memory.peak 2>/dev/null || echo -1; "
@@ -894,7 +1024,10 @@ def child_brief(marker: str, sleep_s: int) -> str:
     )
 
 
-def batch_prompt(tag, n, sleep_s, child_type, final_instruction) -> str:
+def batch_prompt(tag, n, sleep_s, child_type, final_instruction, extra_rule="") -> str:
+    """``sleep_s`` is one value for every child, or a list with one per call
+    (the pinned kills want a short first child and long siblings)."""
+    sleeps = list(sleep_s) if isinstance(sleep_s, (list, tuple)) else [sleep_s] * n
     lines = [
         f"[{tag}] Automated infrastructure test. Follow these steps exactly.",
         "",
@@ -908,13 +1041,13 @@ def batch_prompt(tag, n, sleep_s, child_type, final_instruction) -> str:
         lines.append(
             f'Call {index}: subagent_type="{child_type}", '
             f'description="gate {tag} child {index}", '
-            f'prompt="{child_brief(f"{tag}-C{index}", sleep_s)}"'
+            f'prompt="{child_brief(f"{tag}-C{index}", sleeps[index - 1])}"'
         )
     lines += [
         "",
         f"Step 2: When all {n} results are back, never call delegate_agent "
         "again and call no other tool, even if a result is marked INTERRUPTED "
-        f"or NOT STARTED or was declined. {final_instruction}",
+        f"or NOT STARTED or was declined.{extra_rule} {final_instruction}",
     ]
     return "\n".join(lines)
 
@@ -1429,13 +1562,1652 @@ def recovery_class(result):
 
 
 # ---------------------------------------------------------------------------
+# Pinned lane (P6): helpers
+# ---------------------------------------------------------------------------
+
+
+def pod_json(name):
+    """The pod object, or None when it no longer exists."""
+    try:
+        return json.loads(command(K + ["get", "pod", name, "-o", "json"]))
+    except GateError as exc:
+        if "NotFound" in str(exc) or "not found" in str(exc):
+            return None
+        raise
+
+
+def pod_ready(pod) -> bool:
+    status = (pod or {}).get("status") or {}
+    if status.get("phase") != "Running" or pod["metadata"].get("deletionTimestamp"):
+        return False
+    return all(c.get("ready") for c in status.get("containerStatuses") or [{}])
+
+
+def pod_log(name, since=None, container=PINNED_CONTAINER) -> str:
+    """A pod's log ('' once the pod is gone)."""
+    args = K + ["logs", name, "-c", container]
+    if since:
+        args.append(f"--since-time={since}")
+    try:
+        return command(args, timeout=60)
+    except GateError:
+        return ""
+
+
+def node_agent_process(pod) -> tuple[int, str]:
+    """(host pid, command line) of a pod's agent process, seen from the k3d
+    node. The agent is PID 1 of its container, which ignores a SIGKILL sent
+    from inside; from the node it is an ordinary process."""
+    ids = command(
+        ["docker", "exec", K3D_NODE, "crictl", "ps", "-q", "--state", "running"]
+        + ["--name", PINNED_CONTAINER, "--label", f"io.kubernetes.pod.name={pod}"]
+    ).split()
+    if len(ids) != 1:
+        raise GateFailure(f"expected one running agent container in {pod}: {ids}")
+    pid = int(
+        command(
+            ["docker", "exec", K3D_NODE, "crictl", "inspect", "--output"]
+            + ["go-template", "--template", "{{.info.pid}}", ids[0]]
+        )
+    )
+    cmdline = command(["docker", "exec", K3D_NODE, "cat", f"/proc/{pid}/cmdline"])
+    return pid, cmdline.replace("\x00", " ")
+
+
+def values_lanes() -> str:
+    """The switch value in the gitignored values-local.yaml (exactly one line)."""
+    found = _VALUES_LANES.findall(VALUES_LOCAL.read_text())
+    if len(found) != 1:
+        raise GateError(
+            f"{VALUES_LOCAL.name}: expected one sessionSubagentFanoutLanes line, "
+            f"found {len(found)}"
+        )
+    return found[0][1]
+
+
+def set_values_lanes(value: str) -> str:
+    """Rewrite only the switch line; returns the previous value."""
+    previous = values_lanes()
+    text = VALUES_LOCAL.read_text()
+    VALUES_LOCAL.write_text(
+        _VALUES_LANES.sub(lambda m: f'{m.group(1)}"{value}"', text, count=1)
+    )
+    return previous
+
+
+def lane_names(value) -> set[str]:
+    return {x.strip().lower() for x in str(value or "").split(",") if x.strip()}
+
+
+def orchestrator_serves_lanes(value: str) -> bool:
+    """Tilt re-applied the chart and every live orchestrator pod carries
+    ``value``. The env comes from the ConfigMap (``valueFrom``), so the
+    deployment template holds no literal value: read it in each pod."""
+    dep = deployment(ORCHESTRATOR_DEPLOYMENT)
+    if not rollout_converged(dep):
+        return False
+    pods = [
+        p
+        for p in executor_pods(running_only=False, selector=ORCHESTRATOR_SELECTOR)
+        if not p["terminating"]
+    ]
+    if len(pods) != dep["spec"]["replicas"] or any(
+        p["phase"] != "Running" for p in pods
+    ):
+        return False
+    for pod in pods:
+        served = command(
+            K
+            + ["exec", pod["name"], "-c", ORCHESTRATOR_CONTAINER, "--", "sh", "-c"]
+            + [f'printenv {FANOUT_SWITCH_ENV} || echo "<unset>"']
+        )
+        if served != value:
+            return False
+    return True
+
+
+# A cockpit-like viewer (run inside the orchestrator pod, password on stdin):
+# one WebSocket subscriber on the session's current pod. Without a subscriber
+# a pinned session flips to awaiting_user at its input wait ("eager" headless
+# mode) and keeps that status through later turns, so the detector settles a
+# runtime lost mid-turn as `suspended` instead of `ended`. Commands on stdin:
+# `connect <pod ip>`; output lines: connected/closed/error, never the token.
+_VIEWER_PROGRAM = r"""
+import asyncio, json, sys, urllib.error, urllib.parse, urllib.request
+import websockets
+envelope = json.loads(sys.stdin.readline())
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+def session_token():
+    form = urllib.parse.urlencode({
+        "grant_type": "password", "client_id": "admin-cli", "scope": "openid",
+        "username": envelope["username"], "password": envelope["password"],
+    }).encode()
+    with opener.open(envelope["token_url"], data=form, timeout=30) as response:
+        bearer = json.load(response)["id_token"]
+    request = urllib.request.Request(
+        "http://localhost:8085/api/sessions/%s/connection" % envelope["thread"],
+        headers={"Authorization": "Bearer " + bearer},
+    )
+    with opener.open(request, timeout=60) as response:
+        return json.load(response)["token"]
+async def hold(ip):
+    for attempt in range(20):
+        try:
+            token = await asyncio.to_thread(session_token)
+            url = "ws://%s:8001/p/%s/ws?t=%s" % (ip, envelope["thread"], token)
+            async with websockets.connect(
+                url, max_size=None, open_timeout=30, ping_interval=20
+            ) as ws:
+                print("connected " + ip, flush=True)
+                async for _ in ws:
+                    pass
+            print("closed " + ip, flush=True)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            code = getattr(error, "code", "")
+            print("error %s %s %s" % (ip, type(error).__name__, code), flush=True)
+            await asyncio.sleep(3)
+async def main():
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader()
+    await loop.connect_read_pipe(
+        lambda: asyncio.StreamReaderProtocol(reader), sys.stdin
+    )
+    task = None
+    while True:
+        line = await reader.readline()
+        if not line:
+            break
+        parts = line.decode().split()
+        if len(parts) == 2 and parts[0] == "connect":
+            if task is not None:
+                task.cancel()
+            task = asyncio.create_task(hold(parts[1]))
+    if task is not None:
+        task.cancel()
+asyncio.run(main())
+"""
+
+
+class Viewer:
+    """Holds one cockpit-like WebSocket subscriber on the session's pod."""
+
+    def __init__(self, api, thread, path: Path):
+        self.path = path
+        self.events = []
+        self.proc = subprocess.Popen(
+            K
+            + ["exec", "-i", f"deploy/{ORCHESTRATOR_DEPLOYMENT}"]
+            + ["-c", ORCHESTRATOR_CONTAINER, "--", "python", "-u", "-c"]
+            + [_VIEWER_PROGRAM],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        envelope = {
+            "username": api.username,
+            "password": api.password,
+            "token_url": KEYCLOAK_TOKEN_URL,
+            "thread": thread,
+        }
+        self.proc.stdin.write(json.dumps(envelope) + "\n")
+        self.proc.stdin.flush()
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+
+    def _read(self):
+        for line in self.proc.stdout:
+            entry = {"at": utc_now(), "line": _scrub(line.strip())}
+            self.events.append(entry)
+            with open(self.path, "a") as handle:
+                handle.write(json.dumps(entry) + "\n")
+
+    def connect(self, ip, timeout=120) -> bool:
+        start = len(self.events)
+        try:
+            self.proc.stdin.write(f"connect {ip}\n")
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if any(e["line"] == f"connected {ip}" for e in self.events[start:]):
+                return True
+            if self.proc.poll() is not None:
+                return False
+            time.sleep(1)
+        return False
+
+    def stop(self):
+        try:
+            self.proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            self.proc.wait(15)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+def expected_class_from_row(child) -> str:
+    """The class the settle gives a call, from its child's end state."""
+    if child is None:
+        return "not_started"  # queued behind the cap: no row
+    if child["subagent_outcome"] == PARENT_RESTART_NOT_STARTED_OUTCOME:
+        return "not_started"
+    if child["subagent_status"] == "completed":
+        return "completed"
+    return "interrupted"
+
+
+class PinnedRun(Run):
+    """One pinned conference session (P6).
+
+    The runtime is the session's own agent pod (label srw.io/thread-id); its
+    inputs are pinned deliveries (no run_queue row); a lost runtime is retired
+    by the stale-agent detector and Resume provisions the successor, whose
+    attach settles the batch."""
+
+    def __init__(self, gate, name):
+        super().__init__(gate, name)
+        self.logs = LogCollector(
+            self.dir / "logs",
+            selector=lambda: (
+                f"{PINNED_THREAD_LABEL}={self.thread}" if self.thread else None
+            ),
+            container=PINNED_CONTAINER,
+        )
+        self.orchestrator_logs = LogCollector(
+            self.dir / "logs" / "orchestrator",
+            selector=ORCHESTRATOR_SELECTOR,
+            container=ORCHESTRATOR_CONTAINER,
+        )
+        self.extra_collectors = [self.orchestrator_logs]
+        self.runtimes = []
+        self.facts["runtimes"] = self.runtimes
+        self.facts["lane"] = PINNED_LANE
+        self._answerless_since = None
+        self.viewer = None
+
+    # -- session -----------------------------------------------------------
+    def create_session(self, *, permission_mode="autonomous", cap=None):
+        gate, args = self.gate, self.gate.args
+        delegation = {"enabled": True}
+        if cap is not None:
+            delegation["session_max_concurrent"] = int(cap)
+        body = {
+            "title": f"P6 pinned gate {self.name} {self.nonce}",
+            "expert": {"inline": {"runtime": gate.pinned_expert_runtime()}},
+            "permission_mode": permission_mode,
+            "project_id": gate.project_id,
+            "config_override": {
+                "workspace": {"backend": "sandbox"},
+                "delegation": delegation,
+                "officer": {"conference": True},
+                "llm": {"model": args.model},
+            },
+        }
+        result = gate.api.call("POST", "/api/persistent/threads", body)
+        self.thread = uid(result.get("thread_id") or result["id"])
+        gate.record_thread(self.name, self.thread)
+        self.facts.update(
+            thread=self.thread,
+            permission_mode=permission_mode,
+            cap=cap,
+            model=args.model,
+            project=gate.project_id,
+            parent_parallel_tool_calls=args.parent_parallel_tool_calls,
+        )
+        self.mark("session created", thread=self.thread)
+        if args.viewer:
+            self.viewer = Viewer(gate.api, self.thread, self.dir / "viewer.jsonl")
+            self.extra_collectors.append(self.viewer)
+        if result.get("ignored_config_keys"):
+            raise GateFailure(
+                f"create ignored config keys {result['ignored_config_keys']}"
+            )
+        row = one(
+            "SELECT execution_lane, metadata->'config_override'->'officer' AS officer "
+            f"FROM threads WHERE id='{self.thread}'"
+        )
+        if not row or row["execution_lane"] != PINNED_LANE:
+            raise GateFailure(f"session lane is {row and row['execution_lane']!r}")
+        self.verdict.check(
+            "threads.execution_lane = 'pinned' (officer.conference)", True, row
+        )
+        return self.wait_runtime("first runtime")
+
+    def runtime(self):
+        return one(
+            "SELECT t.status, t.agent_id, t.runtime_generation, "
+            "t.runtime_attach_token, t.runtime_retirement_token, "
+            "t.runtime_retirement_context, t.runtime_retirement_started_at, "
+            "a.hostname, a.pod_uid, a.status AS agent_status, a.last_heartbeat "
+            "FROM threads t LEFT JOIN agents a ON a.id=t.agent_id "
+            f"WHERE t.id='{self.thread}'"
+        )
+
+    def wait_runtime(self, label, previous_pod=None):
+        """Wait for a runtime pod of this session to attach; check its code."""
+
+        def probe():
+            row = self.runtime()
+            if not row or not row["agent_id"] or not row["hostname"]:
+                return False
+            if previous_pod and row["hostname"] == previous_pod:
+                return False
+            pod = pod_json(row["hostname"])
+            if pod is None or not pod_ready(pod):
+                return False
+            labels = pod["metadata"].get("labels") or {}
+            if labels.get(PINNED_THREAD_LABEL) != self.thread:
+                raise GateFailure(
+                    f"{row['hostname']} is labelled for "
+                    f"{labels.get(PINNED_THREAD_LABEL)!r}, not this session"
+                )
+            ads = [
+                m.groupdict()
+                for m in ADVERTISEMENT_RE.finditer(pod_log(row["hostname"]))
+                if m.group("thread") == self.thread
+            ]
+            return (row, pod, ads[-1]) if ads else False
+
+        row, pod, ad = wait_for(
+            f"{self.name}: {label} attached (pod ready, advertisement logged)",
+            probe,
+            timeout=self.gate.args.timeout,
+            interval=3,
+        )
+        name = row["hostname"]
+        path, marker = PINNED_IMAGE_MARKER
+        try:
+            count = command(
+                K
+                + ["exec", name, "-c", PINNED_CONTAINER, "--", "grep", "-c", marker]
+                + [f"{POD_ROOT}/{path}"]
+            )
+        except GateError:
+            count = "0"
+        self.verdict.check(
+            f"{name} runs the current image ({marker} present)",
+            int(count or 0) > 0,
+            count,
+        )
+        bad = served_mismatches(
+            name, PINNED_CONTAINER, PINNED_AGENT_FILES + self.gate.config_paths()
+        )
+        self.verdict.check(f"{name} serves the HEAD bytes", not bad, bad)
+        container = (pod["status"].get("containerStatuses") or [{}])[0]
+        info = {
+            "label": label,
+            "pod": name,
+            "pod_uid": pod["metadata"]["uid"],
+            "agent_id": row["agent_id"],
+            "generation": row["runtime_generation"],
+            "attach_token": row["runtime_attach_token"],
+            "advertisement": ad,
+            "restarts": container.get("restartCount", 0),
+            "image": pod["spec"]["containers"][0]["image"],
+            "db_ts": db_now(),
+        }
+        if self.viewer is not None:
+            ip = (pod.get("status") or {}).get("podIP")
+            info["viewer"] = bool(ip) and self.viewer.connect(ip)
+            self.verdict.check(
+                f"a viewer is subscribed to {name} (the cockpit's WebSocket)",
+                info["viewer"],
+                ip,
+            )
+        self.runtimes.append(info)
+        self.mark(f"{label} attached", pod=name, fanout=ad["fanout"])
+        return info
+
+    def runtime_log(self, pod) -> str:
+        """The longer of the live log and the followed copy (a killed pod's
+        log survives only in the followed copy)."""
+        live = pod_log(pod, since=self.logs.since)
+        followed = self.dir / "logs" / f"{pod}.followed.log"
+        kept = followed.read_text(errors="replace") if followed.exists() else ""
+        return live if len(live) >= len(kept) else kept
+
+    def orchestrator_log(self) -> str:
+        directory = self.dir / "logs" / "orchestrator"
+        return "\n".join(
+            p.read_text(errors="replace") for p in sorted(directory.glob("*.log"))
+        )
+
+    def end(self):
+        if self.thread is None:
+            return
+
+        def settled(row):
+            return (
+                row
+                and row["status"] == "ended"
+                and not row["agent_id"]
+                and not row["runtime_retirement_token"]
+            )
+
+        row = self.runtime()
+        if settled(row):
+            self.mark("session already ended")
+            return
+        path = f"/api/persistent/threads/{self.thread}?force=true"
+        try:
+            self.gate.api.call("DELETE", path)
+            self.mark("session End requested")
+        except GateError as exc:
+            if not (row and row["status"] == "suspended" and not row["agent_id"]):
+                self.verdict.warn("ending the session failed", str(exc))
+                return
+            # A runtime-less suspended sandbox session refuses End (its
+            # workspace pod is gone): bring it up, then End it.
+            self.verdict.warn("End of the suspended session refused", str(exc))
+            try:
+                self.gate.api.call("POST", f"/api/sessions/{self.thread}/prepare", {})
+                self.wait_runtime("runtime for the End")
+                self.gate.api.call("DELETE", path)
+                self.mark("session End requested after prepare")
+            except (GateError, GateFailure) as again:
+                self.verdict.warn("ending the session failed", str(again))
+                return
+        started = time.monotonic()
+        deadline, row, checked = started + 300, None, started
+        while time.monotonic() < deadline:
+            try:
+                row = self.runtime()
+            except GateError:
+                row = None
+            if settled(row):
+                self.mark("session ended")
+                return
+            pod = (row or {}).get("hostname")
+            if pod and time.monotonic() - checked >= 15:
+                checked = time.monotonic()
+                log = pod_log(pod)
+                if log.count(QUIESCE_WEDGE_LOG) >= 3:
+                    self._end_wedged(pod, log, row)
+                    return
+            time.sleep(3)
+        self.verdict.warn("the session's End did not settle within 300 s", row)
+
+    def _end_wedged(self, pod, log, row):
+        """The runtime retries its End quiescence forever (a recovered child's
+        handle is never settled); keep the evidence, then delete this
+        session's pod so the retirement can settle without it."""
+        (self.dir / "logs").mkdir(parents=True, exist_ok=True)
+        (self.dir / "logs" / f"{pod}.after-end.log").write_text(log + "\n")
+        self.facts["end_wedged"] = {
+            "pod": pod,
+            "quiesce_failures": log.count(QUIESCE_WEDGE_LOG),
+            "thread": row,
+        }
+        self.dump("facts.json", self.facts)
+        self.verdict.warn(
+            "End wedged: the runtime cannot quiesce its subagents "
+            f"({QUIESCE_WEDGE_LOG!r}); deleting its pod",
+            {"pod": pod, "failures": log.count(QUIESCE_WEDGE_LOG)},
+        )
+        labels = ((pod_json(pod) or {}).get("metadata") or {}).get("labels") or {}
+        if labels.get(PINNED_THREAD_LABEL) == self.thread:
+            command(K + ["delete", "pod", pod, "--wait=false"])
+            self.mark("deleted the wedged runtime pod", pod=pod)
+
+    # -- reads ---------------------------------------------------------------
+    def queue(self):
+        return None  # a pinned session has no run_queue row
+
+    def deliveries(self):
+        return rows(
+            "SELECT d.delivery_id, d.source, d.state, d.deferred_reason, "
+            "d.claim_generation, d.admission_count, d.supersedes_input_seq, "
+            "d.admitted_turn_number, d.owner_agent_id, d.owner_runtime_generation, "
+            "m.seq, d.persisted_at, d.admitted_at, d.settled_at, d.cancelled_at, "
+            "d.cancelled_reason FROM thread_input_deliveries d LEFT JOIN "
+            "thread_messages m ON m.id=d.message_id "
+            f"WHERE d.thread_id='{self.thread}' ORDER BY d.persisted_at"
+        )
+
+    def assert_not_parked(self):
+        deliveries = self.deliveries()
+        parked = [
+            d
+            for d in deliveries
+            if d["state"] == "deferred" and d["deferred_reason"] == "max_attempts"
+        ]
+        if parked:
+            raise GateFailure(f"input parked at the recovery bound: {parked}")
+        return {"state": PINNED_LANE, "deliveries": deliveries}
+
+    def answered(self, after_seq):
+        deliveries = self.assert_not_parked()["deliveries"]
+        if any(d["state"] not in ("settled", "cancelled") for d in deliveries):
+            self._answerless_since = None
+            return False
+        answers = self.final_answers(after_seq)
+        if answers:
+            self._answerless_since = None
+            return answers
+        # The pinned turn broadcasts its end before its reconcile (P1): give
+        # the answer row a moment, then fail fast on an answerless settle.
+        now = time.monotonic()
+        if self._answerless_since is None:
+            self._answerless_since = now
+        elif now - self._answerless_since > 45:
+            error = sql(
+                "SELECT left(content, 300) FROM thread_messages "
+                f"WHERE thread_id='{self.thread}' AND role='error' "
+                f"AND seq > {int(after_seq)} ORDER BY seq DESC LIMIT 1"
+            )
+            raise GateFailure(
+                f"every input settled without an answer: {error or 'no error row'}"
+            )
+        return False
+
+    def tool_row_counts(self, call_ids):
+        """Tool rows per call, rewound rows included (P2: never a duplicate)."""
+        found = rows(
+            "SELECT tool_call_id, count(*) AS n FROM thread_messages "
+            f"WHERE thread_id='{self.thread}' AND role='tool' "
+            f"AND tool_call_id IN {in_list(call_ids)} GROUP BY tool_call_id"
+        )
+        return {r["tool_call_id"]: r["n"] for r in found}
+
+    # -- kills ---------------------------------------------------------------
+    def kill(self, label, mode):
+        """End the current runtime. sigkill: ``kill -9`` of the agent process
+        from the k3d node (no SIGTERM, no preStop: an OOM kill); force-delete:
+        ``kubectl delete --grace-period=0 --force`` (kubelet still sends
+        SIGTERM and runs preStop for its 2 s minimum grace); graceful: a plain
+        delete (terminationGracePeriodSeconds 180, P4's hand-over)."""
+        row = self.runtime()
+        if not row or not row["hostname"]:
+            raise GateFailure(f"no runtime to kill at {label}: {row}")
+        name = row["hostname"]
+        pod = pod_json(name)
+        labels = ((pod or {}).get("metadata") or {}).get("labels") or {}
+        if labels.get(PINNED_THREAD_LABEL) != self.thread:
+            raise GateFailure(f"{name} is not this session's runtime pod")
+        kill = {
+            "label": label,
+            "mode": mode,
+            "pod": name,
+            "pod_uid": pod["metadata"]["uid"],
+            "agent_id": row["agent_id"],
+            "generation": row["runtime_generation"],
+            "attach_token": row["runtime_attach_token"],
+            # The detector settles `suspended` for awaiting_user, else `ended`.
+            "thread_status": row["status"],
+        }
+        if mode == "sigkill":
+            pid, cmdline = node_agent_process(name)
+            if f"--thread-id {self.thread}" not in cmdline:
+                raise GateFailure(f"pid {pid} is not this session's agent")
+            kill["host_pid"] = pid
+            kill["db_ts"] = db_now()
+            command(["docker", "exec", K3D_NODE, "kill", "-9", str(pid)])
+        elif mode == "force-delete":
+            kill["db_ts"] = db_now()
+            command(
+                K
+                + ["delete", "pod", name, "--grace-period=0", "--force"]
+                + ["--wait=false"]
+            )
+        elif mode == "graceful":
+            kill["db_ts"] = db_now()
+            command(K + ["delete", "pod", name, "--wait=false"])
+        else:
+            raise GateError(f"unknown kill mode {mode!r}")
+        self.facts["kills"].append(kill)
+        self.mark(f"{mode}: {name}", label=label, db_ts=kill["db_ts"])
+        return kill
+
+    def wait_runtime_dead(self, kill, timeout=300):
+        """Record how the killed runtime's container ended."""
+
+        def probe():
+            pod = pod_json(kill["pod"])
+            if pod is None:
+                return {"pod": "deleted"}
+            if pod["metadata"]["uid"] != kill["pod_uid"]:
+                return {"pod": "replaced"}
+            container = (pod["status"].get("containerStatuses") or [{}])[0]
+            terminated = (container.get("state") or {}).get("terminated")
+            if terminated:
+                return {
+                    "phase": pod["status"].get("phase"),
+                    "reason": terminated.get("reason"),
+                    "exit_code": terminated.get("exitCode"),
+                    "signal": terminated.get("signal"),
+                }
+            return False
+
+        kill["runtime_end"] = wait_for(
+            f"{self.name}: {kill['pod']} stopped", probe, timeout=timeout, interval=1
+        )
+        kill["runtime_end_db_ts"] = db_now()
+        return kill["runtime_end"]
+
+    def wait_retired(self, kill, *, live_runtime=False):
+        """Wait until the lost or deleted runtime's retirement settled; sample
+        the pending retirement context (``cause``) on the way, because the
+        settle clears it. ``live_runtime``: the runtime is still running (a
+        person's End), so watch its log for the End's quiescence wedge; on a
+        wedge, record the failure and delete this session's pod."""
+        contexts = kill.setdefault("retirement_contexts_seen", [])
+        statuses = kill.setdefault("statuses_seen", [])
+        checked = [time.monotonic()]
+
+        def probe():
+            row = self.runtime()
+            if not statuses or statuses[-1]["status"] != row["status"]:
+                statuses.append({"at": utc_now(), "status": row["status"]})
+            context = row.get("runtime_retirement_context")
+            if context and (not contexts or contexts[-1]["context"] != context):
+                contexts.append({"at": utc_now(), "context": context})
+            if (
+                row["status"] in ("ended", "suspended")
+                and not row["agent_id"]
+                and not row["runtime_retirement_token"]
+            ):
+                return row
+            if (
+                live_runtime
+                and "end_wedged" not in kill
+                and time.monotonic() - checked[0] >= 15
+            ):
+                checked[0] = time.monotonic()
+                log = pod_log(kill["pod"])
+                if log.count(QUIESCE_WEDGE_LOG) >= 3:
+                    kill["end_wedged"] = {
+                        "at": utc_now(),
+                        "failures": log.count(QUIESCE_WEDGE_LOG),
+                    }
+                    self.verdict.check(
+                        "the End completes on its own (no quiescence wedge)",
+                        False,
+                        f"{log.count(QUIESCE_WEDGE_LOG)} x {QUIESCE_WEDGE_LOG!r}; "
+                        "the gate deletes the pod",
+                    )
+                    self._end_wedged(kill["pod"], log, row)
+            return False
+
+        row = wait_for(
+            f"{self.name}: the runtime retired after the {kill['mode']} of "
+            f"{kill['pod']}",
+            probe,
+            timeout=self.gate.args.retire_timeout,
+            interval=2,
+        )
+        kill["retired_status"] = row["status"]
+        kill["retired_db_ts"] = db_now()
+        kill["retirement_outcomes"] = rows(
+            "SELECT disposition, permanent, outcome, settled_at, "
+            "retired_agent_pod->>'pod_name' AS pod "
+            "FROM thread_runtime_retirement_outcomes "
+            f"WHERE thread_id='{self.thread}' "
+            f"AND runtime_generation='{kill['generation']}' ORDER BY settled_at"
+        )
+        self.mark(
+            "runtime retired",
+            status=row["status"],
+            causes=[(c["context"] or {}).get("cause") for c in contexts],
+        )
+        return row
+
+    def resume(self, kill):
+        """Bring the session back the way the cockpit does: Resume for an
+        ended session; ``prepare`` for a suspended one (the detector settles a
+        runtime lost while the thread read ``awaiting_user`` as suspended, and
+        Resume refuses that with 409 session_not_ended)."""
+        status = (self.runtime() or {}).get("status")
+        if status == "suspended":
+            result = self.gate.api.call(
+                "POST", f"/api/sessions/{self.thread}/prepare", {}
+            )
+            self.mark("prepare requested (suspended session)", result=result)
+        else:
+            result = self.gate.api.call(
+                "POST", f"/api/persistent/threads/{self.thread}/resume", {}
+            )
+            self.mark("resume requested", result=result)
+        kill["revived_by"] = "prepare" if status == "suspended" else "resume"
+        return self.wait_runtime("successor", previous_pod=kill["pod"])
+
+    # -- evidence --------------------------------------------------------------
+    def collect(self):
+        super().collect()
+        if self.thread is None:
+            return
+        t = self.thread
+        agent_ids = sorted(
+            {r["agent_id"] for r in self.runtimes if r.get("agent_id")}
+            | {k["agent_id"] for k in self.facts["kills"] if k.get("agent_id")}
+        )
+        pieces = {
+            "thread_runtime.json": lambda: one(
+                "SELECT id, status, execution_lane, agent_id, runtime_generation, "
+                "runtime_attach_token, runtime_retirement_token, "
+                "runtime_retirement_context, ended_at, metadata->'agent_pod' AS "
+                "agent_pod, metadata->'config_override' AS config_override "
+                f"FROM threads WHERE id='{t}'"
+            ),
+            "retirement_outcomes.json": lambda: rows(
+                "SELECT * FROM thread_runtime_retirement_outcomes "
+                f"WHERE thread_id='{t}' ORDER BY settled_at"
+            ),
+            "agents.json": lambda: rows(
+                "SELECT id, hostname, pod_uid, status, registered_at, "
+                "last_heartbeat, thread_id FROM agents "
+                f"WHERE id::text IN {in_list(agent_ids)}"
+            ),
+            "pinned_deliveries.json": self.deliveries,
+            "child_outcomes.json": lambda: rows(
+                "SELECT id, subagent_handle, parent_tool_call_id, subagent_status, "
+                "subagent_outcome, subagent_error, status, created_at, ended_at "
+                f"FROM threads WHERE parent_thread_id='{t}' ORDER BY created_at"
+            ),
+        }
+        for name, read in pieces.items():
+            try:
+                self.dump(name, read())
+            except Exception as exc:  # partial evidence beats none
+                (self.dir / f"{name}.error").write_text(str(exc))
+
+
+class PinnedScenarios:
+    """The pinned twins of K1-K4, the switch and a person's End (P6).
+
+    Mixed into Gate; selected with ``--lane pinned``."""
+
+    # -- configuration ---------------------------------------------------------
+    def pinned_expert_runtime(self):
+        """HEAD's bundled expert, sent as an inline Expert that authors
+        ``llm.model`` and ``llm.parallel_tool_calls``.
+
+        Session create carries only llm.model/temperature/reasoning_level, and
+        the family matrix fills ``parallel_tool_calls`` unless the Expert
+        authored it. ``muse-spark-1.3`` (the k3d model while MiniMax has no
+        credit) is ``parallel_tool_calls: false`` (start safe), so a parent on
+        it is told "One subagent at a time" and never fans out. P6 tests the
+        lane, not that family flag, so the gate authors it."""
+        path = f"config/experts/{self.args.expert}/config.yaml"
+        manifest = yaml.safe_load(head_bytes(path))
+        runtime = copy.deepcopy(manifest["spec"]["runtime"])
+        private = runtime.setdefault("config", {})
+        private.pop("config_name", None)  # the session role's own base
+        llm = private.setdefault("config", {}).setdefault("llm", {})
+        llm["model"] = self.args.model
+        if self.args.parent_parallel_tool_calls:
+            llm["parallel_tool_calls"] = True
+        return runtime
+
+    def config_paths(self):
+        expert_file, child_file, _ = roster_entry_paths(
+            self.args.expert, self.args.child_type
+        )
+        return CONFIG_FILES + [p for p in (expert_file, child_file) if p]
+
+    def pinned_preflight(self, need, warn, facts):
+        args = self.args
+        try:
+            model = one(
+                "SELECT model_id, family, enabled FROM models "
+                f"WHERE model_id={lit(args.model)}"
+            )
+            need(
+                bool(model and model["enabled"]),
+                f"model {args.model!r} is in the registry and enabled",
+                model,
+            )
+            if args.project:
+                project = one(
+                    "SELECT p.id, p.name, pm.role FROM projects p JOIN "
+                    "project_members pm ON pm.project_id=p.id JOIN users u ON "
+                    f"u.id=pm.user_id WHERE u.preferred_username={lit(self.api_user)} "
+                    f"AND p.id={lit(uid(args.project))}"
+                )
+            else:
+                project = one(
+                    "SELECT p.id, p.name, pm.role FROM users u JOIN projects p ON "
+                    "p.id=u.default_project_id JOIN project_members pm ON "
+                    "pm.project_id=p.id AND pm.user_id=u.id "
+                    f"WHERE u.preferred_username={lit(self.api_user)}"
+                )
+            facts["project"] = project
+            self.project_id = project["id"] if project else None
+            need(
+                bool(project) and project["role"] == "owner",
+                f"{self.api_user!r} owns the conference project (officer.conference "
+                "needs exactly one project and its owner)",
+                project,
+            )
+            if project:
+                open_conference = sql(
+                    "SELECT coalesce(string_agg(id::text, ','), '') FROM threads "
+                    f"WHERE project_id={lit(project['id'])} AND status <> 'ended' "
+                    "AND runtime_retirement_authorized_at IS NULL AND "
+                    "COALESCE(metadata->'config_override'->'officer'->>'conference',"
+                    "'false') = 'true'"
+                )
+                need(
+                    not open_conference,
+                    "no open conference on the project (one per project)",
+                    open_conference,
+                )
+        except GateError as exc:
+            need(False, "pinned database checks", str(exc))
+        if args.pinned_kill == "sigkill":
+            try:
+                version = command(["docker", "exec", K3D_NODE, "crictl", "version"])
+                need("RuntimeName" in version, f"crictl reachable on {K3D_NODE}")
+            except GateError as exc:
+                need(False, f"crictl reachable on {K3D_NODE} (sigkill)", str(exc))
+
+    # -- shared steps ----------------------------------------------------------
+    def _pinned_window(self, run, calls, *, cap, ended_at_kill, running_at_kill):
+        """Wait for: ``ended_at_kill`` children ended, ``running_at_kill`` in
+        their shell sleep, the rest queued (no row)."""
+
+        def probe():
+            run.assert_not_parked()
+            run.check_refusal(calls)
+            children = run.children()
+            running = [c for c in children if c["status"] != "ended"]
+            ended = [c for c in children if c["status"] == "ended"]
+            if len(running) > cap:
+                raise GateFailure(f"{len(running)} children run at once, cap {cap}")
+            if len(ended) > ended_at_kill:
+                raise GateFailure(
+                    f"missed the kill window: {len(ended)} children already ended"
+                )
+            in_shell = [c for c in running if c["in_shell"]]
+            if len(ended) == ended_at_kill and len(in_shell) == running_at_kill:
+                return children
+            return False
+
+        return wait_for(
+            f"{run.name}: {ended_at_kill} child ended, {running_at_kill} in their "
+            "sleep, the rest queued",
+            probe,
+            timeout=self.args.timeout,
+            interval=1,
+        )
+
+    def _pinned_batch(self, run, *, final, cap=2, n=4):
+        run.create_session(cap=cap)
+        run.warm_up(cap=cap)
+        sleeps = self.args.pk_sleeps
+        if len(sleeps) != n:
+            raise GateError(f"--pk-sleeps needs {n} values")
+        seq = run.send(
+            batch_prompt(run.tag("batch"), n, sleeps, self.args.child_type, final),
+            "batch",
+        )
+        calls = run.wait_batch(seq, n)
+        at_kill = self._pinned_window(
+            run, calls, cap=cap, ended_at_kill=1, running_at_kill=2
+        )
+        run.facts["children_at_kill"] = at_kill
+        return seq, calls, at_kill
+
+    def _check_retired_children(self, run, calls, kill, *, graceful=False):
+        """What the retirement left before Resume: no parent result (the dead
+        or draining runtime writes none, P2/P4), every child that ran ended
+        interrupted:parent_restart (P0b/P4), never cancelled:parent_retired."""
+        v = run.verdict
+        written = run.results(calls)
+        v.check(
+            "no parent tool result written before Resume",
+            not written,
+            [r["tool_call_id"] for r in written],
+        )
+        children = run.children()
+        kill["children_at_retirement"] = [
+            (c["subagent_handle"], c["status"], c["subagent_outcome"]) for c in children
+        ]
+        open_rows = [c["subagent_handle"] for c in children if c["status"] != "ended"]
+        v.check("every child row ended by the retirement", not open_rows, open_rows)
+        cancelled = [
+            c["subagent_handle"]
+            for c in children
+            if c["subagent_outcome"] == PERSON_END_OUTCOME
+        ]
+        v.check(
+            f"no child ended {PERSON_END_OUTCOME} (recoverable, not cancelled)",
+            not cancelled,
+            cancelled,
+        )
+        ran = [
+            c
+            for c in children
+            if c["subagent_status"] != "completed"
+            and c["subagent_outcome"] != PARENT_RESTART_NOT_STARTED_OUTCOME
+        ]
+        v.check(
+            f"the interrupted children ended {PARENT_RESTART_OUTCOME}",
+            bool(ran)
+            and all(c["subagent_outcome"] == PARENT_RESTART_OUTCOME for c in ran),
+            [(c["subagent_handle"], c["subagent_outcome"]) for c in ran],
+        )
+        if graceful:
+            log = run.runtime_log(kill["pod"])
+            handed = [line for line in log.splitlines() if HANDOVER_LOG in line]
+            kill["handover_log_lines"] = handed
+            v.check(
+                "the draining runtime ended its children for the successor (P4 log)",
+                bool(handed),
+                handed[:4],
+            )
+        else:
+            causes = [
+                (c["context"] or {}).get("cause")
+                for c in kill.get("retirement_contexts_seen", [])
+            ]
+            if causes:
+                v.check(
+                    "the retirement names cause runtime_lost (P0b)",
+                    "runtime_lost" in causes,
+                    causes,
+                )
+            else:
+                v.warn("the pending retirement context was never sampled")
+        orchestrator = run.orchestrator_log()
+        refused = [
+            line
+            for line in orchestrator.splitlines()
+            if RECEIPT_REFUSED_LOG in line and run.thread in line
+        ]
+        v.check(
+            "no 'Pinned retirement receipt refused' for the session (P0)",
+            not refused,
+            refused[:3],
+        )
+        if not graceful:
+            v.check(
+                "the stale-agent detector retired the offline runtime (P0)",
+                DETECTOR_RETIRED_LOG in orchestrator,
+            )
+
+    def _assert_pinned_recovered_batch(
+        self, run, *, seq, calls, expected, kill, settler, second=None
+    ):
+        v = run.verdict
+        run.facts["expected_classes"] = expected
+        children = run.children()
+        results = run.results(calls)
+        per_call = Counter(r["tool_call_id"] for r in results)
+        v.check(
+            "exactly one result per delegate call",
+            len(results) == len(calls) and all(per_call[c] == 1 for c in calls),
+            dict(per_call),
+        )
+        counts = run.tool_row_counts(calls)
+        v.check(
+            "one tool row per tool_call_id, rewound rows included (P2)",
+            all(counts.get(c) == 1 for c in calls),
+            counts,
+        )
+        actual = {
+            r["tool_call_id"]: recovery_class(r) or "live-written" for r in results
+        }
+        mismatched = {
+            c: (expected[c], actual.get(c))
+            for c in calls
+            if actual.get(c) != expected[c]
+        }
+        v.check(
+            "each result has the class its child had when the runtime died",
+            not mismatched,
+            {"mismatched": mismatched, "classes": actual},
+        )
+        stopped = [
+            r["tool_call_id"] for r in results if STOPPED_MARKER in (r["content"] or "")
+        ]
+        v.check("no STOPPED result (a kill is not a Stop)", not stopped, stopped)
+        conts = run.continuations()
+        v.check("exactly one continuation", len(conts) == 1, len(conts))
+        superseding = [
+            d for d in run.subagent_deliveries() if d["supersedes_input_seq"] == seq
+        ]
+        v.check(
+            "exactly one subagent delivery supersedes the original input",
+            len(superseding) == 1,
+            superseding,
+        )
+        v.check(
+            "the continuation's delivery is settled",
+            len(superseding) == 1 and superseding[0]["state"] == "settled",
+            [d["state"] for d in superseding],
+        )
+        if conts:
+            metrics = (conts[0].get("metrics") or {}).get(RECOVERY_METRICS_KEY) or {}
+            want = {
+                "calls": len(calls),
+                "interrupted": sum(1 for c in calls if expected[c] == "interrupted"),
+                "not_started": sum(1 for c in calls if expected[c] == "not_started"),
+            }
+            got = {key: metrics.get(key) for key in want}
+            v.check(
+                "continuation counts match the batch",
+                got == want,
+                {"got": got, "want": want},
+            )
+        finals = run.final_answers(seq)
+        v.check(
+            "exactly one final answer (the model answers once)",
+            len(finals) == 1,
+            len(finals),
+        )
+        if finals and conts:
+            v.check(
+                "the final answer follows the continuation",
+                finals[-1]["seq"] > conts[0]["seq"],
+            )
+        batch_children = [c for c in children if c["parent_tool_call_id"] in calls]
+        v.check(
+            "every child row of the batch ended",
+            all(c["status"] == "ended" for c in batch_children),
+            [
+                (c["subagent_handle"], c["status"], c["subagent_outcome"])
+                for c in batch_children
+            ],
+        )
+        v.check(
+            "no child spawned for another call (the model did not re-delegate)",
+            len(children) == len(batch_children),
+            len(children) - len(batch_children),
+        )
+        grace = sql(f"SELECT {lit(kill['db_ts'])}::timestamptz + interval '10 seconds'")
+        late = run.audit_count("subagent", after_db_ts=grace)
+        v.check("no child provider call after the kill", late == 0, late)
+        deliveries = run.assert_not_parked()["deliveries"]
+        source = [d for d in deliveries if d["seq"] == seq]
+        v.check(
+            "the source input is settled",
+            len(source) == 1 and source[0]["state"] == "settled",
+            source,
+        )
+        open_ = [d for d in deliveries if d["state"] not in ("settled", "cancelled")]
+        v.check("no delivery left open or parked", not open_, open_)
+        settled_lines = [
+            line
+            for line in run.runtime_log(settler["pod"]).splitlines()
+            if BATCH_SETTLED_LOG in line
+        ]
+        run.facts["batch_settle_log"] = settled_lines
+        v.check(
+            f"the successor {settler['pod']} settled the turn as one batch",
+            bool(settled_lines),
+            settled_lines[:2],
+        )
+        recovery_calls = run.main_calls_with(CONTINUATION_MARKER)
+        run.facts["recovery_main_call_ids"] = [c["id"] for c in recovery_calls]
+        if second is not None:
+            v.check(
+                "the parent's provider called once or twice after recovery (audit)",
+                1 <= len(recovery_calls) <= 2,
+                len(recovery_calls),
+            )
+            served_again = [
+                c
+                for c in recovery_calls
+                if sql(
+                    f"SELECT {lit(c['timestamp'])}::timestamptz > "
+                    f"{lit(second['db_ts'])}::timestamptz"
+                )
+                == "t"
+            ]
+            v.check(
+                "the admitted continuation was served once after the second kill",
+                len(served_again) == 1,
+                [c["id"] for c in served_again],
+            )
+        else:
+            v.check(
+                "the parent's provider called once after recovery (audit)",
+                len(recovery_calls) == 1,
+                len(recovery_calls),
+            )
+        if recovery_calls:
+            problems = each_report_once(recovery_calls[-1]["messages"] or [], results)
+            v.check(
+                "each report exactly once in that call's provider input",
+                not problems,
+                problems,
+            )
+
+    # -- PK0 -------------------------------------------------------------------
+    def scenario_pk0(self, run):
+        """Preflight on a live pinned session: lane, image, the attach
+        advertisement (fanout=True), the offer, and a 2-call batch whose
+        children run at the same time."""
+        cap = 2
+        info = run.create_session(cap=cap)
+        v = run.verdict
+        ad = info["advertisement"]
+        v.check(
+            "attach advertisement batch_settle=True fanout=True",
+            ad["settle"] == "True" and ad["fanout"] == "True",
+            ad,
+        )
+        run.warm_up(cap=cap)
+        seq = run.send(
+            batch_prompt(
+                run.tag("batch"),
+                2,
+                self.args.pk0_sleep,
+                self.args.child_type,
+                short_final("PK0-DONE"),
+            ),
+            "batch",
+        )
+        calls = run.wait_batch(seq, 2)
+        wait_for("pk0: answered", lambda: run.answered(seq), timeout=self.args.timeout)
+        run.wait_audit_settled()
+        children = run.children()
+        v.check(
+            "two child rows, both completed",
+            len(children) == 2
+            and all(c["subagent_status"] == "completed" for c in children),
+            [(c["subagent_handle"], c["subagent_outcome"]) for c in children],
+        )
+        if len(children) == 2:
+            overlap = sql(
+                "SELECT max(created_at) < min(ended_at) FROM threads "
+                f"WHERE parent_thread_id='{run.thread}' AND kind='subagent'"
+            )
+            v.check("the two children ran at the same time", overlap == "t")
+        results = run.results(calls)
+        v.check(
+            "one live result per call, no refusal",
+            len(results) == 2
+            and not any(FANOUT_REFUSAL in (r["content"] or "") for r in results)
+            and not any(recovery_class(r) for r in results),
+            [r["tool_call_id"] for r in results],
+        )
+        v.check("no continuation", not run.continuations())
+        v.check("exactly one final answer", len(run.final_answers(seq)) == 1)
+
+    # -- PK1 -------------------------------------------------------------------
+    def scenario_pk1(self, run):
+        """A live batch: 4 children under cap 2 run in waves; one answer."""
+        n, cap, sleep_s = 4, 2, self.args.pk1_sleep
+        info = run.create_session(cap=cap)
+        run.warm_up(cap=cap)
+        sampler = MemorySampler(
+            run.dir / "memory.jsonl",
+            self.args.sample_interval,
+            selector=f"{PINNED_THREAD_LABEL}={run.thread}",
+            container=PINNED_CONTAINER,
+        )
+        sampler.sample_once()
+        baseline = {s["pod"]: s for s in sampler.samples}
+        sampler.start()
+        max_running = 0
+        try:
+            seq = run.send(
+                batch_prompt(
+                    run.tag("batch"),
+                    n,
+                    sleep_s,
+                    self.args.child_type,
+                    short_final("PK1-DONE"),
+                ),
+                "batch",
+            )
+            calls = run.wait_batch(seq, n)
+
+            def finished():
+                nonlocal max_running
+                run.check_refusal(calls)
+                running = sum(1 for c in run.children() if c["status"] != "ended")
+                if running > cap:
+                    raise GateFailure(f"{running} children run at once, cap {cap}")
+                max_running = max(max_running, running)
+                return run.answered(seq)
+
+            wait_for(
+                "pk1: batch finished and answered",
+                finished,
+                timeout=self.args.timeout,
+                interval=1,
+            )
+        finally:
+            sampler.stop()
+        run.wait_audit_settled()
+        v = run.verdict
+        children = run.children()
+        v.check(
+            f"{n} child rows, all completed",
+            len(children) == n
+            and all(c["subagent_status"] == "completed" for c in children),
+            [(c["subagent_handle"], c["subagent_outcome"]) for c in children],
+        )
+        v.check(f"at most {cap} ran at once (sampled)", max_running <= cap, max_running)
+        waves = one(
+            "SELECT (array_agg(created_at ORDER BY created_at))[3] >= "
+            "(SELECT min(ended_at) FROM threads WHERE parent_thread_id="
+            f"'{run.thread}' AND kind='subagent') AS third_after_first_end "
+            f"FROM threads WHERE parent_thread_id='{run.thread}' AND kind='subagent'"
+        )
+        v.check(
+            "the third child started only after one of the first wave ended",
+            bool(waves and waves["third_after_first_end"]),
+            waves,
+        )
+        results = run.results(calls)
+        counts = run.tool_row_counts(calls)
+        v.check(
+            "one live result per call (no recovery class)",
+            len(results) == n
+            and all(counts.get(c) == 1 for c in calls)
+            and not any(recovery_class(r) for r in results),
+            counts,
+        )
+        v.check("no continuation", not run.continuations())
+        v.check("exactly one final answer", len(run.final_answers(seq)) == 1)
+        window = one(
+            "SELECT extract(epoch FROM min(created_at)) AS start, "
+            "extract(epoch FROM max(ended_at)) AS finish, "
+            "sum(total_tokens) AS child_tokens FROM threads "
+            f"WHERE parent_thread_id='{run.thread}' AND kind='subagent'"
+        )
+        start, finish = float(window["start"] or 0), float(window["finish"] or 0)
+        in_batch = [s for s in sampler.samples if start - 2 <= s["t"] <= finish + 2]
+        measurement = {
+            "children": n,
+            "cap": cap,
+            "sleep_s": sleep_s,
+            "max_running_observed": max_running,
+            "batch_duration_s": round(finish - start, 1) if finish else None,
+            "pod": info["pod"],
+            "memory_baseline_mib": {
+                p: round(s["current"] / 2**20, 1) for p, s in baseline.items()
+            },
+            "memory_peak_sampled_mib": round(
+                max((s["current"] for s in in_batch), default=0) / 2**20, 1
+            ),
+            "cgroup_memory_peak_mib": round(
+                max((s["peak"] for s in sampler.samples), default=0) / 2**20, 1
+            ),
+            "oom_kills": max((s["oom_kill"] for s in sampler.samples), default=0),
+            "child_provider_calls": run.audit_count("subagent"),
+            "child_tokens": int(window["child_tokens"] or 0),
+        }
+        run.facts["measurement"] = measurement
+        run.dump("measurement.json", measurement)
+        print("measurement: " + json.dumps(measurement), flush=True)
+
+    # -- PK2 / PK4 -------------------------------------------------------------
+    def scenario_pk2(self, run, *, pk4=False):
+        """SIGKILL mid-batch (1 ended, 2 running, 1 queued) -> the detector
+        retires the runtime (P0, P0b) -> Resume -> the successor settles."""
+        done = "PK4-DONE" if pk4 else "PK2-DONE"
+        final = long_final(done) if pk4 else short_final(done)
+        seq, calls, at_kill = self._pinned_batch(run, final=final)
+        status_at_kill = {c["parent_tool_call_id"]: c["status"] for c in at_kill}
+        expected = {
+            c: {"ended": "completed", None: "not_started"}.get(
+                status_at_kill.get(c), "interrupted"
+            )
+            for c in calls
+        }
+        kill = run.kill("one ended, two running, one queued", self.args.pinned_kill)
+        run.wait_runtime_dead(kill)
+        run.wait_retired(kill)
+        self._check_retired_children(run, calls, kill)
+        successor = run.resume(kill)
+        second = None
+        if pk4:
+
+            def recovery_streaming():
+                conts = run.continuations()
+                if not conts:
+                    return False
+                if run.final_answers(seq):
+                    raise GateFailure(
+                        "the recovery turn answered before it could be killed"
+                    )
+                streamed = run.stream_events_after(
+                    f"SELECT created_at FROM thread_messages WHERE id='{conts[0]['id']}'"
+                )
+                return conts if streamed else False
+
+            wait_for(
+                "pk4: the continuation's answer streaming on the successor",
+                recovery_streaming,
+                timeout=self.args.timeout,
+                interval=1,
+            )
+            second = run.kill("continuation answer streaming", self.args.pinned_kill)
+            run.wait_runtime_dead(second)
+            run.wait_retired(second)
+            third = run.resume(second)
+        wait_for(
+            f"{run.name}: final answer after recovery",
+            lambda: run.answered(seq),
+            timeout=self.args.timeout,
+        )
+        run.wait_audit_settled()
+        self._assert_pinned_recovered_batch(
+            run,
+            seq=seq,
+            calls=calls,
+            expected=expected,
+            kill=kill,
+            settler=successor,
+            second=second,
+        )
+        if pk4:
+            v = run.verdict
+            cont = [
+                d for d in run.subagent_deliveries() if d["supersedes_input_seq"] == seq
+            ]
+            admissions = [
+                d["admission_count"]
+                for d in run.deliveries()
+                if d["source"] == "subagent" and d["supersedes_input_seq"] == seq
+            ]
+            v.check(
+                "the continuation was admitted twice (P3 counts both)",
+                admissions == [2],
+                {"admission_count": admissions, "deliveries": cont},
+            )
+            lines = [
+                m.groupdict()
+                for m in STALE_ADMISSION_RE.finditer(run.runtime_log(third["pod"]))
+                if m.group("thread") == run.thread
+            ]
+            run.facts["stale_admission_log"] = lines
+            v.check(
+                f"the third runtime {third['pod']} served the admitted event again "
+                "once (P3 log)",
+                any(x["served"] == "1" and x["parked"] == "0" for x in lines),
+                lines,
+            )
+
+    def scenario_pk4(self, run):
+        self.scenario_pk2(run, pk4=True)
+
+    # -- PK3 -------------------------------------------------------------------
+    def scenario_pk3(self, run):
+        """A graceful pod deletion mid-batch hands the batch over (P4, D7)."""
+        seq, calls, at_kill = self._pinned_batch(run, final=short_final("PK3-DONE"))
+        kill = run.kill("one ended, two running, one queued", "graceful")
+        run.wait_runtime_dead(kill)
+        run.wait_retired(kill)
+        run.facts["graceful_retired_status"] = kill["retired_status"]
+        run.verdict.check(
+            f"the session ended or was suspended ({kill['retired_status']})",
+            kill["retired_status"] in ("ended", "suspended"),
+        )
+        self._check_retired_children(run, calls, kill, graceful=True)
+        by_call = {c["parent_tool_call_id"]: c for c in run.children()}
+        expected = {c: expected_class_from_row(by_call.get(c)) for c in calls}
+        successor = run.resume(kill)
+        wait_for(
+            "pk3: final answer after recovery",
+            lambda: run.answered(seq),
+            timeout=self.args.timeout,
+        )
+        run.wait_audit_settled()
+        self._assert_pinned_recovered_batch(
+            run, seq=seq, calls=calls, expected=expected, kill=kill, settler=successor
+        )
+
+    # -- PK5 -------------------------------------------------------------------
+    def _switch_lanes(self, run, value):
+        set_values_lanes(value)
+        run.mark("values-local switch edited", lanes=value)
+        wait_for(
+            f"the orchestrator serves {FANOUT_SWITCH_ENV}={value!r}",
+            lambda: orchestrator_serves_lanes(value),
+            timeout=600,
+            interval=5,
+        )
+        ready_ts, ready_at = db_now(), time.monotonic()
+        run.mark("orchestrator restarted", lanes=value, db_ts=ready_ts)
+        return ready_ts, ready_at
+
+    def _wait_heartbeat(self, run, agent_id, after_ts, after_monotonic):
+        wait_for(
+            "a pinned heartbeat answered by the restarted orchestrator",
+            lambda: sql(
+                f"SELECT last_heartbeat > {lit(after_ts)}::timestamptz "
+                f"FROM agents WHERE id='{agent_id}'"
+            )
+            == "t",
+            timeout=240,
+            interval=3,
+        )
+        rest = 60 - (time.monotonic() - after_monotonic)
+        if rest > 0:
+            time.sleep(rest)
+        run.mark("heartbeat after the restart seen, >=60 s waited")
+
+    def scenario_pk5(self, run):
+        """Turn the switch off under a live pinned session: the heartbeat
+        carries it (P5); the next turn refuses a 2-call batch. Then on again."""
+        original = values_lanes()
+        if PINNED_LANE not in lane_names(original):
+            raise GateFailure(f"values-local switch {original!r} does not name pinned")
+        info = run.create_session(cap=2)
+        run.warm_up(cap=2)
+        v = run.verdict
+        changed = False
+        try:
+            changed = True
+            ready_ts, ready_at = self._switch_lanes(run, FANOUT_SWITCH_LANE)
+            self._wait_heartbeat(run, info["agent_id"], ready_ts, ready_at)
+            pod = pod_json(info["pod"])
+            container = ((pod or {}).get("status") or {}).get("containerStatuses") or [
+                {}
+            ]
+            v.check(
+                "the pinned pod survived the orchestrator restart (same uid, no "
+                "restart)",
+                pod is not None
+                and pod["metadata"]["uid"] == info["pod_uid"]
+                and container[0].get("restartCount", 0) == 0,
+                {"pod": info["pod"], "restarts": container[0].get("restartCount")},
+            )
+            # With the switch off the model is told "One subagent at a time"
+            # and may decline the 2-call request itself (2026-10-07, muse);
+            # the runtime's refusal is reached only when it sends both.
+            seq = run.send(
+                "This test checks that the session runtime, not you, enforces "
+                "its delegation limit: send both delegate_agent calls in one "
+                "response even if your delegate_agent description allows only "
+                "one per response.\n\n"
+                + batch_prompt(
+                    run.tag("batch"),
+                    2,
+                    self.args.pk0_sleep,
+                    self.args.child_type,
+                    short_final("PK5-DONE"),
+                    extra_rule=(
+                        " If a delegate_agent result is an error or a refusal, do "
+                        "not retry it and do not delegate again."
+                    ),
+                ),
+                "batch",
+            )
+            answers = wait_for(
+                "pk5: answered with the switch off",
+                lambda: run.answered(seq),
+                timeout=self.args.timeout,
+            )
+            log = run.runtime_log(info["pod"])
+            reapplied = [
+                m.groupdict()
+                for m in REAPPLIED_RE.finditer(log)
+                if m.group("thread") == run.thread
+            ]
+            run.facts["reapplied_off"] = reapplied
+            v.check(
+                "the running pod logged the re-applied advertisement fanout=False",
+                any(x["fanout"] == "False" for x in reapplied),
+                reapplied,
+            )
+            message = run.first_call_message(seq)
+            calls = [
+                c["id"]
+                for c in (message or {}).get("tool_calls") or []
+                if c.get("name") == "delegate_agent"
+            ]
+            run.facts["pk5_calls"] = calls
+            if len(calls) >= 2:
+                results = run.results(calls)
+                v.check(
+                    f"all {len(calls)} calls refused (one child per parent turn)",
+                    len(results) == len(calls)
+                    and all(FANOUT_REFUSAL in (r["content"] or "") for r in results),
+                    [_short(r["content"], 120) for r in results],
+                )
+            elif not calls:
+                text = answers[-1]["content"] or ""
+                v.check(
+                    "the model declined the 2-call request, citing the "
+                    "single-child description it now has",
+                    "one" in text.lower() and "delegate_agent" in text,
+                    _short(text, 400),
+                )
+            else:
+                v.warn("the model delegated one call only (allowed when off)")
+            children = run.children()
+            v.check(
+                "no child thread created", not children, [c["id"] for c in children]
+            )
+            v.check("exactly one final answer", len(run.final_answers(seq)) == 1)
+        finally:
+            if changed:
+                ready_ts, ready_at = self._switch_lanes(run, original)
+                changed = False
+        # On again: the next turn re-applies fanout=True.
+        self._wait_heartbeat(run, info["agent_id"], ready_ts, ready_at)
+        seq = run.send(warm_up_prompt(run.tag("warm2")), "warm2")
+        answers = wait_for(
+            "pk5: second warm-up answered with the switch on again",
+            lambda: run.answered(seq),
+            timeout=self.args.timeout,
+        )
+        reapplied = [
+            m.groupdict()
+            for m in REAPPLIED_RE.finditer(run.runtime_log(info["pod"]))
+            if m.group("thread") == run.thread
+        ]
+        run.facts["reapplied_on"] = reapplied
+        v.check(
+            "switched back: the pod re-applied fanout=True",
+            bool(reapplied) and reapplied[-1]["fanout"] == "True",
+            reapplied,
+        )
+        text = answers[-1]["content"] or ""
+        if "in a single response" in text:
+            v.check("the offer is back in the tool description", True)
+        else:
+            v.warn("the model paraphrased the fan-out sentence", text)
+
+    # -- PK6 -------------------------------------------------------------------
+    def scenario_pk6(self, run):
+        """A person's End mid-batch still cancels the children (D4); Resume
+        recovers nothing."""
+        seq, calls, _at_kill = self._pinned_batch(run, final=short_final("PK6-DONE"))
+        row = run.runtime()
+        end = {
+            "label": "person's End",
+            "mode": "end",
+            "pod": row["hostname"],
+            "pod_uid": None,
+            "agent_id": row["agent_id"],
+            "generation": row["runtime_generation"],
+            "db_ts": db_now(),
+        }
+        run.facts["kills"].append(end)
+        self.api.call("DELETE", f"/api/persistent/threads/{run.thread}?force=true")
+        run.mark("person's End (force)")
+        run.wait_retired(end, live_runtime=True)
+        v = run.verdict
+        children = run.children()
+        live_at_end = [c for c in children if c["subagent_status"] != "completed"]
+        v.check(
+            f"children live at the End ended {PERSON_END_OUTCOME} (D4)",
+            bool(live_at_end)
+            and all(c["subagent_outcome"] == PERSON_END_OUTCOME for c in live_at_end),
+            [(c["subagent_handle"], c["subagent_outcome"]) for c in live_at_end],
+        )
+        causes = [
+            (c["context"] or {}).get("cause")
+            for c in end.get("retirement_contexts_seen", [])
+        ]
+        v.check(
+            "the End names no runtime_lost cause", "runtime_lost" not in causes, causes
+        )
+        successor = run.resume(end)
+        # §8 (End and Force-End): a batch resumed after an End may mix
+        # finished and retired members; the settle reports a retired member
+        # as CANCELLED (class `retired`), never as interrupted, and runs
+        # nothing again. Whether it settles at all depends on what the old
+        # runtime wrote before it stopped, so both shapes are recorded.
+        time.sleep(90)
+        settled_lines = [
+            line
+            for line in run.runtime_log(successor["pod"]).splitlines()
+            if BATCH_SETTLED_LOG in line
+        ]
+        results = run.results(calls)
+        per_call = Counter(r["tool_call_id"] for r in results)
+        classes = {r["tool_call_id"]: recovery_class(r) for r in results}
+        run.facts["pk6_settled_at_resume"] = settled_lines
+        run.facts["results_after_resume"] = [
+            (r["tool_call_id"], recovery_class(r), _short(r["content"], 160))
+            for r in results
+        ]
+        run.facts["deliveries_after_resume"] = run.deliveries()
+        v.check(
+            "at most one result per call after Resume",
+            all(n == 1 for n in per_call.values()),
+            dict(per_call),
+        )
+        v.check(
+            "no result classed interrupted (an End is not a crash)",
+            "interrupted" not in classes.values(),
+            classes,
+        )
+        cancelled_calls = [c["parent_tool_call_id"] for c in live_at_end]
+        if settled_lines:
+            v.check(
+                "the settle reports the cancelled children as retired (CANCELLED)",
+                all(classes.get(c) == "retired" for c in cancelled_calls),
+                {c: classes.get(c) for c in cancelled_calls},
+            )
+        else:
+            v.warn(
+                "no settle at Resume: the old runtime wrote the results itself",
+                [_short(r["content"], 100) for r in results],
+            )
+        v.check("at most one continuation", len(run.continuations()) <= 1)
+        v.check(
+            "no further child (nothing runs again)",
+            len(run.children()) == len(children),
+            len(run.children()),
+        )
+
+
+# ---------------------------------------------------------------------------
 # The gate
 # ---------------------------------------------------------------------------
 
 
-class Gate:
+class Gate(PinnedScenarios):
     def __init__(self, args):
         self.args = args
+        self.api_user = os.environ.get("SRW_K3D_TEST_USER", "test")
+        self.project_id = None  # pinned: resolved by the preflight
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         default = Path(
             os.environ.get("SRW_GATE_EVIDENCE_DIR")
@@ -1499,7 +3271,13 @@ class Gate:
         except (OSError, AttributeError):
             pass
 
-        feature = sorted(set(AGENT_FILES + ORCHESTRATOR_FILES + CONFIG_FILES))
+        pinned = getattr(args, "lane", "stateless") == PINNED_LANE
+        orchestrator_files = PINNED_ORCHESTRATOR_FILES if pinned else ORCHESTRATOR_FILES
+        switch_lane = PINNED_LANE if pinned else FANOUT_SWITCH_LANE
+        feature = sorted(
+            set(AGENT_FILES + ORCHESTRATOR_FILES + CONFIG_FILES)
+            | (set(PINNED_AGENT_FILES + PINNED_ORCHESTRATOR_FILES) if pinned else set())
+        )
         expert_file, child_file, roster_problem = roster_entry_paths(
             args.expert, args.child_type
         )
@@ -1574,7 +3352,7 @@ class Gate:
             bad = served_mismatches(
                 f"deploy/{ORCHESTRATOR_DEPLOYMENT}",
                 ORCHESTRATOR_CONTAINER,
-                ORCHESTRATOR_FILES + configs,
+                orchestrator_files + configs,
             )
             need(not bad, "orchestrator serves the HEAD bytes", bad)
             lanes = command(
@@ -1586,8 +3364,8 @@ class Gate:
             facts["fanout_switch"] = lanes
             names = {x.strip().lower() for x in lanes.split(",")}
             need(
-                FANOUT_SWITCH_LANE in names,
-                f"operator switch {FANOUT_SWITCH_ENV} names {FANOUT_SWITCH_LANE!r} "
+                switch_lane in names,
+                f"operator switch {FANOUT_SWITCH_ENV} names {switch_lane!r} "
                 f"(values-local: {FANOUT_SWITCH_VALUES_KEY})",
                 repr(lanes),
             )
@@ -1599,7 +3377,17 @@ class Gate:
                 "SELECT count(*) FROM run_queue WHERE state IN ('queued','leased') "
                 "AND unit_kind <> 'bg_task'"
             )
-            need(busy == "0", "run queue idle (no other session turn in flight)", busy)
+            if pinned:
+                # A pinned session never uses the queue; others' turns only
+                # add load.
+                if busy != "0":
+                    warn("stateless turns in flight (load only)", busy)
+            else:
+                need(
+                    busy == "0",
+                    "run queue idle (no other session turn in flight)",
+                    busy,
+                )
             live = sql(
                 "SELECT coalesce(string_agg(id::text, ','), '') FROM threads "
                 "WHERE kind='subagent' AND status <> 'ended' "
@@ -1609,6 +3397,8 @@ class Gate:
             need(not live, "no live child rows anywhere", live)
         except GateError as exc:
             need(False, "database reachable", str(exc))
+        if pinned:
+            self.pinned_preflight(need, warn, facts)
 
         facts["problems"], facts["warnings"] = problems, warnings
         facts["when"], facts["at"] = when, utc_now()
@@ -1642,10 +3432,13 @@ class Gate:
             print(f"FAIL {name}: preconditions not met; scenario not started")
             self.results[name] = "NOT RUN"
             return
-        run = Run(self, name)
+        run = (PinnedRun if name in PINNED_SCENARIOS else Run)(self, name)
         run.facts["preflight"] = facts
+        extra = getattr(run, "extra_collectors", [])
         if name != "measure":  # each measurement size follows its own logs
             run.logs.start()
+        for collector in extra:
+            collector.start()
         try:
             getattr(self, f"scenario_{name}")(run)
         except (GateFailure, GateError) as exc:
@@ -1666,6 +3459,8 @@ class Gate:
                 run.collect()
             finally:
                 run.logs.stop()
+                for collector in extra:
+                    collector.stop()
                 if not self.args.keep_sessions:
                     run.end()
         _after_ok, after = self.preflight(f"after {name}", stage="postflight")
@@ -2307,6 +4102,60 @@ def parse_args(argv=None):
     group.add_argument("--k3", action="store_true", help="kill in the final stream")
     group.add_argument("--k4", action="store_true", help="K2, then kill the recovery")
     group.add_argument("--measure", action="store_true", help="4/8/20 children")
+    pinned = parser.add_argument_group(
+        "pinned lane (P6; needs --lane pinned, one scenario at a time)"
+    )
+    pinned.add_argument(
+        "--lane",
+        choices=("stateless", PINNED_LANE),
+        default="stateless",
+        help="stateless: --k1..--measure (unchanged); pinned: --pk0..--pk6",
+    )
+    pinned.add_argument("--pk0", action="store_true", help="live preflight, 2 calls")
+    pinned.add_argument("--pk1", action="store_true", help="4 calls, cap 2, waves")
+    pinned.add_argument("--pk2", action="store_true", help="SIGKILL mid-batch")
+    pinned.add_argument("--pk3", action="store_true", help="graceful delete (P4)")
+    pinned.add_argument("--pk4", action="store_true", help="PK2, then kill again (P3)")
+    pinned.add_argument("--pk5", action="store_true", help="switch off via heartbeat")
+    pinned.add_argument("--pk6", action="store_true", help="a person's End (D4)")
+    pinned.add_argument(
+        "--model",
+        default="muse-spark-1.3-contributor",
+        help="pinned parent model (children inherit)",
+    )
+    pinned.add_argument(
+        "--project", help="conference project (default: the user's default project)"
+    )
+    pinned.add_argument(
+        "--pinned-kill",
+        choices=("sigkill", "force-delete"),
+        default="sigkill",
+        help="PK2/PK4: kill -9 from the k3d node, or delete --grace-period=0 --force",
+    )
+    pinned.add_argument(
+        "--pk-sleeps",
+        type=lambda raw: [int(x) for x in raw.split(",") if x.strip()],
+        default=[20, 90, 90, 20],
+        help="PK2/PK3/PK4/PK6 per-child sleeps (a short first child, long siblings)",
+    )
+    pinned.add_argument("--pk0-sleep", type=int, default=20)
+    pinned.add_argument("--pk1-sleep", type=int, default=30)
+    pinned.add_argument(
+        "--retire-timeout", type=float, default=900, help="wait for a retirement, s"
+    )
+    pinned.add_argument(
+        "--no-viewer",
+        dest="viewer",
+        action="store_false",
+        help="drive the session headless (no WebSocket subscriber): it then "
+        "reads awaiting_user mid-turn and a lost runtime settles suspended",
+    )
+    pinned.add_argument(
+        "--no-parent-parallel-tool-calls",
+        dest="parent_parallel_tool_calls",
+        action="store_false",
+        help="do not author llm.parallel_tool_calls on the inline expert",
+    )
     parser.add_argument("--out", help="evidence directory (default: timestamped)")
     parser.add_argument(
         "--kill",
@@ -2345,8 +4194,18 @@ def parse_args(argv=None):
     )
     args = parser.parse_args(argv)
     args.scenarios = [name for name in SCENARIOS if getattr(args, name)]
+    pinned_selected = [name for name in PINNED_SCENARIOS if getattr(args, name)]
+    if args.lane == PINNED_LANE:
+        if args.scenarios:
+            parser.error("--k1..--measure are stateless scenarios (omit --lane pinned)")
+        args.scenarios = pinned_selected
+    elif pinned_selected:
+        parser.error("--pk0..--pk6 need --lane pinned")
     if not (args.scenarios or args.preflight or args.print_prompts):
-        parser.error("select --preflight, --print-prompts, --k1..--k4 or --measure")
+        parser.error(
+            "select --preflight, --print-prompts, --k1..--k4, --measure, or "
+            "--lane pinned with --pk0..--pk6"
+        )
     if any(not 1 <= size <= 20 for size in args.measure_sizes):
         parser.error("--measure-sizes must lie in 1..20 (the session cap range)")
     if args.kill == "drain" and ({"k3", "k4"} & set(args.scenarios)):
@@ -2376,6 +4235,12 @@ def main(argv=None):
         if args.kill == "hard"
         else "the executor drains for STATELESS_SHUTDOWN_TIMEOUT_S"
     )
+    if args.lane == PINNED_LANE:
+        note = (
+            "pinned lane; PK2/PK4 kill -9 the agent process from the k3d node"
+            if args.pinned_kill == "sigkill"
+            else "pinned lane; PK2/PK4 delete --grace-period=0 --force"
+        )
     print(BANNER.format(kill=args.kill, kill_note=note), flush=True)
     lock = acquire_lock()
     if lock is None:
