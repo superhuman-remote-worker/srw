@@ -132,6 +132,19 @@ async def _joined_blocking_call(func, /, *args, **kwargs):
     return await joined_blocking_call(func, *args, **kwargs)
 
 
+# Connector credentials materialized in the workspace home: env connector
+# files, the managed-repository ssh-agent namespace and the legacy
+# external-repository key files. Every attach writes them again from the
+# dispatch payload, so no restore needs them, and a snapshot must never become
+# a second copy of them. The rest of ``.ssh/`` is the user's own and stays.
+# GNU tar matches these unanchored, after any ``/`` of the member name.
+CREDENTIAL_EXCLUDE_PATTERNS = (
+    "--exclude=.srw-credentials",
+    "--exclude=.ssh/srw-managed",
+    "--exclude=.ssh/repo_*",
+)
+
+
 def _snapshot_tar_pipeline(include_dirs: list[str], *, strict_terminal: bool) -> str:
     """Build the remote archive pipeline used by workspace snapshots.
 
@@ -149,6 +162,7 @@ def _snapshot_tar_pipeline(include_dirs: list[str], *, strict_terminal: bool) ->
         "--exclude=node_modules/.cache",
         "--exclude=*/lost+found",
         "--exclude=*/node_modules/*",
+        *CREDENTIAL_EXCLUDE_PATTERNS,
     ]
     if not strict_terminal:
         exclude_patterns.extend(
@@ -904,6 +918,7 @@ class SnapshotService:
                 # Workspace content re-cloned/regenerated on restore
                 "--exclude=*/repos/*",
                 "--exclude=*/node_modules/*",
+                *CREDENTIAL_EXCLUDE_PATTERNS,
             ]
             if strict_terminal:
                 # This is the sole durable copy of an emptyDir workspace.

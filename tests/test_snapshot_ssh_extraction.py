@@ -874,3 +874,96 @@ class TestCaptureVmSnapshotAcceptGate:
             assert run_tar("--exclude=*/lost+found") == 0
         finally:
             os.chmod(lost, 0o755)  # allow tmp_path teardown to remove it
+
+    @pytest.mark.asyncio
+    async def test_capture_excludes_connector_credentials(self, service):
+        """Connector credentials in the workspace home never reach a snapshot.
+
+        Env connector files, the managed-repository ssh-agent namespace and
+        the legacy external-repository key files are rewritten from the
+        dispatch payload on every attach; a snapshot must not become a second
+        durable copy of them. The user's own ``~/.ssh`` stays in.
+        """
+        fake = _fake_capture_proc(returncode=0)
+        with patch(
+            "asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)
+        ) as mock_exec:
+            await service.capture_vm_snapshot("job-credentials", "192.0.2.10", 2222)
+
+        remote_cmd = mock_exec.call_args.args[-1]
+        assert "--exclude=.srw-credentials " in remote_cmd
+        assert "--exclude=.ssh/srw-managed " in remote_cmd
+        assert "--exclude=.ssh/repo_* " in remote_cmd
+        assert "--exclude=.ssh " not in remote_cmd
+        assert remote_cmd.count("'") == 2
+
+    def test_capture_command_omits_credentials_from_a_real_archive(self, tmp_path):
+        """Run the real non-strict capture command against a fixture home.
+
+        Proves GNU tar's own matching drops exactly the three credential
+        locations and keeps the rest of ``~/.ssh``, rather than trusting the
+        string shape of the exclude list.
+        """
+        for tool in ("tar", "zstd", "bash"):
+            if shutil.which(tool) is None:
+                pytest.skip(f"{tool} not available")
+        # The capture excludes /tmp/*; keep the fixture under the home
+        # directory like the production root.
+        with tempfile.TemporaryDirectory(
+            prefix="snapshot-credentials-", dir=os.path.expanduser("~")
+        ) as root:
+            home = os.path.join(root, "agent-host")
+            fixture = {
+                ".srw-credentials/0123abcd.sh": "export C0=env-secret\n",
+                ".ssh/srw-managed/config.d/srw-repo-x.conf": "Host srw-repo-x\n",
+                ".ssh/srw-managed/agents/srw-repo-x.state": "pid=1\n",
+                ".ssh/repo_github": "legacy-private-key\n",
+                ".ssh/config": "Host example\n",
+                ".ssh/id_ed25519": "user-private-key\n",
+                ".ssh/known_hosts": "example ssh-ed25519 AAAA\n",
+                "workspace/notes.md": "kept\n",
+            }
+            for relative, content in fixture.items():
+                path = os.path.join(home, relative)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as handle:
+                    handle.write(content)
+
+            async def capture() -> str:
+                fake = _fake_capture_proc(returncode=0)
+                svc = SnapshotService()
+                svc._available = True
+                svc._set_snapshot_context = AsyncMock()
+                svc._collect_environment_info = AsyncMock(return_value={})
+                svc.upload_snapshot = AsyncMock(return_value=True)
+                with patch(
+                    "asyncio.create_subprocess_exec",
+                    new=AsyncMock(return_value=fake),
+                ) as mock_exec:
+                    await svc.capture_vm_snapshot("job-real-tar", "192.0.2.10", 2222)
+                return mock_exec.call_args.args[-1]
+
+            remote_cmd = asyncio.run(capture())
+            local_cmd = remote_cmd.replace(
+                " /home/agent-host/ /usr/local/ ", f" {home}/ "
+            )
+            assert local_cmd != remote_cmd
+            archive = os.path.join(tmp_path, "env.tar.zst")
+            with open(archive, "wb") as output:
+                completed = subprocess.run(
+                    ["bash", "-c", local_cmd], stdout=output, check=False
+                )
+            assert completed.returncode in (0, 1)
+            listing = subprocess.run(
+                ["bash", "-c", f"zstd -dc -- {shlex.quote(archive)} | tar -tf -"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.splitlines()
+
+        assert not [m for m in listing if "/.srw-credentials" in m]
+        assert not [m for m in listing if "/.ssh/srw-managed" in m]
+        assert not [m for m in listing if "/.ssh/repo_" in m]
+        for kept in (".ssh/config", ".ssh/id_ed25519", ".ssh/known_hosts"):
+            assert any(m.endswith(f"agent-host/{kept}") for m in listing), kept
+        assert any(m.endswith("agent-host/workspace/notes.md") for m in listing)
