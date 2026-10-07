@@ -229,13 +229,35 @@ BEGIN
     -- All supported input/child/control admission locks the owner first and
     -- rejects its retirement token. These reads run after that durable fence,
     -- not before a still-open producer can commit an admission.
-    IF EXISTS (SELECT 1 FROM public.thread_input_deliveries
-                WHERE thread_id = owner_id AND state NOT IN ('settled','cancelled')
-                  AND (execution_lane IS DISTINCT FROM 'pinned'
-                       OR (owner_agent_id IS NOT NULL AND
-                           (owner_agent_id IS DISTINCT FROM actor_id
-                            OR owner_pod_uid IS DISTINCT FROM stopped_pod_uid))))
-       OR EXISTS (SELECT 1 FROM public.threads WHERE parent_thread_id = owner_id)
+    -- A non-terminal input claimed by another agent or Pod refuses, except a
+    -- leftover of an earlier life of this thread: its owner is another agent
+    -- row that was the actor of an earlier generation whose retirement
+    -- settled (every outcome row requires that life's own exit receipt) after
+    -- the claim. A claim made after that settlement belongs to a later,
+    -- unreceipted life and still refuses, as does the same agent on another
+    -- Pod and an actor this life replaced without a retirement.
+    IF EXISTS (SELECT 1 FROM public.thread_input_deliveries delivery
+                WHERE delivery.thread_id = owner_id
+                  AND delivery.state NOT IN ('settled','cancelled')
+                  AND (delivery.execution_lane IS DISTINCT FROM 'pinned'
+                       OR (delivery.owner_agent_id IS NOT NULL
+                           AND (delivery.owner_agent_id IS DISTINCT FROM actor_id
+                                OR delivery.owner_pod_uid IS DISTINCT FROM stopped_pod_uid)
+                           AND NOT (
+                               delivery.owner_agent_id IS DISTINCT FROM actor_id
+                               AND EXISTS (
+                                   SELECT 1
+                                     FROM public.thread_runtime_retirement_outcomes prior
+                                    WHERE prior.thread_id = owner_id
+                                      AND prior.agent_id = delivery.owner_agent_id
+                                      AND prior.runtime_generation
+                                          IS DISTINCT FROM generation_id
+                                      AND prior.settled_at >= delivery.owned_at)))))
+       -- In-process session children died with the proven-stopped Pod; their
+       -- queued/running rows stay as the crash left them for the settle.
+       OR EXISTS (SELECT 1 FROM public.threads child
+                   WHERE child.parent_thread_id = owner_id
+                     AND public.pinned_session_child_may_produce(child.id))
        OR EXISTS (SELECT 1 FROM public.thread_control_requests
                    WHERE thread_id = owner_id AND runtime_generation = generation_id)
        OR EXISTS (SELECT 1 FROM public.thread_permission_requests
@@ -14330,6 +14352,55 @@ CREATE FUNCTION public.pinned_retirement_workspace_provision_intent_retired(subj
         ELSE false
     END, false);
 $_$;
+
+
+--
+-- Name: pinned_session_child_may_produce(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_session_child_may_produce(child_id uuid) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS (
+               SELECT 1 FROM public.threads child
+                WHERE child.id = child_id
+                  AND (child.agent_id IS NOT NULL
+                       OR child.control_admission_agent_id IS NOT NULL
+                       OR child.runtime_attach_token IS NOT NULL
+                       OR child.runtime_authority_exposed
+                       OR child.runtime_retirement_token IS NOT NULL
+                       OR COALESCE(child.metadata->'agent_pod', 'null'::jsonb)
+                          NOT IN ('null'::jsonb, '{}'::jsonb)
+                       OR COALESCE(child.metadata->'vm', 'null'::jsonb)
+                          NOT IN ('null'::jsonb, '{}'::jsonb)
+                       OR COALESCE(child.metadata->'_workspace_binding', 'null'::jsonb)
+                          NOT IN ('null'::jsonb, '{}'::jsonb)))
+        OR EXISTS (SELECT 1 FROM public.agents WHERE thread_id = child_id)
+        OR EXISTS (SELECT 1 FROM public.threads WHERE parent_thread_id = child_id)
+        OR EXISTS (SELECT 1 FROM public.thread_input_deliveries
+                    WHERE thread_id = child_id AND state NOT IN ('settled','cancelled'))
+        OR EXISTS (SELECT 1 FROM public.thread_control_requests
+                    WHERE thread_id = child_id AND outcome IS NULL)
+        OR EXISTS (SELECT 1 FROM public.thread_permission_requests
+                    WHERE thread_id = child_id AND status = 'pending')
+        OR EXISTS (SELECT 1 FROM public.thread_interrupt_requests
+                    WHERE thread_id = child_id AND
+                      (outcome IS NULL OR (outcome = 'applied' AND
+                       NOT (COALESCE(result, '{}'::jsonb) ? 'consumed_input_seq'))))
+        OR EXISTS (SELECT 1 FROM public.run_queue
+                    WHERE unit_id = child_id AND (state <> 'done' OR leased_by IS NOT NULL))
+        OR EXISTS (SELECT 1 FROM public.completion_effects
+                    WHERE (scope_id = child_id OR producer_id = child_id)
+                      AND (state <> 'done' OR claimed_by IS NOT NULL))
+        OR EXISTS (SELECT 1 FROM public.thread_agent_workspace_claims
+                    WHERE thread_id = child_id AND status <> 'reclaimed')
+        OR EXISTS (SELECT 1 FROM public.thread_workspace_provision_intents
+                    WHERE thread_id = child_id)
+        OR EXISTS (SELECT 1 FROM public.managed_repository_workspace_creation_reservations
+                    WHERE owner_kind = 'thread' AND owner_id = child_id)
+        OR EXISTS (SELECT 1 FROM public.cloud_ro_mounts
+                    WHERE thread_id = child_id AND status IN ('engaging','active','revoking'))
+$$;
 
 
 --

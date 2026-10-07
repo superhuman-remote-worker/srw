@@ -43,6 +43,7 @@ async def _schema_applied(pg_dsn):
         for name in (
             "0313_pinned_abrupt_actor_exit.sql",
             "0317_pinned_virtual_without_backing_abrupt_exit.sql",
+            "0335_pinned_abrupt_exit_subagents_and_earlier_lives.sql",
         ):
             migration = migration_root / name
             if migration.exists():
@@ -65,6 +66,7 @@ async def killed_life(
     partial=False,
     with_virtual_binding=True,
     authorized=True,
+    before_retirement=None,
 ):
     pod_uid = str(uuid4())
     ids = await fixtures._seed(
@@ -126,6 +128,10 @@ async def killed_life(
                             turn_number=1,
                         )
                 deliveries.append(row["delivery_id"])
+    if before_retirement is not None:
+        ids["generation"] = generation
+        ids["process_generation"] = process_generation
+        await before_retirement(ids, deliveries)
     retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
     if authorized:
         assert await db.authorize_pinned_thread_retirement(

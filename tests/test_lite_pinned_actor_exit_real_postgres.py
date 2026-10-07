@@ -325,7 +325,7 @@ def _route_died_with_the_pod(monkeypatch, ids):
 
 
 async def _retired_warm_lite_actor(
-    db, monkeypatch, *, input_state="settled", vouched=True
+    db, monkeypatch, *, input_state="settled", vouched=True, before_retirement=None
 ):
     """A lite actor on a warm-pool Pod bound through the real 0200 protocol.
 
@@ -403,6 +403,8 @@ async def _retired_warm_lite_actor(
                     conn, transition="settled", **args
                 )
 
+    if before_retirement is not None:
+        await before_retirement(ids, [ids["delivery_id"]])
     api.mark_terminal("agents-a", ids["pod_name"])
     pod = api.pods[("agents-a", ids["pod_name"])]
     pod.spec = NS(

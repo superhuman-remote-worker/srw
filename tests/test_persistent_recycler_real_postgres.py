@@ -157,6 +157,7 @@ async def _schema_applied(pg_dsn):
         for name in (
             "0313_pinned_abrupt_actor_exit.sql",
             "0317_pinned_virtual_without_backing_abrupt_exit.sql",
+            "0335_pinned_abrupt_exit_subagents_and_earlier_lives.sql",
         ):
             migration = (
                 Path(__file__).resolve().parents[1]
