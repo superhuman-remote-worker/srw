@@ -1383,6 +1383,13 @@ class GitManager:
             return None
         return result.stdout.strip() or None
 
+    def remote_reachable(self, name: str = "origin", timeout: int = 30) -> bool:
+        """Whether ``git ls-remote`` reaches ``name`` (transport and auth)."""
+        if not self.is_active:
+            return False
+        result = self._run_git(["ls-remote", "--quiet", name, "HEAD"], timeout=timeout)
+        return result.returncode == 0
+
     def add_remote(self, name: str, url: str) -> bool:
         """Add or update a git remote.
 

@@ -712,11 +712,95 @@ def _ssh_clone_target(
     return clone_url, ""
 
 
+#: A pre-agent clone wrote its key to ``~/.ssh/repo_<datasource-name-slug>``.
+_LEGACY_KEY_NAME = re.compile(r"repo_[a-z0-9-]+")
+_LEGACY_KEY_MARKER = "__srw_legacy_repo_keys__"
+# Lists them: regular files only, slug-shaped names only, and only files whose
+# first line is a PEM key header that is not a public key, so nothing a user
+# named ``repo_*`` that is not such a key is ever touched. Runs in a subshell
+# to leave the persistent ``git`` tab where it was; the marker is split in
+# the command so an echoed or wrapped command line can never read as the
+# answer. (The pattern avoids spelling a private-key header: every command
+# stays clear of what the key-residue checks scan for.)
+_LIST_LEGACY_KEYS = (
+    "( cd ~/.ssh 2>/dev/null || exit 0; _srw_names=''; "
+    "for _srw_f in repo_*; do "
+    '[ -f "$_srw_f" ] && [ ! -L "$_srw_f" ] || continue; '
+    'case "${_srw_f#repo_}" in ""|*[!a-z0-9-]*) continue;; esac; '
+    'IFS= read -r _srw_first < "$_srw_f" || continue; '
+    'case "$_srw_first" in *"PUBLIC KEY-----") ;; '
+    '"-----BEGIN "*" KEY-----") _srw_names="$_srw_names $_srw_f";; esac; '
+    "done; "
+    f"printf '%s%s\\n' {_LEGACY_KEY_MARKER[:13]} "
+    f'{_LEGACY_KEY_MARKER[13:]}"$_srw_names" )'
+)
+
+
+def _legacy_ssh_key_files(backend: Any) -> set[str]:
+    """Names of pre-agent ``~/.ssh/repo_*`` key files; empty when unsure."""
+
+    output = str(backend.shell_run(_LIST_LEGACY_KEYS, timeout=10, tab_name="git"))
+    answers = [
+        line.strip()[len(_LEGACY_KEY_MARKER) :]
+        for line in output.splitlines()
+        if line.strip().startswith(_LEGACY_KEY_MARKER)
+    ]
+    if not answers:
+        return set()
+    return {name for name in answers[-1].split() if _LEGACY_KEY_NAME.fullmatch(name)}
+
+
+def _retire_legacy_ssh_key_files(
+    backend: Any, outcomes: List[Tuple[str, Any]], *, sweep: bool
+) -> None:
+    """Delete pre-agent key files whose repository works through its alias.
+
+    ``outcomes`` holds one ``(name slug, outcome)`` per SSH repository:
+    ``True`` (cloned through its alias), ``False`` (skipped or failed) or the
+    reused checkout's ``GitManager``, re-proven with ``ls-remote`` only when a
+    key file is actually there. A repository's own ``repo_<slug>`` goes once
+    it is proven. With ``sweep``, and every SSH repository proven, every such
+    file goes, including those a renamed or detached connector left behind.
+    """
+
+    try:
+        found = _legacy_ssh_key_files(backend)
+        if not found:
+            return
+        can_sweep = sweep and all(outcome is not False for _, outcome in outcomes)
+        delete: set[str] = set()
+        for ds_name, outcome in outcomes:
+            own = f"repo_{ds_name}"
+            if outcome is False or (own not in found and not can_sweep):
+                continue
+            if outcome is True or outcome.remote_reachable():
+                if own in found:
+                    delete.add(own)
+            else:
+                can_sweep = False
+        if can_sweep:
+            delete |= found
+        if delete:
+            backend.shell_run(
+                "( cd ~/.ssh && rm -f -- "
+                + " ".join(shlex.quote(name) for name in sorted(delete))
+                + " )",
+                timeout=10,
+                tab_name="git",
+            )
+            logger.info("Deleted %d pre-agent SSH key file(s)", len(delete))
+    except Exception as exc:  # cleanup only: never fails a clone
+        logger.warning(
+            "Could not retire pre-agent SSH key files: %s", type(exc).__name__
+        )
+
+
 def clone_repository_datasources(
     repo_datasources: List[Dict[str, Any]],
     workspace_manager: Any,
     *,
     ssh_identity_status: Optional[Dict[str, str]] = None,
+    sweep_legacy_keys: bool = True,
 ) -> None:
     """Clone repository datasources onto the workspace backend.
 
@@ -729,8 +813,11 @@ def clone_repository_datasources(
     and no ``Host`` block is appended. ``ssh_identity_status`` is the
     materializer's ``{authority_id: status}``: a connector whose identity did
     not load is skipped with a warning, never cloned without its key. A
-    reused checkout gets its origin reset to the alias and a pre-agent
-    ``~/.ssh/repo_<slug>`` key file is deleted.
+    reused checkout gets its origin reset to the alias. A pre-agent
+    ``~/.ssh/repo_<slug>`` key file is deleted only once its repository is
+    proven to work through the alias; ``sweep_legacy_keys`` (attach, which
+    sees every repository) also deletes the files of renamed or detached
+    connectors once every SSH repository is proven.
 
     There is deliberately NO agent-local fallback: without a shell-capable
     backend the datasources are skipped with an error. Repository
@@ -743,6 +830,8 @@ def clone_repository_datasources(
             successful clones are registered in its ``source_repos``.
         ssh_identity_status: Which SSH identities the workspace agent holds;
             ``None`` when the caller did not materialize any.
+        sweep_legacy_keys: Whether ``repo_datasources`` is the full set, so
+            key files no listed repository owns may go too.
     """
     if not isinstance(ssh_identity_status, dict):
         ssh_identity_status = None
@@ -791,6 +880,7 @@ def clone_repository_datasources(
         )
 
     clone_names = resolve_repo_clone_names(repo_datasources)
+    ssh_outcomes: List[List[Any]] = []
     for ds, repo_name in zip(repo_datasources, clone_names):
         # ds_name is the safe form of the user-supplied datasource label.
         ds_name = (
@@ -812,16 +902,13 @@ def clone_repository_datasources(
                     auth_method = "token"
 
             ssh_clone_url: Optional[str] = None
+            ssh_outcome: Optional[List[Any]] = None
             if auth_method == "ssh":
                 ssh_clone_url, reason = _ssh_clone_target(ds, ssh_identity_status)
-                # A key file a pre-agent clone wrote is never read again: the
-                # alias's agent holds the key now. Delete it either way.
-                backend.shell_run(
-                    "rm -f -- "
-                    + shlex.quote(backend.resolve_home_path(f".ssh/repo_{ds_name}")),
-                    timeout=10,
-                    tab_name="git",
-                )
+                # A key file a pre-agent clone wrote goes only once this
+                # repository is proven through its alias (after the loop).
+                ssh_outcome = [ds_name, False]
+                ssh_outcomes.append(ssh_outcome)
                 if ssh_clone_url is None:
                     logger.warning(
                         "Skipping SSH repository datasource %r: %s",
@@ -851,15 +938,17 @@ def clone_repository_datasources(
                     backend=backend,
                     remote_cwd=remote_cwd,
                 )
-                if ssh_clone_url is not None and not git_mgr.add_remote(
-                    "origin", ssh_clone_url
-                ):
-                    # A pre-agent checkout points at the real host and its
-                    # deleted key file; leaving it would fail every fetch.
-                    logger.warning(
-                        "Could not point reused repos/%s at its SSH identity",
-                        repo_name,
-                    )
+                if ssh_clone_url is not None:
+                    if git_mgr.add_remote("origin", ssh_clone_url):
+                        # Proven lazily: ls-remote only if a key file is left.
+                        ssh_outcome[1] = git_mgr
+                    else:
+                        # A pre-agent checkout points at the real host and
+                        # its key file; leaving it would fail every fetch.
+                        logger.warning(
+                            "Could not point reused repos/%s at its SSH identity",
+                            repo_name,
+                        )
                 logger.info(
                     "Reusing repository datasource %r from repos/%s",
                     ds_name,
@@ -872,6 +961,8 @@ def clone_repository_datasources(
                     backend=backend,
                     remote_cwd=remote_cwd,
                 )
+                if ssh_outcome is not None and git_mgr:
+                    ssh_outcome[1] = True
             if git_mgr:
                 branch_ready = True
                 if branch and (not reused or ds.get("require_default_branch")):
@@ -962,6 +1053,13 @@ def clone_repository_datasources(
                 ds.get("name", "unnamed"),
                 e,
             )
+
+    if ssh_outcomes:
+        _retire_legacy_ssh_key_files(
+            backend,
+            [(name, outcome) for name, outcome in ssh_outcomes],
+            sweep=sweep_legacy_keys,
+        )
 
 
 # ---------------------------------------------------------------------------

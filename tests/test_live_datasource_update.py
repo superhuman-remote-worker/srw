@@ -1128,6 +1128,8 @@ class TestResetupDatasources:
             [repo_new],
             session.workspace_manager,
             ssh_identity_status=session.workspace_ssh_identity_status,
+            # A live add sees only the added repositories: no key sweep.
+            sweep_legacy_keys=False,
         )
         # Removal keeps the clone on disk (documented) but drops the
         # session-side registration.

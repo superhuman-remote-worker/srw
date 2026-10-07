@@ -160,8 +160,8 @@ class TestBackendClone:
         shell_cmds = [c[0][0] for c in ws.backend.shell_run.call_args_list]
         assert not any(">> ~/.ssh/config" in cmd for cmd in shell_cmds)
         assert not any("PRIVATE KEY" in cmd for cmd in shell_cmds)
-        # A pre-agent key file is deleted.
-        assert "rm -f -- /home/agent-host/.ssh/repo_my-repo" in shell_cmds
+        # Pre-agent key files are looked for, but none was listed here.
+        assert not any("rm -f" in cmd for cmd in shell_cmds)
         assert ws.source_repo_meta["repo"]["token"] == ""
 
     def test_scp_url_reaches_its_real_host(self):
@@ -241,8 +241,6 @@ class TestBackendClone:
 
         mock_clone.assert_not_called()
         add_remote.assert_called_once_with("origin", ds["ssh_identity"]["clone_url"])
-        shell_cmds = [c[0][0] for c in ws.backend.shell_run.call_args_list]
-        assert "rm -f -- /home/agent-host/.ssh/repo_my-repo" in shell_cmds
         assert "repo" in ws.source_repos
 
     def test_two_deploy_keys_on_one_host_clone_through_distinct_aliases(self):
@@ -709,6 +707,148 @@ class TestRealAgentPayloadCarriesForgeMetadata:
             clone_repository_datasources([ds], ws)
 
         assert ws.source_repo_meta["repo"]["datasource_id"] == datasource_id
+
+
+class TestLegacyKeyFiles:
+    """Pre-agent ``~/.ssh/repo_*`` key files go only once the alias works.
+
+    The listing and the deletion run in a real bash against a temporary
+    home, so the shell that decides what is a key file is what is tested.
+    """
+
+    _KEY = "-----BEGIN OPENSSH " + "PRIVATE KEY-----\nAAAA\n-----END\n"
+
+    @pytest.fixture
+    def home(self, tmp_path):
+        ssh = tmp_path / ".ssh"
+        ssh.mkdir()
+        (ssh / "repo_my-repo").write_text(self._KEY)
+        (ssh / "repo_old-name").write_text(self._KEY.replace("OPENSSH ", "RSA "))
+        (ssh / "repo_pub").write_text("-----BEGIN PUBLIC KEY-----\nAAAA\n")
+        (ssh / "repo_notes").write_text("my notes\n")
+        (ssh / "repo_Upper").write_text(self._KEY)
+        (ssh / "other_key").write_text(self._KEY)
+        (tmp_path / "elsewhere").write_text(self._KEY)
+        (ssh / "repo_link").symlink_to(tmp_path / "elsewhere")
+        return tmp_path
+
+    @staticmethod
+    def _workspace(home, *, reused=False):
+        import subprocess
+
+        ws = make_workspace_manager()
+        ws.backend.exists = MagicMock(return_value=reused)
+
+        def shell_run(command, timeout=None, tab_name=None, working_dir=None):
+            result = subprocess.run(
+                ["bash", "-c", command],
+                env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+                capture_output=True,
+                text=True,
+            )
+            return f"Exit code: {result.returncode}\n--- stdout ---\n{result.stdout}"
+
+        ws.backend.shell_run = MagicMock(side_effect=shell_run)
+        return ws
+
+    @staticmethod
+    def _left(home):
+        return sorted(path.name for path in (home / ".ssh").iterdir())
+
+    def _clone(self, ws, *entries, status=None, reachable=True, **kwargs):
+        if status is None:
+            status = {e["ssh_identity"]["authority_id"]: "ready" for e in entries}
+        with patch("agent.managers.git_manager.GitManager") as git_manager:
+            git_manager.clone.return_value = MagicMock()
+            git_manager.return_value.add_remote.return_value = True
+            git_manager.return_value.remote_reachable.return_value = reachable
+            clone_repository_datasources(
+                list(entries), ws, ssh_identity_status=status, **kwargs
+            )
+        return git_manager
+
+    def test_listing_names_only_slug_named_private_key_files(self, home):
+        from agent.core.datasource_setup import _legacy_ssh_key_files
+
+        ws = self._workspace(home)
+        assert _legacy_ssh_key_files(ws.backend) == {"repo_my-repo", "repo_old-name"}
+        (listing,) = [c[0][0] for c in ws.backend.shell_run.call_args_list]
+        assert "PRIVATE KEY" not in listing
+
+    def test_proven_clone_sweeps_its_own_and_a_renamed_connectors_file(self, home):
+        ws = self._workspace(home)
+        self._clone(ws, TestBackendClone._ssh_entry())
+        assert self._left(home) == [
+            "other_key",
+            "repo_Upper",
+            "repo_link",
+            "repo_notes",
+            "repo_pub",
+        ]
+        assert (home / "elsewhere").exists()
+
+    def test_an_unloaded_identity_keeps_every_key_file(self, home):
+        ws = self._workspace(home)
+        ds = TestBackendClone._ssh_entry()
+        self._clone(
+            ws,
+            ds,
+            status={
+                ds["ssh_identity"]["authority_id"]: "workspace_ssh_identity_load_failed"
+            },
+        )
+        assert "repo_my-repo" in self._left(home)
+        assert "repo_old-name" in self._left(home)
+
+    def test_one_unproven_repository_blocks_the_sweep_not_the_proven_one(self, home):
+        ws = self._workspace(home)
+        proven = TestBackendClone._ssh_entry()
+        unloaded = TestBackendClone._ssh_entry(
+            id="00000000-0000-4000-8000-0000000000d2",
+            name="Other Repo",
+            connection_url="git@github.com:org/other.git",
+        )
+        status = {
+            proven["ssh_identity"]["authority_id"]: "ready",
+            unloaded["ssh_identity"][
+                "authority_id"
+            ]: "workspace_ssh_identity_load_failed",
+        }
+        self._clone(ws, proven, unloaded, status=status)
+        left = self._left(home)
+        assert "repo_my-repo" not in left
+        assert "repo_old-name" in left
+
+    @pytest.mark.parametrize("reachable", [True, False])
+    def test_a_reused_checkout_is_proven_with_ls_remote_first(self, home, reachable):
+        ws = self._workspace(home, reused=True)
+        git_manager = self._clone(
+            ws, TestBackendClone._ssh_entry(), reachable=reachable
+        )
+        git_manager.return_value.remote_reachable.assert_called_once_with()
+        left = self._left(home)
+        assert ("repo_my-repo" in left) is not reachable
+        assert ("repo_old-name" in left) is not reachable
+
+    def test_no_key_file_means_no_ls_remote(self, tmp_path):
+        (tmp_path / ".ssh").mkdir()
+        ws = self._workspace(tmp_path, reused=True)
+        git_manager = self._clone(ws, TestBackendClone._ssh_entry())
+        git_manager.return_value.remote_reachable.assert_not_called()
+
+    def test_a_live_add_deletes_only_its_own_file(self, home):
+        ws = self._workspace(home)
+        self._clone(ws, TestBackendClone._ssh_entry(), sweep_legacy_keys=False)
+        left = self._left(home)
+        assert "repo_my-repo" not in left
+        assert "repo_old-name" in left
+
+    def test_token_repositories_never_look_for_key_files(self, home):
+        ws = self._workspace(home)
+        with patch("agent.managers.git_manager.GitManager.clone", return_value=None):
+            clone_repository_datasources([token_ds()], ws)
+        ws.backend.shell_run.assert_not_called()
+        assert "repo_my-repo" in self._left(home)
 
 
 class TestResolveRepoCloneNames:
