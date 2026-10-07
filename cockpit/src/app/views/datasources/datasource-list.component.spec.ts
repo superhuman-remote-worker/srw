@@ -681,6 +681,113 @@ describe('DatasourceListComponent repository forge selection', () => {
   });
 });
 
+describe('DatasourceListComponent SSH connector host keys', () => {
+  const hostKey = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl';
+
+  it('sends an ssh_key connector its host, user, port and pin', () => {
+    const {api, component} = createComponent();
+    component.openCreateForm();
+    component.onScopeModeChange('all');
+    component.formData.name = 'Bastion';
+    component.formData.type = 'ssh_key';
+    component.gitSshKey = '-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----';
+    component.sshHost = ' bastion.example.com ';
+    component.sshUser = 'deploy';
+    component.sshPort = '2200';
+    component.sshKnownHosts = hostKey;
+
+    component.doSave();
+
+    expect(api.createDatasource.mock.calls[0][0].config).toEqual({
+      host: 'bastion.example.com',
+      user: 'deploy',
+      port: 2200,
+      known_hosts: hostKey,
+    });
+  });
+
+  it('round-trips the endpoint on edit and clears it when the host is removed', () => {
+    const {api, component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      type: 'ssh_key',
+      connection_url: null,
+      config: {host: 'bastion.example.com', port: 2200, known_hosts: hostKey},
+    });
+    expect(component.sshHost).toBe('bastion.example.com');
+    expect(component.sshPort).toBe('2200');
+    expect(component.sshKnownHosts).toBe(hostKey);
+
+    component.sshHost = '';
+    component.saveForm();
+
+    expect(api.updateDatasource).toHaveBeenCalledWith(
+      ds.id,
+      expect.objectContaining({config: {}}),
+    );
+  });
+
+  it('offers to pin the host key a Test reported, into the form field', () => {
+    const {component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      type: 'repository',
+      connection_url: 'git@github.com:acme/widget.git',
+      cli_hint: 'git over ssh',
+      config: {forge: 'github'},
+    });
+    expect(component.gitAuthMethod).toBe('ssh');
+    component.formTestResult.set({
+      status: 'ok',
+      message: 'Reached github.com:22',
+      details: {host_key: hostKey},
+    });
+
+    expect(component.testedHostKeyToPin()).toBe(hostKey);
+    component.pinTestedHostKey(hostKey);
+    expect(component.sshKnownHosts).toBe(hostKey);
+    // Once pinned, the offer goes away.
+    expect(component.testedHostKeyToPin()).toBeNull();
+  });
+
+  it.each([
+    ['ssh', {forge: 'github', known_hosts: hostKey}],
+    ['token', {forge: 'github'}],
+  ] as const)('sends the pin only with an SSH-key repository (%s)', (auth, config) => {
+    const {api, component} = createComponent();
+    component.openCreateForm();
+    component.onScopeModeChange('all');
+    component.formData.name = 'Widget';
+    component.formData.type = 'repository';
+    component.onConnectionUrlChange('https://github.com/acme/widget');
+    component.sshKnownHosts = hostKey;
+    component.gitAuthMethod = auth;
+    component.gitSshKey = 'key';
+    component.formCredentials.password = 'tok';
+
+    component.doSave();
+
+    expect(api.createDatasource.mock.calls[0][0].config).toEqual(config);
+  });
+
+  it('names every new string in the catalogue', () => {
+    const form = (en as {datasources: {form: Record<string, string>}}).datasources.form;
+    for (const key of [
+      'sshHostLabel',
+      'sshUserLabel',
+      'sshPortLabel',
+      'sshHostHint',
+      'sshKnownHostsLabel',
+      'sshKnownHostsHint',
+      'sshPinHostKey',
+      'sshAgentNoticeTitle',
+      'sshAgentNotice',
+    ]) {
+      expect(form[key], key).toBeTruthy();
+    }
+  });
+});
+
 describe('DatasourceListComponent availability policy', () => {
   it('passes the selected project through the server-side catalog filter', () => {
     const {api, component} = createComponent();

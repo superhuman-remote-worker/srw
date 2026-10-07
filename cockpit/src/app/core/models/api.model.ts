@@ -392,6 +392,16 @@ export interface DatasourceConfig {
   /** Email: skip the human send-approval freeze (needs the
    *  ``email_autonomous_send`` grant; the server rejects it otherwise). */
   unattended_send?: boolean;
+  /** ssh_key: the host a plain ``ssh <host>`` in the workspace reaches. */
+  host?: string;
+  /** ssh_key: login name on ``host``. */
+  user?: string;
+  /** ssh_key: SSH port on ``host`` (22 when unset). The form sends what was
+   *  typed when it is not a number, so the server's 400 names the problem. */
+  port?: number | string;
+  /** ssh_key and SSH-key repository: pinned host keys (``<type> <base64>``
+   *  or known_hosts lines). Unpinned hosts are trusted on first use. */
+  known_hosts?: string;
 }
 
 export type DatasourceIndexState =
@@ -599,6 +609,13 @@ export interface ProjectDatasource extends Datasource {
 export interface DatasourceTestResult {
   status: 'ok' | 'error';
   message: string;
+  /** Probe-specific facts; an SSH connector reports the host key it saw. */
+  details?: {
+    /** ``<type> <base64>``, the form the ``known_hosts`` field pins. */
+    host_key?: string;
+    host_key_fingerprint?: string;
+    [key: string]: unknown;
+  };
 }
 
 /**

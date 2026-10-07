@@ -659,6 +659,20 @@ type KeyValueRow = {key: string; value: string};
                     </app-button>
                   }
                 </div>
+                @if (formData.type === 'repository') {
+                  <app-form-field [label]="'datasources.form.sshKnownHostsLabel' | transloco">
+                    <app-textarea
+                      size="sm"
+                      class="mono"
+                      [value]="sshKnownHosts"
+                      (valueChange)="sshKnownHosts = $event"
+                      placeholder="ssh-ed25519 AAAA..."
+                      [rows]="2"
+                      [disabled]="isSaving()"
+                    />
+                  </app-form-field>
+                  <div class="form-hint">{{ 'datasources.form.sshKnownHostsHint' | transloco }}</div>
+                }
               }
               @if (editingId()) {
                 <div class="credential-retain-hint">
@@ -1000,11 +1014,54 @@ type KeyValueRow = {key: string; value: string};
                 }
               </div>
               <div class="form-hint">{{ 'datasources.form.sshKeyHint' | transloco }}</div>
+              <div class="form-row">
+                <app-form-field class="flex-1" [label]="'datasources.form.sshHostLabel' | transloco">
+                  <app-input
+                    size="sm"
+                    [value]="sshHost"
+                    (valueChange)="sshHost = $event"
+                    placeholder="bastion.example.com"
+                    [disabled]="isSaving()"
+                  />
+                </app-form-field>
+                <app-form-field class="flex-1" [label]="'datasources.form.sshUserLabel' | transloco">
+                  <app-input
+                    size="sm"
+                    [value]="sshUser"
+                    (valueChange)="sshUser = $event"
+                    placeholder="deploy"
+                    [disabled]="isSaving() || !sshHost.trim()"
+                  />
+                </app-form-field>
+                <app-form-field [label]="'datasources.form.sshPortLabel' | transloco">
+                  <app-input
+                    size="sm"
+                    [value]="sshPort"
+                    (valueChange)="sshPort = $event"
+                    placeholder="22"
+                    [disabled]="isSaving() || !sshHost.trim()"
+                  />
+                </app-form-field>
+              </div>
+              @if (sshHost.trim()) {
+                <app-form-field [label]="'datasources.form.sshKnownHostsLabel' | transloco">
+                  <app-textarea
+                    size="sm"
+                    class="mono"
+                    [value]="sshKnownHosts"
+                    (valueChange)="sshKnownHosts = $event"
+                    placeholder="ssh-ed25519 AAAA..."
+                    [rows]="2"
+                    [disabled]="isSaving()"
+                  />
+                </app-form-field>
+              }
+              <div class="form-hint">{{ 'datasources.form.sshHostHint' | transloco }}</div>
               <div class="trust-notice">
                 <app-icon size="sm">shield</app-icon>
                 <div>
-                  <strong>{{ 'datasources.form.trustNoticeTitle' | transloco }}.</strong>
-                  {{ 'datasources.form.trustNotice' | transloco }}
+                  <strong>{{ 'datasources.form.sshAgentNoticeTitle' | transloco }}.</strong>
+                  {{ 'datasources.form.sshAgentNotice' | transloco }}
                 </div>
               </div>
             }
@@ -1339,6 +1396,13 @@ type KeyValueRow = {key: string; value: string};
                 <app-icon size="sm">{{ formTestResult()!.status === 'ok' ? 'check_circle' : 'error' }}</app-icon>
                 {{ formTestResult()!.message }}
               </div>
+              @if (testedHostKeyToPin(); as hostKey) {
+                <div class="ssh-key-actions">
+                  <app-button size="sm" variant="secondary" type="button" [disabled]="isSaving()" (clicked)="pinTestedHostKey(hostKey)">
+                    <app-icon size="sm">push_pin</app-icon> {{ 'datasources.form.sshPinHostKey' | transloco }}
+                  </app-button>
+                </div>
+              }
             }
           </div>
         </div>
@@ -2896,6 +2960,29 @@ export class DatasourceListComponent implements OnInit {
   gitAuthMethod: 'token' | 'ssh' = 'token';
   gitSshKey = '';
 
+  // SSH endpoint of an ssh_key connector, and the pinned host keys of it or
+  // of an SSH-key repository. Non-secret config, so it round-trips on edit.
+  sshHost = '';
+  sshUser = '';
+  sshPort = '';
+  sshKnownHosts = '';
+
+  /** The host key a Test just reported, when this form can pin it. */
+  testedHostKeyToPin(): string | null {
+    const hostKey = this.formTestResult()?.details?.host_key;
+    if (typeof hostKey !== 'string' || !hostKey) return null;
+    const pinnable =
+      this.formData.type === 'ssh_key' ||
+      (this.formData.type === 'repository' && this.gitAuthMethod === 'ssh');
+    if (!pinnable || this.sshKnownHosts.trim() === hostKey) return null;
+    return hostKey;
+  }
+
+  /** Put the tested host key into the known_hosts field; Save persists it. */
+  pinTestedHostKey(hostKey: string): void {
+    this.sshKnownHosts = hostKey;
+  }
+
   // Generic env var editor
   envVars: { key: string; value: string }[] = [];
   private mcpTransportDirty = false;
@@ -3195,6 +3282,11 @@ export class DatasourceListComponent implements OnInit {
       this.gitAuthMethod = 'token';
       this.gitSshKey = '';
     }
+    // SSH endpoint and pins are non-secret config and round-trip.
+    this.sshHost = ds.config?.host ?? '';
+    this.sshUser = ds.config?.user ?? '';
+    this.sshPort = ds.config?.port ? String(ds.config.port) : '';
+    this.sshKnownHosts = ds.config?.known_hosts ?? '';
     // ENV names can round-trip; blank values preserve the saved credentials.
     this.envVars = ds.type === 'credentials'
       ? (ds.env_var_names ?? []).map(key => ({key, value: ''}))
@@ -4089,7 +4181,22 @@ export class DatasourceListComponent implements OnInit {
     if (this.formData.type === 'repository') {
       // canSave() already requires forge to be non-blank before this can be
       // reached from the UI; the `{}` fallback only guards a defensive call.
-      return this.formData.forge ? {forge: this.formData.forge} : {};
+      const config: DatasourceConfig = this.formData.forge ? {forge: this.formData.forge} : {};
+      if (this.gitAuthMethod === 'ssh' && this.sshKnownHosts.trim()) {
+        config.known_hosts = this.sshKnownHosts.trim();
+      }
+      return config;
+    }
+    if (this.formData.type === 'ssh_key') {
+      // Always an object: clearing the host on edit must clear it server-side.
+      const host = this.sshHost.trim();
+      if (!host) return {};
+      const config: DatasourceConfig = {host};
+      if (this.sshUser.trim()) config.user = this.sshUser.trim();
+      const port = this.sshPort.trim();
+      if (port) config.port = /^\d+$/.test(port) ? Number(port) : port;
+      if (this.sshKnownHosts.trim()) config.known_hosts = this.sshKnownHosts.trim();
+      return config;
     }
     if (this.formData.type === 'email') {
       return {
@@ -4283,6 +4390,10 @@ export class DatasourceListComponent implements OnInit {
     this.emailForm = this.defaultEmailForm();
     this.gitAuthMethod = 'token';
     this.gitSshKey = '';
+    this.sshHost = '';
+    this.sshUser = '';
+    this.sshPort = '';
+    this.sshKnownHosts = '';
     this.envVars = [];
     this.mcpTransportDirty = false;
     this.forgeDirty = false;
