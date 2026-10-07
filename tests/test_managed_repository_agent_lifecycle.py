@@ -29,7 +29,10 @@ from shared.runtime.core.managed_repository import (
     managed_repository_agent_launch_command,
     managed_repository_agent_retirement_command,
     managed_repository_agent_zero_command,
+    managed_ssh_config_include_command,
+    managed_ssh_namespace_setup_command,
     materialize_managed_repository_credentials,
+    render_ssh_identity_config,
 )
 
 
@@ -1066,3 +1069,248 @@ async def test_terminal_end_retires_then_reproves_all_credential_agents() -> Non
     verify_command = backend.verify_terminal_claim_resources_retired.call_args.args[0]
     assert " zero " in verify_command
     assert "ssh-agent" in verify_command
+
+
+# ---------------------------------------------------------------------------
+# Shared runtime for connector identities (connector drivers C1)
+# ---------------------------------------------------------------------------
+
+
+def _agent_key_count(socket_path: str) -> int:
+    listed = subprocess.run(
+        ["ssh-add", "-l"],
+        env={**os.environ, "SSH_AUTH_SOCK": socket_path},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if listed.returncode == 1:
+        return 0
+    assert listed.returncode == 0
+    return len([line for line in listed.stdout.decode().splitlines() if line])
+
+
+def test_fingerprint_proof_without_forge_probe(short_home: Path) -> None:
+    """An identity with no repository proves its key locally and nothing else."""
+
+    authority_id = str(uuid4())
+    private_key, _public_key, fingerprint = _deploy_keypair()
+    launched = _run(
+        managed_repository_agent_launch_command(
+            home_path=str(short_home),
+            authority_id=authority_id,
+            generation=1,
+            preserve_existing=True,
+            expected_fingerprint=fingerprint,
+        ),
+        secret=private_key.encode(),
+    )
+    assert launched.returncode == 0, launched.stderr.decode(errors="replace")
+    state = _state(short_home, authority_id)[1]
+    assert _agent_key_count(state["socket"]) == 1
+
+    other_key = _deploy_keypair()[0]
+    wrong = _run(
+        managed_repository_agent_launch_command(
+            home_path=str(short_home),
+            authority_id=str(uuid4()),
+            generation=1,
+            expected_fingerprint=fingerprint,
+        ),
+        secret=other_key.encode(),
+    )
+    assert wrong.returncode != 0
+    with pytest.raises(Exception):
+        managed_repository_agent_launch_command(
+            home_path=str(short_home),
+            authority_id=authority_id,
+            generation=1,
+            probe_url="ssh://srw-repo-x/o/r.git",
+        )
+    assert (
+        _run(
+            managed_repository_agent_retirement_command(home_path=str(short_home))
+        ).returncode
+        == 0
+    )
+    assert (
+        _run(
+            managed_repository_agent_zero_command(home_path=str(short_home))
+        ).returncode
+        == 0
+    )
+
+
+def test_key_lifetime_expires_and_the_next_materialization_self_heals(
+    short_home: Path,
+) -> None:
+    authority_id = str(uuid4())
+    private_key, _public_key, fingerprint = _deploy_keypair()
+
+    def launch(lifetime: int) -> subprocess.CompletedProcess[bytes]:
+        return _run(
+            managed_repository_agent_launch_command(
+                home_path=str(short_home),
+                authority_id=authority_id,
+                generation=1,
+                preserve_existing=True,
+                expected_fingerprint=fingerprint,
+                key_lifetime_seconds=lifetime,
+            ),
+            secret=private_key.encode(),
+        )
+
+    assert "ssh-add -t 3 -" in managed_repository_agent_launch_command(
+        home_path=str(short_home),
+        authority_id=authority_id,
+        generation=1,
+        key_lifetime_seconds=3,
+    )
+    assert launch(3).returncode == 0
+    first = _state(short_home, authority_id)[1]
+    # A proven reuse re-adds the key, restarting its lifetime.
+    time.sleep(2)
+    assert launch(3).returncode == 0
+    assert _state(short_home, authority_id)[1]["pid"] == first["pid"]
+    time.sleep(2)
+    assert _agent_key_count(first["socket"]) == 1
+    # Unrefreshed, the agent forgets the key on its own ...
+    time.sleep(2)
+    assert _agent_key_count(first["socket"]) == 0
+    # ... and the next materialization replaces the keyless resident.
+    assert launch(3).returncode == 0
+    healed = _state(short_home, authority_id)[1]
+    assert healed["pid"] != first["pid"]
+    assert _agent_key_count(healed["socket"]) == 1
+    assert (
+        _run(
+            managed_repository_agent_retirement_command(home_path=str(short_home))
+        ).returncode
+        == 0
+    )
+
+
+def test_rendered_config_carries_the_legacy_adoption_lines(short_home: Path) -> None:
+    """A crash between spawn and receipt must not wedge terminal teardown."""
+
+    authority_id = str(uuid4())
+    slug = authority_id.replace("-", "")
+    root = short_home / ".ssh" / "srw-managed"
+    socket_path = root / "sockets" / f"{slug}.sock"
+    config = render_ssh_identity_config(
+        alias=f"srw-repo-{slug}",
+        socket_path=str(socket_path),
+        known_hosts_path=str(root / "known_hosts.d" / slug),
+        host="github.com",
+        port=22,
+        user="git",
+        strict_host_key_checking=True,
+        host_key_alias=f"srw-repo-{slug}",
+        extra_hosts=["bastion.example.com"],
+    )
+    lines = config.splitlines()
+    assert lines[:2] == [f"Host srw-repo-{slug}", f"  IdentityAgent {socket_path}"]
+    assert "  StrictHostKeyChecking yes" in lines
+    assert lines.count(f"  IdentityAgent {socket_path}") == 2
+
+    assert (
+        _run(managed_ssh_namespace_setup_command(home_path=str(short_home))).returncode
+        == 0
+    )
+    config_path = root / "config.d" / f"{slug}.conf"
+    config_path.write_text(config)
+    config_path.chmod(0o600)
+    output = subprocess.check_output(["ssh-agent", "-a", str(socket_path), "-s"])
+    pid = int(
+        next(
+            line.split("=", 1)[1].split(";", 1)[0]
+            for line in output.decode().splitlines()
+            if line.startswith("SSH_AGENT_PID=")
+        )
+    )
+    try:
+        assert (
+            _run(
+                managed_repository_agent_retirement_command(home_path=str(short_home))
+            ).returncode
+            == 0
+        )
+        assert not Path(f"/proc/{pid}").exists()
+    finally:
+        _stop(pid)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["git\n  ProxyCommand sh -c id", "a b", "%d", "#x"],
+)
+def test_rendered_config_refuses_values_that_start_a_directive(value: str) -> None:
+    slug = uuid4().hex
+    with pytest.raises(Exception):
+        render_ssh_identity_config(
+            alias=f"srw-repo-{slug}",
+            socket_path=f"/home/agent-host/.ssh/srw-managed/sockets/{slug}.sock",
+            known_hosts_path="/home/agent-host/.ssh/srw-managed/known_hosts",
+            host="github.com",
+            user=value,
+        )
+
+
+def test_include_behind_match_all_survives_a_trailing_host_block(
+    short_home: Path,
+) -> None:
+    slug = uuid4().hex
+    root = short_home / ".ssh" / "srw-managed"
+    socket_path = root / "sockets" / f"{slug}.sock"
+    user_config = short_home / ".ssh" / "config"
+    user_config.parent.mkdir(parents=True)
+    # What a pre-C1 connector clone (or a user) leaves at the end of the file,
+    # followed by the legacy bare Include that therefore only applies to it.
+    user_config.write_text(
+        "Host github.com\n  IdentityFile ~/.ssh/repo_widget\n"
+        f"Include {root}/config.d/*.conf\n"
+    )
+    (root / "config.d").mkdir(parents=True)
+    (root / "config.d" / f"{slug}.conf").write_text(
+        render_ssh_identity_config(
+            alias=f"srw-repo-{slug}",
+            socket_path=str(socket_path),
+            known_hosts_path=str(root / "known_hosts"),
+            host="github.com",
+            port=22,
+            user="git",
+        )
+    )
+
+    def resolved_agent() -> str:
+        evaluated = subprocess.run(
+            ["ssh", "-G", "-F", str(user_config), f"srw-repo-{slug}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        ).stdout.decode()
+        return next(
+            (
+                line.split(" ", 1)[1]
+                for line in evaluated.splitlines()
+                if line.startswith("identityagent ")
+            ),
+            "",
+        )
+
+    # The bare Include sits inside the trailing Host block: the alias is dead.
+    assert resolved_agent() == ""
+    assert (
+        _run(managed_ssh_namespace_setup_command(home_path=str(short_home))).returncode
+        == 0
+    )
+    assert resolved_agent() == str(socket_path)
+    # Idempotent: a second setup appends nothing.
+    before = user_config.read_text()
+    assert before.count("Match all") == 1
+    assert (
+        _run(managed_ssh_config_include_command(home_path=str(short_home))).returncode
+        == 0
+    )
+    assert user_config.read_text() == before
+    assert oct(user_config.stat().st_mode & 0o777) == "0o600"

@@ -64,6 +64,8 @@ from shared.runtime.core.managed_repository import (
     managed_repository_agent_launch_command,
     managed_repository_agent_retirement_command,
     managed_repository_agent_zero_command,
+    managed_ssh_config_include_command,
+    render_ssh_identity_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -1763,19 +1765,13 @@ class IdeSessionService:
             raise ManagedRepositoryAuthorityError("repository_authority_invalid")
         managed_root = f"{home_path}/.ssh/srw-managed"
         socket_path = f"{managed_root}/sockets/{authority_id}.sock"
-        ssh_config_path = f"{home_path}/.ssh/config"
-        config = (
-            f"Host {alias}\n"
-            f"  HostName {host}\n"
-            f"  Port {port}\n"
-            "  User git\n"
-            f"  IdentityAgent {socket_path}\n"
-            # The dedicated agent contains exactly this authority's key. Do
-            # not set IdentitiesOnly without an IdentityFile: OpenSSH would
-            # suppress the agent-only identity we intentionally keep off disk.
-            "  BatchMode yes\n"
-            "  StrictHostKeyChecking accept-new\n"
-            f"  UserKnownHostsFile {managed_root}/known_hosts\n"
+        config = render_ssh_identity_config(
+            alias=alias,
+            socket_path=socket_path,
+            known_hosts_path=f"{managed_root}/known_hosts",
+            host=host,
+            port=port,
+            user="git",
         )
         quoted_workspace = shlex.quote(workspace_path)
         quoted_url = shlex.quote(clone_url)
@@ -1808,12 +1804,8 @@ class IdeSessionService:
             f"{shlex.quote(managed_root + '/sockets')} "
             f"{shlex.quote(managed_root + '/agents')}; "
             f"exec 8>{shlex.quote(managed_root + '/setup.lock')}; flock -x 8; "
-            f"touch {shlex.quote(ssh_config_path)}; "
-            "grep -qxF 'Include ~/.ssh/srw-managed/config.d/*.conf' "
-            f"{shlex.quote(ssh_config_path)} || "
-            "printf '\\nInclude ~/.ssh/srw-managed/config.d/*.conf\\n' "
-            f">> {shlex.quote(ssh_config_path)}; "
-            f"chmod 600 {shlex.quote(ssh_config_path)}; "
+            + managed_ssh_config_include_command(home_path=home_path)
+            + " || exit 1; "
             + launch_agent
             + "; "
             + f"mkdir -p {quoted_workspace}; "
