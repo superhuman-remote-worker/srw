@@ -41,16 +41,11 @@ from shared.tool_catalog.definitions import (
 
 logger = logging.getLogger(__name__)
 
-_CHECK_FAILED = (
-    "SRW couldn't confirm that an upgrade is available right now. The user "
-    "can still try /upgrade-workspace vm."
-)
+_CHECK_FAILED = "SRW couldn't check whether an upgrade is available right now."
 
 
 async def _vm_upgrade_unavailable_reason(context: ToolContext) -> Optional[str]:
     """None when a VM upgrade would be accepted now; otherwise why not."""
-    if not context.thread_id:
-        return "this Session has no identity SRW can check."
     # Imported at call time, not module level: the tests patch
     # agent.tools.orchestrator.jobs._get_client, which a module-level
     # `from` import would have already bound. (No import cycle exists.)
@@ -62,7 +57,7 @@ async def _vm_upgrade_unavailable_reason(context: ToolContext) -> Optional[str]:
     )
     try:
         async with _get_client(user_id=context.user_id) as client:
-            resp = await client.get(url)
+            resp = await client.get(url, timeout=10)
             resp.raise_for_status()
             vm = (resp.json() or {}).get("vm") or {}
     except Exception as exc:  # the offer is optional; never raise into the turn
@@ -82,15 +77,17 @@ def create_workspace_upgrade_tools(context: ToolContext) -> List[Any]:
 
     @tool
     async def request_workspace_upgrade(reason: str) -> str:
-        """Ask the user to upgrade this Session to a VM workspace with a shell.
+        """Ask to upgrade from this lite workspace to one with a shell.
 
         Call this when the task needs capabilities this workspace lacks — a
-        shell, git, running code or builds, or browser control.
+        shell, git, running code or builds, or browser control. In a Session
+        SRW offers a VM, and only when it would accept one; in a Job the
+        workspace is upgraded to a container.
 
-        You are only REQUESTING. If SRW can upgrade this Session, a human is
-        shown your request and decides; if they approve, a VM is provisioned
-        and your existing files carry over. If SRW can't, nothing is offered
-        and you are told why.
+        You are only REQUESTING. A human is shown your request and decides;
+        if they approve, the workspace is provisioned and your existing files
+        carry over. If SRW can't offer an upgrade, nothing is offered and you
+        are told why.
 
         This request does not provision a workspace or automatically resume
         the task. Explain what the upgrade enables, tell the user to send a
@@ -105,14 +102,43 @@ def create_workspace_upgrade_tools(context: ToolContext) -> List[Any]:
         Returns:
             Whether the request was shown to the user, and if not, why.
         """
+        if not context.thread_id:
+            # Worker Job (no thread): the pre-existing sandbox freeze,
+            # unchanged. No availability check.
+            context.request_freeze(
+                {
+                    "freeze_type": "workspace_upgrade_required",
+                    "target_tier": "sandbox",
+                    "reason": reason or "The task needs a real workspace (shell/git).",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            logger.info("request_workspace_upgrade requested: reason=%r", reason)
+            return (
+                "Recorded your request for a sandbox workspace — a human will see "
+                "it and decide. The request has not started a workspace or added "
+                "tools. Explain what it enables and continue useful preparation. "
+                "After an approved upgrade completes, the user can send a "
+                "follow-up message to continue the task; check the newly available "
+                "tools then. Existing files carry over during the upgrade."
+            )
         unavailable = await _vm_upgrade_unavailable_reason(context)
+        if unavailable is _CHECK_FAILED:
+            logger.info("request_workspace_upgrade not offered: check failed")
+            return (
+                "SRW couldn't check whether an upgrade is available right now, "
+                "so nothing was offered to the user. Tell them the task needs a "
+                "shell; they can try /upgrade-workspace vm themselves, or start "
+                "a new Session with a Container workspace. Meanwhile continue "
+                "with the tools you have."
+            )
         if unavailable is not None:
             logger.info("request_workspace_upgrade not offered: %s", unavailable)
             return (
                 f"No workspace upgrade is available for this Session: {unavailable} "
                 "Nothing was offered to the user. Tell them the task needs a "
-                "shell, and that they can start a new Session with a container "
-                "or VM workspace; meanwhile continue with the tools you have."
+                "shell, and that they can start a new Session with a Container "
+                "workspace; meanwhile continue with the tools you have."
             )
         context.request_freeze(
             {

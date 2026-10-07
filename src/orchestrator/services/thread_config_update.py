@@ -1263,6 +1263,7 @@ __all__ = [
     "ThreadConfigStore",
     "ThreadConfigUpdateDependencies",
     "agent_abort_thread_vm_upgrade",
+    "agent_thread_upgrade_availability",
     "agent_update_thread_config",
     "agent_upgrade_thread_to_vm",
     "agent_upgrade_thread_to_workspace",

@@ -78,15 +78,22 @@ async def test_failed_check_offers_nothing(monkeypatch):
     result = await tool.ainvoke({"reason": "need a shell"})
     assert context.consume_freeze_request() is None
     assert "/upgrade-workspace vm" in result
+    assert "nothing was offered" in result
+    assert "No workspace upgrade is available" not in result
 
 
 @pytest.mark.asyncio
-async def test_no_thread_identity_offers_nothing(monkeypatch):
+async def test_worker_job_keeps_the_sandbox_freeze(monkeypatch):
     client = _Client({"vm": {"available": True, "reason": None}})
     monkeypatch.setattr(
         "agent.tools.orchestrator.jobs._get_client", lambda **kw: client
     )
-    (tool,) = create_workspace_upgrade_tools(ToolContext(user_id="u-1"))
-    context_free = await tool.ainvoke({"reason": "need a shell"})
+    context = ToolContext(_job_id="job-1")
+    (tool,) = create_workspace_upgrade_tools(context)
+    result = await tool.ainvoke({"reason": "need pytest"})
     assert client.gets == []
-    assert "Nothing was offered" in context_free
+    freeze = context.consume_freeze_request()
+    assert freeze["freeze_type"] == "workspace_upgrade_required"
+    assert freeze["target_tier"] == "sandbox"
+    assert freeze["reason"] == "need pytest"
+    assert result.startswith("Recorded your request for a sandbox workspace")

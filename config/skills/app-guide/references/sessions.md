@@ -126,8 +126,10 @@ deployment authorization.
    that response. Check any reported error, wait for a workspace upgrade to
    complete if requested, then send the agent a follow-up to continue.
 
-For a Virtual session that needs a browser or shell, choose **Container** in
-**Workspace** and confirm **Upgrade**. Existing files carry over; then check
+For a Virtual session that needs a shell, choose **VM** in **Workspace** when
+VMs are allowed and confirm **Upgrade**; existing files carry over. A running
+session can't upgrade to a Container, so start a new Container session when you
+need one (for example, for the direct or shared browser). Then check
 the needed tool category under **Tools**. If the Workspace choices say **not
 available in this session**, this session cannot change workspace in place:
 start a new session with the needed workspace instead. Use the focused
