@@ -12,69 +12,73 @@ control loop flow.
 """
 
 from typing import Annotated, Any, Dict, List, Mapping, Optional
-from urllib.parse import urlsplit, urlunsplit
 
 from typing_extensions import TypedDict
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
+from shared.runtime_actor import audit_metadata_payload
+
 
 # Hidden dispatch fields that are pure credential transport. Their consumers
 # pop them before the graph starts; dropping them here is the backstop.
-_CREDENTIAL_METADATA_KEYS = ("managed_repository_credentials",)
-# Metadata lists whose entries carry a plaintext ``credentials`` object (Git
-# tokens, SSH keys, env values, credential-file contents) and a URL that may
-# embed userinfo.
-_CREDENTIAL_ENTRY_URLS = {"datasources": "connection_url", "repositories": "repo_url"}
-
-
-def _url_without_userinfo(value: Any) -> Any:
-    """Drop ``user:secret@`` from a URL; a malformed one is dropped whole."""
-    if not isinstance(value, str) or "@" not in value:
-        return value
-    try:
-        parts = urlsplit(value)
-        if not parts.scheme or "@" not in parts.netloc:
-            return value
-        netloc = parts.netloc.rpartition("@")[2]
-        return urlunsplit(parts._replace(netloc=netloc))
-    except ValueError:
-        return ""
+_CREDENTIAL_METADATA_KEYS = (
+    "managed_repository_credentials",
+    "workspace_ssh_identities",
+)
+# Metadata lists whose entries carry connector credentials, in ``credentials``
+# and in URLs (userinfo, query parameters). Nothing reads these lists from
+# state, so an entry keeps only its identity and non-secret descriptive fields.
+_CONNECTOR_LISTS = ("datasources", "repositories")
+_CONNECTOR_ENTRY_FIELDS = (
+    "id",
+    "datasource_id",
+    "name",
+    "type",
+    "role",
+    "description",
+    "project_read_only",
+    "read_only",
+)
 
 
 def checkpoint_safe_metadata(
     metadata: Optional[Mapping[str, Any]],
 ) -> Dict[str, Any]:
-    """Return job metadata without its connector credentials.
+    """Return job metadata without its connector and workspace credentials.
 
     Graph state is persisted by the checkpointer (shared Postgres by default
     and always for stateless workers, pod-local SQLite in the legacy mode), so
-    secret material must never become state. Each ``datasources`` and ``repositories`` entry
-    loses its ``credentials`` and the userinfo of its URL; the other fields
-    stay. The runtime reads credentials from the dispatch payload it holds in
+    those credentials must never become state. Each ``datasources`` and
+    ``repositories`` entry is reduced to an allowlist of identity and
+    descriptive fields (no ``credentials``, ``connection_url`` or
+    ``repo_url``), hidden credential transports are dropped, and
+    ``runtime_actor`` keeps its identity only. Harness-side LLM keys in
+    ``config_override``/``resolved_config`` stay, by owner decision.
+
+    The runtime reads credentials from the dispatch payload it holds in
     process memory (``UniversalAgent._job_metadata``), never from state, and
     every resume or claim delivers that payload again. The input is not
     mutated: the runtime shares its entry dicts.
     """
     if not metadata:
         return {}
-    safe = {
-        key: value
-        for key, value in metadata.items()
-        if key not in _CREDENTIAL_METADATA_KEYS
-    }
-    for list_key, url_key in _CREDENTIAL_ENTRY_URLS.items():
-        entries = safe.get(list_key)
-        if not isinstance(entries, list):
+    safe = audit_metadata_payload(
+        {
+            key: value
+            for key, value in metadata.items()
+            if key not in _CREDENTIAL_METADATA_KEYS
+        }
+    )
+    for list_key in _CONNECTOR_LISTS:
+        if list_key not in safe:
             continue
-        cleaned = []
-        for entry in entries:
-            if isinstance(entry, Mapping):
-                entry = {k: v for k, v in entry.items() if k != "credentials"}
-                if url_key in entry:
-                    entry[url_key] = _url_without_userinfo(entry[url_key])
-            cleaned.append(entry)
-        safe[list_key] = cleaned
+        entries = safe[list_key]
+        safe[list_key] = [
+            {key: entry[key] for key in _CONNECTOR_ENTRY_FIELDS if key in entry}
+            for entry in (entries if isinstance(entries, list) else [])
+            if isinstance(entry, Mapping)
+        ]
     return safe
 
 

@@ -50,6 +50,11 @@ PG_PASSWORD = "c0-pg-password-2b9f"
 MCP_SECRET = "c0-mcp-bearer-80d4"
 REPO_TOKEN = "c0-project-repo-token-3e1c"
 MANAGED_KEY = "c0-managed-deploy-key-91aa"
+QUERY_SECRET = "c0-query-api-key-77b2"
+SLASH_PASSWORD = "c0/pass#word-4d10"
+IDENTITY_KEY = "c0-workspace-ssh-identity-0c3e"
+ACCESS_CREDENTIAL = "c0-actor-access-credential-5a5a"
+REFRESH_CREDENTIAL = "c0-actor-refresh-credential-6b6b"
 
 SECRETS = (
     TOKEN,
@@ -61,6 +66,11 @@ SECRETS = (
     MCP_SECRET,
     REPO_TOKEN,
     MANAGED_KEY,
+    QUERY_SECRET,
+    SLASH_PASSWORD,
+    IDENTITY_KEY,
+    ACCESS_CREDENTIAL,
+    REFRESH_CREDENTIAL,
 )
 
 
@@ -131,12 +141,20 @@ def _metadata() -> dict:
             {
                 "type": "mcp",
                 "name": "c0-mcp",
-                "connection_url": "https://mcp.example.test/sse",
+                "connection_url": f"https://mcp.example.test/sse?api_key={QUERY_SECRET}",
                 "credentials": {
                     "transport": "http",
                     "headers": {"Authorization": f"Bearer {MCP_SECRET}"},
                 },
                 "project_read_only": False,
+            },
+            {
+                # An unencoded "/" and "#" defeat URL parsing of the userinfo.
+                "type": "mongodb",
+                "name": "c0-mongo",
+                "connection_url": f"mongodb://app:{SLASH_PASSWORD}@mongo.example.test/db",
+                "credentials": {},
+                "project_read_only": True,
             },
         ],
         "repositories": [
@@ -152,6 +170,14 @@ def _metadata() -> dict:
             }
         ],
         "managed_repository_credentials": [{"private_key": MANAGED_KEY}],
+        "workspace_ssh_identities": [{"private_key": IDENTITY_KEY}],
+        "runtime_actor": {
+            "caller_kind": "worker",
+            "project_id": "11111111-1111-1111-1111-111111111111",
+            "user_id": "44444444-4444-4444-4444-444444444444",
+            "access_credential": ACCESS_CREDENTIAL,
+            "refresh_credential": REFRESH_CREDENTIAL,
+        },
     }
 
 
@@ -167,24 +193,41 @@ class TestCheckpointSafeMetadata:
 
         _assert_no_secret(json.dumps(safe))
         assert "managed_repository_credentials" not in safe
-        assert all("credentials" not in ds for ds in safe["datasources"])
-        assert all("credentials" not in repo for repo in safe["repositories"])
+        assert "workspace_ssh_identities" not in safe
+        for entry in [*safe["datasources"], *safe["repositories"]]:
+            assert not {"credentials", "connection_url", "repo_url"} & set(entry)
 
-    def test_keeps_the_non_secret_fields(self):
+    def test_runtime_actor_keeps_its_identity_only(self):
+        safe = checkpoint_safe_metadata(_metadata())
+
+        assert safe["runtime_actor"] == {
+            "caller_kind": "worker",
+            "project_id": "11111111-1111-1111-1111-111111111111",
+            "project_role": None,
+            "thread_id": None,
+            "officer_incarnation": None,
+            "user_id": "44444444-4444-4444-4444-444444444444",
+        }
+
+    def test_entries_keep_only_identity_and_descriptive_fields(self):
         source = _metadata()
         safe = checkpoint_safe_metadata(source)
 
-        token_repo = safe["datasources"][0]
-        assert token_repo == {
+        assert safe["datasources"][0] == {
             "type": "repository",
             "name": "c0-token-repo",
             "description": None,
-            "connection_url": "https://git.example.test/owner/repo.git",
             "project_read_only": False,
             "datasource_id": "22222222-2222-2222-2222-222222222222",
-            "config": {"forge": "gitea"},
-            "default_branch": "main",
         }
+        assert safe["repositories"] == [
+            {
+                "id": "33333333-3333-3333-3333-333333333333",
+                "name": "aux",
+                "role": "source",
+                "read_only": True,
+            }
+        ]
         assert [ds["name"] for ds in safe["datasources"]] == [
             ds["name"] for ds in source["datasources"]
         ]
@@ -192,19 +235,6 @@ class TestCheckpointSafeMetadata:
             ds["type"] for ds in source["datasources"]
         ]
         assert safe["datasources"][1]["project_read_only"] is True
-        # scp-style URLs carry a username, never a secret.
-        assert (
-            safe["datasources"][1]["connection_url"]
-            == "git@git.example.test:owner/other.git"
-        )
-        assert safe["datasources"][2]["cli_hint"] == "curl with $C0_GATE_SECRET"
-        assert (
-            safe["datasources"][5]["connection_url"]
-            == "postgresql://db.example.test:5432/app"
-        )
-        assert (
-            safe["repositories"][0]["repo_url"] == "https://git.example.test/o/aux.git"
-        )
         assert safe["description"] == source["description"]
         assert safe["project_id"] == source["project_id"]
 
@@ -219,31 +249,37 @@ class TestCheckpointSafeMetadata:
         assert source["datasources"][0]["credentials"]["token"] == TOKEN
 
     @pytest.mark.parametrize(
-        ("value", "expected"),
+        "url",
         [
-            ("https://user:pw@host/x", "https://host/x"),
-            ("https://tokenonly@host:8443/x?q=1", "https://host:8443/x?q=1"),
-            ("ssh://git@host:2222/o/r.git", "ssh://host:2222/o/r.git"),
-            ("git@host:o/r.git", "git@host:o/r.git"),
-            ("https://host/x", "https://host/x"),
-            ("https://host/user@example.com", "https://host/user@example.com"),
-            ("", ""),
-            (None, None),
+            "https://user:pw@host/x",
+            "https://host/x?password=c0-query-secret",
+            "postgresql://app:pa/ss#word@db/app",
+            "app:secret@db.example.test/app",
+            "deploy@host:o/r.git",
         ],
     )
-    def test_url_userinfo_is_dropped(self, value, expected):
+    def test_urls_never_reach_state(self, url):
         safe = checkpoint_safe_metadata(
-            {"datasources": [{"name": "x", "connection_url": value}]}
+            {
+                "datasources": [{"name": "x", "connection_url": url}],
+                "repositories": [{"name": "y", "repo_url": url}],
+            }
         )
-        assert safe["datasources"][0]["connection_url"] == expected
+        assert safe == {
+            "datasources": [{"name": "x"}],
+            "repositories": [{"name": "y"}],
+        }
 
     @pytest.mark.parametrize("metadata", [None, {}])
     def test_empty_metadata(self, metadata):
         assert checkpoint_safe_metadata(metadata) == {}
 
-    def test_unexpected_shapes_pass_through(self):
+    def test_unexpected_shapes_fail_closed(self):
         metadata = {"datasources": "not-a-list", "repositories": [None, "x"]}
-        assert checkpoint_safe_metadata(metadata) == metadata
+        assert checkpoint_safe_metadata(metadata) == {
+            "datasources": [],
+            "repositories": [],
+        }
 
     def test_initial_state_holds_safe_metadata(self):
         state = create_initial_state(
