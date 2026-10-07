@@ -379,6 +379,11 @@ class JobStartRequest(BaseModel):
         repr=False,
         description="Hidden server-owned repository authority transport",
     )
+    workspace_ssh_identities: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        repr=False,
+        description="Hidden connector SSH keys for workspace ssh-agents",
+    )
     branch_name: Optional[str] = Field(
         default=None,
         description="Git branch for job workspace",
@@ -527,6 +532,11 @@ class JobResumeRequest(BaseModel):
         default=None,
         repr=False,
         description="Hidden server-owned repository authority transport",
+    )
+    workspace_ssh_identities: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        repr=False,
+        description="Hidden connector SSH keys for workspace ssh-agents",
     )
     project_id: Optional[str] = Field(
         default=None,

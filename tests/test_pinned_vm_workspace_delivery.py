@@ -632,6 +632,86 @@ async def test_vm_attach_setup_materializes_repository_bundle(
 
 
 @pytest.mark.asyncio
+async def test_ready_vm_payload_carries_connector_ssh_identities(vm_delivery):
+    """C1: both halves of an SSH connector come from one authorization."""
+
+    identity = {"authority_id": "22222222-2222-4222-8222-222222222222"}
+    datasource = {"type": "ssh_key", "name": "Bastion", "ssh_identity": {}}
+    resolve = AsyncMock(return_value=([datasource], [identity]))
+    vm_delivery.dependencies = replace(
+        vm_delivery.dependencies, resolve_thread_datasource_delivery=resolve
+    )
+
+    payload = await _deliver(vm_delivery)
+
+    assert payload["datasources"] == [datasource]
+    assert payload["workspace_ssh_identities"] == [identity]
+    resolve.assert_awaited_once()
+    normalized = await _normalize(payload)
+    assert normalized["workspace_ssh_identities"] == [identity]
+
+
+@pytest.mark.asyncio
+async def test_vm_attach_setup_loads_connector_ssh_identity(
+    vm_attach_setup, monkeypatch, caplog
+):
+    """The session pops connector keys with the managed bundle and loads them."""
+    from tests.test_workspace_ssh_identity_agent import _payload
+
+    identity = _payload(kind="ssh_key", host=None, port=None, user=None)
+    private_material = identity["private_key"]
+    vm_attach_setup_payload = persistent_app._orchestrator_client.get_thread_workspace
+    vm_attach_setup_payload.return_value["workspace_ssh_identities"] = [identity]
+    monkeypatch.setattr(RemoteBackend, "connect", lambda self: None)
+    monkeypatch.setattr(RemoteBackend, "exists", lambda self, path: False)
+    monkeypatch.setattr(RemoteBackend, "list_dir", lambda self, path: [])
+    monkeypatch.setattr(
+        RemoteBackend,
+        "resolve_home_path",
+        lambda self, path: f"/home/agent-host/{path}",
+    )
+    transferred = []
+
+    def secret_transport(self, command, secret, **kwargs):
+        assert private_material not in command
+        if secret:
+            transferred.append(bytes(secret))
+        return True
+
+    monkeypatch.setattr(RemoteBackend, "execute_with_secret_stdin", secret_transport)
+    monkeypatch.setattr(persistent_session, "WorkspaceManager", MagicMock())
+
+    class WorkspaceSetupComplete(Exception):
+        pass
+
+    async def stop_after_workspace(self, postgres_conn):
+        raise WorkspaceSetupComplete
+
+    monkeypatch.setattr(
+        persistent_session.PersistentSession,
+        "_seed_workspace_baseline_commit",
+        stop_after_workspace,
+    )
+    monkeypatch.setattr(
+        persistent_app._session_attach, "cleanup_failed_attach", AsyncMock()
+    )
+    with pytest.raises(WorkspaceSetupComplete):
+        await persistent_app._session_attach.attach(
+            THREAD,
+            pinned_status_identity_contract=1,
+            pinned_runtime_generation_contract=1,
+            session_runtime_generation=RUNTIME,
+            session_runtime_attach_token=ATTACH,
+        )
+
+    session = persistent_app._session
+    assert private_material.encode() in transferred
+    assert "private_key" not in identity
+    assert private_material not in caplog.text
+    assert session.workspace_ssh_identity_status == {identity["authority_id"]: "ready"}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cleanup_fails", [False, True])
 async def test_vm_setup_failure_is_logged_before_cleanup_settles(
     vm_attach_setup, monkeypatch, caplog, cleanup_fails

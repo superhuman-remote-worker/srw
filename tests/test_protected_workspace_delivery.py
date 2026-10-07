@@ -193,6 +193,7 @@ def test_engaging_response_is_coordinate_free_and_retryable():
         "workspace_ssh_host_key_fingerprint",
         "git_remote_url",
         "managed_repository_credentials",
+        "workspace_ssh_identities",
         "repositories",
         "resolved_config",
         "config_override",

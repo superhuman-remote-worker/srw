@@ -53,6 +53,9 @@ from orchestrator.services.manifest_execution_snapshot import (
     read_execution,
     srw_snapshot_config,
 )
+from orchestrator.services.workspace_ssh_connector import (
+    build_workspace_ssh_identities,
+)
 from shared.backend_kinds import LITE_BACKENDS
 from orchestrator.services.job_mutation_target import (
     FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS,
@@ -397,7 +400,10 @@ async def build_job_start_request(
             return None
 
         managed_repository_credentials: list[dict[str, Any]] | None = None
+        workspace_ssh_identities: list[dict[str, Any]] | None = None
         if workspace_decision.effective_backend in {"sandbox", "vm"}:
+            # Connector keys only ever reach a shell-capable workspace.
+            workspace_ssh_identities = build_workspace_ssh_identities(resolved_ds)
             try:
                 (
                     git_remote_url,
@@ -744,6 +750,7 @@ async def build_job_start_request(
             datasources=datasources_payload,
             repositories=repositories_payload,
             managed_repository_credentials=managed_repository_credentials,
+            workspace_ssh_identities=workspace_ssh_identities,
             branch_name=job.get("branch_name"),
             project_id=str(job["project_id"]) if job.get("project_id") else None,
             runtime_actor=runtime_actor.to_payload(),

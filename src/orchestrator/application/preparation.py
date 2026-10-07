@@ -579,6 +579,11 @@ def thread_workspace_delivery_dependencies(
             thread_mount_dependencies,
             resources,
         ),
+        resolve_thread_datasource_delivery=bound(
+            thread_mount_rows.resolve_thread_datasource_delivery,
+            thread_mount_dependencies,
+            resources,
+        ),
         resolve_thread_repositories=bound(
             thread_mount_rows.resolve_thread_repositories,
             thread_mount_dependencies,

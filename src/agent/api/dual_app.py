@@ -1028,6 +1028,7 @@ async def _process_orchestrator_job(
     datasources: Optional[list] = None,
     repositories: Optional[list] = None,
     managed_repository_credentials: Optional[list] = None,
+    workspace_ssh_identities: Optional[list] = None,
     branch_name: Optional[str] = None,
     project_id: Optional[str] = None,
     runtime_actor: Optional[Dict[str, Any]] = None,
@@ -1093,6 +1094,8 @@ async def _process_orchestrator_job(
             metadata["repositories"] = repositories
         if managed_repository_credentials:
             metadata["managed_repository_credentials"] = managed_repository_credentials
+        if workspace_ssh_identities:
+            metadata["workspace_ssh_identities"] = workspace_ssh_identities
         if branch_name:
             metadata["branch_name"] = branch_name
         if project_id:
@@ -1487,6 +1490,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 datasources=request.datasources,
                 repositories=request.repositories,
                 managed_repository_credentials=(request.managed_repository_credentials),
+                workspace_ssh_identities=(request.workspace_ssh_identities),
                 branch_name=request.branch_name,
                 project_id=request.project_id,
                 runtime_actor=request.runtime_actor,
@@ -1671,6 +1675,10 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 if request.managed_repository_credentials:
                     resume_metadata["managed_repository_credentials"] = (
                         request.managed_repository_credentials
+                    )
+                if request.workspace_ssh_identities:
+                    resume_metadata["workspace_ssh_identities"] = (
+                        request.workspace_ssh_identities
                     )
                 if request.project_id:
                     resume_metadata["project_id"] = request.project_id

@@ -31,6 +31,7 @@ from orchestrator.services.datasource_config import (
     normalize_kb_config as _normalize_kb_config,
 )
 from orchestrator.services.email_datasource import email_dispatch_config
+from orchestrator.services.workspace_ssh_connector import workspace_ssh_descriptor
 from shared.datasource_policy import datasource_tool_categories
 
 
@@ -176,6 +177,23 @@ def build_datasources_payload(
             creds = {}
             is_read_only = True
 
+        # SSH keys never ride ``datasources``: that list becomes job metadata
+        # and graph state. The key travels once, in the hidden
+        # ``workspace_ssh_identities`` field, into a workspace ssh-agent; the
+        # entry keeps only the non-secret alias it is reached through.
+        ssh_identity = workspace_ssh_descriptor(ds)
+        if ds_type == "repository" and ssh_identity is not None:
+            creds = {key: value for key, value in creds.items() if key != "ssh_key"}
+        if ds_type == "ssh_key":
+            creds = {
+                **creds,
+                "files": [
+                    {key: value for key, value in item.items() if key != "contents"}
+                    for item in creds.get("files") or []
+                    if isinstance(item, dict)
+                ],
+            }
+
         entry = {
             "type": ds_type,
             "name": ds["name"],
@@ -231,6 +249,8 @@ def build_datasources_payload(
             entry["default_branch"] = ds["default_branch"]
         if ds_type == "repository" and ds.get("require_default_branch") is True:
             entry["require_default_branch"] = True
+        if ssh_identity is not None:
+            entry["ssh_identity"] = ssh_identity
 
         payload.append(entry)
 

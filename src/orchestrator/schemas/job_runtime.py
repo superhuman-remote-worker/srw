@@ -51,6 +51,11 @@ class JobStartRequest(BaseModel):
         repr=False,
         description="Hidden server-owned repository authority transport",
     )
+    workspace_ssh_identities: list[dict[str, Any]] | None = Field(
+        default=None,
+        repr=False,
+        description="Hidden connector SSH keys for workspace ssh-agents",
+    )
     branch_name: str | None = Field(
         default=None,
         description="Git branch name for this job's workspace",

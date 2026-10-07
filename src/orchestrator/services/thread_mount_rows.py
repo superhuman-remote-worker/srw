@@ -38,6 +38,9 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from orchestrator.services.cloud import ProjectFolderHandle
+from orchestrator.services.workspace_ssh_connector import (
+    build_workspace_ssh_identities,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -451,6 +454,33 @@ async def resolve_thread_datasources(
     return dependencies.build_datasources_payload(resolved) if resolved else None
 
 
+async def resolve_thread_datasource_delivery(
+    thread: dict[str, Any],
+    metadata: dict[str, Any],
+    *,
+    project_ids: list[str] | None = None,
+    dependencies: ThreadMountDependencies,
+) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None]:
+    """``(datasources, workspace_ssh_identities)`` from ONE authorization.
+
+    The workspace delivery needs both halves of an SSH connector: the
+    ``datasources`` entry that names its alias and the hidden key that the
+    agent loads into the workspace ssh-agent. Building both from the same
+    resolution keeps them from disagreeing about which connectors exist.
+    """
+    resolved = await dependencies.resolve_authorized_thread_datasources(
+        thread,
+        metadata.get("datasource_ids"),
+        target_project_ids=project_ids,
+    )
+    if not resolved:
+        return None, None
+    return (
+        dependencies.build_datasources_payload(resolved),
+        build_workspace_ssh_identities(resolved),
+    )
+
+
 async def resolve_thread_repositories(
     project_ids: list[str] | None,
     *,
@@ -507,6 +537,7 @@ __all__ = [
     "build_project_mount_row",
     "build_thread_mount_rows",
     "project_ids_from_mounts",
+    "resolve_thread_datasource_delivery",
     "resolve_thread_datasources",
     "resolve_thread_repositories",
     "should_skip_session_folder",

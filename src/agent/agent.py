@@ -3206,6 +3206,10 @@ class UniversalAgent:
         managed_repository_credentials = metadata.pop(
             "managed_repository_credentials", None
         )
+        # Connector SSH keys (C1) are the same kind of bearer: popped before
+        # anything can copy metadata into graph state or a log line.
+        workspace_ssh_identities = metadata.pop("workspace_ssh_identities", None)
+        self._workspace_ssh_identity_status = {}
         # Fresh capture per job: files we write on top of the pod's git clone,
         # re-asserted if a pod re-provision drops them (see the reconnect hook).
         self._agent_seed_files = {}
@@ -3651,6 +3655,16 @@ class UniversalAgent:
             managed_repository_credentials, workspace_backend
         )
         del managed_repository_credentials
+        from shared.runtime.core.workspace_ssh_identity import (
+            materialize_workspace_ssh_identities,
+        )
+
+        # Per-identity and never fatal: a broken connector key degrades only
+        # its own connector (the clone that follows skips it).
+        self._workspace_ssh_identity_status = materialize_workspace_ssh_identities(
+            workspace_ssh_identities, workspace_backend
+        )
+        del workspace_ssh_identities
         primary_url = metadata.get("git_remote_url")
         if repository_url_has_credentials(primary_url):
             raise ManagedRepositoryMaterializationError(

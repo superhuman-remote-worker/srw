@@ -144,9 +144,11 @@ def test_public_job_ingress_recursively_strips_repository_authority() -> None:
             "git_remote_url": "http://admin:secret@gitea/repo.git",
             "wrapper": {
                 "managed_repository_credentials": [{"private_key": "secret"}],
+                "workspace_ssh_identities": [{"private_key": "secret"}],
                 "repo_name": "foreign-project",
                 "ordinary": "kept",
             },
+            "workspace_ssh_identities": [{"private_key": "secret"}],
         },
         config_override={
             "wrapper": {

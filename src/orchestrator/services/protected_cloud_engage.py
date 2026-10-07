@@ -231,6 +231,7 @@ def _protected_workspace_wait_payload(
         "workspace_ssh_host_key_fingerprint": None,
         "git_remote_url": None,
         "managed_repository_credentials": None,
+        "workspace_ssh_identities": None,
         "repositories": None,
         "config_override": None,
         "resolved_config": None,

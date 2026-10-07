@@ -145,6 +145,11 @@ class ThreadWorkspaceDeliveryDependencies:
     # (``DeploymentSettings.session_subagent_fanout``), read per payload. Off
     # when a composition does not wire it.
     session_subagent_fanout: Any = lambda _lane: False
+    # ``thread_mount_rows.resolve_thread_datasource_delivery``: datasources
+    # plus the hidden connector SSH identities from one authorization. A
+    # composition without it delivers ``resolve_thread_datasources`` alone,
+    # and no connector key.
+    resolve_thread_datasource_delivery: Any = None
 
 
 def agent_canvas_workspace_capabilities(
@@ -902,9 +907,18 @@ async def agent_get_thread_workspace_locked(
     project_ids = await _revalidate_thread_project_ids(
         thread, await _thread_project_ids(thread_id)
     )
-    datasources_payload = await _resolve_thread_datasources(
-        thread, metadata, project_ids=project_ids
-    )
+    resolved_ssh_identities: list[dict[str, Any]] | None = None
+    if dependencies.resolve_thread_datasource_delivery is not None:
+        (
+            datasources_payload,
+            resolved_ssh_identities,
+        ) = await dependencies.resolve_thread_datasource_delivery(
+            thread, metadata, project_ids=project_ids
+        )
+    else:
+        datasources_payload = await _resolve_thread_datasources(
+            thread, metadata, project_ids=project_ids
+        )
     mount_rows = await postgres_db.list_thread_mounts(thread_id)
     suppress_disposable_cloud = bool(
         thread.get("execution_lane") == "stateless" and workspace_backend == "none"
@@ -1122,6 +1136,11 @@ async def agent_get_thread_workspace_locked(
         runtime_repository_backend = "vm"
     elif ws.get("status") == "ready" and (ws.get("pod_ip") or ws.get("host")):
         runtime_repository_backend = "sandbox"
+    # Connector keys, like repository authority, only ever ride a response
+    # that names a ready shell-capable workspace.
+    workspace_ssh_identities = (
+        resolved_ssh_identities if runtime_repository_backend is not None else None
+    )
     if runtime_repository_backend is not None:
         try:
             (
@@ -1362,6 +1381,7 @@ async def agent_get_thread_workspace_locked(
         "namespace": ws.get("namespace"),
         "git_remote_url": git_remote_url,
         "managed_repository_credentials": managed_repository_credentials,
+        "workspace_ssh_identities": workspace_ssh_identities,
         # Public capability only. A ready endpoint without a paired trusted
         # binding must not cause the agent to advertise Canvas tools which can
         # never work.

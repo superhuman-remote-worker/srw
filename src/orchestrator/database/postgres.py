@@ -356,6 +356,7 @@ _SERVER_OWNED_MANAGED_REPOSITORY_CONTEXT_KEYS = frozenset(
         "git_remote_url",
         "repo_name",
         "managed_repository_credentials",
+        "workspace_ssh_identities",
         "managed_repository_authority",
         "repository_auth",
         "repository_credentials",

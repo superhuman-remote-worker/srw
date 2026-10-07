@@ -2990,6 +2990,7 @@ class StatelessTurnExecutor:
                 "managed_repository_credentials",
                 "managed_repository_credentials",
             ),
+            ("workspace_ssh_identities", "workspace_ssh_identities"),
             ("branch_name", "branch_name"),
             ("project_id", "project_id"),
             ("runtime_actor", "runtime_actor"),

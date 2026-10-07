@@ -352,6 +352,9 @@ class PersistentSession:
     # (live_session_settings.md Slice B). Set at attach; replaced by
     # resetup_datasources().
     datasource_configs: List[Dict[str, Any]] = field(default_factory=list)
+    # ``{authority_id: status}`` of the connector SSH identities loaded into
+    # workspace ssh-agents (C1); credential-free. Set at setup, updated live.
+    workspace_ssh_identity_status: Dict[str, str] = field(default_factory=dict)
 
     # Per-tool-call approval decisions (tool_call_id -> 'approved'|'denied').
     # Populated by the WS permission_check; consumed at turn save so the
@@ -392,6 +395,9 @@ class PersistentSession:
         managed_repository_credentials = workspace_override.pop(
             "managed_repository_credentials", None
         )
+        workspace_ssh_identities = workspace_override.pop(
+            "workspace_ssh_identities", None
+        )
         self._llm = llm
         self.auxiliary_llm = auxiliary_llm
         self.postgres_conn = postgres_conn
@@ -429,6 +435,7 @@ class PersistentSession:
                 workspace_override=workspace_override,
                 git_remote_url=git_remote_url,
                 managed_repository_credentials=(managed_repository_credentials),
+                workspace_ssh_identities=workspace_ssh_identities,
                 cloud_mount_cfg=cloud_mount_cfg,
             )
         finally:
@@ -450,6 +457,7 @@ class PersistentSession:
         git_remote_url: Optional[str],
         cloud_mount_cfg: Optional[Dict[str, Any]],
         managed_repository_credentials: Optional[List[Dict[str, Any]]] = None,
+        workspace_ssh_identities: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """The ordered setup steps of :meth:`setup` (see its docstring).
 
@@ -473,6 +481,7 @@ class PersistentSession:
             workspace_override=workspace_override,
             git_remote_url=git_remote_url,
             managed_repository_credentials=managed_repository_credentials,
+            workspace_ssh_identities=workspace_ssh_identities,
         )
         await self._seed_workspace_baseline_commit(postgres_conn)
         _steps["workspace"] = time.perf_counter() - _t
@@ -672,6 +681,7 @@ class PersistentSession:
         workspace_override: Optional[Dict[str, Any]] = None,
         git_remote_url: Optional[str] = None,
         managed_repository_credentials: Optional[List[Dict[str, Any]]] = None,
+        workspace_ssh_identities: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Create workspace using a remote backend (required).
 
@@ -887,6 +897,16 @@ class PersistentSession:
             managed_repository_credentials, workspace_backend
         )
         del managed_repository_credentials
+        from shared.runtime.core.workspace_ssh_identity import (
+            materialize_workspace_ssh_identities,
+        )
+
+        # Per-identity and never fatal: a broken connector key degrades only
+        # its own connector (the clone at attach skips it).
+        self.workspace_ssh_identity_status = materialize_workspace_ssh_identities(
+            workspace_ssh_identities, workspace_backend
+        )
+        del workspace_ssh_identities
         if repository_url_has_credentials(git_remote_url):
             raise ManagedRepositoryMaterializationError(
                 "credentialed_managed_repository_url_refused"

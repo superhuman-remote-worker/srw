@@ -180,6 +180,7 @@ def protected_workspace_delivery(payload: Dict[str, Any]) -> str:
             "workspace_ssh_host_key_fingerprint",
             "git_remote_url",
             "managed_repository_credentials",
+            "workspace_ssh_identities",
             "repositories",
             "resolved_config",
             "config_override",
@@ -681,6 +682,7 @@ async def poll_workspace_ready(
                 "managed_repository_credentials": ws.get(
                     "managed_repository_credentials"
                 ),
+                "workspace_ssh_identities": ws.get("workspace_ssh_identities"),
                 "repositories": ws.get("repositories"),
                 "config_override": ws.get("config_override"),
                 "project_ids": ws.get("project_ids") or [],
@@ -801,6 +803,7 @@ async def poll_workspace_ready(
                 "managed_repository_credentials": ws.get(
                     "managed_repository_credentials"
                 ),
+                "workspace_ssh_identities": ws.get("workspace_ssh_identities"),
                 "repositories": ws.get("repositories"),
                 "config_override": ws.get("config_override"),
                 "project_ids": ws.get("project_ids") or [],

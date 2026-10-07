@@ -27,6 +27,9 @@ from orchestrator.services.managed_repository_authority import (
     ManagedRepositoryAuthorityError,
 )
 from orchestrator.services.manifest_runtime_ownership import uses_srw_runtime
+from orchestrator.services.workspace_ssh_connector import (
+    build_workspace_ssh_identities,
+)
 from orchestrator.services.workspace_tier_policy import LiteWorkspaceConfigError
 from shared.backend_kinds import LITE_BACKENDS
 from shared.runtime.core.loader import canonical_config_name
@@ -558,6 +561,12 @@ async def resume_job_on_agent(
                 exc.code,
             )
             return False
+        # Connector keys only ever reach a shell-capable workspace.
+        workspace_ssh_identities = (
+            build_workspace_ssh_identities(resolved_ds)
+            if workspace_decision.effective_backend in {"sandbox", "vm"}
+            else None
+        )
         if workspace_decision.effective_backend == "vm":
             if not vm_workspaces_on_pod_network():
                 if git_remote_url and not git_remote_url.startswith("ssh://srw-repo-"):
@@ -822,6 +831,7 @@ async def resume_job_on_agent(
             "git_remote_url": git_remote_url,
             "repositories": repositories_payload,
             "managed_repository_credentials": managed_repository_credentials,
+            "workspace_ssh_identities": workspace_ssh_identities,
             "runtime_actor": runtime_actor.to_payload(),
             WORKSPACE_RUNTIME_CONTEXT_KEY: workspace_decision.safe_projection(),
             "workspace_provisioner": (

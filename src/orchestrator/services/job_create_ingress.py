@@ -49,6 +49,7 @@ _SERVER_OWNED_REPOSITORY_CONTEXT_KEYS = {
     "git_remote_url",
     "repo_name",
     "managed_repository_credentials",
+    "workspace_ssh_identities",
     "managed_repository_authority",
     "repository_auth",
     "repository_credentials",

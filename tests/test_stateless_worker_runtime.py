@@ -1025,6 +1025,13 @@ def _bundle(claim: WorkerClaim) -> dict:
                     "private_key": "hidden-runtime-bearer",
                 }
             ],
+            "workspace_ssh_identities": [
+                {
+                    "authority_id": "22222222-2222-4222-8222-222222222222",
+                    "kind": "ssh_key",
+                    "private_key": "hidden-connector-key",
+                }
+            ],
             "workspace_runtime": {
                 "requested_backend": "sandbox",
                 "assigned_backend": "sandbox",
@@ -1066,6 +1073,14 @@ def test_worker_bundle_preserves_exact_workspace_authority_in_metadata():
             "private_key": "hidden-runtime-bearer",
         }
     ]
+    assert metadata["workspace_ssh_identities"] == [
+        {
+            "authority_id": "22222222-2222-4222-8222-222222222222",
+            "kind": "ssh_key",
+            "private_key": "hidden-connector-key",
+        }
+    ]
+    assert "hidden-connector-key" not in repr(request)
     assert metadata["workspace_runtime"] == {
         "requested_backend": "sandbox",
         "assigned_backend": "sandbox",
