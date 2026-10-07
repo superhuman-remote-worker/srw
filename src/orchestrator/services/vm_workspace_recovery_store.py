@@ -2208,11 +2208,35 @@ class VMWorkspaceRecoveryStore:
             )
         async with self.db.acquire() as conn:
             async with conn.transaction():
+                # Cleanup writes now share the retention guard's owner/PVC
+                # locks. Take them before the child row, matching admission and
+                # parent validation; row-first completion can deadlock with a
+                # validator that already owns those advisory locks.
+                identity = await conn.fetchrow(
+                    "SELECT owner_kind,owner_id,pvc_uid,source,request_id,"
+                    "intent_digest,parent_admission_id "
+                    "FROM vm_workspace_cleanup_admissions WHERE id=$1",
+                    admission_id,
+                )
+                if identity is None:
+                    return False
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                    f"workspace-recovery:{identity['owner_kind']}:{identity['owner_id']}",
+                )
+                if identity["pvc_uid"] is not None:
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                        f"workspace-recovery-pvc:{identity['pvc_uid']}",
+                    )
                 row = await conn.fetchrow(
-                    "SELECT request_id,intent_digest,completed_at,outcome,source "
+                    "SELECT owner_kind,owner_id,pvc_uid,source,request_id,"
+                    "intent_digest,parent_admission_id,completed_at,outcome "
                     "FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
                     admission_id,
                 )
+                if row is None or any(row[key] != identity[key] for key in identity.keys()):
+                    return False
                 if (
                     row is not None
                     and row.get("source") == "pinned_thread_retained_disk_purge"

@@ -207,6 +207,10 @@ class TestDeleteJobGiteaCleanup:
         ):
             mock_db.has_child_jobs = AsyncMock(return_value=False)
             mock_db.prepare_stateless_job_for_delete = AsyncMock(return_value=True)
+            mock_db.quiesce_cancelled_stateless_vm_parent = AsyncMock(
+                return_value=False
+            )
+            mock_db.delete_checkpoint_thread = AsyncMock()
             mock_db.delete_job = AsyncMock(
                 side_effect=JobVMAuditNotReady("VM Job terminal proof is pending")
             )
@@ -215,6 +219,10 @@ class TestDeleteJobGiteaCleanup:
             with pytest.raises(HTTPException) as refused:
                 await control_seams.delete_job(_stub_request(), str(job["id"]))
         assert refused.value.status_code == 503
+        mock_db.quiesce_cancelled_stateless_vm_parent.assert_awaited_once_with(
+            str(job["id"]), retention_only=True
+        )
+        mock_db.delete_checkpoint_thread.assert_not_awaited()
         mock_db.delete_job.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -249,12 +257,20 @@ class TestDeleteJobGiteaCleanup:
         ):
             mock_db.has_child_jobs = AsyncMock(return_value=False)
             mock_db.prepare_stateless_job_for_delete = AsyncMock(return_value=True)
+            mock_db.quiesce_cancelled_stateless_vm_parent = AsyncMock(
+                return_value=False
+            )
+            mock_db.delete_checkpoint_thread = AsyncMock()
             mock_db.delete_job = AsyncMock(side_effect=refusal)
             mock_gitea.is_initialized = False
             mock_snapshots.is_available = False
             with pytest.raises(HTTPException) as refused:
                 await control_seams.delete_job(_stub_request(), str(job["id"]))
         assert refused.value.status_code == expected_status
+        mock_db.quiesce_cancelled_stateless_vm_parent.assert_awaited_once_with(
+            str(job["id"]), retention_only=True
+        )
+        mock_db.delete_checkpoint_thread.assert_not_awaited()
         mock_db.delete_job.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -457,6 +473,10 @@ class TestDeleteJobGiteaCleanup:
         ):
             mock_db.has_child_jobs = AsyncMock(return_value=False)
             mock_db.prepare_stateless_job_for_delete = AsyncMock(return_value=True)
+            mock_db.quiesce_cancelled_stateless_vm_parent = AsyncMock(
+                return_value=True
+            )
+            mock_db.delete_checkpoint_thread = AsyncMock(return_value=0)
 
             async def cleanup_after_fence(_job_id):
                 mock_db.prepare_stateless_job_for_delete.assert_awaited_once_with(
@@ -474,6 +494,9 @@ class TestDeleteJobGiteaCleanup:
                 return_claim_state=False,
             ):
                 mock_db.prepare_stateless_job_for_delete.assert_awaited_once()
+                mock_db.delete_checkpoint_thread.assert_awaited_once_with(
+                    str(job["id"]), strict=True
+                )
                 assert prepared_stateless is True
                 assert deletion_actor_user_id == (
                     "00000000-0000-0000-0000-000000000099"
@@ -491,6 +514,12 @@ class TestDeleteJobGiteaCleanup:
 
         assert result == DELETE_RESULT
         cleanup_workspace.assert_awaited_once_with(str(job["id"]))
+        mock_db.quiesce_cancelled_stateless_vm_parent.assert_awaited_once_with(
+            str(job["id"]), retention_only=True
+        )
+        mock_db.delete_checkpoint_thread.assert_awaited_once_with(
+            str(job["id"]), strict=True
+        )
         mock_db.delete_job.assert_awaited_once_with(
             str(job["id"]),
             prepared_stateless=True,

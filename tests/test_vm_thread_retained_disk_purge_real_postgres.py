@@ -980,42 +980,100 @@ async def test_carrier_completion_racing_parent_validation_does_not_reauthorize_
     child, request, digest = await child_permit(db, physical, parent)
     store = operations(db, physical).dependencies.recovery_store
     entered = asyncio.Event()
+    proceed = asyncio.Event()
     original = retained.validate_retained_disk_parent
 
     async def observe_validation(conn, admission_id):
         entered.set()
+        # Completion also takes the owner/PVC advisory locks. Suspend before
+        # validation acquires them so the test exercises a real possible race,
+        # rather than holding an owner row while waiting for its own successor.
+        await proceed.wait()
         await original(conn, admission_id)
 
     monkeypatch.setattr(retained, "validate_retained_disk_parent", observe_validation)
     task = None
     try:
-        async with db.acquire() as conn, conn.transaction():
-            await conn.fetchrow(
-                "SELECT id FROM threads WHERE id=$1 FOR UPDATE", case["thread_id"]
-            )
-            task = asyncio.create_task(
-                store.resume_cleanup_permit(
-                    child.admission_id,
-                    owner_kind="thread",
-                    owner_id=case["thread_id"],
-                    source="controller_rootdisk_delete",
-                    request_id=request,
-                    intent_digest=digest,
-                )
-            )
-            await asyncio.wait_for(entered.wait(), 5)
-            assert await store.complete_cleanup_permit(
+        task = asyncio.create_task(
+            store.resume_cleanup_permit(
                 child.admission_id,
-                outcome="deleted",
+                owner_kind="thread",
+                owner_id=case["thread_id"],
+                source="controller_rootdisk_delete",
                 request_id=request,
                 intent_digest=digest,
             )
+        )
+        await asyncio.wait_for(entered.wait(), 5)
+        assert await store.complete_cleanup_permit(
+            child.admission_id,
+            outcome="deleted",
+            request_id=request,
+            intent_digest=digest,
+        )
+        proceed.set()
         resumed = await asyncio.wait_for(task, 5)
         assert resumed.allowed is False
         assert resumed.completed_outcome == "deleted"
     finally:
-        if task is not None and not task.done():
-            task.cancel()
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_carrier_completion_waits_for_owner_without_locking_child(db, monkeypatch):
+    import asyncio
+
+    case, physical = await settled(db, monkeypatch)
+    permanent = await permanent_begin(db, case)
+    parent = await admit(db, physical, permanent)
+    child, request, digest = await child_permit(db, physical, parent)
+    store = operations(db, physical).dependencies.recovery_store
+    task = None
+    try:
+        async with db.acquire() as blocker, blocker.transaction():
+            pid = await blocker.fetchval("SELECT pg_backend_pid()")
+            await blocker.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                f"workspace-recovery:thread:{case['thread_id']}",
+            )
+            task = asyncio.create_task(
+                store.complete_cleanup_permit(
+                    child.admission_id,
+                    outcome="deleted",
+                    request_id=request,
+                    intent_digest=digest,
+                )
+            )
+            async with db.acquire() as observer:
+                async def wait_for_blocked_completion():
+                    while not await observer.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM pg_stat_activity "
+                        "WHERE $1=ANY(pg_blocking_pids(pid)))",
+                        pid,
+                    ):
+                        if task.done():
+                            await task
+                            pytest.fail("completion did not wait for the owner lock")
+                        await asyncio.sleep(0.01)
+
+                await asyncio.wait_for(wait_for_blocked_completion(), 5)
+                # A concurrent parent validator holding this same owner lock
+                # must be able to read/lock the child. Row-first completion
+                # deadlocks with the established owner-first validation path.
+                async with observer.transaction():
+                    assert await observer.fetchval(
+                        "SELECT id FROM vm_workspace_cleanup_admissions "
+                        "WHERE id=$1 FOR UPDATE NOWAIT",
+                        child.admission_id,
+                    ) == child.admission_id
+        assert await asyncio.wait_for(task, 5)
+    finally:
+        if task is not None:
+            if not task.done():
+                task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
 
