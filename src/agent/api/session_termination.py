@@ -758,8 +758,15 @@ class SessionTerminationCoordinator:
                     await asyncio.wait_for(wake.wait(), timeout=poll_s)
                 except asyncio.TimeoutError:
                     pass
+                woken = wake.is_set()
                 wake.clear()
-                verdict = await self._read_lifecycle(*bound)
+                if woken and self._retirement_mirrored_for(bound[:3]):
+                    # ``retirement_authorized_now`` read and mirrored the
+                    # authorized retirement of this bound life: act on it
+                    # without a second read that could fail and cost a poll.
+                    verdict = "authorized"
+                else:
+                    verdict = await self._read_lifecycle(*bound)
                 if verdict == "detached":
                     return
                 if verdict == "authorized":
@@ -917,7 +924,21 @@ class SessionTerminationCoordinator:
             return "gone"
         return "keep"
 
-    async def retirement_authorized_now(self) -> bool:
+    def _retirement_mirrored_for(self, life: tuple[Any, ...]) -> bool:
+        """An authorized retirement token is mirrored for ``life``, which is
+        still the attached life."""
+
+        exact = self._ports.identity().retirement_identity()
+        return bool(
+            exact is not None
+            and tuple(life) == exact
+            and self.retirement_admission_identity == exact
+            and self.retirement_admission_token is not None
+        )
+
+    async def retirement_authorized_now(
+        self, life: Optional[tuple[Any, ...]] = None
+    ) -> bool:
         """Whether the orchestrator authorized this exact life's retirement,
         read now with the watchdog's own check.
 
@@ -926,34 +947,29 @@ class SessionTerminationCoordinator:
         retirement (End, an Officer decommission, the idle stand-down) or to
         an End still in preflight, which may yet abort. Only the first counts:
         its token is mirrored, as the watchdog mirrors it, and the watchdog is
-        woken to run the termination at once.
+        woken to run the termination at once. ``life`` is the life whose
+        child asks (bound at attach); another attached life never counts.
         """
 
         if self._ports.stateless_mode():
             return False
         identity = self._ports.identity()
         exact = identity.retirement_identity()
-        if exact is None:
+        if exact is None or (life is not None and tuple(life) != exact):
             return False
-        if (
-            self.retirement_admission_identity != exact
-            or self.retirement_admission_token is None
-        ):
+        if not self._retirement_mirrored_for(exact):
             verdict = await self._read_lifecycle(
                 identity.thread_id,
                 identity.session_generation,
                 identity.attach_token,
                 identity.runtime_contract,
             )
-            if verdict != "authorized":
+            if verdict != "authorized" or not self._retirement_mirrored_for(exact):
                 return False
-            wake = self.lifecycle_poll_wake
-            if wake is not None:
-                wake.set()
-        return bool(
-            self.retirement_admission_identity == exact
-            and self.retirement_admission_token is not None
-        )
+        wake = self.lifecycle_poll_wake
+        if wake is not None:
+            wake.set()
+        return True
 
     def start_watchdogs(self) -> None:
         """Start watchdog tasks for the active session. Safe to call repeatedly."""

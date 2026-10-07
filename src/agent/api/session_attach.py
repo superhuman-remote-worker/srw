@@ -35,6 +35,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from agent.api.lease_context import LeaseHandle, LeaseLostError
@@ -1589,7 +1590,11 @@ class SessionAttachCoordinator:
             subagent_provider_admission=self._ports.provider_admission,
             subagent_effect_authority=self._ports.effect_authority,
             subagent_settlement_authority=(self._ports.settlement_authority),
-            subagent_retirement_authorized=self._ports.retirement_authorized,
+            # Bound to this life: a child of it never judges a later attach.
+            subagent_retirement_authorized=partial(
+                self._ports.retirement_authorized,
+                self._identity.retirement_identity(),
+            ),
             subagent_event_callback=self._ports.subagent_event_available,
             subagent_batch_settle_contract=subagent_batch_settle,
             subagent_fanout=subagent_fanout,

@@ -275,3 +275,48 @@ async def test_the_prompt_floor_offers_background_only_where_the_lane_has_it(
         await session.setup(llm=MagicMock())
 
     assert build.call_args.kwargs["delegation_background_available"] is background
+
+
+@pytest.mark.asyncio
+async def test_an_attached_sessions_host_reads_its_retirement_from_the_termination_owner():
+    """P6 review: the subagent host of an attached session reads whether its
+    retirement was authorized from the pinned runtime's termination
+    coordinator (``retirement_authorized_now``), through the real attach
+    composition, bound to the life that attached it."""
+    import agent.api.persistent_app as pa
+    from tests.test_session_delegation_fanout_config import (
+        _attach_until_construction,
+        _lite_workspace,
+    )
+
+    seen = await _attach_until_construction(_lite_workspace())
+    session = _make_session(
+        orchestrator_client=object(),
+        session_parent_authority_provider=lambda: object(),
+        subagent_provider_admission=lambda: True,
+        subagent_effect_authority=lambda: True,
+        subagent_retirement_authorized=seen["subagent_retirement_authorized"],
+    )
+    session.postgres_conn = object()
+    session.tool_context = _context()
+    with (
+        patch(
+            "agent.subagents.session_persistence.SessionSubagentLedger.from_context",
+            return_value=object(),
+        ),
+        patch(
+            "agent.subagents.runtime.SubagentRuntime.from_context",
+            return_value=object(),
+        ) as runtime_factory,
+    ):
+        session._install_session_subagent_runtime()
+    (_, host) = runtime_factory.call_args.args
+
+    with patch.object(
+        pa._session_termination,
+        "retirement_authorized_now",
+        new=AsyncMock(return_value=True),
+    ) as read_now:
+        assert await host.retirement_authorized() is True
+    ((life,), _) = read_now.await_args
+    assert life[0] == "11111111-1111-4111-8111-111111111111"

@@ -939,3 +939,42 @@ async def test_the_leave_stops_writes_first_and_a_late_failure_writes_nothing(
     with pytest.raises(asyncio.CancelledError):
         await calling
     await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_call_whose_read_fails_while_the_leave_runs_is_held(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A refused call reads the lifecycle; meanwhile the termination's leave
+    runs, and the read then fails. The runtime was left, so the call is held
+    all the same rather than answered with its refusal."""
+    ctx, _ = make_parent(tmp_path)
+    ledger = _ListingSessionLedger()
+    ledger.fail_terminal = True
+    _capture_builds(monkeypatch)
+    runtime = _runtime(
+        ctx, ledger, lambda config, limits: FakeChatModel([text_turn("finished")])
+    )
+    entered, allow = asyncio.Event(), asyncio.Event()
+
+    async def failing_read() -> bool:
+        entered.set()
+        await allow.wait()
+        raise RuntimeError("the lifecycle read failed")
+
+    runtime.host.retirement_authorized_fn = failing_read
+    assert await runtime.recover_orphans() == []
+    calling = asyncio.create_task(runtime.run_foreground(call()))
+    await asyncio.wait_for(entered.wait(), 5)  # its end was refused
+    _revoke_parent_authority(runtime)
+
+    await asyncio.wait_for(runtime.leave_to_retirement("ended"), 15)
+    allow.set()
+    await asyncio.sleep(0.05)
+
+    assert not calling.done()
+    calling.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await calling
+    await runtime.close()

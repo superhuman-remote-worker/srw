@@ -8376,6 +8376,71 @@ class TestRetirementAuthorizedNow:
             assert owner.runtime_admission_closed() is False
 
     @pytest.mark.asyncio
+    async def test_another_life_never_counts(self):
+        from contextlib import ExitStack
+
+        from agent.api import persistent_app as pa
+
+        client = SimpleNamespace(
+            get_thread_lifecycle=AsyncMock(
+                return_value=self._lifecycle(authorized=True)
+            )
+        )
+        earlier = (self.thread_id, "77777777-7777-4777-8777-777777777777", "x")
+        with ExitStack() as stack:
+            for patcher in self._patches(pa, client):
+                stack.enter_context(patcher)
+            assert (
+                await pa._session_termination.retirement_authorized_now(earlier)
+                is False
+            )
+            assert pa._session_termination.retirement_admission_identity is None
+        client.get_thread_lifecycle.assert_not_awaited()
+
+    @pytest.mark.parametrize("mirrored", [True, False])
+    @pytest.mark.asyncio
+    async def test_a_woken_watchdog_acts_on_a_mirror_of_its_life(self, mirrored):
+        """Woken after the read mirrored the authorized retirement, the
+        watchdog terminates at once even though its own read would fail; a
+        wake without such a mirror only reads the lifecycle."""
+        from contextlib import ExitStack
+
+        from agent.api import persistent_app as pa
+
+        owner = pa._session_termination
+        client = SimpleNamespace(get_thread_lifecycle=AsyncMock(return_value=None))
+        with ExitStack() as stack:
+            for patcher in self._patches(pa, client):
+                stack.enter_context(patcher)
+            detach = stack.enter_context(
+                patch.object(owner, "terminate", new=AsyncMock())
+            )
+            stack.enter_context(patch.object(owner, "schedule_exit"))
+            watchdog = asyncio.create_task(owner.thread_status_watchdog(poll_s=3600))
+            await asyncio.sleep(0)
+            if mirrored:
+                owner.retirement_admission_identity = (
+                    self.thread_id,
+                    self.generation,
+                    self.attach_token,
+                )
+                owner.retirement_admission_disposition = "ended"
+                owner.retirement_admission_token = self.retirement_token
+                owner.retirement_admission_permanent = False
+            owner.lifecycle_poll_wake.set()
+            if mirrored:
+                await asyncio.wait_for(watchdog, 5)
+                detach.assert_awaited_once_with("thread_retirement_authorized")
+                client.get_thread_lifecycle.assert_not_awaited()
+            else:
+                await asyncio.sleep(0.05)
+                client.get_thread_lifecycle.assert_awaited_once_with(self.thread_id)
+                detach.assert_not_awaited()
+                assert not watchdog.done()
+                watchdog.cancel()
+                await asyncio.gather(watchdog, return_exceptions=True)
+
+    @pytest.mark.asyncio
     async def test_a_stateless_runtime_never_reads_it(self):
         from contextlib import ExitStack
 

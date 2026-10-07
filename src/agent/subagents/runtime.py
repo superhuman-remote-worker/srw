@@ -704,9 +704,12 @@ class SubagentRuntime:
         if not callable(probe):
             return False
         try:
-            return (await probe()) is True
+            authorized = (await probe()) is True
         except Exception:
-            return False
+            authorized = False
+        # The leave may have run while the lifecycle was read (and the read
+        # failed): a left runtime holds the call all the same.
+        return authorized or self._left_to_retirement
 
     async def _run_foreground(self, call: SubagentCall) -> str:
         key = self._key(call)
