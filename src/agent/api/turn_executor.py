@@ -136,6 +136,7 @@ from shared.session_subagent_batch import (
 from shared.session_retirement import (
     acknowledge_session_claim_quiesced,
     active_claim_authority,
+    stateless_stop_markers,
 )
 from shared.cloud_push_tasks import (
     PushAdoptionDeferred,
@@ -435,6 +436,94 @@ SELECT NOT EXISTS (
               AND result_row.tool_call_id = tool_call ->> 'id'
        )
 )
+"""
+
+# Consumption is an input watermark, not proof that an external command
+# finished. A successor must inspect all live debt before restore can repair
+# an unanswered call out of model context. Delegation-only batches retain
+# their existing child-ledger recovery; mixed batches remain ambiguous.
+_SESSION_TOOL_DEBT_SQL = """
+SELECT EXISTS (
+    SELECT 1 FROM thread_messages AS malformed_row
+     WHERE malformed_row.thread_id = $1::uuid
+       AND malformed_row.role = 'ai'
+       AND malformed_row.rewound_at IS NULL
+       AND malformed_row.tool_calls IS NOT NULL
+       AND jsonb_typeof(malformed_row.tool_calls) IS DISTINCT FROM 'array'
+) OR EXISTS (
+    -- A result identifies a call by turn/id, not an occurrence. Duplicate
+    -- same-turn IDs cannot prove which physical effect that result settled.
+    SELECT 1
+      FROM thread_messages AS duplicate_row
+     CROSS JOIN LATERAL jsonb_array_elements(
+         CASE WHEN jsonb_typeof(duplicate_row.tool_calls) = 'array'
+              THEN duplicate_row.tool_calls ELSE '[]'::jsonb END
+     ) AS duplicate_call
+     WHERE duplicate_row.thread_id = $1::uuid
+       AND duplicate_row.role = 'ai'
+       AND duplicate_row.rewound_at IS NULL
+     GROUP BY duplicate_row.turn_number, duplicate_call ->> 'id'
+    HAVING COUNT(*) > 1 AND BOOL_OR(EXISTS (
+        SELECT 1 FROM jsonb_array_elements(
+            CASE WHEN jsonb_typeof(duplicate_row.tool_calls) = 'array'
+                 THEN duplicate_row.tool_calls ELSE '[]'::jsonb END
+        ) AS sibling
+        WHERE sibling ->> 'name' IS DISTINCT FROM 'delegate_agent'
+    ))
+) OR EXISTS (
+    SELECT 1
+      FROM thread_messages AS call_row
+     CROSS JOIN LATERAL jsonb_array_elements(
+         CASE WHEN jsonb_typeof(call_row.tool_calls) = 'array'
+              THEN call_row.tool_calls ELSE '[]'::jsonb END
+     ) AS tool_call
+     WHERE call_row.thread_id = $1::uuid
+       AND call_row.role = 'ai'
+       AND call_row.rewound_at IS NULL
+       AND (
+           jsonb_typeof(tool_call -> 'id') IS DISTINCT FROM 'string'
+           OR BTRIM(COALESCE(tool_call ->> 'id', '')) = ''
+           OR NOT EXISTS (
+               SELECT 1 FROM thread_messages AS result_row
+                WHERE result_row.thread_id = call_row.thread_id
+                  AND result_row.role = 'tool'
+                  AND result_row.rewound_at IS NULL
+                  AND result_row.seq > call_row.seq
+                  AND result_row.turn_number IS NOT DISTINCT FROM call_row.turn_number
+                  AND result_row.tool_call_id = tool_call ->> 'id'
+           )
+       )
+       AND EXISTS (
+           SELECT 1 FROM jsonb_array_elements(
+               CASE WHEN jsonb_typeof(call_row.tool_calls) = 'array'
+                    THEN call_row.tool_calls ELSE '[]'::jsonb END
+           ) AS sibling
+            WHERE sibling ->> 'name' IS DISTINCT FROM 'delegate_agent'
+               OR jsonb_typeof(sibling -> 'id') IS DISTINCT FROM 'string'
+               OR BTRIM(COALESCE(sibling ->> 'id', '')) = ''
+       )
+)
+"""
+
+_SESSION_TOOL_DEBT_AUTHORITY_SQL = (
+    """
+SELECT t.metadata, q.leased_until,
+       ("""
+    + _SESSION_TOOL_DEBT_SQL
+    + """) AS unresolved
+  FROM threads AS t JOIN run_queue AS q ON q.unit_id = t.id
+ WHERE t.id = $1::uuid
+   AND t.execution_lane = 'stateless' AND t.agent_id IS NULL
+   AND t.status IN ('created', 'active', 'awaiting_user')
+   AND t.runtime_retirement_token IS NULL
+   AND q.unit_kind = 'session_turn' AND q.state = 'leased'
+   AND q.lease_token = $2::bigint AND q.leased_by = $3::text
+   AND q.leased_until > clock_timestamp()
+"""
+)
+
+_LOCK_SESSION_TOOL_DEBT_QUEUE_SQL = """
+SELECT unit_id FROM run_queue WHERE unit_id = $1::uuid FOR UPDATE
 """
 
 # Shutdown classification, the delegation branch (parallel_subagents.md §6.3,
@@ -1253,6 +1342,10 @@ class StatelessTurnExecutor:
         # finally block. Cleanup must never downgrade an atomic
         # close+checkpoint retry into a gate-only close.
         self._pending_settled_close: tuple[str, int, int, int | None] | None = None
+        # Only cancellation before Session admission/lease activation. Its
+        # input may belong to an unknown predecessor effect, so shutdown's
+        # ordinary pre-effect hand-back is not an authorized disposition.
+        self._session_admission_cancelled: tuple[str, int] | None = None
         # Monotonic executor-owned copy of the exact external-effect seam.
         # PersistentApp session globals are intentionally cleared by a
         # physical detach, which can precede the queue completion CAS.
@@ -3907,7 +4000,14 @@ class StatelessTurnExecutor:
             shutdown_retry = self._shutdown_retry_claim == (unit_id, int(token))
             if shutdown_retry:
                 self._shutdown_retry_claim = None
-            if cancelled or shutdown_retry:
+            admission_cancelled = self._session_admission_cancelled == (
+                unit_id,
+                int(token),
+            )
+            if admission_cancelled:
+                self._session_admission_cancelled = None
+                self.request_stop()
+            elif cancelled or shutdown_retry:
                 # SIGTERM's hard-cancel is still an ownership transition. Do
                 # not leave a live exact claim to expire after this Pod object
                 # disappears: first drain every local/SFTP/background writer,
@@ -4068,6 +4168,19 @@ class StatelessTurnExecutor:
         token: int,
         claim_lost: asyncio.Event,
     ) -> None:
+        try:
+            if not await self._admit_session_tool_history(pa, claim):
+                return
+        except asyncio.CancelledError:
+            self._session_admission_cancelled = (unit_id, int(token))
+            raise
+        except Exception as exc:
+            # Classification or park/journal ambiguity must not fall through
+            # run()'s generic pre-effect release; this is predecessor debt,
+            # before the new claim has attached or activated any local writer.
+            raise _PostEffectParkError(
+                "Session predecessor tool admission is unproven"
+            ) from exc
         # (d) Claim bundle — the pinned contract. On failure the token-guarded
         # release below is a no-op when the lease is genuinely gone (401/403 =
         # "treat as lease lost: release nothing" happens naturally via the
@@ -5463,6 +5576,106 @@ class StatelessTurnExecutor:
             )
             return False
         return bool(value)
+
+    async def _session_tool_debt(self, conn: Any, claim: ClaimedUnit) -> Any:
+        """Unknown results only under this live queue and owner authority."""
+        row = await conn.fetchrow(
+            _SESSION_TOOL_DEBT_AUTHORITY_SQL,
+            claim.unit_id,
+            claim.lease_token,
+            self._pod_name,
+        )
+        if row is None:
+            return None
+        metadata = row["metadata"] if row["metadata"] is not None else {}
+        if stateless_stop_markers(metadata):
+            return None
+        if type(row["unresolved"]) is not bool:
+            raise RuntimeError("Session tool-debt classification is unproven")
+        if not row["unresolved"]:
+            # Normal completion retains the previous credential record until
+            # the next bundle publishes its successor. It is not park
+            # authority, and the ordinary bundle still validates/replaces it.
+            return row
+        active = active_claim_authority(metadata)
+        if active is not None:
+            token, actor = active
+            if (
+                token != claim.lease_token
+                or actor.pod != self._pod_name
+                or not self._pod_uid
+                or actor.pod_uid != self._pod_uid
+            ):
+                return None
+        return row
+
+    async def _admit_session_tool_history(self, pa: Any, claim: ClaimedUnit) -> bool:
+        """Park predecessor effect debt before attach, pairing or provider I/O.
+
+        The initial read only selects a possible hold. The existing atomic
+        release/journal transaction rechecks locked current authority and
+        debt before it can retire this queue lease. Any lost or ambiguous
+        authority refuses admission; it is never treated as absent debt.
+        """
+        row = await self._session_tool_debt(self._db, claim)
+        if row is None:
+            # A previous cached owner may still be resident. No validated
+            # bundle/attach will retire it on this refusal, so do not accept
+            # another owner after an unproven claim or predecessor authority.
+            self.request_stop()
+            return False
+        if not row["unresolved"]:
+            return True
+
+        # The cache can still belong to the previous unit. Drain under that
+        # unit's existing lease; do not hand its push to this new claim or
+        # activate the new mutable lease before the admission decision.
+        await self._quiesce_claim_before_transition(
+            pa, reason="unresolved_predecessor_tool"
+        )
+        clear = False
+        reason = "loop_died_after_tool_effect"
+
+        async def park_current_debt(conn: Any) -> Optional[str]:
+            nonlocal clear
+            clear = False
+            await conn.fetchrow(_LOCK_SESSION_TOOL_DEBT_QUEUE_SQL, claim.unit_id)
+            current = await self._session_tool_debt(conn, claim)
+            if current is None:
+                return None
+            if not current["unresolved"]:
+                clear = True
+                return None
+            state = await park_unit(
+                conn,
+                unit_id=claim.unit_id,
+                lease_token=claim.lease_token,
+                reason=reason,
+            )
+            # park_unit's general CAS intentionally accepts only token/state.
+            # This admission path also owes a current, unexpired owner at the
+            # CAS; an expiry while acquiring locks/checking debt rolls back.
+            if state is not None and not await conn.fetchval(
+                "SELECT $1::timestamptz > clock_timestamp()",
+                current["leased_until"],
+            ):
+                raise _PostEffectParkError(
+                    "Session admission lease expired before park"
+                )
+            return state
+
+        outcome = await self._settle_release(
+            claim,
+            cas=park_current_debt,
+            park_reason=reason,
+            release_reason="unresolved_predecessor_tool",
+        )
+        if outcome is None and not clear:
+            self.request_stop()
+        # A real late result may clear the debt under the same locked claim.
+        # A lost commit response is the existing idempotent parked outcome,
+        # never permission to reconstruct model/tool context.
+        return outcome is None and clear
 
     async def _park_post_effect_claim(
         self,

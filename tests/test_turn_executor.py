@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -247,6 +247,16 @@ class FakeDB:
 
     async def fetchrow(self, sql: str, *args):
         self.fetch_calls.append((sql, args))
+        if sql == te._SESSION_TOOL_DEBT_AUTHORITY_SQL:
+            # These driver fixtures have no predecessor tool-call rows. The
+            # real-Postgres admission suite exercises debt/current-claim SQL.
+            if self.thread_row is None:
+                return None
+            return {
+                "metadata": self.thread_row["metadata"],
+                "leased_until": datetime.now(timezone.utc) + timedelta(seconds=60),
+                "unresolved": False,
+            }
         if sql == te._LOCK_RELEASE_THREAD_SQL:
             return self.thread_row
         if "SET events_epoch = events_epoch + 1" in sql:
