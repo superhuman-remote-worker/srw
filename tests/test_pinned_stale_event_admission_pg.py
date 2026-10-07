@@ -59,7 +59,7 @@ db = fixtures.db
 
 WAKE = "[wake] the nightly report job finished"
 ANSWER = "The nightly report is ready: 3 failures, all in the import step."
-NOTHING = {"settled": [], "reserved": [], "parked": []}
+NOTHING = {"settled": [], "history": [], "reserved": [], "parked": []}
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +221,22 @@ async def _restored(db, life) -> list[str]:
     return [row["id"] for row in rows]
 
 
+async def _journal_turn_completed(db, life, *, turn):
+    """The loop's ``turn.completed`` frame, as the pinned journal writes it."""
+
+    seq = await db.fetchval(
+        "SELECT COALESCE(max(seq), 0) + 1 FROM thread_events WHERE thread_id=$1::uuid",
+        life["thread"],
+    )
+    await db.execute(
+        "INSERT INTO thread_events (thread_id, epoch, seq, kind, payload) "
+        "VALUES ($1::uuid, 0, $2, 'turn.completed', $3::jsonb)",
+        life["thread"],
+        seq,
+        '{"turn_id": %d, "metrics": {}}' % turn,
+    )
+
+
 async def _settle_source(db, row):
     """The batch recovery's settle of the input it supersedes."""
 
@@ -257,13 +273,16 @@ async def _next_life(db, life):
         db, life["thread"], pod_name=f"persistent-life-{uuid4().hex[:12]}"
     )
     actor = await db.get_agent(str(bound["agent_id"]))
+    marker = fixtures._json(bound["metadata"])["agent_pod"]
     return {
         "thread": life["thread"],
         "agent": str(bound["agent_id"]),
         "pod_uid": str(actor["pod_uid"]),
+        "pod_name": str(marker["pod_name"]),
         "generation": str(bound["runtime_generation"]),
         "attach_token": str(bound["runtime_attach_token"]),
         "process_generation": str(uuid4()),
+        "provision_attempt": str(marker["provision_attempt"]),
     }
 
 
@@ -401,7 +420,8 @@ async def test_event_superseded_by_a_continuation_is_left_to_the_recovery(db):
 @pytest.mark.parametrize("answered", [False, True], ids=["owed", "answered"])
 async def test_event_with_a_later_admission_is_history(db, answered):
     """A later turn ran without it: never replayed into the newer
-    conversation; settled only if its own turn had answered it."""
+    conversation, and settled now, while the later admission still proves
+    it (a hand-back would clear that admission)."""
 
     life, event = await _killed_admitted_event(db)
     if answered:
@@ -421,14 +441,81 @@ async def test_event_with_a_later_admission_is_history(db, answered):
     successor = _restart(later)
     outcome = await _reserve(db, successor)
     row = await _delivery(db, event["delivery_id"])
-    if answered:
-        assert outcome == {**NOTHING, "settled": [str(event["delivery_id"])]}
-        assert row["state"] == "settled"
-    else:
-        assert outcome == NOTHING
-        assert row["state"] == "admitted"
-        assert str(row["owner_runtime_generation"]) == life["process_generation"]
+    key = "settled" if answered else "history"
+    assert outcome == {**NOTHING, key: [str(event["delivery_id"])]}
+    assert row["state"] == "settled"
+    assert row["admitted_turn_number"] == 1
+    assert str(row["owner_runtime_generation"]) == life["process_generation"]
     assert await _claim(db, successor) == []
+    assert await _answers(db, life) == int(answered)
+
+
+@pytest.mark.asyncio
+async def test_history_stays_history_after_a_handed_back_successor_dies(db):
+    """Review probe: the hand-back clears the later row's admission, so the
+    history verdict must be taken in the same pass. An older process left E1
+    admitted; a later one admitted E2 and died; a P3 attach hands E2 back and
+    dies before admitting it again. The next attach must serve E2 only."""
+
+    life = await _live(db)
+    e1 = await _persist(db, life, turn=1)
+    await _admit(db, life, e1, turn=1)
+    await _ai(db, life, turn=1, tool_call=True)
+    legacy = _restart(life)
+    e2 = await _persist(db, legacy, turn=2, content="[wake] the weekly job finished")
+    (claimed,) = await _claim(db, legacy)
+    await _admit(db, legacy, claimed, turn=2)
+    await _ai(db, legacy, turn=2, tool_call=True)
+
+    p3 = _restart(legacy)
+    assert await _reserve(db, p3) == {
+        **NOTHING,
+        "history": [str(e1["delivery_id"])],
+        "reserved": [str(e2["delivery_id"])],
+    }
+    # It dies before admitting E2 again (an attach failure after the step).
+    successor = _restart(p3)
+    assert await _reserve(db, successor) == NOTHING
+    claimed = await _claim(db, successor)
+    assert [row["delivery_id"] for row in claimed] == [e2["delivery_id"]]
+    assert (await _delivery(db, e1["delivery_id"]))["state"] == "settled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final", ["no_answer_row", "final_carries_a_tool_call"])
+async def test_turn_completed_frame_counts_as_answered(db, final):
+    """The pinned loop journals ``turn.completed`` before its best-effort
+    reconcile, and a final message that carries a tool call is no answer row:
+    the frame alone proves the turn ended, as the batch settle accepts."""
+
+    life, event = await _killed_admitted_event(db)
+    if final == "final_carries_a_tool_call":
+        await _ai(db, life, turn=1, tool_call=True)
+    await _journal_turn_completed(db, life, turn=1)
+    successor = _restart(life)
+
+    assert await _reserve(db, successor) == {
+        **NOTHING,
+        "settled": [str(event["delivery_id"])],
+    }
+    assert await _claim(db, successor) == []
+
+
+@pytest.mark.asyncio
+async def test_a_frame_of_an_earlier_turn_with_the_same_number_proves_nothing(db):
+    """The frame must be journaled after the admission: a turn number that
+    came back after a restart is not this turn's end."""
+
+    life = await _live(db)
+    await _journal_turn_completed(db, life, turn=1)
+    event = await _persist(db, life, turn=1)
+    await _admit(db, life, event, turn=1)
+    successor = _restart(life)
+
+    assert await _reserve(db, successor) == {
+        **NOTHING,
+        "reserved": [str(event["delivery_id"])],
+    }
 
 
 @pytest.mark.asyncio
@@ -564,6 +651,77 @@ async def test_a_second_abrupt_death_after_the_re_serve_still_receipts(
         assert (await _delivery(db, event_id))["admission_count"] == 2
 
 
+@pytest.mark.asyncio
+async def test_a_parked_input_of_an_earlier_life_does_not_block_a_later_receipt(
+    db, monkeypatch
+):
+    """Review probe: the park leaves a non-terminal row owned by the life that
+    parked it. Once that life retired, 0335 accepts it as an earlier life's
+    leftover, so the next life's SIGKILL still gets its receipt."""
+
+    events = []
+
+    async def admit_event(ids, deliveries):
+        first = {
+            key: ids[key]
+            for key in (
+                "thread",
+                "agent",
+                "pod_uid",
+                "generation",
+                "attach_token",
+                "process_generation",
+            )
+        }
+        row = await _persist(db, first, turn=2)
+        await _admit(db, first, row, turn=2)
+        await db.execute(
+            "UPDATE thread_input_deliveries SET admission_count=$2 "
+            "WHERE delivery_id=$1::uuid",
+            row["delivery_id"],
+            PINNED_RECOVERY_ADMISSION_LIMIT,
+        )
+        events.append(row["delivery_id"])
+
+    ids, retirement, deliveries, api, _ = await killed_life(
+        db,
+        monkeypatch,
+        backend="virtual",
+        with_virtual_binding=False,
+        before_retirement=admit_event,
+    )
+    (event_id,) = events
+    await _end_first_life(db, ids, retirement)
+    life = await _second_life(db, ids)
+    assert (await _reserve(db, life))["parked"] == [str(event_id)]
+    await _claim(db, life)
+    retirement2 = await _kill(db, api, life)
+    assert (
+        await db.acknowledge_abrupt_pinned_actor_exit(
+            life["thread"], **_receipt_args(life, retirement2)
+        )
+        is not None
+    )
+    await _end_first_life(db, life, retirement2)
+
+    third = await _next_life(db, life)
+    assert await _reserve(db, third) == NOTHING
+    await _claim(db, third)
+    row = await _delivery(db, event_id)
+    assert (row["state"], row["deferred_reason"]) == (
+        "deferred",
+        PINNED_RECOVERY_PARK_REASON,
+    )
+    assert UUID(str(row["owner_agent_id"])) == UUID(life["agent"])
+    retirement3 = await _kill(db, api, third)
+    assert (
+        await db.acknowledge_abrupt_pinned_actor_exit(
+            third["thread"], **_receipt_args(third, retirement3)
+        )
+        is not None
+    )
+
+
 # ---------------------------------------------------------------------------
 # The bound
 # ---------------------------------------------------------------------------
@@ -689,10 +847,12 @@ async def test_owner_retry_clears_the_park_and_serves_it_again(db):
     revived = await thread_transport.thread_queue_retry(
         current["thread"], _request(), dependencies=deps
     )
-    assert (revived["state"], revived["park_reason"]) == (
-        "queued",
-        PINNED_RECOVERY_PARK_REASON,
-    )
+    assert revived == {
+        "thread_id": current["thread"],
+        "state": "rearmed",
+        "park_reason": PINNED_RECOVERY_PARK_REASON,
+        "inputs": [str(event["delivery_id"])],
+    }
     row = await _delivery(db, event["delivery_id"])
     assert (row["state"], row["deferred_reason"], row["admission_count"]) == (
         "deferred",
