@@ -50,6 +50,15 @@ from shared.runtime.utils.ssh_key import (
 _OWNER_ID = "11111111-1111-1111-1111-111111111111"
 
 
+# Deterministic, so parametrized test ids agree across xdist workers.
+_FIXED_ED25519_BLOB = base64.b64encode(
+    len(b"ssh-ed25519").to_bytes(4, "big")
+    + b"ssh-ed25519"
+    + (32).to_bytes(4, "big")
+    + bytes(32)
+).decode()
+
+
 def _host_key() -> str:
     public = Ed25519PrivateKey.generate().public_key()
     return public.public_bytes(Encoding.OpenSSH, PublicFormat.OpenSSH).decode()
@@ -225,7 +234,7 @@ class TestKnownHosts:
             "github.com ssh-dss AAAAB3NzaC1kc3M=",
             "github.com ssh-ed25519 not-base64!",
             # A key blob whose embedded type disagrees with the declared one.
-            "github.com ssh-rsa " + _host_key().split()[1],
+            "github.com ssh-rsa " + _FIXED_ED25519_BLOB,
             "github.com",
         ],
     )

@@ -1051,6 +1051,7 @@ def _execute_managed_secret_command(
     secret: str | bytes | bytearray,
     *,
     timeout: int,
+    operation: str = "managed repository credential materialization",
 ) -> bool:
     """Use the stateless claim fence when the backend provides that seam."""
 
@@ -1061,10 +1062,31 @@ def _execute_managed_secret_command(
                 command,
                 secret,
                 timeout=timeout,
-                operation="managed repository credential materialization",
+                operation=operation,
             )
         )
     return bool(backend.execute_with_secret_stdin(command, secret, timeout=timeout))
+
+
+def _backend_runtime_authority(backend: Any) -> tuple[str | None, str | None]:
+    """The server-attested ``(workspace_generation, runtime_incarnation)``."""
+
+    runtime_authority = getattr(backend, "managed_repository_runtime_authority", None)
+    if runtime_authority is None:
+        return None, None
+    if not isinstance(runtime_authority, tuple) or len(runtime_authority) != 2:
+        raise ManagedRepositoryMaterializationError(
+            "managed_repository_materialization_failed"
+        )
+    try:
+        return (
+            str(UUID(str(runtime_authority[0]))),
+            str(UUID(str(runtime_authority[1]))),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ManagedRepositoryMaterializationError(
+            "managed_repository_materialization_failed"
+        ) from exc
 
 
 def _materialize_validated_credentials(
@@ -1082,22 +1104,9 @@ def _materialize_validated_credentials(
         )
 
     home_path = _backend_managed_home(backend)
-    runtime_authority = getattr(backend, "managed_repository_runtime_authority", None)
-    if runtime_authority is not None:
-        if not isinstance(runtime_authority, tuple) or len(runtime_authority) != 2:
-            raise ManagedRepositoryMaterializationError(
-                "managed_repository_materialization_failed"
-            )
-        try:
-            runtime_workspace_generation = str(UUID(str(runtime_authority[0])))
-            runtime_incarnation = str(UUID(str(runtime_authority[1])))
-        except (TypeError, ValueError) as exc:
-            raise ManagedRepositoryMaterializationError(
-                "managed_repository_materialization_failed"
-            ) from exc
-    else:
-        runtime_workspace_generation = None
-        runtime_incarnation = None
+    runtime_workspace_generation, runtime_incarnation = _backend_runtime_authority(
+        backend
+    )
 
     try:
         setup_ok = _execute_managed_secret_command(

@@ -1166,19 +1166,29 @@ def test_key_lifetime_expires_and_the_next_materialization_self_heals(
         generation=1,
         key_lifetime_seconds=3,
     )
-    assert launch(3).returncode == 0
+    lifetime = 5
+
+    def sleep_until(deadline: float) -> None:
+        time.sleep(max(0.0, deadline - time.monotonic()))
+
+    assert launch(lifetime).returncode == 0
+    loaded_by = time.monotonic()
     first = _state(short_home, authority_id)[1]
     # A proven reuse re-adds the key, restarting its lifetime.
-    time.sleep(2)
-    assert launch(3).returncode == 0
+    sleep_until(loaded_by + 2)
+    refresh_started = time.monotonic()
+    assert launch(lifetime).returncode == 0
+    refreshed_by = time.monotonic()
     assert _state(short_home, authority_id)[1]["pid"] == first["pid"]
-    time.sleep(2)
+    # Past the first load's expiry, inside the refreshed one.
+    sleep_until(loaded_by + lifetime + 0.5)
+    assert time.monotonic() < refresh_started + lifetime
     assert _agent_key_count(first["socket"]) == 1
     # Unrefreshed, the agent forgets the key on its own ...
-    time.sleep(2)
+    sleep_until(refreshed_by + lifetime + 0.5)
     assert _agent_key_count(first["socket"]) == 0
     # ... and the next materialization replaces the keyless resident.
-    assert launch(3).returncode == 0
+    assert launch(lifetime).returncode == 0
     healed = _state(short_home, authority_id)[1]
     assert healed["pid"] != first["pid"]
     assert _agent_key_count(healed["socket"]) == 1

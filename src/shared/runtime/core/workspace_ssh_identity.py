@@ -22,9 +22,23 @@ import hashlib
 import hmac
 import ipaddress
 import re
+import shlex
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable, Mapping, MutableMapping
 from urllib.parse import urlparse
+from uuid import UUID
+
+from shared.runtime.core.managed_repository import (
+    ManagedRepositoryMaterializationError,
+    _backend_managed_home,
+    _backend_runtime_authority,
+    _execute_managed_secret_command,
+    managed_repository_agent_launch_command,
+    managed_repository_agent_retirement_command,
+    managed_ssh_namespace_setup_command,
+    render_ssh_identity_config,
+)
+from shared.runtime.utils.ssh_key import normalize_private_key
 
 _HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 _SSH_USER = re.compile(r"[A-Za-z_][A-Za-z0-9._-]{0,63}")
@@ -260,10 +274,12 @@ def parse_known_hosts(
 
     A line may be a bare ``<type> <base64>`` pair (what a connector's Test
     returns) or a full ``known_hosts`` line. A full line must name ``host`` on
-    ``port``; with ``require_match=False`` (a deployment-wide default list) a
-    line for another host is skipped instead of refused. Markers, certificates
-    and unknown key types are refused, so the rendered per-identity file holds
-    nothing but plain keys under the identity's own alias.
+    ``port``. With ``require_match=False`` (a deployment-wide default list)
+    only full lines naming ``host`` count: a line for another host, and a bare
+    pair that names no host at all, are skipped instead of refused. Markers,
+    certificates and unknown key types are refused, so the rendered
+    per-identity file holds nothing but plain keys under the identity's own
+    alias.
     """
 
     raw = "" if text is None else str(text)
@@ -284,6 +300,8 @@ def parse_known_hosts(
             if len(tokens) < 2:
                 raise SshEndpointError(f"known_hosts line {line_number} has no key")
             entry = _host_key_entry(tokens[0], tokens[1], line_number=line_number)
+            if not require_match:
+                continue
         else:
             if len(tokens) < 3:
                 raise SshEndpointError(
@@ -308,14 +326,340 @@ def parse_known_hosts(
     return entries
 
 
+# ---------------------------------------------------------------------------
+# Workspace materialization
+# ---------------------------------------------------------------------------
+
+WORKSPACE_SSH_IDENTITY_VERSION = 1
+WORKSPACE_SSH_IDENTITY_KINDS = frozenset({"repository", "ssh_key"})
+#: Status of an identity the workspace agent holds and has proven.
+IDENTITY_READY = "ready"
+_FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
+_MAX_EXTRA_HOSTS = 8
+
+
+def workspace_ssh_identity_alias(authority_id: Any) -> str:
+    """The opaque ``Host`` alias of one identity: ``srw-repo-<32hex>``."""
+
+    return f"srw-repo-{UUID(str(authority_id)).hex}"
+
+
+def workspace_ssh_identity_socket(home_path: str, authority_id: Any) -> str:
+    """The identity's ``ssh-agent`` socket inside the managed namespace."""
+
+    return (
+        f"{home_path.rstrip('/')}/.ssh/srw-managed/sockets/"
+        f"{UUID(str(authority_id)).hex}.sock"
+    )
+
+
+class WorkspaceSshIdentityError(RuntimeError):
+    """One identity could not be loaded; ``code`` is credential-free."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+def _validated_identity(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Re-check one internal payload; the orchestrator is not trusted blindly.
+
+    Every value that reaches the rendered SSH config must already be in its
+    normalized form, so nothing the agent writes differs from what was
+    validated at connector create/update and again at dispatch.
+    """
+
+    invalid = WorkspaceSshIdentityError("workspace_ssh_identity_invalid")
+    try:
+        if int(payload.get("version")) != WORKSPACE_SSH_IDENTITY_VERSION:
+            raise ValueError
+        authority_id = str(UUID(str(payload["authority_id"])))
+        generation = payload["generation"]
+        kind = str(payload["kind"])
+        alias = str(payload["alias"])
+        fingerprint = str(payload["public_key_fingerprint"])
+        strict = payload.get("strict_host_key_checking")
+        known_hosts = list(payload.get("known_hosts") or [])
+        extra_hosts = list(payload.get("extra_hosts") or [])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise invalid from exc
+    if (
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 1
+        or kind not in WORKSPACE_SSH_IDENTITY_KINDS
+        or alias != workspace_ssh_identity_alias(authority_id)
+        or not _FINGERPRINT.fullmatch(fingerprint)
+        or not isinstance(strict, bool)
+        or (strict and not known_hosts)
+        or len(extra_hosts) > _MAX_EXTRA_HOSTS
+        or (kind == "repository" and extra_hosts)
+    ):
+        raise invalid
+    host = payload.get("ssh_host")
+    port = payload.get("ssh_port")
+    user = payload.get("ssh_user")
+    try:
+        if host is not None and normalize_ssh_host(host) != host:
+            raise invalid
+        if port is not None and normalize_ssh_port(port) != port:
+            raise invalid
+        if user is not None and normalize_ssh_user(user) != user:
+            raise invalid
+        if any(normalize_ssh_host(value) != value for value in extra_hosts):
+            raise invalid
+        if any(
+            not isinstance(entry, str) or parse_known_hosts(entry) != [entry]
+            for entry in known_hosts
+        ):
+            raise invalid
+    except SshEndpointError as exc:
+        raise invalid from exc
+    if kind == "repository" and (host is None or port is None or user is None):
+        raise invalid
+    if host is None and (port is not None or user is not None or known_hosts):
+        raise invalid
+    try:
+        normalized_key = normalize_private_key(str(payload["private_key"]))
+        if not normalized_key:
+            raise ValueError
+        private_key = bytearray(normalized_key.encode("utf-8"))
+        del normalized_key
+    except (KeyError, TypeError, ValueError) as exc:
+        raise invalid from exc
+    return {
+        "authority_id": authority_id,
+        "generation": generation,
+        "kind": kind,
+        "alias": alias,
+        "ssh_host": host,
+        "ssh_port": port,
+        "ssh_user": user,
+        "extra_hosts": extra_hosts,
+        "known_hosts": known_hosts,
+        "strict": strict,
+        "private_key": private_key,
+        "public_key_fingerprint": fingerprint,
+    }
+
+
+def _wipe(value: Any) -> None:
+    if isinstance(value, bytearray):
+        value[:] = b"\x00" * len(value)
+
+
+def _identity_command(
+    item: Mapping[str, Any],
+    *,
+    home_path: str,
+    runtime_workspace_generation: str | None,
+    runtime_incarnation: str | None,
+) -> str:
+    slug = UUID(item["authority_id"]).hex
+    root = f"{home_path}/.ssh/srw-managed"
+    known_hosts_path = f"{root}/known_hosts.d/{slug}"
+    config = render_ssh_identity_config(
+        alias=item["alias"],
+        socket_path=workspace_ssh_identity_socket(home_path, item["authority_id"]),
+        known_hosts_path=known_hosts_path,
+        host=item["ssh_host"],
+        port=item["ssh_port"],
+        user=item["ssh_user"],
+        strict_host_key_checking=item["strict"],
+        host_key_alias=item["alias"],
+        extra_hosts=item["extra_hosts"],
+    )
+    if item["strict"]:
+        # A pin replaces whatever the file learned or was pinned to before.
+        # Keys are filed under the alias (``HostKeyAlias``), so the pin holds
+        # however the host is spelled and cannot vouch for another identity.
+        content = "".join(f"{item['alias']} {entry}\n" for entry in item["known_hosts"])
+        publish_known_hosts = (
+            f"printf %s {shlex.quote(content)} > "
+            f"{shlex.quote(known_hosts_path)}.tmp.$$; "
+            f"mv -f -- {shlex.quote(known_hosts_path)}.tmp.$$ "
+            f"{shlex.quote(known_hosts_path)}; "
+        )
+    else:
+        # Trust on first use, per identity: keep what an earlier load learned.
+        publish_known_hosts = f"touch {shlex.quote(known_hosts_path)}; "
+    launch = managed_repository_agent_launch_command(
+        home_path=home_path,
+        authority_id=item["authority_id"],
+        generation=int(item["generation"]),
+        preserve_existing=True,
+        expected_fingerprint=item["public_key_fingerprint"],
+        workspace_generation=runtime_workspace_generation,
+        runtime_incarnation=runtime_incarnation,
+        config_content=config,
+    )
+    return "set -eu; umask 077; " + publish_known_hosts + launch
+
+
+def materialize_workspace_ssh_identities(
+    payloads: Iterable[Mapping[str, Any]] | None,
+    backend: Any,
+) -> dict[str, str]:
+    """Load each connector identity into its own workspace ``ssh-agent``.
+
+    Returns ``{authority_id: status}``: :data:`IDENTITY_READY`, or a
+    credential-free error code for that identity alone. Unlike the managed
+    repository materializer, nothing here fails the attach: an external
+    connector's broken key, or a forge outage, degrades only its connector,
+    and the clone that follows is that connector's probe. Every private key is
+    popped from the caller's payloads and zeroed before this returns.
+    """
+
+    raw = list(payloads or [])
+    if not raw:
+        return {}
+    result: dict[str, str] = {}
+    validated: list[dict[str, Any]] = []
+    try:
+        for item in raw:
+            try:
+                validated.append(_validated_identity(item))
+            except WorkspaceSshIdentityError as exc:
+                authority = (
+                    str(item.get("authority_id") or "")
+                    if isinstance(item, Mapping)
+                    else ""
+                )
+                result.setdefault(authority or f"invalid-{len(result)}", exc.code)
+            finally:
+                if isinstance(item, MutableMapping):
+                    item.pop("private_key", None)
+        unique: list[dict[str, Any]] = []
+        for item in validated:
+            if item["authority_id"] in result or any(
+                other["authority_id"] == item["authority_id"] for other in unique
+            ):
+                result[item["authority_id"]] = "workspace_ssh_identity_duplicate"
+                continue
+            unique.append(item)
+        if not unique:
+            return result
+        if not getattr(backend, "supports_shell", False):
+            for item in unique:
+                result[item["authority_id"]] = (
+                    "workspace_ssh_identity_requires_workspace"
+                )
+            return result
+        try:
+            home_path = _backend_managed_home(backend)
+            runtime_workspace_generation, runtime_incarnation = (
+                _backend_runtime_authority(backend)
+            )
+            setup_ok = _execute_managed_secret_command(
+                backend,
+                managed_ssh_namespace_setup_command(home_path=home_path),
+                b"",
+                timeout=15,
+                operation="connector SSH identity materialization",
+            )
+        except (ManagedRepositoryMaterializationError, NotImplementedError, OSError):
+            setup_ok = False
+        if not setup_ok:
+            for item in unique:
+                result[item["authority_id"]] = (
+                    "workspace_ssh_identity_materialization_failed"
+                )
+            return result
+        for item in unique:
+            private_key = item.pop("private_key")
+            try:
+                command = _identity_command(
+                    item,
+                    home_path=home_path,
+                    runtime_workspace_generation=runtime_workspace_generation,
+                    runtime_incarnation=runtime_incarnation,
+                )
+                loaded = _execute_managed_secret_command(
+                    backend,
+                    command,
+                    private_key,
+                    timeout=30,
+                    operation="connector SSH identity materialization",
+                )
+            except (
+                ManagedRepositoryMaterializationError,
+                NotImplementedError,
+                OSError,
+            ):
+                loaded = False
+            finally:
+                _wipe(private_key)
+                del private_key
+            result[item["authority_id"]] = (
+                IDENTITY_READY if loaded else "workspace_ssh_identity_load_failed"
+            )
+        return result
+    finally:
+        for item in raw:
+            if isinstance(item, MutableMapping):
+                item.pop("private_key", None)
+        for item in validated:
+            _wipe(item.pop("private_key", None))
+
+
+def retire_workspace_ssh_identities(authority_ids: Iterable[str], backend: Any) -> bool:
+    """Retire exactly these identities' agents, sparing every other resident.
+
+    Used when a connector is detached from a live session, which owns its
+    workspace. Its socket, receipt, config and host-key file go with it; the
+    terminal owners that retire the whole namespace need no help.
+    """
+
+    slugs = sorted({UUID(str(value)).hex for value in authority_ids})
+    if not slugs:
+        return True
+    if not getattr(backend, "supports_shell", False):
+        return False
+    try:
+        home_path = _backend_managed_home(backend)
+        runtime_workspace_generation, runtime_incarnation = _backend_runtime_authority(
+            backend
+        )
+        command = managed_repository_agent_retirement_command(
+            home_path=home_path,
+            authority_ids=slugs,
+            remove_configs=True,
+            workspace_generation=runtime_workspace_generation,
+            runtime_incarnation=runtime_incarnation,
+        ).rstrip()
+        command += " " + "".join(
+            "rm -f -- "
+            + shlex.quote(f"{home_path}/.ssh/srw-managed/known_hosts.d/{slug}")
+            + "; "
+            for slug in slugs
+        )
+        return _execute_managed_secret_command(
+            backend,
+            command,
+            b"",
+            timeout=30,
+            operation="connector SSH identity retirement",
+        )
+    except (ManagedRepositoryMaterializationError, NotImplementedError, OSError):
+        return False
+
+
 __all__ = [
+    "IDENTITY_READY",
     "KNOWN_HOST_KEY_TYPES",
     "SshEndpointError",
     "SshRepositoryTarget",
+    "WORKSPACE_SSH_IDENTITY_KINDS",
+    "WORKSPACE_SSH_IDENTITY_VERSION",
+    "WorkspaceSshIdentityError",
     "known_hosts_field_matches",
+    "materialize_workspace_ssh_identities",
     "normalize_ssh_host",
     "normalize_ssh_port",
     "normalize_ssh_user",
     "parse_known_hosts",
     "parse_ssh_repository_url",
+    "retire_workspace_ssh_identities",
+    "workspace_ssh_identity_alias",
+    "workspace_ssh_identity_socket",
 ]
