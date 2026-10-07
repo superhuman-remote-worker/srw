@@ -678,8 +678,11 @@ def _ssh_clone_target(
         return None, str(identity["unavailable"])
     clone_url = str(identity.get("clone_url") or "")
     alias = str(identity.get("alias") or "")
+    path = r"[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*"
+    # ``ssh://alias/path`` (absolute) or the scp form ``alias:path``, which
+    # keeps a relative path relative exactly as the connector URL had it.
     if not re.fullmatch(r"srw-repo-[a-f0-9]{32}", alias) or not re.fullmatch(
-        rf"ssh://{alias}/[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*", clone_url
+        rf"(?:ssh://{alias}/|{alias}:){path}", clone_url
     ):
         return None, "its SSH identity is malformed"
     if ssh_identity_status is not None:
@@ -700,8 +703,8 @@ def clone_repository_datasources(
     Every operation runs on the workspace and the clone itself is
     ``GitManager.clone(backend=...)`` (git on the workspace over SSH).
 
-    An SSH-key repository is cloned from ``ssh://srw-repo-<slug>/<path>``, an
-    opaque alias whose key a dedicated workspace ``ssh-agent`` holds
+    An SSH-key repository is cloned from ``ssh://srw-repo-<slug>/<path>`` (or
+    ``srw-repo-<slug>:<path>`` for a relative scp-style path), an opaque alias whose key a dedicated workspace ``ssh-agent`` holds
     (``shared.runtime.core.workspace_ssh_identity``); no key file is written
     and no ``Host`` block is appended. ``ssh_identity_status`` is the
     materializer's ``{authority_id: status}``: a connector whose identity did

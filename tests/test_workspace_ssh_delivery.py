@@ -109,7 +109,8 @@ class TestDatasourcesPayload:
         alias = f"srw-repo-{UUID(workspace_ssh_authority_id(_REPO_ID)).hex}"
         assert repository["ssh_identity"]["alias"] == alias
         assert (
-            repository["ssh_identity"]["clone_url"] == f"ssh://{alias}/acme/widget.git"
+            # scp form, relative path: the clone keeps it relative.
+            repository["ssh_identity"]["clone_url"] == f"{alias}:acme/widget.git"
         )
         assert repository["ssh_identity"]["host"] == "github.com"
         assert ssh_key["credentials"]["files"] == [

@@ -118,7 +118,8 @@ def normalize_ssh_port(value: Any) -> int:
 
     if isinstance(value, bool):
         raise SshEndpointError("SSH port must be an integer between 1 and 65535")
-    if isinstance(value, str) and value.strip().isdigit():
+    # ASCII digits only: str.isdigit() also accepts "²", which int() refuses.
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,5}", value.strip()):
         value = int(value.strip())
     if not isinstance(value, int) or not 1 <= value <= 65535:
         raise SshEndpointError("SSH port must be an integer between 1 and 65535")
@@ -127,12 +128,27 @@ def normalize_ssh_port(value: Any) -> int:
 
 @dataclass(frozen=True)
 class SshRepositoryTarget:
-    """The SSH endpoint and repository path of one Git remote."""
+    """The SSH endpoint and repository path of one Git remote.
+
+    ``relative`` keeps the scp form's meaning: ``host:repos/app.git`` names
+    a path the server resolves (a forge's ``owner/repo``, a VPS user's home),
+    while ``ssh://host/repos/app.git`` and ``host:/srv/app.git`` are
+    absolute. :meth:`clone_url` preserves exactly that distinction.
+    """
 
     host: str
     port: int
     user: str
     path: str
+    relative: bool = False
+
+    def clone_url(self, alias: str) -> str:
+        """The remote through ``alias`` that names the same repository."""
+        if self.relative:
+            # scp-like syntax: git sends the path exactly as the original did.
+            # (``ssh://alias/~/path`` would not do: forges reject a "~" path.)
+            return f"{alias}:{self.path}"
+        return f"ssh://{alias}/{self.path}"
 
 
 def _normalize_repository_path(raw: str) -> str:
@@ -175,9 +191,12 @@ def parse_ssh_repository_url(url: Any) -> SshRepositoryTarget:
             ) from exc
         scheme = parsed.scheme.lower()
         converted = scheme in {"http", "https"}
+        # An HTTPS URL used to be cloned as ``git@host:path``: relative.
+        relative = converted
         if scheme in {"ssh", "git+ssh", "ssh+git"}:
             user = parsed.username or "git"
-            port = raw_port or 22
+            # ``ssh://host:0/`` is refused below, never read as the default.
+            port = 22 if raw_port is None else raw_port
         elif converted:
             if parsed.username is not None:
                 raise SshEndpointError(
@@ -199,6 +218,7 @@ def parse_ssh_repository_url(url: Any) -> SshRepositoryTarget:
         host = match.group("host")
         port = 22
         path = match.group("path")
+        relative = not path.startswith("/")
     normalized_path = _normalize_repository_path(path)
     if converted and not normalized_path.endswith(".git"):
         normalized_path += ".git"
@@ -207,6 +227,7 @@ def parse_ssh_repository_url(url: Any) -> SshRepositoryTarget:
         port=normalize_ssh_port(port),
         user=normalize_ssh_user(user),
         path=normalized_path,
+        relative=relative,
     )
 
 

@@ -202,13 +202,40 @@ class TestEndpointGrammar:
         with pytest.raises(SshEndpointError):
             normalize_ssh_user(user)
 
-    @pytest.mark.parametrize("port", [True, 0, 65536, "22 ", "2x", 1.5, None])
+    @pytest.mark.parametrize(
+        "port", [True, 0, 65536, "22 ", "2x", 1.5, None, "²", "٢٢", "123456"]
+    )
     def test_ports_refused(self, port):
         if port == "22 ":
             assert normalize_ssh_port(port) == 22
             return
         with pytest.raises(SshEndpointError):
             normalize_ssh_port(port)
+
+    @pytest.mark.parametrize(
+        "url", ["ssh://git@host:0/o/r.git", "ssh://git@host:²/o/r.git"]
+    )
+    def test_url_ports_are_refused_not_defaulted(self, url):
+        with pytest.raises(SshEndpointError):
+            parse_ssh_repository_url(url)
+
+    @pytest.mark.parametrize(
+        ("url", "clone_url"),
+        [
+            # Relative scp paths stay relative (a VPS user's home, a forge's
+            # owner/repo); git sends exactly the original path.
+            ("deploy@vps.example.com:repos/app.git", "ALIAS:repos/app.git"),
+            ("git@github.com:acme/widget.git", "ALIAS:acme/widget.git"),
+            ("deploy@vps.example.com:~/app.git", "ALIAS:~/app.git"),
+            ("https://github.com/acme/widget", "ALIAS:acme/widget.git"),
+            # Absolute paths stay absolute.
+            ("deploy@vps.example.com:/srv/app.git", "ssh://ALIAS/srv/app.git"),
+            ("ssh://git@host:2222/acme/widget.git", "ssh://ALIAS/acme/widget.git"),
+            ("ssh://git@host/~deploy/app.git", "ssh://ALIAS/~deploy/app.git"),
+        ],
+    )
+    def test_clone_url_keeps_the_path_meaning(self, url, clone_url):
+        assert parse_ssh_repository_url(url).clone_url("ALIAS") == clone_url
 
 
 class TestKnownHosts:

@@ -154,7 +154,8 @@ class TestBackendClone:
         ) as mock_clone:
             clone_repository_datasources([ds], ws, ssh_identity_status=status)
 
-        assert mock_clone.call_args[0][0] == f"ssh://{alias}/org/repo.git"
+        # An HTTPS URL was always cloned as the relative scp form.
+        assert mock_clone.call_args[0][0] == f"{alias}:org/repo.git"
         ws.backend.write_home_file.assert_not_called()
         shell_cmds = [c[0][0] for c in ws.backend.shell_run.call_args_list]
         assert not any(">> ~/.ssh/config" in cmd for cmd in shell_cmds)
@@ -167,7 +168,9 @@ class TestBackendClone:
         """The scp form used to write ``Host localhost``."""
         ds = self._ssh_entry(connection_url="git@github.com:org/repo.git")
         assert ds["ssh_identity"]["host"] == "github.com"
-        assert ds["ssh_identity"]["clone_url"].endswith("/org/repo.git")
+        assert ds["ssh_identity"]["clone_url"] == (
+            f"{ds['ssh_identity']['alias']}:org/repo.git"
+        )
 
     @staticmethod
     def _warnings(log) -> str:
@@ -193,7 +196,7 @@ class TestBackendClone:
             clone_repository_datasources([ds], ws, ssh_identity_status=status)
         if not materialized:
             # No materializer ran: the alias is still the only clone target.
-            assert mock_clone.call_args[0][0].startswith("ssh://srw-repo-")
+            assert mock_clone.call_args[0][0].startswith("srw-repo-")
             return
         mock_clone.assert_not_called()
         assert ws.source_repos == {}
@@ -260,7 +263,7 @@ class TestBackendClone:
                 [first, second], ws, ssh_identity_status=status
             )
         urls = [call[0][0] for call in mock_clone.call_args_list]
-        assert len({url.split("/")[2] for url in urls}) == 2
+        assert len({url.split(":")[0] for url in urls}) == 2
 
     def test_name_collision_gets_suffix(self):
         ws = make_workspace_manager()

@@ -40,6 +40,7 @@ from uuid import UUID, uuid5
 from shared.runtime.core.workspace_ssh_identity import (
     WORKSPACE_SSH_IDENTITY_VERSION,
     SshEndpointError,
+    SshRepositoryTarget,
     normalize_ssh_host,
     normalize_ssh_port,
     normalize_ssh_user,
@@ -242,7 +243,7 @@ class WorkspaceSshIdentity:
     host: str | None
     port: int | None
     user: str | None
-    repository_path: str | None
+    repository: SshRepositoryTarget | None
     known_hosts: tuple[str, ...]
     private_key: str
     public_key: str
@@ -250,9 +251,9 @@ class WorkspaceSshIdentity:
 
     @property
     def clone_url(self) -> str | None:
-        if self.repository_path is None:
+        if self.repository is None:
             return None
-        return f"ssh://{self.alias}/{self.repository_path}"
+        return self.repository.clone_url(self.alias)
 
     def to_payload(self) -> dict[str, Any]:
         """Internal ``workspace_ssh_identities`` item, the only one with a key."""
@@ -338,7 +339,7 @@ def workspace_ssh_identity(
         host = settings.get("host")
         port = settings.get("port", 22 if host else None)
         user = settings.get("user")
-        path = None
+        repository = None
         pins = (
             _pins(
                 settings.get("known_hosts"),
@@ -355,7 +356,7 @@ def workspace_ssh_identity(
         except SshEndpointError as exc:
             raise WorkspaceSshConnectorError(str(exc)) from exc
         private_key = str(credentials.get("ssh_key") or "")
-        host, port, user, path = target.host, target.port, target.user, target.path
+        host, port, user, repository = target.host, target.port, target.user, target
         pins = _pins(
             config.get("known_hosts"),
             host=host,
@@ -375,7 +376,7 @@ def workspace_ssh_identity(
         host=host,
         port=port,
         user=user,
-        repository_path=path,
+        repository=repository,
         known_hosts=pins,
         private_key=private_key,
         public_key=public_key,
