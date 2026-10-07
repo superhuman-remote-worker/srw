@@ -174,8 +174,9 @@ async def test_emptydir_snapshot_ack_fences_runtime_and_binding_in_real_postgres
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_successor", [False, True])
 async def test_emptydir_rebase_clears_old_proof_and_rejects_old_ack(
-    database, actor, monkeypatch
+    database, actor, monkeypatch, terminal_successor
 ):
     case, pending = await pending_emptydir_ack_case(database, actor, monkeypatch)
     old = emptydir_ack_identity(pending)
@@ -251,6 +252,33 @@ async def test_emptydir_rebase_clears_old_proof_and_rejects_old_ack(
         "AND scope='workspace_container' AND runtime_incarnation=$2)",
         case.thread_id, case.pod_uid,
     )
+    before_rebase = deepcopy(metadata(await database.get_thread(case.thread_id)))
+    if terminal_successor:
+        # The successor is already terminal, but without its own process-zero
+        # receipt its status alone cannot inherit the predecessor's proof.
+        state["workspace_container"]["status"] = "retiring_process_zero"
+        await database.execute(
+            "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
+            case.thread_id, json.dumps(state),
+        )
+        assert not await database.rebase_stateless_thread_workspace_retirement(
+            case.thread_id, terminal_token=old["terminal_token"],
+            retired_runtime_incarnation=case.pod_uid, permanent=False,
+        )
+        # Production DB receipt admission represents the already-completed
+        # external process-zero proof; physical retirement is covered by the
+        # provisioner suite, while this case targets the SQL rebase trigger.
+        assert await database.record_managed_repository_workspace_process_zero(
+            case.thread_id, owner_kind="thread", scope="workspace_container",
+            provisioner="k8s", runtime_incarnation=successor_uid,
+        )
+        assert await database.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM managed_repository_process_zero_receipts "
+            "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+            "AND scope='workspace_container' AND runtime_incarnation=$2)",
+            case.thread_id, successor_uid,
+        )
+        before_rebase = deepcopy(metadata(await database.get_thread(case.thread_id)))
     assert await database.rebase_stateless_thread_workspace_retirement(
         case.thread_id, terminal_token=old["terminal_token"],
         retired_runtime_incarnation=case.pod_uid, permanent=False,
@@ -259,15 +287,74 @@ async def test_emptydir_rebase_clears_old_proof_and_rejects_old_ack(
     rebased_state = metadata(rebased)
     assert rebased_state["workspace_container"]["_snapshot_restore_required"] is False
     assert rebased_state["_stateless_workspace_retirement_pending"] is True
+    assert not await database.finish_stateless_thread_workspace_retirement(
+        case.thread_id, expected_terminal_token=old["terminal_token"]
+    )
+    if terminal_successor:
+        marker = rebased_state["_stateless_claim_retirement"]
+        assert marker["runtime_incarnation"] == successor_uid
+        assert marker["residents_retired_by"] == "workspace_runtime_terminal"
+        assert marker["remote_retired_by"] == "workspace_runtime_terminal"
+        for key in (
+            "_stateless_resident_retirement_ack",
+            "_stateless_shell_retirement_ack",
+        ):
+            assert rebased_state[key] == {
+                "kind": "workspace_runtime_terminal",
+                "terminal_token": old["terminal_token"],
+                "runtime_incarnation": successor_uid,
+            }
+        for malformed_kind in ("missing", None):
+            malformed = deepcopy(before_rebase)
+            malformed["_stateless_claim_retirement"].pop("residents_retired_by", None)
+            if malformed_kind == "missing":
+                malformed["_stateless_resident_retirement_ack"].pop("kind")
+            else:
+                malformed["_stateless_resident_retirement_ack"]["kind"] = None
+            assert not await database.fetchval(
+                "SELECT public.stateless_terminal_snapshot_flag_projection_authorized("
+                "$1::uuid,$2::jsonb,$3::jsonb)",
+                case.thread_id, json.dumps(malformed), json.dumps(rebased_state),
+            )
+        for malformed_kind in ("missing", None):
+            malformed = deepcopy(before_rebase)
+            malformed["_stateless_claim_retirement"].pop("remote_retired_by", None)
+            if malformed_kind == "missing":
+                malformed["_stateless_shell_retirement_ack"].pop("kind")
+            else:
+                malformed["_stateless_shell_retirement_ack"]["kind"] = None
+            assert not await database.fetchval(
+                "SELECT public.stateless_terminal_snapshot_flag_projection_authorized("
+                "$1::uuid,$2::jsonb,$3::jsonb)",
+                case.thread_id, json.dumps(malformed), json.dumps(rebased_state),
+            )
+        for fields in (
+            ("workspace_generation", "endpoint_generation"),
+            ("host_key_fingerprint",),
+        ):
+            malformed = deepcopy(before_rebase)
+            for field in fields:
+                malformed["_stateless_claim_retirement"].pop(field)
+                for ack_key in (
+                    "_stateless_resident_retirement_ack",
+                    "_stateless_shell_retirement_ack",
+                ):
+                    malformed[ack_key].pop(field)
+            assert not await database.fetchval(
+                "SELECT public.stateless_terminal_snapshot_flag_projection_authorized("
+                "$1::uuid,$2::jsonb,$3::jsonb)",
+                case.thread_id, json.dumps(malformed), json.dumps(rebased_state),
+            )
     assert not await database.mark_stateless_thread_snapshot_restore_required(
         case.thread_id, **old
     )
     assert metadata(await database.get_thread(case.thread_id))["workspace_container"][
         "_snapshot_restore_required"
     ] is False
-    old_pod.metadata.uid = successor_uid
-    old_pod.status.pod_ip = "10.42.0.101"
-    case.cluster.objects["pod"] = old_pod
+    if not terminal_successor:
+        old_pod.metadata.uid = successor_uid
+        old_pod.status.pod_ip = "10.42.0.101"
+        case.cluster.objects["pod"] = old_pod
     case.provisioner._snapshot_service = MagicMock(is_available=True)
     case.provisioner._snapshot_service.reconcile_terminal_snapshot_generation = (
         AsyncMock(return_value=(True, "complete"))
@@ -297,7 +384,8 @@ async def test_emptydir_rebase_clears_old_proof_and_rejects_old_ack(
             strict=True,
         )
         retire.assert_not_awaited()
-    assert case.cluster.objects["pod"].metadata.uid == successor_uid
+    if not terminal_successor:
+        assert case.cluster.objects["pod"].metadata.uid == successor_uid
     case.provisioner._snapshot_service.capture_vm_snapshot.assert_not_awaited()
 
 

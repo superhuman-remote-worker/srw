@@ -87,7 +87,8 @@ BEGIN
     -- terminal-runtime proof. An explicitly null retired_by never defaults.
     FOREACH proof IN ARRAY ARRAY[resident_ack, shell_ack] LOOP
         proof_kind := proof ->> 'kind';
-        IF proof_kind NOT IN ('protocol', 'workspace_runtime_terminal')
+        IF proof_kind IS NULL
+           OR proof_kind NOT IN ('protocol', 'workspace_runtime_terminal')
            OR proof -> 'terminal_token' IS DISTINCT FROM to_jsonb(token)
            OR proof ->> 'runtime_incarnation' IS DISTINCT FROM old_runtime
            OR (
@@ -111,10 +112,11 @@ BEGIN
     END LOOP;
     IF old_marker ->> 'workspace_generation' IS DISTINCT FROM
            old_marker ->> 'endpoint_generation'
-       OR old_marker ->> 'workspace_generation' !~
-           '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
-       OR old_marker ->> 'host_key_fingerprint' !~ '^SHA256:[^[:space:]]+$'
-       OR length(old_marker ->> 'host_key_fingerprint') > 128 THEN
+       OR (old_marker ->> 'workspace_generation' ~
+           '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$') IS NOT TRUE
+       OR (old_marker ->> 'host_key_fingerprint' ~
+           '^SHA256:[^[:space:]]+$') IS NOT TRUE
+       OR (length(old_marker ->> 'host_key_fingerprint') <= 128) IS NOT TRUE THEN
         RETURN FALSE;
     END IF;
 
