@@ -49,6 +49,7 @@ src/orchestrator/services/ide_session.py  IdeSessionService._current_ide_restore
 src/orchestrator/services/ide_session.py  IdeSessionService._extract_snapshot_to_k8s_pod  remote-effect  stream_extract_snapshot  82b5dd0c4392  #1  fresh-k8s-attestation
 src/orchestrator/services/ide_session.py  IdeSessionService._extract_snapshot_to_vm  remote-effect  stream_extract_snapshot  42aa99e3ecc5  #1  vm-authority
 src/orchestrator/services/ide_session.py  IdeSessionService._install_and_sync_managed_repository_over_ssh  ssh  pinned_agent_ssh_command  26dd436c5d80  #1  pinned-host-key
+src/orchestrator/services/ide_session.py  IdeSessionService._managed_git_command  ssh  render_ssh_identity_config  c24448621180  #1  local-only
 src/orchestrator/services/ide_session.py  IdeSessionService._repair_git_after_snapshot  ssh  self._install_and_sync_managed_repository_over_ssh  c7ec3aa04f8c  #1  pinned-host-key
 src/orchestrator/services/ide_session.py  IdeSessionService._restore_k8s_ide_container  ssh  self._install_and_sync_managed_repository_over_ssh  210eb27e270d  #1  pinned-host-key
 src/orchestrator/services/ide_session.py  IdeSessionService._restore_snapshot_container  remote-effect  self._extract_snapshot_to_k8s_pod  1dfbd0608e92  #1  fresh-k8s-attestation
