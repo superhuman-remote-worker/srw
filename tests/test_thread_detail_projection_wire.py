@@ -125,6 +125,38 @@ def test_detail_route_returns_the_redacted_owner_projection() -> None:
     assert body["session_runtime_generation"] == _raw_row()["runtime_generation"]
 
 
+def test_detail_route_projects_settled_permanent_cleanup_as_ending() -> None:
+    row = {
+        **_raw_row(),
+        "status": "ended",
+        "execution_lane": "stateless",
+        "runtime_retirement_token": None,
+        "runtime_retirement_authorized_at": None,
+        "runtime_retirement_context": None,
+        "metadata": json.dumps(
+            {
+                "_stateless_workspace_retirement_settled": {
+                    "terminal_token": 2,
+                    "cleanup_complete": True,
+                    "permanent": True,
+                    "snapshot_restore_required": False,
+                    "runtime_incarnation": "6a5b7eb8-ba34-4179-884d-7da1bee7bcc8",
+                    "backing_id": None,
+                }
+            }
+        ),
+    }
+
+    response = _client(_Store(), row).get(f"/api/persistent/threads/{THREAD_ID}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["runtime_retirement_pending"] is True
+    assert body["retirement_disposition"] == "ended"
+    assert body["retirement_permanent"] is True
+    assert "runtime_retirement_token" not in body
+    assert "runtime_retirement_context" not in body
+
+
 def test_detail_route_mints_a_missing_handle_and_projects_mounts() -> None:
     store = _Store()
     body = _client(store).get(f"/api/persistent/threads/{THREAD_ID}").json()

@@ -307,6 +307,114 @@ class TestRedactThreadMetadataShape:
         assert out["retirement_disposition"] is None
         assert out["retirement_permanent"] is False
 
+    @staticmethod
+    def _settled_permanent_metadata() -> dict:
+        return {
+            "_stateless_workspace_retirement_settled": {
+                "terminal_token": 2,
+                "cleanup_complete": True,
+                "permanent": True,
+                "snapshot_restore_required": False,
+                "workspace_absence_proven": False,
+                "runtime_incarnation": "6a5b7eb8-ba34-4179-884d-7da1bee7bcc8",
+                "backing_id": (
+                    "k8s-pvc:superhuman-remote-worker:"
+                    "9f06c714-07d3-439b-91b7-c599d9d49231"
+                ),
+            }
+        }
+
+    @pytest.mark.parametrize("jsonb_string", [False, True])
+    def test_settled_permanent_delete_is_public_ending_until_row_disappears(
+        self, jsonb_string
+    ):
+        import json
+
+        metadata = self._settled_permanent_metadata()
+        row = self._stateless(json.dumps(metadata) if jsonb_string else metadata)
+        original = copy.deepcopy(row)
+        out = redact_thread_metadata(row)
+
+        assert out["runtime_retirement_pending"] is True
+        assert out["retirement_disposition"] == "ended"
+        assert out["retirement_permanent"] is True
+        assert row == original
+        assert "runtime_incarnation" not in out
+        assert "backing_id" not in out
+
+    @pytest.mark.parametrize(
+        ("status", "lane", "permanent", "cleanup_complete"),
+        [
+            ("ended", "stateless", False, True),
+            ("active", "stateless", True, True),
+            ("ended", "pinned", True, True),
+            ("ended", "stateless", True, False),
+        ],
+    )
+    def test_settled_projection_requires_ended_stateless_valid_permanent_marker(
+        self, status, lane, permanent, cleanup_complete
+    ):
+        metadata = self._settled_permanent_metadata()
+        marker = metadata["_stateless_workspace_retirement_settled"]
+        marker["permanent"] = permanent
+        marker["cleanup_complete"] = cleanup_complete
+        row = {**self._stateless(metadata), "status": status, "execution_lane": lane}
+
+        out = redact_thread_metadata(row)
+
+        assert out["runtime_retirement_pending"] is False
+        assert out["retirement_permanent"] is False
+
+    @pytest.mark.parametrize(
+        "broken",
+        [
+            {"permanent": True},
+            {"terminal_token": 2, "permanent": None, "cleanup_complete": True},
+            {"terminal_token": 2, "permanent": "true", "cleanup_complete": True},
+        ],
+    )
+    def test_malformed_settled_marker_does_not_break_owner_projection(self, broken):
+        out = redact_thread_metadata(
+            self._stateless({"_stateless_workspace_retirement_settled": broken})
+        )
+        assert out["runtime_retirement_pending"] is False
+        assert out["retirement_disposition"] is None
+        assert out["retirement_permanent"] is False
+
+    def test_overlapping_settled_and_claim_authority_does_not_promote(self):
+        metadata = {
+            **self._settled_permanent_metadata(),
+            "_stateless_claim_retirement": {"permanent": True},
+        }
+        out = redact_thread_metadata(self._stateless(metadata))
+        assert out["runtime_retirement_pending"] is False
+        assert out["retirement_permanent"] is False
+
+    def test_authorized_pinned_retirement_keeps_precedence_over_settled_marker(self):
+        out = redact_thread_metadata(
+            {
+                **self._stateless(self._settled_permanent_metadata()),
+                "runtime_retirement_token": "pinned-token",
+                "runtime_retirement_authorized_at": "2026-10-07T22:00:00Z",
+                "runtime_retirement_permanent": False,
+                "runtime_retirement_context": {"settle_status": "suspended"},
+            }
+        )
+        assert out["runtime_retirement_pending"] is True
+        assert out["retirement_disposition"] == "suspended"
+        assert out["retirement_permanent"] is False
+
+    def test_active_stateless_retirement_keeps_precedence_over_settled_marker(self):
+        metadata = {
+            **self._settled_permanent_metadata(),
+            "_stateless_workspace_retirement_pending": True,
+            "_stateless_claim_retirement": {"permanent": False},
+        }
+        out = redact_thread_metadata(self._stateless(metadata))
+        assert out["runtime_retirement_pending"] is True
+        assert out["retirement_disposition"] == "ended"
+        assert out["retirement_permanent"] is False
+
     def test_stateless_marker_on_another_lane_is_not_public_ending(self):
         thread = self._stateless({"_stateless_workspace_retirement_pending": True})
         thread["execution_lane"] = "pinned"

@@ -20,6 +20,7 @@ from orchestrator.services.container_provisioner import (
     WORKSPACE_RUNTIME_INCARNATION_KEY,
 )
 from orchestrator.services.job_projection import redact_nested_workspace_state
+from shared.session_retirement import stateless_settled_retirement_authority
 from shared.session_pending_memory import SESSION_PENDING_MEMORY_KEY
 from shared.tool_catalog import TOOL_REGISTRY
 
@@ -38,6 +39,7 @@ def redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
     welcome frame" oddity). The contract is now: metadata always leaves as a
     parsed OBJECT (unparseable/absent → ``{}``).
     """
+    original_metadata = thread.get("metadata")
     raw_retirement_context = thread.get("runtime_retirement_context") or {}
     if isinstance(raw_retirement_context, str):
         try:
@@ -60,6 +62,17 @@ def redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
     retirement_permanent = bool(
         retirement_pending and thread.get("runtime_retirement_permanent") is True
     )
+    settled_permanent = False
+    if (
+        not retirement_pending
+        and thread.get("execution_lane") == "stateless"
+        and thread.get("status") == "ended"
+    ):
+        try:
+            settled = stateless_settled_retirement_authority(original_metadata)
+        except RuntimeError:
+            settled = None
+        settled_permanent = settled is not None and settled["permanent"] is True
 
     thread = redact_nested_workspace_state(
         thread,
@@ -114,6 +127,13 @@ def redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
         retirement_permanent = bool(
             isinstance(marker, Mapping) and marker.get("permanent") is True
         )
+    if not retirement_pending and settled_permanent:
+        # A soft End is complete, but a subsequent permanent Delete can have
+        # admitted exact disk cleanup and still own this row. Keep its card
+        # closed and polling until the durable End retry deletes the owner.
+        retirement_pending = True
+        retirement_disposition = "ended"
+        retirement_permanent = True
     # These are internal capabilities or immutable physical cleanup evidence,
     # not owner API fields.  Never let a broad SELECT * list/detail response
     # leak them.  Cockpit gets only the durable, non-secret lifecycle shape.

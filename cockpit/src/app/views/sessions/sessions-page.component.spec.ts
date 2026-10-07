@@ -9,7 +9,7 @@ import {
     signal,
     ɵresolveComponentResources,
 } from '@angular/core';
-import {TestBed} from '@angular/core/testing';
+import {ComponentFixture, TestBed} from '@angular/core/testing';
 import {TitleCasePipe} from '@angular/common';
 import {HttpClient, HttpErrorResponse} from '@angular/common/http';
 import {Router} from '@angular/router';
@@ -1143,6 +1143,61 @@ describe('SessionsPageComponent (rendered): a fenced permanent delete', () => {
         expect(card(host, 't-del').classList.contains('ending')).toBe(true);
         expect(deleteButton(host, 't-del').disabled).toBe(true);
         expect(deleteButton(host, 't-del').tooltip).toBe('sessions.tooltip.delete');
+    });
+
+    it('polls a settled permanent Delete after one 503 until the server removes the card', async () => {
+        vi.useFakeTimers();
+        let fixture: ComponentFixture<SessionsPageComponent> | undefined;
+        try {
+            const ended = makeThread({
+                id: 't-settled-permanent', status: 'ended', execution_lane: 'stateless',
+            });
+            // The owner projection keeps this ended row in the public ending
+            // state while its admitted permanent cleanup is still settling.
+            const projected = makeThread({
+                ...ended, runtime_retirement_pending: true,
+                retirement_disposition: 'ended', retirement_permanent: true,
+            });
+            serveThreadLists(mocks.mockHttp, [ended], [projected], []);
+            mocks.mockHttp.delete.mockReturnValueOnce(
+                throwError(() => new HttpErrorResponse({
+                    status: 503,
+                    error: {detail: 'Settled workspace permanent cleanup is incomplete'},
+                })),
+            );
+
+            fixture = TestBed.createComponent(SessionsPageComponent);
+            const component = fixture.componentInstance;
+            const host = fixture.nativeElement as HTMLElement;
+            fixture.detectChanges();
+            await vi.advanceTimersByTimeAsync(0);
+            fixture.detectChanges();
+
+            deleteButton(host, ended.id).dispatchEvent(new CustomEvent('clicked'));
+            expect(component.confirmDeleteOpen()).toBe(true);
+            await component.confirmDelete();
+            fixture.detectChanges();
+
+            expect(card(host, ended.id).classList.contains('ending')).toBe(true);
+            expect(resumeButton(host, ended.id).disabled).toBe(true);
+            expect(deleteButton(host, ended.id).disabled).toBe(false);
+            expect(deleteButton(host, ended.id).tooltip).toBe('sessions.tooltip.retryDelete');
+            expect(vi.getTimerCount()).toBe(1);
+            expect(mocks.mockHttp.delete).toHaveBeenCalledTimes(1);
+
+            await vi.advanceTimersByTimeAsync(ENDING_POLL_GAPS_MS[0]);
+            fixture.detectChanges();
+
+            expect(card(host, ended.id)).toBeNull();
+            expect(vi.getTimerCount()).toBe(0);
+            expect(mocks.mockHttp.delete).toHaveBeenCalledTimes(1);
+            expect(mocks.mockHttp.post.mock.calls.some(
+                (call: any[]) => String(call[0]).includes('/resume'),
+            )).toBe(false);
+        } finally {
+            fixture?.destroy();
+            vi.useRealTimers();
+        }
     });
 
     it('retries a fenced force delete as a force delete, and drops the retry once the card leaves ending', async () => {
