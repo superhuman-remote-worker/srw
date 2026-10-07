@@ -1,0 +1,792 @@
+{
+  "none_attached": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [],
+        "sql": [],
+        "mongodb": [],
+        "webdav": [],
+        "repo": [],
+        "email": [],
+        "mcp": []
+      }
+    },
+    "agent_session_categories": {
+      "graph": [],
+      "sql": [],
+      "mongodb": [],
+      "webdav": [],
+      "repo": [],
+      "email": [],
+      "mcp": []
+    }
+  },
+  "all_kinds_read_write": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [
+          "cypher_query",
+          "cypher_execute",
+          "get_database_schema"
+        ],
+        "sql": [
+          "sql_query",
+          "sql_schema",
+          "sql_execute"
+        ],
+        "mongodb": [
+          "mongo_query",
+          "mongo_aggregate",
+          "mongo_schema",
+          "mongo_insert",
+          "mongo_update"
+        ],
+        "webdav": [
+          "webdav_list",
+          "webdav_read",
+          "webdav_info",
+          "webdav_write",
+          "webdav_delete"
+        ],
+        "repo": [
+          "repo_checkout",
+          "repo_commit",
+          "repo_push",
+          "repo_pull",
+          "repo_open_pr",
+          "repo_pr_status"
+        ],
+        "email": [
+          "email_list_folders",
+          "email_list",
+          "email_search",
+          "email_read",
+          "email_move",
+          "email_flag",
+          "email_draft"
+        ],
+        "mcp": [
+          "*"
+        ]
+      }
+    },
+    "agent_session_categories": {
+      "graph": [
+        "cypher_query",
+        "cypher_execute",
+        "get_database_schema"
+      ],
+      "sql": [
+        "sql_query",
+        "sql_schema",
+        "sql_execute"
+      ],
+      "mongodb": [
+        "mongo_query",
+        "mongo_aggregate",
+        "mongo_schema",
+        "mongo_insert",
+        "mongo_update"
+      ],
+      "webdav": [
+        "webdav_list",
+        "webdav_read",
+        "webdav_info",
+        "webdav_write",
+        "webdav_delete"
+      ],
+      "repo": [
+        "repo_checkout",
+        "repo_commit",
+        "repo_push",
+        "repo_pull",
+        "repo_open_pr",
+        "repo_pr_status"
+      ],
+      "email": [
+        "email_list_folders",
+        "email_list",
+        "email_search",
+        "email_read",
+        "email_move",
+        "email_flag",
+        "email_draft"
+      ],
+      "mcp": [
+        "*"
+      ]
+    }
+  },
+  "all_kinds_read_only": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [
+          "cypher_query",
+          "get_database_schema"
+        ],
+        "sql": [
+          "sql_query",
+          "sql_schema"
+        ],
+        "mongodb": [
+          "mongo_query",
+          "mongo_aggregate",
+          "mongo_schema"
+        ],
+        "webdav": [
+          "webdav_list",
+          "webdav_read",
+          "webdav_info"
+        ],
+        "repo": [
+          "repo_pull",
+          "repo_pr_status"
+        ],
+        "email": [
+          "email_list_folders",
+          "email_list",
+          "email_search",
+          "email_read"
+        ],
+        "mcp": [
+          "*"
+        ]
+      }
+    },
+    "agent_session_categories": {
+      "graph": [
+        "cypher_query",
+        "get_database_schema"
+      ],
+      "sql": [
+        "sql_query",
+        "sql_schema"
+      ],
+      "mongodb": [
+        "mongo_query",
+        "mongo_aggregate",
+        "mongo_schema"
+      ],
+      "webdav": [
+        "webdav_list",
+        "webdav_read",
+        "webdav_info"
+      ],
+      "repo": [
+        "repo_pull",
+        "repo_pr_status"
+      ],
+      "email": [
+        "email_list_folders",
+        "email_list",
+        "email_search",
+        "email_read"
+      ],
+      "mcp": [
+        "*"
+      ]
+    }
+  },
+  "all_kinds_unlinked": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [
+          "cypher_query",
+          "cypher_execute",
+          "get_database_schema"
+        ],
+        "sql": [
+          "sql_query",
+          "sql_schema",
+          "sql_execute"
+        ],
+        "mongodb": [
+          "mongo_query",
+          "mongo_aggregate",
+          "mongo_schema",
+          "mongo_insert",
+          "mongo_update"
+        ],
+        "webdav": [
+          "webdav_list",
+          "webdav_read",
+          "webdav_info",
+          "webdav_write",
+          "webdav_delete"
+        ],
+        "repo": [
+          "repo_checkout",
+          "repo_commit",
+          "repo_push",
+          "repo_pull",
+          "repo_open_pr",
+          "repo_pr_status"
+        ],
+        "email": [
+          "email_list_folders",
+          "email_list",
+          "email_search",
+          "email_read",
+          "email_move",
+          "email_flag",
+          "email_draft"
+        ],
+        "mcp": [
+          "*"
+        ]
+      }
+    },
+    "agent_session_categories": {
+      "graph": [
+        "cypher_query",
+        "cypher_execute",
+        "get_database_schema"
+      ],
+      "sql": [
+        "sql_query",
+        "sql_schema",
+        "sql_execute"
+      ],
+      "mongodb": [
+        "mongo_query",
+        "mongo_aggregate",
+        "mongo_schema",
+        "mongo_insert",
+        "mongo_update"
+      ],
+      "webdav": [
+        "webdav_list",
+        "webdav_read",
+        "webdav_info",
+        "webdav_write",
+        "webdav_delete"
+      ],
+      "repo": [
+        "repo_checkout",
+        "repo_commit",
+        "repo_push",
+        "repo_pull",
+        "repo_open_pr",
+        "repo_pr_status"
+      ],
+      "email": [
+        "email_list_folders",
+        "email_list",
+        "email_search",
+        "email_read",
+        "email_move",
+        "email_flag",
+        "email_draft"
+      ],
+      "mcp": [
+        "*"
+      ]
+    }
+  },
+  "no_tool_categories_env_files_kb": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [],
+        "sql": [],
+        "mongodb": [],
+        "webdav": [],
+        "repo": [],
+        "email": [],
+        "mcp": []
+      }
+    },
+    "agent_session_categories": {
+      "graph": [],
+      "sql": [],
+      "mongodb": [],
+      "webdav": [],
+      "repo": [],
+      "email": [],
+      "mcp": []
+    }
+  },
+  "postgresql_read_only_and_read_write": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [],
+        "sql": [
+          "sql_query",
+          "sql_schema",
+          "sql_execute"
+        ],
+        "mongodb": [],
+        "webdav": [],
+        "repo": [],
+        "email": [],
+        "mcp": []
+      }
+    },
+    "agent_session_categories": {
+      "graph": [],
+      "sql": [
+        "sql_query",
+        "sql_schema",
+        "sql_execute"
+      ],
+      "mongodb": [],
+      "webdav": [],
+      "repo": [],
+      "email": [],
+      "mcp": []
+    }
+  },
+  "repositories_all_read_only": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [],
+        "sql": [],
+        "mongodb": [],
+        "webdav": [],
+        "repo": [
+          "repo_pull",
+          "repo_pr_status"
+        ],
+        "email": [],
+        "mcp": []
+      }
+    },
+    "agent_session_categories": {
+      "graph": [],
+      "sql": [],
+      "mongodb": [],
+      "webdav": [],
+      "repo": [
+        "repo_pull",
+        "repo_pr_status"
+      ],
+      "email": [],
+      "mcp": []
+    }
+  },
+  "repositories_one_read_write": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [],
+        "sql": [],
+        "mongodb": [],
+        "webdav": [],
+        "repo": [
+          "repo_checkout",
+          "repo_commit",
+          "repo_push",
+          "repo_pull",
+          "repo_open_pr",
+          "repo_pr_status"
+        ],
+        "email": [],
+        "mcp": []
+      }
+    },
+    "agent_session_categories": {
+      "graph": [],
+      "sql": [],
+      "mongodb": [],
+      "webdav": [],
+      "repo": [
+        "repo_checkout",
+        "repo_commit",
+        "repo_push",
+        "repo_pull",
+        "repo_open_pr",
+        "repo_pr_status"
+      ],
+      "email": [],
+      "mcp": []
+    }
+  },
+  "email_read_only_link_floors_send": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [],
+        "sql": [],
+        "mongodb": [],
+        "webdav": [],
+        "repo": [],
+        "email": [
+          "email_list_folders",
+          "email_list",
+          "email_search",
+          "email_read"
+        ],
+        "mcp": []
+      }
+    },
+    "agent_session_categories": {
+      "graph": [],
+      "sql": [],
+      "mongodb": [],
+      "webdav": [],
+      "repo": [],
+      "email": [
+        "email_list_folders",
+        "email_list",
+        "email_search",
+        "email_read"
+      ],
+      "mcp": []
+    }
+  },
+  "email_unknown_access_fails_closed": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [],
+        "sql": [],
+        "mongodb": [],
+        "webdav": [],
+        "repo": [],
+        "email": [
+          "email_list_folders",
+          "email_list",
+          "email_search",
+          "email_read"
+        ],
+        "mcp": []
+      }
+    },
+    "agent_session_categories": {
+      "graph": [],
+      "sql": [],
+      "mongodb": [],
+      "webdav": [],
+      "repo": [],
+      "email": [
+        "email_list_folders",
+        "email_list",
+        "email_search",
+        "email_read"
+      ],
+      "mcp": []
+    }
+  },
+  "email_two_mailboxes_max_tier": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [],
+        "sql": [],
+        "mongodb": [],
+        "webdav": [],
+        "repo": [],
+        "email": [
+          "email_list_folders",
+          "email_list",
+          "email_search",
+          "email_read",
+          "email_move",
+          "email_flag",
+          "email_draft",
+          "email_send"
+        ],
+        "mcp": []
+      }
+    },
+    "agent_session_categories": {
+      "graph": [],
+      "sql": [],
+      "mongodb": [],
+      "webdav": [],
+      "repo": [],
+      "email": [
+        "email_list_folders",
+        "email_list",
+        "email_search",
+        "email_read"
+      ],
+      "mcp": []
+    },
+    "pinned_defect": "the orchestrator override takes the max tier over every email row while the payload forwards only the first mailbox"
+  },
+  "mcp_datasources_gate_off": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [],
+        "sql": [
+          "sql_query",
+          "sql_schema",
+          "sql_execute"
+        ],
+        "mongodb": [],
+        "webdav": [],
+        "repo": [],
+        "email": [],
+        "mcp": []
+      }
+    },
+    "agent_session_categories": {
+      "graph": [],
+      "sql": [
+        "sql_query",
+        "sql_schema",
+        "sql_execute"
+      ],
+      "mongodb": [],
+      "webdav": [],
+      "repo": [],
+      "email": [],
+      "mcp": []
+    }
+  },
+  "mcp_stdio_gate_off_with_remote": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [],
+        "sql": [],
+        "mongodb": [],
+        "webdav": [],
+        "repo": [],
+        "email": [],
+        "mcp": [
+          "*"
+        ]
+      }
+    },
+    "agent_session_categories": {
+      "graph": [],
+      "sql": [],
+      "mongodb": [],
+      "webdav": [],
+      "repo": [],
+      "email": [],
+      "mcp": [
+        "*"
+      ]
+    }
+  },
+  "mcp_stdio_gate_off_alone": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [],
+        "sql": [],
+        "mongodb": [],
+        "webdav": [],
+        "repo": [],
+        "email": [],
+        "mcp": []
+      }
+    },
+    "agent_session_categories": {
+      "graph": [],
+      "sql": [],
+      "mongodb": [],
+      "webdav": [],
+      "repo": [],
+      "email": [],
+      "mcp": []
+    }
+  },
+  "mcp_read_only_link_still_wildcard": {
+    "orchestrator_override": {
+      "tools": {
+        "graph": [],
+        "sql": [],
+        "mongodb": [],
+        "webdav": [],
+        "repo": [],
+        "email": [],
+        "mcp": [
+          "*"
+        ]
+      }
+    },
+    "agent_session_categories": {
+      "graph": [],
+      "sql": [],
+      "mongodb": [],
+      "webdav": [],
+      "repo": [],
+      "email": [],
+      "mcp": [
+        "*"
+      ]
+    }
+  },
+  "existing_override_is_merged": {
+    "orchestrator_override": {
+      "llm": {
+        "model": "golden-model"
+      },
+      "tools": {
+        "sql": [],
+        "web": [
+          "web_search"
+        ],
+        "graph": [
+          "cypher_query",
+          "cypher_execute",
+          "get_database_schema"
+        ],
+        "mongodb": [],
+        "webdav": [
+          "webdav_list",
+          "webdav_read",
+          "webdav_info"
+        ],
+        "repo": [],
+        "email": [],
+        "mcp": []
+      }
+    },
+    "agent_session_categories": {
+      "graph": [
+        "cypher_query",
+        "cypher_execute",
+        "get_database_schema"
+      ],
+      "sql": [],
+      "mongodb": [],
+      "webdav": [
+        "webdav_list",
+        "webdav_read",
+        "webdav_info"
+      ],
+      "repo": [],
+      "email": [],
+      "mcp": []
+    }
+  },
+  "inventory": {
+    "catalog": [
+      {
+        "type_id": "generic",
+        "title": "Generic",
+        "guide_topic": "datasources",
+        "runtime_kind": "generic_env"
+      },
+      {
+        "type_id": "credentials",
+        "title": "Credentials",
+        "guide_topic": "datasources",
+        "runtime_kind": "generic_env"
+      },
+      {
+        "type_id": "repository",
+        "title": "Repository",
+        "guide_topic": "datasources",
+        "runtime_kind": "repository"
+      },
+      {
+        "type_id": "kb",
+        "title": "OKF Knowledge Base",
+        "guide_topic": "datasources-okf",
+        "runtime_kind": "knowledge"
+      },
+      {
+        "type_id": "postgresql",
+        "title": "PostgreSQL",
+        "guide_topic": "datasources",
+        "runtime_kind": "managed_tools"
+      },
+      {
+        "type_id": "neo4j",
+        "title": "Neo4j",
+        "guide_topic": "datasources",
+        "runtime_kind": "managed_tools"
+      },
+      {
+        "type_id": "mongodb",
+        "title": "MongoDB",
+        "guide_topic": "datasources",
+        "runtime_kind": "managed_tools"
+      },
+      {
+        "type_id": "webdav",
+        "title": "WebDAV",
+        "guide_topic": "datasources",
+        "runtime_kind": "managed_tools"
+      },
+      {
+        "type_id": "email",
+        "title": "Email",
+        "guide_topic": "datasources-email",
+        "runtime_kind": "email_tools"
+      },
+      {
+        "type_id": "mcp",
+        "title": "MCP Server",
+        "guide_topic": "datasources",
+        "runtime_kind": "mcp_tools"
+      },
+      {
+        "type_id": "kubeconfig",
+        "title": "Kubeconfig",
+        "guide_topic": "datasources",
+        "runtime_kind": "credential_file"
+      },
+      {
+        "type_id": "ssh_key",
+        "title": "SSH Key",
+        "guide_topic": "datasources",
+        "runtime_kind": "credential_file"
+      },
+      {
+        "type_id": "generic_file",
+        "title": "Generic file",
+        "guide_topic": "datasources",
+        "runtime_kind": "credential_file"
+      }
+    ],
+    "tool_map": {
+      "neo4j": {
+        "category": "graph",
+        "shape": "read_write"
+      },
+      "postgresql": {
+        "category": "sql",
+        "shape": "read_write"
+      },
+      "mongodb": {
+        "category": "mongodb",
+        "shape": "read_write"
+      },
+      "webdav": {
+        "category": "webdav",
+        "shape": "read_write"
+      },
+      "repository": {
+        "category": "repo",
+        "shape": "read_write"
+      },
+      "email": {
+        "category": "email",
+        "shape": "tiers"
+      },
+      "mcp": {
+        "category": "mcp",
+        "shape": "dynamic"
+      }
+    },
+    "env_connector_types": [
+      "credentials",
+      "generic"
+    ],
+    "credential_file_types_orchestrator": [
+      "generic_file",
+      "kubeconfig",
+      "ssh_key"
+    ],
+    "credential_file_types_agent": [
+      "generic_file",
+      "kubeconfig",
+      "ssh_key"
+    ],
+    "mcp_server_datasource_type": [
+      "generic",
+      "repository",
+      "kb",
+      "postgresql",
+      "neo4j",
+      "mongodb",
+      "webdav",
+      "email",
+      "mcp",
+      "kubeconfig",
+      "ssh_key",
+      "generic_file"
+    ],
+    "pinned_defect": "D1 fixes (L1 §6 #6): the MCP server's DatasourceType lacks 'credentials', so MCP clients cannot create credential connectors"
+  }
+}
