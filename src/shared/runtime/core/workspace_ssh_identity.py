@@ -30,6 +30,7 @@ from uuid import UUID
 
 from shared.runtime.core.managed_repository import (
     _SSH_AGENT_RETIRE_PROGRAM,
+    RESERVED_SSH_HOST_PREFIX,
     ManagedRepositoryMaterializationError,
     _backend_managed_home,
     _backend_runtime_authority,
@@ -88,6 +89,14 @@ def normalize_ssh_host(value: Any) -> str:
     labels = text.split(".")
     if not all(_HOST_LABEL.fullmatch(label) for label in labels):
         raise SshEndpointError("SSH host must be a DNS name or an IP address")
+    if text.lower().startswith(RESERVED_SSH_HOST_PREFIX):
+        # A declared host becomes a ``Host`` line in a shared config. Named
+        # like an identity alias, and read first, it would take over that
+        # alias's agent and host-key settings in every workspace.
+        raise SshEndpointError(
+            f"SSH host must not start with {RESERVED_SSH_HOST_PREFIX!r}, "
+            "which names workspace identities"
+        )
     return text.lower()
 
 

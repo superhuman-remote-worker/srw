@@ -468,3 +468,69 @@ def test_session_attach_prunes_undelivered_identities_but_never_managed_ones(
 
 def test_prune_on_a_fresh_home_is_a_no_op(home: Path) -> None:
     assert prune_workspace_ssh_identities([], _LocalShellBackend(home))
+
+
+def test_a_declared_host_can_never_shadow_an_identity_alias(home: Path) -> None:
+    """Review blocker: an ssh_key host spelled like an alias took it over.
+
+    config.d is read in slug order and the first matching ``Host`` block
+    wins, so an attacker connector whose slug sorts first, declaring the
+    victim's alias as its host, would replace the victim's IdentityAgent,
+    HostKeyAlias, UserKnownHostsFile and StrictHostKeyChecking.
+    """
+
+    from shared.runtime.core.managed_repository import render_ssh_identity_config
+
+    victim_key = _deploy_keypair()
+    victim = _payload(host="gitea.example.com", port=2222, key=victim_key)
+    victim_socket = workspace_ssh_identity_socket(str(home), victim["authority_id"])
+    attacker_id = "00000000-0000-4000-8000-000000000000"
+    attacker_socket = workspace_ssh_identity_socket(str(home), attacker_id)
+    root = home / ".ssh" / "srw-managed"
+
+    # The precondition is real: a block for the alias in a file read first
+    # would shadow the victim (what the renderer used to emit).
+    backend = _LocalShellBackend(home)
+    assert materialize_workspace_ssh_identities([victim], backend) == {
+        victim["authority_id"]: IDENTITY_READY
+    }
+    attacker_file = root / "config.d" / f"{attacker_id.replace('-', '')}.conf"
+    attacker_file.write_text(
+        f"Host {victim['alias']}\n  IdentityAgent {attacker_socket}\n"
+        "  StrictHostKeyChecking no\n"
+    )
+    assert _ssh_options(home, victim["alias"])["identityagent"] == attacker_socket
+    attacker_file.unlink()
+
+    # Every layer now refuses the alias shape as a declared host.
+    for spelling in (victim["alias"], victim["alias"].upper()):
+        with pytest.raises(Exception):
+            render_ssh_identity_config(
+                alias=f"srw-repo-{attacker_id.replace('-', '')}",
+                socket_path=attacker_socket,
+                known_hosts_path=str(root / "known_hosts.d" / "x"),
+                host=None,
+                extra_hosts=[spelling],
+            )
+    attacker = _payload(
+        kind="ssh_key",
+        host=victim["alias"],
+        port=None,
+        user=None,
+        extra_hosts=[victim["alias"]],
+        authority_id=attacker_id,
+    )
+    again = _payload(
+        host="gitea.example.com",
+        port=2222,
+        key=victim_key,
+        authority_id=victim["authority_id"],
+    )
+    status = materialize_workspace_ssh_identities([attacker, again], backend)
+    assert status[attacker_id] == "workspace_ssh_identity_invalid"
+    assert status[victim["authority_id"]] == IDENTITY_READY
+    assert not attacker_file.exists()
+    options = _ssh_options(home, victim["alias"])
+    assert options["identityagent"] == victim_socket
+    assert options["hostkeyalias"] == victim["alias"]
+    assert options["hostname"] == "gitea.example.com"

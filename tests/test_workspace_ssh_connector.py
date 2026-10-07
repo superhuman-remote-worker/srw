@@ -161,11 +161,37 @@ class TestEndpointGrammar:
 
     @pytest.mark.parametrize(
         "host",
-        ["", "a b", "host\nProxyCommand id", "-host", "host_name", "*", "fe80::1%eth0"],
+        [
+            "",
+            "a b",
+            "host\nProxyCommand id",
+            "-host",
+            "host_name",
+            "*",
+            "fe80::1%eth0",
+            # An identity alias: a Host line for it would take the alias over.
+            "srw-repo-" + "0" * 32,
+            "SRW-Repo-" + "a" * 32,
+            "srw-repo-x.example.com",
+        ],
     )
     def test_hosts_refused(self, host):
         with pytest.raises(SshEndpointError):
             normalize_ssh_host(host)
+
+    def test_alias_shaped_hosts_are_refused_on_create_and_in_urls(self):
+        alias = "srw-repo-" + "b" * 32
+        with pytest.raises(WorkspaceSshConnectorError, match="srw-repo-"):
+            validate_workspace_ssh_connector(
+                "ssh_key",
+                connection_url=None,
+                config={"host": alias.upper()},
+                credentials={
+                    "files": [{"contents": generate_ed25519_keypair().private_key}]
+                },
+            )
+        with pytest.raises(SshEndpointError):
+            parse_ssh_repository_url(f"git@{alias}:o/r.git")
 
     @pytest.mark.parametrize("user", ["git", "APKAEIBAERJR2EXAMPLE", "_svc", "a.b-c"])
     def test_users_accepted(self, user):

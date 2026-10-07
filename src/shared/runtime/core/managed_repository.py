@@ -25,6 +25,10 @@ _AUTHORITY_SLUG = re.compile(r"^[a-f0-9]{32}$")
 # A value written onto an SSH config line: no whitespace (a newline would
 # start a new directive), no ``%`` (token expansion) and no ``#``.
 _SSH_CONFIG_VALUE = re.compile(r"^[^\s%#\"'\\]{1,4096}$")
+#: Every identity alias (``srw-repo-<32hex>``) starts with this. No other
+#: ``Host`` line may: config.d is read in slug order and the first matching
+#: block wins, so a declared host spelled like an alias would take it over.
+RESERVED_SSH_HOST_PREFIX = "srw-repo-"
 
 #: Lifetime of a key in a dedicated workspace ``ssh-agent`` (``ssh-add -t``).
 #: Every materialization re-adds a proven resident's key, which restarts the
@@ -670,6 +674,10 @@ def render_ssh_identity_config(
         lines.append(f"  HostName {_ssh_config_value(host)}")
     lines.extend(settings)
     for pattern in extra_hosts:
+        if str(pattern).lower().startswith(RESERVED_SSH_HOST_PREFIX):
+            raise ManagedRepositoryMaterializationError(
+                "managed_repository_credential_invalid"
+            )
         lines.extend([f"Host {_ssh_config_value(pattern)}", agent_line, *settings])
     return "\n".join(lines) + "\n"
 
@@ -1221,6 +1229,7 @@ def materialize_managed_repository_credentials(
 
 __all__ = [
     "ManagedRepositoryMaterializationError",
+    "RESERVED_SSH_HOST_PREFIX",
     "SSH_AGENT_KEY_LIFETIME_SECONDS",
     "managed_repository_agent_launch_command",
     "managed_repository_agent_retirement_command",

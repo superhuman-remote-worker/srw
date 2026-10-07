@@ -208,6 +208,14 @@ class TestWorkspaceSshIdentities:
         assert WORKSPACE_SSH_KNOWN_HOSTS_ENV in caplog.text
         assert "PRIVATE KEY" not in caplog.text
 
+    def test_a_stored_alias_shaped_host_is_never_dispatched(self):
+        """A row stored before the refusal must not reach any workspace."""
+        alias = "srw-repo-" + "c" * 32
+        row = _ssh_key(config={"host": alias})
+        assert build_workspace_ssh_identities([row]) is None
+        (entry,) = build_datasources_payload([row], dependencies=_deps())
+        assert "unavailable" in entry["ssh_identity"]
+
     def test_host_less_ssh_key_has_no_host_settings(self):
         (identity,) = build_workspace_ssh_identities([_ssh_key(config={})])
         assert identity["ssh_host"] is None
