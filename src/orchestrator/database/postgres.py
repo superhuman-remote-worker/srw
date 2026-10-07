@@ -44501,6 +44501,10 @@ class PostgresDB:
                 next_marker.pop("remote_retired_by", None)
                 next_metadata = dict(metadata)
                 next_metadata["_stateless_claim_retirement"] = next_marker
+                if str(raw_binding.get("backing_id") or "").startswith("k8s-pod:"):
+                    successor_workspace = dict(workspace)
+                    successor_workspace["_snapshot_restore_required"] = False
+                    next_metadata["workspace_container"] = successor_workspace
                 next_metadata.pop("_stateless_resident_retirement_ack", None)
                 next_metadata.pop("_stateless_shell_retirement_ack", None)
                 if replacement_has_receipt:
@@ -46505,56 +46509,116 @@ class PostgresDB:
         return row is not None
 
     async def mark_stateless_thread_snapshot_restore_required(
-        self, thread_id: str, *, terminal_token: int
+        self,
+        thread_id: str,
+        *,
+        terminal_token: int,
+        expected_runtime_incarnation: str,
+        expected_host_key_fingerprint: str,
+        expected_workspace_generation: str,
+        expected_backing_id: str,
     ) -> bool:
         """Arm S3 restore only after strict emptyDir capture succeeded."""
-        async with self.acquire() as conn:
-            row = await conn.fetchval(
-                """
-                UPDATE threads
-                SET metadata = jsonb_set(
-                    COALESCE(metadata, '{}'::jsonb),
-                    '{workspace_container,_snapshot_restore_required}',
-                    'true'::jsonb,
-                    true
-                )
-                WHERE id = $1::uuid
-                  AND execution_lane = 'stateless'
-                  AND status = 'ended'
-                  AND metadata #> '{_stateless_workspace_retirement_pending}'
-                      = 'true'::jsonb
-                  AND metadata #>
-                       '{_stateless_claim_retirement,terminal_token}'
-                      = to_jsonb($2::bigint)
-                  AND metadata #>
-                       '{_stateless_claim_retirement,claimant_quiesced}'
-                      = 'true'::jsonb
-                  AND NOT (COALESCE(metadata, '{}'::jsonb)
-                           ? '_stateless_claim_losses')
-                  AND metadata #>
-                       '{_stateless_claim_retirement,resident_cleanup_required}'
-                      = 'true'::jsonb
-                  AND metadata #>
-                       '{_stateless_claim_retirement,residents_retired}'
-                      = 'true'::jsonb
-                  AND metadata #>
-                       '{_stateless_claim_retirement,shell_retirement_required}'
-                      = 'true'::jsonb
-                  AND metadata #>
-                       '{_stateless_claim_retirement,remote_retired}'
-                      = 'true'::jsonb
-                  AND metadata #>
-                       '{_stateless_resident_retirement_ack,terminal_token}'
-                      = to_jsonb($2::bigint)
-                  AND metadata #>
-                       '{_stateless_shell_retirement_ack,terminal_token}'
-                      = to_jsonb($2::bigint)
-                RETURNING id
-                """,
-                thread_id,
-                int(terminal_token),
+        from shared.session_retirement import stateless_retirement_release_authorized
+
+        if type(terminal_token) is not int or terminal_token <= 0:
+            return False
+        try:
+            thread_uuid = _canonical_uuid_text(thread_id, label="snapshot thread")
+            runtime = _canonical_uuid_text(
+                expected_runtime_incarnation, label="snapshot runtime"
             )
-        return row is not None
+            generation = _canonical_uuid_text(
+                expected_workspace_generation, label="snapshot workspace generation"
+            )
+        except RuntimeError:
+            return False
+        if (
+            not isinstance(expected_host_key_fingerprint, str)
+            or not expected_host_key_fingerprint.startswith("SHA256:")
+            or len(expected_host_key_fingerprint) > 128
+            or any(char.isspace() for char in expected_host_key_fingerprint)
+            or not isinstance(expected_backing_id, str)
+        ):
+            return False
+        backing_parts = expected_backing_id.split(":")
+        if (
+            len(backing_parts) != 3
+            or backing_parts[0] != "k8s-pod"
+            or not backing_parts[1]
+            or backing_parts[2] != runtime
+        ):
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT status::text AS status, execution_lane, metadata "
+                    "FROM threads WHERE id=$1::uuid FOR UPDATE",
+                    thread_uuid,
+                )
+                if (
+                    row is None
+                    or row["status"] != "ended"
+                    or row["execution_lane"] != "stateless"
+                ):
+                    return False
+                try:
+                    metadata = _strict_json_object(
+                        row["metadata"], label="snapshot thread metadata"
+                    )
+                    marker = stateless_retirement_release_authorized(metadata)
+                except RuntimeError:
+                    return False
+                workspace = metadata.get("workspace_container")
+                binding = metadata.get("_workspace_binding")
+                if (
+                    marker["terminal_token"] != terminal_token
+                    or marker["permanent"] is not False
+                    or marker["resident_cleanup_required"] is not True
+                    or marker["shell_retirement_required"] is not True
+                    or marker["runtime_incarnation"] != runtime
+                    or marker["host_key_fingerprint"]
+                    != expected_host_key_fingerprint
+                    or marker["workspace_generation"] != generation
+                    or marker["endpoint_generation"] != generation
+                    or not isinstance(workspace, dict)
+                    or workspace.get("_runtime_incarnation") != runtime
+                    or workspace.get("_canvas_workspace_generation") != generation
+                    or not isinstance(binding, dict)
+                    or binding.get("backing_id") != expected_backing_id
+                    or binding.get("generation") != generation
+                    or binding.get("ssh_host_key_fingerprint")
+                    != expected_host_key_fingerprint
+                    or any(
+                        metadata.get(ack_key, {}).get("runtime_incarnation")
+                        != runtime
+                        for ack_key in (
+                            "_stateless_resident_retirement_ack",
+                            "_stateless_shell_retirement_ack",
+                        )
+                    )
+                ):
+                    return False
+                queue = await conn.fetchrow(
+                    "SELECT state, lease_token, leased_by, unit_kind "
+                    "FROM run_queue WHERE unit_id=$1::uuid FOR UPDATE",
+                    thread_uuid,
+                )
+                if (
+                    queue is None
+                    or queue["state"] != "done"
+                    or queue["lease_token"] != terminal_token
+                    or queue["leased_by"] is not None
+                    or queue["unit_kind"] != "session_turn"
+                ):
+                    return False
+                updated = await conn.execute(
+                    "UPDATE threads SET metadata=jsonb_set(metadata, "
+                    "'{workspace_container,_snapshot_restore_required}', "
+                    "'true'::jsonb, true) WHERE id=$1::uuid",
+                    thread_uuid,
+                )
+                return updated == "UPDATE 1"
 
     async def finish_stateless_thread_workspace_retirement(
         self,

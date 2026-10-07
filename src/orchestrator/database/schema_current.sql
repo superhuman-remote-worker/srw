@@ -14813,6 +14813,7 @@ DECLARE
     adoption_reversal_authorized BOOLEAN;
     terminal_cancel_projection_authorized BOOLEAN;
     safe_retirement_projection BOOLEAN;
+    terminal_snapshot_projection_authorized BOOLEAN;
     managed_k8s_envelope BOOLEAN;
     uidless_k8s_candidate BOOLEAN;
     initial_uidless_precreate BOOLEAN;
@@ -15002,6 +15003,19 @@ BEGIN
             AND new_runtime = old_runtime
             AND new_status = 'retiring_process_zero'
             AND (old_envelope - 'status') = (new_envelope - 'status');
+        terminal_snapshot_projection_authorized := FALSE;
+        IF source_kind = 'thread' AND scope_name = 'workspace_container'
+           AND TG_OP = 'UPDATE'
+           AND to_jsonb(OLD) ->> 'status' = 'ended'
+           AND to_jsonb(NEW) ->> 'status' = 'ended'
+           AND to_jsonb(OLD) ->> 'execution_lane' = 'stateless'
+           AND to_jsonb(NEW) ->> 'execution_lane' = 'stateless'
+           AND old_envelope IS DISTINCT FROM new_envelope THEN
+            terminal_snapshot_projection_authorized :=
+                public.stateless_terminal_snapshot_flag_projection_authorized(
+                    source_id, old_state, new_state
+                );
+        END IF;
         initial_uidless_precreate := new_runtime IS NULL
             AND new_status IN ('pending', 'creating', 'restoring')
             AND (
@@ -15191,6 +15205,7 @@ BEGIN
            AND NOT cancel_claim_projection_authorized
            AND NOT terminal_cancel_projection_authorized
            AND NOT safe_retirement_projection
+           AND NOT terminal_snapshot_projection_authorized
            AND NOT adoption_reversal_authorized
            AND NOT initial_uidless_precreate
            AND NOT uidless_precreate_progress THEN
@@ -19103,6 +19118,235 @@ BEGIN
         WHERE owner_kind='thread' AND owner_id=requested_owner
           AND scope='workspace_container' AND provisioner='k8s'
           AND runtime_incarnation=requested_runtime);
+END;
+$_$;
+
+
+--
+-- Name: stateless_terminal_snapshot_flag_projection_authorized(uuid, jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.stateless_terminal_snapshot_flag_projection_authorized(requested_owner uuid, old_state jsonb, new_state jsonb) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $_$
+DECLARE
+    queue_row RECORD;
+    old_marker JSONB;
+    new_marker JSONB;
+    old_workspace JSONB;
+    new_workspace JSONB;
+    binding JSONB;
+    resident_ack JSONB;
+    shell_ack JSONB;
+    old_runtime TEXT;
+    new_runtime TEXT;
+    token BIGINT;
+    replacement_has_receipt BOOLEAN;
+    expected_marker JSONB;
+    expected_state JSONB;
+    replacement_ack JSONB;
+    proof JSONB;
+    proof_kind TEXT;
+BEGIN
+    IF jsonb_typeof(old_state) IS DISTINCT FROM 'object'
+       OR jsonb_typeof(new_state) IS DISTINCT FROM 'object'
+       OR old_state -> '_stateless_workspace_retirement_pending'
+            IS DISTINCT FROM 'true'::JSONB
+       OR old_state ?| ARRAY[
+           '_stateless_workspace_retirement_settled',
+           '_stateless_claim_losses', '_stateless_claim_loss_hold',
+           '_stateless_active_claim'
+       ]
+       OR jsonb_typeof(old_state -> '_stateless_claim_retirement')
+            IS DISTINCT FROM 'object'
+       OR jsonb_typeof(old_state -> 'workspace_container')
+            IS DISTINCT FROM 'object'
+       OR jsonb_typeof(old_state -> '_workspace_binding')
+            IS DISTINCT FROM 'object' THEN
+        RETURN FALSE;
+    END IF;
+    old_marker := old_state -> '_stateless_claim_retirement';
+    old_workspace := old_state -> 'workspace_container';
+    new_workspace := new_state -> 'workspace_container';
+    binding := old_state -> '_workspace_binding';
+    resident_ack := old_state -> '_stateless_resident_retirement_ack';
+    shell_ack := old_state -> '_stateless_shell_retirement_ack';
+    old_runtime := old_marker ->> 'runtime_incarnation';
+    IF (
+        old_marker -> 'terminal_token' IS NOT NULL
+        AND jsonb_typeof(old_marker -> 'terminal_token') = 'number'
+        AND old_marker ->> 'terminal_token' ~ '^[1-9][0-9]*$'
+        AND old_marker -> 'permanent' = 'false'::JSONB
+        AND old_marker -> 'claimant_quiesced' = 'true'::JSONB
+        AND old_marker -> 'resident_cleanup_required' = 'true'::JSONB
+        AND old_marker -> 'shell_retirement_required' = 'true'::JSONB
+        AND old_marker -> 'residents_retired' = 'true'::JSONB
+        AND old_marker -> 'remote_retired' = 'true'::JSONB
+        AND old_marker -> 'workspace_absence_proven' = 'false'::JSONB
+        AND old_runtime ~ '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+        AND jsonb_typeof(resident_ack) = 'object'
+        AND jsonb_typeof(shell_ack) = 'object'
+    ) IS NOT TRUE THEN
+        RETURN FALSE;
+    END IF;
+    token := (old_marker ->> 'terminal_token')::BIGINT;
+    SELECT * INTO queue_row FROM public.run_queue
+     WHERE unit_id=requested_owner FOR UPDATE;
+    IF NOT FOUND OR queue_row.unit_kind <> 'session_turn'
+       OR queue_row.state <> 'done' OR queue_row.leased_by IS NOT NULL
+       OR queue_row.lease_token <> token THEN
+        RETURN FALSE;
+    END IF;
+    -- Match the authoritative parser's exact ACK tuple for both protocol and
+    -- terminal-runtime proof. An explicitly null retired_by never defaults.
+    FOREACH proof IN ARRAY ARRAY[resident_ack, shell_ack] LOOP
+        proof_kind := proof ->> 'kind';
+        IF proof_kind NOT IN ('protocol', 'workspace_runtime_terminal')
+           OR proof -> 'terminal_token' IS DISTINCT FROM to_jsonb(token)
+           OR proof ->> 'runtime_incarnation' IS DISTINCT FROM old_runtime
+           OR (
+               proof = resident_ack AND old_marker ? 'residents_retired_by'
+               AND old_marker ->> 'residents_retired_by' IS DISTINCT FROM proof_kind
+           ) OR (
+               proof = shell_ack AND old_marker ? 'remote_retired_by'
+               AND old_marker ->> 'remote_retired_by' IS DISTINCT FROM proof_kind
+           ) OR (
+               proof_kind = 'protocol' AND (
+                   proof ->> 'workspace_generation' IS DISTINCT FROM
+                       old_marker ->> 'workspace_generation'
+                   OR proof ->> 'endpoint_generation' IS DISTINCT FROM
+                       old_marker ->> 'endpoint_generation'
+                   OR proof ->> 'host_key_fingerprint' IS DISTINCT FROM
+                       old_marker ->> 'host_key_fingerprint'
+               )
+           ) THEN
+            RETURN FALSE;
+        END IF;
+    END LOOP;
+    IF old_marker ->> 'workspace_generation' IS DISTINCT FROM
+           old_marker ->> 'endpoint_generation'
+       OR old_marker ->> 'workspace_generation' !~
+           '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+       OR old_marker ->> 'host_key_fingerprint' !~ '^SHA256:[^[:space:]]+$'
+       OR length(old_marker ->> 'host_key_fingerprint') > 128 THEN
+        RETURN FALSE;
+    END IF;
+
+    -- A capture ACK changes precisely one flag on the same live runtime.
+    IF COALESCE(old_workspace -> '_snapshot_restore_required', 'false'::JSONB)
+            = 'false'::JSONB
+       AND new_state = jsonb_set(
+           old_state, '{workspace_container,_snapshot_restore_required}',
+           'true'::JSONB, TRUE
+       ) THEN
+        RETURN (
+            old_workspace ->> 'provisioner' = 'k8s'
+            AND old_workspace ->> 'status' IN ('ready', 'retiring_process_zero')
+            AND old_workspace ->> '_runtime_incarnation' = old_runtime
+            AND old_workspace ->> '_canvas_workspace_generation' =
+                old_marker ->> 'endpoint_generation'
+            AND binding ->> 'kind' = 'remote'
+            AND binding ->> 'generation' =
+                old_marker ->> 'workspace_generation'
+            AND binding ->> 'ssh_host_key_fingerprint' =
+                old_marker ->> 'host_key_fingerprint'
+            AND binding ->> 'backing_id' =
+                'k8s-pod:' || (old_workspace ->> 'namespace') || ':' || old_runtime
+            AND old_workspace ->> 'namespace' IS NOT NULL
+            AND old_workspace ->> 'namespace' <> ''
+            AND resident_ack ->> 'kind' = 'protocol'
+            AND shell_ack ->> 'kind' = 'protocol'
+        ) IS TRUE;
+    END IF;
+
+    -- Rebase replaces a retired runtime's marker/ACK tuple. The predecessor's
+    -- flag cannot remain authority for the successor, even at the same token.
+    IF COALESCE(old_workspace -> '_snapshot_restore_required', 'false'::JSONB)
+            NOT IN ('false'::JSONB, 'true'::JSONB)
+       OR jsonb_typeof(new_workspace) IS DISTINCT FROM 'object'
+       OR new_workspace IS DISTINCT FROM jsonb_set(
+           old_workspace, '{_snapshot_restore_required}', 'false'::JSONB, TRUE
+       )
+       OR jsonb_typeof(new_state -> '_stateless_claim_retirement')
+            IS DISTINCT FROM 'object' THEN
+        RETURN FALSE;
+    END IF;
+    new_marker := new_state -> '_stateless_claim_retirement';
+    new_runtime := new_workspace ->> '_runtime_incarnation';
+    replacement_has_receipt := EXISTS (
+        SELECT 1 FROM public.managed_repository_process_zero_receipts
+         WHERE owner_kind='thread' AND owner_id=requested_owner
+           AND scope='workspace_container' AND provisioner='k8s'
+           AND runtime_incarnation=new_runtime
+    );
+    IF (
+        old_runtime <> new_runtime
+        AND new_runtime ~ '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+        AND new_workspace ->> 'provisioner' = 'k8s'
+        AND binding ->> 'kind' = 'remote'
+        AND binding ->> 'backing_id' =
+            'k8s-pod:' || (new_workspace ->> 'namespace') || ':' || new_runtime
+        AND new_workspace ->> 'namespace' IS NOT NULL
+        AND new_workspace ->> 'namespace' <> ''
+        AND binding ->> 'generation' =
+            new_workspace ->> '_canvas_workspace_generation'
+        AND binding ->> 'generation' ~
+            '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+        AND binding ->> 'ssh_host_key_fingerprint' ~ '^SHA256:[^[:space:]]+$'
+        AND length(binding ->> 'ssh_host_key_fingerprint') <= 128
+        AND (
+            (new_workspace ->> 'status' = 'ready' AND NOT replacement_has_receipt)
+            OR (new_workspace ->> 'status' IN ('retiring_process_zero', 'deleted')
+                AND replacement_has_receipt)
+        )
+        AND EXISTS (
+            SELECT 1 FROM public.managed_repository_process_zero_receipts
+             WHERE owner_kind='thread' AND owner_id=requested_owner
+               AND scope='workspace_container' AND provisioner='k8s'
+               AND runtime_incarnation=old_runtime
+        )
+    ) IS NOT TRUE THEN
+        RETURN FALSE;
+    END IF;
+    expected_marker := (old_marker - 'residents_retired_by' - 'remote_retired_by')
+        || jsonb_build_object(
+            'shell_retirement_required', TRUE,
+            'resident_cleanup_required', TRUE,
+            'residents_retired', replacement_has_receipt,
+            'remote_retired', replacement_has_receipt,
+            'workspace_absence_proven', FALSE,
+            'workspace_generation', binding -> 'generation',
+            'endpoint_generation', new_workspace -> '_canvas_workspace_generation',
+            'runtime_incarnation', new_runtime,
+            'host_key_fingerprint', binding -> 'ssh_host_key_fingerprint'
+        );
+    expected_state := jsonb_set(old_state,
+        '{workspace_container,_snapshot_restore_required}', 'false'::JSONB, TRUE
+    );
+    expected_state := jsonb_set(expected_state,
+        '{_stateless_claim_retirement}', expected_marker, TRUE
+    ) - '_stateless_resident_retirement_ack'
+      - '_stateless_shell_retirement_ack';
+    IF replacement_has_receipt THEN
+        expected_marker := expected_marker || jsonb_build_object(
+            'residents_retired_by', 'workspace_runtime_terminal',
+            'remote_retired_by', 'workspace_runtime_terminal'
+        );
+        replacement_ack := jsonb_build_object(
+            'kind', 'workspace_runtime_terminal',
+            'terminal_token', token,
+            'runtime_incarnation', new_runtime
+        );
+        expected_state := jsonb_set(expected_state,
+            '{_stateless_claim_retirement}', expected_marker, TRUE
+        ) || jsonb_build_object(
+            '_stateless_resident_retirement_ack', replacement_ack,
+            '_stateless_shell_retirement_ack', replacement_ack
+        );
+    END IF;
+    RETURN new_state = expected_state;
+EXCEPTION WHEN invalid_text_representation OR numeric_value_out_of_range THEN
+    RETURN FALSE;
 END;
 $_$;
 

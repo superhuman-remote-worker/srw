@@ -3,9 +3,10 @@
 import asyncio
 from copy import deepcopy
 from dataclasses import replace
+import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
-from uuid import uuid4
+from unittest.mock import AsyncMock, MagicMock
+from uuid import UUID, uuid4, uuid5
 
 import pytest
 from fastapi import HTTPException
@@ -23,10 +24,11 @@ metadata = initial.metadata
 
 
 async def acknowledged_running_end(
-    database, actor, monkeypatch, *, permanent, physical_cleanup=True
+    database, actor, monkeypatch, *, permanent, physical_cleanup=True,
+    pvc_enabled=True,
 ):
     case = await initial.workspace_attempt(
-        database, actor, monkeypatch, first_wait="ready"
+        database, actor, monkeypatch, first_wait="ready", pvc_enabled=pvc_enabled
     )
     # A completed claimant used this ready runtime. Keep its real creation
     # reservation/binding and exercise all End/cleanup database authorities.
@@ -85,6 +87,310 @@ async def acknowledged_running_end(
     assert str(intent["runtime_incarnation"]) == case.pod_uid
     assert ("pod" not in case.cluster.objects) is physical_cleanup
     return case, pending, operations
+
+
+async def pending_emptydir_ack_case(database, actor, monkeypatch):
+    """Keep real End/ACK rows; change only disposable fixture storage binding."""
+    case, pending, _ = await acknowledged_running_end(
+        database, actor, monkeypatch, permanent=False, physical_cleanup=False,
+        pvc_enabled=False,
+    )
+    return case, pending
+
+
+def emptydir_ack_identity(thread):
+    state = metadata(thread)
+    marker = state["_stateless_claim_retirement"]
+    return {
+        "terminal_token": marker["terminal_token"],
+        "expected_runtime_incarnation": marker["runtime_incarnation"],
+        "expected_host_key_fingerprint": marker["host_key_fingerprint"],
+        "expected_workspace_generation": marker["workspace_generation"],
+        "expected_backing_id": state["_workspace_binding"]["backing_id"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_emptydir_pending_end_reuses_committed_token_and_time(
+    database, actor, monkeypatch
+):
+    case, pending = await pending_emptydir_ack_case(database, actor, monkeypatch)
+    old = emptydir_ack_identity(pending)
+    ended_at = pending["ended_at"]
+    generation = uuid5(
+        UUID(case.thread_id),
+        f"srw:session-end-terminal-snapshot:v1:{old['terminal_token']}:{case.pod_uid}",
+    )
+    retry = await database.begin_stateless_thread_workspace_retirement(
+        case.thread_id, force=True, permanent=False,
+        workspace_absence_proven=False,
+    )
+    again = await database.get_thread(case.thread_id)
+    assert retry["terminal_token"] == old["terminal_token"]
+    assert again["ended_at"] == ended_at
+    assert uuid5(
+        UUID(case.thread_id),
+        f"srw:session-end-terminal-snapshot:v1:{retry['terminal_token']}:"
+        f"{metadata(again)['_stateless_claim_retirement']['runtime_incarnation']}",
+    ) == generation
+
+
+@pytest.mark.asyncio
+async def test_emptydir_snapshot_ack_fences_runtime_and_binding_in_real_postgres(
+    database, actor, monkeypatch
+):
+    case, pending = await pending_emptydir_ack_case(database, actor, monkeypatch)
+    identity = emptydir_ack_identity(pending)
+    for field, wrong in (
+        ("terminal_token", identity["terminal_token"] + 1),
+        ("expected_runtime_incarnation", str(uuid4())),
+        ("expected_host_key_fingerprint", "SHA256:" + "B" * 43),
+        ("expected_workspace_generation", str(uuid4())),
+        ("expected_backing_id", "k8s-pod:wrong:pod"),
+    ):
+        assert not await database.mark_stateless_thread_snapshot_restore_required(
+            case.thread_id, **{**identity, field: wrong},
+        ), field
+    await database.execute(
+        "UPDATE run_queue SET state='queued' WHERE unit_id=$1::uuid",
+        case.thread_id,
+    )
+    assert not await database.mark_stateless_thread_snapshot_restore_required(
+        case.thread_id, **identity
+    )
+    await database.execute(
+        "UPDATE run_queue SET state='done' WHERE unit_id=$1::uuid",
+        case.thread_id,
+    )
+    assert metadata(await database.get_thread(case.thread_id))["workspace_container"].get(
+        "_snapshot_restore_required", False
+    ) is False
+    assert await database.mark_stateless_thread_snapshot_restore_required(
+        case.thread_id, **identity
+    )
+    assert metadata(await database.get_thread(case.thread_id))["workspace_container"][
+        "_snapshot_restore_required"
+    ] is True
+
+
+@pytest.mark.asyncio
+async def test_emptydir_rebase_clears_old_proof_and_rejects_old_ack(
+    database, actor, monkeypatch
+):
+    case, pending = await pending_emptydir_ack_case(database, actor, monkeypatch)
+    old = emptydir_ack_identity(pending)
+    assert await database.mark_stateless_thread_snapshot_restore_required(
+        case.thread_id, **old
+    )
+    # The exact old Pod is retired and its cleanup intent settles while the
+    # business End remains pending. A previously admitted creator can publish
+    # a successor in this gap; use its real reservation and runtime trigger.
+    identity = await case.provisioner.capture_terminal_workspace_identity(case.owner)
+    old_pod = deepcopy(case.cluster.objects["pod"])
+    assert await case.provisioner.release_workspace(
+        case.owner, teardown_identity=identity,
+        expected_runtime_incarnation=case.pod_uid,
+        expected_host_key_fingerprint=old["expected_host_key_fingerprint"],
+        reclaim_volume=False, capture_snapshot=False, strict=True,
+    )
+    successor_uid = str(uuid4())
+    successor_generation = str(uuid4())
+    successor_key = "SHA256:" + ("B" * 43)
+    reservation_id = str(uuid4())
+    claim_token = await database.fetchval(
+        "INSERT INTO managed_repository_workspace_creation_reservations("
+        "id,owner_kind,owner_id,thread_runtime_generation,scope,claimed_by,"
+        "desired_manifest_digest,runtime_incarnation,pod_uid,expires_at,phase) "
+        "VALUES($1::uuid,'thread',$2::uuid,$3::uuid,'workspace_container',"
+        "'successor-test',$4,$5::uuid,$5::uuid,now()+interval '30 minutes',"
+        "'runtime_bound') RETURNING claim_token",
+        reservation_id, case.thread_id, str(pending["runtime_generation"]),
+        "a" * 64, successor_uid,
+    )
+    state = deepcopy(metadata(await database.get_thread(case.thread_id)))
+    workspace = state["workspace_container"]
+    workspace["_runtime_incarnation"] = successor_uid
+    workspace["_canvas_workspace_generation"] = successor_generation
+    workspace["status"] = "ready"
+    workspace["pod_name"] = case.owner.pod_name
+    workspace["pod_ip"] = "10.42.0.101"
+    workspace["port"] = 30022
+    workspace["_creation_reservation_id"] = reservation_id
+    workspace["_creation_claim_token"] = str(claim_token)
+    binding = state["_workspace_binding"]
+    binding["generation"] = successor_generation
+    binding["backing_id"] = f"k8s-pod:{workspace['namespace']}:{successor_uid}"
+    binding["ssh_host_key_fingerprint"] = successor_key
+    await database.execute(
+        "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
+        case.thread_id, json.dumps(state),
+    )
+    from orchestrator.services.stateless_workspace_gate import (
+        stateless_session_workspace_check,
+    )
+    from shared.session_retirement import stateless_retirement_release_authorized
+
+    assert stateless_session_workspace_check({"metadata": state}) == ("sandbox", None)
+    historical = deepcopy(state)
+    historical["workspace_container"]["_runtime_incarnation"] = case.pod_uid
+    historical["workspace_container"]["_canvas_workspace_generation"] = old[
+        "expected_workspace_generation"
+    ]
+    historical["_workspace_binding"]["generation"] = old[
+        "expected_workspace_generation"
+    ]
+    historical["_workspace_binding"]["ssh_host_key_fingerprint"] = old[
+        "expected_host_key_fingerprint"
+    ]
+    assert stateless_retirement_release_authorized(historical)["terminal_token"] == old[
+        "terminal_token"
+    ]
+    assert await database.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM managed_repository_process_zero_receipts "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+        "AND scope='workspace_container' AND runtime_incarnation=$2)",
+        case.thread_id, case.pod_uid,
+    )
+    assert await database.rebase_stateless_thread_workspace_retirement(
+        case.thread_id, terminal_token=old["terminal_token"],
+        retired_runtime_incarnation=case.pod_uid, permanent=False,
+    )
+    rebased = await database.get_thread(case.thread_id)
+    rebased_state = metadata(rebased)
+    assert rebased_state["workspace_container"]["_snapshot_restore_required"] is False
+    assert rebased_state["_stateless_workspace_retirement_pending"] is True
+    assert not await database.mark_stateless_thread_snapshot_restore_required(
+        case.thread_id, **old
+    )
+    assert metadata(await database.get_thread(case.thread_id))["workspace_container"][
+        "_snapshot_restore_required"
+    ] is False
+    old_pod.metadata.uid = successor_uid
+    old_pod.status.pod_ip = "10.42.0.101"
+    case.cluster.objects["pod"] = old_pod
+    case.provisioner._snapshot_service = MagicMock(is_available=True)
+    case.provisioner._snapshot_service.reconcile_terminal_snapshot_generation = (
+        AsyncMock(return_value=(True, "complete"))
+    )
+    case.provisioner._snapshot_service.capture_vm_snapshot = AsyncMock()
+
+    async def old_ack():
+        return await database.mark_stateless_thread_snapshot_restore_required(
+            case.thread_id, **old
+        )
+
+    old_generation = str(uuid5(
+        UUID(case.thread_id),
+        f"srw:session-end-terminal-snapshot:v1:{old['terminal_token']}:{case.pod_uid}",
+    ))
+    with monkeypatch.context() as patch:
+        retire = AsyncMock(return_value=True)
+        patch.setattr(case.provisioner, "_retire_managed_repository_agents", retire)
+        assert not await case.provisioner.release_workspace(
+            case.owner, teardown_identity=identity, require_snapshot=True,
+            expected_runtime_incarnation=case.pod_uid,
+            expected_host_key_fingerprint=old["expected_host_key_fingerprint"],
+            on_snapshot_captured=old_ack, capture_snapshot=False,
+            strict_terminal_snapshot=True,
+            terminal_snapshot_generation=old_generation,
+            terminal_snapshot_created_at=pending["ended_at"].isoformat(),
+            strict=True,
+        )
+        retire.assert_not_awaited()
+    assert case.cluster.objects["pod"].metadata.uid == successor_uid
+    case.provisioner._snapshot_service.capture_vm_snapshot.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_emptydir_snapshot_flag_cannot_be_armed_by_unfenced_sql(
+    database, actor, monkeypatch
+):
+    import asyncpg
+
+    case = await initial.workspace_attempt(
+        database, actor, monkeypatch, first_wait="ready", pvc_enabled=False
+    )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await database.execute(
+            "UPDATE threads SET metadata=jsonb_set(metadata, "
+            "'{workspace_container,_snapshot_restore_required}', "
+            "'true'::jsonb, true) WHERE id=$1::uuid",
+            case.thread_id,
+        )
+    assert metadata(await database.get_thread(case.thread_id))["workspace_container"].get(
+        "_snapshot_restore_required", False
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_emptydir_snapshot_ack_cannot_change_thread_runtime_generation(
+    database, actor, monkeypatch
+):
+    import asyncpg
+
+    case, _ = await pending_emptydir_ack_case(database, actor, monkeypatch)
+    with pytest.raises(asyncpg.CheckViolationError):
+        await database.execute(
+            "UPDATE threads SET runtime_generation=$2::uuid, "
+            "metadata=jsonb_set(metadata, "
+            "'{workspace_container,_snapshot_restore_required}', "
+            "'true'::jsonb, true) WHERE id=$1::uuid",
+            case.thread_id, str(uuid4()),
+        )
+
+
+@pytest.mark.asyncio
+async def test_emptydir_snapshot_trigger_rejects_drifted_end_proof(
+    database, actor, monkeypatch
+):
+    import asyncpg
+
+    case, pending = await pending_emptydir_ack_case(database, actor, monkeypatch)
+    original = deepcopy(metadata(pending))
+    for section, key, wrong in (
+        ("_stateless_claim_retirement", "terminal_token", 999),
+        ("_stateless_claim_retirement", "runtime_incarnation", str(uuid4())),
+        ("_stateless_claim_retirement", "host_key_fingerprint", "SHA256:" + "B" * 43),
+        ("_stateless_claim_retirement", "workspace_generation", str(uuid4())),
+    ):
+        drifted = deepcopy(original)
+        drifted[section][key] = wrong
+        await database.execute(
+            "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
+            case.thread_id, json.dumps(drifted),
+        )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await database.execute(
+                "UPDATE threads SET metadata=jsonb_set(metadata, "
+                "'{workspace_container,_snapshot_restore_required}', "
+                "'true'::jsonb, true) WHERE id=$1::uuid",
+                case.thread_id,
+            )
+        await database.execute(
+            "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
+            case.thread_id, json.dumps(original),
+        )
+    wrong_binding = deepcopy(original)
+    wrong_binding["_workspace_binding"]["backing_id"] = "k8s-pod:wrong:pod"
+    with pytest.raises(asyncpg.CheckViolationError):
+        await database.execute(
+            "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
+            case.thread_id, json.dumps(wrong_binding),
+        )
+    await database.execute(
+        "UPDATE run_queue SET state='queued' WHERE unit_id=$1::uuid",
+        case.thread_id,
+    )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await database.execute(
+            "UPDATE threads SET metadata=jsonb_set(metadata, "
+            "'{workspace_container,_snapshot_restore_required}', "
+            "'true'::jsonb, true) WHERE id=$1::uuid",
+            case.thread_id,
+        )
+    assert metadata(await database.get_thread(case.thread_id))["workspace_container"].get(
+        "_snapshot_restore_required", False
+    ) is False
 
 
 @pytest.mark.asyncio
@@ -230,6 +536,11 @@ async def test_soft_end_resume_end_then_pending_permanent_cleanup_settles_withou
     assert await operations.end_thread_flow(
         case.thread_id, case.before, permanent=False, force=False
     ) == {"status": "ended"}
+    first_end = await database.get_thread(case.thread_id)
+    first_token = metadata(first_end)["_stateless_workspace_retirement_settled"][
+        "terminal_token"
+    ]
+    first_ended_at = first_end["ended_at"]
     original_uid = case.pod_uid
     retained_pvc_uid = case.pvc_uid
     assert case.cluster.objects["pvc"].metadata.uid == retained_pvc_uid
@@ -259,6 +570,19 @@ async def test_soft_end_resume_end_then_pending_permanent_cleanup_settles_withou
         permanent=False,
         force=False,
     ) == {"status": "ended"}
+    second_end = await database.get_thread(case.thread_id)
+    second_token = metadata(second_end)["_stateless_workspace_retirement_settled"][
+        "terminal_token"
+    ]
+    assert second_token > first_token
+    assert second_end["ended_at"] != first_ended_at
+    assert uuid5(
+        UUID(case.thread_id),
+        f"srw:session-end-terminal-snapshot:v1:{first_token}:{original_uid}",
+    ) != uuid5(
+        UUID(case.thread_id),
+        f"srw:session-end-terminal-snapshot:v1:{second_token}:{resumed_uid}",
+    )
     assert case.cluster.objects["pvc"].metadata.uid == retained_pvc_uid
 
     async def cleanup_still_pending(*args, **kwargs):

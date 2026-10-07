@@ -10725,9 +10725,6 @@ class ContainerProvisioner:
                             owner.id,
                         )
                         captured = False
-                    if captured and on_snapshot_captured is not None:
-                        if not await on_snapshot_captured():
-                            return False
                     if not captured and require_snapshot:
                         return False
                     snapshot_captured = snapshot_captured or captured
@@ -10740,6 +10737,17 @@ class ContainerProvisioner:
 
         if require_snapshot and not snapshot_captured:
             return False
+        if snapshot_captured and on_snapshot_captured is not None:
+            try:
+                if not await on_snapshot_captured():
+                    return False
+            except Exception:
+                logger.exception(
+                    "Captured workspace snapshot acknowledgement failed for %s %s",
+                    owner.kind,
+                    owner.id,
+                )
+                return False
 
         # Persist the exact cleanup generation, disposition, and captured
         # resource tuple before retiring any credential process or mutating a
@@ -10753,7 +10761,11 @@ class ContainerProvisioner:
             identity=identity,
             admission_source="explicit",
         )
-        if not isinstance(intent, dict):
+        if (
+            not isinstance(intent, dict)
+            or intent.get("resources_captured_at") is None
+            or intent.get("reclaim_shared_resources") is not reclaim_volume
+        ):
             return False
 
         # Snapshot first, then contain the exact credential-bearing process

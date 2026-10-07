@@ -6,13 +6,14 @@ import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from functools import partial
 import json
 import logging
 import os
 import time
 from typing import Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from fastapi import HTTPException
 import httpx
@@ -649,7 +650,12 @@ async def reconcile_stateless_thread_retirement(
             detail="A different stateless retirement intent is still pending",
         )
 
-    terminal_token = int(closure.get("terminal_token") or 0)
+    raw_terminal_token = closure.get("terminal_token")
+    if raw_terminal_token is None:
+        raw_terminal_token = 0
+    if type(raw_terminal_token) is not int or raw_terminal_token < 0:
+        raise HTTPException(503, "Stateless retirement token is malformed")
+    terminal_token = raw_terminal_token
     if retained_startup_attention is not None:
         retained = (
             await postgres_db.get_stateless_retained_startup_attention_retirement(
@@ -1212,13 +1218,57 @@ async def reconcile_stateless_thread_retirement(
                 if marker.get("host_key_fingerprint")
                 else None
             )
+            terminal_snapshot_generation = None
+            terminal_snapshot_created_at = None
+            if requires_snapshot and not snapshot_already_captured:
+                ended_at = current.get("ended_at")
+                workspace_generation = release_authority.get("workspace_generation")
+                namespace = workspace.get("namespace")
+                try:
+                    thread_uuid = UUID(thread_id)
+                    runtime_uuid = UUID(expected_runtime)
+                    generation_uuid = UUID(workspace_generation)
+                except (TypeError, ValueError, AttributeError) as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Required snapshot identity is malformed",
+                    ) from exc
+                if (
+                    str(thread_uuid) != thread_id
+                    or str(runtime_uuid) != expected_runtime
+                    or str(generation_uuid) != workspace_generation
+                    or type(closure.get("terminal_token")) is not int
+                    or terminal_token <= 0
+                    or current.get("status") != "ended"
+                    or not isinstance(ended_at, datetime)
+                    or ended_at.tzinfo is None
+                    or ended_at.utcoffset() is None
+                    or not expected_fingerprint
+                    or not expected_fingerprint.startswith("SHA256:")
+                    or len(expected_fingerprint) > 128
+                    or any(char.isspace() for char in expected_fingerprint)
+                    or not isinstance(namespace, str)
+                    or not namespace
+                    or ":" in namespace
+                    or backing_id != f"k8s-pod:{namespace}:{expected_runtime}"
+                ):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Required snapshot identity is malformed",
+                    )
+                terminal_snapshot_generation = str(
+                    uuid5(
+                        thread_uuid,
+                        "srw:session-end-terminal-snapshot:v1:"
+                        f"{terminal_token}:{expected_runtime}",
+                    )
+                )
+                terminal_snapshot_created_at = ended_at.isoformat()
 
-            # Begin may have pre-admitted the terminal cleanup generation in
-            # the same transaction that closed the queue and projected
-            # retiring_process_zero. Claim that exact generation and capture
-            # its Pod/PVC/Service UIDs before release_workspace reads it.
-            # Passing an admitted-but-uncaptured intent directly to the lower
-            # deletion boundary correctly fails closed without issuing DELETE.
+            # Capture the exact physical identity before the archive. For a
+            # required emptyDir snapshot, release_workspace claims the cleanup
+            # intent only after the durable capture ACK; PVC and already-proven
+            # paths keep their existing early intent capture.
             try:
                 teardown_identity = (
                     await container_provisioner.capture_terminal_workspace_identity(
@@ -1239,30 +1289,36 @@ async def reconcile_stateless_thread_retirement(
                     status_code=503,
                     detail="Live workspace teardown identity changed",
                 )
-            cleanup_intent = (
-                await container_provisioner.prepare_workspace_cleanup_intent(
-                    WorkspaceOwner.session(thread_id),
-                    expected_runtime_incarnation=expected_runtime,
-                    target_disposition="deleted",
-                    reclaim_shared_resources=permanent,
-                    identity=teardown_identity,
+            if not (requires_snapshot and not snapshot_already_captured):
+                cleanup_intent = (
+                    await container_provisioner.prepare_workspace_cleanup_intent(
+                        WorkspaceOwner.session(thread_id),
+                        expected_runtime_incarnation=expected_runtime,
+                        target_disposition="deleted",
+                        reclaim_shared_resources=permanent,
+                        identity=teardown_identity,
+                    )
                 )
-            )
-            if (
-                not isinstance(cleanup_intent, dict)
-                or cleanup_intent.get("resources_captured_at") is None
-                or bool(cleanup_intent.get("reclaim_shared_resources")) is not permanent
-            ):
-                raise HTTPException(
-                    status_code=503,
-                    detail="Live workspace cleanup authority is incomplete",
-                )
+                if (
+                    not isinstance(cleanup_intent, dict)
+                    or cleanup_intent.get("resources_captured_at") is None
+                    or bool(cleanup_intent.get("reclaim_shared_resources"))
+                    is not permanent
+                ):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Live workspace cleanup authority is incomplete",
+                    )
 
             async def _snapshot_ack() -> bool:
                 return (
                     await postgres_db.mark_stateless_thread_snapshot_restore_required(
                         thread_id,
                         terminal_token=terminal_token,
+                        expected_runtime_incarnation=expected_runtime,
+                        expected_host_key_fingerprint=expected_fingerprint,
+                        expected_workspace_generation=workspace_generation,
+                        expected_backing_id=backing_id,
                     )
                 )
 
@@ -1285,6 +1341,8 @@ async def reconcile_stateless_thread_retirement(
                             requires_snapshot and not snapshot_already_captured
                         ),
                         strict_terminal_snapshot=True,
+                        terminal_snapshot_generation=terminal_snapshot_generation,
+                        terminal_snapshot_created_at=terminal_snapshot_created_at,
                         strict=True,
                         teardown_identity=teardown_identity,
                     ),
