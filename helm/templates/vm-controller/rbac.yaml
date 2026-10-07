@@ -18,10 +18,18 @@ rules:
   - apiGroups: ["kubevirt.io"]
     resources: ["virtualmachines", "virtualmachineinstances"]
     verbs: ["get", "list", "create", "delete"]
+  # Positive pre-SSH stop only changes runStrategy on the exact VM UID/RV.
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines"]
+    verbs: ["patch"]
   - apiGroups: [""]
     resources: ["pods"]
     # Keep reconciliation/retirement authority when new builds are disabled.
     verbs: ["get", "list", "create", "patch", "delete"]
+  # Hold only the exact launcher Pod until terminal evidence and durable zero.
+  - apiGroups: [""]
+    resources: ["pods/finalizers"]
+    verbs: ["patch"]
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "create", "update", "delete"]

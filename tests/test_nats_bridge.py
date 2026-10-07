@@ -637,6 +637,35 @@ class TestQueryVmStatus:
     """Tests for NatsBridge.query_vm_status()."""
 
     @pytest.mark.asyncio
+    async def test_exact_retained_absence_targets_captured_workspace_pvc(
+        self, bridge, mock_nc
+    ):
+        """The default Job rootdisk cannot stand in for a retained workspace PVC."""
+        binding = {
+            "uid": "00000000-0000-4000-8000-000000000322",
+            "generation": 2,
+            "pvc_uid": "00000000-0000-4000-8000-000000000323",
+            "owner_id": "00000000-0000-4000-8000-000000000321",
+            "owner_kind": "job",
+        }
+        mock_nc.request.return_value = MagicMock(
+            data=json.dumps(
+                {"job_id": binding["owner_id"], "status": "not_found"}
+            ).encode()
+        )
+
+        await bridge.query_vm_status(
+            binding["owner_id"],
+            provision_generation="00000000-0000-4000-8000-000000000324",
+            exact_absence=True,
+            workspace_storage=binding,
+        )
+
+        payload = json.loads(mock_nc.request.call_args.args[1])
+        assert payload["exact_absence"] is True
+        assert payload["workspace_storage"] == binding
+
+    @pytest.mark.asyncio
     async def test_query_returns_status_dict(self, bridge, mock_nc):
         response_data = {
             "job_id": "test-job-789",

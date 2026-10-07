@@ -9,6 +9,7 @@ from orchestrator.services.vm_workspace_recovery_store import (
     acquire_vm_cleanup_permit,
     complete_vm_cleanup_permit,
     completed_cleanup_outcome,
+    vm_cleanup_kwargs,
 )
 
 logger = logging.getLogger(__name__)
@@ -131,16 +132,21 @@ async def recycle_provisioning_vm(
                     entity_type="job",
                     purge_disk=False,
                     capture_snapshot=False,
+                    **vm_cleanup_kwargs(cleanup),
                 )
                 disposition = outcome.disposition
                 if disposition in {"completed", "identity_superseded"}:
                     await complete_vm_cleanup_permit(
-                        recovery_store, cleanup, outcome=disposition,
+                        recovery_store,
+                        cleanup,
+                        outcome=disposition,
                         provisioner=provisioner,
                     )
             elif disposition == "completed":
                 await complete_vm_cleanup_permit(
-                    recovery_store, cleanup, outcome=disposition,
+                    recovery_store,
+                    cleanup,
+                    outcome=disposition,
                     provisioner=provisioner,
                 )
             if disposition in {"completed", "identity_superseded"}:

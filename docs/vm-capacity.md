@@ -213,3 +213,27 @@ memory, the original enqueue time, and an exact request-size nonfit finding.
 It does not expose cluster budgets, other owners' requests, queue position,
 predicted fit, or an ETA. A count maximum absent from the admin API remains
 unknown in Cockpit too.
+
+## Failed provisioning and retained Job disks
+
+A Job VM that never reaches SSH readiness can still occupy a launcher and a
+reservation. Timeout or cancellation starts ordinary cleanup; it does not by
+itself prove that compute stopped. The Job-only pre-SSH stop protocol binds the
+current creation request, reservation, VM, VMI, launcher, disk and node before
+requesting shutdown. Cleanup releases capacity only after the matching stop
+evidence and runtime-absence checks settle. Missing or changed identity keeps
+the reservation held.
+
+Stopping compute can retain the disk for Resume. Permanent Job deletion then
+requires an exclusive released workspace binding (or proven unbound disk),
+the complete chain of stopped physical generations and a signed final disk
+purge receipt from the original controller namespace and cluster. An unfinished
+controller cleanup child or a disk consumer keeps deletion pending. Prior stop
+receipts and released reservations remain immutable audit evidence.
+
+Roll out the updated VM Controller and its namespaced VM/Pod-finalizer patch
+permissions before the Orchestrator with migrations 0333 and 0334. Older or
+rerouted controllers cannot supply the required proof. When cleanup stays held,
+compare the owner's creation request, reservation and cleanup evidence with the
+actual VM, launcher and PVC before retrying an operation. Do not infer release
+from a timeout, missing SSH, or an acknowledgement alone.

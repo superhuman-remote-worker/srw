@@ -101,6 +101,7 @@ async def _acquire_creation_lock(lock: asyncio.Lock, wait_timeout: float | None)
     except TimeoutError as exc:
         raise _CreationLockBusy from exc
 
+
 # Configuration from environment
 NATS_URL = os.environ.get("NATS_URL", "nats://nats-leaf.nats.svc.cluster.local:4222")
 # Per-orchestrator scope for vm.lifecycle.* subjects. Required when the
@@ -147,6 +148,7 @@ VM_GOLDEN_IMAGE_ENABLED = os.environ.get(
 # VM_DISK_SIZE) is never smaller than its source.
 VM_GOLDEN_DISK_SIZE = os.environ.get("VM_GOLDEN_DISK_SIZE", "").strip() or VM_DISK_SIZE
 
+
 def effective_disk_size(job_config: Mapping[str, object]) -> str:
     """Per-job rootdisk size: ``job_config["disk_size"]`` when it is a valid
     quantity **not smaller than** ``VM_DISK_SIZE``; otherwise the controller
@@ -160,7 +162,9 @@ def effective_disk_size(job_config: Mapping[str, object]) -> str:
         log.warning(
             "disk_size %r is not a k8s quantity; using %s", requested, VM_DISK_SIZE
         )
-    elif requested not in (None, "") and _quantity_bytes(requested) < _quantity_bytes(VM_DISK_SIZE):
+    elif requested not in (None, "") and _quantity_bytes(requested) < _quantity_bytes(
+        VM_DISK_SIZE
+    ):
         log.warning(
             "disk_size %s is below the controller default %s; using the default",
             requested,
@@ -632,8 +636,25 @@ def _empty_container_state(value: object) -> bool:
     return all(getattr(value, field, None) is None for field in fields)
 
 
-def _exact_terminal_container_evidence(pod: object) -> dict | None:
+def _exact_terminal_container_evidence(
+    pod: object,
+    *,
+    pre_ssh_posttermination_gc: bool = False,
+    vm_template_grace: object = None,
+) -> dict | None:
     """Return current kubelet termination evidence, never ``lastState``."""
+
+    def aware_time(value: object) -> datetime | None:
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        else:
+            return None
+        return parsed if parsed.tzinfo is not None else None
 
     pod_status = _object_value(pod, "status", {})
     if _object_value(pod_status, "reason") in {
@@ -646,13 +667,49 @@ def _exact_terminal_container_evidence(pod: object) -> dict | None:
     grace = _metadata_value(pod, "deletionGracePeriodSeconds")
     if grace is None:
         grace = _metadata_value(pod, "deletion_grace_period_seconds")
-    if grace == 0:
+    if pre_ssh_posttermination_gc and grace is None:
         return None
+    if grace is not None and (type(grace) is not int or grace < 0):
+        return None
+    posttermination_gc = grace == 0
+    deleted_at = None
+    if posttermination_gc:
+        if (
+            not pre_ssh_posttermination_gc
+            or type(vm_template_grace) is not int
+            or vm_template_grace <= 0
+        ):
+            return None
+        deleted_at = aware_time(_metadata_value(pod, "deletionTimestamp"))
+        if deleted_at is None:
+            deleted_at = aware_time(_metadata_value(pod, "deletion_timestamp"))
+        if deleted_at is None:
+            return None
     spec = _object_value(pod, "spec", {})
+    if posttermination_gc:
+        pod_spec_grace = _object_value(spec, "terminationGracePeriodSeconds")
+        if pod_spec_grace is None:
+            pod_spec_grace = _object_value(spec, "termination_grace_period_seconds")
+        if type(pod_spec_grace) is not int or pod_spec_grace <= 0:
+            return None
     restart_policy = _object_value(spec, "restartPolicy")
     if restart_policy is None:
         restart_policy = _object_value(spec, "restart_policy")
     if restart_policy != "Never":
+        return None
+    # A terminal Pod phase does not prove that an injected debug container
+    # stopped. This protocol admits only the launcher image's regular/init
+    # containers; ephemeral containers need a separate complete proof.
+    ephemeral = _container_entries(spec, "ephemeralContainers", "ephemeral_containers")
+    ephemeral_statuses = _container_entries(
+        pod_status, "ephemeralContainerStatuses", "ephemeral_container_statuses"
+    )
+    if (
+        ephemeral is None
+        or ephemeral_statuses is None
+        or ephemeral
+        or ephemeral_statuses
+    ):
         return None
     declared: dict[str, list[str]] = {}
     status_groups: dict[str, list[object]] = {}
@@ -712,6 +769,18 @@ def _exact_terminal_container_evidence(pod: object) -> dict | None:
             finished_at = _object_value(terminated, "finishedAt")
             if finished_at is None:
                 finished_at = _object_value(terminated, "finished_at")
+            if posttermination_gc:
+                started_at = _object_value(terminated, "startedAt")
+                if started_at is None:
+                    started_at = _object_value(terminated, "started_at")
+                started = aware_time(started_at)
+                finished = aware_time(finished_at)
+                if (
+                    started is None
+                    or finished is None
+                    or not started <= finished <= deleted_at
+                ):
+                    return None
             reason = _object_value(terminated, "reason")
             if (
                 _safe_uid(container_id) is None
@@ -2318,7 +2387,9 @@ class VMController:
         from shared.vm_resource_policy import configured_enforcement_required
 
         if "creation_retry" not in job_config and configured_enforcement_required():
-            raise ValueError("VM resource admission requires durable creation authority")
+            raise ValueError(
+                "VM resource admission requires durable creation authority"
+            )
         if "creation_retry" in job_config:
             from vm_controller.creation_actuation import CreationActuator
 
@@ -3112,11 +3183,39 @@ class VMController:
             from shared.vm_workspace_storage import storage_binding, storage_name
 
             workspace_storage = storage_binding(workspace_storage)
-            await self._retained_storage().probe(workspace_storage)
+            # A completed public workspace release intentionally removes the
+            # captured PVC and its attachment lease. Exact-absence status must
+            # inspect that physical absence below; the live-attachment probe
+            # would reject it before the VM/VMI/launcher checks could run.
+            if not exact_absence:
+                await self._retained_storage().probe(workspace_storage)
             rootdisk, rootdisk_owner = (
                 storage_name(workspace_storage),
                 workspace_storage["owner_id"],
             )
+        retained_probe = (
+            {"retained_storage_probe": workspace_storage}
+            if exact_absence and workspace_storage is not None
+            else {}
+        )
+        collector = getattr(self, "resource_inventory_collector", None)
+        cluster_id = getattr(collector, "cluster_id", None)
+        actual_scope = (
+            {
+                "controller_scope": {
+                    "version": 1,
+                    "namespace": VM_NAMESPACE,
+                    "cluster_id": cluster_id,
+                }
+            }
+            if exact_absence
+            and collector is not None
+            and getattr(collector, "namespace", None) == VM_NAMESPACE
+            and isinstance(cluster_id, str)
+            and cluster_id
+            and cluster_id == cluster_id.strip()
+            else {}
+        )
         try:
             vm = await asyncio.to_thread(
                 self.k8s_client.get_namespaced_custom_object,
@@ -3176,6 +3275,8 @@ class VMController:
                 "vmi_absent": vmi_absent,
                 "launcher_absent": launcher_absent,
                 "runtime_absence_known": vmi_absent and launcher_absent,
+                **retained_probe,
+                **actual_scope,
                 **(
                     {"rootdisk_pvc_uid": rootdisk_uid}
                     if rootdisk_uid is not None
@@ -3203,6 +3304,8 @@ class VMController:
             "ready": ready,
             "phase": status.get("printableStatus", "Unknown"),
             "created": status.get("created", False),
+            **retained_probe,
+            **actual_scope,
         }
         if vm_uid is not None:
             result["vm_uid"] = vm_uid
@@ -3699,6 +3802,815 @@ class VMController:
                     }
                 )
         return result
+
+    async def _do_inspect_pre_ssh_stop(
+        self,
+        job_id: str,
+        *,
+        provision_generation: str,
+        expected_vm_uid: str,
+        expected_pvc_uid: str,
+    ) -> dict | None:
+        """Read one pre-SSH launcher vector without authorizing or stopping it."""
+
+        from kubernetes.client.exceptions import ApiException
+        from shared.vm_pre_ssh_stop import valid_frozen_stop_candidate
+
+        generation = _provision_generation(provision_generation)
+        vm_name = f"agent-vm-{job_id}"
+        if (
+            generation is None
+            or _safe_uid(expected_vm_uid) is None
+            or _safe_uid(expected_pvc_uid) is None
+        ):
+            return None
+        async with self._workspace_lifecycle(job_id):
+            try:
+                vm = await asyncio.to_thread(
+                    self.k8s_client.get_namespaced_custom_object,
+                    group=KUBEVIRT_GROUP,
+                    version=KUBEVIRT_VERSION,
+                    namespace=VM_NAMESPACE,
+                    plural=KUBEVIRT_PLURAL,
+                    name=vm_name,
+                )
+                vmi = await asyncio.to_thread(
+                    self.k8s_client.get_namespaced_custom_object,
+                    group=KUBEVIRT_GROUP,
+                    version=KUBEVIRT_VERSION,
+                    namespace=VM_NAMESPACE,
+                    plural=KUBEVIRT_VMI_PLURAL,
+                    name=vm_name,
+                )
+            except ApiException as exc:
+                if exc.status == 404:
+                    return None
+                raise
+            vm_meta = _metadata(vm)
+            labels = _object_value(vm_meta, "labels")
+            annotations = _object_value(vm_meta, "annotations")
+            vm_rv = _object_value(vm_meta, "resourceVersion") or _object_value(
+                vm_meta, "resource_version"
+            )
+            vm_generation = _object_value(vm_meta, "generation")
+            vm_spec = _object_value(vm, "spec", {})
+            vm_status = _object_value(vm, "status", {})
+            vm_conditions = _object_value(vm_status, "conditions", []) or []
+            if (
+                _admitted_vm_uid(vm, expected_name=vm_name) != expected_vm_uid
+                or _object_value(vm_meta, "deletionTimestamp") is not None
+                or _object_value(vm_meta, "deletion_timestamp") is not None
+                or not isinstance(labels, Mapping)
+                or labels.get("srw.io/owner-kind") != "job"
+                or labels.get("srw.io/owner-id") != job_id
+                or not isinstance(annotations, Mapping)
+                or annotations.get("srw.io/provision-generation") != generation
+                or type(vm_generation) is not int
+                or vm_generation < 1
+                or _object_value(vm_spec, "runStrategy") != "RerunOnFailure"
+                or any(
+                    _object_value(condition, "type") == "Ready"
+                    and _object_value(condition, "status") == "True"
+                    for condition in vm_conditions
+                )
+            ):
+                return None
+            vmi_uid = _safe_uid(_metadata_value(vmi, "uid"))
+            vmi_status = _object_value(vmi, "status", {})
+            if (
+                vmi_uid is None
+                or not _owned_by(vmi, kind="VirtualMachine", uid=expected_vm_uid)
+                or _object_value(vmi_status, "phase") != "Running"
+                or _object_value(vmi_status, "migrationState")
+                or _object_value(vmi_status, "migration_state")
+            ):
+                return None
+            pvc_known, pvc = await self._rootdisk_pvc_by_uid(
+                expected_pvc_uid, owner_id=job_id, owner_kind="job"
+            )
+            rootdisk_name = _metadata_value(pvc, "name") if pvc is not None else None
+            if not pvc_known or not isinstance(rootdisk_name, str) or not rootdisk_name:
+                return None
+            dv = await self._get_dv(rootdisk_name)
+            dv_uid = _safe_uid(_metadata_value(dv, "uid")) if dv else None
+            if (
+                dv_uid is None
+                or not _owned_by(pvc, kind="DataVolume", uid=dv_uid)
+                or _storage_volume_name(
+                    _object_value(_object_value(vm_spec, "template", {}), "spec", {}),
+                    rootdisk_name,
+                )
+                is None
+                or _storage_volume_name(_object_value(vmi, "spec", {}), rootdisk_name)
+                is None
+            ):
+                return None
+            pod_list = await asyncio.to_thread(
+                self.core_api.list_namespaced_pod,
+                namespace=VM_NAMESPACE,
+                label_selector=f"vm.kubevirt.io/name={vm_name}",
+            )
+            pods = _object_value(pod_list, "items")
+            if not isinstance(pods, list) or len(pods) != 1:
+                return None
+            pod = pods[0]
+            pod_meta = _metadata(pod)
+            pod_spec = _object_value(pod, "spec", {})
+            pod_status = _object_value(pod, "status", {})
+            pod_name = _object_value(pod_meta, "name")
+            pod_uid = _safe_uid(_object_value(pod_meta, "uid"))
+            pod_rv = _object_value(pod_meta, "resourceVersion") or _object_value(
+                pod_meta, "resource_version"
+            )
+            node_name = _object_value(pod_spec, "nodeName") or _object_value(
+                pod_spec, "node_name"
+            )
+            pod_labels = _object_value(pod_meta, "labels")
+            if (
+                pod_uid is None
+                or not _owned_by(pod, kind="VirtualMachineInstance", uid=vmi_uid)
+                or not isinstance(pod_labels, Mapping)
+                or pod_labels.get("vm.kubevirt.io/name") != vm_name
+                or _object_value(pod_meta, "deletionTimestamp") is not None
+                or _object_value(pod_meta, "deletion_timestamp") is not None
+                or _object_value(pod_status, "phase") != "Running"
+                or _object_value(pod_spec, "restartPolicy") != "Never"
+                or _object_value(pod_status, "reason")
+                in {"NodeLost", "ContainerStatusUnknown"}
+                or not isinstance(node_name, str)
+                or not node_name
+                or _storage_volume_name(pod_spec, rootdisk_name) is None
+                or not _container_mounts_volume(
+                    pod_spec, _storage_volume_name(pod_spec, rootdisk_name)
+                )
+            ):
+                return None
+            for key_pair in (
+                ("ephemeralContainers", "ephemeral_containers"),
+                ("ephemeralContainerStatuses", "ephemeral_container_statuses"),
+            ):
+                source = (
+                    pod_spec if key_pair[0] == "ephemeralContainers" else pod_status
+                )
+                group = _container_entries(source, *key_pair)
+                if group is None or group:
+                    return None
+            containers = []
+            names: set[str] = set()
+            for kind, spec_keys, status_keys in (
+                (
+                    "regular",
+                    ("containers", "containers"),
+                    ("containerStatuses", "container_statuses"),
+                ),
+                (
+                    "init",
+                    ("initContainers", "init_containers"),
+                    ("initContainerStatuses", "init_container_statuses"),
+                ),
+            ):
+                declared = _container_entries(pod_spec, *spec_keys)
+                statuses = _container_entries(pod_status, *status_keys)
+                if declared is None or statuses is None:
+                    return None
+                declared_names = [_object_value(item, "name") for item in declared]
+                status_names = [_object_value(item, "name") for item in statuses]
+                if (
+                    len(set(declared_names)) != len(declared_names)
+                    or set(declared_names) != set(status_names)
+                    or len(set(status_names)) != len(status_names)
+                ):
+                    return None
+                for status in statuses:
+                    name = _object_value(status, "name")
+                    container_id = _object_value(
+                        status, "containerID"
+                    ) or _object_value(status, "container_id")
+                    restart_count = _object_value(status, "restartCount")
+                    if restart_count is None:
+                        restart_count = _object_value(status, "restart_count")
+                    state = _object_value(status, "state", {})
+                    if (
+                        not isinstance(name, str)
+                        or not name
+                        or name in names
+                        or _safe_uid(container_id) is None
+                        or type(restart_count) is not int
+                        or restart_count != 0
+                        or not _empty_container_state(
+                            _object_value(status, "lastState")
+                            or _object_value(status, "last_state")
+                        )
+                        or (
+                            _object_value(state, "running") is None
+                            and _object_value(state, "terminated") is None
+                        )
+                    ):
+                        return None
+                    names.add(name)
+                    containers.append(
+                        {"kind": kind, "name": name, "container_id": container_id}
+                    )
+            try:
+                node = await asyncio.to_thread(self.core_api.read_node, name=node_name)
+            except Exception:
+                return None
+            node_uid = _safe_uid(_metadata_value(node, "uid"))
+            node_status = _object_value(node, "status", {})
+            node_conditions = _object_value(node_status, "conditions", []) or []
+            if node_uid is None or not any(
+                _object_value(condition, "type") == "Ready"
+                and _object_value(condition, "status") == "True"
+                for condition in node_conditions
+            ):
+                return None
+            result = {
+                "kind": "vm_pre_ssh_stop_candidate_v1",
+                "job_id": job_id,
+                "provision_generation": generation,
+                "namespace": VM_NAMESPACE,
+                "vm_name": vm_name,
+                "vm_uid": expected_vm_uid,
+                "vmi_uid": vmi_uid,
+                "launcher_name": pod_name,
+                "launcher_uid": pod_uid,
+                "pvc_uid": expected_pvc_uid,
+                "node_name": node_name,
+                "node_uid": node_uid,
+                "vm_resource_version": vm_rv,
+                "vm_generation": vm_generation,
+                "launcher_resource_version": pod_rv,
+                "containers": containers,
+            }
+            return result if valid_frozen_stop_candidate(result) else None
+
+    async def _do_pre_ssh_stop(self, frozen: Mapping[str, object], digest: str) -> dict:
+        """Stop only the exact retained launcher; ACK alone never proves zero."""
+
+        from kubernetes.client.exceptions import ApiException
+        from shared.vm_pre_ssh_stop import (
+            PRE_SSH_STOP_ANNOTATION,
+            PRE_SSH_STOP_FINALIZER,
+            valid_frozen_stop_candidate,
+            valid_positive_stop_proof,
+        )
+
+        if (
+            not valid_frozen_stop_candidate(frozen)
+            or not isinstance(digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+            or frozen["namespace"] != VM_NAMESPACE
+        ):
+            return {"status": "identity_refused"}
+        job_id = str(frozen["job_id"])
+
+        async def read_current():
+            vm = await asyncio.to_thread(
+                self.k8s_client.get_namespaced_custom_object,
+                group=KUBEVIRT_GROUP,
+                version=KUBEVIRT_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=KUBEVIRT_PLURAL,
+                name=frozen["vm_name"],
+            )
+            pod = await asyncio.to_thread(
+                self.core_api.read_namespaced_pod,
+                namespace=VM_NAMESPACE,
+                name=frozen["launcher_name"],
+            )
+            vm_meta = _metadata(vm)
+            pod_meta = _metadata(pod)
+            vm_labels = _object_value(vm_meta, "labels")
+            vm_annotations = _object_value(vm_meta, "annotations")
+            vm_conditions = (
+                _object_value(_object_value(vm, "status", {}), "conditions", []) or []
+            )
+            vm_strategy = _object_value(_object_value(vm, "spec", {}), "runStrategy")
+            vm_generation = _object_value(vm_meta, "generation")
+            pod_labels = _object_value(pod_meta, "labels")
+            if (
+                _admitted_vm_uid(vm, expected_name=frozen["vm_name"])
+                != frozen["vm_uid"]
+                or not isinstance(vm_labels, Mapping)
+                or vm_labels.get("srw.io/owner-kind") != "job"
+                or vm_labels.get("srw.io/owner-id") != job_id
+                or not isinstance(vm_annotations, Mapping)
+                or vm_annotations.get("srw.io/provision-generation")
+                != frozen["provision_generation"]
+                or type(vm_generation) is not int
+                or vm_generation != frozen["vm_generation"] + (vm_strategy == "Halted")
+                or _object_value(vm_meta, "deletionTimestamp") is not None
+                or _object_value(vm_meta, "deletion_timestamp") is not None
+                or _safe_uid(_object_value(pod_meta, "uid")) != frozen["launcher_uid"]
+                or _object_value(pod_meta, "name") != frozen["launcher_name"]
+                or _object_value(pod_meta, "namespace") != VM_NAMESPACE
+                or not isinstance(pod_labels, Mapping)
+                or pod_labels.get("vm.kubevirt.io/name") != frozen["vm_name"]
+                or not _owned_by(
+                    pod, kind="VirtualMachineInstance", uid=frozen["vmi_uid"]
+                )
+                or any(
+                    _object_value(condition, "type") == "Ready"
+                    and _object_value(condition, "status") == "True"
+                    for condition in vm_conditions
+                )
+            ):
+                return None
+            pod_spec = _object_value(pod, "spec", {})
+            pod_status = _object_value(pod, "status", {})
+            node_name = _object_value(pod_spec, "nodeName") or _object_value(
+                pod_spec, "node_name"
+            )
+            if (
+                node_name != frozen["node_name"]
+                or _object_value(pod_spec, "restartPolicy") != "Never"
+                or _object_value(pod_status, "reason")
+                in {"NodeLost", "ContainerStatusUnknown"}
+            ):
+                return None
+            for source, keys in (
+                (pod_spec, ("ephemeralContainers", "ephemeral_containers")),
+                (
+                    pod_status,
+                    ("ephemeralContainerStatuses", "ephemeral_container_statuses"),
+                ),
+            ):
+                group = _container_entries(source, *keys)
+                if group is None or group:
+                    return None
+            frozen_containers = {
+                (item["kind"], item["name"]): item["container_id"]
+                for item in frozen["containers"]
+            }
+            current_containers = {}
+            for kind, spec_keys, status_keys in (
+                (
+                    "regular",
+                    ("containers", "containers"),
+                    ("containerStatuses", "container_statuses"),
+                ),
+                (
+                    "init",
+                    ("initContainers", "init_containers"),
+                    ("initContainerStatuses", "init_container_statuses"),
+                ),
+            ):
+                declared = _container_entries(pod_spec, *spec_keys)
+                statuses = _container_entries(pod_status, *status_keys)
+                if declared is None or statuses is None:
+                    return None
+                declared_names = [_object_value(item, "name") for item in declared]
+                status_names = [_object_value(item, "name") for item in statuses]
+                if (
+                    len(set(declared_names)) != len(declared_names)
+                    or len(set(status_names)) != len(status_names)
+                    or set(declared_names) != set(status_names)
+                ):
+                    return None
+                for status in statuses:
+                    name = _object_value(status, "name")
+                    cid = _object_value(status, "containerID") or _object_value(
+                        status, "container_id"
+                    )
+                    restart_count = _object_value(status, "restartCount")
+                    if restart_count is None:
+                        restart_count = _object_value(status, "restart_count")
+                    last_state = _object_value(status, "lastState")
+                    if last_state is None:
+                        last_state = _object_value(status, "last_state")
+                    if (
+                        type(restart_count) is not int
+                        or restart_count != 0
+                        or not _empty_container_state(last_state)
+                    ):
+                        return None
+                    current_containers[(kind, name)] = cid
+            if current_containers != frozen_containers:
+                return None
+            pod_list = await asyncio.to_thread(
+                self.core_api.list_namespaced_pod,
+                namespace=VM_NAMESPACE,
+                label_selector=f"vm.kubevirt.io/name={frozen['vm_name']}",
+            )
+            listed = _object_value(pod_list, "items")
+            if (
+                not isinstance(listed, list)
+                or len(listed) != 1
+                or _safe_uid(_metadata_value(listed[0], "uid"))
+                != frozen["launcher_uid"]
+            ):
+                return None
+            node = await asyncio.to_thread(
+                self.core_api.read_node, name=frozen["node_name"]
+            )
+            conditions = (
+                _object_value(_object_value(node, "status", {}), "conditions", []) or []
+            )
+            if _safe_uid(_metadata_value(node, "uid")) != frozen["node_uid"] or not any(
+                _object_value(item, "type") == "Ready"
+                and _object_value(item, "status") == "True"
+                for item in conditions
+            ):
+                return None
+            pvc_known, pvc = await self._rootdisk_pvc_by_uid(
+                frozen["pvc_uid"], owner_id=job_id, owner_kind="job"
+            )
+            rootdisk_name = _metadata_value(pvc, "name") if pvc is not None else None
+            pod_volume = (
+                _storage_volume_name(pod_spec, rootdisk_name)
+                if isinstance(rootdisk_name, str)
+                else None
+            )
+            vm_template = _object_value(
+                _object_value(_object_value(vm, "spec", {}), "template", {}),
+                "spec",
+                {},
+            )
+            if (
+                not pvc_known
+                or not rootdisk_name
+                or pod_volume is None
+                or not _container_mounts_volume(pod_spec, pod_volume)
+                or _storage_volume_name(vm_template, rootdisk_name) is None
+            ):
+                return None
+            try:
+                vmi = await asyncio.to_thread(
+                    self.k8s_client.get_namespaced_custom_object,
+                    group=KUBEVIRT_GROUP,
+                    version=KUBEVIRT_VERSION,
+                    namespace=VM_NAMESPACE,
+                    plural=KUBEVIRT_VMI_PLURAL,
+                    name=frozen["vm_name"],
+                )
+            except ApiException as exc:
+                if exc.status != 404:
+                    raise
+                vmi = None
+            if vmi is not None:
+                vmi_status = _object_value(vmi, "status", {})
+                if (
+                    _safe_uid(_metadata_value(vmi, "uid")) != frozen["vmi_uid"]
+                    or not _owned_by(vmi, kind="VirtualMachine", uid=frozen["vm_uid"])
+                    or _object_value(vmi_status, "migrationState")
+                    or _object_value(vmi_status, "migration_state")
+                    or _storage_volume_name(
+                        _object_value(vmi, "spec", {}), rootdisk_name
+                    )
+                    is None
+                ):
+                    return None
+            return vm, pod, vmi
+
+        async with self._workspace_lifecycle(job_id):
+            try:
+                current = await read_current()
+            except ApiException as exc:
+                if exc.status == 404:
+                    return {"status": "identity_refused"}
+                raise
+            if current is None:
+                return {"status": "identity_refused"}
+            vm, pod, vmi = current
+            vm_spec = _object_value(vm, "spec", {})
+            run_strategy = _object_value(vm_spec, "runStrategy")
+            pod_meta = _metadata(pod)
+            annotations = _object_value(pod_meta, "annotations") or {}
+            finalizers = _object_value(pod_meta, "finalizers") or []
+            if (
+                not isinstance(annotations, Mapping)
+                or not isinstance(finalizers, list)
+                or run_strategy not in {"RerunOnFailure", "Halted"}
+            ):
+                return {"status": "identity_refused"}
+            own_finalizer = PRE_SSH_STOP_FINALIZER in finalizers
+            own_annotation = annotations.get(PRE_SSH_STOP_ANNOTATION)
+            if own_finalizer != (own_annotation == digest):
+                return {"status": "identity_refused"}
+            if own_annotation is not None and own_annotation != digest:
+                return {"status": "identity_refused"}
+            if not own_finalizer:
+                if (
+                    run_strategy != "RerunOnFailure"
+                    or vmi is None
+                    or _object_value(_object_value(vmi, "status", {}), "phase")
+                    != "Running"
+                    or _object_value(pod_meta, "deletionTimestamp") is not None
+                    or _object_value(pod_meta, "deletion_timestamp") is not None
+                ):
+                    return {"status": "identity_refused"}
+                pod_rv = _object_value(pod_meta, "resourceVersion") or _object_value(
+                    pod_meta, "resource_version"
+                )
+                if not isinstance(pod_rv, str) or not pod_rv:
+                    return {"status": "identity_refused"}
+                patch = [
+                    {
+                        "op": "test",
+                        "path": "/metadata/uid",
+                        "value": frozen["launcher_uid"],
+                    },
+                    {
+                        "op": "test",
+                        "path": "/metadata/resourceVersion",
+                        "value": pod_rv,
+                    },
+                ]
+                if _object_value(pod_meta, "annotations") is None:
+                    patch.append(
+                        {
+                            "op": "add",
+                            "path": "/metadata/annotations",
+                            "value": {PRE_SSH_STOP_ANNOTATION: digest},
+                        }
+                    )
+                else:
+                    patch.append(
+                        {
+                            "op": "add",
+                            "path": "/metadata/annotations/srw.io~1vm-pre-ssh-stop-intent-digest",
+                            "value": digest,
+                        }
+                    )
+                if _object_value(pod_meta, "finalizers") is None:
+                    patch.append(
+                        {
+                            "op": "add",
+                            "path": "/metadata/finalizers",
+                            "value": [PRE_SSH_STOP_FINALIZER],
+                        }
+                    )
+                else:
+                    patch.append(
+                        {
+                            "op": "add",
+                            "path": "/metadata/finalizers/-",
+                            "value": PRE_SSH_STOP_FINALIZER,
+                        }
+                    )
+                try:
+                    await asyncio.to_thread(
+                        self.core_api.patch_namespaced_pod,
+                        name=frozen["launcher_name"],
+                        namespace=VM_NAMESPACE,
+                        body=patch,
+                        _content_type="application/json-patch+json",
+                    )
+                except Exception:
+                    # The reply may be lost after the patch landed. Re-read
+                    # the same UID and intent annotation before any VM stop.
+                    pass
+                current = await read_current()
+                if current is None:
+                    return {"status": "identity_refused"}
+                vm, pod, vmi = current
+                pod_meta = _metadata(pod)
+                annotations = _object_value(pod_meta, "annotations") or {}
+                finalizers = _object_value(pod_meta, "finalizers") or []
+                if (
+                    annotations.get(PRE_SSH_STOP_ANNOTATION) != digest
+                    or PRE_SSH_STOP_FINALIZER not in finalizers
+                ):
+                    return {"status": "finalizer_pending"}
+            run_strategy = _object_value(_object_value(vm, "spec", {}), "runStrategy")
+            if run_strategy == "RerunOnFailure":
+                vm_meta = _metadata(vm)
+                vm_rv = _object_value(vm_meta, "resourceVersion") or _object_value(
+                    vm_meta, "resource_version"
+                )
+                if not isinstance(vm_rv, str) or not vm_rv:
+                    return {"status": "identity_refused"}
+                try:
+                    await asyncio.to_thread(
+                        self.k8s_client.patch_namespaced_custom_object,
+                        group=KUBEVIRT_GROUP,
+                        version=KUBEVIRT_VERSION,
+                        namespace=VM_NAMESPACE,
+                        plural=KUBEVIRT_PLURAL,
+                        name=frozen["vm_name"],
+                        body=[
+                            {
+                                "op": "test",
+                                "path": "/metadata/uid",
+                                "value": frozen["vm_uid"],
+                            },
+                            {
+                                "op": "test",
+                                "path": "/metadata/resourceVersion",
+                                "value": vm_rv,
+                            },
+                            {
+                                "op": "test",
+                                "path": "/spec/runStrategy",
+                                "value": "RerunOnFailure",
+                            },
+                            {
+                                "op": "replace",
+                                "path": "/spec/runStrategy",
+                                "value": "Halted",
+                            },
+                        ],
+                        _content_type="application/json-patch+json",
+                    )
+                except Exception:
+                    # A lost reply is settled by exact read, never by an ACK.
+                    pass
+            current = await read_current()
+            if current is None:
+                return {"status": "identity_refused"}
+            vm, pod, vmi = current
+            pod_meta = _metadata(pod)
+            annotations = _object_value(pod_meta, "annotations") or {}
+            finalizers = _object_value(pod_meta, "finalizers") or []
+            if (
+                _object_value(_object_value(vm, "spec", {}), "runStrategy") != "Halted"
+                or annotations.get(PRE_SSH_STOP_ANNOTATION) != digest
+                or PRE_SSH_STOP_FINALIZER not in finalizers
+            ):
+                return {"status": "halt_pending"}
+            vm_template_spec = _object_value(
+                _object_value(_object_value(vm, "spec", {}), "template", {}),
+                "spec",
+                {},
+            )
+            terminal = _exact_terminal_container_evidence(
+                pod,
+                pre_ssh_posttermination_gc=True,
+                vm_template_grace=_object_value(
+                    vm_template_spec, "terminationGracePeriodSeconds"
+                ),
+            )
+            if terminal is None:
+                return {"status": "pending_terminal_proof"}
+            vmi_disposition = "absent" if vmi is None else "terminal"
+            if vmi is not None and _object_value(
+                _object_value(vmi, "status", {}), "phase"
+            ) not in {"Succeeded", "Failed"}:
+                return {"status": "pending_terminal_proof"}
+            proof = {
+                "kind": "vm_pre_ssh_positive_stop_v1",
+                "frozen_digest": digest,
+                "vm_uid": frozen["vm_uid"],
+                "vmi_uid": frozen["vmi_uid"],
+                "launcher_uid": frozen["launcher_uid"],
+                "node_uid": frozen["node_uid"],
+                "vm_run_strategy": "Halted",
+                "vm_generation": _object_value(_metadata(vm), "generation"),
+                "node_ready": True,
+                "vmi_disposition": vmi_disposition,
+                "same_generation_replacement": False,
+                "pod_finalizer": PRE_SSH_STOP_FINALIZER,
+                "pod_intent_digest": digest,
+                "pod_terminal": terminal["pod_terminal"],
+                "containers": terminal["containers"],
+                "controller_authenticated": True,
+            }
+            if not valid_positive_stop_proof(frozen, proof, frozen_digest=digest):
+                return {"status": "identity_refused"}
+            return {"status": "positive_terminal_proof", "terminal_evidence": proof}
+
+    async def _do_release_pre_ssh_stop_finalizer(
+        self,
+        frozen: Mapping[str, object],
+        digest: str,
+        terminal_evidence: Mapping[str, object],
+        *,
+        process_zero_receipt_id: str,
+    ) -> dict:
+        """Drop only our retained-Pod finalizer after signed durable-zero authority."""
+
+        from kubernetes.client.exceptions import ApiException
+        from shared.vm_pre_ssh_stop import (
+            PRE_SSH_STOP_ANNOTATION,
+            PRE_SSH_STOP_FINALIZER,
+            valid_positive_stop_proof,
+        )
+
+        try:
+            if str(UUID(process_zero_receipt_id)) != process_zero_receipt_id:
+                return {"status": "identity_refused"}
+        except (ValueError, TypeError, AttributeError):
+            return {"status": "identity_refused"}
+        if (
+            not valid_positive_stop_proof(
+                frozen, terminal_evidence, frozen_digest=digest
+            )
+            or frozen["namespace"] != VM_NAMESPACE
+        ):
+            return {"status": "identity_refused"}
+        async with self._workspace_lifecycle(str(frozen["job_id"])):
+            vm = await asyncio.to_thread(
+                self.k8s_client.get_namespaced_custom_object,
+                group=KUBEVIRT_GROUP,
+                version=KUBEVIRT_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=KUBEVIRT_PLURAL,
+                name=frozen["vm_name"],
+            )
+            if (
+                _admitted_vm_uid(vm, expected_name=frozen["vm_name"])
+                != frozen["vm_uid"]
+                or _admitted_provision_generation(vm) != frozen["provision_generation"]
+                or _object_value(_object_value(vm, "spec", {}), "runStrategy")
+                != "Halted"
+                or _object_value(_metadata(vm), "generation")
+                != frozen["vm_generation"] + 1
+            ):
+                return {"status": "identity_refused"}
+            try:
+                pod = await asyncio.to_thread(
+                    self.core_api.read_namespaced_pod,
+                    namespace=VM_NAMESPACE,
+                    name=frozen["launcher_name"],
+                )
+            except ApiException as exc:
+                if exc.status == 404:
+                    return {"status": "finalizer_released"}
+                raise
+            meta = _metadata(pod)
+            annotations = _object_value(meta, "annotations") or {}
+            finalizers = _object_value(meta, "finalizers") or []
+            vm_template_spec = _object_value(
+                _object_value(_object_value(vm, "spec", {}), "template", {}),
+                "spec",
+                {},
+            )
+            terminal = _exact_terminal_container_evidence(
+                pod,
+                pre_ssh_posttermination_gc=True,
+                vm_template_grace=_object_value(
+                    vm_template_spec, "terminationGracePeriodSeconds"
+                ),
+            )
+            if (
+                _safe_uid(_object_value(meta, "uid")) != frozen["launcher_uid"]
+                or not _owned_by(
+                    pod, kind="VirtualMachineInstance", uid=frozen["vmi_uid"]
+                )
+                or not isinstance(annotations, Mapping)
+                or annotations.get(PRE_SSH_STOP_ANNOTATION) != digest
+                or not isinstance(finalizers, list)
+                or terminal is None
+                or terminal["containers"] != terminal_evidence["containers"]
+                or terminal["pod_terminal"] != terminal_evidence["pod_terminal"]
+            ):
+                return {"status": "identity_refused"}
+            if PRE_SSH_STOP_FINALIZER not in finalizers:
+                return {"status": "finalizer_released"}
+            if finalizers.count(PRE_SSH_STOP_FINALIZER) != 1:
+                return {"status": "identity_refused"}
+            rv = _object_value(meta, "resourceVersion") or _object_value(
+                meta, "resource_version"
+            )
+            if not isinstance(rv, str) or not rv:
+                return {"status": "identity_refused"}
+            patch = [
+                {
+                    "op": "test",
+                    "path": "/metadata/uid",
+                    "value": frozen["launcher_uid"],
+                },
+                {"op": "test", "path": "/metadata/resourceVersion", "value": rv},
+                {"op": "test", "path": "/metadata/finalizers", "value": finalizers},
+                {
+                    "op": "test",
+                    "path": "/metadata/annotations/srw.io~1vm-pre-ssh-stop-intent-digest",
+                    "value": digest,
+                },
+                {
+                    "op": "remove",
+                    "path": f"/metadata/finalizers/{finalizers.index(PRE_SSH_STOP_FINALIZER)}",
+                },
+            ]
+            try:
+                await asyncio.to_thread(
+                    self.core_api.patch_namespaced_pod,
+                    namespace=VM_NAMESPACE,
+                    name=frozen["launcher_name"],
+                    body=patch,
+                    _content_type="application/json-patch+json",
+                )
+            except Exception:
+                # A lost reply is settled by an exact read, not a second remove.
+                pass
+            try:
+                current = await asyncio.to_thread(
+                    self.core_api.read_namespaced_pod,
+                    namespace=VM_NAMESPACE,
+                    name=frozen["launcher_name"],
+                )
+            except ApiException as exc:
+                if exc.status == 404:
+                    return {"status": "finalizer_released"}
+                raise
+            current_meta = _metadata(current)
+            current_finalizers = _object_value(current_meta, "finalizers") or []
+            if (
+                _safe_uid(_object_value(current_meta, "uid")) != frozen["launcher_uid"]
+                or PRE_SSH_STOP_FINALIZER in current_finalizers
+            ):
+                return {"status": "finalizer_pending"}
+            return {"status": "finalizer_released"}
 
     # =========================================================================
     # Golden-image cloning
@@ -5305,6 +6217,11 @@ class VMController:
                 data["job_id"],
                 provision_generation=request_generation,
                 exact_absence=data.get("exact_absence") is True,
+                **(
+                    {"workspace_storage": data["workspace_storage"]}
+                    if data.get("workspace_storage") is not None
+                    else {}
+                ),
             )
             response = sign_payload(
                 response,
@@ -5349,6 +6266,87 @@ class VMController:
                     operation="status",
                     correlation_id=request_id,
                 )
+
+    async def _dispatch_pre_ssh_stop(self, data: Mapping[str, object]) -> dict:
+        """One signed, Job-only inspect/stop/release operation."""
+
+        action = data.get("action")
+        job_id = data.get("job_id")
+        generation = _provision_generation(data.get("provision_generation"))
+        if not isinstance(job_id, str) or generation is None:
+            return {"status": "identity_refused"}
+        if action == "inspect":
+            candidate = await self._do_inspect_pre_ssh_stop(
+                job_id,
+                provision_generation=generation,
+                expected_vm_uid=data.get("expected_vm_uid"),
+                expected_pvc_uid=data.get("expected_pvc_uid"),
+            )
+            result = (
+                {"status": "candidate", "frozen": candidate}
+                if candidate is not None
+                else {"status": "identity_refused"}
+            )
+        elif action == "stop":
+            frozen = data.get("frozen")
+            if (
+                not isinstance(frozen, Mapping)
+                or frozen.get("job_id") != job_id
+                or frozen.get("provision_generation") != generation
+            ):
+                return {"status": "identity_refused"}
+            result = await self._do_pre_ssh_stop(frozen, data.get("frozen_digest"))
+        elif action == "release":
+            frozen = data.get("frozen")
+            proof = data.get("terminal_evidence")
+            if (
+                not isinstance(frozen, Mapping)
+                or frozen.get("job_id") != job_id
+                or frozen.get("provision_generation") != generation
+                or not isinstance(proof, Mapping)
+            ):
+                return {"status": "identity_refused"}
+            result = await self._do_release_pre_ssh_stop_finalizer(
+                frozen,
+                data.get("frozen_digest"),
+                proof,
+                process_zero_receipt_id=data.get("process_zero_receipt_id"),
+            )
+        else:
+            result = {"status": "identity_refused"}
+        return {"job_id": job_id, "provision_generation": generation, **result}
+
+    async def handle_pre_ssh_stop(self, msg):
+        """NATS request/reply for the same authenticated stop-only protocol."""
+
+        if not msg.reply or LIFECYCLE_HMAC_SECRET is None:
+            return
+        try:
+            signed = json.loads(msg.data.decode())
+            if not isinstance(signed, Mapping):
+                return
+            action = signed.get("action")
+            if action not in {
+                "inspect",
+                "stop",
+                "release",
+            } or not await self._verify_lifecycle_request(
+                signed, "pre-ssh-stop", mutating=action != "inspect"
+            ):
+                return
+            request_id = _lifecycle_request_id(signed)
+            result = await self._dispatch_pre_ssh_stop(unsigned_payload(signed))
+        except Exception:
+            log.exception("VM pre-SSH stop request refused")
+            return
+        response = sign_payload(
+            result,
+            direction="response",
+            operation="pre-ssh-stop",
+            secret=LIFECYCLE_HMAC_SECRET,
+            correlation_id=request_id,
+        )
+        await self.nc.publish(msg.reply, json.dumps(response).encode())
 
     async def handle_list(self, msg):
         """vm.lifecycle.list → _do_list (request/reply only).
@@ -5409,6 +6407,43 @@ class VMController:
         from vm_controller.creation_disposition import http_dispose
 
         return await http_dispose(self, request)
+
+    async def http_pre_ssh_stop(self, request):
+        """HTTP form of the signed exact stop-only request/reply."""
+
+        from aiohttp import web
+
+        if LIFECYCLE_HMAC_SECRET is None:
+            return web.json_response(
+                {"error": "authentication unavailable"}, status=503
+            )
+        try:
+            signed = await request.json()
+            if not isinstance(signed, Mapping):
+                raise ValueError("malformed request")
+            action = signed.get("action")
+            if action not in {
+                "inspect",
+                "stop",
+                "release",
+            } or not await self._verify_lifecycle_request(
+                signed, "pre-ssh-stop", mutating=action != "inspect"
+            ):
+                return web.json_response({"error": "authentication failed"}, status=401)
+            request_id = _lifecycle_request_id(signed)
+            result = await self._dispatch_pre_ssh_stop(unsigned_payload(signed))
+            return web.json_response(
+                sign_payload(
+                    result,
+                    direction="response",
+                    operation="pre-ssh-stop",
+                    secret=LIFECYCLE_HMAC_SECRET,
+                    correlation_id=request_id,
+                )
+            )
+        except Exception:
+            log.exception("HTTP pre-SSH stop request failed")
+            return web.json_response({"error": "stop request failed"}, status=503)
 
     async def _http_create(self, request, *, operation, require_creation_retry=False):
         from aiohttp import web
@@ -6045,6 +7080,7 @@ class VMController:
             "/workspace-recovery/pins", self.http_workspace_recovery_pin
         )
         app.router.add_get("/vms", self.http_list)
+        app.router.add_post("/vm-pre-ssh-stop", self.http_pre_ssh_stop)
         app.router.add_delete("/vms/{job_id}", self.http_delete)
         app.router.add_get("/vms/{job_id}", self.http_status)
         app.router.add_get("/healthz", self.http_health)
@@ -6112,6 +7148,9 @@ class VMController:
                 f"vm.lifecycle.get{suffix}", cb=self.handle_status_query
             )
             await self.nc.subscribe(f"vm.lifecycle.list{suffix}", cb=self.handle_list)
+            await self.nc.subscribe(
+                f"vm.lifecycle.pre_ssh_stop{suffix}", cb=self.handle_pre_ssh_stop
+            )
             log.info(
                 "Subscribed to vm.lifecycle.{create,delete,get,list}.%s — waiting for NATS requests",
                 ORCHESTRATOR_ID,
