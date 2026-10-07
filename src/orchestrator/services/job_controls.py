@@ -241,19 +241,31 @@ class JobControlOperations:
                     job_id, entity_type="job"
                 )
             )
-            permit = await acquire_vm_cleanup_permit(
-                self.dependencies.recovery_store,
-                owner_kind="job",
-                owner_id=job_id,
-                identity=identity,
-                source="public_vm_delete",
-                purge_disk=True,
+            from orchestrator.services.vm_job_retained_disk_purge import (
+                acquire_job_retained_disk_purge,
             )
+
+            retained = await acquire_job_retained_disk_purge(
+                self.dependencies.recovery_store,
+                job_id=job_id,
+                identity=identity,
+            )
+            if retained is None:
+                permit = await acquire_vm_cleanup_permit(
+                    self.dependencies.recovery_store,
+                    owner_kind="job",
+                    owner_id=job_id,
+                    identity=identity,
+                    source="public_vm_delete",
+                    purge_disk=True,
+                )
         except Exception as exc:
             raise HTTPException(
                 status_code=409,
                 detail="VM cleanup authority is temporarily unavailable",
             ) from exc
+        if retained is not None:
+            return await self._delete_retained_job_vm(job_id, identity, retained)
         if not permit.allowed:
             raise HTTPException(
                 status_code=409,
@@ -304,6 +316,56 @@ class JobControlOperations:
                 ) from exc
         if disposition != "completed":
             raise HTTPException(status_code=500, detail="Failed to delete VM")
+        return {"status": "deleting", "job_id": job_id}
+
+    async def _delete_retained_job_vm(self, job_id, identity, permit):
+        """Purge the disk after its old immutable retained compute stop."""
+
+        if not permit.allowed:
+            raise HTTPException(
+                status_code=409, detail="VM retained-disk purge authority is held"
+            )
+        from orchestrator.services.vm_job_retained_disk_purge import (
+            complete_job_retained_disk_purge,
+            read_job_retained_disk_purge_candidate,
+        )
+
+        try:
+            candidate = await read_job_retained_disk_purge_candidate(
+                self.dependencies.recovery_store, permit
+            )
+            if permit.completed_outcome is not None:
+                if permit.completed_outcome != "completed":
+                    raise ResourceAdmissionError("retained_disk_parent_unproven")
+                return {"status": "deleting", "job_id": job_id}
+            if candidate.get("binding_kind") == "bound":
+                # The separate exact-generation Workspace Release already
+                # deleted the disk. A fresh signed probe still owes proof.
+                disposition = "completed"
+            elif candidate.get("binding_kind") == "unbound":
+                outcome = await self.dependencies.vm_provisioner.delete_vm_captured(
+                    job_id,
+                    identity,
+                    entity_type="job",
+                    purge_disk=True,
+                    parent_cleanup=permit.parent_cleanup,
+                )
+                disposition = outcome.disposition
+            else:
+                raise ResourceAdmissionError("retained_disk_binding_unproven")
+            if disposition != "completed":
+                raise ResourceAdmissionError("retained_disk_physical_purge_pending")
+            await complete_job_retained_disk_purge(
+                self.dependencies.recovery_store,
+                permit,
+                outcome=disposition,
+                provisioner=self.dependencies.vm_provisioner,
+            )
+        except ResourceAdmissionError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="VM retained-disk purge is not yet proven",
+            ) from exc
         return {"status": "deleting", "job_id": job_id}
 
     async def resume_job(
@@ -370,7 +432,9 @@ class JobControlOperations:
         )
         if not result.pop("_terminal_notification_owned", False):
             await self.dependencies.resolve_job_notifications(
-                job_id, user=user, hook="approve",
+                job_id,
+                user=user,
+                hook="approve",
             )
         return result
 
@@ -379,7 +443,10 @@ class JobControlOperations:
         from orchestrator.services.vm_idle_lifecycle import _object
 
         payload = _object(operation.get("terminal_publication"))
-        if payload.get("version") != 1 or operation.get("terminal_source_command_id") is None:
+        if (
+            payload.get("version") != 1
+            or operation.get("terminal_source_command_id") is None
+        ):
             raise ValueError("terminal publication source missing")
         job_id = str(operation["owner_id"])
         if payload.get("job_id") != job_id:
@@ -390,21 +457,23 @@ class JobControlOperations:
         completion_data = payload.get("completion_data")
         repo_name, job_branch = payload.get("repo_name"), payload.get("job_branch")
         if not isinstance(completion_data, dict) or not all(
-            isinstance(value, str) and value
-            for value in (repo_name, job_branch)
+            isinstance(value, str) and value for value in (repo_name, job_branch)
         ):
             raise ValueError("terminal publication payload invalid")
         completion_json = json.dumps(completion_data, indent=2, ensure_ascii=False)
         if not self.dependencies.forge.is_initialized:
             raise RuntimeError("terminal completion artifact repository unavailable")
         wrote = await self.dependencies.forge.create_or_update_file(
-            repo_name, "output/job_completion.json", completion_json,
+            repo_name,
+            "output/job_completion.json",
+            completion_json,
             "Approve job: write job_completion.json",
         )
         if not wrote:
             raise RuntimeError("terminal completion artifact publication deferred")
         removed = await self.dependencies.forge.delete_file(
-            repo_name, "output/job_frozen.json",
+            repo_name,
+            "output/job_frozen.json",
             "Approve job: remove job_frozen.json",
         )
         if not removed:
@@ -426,13 +495,17 @@ class JobControlOperations:
         ):
             record_job = {**job, "freeze_data": completion_data}
             await write_job_change_record(
-                record_job, "completed", db=self.dependencies.store,
+                record_job,
+                "completed",
+                db=self.dependencies.store,
                 vector_db=self.dependencies.vector_store,
             )
             if await self.dependencies.store.get_job_change_record(job_id) is None:
                 raise RuntimeError("terminal change record publication deferred")
         await self.dependencies.maybe_wake_session(
-            self.dependencies.store, job_id, "completed",
+            self.dependencies.store,
+            job_id,
+            "completed",
         )
         self.dependencies.kick_session_wake_drain(self.dependencies.store)
         actor_id = payload.get("actor_id")
@@ -868,7 +941,8 @@ class JobControlOperations:
             validate_storage = self.dependencies.validate_workspace_recovery_storage
             if validate_storage is None or not await validate_storage(job_id):
                 raise HTTPException(
-                    409, "Workspace recovery cleanup or exact retained storage is not ready"
+                    409,
+                    "Workspace recovery cleanup or exact retained storage is not ready",
                 )
         recovery = await self.dependencies.recovery_store.unresolved_participation(
             UUID(job_id)
@@ -1330,7 +1404,9 @@ class JobControlOperations:
                                 if not await self.dependencies.store.shed_workspace_context(
                                     job_id, workspace_context_key
                                 ):
-                                    raise HTTPException(409, "Workspace cleanup is still pending")
+                                    raise HTTPException(
+                                        409, "Workspace cleanup is still pending"
+                                    )
                             queued = await self.dependencies.store.queue_job_for_resume(
                                 job_id,
                                 context_merge,
@@ -1394,13 +1470,12 @@ class JobControlOperations:
                 self.dependencies.trigger_dispatch()
                 return {"status": "queued", "message": message, "job_id": job_id}
 
-            if (
-                job.get("execution_lane") in {"stateless", "pinned"}
-                and (
-                    os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower() == "true"
-                    or self.dependencies.get_vm_context(job).get("_suspend_remote_io_closed")
-                    or self.dependencies.get_vm_context(job).get("idle_wake_operation_id")
+            if job.get("execution_lane") in {"stateless", "pinned"} and (
+                os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower() == "true"
+                or self.dependencies.get_vm_context(job).get(
+                    "_suspend_remote_io_closed"
                 )
+                or self.dependencies.get_vm_context(job).get("idle_wake_operation_id")
             ):
                 from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
 
@@ -1410,20 +1485,26 @@ class JobControlOperations:
                     and await idle_store.get_open_for_owner(job_id) is not None
                 ):
                     wake = await idle_store.request_wake(
-                        job_id, execution_requested=True,
+                        job_id,
+                        execution_requested=True,
                         **(
-                            {"context_merge": {
-                                "queued_feedback": request.feedback,
-                                "queued_feedback_reason": feedback_reason,
-                            }}
-                            if request and request.feedback else {}
+                            {
+                                "context_merge": {
+                                    "queued_feedback": request.feedback,
+                                    "queued_feedback_reason": feedback_reason,
+                                }
+                            }
+                            if request and request.feedback
+                            else {}
                         ),
                     )
                     if wake is None:
                         raise HTTPException(
                             status_code=409,
-                            detail={"code": "vm_idle_wake_unavailable",
-                                    "message": "The stopped VM has no current wake authority."},
+                            detail={
+                                "code": "vm_idle_wake_unavailable",
+                                "message": "The stopped VM has no current wake authority.",
+                            },
                         )
                     return {
                         "status": "waking",
@@ -1733,9 +1814,13 @@ class JobControlOperations:
             and idle_episode.get("wait_kind") == "human_review"
             and review_snapshot is None
         ):
-            raise HTTPException(status_code=409, detail="terminal review source changed")
+            raise HTTPException(
+                status_code=409, detail="terminal review source changed"
+            )
         if vm_phase_wait and phase_snapshot is None:
-            raise HTTPException(status_code=409, detail="idle phase approval source changed")
+            raise HTTPException(
+                status_code=409, detail="idle phase approval source changed"
+            )
         if request is None:
             request = JobApproveRequest()
         await self.dependencies.completion_control.guard(
@@ -1792,10 +1877,12 @@ class JobControlOperations:
                     ),
                 )
             control_claim = await self.dependencies.completion_control.claim(
-                {**job, "id": job_id}, source="public_approve",
+                {**job, "id": job_id},
+                source="public_approve",
                 **(
                     {"terminal_review_source": review_snapshot}
-                    if review_snapshot is not None else {}
+                    if review_snapshot is not None
+                    else {}
                 ),
             )
 
@@ -1848,11 +1935,17 @@ class JobControlOperations:
                     freeze_type == "phase_boundary"
                     and job.get("execution_lane") == "pinned"
                     and (
-                        self.dependencies.get_vm_context(job).get("_suspend_remote_io_closed")
-                        or self.dependencies.get_vm_context(job).get("idle_wake_operation_id")
+                        self.dependencies.get_vm_context(job).get(
+                            "_suspend_remote_io_closed"
+                        )
+                        or self.dependencies.get_vm_context(job).get(
+                            "idle_wake_operation_id"
+                        )
                     )
                 ):
-                    from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+                    from orchestrator.services.vm_idle_lifecycle import (
+                        VMIdleLifecycleStore,
+                    )
                     from orchestrator.services.completion_control import (
                         CompletionControlClaimConflict,
                     )
@@ -1872,7 +1965,8 @@ class JobControlOperations:
                                 control_claim
                             ) as (conn, _locked_job):
                                 wake = await idle_store.approve_phase_wake_on_conn(
-                                    conn, job_id=job_id,
+                                    conn,
+                                    job_id=job_id,
                                     claim_id=str(control_claim.claim_id),
                                     expected_source=phase_snapshot,
                                 )
@@ -1881,10 +1975,13 @@ class JobControlOperations:
                                         "pinned idle phase approval source changed"
                                     )
                         except CompletionControlClaimConflict as exc:
-                            raise HTTPException(status_code=409, detail=str(exc)) from exc
+                            raise HTTPException(
+                                status_code=409, detail=str(exc)
+                            ) from exc
                         control_claim_finished = True
                         return {
-                            "status": "waking", "job_id": job_id,
+                            "status": "waking",
+                            "job_id": job_id,
                             "freeze_type": freeze_type,
                             "phase_type": frozen_data.get("phase_type"),
                             "phase_number": frozen_data.get("phase_number"),
@@ -1915,7 +2012,8 @@ class JobControlOperations:
                                     control_claim
                                 ) as (conn, _locked_job):
                                     wake = await idle_store.approve_phase_wake_on_conn(
-                                        conn, job_id=job_id,
+                                        conn,
+                                        job_id=job_id,
                                         claim_id=str(control_claim.claim_id),
                                         expected_source=phase_snapshot,
                                     )
@@ -1924,12 +2022,15 @@ class JobControlOperations:
                                             "idle phase approval source changed"
                                         )
                             except CompletionControlClaimConflict as exc:
-                                raise HTTPException(status_code=409, detail=str(exc)) from exc
+                                raise HTTPException(
+                                    status_code=409, detail=str(exc)
+                                ) from exc
                             control_claim_finished = True
                             self.dependencies.logger.info(
                                 "Job %s phase boundary approved; exact VM wake %s "
                                 "must attest Ready before execution",
-                                job_id, wake["wake_id"],
+                                job_id,
+                                wake["wake_id"],
                             )
                             return {
                                 "status": "waking",
@@ -2038,14 +2139,17 @@ class JobControlOperations:
                     "completion_data": completion_data,
                     "repo_name": repo_name,
                     "job_branch": job_branch,
-                    "actor_id": str(user.get("id")) if user and user.get("id") else None,
+                    "actor_id": str(user.get("id"))
+                    if user and user.get("id")
+                    else None,
                 }
                 try:
                     async with self.dependencies.completion_control.finish_claim(
                         control_claim
                     ) as (conn, _locked_job):
                         operation = await idle_store.approve_terminal_review_on_conn(
-                            conn, job_id=job_id,
+                            conn,
+                            job_id=job_id,
                             claim_id=str(control_claim.claim_id),
                             expected_source=review_snapshot,
                             publication=publication,
@@ -2062,7 +2166,8 @@ class JobControlOperations:
                             "updated_at=CURRENT_TIMESTAMP WHERE id=$1::uuid "
                             "AND status='pending_review' "
                             "AND execution_lane IN ('stateless','pinned') "
-                            "RETURNING id", job_id,
+                            "RETURNING id",
+                            job_id,
                         )
                         if updated is None:
                             raise CompletionControlClaimConflict(
@@ -2079,28 +2184,36 @@ class JobControlOperations:
                     )
 
                     await apply_terminal_job_side_effects(
-                        job, "completed", gitea=self.dependencies.forge,
+                        job,
+                        "completed",
+                        gitea=self.dependencies.forge,
                         db=self.dependencies.store,
                         vector_db=self.dependencies.vector_store,
                     )
                 except Exception:
                     self.dependencies.logger.warning(
                         "Job %s: terminal side effects failed (non-fatal)",
-                        job_id, exc_info=True,
+                        job_id,
+                        exc_info=True,
                     )
                 claimant = f"approve-route:{uuid4()}"
                 claimed = await idle_store.claim_terminal_publication(
-                    str(operation["id"]), claimant=claimant,
+                    str(operation["id"]),
+                    claimant=claimant,
                 )
                 publication_pending = claimed is None
                 if claimed is not None:
                     try:
                         await asyncio.wait_for(
-                            self.publish_terminal_review(claimed), timeout=10,
+                            self.publish_terminal_review(claimed),
+                            timeout=10,
                         )
-                        publication_pending = not await idle_store.mark_terminal_published(
-                            str(operation["id"]), token=claimed["claim_token"],
-                            claimant=claimant,
+                        publication_pending = (
+                            not await idle_store.mark_terminal_published(
+                                str(operation["id"]),
+                                token=claimed["claim_token"],
+                                claimant=claimant,
+                            )
                         )
                     except Exception:
                         publication_pending = True
@@ -2109,12 +2222,14 @@ class JobControlOperations:
                             job_id,
                         )
                         await idle_store.defer_terminal_publication(
-                            str(operation["id"]), token=claimed["claim_token"],
+                            str(operation["id"]),
+                            token=claimed["claim_token"],
                             claimant=claimant,
                         )
                     finally:
                         await idle_store.release_claim(
-                            str(operation["id"]), token=claimed["claim_token"],
+                            str(operation["id"]),
+                            token=claimed["claim_token"],
                             claimant=claimant,
                         )
                 return {
@@ -2345,7 +2460,9 @@ class JobControlOperations:
             if not job:
                 raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
             if worker_execution_held(job.get("context")):
-                raise HTTPException(status_code=409, detail=WORKER_EXECUTION_HOLD_MESSAGE)
+                raise HTTPException(
+                    status_code=409, detail=WORKER_EXECUTION_HOLD_MESSAGE
+                )
             require_srw_runtime(job)
             if self.dependencies.redispatch_livelock_trip(job) is not None:
                 raise HTTPException(
@@ -2978,10 +3095,15 @@ class JobControlOperations:
                 await idle_store.schema_available()
                 and await idle_store.get_open_for_owner(job_id) is not None
             ):
-                return await idle_store.request_wake(
-                    job_id, execution_requested=True,
-                    context_merge=updates, expected_route_id=expected_route_id,
-                ) is not None
+                return (
+                    await idle_store.request_wake(
+                        job_id,
+                        execution_requested=True,
+                        context_merge=updates,
+                        expected_route_id=expected_route_id,
+                    )
+                    is not None
+                )
 
         if job.get("execution_lane") == "stateless":
             queued = await self.dependencies.store.queue_stateless_job_for_resume(

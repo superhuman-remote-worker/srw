@@ -497,6 +497,7 @@ class NatsBridge:
         provision_generation: str | None = None,
         *,
         exact_absence: bool = False,
+        workspace_storage: dict | None = None,
     ) -> Optional[dict]:
         """Query live VM status via NATS request/reply.
 
@@ -531,6 +532,10 @@ class NatsBridge:
             payload["provision_generation"] = generation
         if exact_absence:
             payload["exact_absence"] = True
+        if workspace_storage is not None:
+            from shared.vm_workspace_storage import storage_binding
+
+            payload["workspace_storage"] = storage_binding(workspace_storage)
         payload = sign_payload(
             payload,
             direction="request",
@@ -598,6 +603,52 @@ class NatsBridge:
             return result
         except Exception as e:
             logger.debug("VM status query failed for job %s: %s", job_id, e)
+            return None
+
+    async def request_vm_pre_ssh_stop(
+        self, payload: Mapping[str, Any], *, timeout: float = 8.0
+    ) -> dict | None:
+        """Signed stop-only request/reply; never publish a blind lifecycle stop."""
+
+        if not self._available or self._lifecycle_hmac_secret is None:
+            return None
+        subject = self._subj("vm.lifecycle.pre_ssh_stop")
+        if subject is None:
+            return None
+        job_id = payload.get("job_id")
+        generation = _provision_generation(payload.get("provision_generation"))
+        if not isinstance(job_id, str) or generation is None:
+            return None
+        signed = sign_payload(
+            {**payload, "orchestrator_id": self._orchestrator_id},
+            direction="request",
+            operation="pre-ssh-stop",
+            secret=self._lifecycle_hmac_secret,
+        )
+        auth = signed.get(AUTH_FIELD)
+        request_id = auth.get("request_id") if isinstance(auth, Mapping) else None
+        try:
+            response = await self._nc.request(
+                subject, json.dumps(signed).encode(), timeout=timeout
+            )
+            data = json.loads(response.data.decode())
+            if not isinstance(data, Mapping) or not verify_payload(
+                data,
+                direction="response",
+                operation="pre-ssh-stop",
+                secret=self._lifecycle_hmac_secret,
+                expected_correlation_id=request_id,
+            ):
+                return None
+            result = unsigned_payload(data)
+            if (
+                result.get("job_id") != job_id
+                or result.get("provision_generation") != generation
+            ):
+                return None
+            return {**result, "_identity_authenticated": True}
+        except Exception:
+            logger.debug("VM pre-SSH stop request inconclusive for job %s", job_id)
             return None
 
     async def request_vm_list(

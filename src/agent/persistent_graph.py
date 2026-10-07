@@ -3060,6 +3060,9 @@ async def _execute_turn(
                 max_summary_length=getattr(
                     config.context_management, "max_summary_length", 10000
                 ),
+                # Before the next main call: native where the family is
+                # (compaction WP6).
+                allow_native=True,
             ),
             callbacks.hard_interrupt_event,
         )
@@ -3298,6 +3301,21 @@ async def _execute_turn(
                     provider_attempt_history or provider_attempt_input,
                 )
             )
+            # Keep the answered request for a native compaction (WP5): as
+            # sent, and unfolded (it holds every history object it was built
+            # from; the reply joins `messages` only after this).
+            record_request = getattr(context_manager, "record_main_request", None)
+            if callable(record_request):
+                try:
+                    record_request(
+                        provider_attempt_input,
+                        llm_with_tools,
+                        history=provider_attempt_history or (),
+                        input_tokens=(attempt_metrics or {}).get("input_tokens"),
+                        timeout=llm_timeout,
+                    )
+                except Exception as e:  # never fail a turn over it
+                    logger.debug(f"record_main_request failed (non-fatal): {e}")
             provider_attempt_input = None
             provider_attempt_history = None
             provider_attempt_started_at = None

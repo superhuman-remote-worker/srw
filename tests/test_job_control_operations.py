@@ -315,7 +315,8 @@ async def test_command_mode_resume_queues_stateless_before_agent_delivery(
 
 @pytest.mark.asyncio
 async def test_resume_joins_idle_vm_wake_before_missing_workspace_shed(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
     monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false")
     store = MagicMock()
@@ -323,16 +324,22 @@ async def test_resume_joins_idle_vm_wake_before_missing_workspace_shed(
     operations = _operations(tmp_path, store=store)
     job = {
         **_frozen_job(execution_lane="stateless"),
-        "context": {"vm": {"status": "suspended", "_suspend_remote_io_closed": REQUEST_ID}},
+        "context": {
+            "vm": {"status": "suspended", "_suspend_remote_io_closed": REQUEST_ID}
+        },
     }
     operations.dependencies.get_vm_context.return_value = job["context"]["vm"]
-    with patch("orchestrator.services.vm_idle_lifecycle.VMIdleLifecycleStore") as idle_class:
+    with patch(
+        "orchestrator.services.vm_idle_lifecycle.VMIdleLifecycleStore"
+    ) as idle_class:
         idle = idle_class.return_value
         idle.schema_available = AsyncMock(return_value=True)
         idle.get_open_for_owner = AsyncMock(return_value={"id": REQUEST_ID})
         idle.request_wake = AsyncMock(return_value={"phase": "waking"})
         result = await operations.resume_job_internal(
-            JOB_ID, user={"id": "user-a"}, job=job,
+            JOB_ID,
+            user={"id": "user-a"},
+            job=job,
         )
 
     assert result["status"] == "waking"
@@ -508,10 +515,17 @@ async def test_public_vm_delete_stands_down_before_recovery_owned_cleanup(
     )
     provisioner.release_vm_captured = AsyncMock()
     provisioner.delete_vm = AsyncMock(return_value=True)
-    with patch(
-        "orchestrator.services.job_controls.acquire_vm_cleanup_permit",
-        new_callable=AsyncMock,
-    ) as acquire:
+    with (
+        patch(
+            "orchestrator.services.vm_job_retained_disk_purge.acquire_job_retained_disk_purge",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch(
+            "orchestrator.services.job_controls.acquire_vm_cleanup_permit",
+            new_callable=AsyncMock,
+        ) as acquire,
+    ):
         acquire.return_value = SimpleNamespace(
             allowed=False, reason="workspace_recovery_unresolved"
         )
@@ -525,6 +539,90 @@ async def test_public_vm_delete_stands_down_before_recovery_owned_cleanup(
     acquire.assert_awaited_once()
     provisioner.release_vm_captured.assert_not_awaited()
     provisioner.delete_vm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retained_stop", [False, True])
+async def test_retained_selector_checks_old_stop_before_requiring_runtime_uids(
+    retained_stop: bool,
+) -> None:
+    from orchestrator.services.vm_job_retained_disk_purge import (
+        acquire_job_retained_disk_purge,
+    )
+
+    conn = MagicMock()
+    conn.execute = AsyncMock()
+    conn.fetchrow = AsyncMock(return_value={"id": JOB_ID})
+    conn.fetchval = AsyncMock(return_value=retained_stop)
+
+    @asynccontextmanager
+    async def scope():
+        yield conn
+
+    conn.transaction = scope
+    store = SimpleNamespace(db=SimpleNamespace(acquire=scope))
+    identity = SimpleNamespace(
+        provision_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        vm_uid=None,
+        rootdisk_pvc_uid=None,
+    )
+
+    result = await acquire_job_retained_disk_purge(
+        store, job_id=JOB_ID, identity=identity
+    )
+
+    if retained_stop:
+        assert result.allowed is False
+        assert result.reason == "retained_disk_identity_unproven"
+    else:
+        assert result is None
+    conn.fetchval.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_public_vm_delete_unallocated_job_keeps_ordinary_cleanup_path(
+    tmp_path: Path,
+) -> None:
+    operations = _operations(tmp_path)
+    provisioner = operations.dependencies.vm_provisioner
+    provisioner.lifecycle_available = True
+    provisioner.capture_vm_teardown_identity = AsyncMock(
+        return_value=SimpleNamespace(
+            provision_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            vm_uid=None,
+            rootdisk_pvc_uid=None,
+        )
+    )
+    provisioner.release_vm_captured = AsyncMock(
+        return_value=SimpleNamespace(disposition="completed")
+    )
+    conn = MagicMock()
+    conn.execute = AsyncMock()
+    conn.fetchval = AsyncMock(return_value=False)
+
+    @asynccontextmanager
+    async def scope():
+        yield conn
+
+    conn.transaction = scope
+    operations.dependencies.recovery_store.db = SimpleNamespace(acquire=scope)
+    with (
+        patch(
+            "orchestrator.services.job_controls.acquire_vm_cleanup_permit",
+            new_callable=AsyncMock,
+            return_value=SimpleNamespace(allowed=True, completed_outcome=None),
+        ) as acquire,
+        patch(
+            "orchestrator.services.job_controls.complete_vm_cleanup_permit",
+            new_callable=AsyncMock,
+        ) as complete,
+    ):
+        result = await operations.delete_vm(JOB_ID)
+
+    assert result == {"status": "deleting", "job_id": JOB_ID}
+    acquire.assert_awaited_once()
+    provisioner.release_vm_captured.assert_awaited_once()
+    complete.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -545,14 +643,22 @@ async def test_public_vm_delete_retains_cleanup_permit_on_ambiguous_outcome(
     )
     recovery_store = operations.dependencies.recovery_store
     permit = SimpleNamespace(
-        allowed=True, admission_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        allowed=True,
+        admission_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
     )
     recovery_store.complete_cleanup_permit = AsyncMock()
 
-    with patch(
-        "orchestrator.services.job_controls.acquire_vm_cleanup_permit",
-        new_callable=AsyncMock,
-    ) as acquire:
+    with (
+        patch(
+            "orchestrator.services.vm_job_retained_disk_purge.acquire_job_retained_disk_purge",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch(
+            "orchestrator.services.job_controls.acquire_vm_cleanup_permit",
+            new_callable=AsyncMock,
+        ) as acquire,
+    ):
         acquire.return_value = permit
         with pytest.raises(HTTPException) as pending:
             await operations.delete_vm(JOB_ID)
@@ -560,6 +666,109 @@ async def test_public_vm_delete_retains_cleanup_permit_on_ambiguous_outcome(
     assert pending.value.status_code == 500
     provisioner.release_vm_captured.assert_awaited_once()
     recovery_store.complete_cleanup_permit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("binding_kind", ["bound", "unbound"])
+async def test_retained_job_delete_uses_only_its_dedicated_purge(
+    tmp_path: Path, binding_kind: str
+) -> None:
+    operations = _operations(tmp_path)
+    provisioner = operations.dependencies.vm_provisioner
+    provisioner.lifecycle_available = True
+    identity = SimpleNamespace(
+        provision_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        vm_uid="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        rootdisk_pvc_uid="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    )
+    provisioner.capture_vm_teardown_identity = AsyncMock(return_value=identity)
+    provisioner.delete_vm_captured = AsyncMock(
+        return_value=SimpleNamespace(disposition="completed")
+    )
+    provisioner.release_vm_captured = AsyncMock()
+    permit = SimpleNamespace(
+        allowed=True,
+        admission_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        parent_cleanup={"admission_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd"},
+        completed_outcome=None,
+    )
+    with (
+        patch(
+            "orchestrator.services.vm_job_retained_disk_purge.acquire_job_retained_disk_purge",
+            new_callable=AsyncMock,
+            return_value=permit,
+        ),
+        patch(
+            "orchestrator.services.vm_job_retained_disk_purge.read_job_retained_disk_purge_candidate",
+            new_callable=AsyncMock,
+            return_value={"binding_kind": binding_kind},
+        ),
+        patch(
+            "orchestrator.services.vm_job_retained_disk_purge.complete_job_retained_disk_purge",
+            new_callable=AsyncMock,
+        ) as complete,
+    ):
+        assert await operations.delete_vm(JOB_ID) == {
+            "status": "deleting",
+            "job_id": JOB_ID,
+        }
+    provisioner.release_vm_captured.assert_not_awaited()
+    if binding_kind == "bound":
+        provisioner.delete_vm_captured.assert_not_awaited()
+    else:
+        provisioner.delete_vm_captured.assert_awaited_once_with(
+            JOB_ID,
+            identity,
+            entity_type="job",
+            purge_disk=True,
+            parent_cleanup=permit.parent_cleanup,
+        )
+    complete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_completed_retained_job_purge_does_not_repeat_controller_effect(
+    tmp_path: Path,
+) -> None:
+    operations = _operations(tmp_path)
+    provisioner = operations.dependencies.vm_provisioner
+    provisioner.lifecycle_available = True
+    provisioner.capture_vm_teardown_identity = AsyncMock(
+        return_value=SimpleNamespace(
+            provision_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            vm_uid="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            rootdisk_pvc_uid="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        )
+    )
+    provisioner.delete_vm_captured = AsyncMock()
+    provisioner.release_vm_captured = AsyncMock()
+    permit = SimpleNamespace(
+        allowed=True,
+        admission_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        parent_cleanup={},
+        completed_outcome="completed",
+    )
+    with (
+        patch(
+            "orchestrator.services.vm_job_retained_disk_purge.acquire_job_retained_disk_purge",
+            new_callable=AsyncMock,
+            return_value=permit,
+        ),
+        patch(
+            "orchestrator.services.vm_job_retained_disk_purge.read_job_retained_disk_purge_candidate",
+            new_callable=AsyncMock,
+            return_value={"binding_kind": "unbound"},
+        ) as candidate,
+        patch(
+            "orchestrator.services.vm_job_retained_disk_purge.complete_job_retained_disk_purge",
+            new_callable=AsyncMock,
+        ) as complete,
+    ):
+        assert (await operations.delete_vm(JOB_ID))["status"] == "deleting"
+    candidate.assert_awaited_once()
+    provisioner.delete_vm_captured.assert_not_awaited()
+    provisioner.release_vm_captured.assert_not_awaited()
+    complete.assert_not_awaited()
 
 
 @pytest.mark.asyncio

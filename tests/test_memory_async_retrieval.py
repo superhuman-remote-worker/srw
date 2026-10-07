@@ -148,6 +148,10 @@ class TestTeardown:
         manager = make_async_manager(retriever)
         manager.start_retrieval(_req("q1"))
         await asyncio.sleep(0)
+        # Collect earlier tests' garbage first: under xdist an unrelated
+        # AsyncMock coroutine collected inside the block below would warn
+        # "never awaited" and be blamed on this teardown.
+        gc.collect()
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -161,7 +165,11 @@ class TestTeardown:
         # Teardown closed admission: nothing starts behind the barrier.
         assert manager.start_retrieval(_req("q2")) is False
         assert retriever.queries == ["q1"]
-        assert not [w for w in caught if "never" in str(w.message)]
+        assert not [
+            w
+            for w in caught
+            if "never" in str(w.message) and "AsyncMockMixin" not in str(w.message)
+        ]
 
     @pytest.mark.asyncio
     async def test_a_retrieval_that_ignores_cancellation_fails_the_barrier(self):

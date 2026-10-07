@@ -458,6 +458,10 @@ def _worker_state():
 @pytest.fixture
 def execute_env(worker_config, workspace_manager):
     """Real config/managers, mock LLM, recording manager, legacy-store spies."""
+    # The recording manager serves the synchronous ``assemble`` path these
+    # tests pin, i.e. the legacy injection mode; the bundled default is
+    # append_only (tests/test_execute_prepared_layout.py covers that layout).
+    worker_config.context_management.injection_mode = "legacy"
     todo_manager = TodoManager(workspace_manager)
     todo_manager.add("Do the task")
 

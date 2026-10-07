@@ -755,6 +755,21 @@ async def complete_vm_cleanup_permit(
             recovery_store, permit, outcome=outcome, provisioner=provisioner
         )
         return
+    if (
+        isinstance(proof, Mapping)
+        and isinstance(proof.get("intent"), Mapping)
+        and proof["intent"].get("source") == "public_vm_delete"
+    ):
+        from orchestrator.services.vm_job_retained_disk_purge import (
+            complete_job_retained_disk_purge,
+            has_job_retained_disk_purge_authority,
+        )
+
+        if await has_job_retained_disk_purge_authority(recovery_store, admission_id):
+            await complete_job_retained_disk_purge(
+                recovery_store, permit, outcome=outcome, provisioner=provisioner
+            )
+            return
     if outcome != "completed":
         if await prepare_vm_cleanup_resource(recovery_store, permit) is not None:
             raise ResourceAdmissionError("resource_cleanup_stop_unproven")
@@ -1934,6 +1949,28 @@ class VMWorkspaceRecoveryStore:
             )
 
             await validate_retained_disk_parent(conn, parent_id)
+        if (
+            parent_id is not None
+            and await conn.fetchval(
+                "SELECT source FROM vm_workspace_cleanup_admissions WHERE id=$1",
+                parent_id,
+            )
+            == "public_vm_delete"
+            and await conn.fetchval(
+                "SELECT to_regclass('public.vm_job_retained_disk_purge_authorities') "
+                "IS NOT NULL"
+            )
+            and await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_job_retained_disk_purge_authorities "
+                "WHERE cleanup_admission_id=$1)",
+                parent_id,
+            )
+        ):
+            from orchestrator.services.vm_job_retained_disk_purge import (
+                validate_job_retained_disk_parent,
+            )
+
+            await validate_job_retained_disk_parent(conn, parent_id)
         prior = await conn.fetchrow(
             "SELECT id,completed_at,pvc_uid,source,intent_digest,outcome,parent_admission_id "
             "FROM vm_workspace_cleanup_admissions "
@@ -2166,6 +2203,20 @@ class VMWorkspaceRecoveryStore:
                 if (
                     row is not None
                     and row.get("source") == "pinned_thread_retained_disk_purge"
+                ):
+                    raise ResourceAdmissionError("retained_disk_binding_required")
+                if (
+                    row is not None
+                    and row.get("source") == "public_vm_delete"
+                    and await conn.fetchval(
+                        "SELECT to_regclass('public.vm_job_retained_disk_purge_authorities') "
+                        "IS NOT NULL"
+                    )
+                    and await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_job_retained_disk_purge_authorities "
+                        "WHERE cleanup_admission_id=$1)",
+                        admission_id,
+                    )
                 ):
                     raise ResourceAdmissionError("retained_disk_binding_required")
                 # VM create adoption/non-issuance is settled atomically with
@@ -2584,6 +2635,55 @@ class VMWorkspaceRecoveryStore:
                     # The child may have completed while parent validation
                     # waited for the owner. A durable completion acknowledges
                     # its outcome; it must not authorize another disk effect.
+                    current = await conn.fetchrow(
+                        "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
+                        admission_id,
+                    )
+                    if current is None or any(
+                        current[key] != row[key]
+                        for key in (
+                            "owner_kind",
+                            "owner_id",
+                            "pvc_uid",
+                            "source",
+                            "request_id",
+                            "intent_digest",
+                            "parent_admission_id",
+                        )
+                    ):
+                        return CleanupPermit(
+                            allowed=False, reason="cleanup_reservation_changed"
+                        )
+                    if current["completed_at"] is not None:
+                        return CleanupPermit(
+                            allowed=False,
+                            admission_id=admission_id,
+                            reason="cleanup_request_already_completed",
+                            completed_outcome=current["outcome"],
+                        )
+                if (
+                    await conn.fetchval(
+                        "SELECT source FROM vm_workspace_cleanup_admissions WHERE id=$1",
+                        row["parent_admission_id"],
+                    )
+                    == "public_vm_delete"
+                    and await conn.fetchval(
+                        "SELECT to_regclass('public.vm_job_retained_disk_purge_authorities') "
+                        "IS NOT NULL"
+                    )
+                    and await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_job_retained_disk_purge_authorities "
+                        "WHERE cleanup_admission_id=$1)",
+                        row["parent_admission_id"],
+                    )
+                ):
+                    from orchestrator.services.vm_job_retained_disk_purge import (
+                        validate_job_retained_disk_parent,
+                    )
+
+                    await validate_job_retained_disk_parent(
+                        conn, row["parent_admission_id"]
+                    )
                     current = await conn.fetchrow(
                         "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
                         admission_id,

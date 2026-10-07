@@ -1097,6 +1097,9 @@ def create_execute_node(
                 summarization_prompt,
                 max_summary_length=config.context_management.max_summary_length,
                 restate_after_summary=_restate_todo_list,
+                # The threshold before the next main call: native where the
+                # family is (compaction WP6).
+                allow_native=True,
             )
         finally:
             # Restore original thresholds
@@ -1924,6 +1927,25 @@ def create_execute_node(
                 if _record_usage is not None:
                     _usage = getattr(response, "usage_metadata", None) or {}
                     _record_usage(_usage.get("input_tokens"))
+                # Keep the answered request for a native compaction (WP5):
+                # as sent, and unfolded (every history object it was built
+                # from). The reply reaches the state only after this node.
+                _record_request = getattr(context_mgr, "record_main_request", None)
+                if callable(_record_request):
+                    try:
+                        _record_request(
+                            prepared_messages,
+                            llm_with_tools,
+                            history=prepared_history,
+                            input_tokens=(
+                                getattr(response, "usage_metadata", None) or {}
+                            ).get("input_tokens"),
+                            timeout=llm_timeout,
+                        )
+                    except Exception as e:  # never fail a turn over it
+                        logger.debug(
+                            f"[{job_id}] record_main_request failed (non-fatal): {e}"
+                        )
 
                 # Supervisor guidance rendered into THIS turn's request. The
                 # pinned lane keeps its historical fire-and-forget ack. A
@@ -3714,6 +3736,8 @@ def create_archive_phase_node(
                 summarization_prompt,
                 max_summary_length=config.context_management.max_summary_length,
                 force=force_summarize,
+                # The phase end: native where the family is (WP6).
+                allow_native=True,
             )
 
             # Check for RemoveMessage markers to detect if compaction occurred
@@ -6205,6 +6229,8 @@ def build_phase_alternation_graph(
         model_max_context_tokens=config.limits.model_max_context_tokens,
         # Per-family image-token estimator config (matrix settings.image_tokens).
         image_tokens=config.limits.image_tokens,
+        # Native compaction where the family uses it (WP6).
+        compaction=config.llm.compaction,
     )
     # One model for every phase (U1): the default token counter serves both
     # phases — ContextManager.set_current_phase falls back to it.

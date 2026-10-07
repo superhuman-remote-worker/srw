@@ -71,6 +71,11 @@ default:
     # multimodal families below override with a dimension-aware mode. Verified
     # formulas: knowledge-history/done/context_token_accounting.md §4 + appendix.
     image_tokens: { mode: flat, flat: 1600 }
+    # How a long context is compacted: the auxiliary fold by default. A family
+    # sets `strategy: native` with a recipe to have the working model summarize
+    # itself (compaction refactor WP6; agent.core.native_compaction). Routed to
+    # llm.compaction, so an expert or job `llm.compaction` wins.
+    compaction: { strategy: auxiliary }
     # Session delegation cap for a PARENT of this family: how many
     # delegate_agent children a session runs at once (1..20).
     # Routed to delegation.family_session_max_concurrent, not llm; an expert or
@@ -767,6 +772,7 @@ gpt-5:
   guardrails:
     file: gpt_5.yaml
   settings:
+    compaction: { strategy: native, recipe: codex }  # the model summarizes itself with Codex's prompt (compaction WP6)
     shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0  # Reasoning model: only default 1.0 is supported
     multimodal: true  # GPT-5 supports image inputs
@@ -805,6 +811,7 @@ gpt-5.6:
   guardrails:
     file: gpt_5_6.yaml
   settings:
+    compaction: { strategy: native, recipe: codex }  # the model summarizes itself with Codex's prompt (compaction WP6)
     shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     structured_output_method: json_schema
     temperature: 1.0  # Reasoning model: only default 1.0 is supported
@@ -858,6 +865,7 @@ gpt-6:
   guardrails:
     file: gpt_6.yaml
   settings:
+    compaction: { strategy: native, recipe: codex }  # the model summarizes itself with Codex's prompt (compaction WP6)
     shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     structured_output_method: json_schema  # Structured Outputs supported (Responses `text.format`)
     # Astra rejects CUSTOM temperature/top_p (Azure: "doesn't support custom
@@ -891,6 +899,7 @@ gpt-6.1-sol:
   guardrails:
     file: gpt_6.yaml
   settings:
+    compaction: { strategy: native, recipe: codex }  # the model summarizes itself with Codex's prompt (compaction WP6)
     shell_mode: persistent
     structured_output_method: json_schema
     reasoning_level: medium
@@ -915,6 +924,7 @@ codex:
   guardrails:
     file: codex.yaml
   settings:
+    compaction: { strategy: native, recipe: codex }  # the model summarizes itself with Codex's prompt (compaction WP6)
     shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0  # Reasoning model: temperature effectively disabled
     multimodal: true  # gpt-5.3-codex supports image inputs (screenshots, diagrams, UI)
@@ -936,6 +946,7 @@ codex-spark:
   guardrails:
     file: codex_spark.yaml
   settings:
+    compaction: { strategy: native, recipe: codex }  # the model summarizes itself with Codex's prompt (compaction WP6)
     shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0  # Reasoning model: temperature effectively disabled
     multimodal: false  # Codex Spark is code-focused, no vision

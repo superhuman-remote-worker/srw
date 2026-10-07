@@ -14,6 +14,7 @@ References:
 - LangGraph: Manage Conversation History
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -22,7 +23,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from langchain_core.messages import (
     AIMessage,
@@ -34,6 +35,21 @@ from langchain_core.messages import (
 )
 
 from shared.runtime.core.context_entries import is_context_entry, is_legacy_injection
+from agent.core.native_compaction import (
+    DEFAULT_OUTPUT_RESERVE,
+    STRATEGY_AUXILIARY,
+    STRATEGY_NATIVE,
+    LastRequest,
+    build_fork,
+    compaction_settings,
+    fork_input_tokens,
+    history_for,
+    instruction_with_focus,
+    messages_since,
+    output_cap,
+    recipe_instruction,
+    summary_from_reply,
+)
 from shared.runtime.core.image_tokens import (
     content_to_summary_text,
     estimate_image_block_tokens,
@@ -963,6 +979,10 @@ class ContextConfig:
     # Per-family image-token estimator config (matrix settings.image_tokens via
     # LimitsConfig). None -> flat DEFAULT_IMAGE_TOKENS per image. S4.
     image_tokens: Optional[Dict[str, Any]] = None
+    # The main model's compaction strategy (``llm.compaction``): native = the
+    # model summarizes itself where the caller allows it (WP6); None or
+    # anything else = the auxiliary fold. See agent.core.native_compaction.
+    compaction: Optional[Dict[str, Any]] = None
 
 
 def count_tokens_tiktoken(
@@ -1107,6 +1127,44 @@ def get_token_counter(
     return lambda msgs: count_tokens_approximate(msgs, image_config)
 
 
+def _client_model_name(llm: Any) -> str:
+    """The model name of a chat client, through any binding layers."""
+    target = llm
+    for _ in range(5):
+        if target is None:
+            break
+        for attr in ("model_name", "model"):
+            value = getattr(target, attr, None)
+            if isinstance(value, str) and value:
+                return value
+        target = getattr(target, "bound", None)
+    return "unknown"
+
+
+def _archive_native(
+    auxiliary: Any,
+    messages: List[BaseMessage],
+    model: str,
+    latency_ms: int,
+    metadata: Dict[str, Any],
+    *,
+    response: Optional[AIMessage] = None,
+    error: Optional[BaseException] = None,
+) -> None:
+    """Archive a native compaction call through the auxiliary's archiver."""
+    archive = getattr(auxiliary, "archive_native_compaction", None)
+    if not callable(archive):
+        return
+    archive(
+        messages,
+        model=model,
+        latency_ms=latency_ms,
+        metadata=metadata,
+        response=response,
+        error=error,
+    )
+
+
 class ContextManager:
     """Manages context window for the Universal Agent.
 
@@ -1204,6 +1262,9 @@ class ContextManager:
         # summarizer produced nothing (aux LLM failure) — distinct from a
         # no-op, which callers answering an explicit /compact must tell apart.
         self.last_compaction_failed: bool = False
+        # The conversation's last main request as sent, for a native
+        # compaction fork (WP5). In memory only; see record_main_request.
+        self._last_request: Optional[LastRequest] = None
 
     def _note_compaction_success(self) -> None:
         """Bump the run counter and invalidate the provider-usage anchor.
@@ -1217,6 +1278,47 @@ class ContextManager:
         """
         self.compaction_runs += 1
         self._state.last_provider_input_tokens = None
+        # The kept request describes the history before this compaction.
+        self._last_request = None
+
+    def record_main_request(
+        self,
+        sent: List[BaseMessage],
+        llm: Any,
+        *,
+        history: Iterable[BaseMessage] = (),
+        input_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> None:
+        """Keep the main request just answered, for a native compaction (WP5).
+
+        ``sent`` is the request exactly as the client got it (after the
+        carrier fold), ``llm`` the client that sent it, ``history`` every
+        message object it was built from (the unfolded request, the history
+        list), so the fork can tell which messages were added since.
+        ``input_tokens`` is the provider's count for it. Kept only when the
+        family compacts natively, and only in memory: after a restart or on a
+        new pod nothing is kept and compaction uses the fold.
+        """
+        if not compaction_settings(self.config.compaction).native:
+            self._last_request = None
+            return
+        tokens = (
+            input_tokens
+            if isinstance(input_tokens, int) and not isinstance(input_tokens, bool)
+            else None
+        )
+        self._last_request = LastRequest(
+            messages=list(sent),
+            llm=llm,
+            history=history_for(sent, history),
+            input_tokens=tokens if tokens and tokens > 0 else None,
+            timeout=timeout,
+        )
+
+    def clear_last_request(self) -> None:
+        """Forget the kept main request (the next compaction folds)."""
+        self._last_request = None
 
     def _as_compaction_view(
         self, original: BaseMessage, view: BaseMessage
@@ -1251,6 +1353,9 @@ class ContextManager:
         knowledge-history/done/session_model_switch_stale_context_manager_empty_response.md.
         """
         self.config = config
+        # A model switch compacts with the fold (WP6 decision 3): the kept
+        # request was sent by the previous model's client.
+        self._last_request = None
         image_config = getattr(config, "image_tokens", None)
         self._default_counter = get_token_counter(model, image_config)
         # Sessions use only the default counter (no phase counters); rebind the
@@ -1395,6 +1500,7 @@ class ContextManager:
         trigger: str = "auto",
         focus: Optional[str] = None,
         restate_after_summary: Optional[RestateAfterSummary] = None,
+        allow_native: bool = False,
     ) -> List[BaseMessage]:
         """Ensure messages are within configured limits, summarizing if needed.
 
@@ -1410,6 +1516,8 @@ class ContextManager:
             trigger: ``auto`` | ``manual`` | ``resume`` — compaction event metadata
             focus: Optional user compaction focus (``/compact <focus>``)
             restate_after_summary: Passed to ``summarize_and_compact``.
+            allow_native: Passed to ``summarize_and_compact`` for the first
+                summary. Progressive retries always fold.
 
         Returns:
             Messages (possibly compacted) guaranteed to be within limits
@@ -1427,6 +1535,7 @@ class ContextManager:
                 trigger=trigger,
                 focus=focus,
                 restate_after_summary=restate_after_summary,
+                allow_native=allow_native,
             )
 
             # Keep-window elision (session_silent_failure_audit.md #6): tool
@@ -1791,6 +1900,108 @@ class ContextManager:
 
         return parts
 
+    async def _native_summary(
+        self,
+        messages: List[BaseMessage],
+        auxiliary,
+        *,
+        conversation: List[BaseMessage],
+        seed_summary: Optional[str],
+        trigger: str,
+        focus: Optional[str],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Have the working model summarize its own context (WP6).
+
+        Sends the conversation's last request unchanged, the messages added
+        since, and the recipe's instruction, through the client that sent it
+        (``agent.core.native_compaction``). Returns ``(summary, None)`` on
+        success, ``(None, reason)`` when the family is native but the fork
+        could not run or its reply is unusable, and ``(None, None)`` when the
+        family uses the fold.
+        """
+        settings = compaction_settings(self.config.compaction)
+        if not settings.native:
+            return None, None
+        instruction = recipe_instruction(settings.recipe)
+        if instruction is None:
+            return None, "unknown_recipe"
+        last = self._last_request
+        if last is None:
+            return None, "no_last_request"
+        added, reason = messages_since(last, messages)
+        if reason is not None:
+            return None, reason
+        fork = build_fork(
+            last,
+            scrub_history_tool_call_arguments(list(added or [])),
+            instruction_with_focus(instruction, focus),
+        )
+        tokens = fork_input_tokens(last, fork[len(last.messages) :], self.token_counter)
+        reserve = output_cap(last.llm) or DEFAULT_OUTPUT_RESERVE
+        window = max(self.config.model_max_context_tokens, 1)
+        if tokens + reserve > window:
+            return None, "does_not_fit"
+
+        meta = {"strategy": STRATEGY_NATIVE, "recipe": settings.recipe}
+        await self._emit_compaction_event(
+            "compaction.started",
+            {
+                "trigger": trigger,
+                **meta,
+                "total_tokens": tokens,
+                "ctx_used_tokens": tokens,
+                "ctx_limit_tokens": window,
+                "ctx_used_pct": round(100 * tokens / window),
+                "n_passes": 1,
+            },
+        )
+        model = _client_model_name(last.llm)
+        start = time.monotonic()
+        try:
+            reply = await asyncio.wait_for(
+                last.llm.ainvoke(fork), timeout=last.timeout or 600.0
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            latency_ms = int((time.monotonic() - start) * 1000)
+            failure = "timeout" if isinstance(e, TimeoutError) else "provider_error"
+            logger.warning(f"Native compaction call failed ({failure}): {e}")
+            _archive_native(auxiliary, fork, model, latency_ms, meta, error=e)
+            return None, failure
+        latency_ms = int((time.monotonic() - start) * 1000)
+        summary, reason = summary_from_reply(reply)
+        _archive_native(
+            auxiliary,
+            fork,
+            model,
+            latency_ms,
+            {**meta, **({"rejected": reason} if reason else {})},
+            response=reply,
+        )
+        if reason is not None:
+            return None, reason
+
+        # The file list is recorded from the tool calls, as on the fold.
+        from agent.core.summarizer import files_section
+
+        recorded_files = files_section(seed_summary, conversation)
+        if recorded_files:
+            summary = f"{summary.rstrip()}\n\n{recorded_files}"
+        self._last_summarization_stats = {
+            "n_passes": 1,
+            "duration_ms": latency_ms,
+            "before_tokens": tokens,
+            **meta,
+        }
+        logger.info(
+            f"Native compaction ({settings.recipe}): {len(summary)} chars "
+            f"from a {tokens}-token fork in {latency_ms} ms"
+        )
+        self._state.total_summarizations += 1
+        self._state.summaries.append(summary)
+        return summary, None
+
     async def summarize_conversation(
         self,
         messages: List[BaseMessage],
@@ -1801,6 +2012,7 @@ class ContextManager:
         focus: Optional[str] = None,
         trigger: str = "auto",
         context_tokens: Optional[int] = None,
+        fallback_reason: Optional[str] = None,
     ) -> Optional[str]:
         """Generate a summary of the conversation via the rolling-fold engine.
 
@@ -1821,6 +2033,8 @@ class ContextManager:
             trigger: ``auto`` | ``manual`` | ``resume`` (event metadata)
             context_tokens: Full-context token count for event display
                 (defaults to the planned input size)
+            fallback_reason: Why a native compaction did not run, when it
+                was configured and allowed (event metadata)
 
         Returns:
             Summary string, or None on total summarizer failure — callers
@@ -1892,6 +2106,8 @@ class ContextManager:
                 "aux_limit_tokens": plan.aux_window,
                 "n_passes": plan.n_passes,
                 "plan": plan.describe(),
+                "strategy": STRATEGY_AUXILIARY,
+                **({"fallback_reason": fallback_reason} if fallback_reason else {}),
             },
         )
 
@@ -1936,6 +2152,8 @@ class ContextManager:
             "n_passes": plan.n_passes,
             "duration_ms": int((time.monotonic() - start_time) * 1000),
             "before_tokens": plan.total_tokens,
+            "strategy": STRATEGY_AUXILIARY,
+            **({"fallback_reason": fallback_reason} if fallback_reason else {}),
         }
 
         logger.info(
@@ -1959,6 +2177,7 @@ class ContextManager:
         trigger: str = "auto",
         focus: Optional[str] = None,
         restate_after_summary: Optional[RestateAfterSummary] = None,
+        allow_native: bool = False,
     ) -> List[BaseMessage]:
         """Summarize older messages and compact the conversation.
 
@@ -1983,6 +2202,12 @@ class ContextManager:
                 anyway, so the restatement costs no extra cache miss and stays
                 put until the next compaction. Not called when nothing was
                 summarized.
+            allow_native: The caller is a point where the working model may
+                summarize itself (WP6 decision 3: the threshold before the next
+                main call, a manual ``/compact``, the worker's phase end). It
+                does when the family is native and the conversation's last
+                request is kept and fits; otherwise, or when the fork fails,
+                the auxiliary fold runs, with the reason on its events.
 
         Typed context entries (append-only context injection) are history:
         they go through the same summarized/kept split as the messages they
@@ -2213,19 +2438,33 @@ class ContextManager:
         if old_summaries:
             seed_summary = "\n\n".join(summary_text(m) for m in old_summaries)
 
-        # Generate summary
-        summary = await self.summarize_conversation(
-            conversation,
-            auxiliary,
-            summarization_prompt,
-            max_summary_length,
-            seed_summary=seed_summary,
-            focus=focus,
-            trigger=trigger,
-            context_tokens=self.get_token_count(
-                [m for m in messages if not isinstance(m, RemoveMessage)]
-            ),
-        )
+        # Generate summary: the working model itself where allowed and
+        # configured (WP6), else, or when that fails, the auxiliary fold.
+        summary: Optional[str] = None
+        fallback_reason: Optional[str] = None
+        if allow_native:
+            summary, fallback_reason = await self._native_summary(
+                messages,
+                auxiliary,
+                conversation=conversation,
+                seed_summary=seed_summary,
+                trigger=trigger,
+                focus=focus,
+            )
+        if summary is None:
+            summary = await self.summarize_conversation(
+                conversation,
+                auxiliary,
+                summarization_prompt,
+                max_summary_length,
+                seed_summary=seed_summary,
+                focus=focus,
+                trigger=trigger,
+                context_tokens=self.get_token_count(
+                    [m for m in messages if not isinstance(m, RemoveMessage)]
+                ),
+                fallback_reason=fallback_reason,
+            )
 
         # Stopgap (knowledge-base/knowledge/issues/session_silent_failure_audit.md #4): when the
         # summarizer is fully unavailable, keep the original history rather

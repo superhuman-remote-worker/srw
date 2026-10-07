@@ -2090,6 +2090,13 @@ class LLMConfig:
     # keyless prefix caches, so they get neither.
     prompt_cache_key: Optional[str] = None
 
+    # How a long context is compacted for this model: ``{strategy, recipe}``,
+    # ``strategy: native`` = the model writes its own summary with the named
+    # recipe, anything else = the auxiliary fold. From the family matrix
+    # (``settings.compaction``); an expert or job ``llm.compaction`` wins.
+    # See agent.core.native_compaction.
+    compaction: Optional[Dict[str, Any]] = None
+
     # The one phase override that survived U1 (context compaction).
     summarization: Optional[PhaseLLMOverride] = None
 
@@ -2173,6 +2180,7 @@ class LLMConfig:
             extra_headers=override.extra_headers
             if override.extra_headers is not None
             else self.extra_headers,
+            compaction=self.compaction,
             # Phase overrides not inherited to resolved config
             summarization=None,
         )
@@ -2989,6 +2997,7 @@ def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
         model_max_context_tokens=llm_data.get("model_max_context_tokens"),
         extra_body=llm_data.get("extra_body"),
         extra_headers=llm_data.get("extra_headers"),
+        compaction=llm_data.get("compaction"),
         summarization=_parse_phase_override(llm_data.get("summarization")),
     )
 
