@@ -248,6 +248,68 @@ def test_wait_payload_never_carries_runtime_or_cloud_coordinates():
     assert payload["project_ids"] == []
 
 
+# The non-ready allowlist of an agent image from before C1, verbatim. During a
+# rollout such an agent still polls this endpoint, and its allowlist refuses
+# any key it does not know (``workspace_ssh_identities`` among them), which
+# would fail the protected attach instead of waiting.
+_PRE_C1_AGENT_NON_READY_KEYS = frozenset(
+    {
+        "status",
+        "protected_cloud",
+        "protected_cloud_state",
+        "protected_cloud_error_code",
+        "pod_ip",
+        "pod_name",
+        "pod_port",
+        "namespace",
+        "vm_status",
+        "vm_ssh_host",
+        "vm_ssh_port",
+        "vm_name",
+        "ssh_key_path",
+        "workspace_generation",
+        "workspace_runtime_incarnation",
+        "workspace_ssh_host_key_fingerprint",
+        "git_remote_url",
+        "managed_repository_credentials",
+        "repositories",
+        "resolved_config",
+        "config_override",
+        "project_ids",
+        "datasources",
+        "nc_session_folder",
+        "cloud_sync",
+        "cloud_mount",
+        "cloud_sync_degraded",
+        "canvas_presentation_available",
+        "canvas_live_apps_available",
+        "canvas_shared_browser_available",
+    }
+)
+
+
+@pytest.mark.parametrize("state", ["engaging", "failed"])
+def test_wait_payload_keys_are_ones_every_agent_generation_accepts(state):
+    from agent.api import session_workspace
+
+    payload = engage._protected_workspace_wait_payload(
+        state=state, error_code="engage_refused"
+    )
+
+    assert set(payload) == _PRE_C1_AGENT_NON_READY_KEYS
+    assert "workspace_ssh_identities" not in payload
+    # And the current agent reads it as the wait (or refusal) it is, never as
+    # a malformed payload.
+    if state == "engaging":
+        assert session_workspace.protected_workspace_delivery(payload) == "engaging"
+    else:
+        with pytest.raises(
+            session_workspace.ProtectedCloudUnavailable,
+            match=r"engage was refused \(engage_refused\)",
+        ):
+            session_workspace.protected_workspace_delivery(payload)
+
+
 def test_wait_payload_failed_state_carries_only_the_sanitized_code():
     payload = engage._protected_workspace_wait_payload(
         state="failed", error_code="engage_refused"
