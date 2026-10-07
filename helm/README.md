@@ -1126,6 +1126,22 @@ overlap, slow boot, deadline pause, forced deletion, missing stop evidence, and
 marker/checkpoint/PVC survival. The cluster is deleted on success and failure;
 `--keep-on-failure` is the explicit diagnostic exception.
 
+`orchestrator.vmJobCancelRetention.enabled` defaults to false and renders
+`VM_JOB_CANCEL_RETENTION_ENABLED`. It admits new compute-only retention authority
+for exactly scoped cancelled, never-Ready stateless VM Jobs, including immutable
+supersession of an unissued purge request. Disabled admission holds those
+candidates; it never falls back to disk purge. Persisted retention guards, exact
+retries, settlement and separately authorized permanent Delete remain active.
+
+Publish with the effective gate false. Enable only after the schema and
+retention-aware Controller/Core versions are installed, preservation and Delete
+acceptance is qualified, and every old controller/transport consumer and cleanup
+Core/worker actor has physically stopped. A single new controller response or
+Ready Deployment does not prove that boundary. Both enabling and disabling roll
+Core and stateless worker Pods through template checksums. Disabling stops new
+admissions only after old enabled actors exit; it does not undo admitted work or
+permit rollback to actors that cannot recognize retained authority.
+
 The separate A1 retained-disk Resume adapter is disabled by default at
 `orchestrator.vmRetainedResumeAcceptanceGate.enabled`. On an exclusively owned
 disposable cluster, enable it together with same-cluster VM mode, durable

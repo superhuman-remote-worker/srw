@@ -218,6 +218,12 @@ orchestrator:
   # an image that cannot recognize them.
   vmIdleRelease:
     enabled: false
+  # -- Admit exact never-Ready cancelled Job VM retention. New admissions only:
+  # persisted retention guards, retries and typed permanent Delete stay active
+  # when false. Enable only after qualified controllers and cleanup actors have
+  # replaced every old actor. Disabling does not authorize legacy rollback.
+  vmJobCancelRetention:
+    enabled: false
   # -- Durable recovery for held stateless VM workspaces. The reader, cleanup
   # guards and recovery controls remain active while automation is disabled;
   # disabling this block pauses outstanding operations without releasing data.

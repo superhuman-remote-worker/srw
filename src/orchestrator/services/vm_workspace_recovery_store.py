@@ -1777,6 +1777,7 @@ class VMWorkspaceRecoveryStore:
         parent_provision_generation: str | None = None,
         expected_vm_uid: str | None = None,
         purge_successor: tuple[str, UUID] | None = None,
+        _retained_purge_bootstrap: Any = None,
     ) -> CleanupPermit:
         """Serialize destructive admission with recovery and its exact disk pin.
 
@@ -1971,6 +1972,18 @@ class VMWorkspaceRecoveryStore:
             )
 
             await validate_job_retained_disk_parent(conn, parent_id)
+        from orchestrator.services.vm_job_cancel_retention import (
+            guard_retention_cleanup_on_conn,
+        )
+
+        try:
+            await guard_retention_cleanup_on_conn(
+                conn, owner_kind=owner_kind, owner_id=owner_id, pvc_uid=pvc_uid,
+                source=source, request_id=request_id, intent_digest=intent_digest,
+                parent_admission_id=parent_id, bootstrap=_retained_purge_bootstrap,
+            )
+        except ResourceAdmissionError as exc:
+            return CleanupPermit(allowed=False, reason=str(exc))
         prior = await conn.fetchrow(
             "SELECT id,completed_at,pvc_uid,source,intent_digest,outcome,parent_admission_id "
             "FROM vm_workspace_cleanup_admissions "
@@ -2589,11 +2602,40 @@ class VMWorkspaceRecoveryStore:
     ) -> CleanupPermit:
         """Validate a controller reservation recovered from Kubernetes state."""
 
-        async with self.db.acquire() as conn:
+        async with self.db.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1",
                 admission_id,
             )
+            if row is not None:
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                    f"workspace-recovery:{row['owner_kind']}:{row['owner_id']}",
+                )
+                if row["pvc_uid"] is not None:
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                        f"workspace-recovery-pvc:{row['pvc_uid']}",
+                    )
+                row = await conn.fetchrow(
+                    "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
+                    admission_id,
+                )
+                if row is None:
+                    return CleanupPermit(allowed=False, reason="cleanup_reservation_changed")
+                from orchestrator.services.vm_job_cancel_retention import (
+                    guard_retention_cleanup_on_conn,
+                )
+
+                try:
+                    await guard_retention_cleanup_on_conn(
+                        conn, owner_kind=row["owner_kind"], owner_id=row["owner_id"],
+                        pvc_uid=row["pvc_uid"], source=row["source"],
+                        request_id=row["request_id"], intent_digest=row["intent_digest"],
+                        parent_admission_id=row["parent_admission_id"],
+                    )
+                except ResourceAdmissionError as exc:
+                    return CleanupPermit(allowed=False, reason=str(exc))
             from orchestrator.services.vm_creation_disposition_cleanup import (
                 child_disposition_identity,
             )

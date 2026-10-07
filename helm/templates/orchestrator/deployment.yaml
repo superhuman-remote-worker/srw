@@ -71,6 +71,7 @@ spec:
         checksum/workspace-lifecycle-service-account: {{ .Values.orchestrator.workspaceLifecycleServiceAccountGeneration | default "0197" | toString | sha256sum | quote }}
         checksum/vm-remote-operation-protocol: {{ dict "enabled" $vmRemoteProtocol | toJson | sha256sum | quote }}
         checksum/vm-workspace-recovery: {{ toJson .Values.orchestrator.vmWorkspaceRecovery | sha256sum | quote }}
+        checksum/vm-job-cancel-retention: {{ dict "enabled" ((.Values.orchestrator.vmJobCancelRetention | default dict).enabled | default false) | toJson | sha256sum | quote }}
         checksum/vm-workspace-recovery-acceptance-gate: {{ toJson .Values.orchestrator.vmWorkspaceRecoveryAcceptanceGate | sha256sum | quote }}
         checksum/vm-retained-resume-acceptance-gate: {{ toJson $vmRetainedResumeGate | sha256sum | quote }}
     spec:
@@ -543,6 +544,12 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: STATELESS_WORKER_DEFAULT_ENABLED
+            # Retention admission is default-off; persisted guards remain active.
+            - name: VM_JOB_CANCEL_RETENTION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VM_JOB_CANCEL_RETENTION_ENABLED
             # Recovery admission, workers, and the leader reconciler consume
             # one rendered protocol surface. This Deployment does not use the
             # shared ConfigMap through envFrom, so every key is explicit here.

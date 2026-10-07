@@ -118,6 +118,12 @@ async def _schema_applied(pg_dsn: str) -> None:
         if os.getenv("VM_RECOVERY_TEST_DSN"):
             await conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
         await conn.execute(SCHEMA_FILE.read_text())
+        if not await conn.fetchval(
+            "SELECT to_regclass('public.vm_job_cancel_retention_authorities') IS NOT NULL"
+        ):
+            await conn.execute(
+                (SCHEMA_FILE.parent / "migrations/app/0338_vm_job_cancel_retention.sql").read_text()
+            )
     finally:
         await conn.close()
 

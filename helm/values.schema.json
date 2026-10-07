@@ -1625,6 +1625,13 @@
           },
           "additionalProperties": false
         },
+        "vmJobCancelRetention": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
         "vmWorkspaceRecovery": {
           "type": "object",
           "required": [

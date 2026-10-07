@@ -49,6 +49,10 @@ async def pre_ssh_schema(pg_dsn, _schema_applied):  # noqa: F811
         Path(__file__).resolve().parents[1]
         / "src/orchestrator/database/migrations/app/0334_vm_job_retained_disk_late_purge.sql"
     )
+    retention = (
+        Path(__file__).resolve().parents[1]
+        / "src/orchestrator/database/migrations/app/0338_vm_job_cancel_retention.sql"
+    )
     conn = await asyncpg.connect(pg_dsn)
     try:
         if not await conn.fetchval(
@@ -60,6 +64,10 @@ async def pre_ssh_schema(pg_dsn, _schema_applied):  # noqa: F811
             "IS NOT NULL"
         ):
             await conn.execute(late_purge.read_text())
+        if not await conn.fetchval(
+            "SELECT to_regclass('public.vm_job_cancel_retention_authorities') IS NOT NULL"
+        ):
+            await conn.execute(retention.read_text())
         yield
     finally:
         await conn.close()
@@ -70,7 +78,9 @@ async def db(pre_ssh_schema, _db_fixture):  # noqa: F811
     yield _db_fixture
 
 
-async def seeded_stop(db):
+async def seeded_stop(
+    db, *, cleanup_source="dispatcher_vm_recycle", purge_disk=False, retiring=True,
+):
     policy, inventory, _, _ = await environment(db, installation_count=2)
     retry = await waiter(db, policy, inventory, lane="stateless", user_id=uuid4())
     admitted = await policy.admit(request_id=str(retry["request_id"]))
@@ -132,20 +142,23 @@ async def seeded_stop(db):
         UUID(job_id),
         json.dumps(context),
     )
-    permit = await acquire_vm_cleanup_permit(
-        VMWorkspaceRecoveryStore(db),
-        owner_kind="job",
-        owner_id=job_id,
-        identity=VMTeardownIdentity(generation, vm_uid, pvc_uid),
-        source="dispatcher_vm_recycle",
-        purge_disk=False,
-    )
-    assert permit.allowed and permit.parent_cleanup is not None
-    await db.execute(
-        "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',"
-        "'\"retiring_process_zero\"') WHERE id=$1",
-        UUID(job_id),
-    )
+    permit = None
+    if cleanup_source is not None:
+        permit = await acquire_vm_cleanup_permit(
+            VMWorkspaceRecoveryStore(db),
+            owner_kind="job",
+            owner_id=job_id,
+            identity=VMTeardownIdentity(generation, vm_uid, pvc_uid),
+            source=cleanup_source,
+            purge_disk=purge_disk,
+        )
+        assert permit.allowed and permit.parent_cleanup is not None
+    if retiring:
+        await db.execute(
+            "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',"
+            "'\"retiring_process_zero\"') WHERE id=$1",
+            UUID(job_id),
+        )
     frozen = {
         "kind": "vm_pre_ssh_stop_candidate_v1",
         "job_id": job_id,
@@ -178,7 +191,7 @@ async def seeded_stop(db):
     return {
         "job_id": job_id,
         "generation": generation,
-        "permit": permit.parent_cleanup,
+        "permit": permit.parent_cleanup if permit is not None else None,
         "cleanup_permit": permit,
         "frozen": frozen,
         "reservation_id": admitted["reservation_id"],

@@ -120,6 +120,29 @@ async def acquire_job_retained_disk_purge(store, *, job_id: str, identity):
                 raise ValueError
         except (KeyError, TypeError, ValueError):
             return CleanupPermit(allowed=False, reason="retained_disk_binding_unproven")
+        bootstrap = None
+        if await conn.fetchval(
+            "SELECT to_regclass('public.vm_job_cancel_retention_authorities') IS NOT NULL"
+        ):
+            from orchestrator.services.vm_job_cancel_retention import (
+                JobRetainedPurgeBootstrap,
+            )
+
+            protected = await conn.fetch(
+                "SELECT cleanup_admission_id FROM vm_job_cancel_retention_authorities "
+                "WHERE (job_id=$1 OR pvc_uid=$2) AND NOT "
+                "public.vm_job_cancel_retention_discharged(cleanup_admission_id)",
+                owner, pvc,
+            )
+            if protected:
+                bootstrap = JobRetainedPurgeBootstrap(
+                    job_id=owner, pvc_uid=pvc, final_request_id=final["request_id"],
+                    provision_generation=generation, cleanup_request_id=request_id,
+                    intent_digest=digest,
+                    retention_admission_ids=frozenset(
+                        row["cleanup_admission_id"] for row in protected
+                    ),
+                )
         permit = await store.acquire_cleanup_permit_on_conn(
             conn,
             owner_kind="job",
@@ -128,6 +151,7 @@ async def acquire_job_retained_disk_purge(store, *, job_id: str, identity):
             request_id=request_id,
             source="public_vm_delete",
             intent_digest=digest,
+            _retained_purge_bootstrap=bootstrap,
         )
         if not permit.allowed:
             return permit

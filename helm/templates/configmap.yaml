@@ -368,6 +368,7 @@ data:
   # gate. Recovery budgets remain visible even while automation is disabled so
   # an enable is one coordinated Pod rollout rather than an implicit default.
   VM_WORKSPACE_RECOVERY_ENABLED: {{ $vmRecovery.enabled | quote }}
+  VM_JOB_CANCEL_RETENTION_ENABLED: {{ (.Values.orchestrator.vmJobCancelRetention | default dict).enabled | default false | quote }}
   VM_WORKSPACE_REPLACEMENT_RECOVERY_ENABLED: {{ $vmRecovery.replacementEnabled | quote }}
   VM_WORKSPACE_RECOVERY_DEADLINE_SECONDS: {{ $vmRecovery.deadlineSeconds | quote }}
   VM_WORKSPACE_RECOVERY_MAX_GLOBAL_PROBES: {{ $vmRecovery.maxGlobalProbes | quote }}
