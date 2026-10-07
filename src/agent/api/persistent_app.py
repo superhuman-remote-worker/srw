@@ -533,6 +533,40 @@ def _publish_draft_title(value: Any) -> None:
     _draft_title_value = value
 
 
+def _pinned_session_subagent_runtime() -> Any:
+    """The attached pinned session's delegation runtime, or ``None``."""
+
+    if _stateless_mode():
+        # The stateless executor hands its own batch over at ``stop()``.
+        return None
+    context = getattr(_session, "tool_context", None)
+    return getattr(context, "subagent_runtime", None)
+
+
+def _leave_delegation_batch_for_successor() -> None:
+    """Hand a pinned session's delegation batch to its successor (P4).
+
+    The termination fence's first activation calls this: a pod deletion
+    (preStop or the process shutdown), never a person's Stop or End. Each
+    running child then ends at its next boundary as interrupted by the
+    restart, no call returns a result, and the successor settles the turn at
+    Resume or respawn (parallel_subagents.md §14.2 P4, D7).
+    """
+
+    leave = getattr(
+        _pinned_session_subagent_runtime(), "leave_foreground_for_successor", None
+    )
+    if callable(leave):
+        leave(retiring=True)
+
+
+def _delegation_batch_left_for_successor() -> bool:
+    """Whether the open turn waits only on a batch the successor now owns."""
+
+    runtime = _pinned_session_subagent_runtime()
+    return getattr(runtime, "foreground_held_for_successor", False) is True
+
+
 # Termination owns retirement, quiescence and its tasks; composition remains here
 # until R3.4. Each port names the collaborator read at invocation time.
 _session_termination = SessionTerminationCoordinator(
@@ -550,6 +584,9 @@ _session_termination = SessionTerminationCoordinator(
             *args, **kwargs
         ),
         control_owner_agent_id=lambda: _control_owner_agent_id,
+        delegation_batch_left_for_successor=lambda: (
+            _delegation_batch_left_for_successor()
+        ),
         event_writer=lambda: _event_writer,
         handle_idle_archive=lambda *args, **kwargs: _handle_idle_archive(
             *args, **kwargs
@@ -560,6 +597,9 @@ _session_termination = SessionTerminationCoordinator(
         memory_unavailable_error=MemoryUnavailableError,
         workspace_unavailable_error=WorkspaceUnavailableError,
         input_runtime=lambda: _session_input,
+        leave_delegation_batch_for_successor=lambda: (
+            _leave_delegation_batch_for_successor()
+        ),
         loop_on_error=lambda *args, **kwargs: _loop_on_error(*args, **kwargs),
         loop_task=lambda: _loop_task,
         officer_config=lambda *args, **kwargs: _officer_cfg(*args, **kwargs),

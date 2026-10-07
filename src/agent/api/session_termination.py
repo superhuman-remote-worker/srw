@@ -35,6 +35,9 @@ class SessionTerminationPorts:
     canvas_control: Callable[..., Any]
     close_pinned_control_inbox: Callable[..., Any]
     control_owner_agent_id: Callable[..., Any]
+    #: True only while the open turn waits on nothing but a delegation batch
+    #: handed to the successor (parallel_subagents.md §14.2 P4).
+    delegation_batch_left_for_successor: Callable[..., Any]
     event_writer: Callable[..., Any]
     handle_idle_archive: Callable[..., Any]
     heartbeat_task: Callable[..., Any]
@@ -43,6 +46,9 @@ class SessionTerminationPorts:
     memory_unavailable_error: type[Exception]
     workspace_unavailable_error: type[Exception]
     input_runtime: Callable[..., Any]
+    #: Hands a pinned session's running delegation batch to its successor at
+    #: the termination fence's first activation, a platform shutdown (P4).
+    leave_delegation_batch_for_successor: Callable[..., Any]
     loop_on_error: Callable[..., Any]
     loop_task: Callable[..., Any]
     officer_config: Callable[..., Any]
@@ -260,15 +266,38 @@ class SessionTerminationCoordinator:
                 self._ports.turn_event_open(),
                 self._ports.tool_inflight(),
             )
+            # Only the platform sets this fence (a person's End goes through
+            # retirement admission), so a running delegation batch is handed
+            # to the successor rather than answered with interrupted results.
+            # No await since the latch: no child saw the fence without it.
+            try:
+                self._ports.leave_delegation_batch_for_successor()
+            except Exception:
+                self._logger.warning(
+                    "Delegation batch could not be handed to the successor",
+                    exc_info=True,
+                )
         # queue.get() otherwise has no reason to wake and notice the file/flag.
         # The sentinel is filtered by the loop and is never persisted.
         self._ports.input_runtime().wake_parked_wait(self.termination_queue_sentinel)
         return first
 
     def termination_quiescent(self) -> bool:
-        """True after the current turn's complete settlement boundary."""
+        """True after the current turn's complete settlement boundary.
 
-        if self._ports.tool_inflight() or self._ports.turn_event_open():
+        A turn whose delegation batch was handed to the successor at the fence
+        is such a boundary although it stays open: every call of it is held,
+        no child runs, and the termination's cancellation ends it writing
+        nothing.
+        """
+
+        handed_over = (
+            self.termination_admission_closed()
+            and self._ports.delegation_batch_left_for_successor() is True
+        )
+        if not handed_over and (
+            self._ports.tool_inflight() or self._ports.turn_event_open()
+        ):
             return False
         session = self._ports.session()
         if session is not None:
@@ -278,6 +307,8 @@ class SessionTerminationCoordinator:
             memory = getattr(session, "memory_service", None)
             if int(getattr(memory, "background_tasks_inflight", 0) or 0) > 0:
                 return False
+        if handed_over:
+            return True
         task = self._ports.loop_task()
         return task is None or task.done() or self._ports.input_runtime().awaiting_input
 

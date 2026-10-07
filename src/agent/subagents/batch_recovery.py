@@ -15,11 +15,14 @@ This module builds what the agent supplies: the members it must name
 or, when the spill is missing or unreadable (a ``none``-tier scratch
 workspace dies with its process), the child's last assistant message from its
 stored transcript. A child that was still live gets the interrupted envelope,
-built from its last assistant text only. Every text is redacted before it is
-cut, and its control markers are neutralised; the return budget is split by
-the number of members that carry text (§5.7), passed explicitly: the
-runtime's own batch size is process-local and 1 after a restart (F7). A
-settle is first-write-wins, so what is sent here is what the parent keeps.
+built from its last assistant text only, and so does one whose row was ended
+``interrupted:parent_restart`` without its result reaching the parent (a
+graceful pinned shutdown hands its batch over so, §14.2 P4). Every text is
+redacted before it is cut, and its control markers are neutralised; the
+return budget is split by the number of members that carry text (§5.7),
+passed explicitly: the runtime's own batch size is process-local and 1 after
+a restart (F7). A settle is first-write-wins, so what is sent here is what the
+parent keeps.
 
 The plans themselves prove that the orchestrator can settle a batch: they and
 the settle shipped together. An orchestrator that lists none (or lists them
@@ -75,6 +78,10 @@ INTERRUPTED_TAIL_SHARE = 0.25
 PARENT_RESTART_STATUS = "interrupted"
 PARENT_RESTART_OUTCOME = "interrupted:parent_restart"
 PARENT_RESTART_ERROR = "the parent runtime restarted"
+#: The same end (status and error) for a child whose row was opened but which
+#: never ran: the settle reports it NOT STARTED and takes no text for it.
+#: Mirrors ``orchestrator.database.session_subagent_recovery``.
+PARENT_RESTART_NOT_STARTED_OUTCOME = "interrupted:not_started"
 #: One transcript read or listing, as the single-child path bounds it.
 LOAD_TIMEOUT_S = 5.0
 #: One settle: a bounded transaction (at most 64 members, 1M characters).
@@ -90,6 +97,22 @@ _TEXT_BLOCK_TYPES = frozenset({"text", "output_text"})
 
 class BatchRecoveryError(RuntimeError):
     """The turn could not be settled; recovery stays incomplete and re-runs."""
+
+
+def ended_by_parent_restart(call: Mapping[str, Any]) -> bool:
+    """An ended call whose child was ended unfinished by its parent's restart.
+
+    The predecessor itself writes this outcome when a graceful pinned
+    shutdown hands its batch over (parallel_subagents.md §14.2 P4), and so
+    does the retirement of a runtime lost to a forced stop (P0b). Such a
+    child produced no final report: its result is the INTERRUPTED one, not a
+    replay.
+    """
+
+    return (
+        str(call.get("subagent_status") or "") == PARENT_RESTART_STATUS
+        and str(call.get("outcome") or "") == PARENT_RESTART_OUTCOME
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +606,12 @@ class SessionTurnRecovery:
                 # The terminal facts are stored; state only the status.
                 member["subagent_status"] = str(call.get("subagent_status") or "")
                 member["outcome"] = call.get("outcome")
+                if ended_by_parent_restart(call):
+                    report_file = row.get("report_path") or (
+                        report_path(handle)
+                        if self.runtime._report_exists(handle)
+                        else None
+                    )
             else:
                 if self.runtime._report_exists(handle):
                     report_file = report_path(handle)
@@ -639,7 +668,8 @@ class SessionTurnRecovery:
         entry_budget = ChildBudgets.from_entry(
             entry, subagent_type
         ).return_budget_tokens
-        if call.get("class") == _CALL_ENDED:
+        ended = call.get("class") == _CALL_ENDED
+        if ended and not ended_by_parent_restart(call):
             # The spill first; a successor may not have it (a ``none``-tier
             # scratch workspace dies with its process) or may fail to read
             # it. The settle is first-write-wins, so fall back to the report
@@ -670,12 +700,14 @@ class SessionTurnRecovery:
                 ),
                 context,
             )
-        if call.get("class") != _CALL_LIVE:
+        if not ended and call.get("class") != _CALL_LIVE:
             raise BatchRecoveryError(
                 f"a {call.get('class')!r} call cannot carry a recovered message"
             )
-        # Redact before cutting, so a cut can never split a credential out of
-        # the pattern that recognizes it; then quote harness markers.
+        # A live child, or one whose row was ended as interrupted by the
+        # restart before it finished: what it wrote is partial. Redact before
+        # cutting, so a cut can never split a credential out of the pattern
+        # that recognizes it; then quote harness markers.
         partial = neutralise_control_markers(
             redact_tool_result(await self._transcript_text(thread_id), context)
         )
@@ -701,6 +733,7 @@ __all__ = [
     "INTERRUPTED_TAIL_SHARE",
     "SessionTurnRecovery",
     "batchable",
+    "ended_by_parent_restart",
     "interrupted_envelope",
     "last_assistant_text",
     "plans_by_turn",
