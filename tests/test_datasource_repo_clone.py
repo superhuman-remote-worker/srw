@@ -975,6 +975,85 @@ class TestWorkspaceFactsRepositoryLine:
             in self._render(without_host)
         )
 
+    @staticmethod
+    def _ssh_key_entry(datasource_id, name, config):
+        from shared.runtime.utils.ssh_key import generate_ed25519_keypair
+
+        (payload,) = agent_payload(
+            {
+                "id": datasource_id,
+                "type": "ssh_key",
+                "name": name,
+                "credentials": {
+                    "files": [{"contents": generate_ed25519_keypair().private_key}]
+                },
+                "config": config,
+                "project_read_only": False,
+            }
+        )
+        return payload
+
+    def _render_all(self, entries, **kwargs):
+        ws = make_workspace_manager()
+        ws.read_file.side_effect = FileNotFoundError
+        written = {}
+        ws.write_file.side_effect = lambda path, content: written.update(
+            {path: content}
+        )
+        inject_workspace_facts(entries, ws, **kwargs)
+        return written["README.md"]
+
+    def test_an_identity_whose_key_did_not_load_is_not_advertised(self):
+        repository = TestBackendClone._ssh_entry()
+        ssh_key = self._ssh_key_entry(
+            "00000000-0000-4000-8000-0000000000e1",
+            "Bastion",
+            {"host": "bastion.example.com", "user": "ops"},
+        )
+        entries = [repository, ssh_key]
+        failed = {
+            e["ssh_identity"]["authority_id"]: "workspace_ssh_identity_load_failed"
+            for e in entries
+        }
+
+        content = self._render_all(entries, ssh_identity_status=failed)
+
+        assert "git uses SSH alias" not in content
+        assert "uses it" not in content
+        assert "workspace_ssh_identity_load_failed" not in content
+        assert content.count("its key could not be loaded") == 2
+
+        ready = {e["ssh_identity"]["authority_id"]: "ready" for e in entries}
+        content = self._render_all(entries, ssh_identity_status=ready)
+        assert "git uses SSH alias" in content
+        assert "`ssh ops@bastion.example.com` uses it" in content
+
+    def test_two_ssh_keys_on_one_host_are_each_named_by_their_alias(self):
+        first = self._ssh_key_entry(
+            "00000000-0000-4000-8000-0000000000e1",
+            "Deploy",
+            {"host": "bastion.example.com", "user": "deploy"},
+        )
+        second = self._ssh_key_entry(
+            "00000000-0000-4000-8000-0000000000e2",
+            "Ops",
+            {"host": "BASTION.example.com", "user": "ops"},
+        )
+        other = self._ssh_key_entry(
+            "00000000-0000-4000-8000-0000000000e3",
+            "Build",
+            {"host": "build.example.com"},
+        )
+
+        content = self._render_all([first, second, other])
+
+        for entry in (first, second):
+            alias = entry["ssh_identity"]["alias"]
+            assert f"use the alias: `ssh {alias}` reaches" in content
+        assert "`ssh deploy@bastion.example.com`" not in content
+        assert "`ssh ops@bastion.example.com`" not in content
+        assert "`ssh build.example.com` uses it" in content
+
 
 class TestProcessDatasourcesRepoGuard:
     """process_datasources never clones — repository entries are skipped."""

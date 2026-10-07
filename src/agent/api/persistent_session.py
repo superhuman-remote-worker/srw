@@ -3271,6 +3271,7 @@ class PersistentSession:
                     new_configs,
                     self.workspace_manager,
                     expert=getattr(self.config, "display_name", None),
+                    ssh_identity_status=self.workspace_ssh_identity_status,
                 )
             except Exception as e:
                 logger.warning("Failed to rewrite workspace facts: %s", e)

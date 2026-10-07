@@ -1769,6 +1769,7 @@ class SessionAttachCoordinator:
                     datasources or [],
                     self._session.workspace_manager,
                     expert=getattr(self._session.config, "display_name", None),
+                    ssh_identity_status=self._session.workspace_ssh_identity_status,
                 )
             except Exception as e:
                 self._logger.warning(f"Failed to write workspace facts: {e}")

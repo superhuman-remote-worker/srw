@@ -4356,6 +4356,9 @@ class UniversalAgent:
                 ws,
                 project_name=project_name,
                 expert=getattr(self.config, "display_name", None),
+                ssh_identity_status=getattr(
+                    self, "_workspace_ssh_identity_status", None
+                ),
             )
             if readme:
                 self._agent_seed_files["README.md"] = readme

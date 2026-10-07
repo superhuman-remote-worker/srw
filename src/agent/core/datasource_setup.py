@@ -1108,7 +1108,23 @@ def _repo_meta(workspace_manager: Any, clone_name: str) -> Dict[str, Any]:
     return entry if isinstance(entry, dict) else {}
 
 
-def _ssh_identity_note(ds: Dict[str, Any]) -> str:
+def _ssh_identity_unloaded(
+    identity: Dict[str, Any], ssh_identity_status: Optional[Dict[str, str]]
+) -> bool:
+    """True when the materializer ran and this identity's key is not held."""
+
+    if not isinstance(ssh_identity_status, dict):
+        return False
+    authority = str(identity.get("authority_id") or "")
+    return ssh_identity_status.get(authority) != "ready"
+
+
+_SSH_KEY_NOT_LOADED = "its key could not be loaded into this workspace's ssh-agent"
+
+
+def _ssh_identity_note(
+    ds: Dict[str, Any], ssh_identity_status: Optional[Dict[str, str]] = None
+) -> str:
     """Suffix for an SSH-key repository line: how git reaches it."""
 
     identity = ds.get("ssh_identity")
@@ -1116,25 +1132,59 @@ def _ssh_identity_note(ds: Dict[str, Any]) -> str:
         return ""
     if identity.get("unavailable"):
         return f"; not available: {_ssh_unavailable_reason(identity)}"
+    if _ssh_identity_unloaded(identity, ssh_identity_status):
+        return f"; not available: {_SSH_KEY_NOT_LOADED}"
     return (
         f"; git uses SSH alias `{identity.get('alias')}`, whose key an "
         "ssh-agent holds (never on disk)"
     )
 
 
-def _ssh_key_usage(ds: Dict[str, Any]) -> str:
-    """How the agent uses an ``ssh_key`` connector held by an ssh-agent."""
+def _ssh_key_host(ds: Dict[str, Any]) -> Optional[str]:
+    """The host a delivered ``ssh_key`` connector declares, if any."""
+
+    identity = ds.get("ssh_identity")
+    if (
+        ds.get("type") != "ssh_key"
+        or not isinstance(identity, dict)
+        or not identity.get("alias")
+        or identity.get("unavailable")
+        or not identity.get("host")
+    ):
+        return None
+    return str(identity["host"]).lower()
+
+
+def _ssh_key_usage(
+    ds: Dict[str, Any],
+    ssh_identity_status: Optional[Dict[str, str]] = None,
+    shared_hosts: frozenset[str] = frozenset(),
+) -> str:
+    """How the agent uses an ``ssh_key`` connector held by an ssh-agent.
+
+    ``shared_hosts`` are hosts more than one delivered ``ssh_key`` connector
+    declares. OpenSSH takes the first matching ``Host`` block, so a plain
+    ``ssh <host>`` offers only one of their keys; each is named by its alias.
+    """
 
     identity = ds.get("ssh_identity")
     if not isinstance(identity, dict) or not identity.get("alias"):
         return "not available: its key was not delivered to this workspace."
     if identity.get("unavailable"):
         return f"not available: {_ssh_unavailable_reason(identity)}."
+    if _ssh_identity_unloaded(identity, ssh_identity_status):
+        return f"not available: {_SSH_KEY_NOT_LOADED}."
     fingerprint = (
         f" Key `{identity.get('fingerprint')}`." if identity.get("fingerprint") else ""
     )
     held = "The key is held by an ssh-agent and never written to disk."
     host = identity.get("host")
+    if host and str(host).lower() in shared_hosts:
+        return (
+            f"use the alias: `ssh {identity['alias']}` reaches `{host}` with this "
+            f"key. Another ssh_key connector here also declares `{host}`, so a "
+            f"plain `ssh {host}` may offer the other key. {held}{fingerprint}"
+        )
     if host:
         user = identity.get("user")
         port = identity.get("port")
@@ -1154,6 +1204,7 @@ def _ssh_key_usage(ds: Dict[str, Any]) -> str:
 def _render_connector_lines(
     ds_configs: List[Dict[str, Any]],
     workspace_manager: Any,
+    ssh_identity_status: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """Per-type connector lines with each connector's named access method."""
     lines: List[str] = []
@@ -1217,7 +1268,7 @@ def _render_connector_lines(
                 f"- **{ds.get('name')}** — repository cloned at "
                 f'`./repos/{clone_name}/` (use `repo="{clone_name}"` with the '
                 f"repo_* tools){branch_clause}; {access}{_declared_ro_note(ds)}"
-                + _ssh_identity_note(ds)
+                + _ssh_identity_note(ds, ssh_identity_status)
             )
         lines.append("")
 
@@ -1273,6 +1324,10 @@ def _render_connector_lines(
 
     if creds:
         lines.append("### Credential Files")
+        declared = [_ssh_key_host(ds) for ds in creds]
+        shared_hosts = frozenset(
+            host for host in declared if host and declared.count(host) > 1
+        )
         for ds in creds:
             ds_type = ds.get("type", "unknown")
             name = ds.get("name", "Unnamed")
@@ -1285,7 +1340,10 @@ def _render_connector_lines(
                     f"contexts prefixed `{slug}-*`. Try `kubectl config get-contexts`."
                 )
             elif ds_type == "ssh_key":
-                lines.append(f"- **{name}** (ssh_key) — " + _ssh_key_usage(ds))
+                lines.append(
+                    f"- **{name}** (ssh_key) — "
+                    + _ssh_key_usage(ds, ssh_identity_status, shared_hosts)
+                )
             else:  # generic_file
                 paths = (
                     ", ".join(f"`{f.get('target_path')}`" for f in files) or "<none>"
@@ -1402,6 +1460,7 @@ def render_workspace_facts(
     *,
     project_name: Optional[str] = None,
     expert: Optional[str] = None,
+    ssh_identity_status: Optional[Dict[str, str]] = None,
 ) -> str:
     """Render the marker-delimited workspace-facts block for README.md.
 
@@ -1422,7 +1481,9 @@ def render_workspace_facts(
         lines += ["## Workspace", "", *facts, ""]
 
     lines += ["## Connectors", ""]
-    lines += _render_connector_lines(list(ds_configs or []), workspace_manager)
+    lines += _render_connector_lines(
+        list(ds_configs or []), workspace_manager, ssh_identity_status
+    )
 
     lines += ["## Materials", ""]
     materials = _list_materials(workspace_manager)
@@ -1482,6 +1543,7 @@ def inject_workspace_facts(
     *,
     project_name: Optional[str] = None,
     expert: Optional[str] = None,
+    ssh_identity_status: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
     """Write the workspace-facts block into the workspace's README.md.
 
@@ -1490,6 +1552,10 @@ def inject_workspace_facts(
     names and clone paths. Regenerated at every agent init and on every
     live attach/detach, so the block always reflects the current connector
     set (including the explicit "no connectors" state after a remove-all).
+
+    ``ssh_identity_status`` is the SSH identity materializer's
+    ``{authority_id: status}``: an SSH connector whose key did not load is
+    listed as not available rather than advertised.
 
     Non-fatal: a failure logs a warning. Returns the README content that was
     written, or None when nothing was written.
@@ -1506,6 +1572,7 @@ def inject_workspace_facts(
             workspace_manager,
             project_name=project_name,
             expert=expert,
+            ssh_identity_status=ssh_identity_status,
         )
         content = merge_workspace_facts(existing, block)
         workspace_manager.write_file("README.md", content)
