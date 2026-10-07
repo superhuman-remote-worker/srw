@@ -89,7 +89,7 @@ def _pinned_runtime(ctx, ledger, factory, monkeypatch, **kwargs) -> SubagentRunt
         agent_type="persistent",
         tool_context=ctx,
         admission_fn=_open,
-        effect_authority_fn=_open,
+        effect_authority_fn=kwargs.pop("effect_authority", _open),
         settlement_authority_fn=_open,
     )
     runtime = SubagentRuntime.from_context(
@@ -610,6 +610,264 @@ async def test_abandon_releases_held_calls_without_writes(tmp_path, monkeypatch,
     with pytest.raises(asyncio.CancelledError):
         await task
     assert ledger.opened == [] and ledger.updates == []
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: wide batches, a proof straddling the fence, failure paths
+# ---------------------------------------------------------------------------
+
+
+def _calls(n: int) -> List[SubagentCall]:
+    return [
+        SubagentCall(
+            tool_call_id=f"c{index}",
+            subagent_type="explorer",
+            prompt=f"Report evidence for c{index}.",
+        )
+        for index in range(1, n + 1)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("cap", "n"), [(1, 3), (2, 5), (2, 7)])
+async def test_a_batch_wider_than_twice_its_cap_is_held_whole(
+    tmp_path, monkeypatch, fence, cap, n
+):
+    """Every call queued behind the cap takes a freed slot only to pass it
+    on: a held call keeps none, so all n calls end up held, quiescence is
+    reached and the retirement's quiesce passes with nothing to write."""
+
+    ctx, _ = make_parent(tmp_path, max_concurrent=cap)
+    release, started = asyncio.Event(), []
+    ledger = StrictLedger()
+    runtime = _pinned_runtime(
+        ctx,
+        ledger,
+        lambda _c, _l: _Child(set(), release, started),
+        monkeypatch,
+        cap=cap,
+    )
+    runtime._recovery_complete = True
+    runtime.begin_batch(n)
+    tasks = [asyncio.create_task(runtime.run_foreground(c)) for c in _calls(n)]
+    await _until(lambda: len(started) == cap)
+
+    fence.activate_termination_admission_fence("kubernetes_prestop")
+    release.set()
+    await _until(lambda: runtime.foreground_held_for_successor)
+
+    assert len(runtime._successor_waiters) == n
+    assert runtime._semaphore.held == 0 and runtime._semaphore.waiting == 0
+    assert fence.termination_quiescent() is True
+    assert not any(task.done() for task in tasks)
+    ran = {f"c{index}" for index in range(1, cap + 1)}
+    assert _terminal(ledger) == {call_id: RESTART for call_id in ran}
+    assert {f["parent_tool_call_id"] for _, f in ledger.opened} == ran
+    writes = len(ledger.updates)
+    await runtime.quiesce("parent session retiring as ended")
+    assert len(ledger.updates) == writes
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert all(task.cancelled() for task in tasks)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("proof", "end"), [(1, NOT_STARTED), (2, RESTART)])
+async def test_a_proof_in_flight_when_the_fence_closes_ends_for_the_restart(
+    tmp_path, monkeypatch, fence, proof, end
+):
+    """The child's exact effect-authority proof is awaiting the database
+    when the fence closes admission, and the fence fails it. That is the
+    shutdown, not a lost authority: before the first provider call the
+    child never ran, before its first tool effect it had."""
+
+    ctx, _ = make_parent(tmp_path)
+    in_proof, finish_proof, proofs = asyncio.Event(), asyncio.Event(), []
+
+    async def effect_authority() -> bool:
+        proofs.append(1)
+        if len(proofs) != proof:
+            return _open()
+        in_proof.set()
+        await finish_proof.wait()  # the round trip
+        return _open()
+
+    model = FakeChatModel(
+        [
+            tool_turn("read_file", {"path": "notes/hello.md"}, "c1-read"),
+            text_turn("never asked"),
+        ]
+    )
+    ledger = StrictLedger()
+    runtime = _pinned_runtime(
+        ctx,
+        ledger,
+        lambda _c, _l: model,
+        monkeypatch,
+        effect_authority=effect_authority,
+    )
+    runtime.begin_batch(1)
+    task = asyncio.create_task(runtime.run_foreground(_calls(1)[0]))
+    await asyncio.wait_for(in_proof.wait(), 5)
+
+    fence.activate_termination_admission_fence("kubernetes_prestop")
+    finish_proof.set()
+    await _until(lambda: runtime.foreground_held_for_successor)
+
+    assert _terminal(ledger) == {"c1": end}
+    assert len(model.calls) == proof - 1
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_create_failing_after_the_hand_over_returns_nothing(
+    tmp_path, monkeypatch, fence
+):
+    """The durable create fails once the batch is handed over: the call is
+    held instead of becoming a "Tool execution error" result. Its handle
+    stays unsettled (the create may have committed), so the retirement's
+    quiesce keeps refusing and a forced stop leaves the row to the
+    successor."""
+
+    ctx, _ = make_parent(tmp_path)
+    ledger = StrictLedger()
+    ledger.allow_open.clear()
+    runtime = _pinned_runtime(
+        ctx, ledger, lambda _c, _l: FakeChatModel([]), monkeypatch
+    )
+    runtime._recovery_complete = True
+    task = asyncio.create_task(runtime.run_foreground(_calls(1)[0]))
+    await asyncio.wait_for(ledger.open_started.wait(), 5)
+
+    fence.activate_termination_admission_fence("kubernetes_prestop")
+    ledger.refuse_open = True
+    ledger.allow_open.set()
+    await _until(lambda: runtime.foreground_held_for_successor)
+
+    assert not task.done()
+    assert ledger.updates == []
+    with pytest.raises(RuntimeError, match="settlement authority"):
+        await runtime.quiesce("parent session retiring as ended")
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_release_failing_after_the_hand_over_returns_nothing(
+    tmp_path, monkeypatch, fence
+):
+    import agent.subagents.runtime as runtime_mod
+
+    real_build, building, built = runtime_mod.build_child, asyncio.Event(), []
+    proceed = asyncio.Event()
+
+    async def build(*args: Any, **kwargs: Any) -> Any:
+        building.set()
+        await proceed.wait()
+        child = await real_build(*args, **kwargs)
+
+        async def release() -> None:
+            raise RuntimeError("worktree removal failed")
+
+        child.release = release
+        built.append(child)
+        return child
+
+    monkeypatch.setattr(runtime_mod, "build_child", build)
+    ctx, _ = make_parent(tmp_path)
+    ledger = StrictLedger()
+    runtime = _pinned_runtime(
+        ctx, ledger, lambda _c, _l: FakeChatModel([]), monkeypatch
+    )
+    runtime._recovery_complete = True
+    task = asyncio.create_task(runtime.run_foreground(_calls(1)[0]))
+    await asyncio.wait_for(building.wait(), 5)
+
+    fence.activate_termination_admission_fence("kubernetes_prestop")
+    proceed.set()
+    await _until(lambda: runtime.foreground_held_for_successor)
+
+    assert built and not task.done()
+    assert ledger.opened == [] and ledger.updates == []
+    await runtime.quiesce("parent session retiring as ended")
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_report_failing_to_spill_after_the_hand_over_still_ends_the_row(
+    tmp_path, monkeypatch, fence
+):
+    """A child that finished across the hand-over keeps its own end even when
+    its report cannot be spilled; the call is held, nothing is returned."""
+
+    import agent.subagents.runtime as runtime_mod
+
+    def no_envelope(*args: Any, **kwargs: Any) -> str:
+        raise OSError("workspace gone")
+
+    monkeypatch.setattr(runtime_mod, "build_envelope", no_envelope)
+    ctx, _ = make_parent(tmp_path)
+    ledger = StrictLedger()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Answers(FakeChatModel):
+        async def astream(self, messages, **kw):
+            self.calls.append(list(messages))
+            entered.set()
+            await release.wait()
+            for chunk in text_turn("the finished report"):
+                yield chunk
+
+    runtime = _pinned_runtime(ctx, ledger, lambda _c, _l: Answers([]), monkeypatch)
+    task = asyncio.create_task(runtime.run_foreground(_calls(1)[0]))
+    await asyncio.wait_for(entered.wait(), 5)
+    fence.activate_termination_admission_fence("kubernetes_prestop")
+    release.set()
+    await _until(lambda: runtime.foreground_held_for_successor)
+
+    assert not task.done()
+    assert _terminal(ledger) == {"c1": ("completed", "completed")}
+    ((_, fields),) = [u for u in ledger.updates if u[1].get("status")]
+    assert fields["report_path"] is None
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_call_after_the_hand_over_returns_nothing(
+    tmp_path, monkeypatch, fence
+):
+    """Even a call refused before any child (an unknown type) is the
+    successor's once the batch is handed over: it reports NOT STARTED."""
+
+    ctx, _ = make_parent(tmp_path)
+    ledger = StrictLedger()
+    runtime = _pinned_runtime(
+        ctx, ledger, lambda _c, _l: FakeChatModel([]), monkeypatch
+    )
+    fence.activate_termination_admission_fence("kubernetes_prestop")
+    task = asyncio.create_task(
+        runtime.run_foreground(
+            SubagentCall(tool_call_id="c1", subagent_type="nobody", prompt="Go.")
+        )
+    )
+    await _until(lambda: runtime.foreground_held_for_successor)
+
+    assert not task.done()
+    assert ledger.opened == []
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    # Without the hand-over the same call is refused with its error.
+    other = _pinned_runtime(
+        ctx, StrictLedger(), lambda _c, _l: FakeChatModel([]), monkeypatch
+    )
+    refused = await other.run_foreground(
+        SubagentCall(tool_call_id="c2", subagent_type="nobody", prompt="Go.")
+    )
+    assert refused.startswith("Error: unknown subagent_type")
 
 
 # ---------------------------------------------------------------------------

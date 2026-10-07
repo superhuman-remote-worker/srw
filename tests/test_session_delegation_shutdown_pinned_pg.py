@@ -675,6 +675,67 @@ async def test_a_graceful_pinned_shutdown_hands_a_mixed_batch_to_the_successor(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("cap", "n"), [(1, 3), (2, 5), (2, 7)])
+async def test_a_batch_wider_than_twice_its_cap_is_settled_whole(
+    pg_dsn: str, tmp_path, monkeypatch, fence, cap, n
+) -> None:
+    """Every child under the cap runs at the fence and more than ``cap``
+    calls are queued behind it. All of them are held (a held call keeps no
+    slot), the retirement passes, and the successor's one settle reports the
+    running ones INTERRUPTED and every queued one NOT STARTED."""
+
+    set_session_fanout(monkeypatch)
+    pool = await _fresh_pool(pg_dsn)
+    try:
+        async with AsyncExitStack() as stack:
+            orchestrator = _orchestrator_db(pool)
+            seed = await _pinned_turn(pool, orchestrator, n)
+            started: List[str] = ["(no first child)"]  # every child waits
+            release = asyncio.Event()
+            dying = await _dying_turn(
+                pool,
+                orchestrator,
+                seed,
+                tmp_path,
+                stack,
+                monkeypatch,
+                cap=cap,
+                started=started,
+                release=release,
+            )
+            rows = await _until_rows(pool, seed, ["running"] * cap, started, cap + 1)
+            ran = [c for c in seed.call_ids if c in rows]
+
+            assert fence.activate_termination_admission_fence("kubernetes_prestop")
+            release.set()
+            assert await fence.wait_for_termination_quiescence(15.0) is True
+            assert len(dying.runtime._successor_waiters) == n
+            assert set(await _child_rows(pool, seed)) == set(ran)
+
+            successor = await _terminate_and_resume(
+                pool, orchestrator, seed, dying, tmp_path, stack, monkeypatch
+            )
+            recovered = await successor.runtime().recover_orphans()
+
+            assert successor.settle_requests() == 1
+            assert [entry["status"] for entry in recovered] == ["interrupted"] * cap
+            results = {row["tool_call_id"]: row for row in await _tool_rows(pool, seed)}
+            assert list(results) == seed.call_ids
+            assert {c: _metrics(results[c])["class"] for c in seed.call_ids} == {
+                c: ("interrupted" if c in ran else "not_started") for c in seed.call_ids
+            }
+            for call_id in ran:
+                assert results[call_id]["content"].startswith(INTERRUPTED_HEADER)
+            (continuation,) = await _continuations(pool, seed)
+            assert continuation["content"] == batch_continuation_text(
+                calls=n, interrupted=cap, not_started=n - cap, declined=0, retired=0
+            )
+            assert await _pinned_source_state(pool, seed) == "settled"
+    finally:
+        await pool.close()
+
+
+@pytest.mark.asyncio
 async def test_a_graceful_pinned_shutdown_hands_a_single_call_to_the_successor(
     pg_dsn: str, tmp_path, monkeypatch, fence
 ) -> None:
