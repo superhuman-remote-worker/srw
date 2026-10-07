@@ -39,6 +39,7 @@ from agent.api.persistent_app import _db_rows_to_lc_messages
 from orchestrator.routers import thread_transport
 from orchestrator.services import run_queue_reaper as reaper
 from shared import run_queue
+from shared.event_journal import append_system_frame
 from shared.persistent_input_delivery import (
     claim_stateless_input_delivery,
     persist_input_delivery,
@@ -149,6 +150,8 @@ class _Executor:
         self.mid_turn: Callable[[dict], Awaitable[None]] | None = None
         pa._agent = SimpleNamespace(postgres_conn=self.agent_db)
         monkeypatch.setattr(te, "complete_unit", run_queue.complete_unit)
+        monkeypatch.setattr(te, "park_unit", run_queue.park_unit)
+        monkeypatch.setattr(te, "append_system_frame", append_system_frame)
         monkeypatch.setattr(
             te, "open_interrupt_admission", run_queue.open_interrupt_admission
         )
@@ -598,8 +601,11 @@ async def test_a_killed_recovery_turn_that_delegated_is_settled_not_served_again
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("durable_end", ["final_answer_row", "final_reconcile"])
-async def test_an_admission_whose_turn_already_ended_is_settled_not_served(
+@pytest.mark.parametrize(
+    "durable_end",
+    ["final_answer_row", "final_reconcile", "final_reconcile_with_unresolved_tool"],
+)
+async def test_durable_turn_end_settles_only_resolved_tool_history(
     pg_dsn: str, tmp_path, monkeypatch, harness, durable_end: str
 ) -> None:
     pool = await _fresh_pool(pg_dsn)
@@ -630,9 +636,9 @@ async def test_an_admission_whose_turn_already_ended_is_settled_not_served(
                     turn_number=1,
                 )
             else:
-                # The authoritative final reconcile committed (its last
-                # message carried a tool call, so no row alone proves the
-                # end); the executor died before the loop's settle.
+                # A final reconcile marker alone cannot resolve an unknown
+                # tool effect. The positive fixture includes the matching
+                # result; the negative fixture preserves the unanswered call.
                 handle = LeaseHandle()
                 handle.update(
                     str(seed.session),
@@ -653,7 +659,20 @@ async def test_an_admission_whose_turn_already_ended_is_settled_not_served(
                                     {"id": "t_end", "name": "write_file", "args": {}}
                                 ],
                                 "turn_number": 1,
-                            }
+                            },
+                            *(
+                                [
+                                    {
+                                        "id": str(uuid4()),
+                                        "role": "tool",
+                                        "content": "Summary saved.",
+                                        "tool_call_id": "t_end",
+                                        "turn_number": 1,
+                                    }
+                                ]
+                                if durable_end == "final_reconcile"
+                                else []
+                            ),
                         ],
                         turn_input_message_id=str(continuation["message_id"]),
                         turn_number=1,
@@ -663,6 +682,12 @@ async def test_an_admission_whose_turn_already_ended_is_settled_not_served(
                 finally:
                     current_lease.reset(reset)
             answers_before = await _answers(pool, seed.session)
+            queue_before = await _queue(pool, seed.session)
+            async with pool.acquire() as conn:
+                messages_before = await conn.fetch(
+                    "SELECT * FROM thread_messages WHERE thread_id = $1 ORDER BY seq",
+                    seed.session,
+                )
             await _die(pool, seed.session)
 
             executor = _Executor(
@@ -671,6 +696,42 @@ async def test_an_admission_whose_turn_already_ended_is_settled_not_served(
             await executor.drive(seed.session)
 
             assert executor.served == []
+            if durable_end == "final_reconcile_with_unresolved_tool":
+                assert executor.restored == []
+                assert (await _delivery(pool, continuation["delivery_id"]))[
+                    "state"
+                ] == "admitted"
+                queue = await _queue(pool, seed.session)
+                assert (queue["state"], queue["park_reason"]) == (
+                    "parked",
+                    "loop_died_after_tool_effect",
+                )
+                assert queue["consumed_seq"] == queue_before["consumed_seq"]
+                assert queue["input_seq"] == queue_before["input_seq"]
+                async with pool.acquire() as conn:
+                    lease = await conn.fetchrow(
+                        "SELECT leased_by, leased_until FROM run_queue WHERE unit_id = $1",
+                        seed.session,
+                    )
+                    assert lease["leased_by"] is None
+                    assert lease["leased_until"] is None
+                    assert (
+                        await conn.fetch(
+                            "SELECT * FROM thread_messages WHERE thread_id = $1 ORDER BY seq",
+                            seed.session,
+                        )
+                        == messages_before
+                    )
+                    event = await conn.fetchrow(
+                        "SELECT payload FROM thread_events WHERE thread_id = $1 "
+                        "AND kind = 'turn.parked' ORDER BY epoch DESC, seq DESC LIMIT 1",
+                        seed.session,
+                    )
+                assert event is not None
+                payload = json.loads(event["payload"])
+                assert payload["retryable"] is False
+                assert payload["release_reason"] == "unresolved_predecessor_tool"
+                return
             assert (await _delivery(pool, continuation["delivery_id"]))[
                 "state"
             ] == "settled"
