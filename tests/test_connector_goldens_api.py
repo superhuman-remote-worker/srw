@@ -526,9 +526,7 @@ CASES: dict[str, ApiCase] = {
     # A declared forge used to make a URL-less repository valid; the clone
     # and Test both need the URL (D1a).
     "create/repository/url_required_with_declared_forge": _create(
-        _with(
-            _without(REPOSITORY_TOKEN, "connection_url"), config={"forge": "github"}
-        )
+        _with(_without(REPOSITORY_TOKEN, "connection_url"), config={"forge": "github"})
     ),
     "create/repository/credentials_not_validated": _create(
         _with(REPOSITORY_TOKEN, credentials={"read_only": True})
