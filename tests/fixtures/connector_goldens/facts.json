@@ -1,0 +1,829 @@
+{
+  "readme/no_connectors": {
+    "lines": [
+      "## Connectors",
+      "",
+      "_No connectors attached._",
+      ""
+    ]
+  },
+  "readme/all_kinds_read_write": {
+    "lines": [
+      "## Connectors",
+      "",
+      "### Repositories",
+      "- **Widgets** — repository cloned at `./repos/widgets/` (use `repo=\"widgets\"` with the repo_* tools); base branch `main`; writable — pull requests opened with repo_open_pr are recorded for this job",
+      "- **Gadgets** — repository cloned at `./repos/gadgets/` (use `repo=\"gadgets\"` with the repo_* tools); base branch `develop`; writable — pull requests opened with repo_open_pr are recorded for this job",
+      "",
+      "### OKF Knowledge Bases",
+      "- **Handbook** (centrally indexed, read-only, root `vault`) — use `kb_search`, `kb_grep`, `kb_list`, and `kb_read`",
+      "",
+      "### Databases",
+      "- **Orders DB** (postgresql, read-write) — query + write tools",
+      "- **Supply Graph** (neo4j, read-write) — query + write tools",
+      "- **Events** (mongodb, read-write) — query + write tools",
+      "",
+      "### MCP Servers",
+      "- **Docs MCP** (mcp, http) — not connected yet",
+      "- **Local MCP** (mcp, stdio) — not connected yet",
+      "",
+      "### Credential Files",
+      "- **Service account** (file) — `/home/srw/.config/gcloud/sa.json`, `/home/srw/.config/gcloud/ca.pem`",
+      "- **Staging Cluster** (kubeconfig) — merged into `~/.kube/config`; contexts prefixed `staging-cluster-*`. Try `kubectl config get-contexts`.",
+      "- **Deploy Key** (ssh_key) — private key at `~/.ssh/deploy-key`. Add a host block in `~/.ssh/config` to use it.",
+      "",
+      "### Other",
+      "- **Billing API** (generic) — curl -H \"Authorization: Bearer $BILLING_TOKEN\" $BILLING_URL",
+      "  Environment: `BILLING_TOKEN`",
+      "  Read values with os.environ in workspace scripts. For login forms, use browser_type(ref=..., env_var=\"VARIABLE_NAME\"). Avoid printing credentials or writing literal values into scripts.",
+      "- **Vendor login** (credentials) — CLI via env vars",
+      "  Environment: `VENDOR_USER`, `VENDOR_PASSWORD`",
+      "  Read values with os.environ in workspace scripts. For login forms, use browser_type(ref=..., env_var=\"VARIABLE_NAME\"). Avoid printing credentials or writing literal values into scripts.",
+      "- **Team files** (webdav, read-write tools)",
+      "- **Support inbox** (email, support@example.test, tier `draft`) — folders: `INBOX`, `Support`",
+      ""
+    ],
+    "pinned_defect": "D1d fixes (L1 §6 #3): a session never materializes credential files, yet the README advertises them; a worker writes them to the agent pod, not the workspace the shell runs in"
+  },
+  "readme/all_kinds_read_only": {
+    "lines": [
+      "## Connectors",
+      "",
+      "### Repositories",
+      "- **Widgets** — repository cloned at `./repos/widgets/` (use `repo=\"widgets\"` with the repo_* tools); base branch `main`; read-only — only repo_pull/repo_pr_status",
+      "- **Gadgets** — repository cloned at `./repos/gadgets/` (use `repo=\"gadgets\"` with the repo_* tools); base branch `develop`; read-only — only repo_pull/repo_pr_status",
+      "",
+      "### OKF Knowledge Bases",
+      "- **Handbook** (centrally indexed, read-only, root `vault`) — use `kb_search`, `kb_grep`, `kb_list`, and `kb_read`",
+      "",
+      "### Databases",
+      "- **Orders DB** (postgresql, read-only) — query tools",
+      "- **Supply Graph** (neo4j, read-only) — query tools",
+      "- **Events** (mongodb, read-only) — query tools",
+      "",
+      "### MCP Servers",
+      "- **Docs MCP** (mcp, http) — not connected yet",
+      "- **Local MCP** (mcp, stdio) — not connected yet",
+      "",
+      "### Credential Files",
+      "- **Service account** (file) — `/home/srw/.config/gcloud/sa.json`, `/home/srw/.config/gcloud/ca.pem`",
+      "- **Staging Cluster** (kubeconfig) — merged into `~/.kube/config`; contexts prefixed `staging-cluster-*`. Try `kubectl config get-contexts`.",
+      "- **Deploy Key** (ssh_key) — private key at `~/.ssh/deploy-key`. Add a host block in `~/.ssh/config` to use it.",
+      "",
+      "### Other",
+      "- **Billing API** (generic) — curl -H \"Authorization: Bearer $BILLING_TOKEN\" $BILLING_URL",
+      "  Environment: `BILLING_TOKEN`",
+      "  Read values with os.environ in workspace scripts. For login forms, use browser_type(ref=..., env_var=\"VARIABLE_NAME\"). Avoid printing credentials or writing literal values into scripts.",
+      "- **Vendor login** (credentials) — CLI via env vars",
+      "  Environment: `VENDOR_USER`, `VENDOR_PASSWORD`",
+      "  Read values with os.environ in workspace scripts. For login forms, use browser_type(ref=..., env_var=\"VARIABLE_NAME\"). Avoid printing credentials or writing literal values into scripts.",
+      "- **Team files** (webdav, read-only tools)",
+      "- **Support inbox** (email, support@example.test, tier `read`) — folders: `INBOX`, `Support`",
+      ""
+    ],
+    "pinned_defect": "D1d fixes (L1 §6 #3): a session never materializes credential files, yet the README advertises them; a worker writes them to the agent pod, not the workspace the shell runs in"
+  },
+  "readme/mcp_connected_with_tools": {
+    "lines": [
+      "## Connectors",
+      "",
+      "### MCP Servers",
+      "- **Docs MCP** (mcp, 3 tools) — http; `docs_mcp__tool_00`, `docs_mcp__tool_01`, `docs_mcp__tool_02`",
+      ""
+    ]
+  },
+  "readme/mcp_connected_no_tools": {
+    "lines": [
+      "## Connectors",
+      "",
+      "### MCP Servers",
+      "- **Docs MCP** (mcp, 0 tools) — http; _no tools advertised_",
+      ""
+    ]
+  },
+  "readme/mcp_connected_over_forty_tools": {
+    "lines": [
+      "## Connectors",
+      "",
+      "### MCP Servers",
+      "- **Docs MCP** (mcp, 43 tools) — http; `docs_mcp__tool_00`, `docs_mcp__tool_01`, `docs_mcp__tool_02`, `docs_mcp__tool_03`, `docs_mcp__tool_04`, `docs_mcp__tool_05`, `docs_mcp__tool_06`, `docs_mcp__tool_07`, `docs_mcp__tool_08`, `docs_mcp__tool_09`, `docs_mcp__tool_10`, `docs_mcp__tool_11`, `docs_mcp__tool_12`, `docs_mcp__tool_13`, `docs_mcp__tool_14`, `docs_mcp__tool_15`, `docs_mcp__tool_16`, `docs_mcp__tool_17`, `docs_mcp__tool_18`, `docs_mcp__tool_19`, `docs_mcp__tool_20`, `docs_mcp__tool_21`, `docs_mcp__tool_22`, `docs_mcp__tool_23`, `docs_mcp__tool_24`, `docs_mcp__tool_25`, `docs_mcp__tool_26`, `docs_mcp__tool_27`, `docs_mcp__tool_28`, `docs_mcp__tool_29`, `docs_mcp__tool_30`, `docs_mcp__tool_31`, `docs_mcp__tool_32`, `docs_mcp__tool_33`, `docs_mcp__tool_34`, `docs_mcp__tool_35`, `docs_mcp__tool_36`, `docs_mcp__tool_37`, `docs_mcp__tool_38`, `docs_mcp__tool_39` (+3 more)",
+      ""
+    ]
+  },
+  "readme/mcp_unavailable": {
+    "lines": [
+      "## Connectors",
+      "",
+      "### MCP Servers",
+      "- **Local MCP** (mcp, stdio) — unavailable: ConnectError",
+      ""
+    ]
+  },
+  "readme/repository_with_clone_meta": {
+    "lines": [
+      "## Connectors",
+      "",
+      "### Repositories",
+      "- **Widgets** — repository cloned at `./repos/widgets/` (use `repo=\"widgets\"` with the repo_* tools); base branch `trunk`; read-only — only repo_pull/repo_pr_status",
+      "- **Gadgets** — repository cloned at `./repos/gadgets/` (use `repo=\"gadgets\"` with the repo_* tools); base branch `develop`; writable — pull requests opened with repo_open_pr are recorded for this job",
+      ""
+    ]
+  },
+  "readme/repository_name_collision": {
+    "lines": [
+      "## Connectors",
+      "",
+      "### Repositories",
+      "- **Widgets** — repository cloned at `./repos/widgets/` (use `repo=\"widgets\"` with the repo_* tools); base branch `main`; writable — pull requests opened with repo_open_pr are recorded for this job",
+      "- **Widgets fork** — repository cloned at `./repos/widgets-2/` (use `repo=\"widgets-2\"` with the repo_* tools); writable — pull requests opened with repo_open_pr are recorded for this job",
+      ""
+    ]
+  },
+  "readme/kb_native_is_not_listed": {
+    "lines": [
+      "## Connectors",
+      "",
+      "_No connectors attached._",
+      ""
+    ]
+  },
+  "readme/kb_without_root_path": {
+    "lines": [
+      "## Connectors",
+      "",
+      "### OKF Knowledge Bases",
+      "- **Handbook** (centrally indexed, read-only) — use `kb_search`, `kb_grep`, `kb_list`, and `kb_read`",
+      ""
+    ]
+  },
+  "readme/email_whole_mailbox_from_address_fallback": {
+    "lines": [
+      "## Connectors",
+      "",
+      "### Other",
+      "- **Support inbox** (email, help@example.test, tier `read`) — folders: entire mailbox",
+      ""
+    ]
+  },
+  "readme/generic_without_env_or_hint": {
+    "lines": [
+      "## Connectors",
+      "",
+      "### Other",
+      "- **Billing API** (generic) — CLI via env vars",
+      ""
+    ]
+  },
+  "readme/credential_files_only": {
+    "lines": [
+      "## Connectors",
+      "",
+      "### Credential Files",
+      "- **Staging Cluster** (kubeconfig) — merged into `~/.kube/config`; contexts prefixed `staging-cluster-*`. Try `kubectl config get-contexts`.",
+      "- **Deploy Key** (ssh_key) — private key at `~/.ssh/deploy-key`. Add a host block in `~/.ssh/config` to use it.",
+      "- **Service account** (file) — `/home/srw/.config/gcloud/sa.json`, `/home/srw/.config/gcloud/ca.pem`",
+      "- **Service account** (file) — <none>",
+      ""
+    ],
+    "pinned_defect": "D1d fixes (L1 §6 #3): a session never materializes credential files, yet the README advertises them; a worker writes them to the agent pod, not the workspace the shell runs in"
+  },
+  "readme/declared_read_only_via_payload": {
+    "lines": [
+      "## Connectors",
+      "",
+      "### Databases",
+      "- **Orders DB** (postgresql, read-write) — query + write tools",
+      "",
+      "### Other",
+      "- **Billing API** (generic) — curl -H \"Authorization: Bearer $BILLING_TOKEN\" $BILLING_URL",
+      "  Environment: `BILLING_TOKEN`",
+      "  Read values with os.environ in workspace scripts. For login forms, use browser_type(ref=..., env_var=\"VARIABLE_NAME\"). Avoid printing credentials or writing literal values into scripts.",
+      "- **Team files** (webdav, read-write tools)",
+      "- **Support inbox** (email, support@example.test, tier `draft`) — folders: `INBOX`, `Support`",
+      ""
+    ],
+    "pinned_defect": "the payload never forwards the publisher's declared read_only flag, so the README's 'declared read-only' advisory cannot render"
+  },
+  "readme/declared_read_only_renderer": {
+    "lines": [
+      "## Connectors",
+      "",
+      "### Repositories",
+      "- **Widgets** — repository cloned at `./repos/widgets/` (use `repo=\"widgets\"` with the repo_* tools); read-only — only repo_pull/repo_pr_status (declared read-only — treat as no-write)",
+      "",
+      "### Databases",
+      "- **Orders DB** (postgresql, read-write) — query + write tools (declared read-only — treat as no-write)",
+      "",
+      "### Other",
+      "- **Team files** (webdav, read-write tools) (declared read-only — treat as no-write)",
+      "- **Vendor login** (credentials) — CLI via env vars (declared read-only — treat as no-write)",
+      "  Environment: `VENDOR_USER`",
+      "  Read values with os.environ in workspace scripts. For login forms, use browser_type(ref=..., env_var=\"VARIABLE_NAME\"). Avoid printing credentials or writing literal values into scripts.",
+      "- **Support inbox** (email, unknown account, tier `draft`) — folders: entire mailbox (declared read-only — treat as no-write)",
+      "- **Unknown** (future_type) (declared read-only — treat as no-write)",
+      ""
+    ]
+  },
+  "kb_note/generic/read_write": {
+    "note_id": "ds-d5000001",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Billing API (generic)",
+    "tags": [
+      "datasource",
+      "generic"
+    ],
+    "content": [
+      "## Connector: Billing API",
+      "Billing REST API",
+      "",
+      "### Connection",
+      "- **URL:** https://billing.example.test/api (credentials via env vars)",
+      "- **CLI:** `curl -H \"Authorization: Bearer $BILLING_TOKEN\" $BILLING_URL`",
+      "",
+      "### Environment Variables",
+      "- `BILLING_TOKEN` — available in workspace"
+    ],
+    "retrieval_messages": [
+      "Billing API connection",
+      "How to access Billing API",
+      "available connectors"
+    ]
+  },
+  "kb_note/credentials/read_write": {
+    "note_id": "ds-d5000002",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Vendor login (credentials)",
+    "tags": [
+      "datasource",
+      "credentials"
+    ],
+    "content": [
+      "## Connector: Vendor login",
+      "Vendor portal account",
+      "",
+      "### Environment Variables",
+      "- `VENDOR_USER` — available in workspace",
+      "- `VENDOR_PASSWORD` — available in workspace"
+    ],
+    "retrieval_messages": [
+      "Vendor login connection",
+      "How to access Vendor login",
+      "available connectors"
+    ]
+  },
+  "kb_note/generic_file/read_write": {
+    "note_id": "ds-d5000003",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Service account (generic_file)",
+    "tags": [
+      "datasource",
+      "generic_file"
+    ],
+    "content": [
+      "## Connector: Service account",
+      "GCP service account"
+    ],
+    "retrieval_messages": [
+      "Service account database connection",
+      "generic_file access",
+      "How do I connect to Service account?",
+      "What databases are available?"
+    ],
+    "pinned_defect": "falls through to the bare connector note and the database retrieval phrases"
+  },
+  "kb_note/kubeconfig/read_write": {
+    "note_id": "ds-d5000004",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Staging Cluster (kubeconfig)",
+    "tags": [
+      "datasource",
+      "kubeconfig"
+    ],
+    "content": [
+      "## Connector: Staging Cluster",
+      "Staging Kubernetes"
+    ],
+    "retrieval_messages": [
+      "Staging Cluster database connection",
+      "kubeconfig access",
+      "How do I connect to Staging Cluster?",
+      "What databases are available?"
+    ],
+    "pinned_defect": "falls through to the bare connector note and the database retrieval phrases"
+  },
+  "kb_note/ssh_key/read_write": {
+    "note_id": "ds-d5000005",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Deploy Key (ssh_key)",
+    "tags": [
+      "datasource",
+      "ssh_key"
+    ],
+    "content": [
+      "## Connector: Deploy Key",
+      "Bastion access"
+    ],
+    "retrieval_messages": [
+      "Deploy Key database connection",
+      "ssh_key access",
+      "How do I connect to Deploy Key?",
+      "What databases are available?"
+    ],
+    "pinned_defect": "falls through to the bare connector note and the database retrieval phrases"
+  },
+  "kb_note/repository_token/read_write": {
+    "note_id": "ds-d5000006",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Widgets (repository)",
+    "tags": [
+      "datasource",
+      "repository"
+    ],
+    "content": [
+      "## Repository: Widgets",
+      "Widgets service",
+      "",
+      "### Location",
+      "Cloned to `./repos/widgets/` — git is pre-authenticated.",
+      "",
+      "### Usage",
+      "Use standard git commands:",
+      "- `cd repos/widgets && git status`",
+      "- `git pull`, `git commit`, `git push`",
+      "- No login or credential setup required.",
+      "- Default branch: `main`"
+    ],
+    "retrieval_messages": [
+      "Widgets repository",
+      "git repo Widgets",
+      "How to access Widgets code",
+      "available repositories"
+    ]
+  },
+  "kb_note/repository_ssh/read_write": {
+    "note_id": "ds-d5000007",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Gadgets (repository)",
+    "tags": [
+      "datasource",
+      "repository"
+    ],
+    "content": [
+      "## Repository: Gadgets",
+      "Gadgets service",
+      "",
+      "### Location",
+      "Cloned to `./repos/gadgets/` — git is pre-authenticated.",
+      "",
+      "### Usage",
+      "Use standard git commands:",
+      "- `cd repos/gadgets && git status`",
+      "- `git pull`, `git commit`, `git push`",
+      "- No login or credential setup required.",
+      "- Default branch: `develop`"
+    ],
+    "retrieval_messages": [
+      "Gadgets repository",
+      "git repo Gadgets",
+      "How to access Gadgets code",
+      "available repositories"
+    ]
+  },
+  "kb_note/postgresql/read_write": {
+    "note_id": "ds-d5000008",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Orders DB (postgresql)",
+    "tags": [
+      "datasource",
+      "postgresql"
+    ],
+    "content": [
+      "## Connector: Orders DB",
+      "**Type:** postgresql | **Access:** full (CLI)",
+      "",
+      "Order history",
+      "",
+      "### Connection",
+      "Use `psql` to connect — credentials are pre-configured via environment variables.",
+      "",
+      "### Environment Variables",
+      "- `PGHOST`, `PGUSER`, `PGPASSWORD`, `PGDATABASE` — pre-configured",
+      "",
+      "### Examples",
+      "- `psql -c \"SELECT * FROM users LIMIT 10\"`",
+      "- `psql -c \"CREATE TABLE ...\"`"
+    ],
+    "retrieval_messages": [
+      "Orders DB database connection",
+      "postgresql access",
+      "How do I connect to Orders DB?",
+      "What databases are available?"
+    ],
+    "pinned_defect": "D1 deletes (L1 §6 #7): the read-write managed note describes the retired CLI mode (psql/cypher-shell/mongosh and env vars the workspace never gets)"
+  },
+  "kb_note/neo4j/read_write": {
+    "note_id": "ds-d5000009",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Supply Graph (neo4j)",
+    "tags": [
+      "datasource",
+      "neo4j"
+    ],
+    "content": [
+      "## Connector: Supply Graph",
+      "**Type:** neo4j | **Access:** full (CLI)",
+      "",
+      "Supplier graph",
+      "",
+      "### Connection",
+      "Use `cypher-shell` to connect — credentials are pre-configured via environment variables.",
+      "",
+      "### Environment Variables",
+      "- `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD` — pre-configured",
+      "",
+      "### Examples",
+      "- `cypher-shell \"MATCH (n) RETURN n LIMIT 10\"`",
+      "- `cypher-shell \"CREATE (n:Label {name: 'test'})\"`"
+    ],
+    "retrieval_messages": [
+      "Supply Graph database connection",
+      "neo4j access",
+      "How do I connect to Supply Graph?",
+      "What databases are available?"
+    ],
+    "pinned_defect": "D1 deletes (L1 §6 #7): the read-write managed note describes the retired CLI mode (psql/cypher-shell/mongosh and env vars the workspace never gets)"
+  },
+  "kb_note/mongodb/read_write": {
+    "note_id": "ds-d500000a",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Events (mongodb)",
+    "tags": [
+      "datasource",
+      "mongodb"
+    ],
+    "content": [
+      "## Connector: Events",
+      "**Type:** mongodb | **Access:** full (CLI)",
+      "",
+      "Event store",
+      "",
+      "### Connection",
+      "Use `mongosh` to connect — credentials are pre-configured via environment variables.",
+      "",
+      "### Environment Variables",
+      "- `MONGOSH_URI` — pre-configured",
+      "",
+      "### Examples",
+      "- `mongosh --eval \"db.users.find().limit(10)\"`",
+      "- `mongosh --eval \"db.users.insertOne({...})\"`"
+    ],
+    "retrieval_messages": [
+      "Events database connection",
+      "mongodb access",
+      "How do I connect to Events?",
+      "What databases are available?"
+    ],
+    "pinned_defect": "D1 deletes (L1 §6 #7): the read-write managed note describes the retired CLI mode (psql/cypher-shell/mongosh and env vars the workspace never gets)"
+  },
+  "kb_note/webdav/read_write": {
+    "note_id": "ds-d500000b",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Team files (webdav)",
+    "tags": [
+      "datasource",
+      "webdav"
+    ],
+    "content": [
+      "## Connector: Team files",
+      "**Type:** webdav | **Access:** read-write",
+      "",
+      "Shared drive",
+      "",
+      "### Available Tools",
+      "- `webdav_list` — list files and directories",
+      "- `webdav_read` — read file contents",
+      "- `webdav_info` — get file metadata",
+      "- `webdav_write` — write/upload files",
+      "- `webdav_delete` — delete files"
+    ],
+    "retrieval_messages": [
+      "Team files database connection",
+      "webdav access",
+      "How do I connect to Team files?",
+      "What databases are available?"
+    ]
+  },
+  "kb_note/email/read_write": {
+    "note_id": "ds-d500000c",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Support inbox (email)",
+    "tags": [
+      "datasource",
+      "email"
+    ],
+    "content": [
+      "## Connector: Support inbox",
+      "Customer support mailbox"
+    ],
+    "retrieval_messages": [
+      "Support inbox database connection",
+      "email access",
+      "How do I connect to Support inbox?",
+      "What databases are available?"
+    ],
+    "pinned_defect": "falls through to the bare connector note and the database retrieval phrases"
+  },
+  "kb_note/kb/read_write": {
+    "note_id": "ds-d500000d",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Handbook (kb)",
+    "tags": [
+      "datasource",
+      "kb"
+    ],
+    "content": [
+      "## OKF Knowledge Base: Handbook",
+      "",
+      "Company handbook",
+      "",
+      "Centrally indexed and read-only to agents in this release.",
+      "",
+      "OKF root: `vault`",
+      "",
+      "Attach this connector explicitly, then use the `kb_*` tools."
+    ],
+    "retrieval_messages": [
+      "Handbook knowledge base",
+      "Search Handbook with the KB tools",
+      "available OKF knowledge bases"
+    ]
+  },
+  "kb_note/kb_native/read_write": {
+    "note_id": "ds-d500000e",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Project knowledge (kb)",
+    "tags": [
+      "datasource",
+      "kb"
+    ],
+    "content": [
+      "## OKF Knowledge Base: Project knowledge",
+      "",
+      "This project's own knowledge base",
+      "",
+      "Centrally indexed and read-only to agents in this release.",
+      "",
+      "Attach this connector explicitly, then use the `kb_*` tools."
+    ],
+    "retrieval_messages": [
+      "Project knowledge knowledge base",
+      "Search Project knowledge with the KB tools",
+      "available OKF knowledge bases"
+    ],
+    "pinned_defect": "a project's own KB is described as read-only, though the agent binds it as the writable native KB (the README omits it for that reason)"
+  },
+  "kb_note/mcp_remote/read_write": {
+    "note_id": "ds-d500000f",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Docs MCP (mcp)",
+    "tags": [
+      "datasource",
+      "mcp"
+    ],
+    "content": [
+      "## Connector: Docs MCP",
+      "Documentation search"
+    ],
+    "retrieval_messages": [
+      "Docs MCP database connection",
+      "mcp access",
+      "How do I connect to Docs MCP?",
+      "What databases are available?"
+    ],
+    "pinned_defect": "falls through to the bare connector note and the database retrieval phrases"
+  },
+  "kb_note/mcp_stdio/read_write": {
+    "note_id": "ds-d5000010",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Local MCP (mcp)",
+    "tags": [
+      "datasource",
+      "mcp"
+    ],
+    "content": [
+      "## Connector: Local MCP",
+      "Local tool server"
+    ],
+    "retrieval_messages": [
+      "Local MCP database connection",
+      "mcp access",
+      "How do I connect to Local MCP?",
+      "What databases are available?"
+    ],
+    "pinned_defect": "falls through to the bare connector note and the database retrieval phrases"
+  },
+  "kb_note/postgresql/read_only": {
+    "note_id": "ds-d5000008",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Orders DB (postgresql)",
+    "tags": [
+      "datasource",
+      "postgresql"
+    ],
+    "content": [
+      "## Connector: Orders DB",
+      "**Type:** postgresql | **Access:** read-only (tools)",
+      "",
+      "Order history",
+      "",
+      "### Available Tools",
+      "- `sql_query` — execute SELECT queries",
+      "- `sql_schema` — inspect tables, columns, types, constraints",
+      "",
+      "No CLI access or write operations available."
+    ],
+    "retrieval_messages": [
+      "Orders DB database connection",
+      "postgresql access",
+      "How do I connect to Orders DB?",
+      "What databases are available?"
+    ]
+  },
+  "kb_note/neo4j/read_only": {
+    "note_id": "ds-d5000009",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Supply Graph (neo4j)",
+    "tags": [
+      "datasource",
+      "neo4j"
+    ],
+    "content": [
+      "## Connector: Supply Graph",
+      "**Type:** neo4j | **Access:** read-only (tools)",
+      "",
+      "Supplier graph",
+      "",
+      "### Available Tools",
+      "- `cypher_query` — execute read-only Cypher queries",
+      "- `cypher_execute` — execute write Cypher statements (CREATE, MERGE, DELETE, SET)",
+      "- `get_database_schema` — inspect labels, relationships, properties",
+      "",
+      "No CLI access or write operations available."
+    ],
+    "retrieval_messages": [
+      "Supply Graph database connection",
+      "neo4j access",
+      "How do I connect to Supply Graph?",
+      "What databases are available?"
+    ],
+    "pinned_defect": "the read-only neo4j note lists cypher_execute, a write tool the read-only tool set does not bind"
+  },
+  "kb_note/mongodb/read_only": {
+    "note_id": "ds-d500000a",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Events (mongodb)",
+    "tags": [
+      "datasource",
+      "mongodb"
+    ],
+    "content": [
+      "## Connector: Events",
+      "**Type:** mongodb | **Access:** read-only (tools)",
+      "",
+      "Event store",
+      "",
+      "### Available Tools",
+      "- `mongo_query` — document queries with filters",
+      "- `mongo_aggregate` — aggregation pipelines",
+      "- `mongo_schema` — collections, fields, indexes",
+      "",
+      "No CLI access or write operations available."
+    ],
+    "retrieval_messages": [
+      "Events database connection",
+      "mongodb access",
+      "How do I connect to Events?",
+      "What databases are available?"
+    ]
+  },
+  "kb_note/webdav/read_only": {
+    "note_id": "ds-d500000b",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Team files (webdav)",
+    "tags": [
+      "datasource",
+      "webdav"
+    ],
+    "content": [
+      "## Connector: Team files",
+      "**Type:** webdav | **Access:** read-only",
+      "",
+      "Shared drive",
+      "",
+      "### Available Tools",
+      "- `webdav_list` — list files and directories",
+      "- `webdav_read` — read file contents",
+      "- `webdav_info` — get file metadata"
+    ],
+    "retrieval_messages": [
+      "Team files database connection",
+      "webdav access",
+      "How do I connect to Team files?",
+      "What databases are available?"
+    ]
+  },
+  "kb_note/generic/credentials_stored_as_json_string": {
+    "note_id": "ds-d5000001",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Billing API (generic)",
+    "tags": [
+      "datasource",
+      "generic"
+    ],
+    "content": [
+      "## Connector: Billing API",
+      "Billing REST API",
+      "",
+      "### Connection",
+      "- **URL:** https://billing.example.test/api (credentials via env vars)",
+      "- **CLI:** `curl -H \"Authorization: Bearer $BILLING_TOKEN\" $BILLING_URL`",
+      "",
+      "### Environment Variables",
+      "- `BILLING_TOKEN` — available in workspace"
+    ],
+    "retrieval_messages": [
+      "Billing API connection",
+      "How to access Billing API",
+      "available connectors"
+    ]
+  },
+  "kb_note/generic/no_url_no_hint_no_env": {
+    "note_id": "ds-d5000001",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Billing API (generic)",
+    "tags": [
+      "datasource",
+      "generic"
+    ],
+    "content": [
+      "## Connector: Billing API"
+    ],
+    "retrieval_messages": [
+      "Billing API connection",
+      "How to access Billing API",
+      "available connectors"
+    ]
+  },
+  "kb_note/repository_token/clone_path_from_name": {
+    "note_id": "ds-d5000006",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Widgets Service (repository)",
+    "tags": [
+      "datasource",
+      "repository"
+    ],
+    "content": [
+      "## Repository: Widgets Service",
+      "Widgets service",
+      "",
+      "### Location",
+      "Cloned to `./repos/widgets-service/` — git is pre-authenticated.",
+      "",
+      "### Usage",
+      "Use standard git commands:",
+      "- `cd repos/widgets-service && git status`",
+      "- `git pull`, `git commit`, `git push`",
+      "- No login or credential setup required."
+    ],
+    "retrieval_messages": [
+      "Widgets Service repository",
+      "git repo Widgets Service",
+      "How to access Widgets Service code",
+      "available repositories"
+    ],
+    "pinned_defect": "the note's clone path slugs the connector name, while the clone lands under the upstream repository name"
+  },
+  "kb_note/kb/no_root_path": {
+    "note_id": "ds-d500000d",
+    "project_id": "00000000-0000-0000-0000-0000000000b1",
+    "title": "Connector: Handbook (kb)",
+    "tags": [
+      "datasource",
+      "kb"
+    ],
+    "content": [
+      "## OKF Knowledge Base: Handbook",
+      "",
+      "Company handbook",
+      "",
+      "Centrally indexed and read-only to agents in this release.",
+      "",
+      "Attach this connector explicitly, then use the `kb_*` tools."
+    ],
+    "retrieval_messages": [
+      "Handbook knowledge base",
+      "Search Handbook with the KB tools",
+      "available OKF knowledge bases"
+    ]
+  }
+}
