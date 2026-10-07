@@ -45,15 +45,17 @@ class TestDefault:
         assert config.context_management.injection_mode == INJECTION_MODE_LEGACY
         assert not is_append_only(config)
 
+    # The bundled default flipped to append_only on dev (D15 measured,
+    # 2026-10-07); a config without the key still falls back to legacy above.
     @pytest.mark.parametrize("role_base", ["worker_base", "session_base"])
-    def test_bundled_role_bases_are_legacy(self, role_base):
+    def test_bundled_role_bases_are_append_only(self, role_base):
         config = load_agent_config(str(_REPO / "config" / f"{role_base}.yaml"))
-        assert config.context_management.injection_mode == INJECTION_MODE_LEGACY
-        assert not is_append_only(config)
+        assert config.context_management.injection_mode == INJECTION_MODE_APPEND_ONLY
+        assert is_append_only(config)
 
     def test_the_shared_root_states_the_key(self):
         root = yaml.safe_load((_REPO / "config" / "expert_base.yaml").read_text())
-        assert root["context_management"]["injection_mode"] == "legacy"
+        assert root["context_management"]["injection_mode"] == "append_only"
 
 
 class TestParsing:

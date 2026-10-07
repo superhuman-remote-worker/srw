@@ -237,8 +237,10 @@ context_management:
   max_summary_length: 20000
   # legacy: memory, knowledge, guidance, ... are rebuilt at the request tail
   # every call. append_only: they are appended to the history once, when
-  # they change (append-only context injection, WP2). The rollback flag.
-  injection_mode: legacy
+  # they change (append-only context injection, WP2). The rollback flag:
+  # set it back to legacy to roll back; the code fallback for a config
+  # without this key stays legacy.
+  injection_mode: append_only
 
 research:
   # Proxy for accessing paywalled content (e.g., via SSH tunnel to university)

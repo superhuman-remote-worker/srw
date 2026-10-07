@@ -289,6 +289,9 @@ def env(tmp_path):
     )
     ws.initialize()
     config = load_agent_config(WORKER_CONFIG_PATH)
+    # These tests pin the legacy tail layout; the bundled default is
+    # append_only, so state the mode (``append_env`` switches it back).
+    config.context_management.injection_mode = "legacy"
     todo = TodoManager(ws)
     todo.add("Do the task")
     ctx = ToolContext(workspace_manager=ws)
