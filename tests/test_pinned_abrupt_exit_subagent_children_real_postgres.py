@@ -22,7 +22,12 @@ from orchestrator.application import controls
 from shared.persistent_input_delivery import message_row_id, transition_input_delivery
 from tests import test_lite_pinned_actor_exit_real_postgres as lite
 from tests import test_persistent_recycler_real_postgres as fixtures
+from orchestrator.services import stale_agent_detector as detector
 from tests.test_pinned_abrupt_death_real_postgres import killed_life
+from tests.test_pinned_retirement_retry_parity_real_postgres import (
+    _run_one_detector_pass,
+)
+from tests.test_pinned_vm_initial_binding_real_postgres import _bind_cold_agent
 
 pg_dsn = fixtures.pg_dsn
 _schema_applied = fixtures._schema_applied
@@ -39,6 +44,9 @@ BATCHES = {
     "delegated_once": ["completed"],
     # A pinned background child still queued in the dead process.
     "background": ["background"],
+    # The P0b shape: two running, one queued behind the cap, and one that
+    # finished but whose report never reached the parent.
+    "mixed_batch": ["running", "running", "queued", "completed"],
 }
 
 
@@ -160,7 +168,7 @@ async def _children(db, thread_id):
 
 async def _killed_delegating_life(db, monkeypatch, *, batch, backend, binding):
     children: list[str] = []
-    ids, retirement, deliveries, _, _ = await killed_life(
+    ids, retirement, deliveries, api, _ = await killed_life(
         db,
         monkeypatch,
         backend=backend,
@@ -169,6 +177,7 @@ async def _killed_delegating_life(db, monkeypatch, *, batch, backend, binding):
         before_retirement=_delegating(db, batch, children),
     )
     assert len(children) == len(BATCHES[batch])
+    ids["k8s"] = api
     return ids, retirement, deliveries, children
 
 
@@ -254,46 +263,204 @@ async def test_settled_exit_still_refuses_a_running_child(db, monkeypatch):
     assert await db.acknowledge_abrupt_pinned_actor_exit(ids["thread"], **args)
 
 
-@pytest.mark.asyncio
-async def test_killed_life_that_delegated_ends_and_its_children_are_retired(
-    db, monkeypatch
-):
-    """The whole End after a SIGKILL mid-batch now finishes.
+async def _subagent_events(db, thread_id):
+    return [
+        dict(row)
+        for row in await db.fetch(
+            "SELECT m.content, d.state FROM thread_input_deliveries d "
+            "JOIN thread_messages m ON m.id=d.message_id "
+            "WHERE d.thread_id=$1::uuid AND d.source='subagent' ORDER BY m.seq",
+            thread_id,
+        )
+    ]
 
-    What the retirement settle then does to the live children is existing
-    behaviour (``_terminalize_live_session_subagents_for_retirement``): it
-    ends them ``cancelled:parent_retired``, which the successor's batch settle
-    reports as retired. Pinned here so a later package changes it on purpose.
+
+def _assert_retired_children(rows, batch, events):
+    """What the settle leaves: live children cancelled, finished ones kept."""
+
+    expected = {
+        "interrupted_batch": [("ended", "cancelled", "cancelled:parent_retired")] * 3,
+        "delegated_once": [("ended", "completed", "completed")],
+        "background": [("ended", "cancelled", "cancelled:parent_retired")],
+        "mixed_batch": [("ended", "cancelled", "cancelled:parent_retired")] * 3
+        + [("ended", "completed", "completed")],
+    }[batch]
+    assert [
+        (row["status"], row["subagent_status"], row["subagent_outcome"]) for row in rows
+    ] == expected
+    # Only a pinned background child leaves an event; it is owed to Resume.
+    assert len(events) == int(batch == "background")
+    for event in events:
+        assert "cancelled:parent_retired" in event["content"]
+        assert event["state"] == "persisted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend,binding", TIERS)
+@pytest.mark.parametrize("batch", sorted(BATCHES))
+async def test_detector_retires_a_killed_life_that_delegated(
+    db, monkeypatch, batch, backend, binding
+):
+    """The real durable retry after a SIGKILL: receipt, End funnel, settle.
+
+    What the settle does to live children is existing behaviour
+    (``_terminalize_live_session_subagents_for_retirement``): it ends them
+    ``cancelled:parent_retired``, and a pinned background child also gets its
+    retirement event. Pinned here so a later package changes it on purpose.
     """
 
     ids, retirement, _, children = await _killed_delegating_life(
-        db, monkeypatch, batch="interrupted_batch", backend="none", binding=True
+        db, monkeypatch, batch=batch, backend=backend, binding=binding
     )
-    assert await controls.pinned_retirement_operations(
-        main.app.state.resources
-    ).recover_captured_process_zero(retirement)
-    current = await db.get_thread(ids["thread"])
+    # Children made by the real writers never look like producers.
+    for child in children:
+        assert not await db.fetchval(
+            "SELECT public.pinned_session_child_may_produce($1::uuid)", child
+        )
+    for pod in ids["k8s"].pods.values():
+        pod.spec.restart_policy = "Never"
+    monkeypatch.setattr(detector, "PINNED_RETIREMENT_TERMINAL_PROBE_GRACE_SECONDS", 0)
+    await db.execute(
+        "UPDATE agents SET last_heartbeat=now()-interval '5 minutes' WHERE id=$1::uuid",
+        ids["agent"],
+    )
+    before = (await db.get_thread(ids["thread"]))["last_activity"]
+
+    await _run_one_detector_pass()
+
+    thread = await db.get_thread(ids["thread"])
+    # A retirement event is new transcript activity; nothing else is.
+    assert (thread["last_activity"] > before) is (batch == "background")
+    assert thread["status"] == "ended"
+    assert thread["runtime_retirement_token"] is None
+    assert thread["agent_id"] is None
+    rows = await _children(db, ids["thread"])
+    assert [str(row["id"]) for row in rows] == children
+    _assert_retired_children(rows, batch, await _subagent_events(db, ids["thread"]))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend,binding", TIERS)
+@pytest.mark.parametrize("disposition", ["ended", "suspended"])
+async def test_soft_retirement_with_a_live_background_child_settles(
+    db, monkeypatch, disposition, backend, binding
+):
+    """The agent's own End or suspend, its local cleanup acknowledged."""
+
+    children: list[str] = []
+    ids, retirement, _, _, _ = await killed_life(
+        db,
+        monkeypatch,
+        backend=backend,
+        partial=True,
+        with_virtual_binding=binding,
+        settle_status=disposition,
+        before_retirement=_delegating(db, "background", children),
+    )
+    assert await db.acknowledge_pinned_thread_local_quiescence(
+        ids["thread"],
+        expected_runtime_generation=retirement["generation"],
+        expected_retirement_token=retirement["token"],
+        expected_agent_id=ids["agent"],
+        expected_attach_token=ids["attach_token"],
+        expected_settle_status=disposition,
+        expected_quiescence_protocol="agent_runtime_zero_v1",
+        expected_workspace_generation=None,
+        expected_workspace_runtime_incarnation=None,
+    )
+    before = (await db.get_thread(ids["thread"]))["last_activity"]
     result = await controls.thread_retirement_operations(
         main.app.state.resources
     ).end_thread_flow(
         ids["thread"],
-        current,
+        await db.get_thread(ids["thread"]),
         permanent=False,
         force=True,
         expected_runtime_generation=retirement["generation"],
         expected_agent_id=ids["agent"],
         expected_attach_token=ids["attach_token"],
+        settle_status=disposition,
         local_runtime_quiesced=True,
     )
-    assert result["status"] == "ended"
+    assert result["status"] == disposition
     thread = await db.get_thread(ids["thread"])
-    assert thread["status"] == "ended"
+    assert thread["status"] == disposition
+    assert thread["last_activity"] > before
     assert thread["runtime_retirement_token"] is None
     rows = await _children(db, ids["thread"])
     assert [str(row["id"]) for row in rows] == children
-    assert {
-        (row["status"], row["subagent_status"], row["subagent_outcome"]) for row in rows
-    } == {("ended", "cancelled", "cancelled:parent_retired")}
+    _assert_retired_children(
+        rows, "background", await _subagent_events(db, ids["thread"])
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch", ["interrupted_batch", "mixed_batch"])
+async def test_a_sigkilled_batch_leaves_its_successor_nothing_to_recover(
+    db, monkeypatch, batch
+):
+    """Characterizes the P0b gap; P0b is meant to change these assertions.
+
+    The retirement settle ends every live child ``cancelled:parent_retired``
+    whatever retired the runtime, and the live list excludes that outcome. So
+    after a SIGKILL mid-batch the successor's listing names no interrupted
+    child: with nothing finished it has no plan at all, and with a finished
+    child its plan reports the other calls as ``retired`` (cancelled), which
+    nobody did. Restore then drops the unanswered calls.
+    """
+
+    ids, retirement, deliveries, children = await _killed_delegating_life(
+        db, monkeypatch, batch=batch, backend="none", binding=True
+    )
+    for pod in ids["k8s"].pods.values():
+        pod.spec.restart_policy = "Never"
+    monkeypatch.setattr(detector, "PINNED_RETIREMENT_TERMINAL_PROBE_GRACE_SECONDS", 0)
+    await db.execute(
+        "UPDATE agents SET last_heartbeat=now()-interval '5 minutes' WHERE id=$1::uuid",
+        ids["agent"],
+    )
+    await _run_one_detector_pass()
+    assert (await db.get_thread(ids["thread"]))["status"] == "ended"
+
+    assert await db.resume_thread(ids["thread"])
+    successor = await _bind_cold_agent(db, ids["thread"])
+    actor = await db.get_agent(str(successor["agent_id"]))
+    listing = await db.list_live_session_subagent_recovery(
+        ids["thread"],
+        parent_authority={
+            "version": 1,
+            "execution_lane": "pinned",
+            "parent_thread_id": ids["thread"],
+            "agent_id": str(successor["agent_id"]),
+            "pod_uid": str(actor["pod_uid"]),
+            "session_runtime_generation": str(successor["runtime_generation"]),
+            "runtime_attach_token": str(successor["runtime_attach_token"]),
+        },
+    )
+    listed = [
+        str(row.get("thread_id") or row.get("id")) for row in listing["subagents"]
+    ]
+    if batch == "interrupted_batch":
+        assert listed == []
+        assert listing["recovery_turns"] == []
+    else:
+        # Only the finished child is still owed; the interrupted ones are not.
+        assert listed == [children[3]]
+        [plan] = listing["recovery_turns"]
+        assert [call["class"] for call in plan["calls"]] == [
+            "retired",
+            "retired",
+            "retired",
+            "ended",
+        ]
+    # The abandoned source input stays admitted and unanswered.
+    assert (
+        await db.fetchval(
+            "SELECT state FROM thread_input_deliveries WHERE delivery_id=$1::uuid",
+            deliveries[0],
+        )
+        == "admitted"
+    )
 
 
 async def _replica(db, sql, *args):

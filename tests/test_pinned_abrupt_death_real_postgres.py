@@ -67,6 +67,7 @@ async def killed_life(
     with_virtual_binding=True,
     authorized=True,
     before_retirement=None,
+    settle_status="ended",
 ):
     pod_uid = str(uuid4())
     ids = await fixtures._seed(
@@ -132,13 +133,15 @@ async def killed_life(
         ids["generation"] = generation
         ids["process_generation"] = process_generation
         await before_retirement(ids, deliveries)
-    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
+    retirement = await db.begin_pinned_thread_retirement(
+        ids["thread"], permanent=False, settle_status=settle_status
+    )
     if authorized:
         assert await db.authorize_pinned_thread_retirement(
             ids["thread"],
             token=retirement["token"],
             generation=retirement["generation"],
-            settle_status="ended",
+            settle_status=settle_status,
         )
     api = fixtures.StatefulPinnedK8sApi()
     pod_name = f"persistent-{ids['thread'][:12]}"

@@ -36650,6 +36650,7 @@ class PostgresDB:
         parent_thread_id: UUID | str,
         execution_lane: str,
         disposition: str,
+        touch_parent_activity: bool = True,
     ) -> Dict[str, int]:
         """Cancel live session children inside their parent's retirement tx.
 
@@ -36661,6 +36662,15 @@ class PostgresDB:
         soft-ended parent cannot execute it, but Resume will reclaim that exact
         evidence once.  Foreground children already return through the tool
         call and must not receive a second Lane-B delivery.
+
+        ``touch_parent_activity=False`` leaves the parent row unwritten. A
+        caller that still holds the parent's agent binding must pass it: the
+        deferred ``threads_agent_reciprocity_fence`` checks every row version
+        written in the transaction at commit, so an activity bump written
+        before the caller unbinds the agent fails the whole retirement as
+        nonreciprocal. Such a caller bumps ``last_activity`` in its own
+        unbinding UPDATE when ``deliveries`` is non-zero: a delivery is counted
+        only for a background child ended here, whose event message is new.
         """
 
         if execution_lane not in {"pinned", "stateless"}:
@@ -36776,7 +36786,7 @@ class PostgresDB:
                 raise RuntimeError(
                     "session child retirement event identity conflicts with transcript"
                 )
-            if inserted_message:
+            if inserted_message and touch_parent_activity:
                 await conn.execute(
                     "UPDATE threads SET last_activity=CURRENT_TIMESTAMP "
                     "WHERE id=$1::uuid",
@@ -43903,11 +43913,16 @@ class PostgresDB:
                         == str(captured_agent_pod.get("pod_uid") or "")
                     ):
                         return False
-                await self._terminalize_live_session_subagents_for_retirement(
-                    conn,
-                    parent_thread_id=parsed_thread_id,
-                    execution_lane="pinned",
-                    disposition=final_status,
+                # The parent row is still bound to its agent here; it is
+                # written once, by the unbinding UPDATE below.
+                retired_children = (
+                    await self._terminalize_live_session_subagents_for_retirement(
+                        conn,
+                        parent_thread_id=parsed_thread_id,
+                        execution_lane="pinned",
+                        disposition=final_status,
+                        touch_parent_activity=False,
+                    )
                 )
                 outcome_inserted = await conn.execute(
                     """
@@ -43961,7 +43976,9 @@ class PostgresDB:
                        runtime_retirement_stage_receipt = NULL,
                        runtime_retirement_local_quiescence = NULL,
                        runtime_retirement_external_cleanup = NULL,
-                       metadata = COALESCE(metadata, '{}'::jsonb) - 'agent_pod'
+                       metadata = COALESCE(metadata, '{}'::jsonb) - 'agent_pod',
+                       last_activity = CASE WHEN $5::boolean
+                           THEN CURRENT_TIMESTAMP ELSE last_activity END
                  WHERE id = $1::uuid
                    AND execution_lane = 'pinned'
                    AND runtime_generation = $2::uuid
@@ -43975,6 +43992,7 @@ class PostgresDB:
                     parsed_generation,
                     parsed_token,
                     final_status,
+                    retired_children["deliveries"] > 0,
                 )
                 if row is None:
                     raise RuntimeError(

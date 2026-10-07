@@ -300,11 +300,14 @@ async def test_pinned_soft_settlement_invokes_child_tombstone_in_same_transactio
         generation=str(GENERATION),
         final_status="ended",
     )
+    # The parent row is still bound to its agent while children retire, so
+    # the tombstone must not write it (deferred reciprocity fence).
     tombstone.assert_awaited_once_with(
         conn,
         parent_thread_id=PARENT,
         execution_lane="pinned",
         disposition="ended",
+        touch_parent_activity=False,
     )
     append.assert_awaited_once()
 
