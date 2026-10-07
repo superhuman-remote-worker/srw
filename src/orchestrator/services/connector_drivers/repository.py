@@ -39,6 +39,9 @@ from orchestrator.services.workspace_ssh_connector import (
 from shared.connectors.builtin import REPOSITORY_SPEC
 
 
+_URL_REQUIRED = "Repository connectors require a repository URL"
+
+
 class RepositoryDriver(WorkspaceSshDriver):
     def __init__(self) -> None:
         super().__init__(REPOSITORY_SPEC)
@@ -69,6 +72,10 @@ class RepositoryDriver(WorkspaceSshDriver):
                 config=config,
                 credentials=credentials,
             )
+            # The clone and Test both need it; a declared forge used to make a
+            # URL-less connector valid.
+            if not (draft.connection_url or "").strip():
+                raise HTTPException(status_code=400, detail=_URL_REQUIRED)
             return NormalizedConnector(draft.connection_url, config, credentials)
 
         credentials = self.stored_credentials(draft, existing)
@@ -80,6 +87,10 @@ class RepositoryDriver(WorkspaceSshDriver):
         config = self.validate_effective_endpoint(
             draft, existing, config=config, credentials=credentials
         )
+        # An explicit null leaves the stored URL alone; a blank one would
+        # clear it.
+        if draft.connection_url is not None and not draft.connection_url.strip():
+            raise HTTPException(status_code=400, detail=_URL_REQUIRED)
         return NormalizedConnector(draft.connection_url, config, credentials)
 
     async def check(

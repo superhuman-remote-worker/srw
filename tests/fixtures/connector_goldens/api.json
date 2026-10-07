@@ -2134,6 +2134,29 @@
     },
     "calls": []
   },
+  "create/repository/url_required_with_declared_forge": {
+    "request": {
+      "method": "POST",
+      "path": "/api/datasources",
+      "body": {
+        "name": "Widgets",
+        "type": "repository",
+        "default_branch": "main",
+        "credentials": {
+          "auth_method": "token",
+          "token": "ghp_widgets-secret"
+        },
+        "config": {
+          "forge": "github"
+        }
+      }
+    },
+    "status": 400,
+    "body": {
+      "detail": "Repository connectors require a repository URL"
+    },
+    "calls": []
+  },
   "create/repository/credentials_not_validated": {
     "request": {
       "method": "POST",
@@ -6711,6 +6734,20 @@
         }
       }
     ]
+  },
+  "update/repository/url_cannot_be_cleared": {
+    "request": {
+      "method": "PUT",
+      "path": "/api/datasources/d5000006-0000-0000-0000-000000000006",
+      "body": {
+        "connection_url": "  "
+      }
+    },
+    "status": 400,
+    "body": {
+      "detail": "Repository connectors require a repository URL"
+    },
+    "calls": []
   },
   "update/repository/token_replaces_whole_credentials": {
     "request": {

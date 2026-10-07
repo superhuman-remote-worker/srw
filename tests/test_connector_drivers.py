@@ -397,11 +397,26 @@ def _valid_create(type_id: str) -> dict:
     )
 
     # The most permissive valid body: MCP over stdio needs no URL, and a
-    # token repository that declares its forge needs none to infer it from.
+    # token repository that declares its forge needs none to infer the forge.
     return {
         "mcp": MCP_STDIO,
         "repository": {**REPOSITORY_TOKEN, "config": {"forge": "github"}},
     }.get(type_id, _VALID_CREATE[type_id])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auth", ["token", "ssh"])
+async def test_a_repository_needs_its_url_whatever_its_auth(auth):
+    from tests.test_connector_goldens_api import REPOSITORY_SSH, REPOSITORY_TOKEN
+
+    body = {
+        "token": {**REPOSITORY_TOKEN, "config": {"forge": "github"}},
+        "ssh": REPOSITORY_SSH,
+    }[auth]
+    assert await _accepts("repository", body)
+    without_url = {k: v for k, v in body.items() if k != "connection_url"}
+    assert not await _accepts("repository", without_url)
+    assert not await _accepts("repository", {**body, "connection_url": "  "})
 
 
 @pytest.mark.asyncio

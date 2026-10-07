@@ -523,6 +523,13 @@ CASES: dict[str, ApiCase] = {
     "create/repository/no_url_without_forge": _create(
         _without(REPOSITORY_TOKEN, "connection_url")
     ),
+    # A declared forge used to make a URL-less repository valid; the clone
+    # and Test both need the URL (D1a).
+    "create/repository/url_required_with_declared_forge": _create(
+        _with(
+            _without(REPOSITORY_TOKEN, "connection_url"), config={"forge": "github"}
+        )
+    ),
     "create/repository/credentials_not_validated": _create(
         _with(REPOSITORY_TOKEN, credentials={"read_only": True})
     ),
@@ -893,6 +900,9 @@ CASES.update(
         "update/repository/url_change_keeps_stored_forge": _update(
             _stored("repository_token"),
             {"connection_url": "https://git.example.test/acme/widgets.git"},
+        ),
+        "update/repository/url_cannot_be_cleared": _update(
+            _stored("repository_token"), {"connection_url": "  "}
         ),
         "update/repository/token_replaces_whole_credentials": _update(
             _stored("repository_token"), {"credentials": {"token": "ghp_rotated"}}

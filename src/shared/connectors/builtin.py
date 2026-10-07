@@ -235,9 +235,7 @@ REPOSITORY_SPEC = DriverSpec(
             "known_hosts": {"type": "string", "x-srw-multiline": True},
         },
     },
-    # The clone needs it, but validation accepts a connector without one when
-    # it declares its forge (the repository code stays as it is until C1).
-    legacy_connection_url="optional",
+    legacy_connection_url="required",
     credential_slots=(
         # The token lands in the clone URL, and so in .git/config, until the
         # git swap driver (C3); the key is loaded into an ssh-agent (C1).
