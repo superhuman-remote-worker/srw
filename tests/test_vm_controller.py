@@ -74,9 +74,13 @@ _mock_k8s.client = _mock_k8s_client  # type: ignore[attr-defined]
 _mock_k8s.config = _mock_k8s_config  # type: ignore[attr-defined]
 _mock_k8s_config.load_incluster_config = MagicMock()  # type: ignore[attr-defined]
 
-from kubernetes.client import ApiClient as KubernetesApiClient  # noqa: E402
+from kubernetes.client import (  # noqa: E402
+    ApiClient as KubernetesApiClient,
+    V1Pod as KubernetesV1Pod,
+)
 
 _mock_k8s_client.ApiClient = KubernetesApiClient  # type: ignore[attr-defined]
+_mock_k8s_client.V1Pod = KubernetesV1Pod  # type: ignore[attr-defined]
 
 _K8S_STUB_MODULES = {
     "kubernetes": _mock_k8s,
@@ -5402,6 +5406,342 @@ class TestWorkspaceRecoveryControllerEvidence:
         }
         controller.core_api.patch_namespaced_pod.assert_not_called()
         controller.k8s_client.patch_namespaced_custom_object.assert_not_called()
+
+    def wire_sdk_pre_ssh_stop(self, controller):
+        vm, pod = self.wire_pre_ssh_stop(controller)
+        for owner in pod["metadata"]["ownerReferences"]:
+            owner.update(apiVersion="kubevirt.io/v1", name=vm["metadata"]["name"])
+        for container in pod["spec"]["containers"]:
+            for mount in container.get("volumeMounts", []):
+                mount["mountPath"] = "/var/run/kubevirt-private/vmi-disks/rootdisk"
+        for status in pod["status"]["containerStatuses"]:
+            status.update(
+                image="workspace-image",
+                imageID="workspace-image-id",
+                ready=False,
+                lastState={},
+            )
+        # KubeVirt's restartable console sidecar is an init container.
+        pod["spec"]["initContainers"] = [pod["spec"]["containers"].pop()]
+        pod["spec"]["initContainers"][0]["restartPolicy"] = "Always"
+        pod["status"]["initContainerStatuses"] = [
+            pod["status"]["containerStatuses"].pop()
+        ]
+        client = KubernetesApiClient()
+
+        def read_pod(**kwargs):
+            return client._ApiClient__deserialize(pod, "V1Pod")  # noqa: SLF001
+
+        controller.core_api.read_namespaced_pod.side_effect = read_pod
+        controller.core_api.list_namespaced_pod.side_effect = (
+            lambda **kwargs: client._ApiClient__deserialize(
+                {"items": [pod]}, "V1PodList"
+            )
+        )  # noqa: SLF001
+        controller.core_api.read_node.return_value = client._ApiClient__deserialize(
+            {
+                "metadata": {"uid": self.NODE_UID},
+                "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+            },
+            "V1Node",
+        )  # noqa: SLF001
+        return vm, pod, read_pod
+
+    @pytest.mark.asyncio
+    async def test_pre_ssh_inspection_freezes_real_sdk_pod_before_stop(
+        self, controller
+    ):
+        _, _, read_pod = self.wire_sdk_pre_ssh_stop(controller)
+        pod = read_pod()
+        assert type(pod).__name__ == "V1Pod"
+        assert pod.spec.restart_policy == "Never"
+        assert not hasattr(pod.spec, "restartPolicy")
+        assert pod.spec.ephemeral_containers is None
+        assert pod.status.ephemeral_container_statuses is None
+
+        candidate = await controller._do_inspect_pre_ssh_stop(
+            SAMPLE_JOB_CONFIG["job_id"],
+            provision_generation=PROVISION_GENERATION,
+            expected_vm_uid=self.VM_UID,
+            expected_pvc_uid=self.PVC_UID,
+        )
+
+        assert candidate is not None
+        assert candidate["launcher_uid"] == self.OLD_POD_UID
+        assert candidate["containers"] == [
+            {
+                "kind": "regular",
+                "name": "compute",
+                "container_id": "containerd://compute-old",
+            },
+            {
+                "kind": "init",
+                "name": "guest-console-log",
+                "container_id": "containerd://console-old",
+            },
+        ]
+        controller.core_api.patch_namespaced_pod.assert_not_called()
+        controller.k8s_client.patch_namespaced_custom_object.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pre_ssh_real_sdk_stop_then_release_preserves_exact_cas_and_vector(
+        self, controller
+    ):
+        from kubernetes.client.exceptions import ApiException
+        from shared.vm_pre_ssh_stop import (
+            PRE_SSH_STOP_ANNOTATION,
+            PRE_SSH_STOP_FINALIZER,
+        )
+
+        vm, pod, _ = self.wire_sdk_pre_ssh_stop(controller)
+        frozen = await controller._do_inspect_pre_ssh_stop(
+            SAMPLE_JOB_CONFIG["job_id"],
+            provision_generation=PROVISION_GENERATION,
+            expected_vm_uid=self.VM_UID,
+            expected_pvc_uid=self.PVC_UID,
+        )
+        assert frozen is not None
+        vm["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = 60
+        pod["spec"]["terminationGracePeriodSeconds"] = 60
+        digest = "sha256:" + "a" * 64
+        order = []
+        get_object = controller.k8s_client.get_namespaced_custom_object.side_effect
+
+        def get_after_halt(**kwargs):
+            if (
+                kwargs["plural"] == "virtualmachineinstances"
+                and vm["spec"]["runStrategy"] == "Halted"
+            ):
+                raise ApiException(status=404)
+            return get_object(**kwargs)
+
+        def patch_pod(**kwargs):
+            tests = {
+                item["path"]: item["value"]
+                for item in kwargs["body"]
+                if item["op"] == "test"
+            }
+            assert tests["/metadata/uid"] == self.OLD_POD_UID
+            assert (
+                tests["/metadata/resourceVersion"] == pod["metadata"]["resourceVersion"]
+            )
+            if any(item["op"] == "remove" for item in kwargs["body"]):
+                order.append("release")
+                assert order == ["finalizer", "Halted", "release"]
+                assert tests["/metadata/finalizers"] == [
+                    "other.io/keep",
+                    PRE_SSH_STOP_FINALIZER,
+                ]
+                assert kwargs["body"][-1] == {
+                    "op": "remove",
+                    "path": "/metadata/finalizers/1",
+                }
+                pod["metadata"]["finalizers"].pop(1)
+            else:
+                order.append("finalizer")
+                pod["metadata"].update(
+                    annotations={PRE_SSH_STOP_ANNOTATION: digest},
+                    finalizers=["other.io/keep", PRE_SSH_STOP_FINALIZER],
+                )
+            pod["metadata"]["resourceVersion"] = (
+                "44" if order[-1] == "finalizer" else "46"
+            )
+
+        def patch_vm(**kwargs):
+            order.append("Halted")
+            assert order == ["finalizer", "Halted"]
+            tests = {
+                item["path"]: item["value"]
+                for item in kwargs["body"]
+                if item["op"] == "test"
+            }
+            assert tests == {
+                "/metadata/uid": self.VM_UID,
+                "/metadata/resourceVersion": "42",
+                "/spec/runStrategy": "RerunOnFailure",
+            }
+            vm["spec"]["runStrategy"] = "Halted"
+            vm["metadata"].update(
+                generation=frozen["vm_generation"] + 1, resourceVersion="45"
+            )
+            pod["metadata"].update(
+                deletionGracePeriodSeconds=0, deletionTimestamp="2026-10-07T12:01:00Z"
+            )
+            pod["status"]["phase"] = "Failed"
+            for key in ("containerStatuses", "initContainerStatuses"):
+                for status in pod["status"][key]:
+                    status["state"] = {
+                        "terminated": {
+                            "containerID": status["containerID"],
+                            "exitCode": 0,
+                            "startedAt": "2026-10-07T11:59:00Z",
+                            "finishedAt": "2026-10-07T12:00:00Z",
+                            "reason": "Completed",
+                        }
+                    }
+
+        controller.k8s_client.get_namespaced_custom_object.side_effect = get_after_halt
+        controller.core_api.patch_namespaced_pod.side_effect = patch_pod
+        controller.k8s_client.patch_namespaced_custom_object.side_effect = patch_vm
+        stopped = await controller._do_pre_ssh_stop(frozen, digest)
+        assert stopped["status"] == "positive_terminal_proof"
+        assert {
+            (v["kind"], v["name"], v["container_id"])
+            for v in stopped["terminal_evidence"]["containers"]
+        } == {(v["kind"], v["name"], v["container_id"]) for v in frozen["containers"]}
+        released = await controller._do_release_pre_ssh_stop_finalizer(
+            frozen,
+            digest,
+            stopped["terminal_evidence"],
+            process_zero_receipt_id="00000000-0000-4000-8000-000000000901",
+        )
+        assert released == {"status": "finalizer_released"}
+        assert order == ["finalizer", "Halted", "release"]
+        assert pod["metadata"]["finalizers"] == ["other.io/keep"]
+        assert controller.k8s_client.patch_namespaced_custom_object.call_count == 1
+        assert controller.core_api.patch_namespaced_pod.call_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "unsafe",
+        [
+            "template_grace_missing",
+            "template_grace_null",
+            "template_grace_zero",
+            "pod_grace_missing",
+            "pod_grace_null",
+            "pod_grace_zero",
+            "deletion_grace_missing",
+            "deletion_grace_null",
+            "running",
+            "late_finish",
+            "missing_start",
+            "last_state",
+            "restarted",
+            "replaced_cid",
+        ],
+    )
+    async def test_pre_ssh_real_sdk_stop_preserves_strict_terminal_refusals(
+        self, controller, unsafe
+    ):
+        from kubernetes.client.exceptions import ApiException
+        from shared.vm_pre_ssh_stop import (
+            PRE_SSH_STOP_ANNOTATION,
+            PRE_SSH_STOP_FINALIZER,
+        )
+
+        vm, pod, _ = self.wire_sdk_pre_ssh_stop(controller)
+        frozen = await controller._do_inspect_pre_ssh_stop(
+            SAMPLE_JOB_CONFIG["job_id"],
+            provision_generation=PROVISION_GENERATION,
+            expected_vm_uid=self.VM_UID,
+            expected_pvc_uid=self.PVC_UID,
+        )
+        assert frozen is not None
+        digest = "sha256:" + "a" * 64
+        vm["spec"]["runStrategy"] = "Halted"
+        vm["metadata"]["generation"] = frozen["vm_generation"] + 1
+        vm["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = 60
+        pod["spec"]["terminationGracePeriodSeconds"] = 60
+        pod["metadata"].update(
+            annotations={PRE_SSH_STOP_ANNOTATION: digest},
+            finalizers=[PRE_SSH_STOP_FINALIZER],
+            deletionGracePeriodSeconds=0,
+            deletionTimestamp="2026-10-07T12:01:00Z",
+        )
+        pod["status"]["phase"] = "Failed"
+        for key in ("containerStatuses", "initContainerStatuses"):
+            for item in pod["status"][key]:
+                item["state"] = {
+                    "terminated": {
+                        "containerID": item["containerID"],
+                        "exitCode": 0,
+                        "startedAt": "2026-10-07T11:59:00Z",
+                        "finishedAt": "2026-10-07T12:00:00Z",
+                        "reason": "Completed",
+                    }
+                }
+        status = pod["status"]["containerStatuses"][0]
+        if unsafe.startswith("template_grace"):
+            target = vm["spec"]["template"]["spec"]
+            key = "terminationGracePeriodSeconds"
+            suffix = unsafe.removeprefix("template_grace_")
+        elif unsafe.startswith("pod_grace"):
+            target = pod["spec"]
+            key = "terminationGracePeriodSeconds"
+            suffix = unsafe.removeprefix("pod_grace_")
+        elif unsafe.startswith("deletion_grace"):
+            target = pod["metadata"]
+            key = "deletionGracePeriodSeconds"
+            suffix = unsafe.removeprefix("deletion_grace_")
+        else:
+            target = None
+        if target is not None:
+            if suffix == "missing":
+                target.pop(key)
+            else:
+                target[key] = None if suffix == "null" else 0
+        elif unsafe == "running":
+            status["state"] = {"running": {}}
+        elif unsafe == "late_finish":
+            status["state"]["terminated"]["finishedAt"] = "2026-10-07T12:02:00Z"
+        elif unsafe == "missing_start":
+            status["state"]["terminated"].pop("startedAt")
+        elif unsafe == "last_state":
+            status["lastState"] = copy.deepcopy(status["state"])
+        elif unsafe == "restarted":
+            status["restartCount"] = 1
+        else:
+            status["containerID"] = "containerd://replacement"
+        get_object = controller.k8s_client.get_namespaced_custom_object.side_effect
+
+        def vmi_absent(**kwargs):
+            if kwargs["plural"] == "virtualmachineinstances":
+                raise ApiException(status=404)
+            return get_object(**kwargs)
+
+        controller.k8s_client.get_namespaced_custom_object.side_effect = vmi_absent
+
+        result = await controller._do_pre_ssh_stop(frozen, digest)
+        assert result["status"] in {"identity_refused", "pending_terminal_proof"}
+        assert "terminal_evidence" not in result
+        controller.core_api.patch_namespaced_pod.assert_not_called()
+        controller.k8s_client.patch_namespaced_custom_object.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pre_ssh_real_sdk_inspection_refuses_nonmapping_serializer(
+        self, controller
+    ):
+        self.wire_sdk_pre_ssh_stop(controller)
+        with patch.object(
+            KubernetesApiClient, "sanitize_for_serialization", return_value=MagicMock()
+        ):
+            candidate = await controller._do_inspect_pre_ssh_stop(
+                SAMPLE_JOB_CONFIG["job_id"],
+                provision_generation=PROVISION_GENERATION,
+                expected_vm_uid=self.VM_UID,
+                expected_pvc_uid=self.PVC_UID,
+            )
+        assert candidate is None
+        controller.core_api.patch_namespaced_pod.assert_not_called()
+        controller.k8s_client.patch_namespaced_custom_object.assert_not_called()
+
+    def test_pre_ssh_pod_wire_keeps_mapping_and_sdk_empty_optional_semantics(
+        self, controller
+    ):
+        from vm_controller.controller import _pre_ssh_pod_wire
+
+        _, wire, read_pod = self.wire_sdk_pre_ssh_stop(controller)
+        assert _pre_ssh_pod_wire(wire) is wire
+        normalized = _pre_ssh_pod_wire(read_pod())
+        assert normalized["spec"]["restartPolicy"] == "Never"
+        assert "ephemeralContainers" not in normalized["spec"]
+        assert "ephemeralContainerStatuses" not in normalized["status"]
+        assert (
+            normalized["metadata"]["resourceVersion"]
+            == wire["metadata"]["resourceVersion"]
+        )
+        assert normalized["spec"]["initContainers"][0]["restartPolicy"] == "Always"
 
     @pytest.mark.asyncio
     async def test_pre_ssh_stop_pins_own_intent_before_halted_and_never_mints_zero_on_ack(

@@ -545,6 +545,20 @@ def _object_value(value: object, key: str, default=None):
     return getattr(value, key, default)
 
 
+def _pre_ssh_pod_wire(value: object) -> object:
+    """Use the SDK's actual wire names only at the pre-SSH Pod boundary."""
+
+    if isinstance(value, Mapping):
+        return value
+    from kubernetes.client import ApiClient, V1Pod
+
+    if not isinstance(value, V1Pod):
+        return value
+    wire = ApiClient().sanitize_for_serialization(value)
+    # A serializer double or unknown representation must not supply authority.
+    return wire if type(wire) is dict else None
+
+
 def _metadata(value: object) -> object:
     return _object_value(value, "metadata", {})
 
@@ -3913,7 +3927,7 @@ class VMController:
             pods = _object_value(pod_list, "items")
             if not isinstance(pods, list) or len(pods) != 1:
                 return None
-            pod = pods[0]
+            pod = _pre_ssh_pod_wire(pods[0])
             pod_meta = _metadata(pod)
             pod_spec = _object_value(pod, "spec", {})
             pod_status = _object_value(pod, "status", {})
@@ -4078,6 +4092,7 @@ class VMController:
                 namespace=VM_NAMESPACE,
                 name=frozen["launcher_name"],
             )
+            pod = _pre_ssh_pod_wire(pod)
             vm_meta = _metadata(vm)
             pod_meta = _metadata(pod)
             vm_labels = _object_value(vm_meta, "labels")
@@ -4527,6 +4542,7 @@ class VMController:
                 if exc.status == 404:
                     return {"status": "finalizer_released"}
                 raise
+            pod = _pre_ssh_pod_wire(pod)
             meta = _metadata(pod)
             annotations = _object_value(meta, "annotations") or {}
             finalizers = _object_value(meta, "finalizers") or []
