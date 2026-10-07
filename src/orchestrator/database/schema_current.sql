@@ -10558,7 +10558,7 @@ BEGIN
     SELECT * INTO charge FROM public.vm_resource_reservations
      WHERE id=NEW.reservation_id FOR UPDATE;
     SELECT w.job_id,w.provision_generation,r.state AS retry_state,
-           r.observed_vm_uid,r.observed_pvc_uid
+           r.observed_vm_uid,r.observed_pvc_uid,r.ready_at,r.reason
       INTO source FROM public.vm_resource_waiters w
       JOIN public.vm_creation_retries r ON r.request_id=w.request_id
      WHERE w.request_id=NEW.request_id;
@@ -10586,7 +10586,18 @@ BEGIN
        OR owner_vm->>'vm_uid' IS DISTINCT FROM NEW.vm_uid::text
        OR owner_vm->>'rootdisk_pvc_uid' IS DISTINCT FROM NEW.pvc_uid::text
        OR owner_vm->>'vmi_uid' IS DISTINCT FROM NEW.vmi_uid::text
-       OR owner_vm->>'active_pod_uid' IS DISTINCT FROM NEW.launcher_uid::text
+       OR (
+           owner_vm->>'active_pod_uid' IS DISTINCT FROM NEW.launcher_uid::text
+           AND NOT (
+               owner_vm->>'active_pod_uid' IS NULL
+               AND source.ready_at IS NULL
+               AND source.reason IS NOT DISTINCT FROM 'creation_adopted'
+               AND NOT EXISTS (
+                   SELECT 1 FROM public.vm_resource_recovery_successors
+                    WHERE reservation_id=NEW.reservation_id
+               )
+           )
+       )
        OR proof->>'version' IS DISTINCT FROM '1'
        OR proof->>'kind' IS DISTINCT FROM 'vm_cleanup_physical_stop'
        OR proof->>'job_id' IS DISTINCT FROM NEW.job_id::text
