@@ -2185,6 +2185,7 @@
       "undoNothing": "Es gibt keine Dateiänderungen zum Rückgängigmachen.",
       "undoUnsupported": "Rückgängig machen ist für den Workspace dieser Sitzung nicht verfügbar.",
       "undoRejected": "Der Agent konnte die letzten Dateiänderungen nicht rückgängig machen.",
+      "containerUpgradeUnavailable": "Container-Upgrades sind in dieser Sitzung nicht verfügbar. Verwenden Sie /upgrade-workspace vm oder starten Sie eine neue Sitzung mit einem Container-Workspace.",
       "upgradeUnavailable": "Workspace-Upgrades sind in dieser Sitzung nicht verfügbar."
     },
     "workspaceOffer": {

@@ -6364,7 +6364,15 @@ export class PersistentChatService {
         const lower = word.toLowerCase();
         if (!word) this.upgradeWorkspace(null);
         else if (lower === 'vm') this.upgradeWorkspace('vm');
-        else if (lower === 'container' || lower === 'sandbox') this.upgradeWorkspace('sandbox');
+        else if (lower === 'container' || lower === 'sandbox') {
+          if (this.controlTransport('upgrade-to-workspace') === 'websocket') {
+            // A pinned session refuses container upgrades before provisioning;
+            // say so here rather than send a frame that can only fail.
+            this.error.set(this.transloco.translate('chat.control.containerUpgradeUnavailable'));
+          } else {
+            this.upgradeWorkspace('sandbox');
+          }
+        }
         else this.upgradeWorkspace(null, {template: word});
         return true;
       }
@@ -8098,7 +8106,8 @@ export class PersistentChatService {
         // card is the accept path; the settings pane and the
         // /upgrade-workspace slash command remain as the after-reload
         // fallback (the card is live-only). Honor the offered tier; the
-        // tool only requests `sandbox` today.
+        // pinned agent offers `vm`; a `sandbox` offer on a pinned session is
+        // an older agent's.
         //
         // This fires mid-stream: request_freeze doesn't stop the turn on
         // the session path, so the agent is still talking when the card
@@ -8106,6 +8115,15 @@ export class PersistentChatService {
         // live, and they can't accumulate.
         const tier = (params['target_tier'] as string) || 'sandbox';
         const reason = (params['reason'] as string) || 'shell/git tools needed';
+        if (tier === 'sandbox' && this.controlTransport('upgrade-to-workspace') === 'websocket') {
+          // An older agent still offers a container on a pinned session,
+          // where accepting can only fail: keep the ask in scroll-back, but
+          // raise no card.
+          this._systemMessage(
+            `The agent requested a container workspace, which isn't available in this session: ${reason}`,
+          );
+          break;
+        }
         this.pendingWorkspaceOffer.set({ tier, reason });
         // Keep a line in the stream so the ask survives in scroll-back
         // once the card resolves — but state the fact only. The card is

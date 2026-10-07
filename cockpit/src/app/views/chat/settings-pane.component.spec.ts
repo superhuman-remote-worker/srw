@@ -883,12 +883,27 @@ describe('SettingsPaneComponent workspace tier', () => {
   it('denies the VM upgrade without the vm grant; admin (null grants) allows', () => {
     const {component} = createPane({grants: {vm_workspace: false}});
     expect(component.workspaceTier()).toBe('virtual');
-    expect(component.tierReachability()['sandbox']).toBe('ok');
     expect(component.tierReachability()['vm']).toBe('needsApproval');
 
     TestBed.resetTestingModule();
     const {component: admin} = createPane({grants: null});
     expect(admin.tierReachability()['vm']).toBe('ok');
+  });
+
+  it('a pinned session (socket transport) offers no container upgrade, and says so', () => {
+    const {component, chat} = createPane({grants: null});
+    expect(chat.controlTransport('upgrade-to-workspace')).toBe('websocket');
+    expect(component.tierReachability()['sandbox']).toBe('sessionUnsupported');
+    expect(component.tierReachability()['vm']).toBe('ok');
+    component.onTierPicked('sandbox');
+    expect(component.pendingTier()).toBeNull();
+  });
+
+  it('a REST upgrade transport keeps the container choice', () => {
+    const {component, chat} = createPane({grants: null});
+    chat.controlTransport.mockReturnValue('rest');
+    chat.workspaceTier.set('virtual');
+    expect(component.tierReachability()['sandbox']).toBe('ok');
   });
 
   it('a session with no upgrade transport reaches no tier, and says so', () => {
@@ -934,9 +949,9 @@ describe('SettingsPaneComponent tier upgrade confirmation', () => {
 
   it('a reachable pick opens the dialog instead of dispatching', () => {
     const {component, chat} = createPane({grants: null});
-    component.onTierPicked('sandbox');
+    component.onTierPicked('vm');
 
-    expect(component.pendingTier()).toBe('sandbox');
+    expect(component.pendingTier()).toBe('vm');
     expect(chat.upgradeWorkspace).not.toHaveBeenCalled();
   });
 
@@ -951,7 +966,7 @@ describe('SettingsPaneComponent tier upgrade confirmation', () => {
 
   it('dismissing dispatches nothing — the tier is unchanged', () => {
     const {component, chat} = createPane({grants: null});
-    component.onTierPicked('sandbox');
+    component.onTierPicked('vm');
     component.pendingTier.set(null); // what (closed) and Cancel both do
 
     expect(chat.upgradeWorkspace).not.toHaveBeenCalled();

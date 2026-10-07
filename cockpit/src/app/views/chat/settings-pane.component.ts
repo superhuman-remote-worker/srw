@@ -316,10 +316,17 @@ export class SettingsPaneComponent {
         // A session with no upgrade transport (the stateless lane) can move
         // nowhere, whatever the ladder allows: say so in the option instead
         // of refusing after the confirmation dialog.
-        if (this.chat.controlTransport('upgrade-to-workspace') !== 'websocket') {
+        const upgradeTransport = this.chat.controlTransport('upgrade-to-workspace');
+        if (upgradeTransport === 'unavailable') {
             for (const [tier, state] of Object.entries(map)) {
                 if (state === 'ok' || state === 'needsApproval') map[tier] = 'sessionUnsupported';
             }
+        }
+        // A pinned session (socket transport) refuses container upgrades
+        // before provisioning (persistent_app.py _handle_workspace_upgrade),
+        // so the option says so instead of failing after the confirmation.
+        if (upgradeTransport === 'websocket' && map['sandbox'] === 'ok') {
+            map['sandbox'] = 'sessionUnsupported';
         }
         return map;
     });

@@ -2185,6 +2185,7 @@
       "undoNothing": "There are no file changes to undo.",
       "undoUnsupported": "Undo isn't available for this session's workspace.",
       "undoRejected": "The agent could not undo the last file changes.",
+      "containerUpgradeUnavailable": "Container upgrades aren't available in this session. Use /upgrade-workspace vm, or start a new session with a container workspace.",
       "upgradeUnavailable": "Workspace upgrades aren't available in this session."
     },
     "workspaceOffer": {

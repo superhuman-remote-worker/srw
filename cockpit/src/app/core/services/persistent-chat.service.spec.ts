@@ -4703,7 +4703,6 @@ describe('PersistentChatService — control commands', () => {
   it.each([
     ['/upgrade-workspace', { method: 'upgrade-to-workspace' }],
     ['/upgrade-workspace vm', { method: 'upgrade-to-workspace', target_tier: 'vm' }],
-    ['/upgrade-workspace container', { method: 'upgrade-to-workspace', target_tier: 'sandbox' }],
     [
       '/upgrade-workspace website-builder',
       { method: 'upgrade-to-workspace', template: 'website-builder' },
@@ -4714,6 +4713,18 @@ describe('PersistentChatService — control commands', () => {
     const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
     expect(sent).toContainEqual(control);
   });
+
+  it.each(['/upgrade-workspace container', '/upgrade-workspace sandbox'])(
+    '%s on a pinned session answers locally and sends nothing',
+    async (input: string) => {
+      const ctx = await readySession();
+      await ctx.service.sendMessage(input);
+      const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
+      expect(sent.some((c: any) => c.method === 'upgrade-to-workspace')).toBe(false);
+      expect(ctx.service.error()).toBe('chat.control.containerUpgradeUnavailable');
+      expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+    },
+  );
 
   it('setMode uses the lane-agnostic REST inbox and never the control WS', async () => {
     const ctx = await readySession();
@@ -9683,9 +9694,9 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
 
   it('workspace_upgrade.needed raises the offer and still records a system line', async () => {
     const ctx = await readySession();
-    offer(ctx.es, { target_tier: 'sandbox', reason: 'need to run pytest' });
+    offer(ctx.es, { target_tier: 'vm', reason: 'need to run pytest' });
     expect(ctx.service.pendingWorkspaceOffer()).toEqual({
-      tier: 'sandbox',
+      tier: 'vm',
       reason: 'need to run pytest',
     });
     const lines = ctx.service
@@ -9697,28 +9708,41 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
     expect(lines.some((l: string) => l.includes('session settings'))).toBe(false);
   });
 
-  it('defaults the offered tier to sandbox when the server omits it', async () => {
+  it('old container offer on a pinned session raises no card', async () => {
+    const ctx = await readySession();
+    offer(ctx.es, { target_tier: 'sandbox', reason: 'need a shell' });
+    expect(ctx.service.pendingWorkspaceOffer()).toBeNull();
+    const lines = ctx.service
+      .turns()
+      .filter((t: any) => t.kind === 'system')
+      .map((t: any) => String(t.content));
+    expect(
+      lines.some((l: string) => l.includes("isn't available in this session") && l.includes('need a shell')),
+    ).toBe(true);
+  });
+
+  it('an offer without a tier is the old container offer: no card on a pinned session', async () => {
     const ctx = await readySession();
     offer(ctx.es, { reason: 'shell needed' });
-    expect(ctx.service.pendingWorkspaceOffer()?.tier).toBe('sandbox');
+    expect(ctx.service.pendingWorkspaceOffer()).toBeNull();
   });
 
   it('a second offer replaces the first rather than accumulating', async () => {
     const ctx = await readySession();
-    offer(ctx.es, { target_tier: 'sandbox', reason: 'first' });
-    offer(ctx.es, { target_tier: 'sandbox', reason: 'second' }, '1:3');
+    offer(ctx.es, { target_tier: 'vm', reason: 'first' });
+    offer(ctx.es, { target_tier: 'vm', reason: 'second' }, '1:3');
     expect(ctx.service.pendingWorkspaceOffer()?.reason).toBe('second');
   });
 
   it('accepting clears the offer and sends the upgrade control message', async () => {
     const ctx = await readySession();
-    offer(ctx.es, { target_tier: 'sandbox', reason: 'need a shell' });
-    ctx.service.upgradeWorkspace('sandbox');
+    offer(ctx.es, { target_tier: 'vm', reason: 'need a shell' });
+    ctx.service.upgradeWorkspace('vm');
     expect(ctx.service.pendingWorkspaceOffer()).toBeNull();
-    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'sandbox' });
+    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'vm' });
     expect(sentControl(ctx)).toContainEqual({
       method: 'upgrade-to-workspace',
-      target_tier: 'sandbox',
+      target_tier: 'vm',
     });
   });
 
@@ -9813,7 +9837,7 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
 
   it('a failed upgrade clears the offer and sends nothing', async () => {
     const ctx = await readySession();
-    offer(ctx.es, { target_tier: 'sandbox', reason: 'need a shell' });
+    offer(ctx.es, { target_tier: 'vm', reason: 'need a shell' });
     ctx.service.upgradeWorkspace('sandbox', { thenContinue: true });
     fireSseMessage(
       ctx.es,
@@ -9832,7 +9856,7 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
 
   it('dismissing the offer touches only local state', async () => {
     const ctx = await readySession();
-    offer(ctx.es, { target_tier: 'sandbox', reason: 'need a shell' });
+    offer(ctx.es, { target_tier: 'vm', reason: 'need a shell' });
     ctx.service.dismissWorkspaceOffer();
     expect(ctx.service.pendingWorkspaceOffer()).toBeNull();
     expect(sentControl(ctx)).toHaveLength(0);
@@ -9841,7 +9865,7 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
 
   it('disconnect clears the upgrade state so it cannot bleed across threads', async () => {
     const ctx = await readySession();
-    offer(ctx.es, { target_tier: 'sandbox', reason: 'need a shell' });
+    offer(ctx.es, { target_tier: 'vm', reason: 'need a shell' });
     ctx.service.upgradeWorkspace('sandbox', { thenContinue: true });
     ctx.service.disconnect();
     // .complete only ever arrives over the control WS disconnect() just
@@ -11958,6 +11982,13 @@ describe('PersistentChatService — control transport is declared, never inferre
     expect((ctx.service as any).controlOutbox).toEqual([]);
     expect(ctx.mockHttp.post).not.toHaveBeenCalled();
     expect(ctx.wsInstances).toHaveLength(0);
+  });
+
+  it('/upgrade-workspace container without a transport keeps the generic refusal', async () => {
+    const ctx = await socketlessSession();
+    expect(ctx.service.controlTransport('upgrade-to-workspace')).toBe('unavailable');
+    await ctx.service.sendMessage('/upgrade-workspace container');
+    expect(ctx.service.error()).toBe('chat.control.upgradeUnavailable');
   });
 
   it('/done without an archive socket ends through the owner End path', async () => {
