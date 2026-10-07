@@ -605,7 +605,7 @@ def test_probe_of_an_ssh_repository_connector_reports_its_host_key(monkeypatch):
     wire = _wire(datasource=row)
     body = wire.client.post(f"/api/datasources/{DATASOURCE_ID}/test").json()
     assert body["status"] == "ok"
-    assert body["details"]["host_key"] == host_key
+    assert body["details"]["host_key"] == f"github.com {host_key}"
     assert "PRIVATE KEY" not in str(body)
 
 

@@ -46,9 +46,14 @@ from shared.runtime.core.workspace_ssh_identity import (
     normalize_ssh_user,
     parse_known_hosts,
     parse_ssh_repository_url,
+    select_known_hosts,
     workspace_ssh_identity_alias,
 )
-from shared.runtime.utils.ssh_key import InvalidSSHKeyError, ssh_public_identity
+from shared.runtime.utils.ssh_key import (
+    InvalidSSHKeyError,
+    private_key_is_encrypted,
+    ssh_public_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +69,35 @@ SSH_KEY_CONFIG_FIELDS = frozenset({"host", "user", "port", "known_hosts"})
 
 
 class WorkspaceSshConnectorError(ValueError):
-    """A connector's SSH settings are unsafe or unusable (HTTP 400 detail)."""
+    """A connector's SSH settings are unsafe or unusable (HTTP 400 detail).
+
+    ``code`` is a fixed, credential-free reason: the only thing that leaves
+    the API path. Descriptors, the workspace README and logs carry the code,
+    never the message, which may quote what the connector's author typed.
+    """
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+#: The reason codes an ``unavailable`` descriptor can carry.
+UNAVAILABLE_REASONS = frozenset(
+    {
+        "ssh_endpoint_invalid",
+        "ssh_key_invalid",
+        "ssh_key_passphrase",
+        "known_hosts_invalid",
+        "default_known_hosts_invalid",
+        "ssh_identity_unresolvable",
+    }
+)
+
+
+def known_hosts_host_field(host: str, port: int) -> str:
+    """How ``known_hosts`` names ``host`` on ``port``."""
+
+    return host if port == 22 else f"[{host}]:{port}"
 
 
 def repository_uses_ssh_key(credentials: Mapping[str, Any] | None) -> bool:
@@ -92,23 +125,50 @@ def ssh_key_connector_private_key(credentials: Mapping[str, Any] | None) -> str:
     return contents if isinstance(contents, str) else ""
 
 
-def _check_private_key(private_key: str) -> None:
+def _check_private_key(private_key: str) -> tuple[str, str]:
+    """``(public key, fingerprint)``; refusals never quote the key text."""
+
     try:
-        ssh_public_identity(private_key)
+        return ssh_public_identity(private_key)
     except InvalidSSHKeyError as exc:
-        raise WorkspaceSshConnectorError(f"Invalid SSH key: {exc}") from exc
+        # validate_private_key quotes the first or last key line in some of
+        # its messages; none of that may reach a log, a README or a 400.
+        if private_key_is_encrypted(private_key):
+            raise WorkspaceSshConnectorError(
+                "Invalid SSH key: it is passphrase-protected; remove the "
+                "passphrase (ssh-keygen -p) or generate a dedicated key without one",
+                code="ssh_key_passphrase",
+            ) from exc
+        raise WorkspaceSshConnectorError(
+            "Invalid SSH key: expected an unencrypted OpenSSH or PEM private key",
+            code="ssh_key_invalid",
+        ) from exc
 
 
 def _known_hosts_config(value: Any, *, host: str, port: int) -> str | None:
+    """Pinned host keys as ``known_hosts`` lines that name ``host``/``port``.
+
+    Stored host-qualified (``host type key`` or ``[host]:port type key``) so
+    that a later edit of the host or port no longer matches its old pin and
+    is refused instead of silently trusting the old host's key for the new.
+    A bare ``type key`` pair (what Test reports) is qualified here.
+    """
+
     if value is None or (isinstance(value, str) and not value.strip()):
         return None
     if not isinstance(value, str):
-        raise WorkspaceSshConnectorError("known_hosts must be text")
+        raise WorkspaceSshConnectorError(
+            "known_hosts must be text", code="known_hosts_invalid"
+        )
     try:
-        entries = parse_known_hosts(value, host=host, port=port, require_match=True)
+        entries = parse_known_hosts(value, host=host, port=port)
     except SshEndpointError as exc:
-        raise WorkspaceSshConnectorError(str(exc)) from exc
-    return "\n".join(entries) or None
+        raise WorkspaceSshConnectorError(
+            f"{exc}; Test the connector again and pin the key it reports",
+            code="known_hosts_invalid",
+        ) from exc
+    field = known_hosts_host_field(host, port)
+    return "\n".join(f"{field} {entry}" for entry in entries) or None
 
 
 def _validate_ssh_key_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -116,7 +176,8 @@ def _validate_ssh_key_config(config: Mapping[str, Any] | None) -> dict[str, Any]
     unknown = sorted(set(raw) - SSH_KEY_CONFIG_FIELDS)
     if unknown:
         raise WorkspaceSshConnectorError(
-            f"Unknown SSH key connector config field(s): {', '.join(unknown)}"
+            f"Unknown SSH key connector config field(s): {', '.join(unknown)}",
+            code="ssh_endpoint_invalid",
         )
     host_value = raw.get("host")
     if host_value is None or (isinstance(host_value, str) and not host_value.strip()):
@@ -124,7 +185,8 @@ def _validate_ssh_key_config(config: Mapping[str, Any] | None) -> dict[str, Any]
             str(raw.get("known_hosts") or "").strip()
         ):
             raise WorkspaceSshConnectorError(
-                "Set an SSH host before setting its user, port or known_hosts"
+                "Set an SSH host before setting its user, port or known_hosts",
+                code="ssh_endpoint_invalid",
             )
         return {}
     try:
@@ -137,21 +199,25 @@ def _validate_ssh_key_config(config: Mapping[str, Any] | None) -> dict[str, Any]
             port = normalize_ssh_port(raw["port"])
             normalized["port"] = port
     except SshEndpointError as exc:
-        raise WorkspaceSshConnectorError(str(exc)) from exc
+        raise WorkspaceSshConnectorError(str(exc), code="ssh_endpoint_invalid") from exc
     known_hosts = _known_hosts_config(raw.get("known_hosts"), host=host, port=port)
     if known_hosts:
         normalized["known_hosts"] = known_hosts
     return normalized
 
 
+def _repository_target(connection_url: str | None) -> SshRepositoryTarget:
+    try:
+        return parse_ssh_repository_url(connection_url)
+    except SshEndpointError as exc:
+        raise WorkspaceSshConnectorError(str(exc), code="ssh_endpoint_invalid") from exc
+
+
 def _validate_repository_ssh_config(
     connection_url: str | None, config: Mapping[str, Any] | None
 ) -> dict[str, Any]:
     out = dict(config or {})
-    try:
-        target = parse_ssh_repository_url(connection_url)
-    except SshEndpointError as exc:
-        raise WorkspaceSshConnectorError(str(exc)) from exc
+    target = _repository_target(connection_url)
     known_hosts = _known_hosts_config(
         out.pop("known_hosts", None), host=target.host, port=target.port
     )
@@ -187,7 +253,8 @@ def validate_workspace_ssh_connector(
         out = dict(config or {})
         if str(out.pop("known_hosts", None) or "").strip():
             raise WorkspaceSshConnectorError(
-                "known_hosts applies only to SSH-key repository connectors"
+                "known_hosts applies only to SSH-key repository connectors",
+                code="known_hosts_invalid",
             )
         return out
     normalized = _validate_repository_ssh_config(connection_url, config)
@@ -303,21 +370,28 @@ def _pins(
 ) -> tuple[str, ...]:
     if str(configured or "").strip():
         try:
-            return tuple(
-                parse_known_hosts(configured, host=host, port=port, require_match=True)
-            )
+            return tuple(parse_known_hosts(configured, host=host, port=port))
         except SshEndpointError as exc:
-            raise WorkspaceSshConnectorError(str(exc)) from exc
+            raise WorkspaceSshConnectorError(
+                str(exc), code="known_hosts_invalid"
+            ) from exc
     try:
-        return tuple(
-            parse_known_hosts(
-                default_known_hosts, host=host, port=port, require_match=False
-            )
-        )
+        entries, ignored = select_known_hosts(default_known_hosts, host=host, port=port)
     except SshEndpointError as exc:
         raise WorkspaceSshConnectorError(
-            f"{WORKSPACE_SSH_KNOWN_HOSTS_ENV} is invalid: {exc}"
+            f"{WORKSPACE_SSH_KNOWN_HOSTS_ENV} is invalid",
+            code="default_known_hosts_invalid",
         ) from exc
+    if ignored:
+        # One bad line in a deployment-wide list must not disable every SSH
+        # connector; it disables only itself.
+        logger.warning(
+            "%s: ignored %d unusable line(s) for %s",
+            WORKSPACE_SSH_KNOWN_HOSTS_ENV,
+            ignored,
+            known_hosts_host_field(host, port),
+        )
+    return tuple(entries)
 
 
 def workspace_ssh_identity(
@@ -330,7 +404,9 @@ def workspace_ssh_identity(
     try:
         authority_id = workspace_ssh_authority_id(ds.get("id"))
     except (TypeError, ValueError) as exc:
-        raise WorkspaceSshConnectorError("connector has no stable identity") from exc
+        raise WorkspaceSshConnectorError(
+            "connector has no stable identity", code="ssh_identity_unresolvable"
+        ) from exc
     credentials = _json_object(ds.get("credentials"))
     config = _json_object(ds.get("config"))
     if ds.get("type") == "ssh_key":
@@ -351,10 +427,7 @@ def workspace_ssh_identity(
             else ()
         )
     elif ds.get("type") == "repository":
-        try:
-            target = parse_ssh_repository_url(ds.get("connection_url"))
-        except SshEndpointError as exc:
-            raise WorkspaceSshConnectorError(str(exc)) from exc
+        target = _repository_target(ds.get("connection_url"))
         private_key = str(credentials.get("ssh_key") or "")
         host, port, user, repository = target.host, target.port, target.user, target
         pins = _pins(
@@ -364,11 +437,10 @@ def workspace_ssh_identity(
             default_known_hosts=default_known_hosts,
         )
     else:
-        raise WorkspaceSshConnectorError("connector does not hold an SSH key")
-    try:
-        public_key, fingerprint = ssh_public_identity(private_key)
-    except InvalidSSHKeyError as exc:
-        raise WorkspaceSshConnectorError(f"Invalid SSH key: {exc}") from exc
+        raise WorkspaceSshConnectorError(
+            "connector does not hold an SSH key", code="ssh_identity_unresolvable"
+        )
+    public_key, fingerprint = _check_private_key(private_key)
     return WorkspaceSshIdentity(
         authority_id=authority_id,
         kind=str(ds["type"]),
@@ -389,9 +461,11 @@ def workspace_ssh_descriptor(
 ) -> dict[str, Any] | None:
     """The ``ssh_identity`` an agent payload entry carries instead of a key.
 
-    ``unavailable`` names why a stored row cannot be delivered (a pre-C1 row
-    with an encrypted key or an unsafe host, say); the agent then skips that
-    connector rather than writing anything from it.
+    ``unavailable`` is a fixed reason code (:data:`UNAVAILABLE_REASONS`) for a
+    stored row that cannot be delivered (a pre-C1 row with an encrypted key or
+    an unsafe host, say); the agent then skips that connector rather than
+    writing anything from it. Never the error text, which can quote the key or
+    whatever the connector's author typed into another user's README.
     """
 
     if not is_workspace_ssh_connector(ds):
@@ -404,11 +478,11 @@ def workspace_ssh_descriptor(
         try:
             authority_id = workspace_ssh_authority_id(ds.get("id"))
         except (TypeError, ValueError):
-            return {"unavailable": str(exc)}
+            return {"unavailable": "ssh_identity_unresolvable"}
         return {
             "alias": workspace_ssh_identity_alias(authority_id),
             "authority_id": authority_id,
-            "unavailable": str(exc),
+            "unavailable": exc.code,
         }
 
 
@@ -421,7 +495,8 @@ def build_workspace_ssh_identities(
 
     Built only from an already-authorized, exactly-resolved connector set,
     like ``build_datasources_payload``. A row that cannot be delivered is
-    logged by name and left out; it never fails the delivery.
+    logged by id and reason code and left out; it never fails the delivery.
+    ``None`` when nothing is delivered, so the field is absent from the wire.
     """
 
     if default_known_hosts is None:
@@ -436,9 +511,9 @@ def build_workspace_ssh_identities(
             )
         except WorkspaceSshConnectorError as exc:
             logger.warning(
-                "SSH connector %r cannot be delivered to a workspace: %s",
-                ds.get("name"),
-                exc,
+                "SSH connector %s cannot be delivered to a workspace (%s)",
+                ds.get("id"),
+                exc.code,
             )
             continue
         identities.append(identity.to_payload())
@@ -456,7 +531,7 @@ async def fetch_ssh_host_key(host: str, port: int) -> str:
     """Return the ``"<type> <base64>"`` host key ``host:port`` presents.
 
     Only the key exchange runs; nothing authenticates and no connector key
-    is offered. The answer is what the connector form offers to pin.
+    is offered.
     """
 
     import asyncio
@@ -472,13 +547,44 @@ async def fetch_ssh_host_key(host: str, port: int) -> str:
     return entry
 
 
+def apply_ssh_test_overrides(
+    ds: Mapping[str, Any], overrides: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """The row Test probes: an SSH connector's endpoint as the form edits it.
+
+    The connector form tests before it saves, so Test must reach the host
+    and port being typed, not the stored ones. Only the non-secret endpoint
+    fields of an SSH connector are taken (``connection_url`` and ``config``);
+    they are validated exactly as an update would validate them. Other
+    connector types ignore overrides.
+    """
+
+    row = dict(ds)
+    if not overrides or not is_workspace_ssh_connector(row):
+        return row
+    if "connection_url" in overrides and row.get("type") == "repository":
+        row["connection_url"] = overrides.get("connection_url")
+    if "config" in overrides:
+        row["config"] = overrides.get("config") or {}
+    row["config"] = validate_workspace_ssh_connector(
+        str(row.get("type")),
+        connection_url=row.get("connection_url"),
+        config=_json_object(row.get("config")),
+        credentials=_json_object(row.get("credentials")),
+        check_key=False,
+    )
+    return row
+
+
 async def probe_workspace_ssh_connector(ds: Mapping[str, Any]) -> dict[str, Any] | None:
     """Test an SSH connector's endpoint: reach it and report its host key.
 
     ``None`` means there is no endpoint to test (an ``ssh_key`` without a
-    host). The reported ``details.host_key`` is the bare ``<type> <base64>``
-    pair the connector's ``known_hosts`` field accepts. A pinned connector
-    whose host now presents another key fails, as its workspace clone would.
+    host). ``details.host_key`` is a host-qualified ``known_hosts`` line
+    (``host type key`` or ``[host]:port type key``), the form the connector's
+    pin is stored in, so a pin can never silently follow a host change. A
+    pinned connector whose host now presents another key fails, as its
+    workspace clone would.
     """
 
     import base64
@@ -499,7 +605,7 @@ async def probe_workspace_ssh_connector(ds: Mapping[str, Any]) -> dict[str, Any]
         host_key = await fetch_ssh_host_key(identity.host, identity.port)
     except Exception:
         logger.warning(
-            "SSH host key probe failed for connector %r", ds.get("name"), exc_info=True
+            "SSH host key probe failed for connector %s", ds.get("id"), exc_info=True
         )
         return {
             "status": "error",
@@ -512,7 +618,7 @@ async def probe_workspace_ssh_connector(ds: Mapping[str, Any]) -> dict[str, Any]
     details = {
         "host": identity.host,
         "port": identity.port,
-        "host_key": host_key,
+        "host_key": f"{known_hosts_host_field(identity.host, identity.port)} {host_key}",
         "host_key_fingerprint": fingerprint,
         "host_key_pinned": pinned,
         "host_key_matches_pin": matches if pinned else None,
@@ -539,16 +645,19 @@ async def probe_workspace_ssh_connector(ds: Mapping[str, Any]) -> dict[str, Any]
 
 __all__ = [
     "SSH_KEY_CONFIG_FIELDS",
+    "UNAVAILABLE_REASONS",
     "WORKSPACE_SSH_KNOWN_HOSTS_ENV",
     "WorkspaceSshConnectorError",
     "WorkspaceSshIdentity",
+    "apply_ssh_test_overrides",
     "build_workspace_ssh_identities",
     "default_workspace_ssh_known_hosts",
     "fetch_ssh_host_key",
     "is_workspace_ssh_connector",
+    "known_hosts_host_field",
+    "probe_workspace_ssh_connector",
     "repository_uses_ssh_key",
     "ssh_key_connector_private_key",
-    "probe_workspace_ssh_connector",
     "validate_workspace_ssh_connector",
     "workspace_ssh_authority_id",
     "workspace_ssh_descriptor",

@@ -10,6 +10,7 @@ import {
     DatasourceConfig,
     DatasourceCreateRequest,
     DatasourceIndexStatus,
+    DatasourceTestEdits,
     DatasourceTestResult,
     DatasourceType,
     DatasourceUpdateRequest,
@@ -1019,7 +1020,7 @@ type KeyValueRow = {key: string; value: string};
                   <app-input
                     size="sm"
                     [value]="sshHost"
-                    (valueChange)="sshHost = $event"
+                    (valueChange)="onSshEndpointChange('host', $event)"
                     placeholder="bastion.example.com"
                     [disabled]="isSaving()"
                   />
@@ -1037,7 +1038,7 @@ type KeyValueRow = {key: string; value: string};
                   <app-input
                     size="sm"
                     [value]="sshPort"
-                    (valueChange)="sshPort = $event"
+                    (valueChange)="onSshEndpointChange('port', $event)"
                     placeholder="22"
                     [disabled]="isSaving() || !sshHost.trim()"
                   />
@@ -1349,7 +1350,7 @@ type KeyValueRow = {key: string; value: string};
 
           <div class="form-footer-bar">
             <div class="form-actions">
-              @if (!isEnvType() && formData.type !== 'repository' && !isCredentialFileType()) {
+              @if (formTestAvailable()) {
                 <app-button
                   variant="secondary"
                   size="sm"
@@ -2967,14 +2968,46 @@ export class DatasourceListComponent implements OnInit {
   sshPort = '';
   sshKnownHosts = '';
 
+  /** An SSH connector with an endpoint: Test reaches it and reports its key. */
+  isSshEndpointForm(): boolean {
+    return (
+      (this.formData.type === 'repository' && this.gitAuthMethod === 'ssh') ||
+      (this.formData.type === 'ssh_key' && !!this.sshHost.trim())
+    );
+  }
+
+  /** Whether the form offers Test (SSH connectors report the host key). */
+  formTestAvailable(): boolean {
+    if (this.isSshEndpointForm()) return true;
+    return (
+      !this.isEnvType() &&
+      this.formData.type !== 'repository' &&
+      !this.isCredentialFileType()
+    );
+  }
+
+  /** What Test must reach while editing: the endpoint as typed, unsaved. */
+  private sshTestEdits(): DatasourceTestEdits | undefined {
+    if (!this.isSshEndpointForm()) return undefined;
+    if (this.formData.type === 'repository') {
+      return {connection_url: this.connectionUrlForPayload(), config: this.buildTypeConfig()};
+    }
+    return {config: this.buildTypeConfig()};
+  }
+
+  /** A host or port edit drops the pin: it named the old endpoint. */
+  onSshEndpointChange(field: 'host' | 'port', value: string): void {
+    const previous = field === 'host' ? this.sshHost : this.sshPort;
+    if (field === 'host') this.sshHost = value;
+    else this.sshPort = value;
+    if (value.trim() !== previous.trim()) this.sshKnownHosts = '';
+  }
+
   /** The host key a Test just reported, when this form can pin it. */
   testedHostKeyToPin(): string | null {
     const hostKey = this.formTestResult()?.details?.host_key;
     if (typeof hostKey !== 'string' || !hostKey) return null;
-    const pinnable =
-      this.formData.type === 'ssh_key' ||
-      (this.formData.type === 'repository' && this.gitAuthMethod === 'ssh');
-    if (!pinnable || this.sshKnownHosts.trim() === hostKey) return null;
+    if (!this.isSshEndpointForm() || this.sshKnownHosts.trim() === hostKey) return null;
     return hostKey;
   }
 
@@ -3617,6 +3650,10 @@ export class DatasourceListComponent implements OnInit {
   onConnectionUrlChange(value: string = this.formData.connection_url): void {
     this.connectionUrlDirty = !this.editingOriginal ||
       value !== (this.editingOriginal.connection_url ?? '');
+    if (this.formData.type === 'repository' && value !== this.formData.connection_url) {
+      // A pinned host key names the old URL's host; the server would refuse it.
+      this.sshKnownHosts = '';
+    }
     this.formData.connection_url = value;
     if (this.formData.type === 'repository' && !this.forgeDirty) {
       this.formData.forge = this.inferForgeFromUrl(value);
@@ -3892,7 +3929,7 @@ export class DatasourceListComponent implements OnInit {
     if (editId) {
       this.isTesting.set(true);
       this.formTestResult.set(null);
-      this.api.testDatasource(editId).subscribe({
+      this.api.testDatasource(editId, this.sshTestEdits()).subscribe({
         next: (result) => {
           this.isTesting.set(false);
           this.formTestResult.set(result);

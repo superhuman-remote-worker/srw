@@ -359,7 +359,7 @@ class TestRepositoryConnectorEndpoint:
 
         assert reached == [("github.com", 22)]
         assert result["status"] == "ok"
-        assert result["details"]["host_key"] == " ".join(host_key[:2])
+        assert result["details"]["host_key"] == "github.com " + " ".join(host_key[:2])
         assert result["details"]["host_key_pinned"] is False
         assert "PRIVATE KEY" not in json.dumps(result)
 

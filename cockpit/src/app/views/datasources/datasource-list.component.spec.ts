@@ -727,27 +727,73 @@ describe('DatasourceListComponent SSH connector host keys', () => {
     );
   });
 
-  it('offers to pin the host key a Test reported, into the form field', () => {
-    const {component, ds} = createComponent();
+  it('edits the host, tests the edited host, and pins what Test reports', () => {
+    const {api, component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      type: 'ssh_key',
+      connection_url: null,
+      config: {host: 'bastion.example.com', known_hosts: `bastion.example.com ${hostKey}`},
+    });
+    expect(component.formTestAvailable()).toBe(true);
+
+    // The old pin named the old host: editing the host drops it.
+    component.onSshEndpointChange('host', 'new-bastion.example.com');
+    component.onSshEndpointChange('port', '2200');
+    expect(component.sshKnownHosts).toBe('');
+
+    const reported = `[new-bastion.example.com]:2200 ${hostKey}`;
+    api.testDatasource.mockReturnValue(
+      of({status: 'ok', message: 'Reached', details: {host_key: reported}}),
+    );
+    component.testFromForm();
+
+    // Test reached the endpoint being typed, not the saved one.
+    expect(api.testDatasource).toHaveBeenCalledWith(ds.id, {
+      config: {host: 'new-bastion.example.com', port: 2200},
+    });
+    expect(component.testedHostKeyToPin()).toBe(reported);
+    component.pinTestedHostKey(component.testedHostKeyToPin()!);
+    expect(component.testedHostKeyToPin()).toBeNull();
+
+    component.saveForm();
+    expect(api.updateDatasource).toHaveBeenCalledWith(
+      ds.id,
+      expect.objectContaining({
+        config: {host: 'new-bastion.example.com', port: 2200, known_hosts: reported},
+      }),
+    );
+  });
+
+  it('offers Test for SSH-key repositories and sends the edited URL', () => {
+    const {api, component, ds} = createComponent();
     component.openEditForm({
       ...ds,
       type: 'repository',
-      connection_url: 'git@github.com:acme/widget.git',
+      connection_url: 'ssh://git@git.example.com:2222/acme/widget.git',
       cli_hint: 'git over ssh',
-      config: {forge: 'github'},
+      config: {forge: 'gitea', known_hosts: `[git.example.com]:2222 ${hostKey}`},
     });
     expect(component.gitAuthMethod).toBe('ssh');
-    component.formTestResult.set({
-      status: 'ok',
-      message: 'Reached github.com:22',
-      details: {host_key: hostKey},
+    expect(component.formTestAvailable()).toBe(true);
+
+    component.onConnectionUrlChange('ssh://git@git2.example.com:2222/acme/widget.git');
+    expect(component.sshKnownHosts).toBe('');
+    component.onForgeSelect('gitea');
+    component.testFromForm();
+    expect(api.testDatasource).toHaveBeenCalledWith(ds.id, {
+      connection_url: 'ssh://git@git2.example.com:2222/acme/widget.git',
+      config: {forge: 'gitea'},
     });
 
-    expect(component.testedHostKeyToPin()).toBe(hostKey);
-    component.pinTestedHostKey(hostKey);
-    expect(component.sshKnownHosts).toBe(hostKey);
-    // Once pinned, the offer goes away.
-    expect(component.testedHostKeyToPin()).toBeNull();
+    component.gitAuthMethod = 'token';
+    expect(component.formTestAvailable()).toBe(false);
+  });
+
+  it('offers no Test for an ssh_key without a host', () => {
+    const {component, ds} = createComponent();
+    component.openEditForm({...ds, type: 'ssh_key', connection_url: null, config: {}});
+    expect(component.formTestAvailable()).toBe(false);
   });
 
   it.each([

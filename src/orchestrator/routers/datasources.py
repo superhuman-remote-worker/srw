@@ -29,6 +29,7 @@ from fastapi import APIRouter, Depends, Query, Request
 
 from orchestrator.schemas.datasources import (
     DatasourceCreate,
+    DatasourceTestRequest,
     DatasourceUpdate,
     SSHKeyGenerateRequest,
     SSHKeyGenerateResponse,
@@ -347,6 +348,7 @@ async def reindex_datasource_knowledge(
 async def test_datasource(
     request: Request,
     datasource_id: str,
+    body: DatasourceTestRequest | None = None,
     *,
     dependencies: DatasourcesDependencies = Depends(get_datasources_dependencies),
 ) -> dict[str, Any]:
@@ -355,7 +357,8 @@ async def test_datasource(
     The gate is bound rather than awaited here so it stays inside the
     operation's try/except: an unexpected (non-``HTTPException``) failure
     while resolving the connector must still surface as a 500 with its
-    message, exactly as it did in ``main``.
+    message, exactly as it did in ``main``. ``body`` carries the SSH endpoint
+    a connector form is editing (see :class:`DatasourceTestRequest`).
     """
 
     async def owned_datasource() -> tuple[dict[str, Any], dict[str, Any]]:
@@ -364,5 +367,7 @@ async def test_datasource(
         )
 
     return await datasources.test_datasource(
-        resolve_datasource=owned_datasource, dependencies=dependencies.operations
+        resolve_datasource=owned_datasource,
+        overrides=body.model_dump(exclude_unset=True) if body is not None else None,
+        dependencies=dependencies.operations,
     )

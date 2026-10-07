@@ -1,7 +1,7 @@
 """Datasource and repository connector API contracts."""
 
 from typing import Any, Literal
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from shared.runtime.core.datasource_catalog import DATASOURCE_TYPE_IDS
 
 
@@ -123,6 +123,21 @@ class DatasourceUpdate(BaseModel):
         if changed and self.policy_revision is None:
             raise ValueError("policy_revision is required for availability changes")
         return self
+
+
+class DatasourceTestRequest(BaseModel):
+    """Optional body of ``POST /api/datasources/{id}/test``.
+
+    The connector form tests before it saves. For an SSH-key repository or an
+    ``ssh_key`` connector, the endpoint being typed (``connection_url`` and
+    ``config``) is what Test reaches; it is validated like an update and never
+    stored. Other connector types ignore it and test the saved row.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    connection_url: str | None = Field(None, max_length=2048)
+    config: dict[str, Any] | None = None
 
 
 class SSHKeyGenerateRequest(BaseModel):

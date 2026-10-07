@@ -39,6 +39,7 @@ from shared.runtime.core.workspace_ssh_identity import (
     normalize_ssh_user,
     parse_known_hosts,
     parse_ssh_repository_url,
+    select_known_hosts,
 )
 from shared.runtime.utils.ssh_key import (
     InvalidSSHKeyError,
@@ -275,10 +276,23 @@ class TestKnownHosts:
 
     def test_default_list_selects_matching_lines_only(self):
         github, gitlab = _host_key(), _host_key()
-        text = f"github.com {github}\ngitlab.com {gitlab}\n"
-        assert parse_known_hosts(text, host="gitlab.com", require_match=False) == [
-            gitlab
-        ]
+        text = f"github.com {github}\ngitlab.com {gitlab}\n{_host_key()}\n"
+        assert select_known_hosts(text, host="gitlab.com") == ([gitlab], 0)
+
+    def test_one_bad_default_line_disables_only_itself(self):
+        """Review: a marker or exotic key type used to refuse the whole list."""
+        github = _host_key()
+        text = (
+            "@cert-authority *.example.com ssh-ed25519 " + _FIXED_ED25519_BLOB + "\n"
+            "legacy.example.com ssh-dss AAAAB3NzaC1kc3M=\n"
+            f"github.com {github}\n"
+            "github.com ssh-dss AAAAB3NzaC1kc3M=\n"
+            "@revoked github.com ssh-ed25519 " + _FIXED_ED25519_BLOB + "\n"
+        )
+        # Other hosts' bad lines are not even looked at; this host's are
+        # skipped and counted for one warning.
+        assert select_known_hosts(text, host="github.com") == ([github], 2)
+        assert select_known_hosts(text, host="gitlab.com") == ([], 0)
 
     @pytest.mark.parametrize(
         "line",
@@ -344,8 +358,46 @@ class TestValidateWorkspaceSshConnector:
             "host": "bastion.example.com",
             "user": "deploy",
             "port": 2200,
-            "known_hosts": key,
+            # Stored host-qualified, so a later host or port edit cannot
+            # silently keep trusting this key.
+            "known_hosts": f"[bastion.example.com]:2200 {key}",
         }
+
+    def test_a_bare_pin_is_qualified_and_a_host_change_refuses_it(self):
+        key = _host_key()
+        private = generate_ed25519_keypair().private_key
+        stored = validate_workspace_ssh_connector(
+            "ssh_key",
+            connection_url=None,
+            config={"host": "bastion.example.com", "known_hosts": key},
+            credentials={"files": [{"contents": private}]},
+        )
+        assert stored["known_hosts"] == f"bastion.example.com {key}"
+        for edit in ({"host": "other.example.com"}, {"port": 2222}):
+            with pytest.raises(WorkspaceSshConnectorError, match="different host"):
+                validate_workspace_ssh_connector(
+                    "ssh_key",
+                    connection_url=None,
+                    config={**stored, **edit},
+                    credentials={},
+                    check_key=False,
+                )
+
+    def test_refusals_never_quote_the_key(self):
+        secret_line = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo="
+        for key in (
+            f"-----BEGIN OPENSSH PRIVATE KEY-----\n{secret_line}\nnot-an-end-marker\n",
+            f"{secret_line}\n{secret_line}\n{secret_line}\n",
+        ):
+            with pytest.raises(WorkspaceSshConnectorError) as exc:
+                validate_workspace_ssh_connector(
+                    "ssh_key",
+                    connection_url=None,
+                    config={},
+                    credentials={"files": [{"contents": key}]},
+                )
+            assert secret_line not in str(exc.value)
+            assert exc.value.code == "ssh_key_invalid"
 
     def test_ssh_key_without_host_has_no_config(self):
         assert (
@@ -410,7 +462,20 @@ class TestValidateWorkspaceSshConnector:
                 "ssh_key": generate_ed25519_keypair().private_key,
             },
         )
-        assert config == {"forge": "github", "known_hosts": key}
+        assert config == {"forge": "github", "known_hosts": f"github.com {key}"}
+        # A URL edit to another host or port no longer matches the pin.
+        for url in (
+            "ssh://git@github.com:2222/acme/widget.git",
+            "git@gitlab.com:a/b.git",
+        ):
+            with pytest.raises(WorkspaceSshConnectorError, match="different host"):
+                validate_workspace_ssh_connector(
+                    "repository",
+                    connection_url=url,
+                    config=config,
+                    credentials={"auth_method": "ssh"},
+                    check_key=False,
+                )
 
     def test_ssh_repository_url_injection_is_refused(self):
         with pytest.raises(WorkspaceSshConnectorError):
@@ -747,7 +812,10 @@ class TestProbe:
             _ssh_key_row(config)
         )
 
-        assert result["details"]["host_key"] == presented
+        # Host-qualified: pinning it can never follow a later host change.
+        assert (
+            result["details"]["host_key"] == f"[bastion.example.com]:2200 {presented}"
+        )
         assert result["details"]["port"] == 2200
         if pin == "other":
             assert result["status"] == "error"
@@ -788,7 +856,47 @@ class TestProbe:
         row = _ssh_key_row({"host": "bastion.example.com"})
         result = await route(object(), row["id"], dependencies=_route_deps(row))
         assert result["status"] == "ok"
-        assert result["details"]["host_key"] == presented
+        assert result["details"]["host_key"] == f"bastion.example.com {presented}"
+
+    @pytest.mark.asyncio
+    async def test_route_probes_the_edited_endpoint_not_the_saved_one(
+        self, monkeypatch
+    ):
+        """The form tests before it saves: Test reaches what is being typed."""
+        from orchestrator.routers.datasources import test_datasource as route
+        from orchestrator.schemas.datasources import DatasourceTestRequest
+        from orchestrator.services import workspace_ssh_connector
+        from tests.test_repository_probe import _route_deps
+
+        reached = []
+
+        async def fetch(host, port):
+            reached.append((host, port))
+            return _host_key()
+
+        monkeypatch.setattr(workspace_ssh_connector, "fetch_ssh_host_key", fetch)
+        row = _ssh_key_row({"host": "bastion.example.com"})
+        edited = DatasourceTestRequest(
+            config={"host": "new-bastion.example.com", "port": 2200}
+        )
+        result = await route(
+            object(), row["id"], body=edited, dependencies=_route_deps(row)
+        )
+        assert reached == [("new-bastion.example.com", 2200)]
+        assert result["details"]["host_key"].startswith(
+            "[new-bastion.example.com]:2200 "
+        )
+
+        # The edited values are validated exactly as an update would be.
+        with pytest.raises(Exception) as refused:
+            await route(
+                object(),
+                row["id"],
+                body=DatasourceTestRequest(config={"host": "h\nProxyCommand id"}),
+                dependencies=_route_deps(row),
+            )
+        assert getattr(refused.value, "status_code", None) == 400
+        assert len(reached) == 1
 
     @pytest.mark.asyncio
     async def test_ssh_key_without_host_has_nothing_to_probe(self):

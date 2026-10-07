@@ -74,6 +74,7 @@ from orchestrator.services.email_datasource import (
 )
 from orchestrator.services.workspace_ssh_connector import (
     WorkspaceSshConnectorError,
+    apply_ssh_test_overrides,
     probe_workspace_ssh_connector,
     repository_uses_ssh_key,
     validate_workspace_ssh_connector,
@@ -1370,15 +1371,23 @@ async def test_datasource(
     *,
     resolve_datasource: ResolveDatasourceOwner,
     dependencies: DatasourceDependencies,
+    overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Test connectivity to a connector.
 
     Attempts to connect using the stored connection details and returns
     the result. Does not modify any data. F3: creator/admin only (test
-    uses live credentials and probes the target).
+    uses live credentials and probes the target). ``overrides`` is the SSH
+    endpoint a connector form is editing; it is validated like an update and
+    only an SSH connector's probe reads it.
     """
     try:
         _, ds = await resolve_datasource()
+        if overrides:
+            try:
+                ds = apply_ssh_test_overrides(ds, overrides)
+            except WorkspaceSshConnectorError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         ds_type = ds["type"]
         url = ds["connection_url"]
         creds = ds.get("credentials") or {}

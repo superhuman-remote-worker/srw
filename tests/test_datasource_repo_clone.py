@@ -223,7 +223,7 @@ class TestBackendClone:
             )
         mock_clone.assert_not_called()
         ws.backend.write_home_file.assert_not_called()
-        assert "Invalid SSH key" in self._warnings(log)
+        assert "its SSH key could not be parsed" in self._warnings(log)
         assert "no workspace SSH identity" in self._warnings(log)
 
     def test_reused_checkout_is_pointed_at_the_alias(self):

@@ -666,6 +666,26 @@ def create_datasource_connection(
 # ---------------------------------------------------------------------------
 
 
+#: What an ``unavailable`` SSH identity's fixed reason code means. Anything
+#: else is shown as the generic reason: the field is never echoed verbatim
+#: into a README (or a log), which another user's connector would control.
+_SSH_UNAVAILABLE_REASONS = {
+    "ssh_endpoint_invalid": "its SSH host, user, port or repository URL is not allowed",
+    "ssh_key_invalid": "its SSH key could not be parsed",
+    "ssh_key_passphrase": "its SSH key is passphrase-protected",
+    "known_hosts_invalid": "its pinned host key is not valid for its host",
+    "default_known_hosts_invalid": "the default host keys of this deployment are invalid",
+    "ssh_identity_unresolvable": "it has no stable identity",
+}
+
+
+def _ssh_unavailable_reason(identity: Dict[str, Any]) -> str:
+    return _SSH_UNAVAILABLE_REASONS.get(
+        str(identity.get("unavailable") or ""),
+        "it cannot be delivered to this workspace",
+    )
+
+
 def _ssh_clone_target(
     ds: Dict[str, Any], ssh_identity_status: Optional[Dict[str, str]]
 ) -> tuple[Optional[str], str]:
@@ -675,7 +695,7 @@ def _ssh_clone_target(
     if not isinstance(identity, dict):
         return None, "no workspace SSH identity was delivered for it"
     if identity.get("unavailable"):
-        return None, str(identity["unavailable"])
+        return None, _ssh_unavailable_reason(identity)
     clone_url = str(identity.get("clone_url") or "")
     alias = str(identity.get("alias") or "")
     path = r"[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*"
@@ -997,7 +1017,7 @@ def _ssh_identity_note(ds: Dict[str, Any]) -> str:
     if not isinstance(identity, dict):
         return ""
     if identity.get("unavailable"):
-        return f"; not available: {identity['unavailable']}"
+        return f"; not available: {_ssh_unavailable_reason(identity)}"
     return (
         f"; git uses SSH alias `{identity.get('alias')}`, whose key an "
         "ssh-agent holds (never on disk)"
@@ -1011,7 +1031,7 @@ def _ssh_key_usage(ds: Dict[str, Any]) -> str:
     if not isinstance(identity, dict) or not identity.get("alias"):
         return "not available: its key was not delivered to this workspace."
     if identity.get("unavailable"):
-        return f"not available: {identity['unavailable']}."
+        return f"not available: {_ssh_unavailable_reason(identity)}."
     fingerprint = (
         f" Key `{identity.get('fingerprint')}`." if identity.get("fingerprint") else ""
     )

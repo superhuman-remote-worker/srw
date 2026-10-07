@@ -606,12 +606,19 @@ export interface ProjectDatasource extends Datasource {
 /**
  * Result from testing a datasource connection.
  */
+/** The SSH endpoint a connector form is editing; Test reaches it unsaved. */
+export interface DatasourceTestEdits {
+  connection_url?: string | null;
+  config?: DatasourceConfig;
+}
+
 export interface DatasourceTestResult {
   status: 'ok' | 'error';
   message: string;
   /** Probe-specific facts; an SSH connector reports the host key it saw. */
   details?: {
-    /** ``<type> <base64>``, the form the ``known_hosts`` field pins. */
+    /** A host-qualified known_hosts line (``host type key`` or
+     *  ``[host]:port type key``), the form the ``known_hosts`` field pins. */
     host_key?: string;
     host_key_fingerprint?: string;
     [key: string]: unknown;

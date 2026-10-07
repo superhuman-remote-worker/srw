@@ -22,6 +22,7 @@ import {
     DatasourceCreateRequest,
     DatasourceIndexStatus,
     DatasourceReindexResult,
+    DatasourceTestEdits,
     DatasourceTestResult,
     DatasourceUpdateRequest,
     EligibleDatasource,
@@ -1099,10 +1100,18 @@ export class ApiService {
   }
 
   /**
-   * Test connectivity to a datasource.
+   * Test connectivity to a datasource. ``edits`` is the SSH endpoint the
+   * connector form is editing (``connection_url``/``config``): an SSH
+   * connector's Test reaches it instead of the saved one.
    */
-  testDatasource(id: string): Observable<DatasourceTestResult | null> {
-    return this.http.post<DatasourceTestResult>(`${this.baseUrl}/datasources/${id}/test`, {}).pipe(
+  testDatasource(
+    id: string,
+    edits?: DatasourceTestEdits,
+  ): Observable<DatasourceTestResult | null> {
+    return this.http.post<DatasourceTestResult>(
+      `${this.baseUrl}/datasources/${id}/test`,
+      edits ?? {},
+    ).pipe(
       catchError((error) => {
         console.error(`Failed to test datasource ${id}:`, error);
         return of(null);

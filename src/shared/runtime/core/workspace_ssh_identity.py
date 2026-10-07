@@ -300,18 +300,15 @@ def parse_known_hosts(
     *,
     host: str | None = None,
     port: int = 22,
-    require_match: bool = True,
 ) -> list[str]:
-    """Return the ``"<type> <base64>"`` host keys of ``known_hosts`` text.
+    """Return the ``"<type> <base64>"`` host keys of a connector's pin.
 
-    A line may be a bare ``<type> <base64>`` pair (what a connector's Test
-    returns) or a full ``known_hosts`` line. A full line must name ``host`` on
-    ``port``. With ``require_match=False`` (a deployment-wide default list)
-    only full lines naming ``host`` count: a line for another host, and a bare
-    pair that names no host at all, are skipped instead of refused. Markers,
-    certificates and unknown key types are refused, so the rendered
-    per-identity file holds nothing but plain keys under the identity's own
-    alias.
+    A line may be a bare ``<type> <base64>`` pair or a full ``known_hosts``
+    line, which must name ``host`` on ``port``. Strict: markers,
+    certificates, unknown key types and lines for another host are refused,
+    so the rendered per-identity file holds nothing but plain keys under the
+    identity's own alias. A deployment-wide list goes through the tolerant
+    :func:`select_known_hosts` instead.
     """
 
     raw = "" if text is None else str(text)
@@ -332,8 +329,6 @@ def parse_known_hosts(
             if len(tokens) < 2:
                 raise SshEndpointError(f"known_hosts line {line_number} has no key")
             entry = _host_key_entry(tokens[0], tokens[1], line_number=line_number)
-            if not require_match:
-                continue
         else:
             if len(tokens) < 3:
                 raise SshEndpointError(
@@ -344,11 +339,9 @@ def parse_known_hosts(
             if host is not None and not known_hosts_field_matches(
                 tokens[0], host=host, port=port
             ):
-                if require_match:
-                    raise SshEndpointError(
-                        f"known_hosts line {line_number} is for a different host"
-                    )
-                continue
+                raise SshEndpointError(
+                    f"known_hosts line {line_number} is for a different host"
+                )
         if entry not in entries:
             entries.append(entry)
     if len(entries) > _MAX_KNOWN_HOST_KEYS:
@@ -356,6 +349,46 @@ def parse_known_hosts(
             f"known_hosts may pin at most {_MAX_KNOWN_HOST_KEYS} host keys"
         )
     return entries
+
+
+def select_known_hosts(
+    text: Any, *, host: str, port: int = 22
+) -> tuple[list[str], int]:
+    """Pick the keys a deployment-wide ``known_hosts`` list pins for one host.
+
+    Returns ``(entries, ignored)``. Comments, bare pairs (they name no host)
+    and lines for other hosts are skipped before anything is validated, so
+    one marker or exotic key type elsewhere in the list never disables an
+    unrelated connector. A line that does name this host but cannot be used
+    (a marker, an unsupported key type, a broken key) is skipped and
+    counted; the caller logs the count once. Only an oversized or NUL-bearing
+    list is refused outright.
+    """
+
+    raw = "" if text is None else str(text)
+    if len(raw.encode("utf-8")) > _MAX_KNOWN_HOSTS_BYTES or "\x00" in raw:
+        raise SshEndpointError("known_hosts must be at most 64 KiB of text")
+    entries: list[str] = []
+    ignored = 0
+    for line_number, line in enumerate(raw.splitlines(), start=1):
+        tokens = line.strip().split()
+        if not tokens or tokens[0].startswith("#") or tokens[0] in KNOWN_HOST_KEY_TYPES:
+            continue
+        marker = tokens[0].startswith("@")
+        field = tokens[1] if marker and len(tokens) > 1 else tokens[0]
+        if not known_hosts_field_matches(field, host=host, port=port):
+            continue
+        if marker or len(tokens) < 3:
+            ignored += 1
+            continue
+        try:
+            entry = _host_key_entry(tokens[1], tokens[2], line_number=line_number)
+        except SshEndpointError:
+            ignored += 1
+            continue
+        if entry not in entries and len(entries) < _MAX_KNOWN_HOST_KEYS:
+            entries.append(entry)
+    return entries, ignored
 
 
 # ---------------------------------------------------------------------------
@@ -754,6 +787,7 @@ __all__ = [
     "parse_ssh_repository_url",
     "prune_workspace_ssh_identities",
     "retire_workspace_ssh_identities",
+    "select_known_hosts",
     "workspace_ssh_identity_alias",
     "workspace_ssh_identity_socket",
 ]

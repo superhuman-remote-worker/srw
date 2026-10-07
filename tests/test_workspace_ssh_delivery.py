@@ -203,11 +203,45 @@ class TestWorkspaceSshIdentities:
         assert on_bastion["known_hosts"] == []
         assert on_bastion["strict_host_key_checking"] is False
 
-    def test_invalid_deployment_default_fails_closed(self, monkeypatch, caplog):
-        monkeypatch.setenv(WORKSPACE_SSH_KNOWN_HOSTS_ENV, "github.com ssh-dss AAAA")
-        assert build_workspace_ssh_identities([_repository()]) is None
-        assert WORKSPACE_SSH_KNOWN_HOSTS_ENV in caplog.text
+    def test_one_bad_default_line_degrades_only_its_host(self, monkeypatch, caplog):
+        """Review: one unusable line used to disable every SSH connector."""
+        github = _host_key()
+        monkeypatch.setenv(
+            WORKSPACE_SSH_KNOWN_HOSTS_ENV,
+            "@cert-authority *.corp.example ssh-ed25519 AAAA\n"
+            "github.com ssh-dss AAAAB3NzaC1kc3M=\n"
+            f"github.com {github}\n",
+        )
+        on_github, on_bastion = build_workspace_ssh_identities(
+            [_repository(), _ssh_key()]
+        )
+        assert on_github["known_hosts"] == [github]
+        assert on_bastion["known_hosts"] == []
+        assert caplog.text.count(WORKSPACE_SSH_KNOWN_HOSTS_ENV) == 1
         assert "PRIVATE KEY" not in caplog.text
+
+    def test_an_unreadable_default_list_fails_closed(self, monkeypatch, caplog):
+        monkeypatch.setenv(WORKSPACE_SSH_KNOWN_HOSTS_ENV, "x" * (65 * 1024))
+        row = _repository()
+        assert build_workspace_ssh_identities([row]) is None
+        (entry,) = build_datasources_payload([row], dependencies=_deps())
+        assert entry["ssh_identity"]["unavailable"] == "default_known_hosts_invalid"
+
+    def test_unavailable_reasons_are_fixed_codes(self, caplog):
+        """Review: the reason used to quote key lines into READMEs and logs."""
+        secret_line = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo="
+        row = _repository(
+            credentials={
+                "auth_method": "ssh",
+                "ssh_key": f"{secret_line}\n{secret_line}\n{secret_line}\n",
+            }
+        )
+        (entry,) = build_datasources_payload([row], dependencies=_deps())
+        assert entry["ssh_identity"]["unavailable"] == "ssh_key_invalid"
+        assert build_workspace_ssh_identities([row]) is None
+        assert secret_line not in json.dumps(entry)
+        assert secret_line not in caplog.text
+        assert "ssh_key_invalid" in caplog.text
 
     def test_a_stored_alias_shaped_host_is_never_dispatched(self):
         """A row stored before the refusal must not reach any workspace."""
