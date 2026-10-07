@@ -11222,9 +11222,9 @@ async def _handle_workspace_upgrade(
     if template:
         target_tier = "vm"  # the orchestrator refuses a template of any other tier
     elif not target_tier:
-        target_tier = (
-            "vm" if _upgrade_already_satisfied(src_backend, "sandbox") else "sandbox"
-        )
+        # The in-process container swap below is refused on this lane, so the
+        # next tier a lite Session can actually reach is a VM.
+        target_tier = "vm"
     if target_tier == "sandbox":
         # The old in-process swap has no durable receipt spanning Pod
         # attestation, repository-key delivery, and seed writes. Fail before
@@ -11234,8 +11234,9 @@ async def _handle_workspace_upgrade(
             "workspace_upgrade.failed",
             {
                 "reason": (
-                    "Kubernetes hot workspace upgrades require exact runtime "
-                    "authority; use the normal pause/redispatch path"
+                    "Container upgrades aren't available in this session. Use "
+                    "/upgrade-workspace vm, or start a new Session with a "
+                    "container workspace."
                 )
             },
         )

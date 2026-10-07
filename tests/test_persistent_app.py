@@ -4674,9 +4674,10 @@ class TestHandleWorkspaceUpgradeTierOrTemplate:
         return sess
 
     @pytest.mark.asyncio
-    async def test_no_tier_on_a_lite_session_is_the_container_refusal(self):
+    async def test_no_tier_on_a_lite_session_goes_to_a_vm(self):
         ws = AsyncMock()
         client = AsyncMock()
+        client.request_thread_workspace_upgrade.side_effect = RuntimeError("stop here")
         virtual = SimpleNamespace(supports_shell=False)
         with (
             patch(
@@ -4688,6 +4689,26 @@ class TestHandleWorkspaceUpgradeTierOrTemplate:
         ):
             await _handle_workspace_upgrade(ws)
 
+        call = client.request_thread_workspace_upgrade.call_args
+        assert call is not None
+        assert call.args == ("tid",)
+        assert call.kwargs["target_tier"] == "vm"
+
+    @pytest.mark.asyncio
+    async def test_explicit_container_on_a_lite_session_is_refused_plainly(self):
+        ws = AsyncMock()
+        client = AsyncMock()
+        virtual = SimpleNamespace(supports_shell=False)
+        with (
+            patch(
+                "agent.api.persistent_app._session",
+                self._session_with_backend(virtual),
+            ),
+            patch("agent.api.persistent_app._orchestrator_client", client),
+            patch("agent.api.persistent_app._session_identity._thread_id", "tid"),
+        ):
+            await _handle_workspace_upgrade(ws, target_tier="sandbox")
+
         client.request_thread_workspace_upgrade.assert_not_called()
         failed = [
             c[0][0]
@@ -4695,7 +4716,11 @@ class TestHandleWorkspaceUpgradeTierOrTemplate:
             if c[0][0].get("method") == "workspace_upgrade.failed"
         ]
         assert len(failed) == 1
-        assert "exact runtime authority" in failed[0]["params"]["reason"]
+        assert failed[0]["params"]["reason"] == (
+            "Container upgrades aren't available in this session. Use "
+            "/upgrade-workspace vm, or start a new Session with a container "
+            "workspace."
+        )
 
     @pytest.mark.asyncio
     async def test_no_tier_on_a_container_session_asks_for_a_vm(self):
@@ -4823,7 +4848,11 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
             if call.args[0].get("method") == "workspace_upgrade.failed"
         ]
         assert len(failed) == 1
-        assert "exact runtime authority" in failed[0].args[0]["params"]["reason"]
+        assert failed[0].args[0]["params"]["reason"] == (
+            "Container upgrades aren't available in this session. Use "
+            "/upgrade-workspace vm, or start a new Session with a container "
+            "workspace."
+        )
 
     @pytest.mark.asyncio
     async def test_sandbox_to_unattested_vm_withdraws_browser_capability(self):
