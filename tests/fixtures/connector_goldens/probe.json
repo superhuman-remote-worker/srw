@@ -1,0 +1,965 @@
+{
+  "gate_crash_is_a_500": {
+    "status": 500,
+    "body": {
+      "detail": "Connector test failed (error_ref=<error_ref>)"
+    },
+    "probe_calls": []
+  },
+  "generic/no_test": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "No connectivity test for generic connectors"
+    },
+    "probe_calls": []
+  },
+  "credentials/valid": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "Credential variables are valid; provider access is tested in the workspace"
+    },
+    "probe_calls": []
+  },
+  "credentials/invalid_stored_env_is_a_500": {
+    "status": 500,
+    "body": {
+      "detail": "Connector test failed (error_ref=<error_ref>)"
+    },
+    "probe_calls": []
+  },
+  "generic_file/unknown_type": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "Unknown connector type: generic_file"
+    },
+    "probe_calls": [],
+    "pinned_defect": "D1 fixes (L1 §6 #1): credential-file connectors answer Test with 'Unknown connector type' while the cockpit offers Test on every row"
+  },
+  "kubeconfig/unknown_type": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "Unknown connector type: kubeconfig"
+    },
+    "probe_calls": [],
+    "pinned_defect": "D1 fixes (L1 §6 #1): credential-file connectors answer Test with 'Unknown connector type' while the cockpit offers Test on every row"
+  },
+  "ssh_key/unknown_type": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "Unknown connector type: ssh_key"
+    },
+    "probe_calls": [],
+    "pinned_defect": "D1 fixes (L1 §6 #1): credential-file connectors answer Test with 'Unknown connector type' while the cockpit offers Test on every row"
+  },
+  "postgresql/connected": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "Connected: PostgreSQL 16.4 (Debian 16.4-1.pgdg120+2) on x86_64-pc-linux-gnu, compiled by gc"
+    },
+    "probe_calls": [
+      {
+        "asyncpg.connect": [
+          "postgresql://orders:pg-secret@db.example.test:5432/orders",
+          {
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "fetchval": "SELECT version()"
+      },
+      "close"
+    ]
+  },
+  "postgresql/connect_failed": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "PostgreSQL connection failed",
+      "error_ref": "<error_ref>"
+    },
+    "probe_calls": [
+      {
+        "asyncpg.connect": [
+          "postgresql://orders:pg-secret@db.example.test:5432/orders",
+          {
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
+  "neo4j/connected": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "Connected to Neo4j"
+    },
+    "probe_calls": [
+      {
+        "neo4j.GraphDatabase.driver": [
+          "bolt://neo4j.example.test:7687",
+          [
+            "graph",
+            "neo-secret"
+          ]
+        ]
+      },
+      "verify_connectivity",
+      "close"
+    ],
+    "pinned_defect": "D1 names it (L1 §6 #8): the Neo4j probe blocks the event loop"
+  },
+  "neo4j/no_credentials_default_auth": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "Connected to Neo4j"
+    },
+    "probe_calls": [
+      {
+        "neo4j.GraphDatabase.driver": [
+          "bolt://neo4j.example.test:7687",
+          [
+            "neo4j",
+            ""
+          ]
+        ]
+      },
+      "verify_connectivity",
+      "close"
+    ]
+  },
+  "neo4j/connect_failed": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "Neo4j connection failed",
+      "error_ref": "<error_ref>"
+    },
+    "probe_calls": [
+      {
+        "neo4j.GraphDatabase.driver": [
+          "bolt://neo4j.example.test:7687",
+          [
+            "graph",
+            "neo-secret"
+          ]
+        ]
+      },
+      "verify_connectivity"
+    ]
+  },
+  "mongodb/connected": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "Connected to MongoDB"
+    },
+    "probe_calls": [
+      {
+        "pymongo.MongoClient": [
+          "mongodb://events:mongo-secret@mongo.example.test:27017/events",
+          {
+            "serverSelectionTimeoutMS": 5000
+          }
+        ]
+      },
+      "server_info",
+      "close"
+    ],
+    "pinned_defect": "D1 names it (L1 §6 #8): the MongoDB probe blocks the event loop"
+  },
+  "mongodb/connect_failed": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "MongoDB connection failed",
+      "error_ref": "<error_ref>"
+    },
+    "probe_calls": [
+      {
+        "pymongo.MongoClient": [
+          "mongodb://events:mongo-secret@mongo.example.test:27017/events",
+          {
+            "serverSelectionTimeoutMS": 5000
+          }
+        ]
+      },
+      "server_info"
+    ]
+  },
+  "webdav/connected": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "Connected to WebDAV"
+    },
+    "probe_calls": [
+      {
+        "webdav3.client.Client": {
+          "webdav_hostname": "https://cloud.example.test/remote.php/dav/files/alice",
+          "webdav_login": "alice",
+          "webdav_password": "dav-secret"
+        }
+      },
+      {
+        "list": "/"
+      }
+    ],
+    "pinned_defect": "D1 names it (L1 §6 #8): the WebDAV probe blocks the event loop"
+  },
+  "webdav/connect_failed": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "WebDAV connection failed",
+      "error_ref": "<error_ref>"
+    },
+    "probe_calls": [
+      {
+        "webdav3.client.Client": {
+          "webdav_hostname": "https://cloud.example.test/remote.php/dav/files/alice",
+          "webdav_login": "alice",
+          "webdav_password": "dav-secret"
+        }
+      },
+      {
+        "list": "/"
+      }
+    ]
+  },
+  "email/draft_connected": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "Connected to IMAP mailbox; verified 2 folder(s)"
+    },
+    "probe_calls": [
+      {
+        "imaplib.IMAP4_SSL": [
+          "imap.example.test",
+          993,
+          10.0
+        ]
+      },
+      {
+        "imap.login": "support@example.test"
+      },
+      {
+        "imap.status": [
+          "\"INBOX\"",
+          "(MESSAGES)"
+        ]
+      },
+      {
+        "imap.status": [
+          "\"Support\"",
+          "(MESSAGES)"
+        ]
+      },
+      "imap.logout"
+    ]
+  },
+  "email/send_connected_starttls": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "Connected to IMAP mailbox; verified 2 folder(s); SMTP auth ok"
+    },
+    "probe_calls": [
+      {
+        "imaplib.IMAP4": [
+          "imap.example.test",
+          143,
+          10.0
+        ]
+      },
+      "imap.starttls",
+      {
+        "imap.login": "support@example.test"
+      },
+      {
+        "imap.status": [
+          "\"INBOX\"",
+          "(MESSAGES)"
+        ]
+      },
+      {
+        "imap.status": [
+          "\"Support\"",
+          "(MESSAGES)"
+        ]
+      },
+      "imap.logout",
+      {
+        "smtplib.SMTP": [
+          "smtp.example.test",
+          587,
+          10.0
+        ]
+      },
+      "smtp.starttls",
+      "smtp.ehlo",
+      {
+        "smtp.login": "support@example.test"
+      },
+      "smtp.quit"
+    ]
+  },
+  "email/imap_connect_failed": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "IMAP connection to imap.example.test:993 failed: Connection refused"
+    },
+    "probe_calls": [
+      {
+        "imaplib.IMAP4_SSL": [
+          "imap.example.test",
+          993,
+          10.0
+        ]
+      }
+    ]
+  },
+  "email/imap_login_failed": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "IMAP login failed (check username/app password): [AUTHENTICATIONFAILED] Invalid credentials"
+    },
+    "probe_calls": [
+      {
+        "imaplib.IMAP4_SSL": [
+          "imap.example.test",
+          993,
+          10.0
+        ]
+      },
+      {
+        "imap.login": "support@example.test"
+      },
+      "imap.logout"
+    ]
+  },
+  "email/folder_missing": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "IMAP folder(s) not found: Support"
+    },
+    "probe_calls": [
+      {
+        "imaplib.IMAP4_SSL": [
+          "imap.example.test",
+          993,
+          10.0
+        ]
+      },
+      {
+        "imap.login": "support@example.test"
+      },
+      {
+        "imap.status": [
+          "\"INBOX\"",
+          "(MESSAGES)"
+        ]
+      },
+      {
+        "imap.status": [
+          "\"Support\"",
+          "(MESSAGES)"
+        ]
+      },
+      "imap.logout"
+    ]
+  },
+  "email/smtp_auth_failed": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "SMTP auth failed (check username/app password): (535, b'5.7.8 rejected')"
+    },
+    "probe_calls": [
+      {
+        "imaplib.IMAP4_SSL": [
+          "imap.example.test",
+          993,
+          10.0
+        ]
+      },
+      {
+        "imap.login": "support@example.test"
+      },
+      {
+        "imap.status": [
+          "\"INBOX\"",
+          "(MESSAGES)"
+        ]
+      },
+      {
+        "imap.status": [
+          "\"Support\"",
+          "(MESSAGES)"
+        ]
+      },
+      "imap.logout",
+      {
+        "smtplib.SMTP_SSL": [
+          "smtp.example.test",
+          465,
+          10.0
+        ]
+      },
+      "smtp.ehlo",
+      {
+        "smtp.login": "support@example.test"
+      },
+      "smtp.quit"
+    ]
+  },
+  "email/smtp_connect_failed": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "SMTP connection to smtp.example.test:465 failed: Connection unexpectedly closed"
+    },
+    "probe_calls": [
+      {
+        "imaplib.IMAP4_SSL": [
+          "imap.example.test",
+          993,
+          10.0
+        ]
+      },
+      {
+        "imap.login": "support@example.test"
+      },
+      {
+        "imap.status": [
+          "\"INBOX\"",
+          "(MESSAGES)"
+        ]
+      },
+      {
+        "imap.status": [
+          "\"Support\"",
+          "(MESSAGES)"
+        ]
+      },
+      "imap.logout",
+      {
+        "smtplib.SMTP_SSL": [
+          "smtp.example.test",
+          465,
+          10.0
+        ]
+      },
+      "smtp.ehlo",
+      {
+        "smtp.login": "support@example.test"
+      },
+      "smtp.quit"
+    ]
+  },
+  "email/send_without_folders": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "access='send' requires a non-empty folder allowlist (folders)"
+    },
+    "probe_calls": []
+  },
+  "email/send_without_smtp": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "access='send' requires an smtp block in credentials"
+    },
+    "probe_calls": [
+      {
+        "imaplib.IMAP4_SSL": [
+          "imap.example.test",
+          993,
+          10.0
+        ]
+      },
+      {
+        "imap.login": "support@example.test"
+      },
+      {
+        "imap.status": [
+          "\"INBOX\"",
+          "(MESSAGES)"
+        ]
+      },
+      {
+        "imap.status": [
+          "\"Support\"",
+          "(MESSAGES)"
+        ]
+      },
+      "imap.logout"
+    ]
+  },
+  "email/incomplete_credentials": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "Email credentials are incomplete: username, password, and imap.host are required"
+    },
+    "probe_calls": []
+  },
+  "email/outer_timeout": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "IMAP/SMTP connectivity test timed out after 10s"
+    },
+    "probe_calls": [
+      "probe_email_connection"
+    ]
+  },
+  "email/probe_crashed": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "IMAP/SMTP connection failed",
+      "error_ref": "<error_ref>"
+    },
+    "probe_calls": [
+      "probe_email_connection"
+    ]
+  },
+  "repository/token_write_access": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "Authenticated as srw-bot (fine-grained token); write access to acme/widgets; repository default branch main (connector targets develop)",
+      "details": {
+        "forge": "github",
+        "owner": "acme",
+        "repo": "widgets",
+        "principal": "srw-bot",
+        "principal_id": 5,
+        "token_class": "fine-grained",
+        "scopes": null,
+        "can_write": true,
+        "is_admin": false,
+        "default_branch": "main",
+        "warnings": []
+      }
+    },
+    "probe_calls": [
+      {
+        "request": "GET https://api.github.com/user",
+        "authorization": true
+      },
+      {
+        "request": "GET https://api.github.com/repos/acme/widgets",
+        "authorization": true
+      }
+    ]
+  },
+  "repository/token_warnings": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "Authenticated as owner (classic token); read-only access to acme/widgets; repository default branch main — WARNING: owner administers acme/widgets: branch rules with an admin bypass will not bind the agent; classic 'repo' scope reaches every repository this account can push to, private ones included; 'public_repo' bounds it to public repos; owner cannot push to acme/widgets but the connector is not marked read-only",
+      "details": {
+        "forge": "github",
+        "owner": "acme",
+        "repo": "widgets",
+        "principal": "owner",
+        "principal_id": 5,
+        "token_class": "classic",
+        "scopes": [
+          "repo"
+        ],
+        "can_write": false,
+        "is_admin": true,
+        "default_branch": "main",
+        "warnings": [
+          "owner administers acme/widgets: branch rules with an admin bypass will not bind the agent",
+          "classic 'repo' scope reaches every repository this account can push to, private ones included; 'public_repo' bounds it to public repos",
+          "owner cannot push to acme/widgets but the connector is not marked read-only"
+        ]
+      }
+    },
+    "probe_calls": [
+      {
+        "request": "GET https://api.github.com/user",
+        "authorization": true
+      },
+      {
+        "request": "GET https://api.github.com/repos/acme/widgets",
+        "authorization": true
+      }
+    ]
+  },
+  "repository/token_read_only_connector": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "Authenticated as reader (fine-grained token); read-only access to acme/widgets; repository default branch main",
+      "details": {
+        "forge": "github",
+        "owner": "acme",
+        "repo": "widgets",
+        "principal": "reader",
+        "principal_id": 6,
+        "token_class": "fine-grained",
+        "scopes": null,
+        "can_write": false,
+        "is_admin": false,
+        "default_branch": "main",
+        "warnings": []
+      }
+    },
+    "probe_calls": [
+      {
+        "request": "GET https://api.github.com/user",
+        "authorization": true
+      },
+      {
+        "request": "GET https://api.github.com/repos/acme/widgets",
+        "authorization": true
+      }
+    ]
+  },
+  "repository/token_gitea": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "Authenticated as srw-bot (token); write access to acme/widgets; repository default branch main",
+      "details": {
+        "forge": "gitea",
+        "owner": "acme",
+        "repo": "widgets",
+        "principal": "srw-bot",
+        "principal_id": 5,
+        "token_class": "unknown",
+        "scopes": null,
+        "can_write": true,
+        "is_admin": false,
+        "default_branch": "main",
+        "warnings": []
+      }
+    },
+    "probe_calls": [
+      {
+        "request": "GET https://git.example.test/api/v1/user",
+        "authorization": true
+      },
+      {
+        "request": "GET https://git.example.test/api/v1/repos/acme/widgets",
+        "authorization": true
+      }
+    ]
+  },
+  "repository/token_rejected": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "github rejected the token (HTTP 401)"
+    },
+    "probe_calls": [
+      {
+        "request": "GET https://api.github.com/user",
+        "authorization": true
+      }
+    ]
+  },
+  "repository/not_found": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "acme/widgets not found on github, or the token cannot see it (HTTP 404)"
+    },
+    "probe_calls": [
+      {
+        "request": "GET https://api.github.com/user",
+        "authorization": true
+      },
+      {
+        "request": "GET https://api.github.com/repos/acme/widgets",
+        "authorization": true
+      }
+    ]
+  },
+  "repository/unreachable": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "Could not reach github: connection refused"
+    },
+    "probe_calls": [
+      {
+        "request": "GET https://api.github.com/user"
+      }
+    ]
+  },
+  "repository/self_hosted_without_forge": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "Repository connectors on a self-hosted host must declare 'forge' explicitly (one of ['gitea', 'github', 'gitlab']) — a self-hosted Gitea and GitLab cannot be told apart by URL"
+    },
+    "probe_calls": []
+  },
+  "repository/ssh_key_not_probed": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "No API probe for SSH-key repository connectors; the clone at job start is the test"
+    },
+    "probe_calls": []
+  },
+  "repository/no_credentials_not_probed": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "No API probe for SSH-key repository connectors; the clone at job start is the test"
+    },
+    "probe_calls": []
+  },
+  "repository/token_inferred_without_auth_method": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "Authenticated as srw-bot (fine-grained token); write access to acme/widgets; repository default branch main",
+      "details": {
+        "forge": "github",
+        "owner": "acme",
+        "repo": "widgets",
+        "principal": "srw-bot",
+        "principal_id": 5,
+        "token_class": "fine-grained",
+        "scopes": null,
+        "can_write": true,
+        "is_admin": false,
+        "default_branch": "main",
+        "warnings": []
+      }
+    },
+    "probe_calls": [
+      {
+        "request": "GET https://api.github.com/user",
+        "authorization": true
+      },
+      {
+        "request": "GET https://api.github.com/repos/acme/widgets",
+        "authorization": true
+      }
+    ]
+  },
+  "kb/notes_found": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "Found 2 Markdown note(s)",
+      "head": "cccccccccccccccccccccccccccccccccccccccc",
+      "note_count": 2
+    },
+    "probe_calls": [
+      {
+        "kb_source_from_datasource": "https://git.example.test/acme/handbook.git"
+      },
+      "get_head",
+      {
+        "snapshot": "cccccccccccccccccccccccccccccccccccccccc"
+      }
+    ]
+  },
+  "kb/no_head": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "Repository branch has no resolvable HEAD",
+      "head": null,
+      "note_count": 0
+    },
+    "probe_calls": [
+      {
+        "kb_source_from_datasource": "https://git.example.test/acme/handbook.git"
+      },
+      "get_head"
+    ]
+  },
+  "kb/no_notes_under_root": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "No Markdown notes found under 'vault'",
+      "head": "cccccccccccccccccccccccccccccccccccccccc",
+      "note_count": 0
+    },
+    "probe_calls": [
+      {
+        "kb_source_from_datasource": "https://git.example.test/acme/handbook.git"
+      },
+      "get_head",
+      {
+        "snapshot": "cccccccccccccccccccccccccccccccccccccccc"
+      }
+    ]
+  },
+  "kb/no_notes_without_root": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "No Markdown notes found",
+      "head": "cccccccccccccccccccccccccccccccccccccccc",
+      "note_count": 0
+    },
+    "probe_calls": [
+      {
+        "kb_source_from_datasource": "https://git.example.test/acme/handbook.git"
+      },
+      "get_head",
+      {
+        "snapshot": "cccccccccccccccccccccccccccccccccccccccc"
+      }
+    ]
+  },
+  "kb/source_failed": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "Knowledge base probe failed",
+      "error_ref": "<error_ref>"
+    },
+    "probe_calls": [
+      {
+        "kb_source_from_datasource": "https://git.example.test/acme/handbook.git"
+      }
+    ]
+  },
+  "mcp/gate_off": {
+    "status": 403,
+    "body": {
+      "detail": "MCP connectors are disabled on this deployment"
+    },
+    "probe_calls": []
+  },
+  "mcp/invalid_stored_config": {
+    "status": 400,
+    "body": {
+      "detail": "http MCP servers require connection_url"
+    },
+    "probe_calls": []
+  },
+  "mcp/remote_http_connected": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "Connected: 10 tools (tool_0, tool_1, tool_2, tool_3, tool_4, tool_5, tool_6, tool_7, …)"
+    },
+    "probe_calls": [
+      {
+        "transport": "streamable_http",
+        "url": "https://mcp.example.test/mcp",
+        "headers": {
+          "Authorization": "Bearer mcp-secret"
+        }
+      },
+      "initialize",
+      "list_tools"
+    ]
+  },
+  "mcp/remote_sse_custom_headers_no_tools": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "Connected: 0 tools"
+    },
+    "probe_calls": [
+      {
+        "transport": "sse",
+        "url": "https://mcp.example.test/mcp",
+        "headers": {
+          "X-Api-Key": "k"
+        }
+      },
+      "initialize",
+      "list_tools"
+    ]
+  },
+  "mcp/remote_connect_failed": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "MCP connection failed (ConnectError)"
+    },
+    "probe_calls": [
+      {
+        "transport": "streamable_http",
+        "url": "https://mcp.example.test/mcp",
+        "headers": {
+          "Authorization": "Bearer mcp-secret"
+        }
+      }
+    ]
+  },
+  "mcp/remote_timed_out": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "MCP connect timed out after 10s"
+    },
+    "probe_calls": [
+      {
+        "transport": "streamable_http",
+        "url": "https://mcp.example.test/mcp",
+        "headers": {
+          "Authorization": "Bearer mcp-secret"
+        }
+      }
+    ]
+  },
+  "mcp/stdio_connected": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "Connected: 1 tools (echo)"
+    },
+    "probe_calls": [
+      {
+        "transport": "stdio",
+        "command": "npx",
+        "args": [
+          "-y",
+          "@acme/mcp"
+        ],
+        "credential_env": {
+          "ACME_KEY": "stdio-secret"
+        },
+        "stderr_discarded": true
+      },
+      "initialize",
+      "list_tools"
+    ]
+  },
+  "mcp/stdio_runtime_missing": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "stdio server untested here (runtime not on the orchestrator); it will resolve on the agent at job start"
+    },
+    "probe_calls": []
+  },
+  "mcp/stdio_gate_off": {
+    "status": 400,
+    "body": {
+      "detail": "stdio MCP servers are disabled on this deployment"
+    },
+    "probe_calls": []
+  }
+}
