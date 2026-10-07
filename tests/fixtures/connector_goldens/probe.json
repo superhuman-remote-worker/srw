@@ -45,14 +45,13 @@
     },
     "probe_calls": []
   },
-  "ssh_key/unknown_type": {
+  "ssh_key/no_host_no_connection_test": {
     "status": 200,
     "body": {
-      "status": "error",
-      "message": "Unknown connector type: ssh_key"
+      "status": "unsupported",
+      "message": "SSH Key connectors without a host have no endpoint to test; add the host to test it and pin its host key"
     },
-    "probe_calls": [],
-    "pinned_defect": "C1 changes this: ssh_key stays on the legacy path, where Test answers 'Unknown connector type' while the cockpit offers Test on every row; generic_file and kubeconfig answer 'unsupported' since D1a"
+    "probe_calls": []
   },
   "postgresql/connected": {
     "status": 200,

@@ -32,6 +32,7 @@ from orchestrator.services.workspace_ssh_connector import (
     probe_workspace_ssh_connector,
 )
 from shared.connectors.builtin import SSH_KEY_SPEC
+from shared.connectors.envelope import unsupported_check
 
 
 class SshKeyDriver(WorkspaceSshDriver):
@@ -87,7 +88,10 @@ class SshKeyDriver(WorkspaceSshDriver):
         probed = await probe_workspace_ssh_connector(row)
         if probed is not None:
             return probed
-        return {"status": "error", "message": f"Unknown connector type: {self.type_id}"}
+        return unsupported_check(
+            f"{self.spec.title} connectors without a host have no endpoint to "
+            "test; add the host to test it and pin its host key"
+        )
 
     def bind(
         self, row: Mapping[str, Any], credentials: Any, *, ctx: BindContext
