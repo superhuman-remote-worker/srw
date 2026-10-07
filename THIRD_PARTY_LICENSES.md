@@ -79,6 +79,24 @@ before the on-prem launch:
 
 ---
 
+## Adapted prompt text
+
+Prompt text taken from other projects, with the changes we made (Apache-2.0 §4(b)).
+Hand-maintained; add a row whenever a prompt adopts third-party text.
+
+| Our files | Source | License | Changes |
+|---|---|---|---|
+| The two compaction paragraphs ("When you run out of context…", "Compaction does not end the task…") in `config/prompts/systemprompt_gpt_5.txt`, `systemprompt_interactive_gpt_5.txt`, `systemprompt_gpt_6_1_sol.txt` and `systemprompt_interactive_gpt_6_1_sol.txt` | [OpenAI Codex](https://github.com/openai/codex), `codex-rs/models-manager/models.json`, the GPT-6 `instructions_template` ("Working with the user"), commit `a6baf8867cb4` | Apache-2.0 | Removed the clause "but you will still see all prior user requests" (SRW does not keep them) |
+
+NOTICE of OpenAI Codex (the part that applies):
+
+```
+OpenAI Codex
+Copyright 2025 OpenAI
+```
+
+---
+
 ## How to (re)generate
 
 CI keeps this file current automatically — see [`.github/workflows`](.github/workflows):
