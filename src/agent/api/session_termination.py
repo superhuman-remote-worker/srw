@@ -104,6 +104,9 @@ class SessionTerminationCoordinator:
         self.native_first_use_identity = None
         self.boot_first_use_closed_identity = None
         self.watchdog_tasks = []
+        # Set by a running lifecycle watchdog; waking it reads the lifecycle
+        # at once (``retirement_authorized_now``).
+        self.lifecycle_poll_wake: asyncio.Event | None = None
         self.terminating = False
         self.termination_task = None
         self.sessions_served = 0
@@ -741,147 +744,216 @@ class SessionTerminationCoordinator:
         so we exit.
         """
 
-        bound_thread_id = self._ports.identity().thread_id
-        bound_runtime_generation = self._ports.identity().session_generation
-        bound_runtime_attach_token = self._ports.identity().attach_token
-        runtime_generation_required = self._ports.identity().runtime_contract
-        while True:
-            try:
-                await asyncio.sleep(poll_s)
-            except asyncio.CancelledError:
-                raise
-            if not self._ports.orchestrator_client() or not bound_thread_id:
-                continue
-            if (
-                self._ports.identity().thread_id != bound_thread_id
-                or self._ports.identity().session_generation != bound_runtime_generation
-                or self._ports.identity().attach_token != bound_runtime_attach_token
-            ):
-                return
-            try:
-                lifecycle = (
-                    await self._ports.orchestrator_client().get_thread_lifecycle(
-                        bound_thread_id
-                    )
-                )
-            except Exception as e:
-                self._logger.debug(f"Thread lifecycle poll failed (non-fatal): {e}")
-                continue
-            if not lifecycle:
-                continue
-            if (
-                self._ports.identity().thread_id != bound_thread_id
-                or self._ports.identity().session_generation != bound_runtime_generation
-                or self._ports.identity().attach_token != bound_runtime_attach_token
-            ):
-                return
-            status = lifecycle.get("status")
-            observed_generation = canonical_runtime_generation(
-                lifecycle.get("session_runtime_generation")
-            )
-            generation_moved = bool(
-                bound_runtime_generation is not None
-                and observed_generation != bound_runtime_generation
-            )
-            generation_missing = bool(
-                runtime_generation_required and observed_generation is None
-            )
-            observed_attach_token = canonical_runtime_generation(
-                lifecycle.get("session_runtime_attach_token")
-            )
-            attach_token_moved = observed_attach_token != bound_runtime_attach_token
-            retirement_preflight = lifecycle.get("runtime_retirement_preflight") is True
-            retirement_authorized = (
-                lifecycle.get("runtime_retirement_authorized") is True
-            )
-            if retirement_preflight and not retirement_authorized:
-                # Owner End is still checking turn/control preconditions. No
-                # authority has been minted and it may be aborted; keep the exact
-                # runtime fully alive and never infer retirement from "pending".
-                continue
-            if (
-                status == "ending"
-                and retirement_authorized
-                and not generation_moved
-                and not generation_missing
-                and not attach_token_moved
-            ):
-                disposition = lifecycle.get("retirement_disposition")
-                permanent = lifecycle.get("retirement_permanent")
-                retirement_token = canonical_runtime_generation(
-                    lifecycle.get("session_runtime_retirement_token")
-                )
-                if disposition not in {"ended", "suspended"}:
-                    self._logger.warning(
-                        "Authorized retirement omitted its immutable disposition "
-                        "(thread=%s)",
-                        bound_thread_id,
-                    )
-                    continue
-                if type(permanent) is not bool:
-                    self._logger.warning(
-                        "Authorized retirement omitted immutable permanent intent "
-                        "(thread=%s)",
-                        bound_thread_id,
-                    )
-                    continue
-                identity = self._ports.identity().retirement_identity()
-                if identity is None:
-                    return
-                self.retirement_admission_identity = identity
-                self.retirement_admission_disposition = disposition
-                # A malformed/missing token is not locally accepted. The common
-                # Begin call below will idempotently recover the exact token from
-                # the server before any teardown effect.
-                self.retirement_admission_token = retirement_token
-                self.retirement_admission_permanent = permanent
+        bound = (
+            self._ports.identity().thread_id,
+            self._ports.identity().session_generation,
+            self._ports.identity().attach_token,
+            self._ports.identity().runtime_contract,
+        )
+        # ``retirement_authorized_now`` wakes the next read early.
+        wake = self.lifecycle_poll_wake = asyncio.Event()
+        try:
+            while True:
                 try:
-                    await self.terminate("thread_retirement_authorized")
-                except Exception as exc:
-                    self._logger.warning(
-                        "Authorized retirement cleanup failed: %s", type(exc).__name__
-                    )
+                    await asyncio.wait_for(wake.wait(), timeout=poll_s)
+                except asyncio.TimeoutError:
+                    pass
+                wake.clear()
+                verdict = await self._read_lifecycle(*bound)
+                if verdict == "detached":
                     return
-                self.schedule_exit(delay=1.0)
-                return
-            if status == "ending":
-                # Exact-contract retirement is actionable only with the explicit
-                # authorization bit and immutable disposition/token handshake.
-                # A malformed or mixed-version shape must not trick the runtime
-                # into tearing down while owner preflight may still abort.
+                if verdict == "authorized":
+                    try:
+                        await self.terminate("thread_retirement_authorized")
+                    except Exception as exc:
+                        self._logger.warning(
+                            "Authorized retirement cleanup failed: %s",
+                            type(exc).__name__,
+                        )
+                        return
+                    self.schedule_exit(delay=1.0)
+                    return
+                if verdict == "gone":
+                    try:
+                        await self.terminate("thread_ended_oob")
+                    except Exception as e:
+                        self._logger.warning(
+                            f"Detach during status-watchdog exit failed: {e}"
+                        )
+                        # Local writer/process/mount quiescence or exact receipt
+                        # is unproven.  Exiting here would abandon live workspace
+                        # writers and the only local retry owner. Stay
+                        # fenced/nonclaimable; the exact retirement task or
+                        # durable reconciler converges it.
+                        return
+                    self.schedule_exit(delay=1.0)
+                    return
+        finally:
+            if self.lifecycle_poll_wake is wake:
+                self.lifecycle_poll_wake = None
+
+    async def _read_lifecycle(
+        self,
+        bound_thread_id: Optional[str],
+        bound_runtime_generation: Optional[str],
+        bound_runtime_attach_token: Optional[str],
+        runtime_generation_required: bool,
+    ) -> str:
+        """One lifecycle read for the bound life: the watchdog's check.
+
+        ``authorized``: the orchestrator authorized this exact life's
+        retirement, now mirrored locally; ``gone``: the lifecycle no longer
+        belongs to this runtime; ``detached``: the local life changed;
+        ``keep``: nothing to act on (including an End still in preflight).
+        """
+
+        if not self._ports.orchestrator_client() or not bound_thread_id:
+            return "keep"
+        if (
+            self._ports.identity().thread_id != bound_thread_id
+            or self._ports.identity().session_generation != bound_runtime_generation
+            or self._ports.identity().attach_token != bound_runtime_attach_token
+        ):
+            return "detached"
+        try:
+            lifecycle = await self._ports.orchestrator_client().get_thread_lifecycle(
+                bound_thread_id
+            )
+        except Exception as e:
+            self._logger.debug(f"Thread lifecycle poll failed (non-fatal): {e}")
+            return "keep"
+        if not lifecycle:
+            return "keep"
+        if (
+            self._ports.identity().thread_id != bound_thread_id
+            or self._ports.identity().session_generation != bound_runtime_generation
+            or self._ports.identity().attach_token != bound_runtime_attach_token
+        ):
+            return "detached"
+        status = lifecycle.get("status")
+        observed_generation = canonical_runtime_generation(
+            lifecycle.get("session_runtime_generation")
+        )
+        generation_moved = bool(
+            bound_runtime_generation is not None
+            and observed_generation != bound_runtime_generation
+        )
+        generation_missing = bool(
+            runtime_generation_required and observed_generation is None
+        )
+        observed_attach_token = canonical_runtime_generation(
+            lifecycle.get("session_runtime_attach_token")
+        )
+        attach_token_moved = observed_attach_token != bound_runtime_attach_token
+        retirement_preflight = lifecycle.get("runtime_retirement_preflight") is True
+        retirement_authorized = lifecycle.get("runtime_retirement_authorized") is True
+        if retirement_preflight and not retirement_authorized:
+            # Owner End is still checking turn/control preconditions. No
+            # authority has been minted and it may be aborted; keep the exact
+            # runtime fully alive and never infer retirement from "pending".
+            return "keep"
+        if (
+            status == "ending"
+            and retirement_authorized
+            and not generation_moved
+            and not generation_missing
+            and not attach_token_moved
+        ):
+            disposition = lifecycle.get("retirement_disposition")
+            permanent = lifecycle.get("retirement_permanent")
+            retirement_token = canonical_runtime_generation(
+                lifecycle.get("session_runtime_retirement_token")
+            )
+            if disposition not in {"ended", "suspended"}:
                 self._logger.warning(
-                    "Ignoring unauthorised/malformed ending lifecycle response "
-                    "for thread %s",
+                    "Authorized retirement omitted its immutable disposition "
+                    "(thread=%s)",
                     bound_thread_id,
                 )
-                continue
-            if (
-                status not in ("created", "active", "awaiting_user")
-                or generation_moved
-                or generation_missing
-                or attach_token_moved
-            ):
-                self._logger.info(
-                    "Thread %s lifecycle no longer belongs to this runtime "
-                    "(status=%r generation_match=%s attach_match=%s) — exiting.",
+                return "keep"
+            if type(permanent) is not bool:
+                self._logger.warning(
+                    "Authorized retirement omitted immutable permanent intent "
+                    "(thread=%s)",
                     bound_thread_id,
-                    status,
-                    not (generation_moved or generation_missing),
-                    not attach_token_moved,
                 )
-                try:
-                    await self.terminate("thread_ended_oob")
-                except Exception as e:
-                    self._logger.warning(
-                        f"Detach during status-watchdog exit failed: {e}"
-                    )
-                    # Local writer/process/mount quiescence or exact receipt is
-                    # unproven.  Exiting here would abandon live workspace writers
-                    # and the only local retry owner. Stay fenced/nonclaimable;
-                    # the exact retirement task or durable reconciler converges it.
-                    return
-                self.schedule_exit(delay=1.0)
-                return
+                return "keep"
+            identity = self._ports.identity().retirement_identity()
+            if identity is None:
+                return "detached"
+            self.retirement_admission_identity = identity
+            self.retirement_admission_disposition = disposition
+            # A malformed/missing token is not locally accepted. The common
+            # Begin call will idempotently recover the exact token from the
+            # server before any teardown effect.
+            self.retirement_admission_token = retirement_token
+            self.retirement_admission_permanent = permanent
+            return "authorized"
+        if status == "ending":
+            # Exact-contract retirement is actionable only with the explicit
+            # authorization bit and immutable disposition/token handshake.
+            # A malformed or mixed-version shape must not trick the runtime
+            # into tearing down while owner preflight may still abort.
+            self._logger.warning(
+                "Ignoring unauthorised/malformed ending lifecycle response "
+                "for thread %s",
+                bound_thread_id,
+            )
+            return "keep"
+        if (
+            status not in ("created", "active", "awaiting_user")
+            or generation_moved
+            or generation_missing
+            or attach_token_moved
+        ):
+            self._logger.info(
+                "Thread %s lifecycle no longer belongs to this runtime "
+                "(status=%r generation_match=%s attach_match=%s) — exiting.",
+                bound_thread_id,
+                status,
+                not (generation_moved or generation_missing),
+                not attach_token_moved,
+            )
+            return "gone"
+        return "keep"
+
+    async def retirement_authorized_now(self) -> bool:
+        """Whether the orchestrator authorized this exact life's retirement,
+        read now with the watchdog's own check.
+
+        A child's write refused for lost parent authority calls this: the
+        retirement token that refused it may belong to an authorized
+        retirement (End, an Officer decommission, the idle stand-down) or to
+        an End still in preflight, which may yet abort. Only the first counts:
+        its token is mirrored, as the watchdog mirrors it, and the watchdog is
+        woken to run the termination at once.
+        """
+
+        if self._ports.stateless_mode():
+            return False
+        identity = self._ports.identity()
+        exact = identity.retirement_identity()
+        if exact is None:
+            return False
+        if (
+            self.retirement_admission_identity != exact
+            or self.retirement_admission_token is None
+        ):
+            verdict = await self._read_lifecycle(
+                identity.thread_id,
+                identity.session_generation,
+                identity.attach_token,
+                identity.runtime_contract,
+            )
+            if verdict != "authorized":
+                return False
+            wake = self.lifecycle_poll_wake
+            if wake is not None:
+                wake.set()
+        return bool(
+            self.retirement_admission_identity == exact
+            and self.retirement_admission_token is not None
+        )
 
     def start_watchdogs(self) -> None:
         """Start watchdog tasks for the active session. Safe to call repeatedly."""
@@ -2172,29 +2244,12 @@ class SessionTerminationCoordinator:
         # authority. Close child admission and settle every generation before the
         # server installs the retirement token that revokes it.
         quiesce_reason = f"parent session retiring as {retirement_disposition}"
-        try:
-            await self._ports.session().quiesce_subagents(quiesce_reason)
-        except Exception as exc:
-            if self.retirement_admission_token is None:
-                self._logger.warning(
-                    "Session child runtime did not quiesce before retirement "
-                    "(thread=%s disposition=%s)",
-                    self._ports.identity().thread_id,
-                    retirement_disposition,
-                    exc_info=True,
-                )
-                return False
-            # A person's End: the server installed and authorized this exact
-            # life's token first (the watchdog mirrored it), so the authority
-            # children settle with is gone for good and a live child can never
-            # settle. Leave the children to the retirement, which ends their
+        if self.retirement_admission_token is not None:
+            # The orchestrator installed and authorized this exact life's
+            # token first (End, an Officer decommission, the idle stand-down;
+            # the watchdog mirrored it): the authority children settle with is
+            # gone for good. Leave them to the retirement, which ends their
             # running rows ``cancelled:parent_retired`` (D4).
-            self._logger.info(
-                "Session child runtime cannot settle under the authorized "
-                "retirement (%s); leaving its children to it (thread=%s)",
-                exc,
-                self._ports.identity().thread_id,
-            )
             try:
                 await self._ports.session().leave_subagents_to_retirement(
                     quiesce_reason
@@ -2203,6 +2258,18 @@ class SessionTerminationCoordinator:
                 self._logger.warning(
                     "Session child runtime could not be left to the authorized "
                     "retirement (thread=%s disposition=%s)",
+                    self._ports.identity().thread_id,
+                    retirement_disposition,
+                    exc_info=True,
+                )
+                return False
+        else:
+            try:
+                await self._ports.session().quiesce_subagents(quiesce_reason)
+            except Exception:
+                self._logger.warning(
+                    "Session child runtime did not quiesce before retirement "
+                    "(thread=%s disposition=%s)",
                     self._ports.identity().thread_id,
                     retirement_disposition,
                     exc_info=True,

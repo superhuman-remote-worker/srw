@@ -358,9 +358,11 @@ async def _dying_turn(
     started: List[str],
     release: asyncio.Event,
     open_gate: tuple[int, asyncio.Event, asyncio.Event] | None = None,
+    background: bool = False,
 ) -> _Dying:
     """The real loop turn delegating every call of ``seed``, under the real
     runtime and session ledger, with children reading the real fence.
+    ``background`` makes every call a background one.
 
     ``open_gate`` ``(n, entered, allow)`` holds the n-th child's durable
     create until ``allow`` is set."""
@@ -432,7 +434,7 @@ async def _dying_turn(
                 "description": f"country {index}",
                 "prompt": f"Take-home pay in country {index}.",
                 "subagent_type": "explorer",
-                "run_in_background": False,
+                "run_in_background": background,
             },
         }
         for index, call_id in enumerate(seed.call_ids)

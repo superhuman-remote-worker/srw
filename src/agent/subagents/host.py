@@ -427,6 +427,7 @@ class SessionHost:
     admission_fn: Optional[Callable[[], bool]] = None
     effect_authority_fn: Optional[Callable[[], Any]] = None
     settlement_authority_fn: Optional[Callable[[], Any]] = None
+    retirement_authorized_fn: Optional[Callable[[], Any]] = None
     event_fn: Optional[Callable[[str], Any]] = None
     delivery_channel: str = "event"
 
@@ -491,6 +492,30 @@ class SessionHost:
         except Exception:
             logger.warning(
                 "session subagent host: settlement-authority proof failed — closing",
+                exc_info=True,
+            )
+            return False
+
+    async def retirement_authorized(self) -> bool:
+        """Whether the orchestrator authorized this exact session life's
+        retirement, read now (not at the lifecycle watchdog's next poll).
+
+        The runtime asks after a child write was refused for lost parent
+        authority: an authorized retirement takes it for good, while an End
+        still in preflight may yet abort. Unwired or failing reads say no.
+        """
+
+        probe = self.retirement_authorized_fn
+        if not callable(probe):
+            return False
+        try:
+            value = probe()
+            if inspect.isawaitable(value):
+                value = await value
+            return value is True
+        except Exception:
+            logger.warning(
+                "session subagent host: retirement lifecycle read failed",
                 exc_info=True,
             )
             return False

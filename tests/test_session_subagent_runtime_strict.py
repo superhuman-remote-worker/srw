@@ -791,3 +791,151 @@ async def test_a_call_starting_at_a_persons_end_returns_no_result(
         await starting
     assert ledger.updates == []
     await runtime.close()
+
+
+class _GatedModel(FakeChatModel):
+    """Waits inside its provider call until ``gate`` opens."""
+
+    def __init__(self, script: list[Any]) -> None:
+        super().__init__(script)
+        self.gate = asyncio.Event()
+
+    async def astream(self, messages: Any, **kw: Any) -> Any:
+        self.hang_started.set()
+        await self.gate.wait()
+        async for chunk in super().astream(messages, **kw):
+            yield chunk
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorized", [True, False])
+async def test_a_call_refused_before_the_termination_reads_the_lifecycle(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    authorized: bool,
+):
+    """k3d P6 review 2026-10-07: up to a watchdog poll after an authorized
+    End, every child write is refused while no leave has run yet: a child's
+    end and a queued call's row. Each refused call asks the host to read the
+    lifecycle now. An authorized retirement holds the call (no refusal
+    reaches the parent); anything else, such as an End still in preflight,
+    fails it as before."""
+    ctx, _ = make_parent(tmp_path, max_concurrent=1)
+    ledger = _ListingSessionLedger()
+    _capture_builds(monkeypatch)
+    model = _GatedModel([text_turn("finished just after the End")])
+    runtime = _runtime(ctx, ledger, lambda config, limits: model)
+    read = AsyncMock(return_value=authorized)
+    runtime.host.retirement_authorized_fn = read
+    assert await runtime.recover_orphans() == []
+    first = asyncio.create_task(runtime.run_foreground(call("c1")))
+    await asyncio.wait_for(model.hang_started.wait(), 5)
+    queued = asyncio.create_task(runtime.run_foreground(call("c2")))
+    await asyncio.sleep(0.05)
+
+    _revoke_parent_authority(runtime)
+    ledger.fail_terminal = True
+    ledger.open_mode = "error"
+    model.gate.set()
+
+    if authorized:
+        deadline = asyncio.get_running_loop().time() + 10
+        while len(runtime._successor_waiters) < 2:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.01)
+        assert not first.done() and not queued.done()
+        assert read.await_count == 2
+        await asyncio.wait_for(runtime.leave_to_retirement("ended"), 15)
+        for task in (first, queued):
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    else:
+        done, pending = await asyncio.wait({first, queued}, timeout=10)
+        assert not pending
+        assert isinstance(first.exception(), TerminalFailure)
+        assert isinstance(queued.exception(), OpenFailure)
+        assert read.await_count == 2
+        assert runtime._successor_waiters == set()
+        assert runtime._left_to_retirement is False
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_background_call_after_the_leave_returns_nothing(tmp_path):
+    """A background child is released by the leave with no write and no
+    delivery; a background call after it is held like a foreground one, so
+    no "quiescing" refusal reaches the parent's turn."""
+    from tests.test_subagent_background_runtime import StrictLedger
+    from tests.test_subagent_runtime import runtime_for
+
+    ctx, _ = make_parent(tmp_path)
+    ledger = StrictLedger()
+    fake = FakeChatModel([HANG])
+    runtime = runtime_for(ctx, factory=lambda config, limits: fake, ledger=ledger)
+    await runtime.run_background(call(run_in_background=True))
+    await asyncio.wait_for(fake.hang_started.wait(), 5)
+
+    await asyncio.wait_for(runtime.leave_to_retirement("ended"), 15)
+
+    assert ledger.terminal_calls == []
+    assert runtime.drain_local_deliveries() == []
+    assert runtime.active == {}
+    assert all(task.done() for task in runtime._background_tasks.values())
+    late = asyncio.create_task(
+        runtime.run_background(call("late", run_in_background=True))
+    )
+    await asyncio.sleep(0.05)
+    assert not late.done()
+    late.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await late
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_the_leave_stops_writes_first_and_a_late_failure_writes_nothing(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The leave closes writes and results before it awaits anything, and a
+    child whose run fails after it writes no terminal row: no authority
+    remains for it, and the retirement ends the row."""
+    ctx, _ = make_parent(tmp_path)
+    ledger = _ListingSessionLedger()
+    _capture_builds(monkeypatch)
+    entered, allow = asyncio.Event(), asyncio.Event()
+
+    async def failing_run(self: Any, brief: str, *, role: str = "human") -> Any:
+        entered.set()
+        await allow.wait()
+        raise RuntimeError("the child loop died")
+
+    monkeypatch.setattr(runtime_mod.SubagentDriver, "run", failing_run)
+    runtime = _runtime(
+        ctx, ledger, lambda config, limits: FakeChatModel([text_turn("unused")])
+    )
+    assert await runtime.recover_orphans() == []
+    calling = asyncio.create_task(runtime.run_foreground(call()))
+    await asyncio.wait_for(entered.wait(), 5)
+    _revoke_parent_authority(runtime)
+
+    async with runtime._state_lock:
+        leaving = asyncio.create_task(runtime.leave_to_retirement("ended"))
+        await asyncio.sleep(0)
+        assert runtime._left_to_retirement is True  # before the lock
+        allow.set()
+        await asyncio.sleep(0.05)  # the run fails while the leave waits
+    await asyncio.wait_for(leaving, 15)
+
+    assert not calling.done()  # held: its failure is no result either
+    terminal = [
+        fields
+        for _, fields in ledger.updates
+        if fields.get("status") not in {"queued", "running"}
+    ]
+    assert terminal == []
+    calling.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await calling
+    await runtime.close()

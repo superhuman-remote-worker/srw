@@ -216,6 +216,9 @@ class PersistentSession:
     subagent_provider_admission: Optional[Callable[[], bool]] = None
     subagent_effect_authority: Optional[Callable[[], Any]] = None
     subagent_settlement_authority: Optional[Callable[[], Any]] = None
+    # Reads, after a refused child write, whether the orchestrator authorized
+    # this life's retirement (``SessionHost.retirement_authorized``).
+    subagent_retirement_authorized: Optional[Callable[[], Any]] = None
     subagent_event_callback: Optional[Callable[[str], Any]] = None
     # The orchestrator's per-claim advertisement (parallel_subagents.md §12):
     # it can settle an interrupted delegation batch
@@ -2297,6 +2300,7 @@ class PersistentSession:
             admission_fn=self.subagent_provider_admission,
             effect_authority_fn=self.subagent_effect_authority,
             settlement_authority_fn=self.subagent_settlement_authority,
+            retirement_authorized_fn=self.subagent_retirement_authorized,
             event_fn=self.subagent_event_callback,
         )
         context._parent_host = host
@@ -2355,10 +2359,12 @@ class PersistentSession:
     async def leave_subagents_to_retirement(self, reason: str) -> None:
         """Close child work under a retirement authorized for this life.
 
-        A person's End installs the retirement token before this runtime
-        hears of it, which takes the authority ``quiesce_subagents`` settles
-        with. Children are left to the retirement with no durable write
-        (``SubagentRuntime.leave_to_retirement``); this life never resumes.
+        A retirement the orchestrator authorizes itself (End, an Officer
+        decommission, the idle stand-down) installs its token before this
+        runtime hears of it, which takes the authority ``quiesce_subagents``
+        settles with. Children are left to the retirement with no durable
+        write (``SubagentRuntime.leave_to_retirement``); this life never
+        resumes.
         """
 
         if self._subagent_runtime_quiesced:

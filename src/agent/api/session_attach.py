@@ -405,6 +405,7 @@ class SessionAttachPorts:
     provider_admission: Callable[..., Any]
     effect_authority: Callable[..., Any]
     settlement_authority: Callable[..., Any]
+    retirement_authorized: Callable[..., Any]
     subagent_event_available: Callable[..., Any]
     # Runtime state an attach resets or clears.
     reset_turn_state: Callable[[], None]
@@ -1588,6 +1589,7 @@ class SessionAttachCoordinator:
             subagent_provider_admission=self._ports.provider_admission,
             subagent_effect_authority=self._ports.effect_authority,
             subagent_settlement_authority=(self._ports.settlement_authority),
+            subagent_retirement_authorized=self._ports.retirement_authorized,
             subagent_event_callback=self._ports.subagent_event_available,
             subagent_batch_settle_contract=subagent_batch_settle,
             subagent_fanout=subagent_fanout,

@@ -319,10 +319,10 @@ class SubagentRuntime:
         # ``interrupted:parent_restart`` before the retirement, which would
         # otherwise cancel a running row for good.
         self._foreground_ends_for_successor = False
-        # Set once by ``leave_to_retirement`` (a person's End took the parent's
-        # authority) and never cleared: no child of this life writes again,
-        # and every foreground call still in progress is held.
-        self._foreground_retired = False
+        # Set once by ``leave_to_retirement`` (a retirement the orchestrator
+        # authorized took the parent's authority) and never cleared: no child
+        # of this life writes again, and no delegate call returns.
+        self._left_to_retirement = False
         # Foreground calls in progress, and the waiters of the ones held
         # for the successor (``_await_successor_cancellation``) with their
         # in-flight keys. A held call does nothing more and never returns.
@@ -654,8 +654,10 @@ class SubagentRuntime:
         for_successor(retiring=True)``) no call returns, whatever it ended
         with: a replay, a refusal or a failure would otherwise become a tool
         result the parent saves, and the successor's settle owns the turn. The
-        same holds once a person's End left the batch to the retirement
-        (``leave_to_retirement``).
+        same holds once the batch was left to an authorized retirement
+        (``leave_to_retirement``), and for a call that failed because such a
+        retirement took the parent's authority before the termination left
+        it (``_retired_by_orchestrator``).
         """
         if call.run_in_background:
             return await self.run_background(call)
@@ -667,7 +669,8 @@ class SubagentRuntime:
                 envelope = await self._run_foreground(call)
             except Exception:
                 if not (
-                    self._foreground_ends_for_successor or self._foreground_retired
+                    self._foreground_ends_for_successor
+                    or await self._retired_by_orchestrator()
                 ):
                     raise
                 logger.warning(
@@ -677,11 +680,33 @@ class SubagentRuntime:
                     exc_info=True,
                 )
                 await self._await_successor_cancellation(call)
-            if self._foreground_ends_for_successor or self._foreground_retired:
+            if self._foreground_ends_for_successor or self._left_to_retirement:
                 await self._await_successor_cancellation(call)
             return envelope
         finally:
             self._foreground_in_progress -= 1
+
+    async def _retired_by_orchestrator(self) -> bool:
+        """Whether this life was left, or is about to be left, to a retirement
+        the orchestrator authorized.
+
+        Asked when a delegate call failed: until the lifecycle watchdog's next
+        poll, an authorized retirement shows only as refused child writes
+        (``pinned_parent_not_current``), and such a failure is no result for
+        the parent to save. An End still in preflight refuses them too but
+        may abort, so the host reads the lifecycle now and only an authorized
+        retirement of this exact life counts.
+        """
+
+        if self._left_to_retirement:
+            return True
+        probe = getattr(self.host, "retirement_authorized", None)
+        if not callable(probe):
+            return False
+        try:
+            return (await probe()) is True
+        except Exception:
+            return False
 
     async def _run_foreground(self, call: SubagentCall) -> str:
         key = self._key(call)
@@ -969,10 +994,10 @@ class SubagentRuntime:
                 except Exception:  # pragma: no cover - best effort
                     logger.warning("subagent %s: close failed", handle, exc_info=True)
 
-        if self._foreground_retired:
-            # Stopped by a person's End (``leave_to_retirement``), or finished
-            # just as it came: no report is spilled and no row written, as no
-            # authority remains for them. The retirement ends a running row
+        if self._left_to_retirement:
+            # Stopped by ``leave_to_retirement``, or finished just as it came:
+            # no report is spilled and no row written, as no authority remains
+            # for them. The retirement ends a running row
             # ``cancelled:parent_retired`` (D4) and Resume answers the call.
             raise _LeftForSuccessor()
         if self._foreground_ends_for_successor and (
@@ -1080,7 +1105,29 @@ class SubagentRuntime:
         concrete child thread and generation.  Null/best-effort ledgers are
         therefore refused here even though foreground U3 delegation continues
         to tolerate them.
+
+        Once the runtime is left to an authorized retirement, or the call
+        failed because such a retirement took the parent's authority, the
+        call returns nothing, as a foreground one: its refusal is no result
+        for the parent to save, and the termination cancels the turn.
         """
+        try:
+            answer = await self._run_background(call)
+        except Exception:
+            if not await self._retired_by_orchestrator():
+                raise
+        else:
+            if not self._left_to_retirement:
+                return answer
+        # Counted like a held foreground call (``foreground_held_for_
+        # successor``).
+        self._foreground_in_progress += 1
+        try:
+            await self._await_successor_cancellation(call)
+        finally:
+            self._foreground_in_progress -= 1
+
+    async def _run_background(self, call: SubagentCall) -> str:
         key = self._key(call)
         if key is not None:
             record = self._records.get(key)
@@ -2569,7 +2616,7 @@ class SubagentRuntime:
             # the runtime so the same exact life can retry quiescence or resume
             # after a proven-uncommitted Begin. Explicit authority-loss paths
             # call ``abandon`` themselves; a retirement the orchestrator
-            # authorized for this life calls ``leave_to_retirement``.
+            # authorized for this life goes to ``leave_to_retirement``.
             raise RuntimeError(
                 "subagent quiesce cannot prove exact settlement authority"
             )
@@ -2744,12 +2791,13 @@ class SubagentRuntime:
     async def leave_to_retirement(self, reason: str = "parent retired") -> None:
         """Leave every child to the parent's authorized retirement (D4).
 
-        A person's End authorizes the pinned retirement before the runtime
-        hears of it, and the token it installs revokes, for good, the parent
-        authority every child write needs: ``quiesce`` can then settle
-        neither a live child nor a pending receipt. The termination calls
-        this instead, and only with the orchestrator's authorization of this
-        exact life in hand.
+        A retirement the orchestrator authorizes itself (a person's End, an
+        Officer decommission, the idle stand-down) installs its token before
+        the runtime hears of it, which revokes, for good, the parent authority
+        every child write needs: ``quiesce`` can then settle neither a live
+        child nor a pending receipt. The termination calls this instead, and
+        only with the orchestrator's authorization of this exact life in
+        hand.
 
         Nothing is written. Running children are stopped and their rows stay
         running, for the retirement to end ``cancelled:parent_retired``; a
@@ -2760,12 +2808,13 @@ class SubagentRuntime:
         and every foreground call in progress is held. The runtime is never
         reused (``resume`` refuses it).
         """
+        # First, so no call can return or write while the lock is awaited.
+        self._foreground_left_for_successor = True
+        self._left_to_retirement = True
         async with self._state_lock:
             self._accepting = False
             self._abandoning = True
             self._persistence_abandoned = True
-        self._foreground_left_for_successor = True
-        self._foreground_retired = True
         await self._background_admissions_drained.wait()
         tasks = [task for task in self._background_tasks.values() if not task.done()]
         for task in tasks:
@@ -3054,6 +3103,9 @@ class SubagentRuntime:
     ) -> None:
         """Commit or retain one strict foreground terminal receipt."""
 
+        if self._left_to_retirement:
+            # No authority remains for the write: the retirement ends the row.
+            return
         try:
             await self._terminal_ledger_update(subagent_id, **fields)
         except BaseException:

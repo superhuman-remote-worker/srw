@@ -454,6 +454,7 @@ _session_attach = SessionAttachCoordinator(
         settlement_authority=lambda *args, **kwargs: (
             _loop_runtime_settlement_authority_current(*args, **kwargs)
         ),
+        retirement_authorized=lambda: _session_termination.retirement_authorized_now(),
         subagent_event_available=lambda *args, **kwargs: (
             _session_subagent_event_available(*args, **kwargs)
         ),

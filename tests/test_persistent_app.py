@@ -3896,11 +3896,12 @@ async def test_child_quiescence_failure_refuses_retirement_begin():
 
 @pytest.mark.parametrize("left", [True, False])
 @pytest.mark.asyncio
-async def test_an_authorized_retirement_leaves_unsettleable_children_to_it(left):
-    """A person's End: the watchdog mirrored the server's token for this exact
-    life, so quiescence cannot prove settlement authority. The children are
-    left to the retirement instead, and Begin is already satisfied; if even
-    that fails, Begin stays refused for the retry (P6 defect 1)."""
+async def test_an_authorized_retirement_leaves_the_children_to_it(left):
+    """The watchdog mirrored the server's token for this exact life (an End,
+    an Officer decommission, the idle stand-down): no authority remains to
+    settle children with, so Begin leaves them to the retirement without
+    trying ``quiesce``. If even that fails, Begin stays refused for the retry
+    (P6 defect 1)."""
     from agent.api import persistent_app as mod
 
     identity = (
@@ -3909,9 +3910,6 @@ async def test_an_authorized_retirement_leaves_unsettleable_children_to_it(left)
         "99999999-9999-4999-8999-999999999999",
     )
     session = _retirement_session_mock()
-    session.quiesce_subagents.side_effect = RuntimeError(
-        "subagent quiesce cannot prove exact settlement authority"
-    )
     if not left:
         session.leave_subagents_to_retirement.side_effect = RuntimeError("unheld")
     close_controls = AsyncMock(return_value=True)
@@ -3936,6 +3934,7 @@ async def test_an_authorized_retirement_leaves_unsettleable_children_to_it(left)
     ):
         assert await mod._session_termination.begin_retirement() is left
 
+    session.quiesce_subagents.assert_not_awaited()
     session.leave_subagents_to_retirement.assert_awaited_once_with(
         "parent session retiring as ended"
     )
@@ -8272,6 +8271,123 @@ class TestThreadStatusWatchdog:
                         await pa._session_termination.thread_status_watchdog(poll_s=0)
         detach.assert_awaited_once()
         exit_fn.assert_called_once()
+
+
+class TestRetirementAuthorizedNow:
+    """A refused child write reads the lifecycle at once with the watchdog's
+    own check (P6 defect 1): an authorized retirement of this exact life is
+    mirrored and wakes the watchdog; an End in preflight is not one."""
+
+    generation = "88888888-8888-4888-8888-888888888888"
+    attach_token = "99999999-9999-4999-8999-999999999999"
+    retirement_token = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    thread_id = "retirement-read-now"
+
+    def _lifecycle(self, *, authorized: bool) -> dict:
+        return {
+            "status": "ending" if authorized else "active",
+            "session_runtime_generation": self.generation,
+            "session_runtime_attach_token": self.attach_token,
+            "runtime_retirement_pending": True,
+            "runtime_retirement_preflight": not authorized,
+            "runtime_retirement_authorized": authorized,
+            "retirement_disposition": "ended" if authorized else None,
+            "retirement_permanent": False,
+            "session_runtime_retirement_token": (
+                self.retirement_token if authorized else None
+            ),
+        }
+
+    def _patches(self, pa, client):
+        owner = pa._session_termination
+        return (
+            patch.object(pa, "_orchestrator_client", client),
+            patch.object(pa, "_stateless_mode", return_value=False),
+            patch.object(pa._session_identity, "_thread_id", self.thread_id),
+            patch.object(pa._session_identity, "_session_generation", self.generation),
+            patch.object(pa._session_identity, "_attach_token", self.attach_token),
+            patch.object(pa._session_identity, "_runtime_contract", True),
+            patch.object(owner, "retirement_admission_identity", None),
+            patch.object(owner, "retirement_admission_disposition", None),
+            patch.object(owner, "retirement_admission_token", None),
+            patch.object(owner, "retirement_admission_permanent", None),
+            patch.object(owner, "lifecycle_poll_wake", None),
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_authorized_retirement_is_mirrored_and_wakes_the_watchdog(self):
+        from contextlib import ExitStack
+
+        from agent.api import persistent_app as pa
+
+        owner = pa._session_termination
+        client = SimpleNamespace(
+            get_thread_lifecycle=AsyncMock(
+                return_value=self._lifecycle(authorized=True)
+            )
+        )
+        with ExitStack() as stack:
+            for patcher in self._patches(pa, client):
+                stack.enter_context(patcher)
+            detach = stack.enter_context(
+                patch.object(owner, "terminate", new=AsyncMock())
+            )
+            exit_fn = stack.enter_context(patch.object(owner, "schedule_exit"))
+            watchdog = asyncio.create_task(owner.thread_status_watchdog(poll_s=3600))
+            await asyncio.sleep(0)
+            assert owner.lifecycle_poll_wake is not None
+
+            assert await owner.retirement_authorized_now() is True
+            assert owner.retirement_admission_identity == (
+                self.thread_id,
+                self.generation,
+                self.attach_token,
+            )
+            assert owner.retirement_admission_token == self.retirement_token
+            # Woken, the watchdog runs the termination now, not in an hour.
+            await asyncio.wait_for(watchdog, 5)
+            detach.assert_awaited_once_with("thread_retirement_authorized")
+            exit_fn.assert_called_once()
+            assert owner.lifecycle_poll_wake is None
+            # Mirrored: a later refusal needs no read.
+            client.get_thread_lifecycle.reset_mock()
+            assert await owner.retirement_authorized_now() is True
+            client.get_thread_lifecycle.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_end_in_preflight_is_not_an_authorized_retirement(self):
+        from contextlib import ExitStack
+
+        from agent.api import persistent_app as pa
+
+        owner = pa._session_termination
+        client = SimpleNamespace(
+            get_thread_lifecycle=AsyncMock(
+                return_value=self._lifecycle(authorized=False)
+            )
+        )
+        with ExitStack() as stack:
+            for patcher in self._patches(pa, client):
+                stack.enter_context(patcher)
+            assert await owner.retirement_authorized_now() is False
+            client.get_thread_lifecycle.assert_awaited_once_with(self.thread_id)
+            assert owner.retirement_admission_identity is None
+            assert owner.retirement_admission_token is None
+            assert owner.runtime_admission_closed() is False
+
+    @pytest.mark.asyncio
+    async def test_a_stateless_runtime_never_reads_it(self):
+        from contextlib import ExitStack
+
+        from agent.api import persistent_app as pa
+
+        client = SimpleNamespace(get_thread_lifecycle=AsyncMock())
+        with ExitStack() as stack:
+            for patcher in self._patches(pa, client):
+                stack.enter_context(patcher)
+            stack.enter_context(patch.object(pa, "_stateless_mode", return_value=True))
+            assert await pa._session_termination.retirement_authorized_now() is False
+        client.get_thread_lifecycle.assert_not_awaited()
 
 
 class TestStartStopWatchdogs:
