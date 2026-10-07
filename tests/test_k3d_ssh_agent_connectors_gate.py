@@ -122,3 +122,115 @@ def test_session_and_detach_scripts_are_valid_bash(monkeypatch):
         assert subprocess.run(["bash", "-n"], input=script, text=True).returncode == 0
     # Nothing was observed, so nothing may pass by default.
     assert not runner.report.passed
+
+
+def _runner():
+    args = gate.build_parser().parse_args(
+        ["--run", "--confirm", gate.LOCAL_CONFIRMATION]
+    )
+    runner = gate.SshAgentConnectorsGate(args)
+    runner.keys = {label: gate.make_key(label) for label in "abcd"}
+    return runner
+
+
+def test_a_regressed_201_on_a_refused_connector_is_still_cleaned_up(monkeypatch):
+    runner = _runner()
+    created = iter(range(100))
+
+    def call(method, path, body=None):
+        if method == "POST":
+            return 201, {"id": f"stray-{next(created)}"}
+        return 204, {}
+
+    deleted: list[str] = []
+
+    def cleanup_call(method, path, body=None):
+        deleted.append(path)
+        return 204, {}
+
+    monkeypatch.setattr(runner.api, "call", call)
+    runner.validation()
+
+    assert not runner.report.passed
+    assert sorted(runner.connectors.values()) == ["stray-0", "stray-1", "stray-2"]
+    monkeypatch.setattr(runner.api, "call", cleanup_call)
+    runner.cleanup()
+    assert sorted(deleted) == [
+        "/api/datasources/stray-0",
+        "/api/datasources/stray-1",
+        "/api/datasources/stray-2",
+    ]
+
+
+def test_the_alias_host_is_part_of_validation(monkeypatch):
+    runner = _runner()
+    bodies: list[dict] = []
+
+    def call(method, path, body=None):
+        bodies.append(body)
+        return 400, {"detail": "refused passphrase"}
+
+    monkeypatch.setattr(runner.api, "call", call)
+    runner.validation()
+
+    assert runner.report.passed
+    assert not runner.connectors
+    assert any(
+        (body.get("config") or {}).get("host", "").lower().startswith("srw-repo-")
+        for body in bodies
+    )
+
+
+@pytest.mark.parametrize(
+    ("rc", "output", "count"),
+    [
+        (0, "ssh-agents=0", 0),
+        (0, "noise\nssh-agents=2", 2),
+        (0, "", None),
+        (0, "0", None),
+        (1, "ssh-agents=0", None),
+        (126, "", None),
+    ],
+)
+def test_the_end_count_needs_a_clean_exit_and_an_answer(rc, output, count):
+    assert gate.ssh_agent_count(rc, output) == count
+
+
+def test_the_end_count_script_counts_from_proc():
+    result = subprocess.run(
+        ["bash", "-s"], input=gate.COUNT_SSH_AGENTS, text=True, capture_output=True
+    )
+    assert result.returncode == 0
+    assert gate.ssh_agent_count(result.returncode, result.stdout) is not None
+
+
+@pytest.mark.parametrize("pods_after", [[], [{"metadata": {"name": "pod"}}]])
+def test_end_fails_when_the_workspace_exec_fails(monkeypatch, pods_after):
+    runner = _runner()
+    runner.thread = "00000000-0000-4000-8000-000000000001"
+    listings = iter([[{"metadata": {"name": "pod"}}], pods_after])
+    monkeypatch.setattr(runner.api, "ok", lambda *a, **k: {})
+    monkeypatch.setattr(gate, "sql", lambda query: "none")
+    monkeypatch.setattr(gate.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        gate, "command", lambda args, **k: gate.json.dumps({"items": next(listings)})
+    )
+    monkeypatch.setattr(runner, "ws", lambda pod, script, check=True: (1, ""))
+
+    runner.end()
+
+    # A vanished workspace is a pass; a live one that did not answer is not.
+    assert runner.report.passed is (not pods_after)
+
+
+@pytest.mark.parametrize(
+    ("origin", "alias"),
+    [
+        ("ssh://srw-repo-" + "a" * 32 + "/srw/r.git", "srw-repo-" + "a" * 32),
+        ("srw-repo-" + "b" * 32 + ":srw/r.git", "srw-repo-" + "b" * 32),
+        ("ssh://git@gitea:2222/srw/r.git", None),
+        ("ssh://srw-repo-" + "a" * 32 + "/srw/other.git", None),
+    ],
+)
+def test_origin_alias_accepts_both_url_forms(origin, alias):
+    assert gate.origin_alias(origin, owner="srw", repo="r") == alias

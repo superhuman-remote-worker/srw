@@ -17,13 +17,15 @@ four connectors that point at Gitea's SSH endpoint as if it were GitHub:
 
 Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
 
-  validation  an injected host and a passphrase key are refused with 400
+  validation  an injected host, an identity-alias host (srw-repo-...) and a
+              passphrase key are refused with 400; anything created anyway
+              is recorded first, so cleanup deletes it
   test-pin    Test on A reports Gitea's host key; pinning it is accepted
   no-key      no "PRIVATE KEY" and no gate key body anywhere under the
               workspace home; no legacy ~/.ssh/repo_* file
   one-key     every socket in ~/.ssh/srw-managed/sockets holds exactly one
               key, and A, B, C, D are each held by their own socket
-  clone-push  repos a and b are cloned from ssh://srw-repo-<slug>/...; a
+  clone-push  repos a and b are cloned through srw-repo-<slug> aliases; a
               fetch works in each and a push from a lands in Gitea
   same-host   two deploy keys on one host both work, and alias A cannot read
               repo b (each alias offers only its own key)
@@ -34,7 +36,8 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
   checkpoint  no gate key body in the LangGraph checkpoint tables (the job)
   detach      after B is detached (stateless: applied at the next attach)
               B's agent and config are gone and A still fetches
-  end         after End the workspace holds no ssh-agent process
+  end         after End the workspace holds no ssh-agent process (counted
+              from /proc; a failed exec or no answer is a FAIL, not zero)
   snapshot    no gate key body in the thread's S3 snapshot objects
 
 Run with the repository venv on the k3d-srw cluster, alone (no other gate or
@@ -418,7 +421,7 @@ class Report:
 PLAN = [
     "preflight: k3d-srw context, served C1 bytes, Gitea and Keycloak reachable",
     "fixture: 3 Gitea repos, 4 ed25519 deploy/connector keys (stdin only)",
-    "validation: injected host and passphrase key are refused (400)",
+    "validation: injected host, alias host and passphrase key are refused (400)",
     "connectors: A (pinned via Test), B (unpinned, same host), C (ssh_key), D (wrong pin)",
     "session: stateless sandbox session with A, B, C, D; one turn",
     "workspace: no-key, one-key, clone-push, same-host, ssh-key, wrong-pin, include",
@@ -429,6 +432,35 @@ PLAN = [
     "snapshot: no key body in threads/<id>/ (and jobs/<id>/) objects",
     "cleanup: end session, cancel+delete job, delete connectors and repos",
 ]
+
+
+# Counts from /proc, so a missing ps cannot read as "zero agents"; the
+# trailing marker line is the only output that counts as an answer.
+COUNT_SSH_AGENTS = (
+    "n=0\n"
+    "for f in /proc/[0-9]*/comm; do\n"
+    '  IFS= read -r c < "$f" 2>/dev/null || continue\n'
+    '  [ "$c" = ssh-agent ] && n=$((n + 1))\n'
+    "done\n"
+    'echo "ssh-agents=$n"\n'
+)
+
+
+def ssh_agent_count(rc: int, output: str) -> int | None:
+    """The count ``COUNT_SSH_AGENTS`` printed, or None when it did not answer."""
+    if rc != 0:
+        return None
+    lines = output.strip().splitlines()
+    match = re.fullmatch(r"ssh-agents=([0-9]+)", lines[-1]) if lines else None
+    return int(match.group(1)) if match else None
+
+
+def origin_alias(origin: str, *, owner: str, repo: str) -> str | None:
+    """The identity alias in a clone origin, either URL form, or None."""
+    alias = r"(srw-repo-[0-9a-f]{32})"
+    path = rf"{re.escape(owner)}/{re.escape(repo)}\.git"
+    match = re.fullmatch(rf"ssh://{alias}/{path}|{alias}:{path}", origin)
+    return (match.group(1) or match.group(2)) if match else None
 
 
 class SshAgentConnectorsGate:
@@ -599,29 +631,50 @@ class SshAgentConnectorsGate:
         self.connectors[label] = str(created["id"])
         return self.connectors[label]
 
-    def validation(self) -> None:
-        encrypted = make_key("encrypted", passphrase=b"gate-passphrase")
-        status, body = self.api.call(
+    def attempt_connector(self, label: str, body: dict[str, Any]) -> tuple[int, Any]:
+        """POST a connector that should be refused; record it if it was not.
+
+        The id is recorded before anyone looks at the status code, so a
+        regression that answers 201 still leaves a connector cleanup deletes.
+        """
+        status, parsed = self.api.call(
             "POST",
             "/api/datasources",
+            {"name": f"{self.gate_id} {label}", "scope_mode": "all", **body},
+        )
+        if isinstance(parsed, dict) and parsed.get("id"):
+            self.connectors[label] = str(parsed["id"])
+        return status, parsed
+
+    def validation(self) -> None:
+        encrypted = make_key("encrypted", passphrase=b"gate-passphrase")
+        key = {"files": [{"contents": self.keys["c"].private_key}]}
+        status, _body = self.attempt_connector(
+            "refused-host",
             {
-                "name": f"{self.gate_id} refused-host",
                 "type": "ssh_key",
-                "scope_mode": "all",
                 "config": {"host": "gitea\n  ProxyCommand sh -c id"},
-                "credentials": {"files": [{"contents": self.keys["c"].private_key}]},
+                "credentials": key,
             },
         )
         self.report.check(
             "validation: injected host refused", status == 400, f"HTTP {status}"
         )
-        status, body = self.api.call(
-            "POST",
-            "/api/datasources",
+        status, _body = self.attempt_connector(
+            "refused-alias",
             {
-                "name": f"{self.gate_id} refused-passphrase",
                 "type": "ssh_key",
-                "scope_mode": "all",
+                "config": {"host": "SRW-REPO-" + "0" * 32},
+                "credentials": key,
+            },
+        )
+        self.report.check(
+            "validation: identity-alias host refused", status == 400, f"HTTP {status}"
+        )
+        status, body = self.attempt_connector(
+            "refused-passphrase",
+            {
+                "type": "ssh_key",
                 "credentials": {"files": [{"contents": encrypted.private_key}]},
             },
         )
@@ -747,18 +800,13 @@ class SshAgentConnectorsGate:
             check=False,
         )
         lines = origins.splitlines()
-        cloned = (
-            rc == 0
-            and len(lines) == 2
-            and all(
-                re.fullmatch(
-                    rf"ssh://srw-repo-[0-9a-f]{{32}}/{owner}/{name}\.git", line
-                )
-                for line, name in zip(lines, (a, b))
-            )
-        )
+        matches = [
+            origin_alias(line, owner=owner, repo=name)
+            for line, name in zip(lines, (a, b))
+        ]
+        cloned = rc == 0 and len(lines) == 2 and all(matches)
         self.report.check("clone-push: cloned through aliases", cloned, origins)
-        alias_a = lines[0].split("/")[2] if cloned else "srw-repo-unknown"
+        alias_a = matches[0] if cloned else "srw-repo-unknown"
 
         rc, _out = self.ws(
             pod,
@@ -789,7 +837,7 @@ class SshAgentConnectorsGate:
         )
         rc, _out = self.ws(
             pod,
-            f"GIT_TERMINAL_PROMPT=0 git ls-remote ssh://{alias_a}/{owner}/{b}.git "
+            f"GIT_TERMINAL_PROMPT=0 git ls-remote {alias_a}:{owner}/{b}.git "
             ">/dev/null 2>&1\n",
             check=False,
         )
@@ -904,11 +952,19 @@ class SshAgentConnectorsGate:
             return
         time.sleep(10)
         pod = pods[0]["metadata"]["name"]
-        _rc, agents = self.ws(
-            pod, "ps -eo comm= | grep -cx ssh-agent || true\n", check=False
-        )
+        rc, out = self.ws(pod, COUNT_SSH_AGENTS, check=False)
+        if rc != 0:
+            remaining = json.loads(
+                command(K + ["get", "pods", "-l", selector, "-o", "json"])
+            )["items"]
+            if not remaining:
+                self.report.check("end: no ssh-agent left (workspace deleted)", True)
+                return
+        count = ssh_agent_count(rc, out)
         self.report.check(
-            "end: no ssh-agent left", agents.strip() in ("", "0"), f"{agents} agents"
+            "end: no ssh-agent left",
+            count == 0,
+            f"exit {rc}; {'unreadable' if count is None else count} agents",
         )
 
     def snapshot(self) -> None:
