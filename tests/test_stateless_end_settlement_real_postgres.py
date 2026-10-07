@@ -191,6 +191,160 @@ async def test_physical_soft_end_keeps_retention_truth_until_permanent_reclaim(
 
 
 @pytest.mark.asyncio
+async def test_soft_end_resume_end_then_pending_permanent_cleanup_settles_without_delete_replay(
+    database, actor, monkeypatch
+):
+    """A 503 after the second End leaves one fenced background deletion owner."""
+    from orchestrator.services.session_provisioner import ensure_session_workspace
+
+    case = await initial.workspace_attempt(
+        database, actor, monkeypatch, first_wait="ready"
+    )
+    await database.execute(
+        "INSERT INTO run_queue(unit_id,unit_kind,state,lease_token) "
+        "VALUES($1::uuid,'session_turn','done',2)",
+        case.thread_id,
+    )
+
+    async def residents(thread, *, terminal_token, **_):
+        return protocol.ResidentRetirementProof(
+            authority=protocol.resolve_shell_retirement_authority(
+                thread, terminal_token=terminal_token
+            )
+        )
+
+    async def shell(thread, *, terminal_token, **_):
+        return protocol.resolve_shell_retirement_authority(
+            thread, terminal_token=terminal_token
+        )
+
+    monkeypatch.setattr(protocol, "retire_stateless_workspace_residents", residents)
+    monkeypatch.setattr(protocol, "retire_stateless_session_shell", shell)
+    monkeypatch.setattr(protocol, "verify_stateless_workspace_residents_retired", shell)
+    operations = ThreadRetirementOperations(
+        replace(
+            initial.retirement_dependencies(database, case),
+            build_agent_cloud_mount=AsyncMock(return_value=None),
+        )
+    )
+    assert await operations.end_thread_flow(
+        case.thread_id, case.before, permanent=False, force=False
+    ) == {"status": "ended"}
+    original_uid = case.pod_uid
+    retained_pvc_uid = case.pvc_uid
+    assert case.cluster.objects["pvc"].metadata.uid == retained_pvc_uid
+
+    assert await initial.resume_case(database, case, actor)
+    wait_for_ready = case.provisioner._wait_for_ready
+
+    async def ready_after_resume(*args, **kwargs):
+        case.cluster.become_ready()
+        return await wait_for_ready(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(case.provisioner, "_wait_for_ready", ready_after_resume)
+        await ensure_session_workspace(
+            case.thread_id,
+            db=database,
+            provisioner=case.provisioner,
+            suspension=case.suspension,
+        )
+    resumed_uid = case.cluster.objects["pod"].metadata.uid
+    assert resumed_uid != original_uid
+    assert case.cluster.objects["pvc"].metadata.uid == retained_pvc_uid
+
+    assert await operations.end_thread_flow(
+        case.thread_id,
+        await database.get_thread(case.thread_id),
+        permanent=False,
+        force=False,
+    ) == {"status": "ended"}
+    assert case.cluster.objects["pvc"].metadata.uid == retained_pvc_uid
+
+    async def cleanup_still_pending(*args, **kwargs):
+        return None
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            case.provisioner,
+            "reconcile_workspace_cleanup_intent",
+            cleanup_still_pending,
+        )
+        with pytest.raises(HTTPException) as refusal:
+            await operations.end_thread_flow(
+                case.thread_id,
+                await database.get_thread(case.thread_id),
+                permanent=True,
+                force=False,
+            )
+    assert refusal.value.status_code == 503
+    assert refusal.value.detail == "Settled workspace permanent cleanup is incomplete"
+    assert await database.get_thread(case.thread_id) is not None
+    assert case.cluster.objects["pvc"].metadata.uid == retained_pvc_uid
+    pending_reclaim = await database.fetch(
+        "SELECT runtime_incarnation,result_kind "
+        "FROM managed_repository_workspace_cleanup_intents "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+        "AND resource_policy='terminal_reclaim'",
+        case.thread_id,
+    )
+    assert len(pending_reclaim) == 1
+    assert str(pending_reclaim[0]["runtime_incarnation"]) == resumed_uid
+    assert pending_reclaim[0]["result_kind"] is None
+
+    candidates = await database.list_retryable_stateless_end_settlements()
+    assert [str(candidate["id"]) for candidate in candidates] == [case.thread_id]
+    assert (
+        metadata(candidates[0])["_stateless_workspace_retirement_settled"]["permanent"]
+        is True
+    )
+    dependencies = SimpleNamespace(
+        store=database, thread_retirement_operations=lambda: operations
+    )
+    assert await detector.retry_stateless_end_settlement(
+        candidates[0], dependencies=dependencies
+    )
+    assert await database.get_thread(case.thread_id) is None
+    assert case.cluster.objects == {}
+    assert case.cluster.pod_create_calls == 2
+    assert (
+        await database.fetch(
+            "SELECT 1 FROM run_queue WHERE unit_id=$1::uuid", case.thread_id
+        )
+        == []
+    )
+    creations = await database.fetch(
+        "SELECT runtime_incarnation,result_kind "
+        "FROM managed_repository_workspace_creation_reservations "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid",
+        case.thread_id,
+    )
+    assert len(creations) == 2
+    assert {str(row["runtime_incarnation"]) for row in creations} == {
+        original_uid,
+        resumed_uid,
+    }
+    assert all(row["result_kind"] == "settled" for row in creations)
+    cleanup = await database.fetch(
+        "SELECT runtime_incarnation,resource_policy,target_disposition,result_kind "
+        "FROM managed_repository_workspace_cleanup_intents "
+        "WHERE owner_kind='thread' AND owner_id=$1::uuid",
+        case.thread_id,
+    )
+    assert len(cleanup) == 4
+    assert {str(row["runtime_incarnation"]) for row in cleanup} == {
+        original_uid,
+        resumed_uid,
+    }
+    assert {row["resource_policy"] for row in cleanup} == {
+        "preserve",
+        "terminal_reclaim",
+    }
+    assert all(row["target_disposition"] == "deleted" for row in cleanup)
+    assert all(row["result_kind"] == "settled" for row in cleanup)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "drift",
     [

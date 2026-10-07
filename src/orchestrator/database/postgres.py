@@ -45156,7 +45156,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             async with conn.transaction():
                 thread = await conn.fetchrow(
-                    "SELECT id, status::text AS status, execution_lane, runtime_generation, metadata "
+                    "SELECT id, status::text AS status, execution_lane, runtime_generation, metadata, events_epoch "
                     "FROM threads WHERE id = $1::uuid FOR UPDATE",
                     thread_id,
                 )
@@ -45208,7 +45208,7 @@ class PostgresDB:
                         "settled stateless retirement retained live claim authority"
                     )
                 queue = await conn.fetchrow(
-                    "SELECT unit_kind, state, lease_token, leased_by, last_leased_by, "
+                    "SELECT unit_kind, state, park_reason, lease_token, leased_by, last_leased_by, "
                     "       leased_until, attempts_since_completion, input_seq, "
                     "       consumed_seq, control_input_seq, control_consumed_seq, "
                     "       interrupt_admission_lease_token, "
@@ -45412,9 +45412,42 @@ class PostgresDB:
                     )
                 ):
                     raise RuntimeError("retained startup retirement admission changed")
+                # An exact successor-admission park is an unknown tool result,
+                # not runnable input. Normal End may retire that held runtime
+                # without pretending the input or command completed. Require
+                # the same current-epoch/token durable park, not its reason
+                # string alone; every other busy/claim-loss gate still applies.
+                held_tool_input = bool(
+                    pending_input
+                    and queue is not None
+                    and queue_state == "parked"
+                    and int(queue["lease_token"] or 0) > 0
+                    and queue["park_reason"] == "loop_died_after_tool_effect"
+                    and queue["leased_by"] is None
+                    and queue["leased_until"] is None
+                    and active_claim is None
+                    and not claim_losses
+                    and loss_hold is None
+                    and await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM thread_events "
+                        "WHERE thread_id=$1::uuid AND epoch=$2::integer "
+                        "AND kind='turn.parked' "
+                        "AND payload->'lease_token'=to_jsonb($3::bigint) "
+                        "AND payload->>'reason'='loop_died_after_tool_effect' "
+                        "AND payload->>'release_reason'='unresolved_predecessor_tool' "
+                        "AND payload->'retryable'='false'::jsonb)",
+                        thread_id,
+                        thread["events_epoch"],
+                        int(queue["lease_token"]),
+                    )
+                )
                 if not force and (
                     queue_state == "leased"
-                    or (pending_input and retained_startup_attention is None)
+                    or (
+                        pending_input
+                        and retained_startup_attention is None
+                        and not held_tool_input
+                    )
                     or pending_control
                     or pending_interrupt
                     or pending_permission

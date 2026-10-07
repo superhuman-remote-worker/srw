@@ -12,7 +12,7 @@ from dataclasses import replace
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -495,6 +495,24 @@ async def test_answered_watermark_skip_does_no_model_or_tool_admission(db, monke
 
 
 @pytest.mark.asyncio
+async def test_normal_end_can_retire_parked_debt_without_fabricated_result(
+    db, monkeypatch
+):
+    thread, claim = await seed(db)
+    ex, pa = executor(db, monkeypatch)
+    assert await ex._admit_session_tool_history(pa, claim) is False
+    before = await rows(db, thread)
+    result = await db.begin_stateless_thread_workspace_retirement(
+        str(thread), force=False
+    )
+    assert result["state"] == "closed"
+    after = await rows(db, thread)
+    assert after["queue"]["state"] == "done"
+    assert after["queue"]["consumed_seq"] == before["queue"]["consumed_seq"]
+    assert after["messages"] == before["messages"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "calls",
     [
@@ -880,3 +898,273 @@ async def test_pre_activation_cancellation_never_uses_new_claim_shutdown_release
     ex._fetch_bundle.assert_not_awaited()
     if stage == "prior_push":
         pa._hand_off_cloud_push.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    [
+        "event_missing",
+        "event_epoch",
+        "event_token",
+        "event_token_string",
+        "event_retryable",
+        "event_reason",
+        "event_release",
+        "event_payload",
+        "token_zero",
+        "leased",
+        "active_claim",
+        "loss_ledger",
+        "control",
+        "interrupt",
+        "permission",
+    ],
+)
+async def test_normal_end_requires_exact_current_park_and_no_other_obligation(
+    db, monkeypatch, change
+):
+    thread, claim = await seed(db)
+    ex, pa = executor(db, monkeypatch)
+    assert await ex._admit_session_tool_history(pa, claim) is False
+    async with db.acquire() as conn:
+        if change.startswith("event_"):
+            if change == "event_missing":
+                await conn.execute(
+                    "DELETE FROM thread_events WHERE thread_id=$1", thread
+                )
+            elif change == "event_epoch":
+                await conn.execute(
+                    "UPDATE threads SET events_epoch=events_epoch+1 WHERE id=$1", thread
+                )
+            else:
+                payload = json.loads(
+                    await conn.fetchval(
+                        "SELECT payload FROM thread_events WHERE thread_id=$1", thread
+                    )
+                )
+                key, value = {
+                    "event_token": ("lease_token", claim.lease_token + 1),
+                    "event_token_string": ("lease_token", str(claim.lease_token)),
+                    "event_retryable": ("retryable", "false"),
+                    "event_reason": ("reason", "attach_failed"),
+                    "event_release": ("release_reason", "loop_died"),
+                    "event_payload": (None, []),
+                }[change]
+                if key is None:
+                    payload = value
+                else:
+                    payload[key] = value
+                await conn.execute(
+                    "UPDATE thread_events SET payload=$2::jsonb WHERE thread_id=$1",
+                    thread,
+                    json.dumps(payload),
+                )
+        elif change == "token_zero":
+            await conn.execute(
+                "UPDATE run_queue SET lease_token=0 WHERE unit_id=$1", thread
+            )
+            await conn.execute(
+                "UPDATE thread_events SET payload=jsonb_set(payload,'{lease_token}','0') WHERE thread_id=$1",
+                thread,
+            )
+        elif change == "leased":
+            await conn.execute(
+                "UPDATE run_queue SET state='leased',leased_by=$2,leased_until=now()+interval '1 minute' WHERE unit_id=$1",
+                thread,
+                POD,
+            )
+        elif change == "active_claim":
+            await conn.execute(
+                "UPDATE threads SET metadata=$2::jsonb WHERE id=$1",
+                thread,
+                json.dumps(
+                    {
+                        "_stateless_active_claim": {
+                            "lease_token": claim.lease_token,
+                            "pod": POD,
+                            "pod_uid": POD_UID,
+                        }
+                    }
+                ),
+            )
+        elif change == "loss_ledger":
+            # Reaper-shaped old active claimant + unresolved loss ledger,
+            # queue/hold bumped to its successor. Even a matching park event
+            # cannot stand in for exact physical old-claimant quiescence.
+            successor_token = claim.lease_token + 1
+            await conn.execute(
+                "UPDATE run_queue SET lease_token=$2 WHERE unit_id=$1",
+                thread,
+                successor_token,
+            )
+            await conn.execute(
+                "UPDATE thread_events SET payload=jsonb_set(payload,'{lease_token}',to_jsonb($2::bigint)) WHERE thread_id=$1",
+                thread,
+                successor_token,
+            )
+            await conn.execute(
+                "UPDATE threads SET metadata=$2::jsonb WHERE id=$1",
+                thread,
+                json.dumps(
+                    {
+                        "_stateless_active_claim": {
+                            "lease_token": claim.lease_token,
+                            "pod": POD,
+                            "pod_uid": POD_UID,
+                        },
+                        "_stateless_claim_losses": {
+                            str(claim.lease_token): {
+                                "pod": POD,
+                                "pod_uid": POD_UID,
+                                "quiesced": False,
+                            }
+                        },
+                        "_stateless_claim_loss_hold": {
+                            "lease_token": successor_token,
+                            "attempts_since_completion": 0,
+                            "intended_state": "parked",
+                            "park_reason": "loop_died_after_tool_effect",
+                        },
+                    }
+                ),
+            )
+        elif change == "control":
+            await conn.execute(
+                "UPDATE run_queue SET control_input_seq=1,control_consumed_seq=0 WHERE unit_id=$1",
+                thread,
+            )
+        elif change == "permission":
+            await conn.execute(
+                "INSERT INTO thread_permission_requests(id,thread_id,tool_call_id,tool_name) VALUES($1,$2,'pending','run_command')",
+                uuid4(),
+                thread,
+            )
+        else:
+            await conn.execute(
+                "INSERT INTO thread_interrupt_requests(id,thread_id,client_request_id,target_turn_id,accepted_lease_token,accepted_leased_by,requested_by) VALUES($1,$2,$3,1,$4,$5,'user')",
+                uuid4(),
+                thread,
+                uuid4(),
+                claim.lease_token,
+                POD,
+            )
+    before = await rows(db, thread)
+    assert (
+        await db.begin_stateless_thread_workspace_retirement(str(thread), force=False)
+    )["state"] == "busy"
+    assert await rows(db, thread) == before
+
+
+@pytest.mark.asyncio
+async def test_later_input_event_does_not_make_same_epoch_park_stale(db, monkeypatch):
+    from shared.event_journal import append_system_frame
+
+    thread, claim = await seed(db)
+    ex, pa = executor(db, monkeypatch)
+    assert await ex._admit_session_tool_history(pa, claim) is False
+    async with db.acquire() as conn:
+        fresh = await conn.fetchval(
+            "INSERT INTO thread_messages(id,thread_id,role,content,turn_number) VALUES($1,$2,'human','Keep this pending',2) RETURNING seq",
+            uuid4(),
+            thread,
+        )
+        await record_input_seq(
+            conn, unit_id=thread, unit_kind=UNIT_KIND_SESSION_TURN, input_seq=fresh
+        )
+        await append_system_frame(
+            conn, thread_id=str(thread), kind="input.accepted", payload={}
+        )
+    assert (
+        await db.begin_stateless_thread_workspace_retirement(str(thread), force=False)
+    )["state"] == "closed"
+
+
+@pytest.mark.asyncio
+async def test_physical_end_retains_pvc_and_resume_pending_input_parks_again(
+    db, monkeypatch
+):
+    from orchestrator.services import stateless_session_retirement as protocol
+    from orchestrator.services.session_provisioner import ensure_session_workspace
+    from tests import test_stateless_failed_start_end_real_postgres as lifecycle
+
+    db.manifest_runtime_image = "test.invalid/srw:installed"
+    actor = await db.fetchrow(
+        "INSERT INTO users(display_name,is_approved,is_admin) VALUES('Held command owner',true,true) RETURNING *"
+    )
+    case = await lifecycle.workspace_attempt(db, actor, monkeypatch, first_wait="ready")
+    thread, claim = await seed(db, thread=UUID(case.thread_id))
+    ex, pa = executor(db, monkeypatch)
+    assert await ex._admit_session_tool_history(pa, claim) is False
+    before = await rows(db, thread)
+    assert before["thread"]["events_epoch"] == case.before["events_epoch"] + 1
+    assert json.loads(before["thread"]["metadata"]) == lifecycle.metadata(case.before)
+
+    # SSH resident/shell acknowledgement is the only external protocol fake;
+    # the actual End funnel owns DB retirement, K8s finalizers and process zero.
+    async def shell(row, *, terminal_token, **kwargs):
+        return protocol.resolve_shell_retirement_authority(
+            row, terminal_token=terminal_token
+        )
+
+    async def residents(row, *, terminal_token, **kwargs):
+        return protocol.ResidentRetirementProof(
+            authority=await shell(row, terminal_token=terminal_token)
+        )
+
+    monkeypatch.setattr(protocol, "retire_stateless_workspace_residents", residents)
+    monkeypatch.setattr(protocol, "retire_stateless_session_shell", shell)
+    monkeypatch.setattr(protocol, "verify_stateless_workspace_residents_retired", shell)
+    dependencies = replace(
+        lifecycle.retirement_dependencies(db, case),
+        build_agent_cloud_mount=AsyncMock(return_value=None),
+    )
+    assert await lifecycle.end_thread_flow(
+        case.thread_id,
+        await db.get_thread(case.thread_id),
+        permanent=False,
+        force=False,
+        dependencies=dependencies,
+    ) == {"status": "ended"}
+    ended = await rows(db, thread)
+    assert "pod" not in case.cluster.objects
+    assert case.cluster.objects["pvc"].metadata.uid == case.pvc_uid
+    assert ended["messages"] == before["messages"]
+    assert ended["queue"]["consumed_seq"] == before["queue"]["consumed_seq"]
+    receipts = await db.fetch(
+        "SELECT runtime_incarnation FROM managed_repository_process_zero_receipts WHERE owner_kind='thread' AND owner_id=$1 AND scope='stateless_workspace'",
+        thread,
+    )
+    assert [str(row["runtime_incarnation"]) for row in receipts] == [case.pod_uid]
+    assert await lifecycle.resume_case(db, case, actor) == {
+        "status": "created",
+        "thread_id": case.thread_id,
+    }
+    resumed = await rows(db, thread)
+    assert resumed["queue"]["state"] == "queued"
+    assert resumed["queue"]["input_seq"] == before["queue"]["input_seq"]
+    assert resumed["queue"]["consumed_seq"] == before["queue"]["consumed_seq"]
+    await ensure_session_workspace(
+        case.thread_id, db=db, provisioner=case.provisioner, suspension=case.suspension
+    )
+    assert case.cluster.pod_create_calls == 2
+    assert case.cluster.objects["pvc"].metadata.uid == case.pvc_uid
+    successor = await claim_unit(
+        db,
+        unit_kind=UNIT_KIND_SESSION_TURN,
+        pod_name=POD,
+        prefer_unit_id=thread,
+        affinity_grace_seconds=0,
+    )
+    assert successor is not None and successor.lease_token > claim.lease_token
+    assert await ex._admit_session_tool_history(pa, successor) is False
+    after = await rows(db, thread)
+    assert after["queue"]["state"] == "parked"
+    assert after["messages"] == before["messages"]
+    assert after["events"][-1]["kind"] == "turn.parked"
+    assert after["events"][-1]["epoch"] == after["thread"]["events_epoch"]
+    assert (
+        json.loads(after["events"][-1]["payload"])["lease_token"]
+        == successor.lease_token
+    )
+    ex._fetch_bundle.assert_not_awaited()
