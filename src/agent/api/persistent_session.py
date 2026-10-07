@@ -898,28 +898,30 @@ class PersistentSession:
         )
         del managed_repository_credentials
         from shared.runtime.core.workspace_ssh_identity import (
-            IDENTITY_READY,
             materialize_workspace_ssh_identities,
             prune_workspace_ssh_identities,
         )
 
         # Per-identity and never fatal: a broken connector key degrades only
-        # its own connector (the clone at attach skips it).
-        self.workspace_ssh_identity_status = materialize_workspace_ssh_identities(
-            workspace_ssh_identities, workspace_backend
+        # its own connector (the clone at attach skips it). Off the event
+        # loop: each identity is a blocking round trip to the workspace.
+        self.workspace_ssh_identity_status = await asyncio.to_thread(
+            materialize_workspace_ssh_identities,
+            workspace_ssh_identities,
+            workspace_backend,
         )
         del workspace_ssh_identities
         # A session owns its workspace. A connector no longer delivered was
         # detached (a stateless session applies connector edits here, at its
         # next attach, never through the live detach), so its agent goes.
+        # Every DELIVERED identity is kept, loaded or not: one whose load
+        # failed this time must not cost a healthy resident agent, or its
+        # learned host key, that an earlier attach left.
         if getattr(
             workspace_backend, "supports_shell", False
-        ) and not prune_workspace_ssh_identities(
-            [
-                authority
-                for authority, status in self.workspace_ssh_identity_status.items()
-                if status == IDENTITY_READY
-            ],
+        ) and not await asyncio.to_thread(
+            prune_workspace_ssh_identities,
+            list(self.workspace_ssh_identity_status),
             workspace_backend,
         ):
             logger.warning(

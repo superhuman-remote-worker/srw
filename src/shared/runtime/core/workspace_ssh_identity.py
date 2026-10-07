@@ -724,10 +724,17 @@ def prune_workspace_ssh_identities(
     with a ``known_hosts.d/<slug>`` file, which managed repositories and the
     IDE never write, so a managed agent in the same namespace is never
     touched. Never used for jobs, whose workspace a root and its children
-    share.
+    share. ``keep`` may hold the materializer's placeholder keys for payloads
+    without a valid authority; they name no identity and are ignored.
     """
 
-    keep = sorted({UUID(str(value)).hex for value in keep_authority_ids})
+    kept: set[str] = set()
+    for value in keep_authority_ids:
+        try:
+            kept.add(UUID(str(value)).hex)
+        except (TypeError, ValueError):
+            continue
+    keep = sorted(kept)
     if not getattr(backend, "supports_shell", False):
         return False
     try:

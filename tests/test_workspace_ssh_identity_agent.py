@@ -469,6 +469,29 @@ def test_session_attach_prunes_undelivered_identities_but_never_managed_ones(
     )
 
 
+def test_prune_keeps_a_delivered_identity_whose_reload_failed(home: Path) -> None:
+    """The session keeps every delivered authority, loaded or not."""
+
+    first = _payload()
+    authority = first["authority_id"]
+    again = dict(first, private_key="not a key")
+    backend = _LocalShellBackend(home)
+    assert materialize_workspace_ssh_identities([first], backend) == {
+        authority: "ready"
+    }
+
+    status = materialize_workspace_ssh_identities([again, {"version": 1}], backend)
+    assert status[authority] != "ready"
+    assert len(status) == 2  # plus a placeholder for the authority-less payload
+
+    assert prune_workspace_ssh_identities(list(status), backend)
+    slug = authority.replace("-", "")
+    assert (home / ".ssh" / "srw-managed" / "known_hosts.d" / slug).exists()
+    assert _agent_fingerprints(workspace_ssh_identity_socket(str(home), authority)) == [
+        first["public_key_fingerprint"]
+    ]
+
+
 def test_prune_on_a_fresh_home_is_a_no_op(home: Path) -> None:
     assert prune_workspace_ssh_identities([], _LocalShellBackend(home))
 

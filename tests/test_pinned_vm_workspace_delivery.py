@@ -652,10 +652,16 @@ async def test_ready_vm_payload_carries_connector_ssh_identities(vm_delivery):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("load_ok", [True, False])
 async def test_vm_attach_setup_loads_connector_ssh_identity(
-    vm_attach_setup, monkeypatch, caplog
+    vm_attach_setup, monkeypatch, caplog, load_ok
 ):
-    """The session pops connector keys with the managed bundle and loads them."""
+    """The session pops connector keys with the managed bundle and loads them.
+
+    A delivered identity whose load failed is still kept by the prune: a
+    transient failure must not retire the healthy agent (and the learned
+    host key) an earlier attach left for it.
+    """
     from tests.test_workspace_ssh_identity_agent import _payload
 
     identity = _payload(kind="ssh_key", host=None, port=None, user=None)
@@ -678,6 +684,8 @@ async def test_vm_attach_setup_loads_connector_ssh_identity(
         commands.append(command)
         if secret:
             transferred.append(bytes(secret))
+            # Only the connector identity (it writes known_hosts.d) fails.
+            return load_ok or "known_hosts.d" not in command
         return True
 
     monkeypatch.setattr(RemoteBackend, "execute_with_secret_stdin", secret_transport)
@@ -710,7 +718,11 @@ async def test_vm_attach_setup_loads_connector_ssh_identity(
     assert private_material.encode() in transferred
     assert "private_key" not in identity
     assert private_material not in caplog.text
-    assert session.workspace_ssh_identity_status == {identity["authority_id"]: "ready"}
+    assert session.workspace_ssh_identity_status == {
+        identity["authority_id"]: (
+            "ready" if load_ok else "workspace_ssh_identity_load_failed"
+        )
+    }
     # The attach prunes every connector identity it did not deliver (a
     # stateless session applies a detach here) and keeps the delivered one.
     (prune,) = [command for command in commands if "_srw_keep=" in command]
