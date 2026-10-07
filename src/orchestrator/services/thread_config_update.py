@@ -743,6 +743,22 @@ def _refuse_stateless_upgrade(thread: dict[str, Any]) -> None:
 # retrying must stay possible.
 _RETRYABLE_VM_STATUSES = frozenset({"failed", "aborted"})
 
+# A Session VM upgrade in one of these states is already under way: a second
+# request is a no-op (agent_upgrade_thread_to_vm) and not worth offering.
+_VM_UPGRADE_IN_PROGRESS_STATUSES = frozenset(
+    {
+        "provisioning",
+        "created",
+        "starting",
+        "ssh_pending",
+        "ready",
+        "waiting_golden",
+        "waiting_capacity",
+        "waiting_headscale",
+        "waiting_preparation",
+    }
+)
+
 
 def _upgrade_current_backend(
     thread: dict[str, Any], metadata: Mapping[str, Any]
@@ -851,17 +867,7 @@ async def agent_upgrade_thread_to_vm(
         if raw_vm_ctx is not None and not isinstance(raw_vm_ctx, Mapping):
             raise HTTPException(status_code=409, detail="VM authority is malformed")
         vm_ctx = dict(raw_vm_ctx) if raw_vm_ctx is not None else None
-        if (vm_ctx or {}).get("status") in (
-            "provisioning",
-            "created",
-            "starting",
-            "ssh_pending",
-            "ready",
-            "waiting_golden",
-            "waiting_capacity",
-            "waiting_headscale",
-            "waiting_preparation",
-        ):
+        if (vm_ctx or {}).get("status") in _VM_UPGRADE_IN_PROGRESS_STATUSES:
             return {
                 "status": vm_ctx["status"],
                 "thread_id": thread_id,
@@ -927,6 +933,80 @@ async def agent_upgrade_thread_to_vm(
         "thread_id": thread_id,
         "vm_provisioner_mode": vm_provisioner.mode,
     }
+
+
+VM_PROVISIONING_UNAVAILABLE = "VM workspaces aren't available on this installation."
+VM_UPGRADE_IN_PROGRESS = "A VM upgrade is already in progress."
+
+
+def _refusal_text(exc: HTTPException) -> str:
+    detail = exc.detail
+    if isinstance(detail, Mapping):
+        detail = detail.get("message") or detail.get("code")
+    return str(detail or "This upgrade isn't available.")
+
+
+async def _vm_upgrade_availability(
+    thread: dict[str, Any], dependencies: ThreadConfigUpdateDependencies
+) -> dict[str, Any]:
+    """The VM upgrade's pre-effect refusals, in its order, with no effect."""
+
+    def unavailable(reason: str) -> dict[str, Any]:
+        return {"available": False, "reason": reason}
+
+    try:
+        _refuse_stateless_upgrade(thread)
+        metadata = require_unprotected_workspace_upgrade(thread)
+        await dependencies.enforce_workspace_upgrade_grants(thread, target_tier="vm")
+    except HTTPException as exc:
+        return unavailable(_refusal_text(exc))
+    if not dependencies.vm_provisioner.is_available:
+        return unavailable(VM_PROVISIONING_UNAVAILABLE)
+    vm_ctx = metadata.get("vm")
+    if vm_ctx is not None and not isinstance(vm_ctx, Mapping):
+        return unavailable("VM authority is malformed")
+    if (vm_ctx or {}).get("status") in _VM_UPGRADE_IN_PROGRESS_STATUSES:
+        return unavailable(VM_UPGRADE_IN_PROGRESS)
+
+    from orchestrator.services.workspace_defaults_resolution import (
+        CONTAINER_UPGRADE_UNAVAILABLE,
+        upgrade_record,
+    )
+
+    try:
+        mode, _record = await upgrade_record(
+            dependencies.store,
+            thread.get("user_id"),
+            role="session",
+            project_id=_thread_project_id(thread),
+            current_backend=_upgrade_current_backend(thread, metadata),
+            requested_backend="vm",
+        )
+    except HTTPException as exc:
+        return unavailable(_refusal_text(exc))
+    if mode != "vm":
+        return unavailable(CONTAINER_UPGRADE_UNAVAILABLE)
+    return {"available": True, "reason": None}
+
+
+async def agent_thread_upgrade_availability(
+    request: Request,
+    thread_id: str,
+    *,
+    dependencies: ThreadConfigUpdateDependencies,
+) -> dict[str, Any]:
+    """Body of ``GET /api/agents/threads/{thread_id}/upgrade-availability``.
+
+    Whether a VM upgrade would be accepted right now, by the VM upgrade's own
+    pre-effect refusals; nothing is provisioned or written. The pinned agent
+    asks before it offers an upgrade, so the user never gets an offer that
+    can only fail (stateless upgrade design, decision 1).
+    """
+    await dependencies.require_internal(request)
+    thread = await dependencies.store.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    return {"vm": await _vm_upgrade_availability(thread, dependencies)}
 
 
 async def agent_abort_thread_vm_upgrade(

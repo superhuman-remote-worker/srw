@@ -914,3 +914,112 @@ class TestInternalPatch:
                 dependencies=deps,
             )
         assert exc.value.status_code == 500
+
+
+class TestUpgradeAvailability:
+    @pytest.mark.asyncio
+    async def test_unknown_thread_is_404(self):
+        deps = _deps()
+        deps.store.get_thread = AsyncMock(return_value=None)
+        with pytest.raises(HTTPException) as exc:
+            await tcu.agent_thread_upgrade_availability(
+                MagicMock(), THREAD, dependencies=deps
+            )
+        assert exc.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_virtual_session_can_upgrade_to_a_vm(self):
+        deps = _deps()
+        result = await tcu.agent_thread_upgrade_availability(
+            MagicMock(), THREAD, dependencies=deps
+        )
+        assert result == {"vm": {"available": True, "reason": None}}
+        deps.require_internal.assert_awaited_once()
+        deps.store.merge_thread_vm_context.assert_not_awaited()
+        deps.vm_provisioner.create_thread_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stateless_lane_is_unavailable_before_the_grant_gate(self):
+        deps = _deps()
+        deps.store.get_thread = AsyncMock(
+            return_value=_pinned_thread(execution_lane="stateless")
+        )
+        result = await tcu.agent_thread_upgrade_availability(
+            MagicMock(), THREAD, dependencies=deps
+        )
+        assert result == {
+            "vm": {
+                "available": False,
+                "reason": "Workspace upgrades are not yet supported on the stateless lane",
+            }
+        }
+        deps.enforce_workspace_upgrade_grants.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_protected_session_is_unavailable_with_its_refusal_text(self):
+        deps = _deps()
+        deps.store.get_thread = AsyncMock(
+            return_value=_pinned_thread(metadata={"protected_cloud": True})
+        )
+        result = await tcu.agent_thread_upgrade_availability(
+            MagicMock(), THREAD, dependencies=deps
+        )
+        assert result["vm"]["available"] is False
+        assert result["vm"]["reason"] == (
+            "Protected cloud sessions cannot upgrade or replace their "
+            "Container workspace."
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_refused_grant_is_unavailable_with_the_grant_text(self):
+        deps = _deps()
+        deps.enforce_workspace_upgrade_grants.side_effect = HTTPException(
+            status_code=403, detail="vm_workspace grant denied"
+        )
+        result = await tcu.agent_thread_upgrade_availability(
+            MagicMock(), THREAD, dependencies=deps
+        )
+        assert result == {
+            "vm": {"available": False, "reason": "vm_workspace grant denied"}
+        }
+
+    @pytest.mark.asyncio
+    async def test_an_absent_provisioner_is_unavailable(self):
+        deps = _deps()
+        deps.vm_provisioner.is_available = False
+        result = await tcu.agent_thread_upgrade_availability(
+            MagicMock(), THREAD, dependencies=deps
+        )
+        assert result == {
+            "vm": {
+                "available": False,
+                "reason": "VM workspaces aren't available on this installation.",
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_in_flight_vm_is_unavailable(self):
+        deps = _deps()
+        deps.store.get_thread = AsyncMock(
+            return_value=_pinned_thread(metadata={"vm": {"status": "waiting_capacity"}})
+        )
+        result = await tcu.agent_thread_upgrade_availability(
+            MagicMock(), THREAD, dependencies=deps
+        )
+        assert result == {
+            "vm": {"available": False, "reason": "A VM upgrade is already in progress."}
+        }
+
+    @pytest.mark.asyncio
+    async def test_vm_session_is_unavailable_by_the_tier_rule(self):
+        deps = _deps()
+        deps.store.get_thread = AsyncMock(
+            return_value=_pinned_thread(
+                metadata={"config_override": {"workspace": {"backend": "vm"}}}
+            )
+        )
+        result = await tcu.agent_thread_upgrade_availability(
+            MagicMock(), THREAD, dependencies=deps
+        )
+        assert result["vm"]["available"] is False
+        assert result["vm"]["reason"]  # the tier rule's own refusal text
