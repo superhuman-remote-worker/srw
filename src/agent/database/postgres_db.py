@@ -2570,6 +2570,32 @@ class PostgresDB:
                     runtime_attach_token=runtime_attach_token,
                 )
 
+    async def reserve_stale_pinned_admissions(
+        self,
+        *,
+        thread_id: str,
+        agent_id: str,
+        pod_uid: str,
+        runtime_generation: str,
+        session_runtime_generation: str,
+        runtime_attach_token: str,
+    ) -> Dict[str, List[str]]:
+        """Serve again, settle or park events an earlier process admitted."""
+
+        from shared.persistent_input_delivery import reserve_stale_pinned_admissions
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                return await reserve_stale_pinned_admissions(
+                    conn,
+                    thread_id=thread_id,
+                    agent_id=agent_id,
+                    pod_uid=pod_uid,
+                    runtime_generation=runtime_generation,
+                    session_runtime_generation=session_runtime_generation,
+                    runtime_attach_token=runtime_attach_token,
+                )
+
     async def mark_pinned_input_delivery_queued(
         self,
         *,

@@ -1986,6 +1986,13 @@ class SessionAttachCoordinator:
         # recovered background evidence joins the durable-input reclaim below.
         await self._session.recover_subagents()
 
+        # An event an earlier process admitted and never settled is owed to
+        # this one (parallel_subagents.md §14.2, P3). After recovery, whose
+        # batch settle supersedes an input that delegated; before restore, so
+        # restore leaves out the copy handed back and the loop runs it once.
+        if not self._ports.stateless_mode():
+            await self._reserve_stale_pinned_admissions()
+
         # Restore message history from DB (for session resume). After recovery:
         # settling an interrupted delegation turn writes one tool result per call
         # into the transcript (parallel_subagents.md §5.4, F15), and restore must
@@ -2076,6 +2083,39 @@ class SessionAttachCoordinator:
         self._logger.info(
             f"Session attached: thread={self._identity.thread_id} events_epoch={self._ports.events_epoch()}"
         )
+
+    async def _reserve_stale_pinned_admissions(self) -> None:
+        """Hand back, settle or park events a dead pinned process admitted.
+
+        Runs under this attach's exact pinned identity (the one the reclaim
+        below uses) and fails the attach like that reclaim does: the queue is
+        still closed, so nothing is served before it converges.
+        """
+
+        session = self._session
+        thread_id = self._identity.thread_id
+        if session is None or session.postgres_conn is None or thread_id is None:
+            return
+        agent_id, pod_uid, process_generation, attach_token = (
+            self._input.pinned_identity()
+        )
+        outcome = await session.postgres_conn.reserve_stale_pinned_admissions(
+            thread_id=thread_id,
+            agent_id=agent_id,
+            pod_uid=pod_uid,
+            runtime_generation=process_generation,
+            session_runtime_generation=str(self._identity.session_generation or ""),
+            runtime_attach_token=attach_token,
+        )
+        if any(outcome.get(key) for key in ("settled", "reserved", "parked")):
+            self._logger.info(
+                "Stale pinned admissions for thread %s: %d settled, %d served "
+                "again, %d parked at the recovery bound",
+                thread_id,
+                len(outcome.get("settled") or ()),
+                len(outcome.get("reserved") or ()),
+                len(outcome.get("parked") or ()),
+            )
 
     async def cleanup_failed_attach(
         self, thread_id: str, *, restore_thread_id: str | None = None

@@ -144,7 +144,9 @@ async def thread_input(
         )
 
     if not body.content or not isinstance(body.content, str):
-        raise HTTPException(status_code=400, detail="content must be a non-empty string")
+        raise HTTPException(
+            status_code=400, detail="content must be a non-empty string"
+        )
     from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
 
     idle = VMIdleLifecycleStore(store)
@@ -164,16 +166,19 @@ async def thread_input(
     continuation = await idle.get_pending_access_continuation(thread_id)
     if open_idle is not None or retained_ready or continuation is not None:
         wake = await idle.request_thread_wake(
-            thread_id, execution_requested=True,
+            thread_id,
+            execution_requested=True,
         )
         if wake is None:
             raise HTTPException(
-                status_code=409, detail={"code": "session_idle_wake_held"},
+                status_code=409,
+                detail={"code": "session_idle_wake_held"},
             )
         return JSONResponse(
             status_code=202,
             content={
-                "accepted": False, "state": "waking",
+                "accepted": False,
+                "state": "waking",
                 "wake_id": str(wake["wake_id"]),
                 "thread_id": thread_id,
             },
@@ -284,8 +289,18 @@ async def thread_queue_retry(
     hold / a non-retryable reason; 404 when not parked. Audited. The admin
     verb ``POST /api/admin/run-queue/{unit_id}/unpark`` remains the
     operator path for the non-retryable reasons.
+
+    A pinned session has no queue unit; its input parks at the recovery
+    bound instead (parallel_subagents.md §14.2, P3). The same verb re-arms
+    every parked input of the thread (``retry_parked_pinned_inputs``): the
+    live runtime's inbox poll serves it, or the next attach does.
     """
     from orchestrator.services.stateless_queue_state import park_retry_refusal
+    from shared.persistent_input_delivery import (
+        PINNED_RECOVERY_ADMISSION_LIMIT,
+        PINNED_RECOVERY_PARK_REASON,
+        retry_parked_pinned_inputs,
+    )
     from shared.run_queue import STATE_PARKED, queue_state_for, unpark_unit
 
     try:
@@ -303,19 +318,28 @@ async def thread_queue_retry(
             )
             if authority is None:
                 raise HTTPException(status_code=404, detail="Thread not found")
-            queue_state = await queue_state_for(conn, unit_id=thread_id)
-            if queue_state is None or queue_state.get("state") != STATE_PARKED:
-                raise HTTPException(status_code=404, detail="Unit is not parked")
-            park_reason = queue_state.get("park_reason")
-            refusal = park_retry_refusal(park_reason, authority["metadata"])
-            if refusal is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail={"code": refusal, "park_reason": park_reason},
-                )
-            ok = await unpark_unit(conn, unit_id=thread_id)
+            if str(authority["execution_lane"] or "pinned") == "pinned":
+                retried = await retry_parked_pinned_inputs(conn, thread_id=thread_id)
+                queue_state = {
+                    "park_reason": PINNED_RECOVERY_PARK_REASON,
+                    "attempts": PINNED_RECOVERY_ADMISSION_LIMIT,
+                }
+                ok = bool(retried)
+            else:
+                queue_state = await queue_state_for(conn, unit_id=thread_id)
+                if queue_state is None or queue_state.get("state") != STATE_PARKED:
+                    raise HTTPException(status_code=404, detail="Unit is not parked")
+                park_reason = queue_state.get("park_reason")
+                refusal = park_retry_refusal(park_reason, authority["metadata"])
+                if refusal is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"code": refusal, "park_reason": park_reason},
+                    )
+                ok = await unpark_unit(conn, unit_id=thread_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Unit is not parked")
+    park_reason = queue_state.get("park_reason")
     attempts = int(queue_state.get("attempts") or 0)
     logger.info(
         "run_queue retry (owner): unit=%s park_reason=%s attempts=%d",
