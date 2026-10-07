@@ -38,7 +38,13 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               B's agent and config are gone and A still fetches
   end         after End the workspace holds no ssh-agent process (counted
               from /proc; a failed exec or no answer is a FAIL, not zero)
-  snapshot    no gate key body in the thread's S3 snapshot objects
+  job-settle  the job reaches a resting status (a review pause is approved,
+              as the C0 gate does) before anything scans its snapshot
+  snapshot    the job's jobs/<id>/ S3 snapshot appears (bounded wait) and
+              holds no gate key body; a threads/<id>/ snapshot is scanned
+              if present (a stateless sandbox End writes none) and
+              reported as absent otherwise. --allow-no-snapshot passes
+              only when no object store is configured at all
 
 Run with the repository venv on the k3d-srw cluster, alone (no other gate or
 full test run): this is a mutating gate.
@@ -253,6 +259,9 @@ async def main():
             if not page.get("IsTruncated"):
                 break
             token = page.get("NextContinuationToken")
+    if request.get("list_only"):
+        print(json.dumps({"configured": True, "objects": keys}))
+        return
     for key in keys:
         raw = s3.get_object(Bucket=service._bucket, Key=key)["Body"].read()
         data = raw
@@ -429,7 +438,8 @@ PLAN = [
     "detach: drop B, one more turn; B retired, A still works",
     "job: stateless job with A and C; no key in workspace, checkpoint or job rows",
     "end: End the session; no ssh-agent left",
-    "snapshot: no key body in threads/<id>/ (and jobs/<id>/) objects",
+    "job-settle: wait for a resting job status; approve a review pause",
+    "snapshot: wait for jobs/<id>/ objects, scan them (and threads/<id>/ if any)",
     "cleanup: end session, cancel+delete job, delete connectors and repos",
 ]
 
@@ -463,6 +473,11 @@ def origin_alias(origin: str, *, owner: str, repo: str) -> str | None:
     return (match.group(1) or match.group(2)) if match else None
 
 
+# Statuses a job rests in; the orchestrator's completion path owns them.
+JOB_TERMINAL = frozenset({"completed", "failed", "cancelled"})
+JOB_RESTING = JOB_TERMINAL | {"pending_review", "paused", "waiting"}
+
+
 class SshAgentConnectorsGate:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -474,6 +489,7 @@ class SshAgentConnectorsGate:
         self.connectors: dict[str, str] = {}  # label -> datasource id
         self.thread: str | None = None
         self.job: str | None = None
+        self._snapshot_listing: list[str] = []
         self.gitea: dict[str, Any] = {}
 
     # -- helpers -----------------------------------------------------------
@@ -967,35 +983,117 @@ class SshAgentConnectorsGate:
             f"exit {rc}; {'unreadable' if count is None else count} agents",
         )
 
-    def snapshot(self) -> None:
-        result = in_orchestrator(
-            _SNAPSHOT_PROGRAM,
-            {
-                "prefixes": [f"threads/{self.thread}/"]
-                + ([f"jobs/{self.job}/"] if self.job else []),
-                "needles": self.needles() + ["PRIVATE KEY"],
-            },
-            timeout=600,
-        )
-        if not result.get("configured"):
-            self.report.check(
-                "snapshot: object store configured", self.args.allow_no_snapshot
+    def job_status(self) -> str:
+        return sql(f"SELECT coalesce(status, '') FROM jobs WHERE id = {lit(self.job)}")
+
+    def job_settle(self) -> None:
+        """Wait (bounded) for the job to rest; approve a review pause.
+
+        The job's terminal snapshot is uploaded by its own teardown, after it
+        completes, so nothing may scan (or clean up) before then. A job that
+        pauses for review is approved, as the C0 gate does, so its teardown
+        takes that snapshot.
+        """
+
+        def status_in(statuses: frozenset[str]) -> Callable[[], str | None]:
+            def probe() -> str | None:
+                status = self.job_status()
+                return status if status in statuses else None
+
+            return probe
+
+        timeout = self.args.job_timeout
+        try:
+            status = wait_for(
+                "job resting", status_in(JOB_RESTING), timeout=timeout, interval=5
             )
-            return
+            if status == "pending_review":
+                self.api.ok("POST", f"/api/jobs/{self.job}/approve", {})
+                print("job approved after its review pause", flush=True)
+                status = wait_for(
+                    "approved job ends",
+                    status_in(JOB_TERMINAL),
+                    timeout=timeout,
+                    interval=5,
+                )
+        except GateError as exc:
+            status = f"{self.job_status() or 'missing'} ({exc})"
+        self.report.check(
+            "job-settle: job completed", status == "completed", f"status {status}"
+        )
+
+    def snapshot_objects(self, prefix: str, *, scan: bool) -> dict:
+        request: dict[str, Any] = {"prefixes": [prefix], "needles": []}
+        if scan:
+            request["needles"] = self.needles() + ["PRIVATE KEY"]
+        else:
+            request["list_only"] = True
+        return in_orchestrator(_SNAPSHOT_PROGRAM, request, timeout=600)
+
+    def scan_snapshot(self, name: str, prefix: str) -> None:
+        result = self.snapshot_objects(prefix, scan=True)
         if not result.get("decoder"):
-            self.report.check("snapshot: zstd decoder available", False)
+            self.report.check(f"{name}: zstd decoder available", False)
             return
         objects = result.get("objects") or []
-        if not objects:
-            self.report.check(
-                "snapshot: a snapshot was captured", self.args.allow_no_snapshot
-            )
-            return
         self.report.check(
-            "snapshot: no key in snapshot objects",
-            not result.get("hits"),
+            f"{name}: no key in snapshot objects",
+            bool(objects) and not result.get("hits"),
             f"{len(objects)} objects; hits {result.get('hits')}",
         )
+
+    def snapshot_settled(self, prefix: str) -> bool:
+        """True once objects exist and the listing held still for one poll."""
+
+        listed = self.snapshot_objects(prefix, scan=False).get("objects") or []
+        previous, self._snapshot_listing = self._snapshot_listing, sorted(listed)
+        return bool(listed) and self._snapshot_listing == previous
+
+    def snapshot(self) -> None:
+        """Scan the S3 snapshots, all before cleanup deletes anything.
+
+        The job's ``jobs/<id>/`` snapshot is required once an object store is
+        configured; ``--allow-no-snapshot`` covers only a deployment without
+        one. A stateless sandbox session's End writes no ``threads/<id>/``
+        snapshot, so the thread's is scanned when present and reported as
+        absent otherwise.
+        """
+
+        thread_prefix = f"threads/{self.thread}/"
+        if not self.snapshot_objects(thread_prefix, scan=False).get("configured"):
+            self.report.check(
+                "snapshot: object store configured",
+                self.args.allow_no_snapshot,
+                "none"
+                + (" (--allow-no-snapshot)" if self.args.allow_no_snapshot else ""),
+            )
+            return
+        if self.job:
+            job_prefix = f"jobs/{self.job}/"
+            self._snapshot_listing = []
+            try:
+                wait_for(
+                    "job snapshot objects",
+                    lambda: self.snapshot_settled(job_prefix),
+                    timeout=self.args.snapshot_timeout,
+                    interval=15,
+                )
+            except GateError:
+                self.report.check(
+                    "snapshot (job): the job's snapshot was captured",
+                    False,
+                    f"no settled {job_prefix} objects after "
+                    f"{self.args.snapshot_timeout}s",
+                )
+            else:
+                self.scan_snapshot("snapshot (job)", job_prefix)
+        # Listed last, so a late thread upload is still scanned.
+        if self.snapshot_objects(thread_prefix, scan=False).get("objects"):
+            self.scan_snapshot("snapshot (thread)", thread_prefix)
+        else:
+            self.report.check(
+                "snapshot (thread): none to scan", True, f"{thread_prefix} absent"
+            )
 
     def job_run(self) -> None:
         created = self.api.ok(
@@ -1107,6 +1205,10 @@ class SshAgentConnectorsGate:
             if not self.args.skip_job:
                 self.job_run()
             self.end()
+            if self.job:
+                # Before any scan, and long before cleanup deletes the job
+                # (and with it every jobs/<id>/ object).
+                self.job_settle()
             self.snapshot()
         except GateError as exc:
             self.report.check("gate infrastructure", False, str(exc))
@@ -1148,9 +1250,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--turn-timeout", type=int, default=420)
     parser.add_argument("--skip-job", action="store_true")
     parser.add_argument(
+        "--job-timeout",
+        type=int,
+        default=900,
+        help="seconds the job may take to rest (and again after an approval)",
+    )
+    parser.add_argument(
+        "--snapshot-timeout",
+        type=int,
+        default=300,
+        help="seconds to wait for the job's jobs/<id>/ snapshot objects",
+    )
+    parser.add_argument(
         "--allow-no-snapshot",
         action="store_true",
-        help="pass the snapshot check when no snapshot exists (no object store)",
+        help="pass the snapshot check when no object store is configured",
     )
     parser.add_argument("--keep", action="store_true", help="skip cleanup")
     return parser
@@ -1165,6 +1279,10 @@ def validate(args: argparse.Namespace) -> None:
         raise SafetyError("--confirm is accepted only with --run")
     if not 60 <= args.turn_timeout <= 1800:
         raise SafetyError("--turn-timeout must be between 60 and 1800 seconds")
+    if not 60 <= args.job_timeout <= 3600:
+        raise SafetyError("--job-timeout must be between 60 and 3600 seconds")
+    if not 30 <= args.snapshot_timeout <= 1800:
+        raise SafetyError("--snapshot-timeout must be between 30 and 1800 seconds")
 
 
 def main(argv: list[str] | None = None) -> int:

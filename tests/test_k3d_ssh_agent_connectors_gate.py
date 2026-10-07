@@ -28,6 +28,10 @@ _SPEC.loader.exec_module(gate)
         ["--run", "--confirm", "yes"],
         ["--confirm", gate.LOCAL_CONFIRMATION],
         ["--turn-timeout", "5"],
+        ["--job-timeout", "5"],
+        ["--job-timeout", "7200"],
+        ["--snapshot-timeout", "5"],
+        ["--snapshot-timeout", "7200"],
     ],
 )
 def test_refuses_anything_outside_the_local_disposable_boundary(argv, monkeypatch):
@@ -234,3 +238,188 @@ def test_end_fails_when_the_workspace_exec_fails(monkeypatch, pods_after):
 )
 def test_origin_alias_accepts_both_url_forms(origin, alias):
     assert gate.origin_alias(origin, owner="srw", repo="r") == alias
+
+
+# -- job settle and snapshot ordering -----------------------------------------
+# The k3d run of 2026-10-07 scanned before the job's completion snapshot was
+# uploaded, then cleanup deleted the job and with it every jobs/<id>/ object.
+
+
+class _Clock:
+    """A fake ``time`` for wait_for: every sleep advances the clock."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def clocked(monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(gate, "time", clock)
+    return clock
+
+
+def _gate_runner(*extra):
+    args = gate.build_parser().parse_args(
+        ["--run", "--confirm", gate.LOCAL_CONFIRMATION, *extra]
+    )
+    runner = gate.SshAgentConnectorsGate(args)
+    runner.keys = {label: gate.make_key(label) for label in "abcd"}
+    runner.thread = "00000000-0000-4000-8000-000000000001"
+    runner.job = "00000000-0000-4000-8000-0000000000aa"
+    return runner
+
+
+def _statuses(monkeypatch, runner, *sequence):
+    remaining = list(sequence)
+
+    def status():
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+    monkeypatch.setattr(runner, "job_status", status)
+
+
+def test_job_settle_approves_a_review_pause_and_waits_for_completion(
+    monkeypatch, clocked
+):
+    runner = _gate_runner()
+    _statuses(
+        monkeypatch, runner, "processing", "pending_review", "processing", "completed"
+    )
+    calls = []
+    monkeypatch.setattr(runner.api, "ok", lambda *a, **k: calls.append(a) or {})
+
+    runner.job_settle()
+
+    assert calls == [("POST", f"/api/jobs/{runner.job}/approve", {})]
+    assert runner.report.results == [
+        ("job-settle: job completed", True, "status completed")
+    ]
+
+
+@pytest.mark.parametrize("stuck", ["processing", "paused", "failed"])
+def test_job_settle_fails_a_job_that_does_not_complete(monkeypatch, clocked, stuck):
+    runner = _gate_runner("--job-timeout", "60")
+    _statuses(monkeypatch, runner, stuck)
+    monkeypatch.setattr(runner.api, "ok", lambda *a, **k: pytest.fail("no approval"))
+
+    runner.job_settle()
+
+    assert not runner.report.passed
+    assert clocked.now <= 70
+
+
+def _store(monkeypatch, *, configured=True, job=(), thread=(), hits=()):
+    """Fake the in-orchestrator snapshot program; ``job`` is a listing sequence."""
+
+    job_listings = list(job)
+    log = []
+
+    def program(source, request, timeout=180):
+        assert source is gate._SNAPSHOT_PROGRAM
+        (prefix,) = request["prefixes"]
+        kind = "job" if prefix.startswith("jobs/") else "thread"
+        log.append((kind, "list" if request.get("list_only") else "scan"))
+        if not configured:
+            return {"configured": False}
+        if kind == "job":
+            objects = job_listings.pop(0) if len(job_listings) > 1 else job_listings[0]
+        else:
+            objects = list(thread)
+        if request.get("list_only"):
+            return {"configured": True, "objects": list(objects)}
+        assert "PRIVATE KEY" in request["needles"]
+        return {
+            "configured": True,
+            "decoder": True,
+            "objects": list(objects),
+            "hits": [key for key in objects if key in hits],
+        }
+
+    monkeypatch.setattr(gate, "in_orchestrator", program)
+    return log
+
+
+def test_snapshot_waits_for_settled_job_objects_then_scans(monkeypatch, clocked):
+    runner = _gate_runner()
+    log = _store(
+        monkeypatch,
+        job=([], [], ["jobs/x/1"], ["jobs/x/1", "jobs/x/2"], ["jobs/x/1", "jobs/x/2"]),
+    )
+
+    runner.snapshot()
+
+    assert runner.report.passed
+    names = [name for name, _, _ in runner.report.results]
+    assert names == [
+        "snapshot (job): no key in snapshot objects",
+        "snapshot (thread): none to scan",
+    ]
+    # Scanned only once the listing held still.
+    assert log.index(("job", "scan")) > 4
+
+
+def test_a_missing_job_snapshot_fails_even_with_allow_no_snapshot(monkeypatch, clocked):
+    runner = _gate_runner("--allow-no-snapshot", "--snapshot-timeout", "60")
+    _store(monkeypatch, job=([],))
+
+    runner.snapshot()
+
+    assert not runner.report.passed
+    assert ("snapshot (job): the job's snapshot was captured", False) in [
+        (name, ok) for name, ok, _ in runner.report.results
+    ]
+    assert clocked.now <= 80
+
+
+@pytest.mark.parametrize("allowed", [True, False])
+def test_allow_no_snapshot_covers_only_a_missing_object_store(
+    monkeypatch, clocked, allowed
+):
+    runner = _gate_runner(*(["--allow-no-snapshot"] if allowed else []))
+    _store(monkeypatch, configured=False)
+
+    runner.snapshot()
+
+    assert runner.report.passed is allowed
+
+
+def test_a_present_thread_snapshot_is_scanned(monkeypatch, clocked):
+    runner = _gate_runner()
+    runner.job = None
+    _store(monkeypatch, thread=["threads/t/1"], hits=["threads/t/1"])
+
+    runner.snapshot()
+
+    assert runner.report.results[-1][:2] == (
+        "snapshot (thread): no key in snapshot objects",
+        False,
+    )
+
+
+def test_run_settles_and_scans_the_job_before_cleanup(monkeypatch):
+    runner = _gate_runner()
+    runner.job = None
+    order = []
+    steps = (
+        "preflight fixture validation connectors_setup session session_checks "
+        "detach end job_settle snapshot cleanup"
+    ).split()
+    for step in steps:
+        monkeypatch.setattr(runner, step, lambda step=step: order.append(step) or None)
+
+    def job_run():
+        order.append("job_run")
+        runner.job = "00000000-0000-4000-8000-0000000000aa"
+
+    monkeypatch.setattr(runner, "job_run", job_run)
+    runner.report.check("stand-in", True)
+
+    assert runner.run() == 0
+    assert order[-5:] == ["job_run", "end", "job_settle", "snapshot", "cleanup"]
