@@ -263,7 +263,18 @@ _SECRETS: list[str] = []
 #   PK5 edits that one key of the gitignored values file itself (and restores
 #   it); Tilt re-applies the chart and the orchestrator restarts.
 # ---------------------------------------------------------------------------
-PINNED_SCENARIOS = ("pk0", "pk1", "pk2", "pk3", "pk4", "pk5", "pk6")
+PINNED_SCENARIOS = (
+    "pk0",
+    "pk1",
+    "pk2",
+    "pk2e",
+    "pk3",
+    "pk4",
+    "pk5",
+    "pk6",
+    "pk6b",
+    "pk6c",
+)
 PINNED_LANE = "pinned"
 PINNED_CONTAINER = "agent"
 PINNED_THREAD_LABEL = "srw.io/thread-id"
@@ -275,12 +286,14 @@ ORCHESTRATOR_SELECTOR = (
 K3D_NODE = "k3d-srw-server-0"
 VALUES_LOCAL = ROOT / "deployment" / "values-local.yaml"
 _VALUES_LANES = re.compile(r'^(\s*sessionSubagentFanoutLanes:\s*)"([^"]*)"\s*$', re.M)
-# A served image older than P3 lacks this function (the brief's image check).
-PINNED_IMAGE_MARKER = (
-    "src/shared/persistent_input_delivery.py",
-    "reserve_stale_pinned_admissions",
+# Code a served pinned image must contain: P3's re-serve and the person-End
+# fix (54ac1ea99..0f4b59aa9).
+PINNED_IMAGE_MARKERS = (
+    ("src/shared/persistent_input_delivery.py", "reserve_stale_pinned_admissions"),
+    ("src/agent/api/session_termination.py", "retirement_authorized_now"),
 )
 PINNED_AGENT_FILES = AGENT_FILES + [
+    "src/agent/subagents/host.py",
     "src/agent/api/session_attach.py",
     "src/agent/api/session_termination.py",
 ]
@@ -315,6 +328,8 @@ RECEIPT_REFUSED_LOG = "Pinned retirement receipt refused"
 # subagents.runtime.quiesce: End cannot settle the runtime's children (seen
 # after a recovery: the recovered handles are never marked settled).
 QUIESCE_WEDGE_LOG = "subagent quiesce cannot prove exact settlement authority"
+# Raw errors a stopping runtime once wrote as a batch's results (PK6, run 2).
+END_ERROR_TEXTS = ("pinned_parent_not_current", "quiescing; child was not started")
 # stale_agent_detector step 3: the detector retired an offline runtime.
 DETECTOR_RETIRED_LOG = "offline pinned runtime(s) through exact End"
 PARENT_RESTART_OUTCOME = "interrupted:parent_restart"
@@ -1024,9 +1039,31 @@ def child_brief(marker: str, sleep_s: int) -> str:
     )
 
 
-def batch_prompt(tag, n, sleep_s, child_type, final_instruction, extra_rule="") -> str:
+def short_step_brief(marker: str, steps: int, step_s: int = 4) -> str:
+    """A child that takes many quick steps (one tool call and one provider
+    call each) instead of one long sleep: it reaches a write boundary every
+    few seconds (PK6b)."""
+    commands = ", ".join(
+        f"`sleep {step_s} && echo {marker}-S{i}`" for i in range(1, int(steps) + 1)
+    )
+    return (
+        "Automated infrastructure test. Run these shell commands one at a "
+        "time, each as its own separate tool call, and wait for each to "
+        f"return before the next: {commands}. Use your shell command tool "
+        "(shell_execute or run_command) with timeout=60. Do not combine "
+        "commands, do not run any other command and do not read or write any "
+        f"file. When the last one has returned, reply with exactly the line "
+        f"{marker}-DONE and nothing else."
+    )
+
+
+def batch_prompt(
+    tag, n, sleep_s, child_type, final_instruction, extra_rule="", brief_fn=None
+) -> str:
     """``sleep_s`` is one value for every child, or a list with one per call
-    (the pinned kills want a short first child and long siblings)."""
+    (the pinned kills want a short first child and long siblings).
+    ``brief_fn(marker, value)`` replaces the sleep brief (PK6b: step counts)."""
+    brief_fn = brief_fn or child_brief
     sleeps = list(sleep_s) if isinstance(sleep_s, (list, tuple)) else [sleep_s] * n
     lines = [
         f"[{tag}] Automated infrastructure test. Follow these steps exactly.",
@@ -1041,7 +1078,7 @@ def batch_prompt(tag, n, sleep_s, child_type, final_instruction, extra_rule="") 
         lines.append(
             f'Call {index}: subagent_type="{child_type}", '
             f'description="gate {tag} child {index}", '
-            f'prompt="{child_brief(f"{tag}-C{index}", sleeps[index - 1])}"'
+            f'prompt="{brief_fn(f"{tag}-C{index}", sleeps[index - 1])}"'
         )
     lines += [
         "",
@@ -1922,20 +1959,20 @@ class PinnedRun(Run):
             interval=3,
         )
         name = row["hostname"]
-        path, marker = PINNED_IMAGE_MARKER
-        try:
-            count = command(
-                K
-                + ["exec", name, "-c", PINNED_CONTAINER, "--", "grep", "-c", marker]
-                + [f"{POD_ROOT}/{path}"]
+        for path, marker in PINNED_IMAGE_MARKERS:
+            try:
+                count = command(
+                    K
+                    + ["exec", name, "-c", PINNED_CONTAINER, "--", "grep", "-c"]
+                    + [marker, f"{POD_ROOT}/{path}"]
+                )
+            except GateError:
+                count = "0"
+            self.verdict.check(
+                f"{name} runs the current image ({marker} present)",
+                int(count or 0) > 0,
+                count,
             )
-        except GateError:
-            count = "0"
-        self.verdict.check(
-            f"{name} runs the current image ({marker} present)",
-            int(count or 0) > 0,
-            count,
-        )
         bad = served_mismatches(
             name, PINNED_CONTAINER, PINNED_AGENT_FILES + self.gate.config_paths()
         )
@@ -2199,7 +2236,8 @@ class PinnedRun(Run):
         wedge, record the failure and delete this session's pod."""
         contexts = kill.setdefault("retirement_contexts_seen", [])
         statuses = kill.setdefault("statuses_seen", [])
-        checked = [time.monotonic()]
+        started = time.monotonic()
+        checked = [started]
 
         def probe():
             row = self.runtime()
@@ -2214,9 +2252,13 @@ class PinnedRun(Run):
                 and not row["runtime_retirement_token"]
             ):
                 return row
+            # A wedge is a retry loop that outlives a normal End (a soft End
+            # with a snapshot upload took about 75 s): never delete on a
+            # transient retry.
             if (
                 live_runtime
                 and "end_wedged" not in kill
+                and time.monotonic() - started >= 240
                 and time.monotonic() - checked[0] >= 15
             ):
                 checked[0] = time.monotonic()
@@ -2244,6 +2286,15 @@ class PinnedRun(Run):
         )
         kill["retired_status"] = row["status"]
         kill["retired_db_ts"] = db_now()
+        kill["settled_after_s"] = round(
+            float(
+                sql(
+                    f"SELECT extract(epoch FROM {lit(kill['retired_db_ts'])}::"
+                    f"timestamptz - {lit(kill['db_ts'])}::timestamptz)"
+                )
+            ),
+            1,
+        )
         kill["retirement_outcomes"] = rows(
             "SELECT disposition, permanent, outcome, settled_at, "
             "retired_agent_pod->>'pod_name' AS pod "
@@ -2408,14 +2459,30 @@ class PinnedScenarios:
                 need(False, f"crictl reachable on {K3D_NODE} (sigkill)", str(exc))
 
     # -- shared steps ----------------------------------------------------------
-    def _pinned_window(self, run, calls, *, cap, ended_at_kill, running_at_kill):
+    def _pinned_window(
+        self,
+        run,
+        calls,
+        *,
+        cap,
+        ended_at_kill,
+        running_at_kill,
+        only_calls=False,
+        require_shell=True,
+        at_least=False,
+    ):
         """Wait for: ``ended_at_kill`` children ended, ``running_at_kill`` in
-        their shell sleep, the rest queued (no row)."""
+        their shell sleep (or merely running, without ``require_shell``), the
+        rest queued (no row). ``only_calls``: count the batch's children only
+        (a background child runs beside it); ``at_least``: more running is
+        fine (the expectations follow the observed rows)."""
 
         def probe():
             run.assert_not_parked()
             run.check_refusal(calls)
             children = run.children()
+            if only_calls:
+                children = [c for c in children if c["parent_tool_call_id"] in calls]
             running = [c for c in children if c["status"] != "ended"]
             ended = [c for c in children if c["status"] == "ended"]
             if len(running) > cap:
@@ -2424,8 +2491,12 @@ class PinnedScenarios:
                 raise GateFailure(
                     f"missed the kill window: {len(ended)} children already ended"
                 )
-            in_shell = [c for c in running if c["in_shell"]]
-            if len(ended) == ended_at_kill and len(in_shell) == running_at_kill:
+            busy = [c for c in running if c["in_shell"] or not require_shell]
+            if len(ended) == ended_at_kill and (
+                len(busy) >= running_at_kill
+                if at_least
+                else len(busy) == running_at_kill
+            ):
                 return children
             return False
 
@@ -2437,19 +2508,38 @@ class PinnedScenarios:
             interval=1,
         )
 
-    def _pinned_batch(self, run, *, final, cap=2, n=4):
-        run.create_session(cap=cap)
-        run.warm_up(cap=cap)
-        sleeps = self.args.pk_sleeps
+    def _pinned_batch(
+        self,
+        run,
+        *,
+        final,
+        cap=2,
+        n=4,
+        sleeps=None,
+        brief_fn=None,
+        create=True,
+        window=None,
+    ):
+        if create:
+            run.create_session(cap=cap)
+            run.warm_up(cap=cap)
+        sleeps = self.args.pk_sleeps if sleeps is None else sleeps
         if len(sleeps) != n:
-            raise GateError(f"--pk-sleeps needs {n} values")
+            raise GateError(f"the per-child values need {n} entries: {sleeps}")
         seq = run.send(
-            batch_prompt(run.tag("batch"), n, sleeps, self.args.child_type, final),
+            batch_prompt(
+                run.tag("batch"),
+                n,
+                sleeps,
+                self.args.child_type,
+                final,
+                brief_fn=brief_fn,
+            ),
             "batch",
         )
         calls = run.wait_batch(seq, n)
         at_kill = self._pinned_window(
-            run, calls, cap=cap, ended_at_kill=1, running_at_kill=2
+            run, calls, cap=cap, ended_at_kill=1, running_at_kill=2, **(window or {})
         )
         run.facts["children_at_kill"] = at_kill
         return seq, calls, at_kill
@@ -2843,9 +2933,10 @@ class PinnedScenarios:
         print("measurement: " + json.dumps(measurement), flush=True)
 
     # -- PK2 / PK4 -------------------------------------------------------------
-    def scenario_pk2(self, run, *, pk4=False):
+    def scenario_pk2(self, run, *, pk4=False, end_after=False):
         """SIGKILL mid-batch (1 ended, 2 running, 1 queued) -> the detector
-        retires the runtime (P0, P0b) -> Resume -> the successor settles."""
+        retires the runtime (P0, P0b) -> Resume -> the successor settles.
+        ``end_after`` (PK2e): then a person's End of the recovered life."""
         done = "PK4-DONE" if pk4 else "PK2-DONE"
         final = long_final(done) if pk4 else short_final(done)
         seq, calls, at_kill = self._pinned_batch(run, final=final)
@@ -2929,6 +3020,11 @@ class PinnedScenarios:
                 any(x["served"] == "1" and x["parked"] == "0" for x in lines),
                 lines,
             )
+        if end_after:
+            # The successor recovered the batch at attach: its handles must
+            # settle so that a person's End can close the life (54ac1ea99).
+            self._person_end(run, "person's End after the recovery")
+            self._no_runtime_error_rows(run, "after the End")
 
     def scenario_pk4(self, run):
         self.scenario_pk2(run, pk4=True)
@@ -3112,90 +3208,251 @@ class PinnedScenarios:
         else:
             v.warn("the model paraphrased the fan-out sentence", text)
 
-    # -- PK6 -------------------------------------------------------------------
-    def scenario_pk6(self, run):
-        """A person's End mid-batch still cancels the children (D4); Resume
-        recovers nothing."""
-        seq, calls, _at_kill = self._pinned_batch(run, final=short_final("PK6-DONE"))
+    # -- PK6a / PK6b / PK6c: a person's End mid-batch ----------------------
+    def _person_end(self, run, end_label):
+        """A person's End (the cockpit's End anyway: DELETE ?force=true) of
+        the current runtime; returns the end record once the retirement
+        settled. The End must complete on its own (54ac1ea99, c22c4abe1)."""
         row = run.runtime()
         end = {
-            "label": "person's End",
+            "label": end_label,
             "mode": "end",
             "pod": row["hostname"],
             "pod_uid": None,
             "agent_id": row["agent_id"],
             "generation": row["runtime_generation"],
+            "thread_status": row["status"],
             "db_ts": db_now(),
         }
         run.facts["kills"].append(end)
         self.api.call("DELETE", f"/api/persistent/threads/{run.thread}?force=true")
-        run.mark("person's End (force)")
+        run.mark("person's End (force)", label=end_label)
         run.wait_retired(end, live_runtime=True)
-        v = run.verdict
-        children = run.children()
-        live_at_end = [c for c in children if c["subagent_status"] != "completed"]
-        v.check(
-            f"children live at the End ended {PERSON_END_OUTCOME} (D4)",
-            bool(live_at_end)
-            and all(c["subagent_outcome"] == PERSON_END_OUTCOME for c in live_at_end),
-            [(c["subagent_handle"], c["subagent_outcome"]) for c in live_at_end],
+        run.verdict.check(
+            f"the End completes on its own in {end.get('settled_after_s')} s "
+            "(no quiescence wedge, no pod deleted)",
+            "end_wedged" not in end,
+            {
+                "settled_after_s": end.get("settled_after_s"),
+                "status": end.get("retired_status"),
+            },
         )
         causes = [
             (c["context"] or {}).get("cause")
             for c in end.get("retirement_contexts_seen", [])
         ]
-        v.check(
+        run.verdict.check(
             "the End names no runtime_lost cause", "runtime_lost" not in causes, causes
         )
+        return end
+
+    def _no_runtime_error_rows(self, run, label):
+        found = rows(
+            "SELECT seq, role, tool_call_id, left(content, 200) AS content "
+            f"FROM thread_messages WHERE thread_id='{run.thread}' AND ("
+            + " OR ".join(f"position({lit(t)} in content) > 0" for t in END_ERROR_TEXTS)
+            + ") ORDER BY seq"
+        )
+        run.verdict.check(
+            f"no {' / '.join(END_ERROR_TEXTS)} row in the parent transcript ({label})",
+            not found,
+            found,
+        )
+
+    def _person_end_scenario(self, run, *, variant):
+        """PK6a long sleeps, PK6b short steps, PK6c with a background child:
+        a person's End mid-batch completes on its own, cancels the live
+        children (D4), the old runtime writes nothing into the parent, and
+        Resume settles every call once (completed / CANCELLED / NOT STARTED)
+        with one continuation and one answer to it (design §8)."""
+        v = run.verdict
+        cap = 3 if variant == "pk6c" else 2
+        background = None
+        window = {}
+        brief_fn = None
+        sleeps = None
+        if variant == "pk6b":
+            brief_fn, sleeps = short_step_brief, self.args.pk6b_steps
+            window = {"require_shell": False}
+        run.create_session(cap=cap)
+        run.warm_up(cap=cap)
+        if variant == "pk6c":
+            tag = run.tag("bg")
+            bg_seq = run.send(
+                f"[{tag}] Automated infrastructure test. Call the delegate_agent "
+                "tool exactly once, with run_in_background=true and these "
+                f'arguments: subagent_type="{self.args.child_type}", '
+                f'description="gate {tag} background child", '
+                f'prompt="{child_brief(f"{tag}-BG", self.args.pk6c_bg_sleep)}". '
+                "Call no other tool. When the tool returns its receipt, reply "
+                "with exactly one line: BG-STARTED.",
+                "bg",
+            )
+            wait_for(
+                "pk6c: background delegation answered",
+                lambda: run.answered(bg_seq),
+                timeout=self.args.timeout,
+            )
+
+            def background_running():
+                kids = run.children()
+                if len(kids) > 1:
+                    raise GateFailure(f"expected one background child, saw {len(kids)}")
+                return kids[0] if kids and kids[0]["in_shell"] else False
+
+            background = wait_for(
+                "pk6c: the background child is in its sleep",
+                background_running,
+                timeout=self.args.timeout,
+            )
+            run.facts["background_child"] = background
+            window = {"only_calls": True, "at_least": True}
+        seq, calls, at_end = self._pinned_batch(
+            run,
+            final=short_final(f"{variant.upper()}-DONE"),
+            cap=cap,
+            sleeps=sleeps,
+            brief_fn=brief_fn,
+            create=False,
+            window=window,
+        )
+        end = self._person_end(run, "person's End mid-batch")
+        children = run.children()
+        batch = [c for c in children if c["parent_tool_call_id"] in calls]
+        by_call = {c["parent_tool_call_id"]: c for c in batch}
+        live_at_end = [c for c in batch if c["subagent_status"] != "completed"]
+        v.check(
+            f"the batch children live at the End ended {PERSON_END_OUTCOME} (D4)",
+            bool(live_at_end)
+            and all(c["subagent_outcome"] == PERSON_END_OUTCOME for c in live_at_end),
+            [(c["subagent_handle"], c["subagent_outcome"]) for c in batch],
+        )
+        counts = run.tool_row_counts(calls)
+        v.check(
+            "the old runtime wrote nothing into the parent (no tool row for a call)",
+            not counts,
+            counts,
+        )
+        self._no_runtime_error_rows(run, "before Resume")
+        if background is not None:
+            bg = next(c for c in children if c["id"] == background["id"])
+            v.check(
+                f"the background child ended {PERSON_END_OUTCOME}",
+                bg["status"] == "ended"
+                and bg["subagent_outcome"] == PERSON_END_OUTCOME,
+                (bg["subagent_handle"], bg["status"], bg["subagent_outcome"]),
+            )
+        expected = {}
+        for call in calls:
+            child = by_call.get(call)
+            if child is None or child["subagent_outcome"] in (
+                PARENT_RESTART_NOT_STARTED_OUTCOME,
+            ):
+                expected[call] = "not_started"
+            elif child["subagent_status"] == "completed":
+                expected[call] = "completed"
+            else:
+                expected[call] = "retired"
+        run.facts["expected_classes"] = expected
         successor = run.resume(end)
-        # §8 (End and Force-End): a batch resumed after an End may mix
-        # finished and retired members; the settle reports a retired member
-        # as CANCELLED (class `retired`), never as interrupted, and runs
-        # nothing again. Whether it settles at all depends on what the old
-        # runtime wrote before it stopped, so both shapes are recorded.
-        time.sleep(90)
+        wait_for(
+            f"{run.name}: answered after Resume",
+            lambda: run.answered(seq),
+            timeout=self.args.timeout,
+        )
+        run.wait_audit_settled()
+        results = run.results(calls)
+        counts = run.tool_row_counts(calls)
+        v.check(
+            "exactly one result per call, rewound rows included",
+            len(results) == len(calls) and all(counts.get(c) == 1 for c in calls),
+            counts,
+        )
+        actual = {r["tool_call_id"]: recovery_class(r) for r in results}
+        v.check(
+            "each result is completed / CANCELLED (retired) / NOT STARTED as its "
+            "child was at the End",
+            all(actual.get(c) == expected[c] for c in calls),
+            {"expected": expected, "actual": actual},
+        )
         settled_lines = [
             line
             for line in run.runtime_log(successor["pod"]).splitlines()
             if BATCH_SETTLED_LOG in line
         ]
-        results = run.results(calls)
-        per_call = Counter(r["tool_call_id"] for r in results)
-        classes = {r["tool_call_id"]: recovery_class(r) for r in results}
-        run.facts["pk6_settled_at_resume"] = settled_lines
-        run.facts["results_after_resume"] = [
-            (r["tool_call_id"], recovery_class(r), _short(r["content"], 160))
-            for r in results
+        run.facts["batch_settle_log"] = settled_lines
+        v.check("the successor settled the turn as one batch", bool(settled_lines))
+        conts = run.continuations()
+        v.check("exactly one continuation", len(conts) == 1, len(conts))
+        superseding = [
+            d for d in run.subagent_deliveries() if d["supersedes_input_seq"] == seq
         ]
-        run.facts["deliveries_after_resume"] = run.deliveries()
         v.check(
-            "at most one result per call after Resume",
-            all(n == 1 for n in per_call.values()),
-            dict(per_call),
+            "one settled delivery supersedes the original input",
+            len(superseding) == 1 and superseding[0]["state"] == "settled",
+            superseding,
         )
-        v.check(
-            "no result classed interrupted (an End is not a crash)",
-            "interrupted" not in classes.values(),
-            classes,
-        )
-        cancelled_calls = [c["parent_tool_call_id"] for c in live_at_end]
-        if settled_lines:
+        if conts:
+            metrics = (conts[0].get("metrics") or {}).get(RECOVERY_METRICS_KEY) or {}
+            want = {
+                "calls": len(calls),
+                "retired": sum(1 for c in calls if expected[c] == "retired"),
+                "not_started": sum(1 for c in calls if expected[c] == "not_started"),
+                "interrupted": 0,
+            }
+            got = {key: metrics.get(key) for key in want}
             v.check(
-                "the settle reports the cancelled children as retired (CANCELLED)",
-                all(classes.get(c) == "retired" for c in cancelled_calls),
-                {c: classes.get(c) for c in cancelled_calls},
+                "continuation counts match", got == want, {"got": got, "want": want}
             )
-        else:
-            v.warn(
-                "no settle at Resume: the old runtime wrote the results itself",
-                [_short(r["content"], 100) for r in results],
+            answers = [
+                a
+                for a in run.final_answers(seq)
+                if a["turn_number"] == conts[0]["turn_number"]
+            ]
+            v.check(
+                "exactly one answer to the continuation, after it",
+                len(answers) == 1 and answers[0]["seq"] > conts[0]["seq"],
+                [(a["seq"], a["turn_number"]) for a in answers],
             )
-        v.check("at most one continuation", len(run.continuations()) <= 1)
+            run.facts["answers_after_input"] = [
+                (a["seq"], a["turn_number"]) for a in run.final_answers(seq)
+            ]
+        self._no_runtime_error_rows(run, "after Resume")
         v.check(
             "no further child (nothing runs again)",
             len(run.children()) == len(children),
             len(run.children()),
         )
+        if background is not None:
+            events = rows(
+                "SELECT seq, role, turn_number, left(content, 300) AS content, "
+                f"created_at FROM thread_messages WHERE thread_id='{run.thread}' "
+                f"AND role='event' AND position({lit(background['subagent_handle'])} "
+                "in content) > 0 ORDER BY seq"
+            )
+            run.facts["background_events"] = events
+            v.check(
+                "the background child's cancellation reached the parent as one event",
+                len(events) == 1,
+                events,
+            )
+
+    def scenario_pk6(self, run):
+        """PK6a: long-sleep children."""
+        self._person_end_scenario(run, variant="pk6")
+
+    def scenario_pk6b(self, run):
+        """PK6b: short-step children (a write boundary every few seconds)."""
+        self._person_end_scenario(run, variant="pk6b")
+
+    def scenario_pk6c(self, run):
+        """PK6c: a background child running beside the foreground batch."""
+        self._person_end_scenario(run, variant="pk6c")
+
+    def scenario_pk2e(self, run):
+        """PK2, then a person's End after the recovery (it hung 4/4 before
+        54ac1ea99: the recovered handles were never settled)."""
+        self.scenario_pk2(run, end_after=True)
 
 
 # ---------------------------------------------------------------------------
@@ -4117,7 +4374,25 @@ def parse_args(argv=None):
     pinned.add_argument("--pk3", action="store_true", help="graceful delete (P4)")
     pinned.add_argument("--pk4", action="store_true", help="PK2, then kill again (P3)")
     pinned.add_argument("--pk5", action="store_true", help="switch off via heartbeat")
-    pinned.add_argument("--pk6", action="store_true", help="a person's End (D4)")
+    pinned.add_argument(
+        "--pk2e", action="store_true", help="PK2, then a person's End after it"
+    )
+    pinned.add_argument(
+        "--pk6", action="store_true", help="PK6a: a person's End mid-batch (D4)"
+    )
+    pinned.add_argument(
+        "--pk6b", action="store_true", help="PK6a with short-step children"
+    )
+    pinned.add_argument(
+        "--pk6c", action="store_true", help="PK6a beside a background child"
+    )
+    pinned.add_argument(
+        "--pk6b-steps",
+        type=lambda raw: [int(x) for x in raw.split(",") if x.strip()],
+        default=[2, 15, 15, 2],
+        help="PK6b: shell steps per child (4 s each)",
+    )
+    pinned.add_argument("--pk6c-bg-sleep", type=int, default=600)
     pinned.add_argument(
         "--model",
         default="muse-spark-1.3-contributor",
