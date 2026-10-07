@@ -81,6 +81,7 @@ def _retirement_session_mock(**kwargs):
 
     session = MagicMock(**kwargs)
     session.quiesce_subagents = AsyncMock()
+    session.leave_subagents_to_retirement = AsyncMock()
     session.resume_subagents = AsyncMock()
     return session
 
@@ -3887,6 +3888,57 @@ async def test_child_quiescence_failure_refuses_retirement_begin():
         )
         assert mod._session_termination.runtime_admission_closed() is True
 
+    close_controls.assert_not_awaited()
+    update.assert_not_awaited()
+    # Without the server's token this life may still own its children.
+    session.leave_subagents_to_retirement.assert_not_awaited()
+
+
+@pytest.mark.parametrize("left", [True, False])
+@pytest.mark.asyncio
+async def test_an_authorized_retirement_leaves_unsettleable_children_to_it(left):
+    """A person's End: the watchdog mirrored the server's token for this exact
+    life, so quiescence cannot prove settlement authority. The children are
+    left to the retirement instead, and Begin is already satisfied; if even
+    that fails, Begin stays refused for the retry (P6 defect 1)."""
+    from agent.api import persistent_app as mod
+
+    identity = (
+        "retirement-person-end",
+        "88888888-8888-4888-8888-888888888888",
+        "99999999-9999-4999-8999-999999999999",
+    )
+    session = _retirement_session_mock()
+    session.quiesce_subagents.side_effect = RuntimeError(
+        "subagent quiesce cannot prove exact settlement authority"
+    )
+    if not left:
+        session.leave_subagents_to_retirement.side_effect = RuntimeError("unheld")
+    close_controls = AsyncMock(return_value=True)
+    update = AsyncMock(return_value=True)
+
+    with (
+        patch.object(mod, "_session", session),
+        patch.object(mod._session_identity, "_thread_id", identity[0]),
+        patch.object(mod._session_identity, "_session_generation", identity[1]),
+        patch.object(mod._session_identity, "_attach_token", identity[2]),
+        patch.object(mod._session_termination, "retirement_admission_identity", identity),
+        patch.object(mod._session_termination, "retirement_admission_disposition", "ended"),
+        patch.object(mod._session_termination, "retirement_admission_token",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        ),
+        patch.object(mod._session_termination, "retirement_admission_permanent", False),
+        patch.object(mod._session_identity, "_runtime_contract", True),
+        patch.object(mod, "_stateless_mode", return_value=False),
+        patch.object(mod, "_registered_pinned_agent_id", return_value="agent-a"),
+        patch.object(mod, "_close_pinned_control_inbox", close_controls),
+        patch.object(mod, "_update_thread_status", update),
+    ):
+        assert await mod._session_termination.begin_retirement() is left
+
+    session.leave_subagents_to_retirement.assert_awaited_once_with(
+        "parent session retiring as ended"
+    )
     close_controls.assert_not_awaited()
     update.assert_not_awaited()
 

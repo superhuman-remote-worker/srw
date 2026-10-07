@@ -2171,19 +2171,43 @@ class SessionTerminationCoordinator:
         # Child terminal/transcript writes require the still-current parent
         # authority. Close child admission and settle every generation before the
         # server installs the retirement token that revokes it.
+        quiesce_reason = f"parent session retiring as {retirement_disposition}"
         try:
-            await self._ports.session().quiesce_subagents(
-                f"parent session retiring as {retirement_disposition}"
-            )
-        except Exception:
-            self._logger.warning(
-                "Session child runtime did not quiesce before retirement "
-                "(thread=%s disposition=%s)",
+            await self._ports.session().quiesce_subagents(quiesce_reason)
+        except Exception as exc:
+            if self.retirement_admission_token is None:
+                self._logger.warning(
+                    "Session child runtime did not quiesce before retirement "
+                    "(thread=%s disposition=%s)",
+                    self._ports.identity().thread_id,
+                    retirement_disposition,
+                    exc_info=True,
+                )
+                return False
+            # A person's End: the server installed and authorized this exact
+            # life's token first (the watchdog mirrored it), so the authority
+            # children settle with is gone for good and a live child can never
+            # settle. Leave the children to the retirement, which ends their
+            # running rows ``cancelled:parent_retired`` (D4).
+            self._logger.info(
+                "Session child runtime cannot settle under the authorized "
+                "retirement (%s); leaving its children to it (thread=%s)",
+                exc,
                 self._ports.identity().thread_id,
-                retirement_disposition,
-                exc_info=True,
             )
-            return False
+            try:
+                await self._ports.session().leave_subagents_to_retirement(
+                    quiesce_reason
+                )
+            except Exception:
+                self._logger.warning(
+                    "Session child runtime could not be left to the authorized "
+                    "retirement (thread=%s disposition=%s)",
+                    self._ports.identity().thread_id,
+                    retirement_disposition,
+                    exc_info=True,
+                )
+                return False
         # From this point onward every child is settled. Exact no-retirement
         # reconciliation clears the tokenless latch and resumes both surfaces
         # together; every other failure stays safely fail-closed.

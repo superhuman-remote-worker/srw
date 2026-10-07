@@ -2352,6 +2352,27 @@ class PersistentSession:
             await quiesce(reason)
         self._subagent_runtime_quiesced = True
 
+    async def leave_subagents_to_retirement(self, reason: str) -> None:
+        """Close child work under a retirement authorized for this life.
+
+        A person's End installs the retirement token before this runtime
+        hears of it, which takes the authority ``quiesce_subagents`` settles
+        with. Children are left to the retirement with no durable write
+        (``SubagentRuntime.leave_to_retirement``); this life never resumes.
+        """
+
+        if self._subagent_runtime_quiesced:
+            return
+        runtime = getattr(self.tool_context, "subagent_runtime", None)
+        if runtime is not None:
+            leave = getattr(runtime, "leave_to_retirement", None)
+            if not callable(leave):
+                raise RuntimeError(
+                    "session subagent runtime cannot be left to its retirement"
+                )
+            await leave(reason)
+        self._subagent_runtime_quiesced = True
+
     async def resume_subagents(self) -> None:
         """Re-arm a settled child runtime after exact retirement abort proof."""
 

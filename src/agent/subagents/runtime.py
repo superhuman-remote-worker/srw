@@ -299,10 +299,11 @@ class SubagentRuntime:
         self._writer_guard = SharedWriterGuard()
         self._handles: set[str] = set()
         # Handles whose child leaves nothing to settle: its strict terminal
-        # receipt committed, or ``_spawn`` returned before any durable row was
-        # opened. ``quiesce`` without parent authority may close a life whose
-        # every minted handle is here; a minted handle missing from it may
-        # still have a build or durable create in flight.
+        # receipt committed, ``_spawn`` returned before any durable row was
+        # opened, or orphan recovery ended its foreground row durably (alone
+        # or in its turn's settle). ``quiesce`` without parent authority may
+        # close a life whose every minted handle is here; a minted handle
+        # missing from it may still have a build or durable create in flight.
         self._settled_handles: set[str] = set()
         self._worktree_index = 0
         self._batch_size = 1
@@ -318,6 +319,10 @@ class SubagentRuntime:
         # ``interrupted:parent_restart`` before the retirement, which would
         # otherwise cancel a running row for good.
         self._foreground_ends_for_successor = False
+        # Set once by ``leave_to_retirement`` (a person's End took the parent's
+        # authority) and never cleared: no child of this life writes again,
+        # and every foreground call still in progress is held.
+        self._foreground_retired = False
         # Foreground calls in progress, and the waiters of the ones held
         # for the successor (``_await_successor_cancellation``) with their
         # in-flight keys. A held call does nothing more and never returns.
@@ -648,7 +653,9 @@ class SubagentRuntime:
         Once a pinned batch is handed to the successor (``leave_foreground_
         for_successor(retiring=True)``) no call returns, whatever it ended
         with: a replay, a refusal or a failure would otherwise become a tool
-        result the parent saves, and the successor's settle owns the turn.
+        result the parent saves, and the successor's settle owns the turn. The
+        same holds once a person's End left the batch to the retirement
+        (``leave_to_retirement``).
         """
         if call.run_in_background:
             return await self.run_background(call)
@@ -659,7 +666,9 @@ class SubagentRuntime:
             try:
                 envelope = await self._run_foreground(call)
             except Exception:
-                if not self._foreground_ends_for_successor:
+                if not (
+                    self._foreground_ends_for_successor or self._foreground_retired
+                ):
                     raise
                 logger.warning(
                     "subagent call %s failed after the hand-over; its result is "
@@ -668,7 +677,7 @@ class SubagentRuntime:
                     exc_info=True,
                 )
                 await self._await_successor_cancellation(call)
-            if self._foreground_ends_for_successor:
+            if self._foreground_ends_for_successor or self._foreground_retired:
                 await self._await_successor_cancellation(call)
             return envelope
         finally:
@@ -960,6 +969,12 @@ class SubagentRuntime:
                 except Exception:  # pragma: no cover - best effort
                     logger.warning("subagent %s: close failed", handle, exc_info=True)
 
+        if self._foreground_retired:
+            # Stopped by a person's End (``leave_to_retirement``), or finished
+            # just as it came: no report is spilled and no row written, as no
+            # authority remains for them. The retirement ends a running row
+            # ``cancelled:parent_retired`` (D4) and Resume answers the call.
+            raise _LeftForSuccessor()
         if self._foreground_ends_for_successor and (
             result is None or result.status in _HANDED_OVER_ENDS
         ):
@@ -2307,6 +2322,9 @@ class SubagentRuntime:
                             settled, handled = await batch.recover(row)
                             recovered.extend(settled)
                             if handled:
+                                # The settle ended its row, or it was closed
+                                # meanwhile: nothing is left to settle here.
+                                self._settled_handles.add(handle)
                                 continue
                         loader = getattr(self.ledger, "load_messages", None)
                         terminalize = getattr(
@@ -2390,6 +2408,7 @@ class SubagentRuntime:
                                 f"session foreground orphan {handle} could not "
                                 "be durably delivered"
                             )
+                        self._settled_handles.add(handle)
                         delivered = (
                             str(committed.get("result") or "") != "already_delivered"
                         )
@@ -2427,6 +2446,7 @@ class SubagentRuntime:
                         report_path=row.get("report_path") or None,
                         error="the parent runtime restarted",
                     )
+                    self._settled_handles.add(handle)
                     recovered.append(
                         {
                             "handle": handle,
@@ -2548,7 +2568,8 @@ class SubagentRuntime:
             # retirement Begin commits. Keep admission closed, but preserve
             # the runtime so the same exact life can retry quiescence or resume
             # after a proven-uncommitted Begin. Explicit authority-loss paths
-            # call ``abandon`` themselves.
+            # call ``abandon`` themselves; a retirement the orchestrator
+            # authorized for this life calls ``leave_to_retirement``.
             raise RuntimeError(
                 "subagent quiesce cannot prove exact settlement authority"
             )
@@ -2718,6 +2739,57 @@ class SubagentRuntime:
                 return_exceptions=True,
             )
         self._active.clear()
+        await self._notify_changed()
+
+    async def leave_to_retirement(self, reason: str = "parent retired") -> None:
+        """Leave every child to the parent's authorized retirement (D4).
+
+        A person's End authorizes the pinned retirement before the runtime
+        hears of it, and the token it installs revokes, for good, the parent
+        authority every child write needs: ``quiesce`` can then settle
+        neither a live child nor a pending receipt. The termination calls
+        this instead, and only with the orchestrator's authorization of this
+        exact life in hand.
+
+        Nothing is written. Running children are stopped and their rows stay
+        running, for the retirement to end ``cancelled:parent_retired``; a
+        queued or starting call never starts. No foreground call returns: each
+        is held, as at a platform hand-over, until the termination cancels the
+        parent turn, and Resume's settle answers each call once. Background
+        children are released as by ``abandon``. Returns once no child runs
+        and every foreground call in progress is held. The runtime is never
+        reused (``resume`` refuses it).
+        """
+        async with self._state_lock:
+            self._accepting = False
+            self._abandoning = True
+            self._persistence_abandoned = True
+        self._foreground_left_for_successor = True
+        self._foreground_retired = True
+        await self._background_admissions_drained.wait()
+        tasks = [task for task in self._background_tasks.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        drivers = list(self._active.values())
+        logger.info(
+            "subagent runtime left to the retirement (%s): stopping %d child(ren)",
+            reason,
+            len(drivers),
+        )
+        await asyncio.gather(
+            *(driver.stop(timeout=BATCH_STOP_GRACE_S) for driver in drivers),
+            return_exceptions=True,
+        )
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + BATCH_STOP_GRACE_S
+        while self._active or self._unheld_inflight():
+            if loop.time() >= deadline:
+                raise RuntimeError(
+                    "subagent retirement left a child running or a call unheld"
+                )
+            await asyncio.sleep(0.01)
         await self._notify_changed()
 
     # ------------------------------------------------------------------
