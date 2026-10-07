@@ -19,11 +19,17 @@ promise a continuation: only the human can grant one.
 Category ``core`` (not an execution category), so it survives
 ``filter_tools_by_backend`` on the lite tiers where it actually matters; the
 session only exposes it while the backend has no shell.
+
+On the pinned lane the in-process container swap is refused
+(persistent_app.py _handle_workspace_upgrade), so the offer asks for a VM, and
+only after the orchestrator confirms a VM upgrade would be accepted
+(GET /api/agents/threads/{id}/upgrade-availability). Otherwise no offer is
+raised and the model is told why (stateless upgrade design, decision 1).
 """
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, List
+from typing import Any, List, Optional
 
 from langchain_core.tools import tool
 
@@ -35,6 +41,37 @@ from shared.tool_catalog.definitions import (
 
 logger = logging.getLogger(__name__)
 
+_CHECK_FAILED = (
+    "SRW couldn't confirm that an upgrade is available right now. The user "
+    "can still try /upgrade-workspace vm."
+)
+
+
+async def _vm_upgrade_unavailable_reason(context: ToolContext) -> Optional[str]:
+    """None when a VM upgrade would be accepted now; otherwise why not."""
+    if not context.thread_id:
+        return "this Session has no identity SRW can check."
+    # Imported at call time, not module level: the tests patch
+    # agent.tools.orchestrator.jobs._get_client, which a module-level
+    # `from` import would have already bound. (No import cycle exists.)
+    from agent.tools.orchestrator.jobs import _get_client, _get_orchestrator_url
+
+    url = (
+        f"{_get_orchestrator_url()}/api/agents/threads/"
+        f"{context.thread_id}/upgrade-availability"
+    )
+    try:
+        async with _get_client(user_id=context.user_id) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            vm = (resp.json() or {}).get("vm") or {}
+    except Exception as exc:  # the offer is optional; never raise into the turn
+        logger.warning("upgrade availability check failed: %s", exc)
+        return _CHECK_FAILED
+    if vm.get("available") is True:
+        return None
+    return str(vm.get("reason") or "SRW would refuse the upgrade.")
+
 
 def create_workspace_upgrade_tools(context: ToolContext) -> List[Any]:
     """Create the agent-initiated workspace-upgrade request tool.
@@ -45,15 +82,15 @@ def create_workspace_upgrade_tools(context: ToolContext) -> List[Any]:
 
     @tool
     async def request_workspace_upgrade(reason: str) -> str:
-        """Request an upgrade from the lite (virtual) workspace to a real sandbox.
+        """Ask the user to upgrade this Session to a VM workspace with a shell.
 
-        Call this when the task needs capabilities the lite workspace lacks — a
+        Call this when the task needs capabilities this workspace lacks — a
         shell, git, running code or builds, or browser control.
 
-        You are only REQUESTING. A human is shown your request and decides. If
-        they approve, a sandbox is provisioned and your existing files carry
-        over; they may then ask you to continue, or simply pick the conversation
-        back up themselves. If they decline, they will tell you why.
+        You are only REQUESTING. If SRW can upgrade this Session, a human is
+        shown your request and decides; if they approve, a VM is provisioned
+        and your existing files carry over. If SRW can't, nothing is offered
+        and you are told why.
 
         This request does not provision a workspace or automatically resume
         the task. Explain what the upgrade enables, tell the user to send a
@@ -66,20 +103,29 @@ def create_workspace_upgrade_tools(context: ToolContext) -> List[Any]:
                 needed (e.g. "need to run pytest", "clone and build the repo").
 
         Returns:
-            Confirmation that the request was recorded.
+            Whether the request was shown to the user, and if not, why.
         """
+        unavailable = await _vm_upgrade_unavailable_reason(context)
+        if unavailable is not None:
+            logger.info("request_workspace_upgrade not offered: %s", unavailable)
+            return (
+                f"No workspace upgrade is available for this Session: {unavailable} "
+                "Nothing was offered to the user. Tell them the task needs a "
+                "shell, and that they can start a new Session with a container "
+                "or VM workspace; meanwhile continue with the tools you have."
+            )
         context.request_freeze(
             {
                 "freeze_type": "workspace_upgrade_required",
-                "target_tier": "sandbox",
+                "target_tier": "vm",
                 "reason": reason or "The task needs a real workspace (shell/git).",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         )
         logger.info("request_workspace_upgrade requested: reason=%r", reason)
         return (
-            "Recorded your request for a sandbox workspace — a human will see "
-            "it and decide. The request has not started a workspace or added "
+            "Recorded your request for a VM workspace — a human will see it "
+            "and decide. The request has not started a workspace or added "
             "tools. Explain what it enables and continue useful preparation. "
             "After an approved upgrade completes, the user can send a "
             "follow-up message to continue the task; check the newly available "

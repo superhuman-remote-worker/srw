@@ -302,13 +302,13 @@ WORKSPACE_UPGRADE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "core.upgrade",
         "function": "request_workspace_upgrade",
         "description": (
-            "Request an upgrade from the lite workspace to a real sandbox "
-            "container (shell, git, file tools). A human decides before "
-            "anything is provisioned; you only request, and you may not be "
-            "resumed afterwards."
+            "Ask the user to upgrade this Session from its lite workspace to a "
+            "VM workspace (shell, git, file tools), when SRW would accept the "
+            "upgrade. A human decides before anything is provisioned; you only "
+            "request, and you may not be resumed afterwards."
         ),
         "category": "core",
-        "short_description": "Ask to upgrade to a real sandbox workspace.",
+        "short_description": "Ask to upgrade to a VM workspace.",
         "phases": ["strategic", "tactical"],  # Available in both modes
         # No config lists this; persistent_session.py:1547 and agent.py:3078
         # append it, and only where there is something to upgrade to.
