@@ -273,10 +273,11 @@ def test_deployment_settings_keep_their_environment_contract(
 
 
 def test_session_subagent_fanout_is_read_per_lane_and_at_call_time(monkeypatch):
-    """parallel_subagents.md §12 (WP3c): the three advertising compositions
-    (stateless claim bundle, pinned attach body, workspace pull payload) read
-    the application's settings when they run, so a replaced settings object is
-    seen by the next claim or attach without rebuilding any dependency."""
+    """parallel_subagents.md §12 (WP3c): the advertising compositions
+    (stateless claim bundle, pinned attach body, workspace pull payload, and
+    since §14.2 P5 the pinned heartbeat) read the application's settings when
+    they run, so a replaced settings object is seen by the next claim, attach
+    or heartbeat without rebuilding any dependency."""
     from orchestrator.application import preparation, sessions
 
     monkeypatch.delenv("SESSION_SUBAGENT_FANOUT_LANES", raising=False)
@@ -291,13 +292,14 @@ def test_session_subagent_fanout_is_read_per_lane_and_at_call_time(monkeypatch):
         preparation.thread_workspace_delivery_dependencies(
             resources
         ).session_subagent_fanout,
+        sessions.agent_registration_dependencies(resources).session_subagent_fanout,
     ]
-    assert [read("stateless") for read in readers] == [False] * 3
+    assert [read("stateless") for read in readers] == [False] * 4
     resources.settings = dataclasses.replace(
         resources.settings, session_subagent_fanout_lanes=frozenset({"stateless"})
     )
-    assert [read("stateless") for read in readers] == [True] * 3
-    assert [read("pinned") for read in readers] == [False] * 3
+    assert [read("stateless") for read in readers] == [True] * 4
+    assert [read("pinned") for read in readers] == [False] * 4
 
 
 def test_create_app_uses_explicit_settings():

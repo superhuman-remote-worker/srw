@@ -1236,10 +1236,7 @@ def _ensure_persistent_loop_started(
                 project_ids=_session.project_ids,
                 tool_context=_session.tool_context,
                 initial_turn_count=_session.turn_count,
-                get_current_tools=lambda: (
-                    _session.llm_with_tools,
-                    _session.tools,
-                ),
+                get_current_tools=_loop_current_tools,
                 get_current_context=lambda: (
                     _session.context_manager,
                     _session.config,
@@ -1480,7 +1477,7 @@ async def lifespan(app: FastAPI):
                     get_status=_heartbeat_status,
                     get_job_id=lambda: None,
                     get_metrics=_get_agent_metrics,
-                    on_response=_session_termination.handle_heartbeat_intents,
+                    on_response=_on_heartbeat_response,
                 )
             )
             logger.info("Registered with orchestrator as persistent agent")
@@ -5631,6 +5628,38 @@ async def _current_canvas_for_control() -> dict[str, Any] | None:
 # _broadcast() rather than writing to one ws. The input and interrupt
 # callbacks are the input owner's (``_session_input``).
 # ---------------------------------------------------------------------------
+
+
+async def _on_heartbeat_response(response: Dict[str, Any]) -> None:
+    """Heartbeat-response callback of a registered persistent runtime.
+
+    Holds a pinned session's fan-out advertisement for its next turn start
+    (parallel_subagents.md §14.2 P5), then hands the response to the
+    termination coordinator, which owns the drain intent. The hold is a plain
+    store and cannot fail the drain path.
+    """
+
+    _session_attach.hold_heartbeat_subagent_advertisement(response)
+    await _session_termination.handle_heartbeat_intents(response)
+
+
+def _loop_current_tools() -> tuple[Any, Any]:
+    """The tool binding a turn runs with, read once after its input arrives.
+
+    First applies the fan-out advertisement a heartbeat held for this pinned
+    session (P5). The loop reads this once per input, before the turn starts
+    and never again inside it, so a switch that arrives mid-turn reaches the
+    next turn and the running turn keeps the binding and the gate it started
+    with. A failed apply keeps the current binding.
+    """
+
+    try:
+        _session_attach.apply_heartbeat_subagent_advertisement()
+    except Exception:  # noqa: BLE001 - never fail a turn over the switch
+        logger.warning(
+            "Heartbeat fan-out advertisement could not be applied", exc_info=True
+        )
+    return _session.llm_with_tools, _session.tools
 
 
 async def _loop_before_turn_authorization() -> tuple[bool, str]:

@@ -481,6 +481,10 @@ class SessionAttachCoordinator:
         # prove a partial sandbox runtime writer-free. Never logged (it holds
         # transport paths).
         self._cleanup_context: Optional[dict[str, Any]] = None
+        # The newest heartbeat's fan-out advertisement for a pinned session
+        # (batch settle, switch), held until the next turn start
+        # (parallel_subagents.md §14.2 P5). None = nothing to apply.
+        self._heartbeat_subagent_advertisement: Optional[tuple[Any, Any]] = None
 
     # --- Views ----------------------------------------------------------------
 
@@ -642,6 +646,48 @@ class SessionAttachCoordinator:
                 fanout_allowed,
             )
         return changed
+
+    def hold_heartbeat_subagent_advertisement(self, response: Any) -> None:
+        """Hold a heartbeat response's fan-out advertisement for the next turn.
+
+        A pinned runtime claims its inputs from Postgres, so the heartbeat is
+        the only orchestrator response a running pinned session receives
+        (parallel_subagents.md §14.2 P5). It carries both keys for a pinned
+        session; an older orchestrator, or one answering for an agent with no
+        pinned thread, sends neither, and that means no change, never off.
+        The newest response replaces an older held one. Nothing is applied
+        here: the switch must not move under a running turn.
+        """
+
+        if not isinstance(response, dict):
+            return
+        if (
+            SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY not in response
+            or SESSION_SUBAGENT_FANOUT_KEY not in response
+        ):
+            return
+        self._heartbeat_subagent_advertisement = (
+            response[SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY],
+            response[SESSION_SUBAGENT_FANOUT_KEY],
+        )
+
+    def apply_heartbeat_subagent_advertisement(self) -> bool:
+        """Apply the held heartbeat advertisement once, at a pinned turn start.
+
+        Called before the turn reads its tool binding, so a value that arrives
+        mid-turn reaches the next turn and never the running one; a batch
+        already running is not stopped. The stateless lane never takes it:
+        its claim bundle is the per-claim authority. Returns True when a value
+        changed (``apply_subagent_advertisement`` logs the change).
+        """
+
+        held = self._heartbeat_subagent_advertisement
+        if held is None or self._session is None:
+            return False
+        self._heartbeat_subagent_advertisement = None
+        if self._ports.stateless_mode():
+            return False
+        return self.apply_subagent_advertisement(*held)
 
     def runtime_actor_for_attach(
         self,
@@ -1517,6 +1563,10 @@ class SessionAttachCoordinator:
             tuple(reversed(subagent_workspace_responses)),
             from_workspace=not self._ports.stateless_mode(),
         )
+        # This attach's advertisement supersedes one a heartbeat held for an
+        # earlier binding of this process (P5); the next heartbeat brings the
+        # current value again.
+        self._heartbeat_subagent_advertisement = None
         self._logger.info(
             "Session delegation advertisement: thread=%s batch_settle=%s "
             "fanout=%s source=%s",

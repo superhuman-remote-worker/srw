@@ -61,6 +61,7 @@ from shared.subagent_lifecycle import (
     SubagentLifecycleError,
 )
 from shared.pinned_session_identity import PINNED_SESSION_READY_IDENTITY_CONTRACT
+from shared.session_subagent_batch import SESSION_SUBAGENT_FANOUT_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -566,6 +567,14 @@ async def _handle_heartbeat_intents(response: Dict[str, Any]) -> None:
     global _drain_intent_received, _drain_intent_handled, _drain_deferred_logged
     _check_job_preempted(response)
     _update_guidance_inbox(response)
+    if SESSION_SUBAGENT_FANOUT_KEY in response:
+        # A pinned session adopted on persistent_app's state takes the
+        # operator's fan-out switch from this response at its next turn
+        # start (parallel_subagents.md §14.2 P5). Only a response for a
+        # pinned thread carries the key.
+        import agent.api.persistent_app as pa
+
+        pa._session_attach.hold_heartbeat_subagent_advertisement(response)
     intents = response.get("intents") or {}
     if not isinstance(intents, dict) or not intents.get("should_drain"):
         return

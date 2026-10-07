@@ -87,6 +87,12 @@ from orchestrator.services.session_runtime_admission import (
     thread_runtime_refusal_detail,
 )
 from orchestrator.services.stateless_workspace_gate import thread_metadata_object
+from shared.run_queue import LANE_PINNED
+from shared.session_subagent_batch import (
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT,
+    SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY,
+    SESSION_SUBAGENT_FANOUT_KEY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +141,46 @@ class AgentRegistrationDependencies:
 
     # B11 scheduler.
     trigger_dispatch: Callable[[], None]
+
+    # The operator's session fan-out switch, ``(lane) -> bool``
+    # (``DeploymentSettings.session_subagent_fanout``), read at every
+    # heartbeat of a pinned session (parallel_subagents.md §14.2 P5). Off
+    # unless the application binds it.
+    session_subagent_fanout: Callable[[str], bool] = lambda _lane: False
+
+
+def pinned_session_subagent_advertisement(
+    result: dict[str, Any],
+    *,
+    dependencies: AgentRegistrationDependencies,
+) -> dict[str, Any]:
+    """The fan-out advertisement a heartbeat carries to a pinned session.
+
+    A pinned runtime claims its inputs from Postgres, so no orchestrator
+    response accompanies a turn; before this it learned the operator's switch
+    only at attach, and turning the lane off never reached a running session
+    (parallel_subagents.md §14.1, §14.2 P5). The heartbeat already resolves
+    the bound thread, so it carries the same two keys as the pushed pinned
+    attach body and the ready workspace payload, evaluated now with the same
+    per-lane setting. The agent holds them and applies them at its next turn
+    start. Empty for an agent with no bound thread or a non-pinned one; an
+    agent that predates the keys ignores them.
+    """
+
+    if not result.get("thread_id"):
+        return {}
+    if not dependencies.thread_uses_pinned_execution(
+        {"execution_lane": result.get("execution_lane")}
+    ):
+        return {}
+    return {
+        SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT_KEY: (
+            SESSION_SUBAGENT_BATCH_SETTLE_CONTRACT
+        ),
+        SESSION_SUBAGENT_FANOUT_KEY: bool(
+            dependencies.session_subagent_fanout(LANE_PINNED)
+        ),
+    }
 
 
 async def register_agent(
@@ -740,6 +786,18 @@ async def agent_heartbeat(
                 pending_guidance = None
                 queued_replies = None
 
+        # A pinned session's fan-out switch (P5). Best-effort like the rest:
+        # an absent pair means "no change" to the agent, never "off".
+        try:
+            advertisement = pinned_session_subagent_advertisement(
+                result, dependencies=dependencies
+            )
+        except Exception as exc:
+            advertisement = {}
+            logger.warning(
+                f"Session fan-out advertisement skipped for agent {agent_id}: {exc}"
+            )
+
         # Surface orchestrator-set intents (drain, version-upgrade hints)
         # so the agent can react on the next heartbeat tick. Keeping the
         # legacy {"status": "ok"} key for back-compat with older agent
@@ -750,6 +808,7 @@ async def agent_heartbeat(
             "job_status": job_status,
             "pending_guidance": pending_guidance,
             "queued_replies": queued_replies,
+            **advertisement,
         }
     except HTTPException:
         raise

@@ -370,6 +370,9 @@ def agent_registration_dependencies(
             jobs_composition.job_dispatch_dependencies,
             resources,
         ),
+        session_subagent_fanout=lambda lane: (
+            resources.settings.session_subagent_fanout(lane)
+        ),
     )
 
 

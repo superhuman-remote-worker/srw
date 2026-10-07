@@ -26984,11 +26984,14 @@ class PostgresDB:
             # The agent's bound thread rides the same row read at zero
             # marginal DB cost; the handler needs it to slide a thread-bound
             # runtime-actor grant on liveness. None for stateless workers.
+            # Its lane rides along too: a pinned session learns the operator's
+            # fan-out switch from this response (parallel_subagents.md P5).
             return {
                 "previous_status": prev_status,
                 "effective_status": effective_status,
                 "intents": intents,
                 "thread_id": str(bound_thread_id) if bound_thread_id else None,
+                "execution_lane": (lane or None) if bound_thread_id else None,
                 "session_runtime_generation": (
                     str(expected_generation) if expected_generation else None
                 ),

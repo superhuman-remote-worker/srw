@@ -720,6 +720,87 @@ def test_a_failed_activity_merge_never_fails_the_heartbeat():
     assert resp.status_code == 200
 
 
+@pytest.mark.parametrize("lanes", [frozenset({"stateless", "pinned"}), frozenset()])
+def test_a_pinned_session_heartbeat_carries_the_fanout_switch(lanes):
+    """parallel_subagents.md §14.2 P5: the heartbeat is the only response a
+    running pinned session receives, so it carries the same two keys as the
+    pinned attach body, the switch read now for the pinned lane."""
+    store = _store(
+        heartbeat=AsyncMock(
+            return_value={
+                "intents": {},
+                "thread_id": THREAD_ID,
+                "execution_lane": "pinned",
+            }
+        )
+    )
+    seen: list[str] = []
+
+    def _switch(lane):
+        seen.append(lane)
+        return lane in lanes
+
+    deps = _deps(store=store, session_subagent_fanout=_switch)
+    resp = _client(deps).post(
+        f"/api/agents/{AGENT_ID}/heartbeat", json={"status": "session"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["session_subagent_batch_settle_contract"] == 1
+    assert body["session_subagent_fanout"] is ("pinned" in lanes)
+    assert seen == ["pinned"]
+
+
+@pytest.mark.parametrize(
+    "beat",
+    [
+        # A stateless thread learns its switch at every claim, never here.
+        {"intents": {}, "thread_id": THREAD_ID, "execution_lane": "stateless"},
+        # An unknown or missing lane never inherits the pinned switch.
+        {"intents": {}, "thread_id": THREAD_ID, "execution_lane": None},
+        # A pool or worker agent with no bound thread.
+        {"intents": {}, "thread_id": None, "execution_lane": None},
+        # An older store result without the lane.
+        {"intents": {}, "thread_id": THREAD_ID},
+    ],
+)
+def test_a_heartbeat_without_a_pinned_thread_carries_no_advertisement(beat):
+    store = _store(heartbeat=AsyncMock(return_value=beat))
+    switch = MagicMock(return_value=True)
+    deps = _deps(store=store, session_subagent_fanout=switch)
+    resp = _client(deps).post(
+        f"/api/agents/{AGENT_ID}/heartbeat", json={"status": "ready"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "session_subagent_fanout" not in body
+    assert "session_subagent_batch_settle_contract" not in body
+    switch.assert_not_called()
+
+
+def test_a_failed_switch_read_never_fails_the_heartbeat():
+    """Absent keys mean "no change" to the agent, so a failed read omits
+    them instead of failing the beat or reporting the lane off."""
+    store = _store(
+        heartbeat=AsyncMock(
+            return_value={
+                "intents": {},
+                "thread_id": THREAD_ID,
+                "execution_lane": "pinned",
+            }
+        )
+    )
+    deps = _deps(
+        store=store, session_subagent_fanout=MagicMock(side_effect=RuntimeError("x"))
+    )
+    resp = _client(deps).post(
+        f"/api/agents/{AGENT_ID}/heartbeat", json={"status": "session"}
+    )
+    assert resp.status_code == 200
+    assert "session_subagent_fanout" not in resp.json()
+    deps.logger.warning.assert_called()
+
+
 def test_graph_progress_folds_into_metrics():
     store = _store()
     deps = _deps(store=store)
