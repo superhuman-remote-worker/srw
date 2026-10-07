@@ -98,6 +98,18 @@ VALUE_FIELDS: dict[str, dict[str, tuple[ValueType, bool, bool]]] = {
     },
     "pod_env": {"name": ("string", True, False), "value": ("string", True, True)},
     "pod_file": {"path": ("string", True, False), "content": ("string", True, True)},
+    # A key loaded into the workspace's ssh-agent and reached through an
+    # opaque alias; host, port and user are absent for a host-less ssh_key.
+    "ssh_identity": {
+        "alias": ("string", True, False),
+        "authority_id": ("string", True, False),
+        "private_key": ("string", True, True),
+        "fingerprint": ("string", True, False),
+        "host": ("string_or_null", False, False),
+        "port": ("integer", False, False),
+        "user": ("string_or_null", False, False),
+        "known_hosts": ("string_list", False, False),
+    },
 }
 #: Closed value enums inside a form (``null`` stays allowed where the type
 #: allows it).  A checkout's ``auth`` names how the credential reaches git:

@@ -26,6 +26,7 @@ DatasourceRuntimeKind = Literal[
     "email_tools",
     "mcp_tools",
     "credential_file",
+    "ssh_identity",
 ]
 
 
@@ -46,6 +47,7 @@ _RUNTIME_KIND_BY_FORM: dict[str, DatasourceRuntimeKind] = {
     "managed_connection": "managed_tools",
     "mcp_client": "mcp_tools",
     "credential_file": "credential_file",
+    "ssh_identity": "ssh_identity",
 }
 
 

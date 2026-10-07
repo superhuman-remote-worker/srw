@@ -22,10 +22,13 @@ import os
 import re
 from typing import Any
 
-from shared.connectors.builtin import legacy_types_with_form
+from shared.connectors.builtin import legacy_types_with_slot
 
-#: Stored types whose driver delivers credential files (from the driver specs).
-CREDENTIAL_FILE_TYPES: frozenset[str] = legacy_types_with_form("credential_file")
+#: Stored types whose credentials are a ``files[]`` list, normalized here
+#: (from the driver specs). An ssh_key's first file is its private key: it is
+#: validated here like any file but loaded into a workspace ssh-agent, never
+#: written out.
+CREDENTIAL_FILE_TYPES: frozenset[str] = legacy_types_with_slot("files")
 
 MAX_FILES_PER_DATASOURCE = 5
 MAX_FILE_BYTES = 64 * 1024  # 64 KB UTF-8

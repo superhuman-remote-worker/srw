@@ -225,17 +225,22 @@ REPOSITORY_SPEC = DriverSpec(
     title="Repository",
     guide_topic="datasources",
     plane="bind_time",
-    delivery_forms=("checkout",),
+    # A token repository is a checkout only; an SSH-key repository's key
+    # also goes into the workspace's ssh-agent.
+    delivery_forms=("checkout", "ssh_identity"),
     config_schema={
         "type": "object",
-        "properties": {"forge": {"enum": list(FORGES)}},
+        "properties": {
+            "forge": {"enum": list(FORGES)},
+            "known_hosts": {"type": "string", "x-srw-multiline": True},
+        },
     },
     # The clone needs it, but validation accepts a connector without one when
     # it declares its forge (the repository code stays as it is until C1).
     legacy_connection_url="optional",
     credential_slots=(
-        # Both land in the workspace today: the token in the clone URL (and so
-        # in .git/config), the key under ~/.ssh/.
+        # The token lands in the clone URL, and so in .git/config, until the
+        # git swap driver (C3); the key is loaded into an ssh-agent (C1).
         CredentialSlot(
             "token",
             "secret_string",
@@ -247,7 +252,7 @@ REPOSITORY_SPEC = DriverSpec(
             "ssh_key",
             "ssh_private_key",
             {"type": "object", "properties": {"ssh_key": _SECRET}},
-            delivery="file",
+            delivery="ssh_agent",
             update="replace",
         ),
     ),
@@ -587,8 +592,42 @@ def _credential_file(
 KUBECONFIG_SPEC = _credential_file(
     "kubeconfig", "kubeconfig", "Kubeconfig", "kubeconfig", "kubeconfig"
 )
-SSH_KEY_SPEC = _credential_file(
-    "ssh_key", "ssh-key", "SSH Key", "ssh_private_key", "key"
+SSH_KEY_SPEC = DriverSpec(
+    name="srw.ssh-key/v1",
+    legacy_type="ssh_key",
+    title="SSH Key",
+    guide_topic="datasources",
+    plane="bind_time",
+    delivery_forms=("ssh_identity",),
+    config_schema={
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "host": {"type": "string"},
+            "user": {"type": "string"},
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "known_hosts": {"type": "string", "x-srw-multiline": True},
+        },
+    },
+    legacy_connection_url="optional",
+    credential_slots=(
+        # files[0] is the private key, an optional files[1] its public key.
+        CredentialSlot(
+            "files",
+            "ssh_private_key",
+            _FILES,
+            required=True,
+            delivery="ssh_agent",
+            update="replace",
+        ),
+    ),
+    access_levels=_declared_only("key"),
+    supported_backends=SHELL_BACKENDS,
+    workspace_requirements=(
+        "A shell workspace: the key is loaded into a dedicated ssh-agent there "
+        "and reached through an opaque alias; it never lands on disk."
+    ),
+    holds_upstream_credentials=True,
 )
 GENERIC_FILE_SPEC = _credential_file(
     "generic_file", "generic-file", "Generic file", "file", "file"
@@ -634,6 +673,15 @@ _TOOL_MAP_ORDER: tuple[DriverSpec, ...] = (
 def spec_for_type(legacy_type: str | None) -> DriverSpec | None:
     """The built-in spec serving a stored ``datasources.type``."""
     return _BY_TYPE.get(legacy_type or "")
+
+
+def legacy_types_with_slot(slot: str) -> frozenset[str]:
+    """Stored types whose credentials have the named slot."""
+    return frozenset(
+        spec.legacy_type
+        for spec in DATASOURCE_SPECS
+        if spec.legacy_type and any(item.name == slot for item in spec.credential_slots)
+    )
 
 
 def legacy_types_with_form(form: str) -> frozenset[str]:

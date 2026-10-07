@@ -37,11 +37,12 @@ DeliveryForm = Literal[
     "knowledge_index",
     "pod_env",
     "pod_file",
+    "ssh_identity",
 ]
 CredentialKind = Literal[
     "secret_string", "file", "ssh_private_key", "oauth2", "kubeconfig"
 ]
-CredentialDelivery = Literal["env", "file"]
+CredentialDelivery = Literal["env", "file", "ssh_agent"]
 CredentialUpdate = Literal["keep_if_blank", "merge", "replace"]
 LiveDetach = Literal["immediate", "next_attach", "refused"]
 Operation = Literal[
@@ -92,8 +93,9 @@ class CredentialSlot:
 
     ``schema`` is a JSON Schema for the keys the slot owns; secret values carry
     ``"writeOnly": true``.  ``access_levels`` lists the levels that need it
-    (empty: every level).  ``delivery`` is ``None`` when the credential never
-    reaches a workspace (SRW or the agent process holds it).  ``update`` is
+    (empty: every level).  ``delivery`` is how the credential reaches the
+    workspace (an environment file, a file, or a key in its ssh-agent), or
+    ``None`` when it never does (SRW or the agent process holds it).  ``update`` is
     how an edit treats the stored value: a blank edit keeps it, a merge adds
     keys, a replace swaps the whole object.
     """

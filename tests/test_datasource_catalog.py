@@ -33,10 +33,21 @@ def test_datasource_catalog_is_unique_and_complete():
 
 
 def test_datasource_catalog_matches_agent_consumers():
+    from shared.connectors.builtin import legacy_types_with_slot
+
+    # Files delivered to the agent pod. An ssh_key's key goes into the
+    # workspace's ssh-agent instead (C1), so it is catalogued as an SSH
+    # identity; both the agent and the orchestrator still treat its stored
+    # credentials as a files[] list.
     credential_types = {
         definition.type_id
         for definition in DATASOURCE_TYPE_CATALOG
         if definition.runtime_kind == "credential_file"
+    }
+    ssh_identity_types = {
+        definition.type_id
+        for definition in DATASOURCE_TYPE_CATALOG
+        if definition.runtime_kind == "ssh_identity"
     }
     # "repository" keeps its own runtime_kind — it clones onto the workspace
     # instead of opening a connection — but it is tool-backed too now (the
@@ -48,8 +59,12 @@ def test_datasource_catalog_matches_agent_consumers():
         in {"managed_tools", "email_tools", "mcp_tools", "repository"}
     }
 
-    assert credential_types == CREDENTIAL_FILE_TYPES
-    assert credential_types == ORCHESTRATOR_CREDENTIAL_FILE_TYPES
+    assert credential_types == {"kubeconfig", "generic_file"}
+    assert ssh_identity_types == {"ssh_key"}
+    files_types = legacy_types_with_slot("files")
+    assert files_types == credential_types | ssh_identity_types
+    assert CREDENTIAL_FILE_TYPES == files_types
+    assert ORCHESTRATOR_CREDENTIAL_FILE_TYPES == files_types
     assert tool_types == set(DATASOURCE_TOOL_MAP)
 
 

@@ -720,7 +720,7 @@
         "type_id": "ssh_key",
         "title": "SSH Key",
         "guide_topic": "datasources",
-        "runtime_kind": "credential_file"
+        "runtime_kind": "ssh_identity"
       },
       {
         "type_id": "generic_file",

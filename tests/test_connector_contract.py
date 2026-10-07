@@ -80,7 +80,7 @@ class TestBuiltinSpecs:
         assert env.access_levels == files.access_levels == ()
 
     def test_declared_read_only_is_advisory_on_env_and_file_connectors(self):
-        for form in ("env_file", "credential_file"):
+        for form in ("env_file", "credential_file", "ssh_identity"):
             for type_id in legacy_types_with_form(form):
                 read_only = spec_for_type(type_id).access_level("ReadOnly")
                 assert read_only.advisory, type_id
@@ -202,6 +202,16 @@ _VALUES = {
     "knowledge_index": {"datasource_id": "d1", "config": {"root_path": "docs"}},
     "pod_env": {"name": "TOKEN", "value": "x"},
     "pod_file": {"path": "/run/srw/bindings/key", "content": "x"},
+    "ssh_identity": {
+        "alias": "srw-repo-" + "a" * 32,
+        "authority_id": "00000000-0000-4000-8000-0000000000a2",
+        "private_key": "key",
+        "fingerprint": "SHA256:x",
+        "host": "bastion.example.com",
+        "port": 22,
+        "user": "deploy",
+        "known_hosts": ["ssh-ed25519 AAAA"],
+    },
 }
 
 

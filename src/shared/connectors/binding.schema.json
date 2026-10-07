@@ -74,7 +74,8 @@
             "mcp_client",
             "knowledge_index",
             "pod_env",
-            "pod_file"
+            "pod_file",
+            "ssh_identity"
           ]
         },
         "value": {
@@ -417,6 +418,59 @@
               "required": [
                 "path",
                 "content"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "form": {
+              "const": "ssh_identity"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "alias": {
+                  "type": "string"
+                },
+                "authority_id": {
+                  "type": "string"
+                },
+                "private_key": {
+                  "type": "string",
+                  "writeOnly": true
+                },
+                "fingerprint": {
+                  "type": "string"
+                },
+                "host": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "port": {
+                  "type": "integer"
+                },
+                "user": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "known_hosts": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "alias",
+                "authority_id",
+                "private_key",
+                "fingerprint"
               ],
               "additionalProperties": false
             }
