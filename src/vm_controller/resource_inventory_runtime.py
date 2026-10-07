@@ -1,6 +1,7 @@
 """Non-overlapping inventory publication, isolated from VM lifecycle handling."""
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import hmac
 import json
@@ -133,6 +134,24 @@ def _inventory_api_client():
     return client.ApiClient(configuration=config)
 
 
+async def _close_inventory_executor(executor):
+    shutdown = asyncio.create_task(
+        asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=True)
+    )
+    try:
+        await asyncio.shield(shutdown)
+    except asyncio.CancelledError:
+        # A second cancellation must not close the Kubernetes client while
+        # its worker still holds an in-flight SDK request.
+        while not shutdown.done():
+            try:
+                await asyncio.shield(shutdown)
+            except asyncio.CancelledError:
+                pass
+        shutdown.result()
+        raise
+
+
 @asynccontextmanager
 async def _observer_resources(settings, *, base_url, secret):
     from kubernetes import client
@@ -147,32 +166,41 @@ async def _observer_resources(settings, *, base_url, secret):
             follow_redirects=False,
             trust_env=False,
         ) as http:
-            collector = ResourceInventoryCollector(
-                core=client.CoreV1Api(api),
-                custom=client.CustomObjectsApi(api),
-                storage=client.StorageV1Api(api),
-                cluster_id=settings.cluster_id,
-                namespace=settings.namespace,
-                controller_id=str(uuid4()),
-                policy_digest=settings.policy_digest,
-                label_keys=settings.label_keys,
-                max_items=settings.max_items,
-                max_bytes=settings.max_bytes,
-                request_timeout_seconds=settings.request_timeout_seconds,
-                collection_timeout_seconds=settings.collection_timeout_seconds,
-                protocol=settings.protocol,
-                kubevirt_namespace=settings.kubevirt_namespace,
-                kubevirt_name=settings.kubevirt_name,
+            executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="vm-inventory"
             )
-            yield ResourceInventoryObserver(
-                collector=collector,
-                publisher=InventoryPublisher(
-                    http,
-                    secret=secret,
-                    timeout_seconds=settings.publication_timeout_seconds,
-                ),
-                interval_seconds=settings.publish_interval_seconds,
-            )
+            try:
+                collector = ResourceInventoryCollector(
+                    core=client.CoreV1Api(api),
+                    custom=client.CustomObjectsApi(api),
+                    storage=client.StorageV1Api(api),
+                    cluster_id=settings.cluster_id,
+                    namespace=settings.namespace,
+                    controller_id=str(uuid4()),
+                    policy_digest=settings.policy_digest,
+                    label_keys=settings.label_keys,
+                    max_items=settings.max_items,
+                    max_bytes=settings.max_bytes,
+                    request_timeout_seconds=settings.request_timeout_seconds,
+                    collection_timeout_seconds=settings.collection_timeout_seconds,
+                    protocol=settings.protocol,
+                    kubevirt_namespace=settings.kubevirt_namespace,
+                    kubevirt_name=settings.kubevirt_name,
+                    collection_executor=executor,
+                )
+                yield ResourceInventoryObserver(
+                    collector=collector,
+                    publisher=InventoryPublisher(
+                        http,
+                        secret=secret,
+                        timeout_seconds=settings.publication_timeout_seconds,
+                    ),
+                    interval_seconds=settings.publish_interval_seconds,
+                )
+            finally:
+                # The observer context first cancels/drains its current collection.
+                # Keep the event loop responsive if a direct caller still has work.
+                await _close_inventory_executor(executor)
 
 
 @asynccontextmanager

@@ -1,6 +1,7 @@
 """Bounded LIST inventory for VM admission; no create or reservation effects."""
 
 import asyncio
+from contextvars import copy_context
 from datetime import datetime, timezone
 import time
 from uuid import uuid4
@@ -322,6 +323,7 @@ class ResourceInventoryCollector:
         protocol=1,
         kubevirt_namespace=None,
         kubevirt_name=None,
+        collection_executor=None,
     ):
         self.core, self.custom, self.storage = core, custom, storage
         self.namespace, self.cluster_id, self.controller_id = (
@@ -354,9 +356,17 @@ class ResourceInventoryCollector:
         self.protocol = protocol
         self.kubevirt_namespace = kubevirt_namespace
         self.kubevirt_name = kubevirt_name
+        self.collection_executor = collection_executor
 
-    async def _run_worker(self, method):
-        task = asyncio.create_task(asyncio.to_thread(method))
+    async def _run_worker(self, method, *, executor=None):
+        if executor is None:
+            task = asyncio.create_task(asyncio.to_thread(method))
+        else:
+            # run_in_executor does not copy contextvars as to_thread does.
+            context = copy_context()
+            task = asyncio.get_running_loop().run_in_executor(
+                executor, context.run, method
+            )
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -374,11 +384,11 @@ class ResourceInventoryCollector:
                 task.exception()  # Retrieve any worker error; preserve cancellation.
             raise
 
-    async def _call(self, method, **kwargs):
+    async def _call(self, method, *, executor=None, **kwargs):
         def call_and_document():
             return _document(method(**kwargs))
 
-        return await self._run_worker(call_and_document)
+        return await self._run_worker(call_and_document, executor=executor)
 
     async def _get(self, method, *, deadline, **kwargs):
         budget = deadline - time.monotonic()
@@ -496,7 +506,7 @@ class ResourceInventoryCollector:
             raise InventoryError("collection_stale")
         return proof
 
-    async def _list(self, method, *, deadline, remaining, **kwargs):
+    async def _list(self, method, *, deadline, remaining, executor=None, **kwargs):
         items, tokens, version, token = [], set(), None, None
         while True:
             budget = deadline - time.monotonic()
@@ -509,7 +519,7 @@ class ResourceInventoryCollector:
             }
             if token is not None:
                 options["_continue"] = token
-            response = await self._call(method, **options)
+            response = await self._call(method, executor=executor, **options)
             if time.monotonic() > deadline:
                 raise InventoryError("collection_stale")
             metadata = _map(response.get("metadata", {}))
@@ -593,6 +603,7 @@ class ResourceInventoryCollector:
                     method,
                     deadline=deadline,
                     remaining=self.max_items - count,
+                    executor=self.collection_executor,
                     **kwargs,
                 )
                 count += len(raw[kind])
@@ -601,6 +612,7 @@ class ResourceInventoryCollector:
                     self.core.list_namespaced_limit_range,
                     deadline=deadline,
                     remaining=self.max_items - count,
+                    executor=self.collection_executor,
                     namespace=self.namespace,
                 )
                 if limits:
@@ -610,6 +622,7 @@ class ResourceInventoryCollector:
                     raise InventoryError("collection_stale")
                 kubevirt = await self._call(
                     self.custom.get_namespaced_custom_object,
+                    executor=self.collection_executor,
                     group="kubevirt.io",
                     version="v1",
                     plural="kubevirts",
@@ -623,6 +636,7 @@ class ResourceInventoryCollector:
                 if not isinstance(rv, str) or not rv:
                     raise InventoryError("collection_incomplete")
                 versions["kubevirt"] = rv
+
             def finish_snapshot():
                 if self.protocol == 2:
                     snapshot["installed_profile"] = normalize_installed_profile(
@@ -646,7 +660,9 @@ class ResourceInventoryCollector:
                     snapshot, max_items=self.max_items, max_bytes=self.max_bytes
                 )
 
-            return await self._run_worker(finish_snapshot)
+            return await self._run_worker(
+                finish_snapshot, executor=self.collection_executor
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:

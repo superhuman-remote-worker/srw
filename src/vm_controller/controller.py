@@ -559,6 +559,24 @@ def _pre_ssh_pod_wire(value: object) -> object:
     return wire if type(wire) is dict else None
 
 
+def _pre_ssh_effective_vm_grace(vm: object) -> int | None:
+    """Resolve admitted VM grace only for the pre-SSH terminal observer."""
+
+    spec = vm
+    for key in ("spec", "template", "spec"):
+        if not isinstance(spec, Mapping):
+            return None
+        spec = spec.get(key)
+        if not isinstance(spec, Mapping) or not spec:
+            return None
+    if "terminationGracePeriodSeconds" not in spec:
+        # KubeVirt v1.8.4: API DefaultGracePeriodSeconds and the launcher
+        # renderer's gracePeriodInSeconds use 30 only for an unset field.
+        return 30
+    grace = spec["terminationGracePeriodSeconds"]
+    return grace if type(grace) is int and grace > 0 else None
+
+
 def _metadata(value: object) -> object:
     return _object_value(value, "metadata", {})
 
@@ -4443,17 +4461,10 @@ class VMController:
                 or PRE_SSH_STOP_FINALIZER not in finalizers
             ):
                 return {"status": "halt_pending"}
-            vm_template_spec = _object_value(
-                _object_value(_object_value(vm, "spec", {}), "template", {}),
-                "spec",
-                {},
-            )
             terminal = _exact_terminal_container_evidence(
                 pod,
                 pre_ssh_posttermination_gc=True,
-                vm_template_grace=_object_value(
-                    vm_template_spec, "terminationGracePeriodSeconds"
-                ),
+                vm_template_grace=_pre_ssh_effective_vm_grace(vm),
             )
             if terminal is None:
                 return {"status": "pending_terminal_proof"}
@@ -4546,17 +4557,10 @@ class VMController:
             meta = _metadata(pod)
             annotations = _object_value(meta, "annotations") or {}
             finalizers = _object_value(meta, "finalizers") or []
-            vm_template_spec = _object_value(
-                _object_value(_object_value(vm, "spec", {}), "template", {}),
-                "spec",
-                {},
-            )
             terminal = _exact_terminal_container_evidence(
                 pod,
                 pre_ssh_posttermination_gc=True,
-                vm_template_grace=_object_value(
-                    vm_template_spec, "terminationGracePeriodSeconds"
-                ),
+                vm_template_grace=_pre_ssh_effective_vm_grace(vm),
             )
             if (
                 _safe_uid(_object_value(meta, "uid")) != frozen["launcher_uid"]

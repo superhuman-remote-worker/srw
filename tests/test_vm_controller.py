@@ -30,6 +30,7 @@ from cryptography.hazmat.primitives.serialization import (
     PublicFormat,
     load_ssh_private_key,
 )
+from kubernetes.client.exceptions import ApiException as KubernetesApiException
 
 from vm_controller.lifecycle_auth import sign_payload
 
@@ -56,16 +57,18 @@ def test_controller_dockerfile_packages_lifecycle_auth_module() -> None:
     assert "COPY src/vm_controller/ ./src/vm_controller/" in dockerfile
 
 
-class _FakeApiException(Exception):
-    """Stand-in for kubernetes.client.exceptions.ApiException."""
+class _FakeApiException(KubernetesApiException):
+    """Convenient test error that remains compatible with the real SDK type."""
 
     def __init__(self, status=500, body=""):
-        self.status = status
+        super().__init__(status=status, reason=body)
         self.body = body
-        super().__init__(f"{status}: {body}")
+
+    def __str__(self):
+        return f"{self.status}: {self.body}"
 
 
-_mock_k8s_exc.ApiException = _FakeApiException  # type: ignore[attr-defined]
+_mock_k8s_exc.ApiException = KubernetesApiException  # type: ignore[attr-defined]
 _mock_k8s_client.exceptions = _mock_k8s_exc  # type: ignore[attr-defined]
 _mock_k8s_client.CustomObjectsApi = MagicMock  # type: ignore[attr-defined]
 _mock_k8s_client.CoreV1Api = MagicMock  # type: ignore[attr-defined]
@@ -5484,8 +5487,9 @@ class TestWorkspaceRecoveryControllerEvidence:
         controller.k8s_client.patch_namespaced_custom_object.assert_not_called()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("vm_grace", ["absent", 30, 60])
     async def test_pre_ssh_real_sdk_stop_then_release_preserves_exact_cas_and_vector(
-        self, controller
+        self, controller, vm_grace
     ):
         from kubernetes.client.exceptions import ApiException
         from shared.vm_pre_ssh_stop import (
@@ -5501,7 +5505,8 @@ class TestWorkspaceRecoveryControllerEvidence:
             expected_pvc_uid=self.PVC_UID,
         )
         assert frozen is not None
-        vm["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = 60
+        if vm_grace != "absent":
+            vm["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = vm_grace
         pod["spec"]["terminationGracePeriodSeconds"] = 60
         digest = "sha256:" + "a" * 64
         order = []
@@ -5601,11 +5606,160 @@ class TestWorkspaceRecoveryControllerEvidence:
         assert controller.k8s_client.patch_namespaced_custom_object.call_count == 1
         assert controller.core_api.patch_namespaced_pod.call_count == 2
 
+    async def wire_sdk_postterminal_pre_ssh_stop(self, controller):
+        from kubernetes.client.exceptions import ApiException
+        from shared.vm_pre_ssh_stop import (
+            PRE_SSH_STOP_ANNOTATION,
+            PRE_SSH_STOP_FINALIZER,
+        )
+        from tests.test_vm_pre_ssh_stop_protocol import proof
+
+        vm, pod, read_pod = self.wire_sdk_pre_ssh_stop(controller)
+        frozen = await controller._do_inspect_pre_ssh_stop(
+            SAMPLE_JOB_CONFIG["job_id"],
+            provision_generation=PROVISION_GENERATION,
+            expected_vm_uid=self.VM_UID,
+            expected_pvc_uid=self.PVC_UID,
+        )
+        assert frozen is not None
+        digest = "sha256:" + "a" * 64
+        vm["spec"]["runStrategy"] = "Halted"
+        vm["metadata"]["generation"] = frozen["vm_generation"] + 1
+        pod["spec"]["terminationGracePeriodSeconds"] = 60
+        pod["metadata"].update(
+            annotations={PRE_SSH_STOP_ANNOTATION: digest},
+            finalizers=["other.io/keep", PRE_SSH_STOP_FINALIZER],
+            deletionGracePeriodSeconds=0,
+            deletionTimestamp="2026-10-07T12:01:00Z",
+        )
+        pod["status"]["phase"] = "Failed"
+        for key in ("containerStatuses", "initContainerStatuses"):
+            for status in pod["status"][key]:
+                status["state"] = {
+                    "terminated": {
+                        "containerID": status["containerID"],
+                        "exitCode": 0,
+                        "startedAt": "2026-10-07T11:59:00Z",
+                        "finishedAt": "2026-10-07T12:00:00Z",
+                        "reason": "Completed",
+                    }
+                }
+        get_object = controller.k8s_client.get_namespaced_custom_object.side_effect
+
+        def vmi_absent(**kwargs):
+            if kwargs["plural"] == "virtualmachineinstances":
+                raise ApiException(status=404)
+            return get_object(**kwargs)
+
+        controller.k8s_client.get_namespaced_custom_object.side_effect = vmi_absent
+        observed = proof(frozen)
+        for item in observed["containers"]:
+            # The real SDK serializer emits UTC datetimes with this offset.
+            item["finished_at"] = "2026-10-07T12:00:00+00:00"
+        # Terminal wire evidence records init statuses before regular statuses.
+        observed["containers"].sort(key=lambda item: item["kind"])
+        return vm, pod, frozen, digest, read_pod, observed
+
+    @pytest.mark.asyncio
+    async def test_pre_ssh_real_sdk_release_uses_omitted_vm_grace(self, controller):
+        (
+            vm,
+            pod,
+            frozen,
+            digest,
+            read_pod,
+            observed,
+        ) = await self.wire_sdk_postterminal_pre_ssh_stop(controller)
+        assert "terminationGracePeriodSeconds" not in vm["spec"]["template"]["spec"]
+
+        def release_own_finalizer(**kwargs):
+            assert kwargs["body"][-1] == {
+                "op": "remove",
+                "path": "/metadata/finalizers/1",
+            }
+            pod["metadata"]["finalizers"].pop(1)
+            return read_pod()
+
+        controller.core_api.patch_namespaced_pod.side_effect = release_own_finalizer
+        result = await controller._do_release_pre_ssh_stop_finalizer(
+            frozen,
+            digest,
+            observed,
+            process_zero_receipt_id="00000000-0000-4000-8000-000000000901",
+        )
+        assert result == {"status": "finalizer_released"}
+        assert pod["metadata"]["finalizers"] == ["other.io/keep"]
+        controller.k8s_client.patch_namespaced_custom_object.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("vm_grace", [None, 0, -1, True, "30", 30.0, [], {}])
+    async def test_pre_ssh_vm_grace_shape_refuses_stop_and_release(
+        self, controller, vm_grace
+    ):
+        (
+            vm,
+            pod,
+            frozen,
+            digest,
+            _,
+            observed,
+        ) = await self.wire_sdk_postterminal_pre_ssh_stop(controller)
+        vm["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = vm_grace
+        # KubeVirt still renders positive Pod grace for explicit VM grace0.
+        if type(vm_grace) is int and vm_grace == 0:
+            pod["spec"]["terminationGracePeriodSeconds"] = 30
+        assert (await controller._do_pre_ssh_stop(frozen, digest)) == {
+            "status": "pending_terminal_proof"
+        }
+        assert (
+            await controller._do_release_pre_ssh_stop_finalizer(
+                frozen,
+                digest,
+                observed,
+                process_zero_receipt_id="00000000-0000-4000-8000-000000000901",
+            )
+        ) == {"status": "identity_refused"}
+        controller.core_api.patch_namespaced_pod.assert_not_called()
+        controller.k8s_client.patch_namespaced_custom_object.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "path", [("spec",), ("spec", "template"), ("spec", "template", "spec")]
+    )
+    @pytest.mark.parametrize("shape", ["absent", None, {}, [], "invalid"])
+    async def test_pre_ssh_vm_grace_shape_malformed_parent_refuses_release(
+        self, controller, path, shape
+    ):
+        (
+            vm,
+            _,
+            frozen,
+            digest,
+            _,
+            observed,
+        ) = await self.wire_sdk_postterminal_pre_ssh_stop(controller)
+        parent = vm
+        for key in path[:-1]:
+            parent = parent[key]
+        if shape == "absent":
+            parent.pop(path[-1])
+        else:
+            parent[path[-1]] = shape
+        assert (
+            await controller._do_release_pre_ssh_stop_finalizer(
+                frozen,
+                digest,
+                observed,
+                process_zero_receipt_id="00000000-0000-4000-8000-000000000901",
+            )
+        ) == {"status": "identity_refused"}
+        controller.core_api.patch_namespaced_pod.assert_not_called()
+        controller.k8s_client.patch_namespaced_custom_object.assert_not_called()
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "unsafe",
         [
-            "template_grace_missing",
             "template_grace_null",
             "template_grace_zero",
             "pod_grace_missing",
