@@ -21,10 +21,12 @@ from orchestrator.services.agent_datasource_payload import (
     DatasourcePayloadDependencies,
     build_datasources_payload,
 )
+from orchestrator.services.agent_datasource_payload import (
+    build_workspace_ssh_identities as _build_identities,
+)
 from orchestrator.services.connector_drivers import builtin_connector_drivers
 from orchestrator.services.workspace_ssh_connector import (
     WORKSPACE_SSH_KNOWN_HOSTS_ENV,
-    build_workspace_ssh_identities,
     workspace_ssh_authority_id,
 )
 from shared.runtime.utils.ssh_key import generate_ed25519_keypair, ssh_public_identity
@@ -41,6 +43,11 @@ def _deps() -> DatasourcePayloadDependencies:
         mcp_stdio_enabled=lambda: True,
         connector_drivers=builtin_connector_drivers(),
     )
+
+
+def build_workspace_ssh_identities(rows):
+    """The delivery field, built through the connector drivers."""
+    return _build_identities(rows, dependencies=_deps())
 
 
 def _host_key() -> str:
@@ -298,6 +305,7 @@ async def test_thread_delivery_builds_both_halves_from_one_authorization():
         build_datasources_payload=lambda resolved: build_datasources_payload(
             resolved, dependencies=_deps()
         ),
+        build_workspace_ssh_identities=build_workspace_ssh_identities,
     )
 
     (

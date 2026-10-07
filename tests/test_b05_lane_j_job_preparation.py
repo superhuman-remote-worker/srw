@@ -264,6 +264,11 @@ def _start_bundle_deps() -> job_start_bundle.JobStartBundleDependencies:
             preparation_composition.datasource_payload_dependencies,
             main.app.state.resources,
         ),
+        build_workspace_ssh_identities=bound(
+            agent_datasource_payload_module.build_workspace_ssh_identities,
+            preparation_composition.datasource_payload_dependencies,
+            main.app.state.resources,
+        ),
         prepare_job_primary_repository_authority=managed_repository_authority_module.prepare_job_primary_repository_authority,
         prepare_project_repository_authority=managed_repository_authority_module.prepare_project_repository_authority,
         authorize_job_repository_transport=managed_repository_authority_module.authorize_job_repository_transport,
@@ -3699,6 +3704,13 @@ LATE_BINDING_TABLE = [
         "build_datasource_tool_override",
         _BOUND,
         (agent_datasource_payload_module, "build_datasource_tool_override"),
+        _PREP.datasource_payload_dependencies,
+    ),
+    (
+        _start_bundle_deps,
+        "build_workspace_ssh_identities",
+        _BOUND,
+        (agent_datasource_payload_module, "build_workspace_ssh_identities"),
         _PREP.datasource_payload_dependencies,
     ),
     (

@@ -27,9 +27,6 @@ from orchestrator.services.managed_repository_authority import (
     ManagedRepositoryAuthorityError,
 )
 from orchestrator.services.manifest_runtime_ownership import uses_srw_runtime
-from orchestrator.services.workspace_ssh_connector import (
-    build_workspace_ssh_identities,
-)
 from orchestrator.services.workspace_tier_policy import LiteWorkspaceConfigError
 from shared.backend_kinds import LITE_BACKENDS
 from shared.runtime.core.loader import canonical_config_name
@@ -106,6 +103,7 @@ class JobDeliveryDependencies:
     resolve_authorized_job_datasources: Callable[..., Any]
     apply_cloud_storage_override: Callable[..., Any]
     build_datasources_payload: Callable[..., Any]
+    build_workspace_ssh_identities: Callable[..., Any]
     job_project_repositories: Callable[..., Any]
     build_datasource_tool_override: Callable[..., Any]
     inject_matching_workspace_config: Callable[..., Any]
@@ -563,7 +561,7 @@ async def resume_job_on_agent(
             return False
         # Connector keys only ever reach a shell-capable workspace.
         workspace_ssh_identities = (
-            build_workspace_ssh_identities(resolved_ds)
+            dependencies.build_workspace_ssh_identities(resolved_ds)
             if workspace_decision.effective_backend in {"sandbox", "vm"}
             else None
         )

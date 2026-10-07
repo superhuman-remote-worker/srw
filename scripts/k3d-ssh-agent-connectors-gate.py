@@ -94,6 +94,9 @@ POD_ROOT = "/app"
 # can still run an old image).
 ORCHESTRATOR_FILES = [
     "src/orchestrator/services/workspace_ssh_connector.py",
+    "src/orchestrator/services/connector_drivers/workspace_ssh.py",
+    "src/orchestrator/services/connector_drivers/repository.py",
+    "src/orchestrator/services/connector_drivers/ssh_key.py",
     "src/orchestrator/services/agent_datasource_payload.py",
     "src/orchestrator/services/thread_mount_rows.py",
     "src/orchestrator/services/thread_workspace_delivery.py",

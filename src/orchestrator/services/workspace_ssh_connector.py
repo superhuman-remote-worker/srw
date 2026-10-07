@@ -13,13 +13,14 @@ over unchanged:
   connector writes into other users' ``~/.ssh/config``, so host, user, port and
   pinned host keys are held to a strict grammar, and a passphrase-protected key
   is refused because a workspace can never unlock it.
-* :func:`build_workspace_ssh_identities` turns resolved rows into the hidden
-  ``workspace_ssh_identities`` delivery field, carried and stripped wherever
-  ``managed_repository_credentials`` is; :func:`workspace_ssh_descriptor` is
-  the non-secret part that rides the connector's ``datasources`` entry in place
-  of its key. Both re-validate the stored row, so a row that predates the
-  validation degrades to an unavailable connector instead of reaching a
-  workspace's SSH config.
+* :func:`workspace_ssh_identity` resolves a stored row into the item of the
+  hidden ``workspace_ssh_identities`` delivery field (built through the
+  connector drivers by ``agent_datasource_payload.build_workspace_ssh_identities``
+  and carried and stripped wherever ``managed_repository_credentials`` is);
+  :func:`workspace_ssh_descriptor` is the non-secret part that rides the
+  connector's ``datasources`` entry in place of its key. Both re-validate the
+  stored row, so a row that predates the validation degrades to an
+  unavailable connector instead of reaching a workspace's SSH config.
 * :func:`probe_workspace_ssh_connector` is Test connection: it reaches the
   connector's host and reports the host key, which the connector form offers
   to pin.
@@ -34,7 +35,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 from uuid import UUID, uuid5
 
 from shared.runtime.core.workspace_ssh_identity import (
@@ -486,40 +487,6 @@ def workspace_ssh_descriptor(
         }
 
 
-def build_workspace_ssh_identities(
-    resolved_ds: Iterable[Mapping[str, Any]] | None,
-    *,
-    default_known_hosts: str | None = None,
-) -> list[dict[str, Any]] | None:
-    """The hidden ``workspace_ssh_identities`` field for one delivery.
-
-    Built only from an already-authorized, exactly-resolved connector set,
-    like ``build_datasources_payload``. A row that cannot be delivered is
-    logged by id and reason code and left out; it never fails the delivery.
-    ``None`` when nothing is delivered, so the field is absent from the wire.
-    """
-
-    if default_known_hosts is None:
-        default_known_hosts = default_workspace_ssh_known_hosts()
-    identities: list[dict[str, Any]] = []
-    for ds in resolved_ds or []:
-        if not is_workspace_ssh_connector(ds):
-            continue
-        try:
-            identity = workspace_ssh_identity(
-                ds, default_known_hosts=default_known_hosts
-            )
-        except WorkspaceSshConnectorError as exc:
-            logger.warning(
-                "SSH connector %s cannot be delivered to a workspace (%s)",
-                ds.get("id"),
-                exc.code,
-            )
-            continue
-        identities.append(identity.to_payload())
-    return identities or None
-
-
 # ---------------------------------------------------------------------------
 # Test connection
 # ---------------------------------------------------------------------------
@@ -650,7 +617,6 @@ __all__ = [
     "WorkspaceSshConnectorError",
     "WorkspaceSshIdentity",
     "apply_ssh_test_overrides",
-    "build_workspace_ssh_identities",
     "default_workspace_ssh_known_hosts",
     "fetch_ssh_host_key",
     "is_workspace_ssh_connector",

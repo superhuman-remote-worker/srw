@@ -376,6 +376,11 @@ def job_delivery_operations(
                 preparation_composition.datasource_payload_dependencies,
                 resources,
             ),
+            build_workspace_ssh_identities=bound(
+                agent_datasource_payload.build_workspace_ssh_identities,
+                preparation_composition.datasource_payload_dependencies,
+                resources,
+            ),
             job_project_repositories=bound(
                 job_start_bundle.job_project_repositories,
                 preparation_composition.job_start_bundle_dependencies,

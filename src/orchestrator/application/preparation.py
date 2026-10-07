@@ -227,6 +227,11 @@ def job_start_bundle_dependencies(
             datasource_payload_dependencies,
             resources,
         ),
+        build_workspace_ssh_identities=bound(
+            agent_datasource_payload.build_workspace_ssh_identities,
+            datasource_payload_dependencies,
+            resources,
+        ),
         prepare_job_primary_repository_authority=(
             managed_repository_authority.prepare_job_primary_repository_authority
         ),
@@ -518,6 +523,11 @@ def thread_mount_dependencies(
         ),
         build_datasources_payload=bound(
             agent_datasource_payload.build_datasources_payload,
+            datasource_payload_dependencies,
+            resources,
+        ),
+        build_workspace_ssh_identities=bound(
+            agent_datasource_payload.build_workspace_ssh_identities,
             datasource_payload_dependencies,
             resources,
         ),

@@ -53,9 +53,6 @@ from orchestrator.services.manifest_execution_snapshot import (
     read_execution,
     srw_snapshot_config,
 )
-from orchestrator.services.workspace_ssh_connector import (
-    build_workspace_ssh_identities,
-)
 from shared.backend_kinds import LITE_BACKENDS
 from orchestrator.services.job_mutation_target import (
     FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS,
@@ -112,6 +109,9 @@ class JobStartBundleDependencies:
     ]
     build_datasource_tool_override: Callable[
         [list[dict[str, Any]], dict[str, Any] | None], dict[str, Any]
+    ]
+    build_workspace_ssh_identities: Callable[
+        [list[dict[str, Any]]], list[dict[str, Any]] | None
     ]
 
     # Repository authority (B04-era managed repository service).
@@ -403,7 +403,9 @@ async def build_job_start_request(
         workspace_ssh_identities: list[dict[str, Any]] | None = None
         if workspace_decision.effective_backend in {"sandbox", "vm"}:
             # Connector keys only ever reach a shell-capable workspace.
-            workspace_ssh_identities = build_workspace_ssh_identities(resolved_ds)
+            workspace_ssh_identities = dependencies.build_workspace_ssh_identities(
+                resolved_ds
+            )
             try:
                 (
                     git_remote_url,

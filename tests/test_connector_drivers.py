@@ -456,3 +456,39 @@ async def test_the_deployment_gate_refuses_before_authentication(type_id):
         assert caught.value.status_code == 403
     else:
         await driver.prevalidate(_draft(body), environment)
+
+
+def test_workspace_ssh_identities_are_the_drivers_answer():
+    """The delivery field holds what the installed drivers deliver, no more."""
+    from orchestrator.services.agent_datasource_payload import (
+        DatasourcePayloadDependencies,
+        build_workspace_ssh_identities,
+    )
+    from orchestrator.services.connector_drivers.ssh_key import SshKeyDriver
+    from shared.runtime.utils.ssh_key import generate_ed25519_keypair
+
+    row = {
+        "id": "00000000-0000-4000-8000-0000000000a2",
+        "type": "ssh_key",
+        "name": "Bastion",
+        "credentials": {
+            "files": [{"contents": generate_ed25519_keypair().private_key}]
+        },
+        "config": {},
+    }
+
+    def deliver(*drivers):
+        return build_workspace_ssh_identities(
+            [row],
+            dependencies=DatasourcePayloadDependencies(
+                logger=logging.getLogger(__name__),
+                mcp_datasources_enabled=lambda: True,
+                mcp_stdio_enabled=lambda: True,
+                connector_drivers=ConnectorDriverRegistry(drivers),
+            ),
+        )
+
+    (identity,) = deliver(SshKeyDriver())
+    assert identity["kind"] == "ssh_key"
+    assert identity["private_key"] == row["credentials"]["files"][0]["contents"]
+    assert deliver() is None

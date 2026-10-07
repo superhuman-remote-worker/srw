@@ -36,7 +36,12 @@ from orchestrator.services.connector_drivers import ConnectorDriverRegistry
 from orchestrator.services.connector_drivers.base import (
     BindContext,
     DeploymentGates,
+    SupportsWorkspaceSshIdentity,
     payload_entry,
+)
+from orchestrator.services.workspace_ssh_connector import (
+    WorkspaceSshConnectorError,
+    default_workspace_ssh_known_hosts,
 )
 from shared.datasource_policy import datasource_tool_categories
 
@@ -198,3 +203,39 @@ def build_datasources_payload(
             payload.append(entry)
 
     return payload or None
+
+
+def build_workspace_ssh_identities(
+    resolved_ds: list[dict[str, Any]] | None,
+    *,
+    dependencies: DatasourcePayloadDependencies,
+) -> list[dict[str, Any]] | None:
+    """The hidden ``workspace_ssh_identities`` field for one delivery.
+
+    Built only from an already-authorized, exactly-resolved connector set,
+    like :func:`build_datasources_payload`: each row's driver says whether it
+    holds a key for the workspace's ssh-agent. A row that cannot be delivered
+    is logged by id and fixed reason code and left out; it never fails the
+    delivery. ``None`` when nothing is delivered, so the field is absent from
+    the wire.
+    """
+    default_known_hosts = default_workspace_ssh_known_hosts()
+    identities: list[dict[str, Any]] = []
+    for ds in resolved_ds or []:
+        driver = dependencies.connector_drivers.for_type(ds.get("type"))
+        if not isinstance(driver, SupportsWorkspaceSshIdentity):
+            continue
+        try:
+            identity = driver.workspace_ssh_identity(
+                ds, default_known_hosts=default_known_hosts
+            )
+        except WorkspaceSshConnectorError as exc:
+            dependencies.logger.warning(
+                "SSH connector %s cannot be delivered to a workspace (%s)",
+                ds.get("id"),
+                exc.code,
+            )
+            continue
+        if identity is not None:
+            identities.append(identity.to_payload())
+    return identities or None

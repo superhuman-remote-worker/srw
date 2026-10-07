@@ -38,9 +38,6 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from orchestrator.services.cloud import ProjectFolderHandle
-from orchestrator.services.workspace_ssh_connector import (
-    build_workspace_ssh_identities,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +63,7 @@ class ThreadMountDependencies:
     externalize_gitea_url: Callable[[str], str]
     resolve_authorized_thread_datasources: Callable[..., Awaitable[Any]]
     build_datasources_payload: Callable[[Any], Any]
+    build_workspace_ssh_identities: Callable[[Any], Any]
     cloud_workspace_driver: Callable[[], str]
 
 
@@ -477,7 +475,7 @@ async def resolve_thread_datasource_delivery(
         return None, None
     return (
         dependencies.build_datasources_payload(resolved),
-        build_workspace_ssh_identities(resolved),
+        dependencies.build_workspace_ssh_identities(resolved),
     )
 
 
