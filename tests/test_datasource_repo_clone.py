@@ -739,18 +739,32 @@ class TestLegacyKeyFiles:
         (ssh / "other_key").write_text(self._KEY)
         # Slug-named, a key, but no IdentityFile line names it: the user's.
         (ssh / "repo_unnamed").write_text(self._KEY)
+        # A key the user's own block names by its absolute path.
+        (ssh / "repo_userabs").write_text(self._KEY)
+        # An old block the user edited (a line added after it).
+        (ssh / "repo_edited").write_text(self._KEY)
+        # The old block's lines, but another indentation.
+        (ssh / "repo_tabbed").write_text(self._KEY)
+        # An exact old block, and a line of the user's own also naming it.
+        (ssh / "repo_shared").write_text(self._KEY)
         (tmp_path / "elsewhere").write_text(self._KEY)
         (ssh / "repo_link").symlink_to(tmp_path / "elsewhere")
         (ssh / "config").write_text(
             "# mine\nHost myserver\n  User me\n"
+            f"\nHost userhost\n  IdentityFile {ssh}/repo_userabs\n"
+            f"\nHost forge\n  IdentityFile {ssh}/repo_edited\n"
+            "  StrictHostKeyChecking accept-new\n  Port 2222\n"
+            f"\nHost tabbed\n\tIdentityFile {ssh}/repo_tabbed\n"
+            "  StrictHostKeyChecking accept-new\n"
+            + self._block(ssh, "repo_shared", host="shared")
+            + f"\nHost alsomine\n  IdentityFile {ssh}/repo_shared\n"
             # Every attach appended the block again.
             + self._block(ssh, "repo_my-repo")
             + self._block(ssh, "repo_my-repo")
             + self._block(ssh, "repo_old-name", host="gitlab.example.com")
-            # Named, but each fails another check.
-            + "\nHost other\n"
+            # Named by exact blocks, but each fails another check.
             + "".join(
-                f"  IdentityFile {ssh}/{name}\n"
+                self._block(ssh, name, host="other")
                 for name in ("repo_pub", "repo_notes", "repo_Upper", "repo_link")
             )
         )
@@ -800,7 +814,9 @@ class TestLegacyKeyFiles:
             )
         return git_manager
 
-    def test_listing_names_only_configured_slug_named_private_key_files(self, home):
+    def test_listing_names_only_old_block_named_slug_named_private_key_files(
+        self, home
+    ):
         from agent.core.datasource_setup import _legacy_ssh_key_files
 
         ws = self._workspace(home)
@@ -819,10 +835,14 @@ class TestLegacyKeyFiles:
             "config",
             "other_key",
             "repo_Upper",
+            "repo_edited",
             "repo_link",
             "repo_notes",
             "repo_pub",
+            "repo_shared",
+            "repo_tabbed",
             "repo_unnamed",
+            "repo_userabs",
         ]
         assert (home / "elsewhere").exists()
         # Each deleted key's exact pre-agent blocks went with it; nothing else.
@@ -868,38 +888,106 @@ class TestLegacyKeyFiles:
         assert (ssh / "repo_deploy.pub").exists()
         assert "IdentityFile ~/.ssh/repo_deploy" in (ssh / "config").read_text()
 
+    @pytest.mark.parametrize(
+        "user_lines",
+        [
+            # A bare absolute IdentityFile in the user's own block.
+            "\nHost deploy\n  IdentityFile {path}\n",
+            # The old indentation and trust line, but more of the user's own.
+            "\nHost deploy\n  IdentityFile {path}\n"
+            "  StrictHostKeyChecking accept-new\n  User git\n",
+            # Other indentation, other order.
+            "\nHost deploy\n\tIdentityFile {path}\n  StrictHostKeyChecking accept-new\n",
+            "\nHost deploy\n  StrictHostKeyChecking accept-new\n  IdentityFile {path}\n",
+            "\nMatch host deploy\n  IdentityFile {path}\n"
+            "  StrictHostKeyChecking accept-new\n",
+            "\nIdentityFile {path}\n",
+        ],
+    )
+    def test_a_user_written_identity_file_line_never_causes_a_delete(
+        self, home, user_lines
+    ):
+        """A real ``ssh-keygen`` key the user's own config names by path."""
+        import shutil
+        import subprocess
+
+        if shutil.which("ssh-keygen") is None:
+            pytest.skip("ssh-keygen not installed")
+        ssh = home / ".ssh"
+        path = ssh / "repo_deploy"
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(path)],
+            check=True,
+        )
+        key = path.read_bytes()
+        lines = user_lines.format(path=path)
+        with (ssh / "config").open("a") as config:
+            config.write(lines)
+        ws = self._workspace(home)
+
+        self._clone(ws, TestBackendClone._ssh_entry())
+
+        assert path.read_bytes() == key
+        assert lines in (ssh / "config").read_text()
+        # The sweep itself still ran: the old blocks' keys are gone.
+        assert "repo_my-repo" not in self._left(home)
+
+    def test_a_key_its_old_block_and_a_user_line_both_name_is_kept(self, home):
+        ssh = home / ".ssh"
+        user_lines = f"\nHost mine\n  User me\n  IdentityFile {ssh}/repo_old-name\n"
+        with (ssh / "config").open("a") as config:
+            config.write(user_lines)
+        ws = self._workspace(home)
+        before = (ssh / "config").read_text()
+
+        self._clone(ws, TestBackendClone._ssh_entry())
+
+        assert "repo_old-name" in self._left(home)
+        # Its old block stays with it, so nothing points at a missing file.
+        after = (ssh / "config").read_text()
+        assert self._block(ssh, "repo_old-name", "gitlab.example.com") in after
+        assert user_lines in after
+        assert after == before.replace(self._block(ssh, "repo_my-repo"), "")
+
     def test_the_program_rechecks_every_name_it_is_given(self, home):
-        """A name the config does not mention survives even a direct request."""
+        """A name no exact old block names survives even a direct request."""
         import subprocess
 
         from agent.core.datasource_setup import _RETIRE_LEGACY_KEYS_PROGRAM
 
         ssh = home / ".ssh"
         (ssh / "repo_deploy").write_text(self._KEY)
+        before = (ssh / "config").read_text()
+        refused = [
+            "repo_deploy",
+            "repo_userabs",
+            "repo_edited",
+            "repo_tabbed",
+            "repo_shared",
+            "repo_pub",
+            "repo_link",
+        ]
         subprocess.run(
             ["python3", "-c", _RETIRE_LEGACY_KEYS_PROGRAM, str(ssh)]
-            + ["repo_deploy", "repo_pub", "repo_link", "../other_key"],
+            + refused
+            + ["../other_key"],
             check=True,
         )
-        assert {"repo_deploy", "repo_pub", "repo_link", "other_key"} <= set(
-            self._left(home)
-        )
+        assert {*refused, "other_key"} <= set(self._left(home))
+        assert (ssh / "config").read_text() == before
 
-    def test_a_block_the_user_edited_is_left_as_it_is(self, home):
+    def test_a_block_the_user_edited_keeps_its_key_and_stays(self, home):
         ssh = home / ".ssh"
-        (ssh / "repo_edited").write_text(self._KEY)
         edited = (
             f"\nHost forge\n  IdentityFile {ssh}/repo_edited\n"
             "  StrictHostKeyChecking accept-new\n  Port 2222\n"
         )
-        with (ssh / "config").open("a") as config:
-            config.write(edited)
         ws = self._workspace(home)
 
         self._clone(ws, TestBackendClone._ssh_entry())
 
-        # Named by its IdentityFile line, so the key goes; the block stays.
-        assert "repo_edited" not in self._left(home)
+        # Not the exact old shape any more: the key and the block both stay.
+        assert "repo_edited" in self._left(home)
         assert edited in (ssh / "config").read_text()
 
     def test_an_unloaded_identity_keeps_every_key_file(self, home):

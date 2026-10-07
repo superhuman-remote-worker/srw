@@ -728,8 +728,10 @@ def _ssh_clone_target(
 #: A pre-agent clone wrote its key to ``~/.ssh/repo_<datasource-name-slug>``
 #: and appended, to ``~/.ssh/config``, exactly
 #: ``\nHost <host>\n  IdentityFile <abs key path>\n  StrictHostKeyChecking
-#: accept-new\n``. A ``repo_*`` file no ``IdentityFile`` line names is not
-#: one of ours (``ssh-keygen -f ~/.ssh/repo_deploy``) and is never touched.
+#: accept-new\n``. Only a key that such an exact block names, and that no
+#: other config line names, is ours to delete: an ``IdentityFile`` line a user
+#: wrote (absolute path or not) never causes a delete, and neither does a key
+#: no line names (``ssh-keygen -f ~/.ssh/repo_deploy``).
 _LEGACY_KEY_NAME = re.compile(r"repo_[a-z0-9-]+")
 _LEGACY_KEY_MARKER = "__srw_legacy_repo_keys__"
 #: How far a clone call may retire those files: ``sweep`` (the workspace
@@ -739,20 +741,36 @@ _LEGACY_KEY_MARKER = "__srw_legacy_repo_keys__"
 #: image may need for its next fetch or push).
 LEGACY_KEY_FILE_MODES = frozenset({"sweep", "own", "keep"})
 
+# One awk pass over config per candidate (``path`` is its absolute path).
+# Every line naming the file must be the IdentityFile line of an exact
+# pre-agent block (``Host <host>`` before it, ``  StrictHostKeyChecking
+# accept-new`` after it, nothing indented after that), and one must be.
+# The delete program applies the same rule again.
+_EXACT_BLOCK_AWK = (
+    "'{ line[NR] = $0 } END { exact = 0; other = 0; "
+    'for (i = 1; i <= NR; i++) { s = line[i]; sub(/^[ \\t]+/, "", s); '
+    'sub(/[ \\t\\r]+$/, "", s); if (s != "IdentityFile " path) continue; '
+    'if (line[i] == "  IdentityFile " path && i > 1 '
+    "&& line[i - 1] ~ /^Host [^ \\t\\r]+$/ && i < NR "
+    '&& line[i + 1] == "  StrictHostKeyChecking accept-new" '
+    "&& (i + 2 > NR || line[i + 2] !~ /^[ \\t]/)) exact++; else other++ } "
+    "exit !(exact > 0 && other == 0) }'"
+)
+
 
 def _list_legacy_keys_command(ssh_dir: str) -> str:
     """List pre-agent key files: one marker line on stdout.
 
     Regular files only, slug-shaped names only, a PEM key header that is not
-    a public key, and an ``IdentityFile <ssh_dir>/<name>`` line in
-    ``config``. Runs in a subshell to leave the persistent ``git`` tab where
-    it was; the marker is split in the command so an echoed or wrapped
-    command line can never read as the answer. (The pattern avoids spelling
-    a private-key header: every command stays clear of what the key-residue
-    checks scan for.)
+    a public key, and named in ``config`` only by exact pre-agent blocks
+    (:data:`_EXACT_BLOCK_AWK`). Runs in a subshell to leave the persistent
+    ``git`` tab where it was; the marker is split in the command so an echoed
+    or wrapped command line can never read as the answer. (The pattern avoids
+    spelling a private-key header: every command stays clear of what the
+    key-residue checks scan for.)
     """
 
-    want = shlex.quote(f"IdentityFile {ssh_dir}/")
+    prefix = shlex.quote(f"{ssh_dir}/")
     return (
         f"( cd {shlex.quote(ssh_dir)} 2>/dev/null || exit 0; "
         "test -f config || exit 0; _srw_names=''; "
@@ -762,9 +780,7 @@ def _list_legacy_keys_command(ssh_dir: str) -> str:
         'IFS= read -r _srw_first < "$_srw_f" || continue; '
         'case "$_srw_first" in *"PUBLIC KEY-----") continue;; '
         '"-----BEGIN "*" KEY-----") ;; *) continue;; esac; '
-        f'awk -v want={want}"$_srw_f" '
-        '\'{ sub(/^[ \\t]+/, ""); sub(/[ \\t\\r]+$/, "") } '
-        "$0 == want { found = 1 } END { exit !found }' config || continue; "
+        f'awk -v path={prefix}"$_srw_f" {_EXACT_BLOCK_AWK} config || continue; '
         '_srw_names="$_srw_names $_srw_f"; '
         "done; "
         f"printf '%s%s\\n' {_LEGACY_KEY_MARKER[:13]} "
@@ -773,10 +789,10 @@ def _list_legacy_keys_command(ssh_dir: str) -> str:
 
 
 # Runs on the workspace (argv: ssh dir, names). Re-checks every name exactly
-# as the listing did, deletes it, then removes each deleted key's EXACT
-# pre-agent block from config: ``Host <host>`` / ``  IdentityFile <path>`` /
-# ``  StrictHostKeyChecking accept-new`` with nothing indented after it (and
-# the blank line that preceded it). A block a user edited stays as it is.
+# as the listing did (the same exact-block rule), deletes it, then removes
+# each deleted key's exact pre-agent blocks from config (and the blank line
+# before each). Since no other line may name a deleted key, nothing in config
+# is left pointing at it; a block a user edited never qualified.
 _RETIRE_LEGACY_KEYS_PROGRAM = r"""
 import os, re, stat, sys, tempfile
 ssh_dir, names = sys.argv[1], sys.argv[2:]
@@ -786,7 +802,28 @@ try:
         lines = handle.read().split("\n")
 except OSError:
     sys.exit(0)
-named = {line.strip() for line in lines}
+HOST = re.compile(r"Host [^ \t\r]+")
+TRUST = "  StrictHostKeyChecking accept-new"
+def exact_block_at(index, path):
+    following = lines[index + 2] if index + 2 < len(lines) else ""
+    return (
+        lines[index] == "  IdentityFile " + path
+        and index > 0
+        and HOST.fullmatch(lines[index - 1]) is not None
+        and index + 1 < len(lines)
+        and lines[index + 1] == TRUST
+        and not following[:1].isspace()
+    )
+def only_exact_blocks_name(path):
+    exact = other = 0
+    for index, line in enumerate(lines):
+        if line.strip() != "IdentityFile " + path:
+            continue
+        if exact_block_at(index, path):
+            exact += 1
+        else:
+            other += 1
+    return exact > 0 and other == 0
 def key_file(path):
     try:
         if not stat.S_ISREG(os.lstat(path).st_mode):
@@ -806,21 +843,17 @@ for name in names:
     if (
         re.fullmatch(r"repo_[a-z0-9-]+", name)
         and key_file(path)
-        and "IdentityFile " + path in named
+        and only_exact_blocks_name(path)
     ):
         os.unlink(path)
         removed.add(path)
 kept, index, changed = [], 0, False
 while index < len(lines):
-    block = lines[index:index + 3]
-    following = lines[index + 3] if index + 3 < len(lines) else ""
     if (
-        len(block) == 3
-        and re.fullmatch(r"Host \S+", block[0])
-        and block[1].startswith("  IdentityFile ")
-        and block[1][len("  IdentityFile "):] in removed
-        and block[2] == "  StrictHostKeyChecking accept-new"
-        and not following[:1].isspace()
+        index + 1 < len(lines)
+        and lines[index + 1].startswith("  IdentityFile ")
+        and lines[index + 1][len("  IdentityFile "):] in removed
+        and exact_block_at(index + 1, lines[index + 1][len("  IdentityFile "):])
     ):
         if kept and kept[-1] == "":
             kept.pop()
@@ -872,9 +905,9 @@ def _retire_legacy_ssh_key_files(
     key file is actually there. A repository's own ``repo_<slug>`` goes once
     it is proven. In ``sweep`` mode, with every SSH repository proven, every
     listed file goes, including those a renamed or detached connector left
-    behind. ``keep`` touches nothing. Only files ``~/.ssh/config`` names in
-    an ``IdentityFile`` line are ever listed; each deleted key's exact
-    pre-agent ``Host`` block goes with it.
+    behind. ``keep`` touches nothing. Only files that exact pre-agent
+    ``Host`` blocks, and nothing else in ``~/.ssh/config``, name are ever
+    listed; those blocks go with the key.
     """
 
     if mode == "keep":
@@ -950,8 +983,9 @@ def clone_repository_datasources(
     materializer's ``{authority_id: status}``: a connector whose identity did
     not load is skipped with a warning, never cloned without its key. A
     reused checkout gets its origin reset to the alias. A pre-agent
-    ``~/.ssh/repo_<slug>`` key file (one ``~/.ssh/config`` names) is deleted
-    only once its repository is proven to work through the alias;
+    ``~/.ssh/repo_<slug>`` key file (one only its exact pre-agent
+    ``~/.ssh/config`` block names) is deleted only once its repository is
+    proven to work through the alias;
     ``legacy_key_files`` says how far that goes.
 
     There is deliberately NO agent-local fallback: without a shell-capable
