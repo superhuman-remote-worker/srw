@@ -79,6 +79,64 @@ def _isolate_pinned_write_fence():
         module.PROCESS_PINNED_WRITE_FENCE.reset()
 
 
+def _persistent_session_state(module):
+    return (
+        module._session,
+        dict(vars(module._session_identity)),
+        dict(vars(module._session_termination)),
+    )
+
+
+def _imported_persistent_session_state(module):
+    """The session state ``persistent_app`` has right after its import."""
+
+    identity = module._session_identity
+    termination = module._session_termination
+    fresh_identity = type(identity)(identity._ports)
+    fresh_termination = type(termination)(
+        termination._ports,
+        logger=termination._logger,
+        termination_queue_sentinel=termination.termination_queue_sentinel,
+    )
+    return None, dict(vars(fresh_identity)), dict(vars(fresh_termination))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_persistent_session_runtime(monkeypatch):
+    """Give every test back the agent's process session state it started with.
+
+    ``persistent_app`` keeps the attached session, its identity (thread,
+    generation, attach token, runtime contract) and the termination
+    coordinator's retirement admission as process singletons. A test that
+    attaches or retires without restoring them changes how a later test in the
+    same xdist worker classifies a failed retirement. A leaked runtime contract
+    made an unproven settlement an exact retirement that retries forever; with
+    the retry delays patched to zero that loop never yielded, logged on every
+    pass and grew the worker to ~40 GiB.
+
+    ``monkeypatch`` is undone before the restore: it can be set up before this
+    fixture (another autouse fixture requests it), and its own later undo would
+    write back whatever a test's mid-test ``setattr`` captured as the old value.
+    """
+    module = sys.modules.get("agent.api.persistent_app")
+    saved = _persistent_session_state(module) if module is not None else None
+    yield
+    monkeypatch.undo()
+    module = sys.modules.get("agent.api.persistent_app")
+    if module is None:
+        return
+    if saved is None:
+        saved = _imported_persistent_session_state(module)
+    session, identity, termination = saved
+    module._session = session
+    for owner, state in (
+        (module._session_identity, identity),
+        (module._session_termination, termination),
+    ):
+        vars(owner).clear()
+        vars(owner).update(state)
+
+
 from orchestrator.services import notification_catalog as _notification_catalog  # noqa: E402
 
 _NOTIFICATION_REGISTRIES = (

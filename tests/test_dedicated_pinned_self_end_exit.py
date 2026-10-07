@@ -53,6 +53,15 @@ def _attached_runtime(*, inner, bound_thread: str | None, exit_fn=None):
             patch.object(pa._session_identity, "_session_generation", GENERATION)
         )
         stack.enter_context(patch.object(pa._session_identity, "_attach_token", ATTACH))
+        # Pin the retry classification inputs: with the retry delays at zero, a
+        # contract or admission identity leaked by an earlier test in the worker
+        # makes an unproven settlement retry forever without yielding.
+        stack.enter_context(
+            patch.object(pa._session_identity, "_runtime_contract", False)
+        )
+        stack.enter_context(
+            patch.object(pa._session_termination, "retirement_admission_identity", None)
+        )
         stack.enter_context(
             patch.object(pa._session_termination, "termination_task", None)
         )
