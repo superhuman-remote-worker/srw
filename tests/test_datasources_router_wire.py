@@ -581,7 +581,35 @@ def test_probe_of_an_mcp_connector_is_403_when_the_deployment_disables_them():
     assert response.json()["detail"] == "MCP connectors are disabled on this deployment"
 
 
-def test_probe_of_an_ssh_repository_connector_reports_no_api_probe():
+def test_probe_of_an_ssh_repository_connector_reports_its_host_key(monkeypatch):
+    """C1: no forge API takes a deploy key; Test reaches the SSH endpoint."""
+    from orchestrator.services import workspace_ssh_connector
+    from shared.runtime.utils.ssh_key import generate_ed25519_keypair
+
+    host_key = " ".join(generate_ed25519_keypair().public_key.split()[:2])
+
+    async def fetch(host, port):
+        assert (host, port) == ("github.com", 22)
+        return host_key
+
+    monkeypatch.setattr(workspace_ssh_connector, "fetch_ssh_host_key", fetch)
+    row = dict(
+        SECRET_ROW,
+        type="repository",
+        connection_url="git@github.com:acme/widget.git",
+        credentials={
+            "auth_method": "ssh",
+            "ssh_key": generate_ed25519_keypair().private_key,
+        },
+    )
+    wire = _wire(datasource=row)
+    body = wire.client.post(f"/api/datasources/{DATASOURCE_ID}/test").json()
+    assert body["status"] == "ok"
+    assert body["details"]["host_key"] == host_key
+    assert "PRIVATE KEY" not in str(body)
+
+
+def test_probe_of_an_unusable_ssh_repository_connector_is_an_error():
     row = dict(
         SECRET_ROW,
         type="repository",
@@ -590,8 +618,8 @@ def test_probe_of_an_ssh_repository_connector_reports_no_api_probe():
     )
     wire = _wire(datasource=row)
     body = wire.client.post(f"/api/datasources/{DATASOURCE_ID}/test").json()
-    assert body["status"] == "ok"
-    assert "clone at job start is the test" in body["message"]
+    assert body["status"] == "error"
+    assert "Invalid SSH key" in body["message"]
 
 
 def test_probe_surfaces_a_gate_crash_as_a_500_without_its_message():
