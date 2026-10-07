@@ -327,6 +327,15 @@ class JobControlOperations:
 
             try:
                 await d.archive_and_cleanup_workspace(job_id)
+                select_vm = getattr(
+                    store, "quiesce_cancelled_stateless_vm_parent", None
+                )
+                if (
+                    stateless
+                    and select_vm is not None
+                    and await select_vm(job_id, retention_only=True) is True
+                ):
+                    await store.delete_checkpoint_thread(job_id, strict=True)
             except Exception as exc:
                 d.logger.warning(
                     "Workspace cleanup is incomplete for job %s: %s", job_id, exc

@@ -80,6 +80,8 @@ _mock_k8s_config.load_incluster_config = MagicMock()  # type: ignore[attr-define
 from kubernetes.client import (  # noqa: E402
     ApiClient as KubernetesApiClient,
     V1Pod as KubernetesV1Pod,
+    V1PodList as KubernetesV1PodList,
+    V1ListMeta as KubernetesV1ListMeta,
 )
 
 _mock_k8s_client.ApiClient = KubernetesApiClient  # type: ignore[attr-defined]
@@ -7348,6 +7350,306 @@ class TestLifecycleIdentityGenerationContinuation:
         release_create.set()
         await asyncio.gather(create_task, delete_task)
         assert delete_entered.is_set()
+
+
+def _wire_cancel_retention_disk(controller):
+    from uuid import uuid4
+
+    owner, pvc_uid, dv_uid = (str(uuid4()) for _ in range(3))
+    name = f"agent-vm-{owner}-rootdisk"
+    labels = {"srw.io/owner-kind": "job", "srw.io/owner-id": owner}
+    dv = {
+        "metadata": {
+            "name": name,
+            "namespace": VM_NAMESPACE,
+            "uid": dv_uid,
+            "labels": labels,
+            "ownerReferences": [],
+        }
+    }
+    pvc = {
+        "metadata": {
+            "name": name,
+            "namespace": VM_NAMESPACE,
+            "uid": pvc_uid,
+            "labels": labels,
+            "ownerReferences": [
+                {
+                    "apiVersion": "cdi.kubevirt.io/v1beta1",
+                    "kind": "DataVolume",
+                    "name": name,
+                    "uid": dv_uid,
+                    "controller": True,
+                }
+            ],
+        }
+    }
+    controller._get_dv = AsyncMock(return_value=dv)
+    controller._rootdisk_pvc_probe = AsyncMock(return_value=(True, pvc_uid))
+    controller.core_api.read_namespaced_persistent_volume_claim.side_effect = None
+    controller.core_api.read_namespaced_persistent_volume_claim.return_value = pvc
+    empty = {"metadata": {"resourceVersion": "10"}, "items": []}
+    controller.k8s_client.list_namespaced_custom_object.return_value = empty
+    controller.core_api.list_namespaced_pod.return_value = empty
+    return owner, pvc_uid, dv, pvc
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "second_uid",
+        "dv_owned",
+        "extra_owner",
+        "wrong_owner_name",
+        "pvc_deleting",
+        "dv_deleting",
+        "namespace",
+        "foreign_consumer",
+        "incomplete_list",
+    ],
+)
+async def test_cancel_retention_requires_exact_standalone_disk_and_no_consumers(
+    controller, fault
+):
+    from uuid import uuid4
+
+    owner, pvc_uid, dv, pvc = _wire_cancel_retention_disk(controller)
+    if fault == "second_uid":
+        pvc["metadata"]["uid"] = str(uuid4())
+    elif fault == "dv_owned":
+        dv["metadata"]["ownerReferences"] = [
+            {"kind": "VirtualMachine", "uid": str(uuid4())}
+        ]
+    elif fault == "extra_owner":
+        pvc["metadata"]["ownerReferences"].append(
+            {"kind": "VirtualMachine", "uid": str(uuid4())}
+        )
+    elif fault == "wrong_owner_name":
+        pvc["metadata"]["ownerReferences"][0]["name"] = "different"
+    elif fault in {"pvc_deleting", "dv_deleting"}:
+        (pvc if fault == "pvc_deleting" else dv)["metadata"]["deletionTimestamp"] = (
+            "now"
+        )
+    elif fault == "namespace":
+        pvc["metadata"]["namespace"] = "foreign"
+    elif fault == "foreign_consumer":
+        controller.core_api.list_namespaced_pod.return_value = {
+            "metadata": {"resourceVersion": "10"},
+            "items": [
+                {
+                    "metadata": {
+                        "name": "foreign",
+                        "namespace": VM_NAMESPACE,
+                        "uid": str(uuid4()),
+                    },
+                    "spec": {
+                        "volumes": [
+                            {
+                                "name": "root",
+                                "ephemeral": {
+                                    "persistentVolumeClaim": {
+                                        "claimName": pvc["metadata"]["name"]
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+    elif fault == "incomplete_list":
+        controller.core_api.list_namespaced_pod.return_value = {
+            "metadata": {"resourceVersion": "10", "continue": "next"},
+            "items": [],
+        }
+    if fault is not None:
+        with pytest.raises(RuntimeError):
+            await controller._qualify_cancel_retained_rootdisk(owner, pvc_uid)
+    else:
+        result = await controller._qualify_cancel_retained_rootdisk(owner, pvc_uid)
+        assert result["pvc_uid"] == pvc_uid
+        assert result["dv_uid"] == dv["metadata"]["uid"]
+        assert result["no_consumers"] is True
+    controller.k8s_client.delete_namespaced_custom_object.assert_not_called()
+    controller.k8s_client.patch_namespaced_custom_object.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rootdisk_final_read_must_still_have_probed_uid(controller):
+    from uuid import uuid4
+
+    owner, pvc_uid, _, pvc = _wire_cancel_retention_disk(controller)
+    pvc["metadata"]["uid"] = str(uuid4())
+    with pytest.raises(RuntimeError):
+        await controller._exact_rootdisk_identity(
+            pvc["metadata"]["name"],
+            owner_kind="job",
+            owner_id=owner,
+            expected_pvc_uid=pvc_uid,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", [False, True])
+async def test_pre_stop_allows_only_exact_frozen_consumers_without_absence_claim(
+    controller, replacement
+):
+    from uuid import uuid4
+
+    owner, pvc_uid, _, pvc = _wire_cancel_retention_disk(controller)
+    runtime = {
+        "vm_name": f"agent-vm-{owner}",
+        "vm_uid": str(uuid4()),
+        "vmi_uid": str(uuid4()),
+        "launcher_name": "virt-launcher-exact",
+        "launcher_uid": str(uuid4()),
+    }
+    pod = {
+        "metadata": {
+            "name": runtime["launcher_name"],
+            "namespace": VM_NAMESPACE,
+            "uid": str(uuid4()) if replacement else runtime["launcher_uid"],
+            "ownerReferences": [
+                {
+                    "kind": "VirtualMachineInstance",
+                    "uid": runtime["vmi_uid"],
+                    "controller": True,
+                }
+            ],
+        },
+        "spec": {
+            "volumes": [
+                {
+                    "name": "root",
+                    "persistentVolumeClaim": {"claimName": pvc["metadata"]["name"]},
+                }
+            ]
+        },
+    }
+    controller.core_api.list_namespaced_pod.return_value = {
+        "metadata": {"resourceVersion": "10"},
+        "items": [pod],
+    }
+    if replacement:
+        with pytest.raises(RuntimeError):
+            await controller._qualify_cancel_retained_rootdisk(
+                owner, pvc_uid, allowed_runtime=runtime
+            )
+    else:
+        result = await controller._qualify_cancel_retained_rootdisk(
+            owner, pvc_uid, allowed_runtime=runtime
+        )
+        assert "no_consumers" not in result
+        with pytest.raises(RuntimeError):
+            await controller._qualify_cancel_retained_rootdisk(owner, pvc_uid)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after_finalizer", [False, True])
+async def test_retention_stop_rechecks_disk_before_halted(controller, after_finalizer):
+    from shared.vm_pre_ssh_stop import PRE_SSH_STOP_ANNOTATION, PRE_SSH_STOP_FINALIZER
+    from tests.test_vm_job_cancel_retention_protocol import preflight
+
+    fixture = TestWorkspaceRecoveryControllerEvidence()
+    vm, pod = fixture.wire_pre_ssh_stop(controller)
+    controller.core_api.read_namespaced_pod.return_value = pod
+    frozen = await controller._do_inspect_pre_ssh_stop(
+        SAMPLE_JOB_CONFIG["job_id"],
+        provision_generation=PROVISION_GENERATION,
+        expected_vm_uid=fixture.VM_UID,
+        expected_pvc_uid=fixture.PVC_UID,
+    )
+    qualification = preflight(frozen)
+    storage = {
+        key: qualification[key]
+        for key in (
+            "namespace",
+            "owner_id",
+            "pvc_name",
+            "pvc_uid",
+            "dv_uid",
+            "ownership",
+            "deleting",
+        )
+    }
+    controller._qualify_cancel_retained_rootdisk = AsyncMock(
+        side_effect=(
+            [storage, RuntimeError("ownership changed")]
+            if after_finalizer
+            else RuntimeError("ownership changed")
+        )
+    )
+    digest = "sha256:" + "a" * 64
+
+    def retain_pod(**_kwargs):
+        pod["metadata"]["annotations"] = {PRE_SSH_STOP_ANNOTATION: digest}
+        pod["metadata"]["finalizers"] = [PRE_SSH_STOP_FINALIZER]
+
+    controller.core_api.patch_namespaced_pod.side_effect = retain_pod
+    result = await controller._do_pre_ssh_stop(
+        frozen, digest, retention_preflight=qualification
+    )
+    assert result["status"] == "identity_refused"
+    assert controller.core_api.patch_namespaced_pod.call_count == int(after_finalizer)
+    controller.k8s_client.patch_namespaced_custom_object.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_retaining_compute_delete_checks_disk_before_vm_delete(controller):
+    from uuid import uuid4
+
+    owner, pvc_uid, dv, _ = _wire_cancel_retention_disk(controller)
+    vm_uid = str(uuid4())
+    controller.k8s_client.get_namespaced_custom_object.side_effect = None
+    controller.k8s_client.get_namespaced_custom_object.return_value = {
+        "metadata": {
+            "name": f"agent-vm-{owner}",
+            "uid": vm_uid,
+            "annotations": {"srw.io/provision-generation": PROVISION_GENERATION},
+        }
+    }
+    dv["metadata"]["ownerReferences"] = [{"kind": "VirtualMachine", "uid": vm_uid}]
+    with pytest.raises(RuntimeError, match="standalone"):
+        await controller._do_delete(
+            owner,
+            purge_disk=False,
+            provision_generation=PROVISION_GENERATION,
+            expected_vm_uid=vm_uid,
+            expected_rootdisk_pvc_uid=pvc_uid,
+            parent_cleanup={"intent": {"source": "job_terminal_vm_release"}},
+        )
+    controller.k8s_client.delete_namespaced_custom_object.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_absent_compute_status_emits_full_observed_retained_disk(controller):
+    owner, pvc_uid, dv, _ = _wire_cancel_retention_disk(controller)
+    controller.k8s_client.get_namespaced_custom_object.side_effect = _FakeApiException(
+        404
+    )
+    controller.core_api.list_namespaced_pod.return_value = KubernetesV1PodList(
+        metadata=KubernetesV1ListMeta(resource_version="10"),
+        items=[],
+    )
+    result = await controller._do_status(
+        owner, PROVISION_GENERATION, exact_absence=True
+    )
+    assert result["runtime_absence_known"] is True
+    assert result["retained_rootdisk"] == {
+        "version": 1,
+        "kind": "vm_retained_rootdisk_v1",
+        "namespace": VM_NAMESPACE,
+        "owner_kind": "job",
+        "owner_id": owner,
+        "pvc_uid": pvc_uid,
+        "pvc_name": dv["metadata"]["name"],
+        "dv_uid": dv["metadata"]["uid"],
+        "ownership": "standalone_dv",
+        "deleting": False,
+        "no_consumers": True,
+    }
 
 
 class TestRenderDiskSize:

@@ -5984,13 +5984,16 @@ class PostgresDB:
         ):
             return await select_cancelled_container_completion_replay(conn, owner_id)
 
-    async def quiesce_cancelled_stateless_vm_parent(self, job_id: str) -> bool:
-        """Select only this Cancel's open VM parent after its worker is done.
+    async def quiesce_cancelled_stateless_vm_parent(
+        self, job_id: str, *, retention_only: bool = False
+    ) -> bool:
+        """Select this cancelled Job's exact VM cleanup ordering dependency.
 
-        This permits the service to replay an already-admitted exact terminal
-        cleanup before a second checkpoint prune. It issues no cleanup permit
-        and grants no effect by itself; the ordinary archive path revalidates
-        the parent, resource policy and physical stop before settlement.
+        Legacy Cancel selects an open parent; typed retention also selects a
+        settled parent so response-loss and permanent Delete retries can finish.
+        ``retention_only`` restricts Delete's prune deferral to that persistent
+        link. This read grants no effect: archive revalidates the parent,
+        resource policy and physical stop before settlement.
         """
         try:
             owner_id = UUID(job_id)
@@ -6038,9 +6041,9 @@ class PostgresDB:
                     context = json.loads(context)
                 except (TypeError, ValueError):
                     return False
-            if (
-                not isinstance(context, dict)
-                or context.get("_stateless_cancel_cleanup_pending") is not True
+            if not isinstance(context, dict) or (
+                context.get("_stateless_cancel_cleanup_pending") is not True
+                and context.get("_stateless_delete_pending") is not True
             ):
                 return False
             canonical_owner, ambiguous = _job_workspace_owner(owner_id, row)
@@ -6106,6 +6109,32 @@ class PostgresDB:
                 "WHERE job_id=$1 AND resolved_at IS NULL)",
                 owner_id,
             ):
+                return False
+            if vm_uid is not None and await conn.fetchval(
+                "SELECT to_regclass('public.vm_job_cancel_retention_authorities') IS NOT NULL"
+            ):
+                retained = await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_job_cancel_retention_authorities a "
+                    "JOIN vm_workspace_cleanup_admissions c ON c.id=a.cleanup_admission_id "
+                    "WHERE a.job_id=$1 AND a.provision_generation=$2 AND a.vm_uid=$3 AND a.pvc_uid=$4 "
+                    "AND c.owner_kind='job' AND c.owner_id=a.job_id AND c.pvc_uid=a.pvc_uid "
+                    "AND c.request_id=a.cleanup_request_id AND c.intent_digest=a.intent_digest "
+                    "AND c.source='job_terminal_vm_release' AND c.parent_admission_id IS NULL "
+                    "AND (c.completed_at IS NULL OR c.outcome='completed'))",
+                    owner_id,
+                    UUID(generation),
+                    UUID(vm_uid),
+                    UUID(pvc_uid),
+                )
+                if retained:
+                    # Ordering only, including settlement response-loss replay.
+                    # Archive reacquires exact effect authority after this snapshot.
+                    return True
+            if (
+                retention_only
+                or context.get("_stateless_cancel_cleanup_pending") is not True
+            ):
+                # Permanent Delete defers prune only for a linked retaining parent.
                 return False
             expected_owner, expected_pvc, request_id, digest, _ = (
                 vm_cleanup_request_identity(
@@ -6208,6 +6237,14 @@ class PostgresDB:
         except ValueError:
             return False
 
+        from orchestrator.services.vm_job_cancel_retention import (
+            complete_cancel_retention_marker,
+        )
+
+        retained = await complete_cancel_retention_marker(self, str(job_uuid))
+        if retained is not None:
+            return retained
+
         async with self.acquire() as conn:
             async with conn.transaction():
                 queue = await conn.fetchrow(
@@ -6260,7 +6297,9 @@ class PostgresDB:
         jobs lock order, retain the jobs row as a non-runnable cleanup anchor,
         then require all canonical checkpoint rows to be gone. The caller may
         tear down external resources and delete the jobs row only after this
-        method succeeds.
+        method succeeds. A linked typed VM retention parent defers strict prune
+        until its workspace cleanup settles; the Delete service completes that
+        prune before removing the jobs row.
 
         Returns ``False`` if the row no longer exists on the stateless lane.
         Strict checkpoint failures raise and deliberately leave a cancelled,
@@ -6305,6 +6344,12 @@ class PostgresDB:
         except _DeleteCASLostError:
             return False
 
+        if await self.quiesce_cancelled_stateless_vm_parent(
+            job_id, retention_only=True
+        ):
+            # Its typed retaining parent must settle before checkpoint admission.
+            # Delete retries strict prune using the same persistent linked selector.
+            return True
         await self.delete_checkpoint_thread(job_id, strict=True)
         return True
 

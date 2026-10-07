@@ -1180,7 +1180,21 @@ class VMResourceReservationStore:
                 "UPDATE vm_resource_reservations SET state='teardown' WHERE id=$1",
                 charge["id"],
             )
+        from orchestrator.services.vm_job_cancel_retention import (
+            retention_for_admission_on_conn,
+        )
+
+        retention = {}
+        if await retention_for_admission_on_conn(conn, cleanup["id"]) is not None:
+            preflight = await conn.fetchval(
+                "SELECT retention_preflight FROM vm_pre_ssh_stop_intents WHERE cleanup_admission_id=$1",
+                cleanup["id"],
+            )
+            retention["retention_preflight"] = (
+                _json(preflight) if preflight is not None else None
+            )
         return {
+            **retention,
             "job_id": str(job["id"]),
             "provision_generation": str(retry["provision_generation"]),
             "vm_uid": str(charge["vm_uid"]),
@@ -1211,6 +1225,25 @@ class VMResourceReservationStore:
             ),
             "controller_authenticated": True,
         }
+        from orchestrator.services.vm_job_cancel_retention import (
+            retention_for_admission_on_conn,
+        )
+
+        if await retention_for_admission_on_conn(conn, cleanup["id"]) is not None:
+            from shared.vm_cancel_retention import retained_rootdisk_from_preflight
+
+            preflight = await conn.fetchval(
+                "SELECT retention_preflight FROM vm_pre_ssh_stop_intents WHERE cleanup_admission_id=$1",
+                cleanup["id"],
+            )
+            try:
+                expected["retained_rootdisk"] = retained_rootdisk_from_preflight(
+                    _json(preflight)
+                )
+            except (ValueError, TypeError) as exc:
+                raise ResourceAdmissionError(
+                    "resource_cleanup_retention_unproven"
+                ) from exc
         if (
             charge["state"] != "teardown"
             or proof != expected
@@ -1264,6 +1297,12 @@ class VMResourceReservationStore:
             "UPDATE vm_resource_waiters SET state='released',revision=revision+1 "
             "WHERE request_id=$1 AND state='admitted'", retry["request_id"],
         )
+        if "retained_rootdisk" in expected:
+            await conn.execute(
+                "UPDATE jobs SET context=jsonb_set(context,'{vm}',(context->'vm')||"
+                '\'{"status":"deleted","compute_released":true,"disk_kept":true}\'::jsonb) WHERE id=$1',
+                job["id"],
+            )
         return True
 
     async def _lock_policy(self, conn, *, allow_drain=False, allow_off=False):

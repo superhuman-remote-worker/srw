@@ -593,6 +593,9 @@ async def test_cancel_cleanup_session_lock_is_single_owner_and_released(monkeypa
 @pytest.mark.asyncio
 async def test_cancel_cleanup_marker_clears_only_after_queue_is_done():
     conn = MagicMock()
+    conn.fetchval = AsyncMock(
+        return_value=False
+    )  # Legacy fixture has no VM retention schema.
     conn.transaction.return_value = _AsyncCM()
     conn.fetchrow = AsyncMock(
         side_effect=[
@@ -610,6 +613,7 @@ async def test_cancel_cleanup_marker_clears_only_after_queue_is_done():
 @pytest.mark.asyncio
 async def test_cancel_cleanup_marker_stays_while_queue_is_live():
     conn = MagicMock()
+    conn.fetchval = AsyncMock(return_value=False)
     conn.transaction.return_value = _AsyncCM()
     conn.fetchrow = AsyncMock(return_value={"state": "leased"})
     db = _db_with_conn(conn)
@@ -621,6 +625,7 @@ async def test_cancel_cleanup_marker_stays_while_queue_is_live():
 @pytest.mark.asyncio
 async def test_cancel_cleanup_finalizers_are_idempotent_after_marker_clear():
     conn = MagicMock()
+    conn.fetchval = AsyncMock(return_value=False)
     conn.transaction.return_value = _AsyncCM()
     cleanup_pending = True
 
@@ -675,6 +680,7 @@ async def test_prepare_delete_fences_queue_before_job_and_strictly_prunes():
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
     db = _db_with_conn(conn)
+    db.quiesce_cancelled_stateless_vm_parent = AsyncMock(return_value=False)
 
     assert await db.prepare_stateless_job_for_delete(JOB_ID)
     assert calls == ["queue_lock", "queue_close", "job_cancel"]
@@ -698,6 +704,7 @@ async def test_prepare_delete_prune_failure_retains_fenced_job_for_retry():
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
     db = _db_with_conn(conn)
+    db.quiesce_cancelled_stateless_vm_parent = AsyncMock(return_value=False)
     db.delete_checkpoint_thread.side_effect = RuntimeError("prune unavailable")
 
     with pytest.raises(RuntimeError, match="prune unavailable"):

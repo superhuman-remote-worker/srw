@@ -377,6 +377,45 @@ async def insert_intent(db, state, permit, qualification):
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", [None, "missing", "foreign"])
+async def test_python_stop_intent_requires_and_replays_retention_preflight(db, fault):
+    from orchestrator.services.vm_pre_ssh_stop_store import VMPreSSHStopConflict
+
+    state = await cancelled(db)
+    permit = await acquire(state)
+    qualification = preflight(state)
+    if fault == "foreign":
+        qualification["pvc_uid"] = str(uuid4())
+    if fault is not None:
+        with pytest.raises(VMPreSSHStopConflict):
+            await state["store"].admit_intent(
+                state["job_id"],
+                state["generation"],
+                permit.parent_cleanup,
+                state["frozen"],
+                retention_preflight=None if fault == "missing" else qualification,
+            )
+        assert await db.fetchval("SELECT count(*) FROM vm_pre_ssh_stop_intents") == 0
+    else:
+        intent = await state["store"].admit_intent(
+            state["job_id"],
+            state["generation"],
+            permit.parent_cleanup,
+            state["frozen"],
+            retention_preflight=qualification,
+        )
+        assert intent["retention_preflight"] == qualification
+        assert (
+            await state["store"].current_intent(
+                state["job_id"],
+                state["generation"],
+                permit.parent_cleanup,
+            )
+            == intent
+        )
+
+
 async def positive_retention(db):
     state = await cancelled(db)
     permit = await acquire(state)
@@ -454,12 +493,352 @@ async def settle_sql(db, state, *, evidence=None, release=True):
                 "FROM vm_resource_cleanup_stop_receipts s WHERE s.cleanup_admission_id=$1 AND v.id=s.reservation_id",
                 admission,
             )
+
             await conn.execute(
                 "UPDATE vm_resource_waiters SET state='released',revision=revision+1 "
                 "WHERE request_id=(SELECT creation_request_id FROM vm_job_cancel_retention_authorities "
                 "WHERE cleanup_admission_id=$1)",
                 admission,
             )
+
+
+@pytest.mark.asyncio
+async def test_retention_compute_settlement_keeps_full_wire_proof_and_replays_once(db):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from orchestrator.services.vm_workspace_recovery_store import (
+        complete_vm_cleanup_permit,
+        prepare_vm_cleanup_resource,
+    )
+
+    state = await positive_retention(db)
+    permit = state["retention"]
+    candidate = await prepare_vm_cleanup_resource(state["recovery"], permit)
+    assert candidate["retention_preflight"] == state["preflight"]
+    provisioner = SimpleNamespace(
+        attest_vm_cleanup_stop=AsyncMock(return_value=state["evidence"])
+    )
+    await complete_vm_cleanup_permit(
+        state["recovery"], permit, outcome="completed", provisioner=provisioner
+    )
+    stored = await db.fetchval(
+        "SELECT stop_evidence FROM vm_resource_cleanup_stop_receipts WHERE cleanup_admission_id=$1",
+        permit.admission_id,
+    )
+    assert json.loads(stored) == state["evidence"]
+    assert await db.fetchval(
+        "SELECT public.vm_job_cancel_retention_settled($1)", permit.admission_id
+    )
+    await complete_vm_cleanup_permit(
+        state["recovery"],
+        await acquire(state),
+        outcome="completed",
+        provisioner=provisioner,
+    )
+    provisioner.attest_vm_cleanup_stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_markerless_retention_retry_precedes_checkpoint_prune(db):
+    state = await cancelled(db)
+    permit = await acquire(state)
+    assert permit.allowed
+    assert await db.quiesce_cancelled_stateless_vm_parent(state["job_id"])
+    assert not await db.complete_stateless_cancel_cleanup(state["job_id"])
+    context = json.loads(
+        await db.fetchval("SELECT context FROM jobs WHERE id=$1", UUID(state["job_id"]))
+    )
+    assert context["_stateless_cancel_cleanup_pending"] is True
+    assert "_job_terminal_vm_cleanup" not in context
+
+
+@pytest.mark.asyncio
+async def test_delete_keeps_strict_prune_for_legacy_open_true_parent(db, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    state = await cancelled(db)
+    assert await db.quiesce_cancelled_stateless_vm_parent(state["job_id"])
+    assert not await db.quiesce_cancelled_stateless_vm_parent(
+        state["job_id"], retention_only=True
+    )
+    prune = AsyncMock()
+    monkeypatch.setattr(db, "delete_checkpoint_thread", prune)
+    assert await db.prepare_stateless_job_for_delete(state["job_id"])
+    prune.assert_awaited_once_with(state["job_id"], strict=True)
+
+
+@pytest.mark.asyncio
+async def test_markerless_settled_retention_clears_pending_after_restart(
+    db, monkeypatch
+):
+    state = await positive_retention(db)
+    await settle_sql(db, state)
+    monkeypatch.setenv("VM_JOB_CANCEL_RETENTION_ENABLED", "false")
+    assert await db.quiesce_cancelled_stateless_vm_parent(state["job_id"])
+    assert await db.complete_stateless_cancel_cleanup(state["job_id"])
+    context = json.loads(
+        await db.fetchval("SELECT context FROM jobs WHERE id=$1", UUID(state["job_id"]))
+    )
+    assert "_stateless_cancel_cleanup_pending" not in context
+    assert context["vm"]["compute_released"] is True
+    assert context["vm"]["disk_kept"] is True
+    assert context["vm"]["rootdisk_pvc_uid"] == state["frozen"]["pvc_uid"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("already_settled", [False, True])
+async def test_actual_cancel_settle_keeps_disk_and_survives_settlement_response_loss(
+    db, monkeypatch, already_settled
+):
+    import logging
+    from functools import partial
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from orchestrator.services import thread_retirement
+    from orchestrator.services.job_mutation_controls import JobControlOperations
+    from orchestrator.services.vm_workspace_policy import vm_needs_release
+
+    state = await positive_retention(db)
+    if already_settled:
+        await settle_sql(db, state)
+    monkeypatch.setenv("VM_JOB_CANCEL_RETENTION_ENABLED", "false")
+    provisioner = SimpleNamespace(
+        lifecycle_available=True,
+        capture_vm_teardown_identity=AsyncMock(return_value=state["identity"]),
+        release_vm_captured=AsyncMock(
+            return_value=SimpleNamespace(disposition="completed")
+        ),
+        delete_vm_captured=AsyncMock(
+            side_effect=AssertionError("Cancel must not purge")
+        ),
+        attest_vm_cleanup_stop=AsyncMock(return_value=state["evidence"]),
+    )
+    archive_dependencies = SimpleNamespace(
+        store=db,
+        vm_provisioner=provisioner,
+        recovery_store=state["recovery"],
+        container_provisioner=None,
+        docker_provisioner=None,
+        get_container_context=lambda _: {},
+        get_vm_context=lambda job: json.loads(job["context"])["vm"],
+        vm_needs_release=vm_needs_release,
+    )
+    control = JobControlOperations(
+        SimpleNamespace(
+            store=db,
+            logger=logging.getLogger(__name__),
+            archive_and_cleanup_workspace=partial(
+                thread_retirement.archive_and_cleanup_workspace,
+                dependencies=archive_dependencies,
+            ),
+        )
+    )
+    assert await control.wait_for_stateless_cancel_settle(
+        state["job_id"], timeout_seconds=0
+    )
+    assert await control.wait_for_stateless_cancel_settle(
+        state["job_id"], timeout_seconds=0
+    )
+    assert provisioner.release_vm_captured.await_count == int(not already_settled)
+    provisioner.delete_vm_captured.assert_not_awaited()
+    assert (
+        await db.fetchval("SELECT count(*) FROM vm_job_retained_disk_purge_authorities")
+        == 0
+    )
+    assert await db.fetchval(
+        "SELECT public.vm_job_cancel_retention_settled($1)",
+        state["retention"].admission_id,
+    )
+    context = json.loads(
+        await db.fetchval("SELECT context FROM jobs WHERE id=$1", UUID(state["job_id"]))
+    )
+    assert context["vm"]["disk_kept"] is True
+
+
+@pytest.mark.asyncio
+async def test_exact_durably_ready_source_stays_outside_never_ready_policy(db):
+    state = await cancelled(db, old=False, retiring=False)
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,status}','\"ready\"') WHERE id=$1",
+        UUID(state["job_id"]),
+    )
+    await db.execute(
+        "UPDATE vm_creation_retries SET ready_at=clock_timestamp() WHERE job_id=$1",
+        UUID(state["job_id"]),
+    )
+    before = await authority_rows(db, state)
+    assert await acquire(state) is None
+    assert await authority_rows(db, state) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled_gate", [False, True])
+async def test_markerless_cancel_archive_never_falls_back_to_purge(
+    db, monkeypatch, enabled_gate
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from orchestrator.services import thread_retirement
+    from orchestrator.services.vm_workspace_policy import vm_needs_release
+
+    state = await cancelled(db)
+    monkeypatch.setenv("VM_JOB_CANCEL_RETENTION_ENABLED", str(enabled_gate).lower())
+    generic = AsyncMock(side_effect=AssertionError("retention fell through to purge"))
+    monkeypatch.setattr(thread_retirement, "acquire_vm_cleanup_permit", generic)
+    monkeypatch.setattr(thread_retirement, "complete_vm_cleanup_permit", AsyncMock())
+    provisioner = SimpleNamespace(
+        lifecycle_available=True,
+        capture_vm_teardown_identity=AsyncMock(return_value=state["identity"]),
+        release_vm_captured=AsyncMock(
+            return_value=SimpleNamespace(disposition="completed")
+        ),
+    )
+    context = json.loads(
+        await db.fetchval("SELECT context FROM jobs WHERE id=$1", UUID(state["job_id"]))
+    )
+    dependencies = SimpleNamespace(
+        store=db,
+        vm_provisioner=provisioner,
+        recovery_store=state["recovery"],
+        container_provisioner=None,
+        docker_provisioner=None,
+        get_container_context=lambda _: {},
+        get_vm_context=lambda _: context["vm"],
+        vm_needs_release=vm_needs_release,
+    )
+    if enabled_gate:
+        await thread_retirement.archive_and_cleanup_workspace(
+            state["job_id"], dependencies=dependencies
+        )
+        assert provisioner.release_vm_captured.await_args.kwargs["purge_disk"] is False
+        assert (
+            provisioner.release_vm_captured.await_args.kwargs["capture_snapshot"]
+            is False
+        )
+    else:
+        with pytest.raises(RuntimeError, match="retention"):
+            await thread_retirement.archive_and_cleanup_workspace(
+                state["job_id"], dependencies=dependencies
+            )
+        provisioner.release_vm_captured.assert_not_awaited()
+    generic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("already_settled", [False, True])
+@pytest.mark.parametrize("lost_reply", [False, True])
+async def test_permanent_job_delete_reuses_retention_then_typed_purge(
+    db, already_settled, lost_reply
+):
+    import logging
+    from functools import partial
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from orchestrator.services import thread_retirement
+    from orchestrator.services.job_mutation_controls import JobControlOperations
+    from orchestrator.services.vm_workspace_policy import vm_needs_release
+
+    state = await positive_retention(db)
+    if already_settled:
+        await settle_sql(db, state)
+        assert await db.complete_stateless_cancel_cleanup(state["job_id"])
+    effects = []
+    purge_parents = []
+
+    async def release(_job_id, _identity, **kwargs):
+        assert kwargs["purge_disk"] is False
+        effects.append("compute")
+        return SimpleNamespace(disposition="completed")
+
+    async def purge(_job_id, _identity, **kwargs):
+        assert kwargs["purge_disk"] is True
+        context = json.loads(
+            await db.fetchval(
+                "SELECT context FROM jobs WHERE id=$1", UUID(state["job_id"])
+            )
+        )
+        assert context["_stateless_delete_pending"] is True
+        purge_parents.append(kwargs["parent_cleanup"]["admission_id"])
+        if len(purge_parents) == 1:
+            effects.append("disk")
+            if lost_reply:
+                return SimpleNamespace(disposition="retry_pending")
+        return SimpleNamespace(disposition="completed")
+
+    async def attest(candidate):
+        if not candidate["purge_disk"]:
+            return state["evidence"]
+        return {
+            **{
+                key: value
+                for key, value in state["evidence"].items()
+                if key != "retained_rootdisk"
+            },
+            "pvc_disposition": "purged",
+            "controller_scope": candidate["controller_scope"],
+        }
+
+    provisioner = SimpleNamespace(
+        lifecycle_available=True,
+        capture_vm_teardown_identity=AsyncMock(return_value=state["identity"]),
+        release_vm_captured=release,
+        delete_vm_captured=purge,
+        attest_vm_cleanup_stop=attest,
+    )
+    archive_dependencies = SimpleNamespace(
+        store=db,
+        vm_provisioner=provisioner,
+        recovery_store=state["recovery"],
+        container_provisioner=None,
+        docker_provisioner=None,
+        get_container_context=lambda _: {},
+        get_vm_context=lambda job: json.loads(job["context"])["vm"],
+        vm_needs_release=vm_needs_release,
+    )
+
+    @asynccontextmanager
+    async def vector_connection():
+        yield SimpleNamespace(execute=AsyncMock())
+
+    control = JobControlOperations(
+        SimpleNamespace(
+            store=db,
+            logger=logging.getLogger(__name__),
+            archive_and_cleanup_workspace=partial(
+                thread_retirement.archive_and_cleanup_workspace,
+                dependencies=archive_dependencies,
+            ),
+            snapshot_service=SimpleNamespace(is_available=False),
+            vector_db=SimpleNamespace(acquire=vector_connection),
+            resolve_job_notifications=AsyncMock(),
+        )
+    )
+    job = await db.get_job(state["job_id"])
+    if lost_reply:
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as lost:
+            await control.delete(
+                state["job_id"], caller={"id": job["user_id"]}, job=job
+            )
+        assert lost.value.status_code == 503
+        assert await db.get_job(state["job_id"]) is not None
+        job = await db.get_job(state["job_id"])
+    result = await control.delete(
+        state["job_id"], caller={"id": job["user_id"]}, job=job
+    )
+    assert result["status"] == "deleted"
+    assert effects == (["disk"] if already_settled else ["compute", "disk"])
+    assert len(set(purge_parents)) == 1
+    assert await db.get_job(state["job_id"]) is None
+    assert (
+        await db.fetchval("SELECT count(*) FROM vm_job_retained_disk_purge_receipts")
+        == 1
+    )
+    assert await db.fetchval(
+        "SELECT deletion_receipt IS NOT NULL FROM vm_job_creation_owners WHERE job_id=$1",
+        UUID(state["job_id"]),
+    )
 
 
 @pytest.mark.asyncio

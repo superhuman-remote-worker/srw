@@ -210,6 +210,23 @@ async def acquire_cancel_retention(store, *, job_id: str, identity):
             "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
             f"workspace-recovery-pvc:{pvc}",
         )
+        if (
+            prior is None
+            and vm.get("status") == "ready"
+            and await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_creation_retries WHERE owner_kind='job' "
+                "AND job_id=$1 AND provision_generation=$2 AND observed_vm_uid=$3 "
+                "AND observed_pvc_uid=$4 AND ready_at IS NOT NULL)",
+                owner,
+                generation,
+                vm_uid,
+                pvc,
+            )
+        ):
+            # An exact currently and durably Ready source is outside this policy.
+            # Ready history appearing on an already-retiring candidate is drift;
+            # missing/uncertain sources remain recognized refusals below.
+            return None
         if prior is not None:
             if (
                 prior["provision_generation"] != generation
@@ -370,3 +387,55 @@ async def acquire_cancel_retention(store, *, job_id: str, identity):
             )
         await prepare_vm_cleanup_resource(store, permit, _conn=conn)
         return permit
+
+
+async def complete_cancel_retention_marker(db, job_id: str):
+    """None means legacy cleanup; a retaining owner needs its full settled proof."""
+    owner = _uuid(job_id)
+    async with db.acquire() as conn, conn.transaction():
+        if not await _installed(conn):
+            return None
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            f"workspace-recovery:job:{owner}",
+        )
+        authority = await conn.fetchrow(
+            "SELECT * FROM vm_job_cancel_retention_authorities WHERE job_id=$1 ORDER BY admitted_at DESC LIMIT 1",
+            owner,
+        )
+        if authority is None:
+            return None
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            f"workspace-recovery-pvc:{authority['pvc_uid']}",
+        )
+        await conn.fetchrow(
+            "SELECT id FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR SHARE",
+            authority["cleanup_admission_id"],
+        )
+        await conn.fetchrow(
+            "SELECT unit_id FROM run_queue WHERE unit_id=$1 FOR UPDATE", owner
+        )
+        job = await conn.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner)
+        if job is None:
+            return True
+        if not await retention_settlement_is_current_on_conn(
+            conn,
+            job_id=owner,
+            generation=authority["provision_generation"],
+            admission_id=authority["cleanup_admission_id"],
+        ):
+            return False
+        disk_kept = not await conn.fetchval(
+            "SELECT public.vm_job_cancel_retention_discharged($1)",
+            authority["cleanup_admission_id"],
+        )
+        await conn.execute(
+            "UPDATE jobs SET context=jsonb_set(context-'_stateless_cancel_cleanup_pending','{vm}',"
+            "(context->'vm')||$2::jsonb),updated_at=clock_timestamp() WHERE id=$1",
+            owner,
+            json.dumps(
+                {"status": "deleted", "compute_released": True, "disk_kept": disk_kept}
+            ),
+        )
+        return True

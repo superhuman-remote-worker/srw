@@ -77,6 +77,7 @@ class _VMTeardownProbe:
     runtime_absence_known: bool = False
     vmi_absent: bool = False
     launcher_absent: bool = False
+    retained_rootdisk: Mapping[str, Any] | None = None
 
 
 def _provision_generation(value: object) -> str | None:
@@ -1453,6 +1454,7 @@ class VMProvisioner:
                 runtime_absence_known=result.get("runtime_absence_known") is True,
                 vmi_absent=result.get("vmi_absent") is True,
                 launcher_absent=result.get("launcher_absent") is True,
+                retained_rootdisk=result.get("retained_rootdisk"),
             )
         if status in {"query_failed", "delete_failed"} or identity.vm_uid is None:
             return _VMTeardownProbe("unknown")
@@ -1555,6 +1557,24 @@ class VMProvisioner:
             return None
         if type(candidate.get("purge_disk")) is not bool:
             return None
+        retention_preflight = candidate.get("retention_preflight")
+        if "retention_preflight" in candidate:
+            from shared.vm_cancel_retention import valid_retention_preflight
+
+            if (
+                owner_kind != "job"
+                or candidate["purge_disk"] is not False
+                or not isinstance(retention_preflight, Mapping)
+                or not valid_retention_preflight(
+                    retention_preflight, retention_preflight.get("frozen")
+                )
+                or any(
+                    retention_preflight["frozen"].get(key) != value
+                    for key, value in fields.items()
+                )
+                or await self._storage_context(fields[owner_key]) is not None
+            ):
+                return None
         binding_kind = candidate.get("binding_kind")
         if binding_kind not in {None, "bound", "unbound"}:
             return None
@@ -1630,9 +1650,19 @@ class VMProvisioner:
             != (None if candidate["purge_disk"] else fields["pvc_uid"])
         ):
             return None
+        retained = {}
+        if "retention_preflight" in candidate:
+            from shared.vm_cancel_retention import valid_retained_rootdisk
+
+            if not valid_retained_rootdisk(
+                probe.retained_rootdisk, retention_preflight
+            ):
+                return None
+            retained["retained_rootdisk"] = dict(probe.retained_rootdisk)
         return {
             "version": 1,
             "kind": "vm_cleanup_physical_stop",
+            **retained,
             **fields,
             **({"owner_kind": "thread"} if owner_kind == "thread" else {}),
             **(
@@ -1726,6 +1756,9 @@ class VMProvisioner:
             return False
         store = VMPreSSHStopStore(self._db)
         try:
+            retention_required = await store.requires_retention_preflight(
+                parent_cleanup
+            )
             intent = await store.current_intent(
                 job_id, identity.provision_generation, parent_cleanup
             )
@@ -1740,16 +1773,36 @@ class VMProvisioner:
                     }
                 )
                 frozen = inspected.get("frozen") if inspected else None
+                preflight = inspected.get("retention_preflight") if inspected else None
+                from shared.vm_cancel_retention import valid_retention_preflight
+
                 if (
                     inspected is None
                     or inspected.get("_identity_authenticated") is not True
                     or inspected.get("status") != "candidate"
                     or not valid_frozen_stop_candidate(frozen)
+                    or (
+                        retention_required
+                        and not valid_retention_preflight(preflight, frozen)
+                    )
                 ):
                     return False
                 intent = await store.admit_intent(
-                    job_id, identity.provision_generation, parent_cleanup, frozen
+                    job_id,
+                    identity.provision_generation,
+                    parent_cleanup,
+                    frozen,
+                    **(
+                        {"retention_preflight": preflight} if retention_required else {}
+                    ),
                 )
+            if retention_required:
+                from shared.vm_cancel_retention import valid_retention_preflight
+
+                if not valid_retention_preflight(
+                    intent.get("retention_preflight"), intent.get("frozen")
+                ):
+                    return False
             stopped = await self._request_pre_ssh_stop(
                 {
                     "action": "stop",

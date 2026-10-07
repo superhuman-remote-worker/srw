@@ -11,6 +11,7 @@ from shared.vm_pre_ssh_stop import (
     valid_frozen_stop_candidate,
     valid_positive_stop_proof,
 )
+from shared.vm_cancel_retention import valid_retention_preflight
 
 
 class VMPreSSHStopConflict(RuntimeError):
@@ -53,9 +54,53 @@ def _require_intent_current(intent: Any, cleanup: Any, retry: Any, charge: Any) 
         raise VMPreSSHStopConflict("stop_intent_parent_changed")
 
 
+def _intent_wire(row):
+    frozen = _json_object(row["frozen"])
+    result = {"frozen": frozen, "frozen_digest": row["frozen_digest"]}
+    preflight = row.get("retention_preflight")
+    if preflight is not None:
+        preflight = _json_object(preflight)
+        if not valid_retention_preflight(preflight, frozen):
+            raise VMPreSSHStopConflict("retention_preflight_unproven")
+        result["retention_preflight"] = preflight
+    return result
+
+
 class VMPreSSHStopStore:
     def __init__(self, db: Any):
         self.db = db
+
+    async def requires_retention_preflight(self, parent_cleanup) -> bool:
+        from orchestrator.services.vm_job_cancel_retention import (
+            retention_for_admission_on_conn,
+        )
+
+        async with self.db.acquire() as conn:
+            return (
+                await retention_for_admission_on_conn(
+                    conn, _uuid(parent_cleanup["admission_id"])
+                )
+                is not None
+            )
+
+    async def _retention_preflight_current(self, conn, cleanup, frozen, preflight):
+        from orchestrator.services.vm_job_cancel_retention import (
+            retention_for_admission_on_conn,
+        )
+
+        authority = await retention_for_admission_on_conn(conn, cleanup["id"])
+        if authority is None:
+            if preflight is not None:
+                raise VMPreSSHStopConflict("retention_preflight_without_authority")
+            return
+        if authority["cleanup_admission_id"] != cleanup[
+            "id"
+        ] or not valid_retention_preflight(preflight, frozen):
+            raise VMPreSSHStopConflict("retention_preflight_unproven")
+        if not await conn.fetchval(
+            "SELECT public.validate_vm_job_cancel_retention($1,false)", cleanup["id"]
+        ):
+            raise VMPreSSHStopConflict("retention_authority_changed")
 
     async def has_intent(self, job_id: str, generation: str) -> bool:
         owner, incarnation = _uuid(job_id), _uuid(generation)
@@ -220,7 +265,11 @@ class VMPreSSHStopStore:
                     parent_cleanup=parent_cleanup,
                     frozen=frozen,
                 )
-                return {"frozen": frozen, "frozen_digest": row["frozen_digest"]}
+                wire = _intent_wire(row)
+                await self._retention_preflight_current(
+                    conn, cleanup, frozen, wire.get("retention_preflight")
+                )
+                return wire
 
     async def admit_intent(
         self,
@@ -228,6 +277,8 @@ class VMPreSSHStopStore:
         generation: str,
         parent_cleanup: Mapping[str, Any],
         frozen: Mapping[str, Any],
+        *,
+        retention_preflight: Mapping[str, Any] | None = None,
     ) -> dict:
         owner, incarnation = _uuid(job_id), _uuid(generation)
         if not valid_frozen_stop_candidate(frozen):
@@ -241,6 +292,9 @@ class VMPreSSHStopStore:
                     parent_cleanup=parent_cleanup,
                     frozen=frozen,
                 )
+                await self._retention_preflight_current(
+                    conn, cleanup, frozen, retention_preflight
+                )
                 prior = await conn.fetchrow(
                     "SELECT * FROM vm_pre_ssh_stop_intents "
                     "WHERE cleanup_admission_id=$1",
@@ -250,10 +304,10 @@ class VMPreSSHStopStore:
                     _require_intent_current(prior, cleanup, retry, charge)
                     if _json_object(prior["frozen"]) != dict(frozen):
                         raise VMPreSSHStopConflict("stop_intent_rebound")
-                    return {
-                        "frozen": dict(frozen),
-                        "frozen_digest": prior["frozen_digest"],
-                    }
+                    wire = _intent_wire(prior)
+                    if wire.get("retention_preflight") != retention_preflight:
+                        raise VMPreSSHStopConflict("retention_preflight_rebound")
+                    return wire
                 if await conn.fetchval(
                     "SELECT EXISTS(SELECT 1 FROM managed_repository_process_zero_receipts "
                     "WHERE owner_kind='job' AND owner_id=$1 AND scope='vm' "
@@ -262,15 +316,21 @@ class VMPreSSHStopStore:
                     str(incarnation),
                 ):
                     raise VMPreSSHStopConflict("preexisting_zero_receipt")
+                preflight_column = (
+                    ",retention_preflight" if retention_preflight is not None else ""
+                )
+                preflight_value = (
+                    ",$14::jsonb" if retention_preflight is not None else ""
+                )
                 row = await conn.fetchrow(
                     "INSERT INTO vm_pre_ssh_stop_intents ("
                     "cleanup_admission_id,job_id,provision_generation,"
                     "creation_request_id,reservation_id,reservation_revision,"
                     "vm_uid,vmi_uid,launcher_uid,pvc_uid,node_uid,"
-                    "cleanup_intent_digest,frozen,frozen_digest) VALUES ("
+                    f"cleanup_intent_digest,frozen,frozen_digest{preflight_column}) VALUES ("
                     "$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,"
                     "'sha256:'||encode(sha256(convert_to($13::jsonb::text,'UTF8')),'hex')"
-                    ") RETURNING frozen_digest",
+                    f"{preflight_value}) RETURNING *",
                     cleanup["id"],
                     owner,
                     incarnation,
@@ -284,8 +344,13 @@ class VMPreSSHStopStore:
                     charge["node_uid"],
                     cleanup["intent_digest"],
                     json.dumps(dict(frozen)),
+                    *(
+                        [json.dumps(dict(retention_preflight))]
+                        if retention_preflight is not None
+                        else []
+                    ),
                 )
-                return {"frozen": dict(frozen), "frozen_digest": row["frozen_digest"]}
+                return _intent_wire(row)
 
     async def commit_positive_proof(
         self,

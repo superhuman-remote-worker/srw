@@ -326,40 +326,16 @@ class JobControlOperations:
                 status_code=409, detail="VM retained-disk purge authority is held"
             )
         from orchestrator.services.vm_job_retained_disk_purge import (
-            complete_job_retained_disk_purge,
-            read_job_retained_disk_purge_candidate,
+            execute_job_retained_disk_purge,
         )
 
         try:
-            candidate = await read_job_retained_disk_purge_candidate(
-                self.dependencies.recovery_store, permit
-            )
-            if permit.completed_outcome is not None:
-                if permit.completed_outcome != "completed":
-                    raise ResourceAdmissionError("retained_disk_parent_unproven")
-                return {"status": "deleting", "job_id": job_id}
-            if candidate.get("binding_kind") == "bound":
-                # The separate exact-generation Workspace Release already
-                # deleted the disk. A fresh signed probe still owes proof.
-                disposition = "completed"
-            elif candidate.get("binding_kind") == "unbound":
-                outcome = await self.dependencies.vm_provisioner.delete_vm_captured(
-                    job_id,
-                    identity,
-                    entity_type="job",
-                    purge_disk=True,
-                    parent_cleanup=permit.parent_cleanup,
-                )
-                disposition = outcome.disposition
-            else:
-                raise ResourceAdmissionError("retained_disk_binding_unproven")
-            if disposition != "completed":
-                raise ResourceAdmissionError("retained_disk_physical_purge_pending")
-            await complete_job_retained_disk_purge(
+            await execute_job_retained_disk_purge(
                 self.dependencies.recovery_store,
-                permit,
-                outcome=disposition,
-                provisioner=self.dependencies.vm_provisioner,
+                self.dependencies.vm_provisioner,
+                job_id=job_id,
+                identity=identity,
+                permit=permit,
             )
         except ResourceAdmissionError as exc:
             raise HTTPException(

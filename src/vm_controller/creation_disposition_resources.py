@@ -107,7 +107,39 @@ def _items(value):
     return value["items"]
 
 
-def _scan_consumers(ctrl, namespace, job_name, root, secret):
+def _allowed_runtime_consumer(item, kind, metadata, runtime):
+    if not isinstance(runtime, Mapping):
+        return False
+    name_key, uid_key = {
+        "virtualmachines": ("vm_name", "vm_uid"),
+        "virtualmachineinstances": ("vm_name", "vmi_uid"),
+        "pods": ("launcher_name", "launcher_uid"),
+    }[kind]
+    if metadata.get("name") != runtime.get(name_key) or metadata.get(
+        "uid"
+    ) != runtime.get(uid_key):
+        return False
+    if kind == "virtualmachines":
+        return True
+    expected_kind, expected_uid = (
+        ("VirtualMachine", runtime.get("vm_uid"))
+        if kind == "virtualmachineinstances"
+        else ("VirtualMachineInstance", runtime.get("vmi_uid"))
+    )
+    refs = metadata.get("ownerReferences")
+    return (
+        isinstance(refs, list)
+        and len(refs) == 1
+        and isinstance(refs[0], Mapping)
+        and (
+            refs[0].get("kind") == expected_kind
+            and refs[0].get("uid") == expected_uid
+            and refs[0].get("controller") is True
+        )
+    )
+
+
+def _scan_consumers(ctrl, namespace, job_name, root, secret, allowed_runtime=None):
     """Read and interpret each complete namespace LIST in one owned worker."""
     documents = []
     for plural in ("virtualmachines", "virtualmachineinstances"):
@@ -123,6 +155,8 @@ def _scan_consumers(ctrl, namespace, job_name, root, secret):
     documents.extend(("pods", item) for item in _items(result))
     for kind, item in documents:
         metadata = _consumer_spec(item, kind, namespace)
+        if _allowed_runtime_consumer(item, kind, metadata, allowed_runtime):
+            continue
         if (
             metadata.get("name") == job_name
             or (metadata.get("labels") or {}).get("vm.kubevirt.io/name") == job_name
@@ -147,14 +181,24 @@ async def require_no_consumers(actuator, disposition):
     secret = disposition["objects"].get("cloud_init", {}).get("name")
     if await actuator.read("vm", job_name) is not None:
         raise CreationUnproven("creation_vm_requires_observation")
+    await scan_consumers(
+        actuator.controller, actuator.namespace, job_name, root, secret
+    )
+
+
+async def scan_consumers(
+    ctrl, namespace, job_name, root, secret=None, allowed_runtime=None
+):
+    """Complete namespace scan, retaining ownership of all SDK work on cancellation."""
     worker = asyncio.create_task(
         asyncio.to_thread(
             _scan_consumers,
-            actuator.controller,
-            actuator.namespace,
+            ctrl,
+            namespace,
             job_name,
             root,
             secret,
+            allowed_runtime,
         )
     )
     try:

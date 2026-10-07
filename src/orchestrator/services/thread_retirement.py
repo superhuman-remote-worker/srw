@@ -2719,11 +2719,13 @@ async def archive_and_cleanup_workspace(
     reclaim_volume: bool = True,
     dependencies: ThreadRetirementDependencies,
 ) -> list[str]:
-    """Snapshot workspace to S3, then delete container/VM.
+    """Retire workspace compute under its admitted storage policy.
 
-    Centralized cleanup for all workspace teardown paths (job completion,
-    cancellation, cascade cleanup, thread end). Each provisioner's release
-    method handles snapshot-before-delete internally.
+    Centralized cleanup for job completion, cancellation, cascade cleanup and
+    thread end. Provisioners handle snapshot-before-delete where required.
+    Typed never-Ready VM Cancel retention skips snapshot capture, keeps the
+    exact rootdisk and releases compute; permanent Delete needs separate
+    durable purge authority.
 
     Args:
         entity_id: Job or thread UUID.
@@ -2735,8 +2737,8 @@ async def archive_and_cleanup_workspace(
             that status, and the agent's idle-archive sets it automatically
             after 30 idle minutes), so tearing its volume down would silently
             destroy a workspace the user can still reopen. Only a genuine
-            permanent delete passes True. Jobs keep the default: reclaiming a
-            job's PVC on a terminal state is correct and unchanged.
+            permanent delete passes True. Job storage policy is selected from
+            its cleanup authority, including typed VM Cancel retention.
 
     Returns:
         List of action descriptions for logging.
@@ -2907,8 +2909,28 @@ async def archive_and_cleanup_workspace(
                 teardown_identity = await vm_provisioner.capture_vm_teardown_identity(
                     entity_id
                 )
+                retaining = None
+                if (
+                    job.get("status") == "cancelled"
+                    and job.get("execution_lane") == "stateless"
+                    and not job.get("parent_job_id")
+                    and vm_ctx.get("workspace_storage") is None
+                ):
+                    from orchestrator.services.vm_job_cancel_retention import (
+                        acquire_cancel_retention,
+                    )
+
+                    retaining = await acquire_cancel_retention(
+                        recovery_store,
+                        job_id=entity_id,
+                        identity=teardown_identity,
+                    )
+                    if retaining is not None and not retaining.allowed:
+                        raise RuntimeError("job VM cancel retention remains held")
                 purge_disk = True
-                if vm_ctx.get("workspace_storage") is not None:
+                if retaining is not None:
+                    purge_disk = False
+                elif vm_ctx.get("workspace_storage") is not None:
                     # The context is a hint; only the durable reservation can
                     # authorize keeping this rootdisk after terminal compute.
                     if await vm_provisioner._storage_context(entity_id) is None:
@@ -2924,14 +2946,16 @@ async def archive_and_cleanup_workspace(
                     pvc_uid=teardown_identity.rootdisk_pvc_uid,
                 ):
                     raise RuntimeError("terminal VM rootdisk belongs to idle review release")
-                cleanup = await acquire_vm_cleanup_permit(
-                    recovery_store,
-                    owner_kind="job",
-                    owner_id=entity_id,
-                    identity=teardown_identity,
-                    source="job_terminal_vm_release",
-                    purge_disk=purge_disk,
-                )
+                cleanup = retaining
+                if cleanup is None:
+                    cleanup = await acquire_vm_cleanup_permit(
+                        recovery_store,
+                        owner_kind="job",
+                        owner_id=entity_id,
+                        identity=teardown_identity,
+                        source="job_terminal_vm_release",
+                        purge_disk=purge_disk,
+                    )
                 if not cleanup.allowed:
                     raise RuntimeError("job VM cleanup held for workspace recovery")
                 marker = (
@@ -2953,6 +2977,9 @@ async def archive_and_cleanup_workspace(
                         ssh_host=vm_ctx.get("ssh_host"),
                         ssh_port=vm_ctx.get("ssh_port"),
                         purge_disk=purge_disk,
+                        **(
+                            {"capture_snapshot": False} if retaining is not None else {}
+                        ),
                         **vm_cleanup_kwargs(cleanup),
                     )
                     disposition = outcome.disposition
@@ -2965,7 +2992,35 @@ async def archive_and_cleanup_workspace(
                         )
                 if disposition != "completed":
                     raise RuntimeError("VM exact teardown remains " + str(disposition))
-                actions.append("vm released")
+                actions.append(
+                    "vm compute released; rootdisk retained"
+                    if retaining is not None
+                    else "vm released"
+                )
+
+        if (
+            vm_ctx
+            and job.get("execution_lane") == "stateless"
+            and raw_context.get("_stateless_delete_pending") is True
+        ):
+            from orchestrator.services.vm_job_retained_disk_purge import (
+                acquire_job_retained_disk_purge,
+                execute_job_retained_disk_purge,
+            )
+
+            identity = await vm_provisioner.capture_vm_teardown_identity(entity_id)
+            purge = await acquire_job_retained_disk_purge(
+                recovery_store, job_id=entity_id, identity=identity
+            )
+            if purge is not None:
+                await execute_job_retained_disk_purge(
+                    recovery_store,
+                    vm_provisioner,
+                    job_id=entity_id,
+                    identity=identity,
+                    permit=purge,
+                )
+                actions.append("retained vm rootdisk permanently deleted")
 
         # Workspace container cleanup (snapshot + delete)
         if ws_ctx and ws_ctx.get("status") not in (

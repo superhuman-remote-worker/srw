@@ -36,6 +36,39 @@ async def _lock_owner(conn, owner: UUID, pvc: UUID | None = None) -> None:
         )
 
 
+async def execute_job_retained_disk_purge(
+    store, provisioner, *, job_id, identity, permit
+):
+    """Actuate only the separately admitted permanent Delete and its exact proof."""
+    if not permit.allowed:
+        raise ResourceAdmissionError("retained_disk_purge_authority_held")
+    candidate = await read_job_retained_disk_purge_candidate(store, permit)
+    if permit.completed_outcome is not None:
+        if permit.completed_outcome != "completed":
+            raise ResourceAdmissionError("retained_disk_parent_unproven")
+    else:
+        if candidate.get("binding_kind") == "bound":
+            # Workspace Release already deleted this exact bound generation;
+            # the same signed physical absence still has to settle below.
+            disposition = "completed"
+        elif candidate.get("binding_kind") == "unbound":
+            outcome = await provisioner.delete_vm_captured(
+                job_id,
+                identity,
+                entity_type="job",
+                purge_disk=True,
+                parent_cleanup=permit.parent_cleanup,
+            )
+            disposition = outcome.disposition
+        else:
+            raise ResourceAdmissionError("retained_disk_binding_unproven")
+        if disposition != "completed":
+            raise ResourceAdmissionError("retained_disk_physical_purge_pending")
+        await complete_job_retained_disk_purge(
+            store, permit, outcome=disposition, provisioner=provisioner
+        )
+
+
 async def acquire_job_retained_disk_purge(store, *, job_id: str, identity):
     """Return None only when this Job has no typed retained physical stop.
 
@@ -350,3 +383,19 @@ async def complete_job_retained_disk_purge(store, permit, *, outcome, provisione
             "WHERE id=$1 AND completed_at IS NULL",
             permit.admission_id,
         )
+        if await conn.fetchval(
+            "SELECT to_regclass('public.vm_job_cancel_retention_authorities') IS NOT NULL"
+        ) and await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM vm_job_cancel_retention_authorities WHERE job_id=$1 "
+            "AND provision_generation=$2 AND public.vm_job_cancel_retention_discharged(cleanup_admission_id))",
+            UUID(candidate["job_id"]),
+            UUID(candidate["provision_generation"]),
+        ):
+            # Project only alongside the validated purge receipt and completion.
+            await conn.execute(
+                "UPDATE jobs SET context=jsonb_set(context,'{vm}',(context->'vm')||"
+                '\'{"status":"deleted","compute_released":true,"disk_kept":false}\'::jsonb) '
+                "WHERE id=$1 AND context->'vm'->>'provision_generation'=$2",
+                UUID(candidate["job_id"]),
+                candidate["provision_generation"],
+            )

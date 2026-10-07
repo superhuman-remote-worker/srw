@@ -3065,6 +3065,24 @@ class VMController:
                         "refusing to delete a superseded rootdisk PVC UID"
                     )
 
+        if (
+            owner_kind == "job"
+            and purge_disk is False
+            and workspace_storage is None
+            and isinstance(parent_cleanup, Mapping)
+            and isinstance(parent_cleanup.get("intent"), Mapping)
+            and parent_cleanup["intent"].get("source") == "job_terminal_vm_release"
+        ):
+            await self._qualify_cancel_retained_rootdisk(
+                job_id,
+                expected_rootdisk_pvc_uid,
+                allowed_runtime=(
+                    {"vm_name": vm_name, "vm_uid": admitted_vm_uid}
+                    if not vm_already_absent
+                    else None
+                ),
+            )
+
         try:
             if vm_already_absent:
                 raise ApiException(status=404)
@@ -3299,6 +3317,22 @@ class VMController:
                     launcher_absent = isinstance(items, list) and not items
                 except Exception:
                     launcher_absent = False
+            retained_rootdisk = None
+            if (
+                workspace_storage is None
+                and rootdisk_known
+                and rootdisk_uid is not None
+                and vmi_absent
+                and launcher_absent
+            ):
+                try:
+                    retained_rootdisk = await self._qualify_cancel_retained_rootdisk(
+                        job_id, rootdisk_uid
+                    )
+                except Exception:
+                    # Signed basic absence remains usable by legacy cleanup;
+                    # new retention cannot settle without the complete witness.
+                    pass
             return {
                 "job_id": job_id,
                 "status": "not_found",
@@ -3307,6 +3341,11 @@ class VMController:
                 "vmi_absent": vmi_absent,
                 "launcher_absent": launcher_absent,
                 "runtime_absence_known": vmi_absent and launcher_absent,
+                **(
+                    {"retained_rootdisk": retained_rootdisk}
+                    if retained_rootdisk is not None
+                    else {}
+                ),
                 **retained_probe,
                 **actual_scope,
                 **(
@@ -4076,7 +4115,9 @@ class VMController:
             }
             return result if valid_frozen_stop_candidate(result) else None
 
-    async def _do_pre_ssh_stop(self, frozen: Mapping[str, object], digest: str) -> dict:
+    async def _do_pre_ssh_stop(
+        self, frozen: Mapping[str, object], digest: str, *, retention_preflight=None
+    ) -> dict:
         """Stop only the exact retained launcher; ACK alone never proves zero."""
 
         from kubernetes.client.exceptions import ApiException
@@ -4095,6 +4136,25 @@ class VMController:
         ):
             return {"status": "identity_refused"}
         job_id = str(frozen["job_id"])
+        if retention_preflight is not None:
+            from shared.vm_cancel_retention import valid_retention_preflight
+
+            if not valid_retention_preflight(retention_preflight, frozen):
+                return {"status": "identity_refused"}
+
+        async def qualify_retention():
+            if retention_preflight is None:
+                return True
+            try:
+                observed = await self._qualify_cancel_retained_rootdisk(
+                    job_id, frozen["pvc_uid"], allowed_runtime=frozen
+                )
+                return all(
+                    retention_preflight.get(key) == value
+                    for key, value in observed.items()
+                )
+            except Exception:
+                return False
 
         async def read_current():
             vm = await asyncio.to_thread(
@@ -4304,6 +4364,8 @@ class VMController:
                 raise
             if current is None:
                 return {"status": "identity_refused"}
+            if not await qualify_retention():
+                return {"status": "identity_refused"}
             vm, pod, vmi = current
             vm_spec = _object_value(vm, "spec", {})
             run_strategy = _object_value(vm_spec, "runStrategy")
@@ -4407,6 +4469,9 @@ class VMController:
                     return {"status": "finalizer_pending"}
             run_strategy = _object_value(_object_value(vm, "spec", {}), "runStrategy")
             if run_strategy == "RerunOnFailure":
+                # Recheck storage immediately before Halted, after finalizer CAS.
+                if not await qualify_retention():
+                    return {"status": "identity_refused"}
                 vm_meta = _metadata(vm)
                 vm_rv = _object_value(vm_meta, "resourceVersion") or _object_value(
                     vm_meta, "resource_version"
@@ -4839,6 +4904,11 @@ class VMController:
         pvc_labels = _metadata_value(pvc, "labels", {}) or {}
         if (
             _metadata_value(pvc, "name") != name
+            or _metadata_value(pvc, "uid") != pvc_uid
+            or (
+                expected_pvc_uid is not None
+                and _metadata_value(pvc, "uid") != expected_pvc_uid
+            )
             or _metadata_value(pvc, "deletionTimestamp") is not None
             or _metadata_value(pvc, "deletion_timestamp") is not None
             or not isinstance(pvc_labels, Mapping)
@@ -4848,6 +4918,77 @@ class VMController:
         ):
             raise RuntimeError("rootdisk PVC ownership is not exact")
         return dv, pvc, dv_uid, pvc_uid
+
+    async def _qualify_cancel_retained_rootdisk(
+        self, job_id: str, expected_pvc_uid: str, *, allowed_runtime=None
+    ) -> dict:
+        """Observe a standalone DV/PVC chain; never detach ownership to make it safe."""
+        from uuid import UUID
+        from vm_controller.creation_disposition_resources import scan_consumers
+
+        try:
+            if any(str(UUID(value)) != value for value in (job_id, expected_pvc_uid)):
+                raise ValueError
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise RuntimeError("retained rootdisk identity is unproven") from exc
+        name = _rootdisk_name(job_id)
+        dv, pvc, dv_uid, pvc_uid = await self._exact_rootdisk_identity(
+            name, owner_kind="job", owner_id=job_id, expected_pvc_uid=expected_pvc_uid
+        )
+        dv_refs = _metadata_value(dv, "ownerReferences")
+        if dv_refs is None:
+            dv_refs = _metadata_value(dv, "owner_references")
+        pvc_refs = _metadata_value(pvc, "ownerReferences")
+        if pvc_refs is None:
+            pvc_refs = _metadata_value(pvc, "owner_references")
+        if (
+            dv_refs not in (None, [])
+            or _metadata_value(dv, "namespace") != VM_NAMESPACE
+            or _metadata_value(pvc, "namespace") != VM_NAMESPACE
+            or not isinstance(pvc_refs, list)
+            or len(pvc_refs) != 1
+        ):
+            raise RuntimeError("retained rootdisk ownership is not standalone")
+        ref = pvc_refs[0]
+        if (
+            _object_value(ref, "kind") != "DataVolume"
+            or _object_value(ref, "uid") != dv_uid
+            or _object_value(ref, "name") != name
+            or (_object_value(ref, "apiVersion") or _object_value(ref, "api_version"))
+            != "cdi.kubevirt.io/v1beta1"
+            or _object_value(ref, "controller") is not True
+        ):
+            raise RuntimeError("retained rootdisk owner reference is unproven")
+        try:
+            if str(UUID(dv_uid)) != dv_uid:
+                raise ValueError
+            await scan_consumers(
+                self,
+                VM_NAMESPACE,
+                f"agent-vm-{job_id}",
+                name,
+                allowed_runtime=allowed_runtime,
+            )
+        except Exception as exc:
+            raise RuntimeError("retained rootdisk consumers are unproven") from exc
+        storage = {
+            "namespace": VM_NAMESPACE,
+            "owner_id": job_id,
+            "pvc_name": name,
+            "pvc_uid": pvc_uid,
+            "dv_uid": dv_uid,
+            "ownership": "standalone_dv",
+            "deleting": False,
+        }
+        if allowed_runtime is not None:
+            return storage
+        return {
+            "version": 1,
+            "kind": "vm_retained_rootdisk_v1",
+            "owner_kind": "job",
+            **storage,
+            "no_consumers": True,
+        }
 
     async def _cleanup_carrier_pvc(self, name: str) -> object | None:
         from kubernetes.client.exceptions import ApiException
@@ -6307,6 +6448,23 @@ class VMController:
                 if candidate is not None
                 else {"status": "identity_refused"}
             )
+            if candidate is not None:
+                try:
+                    storage = await self._qualify_cancel_retained_rootdisk(
+                        job_id, candidate["pvc_uid"], allowed_runtime=candidate
+                    )
+                    result["retention_preflight"] = {
+                        "version": 1,
+                        "kind": "vm_cancel_retention_preflight_v1",
+                        "stop_policy": "cancel_retention_v1",
+                        "frozen": candidate,
+                        **storage,
+                        "consumer_scope": "exact_frozen_runtime_only",
+                    }
+                except Exception:
+                    # Legacy inspection remains usable. New retention authority
+                    # requires this capability witness before admitting a stop.
+                    pass
         elif action == "stop":
             frozen = data.get("frozen")
             if (
@@ -6315,7 +6473,15 @@ class VMController:
                 or frozen.get("provision_generation") != generation
             ):
                 return {"status": "identity_refused"}
-            result = await self._do_pre_ssh_stop(frozen, data.get("frozen_digest"))
+            result = await self._do_pre_ssh_stop(
+                frozen,
+                data.get("frozen_digest"),
+                **(
+                    {"retention_preflight": data["retention_preflight"]}
+                    if "retention_preflight" in data
+                    else {}
+                ),
+            )
         elif action == "release":
             frozen = data.get("frozen")
             proof = data.get("terminal_evidence")
