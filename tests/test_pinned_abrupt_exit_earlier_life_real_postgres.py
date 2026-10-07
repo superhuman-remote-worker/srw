@@ -235,6 +235,17 @@ async def test_second_abrupt_death_receipts_with_the_first_lifes_leftovers(
     leftovers = await _states(db, deliveries)
     assert leftovers[0]["state"] == "admitted"
     assert leftovers[0]["owner_agent_id"] == first_agent
+    # The first life's settle recorded its outcome; a recorded retired Pod is
+    # the Pod that claimed these leftovers.
+    first_outcome = await db.fetchrow(
+        "SELECT agent_id,retired_agent_pod FROM thread_runtime_retirement_outcomes "
+        "WHERE thread_id=$1::uuid AND runtime_generation=$2::uuid",
+        ids["thread"],
+        retirement["generation"],
+    )
+    assert first_outcome["agent_id"] == first_agent
+    recorded = fixtures._json(first_outcome["retired_agent_pod"])
+    assert recorded is None or recorded["pod_uid"] == ids["pod_uid"]
     retirement2 = await _kill(db, api, life)
 
     receipt = await db.acknowledge_abrupt_pinned_actor_exit(
@@ -312,21 +323,27 @@ async def _foreign_delivery(db, ids, *, owner_agent, owner_pod, state, lane, own
         )
 
 
-async def _earlier_outcome(db, *, thread, generation, agent, settled_at):
-    """An append-only settled retirement outcome, as an earlier End wrote it."""
+async def _earlier_outcome(db, *, thread, generation, agent, settled_at, pod=None):
+    """An append-only settled retirement outcome, as an earlier End wrote it.
+
+    ``pod`` is the retired Pod UID the outcome recorded, when it recorded one.
+    """
 
     await _replica(
         db,
         "INSERT INTO thread_runtime_retirement_outcomes (thread_id,"
         "runtime_generation,retirement_token,agent_id,runtime_attach_token,"
-        "disposition,permanent,outcome,settled_at) VALUES ($1::uuid,$2::uuid,$3,"
-        "$4,$5,'ended',false,'settled',$6)",
+        "disposition,permanent,outcome,settled_at,retired_agent_pod) VALUES "
+        "($1::uuid,$2::uuid,$3,$4,$5,'ended',false,'settled',$6,"
+        "CASE WHEN $7::text IS NULL THEN NULL "
+        "ELSE jsonb_build_object('pod_uid',$7::text) END)",
         thread,
         generation,
         uuid4(),
         agent,
         uuid4(),
         settled_at,
+        pod,
     )
 
 
@@ -348,6 +365,10 @@ LEFTOVERS = {
     "earlier_life_admitted": True,
     "earlier_life_queued": True,
     "earlier_life_owned": True,
+    # The earlier outcome recorded the retired Pod: it is the claim's Pod.
+    "earlier_life_on_its_recorded_pod": True,
+    # The earlier outcome recorded another Pod than the one that claimed.
+    "outcome_retired_another_pod": False,
     # An owner with no receipted life: e.g. the actor this life replaced
     # after it went offline, never proven stopped.
     "unreceipted_owner": False,
@@ -388,6 +409,11 @@ async def test_abrupt_receipt_accepts_only_a_receipted_earlier_lifes_leftover(
             ids["generation"] if case == "outcome_of_current_generation" else uuid4()
         )
         outcome_agent = str(uuid4()) if case == "outcome_of_another_agent" else owner
+        owner_pod = str(uuid4())
+        retired_pod = {
+            "earlier_life_on_its_recorded_pod": owner_pod,
+            "outcome_retired_another_pod": str(uuid4()),
+        }.get(case)
         if case != "unreceipted_owner":
             await _earlier_outcome(
                 db,
@@ -395,6 +421,7 @@ async def test_abrupt_receipt_accepts_only_a_receipted_earlier_lifes_leftover(
                 generation=outcome_generation,
                 agent=outcome_agent,
                 settled_at=settled_at,
+                pod=retired_pod,
             )
         state = {"earlier_life_queued": "queued", "earlier_life_owned": "owned"}.get(
             case, "admitted"
@@ -403,7 +430,7 @@ async def test_abrupt_receipt_accepts_only_a_receipted_earlier_lifes_leftover(
             db,
             ids,
             owner_agent=UUID(owner),
-            owner_pod=str(uuid4()),
+            owner_pod=owner_pod,
             state=state,
             lane="stateless" if case == "stateless_claim" else "pinned",
             owned_at=claimed_at,

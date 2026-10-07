@@ -233,9 +233,18 @@ BEGIN
     -- leftover of an earlier life of this thread: its owner is another agent
     -- row that was the actor of an earlier generation whose retirement
     -- settled (every outcome row requires that life's own exit receipt) after
-    -- the claim. A claim made after that settlement belongs to a later,
-    -- unreceipted life and still refuses, as does the same agent on another
-    -- Pod and an actor this life replaced without a retirement.
+    -- the claim, on the Pod that outcome recorded when it recorded one.
+    -- Invariants relied on: a claim locks the thread and is refused once the
+    -- retirement token is set (lock_runtime_authority), so every claim of a
+    -- life precedes its Begin and therefore its settle transaction, and
+    -- owned_at < settled_at is strict; a later claim needs a new life (only
+    -- Resume, a suspend or an attach abort rotates the generation). Agent
+    -- rows recur: a warm-pool agent returns to the pool and a same-hostname
+    -- registration can reuse an agent id, so an outcome naming the owner
+    -- agent proves nothing about a claim made after it, nor about another
+    -- Pod. Hence a claim after that settlement, the same agent on another
+    -- Pod, a Pod the outcome did not retire, and an actor this life replaced
+    -- without a retirement all still refuse.
     IF EXISTS (SELECT 1 FROM public.thread_input_deliveries delivery
                 WHERE delivery.thread_id = owner_id
                   AND delivery.state NOT IN ('settled','cancelled')
@@ -252,7 +261,11 @@ BEGIN
                                       AND prior.agent_id = delivery.owner_agent_id
                                       AND prior.runtime_generation
                                           IS DISTINCT FROM generation_id
-                                      AND prior.settled_at >= delivery.owned_at)))))
+                                      AND prior.settled_at >= delivery.owned_at
+                                      AND (prior.retired_agent_pod IS NULL
+                                           OR prior.retired_agent_pod->>'pod_uid'
+                                              IS NOT DISTINCT FROM
+                                              delivery.owner_pod_uid))))))
        -- In-process session children died with the proven-stopped Pod; their
        -- queued/running rows stay as the crash left them for the settle.
        OR EXISTS (SELECT 1 FROM public.threads child
