@@ -309,16 +309,19 @@ default template from the lookup above, unless it names a template.
 | --- | --- |
 | `/upgrade-workspace vm` in a Session | a VM from the default VM template |
 | `/upgrade-workspace <template name>` in a Session | that template. SRW looks for the name in the Session's Project, then in your Account, then in the shared Catalog. In a running Session it must be a VM template. |
-| `/upgrade-workspace` without an argument | the next tier (for a `virtual` Session, see below) |
+| `/upgrade-workspace` without an argument | a VM from the default VM template (a running Session can't move to a container) |
 | The agent's approval request (it needs `sudo`) | a VM from the default VM template |
+| The agent's upgrade request in a `virtual` or `none` Session | a VM from the default VM template, offered only when SRW would accept it |
 | A Job frozen for a VM (`POST /api/jobs/{id}/upgrade-to-vm`) | a VM from the default VM template |
 | A running `virtual` or `none` Job that needs a container | a container from the default container template |
 
-- **Container upgrades of a running Session are unavailable.** In a `virtual`
-  Session, `/upgrade-workspace container` and `/upgrade-workspace` without an
-  argument are refused, and a container template name is refused with
-  "Container upgrades of a running Session are unavailable; start a new Session
-  with this template." Start a new Session with the container you need.
+- **Container upgrades of a running Session are unavailable.**
+  `/upgrade-workspace container` answers in the chat without sending anything,
+  the Settings pane marks Container "not available in this session", and a
+  container template name is refused with "Container upgrades of a running
+  Session are unavailable; start a new Session with this template." Start a
+  new Session with the container you need. `/upgrade-workspace` without an
+  argument goes to a VM.
 - **Refusals.**
   - A template that isn't a higher tier than the current one: 400 "An upgrade
     must move to a higher tier than the current one."

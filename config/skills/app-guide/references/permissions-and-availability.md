@@ -121,20 +121,23 @@ default is Container for jobs and Virtual for sessions; an operator can change i
 
 A running session's header **Settings** panel shows **Workspace** in its main
 **Settings** tab. On narrow screens, use the header's three-dot menu →
-**Settings**. Choose **Container** to upgrade a Virtual session, then confirm
+**Settings**. A running Virtual session can upgrade to a VM when its owner has the
+`vm_workspace` grant and VMs are enabled: choose **VM**, then confirm
 **Upgrade**. The session keeps its conversation and carries existing files
 over. Wait for provisioning to complete before checking the newly available
-tools. Virtual or Container can offer VM when allowed. None currently shows
-a fixed workspace value in this selector; start a new Container session when
-no upgrade action is offered. Some sessions cannot change workspace in place
+tools. A running session can't upgrade to a Container; its Container choice
+says **not available in this session**. Start a new Container session for
+that. None currently shows a fixed workspace value in this selector; start a
+new Container session when no upgrade action is offered. Some sessions cannot change workspace in place
 at all: their Workspace choices say **not available in this session** and
 `/upgrade-workspace` is refused. Start a new session with the needed workspace
 then.
 
 Workspace changes are upgrade-only: to move down to Virtual or None, start a
 new session. A workspace upgrade does not automatically enable a missing tool
-category. If `request_workspace_upgrade` is currently visible, the agent can
-use it to present an upgrade request for the user's decision. It does not
+category. If `request_workspace_upgrade` is currently visible, the agent can use it to
+present a VM upgrade request for the user's decision; when SRW would refuse a
+VM upgrade, the tool says why and nothing is shown to the user. It does not
 provision the workspace or automatically resume work; the user can send a
 follow-up message after the upgrade completes.
 

@@ -35,11 +35,11 @@ online service, explain the setup path if browser tools are missing:
 
 1. Open the chat header's **Settings** (sliders icon), or on a narrow screen
    choose **Settings** from the header's three-dot menu.
-2. In the **Settings** tab, check **Workspace**. For a Virtual session, choose
-   **Container**, confirm **Upgrade**, and wait for it to finish. This carries
-   existing files over and keeps the conversation. A None session has no
-   upgrade choice in this selector; start a Container session if no upgrade
-   action is offered. There is no live Advanced tab.
+2. In the **Settings** tab, check **Workspace**. A running session can't
+   upgrade to a Container: start a new Container session for the direct
+   browser. A Virtual session can upgrade to a **VM** when VMs are allowed;
+   confirm **Upgrade** and wait for it to finish. This carries existing files
+   over and keeps the conversation. There is no live Advanced tab.
 3. Under **Tools**, enable **Browser** if it is off. The direct-browser tools
    need a shell-capable workspace and the `browser` capability grant. The
    **Shell** checkbox controls separate command tools; it is not an extra
@@ -51,7 +51,7 @@ online service, explain the setup path if browser tools are missing:
    check that the actual browser tools are loaded and report the outcome of
    its browser operation.
 
-If `request_workspace_upgrade` is visible, the agent can present the upgrade
+If `request_workspace_upgrade` is visible, the agent can present a VM upgrade
 offer itself. The user still decides; an offer does not mean a browser is
 already available. Meanwhile the agent can use available web research or
 prepare files that do not need browser interaction.
