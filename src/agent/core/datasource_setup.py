@@ -725,34 +725,132 @@ def _ssh_clone_target(
     return clone_url, ""
 
 
-#: A pre-agent clone wrote its key to ``~/.ssh/repo_<datasource-name-slug>``.
+#: A pre-agent clone wrote its key to ``~/.ssh/repo_<datasource-name-slug>``
+#: and appended, to ``~/.ssh/config``, exactly
+#: ``\nHost <host>\n  IdentityFile <abs key path>\n  StrictHostKeyChecking
+#: accept-new\n``. A ``repo_*`` file no ``IdentityFile`` line names is not
+#: one of ours (``ssh-keygen -f ~/.ssh/repo_deploy``) and is never touched.
 _LEGACY_KEY_NAME = re.compile(r"repo_[a-z0-9-]+")
 _LEGACY_KEY_MARKER = "__srw_legacy_repo_keys__"
-# Lists them: regular files only, slug-shaped names only, and only files whose
-# first line is a PEM key header that is not a public key, so nothing a user
-# named ``repo_*`` that is not such a key is ever touched. Runs in a subshell
-# to leave the persistent ``git`` tab where it was; the marker is split in
-# the command so an echoed or wrapped command line can never read as the
-# answer. (The pattern avoids spelling a private-key header: every command
-# stays clear of what the key-residue checks scan for.)
-_LIST_LEGACY_KEYS = (
-    "( cd ~/.ssh 2>/dev/null || exit 0; _srw_names=''; "
-    "for _srw_f in repo_*; do "
-    '[ -f "$_srw_f" ] && [ ! -L "$_srw_f" ] || continue; '
-    'case "${_srw_f#repo_}" in ""|*[!a-z0-9-]*) continue;; esac; '
-    'IFS= read -r _srw_first < "$_srw_f" || continue; '
-    'case "$_srw_first" in *"PUBLIC KEY-----") ;; '
-    '"-----BEGIN "*" KEY-----") _srw_names="$_srw_names $_srw_f";; esac; '
-    "done; "
-    f"printf '%s%s\\n' {_LEGACY_KEY_MARKER[:13]} "
-    f'{_LEGACY_KEY_MARKER[13:]}"$_srw_names" )'
-)
+#: How far a clone call may retire those files: ``sweep`` (the workspace
+#: owner's attach, which sees every repository),
+#: ``own`` (a live add: only each proven repository's own file) or ``keep``
+#: (a child job on its parent's workspace, which a parent still on a pre-agent
+#: image may need for its next fetch or push).
+LEGACY_KEY_FILE_MODES = frozenset({"sweep", "own", "keep"})
 
 
-def _legacy_ssh_key_files(backend: Any) -> set[str]:
+def _list_legacy_keys_command(ssh_dir: str) -> str:
+    """List pre-agent key files: one marker line on stdout.
+
+    Regular files only, slug-shaped names only, a PEM key header that is not
+    a public key, and an ``IdentityFile <ssh_dir>/<name>`` line in
+    ``config``. Runs in a subshell to leave the persistent ``git`` tab where
+    it was; the marker is split in the command so an echoed or wrapped
+    command line can never read as the answer. (The pattern avoids spelling
+    a private-key header: every command stays clear of what the key-residue
+    checks scan for.)
+    """
+
+    want = shlex.quote(f"IdentityFile {ssh_dir}/")
+    return (
+        f"( cd {shlex.quote(ssh_dir)} 2>/dev/null || exit 0; "
+        "test -f config || exit 0; _srw_names=''; "
+        "for _srw_f in repo_*; do "
+        '[ -f "$_srw_f" ] && [ ! -L "$_srw_f" ] || continue; '
+        'case "${_srw_f#repo_}" in ""|*[!a-z0-9-]*) continue;; esac; '
+        'IFS= read -r _srw_first < "$_srw_f" || continue; '
+        'case "$_srw_first" in *"PUBLIC KEY-----") continue;; '
+        '"-----BEGIN "*" KEY-----") ;; *) continue;; esac; '
+        f'awk -v want={want}"$_srw_f" '
+        '\'{ sub(/^[ \\t]+/, ""); sub(/[ \\t\\r]+$/, "") } '
+        "$0 == want { found = 1 } END { exit !found }' config || continue; "
+        '_srw_names="$_srw_names $_srw_f"; '
+        "done; "
+        f"printf '%s%s\\n' {_LEGACY_KEY_MARKER[:13]} "
+        f'{_LEGACY_KEY_MARKER[13:]}"$_srw_names" )'
+    )
+
+
+# Runs on the workspace (argv: ssh dir, names). Re-checks every name exactly
+# as the listing did, deletes it, then removes each deleted key's EXACT
+# pre-agent block from config: ``Host <host>`` / ``  IdentityFile <path>`` /
+# ``  StrictHostKeyChecking accept-new`` with nothing indented after it (and
+# the blank line that preceded it). A block a user edited stays as it is.
+_RETIRE_LEGACY_KEYS_PROGRAM = r"""
+import os, re, stat, sys, tempfile
+ssh_dir, names = sys.argv[1], sys.argv[2:]
+config = os.path.join(ssh_dir, "config")
+try:
+    with open(config, encoding="utf-8", errors="surrogateescape") as handle:
+        lines = handle.read().split("\n")
+except OSError:
+    sys.exit(0)
+named = {line.strip() for line in lines}
+def key_file(path):
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return False
+        with open(path, "rb") as handle:
+            first = handle.readline(4096).rstrip(b"\r\n")
+    except OSError:
+        return False
+    return (
+        first.startswith(b"-----BEGIN ")
+        and first.endswith(b" KEY-----")
+        and not first.endswith(b"PUBLIC KEY-----")
+    )
+removed = set()
+for name in names:
+    path = os.path.join(ssh_dir, name)
+    if (
+        re.fullmatch(r"repo_[a-z0-9-]+", name)
+        and key_file(path)
+        and "IdentityFile " + path in named
+    ):
+        os.unlink(path)
+        removed.add(path)
+kept, index, changed = [], 0, False
+while index < len(lines):
+    block = lines[index:index + 3]
+    following = lines[index + 3] if index + 3 < len(lines) else ""
+    if (
+        len(block) == 3
+        and re.fullmatch(r"Host \S+", block[0])
+        and block[1].startswith("  IdentityFile ")
+        and block[1][len("  IdentityFile "):] in removed
+        and block[2] == "  StrictHostKeyChecking accept-new"
+        and not following[:1].isspace()
+    ):
+        if kept and kept[-1] == "":
+            kept.pop()
+        index += 3
+        changed = True
+        continue
+    kept.append(lines[index])
+    index += 1
+if changed and not os.path.islink(config):
+    mode = stat.S_IMODE(os.stat(config).st_mode)
+    descriptor, temporary = tempfile.mkstemp(dir=ssh_dir, prefix=".config.srw-")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", errors="surrogateescape") as handle:
+            handle.write("\n".join(kept))
+        os.chmod(temporary, mode)
+        os.replace(temporary, config)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+"""
+
+
+def _legacy_ssh_key_files(backend: Any, ssh_dir: str) -> set[str]:
     """Names of pre-agent ``~/.ssh/repo_*`` key files; empty when unsure."""
 
-    output = str(backend.shell_run(_LIST_LEGACY_KEYS, timeout=10, tab_name="git"))
+    output = str(
+        backend.shell_run(
+            _list_legacy_keys_command(ssh_dir), timeout=10, tab_name="git"
+        )
+    )
     answers = [
         line.strip()[len(_LEGACY_KEY_MARKER) :]
         for line in output.splitlines()
@@ -764,7 +862,7 @@ def _legacy_ssh_key_files(backend: Any) -> set[str]:
 
 
 def _retire_legacy_ssh_key_files(
-    backend: Any, outcomes: List[Tuple[str, Any]], *, sweep: bool
+    backend: Any, outcomes: List[Tuple[str, Any]], *, mode: str
 ) -> None:
     """Delete pre-agent key files whose repository works through its alias.
 
@@ -772,15 +870,27 @@ def _retire_legacy_ssh_key_files(
     ``True`` (cloned through its alias), ``False`` (skipped or failed) or the
     reused checkout's ``GitManager``, re-proven with ``ls-remote`` only when a
     key file is actually there. A repository's own ``repo_<slug>`` goes once
-    it is proven. With ``sweep``, and every SSH repository proven, every such
-    file goes, including those a renamed or detached connector left behind.
+    it is proven. In ``sweep`` mode, with every SSH repository proven, every
+    listed file goes, including those a renamed or detached connector left
+    behind. ``keep`` touches nothing. Only files ``~/.ssh/config`` names in
+    an ``IdentityFile`` line are ever listed; each deleted key's exact
+    pre-agent ``Host`` block goes with it.
     """
 
+    if mode == "keep":
+        return
     try:
-        found = _legacy_ssh_key_files(backend)
+        from shared.runtime.core.managed_repository import (
+            _execute_managed_secret_command,
+        )
+
+        ssh_dir = backend.resolve_home_path(".ssh")
+        found = _legacy_ssh_key_files(backend, ssh_dir)
         if not found:
             return
-        can_sweep = sweep and all(outcome is not False for _, outcome in outcomes)
+        can_sweep = mode == "sweep" and all(
+            outcome is not False for _, outcome in outcomes
+        )
         delete: set[str] = set()
         for ds_name, outcome in outcomes:
             own = f"repo_{ds_name}"
@@ -793,15 +903,28 @@ def _retire_legacy_ssh_key_files(
                 can_sweep = False
         if can_sweep:
             delete |= found
-        if delete:
-            backend.shell_run(
-                "( cd ~/.ssh && rm -f -- "
-                + " ".join(shlex.quote(name) for name in sorted(delete))
-                + " )",
-                timeout=10,
-                tab_name="git",
-            )
-            logger.info("Deleted %d pre-agent SSH key file(s)", len(delete))
+        if not delete:
+            return
+        command = " ".join(
+            [
+                "python3",
+                "-c",
+                shlex.quote(_RETIRE_LEGACY_KEYS_PROGRAM),
+                shlex.quote(ssh_dir),
+                *(shlex.quote(name) for name in sorted(delete)),
+            ]
+        )
+        # Off tmux, under the claim fence a stateless backend provides.
+        if _execute_managed_secret_command(
+            backend,
+            command,
+            b"",
+            timeout=30,
+            operation="pre-agent SSH key retirement",
+        ):
+            logger.info("Retired %d pre-agent SSH key file(s)", len(delete))
+        else:
+            logger.warning("Could not retire pre-agent SSH key files")
     except Exception as exc:  # cleanup only: never fails a clone
         logger.warning(
             "Could not retire pre-agent SSH key files: %s", type(exc).__name__
@@ -813,7 +936,7 @@ def clone_repository_datasources(
     workspace_manager: Any,
     *,
     ssh_identity_status: Optional[Dict[str, str]] = None,
-    sweep_legacy_keys: bool = True,
+    legacy_key_files: str = "sweep",
 ) -> None:
     """Clone repository datasources onto the workspace backend.
 
@@ -827,10 +950,9 @@ def clone_repository_datasources(
     materializer's ``{authority_id: status}``: a connector whose identity did
     not load is skipped with a warning, never cloned without its key. A
     reused checkout gets its origin reset to the alias. A pre-agent
-    ``~/.ssh/repo_<slug>`` key file is deleted only once its repository is
-    proven to work through the alias; ``sweep_legacy_keys`` (attach, which
-    sees every repository) also deletes the files of renamed or detached
-    connectors once every SSH repository is proven.
+    ``~/.ssh/repo_<slug>`` key file (one ``~/.ssh/config`` names) is deleted
+    only once its repository is proven to work through the alias;
+    ``legacy_key_files`` says how far that goes.
 
     There is deliberately NO agent-local fallback: without a shell-capable
     backend the datasources are skipped with an error. Repository
@@ -843,11 +965,15 @@ def clone_repository_datasources(
             successful clones are registered in its ``source_repos``.
         ssh_identity_status: Which SSH identities the workspace agent holds;
             ``None`` when the caller did not materialize any.
-        sweep_legacy_keys: Whether ``repo_datasources`` is the full set, so
-            key files no listed repository owns may go too.
+        legacy_key_files: ``sweep`` when the workspace owner passes its
+            full set (key files no listed repository owns may go too),
+            ``own`` for a partial set (a live add), ``keep`` when the
+            workspace is someone else's (a child job on its parent's).
     """
     if not isinstance(ssh_identity_status, dict):
         ssh_identity_status = None
+    if legacy_key_files not in LEGACY_KEY_FILE_MODES:
+        raise ValueError(f"unknown legacy_key_files mode {legacy_key_files!r}")
     if not repo_datasources:
         return
 
@@ -1071,7 +1197,7 @@ def clone_repository_datasources(
         _retire_legacy_ssh_key_files(
             backend,
             [(name, outcome) for name, outcome in ssh_outcomes],
-            sweep=sweep_legacy_keys,
+            mode=legacy_key_files,
         )
 
 

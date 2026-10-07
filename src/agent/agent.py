@@ -143,6 +143,27 @@ def _stateless_worker_remote_authority(
     )
 
 
+def _job_owns_its_workspace(metadata: Dict[str, Any], job_id: Any) -> bool:
+    """False for a child job that runs on its parent's workspace.
+
+    The orchestrator marks such a child with ``inherits_parent_workspace``
+    (or ``provisions_parent_workspace`` for a scholar that provisions the
+    parent's pod) in its context, and attests ``workspace_owner_id`` as the
+    parent where it attests an owner at all. Anything that is the owner's to
+    decide about the shared home (retiring pre-agent key files a parent on an
+    older image may still use) stays with the owner.
+    """
+
+    context = metadata.get("context")
+    context = context if isinstance(context, dict) else {}
+    if context.get("inherits_parent_workspace") in (True, "true") or context.get(
+        "provisions_parent_workspace"
+    ):
+        return False
+    owner_id = metadata.get("workspace_owner_id")
+    return not owner_id or str(owner_id) == str(job_id)
+
+
 # >>> TEMPORARY QUICKFIX (2026-07-30) — delete with the upstream fix.
 # knowledge-history/done/codex_stream_disconnect_shape_nudge.md
 # Injected as a user turn when the orchestrator has seen N byte-identical
@@ -4329,6 +4350,15 @@ class UniversalAgent:
                 ws,
                 ssh_identity_status=getattr(
                     self, "_workspace_ssh_identity_status", None
+                ),
+                # A child job sees only its own repositories, on a home its
+                # parent (perhaps still on a pre-agent image) owns.
+                legacy_key_files=(
+                    "sweep"
+                    if _job_owns_its_workspace(
+                        self._job_metadata or {}, self._current_job_id
+                    )
+                    else "keep"
                 ),
             )
 

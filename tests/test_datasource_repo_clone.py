@@ -712,11 +712,20 @@ class TestRealAgentPayloadCarriesForgeMetadata:
 class TestLegacyKeyFiles:
     """Pre-agent ``~/.ssh/repo_*`` key files go only once the alias works.
 
-    The listing and the deletion run in a real bash against a temporary
-    home, so the shell that decides what is a key file is what is tested.
+    The listing and the deletion run in a real bash (and python3) against a
+    temporary home, so the shell that decides what is a key file, and the
+    program that edits ``~/.ssh/config``, are what is tested.
     """
 
     _KEY = "-----BEGIN OPENSSH " + "PRIVATE KEY-----\nAAAA\n-----END\n"
+
+    @staticmethod
+    def _block(ssh, name, host="github.com"):
+        """Exactly what a pre-agent clone appended to ~/.ssh/config."""
+        return (
+            f"\nHost {host}\n  IdentityFile {ssh}/{name}\n"
+            "  StrictHostKeyChecking accept-new\n"
+        )
 
     @pytest.fixture
     def home(self, tmp_path):
@@ -728,8 +737,23 @@ class TestLegacyKeyFiles:
         (ssh / "repo_notes").write_text("my notes\n")
         (ssh / "repo_Upper").write_text(self._KEY)
         (ssh / "other_key").write_text(self._KEY)
+        # Slug-named, a key, but no IdentityFile line names it: the user's.
+        (ssh / "repo_unnamed").write_text(self._KEY)
         (tmp_path / "elsewhere").write_text(self._KEY)
         (ssh / "repo_link").symlink_to(tmp_path / "elsewhere")
+        (ssh / "config").write_text(
+            "# mine\nHost myserver\n  User me\n"
+            # Every attach appended the block again.
+            + self._block(ssh, "repo_my-repo")
+            + self._block(ssh, "repo_my-repo")
+            + self._block(ssh, "repo_old-name", host="gitlab.example.com")
+            # Named, but each fails another check.
+            + "\nHost other\n"
+            + "".join(
+                f"  IdentityFile {ssh}/{name}\n"
+                for name in ("repo_pub", "repo_notes", "repo_Upper", "repo_link")
+            )
+        )
         return tmp_path
 
     @staticmethod
@@ -738,17 +762,26 @@ class TestLegacyKeyFiles:
 
         ws = make_workspace_manager()
         ws.backend.exists = MagicMock(return_value=reused)
+        ws.backend.resolve_home_path = MagicMock(
+            side_effect=lambda rel: f"{home}/{rel}"
+        )
+        env = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
 
         def shell_run(command, timeout=None, tab_name=None, working_dir=None):
             result = subprocess.run(
-                ["bash", "-c", command],
-                env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
-                capture_output=True,
-                text=True,
+                ["bash", "-c", command], env=env, capture_output=True, text=True
             )
             return f"Exit code: {result.returncode}\n--- stdout ---\n{result.stdout}"
 
+        def secret_stdin(command, secret, *, timeout=30):
+            result = subprocess.run(
+                ["bash", "-c", command], env=env, input=bytes(secret), check=False
+            )
+            return result.returncode == 0
+
         ws.backend.shell_run = MagicMock(side_effect=shell_run)
+        ws.backend.execute_claim_resource_with_secret_stdin = None
+        ws.backend.execute_with_secret_stdin = MagicMock(side_effect=secret_stdin)
         return ws
 
     @staticmethod
@@ -767,25 +800,107 @@ class TestLegacyKeyFiles:
             )
         return git_manager
 
-    def test_listing_names_only_slug_named_private_key_files(self, home):
+    def test_listing_names_only_configured_slug_named_private_key_files(self, home):
         from agent.core.datasource_setup import _legacy_ssh_key_files
 
         ws = self._workspace(home)
-        assert _legacy_ssh_key_files(ws.backend) == {"repo_my-repo", "repo_old-name"}
+        assert _legacy_ssh_key_files(ws.backend, f"{home}/.ssh") == {
+            "repo_my-repo",
+            "repo_old-name",
+        }
         (listing,) = [c[0][0] for c in ws.backend.shell_run.call_args_list]
         assert "PRIVATE KEY" not in listing
 
     def test_proven_clone_sweeps_its_own_and_a_renamed_connectors_file(self, home):
         ws = self._workspace(home)
+        before = (home / ".ssh" / "config").read_text()
         self._clone(ws, TestBackendClone._ssh_entry())
         assert self._left(home) == [
+            "config",
             "other_key",
             "repo_Upper",
             "repo_link",
             "repo_notes",
             "repo_pub",
+            "repo_unnamed",
         ]
         assert (home / "elsewhere").exists()
+        # Each deleted key's exact pre-agent blocks went with it; nothing else.
+        ssh = home / ".ssh"
+        assert (ssh / "config").read_text() == (
+            before.replace(self._block(ssh, "repo_my-repo"), "").replace(
+                self._block(ssh, "repo_old-name", "gitlab.example.com"), ""
+            )
+        )
+        assert "repo_my-repo" not in (ssh / "config").read_text()
+        assert "Host myserver\n  User me\n" in (ssh / "config").read_text()
+
+    def test_a_users_own_repo_key_is_never_deleted(self, home):
+        """``ssh-keygen -f ~/.ssh/repo_deploy`` in a persistent home."""
+        import shutil
+        import subprocess
+
+        if shutil.which("ssh-keygen") is None:
+            pytest.skip("ssh-keygen not installed")
+        ssh = home / ".ssh"
+        subprocess.run(
+            [
+                "ssh-keygen",
+                "-q",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-f",
+                str(ssh / "repo_deploy"),
+            ],
+            check=True,
+        )
+        key = (ssh / "repo_deploy").read_bytes()
+        # The user's own config may even point at it with ``~``.
+        with (ssh / "config").open("a") as config:
+            config.write("\nHost deploy\n  IdentityFile ~/.ssh/repo_deploy\n")
+        ws = self._workspace(home)
+
+        self._clone(ws, TestBackendClone._ssh_entry())
+
+        assert (ssh / "repo_deploy").read_bytes() == key
+        assert (ssh / "repo_deploy.pub").exists()
+        assert "IdentityFile ~/.ssh/repo_deploy" in (ssh / "config").read_text()
+
+    def test_the_program_rechecks_every_name_it_is_given(self, home):
+        """A name the config does not mention survives even a direct request."""
+        import subprocess
+
+        from agent.core.datasource_setup import _RETIRE_LEGACY_KEYS_PROGRAM
+
+        ssh = home / ".ssh"
+        (ssh / "repo_deploy").write_text(self._KEY)
+        subprocess.run(
+            ["python3", "-c", _RETIRE_LEGACY_KEYS_PROGRAM, str(ssh)]
+            + ["repo_deploy", "repo_pub", "repo_link", "../other_key"],
+            check=True,
+        )
+        assert {"repo_deploy", "repo_pub", "repo_link", "other_key"} <= set(
+            self._left(home)
+        )
+
+    def test_a_block_the_user_edited_is_left_as_it_is(self, home):
+        ssh = home / ".ssh"
+        (ssh / "repo_edited").write_text(self._KEY)
+        edited = (
+            f"\nHost forge\n  IdentityFile {ssh}/repo_edited\n"
+            "  StrictHostKeyChecking accept-new\n  Port 2222\n"
+        )
+        with (ssh / "config").open("a") as config:
+            config.write(edited)
+        ws = self._workspace(home)
+
+        self._clone(ws, TestBackendClone._ssh_entry())
+
+        # Named by its IdentityFile line, so the key goes; the block stays.
+        assert "repo_edited" not in self._left(home)
+        assert edited in (ssh / "config").read_text()
 
     def test_an_unloaded_identity_keeps_every_key_file(self, home):
         ws = self._workspace(home)
@@ -838,10 +953,26 @@ class TestLegacyKeyFiles:
 
     def test_a_live_add_deletes_only_its_own_file(self, home):
         ws = self._workspace(home)
-        self._clone(ws, TestBackendClone._ssh_entry(), sweep_legacy_keys=False)
+        self._clone(ws, TestBackendClone._ssh_entry(), legacy_key_files="own")
         left = self._left(home)
         assert "repo_my-repo" not in left
         assert "repo_old-name" in left
+        assert "repo_old-name" in (home / ".ssh" / "config").read_text()
+
+    def test_a_child_job_on_a_shared_workspace_touches_no_key_file(self, home):
+        ws = self._workspace(home)
+        before = (home / ".ssh" / "config").read_text()
+        self._clone(ws, TestBackendClone._ssh_entry(), legacy_key_files="keep")
+        assert "repo_my-repo" in self._left(home)
+        assert "repo_old-name" in self._left(home)
+        assert (home / ".ssh" / "config").read_text() == before
+        ws.backend.shell_run.assert_not_called()
+
+    def test_an_unknown_mode_is_refused(self, home):
+        with pytest.raises(ValueError):
+            clone_repository_datasources(
+                [token_ds()], self._workspace(home), legacy_key_files="all"
+            )
 
     def test_token_repositories_never_look_for_key_files(self, home):
         ws = self._workspace(home)
@@ -849,6 +980,58 @@ class TestLegacyKeyFiles:
             clone_repository_datasources([token_ds()], ws)
         ws.backend.shell_run.assert_not_called()
         assert "repo_my-repo" in self._left(home)
+
+
+class TestJobWorkspaceOwnership:
+    """Only the workspace owner retires pre-agent key files (job side)."""
+
+    JOB = "00000000-0000-4000-8000-0000000000a1"
+    PARENT = "00000000-0000-4000-8000-0000000000a0"
+
+    @pytest.mark.parametrize(
+        ("metadata", "owns"),
+        [
+            ({}, True),
+            ({"context": {"description": "x"}}, True),
+            ({"workspace_owner_id": JOB}, True),
+            ({"workspace_owner_id": PARENT}, False),
+            ({"context": {"inherits_parent_workspace": True}}, False),
+            ({"context": {"inherits_parent_workspace": "true"}}, False),
+            ({"context": {"provisions_parent_workspace": PARENT}}, False),
+            ({"context": "not a dict"}, True),
+        ],
+    )
+    def test_ownership(self, metadata, owns):
+        from agent.agent import _job_owns_its_workspace
+
+        assert _job_owns_its_workspace(metadata, self.JOB) is owns
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("context", "mode"),
+        [({}, "sweep"), ({"inherits_parent_workspace": True}, "keep")],
+    )
+    async def test_job_tools_pass_the_owner_mode(self, context, mode):
+        from agent.agent import UniversalAgent
+
+        class Stop(Exception):
+            pass
+
+        agent = object.__new__(UniversalAgent)
+        agent._current_job_id = self.JOB
+        agent._job_metadata = {"context": context, "datasources": [token_ds()]}
+        agent._workspace_manager = make_workspace_manager()
+        agent._datasource_connections = {}
+        agent._datasource_clients = {}
+        clone = MagicMock(side_effect=Stop)
+        with (
+            patch("agent.core.datasource_setup.install_workspace_credentials"),
+            patch("agent.core.datasource_setup.clone_repository_datasources", clone),
+            pytest.raises(Stop),
+        ):
+            await UniversalAgent._setup_job_tools(agent)
+
+        assert clone.call_args.kwargs["legacy_key_files"] == mode
 
 
 class TestResolveRepoCloneNames:

@@ -3243,7 +3243,7 @@ class PersistentSession:
                     ssh_identity_status=self.workspace_ssh_identity_status,
                     # Only the added ones: another repository's key file is
                     # not this batch's to sweep.
-                    sweep_legacy_keys=False,
+                    legacy_key_files="own",
                 )
             except Exception as e:
                 logger.warning("Live repository clone failed: %s", e)
