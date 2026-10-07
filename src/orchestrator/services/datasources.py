@@ -72,6 +72,11 @@ from orchestrator.services.email_datasource import (
     validate_email_config,
     validate_email_credentials,
 )
+from orchestrator.services.workspace_ssh_connector import (
+    WorkspaceSshConnectorError,
+    repository_uses_ssh_key,
+    validate_workspace_ssh_connector,
+)
 from shared.runtime.core.datasource_catalog import DATASOURCE_TYPES
 from shared.credential_connectors import (
     CredentialConnectorAttachedError,
@@ -82,6 +87,9 @@ from shared.runtime.utils.ssh_key import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Connector types whose SSH key reaches a workspace ``ssh-agent`` (C1).
+WORKSPACE_SSH_CONNECTOR_TYPES = frozenset({"repository", "ssh_key"})
 
 #: Authenticate the caller. Bound by the router to ``require_approved_user``.
 ApproveCaller = Callable[[], Awaitable[dict[str, Any]]]
@@ -450,6 +458,9 @@ async def create_datasource(
         datasource_config = normalize_repository_config(
             body.config, body.connection_url
         )
+    elif body.type == "ssh_key":
+        # Host, user, port and pinned host keys; validated with the key below.
+        datasource_config = dict(body.config or {})
     else:
         if body.config:
             raise HTTPException(
@@ -479,6 +490,16 @@ async def create_datasource(
         credentials = normalize_credential_files(body.type, body.name, credentials)
     except CredentialFileValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if body.type in WORKSPACE_SSH_CONNECTOR_TYPES:
+        try:
+            datasource_config = validate_workspace_ssh_connector(
+                body.type,
+                connection_url=connection_url,
+                config=datasource_config,
+                credentials=credentials,
+            )
+        except WorkspaceSshConnectorError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if body.type == "kb":
         validate_kb_repository_auth(connection_url, credentials)
     if body.type == "email":
@@ -782,6 +803,8 @@ async def update_datasource(
             datasource_config = normalize_repository_config(
                 datasource_config, effective_url
             )
+    elif existing_ds.get("type") == "ssh_key":
+        pass  # host/user/port/known_hosts, validated with the key below
     elif datasource_config:
         raise HTTPException(
             status_code=400,
@@ -790,6 +813,50 @@ async def update_datasource(
                 "and email connectors"
             ),
         )
+    if existing_ds.get("type") in WORKSPACE_SSH_CONNECTOR_TYPES and (
+        datasource_config is not None
+        or credentials is not None
+        or "connection_url" in body.model_fields_set
+    ):
+        # Validate the EFFECTIVE endpoint: a URL-only edit of an SSH-key
+        # repository moves the host its stored key and pins are used for. A
+        # preserved (None) key was checked when it was stored.
+        effective_config = datasource_config
+        if effective_config is None:
+            effective_config = existing_ds.get("config") or {}
+            if isinstance(effective_config, str):
+                try:
+                    effective_config = json.loads(effective_config)
+                except ValueError:
+                    effective_config = {}
+        effective_credentials = (
+            credentials
+            if credentials is not None
+            else (existing_ds.get("credentials") or {})
+        )
+        if (
+            datasource_config is None
+            and existing_ds.get("type") == "repository"
+            and not repository_uses_ssh_key(effective_credentials)
+        ):
+            # A switch to token auth leaves a stored pin unread, not invalid.
+            effective_config = {
+                key: value
+                for key, value in effective_config.items()
+                if key != "known_hosts"
+            }
+        try:
+            checked_config = validate_workspace_ssh_connector(
+                existing_ds["type"],
+                connection_url=body.connection_url or existing_ds.get("connection_url"),
+                config=effective_config,
+                credentials=effective_credentials,
+                check_key=credentials is not None,
+            )
+        except WorkspaceSshConnectorError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if datasource_config is not None:
+            datasource_config = checked_config
     try:
         policy_result: dict[str, Any] | None = None
         content_fields = {

@@ -134,6 +134,80 @@ def validate_private_key(key: str) -> str:
     return normalized
 
 
+def private_key_is_encrypted(key: str) -> bool:
+    """Whether ``key`` is passphrase-protected (OpenSSH or PEM framing).
+
+    Workspace identities are loaded with ``ssh-add -`` over a channel with no
+    terminal and no askpass, so an encrypted key could never be unlocked
+    there. Detecting it up front turns that dead end into a clear refusal.
+    """
+    normalized = normalize_private_key(key) if isinstance(key, str) else ""
+    lines = normalized.rstrip("\n").split("\n")
+    if not lines or not lines[0]:
+        return False
+    if lines[0] == "-----BEGIN ENCRYPTED PRIVATE KEY-----":
+        return True
+    if any(line.replace(" ", "") == "Proc-Type:4,ENCRYPTED" for line in lines[1:]):
+        return True
+    if lines[0] != "-----BEGIN OPENSSH PRIVATE KEY-----":
+        return False
+    try:
+        blob = base64.b64decode("".join(lines[1:-1]), validate=True)
+    except (ValueError, base64.binascii.Error):
+        return False
+    magic = b"openssh-key-v1\x00"
+    if not blob.startswith(magic) or len(blob) < len(magic) + 4:
+        return False
+    offset = len(magic)
+    length = int.from_bytes(blob[offset : offset + 4], "big")
+    cipher = blob[offset + 4 : offset + 4 + length]
+    return cipher != b"none"
+
+
+def ssh_public_identity(key: str) -> tuple[str, str]:
+    """Return ``(public key line, SHA256 fingerprint)`` of an unencrypted key.
+
+    The fingerprint is OpenSSH's ``SHA256:<base64>`` form, the value
+    ``ssh-add -l`` prints, so a workspace can prove that its agent holds
+    exactly this key. Raises :class:`InvalidSSHKeyError` for an encrypted or
+    unparseable key.
+    """
+    normalized = validate_private_key(key)
+    if private_key_is_encrypted(normalized):
+        raise InvalidSSHKeyError(
+            "SSH private key is passphrase-protected; remove the passphrase "
+            "(ssh-keygen -p) or generate a dedicated key without one"
+        )
+    import hashlib
+
+    from cryptography.exceptions import UnsupportedAlgorithm
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding,
+        PublicFormat,
+        load_pem_private_key,
+        load_ssh_private_key,
+    )
+
+    data = normalized.encode("utf-8")
+    try:
+        if normalized.startswith("-----BEGIN OPENSSH PRIVATE KEY-----"):
+            private = load_ssh_private_key(data, password=None)
+        else:
+            private = load_pem_private_key(data, password=None)
+        public_line = (
+            private.public_key()
+            .public_bytes(Encoding.OpenSSH, PublicFormat.OpenSSH)
+            .decode("ascii")
+        )
+    except (TypeError, ValueError, UnsupportedAlgorithm) as exc:
+        raise InvalidSSHKeyError(
+            "SSH private key could not be parsed as an RSA, ECDSA or Ed25519 key"
+        ) from exc
+    digest = hashlib.sha256(base64.b64decode(public_line.split()[1])).digest()
+    fingerprint = "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+    return public_line, fingerprint
+
+
 class GeneratedKeypair(NamedTuple):
     """The two halves of a freshly generated SSH keypair.
 
@@ -195,5 +269,7 @@ __all__ = [
     "InvalidSSHKeyError",
     "generate_ed25519_keypair",
     "normalize_private_key",
+    "private_key_is_encrypted",
+    "ssh_public_identity",
     "validate_private_key",
 ]

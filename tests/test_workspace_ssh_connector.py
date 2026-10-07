@@ -1,0 +1,625 @@
+"""C1 validation of connectors whose SSH key reaches a workspace ssh-agent.
+
+A shared ``ssh_key`` or SSH-key ``repository`` connector writes into other
+users' ``~/.ssh/config``. Every value that lands on an SSH config line must be
+refused rather than escaped when it could smuggle a directive (``ProxyCommand``
+runs code), and a passphrase-protected key is refused because a workspace can
+never unlock it.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+from unittest.mock import AsyncMock
+
+import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import (
+    BestAvailableEncryption,
+    Encoding,
+    PrivateFormat,
+    PublicFormat,
+)
+from fastapi.testclient import TestClient
+
+from orchestrator.security import access as access_module
+from orchestrator.security import auth as auth_module
+from orchestrator.services.workspace_ssh_connector import (
+    WorkspaceSshConnectorError,
+    repository_uses_ssh_key,
+    validate_workspace_ssh_connector,
+)
+from shared.runtime.core.workspace_ssh_identity import (
+    SshEndpointError,
+    known_hosts_field_matches,
+    normalize_ssh_host,
+    normalize_ssh_port,
+    normalize_ssh_user,
+    parse_known_hosts,
+    parse_ssh_repository_url,
+)
+from shared.runtime.utils.ssh_key import (
+    InvalidSSHKeyError,
+    generate_ed25519_keypair,
+    private_key_is_encrypted,
+    ssh_public_identity,
+)
+
+_OWNER_ID = "11111111-1111-1111-1111-111111111111"
+
+
+def _host_key() -> str:
+    public = Ed25519PrivateKey.generate().public_key()
+    return public.public_bytes(Encoding.OpenSSH, PublicFormat.OpenSSH).decode()
+
+
+def _encrypted_openssh_key() -> str:
+    return (
+        Ed25519PrivateKey.generate()
+        .private_bytes(
+            Encoding.PEM, PrivateFormat.OpenSSH, BestAvailableEncryption(b"pw")
+        )
+        .decode()
+    )
+
+
+def _encrypted_pkcs8_key() -> str:
+    return (
+        Ed25519PrivateKey.generate()
+        .private_bytes(
+            Encoding.PEM, PrivateFormat.PKCS8, BestAvailableEncryption(b"pw")
+        )
+        .decode()
+    )
+
+
+class TestRepositoryUrl:
+    @pytest.mark.parametrize(
+        ("url", "host", "port", "user", "path"),
+        [
+            # The scp form used to parse to no host and wrote ``Host localhost``.
+            (
+                "git@github.com:acme/widget.git",
+                "github.com",
+                22,
+                "git",
+                "acme/widget.git",
+            ),
+            (
+                "ssh://git@gitea.example.com:2222/acme/widget.git",
+                "gitea.example.com",
+                2222,
+                "git",
+                "acme/widget.git",
+            ),
+            (
+                "https://github.com/acme/widget",
+                "github.com",
+                22,
+                "git",
+                "acme/widget.git",
+            ),
+            (
+                "ssh://deploy@10.0.0.5/group/sub/repo.git",
+                "10.0.0.5",
+                22,
+                "deploy",
+                "group/sub/repo.git",
+            ),
+            ("git@[2001:db8::1]:o/r.git", "2001:db8::1", 22, "git", "o/r.git"),
+        ],
+    )
+    def test_supported_forms_resolve_the_real_endpoint(
+        self, url, host, port, user, path
+    ):
+        target = parse_ssh_repository_url(url)
+        assert (target.host, target.port, target.user, target.path) == (
+            host,
+            port,
+            user,
+            path,
+        )
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "git@github.com\n  ProxyCommand sh -c id:o/r.git",
+            "ssh://git@host:99999/o/r.git",
+            "ssh://-oProxyCommand=id/o/r.git",
+            "ssh://host%0aProxyCommand/o/r.git",
+            "ssh://-oUser@host/o/r.git",
+            "ssh://git@host/../etc/passwd",
+            "ssh://git:secret@host/o/r.git",
+            "https://oauth2:token@github.com/o/r.git",
+            "ftp://host/o/r.git",
+            "ssh://host/o/r.git?x=1",
+            "",
+        ],
+    )
+    def test_injection_and_credentials_are_refused(self, url):
+        with pytest.raises(SshEndpointError):
+            parse_ssh_repository_url(url)
+
+
+class TestEndpointGrammar:
+    @pytest.mark.parametrize(
+        "host", ["github.com", "GitHub.com", "10.1.2.3", "srw-gitea-ssh.srw.svc"]
+    )
+    def test_hosts_accepted(self, host):
+        assert normalize_ssh_host(host) == host.lower()
+
+    @pytest.mark.parametrize(
+        "host",
+        ["", "a b", "host\nProxyCommand id", "-host", "host_name", "*", "fe80::1%eth0"],
+    )
+    def test_hosts_refused(self, host):
+        with pytest.raises(SshEndpointError):
+            normalize_ssh_host(host)
+
+    @pytest.mark.parametrize("user", ["git", "APKAEIBAERJR2EXAMPLE", "_svc", "a.b-c"])
+    def test_users_accepted(self, user):
+        assert normalize_ssh_user(user) == user
+
+    @pytest.mark.parametrize("user", ["", "-oProxyCommand", "a b", "a\nb", "a@b", "%u"])
+    def test_users_refused(self, user):
+        with pytest.raises(SshEndpointError):
+            normalize_ssh_user(user)
+
+    @pytest.mark.parametrize("port", [True, 0, 65536, "22 ", "2x", 1.5, None])
+    def test_ports_refused(self, port):
+        if port == "22 ":
+            assert normalize_ssh_port(port) == 22
+            return
+        with pytest.raises(SshEndpointError):
+            normalize_ssh_port(port)
+
+
+class TestKnownHosts:
+    def test_bare_and_full_lines_normalize_to_type_and_key(self):
+        key = _host_key()
+        text = f"# comment\n{key}\ngithub.com {key} trailing comment\n"
+        assert parse_known_hosts(text, host="github.com", port=22) == [key]
+
+    def test_non_default_port_uses_bracketed_form(self):
+        key = _host_key()
+        assert parse_known_hosts(
+            f"[gitea.example.com]:2222 {key}", host="gitea.example.com", port=2222
+        ) == [key]
+        with pytest.raises(SshEndpointError, match="different host"):
+            parse_known_hosts(
+                f"gitea.example.com {key}", host="gitea.example.com", port=2222
+            )
+
+    def test_hashed_host_matches(self):
+        key = _host_key()
+        salt = b"0123456789abcdef0123"
+        digest = hmac.new(salt, b"github.com", hashlib.sha1).digest()
+        field = (
+            f"|1|{base64.b64encode(salt).decode()}|{base64.b64encode(digest).decode()}"
+        )
+        assert known_hosts_field_matches(field, host="github.com", port=22)
+        assert not known_hosts_field_matches(field, host="gitlab.com", port=22)
+        assert parse_known_hosts(f"{field} {key}", host="github.com") == [key]
+
+    def test_wildcards_and_negation(self):
+        assert known_hosts_field_matches(
+            "*.example.com", host="git.example.com", port=22
+        )
+        assert not known_hosts_field_matches(
+            "*.example.com,!git.example.com", host="git.example.com", port=22
+        )
+
+    def test_default_list_selects_matching_lines_only(self):
+        github, gitlab = _host_key(), _host_key()
+        text = f"github.com {github}\ngitlab.com {gitlab}\n"
+        assert parse_known_hosts(text, host="gitlab.com", require_match=False) == [
+            gitlab
+        ]
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "@cert-authority *.example.com ssh-ed25519 AAAA",
+            "github.com ssh-dss AAAAB3NzaC1kc3M=",
+            "github.com ssh-ed25519 not-base64!",
+            # A key blob whose embedded type disagrees with the declared one.
+            "github.com ssh-rsa " + _host_key().split()[1],
+            "github.com",
+        ],
+    )
+    def test_malformed_lines_are_refused(self, line):
+        with pytest.raises(SshEndpointError):
+            parse_known_hosts(line, host="github.com")
+
+
+class TestPrivateKeyInspection:
+    def test_fingerprint_matches_openssh_form(self):
+        keypair = generate_ed25519_keypair("c1")
+        public_line, fingerprint = ssh_public_identity(keypair.private_key)
+        assert public_line.split()[:2] == keypair.public_key.split()[:2]
+        digest = hashlib.sha256(base64.b64decode(public_line.split()[1])).digest()
+        assert fingerprint == "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
+        assert not private_key_is_encrypted(keypair.private_key)
+
+    @pytest.mark.parametrize("factory", [_encrypted_openssh_key, _encrypted_pkcs8_key])
+    def test_encrypted_keys_are_detected_and_refused(self, factory):
+        key = factory()
+        assert private_key_is_encrypted(key)
+        with pytest.raises(InvalidSSHKeyError, match="passphrase"):
+            ssh_public_identity(key)
+
+    def test_traditional_pem_proc_type_is_detected(self):
+        key = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            "Proc-Type: 4,ENCRYPTED\n"
+            "DEK-Info: AES-128-CBC,00000000000000000000000000000000\n"
+            "\n"
+            "AAAA\n"
+            "-----END RSA PRIVATE KEY-----\n"
+        )
+        assert private_key_is_encrypted(key)
+
+
+class TestValidateWorkspaceSshConnector:
+    def test_ssh_key_config_is_normalized(self):
+        key = _host_key()
+        config = validate_workspace_ssh_connector(
+            "ssh_key",
+            connection_url=None,
+            config={
+                "host": "Bastion.Example.com",
+                "user": "deploy",
+                "port": "2200",
+                "known_hosts": f"[bastion.example.com]:2200 {key}",
+            },
+            credentials={
+                "files": [{"contents": generate_ed25519_keypair().private_key}]
+            },
+        )
+        assert config == {
+            "host": "bastion.example.com",
+            "user": "deploy",
+            "port": 2200,
+            "known_hosts": key,
+        }
+
+    def test_ssh_key_without_host_has_no_config(self):
+        assert (
+            validate_workspace_ssh_connector(
+                "ssh_key",
+                connection_url=None,
+                config={},
+                credentials={
+                    "files": [{"contents": generate_ed25519_keypair().private_key}]
+                },
+            )
+            == {}
+        )
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"host": "h\n  ProxyCommand sh -c id"},
+            {"host": "h", "user": "u\nProxyCommand id"},
+            {"host": "h", "port": "22\nProxyCommand id"},
+            {"user": "deploy"},
+            {"host": "h", "proxy_command": "id"},
+        ],
+    )
+    def test_ssh_key_config_injection_is_refused(self, config):
+        with pytest.raises(WorkspaceSshConnectorError):
+            validate_workspace_ssh_connector(
+                "ssh_key",
+                connection_url=None,
+                config=config,
+                credentials={
+                    "files": [{"contents": generate_ed25519_keypair().private_key}]
+                },
+            )
+
+    def test_encrypted_ssh_key_is_refused_with_a_clear_message(self):
+        with pytest.raises(WorkspaceSshConnectorError, match="passphrase"):
+            validate_workspace_ssh_connector(
+                "ssh_key",
+                connection_url=None,
+                config={},
+                credentials={"files": [{"contents": _encrypted_openssh_key()}]},
+            )
+
+    def test_preserved_key_is_not_rechecked(self):
+        assert validate_workspace_ssh_connector(
+            "ssh_key",
+            connection_url=None,
+            config={"host": "h"},
+            credentials={},
+            check_key=False,
+        ) == {"host": "h"}
+
+    def test_ssh_repository_pins_are_normalized_against_its_host(self):
+        key = _host_key()
+        config = validate_workspace_ssh_connector(
+            "repository",
+            connection_url="git@github.com:acme/widget.git",
+            config={"forge": "github", "known_hosts": f"github.com {key}"},
+            credentials={
+                "auth_method": "ssh",
+                "ssh_key": generate_ed25519_keypair().private_key,
+            },
+        )
+        assert config == {"forge": "github", "known_hosts": key}
+
+    def test_ssh_repository_url_injection_is_refused(self):
+        with pytest.raises(WorkspaceSshConnectorError):
+            validate_workspace_ssh_connector(
+                "repository",
+                connection_url="ssh://git@-oProxyCommand=id/o/r.git",
+                config={"forge": "gitea"},
+                credentials={"ssh_key": generate_ed25519_keypair().private_key},
+            )
+
+    def test_encrypted_repository_key_is_refused(self):
+        with pytest.raises(WorkspaceSshConnectorError, match="passphrase"):
+            validate_workspace_ssh_connector(
+                "repository",
+                connection_url="git@github.com:acme/widget.git",
+                config={"forge": "github"},
+                credentials={"auth_method": "ssh", "ssh_key": _encrypted_pkcs8_key()},
+            )
+
+    def test_token_repository_cannot_carry_known_hosts(self):
+        assert not repository_uses_ssh_key({"auth_method": "token", "ssh_key": "x"})
+        with pytest.raises(WorkspaceSshConnectorError, match="only to SSH-key"):
+            validate_workspace_ssh_connector(
+                "repository",
+                connection_url="https://github.com/acme/widget",
+                config={"forge": "github", "known_hosts": _host_key()},
+                credentials={"token": "t"},
+            )
+
+
+# =============================================================================
+# Endpoint level: the validation must be wired into create AND update.
+# =============================================================================
+
+
+@pytest.fixture
+def app_client(monkeypatch):
+    from orchestrator import main
+
+    monkeypatch.setattr(
+        auth_module,
+        "require_approved_user",
+        AsyncMock(return_value={"id": _OWNER_ID, "is_admin": False}),
+    )
+    return TestClient(main.app)
+
+
+def _echo_create(**kwargs):
+    return {
+        "id": "22222222-2222-2222-2222-222222222222",
+        "name": kwargs["name"],
+        "type": kwargs["ds_type"],
+        "connection_url": kwargs["connection_url"],
+        "description": kwargs["description"],
+        "credentials": kwargs["credentials"],
+        "job_id": kwargs["job_id"],
+        "cli_hint": kwargs["cli_hint"],
+        "default_branch": kwargs["default_branch"],
+        "config": kwargs["config"],
+        "created_by": kwargs["created_by"],
+        "is_global": kwargs["is_global"],
+        "read_only": kwargs["read_only"],
+    }
+
+
+class TestCreateEndpoint:
+    def test_ssh_key_connector_persists_validated_host_fields(
+        self, app_client, monkeypatch
+    ):
+        from orchestrator import main
+
+        create = AsyncMock(side_effect=lambda **kwargs: _echo_create(**kwargs))
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db, "create_datasource", create
+        )
+        response = app_client.post(
+            "/api/datasources",
+            json={
+                "name": "bastion",
+                "type": "ssh_key",
+                "config": {"host": "bastion.example.com", "user": "deploy"},
+                "credentials": {
+                    "files": [{"contents": generate_ed25519_keypair().private_key}]
+                },
+            },
+        )
+        assert response.status_code < 300, response.text
+        assert create.await_args.kwargs["config"] == {
+            "host": "bastion.example.com",
+            "user": "deploy",
+        }
+
+    @pytest.mark.parametrize(
+        ("body", "detail"),
+        [
+            (
+                {
+                    "type": "ssh_key",
+                    "config": {"host": "h\nProxyCommand id"},
+                    "credentials": {
+                        "files": [{"contents": generate_ed25519_keypair().private_key}]
+                    },
+                },
+                "SSH host",
+            ),
+            (
+                {
+                    "type": "ssh_key",
+                    "credentials": {"files": [{"contents": _encrypted_openssh_key()}]},
+                },
+                "passphrase",
+            ),
+            (
+                {
+                    "type": "repository",
+                    "connection_url": "ssh://git@h/o/r.git",
+                    "config": {"forge": "gitea"},
+                    "credentials": {
+                        "auth_method": "ssh",
+                        "ssh_key": _encrypted_pkcs8_key(),
+                    },
+                },
+                "passphrase",
+            ),
+            (
+                {
+                    "type": "repository",
+                    "connection_url": "git@-oProxyCommand=id:o/r.git",
+                    "config": {"forge": "gitea"},
+                    "credentials": {
+                        "auth_method": "ssh",
+                        "ssh_key": generate_ed25519_keypair().private_key,
+                    },
+                },
+                "SSH host",
+            ),
+        ],
+    )
+    def test_unsafe_ssh_connectors_are_400_and_never_persisted(
+        self, app_client, monkeypatch, body, detail
+    ):
+        from orchestrator import main
+
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db,
+            "create_datasource",
+            AsyncMock(side_effect=AssertionError("must not persist")),
+        )
+        response = app_client.post("/api/datasources", json={"name": "c1", **body})
+        assert response.status_code == 400, response.text
+        assert detail in response.json()["detail"]
+        assert "PRIVATE KEY" not in response.text
+
+
+class TestUpdateEndpoint:
+    def _patch_update(self, monkeypatch, existing_ds):
+        from orchestrator import main
+
+        monkeypatch.setattr(
+            access_module,
+            "require_datasource_owner",
+            AsyncMock(return_value=({"id": _OWNER_ID, "is_admin": False}, existing_ds)),
+        )
+        update = AsyncMock(return_value=True)
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db, "update_datasource", update
+        )
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db,
+            "get_datasource",
+            AsyncMock(return_value=existing_ds),
+        )
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db,
+            "list_datasource_projects",
+            AsyncMock(return_value=[]),
+        )
+        return TestClient(main.app), update
+
+    def test_url_only_edit_of_ssh_repository_is_validated(self, monkeypatch):
+        existing = {
+            "id": "33333333-3333-3333-3333-333333333333",
+            "name": "widget",
+            "type": "repository",
+            "connection_url": "git@github.com:acme/widget.git",
+            "credentials": {
+                "auth_method": "ssh",
+                "ssh_key": generate_ed25519_keypair().private_key,
+            },
+            "config": {"forge": "github"},
+            "is_global": False,
+            "read_only": None,
+        }
+        client, update = self._patch_update(monkeypatch, existing)
+        response = client.put(
+            f"/api/datasources/{existing['id']}",
+            json={"connection_url": "git@host\nProxyCommand id:o/r.git"},
+        )
+        assert response.status_code == 400, response.text
+        update.assert_not_awaited()
+
+    def test_ssh_key_host_edit_is_validated_and_persisted(self, monkeypatch):
+        existing = {
+            "id": "44444444-4444-4444-4444-444444444444",
+            "name": "bastion",
+            "type": "ssh_key",
+            "connection_url": None,
+            "credentials": {
+                "files": [{"contents": generate_ed25519_keypair().private_key}]
+            },
+            "config": {},
+            "is_global": False,
+            "read_only": None,
+        }
+        client, update = self._patch_update(monkeypatch, existing)
+        response = client.put(
+            f"/api/datasources/{existing['id']}",
+            json={"config": {"host": "bastion.example.com", "port": 2200}},
+        )
+        assert response.status_code < 300, response.text
+        assert update.await_args.kwargs["config"] == {
+            "host": "bastion.example.com",
+            "port": 2200,
+        }
+
+        update.reset_mock()
+        response = client.put(
+            f"/api/datasources/{existing['id']}",
+            json={"config": {"host": "bastion", "user": "x y"}},
+        )
+        assert response.status_code == 400, response.text
+        update.assert_not_awaited()
+
+    def test_rename_does_not_revalidate_a_legacy_ssh_repository(self, monkeypatch):
+        existing = {
+            "id": "55555555-5555-5555-5555-555555555555",
+            "name": "legacy",
+            "type": "repository",
+            # Created before C1: no longer passes the strict grammar.
+            "connection_url": "git@host_with_underscore:o/r.git",
+            "credentials": {"auth_method": "ssh", "ssh_key": "legacy"},
+            "config": {"forge": "gitea"},
+            "is_global": False,
+            "read_only": None,
+        }
+        client, update = self._patch_update(monkeypatch, existing)
+        response = client.put(
+            f"/api/datasources/{existing['id']}", json={"name": "renamed"}
+        )
+        assert response.status_code < 300, response.text
+        update.assert_awaited_once()
+
+    def test_switch_to_token_auth_ignores_a_stored_pin(self, monkeypatch):
+        existing = {
+            "id": "66666666-6666-6666-6666-666666666666",
+            "name": "widget",
+            "type": "repository",
+            "connection_url": "git@github.com:acme/widget.git",
+            "credentials": {
+                "auth_method": "ssh",
+                "ssh_key": generate_ed25519_keypair().private_key,
+            },
+            "config": {"forge": "github", "known_hosts": _host_key()},
+            "is_global": False,
+            "read_only": None,
+        }
+        client, update = self._patch_update(monkeypatch, existing)
+        response = client.put(
+            f"/api/datasources/{existing['id']}",
+            json={"credentials": {"auth_method": "token", "token": "t0k"}},
+        )
+        assert response.status_code < 300, response.text
+        update.assert_awaited_once()
+        assert update.await_args.kwargs["config"] is None
