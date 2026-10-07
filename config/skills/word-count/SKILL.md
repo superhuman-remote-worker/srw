@@ -26,5 +26,5 @@ answer. The script reads only the file you pass and writes nothing — its outpu
 is the only thing that matters.
 
 If you are on a lite (virtual) workspace with no shell, `use_skill` will tell you
-the script can't run here; call `request_workspace_upgrade` to ask for a workspace with a shell, then
-run the command above.
+the script can't run here; call `request_workspace_upgrade` to ask for a
+workspace with a shell, then run the command above.

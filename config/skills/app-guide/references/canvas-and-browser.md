@@ -125,7 +125,7 @@ different workspace bytes under the old presentation.
 
 ## Share the browser with the agent
 
-**Required workspace:** start with or upgrade to a **Container workspace**.
+**Required workspace:** start with a **Container workspace**.
 Virtual and None cannot host the shared browser, and VM support must not be
 promised.
 
@@ -166,7 +166,7 @@ Use the reported code and shown reason instead of guessing:
 - `feature_disabled` — Shared browser is off on this server, so its normal
   action is intentionally hidden.
 - `workspace_required` — **This session type does not provide a browser
-  workspace**; the session is using Virtual or None. Start with or upgrade to a
+  workspace**; the session is using Virtual or None. Start with a
   Container workspace.
 - `workspace_unattested` — **This workspace is not trusted for shared-browser
   access**; its current workspace binding is not attested. Retrying the same

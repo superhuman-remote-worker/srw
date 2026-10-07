@@ -301,9 +301,10 @@ refusal. Those paths retry it.
 
 ### Upgrades
 
-An upgrade moves to the tier it asks for, or to the next one up (`none` and
-`virtual` go to a container, a container goes to a VM). It gets that tier's
-default template from the lookup above, unless it names a template.
+An upgrade moves to the tier it asks for, or to the next one up: a running
+Session goes to a VM; a Job goes from `none` or `virtual` to a container, and
+from a container to a VM. It gets that tier's default template from the lookup
+above, unless it names a template.
 
 | Trigger | Result |
 | --- | --- |
