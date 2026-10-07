@@ -36,15 +36,23 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
   checkpoint  no gate key body in the LangGraph checkpoint tables (the job)
   detach      after B is detached (stateless: applied at the next attach)
               B's agent and config are gone and A still fetches
+  job-snap    on k3d a stateless job's S3 snapshot comes from a cancel, not
+              from completion (or an approval). So once the job's workspace
+              checks pass, and while it still runs (its brief holds it in a
+              deliberate sleep), the gate cancels it, waits (bounded) for
+              the cancel to finish and for the jobs/<id>/ objects to settle,
+              and scans them for gate key bodies. A cancel that leaves no
+              object FAILS. A job that settled before the cancel is reported
+              SKIP (k3d completion takes no snapshot), after one listing.
   end         after End the workspace holds no ssh-agent process (counted
               from /proc; a failed exec or no answer is a FAIL, not zero)
-  job-settle  the job reaches a resting status (a review pause is approved,
-              as the C0 gate does) before anything scans its snapshot
-  snapshot    the job's jobs/<id>/ S3 snapshot appears (bounded wait) and
-              holds no gate key body; a threads/<id>/ snapshot is scanned
-              if present (a stateless sandbox End writes none) and
-              reported as absent otherwise. --allow-no-snapshot passes
-              only when no object store is configured at all
+  snapshot    a threads/<id>/ snapshot is scanned if present (a stateless
+              sandbox End writes none) and reported as absent otherwise.
+              --allow-no-snapshot passes only when no object store is
+              configured at all
+
+A pass is every check line PASS (SKIP lines are allowed) and a final
+``PASS c1-<id>: N checks, 0 failed`` with exit status 0.
 
 Run with the repository venv on the k3d-srw cluster, alone (no other gate or
 full test run): this is a mutating gate.
@@ -416,6 +424,7 @@ def random_host_key() -> str:
 class Report:
     gate_id: str
     results: list[tuple[str, bool, str]] = field(default_factory=list)
+    skipped: list[tuple[str, str]] = field(default_factory=list)
 
     def check(self, name: str, ok: bool, detail: str = "") -> bool:
         self.results.append((name, bool(ok), _scrub(detail)))
@@ -424,6 +433,11 @@ class Report:
             flush=True,
         )
         return bool(ok)
+
+    def skip(self, name: str, reason: str) -> None:
+        """A check that could not run here; it neither passes nor fails."""
+        self.skipped.append((name, _scrub(reason)))
+        print(f"SKIP {name}: {_scrub(reason)}", flush=True)
 
     @property
     def passed(self) -> bool:
@@ -440,9 +454,9 @@ PLAN = [
     "transcript: no key body in thread rows",
     "detach: drop B, one more turn; B retired, A still works",
     "job: stateless job with A and C; no key in workspace, checkpoint or job rows",
+    "job-snap: cancel the still-running job; wait for jobs/<id>/ objects; scan them",
     "end: End the session; no ssh-agent left",
-    "job-settle: wait for a resting job status; approve a review pause",
-    "snapshot: wait for jobs/<id>/ objects, scan them (and threads/<id>/ if any)",
+    "snapshot: scan threads/<id>/ objects if any (a sandbox End writes none)",
     "cleanup: end session, cancel+delete job, delete connectors and repos",
 ]
 
@@ -476,9 +490,11 @@ def origin_alias(origin: str, *, owner: str, repo: str) -> str | None:
     return (match.group(1) or match.group(2)) if match else None
 
 
-# Statuses a job rests in; the orchestrator's completion path owns them.
-JOB_TERMINAL = frozenset({"completed", "failed", "cancelled"})
-JOB_RESTING = JOB_TERMINAL | {"pending_review", "paused", "waiting"}
+# A job in these statuses is still running; a cancel ends it (and on k3d is
+# what uploads its jobs/<id>/ snapshot).
+JOB_RUNNING = frozenset({"created", "processing"})
+# Long enough that the job is still running when its workspace checks end.
+JOB_SLEEP_SECONDS = 600
 
 
 class SshAgentConnectorsGate:
@@ -493,6 +509,7 @@ class SshAgentConnectorsGate:
         self.thread: str | None = None
         self.job: str | None = None
         self._snapshot_listing: list[str] = []
+        self._store: bool | None = None
         self.gitea: dict[str, Any] = {}
 
     # -- helpers -----------------------------------------------------------
@@ -989,41 +1006,83 @@ class SshAgentConnectorsGate:
     def job_status(self) -> str:
         return sql(f"SELECT coalesce(status, '') FROM jobs WHERE id = {lit(self.job)}")
 
-    def job_settle(self) -> None:
-        """Wait (bounded) for the job to rest; approve a review pause.
+    def store_configured(self) -> bool:
+        """Whether an object store is configured; reported once if not."""
 
-        The job's terminal snapshot is uploaded by its own teardown, after it
-        completes, so nothing may scan (or clean up) before then. A job that
-        pauses for review is approved, as the C0 gate does, so its teardown
-        takes that snapshot.
+        if self._store is None:
+            listed = self.snapshot_objects(f"threads/{self.thread}/", scan=False)
+            self._store = bool(listed.get("configured"))
+            if not self._store:
+                self.report.check(
+                    "snapshot: object store configured",
+                    self.args.allow_no_snapshot,
+                    "none"
+                    + (" (--allow-no-snapshot)" if self.args.allow_no_snapshot else ""),
+                )
+        return self._store
+
+    def job_snapshot(self) -> None:
+        """Cancel the running job, then scan the snapshot the cancel uploads.
+
+        On k3d a stateless job's ``jobs/<id>/`` snapshot comes from a cancel:
+        neither completion nor an approval takes one. So this runs once the
+        job's workspace checks pass, while its brief still holds it in a
+        sleep, and before End and cleanup (whose delete removes the objects).
+        A job that settled first is reported SKIP after one listing.
         """
 
-        def status_in(statuses: frozenset[str]) -> Callable[[], str | None]:
-            def probe() -> str | None:
-                status = self.job_status()
-                return status if status in statuses else None
-
-            return probe
-
-        timeout = self.args.job_timeout
-        try:
-            status = wait_for(
-                "job resting", status_in(JOB_RESTING), timeout=timeout, interval=5
-            )
-            if status == "pending_review":
-                self.api.ok("POST", f"/api/jobs/{self.job}/approve", {})
-                print("job approved after its review pause", flush=True)
-                status = wait_for(
-                    "approved job ends",
-                    status_in(JOB_TERMINAL),
-                    timeout=timeout,
-                    interval=5,
+        if not self.job or not self.store_configured():
+            return
+        prefix = f"jobs/{self.job}/"
+        status = self.job_status()
+        if status not in JOB_RUNNING:
+            if self.snapshot_objects(prefix, scan=False).get("objects"):
+                self.scan_snapshot("snapshot (job)", prefix)
+            else:
+                self.report.skip(
+                    "snapshot (job)",
+                    f"job settled ({status or 'missing'}) before cancel; "
+                    "k3d completion takes no snapshot",
                 )
-        except GateError as exc:
-            status = f"{self.job_status() or 'missing'} ({exc})"
-        self.report.check(
-            "job-settle: job completed", status == "completed", f"status {status}"
-        )
+            return
+
+        def stopped_status() -> str | None:
+            current = self.job_status()
+            return current if current and current not in JOB_RUNNING else None
+
+        self.api.ok("PUT", f"/api/jobs/{self.job}/cancel")
+        print(f"job {self.job} cancelled to take its snapshot", flush=True)
+        try:
+            stopped = wait_for(
+                "cancelled job stops",
+                stopped_status,
+                timeout=self.args.job_timeout,
+                interval=5,
+            )
+            self.report.check("job-snap: the cancel finished", True, f"{stopped}")
+        except GateError:
+            self.report.check(
+                "job-snap: the cancel finished",
+                False,
+                f"still {self.job_status() or 'missing'} after "
+                f"{self.args.job_timeout}s",
+            )
+        self._snapshot_listing = []
+        try:
+            wait_for(
+                "job snapshot objects",
+                lambda: self.snapshot_settled(prefix),
+                timeout=self.args.snapshot_timeout,
+                interval=15,
+            )
+        except GateError:
+            self.report.check(
+                "snapshot (job): the cancel took a snapshot",
+                False,
+                f"no settled {prefix} objects after {self.args.snapshot_timeout}s",
+            )
+            return
+        self.scan_snapshot("snapshot (job)", prefix)
 
     def snapshot_objects(self, prefix: str, *, scan: bool) -> dict:
         request: dict[str, Any] = {"prefixes": [prefix], "needles": []}
@@ -1053,44 +1112,17 @@ class SshAgentConnectorsGate:
         return bool(listed) and self._snapshot_listing == previous
 
     def snapshot(self) -> None:
-        """Scan the S3 snapshots, all before cleanup deletes anything.
+        """Scan the thread's S3 snapshot after End, before cleanup.
 
-        The job's ``jobs/<id>/`` snapshot is required once an object store is
-        configured; ``--allow-no-snapshot`` covers only a deployment without
-        one. A stateless sandbox session's End writes no ``threads/<id>/``
+        ``--allow-no-snapshot`` covers only a deployment without an object
+        store. A stateless sandbox session's End writes no ``threads/<id>/``
         snapshot, so the thread's is scanned when present and reported as
-        absent otherwise.
+        absent otherwise. (The job's is scanned by :meth:`job_snapshot`.)
         """
 
         thread_prefix = f"threads/{self.thread}/"
-        if not self.snapshot_objects(thread_prefix, scan=False).get("configured"):
-            self.report.check(
-                "snapshot: object store configured",
-                self.args.allow_no_snapshot,
-                "none"
-                + (" (--allow-no-snapshot)" if self.args.allow_no_snapshot else ""),
-            )
+        if not self.store_configured():
             return
-        if self.job:
-            job_prefix = f"jobs/{self.job}/"
-            self._snapshot_listing = []
-            try:
-                wait_for(
-                    "job snapshot objects",
-                    lambda: self.snapshot_settled(job_prefix),
-                    timeout=self.args.snapshot_timeout,
-                    interval=15,
-                )
-            except GateError:
-                self.report.check(
-                    "snapshot (job): the job's snapshot was captured",
-                    False,
-                    f"no settled {job_prefix} objects after "
-                    f"{self.args.snapshot_timeout}s",
-                )
-            else:
-                self.scan_snapshot("snapshot (job)", job_prefix)
-        # Listed last, so a late thread upload is still scanned.
         if self.snapshot_objects(thread_prefix, scan=False).get("objects"):
             self.scan_snapshot("snapshot (thread)", thread_prefix)
         else:
@@ -1103,9 +1135,15 @@ class SshAgentConnectorsGate:
             "POST",
             "/api/jobs",
             {
+                # The sleep keeps the job running through its workspace
+                # checks, so the gate can cancel it: on k3d only a cancel
+                # uploads the job's snapshot.
                 "description": (
-                    "C1 ssh-agent gate: write the word ok to output/c1.txt, "
-                    "then complete the job."
+                    "C1 ssh-agent gate. Step 1: run the shell command "
+                    f"`sleep {JOB_SLEEP_SECONDS}` and wait for it to finish; it "
+                    "is a deliberate delay, so do not skip, shorten or "
+                    "background it. Step 2: write the word ok to "
+                    "output/c1.txt. Step 3: complete the job."
                 ),
                 "datasource_ids": [self.connectors["A"], self.connectors["C"]],
                 "config_override": {"workspace": {"backend": "sandbox"}},
@@ -1207,11 +1245,10 @@ class SshAgentConnectorsGate:
             self.detach()
             if not self.args.skip_job:
                 self.job_run()
+                # While the job still runs, and long before cleanup deletes
+                # it (and with it every jobs/<id>/ object).
+                self.job_snapshot()
             self.end()
-            if self.job:
-                # Before any scan, and long before cleanup deletes the job
-                # (and with it every jobs/<id>/ object).
-                self.job_settle()
             self.snapshot()
         except GateError as exc:
             self.report.check("gate infrastructure", False, str(exc))
@@ -1232,9 +1269,11 @@ class SshAgentConnectorsGate:
                 self.cleanup()
         verdict = "PASS" if self.report.passed else "FAIL"
         failed = [name for name, ok, _ in self.report.results if not ok]
+        skipped = [name for name, _ in self.report.skipped]
         print(
             f"{verdict} {self.gate_id}: {len(self.report.results)} checks, "
             f"{len(failed)} failed {failed if failed else ''}".rstrip()
+            + (f", {len(skipped)} skipped {skipped}" if skipped else "")
         )
         return 0 if self.report.passed else 1
 
@@ -1256,7 +1295,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--job-timeout",
         type=int,
         default=900,
-        help="seconds the job may take to rest (and again after an approval)",
+        help="seconds a cancelled job may take to stop",
     )
     parser.add_argument(
         "--snapshot-timeout",

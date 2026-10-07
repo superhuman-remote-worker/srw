@@ -240,9 +240,11 @@ def test_origin_alias_accepts_both_url_forms(origin, alias):
     assert gate.origin_alias(origin, owner="srw", repo="r") == alias
 
 
-# -- job settle and snapshot ordering -----------------------------------------
-# The k3d run of 2026-10-07 scanned before the job's completion snapshot was
-# uploaded, then cleanup deleted the job and with it every jobs/<id>/ object.
+# -- job snapshot by cancel, and snapshot ordering ------------------------------
+# k3d runs of 2026-10-07/08: a stateless job's jobs/<id>/ snapshot is uploaded
+# by a cancel of the running job, never by its completion or an approval, and
+# cleanup's delete removes it. The gate cancels the running job itself, scans,
+# and only then Ends the session and cleans up.
 
 
 class _Clock:
@@ -285,37 +287,7 @@ def _statuses(monkeypatch, runner, *sequence):
     monkeypatch.setattr(runner, "job_status", status)
 
 
-def test_job_settle_approves_a_review_pause_and_waits_for_completion(
-    monkeypatch, clocked
-):
-    runner = _gate_runner()
-    _statuses(
-        monkeypatch, runner, "processing", "pending_review", "processing", "completed"
-    )
-    calls = []
-    monkeypatch.setattr(runner.api, "ok", lambda *a, **k: calls.append(a) or {})
-
-    runner.job_settle()
-
-    assert calls == [("POST", f"/api/jobs/{runner.job}/approve", {})]
-    assert runner.report.results == [
-        ("job-settle: job completed", True, "status completed")
-    ]
-
-
-@pytest.mark.parametrize("stuck", ["processing", "paused", "failed"])
-def test_job_settle_fails_a_job_that_does_not_complete(monkeypatch, clocked, stuck):
-    runner = _gate_runner("--job-timeout", "60")
-    _statuses(monkeypatch, runner, stuck)
-    monkeypatch.setattr(runner.api, "ok", lambda *a, **k: pytest.fail("no approval"))
-
-    runner.job_settle()
-
-    assert not runner.report.passed
-    assert clocked.now <= 70
-
-
-def _store(monkeypatch, *, configured=True, job=(), thread=(), hits=()):
+def _store(monkeypatch, *, configured=True, job=([],), thread=(), hits=()):
     """Fake the in-orchestrator snapshot program; ``job`` is a listing sequence."""
 
     job_listings = list(job)
@@ -346,36 +318,109 @@ def _store(monkeypatch, *, configured=True, job=(), thread=(), hits=()):
     return log
 
 
-def test_snapshot_waits_for_settled_job_objects_then_scans(monkeypatch, clocked):
+def _api(monkeypatch, runner):
+    calls = []
+    monkeypatch.setattr(runner.api, "ok", lambda *a, **k: calls.append(a) or {})
+    return calls
+
+
+def test_a_running_job_is_cancelled_and_its_snapshot_scanned(monkeypatch, clocked):
     runner = _gate_runner()
+    _statuses(monkeypatch, runner, "processing", "processing", "cancelled")
+    calls = _api(monkeypatch, runner)
     log = _store(
         monkeypatch,
         job=([], [], ["jobs/x/1"], ["jobs/x/1", "jobs/x/2"], ["jobs/x/1", "jobs/x/2"]),
     )
 
-    runner.snapshot()
+    runner.job_snapshot()
 
+    assert calls == [("PUT", f"/api/jobs/{runner.job}/cancel")]
     assert runner.report.passed
-    names = [name for name, _, _ in runner.report.results]
-    assert names == [
+    assert [name for name, _, _ in runner.report.results] == [
+        "job-snap: the cancel finished",
         "snapshot (job): no key in snapshot objects",
-        "snapshot (thread): none to scan",
     ]
     # Scanned only once the listing held still.
     assert log.index(("job", "scan")) > 4
+    assert not runner.report.skipped
 
 
-def test_a_missing_job_snapshot_fails_even_with_allow_no_snapshot(monkeypatch, clocked):
-    runner = _gate_runner("--allow-no-snapshot", "--snapshot-timeout", "60")
-    _store(monkeypatch, job=([],))
+def test_a_key_in_the_cancel_snapshot_fails(monkeypatch, clocked):
+    runner = _gate_runner()
+    _statuses(monkeypatch, runner, "processing", "cancelled")
+    _api(monkeypatch, runner)
+    _store(monkeypatch, job=(["jobs/x/1"],), hits=["jobs/x/1"])
 
-    runner.snapshot()
+    runner.job_snapshot()
 
     assert not runner.report.passed
-    assert ("snapshot (job): the job's snapshot was captured", False) in [
+
+
+@pytest.mark.parametrize("allowed", [True, False])
+def test_a_cancel_that_leaves_no_object_fails_with_a_store(
+    monkeypatch, clocked, allowed
+):
+    flags = ["--snapshot-timeout", "60"] + (["--allow-no-snapshot"] if allowed else [])
+    runner = _gate_runner(*flags)
+    _statuses(monkeypatch, runner, "processing", "cancelled")
+    _api(monkeypatch, runner)
+    _store(monkeypatch, job=([],))
+
+    runner.job_snapshot()
+
+    assert not runner.report.passed
+    assert ("snapshot (job): the cancel took a snapshot", False) in [
         (name, ok) for name, ok, _ in runner.report.results
     ]
-    assert clocked.now <= 80
+    assert clocked.now <= 120
+
+
+def test_a_cancel_that_never_finishes_fails(monkeypatch, clocked):
+    runner = _gate_runner("--job-timeout", "60", "--snapshot-timeout", "30")
+    _statuses(monkeypatch, runner, "processing")
+    _api(monkeypatch, runner)
+    _store(monkeypatch, job=(["jobs/x/1"],))
+
+    runner.job_snapshot()
+
+    assert ("job-snap: the cancel finished", False) in [
+        (name, ok) for name, ok, _ in runner.report.results
+    ]
+
+
+@pytest.mark.parametrize("settled", ["completed", "pending_review", "failed"])
+def test_a_job_that_settled_first_is_skipped_not_failed(
+    monkeypatch, clocked, settled, capsys
+):
+    runner = _gate_runner()
+    _statuses(monkeypatch, runner, settled)
+    monkeypatch.setattr(runner.api, "ok", lambda *a, **k: pytest.fail("no cancel"))
+    log = _store(monkeypatch, job=([],))
+
+    runner.job_snapshot()
+    runner.report.check("stand-in", True)
+
+    assert runner.report.passed
+    assert [name for name, _ in runner.report.skipped] == ["snapshot (job)"]
+    assert "k3d completion takes no snapshot" in capsys.readouterr().out
+    # One listing, no wait.
+    assert log.count(("job", "list")) == 1
+    assert clocked.now == 0
+
+
+def test_a_settled_job_with_objects_is_still_scanned(monkeypatch, clocked):
+    runner = _gate_runner()
+    _statuses(monkeypatch, runner, "completed")
+    monkeypatch.setattr(runner.api, "ok", lambda *a, **k: pytest.fail("no cancel"))
+    _store(monkeypatch, job=(["jobs/x/1"],))
+
+    runner.job_snapshot()
+
+    assert runner.report.results[-1][:2] == (
+        "snapshot (job): no key in snapshot objects",
+        True,
+    )
 
 
 @pytest.mark.parametrize("allowed", [True, False])
@@ -383,11 +428,31 @@ def test_allow_no_snapshot_covers_only_a_missing_object_store(
     monkeypatch, clocked, allowed
 ):
     runner = _gate_runner(*(["--allow-no-snapshot"] if allowed else []))
+    _statuses(monkeypatch, runner, "processing")
+    monkeypatch.setattr(runner.api, "ok", lambda *a, **k: pytest.fail("no cancel"))
     _store(monkeypatch, configured=False)
 
+    runner.job_snapshot()
     runner.snapshot()
 
     assert runner.report.passed is allowed
+    # Reported once, not once per scan.
+    assert len(runner.report.results) == 1
+
+
+def test_an_absent_thread_snapshot_passes_as_absent(monkeypatch, clocked):
+    runner = _gate_runner()
+    _store(monkeypatch)
+
+    runner.snapshot()
+
+    assert runner.report.results == [
+        (
+            "snapshot (thread): none to scan",
+            True,
+            f"threads/{runner.thread}/ absent",
+        )
+    ]
 
 
 def test_a_present_thread_snapshot_is_scanned(monkeypatch, clocked):
@@ -403,23 +468,52 @@ def test_a_present_thread_snapshot_is_scanned(monkeypatch, clocked):
     )
 
 
-def test_run_settles_and_scans_the_job_before_cleanup(monkeypatch):
+def test_the_job_brief_holds_it_in_a_sleep(monkeypatch):
+    runner = _gate_runner()
+    runner.connectors = {label: f"id-{label}" for label in "ABCD"}
+    bodies = []
+
+    class Stop(Exception):
+        pass
+
+    def ok(method, path, body=None):
+        bodies.append(body)
+        raise Stop
+
+    monkeypatch.setattr(runner.api, "ok", ok)
+    with pytest.raises(Stop):
+        runner.job_run()
+
+    assert f"sleep {gate.JOB_SLEEP_SECONDS}" in bodies[0]["description"]
+
+
+def test_run_scans_the_job_snapshot_before_end_and_cleanup(monkeypatch):
     runner = _gate_runner()
     runner.job = None
     order = []
     steps = (
         "preflight fixture validation connectors_setup session session_checks "
-        "detach end job_settle snapshot cleanup"
+        "detach job_run job_snapshot end snapshot cleanup"
     ).split()
     for step in steps:
         monkeypatch.setattr(runner, step, lambda step=step: order.append(step) or None)
-
-    def job_run():
-        order.append("job_run")
-        runner.job = "00000000-0000-4000-8000-0000000000aa"
-
-    monkeypatch.setattr(runner, "job_run", job_run)
     runner.report.check("stand-in", True)
 
     assert runner.run() == 0
-    assert order[-5:] == ["job_run", "end", "job_settle", "snapshot", "cleanup"]
+    assert order[-5:] == ["job_run", "job_snapshot", "end", "snapshot", "cleanup"]
+
+
+def test_the_verdict_counts_skips_without_failing(monkeypatch, capsys):
+    runner = _gate_runner("--skip-job")
+    for step in (
+        "preflight fixture validation connectors_setup session session_checks "
+        "detach end snapshot cleanup"
+    ).split():
+        monkeypatch.setattr(runner, step, lambda: None)
+    runner.report.check("stand-in", True)
+    runner.report.skip("snapshot (job)", "job settled")
+
+    assert runner.run() == 0
+    last = capsys.readouterr().out.strip().splitlines()[-1]
+    assert last.startswith(f"PASS {runner.gate_id}: 1 checks, 0 failed")
+    assert "1 skipped" in last
