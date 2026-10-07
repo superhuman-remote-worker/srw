@@ -144,9 +144,7 @@ async def thread_input(
         )
 
     if not body.content or not isinstance(body.content, str):
-        raise HTTPException(
-            status_code=400, detail="content must be a non-empty string"
-        )
+        raise HTTPException(status_code=400, detail="content must be a non-empty string")
     from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
 
     idle = VMIdleLifecycleStore(store)
@@ -166,19 +164,16 @@ async def thread_input(
     continuation = await idle.get_pending_access_continuation(thread_id)
     if open_idle is not None or retained_ready or continuation is not None:
         wake = await idle.request_thread_wake(
-            thread_id,
-            execution_requested=True,
+            thread_id, execution_requested=True,
         )
         if wake is None:
             raise HTTPException(
-                status_code=409,
-                detail={"code": "session_idle_wake_held"},
+                status_code=409, detail={"code": "session_idle_wake_held"},
             )
         return JSONResponse(
             status_code=202,
             content={
-                "accepted": False,
-                "state": "waking",
+                "accepted": False, "state": "waking",
                 "wake_id": str(wake["wake_id"]),
                 "thread_id": thread_id,
             },
@@ -292,8 +287,13 @@ async def thread_queue_retry(
 
     A pinned session has no queue unit; its input parks at the recovery
     bound instead (parallel_subagents.md §14.2, P3). The same verb re-arms
-    every parked input of the thread (``retry_parked_pinned_inputs``): the
-    live runtime's inbox poll serves it, or the next attach does.
+    every parked input of the thread (``retry_parked_pinned_inputs``) and
+    answers ``{state:'rearmed', inputs:[...]}``. It wakes nothing: the
+    pinned runtime takes a re-armed input at its next inbox read, which is
+    its loop's input wait (a poll of at most a second), its next accepted
+    input, or the next attach. A runtime whose loop has not started (its
+    attach found no other work) reads it when a socket connects or input
+    arrives.
     """
     from orchestrator.services.stateless_queue_state import park_retry_refusal
     from shared.persistent_input_delivery import (
@@ -309,6 +309,7 @@ async def thread_queue_retry(
         raise HTTPException(status_code=404, detail="Thread not found") from None
     store = dependencies.store
     user, _thread = await dependencies.require_thread_owner(request, store, thread_id)
+    rearmed: list[str] | None = None
     async with store.acquire() as conn:
         async with conn.transaction():
             authority = await conn.fetchrow(
@@ -319,12 +320,12 @@ async def thread_queue_retry(
             if authority is None:
                 raise HTTPException(status_code=404, detail="Thread not found")
             if str(authority["execution_lane"] or "pinned") == "pinned":
-                retried = await retry_parked_pinned_inputs(conn, thread_id=thread_id)
+                rearmed = await retry_parked_pinned_inputs(conn, thread_id=thread_id)
                 queue_state = {
                     "park_reason": PINNED_RECOVERY_PARK_REASON,
                     "attempts": PINNED_RECOVERY_ADMISSION_LIMIT,
                 }
-                ok = bool(retried)
+                ok = bool(rearmed)
             else:
                 queue_state = await queue_state_for(conn, unit_id=thread_id)
                 if queue_state is None or queue_state.get("state") != STATE_PARKED:
@@ -356,6 +357,13 @@ async def thread_queue_retry(
         detail=f"owner unpark park_reason={park_reason} attempts={attempts}",
         request=request,
     )
+    if rearmed is not None:
+        return {
+            "thread_id": thread_id,
+            "state": "rearmed",
+            "park_reason": park_reason,
+            "inputs": rearmed,
+        }
     return {
         "thread_id": thread_id,
         "unit_id": thread_id,

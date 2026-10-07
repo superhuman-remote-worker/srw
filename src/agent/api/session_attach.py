@@ -2107,14 +2107,13 @@ class SessionAttachCoordinator:
             session_runtime_generation=str(self._identity.session_generation or ""),
             runtime_attach_token=attach_token,
         )
-        if any(outcome.get(key) for key in ("settled", "reserved", "parked")):
+        keys = ("settled", "history", "reserved", "parked")
+        if any(outcome.get(key) for key in keys):
             self._logger.info(
-                "Stale pinned admissions for thread %s: %d settled, %d served "
-                "again, %d parked at the recovery bound",
+                "Stale pinned admissions for thread %s: %d answered, %d history, "
+                "%d served again, %d parked at the recovery bound",
                 thread_id,
-                len(outcome.get("settled") or ()),
-                len(outcome.get("reserved") or ()),
-                len(outcome.get("parked") or ()),
+                *(len(outcome.get(key) or ()) for key in keys),
             )
 
     async def cleanup_failed_attach(

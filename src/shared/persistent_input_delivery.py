@@ -170,6 +170,66 @@ def stale_stateless_admission_sql(
     )"""
 
 
+def turn_completed_frame_sql(*, thread: str, turn_id: str, after: str) -> str:
+    """SQL body: the loop's ``turn.completed`` frame for one turn of a thread.
+
+    ``SELECT 1 ...``, for the caller to wrap in ``EXISTS``. The frame proves
+    the turn ended, not that its rows are durable: the pinned loop broadcasts
+    it before its best-effort transcript reconcile (parallel_subagents.md
+    §14.1), and a final message that carries a tool call has no answer row.
+    ``thread``, ``turn_id`` (text) and ``after`` (the earliest the frame may
+    be journaled) are SQL expressions. The batch settle anchors it after the
+    delegating AI row; the pinned re-serve after the admission.
+    """
+
+    return f"""
+SELECT 1
+  FROM thread_events AS frame
+ WHERE frame.thread_id = {thread}
+   AND frame.kind = 'turn.completed'
+   AND (frame.payload->>'turn_id') = {turn_id}
+   AND frame.created_at >= {after}
+"""
+
+
+def pinned_admission_answered_sql(
+    *, delivery: str = "delivery", message: str = "message"
+) -> str:
+    """SQL predicate: a pinned admission's own turn reached its end.
+
+    ``stale_admission_answered_sql`` (its final answer row), or the loop's
+    ``turn.completed`` frame for the admitted turn journaled after the
+    admission: the same proof the batch settle accepts. The stateless lane
+    keeps the narrower predicate; its loop journals the frame only after the
+    authoritative reconcile that the first proof reads.
+    """
+
+    answered = stale_admission_answered_sql(delivery=delivery, message=message)
+    frame = turn_completed_frame_sql(
+        thread=f"{delivery}.thread_id",
+        turn_id=f"{delivery}.admitted_turn_number::text",
+        after=f"{delivery}.admitted_at",
+    )
+    return f"({answered} OR EXISTS ({frame}))"
+
+
+def later_pinned_admission_sql(*, delivery: str = "delivery") -> str:
+    """SQL predicate: another input of the thread was admitted after this one.
+
+    The pinned loop admits one input per turn, so a later admission means the
+    conversation went on without this turn. Read it before a hand-back: the
+    hand-back clears the later row's own ``admitted_at``.
+    """
+
+    return f"""EXISTS (
+        SELECT 1
+          FROM thread_input_deliveries AS later
+         WHERE later.thread_id = {delivery}.thread_id
+           AND later.delivery_id <> {delivery}.delivery_id
+           AND later.admitted_at > {delivery}.admitted_at
+    )"""
+
+
 def stale_pinned_admission_sql(
     *,
     process_generation: str,
@@ -182,9 +242,11 @@ def stale_pinned_admission_sql(
     §14.1, "an admitted but unsettled delivery is never served again"). A
     pinned claim takes only unadmitted rows, so an event whose runtime died
     after provider admission stayed ``admitted`` and no successor served it.
-    Such an admission is owed to the current runtime: served again when its
-    turn left no durable end, settled when it did
-    (``stale_admission_answered_sql``). The guards:
+    ``reserve_stale_pinned_admissions`` resolves every such row: settled when
+    its turn reached its end (``pinned_admission_answered_sql``) or when a
+    later admission made it history (``later_pinned_admission_sql``: replaying
+    it into a newer conversation would be wrong, and an unsettled delivery
+    blocks rewind and idle release), otherwise served again. The guards:
 
     * events only. A ``direct_human`` partial turn keeps its immutable
       admission receipt and is never replayed (R3.3c, migration 0313).
@@ -195,34 +257,17 @@ def stale_pinned_admission_sql(
     * no live ``subagent`` continuation supersedes the event: a turn that
       delegated and died is settled against its input by the batch recovery,
       which runs before this (parallel_subagents.md D3).
-    * an unanswered admission only while no other input of the thread was
-      admitted after it. The pinned loop admits one input per turn, so a later
-      admission means the conversation went on without this turn; replaying
-      it into a newer conversation would be wrong (the stateless watermark's
-      role). An answered admission is settled wherever it sits: an unsettled
-      delivery blocks rewind.
 
     ``process_generation`` is an SQL expression (a parameter); the aliases
     name the caller's delivery and message rows.
     """
 
-    answered = stale_admission_answered_sql(delivery=delivery, message=message)
     return f"""(
         {delivery}.execution_lane = 'pinned'
         AND {delivery}.state = 'admitted'
         AND {delivery}.source <> 'direct_human'
         AND {message}.role = 'event'
         AND {delivery}.owner_runtime_generation IS DISTINCT FROM {process_generation}
-        AND (
-            NOT EXISTS (
-                SELECT 1
-                  FROM thread_input_deliveries AS later
-                 WHERE later.thread_id = {delivery}.thread_id
-                   AND later.delivery_id <> {delivery}.delivery_id
-                   AND later.admitted_at > {delivery}.admitted_at
-            )
-            OR {answered}
-        )
         AND NOT EXISTS (
             SELECT 1
               FROM thread_input_deliveries AS successor
@@ -1357,8 +1402,11 @@ async def reserve_stale_pinned_admissions(
     (parallel_subagents.md §14.2, P3). For each ``stale_pinned_admission_sql``
     row:
 
-    * its turn reached a durable end (``stale_admission_answered_sql``):
-      settled, never answered twice;
+    * its turn reached its end (``pinned_admission_answered_sql``): settled,
+      never answered twice;
+    * otherwise, when another input was admitted after it
+      (``later_pinned_admission_sql``): settled as history, now, while that
+      evidence exists (a hand-back below clears the later row's admission);
     * otherwise, when its recovery chain already holds
       ``PINNED_RECOVERY_ADMISSION_LIMIT`` admissions: parked with one notice;
     * otherwise: handed back to ``owned`` by this exact runtime with a new
@@ -1382,10 +1430,11 @@ async def reserve_stale_pinned_admissions(
         runtime_attach_token=UUID(str(runtime_attach_token)),
     )
     stale = stale_pinned_admission_sql(process_generation="$3::uuid")
-    answered = stale_admission_answered_sql()
+    answered = pinned_admission_answered_sql()
+    later = later_pinned_admission_sql()
     rows = await conn.fetch(
         "SELECT delivery.*, message.seq, message.role, "
-        f"{answered} AS admission_answered "
+        f"{answered} AS admission_answered, {later} AS later_admission "
         "FROM thread_input_deliveries AS delivery "
         "JOIN thread_messages AS message ON message.id = delivery.message_id "
         "WHERE delivery.thread_id = $1 AND message.rewound_at IS NULL "
@@ -1398,10 +1447,15 @@ async def reserve_stale_pinned_admissions(
         int(thread.get("conversation_revision") or 0),
         runtime_uuid,
     )
-    outcome: dict[str, list[str]] = {"settled": [], "reserved": [], "parked": []}
+    outcome: dict[str, list[str]] = {
+        "settled": [],
+        "history": [],
+        "reserved": [],
+        "parked": [],
+    }
     for row in rows:
         delivery_id = row["delivery_id"]
-        if bool(row["admission_answered"]):
+        if bool(row["admission_answered"]) or bool(row["later_admission"]):
             settled = await conn.fetchval(
                 "UPDATE thread_input_deliveries SET state = 'settled', "
                 "settled_at = statement_timestamp(), "
@@ -1411,7 +1465,8 @@ async def reserve_stale_pinned_admissions(
                 delivery_id,
             )
             if settled is not None:
-                outcome["settled"].append(str(delivery_id))
+                key = "settled" if bool(row["admission_answered"]) else "history"
+                outcome[key].append(str(delivery_id))
             continue
         admissions, _ = await recovery_chain_admissions(conn, delivery_id=delivery_id)
         if admissions >= PINNED_RECOVERY_ADMISSION_LIMIT:

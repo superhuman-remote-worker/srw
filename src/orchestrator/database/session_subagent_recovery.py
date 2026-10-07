@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 from uuid import UUID
 
+from shared.persistent_input_delivery import turn_completed_frame_sql
 from shared.session_subagent_authority import (
     SessionParentAuthority,
     SessionParentAuthorityRefused,
@@ -182,18 +183,11 @@ async def load_recovery_parent_input(
 
 # The loop's ``turn.completed`` frame for turn ``$2`` of thread ``$1``,
 # journaled after the delegating AI row ``$3``.
-_TURN_COMPLETED_FRAME_SQL = """
-SELECT 1
-  FROM thread_events AS frame
- WHERE frame.thread_id = $1
-   AND frame.kind = 'turn.completed'
-   AND (frame.payload->>'turn_id') = $2::text
-   AND frame.created_at >= (
-       SELECT created_at
-         FROM thread_messages
-        WHERE id = $3
-   )
-"""
+_TURN_COMPLETED_FRAME_SQL = turn_completed_frame_sql(
+    thread="$1",
+    turn_id="$2::text",
+    after="(SELECT created_at FROM thread_messages WHERE id = $3)",
+)
 
 
 async def turn_completed_frame_journaled(
