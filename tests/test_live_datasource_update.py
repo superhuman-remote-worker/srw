@@ -1124,7 +1124,11 @@ class TestResetupDatasources:
         ):
             await session.resetup_datasources([repo_new])
 
-        clone.assert_called_once_with([repo_new], session.workspace_manager)
+        clone.assert_called_once_with(
+            [repo_new],
+            session.workspace_manager,
+            ssh_identity_status=session.workspace_ssh_identity_status,
+        )
         # Removal keeps the clone on disk (documented) but drops the
         # session-side registration.
         assert "old-repo" not in session.workspace_manager.source_repos
@@ -1211,9 +1215,85 @@ class TestResetupDatasources:
     async def test_noop_before_tool_setup(self):
         session = _make_session()
         session.tool_context = None
-        summary = await session.resetup_datasources([_ds("postgresql", "PG")])
+        identity = {"authority_id": "a", "private_key": "secret"}
+        summary = await session.resetup_datasources(
+            [_ds("postgresql", "PG")], workspace_ssh_identities=[identity]
+        )
         assert summary["added"] == []
+        assert "private_key" not in identity
         session.resetup_tools_for_backend.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_live_detach_retires_exactly_the_detached_ssh_identity(self):
+        """C1: a session owns its workspace, so detach retires that agent."""
+
+        def ssh(name, authority):
+            return {
+                **_ds("ssh_key", name),
+                "ssh_identity": {
+                    "alias": f"srw-repo-{authority}",
+                    "authority_id": authority,
+                },
+            }
+
+        kept, detached = ssh("Kept", "kept-id"), ssh("Detached", "detached-id")
+        session = _make_session(datasource_configs=[kept, detached])
+        session.workspace_ssh_identity_status = {
+            "kept-id": "ready",
+            "detached-id": "ready",
+        }
+        delivered = [{"authority_id": "kept-id", "private_key": "secret"}]
+        with (
+            patch(
+                "agent.core.datasource_setup.process_datasources",
+                return_value=({}, {}, []),
+            ),
+            patch("agent.core.datasource_setup.inject_workspace_facts"),
+            patch(
+                "shared.runtime.core.workspace_ssh_identity."
+                "retire_workspace_ssh_identities",
+                return_value=True,
+            ) as retire,
+            patch(
+                "shared.runtime.core.workspace_ssh_identity."
+                "materialize_workspace_ssh_identities",
+                return_value={"kept-id": "ready"},
+            ) as materialize,
+        ):
+            await session.resetup_datasources(
+                [kept], workspace_ssh_identities=delivered
+            )
+
+        retire.assert_called_once_with(
+            ["detached-id"], session.workspace_manager.backend
+        )
+        materialize.assert_called_once_with(
+            delivered, session.workspace_manager.backend
+        )
+        assert session.workspace_ssh_identity_status == {"kept-id": "ready"}
+
+    @pytest.mark.asyncio
+    async def test_rename_keeps_the_identity(self):
+        """Identity follows the connector id, not its (type, name) key."""
+        before = {
+            **_ds("ssh_key", "Old name"),
+            "ssh_identity": {"authority_id": "same-id"},
+        }
+        after = {**before, "name": "New name"}
+        session = _make_session(datasource_configs=[before])
+        with (
+            patch(
+                "agent.core.datasource_setup.process_datasources",
+                return_value=({}, {}, []),
+            ),
+            patch("agent.core.datasource_setup.inject_workspace_facts"),
+            patch(
+                "shared.runtime.core.workspace_ssh_identity."
+                "retire_workspace_ssh_identities"
+            ) as retire,
+        ):
+            await session.resetup_datasources([after])
+        retire.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

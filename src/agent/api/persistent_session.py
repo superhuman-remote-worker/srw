@@ -3035,8 +3035,53 @@ class PersistentSession:
             f"Re-derived {len(self.tools)} tools after backend swap ({backend_name})"
         )
 
+    async def _resetup_workspace_ssh_identities(
+        self,
+        old_configs: List[Dict[str, Any]],
+        new_configs: List[Dict[str, Any]],
+        workspace_ssh_identities: Optional[List[Dict[str, Any]]],
+    ) -> None:
+        """Retire detached connector identities, then (re)load the rest."""
+        from shared.runtime.core.workspace_ssh_identity import (
+            materialize_workspace_ssh_identities,
+            retire_workspace_ssh_identities,
+        )
+
+        def _authorities(configs: List[Dict[str, Any]]) -> set[str]:
+            return {
+                str(ds["ssh_identity"]["authority_id"])
+                for ds in configs
+                if isinstance(ds.get("ssh_identity"), dict)
+                and ds["ssh_identity"].get("authority_id")
+            }
+
+        backend = getattr(self.workspace_manager, "backend", None)
+        detached = sorted(_authorities(old_configs) - _authorities(new_configs))
+        if detached:
+            if backend is not None and await asyncio.to_thread(
+                retire_workspace_ssh_identities, detached, backend
+            ):
+                for authority in detached:
+                    self.workspace_ssh_identity_status.pop(authority, None)
+            else:
+                logger.warning(
+                    "Could not retire %d detached connector SSH identities; "
+                    "terminal teardown retires them",
+                    len(detached),
+                )
+        if workspace_ssh_identities:
+            self.workspace_ssh_identity_status.update(
+                await asyncio.to_thread(
+                    materialize_workspace_ssh_identities,
+                    workspace_ssh_identities,
+                    backend,
+                )
+            )
+
     async def resetup_datasources(
-        self, new_datasources: List[Dict[str, Any]]
+        self,
+        new_datasources: List[Dict[str, Any]],
+        workspace_ssh_identities: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Apply a live datasource selection change (live_session_settings.md
         Slice B).
@@ -3065,9 +3110,13 @@ class PersistentSession:
         holds a copy of. Existing kb entries pass through untouched; a changed
         kb selection takes effect on the next attach.
 
-        Repository removals keep their clone + SSH key on the workspace
-        (cheap honesty — scrubbing is not a security boundary) but drop the
-        ``source_repos`` registration. A live repository ADD whose clone name
+        Repository removals keep their clone on the workspace (cheap honesty
+        — scrubbing is not a security boundary) but drop the ``source_repos``
+        registration. A removed SSH connector (repository or ``ssh_key``) has
+        exactly its own workspace ssh-agent retired: the session owns its
+        workspace, so nothing else can still be using that identity. The
+        identities that stay are re-proven, and added ones loaded, from
+        ``workspace_ssh_identities`` before any clone. A live repository ADD whose clone name
         collides with an existing clone fails that one clone with a warning
         (the existing clone is never touched); a resume re-resolves suffixed
         names over the full list.
@@ -3075,6 +3124,8 @@ class PersistentSession:
         Args:
             new_datasources: Full datasource payload for the thread, as
                 returned by ``GET /api/agents/threads/{id}/workspace``.
+            workspace_ssh_identities: The same response's hidden connector
+                keys; consumed (keys popped and zeroed) here.
 
         Returns:
             Summary dict: ``added``/``removed`` display names (transcript
@@ -3092,6 +3143,9 @@ class PersistentSession:
 
         if not self.tool_context:
             logger.warning("resetup_datasources called before tool setup — skipping")
+            for identity in workspace_ssh_identities or []:
+                if isinstance(identity, dict):
+                    identity.pop("private_key", None)
             return {
                 "added": [],
                 "removed": [],
@@ -3104,6 +3158,10 @@ class PersistentSession:
         await asyncio.to_thread(
             install_workspace_credentials, new_configs, self.workspace_manager
         )
+        await self._resetup_workspace_ssh_identities(
+            old_configs, new_configs, workspace_ssh_identities
+        )
+        del workspace_ssh_identities
 
         # The internal payload strips datasource ids, so identity for the
         # add/remove summary is (type, name) — unique enough for display and
@@ -3158,7 +3216,11 @@ class PersistentSession:
         removed_repos = {_key(ds) for ds in removed if ds.get("type") == "repository"}
         if added_repos and self.workspace_manager:
             try:
-                clone_repository_datasources(added_repos, self.workspace_manager)
+                clone_repository_datasources(
+                    added_repos,
+                    self.workspace_manager,
+                    ssh_identity_status=self.workspace_ssh_identity_status,
+                )
             except Exception as e:
                 logger.warning("Live repository clone failed: %s", e)
         if removed_repos and self.workspace_manager:

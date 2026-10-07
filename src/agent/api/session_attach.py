@@ -1753,7 +1753,9 @@ class SessionAttachCoordinator:
             from agent.core.datasource_setup import clone_repository_datasources
 
             clone_repository_datasources(
-                repo_datasources, self._session.workspace_manager
+                repo_datasources,
+                self._session.workspace_manager,
+                ssh_identity_status=self._session.workspace_ssh_identity_status,
             )
 
         # README.md workspace-facts block (connectors, materials, layout) — after

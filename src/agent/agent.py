@@ -423,10 +423,13 @@ class UniversalAgent:
         self._datasource_clients: Dict[
             str, Any
         ] = {}  # Parent clients for cleanup (e.g. MongoClient)
-        # Manifest of materialized credential files (kubeconfig / ssh_key /
+        # Manifest of materialized credential files (kubeconfig /
         # generic_file). Populated by process_credential_files() at job start;
         # consumed by cleanup_credential_files() at job end.
         self._datasource_files_manifest: Optional[Dict[str, Any]] = None
+        # ``{authority_id: status}`` of the connector SSH identities loaded
+        # into workspace ssh-agents for this job (C1); credential-free.
+        self._workspace_ssh_identity_status: Dict[str, str] = {}
 
         # Orchestrator client (injected by app layer for delegation/reporting)
         self._orchestrator_client = None
@@ -4321,9 +4324,16 @@ class UniversalAgent:
             register_mcp_tools(None)
 
         if repo_datasources:
-            clone_repository_datasources(repo_datasources, ws)
+            clone_repository_datasources(
+                repo_datasources,
+                ws,
+                ssh_identity_status=getattr(
+                    self, "_workspace_ssh_identity_status", None
+                ),
+            )
 
-        # Materialize credential files (kubeconfig, ssh_key, generic_file).
+        # Materialize credential files (kubeconfig, generic_file; an ssh_key
+        # connector lives in a workspace ssh-agent instead).
         # Tracked in a manifest so _close_datasource_connections() can undo it.
         try:
             self._datasource_files_manifest = process_credential_files(ds_configs)

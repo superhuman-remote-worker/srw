@@ -122,30 +122,145 @@ class TestBackendClone:
         git_mgr.checkout_branch.assert_called_once_with("dev")
         assert ws.source_repos["repo"] is git_mgr
 
-    def test_ssh_auth_writes_key_on_backend_and_converts_url(self):
-        ws = make_workspace_manager()
-        ds = {
+    @staticmethod
+    def _ssh_entry(**row_over):
+        """An SSH-key repository as the REAL payload builder emits it."""
+        from shared.runtime.utils.ssh_key import generate_ed25519_keypair
+
+        row = {
+            "id": "00000000-0000-4000-8000-0000000000d1",
             "type": "repository",
             "name": "My Repo",
             "connection_url": "https://github.com/org/repo.git",
+            "credentials": {
+                "auth_method": "ssh",
+                "ssh_key": generate_ed25519_keypair().private_key,
+            },
+            "config": {"forge": "github"},
+            "project_read_only": False,
+            **row_over,
+        }
+        (entry,) = agent_payload(row)
+        return entry
+
+    def test_ssh_repository_clones_its_alias_and_writes_no_key(self):
+        """C1: no key file, no appended Host block, clone the opaque alias."""
+        ws = make_workspace_manager()
+        ds = self._ssh_entry()
+        alias = ds["ssh_identity"]["alias"]
+        status = {ds["ssh_identity"]["authority_id"]: "ready"}
+        with patch(
+            "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
+        ) as mock_clone:
+            clone_repository_datasources([ds], ws, ssh_identity_status=status)
+
+        assert mock_clone.call_args[0][0] == f"ssh://{alias}/org/repo.git"
+        ws.backend.write_home_file.assert_not_called()
+        shell_cmds = [c[0][0] for c in ws.backend.shell_run.call_args_list]
+        assert not any(">> ~/.ssh/config" in cmd for cmd in shell_cmds)
+        assert not any("PRIVATE KEY" in cmd for cmd in shell_cmds)
+        # A pre-agent key file is deleted.
+        assert "rm -f -- /home/agent-host/.ssh/repo_my-repo" in shell_cmds
+        assert ws.source_repo_meta["repo"]["token"] == ""
+
+    def test_scp_url_reaches_its_real_host(self):
+        """The scp form used to write ``Host localhost``."""
+        ds = self._ssh_entry(connection_url="git@github.com:org/repo.git")
+        assert ds["ssh_identity"]["host"] == "github.com"
+        assert ds["ssh_identity"]["clone_url"].endswith("/org/repo.git")
+
+    @staticmethod
+    def _warnings(log) -> str:
+        return "\n".join(
+            call.args[0] % call.args[1:] for call in log.warning.call_args_list
+        )
+
+    @pytest.mark.parametrize("materialized", [True, False])
+    def test_unloaded_identity_is_skipped_not_cloned_without_its_key(
+        self, materialized
+    ):
+        ws = make_workspace_manager()
+        ds = self._ssh_entry()
+        status = (
+            {ds["ssh_identity"]["authority_id"]: "workspace_ssh_identity_load_failed"}
+            if materialized
+            else None
+        )
+        with (
+            patch("agent.managers.git_manager.GitManager.clone") as mock_clone,
+            patch("agent.core.datasource_setup.logger") as log,
+        ):
+            clone_repository_datasources([ds], ws, ssh_identity_status=status)
+        if not materialized:
+            # No materializer ran: the alias is still the only clone target.
+            assert mock_clone.call_args[0][0].startswith("ssh://srw-repo-")
+            return
+        mock_clone.assert_not_called()
+        assert ws.source_repos == {}
+        assert "load_failed" in self._warnings(log)
+
+    def test_unavailable_or_legacy_ssh_entries_are_skipped(self):
+        ws = make_workspace_manager()
+        unavailable = self._ssh_entry(
+            credentials={"auth_method": "ssh", "ssh_key": "not a key"}
+        )
+        # What a pre-C1 orchestrator sends: the key itself, no identity.
+        legacy = {
+            "type": "repository",
+            "name": "Legacy",
+            "connection_url": "git@github.com:org/legacy.git",
             "credentials": {"auth_method": "ssh", "ssh_key": "KEYMATERIAL"},
+        }
+        with (
+            patch("agent.managers.git_manager.GitManager.clone") as mock_clone,
+            patch("agent.core.datasource_setup.logger") as log,
+        ):
+            clone_repository_datasources(
+                [unavailable, legacy], ws, ssh_identity_status={}
+            )
+        mock_clone.assert_not_called()
+        ws.backend.write_home_file.assert_not_called()
+        assert "Invalid SSH key" in self._warnings(log)
+        assert "no workspace SSH identity" in self._warnings(log)
+
+    def test_reused_checkout_is_pointed_at_the_alias(self):
+        ws = make_workspace_manager()
+        ws.backend.exists = MagicMock(return_value=True)
+        ds = self._ssh_entry()
+        status = {ds["ssh_identity"]["authority_id"]: "ready"}
+        with (
+            patch("agent.managers.git_manager.GitManager.clone") as mock_clone,
+            patch(
+                "agent.managers.git_manager.GitManager.add_remote", return_value=True
+            ) as add_remote,
+        ):
+            clone_repository_datasources([ds], ws, ssh_identity_status=status)
+
+        mock_clone.assert_not_called()
+        add_remote.assert_called_once_with("origin", ds["ssh_identity"]["clone_url"])
+        shell_cmds = [c[0][0] for c in ws.backend.shell_run.call_args_list]
+        assert "rm -f -- /home/agent-host/.ssh/repo_my-repo" in shell_cmds
+        assert "repo" in ws.source_repos
+
+    def test_two_deploy_keys_on_one_host_clone_through_distinct_aliases(self):
+        ws = make_workspace_manager()
+        first = self._ssh_entry()
+        second = self._ssh_entry(
+            id="00000000-0000-4000-8000-0000000000d2",
+            name="Other Repo",
+            connection_url="git@github.com:org/other.git",
+        )
+        status = {
+            entry["ssh_identity"]["authority_id"]: "ready" for entry in (first, second)
         }
         with patch(
             "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
         ) as mock_clone:
-            clone_repository_datasources([ds], ws)
-
-        # Key written to the workspace home (normalized with trailing newline)
-        ws.backend.write_home_file.assert_called_once_with(
-            ".ssh/repo_my-repo", "KEYMATERIAL\n"
-        )
-        # chmod + ssh config appended via shell on the workspace
-        shell_cmds = [c[0][0] for c in ws.backend.shell_run.call_args_list]
-        assert any("mkdir -p ~/.ssh" in cmd for cmd in shell_cmds)
-        assert any("chmod 600" in cmd for cmd in shell_cmds)
-        assert any(">> ~/.ssh/config" in cmd for cmd in shell_cmds)
-        # HTTPS URL converted to SSH form so git uses the key
-        assert mock_clone.call_args[0][0] == "git@github.com:org/repo.git"
+            clone_repository_datasources(
+                [first, second], ws, ssh_identity_status=status
+            )
+        urls = [call[0][0] for call in mock_clone.call_args_list]
+        assert len({url.split("/")[2] for url in urls}) == 2
 
     def test_name_collision_gets_suffix(self):
         ws = make_workspace_manager()
@@ -677,6 +792,45 @@ class TestWorkspaceFactsRepositoryLine:
     def test_read_only_falls_back_to_the_payload_flag_without_meta(self):
         content = self._render(token_ds(name="Mirror", project_read_only=True))
         assert "read-only — only repo_pull/repo_pr_status" in content
+
+    def test_ssh_repository_names_its_alias(self):
+        ds = TestBackendClone._ssh_entry()
+        content = self._render(ds)
+        assert (
+            f"git uses SSH alias `{ds['ssh_identity']['alias']}`, whose key an "
+            "ssh-agent holds (never on disk)"
+        ) in content
+
+    def test_ssh_key_lines_say_how_to_use_the_agent(self):
+        from shared.runtime.utils.ssh_key import generate_ed25519_keypair
+
+        def entry(config):
+            (payload,) = agent_payload(
+                {
+                    "id": "00000000-0000-4000-8000-0000000000e1",
+                    "type": "ssh_key",
+                    "name": "Bastion",
+                    "credentials": {
+                        "files": [{"contents": generate_ed25519_keypair().private_key}]
+                    },
+                    "config": config,
+                    "project_read_only": False,
+                }
+            )
+            return payload
+
+        with_host = entry({"host": "bastion.example.com", "user": "ops", "port": 2200})
+        content = self._render(with_host)
+        assert "`ssh ops@bastion.example.com` (port 2200) uses it" in content
+        assert "never written to disk" in content
+        assert "~/.ssh/bastion" not in content
+
+        without_host = entry({})
+        slug = without_host["ssh_identity"]["alias"].removeprefix("srw-repo-")
+        assert (
+            f"ssh -o IdentityAgent=~/.ssh/srw-managed/sockets/{slug}.sock"
+            in self._render(without_host)
+        )
 
 
 class TestProcessDatasourcesRepoGuard:

@@ -10408,6 +10408,9 @@ async def _handle_config_update(
         # attach converges). Credentials never ride config_override — this
         # internal endpoint re-injects them per fetch.
         new_ds_payload: Optional[List[Dict[str, Any]]] = None
+        # Hidden connector SSH keys from the same response; consumed (popped
+        # and zeroed) by resetup_datasources, never merged into any config.
+        new_ssh_identities: Optional[List[Dict[str, Any]]] = None
         if ds_update:
             ws_info = await _orchestrator_client.get_thread_workspace(
                 _session_identity.thread_id
@@ -10423,6 +10426,7 @@ async def _handle_config_update(
                 )
                 return
             new_ds_payload = ws_info.get("datasources") or []
+            new_ssh_identities = ws_info.pop("workspace_ssh_identities", None)
 
         # Live `config.update` is the same raw-override shape as the legacy
         # attach path above; normalise before both the merge and the markers.
@@ -10511,7 +10515,11 @@ async def _handle_config_update(
             # also covers a tools fragment riding the same frame. Replaced
             # connections stay open until the in-flight turn (if any) ends —
             # bound tools captured them in closures at load time.
-            ds_summary = await _session.resetup_datasources(new_ds_payload or [])
+            ds_summary = await _session.resetup_datasources(
+                new_ds_payload or [],
+                workspace_ssh_identities=new_ssh_identities,
+            )
+            new_ssh_identities = None
             stale_conns = ds_summary.pop("stale_connections", {})
             stale_clients = ds_summary.pop("stale_clients", {})
             if stale_conns or stale_clients:

@@ -341,7 +341,8 @@ def process_credential_files(
 ) -> Dict[str, Any]:
     """Materialize ``credentials.files[]`` for credential-file datasource types.
 
-    For each ``kubeconfig``/``ssh_key``/``generic_file`` datasource:
+    For each ``kubeconfig``/``generic_file`` datasource (``ssh_key`` lives in
+    a workspace ``ssh-agent`` and is skipped here):
       - ``mkdir -p`` the parent (recording new dirs in the manifest).
       - For ``kubeconfig`` entries, prefix cluster/user/context names with
         the datasource slug so multi-cluster merging is collision-free.
@@ -379,7 +380,10 @@ def process_credential_files(
 
     for ds in ds_configs:
         ds_type = ds.get("type")
-        if ds_type not in CREDENTIAL_FILE_TYPES:
+        # An ssh_key connector's key never reaches the agent pod or the
+        # workspace disk: it is loaded into a workspace ssh-agent instead
+        # (``shared.runtime.core.workspace_ssh_identity``).
+        if ds_type not in CREDENTIAL_FILE_TYPES or ds_type == "ssh_key":
             continue
         creds = ds.get("credentials") or {}
         files = creds.get("files") or []
@@ -662,16 +666,48 @@ def create_datasource_connection(
 # ---------------------------------------------------------------------------
 
 
+def _ssh_clone_target(
+    ds: Dict[str, Any], ssh_identity_status: Optional[Dict[str, str]]
+) -> tuple[Optional[str], str]:
+    """``(clone_url, "")`` for a loaded SSH identity, else ``(None, reason)``."""
+
+    identity = ds.get("ssh_identity")
+    if not isinstance(identity, dict):
+        return None, "no workspace SSH identity was delivered for it"
+    if identity.get("unavailable"):
+        return None, str(identity["unavailable"])
+    clone_url = str(identity.get("clone_url") or "")
+    alias = str(identity.get("alias") or "")
+    if not re.fullmatch(r"srw-repo-[a-f0-9]{32}", alias) or not re.fullmatch(
+        rf"ssh://{alias}/[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*", clone_url
+    ):
+        return None, "its SSH identity is malformed"
+    if ssh_identity_status is not None:
+        status = ssh_identity_status.get(str(identity.get("authority_id") or ""))
+        if status != "ready":
+            return None, f"its key is not loaded ({status or 'not delivered'})"
+    return clone_url, ""
+
+
 def clone_repository_datasources(
     repo_datasources: List[Dict[str, Any]],
     workspace_manager: Any,
+    *,
+    ssh_identity_status: Optional[Dict[str, str]] = None,
 ) -> None:
     """Clone repository datasources onto the workspace backend.
 
-    Every operation runs on the workspace: SSH key material lands in the
-    workspace home via ``backend.write_home_file``, host config via
-    ``backend.shell_run``, and the clone itself is
+    Every operation runs on the workspace and the clone itself is
     ``GitManager.clone(backend=...)`` (git on the workspace over SSH).
+
+    An SSH-key repository is cloned from ``ssh://srw-repo-<slug>/<path>``, an
+    opaque alias whose key a dedicated workspace ``ssh-agent`` holds
+    (``shared.runtime.core.workspace_ssh_identity``); no key file is written
+    and no ``Host`` block is appended. ``ssh_identity_status`` is the
+    materializer's ``{authority_id: status}``: a connector whose identity did
+    not load is skipped with a warning, never cloned without its key. A
+    reused checkout gets its origin reset to the alias and a pre-agent
+    ``~/.ssh/repo_<slug>`` key file is deleted.
 
     There is deliberately NO agent-local fallback: without a shell-capable
     backend the datasources are skipped with an error. Repository
@@ -682,7 +718,11 @@ def clone_repository_datasources(
         repo_datasources: Datasource config dicts of type "repository".
         workspace_manager: WorkspaceManager whose backend hosts the clones;
             successful clones are registered in its ``source_repos``.
+        ssh_identity_status: Which SSH identities the workspace agent holds;
+            ``None`` when the caller did not materialize any.
     """
+    if not isinstance(ssh_identity_status, dict):
+        ssh_identity_status = None
     if not repo_datasources:
         return
 
@@ -698,7 +738,6 @@ def clone_repository_datasources(
         return
 
     from agent.managers.git_manager import GitManager
-    from shared.runtime.utils.ssh_key import normalize_private_key
 
     # The workspace root is itself a durable Git repository. Without this
     # exclusion, its next checkpoint records each nested checkout as a
@@ -731,9 +770,6 @@ def clone_repository_datasources(
     clone_names = resolve_repo_clone_names(repo_datasources)
     for ds, repo_name in zip(repo_datasources, clone_names):
         # ds_name is the safe form of the user-supplied datasource label.
-        # It stays the SSH key filename and SSH config alias so that two
-        # datasources with different keys for the same repo don't clobber
-        # each other's auth material.
         ds_name = (
             re.sub(r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()).strip("-")
             or "repo"
@@ -743,68 +779,34 @@ def clone_repository_datasources(
             branch = ds.get("default_branch")
             creds = ds.get("credentials") or {}
 
-            # Determine auth method: explicit field, or infer from
-            # credentials keys (ssh_key present → ssh).
+            # Determine auth method: explicit field, or infer from the
+            # delivered SSH identity / credentials keys.
             auth_method = creds.get("auth_method")
             if not auth_method:
-                if creds.get("ssh_key"):
+                if ds.get("ssh_identity") is not None or creds.get("ssh_key"):
                     auth_method = "ssh"
                 elif creds.get("token"):
                     auth_method = "token"
 
-            if auth_method == "ssh" and creds.get("ssh_key"):
-                # Normalize defensively: orchestrator validation already
-                # runs on save, but legacy rows in the datasources table
-                # may predate it. Cheap insurance.
-                ssh_key_text = normalize_private_key(creds["ssh_key"])
-
-                parsed = urlparse(repo_url)
-                host = parsed.hostname or "localhost"
-
-                # Write SSH key and configure on the workspace.
-                # write_home_file lands the key under $HOME without
-                # tripping the workspace-boundary check on write_file;
-                # resolve_home_path gives us the absolute path for the
-                # subsequent chmod and SSH config IdentityFile entry.
-                rel_key = f".ssh/repo_{ds_name}"
-                key_path = backend.resolve_home_path(rel_key)
+            ssh_clone_url: Optional[str] = None
+            if auth_method == "ssh":
+                ssh_clone_url, reason = _ssh_clone_target(ds, ssh_identity_status)
+                # A key file a pre-agent clone wrote is never read again: the
+                # alias's agent holds the key now. Delete it either way.
                 backend.shell_run(
-                    "mkdir -p ~/.ssh && chmod 700 ~/.ssh",
+                    "rm -f -- "
+                    + shlex.quote(backend.resolve_home_path(f".ssh/repo_{ds_name}")),
                     timeout=10,
                     tab_name="git",
                 )
-                backend.write_home_file(rel_key, ssh_key_text)
-                backend.shell_run(
-                    f"chmod 600 {shlex.quote(key_path)}",
-                    timeout=10,
-                    tab_name="git",
-                )
-                # Append SSH config for this host
-                ssh_config = (
-                    f"\nHost {host}\n"
-                    f"  IdentityFile {key_path}\n"
-                    f"  StrictHostKeyChecking accept-new\n"
-                )
-                backend.shell_run(
-                    f"printf %s {shlex.quote(ssh_config)} >> ~/.ssh/config",
-                    timeout=10,
-                    tab_name="git",
-                )
-
-                # Convert HTTPS URL to SSH URL so git uses the key.
-                # strip("/") handles trailing slashes too — datasource URLs
-                # entered as `.../repo/` would otherwise become `repo/.git`,
-                # which GitHub's SSH server rejects.
-                if parsed.scheme in ("http", "https"):
-                    path = parsed.path.strip("/")
-                    if not path.endswith(".git"):
-                        path += ".git"
-                    repo_url = f"git@{host}:{path}"
-                    logger.info(
-                        "Converted HTTPS URL to SSH for %s: %s",
+                if ssh_clone_url is None:
+                    logger.warning(
+                        "Skipping SSH repository datasource %r: %s",
                         ds_name,
-                        repo_url,
+                        reason,
                     )
+                    continue
+                repo_url = ssh_clone_url
 
             elif (auth_method == "token" or not auth_method) and creds.get("token"):
                 parsed = urlparse(repo_url)
@@ -826,6 +828,15 @@ def clone_repository_datasources(
                     backend=backend,
                     remote_cwd=remote_cwd,
                 )
+                if ssh_clone_url is not None and not git_mgr.add_remote(
+                    "origin", ssh_clone_url
+                ):
+                    # A pre-agent checkout points at the real host and its
+                    # deleted key file; leaving it would fail every fetch.
+                    logger.warning(
+                        "Could not point reused repos/%s at its SSH identity",
+                        repo_name,
+                    )
                 logger.info(
                     "Reusing repository datasource %r from repos/%s",
                     ds_name,
@@ -976,6 +987,49 @@ def _repo_meta(workspace_manager: Any, clone_name: str) -> Dict[str, Any]:
     return entry if isinstance(entry, dict) else {}
 
 
+def _ssh_identity_note(ds: Dict[str, Any]) -> str:
+    """Suffix for an SSH-key repository line: how git reaches it."""
+
+    identity = ds.get("ssh_identity")
+    if not isinstance(identity, dict):
+        return ""
+    if identity.get("unavailable"):
+        return f"; not available: {identity['unavailable']}"
+    return (
+        f"; git uses SSH alias `{identity.get('alias')}`, whose key an "
+        "ssh-agent holds (never on disk)"
+    )
+
+
+def _ssh_key_usage(ds: Dict[str, Any]) -> str:
+    """How the agent uses an ``ssh_key`` connector held by an ssh-agent."""
+
+    identity = ds.get("ssh_identity")
+    if not isinstance(identity, dict) or not identity.get("alias"):
+        return "not available: its key was not delivered to this workspace."
+    if identity.get("unavailable"):
+        return f"not available: {identity['unavailable']}."
+    fingerprint = (
+        f" Key `{identity.get('fingerprint')}`." if identity.get("fingerprint") else ""
+    )
+    held = "The key is held by an ssh-agent and never written to disk."
+    host = identity.get("host")
+    if host:
+        user = identity.get("user")
+        port = identity.get("port")
+        target = f"{user}@{host}" if user else str(host)
+        port_clause = f" (port {port})" if port and port != 22 else ""
+        return (
+            f"`ssh {target}`{port_clause} uses it, as does the alias "
+            f"`{identity['alias']}`. {held}{fingerprint}"
+        )
+    slug = str(identity["alias"]).removeprefix("srw-repo-")
+    return (
+        "use it with `ssh -o IdentityAgent=~/.ssh/srw-managed/sockets/"
+        f"{slug}.sock <user>@<host>`. {held}{fingerprint}"
+    )
+
+
 def _render_connector_lines(
     ds_configs: List[Dict[str, Any]],
     workspace_manager: Any,
@@ -1042,6 +1096,7 @@ def _render_connector_lines(
                 f"- **{ds.get('name')}** — repository cloned at "
                 f'`./repos/{clone_name}/` (use `repo="{clone_name}"` with the '
                 f"repo_* tools){branch_clause}; {access}{_declared_ro_note(ds)}"
+                + _ssh_identity_note(ds)
             )
         lines.append("")
 
@@ -1109,10 +1164,7 @@ def _render_connector_lines(
                     f"contexts prefixed `{slug}-*`. Try `kubectl config get-contexts`."
                 )
             elif ds_type == "ssh_key":
-                lines.append(
-                    f"- **{name}** (ssh_key) — private key at `~/.ssh/{slug}`. "
-                    f"Add a host block in `~/.ssh/config` to use it."
-                )
+                lines.append(f"- **{name}** (ssh_key) — " + _ssh_key_usage(ds))
             else:  # generic_file
                 paths = (
                     ", ".join(f"`{f.get('target_path')}`" for f in files) or "<none>"

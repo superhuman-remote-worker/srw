@@ -137,9 +137,29 @@ contexts:
 
 
 class TestProcessCredentialFiles:
-    def test_writes_ssh_key_with_correct_mode(self, tmp_path: Path):
+    def test_ssh_key_is_never_written_to_disk(self, tmp_path: Path):
+        """C1: an ssh_key connector lives in a workspace ssh-agent instead."""
         ds = {
             "type": "ssh_key",
+            "name": "Github",
+            "credentials": {
+                "files": [
+                    {
+                        "name": "github",
+                        "contents": "----PRIVATE----",
+                        "target_path": "/home/srw/.ssh/github",
+                        "mode": "0600",
+                    }
+                ]
+            },
+        }
+        manifest = process_credential_files([ds], home_dir=str(tmp_path))
+        assert not (tmp_path / ".ssh").exists()
+        assert manifest == {"files": [], "dirs": [], "env_vars": []}
+
+    def test_writes_file_with_correct_mode(self, tmp_path: Path):
+        ds = {
+            "type": "generic_file",
             "name": "Github",
             "credentials": {
                 "files": [
@@ -196,7 +216,7 @@ class TestProcessCredentialFiles:
         target.parent.mkdir(parents=True)
         target.write_text("DO NOT OVERWRITE")
         ds = {
-            "type": "ssh_key",
+            "type": "generic_file",
             "name": "Github",
             "credentials": {
                 "files": [
@@ -254,7 +274,7 @@ class TestCleanup:
         (ssh_dir / "known_hosts").write_text("pre-existing")
 
         ds = {
-            "type": "ssh_key",
+            "type": "generic_file",
             "name": "Github",
             "credentials": {
                 "files": [
