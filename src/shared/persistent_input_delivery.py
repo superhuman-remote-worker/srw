@@ -30,6 +30,11 @@ PINNED_RECOVERY_ADMISSION_LIMIT = 5
 # the owner's retry (``retry_parked_pinned_inputs``) re-arms it.
 PINNED_RECOVERY_PARK_REASON = "max_attempts"
 PINNED_RECOVERY_RETRY_REASON = "owner_retry"
+# The pinned admission CAS's count assignments (a fragment of its SET list).
+PINNED_ADMISSION_COUNT_INCREMENT = "admission_count = delivery.admission_count + 1, "
+PINNED_ADMISSION_COUNT_DECREMENT = (
+    "admission_count = GREATEST(delivery.admission_count - 1, 0), "
+)
 PINNED_RECOVERY_PARK_NOTICE = (
     "This input was stopped after {attempts} attempts. Each attempt was cut "
     "short because the process running this session was replaced, so it is "
@@ -1637,8 +1642,8 @@ async def transition_input_delivery(
         assignments = (
             "state = 'admitted', admitted_at = statement_timestamp(), "
             "admitted_turn_number = $6, deferred_reason = NULL, "
-            "admission_count = delivery.admission_count + 1, "
-            "deferred_at = NULL, updated_at = statement_timestamp()"
+            + PINNED_ADMISSION_COUNT_INCREMENT
+            + "deferred_at = NULL, updated_at = statement_timestamp()"
         )
     elif transition == "settled":
         states = ("admitted",)
@@ -1657,8 +1662,8 @@ async def transition_input_delivery(
         states = ("admitted",)
         assignments = (
             "state = 'deferred', admitted_at = NULL, admitted_turn_number = NULL, "
-            "admission_count = GREATEST(delivery.admission_count - 1, 0), "
-            "deferred_reason = LEFT(COALESCE($7, 'provider_not_started'), 120), "
+            + PINNED_ADMISSION_COUNT_DECREMENT
+            + "deferred_reason = LEFT(COALESCE($7, 'provider_not_started'), 120), "
             "deferred_at = statement_timestamp(), queued_at = NULL, "
             "updated_at = statement_timestamp()"
         )

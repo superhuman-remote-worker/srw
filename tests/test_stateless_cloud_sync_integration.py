@@ -1378,6 +1378,11 @@ async def test_none_agent_cloud_suppression_is_stateless_only(
             AsyncMock(return_value=set()),
         ) as reclaim_pinned,
         patch.object(
+            papp._session_attach,
+            "_reserve_stale_pinned_admissions",
+            AsyncMock(),
+        ) as reserve_pinned,
+        patch.object(
             papp, "_resolve_event_journal_epoch", AsyncMock(return_value=(1, 0))
         ),
         patch.object(papp, "_OrderedPersistentEventWriter") as writer_cls,
@@ -1406,8 +1411,10 @@ async def test_none_agent_cloud_suppression_is_stateless_only(
         workspace_sync.pull_all.assert_not_awaited()
     if stateless:
         reclaim_pinned.assert_not_awaited()
+        reserve_pinned.assert_not_awaited()
     else:
         reclaim_pinned.assert_awaited_once_with()
+        reserve_pinned.assert_awaited_once_with()
     writer_cls.assert_called_once()
 
 

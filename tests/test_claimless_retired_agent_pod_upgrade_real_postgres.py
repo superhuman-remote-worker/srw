@@ -69,6 +69,10 @@ from orchestrator.services.pinned_agent_authority import (
 from orchestrator.services.pinned_k8s_effect import PINNED_AUTHORITY_FINALIZER
 from orchestrator.services.session_router import SessionRouterService
 from orchestrator.security import crypto
+from shared.persistent_input_delivery import (
+    PINNED_ADMISSION_COUNT_DECREMENT,
+    PINNED_ADMISSION_COUNT_INCREMENT,
+)
 from tests import test_pinned_permanent_warm_release_real_postgres as upstream_warm
 from tests import test_self_ended_pinned_retirement_real_postgres as self_end
 
@@ -434,7 +438,52 @@ def _sorted(data):
     }
 
 
+class _EraConnection:
+    """A pool connection that writes what the replayed history's agent wrote.
+
+    The lives before each upgrade stand in for that era's agent with today's
+    writers. Every replayed history predates 0337, whose pinned admission CAS
+    also counts the admission (``admission_count``); until the upgrade adds
+    the column, the CAS runs without that assignment, as it did then.
+    """
+
+    _FRAGMENTS = (PINNED_ADMISSION_COUNT_INCREMENT, PINNED_ADMISSION_COUNT_DECREMENT)
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    async def _era(self, query):
+        if any(fragment in query for fragment in self._FRAGMENTS) and not (
+            await self._conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema='public' "
+                "AND table_name='thread_input_deliveries' "
+                "AND column_name='admission_count')"
+            )
+        ):
+            for fragment in self._FRAGMENTS:
+                query = query.replace(fragment, "")
+        return query
+
+    async def execute(self, query, *args, **kwargs):
+        return await self._conn.execute(await self._era(query), *args, **kwargs)
+
+    async def fetch(self, query, *args, **kwargs):
+        return await self._conn.fetch(await self._era(query), *args, **kwargs)
+
+    async def fetchrow(self, query, *args, **kwargs):
+        return await self._conn.fetchrow(await self._era(query), *args, **kwargs)
+
+    async def fetchval(self, query, *args, **kwargs):
+        return await self._conn.fetchval(await self._era(query), *args, **kwargs)
+
+
 async def _open_store(database, monkeypatch):
+    from contextlib import asynccontextmanager
+
     monkeypatch.setenv("EXPERTS_DB_ENABLED", "false")
     monkeypatch.setenv("APP_ENCRYPTION_KEY", "P" * 32)
     crypto.reset_cipher_cache()
@@ -442,6 +491,14 @@ async def _open_store(database, monkeypatch):
         connection_string=database.admin_dsn, min_connections=1, max_connections=10
     )
     await db.connect()
+    original = db.acquire
+
+    @asynccontextmanager
+    async def acquire(*args, **kwargs):
+        async with original(*args, **kwargs) as conn:
+            yield _EraConnection(conn)
+
+    monkeypatch.setattr(db, "acquire", acquire)
     return db
 
 
