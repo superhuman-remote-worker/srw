@@ -9730,6 +9730,8 @@ async def _compact_session_manually(
         keep_recent_override=keep_recent_override,
         trigger="manual",
         focus=focus or None,
+        # A manual /compact: native where the family is (compaction WP6).
+        allow_native=True,
     )
     # summarize_and_compact returns a LangGraph reducer delta; this
     # transport has no reducer, so strip the RemoveMessage markers before

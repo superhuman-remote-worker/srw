@@ -87,6 +87,7 @@ Hand-maintained; add a row whenever a prompt adopts third-party text.
 | Our files | Source | License | Changes |
 |---|---|---|---|
 | The two compaction paragraphs ("When you run out of context…", "Compaction does not end the task…") in `config/prompts/systemprompt_gpt_5.txt`, `systemprompt_interactive_gpt_5.txt`, `systemprompt_gpt_6_1_sol.txt` and `systemprompt_interactive_gpt_6_1_sol.txt` | [OpenAI Codex](https://github.com/openai/codex), `codex-rs/models-manager/models.json`, the GPT-6 `instructions_template` ("Working with the user"), commit `a6baf8867cb4` | Apache-2.0 | Removed the clause "but you will still see all prior user requests" (SRW does not keep them) |
+| `config/prompts/compaction/codex/prompt.md` (the native compaction instruction for GPT models) | [OpenAI Codex](https://github.com/openai/codex), `codex-rs/prompts/templates/compact/prompt.md`, commit `a6baf8867cb4` | Apache-2.0 | Added a last line asking for the summary only, without tool calls (SRW keeps the tools in the request) |
 
 NOTICE of OpenAI Codex (the part that applies):
 

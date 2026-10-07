@@ -1767,6 +1767,55 @@ class AuxiliaryLLM:
                 f"Failed to archive auxiliary call ({task.__class__.__name__}): {e}"
             )
 
+    def archive_native_compaction(
+        self,
+        messages: List[BaseMessage],
+        *,
+        model: str,
+        latency_ms: int,
+        metadata: dict,
+        response: Optional[AIMessage] = None,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        """Archive a native compaction fork as a summarization call (WP6).
+
+        The working model ran it, not this client, but it is the same kind of
+        call: one ``llm_requests`` row with ``call_type='summarization'`` and
+        ``SummarizeTask``, so the summary audit sees both strategies.
+        ``metadata`` says which (``strategy``, ``recipe``). Pass the reply, or
+        the error the call raised. Fire-and-forget — never raises.
+        """
+        if not self._archiver or not self._job_id:
+            return
+        meta = {"task_class": "SummarizeTask", **metadata}
+        call_type = _TASK_CALL_TYPES["SummarizeTask"]
+        try:
+            if error is not None:
+                self._archiver.archive_error(
+                    job_id=self._job_id,
+                    agent_type=self._agent_type,
+                    messages=messages,
+                    model=model,
+                    error=str(error),
+                    error_type=type(error).__name__,
+                    latency_ms=latency_ms,
+                    call_type=call_type,
+                    auxiliary_metadata=meta,
+                )
+            elif response is not None:
+                self._archiver.archive(
+                    job_id=self._job_id,
+                    agent_type=self._agent_type,
+                    messages=messages,
+                    response=response,
+                    model=model,
+                    latency_ms=latency_ms,
+                    call_type=call_type,
+                    auxiliary_metadata=meta,
+                )
+        except Exception as e:
+            logger.warning(f"Failed to archive a native compaction call: {e}")
+
     def _archive_error(
         self,
         task: AuxTask,

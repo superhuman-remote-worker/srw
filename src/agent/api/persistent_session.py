@@ -3238,6 +3238,9 @@ class PersistentSession:
             model_max_context_tokens=lim.model_max_context_tokens,
             # Per-family image-token estimator (matrix settings.image_tokens).
             image_tokens=lim.image_tokens,
+            # Native compaction where the family uses it (WP6); a model swap
+            # rebuilds this from the new model's config.
+            compaction=getattr(cfg.llm, "compaction", None),
         )
 
     def _setup_context_manager(self) -> None:
