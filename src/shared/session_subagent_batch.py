@@ -239,7 +239,14 @@ def result_metrics(
     subagent_status: str | None = None,
     report_path: str | None = None,
 ) -> dict[str, Any]:
-    """``thread_messages.metrics`` of one tool result a settle writes."""
+    """``thread_messages.metrics`` of one tool result a settle writes.
+
+    ``delivery_id`` names the turn's batch continuation
+    (``session_subagent_batch_delivery_id``). It may name a delivery that has
+    no row: when only the turn's ``turn.completed`` frame proved the turn
+    ended, the results are written and no continuation follows. Never join
+    on it expecting a continuation.
+    """
 
     if result_class not in RESULT_CLASS_BY_CALL_CLASS.values():
         raise ValueError(f"unknown recovered result class {result_class!r}")

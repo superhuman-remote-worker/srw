@@ -56,6 +56,7 @@ from orchestrator.database.dispatch_discovery import (
     JobDiscoveryCursor,
     discovery_page_bounds,
 )
+from shared.session_subagent_batch import CALL_ENDED, CALL_LIVE
 from orchestrator.database.session_subagent_recovery import (
     advance_recovery_watermark,
     delivery_disposition,
@@ -64,9 +65,12 @@ from orchestrator.database.session_subagent_recovery import (
     load_recovery_parent_input,
     parent_turn_completed as recovered_turn_completed,
     plan_recovery_turns,
+    recovery_input_continued,
     settle_recovery_source,
     settle_session_subagent_batch as _settle_session_subagent_batch,
     stamp_recovered_child,
+    turn_completed_frame_journaled,
+    write_recovered_result,
 )
 from orchestrator.database.container_startup_stage import (
     BoundPodObserved,
@@ -38038,7 +38042,7 @@ class PostgresDB:
                     SELECT runtime_generation, status, subagent_status,
                            subagent_outcome, subagent_error, report_path,
                            total_turns, total_tokens, subagent_handle,
-                           parent_tool_call_id, metadata
+                           subagent_type, parent_tool_call_id, metadata
                       FROM threads
                      WHERE id = $1
                        AND kind = 'subagent'
@@ -38066,6 +38070,8 @@ class PostgresDB:
                     )
                 supersedes_input_seq: int | None = None
                 recovery_turn_number: int | None = None
+                own_delivery_exists = False
+                frame_only = False
                 source_delivery_state: str | None = None
                 source_already_complete = False
                 parent_iteration: int | None = None
@@ -38163,10 +38169,9 @@ class PostgresDB:
                         parent_iteration,
                         int(parent_ai_seq),
                     )
-                    delivered_by_tool_message = False
-                    parent_turn_completed = False
-                    if parent_result_seq is not None and child["status"] == "ended":
-                        delivered_by_tool_message = not await conn.fetchval(
+                    # This child's own continuation, from an earlier attempt.
+                    own_delivery_exists = bool(
+                        await conn.fetchval(
                             """
                             SELECT EXISTS (
                                 SELECT 1 FROM thread_input_deliveries
@@ -38177,6 +38182,13 @@ class PostgresDB:
                                 child_uuid, expected_generation
                             ),
                         )
+                    )
+                    delivered_by_tool_message = (
+                        parent_result_seq is not None
+                        and child["status"] == "ended"
+                        and not own_delivery_exists
+                    )
+                    parent_turn_completed = False
                     if delivered_by_tool_message:
                         # Whether the parent INPUT is consumed is a turn-level
                         # fact. Two durable proofs that the turn answered it:
@@ -38209,7 +38221,8 @@ class PostgresDB:
                             # still owes its answer. Like a live child whose
                             # result is durable, fall through to the
                             # saved-result continuation below (and like the
-                            # batch settle; parallel_subagents.md §14.1).
+                            # batch settle; parallel_subagents.md §14.1),
+                            # unless the turn was already resumed.
                             delivered_by_tool_message = False
 
                     if (
@@ -38316,6 +38329,59 @@ class PostgresDB:
                         "live foreground orphan recovery requires an interrupted "
                         "parent-restart outcome"
                     )
+                if foreground_orphan_recovery and not own_delivery_exists:
+                    if parent_result_already_durable and (
+                        str(metadata.get("subagent_foreground_recovery_generation"))
+                        == str(expected_generation)
+                        or await recovery_input_continued(
+                            conn,
+                            parent_thread_id=parent_uuid,
+                            supersedes_input_seq=int(supersedes_input_seq or 0),
+                        )
+                    ):
+                        # The result is durable and the turn was already
+                        # resumed (the batch, or a sibling's recovery wrote a
+                        # continuation for this input) or an earlier recovery
+                        # closed this generation. A second continuation would
+                        # answer the input twice.
+                        if not already_terminal:
+                            await end_session_child(
+                                conn,
+                                child_id=child_uuid,
+                                parent_thread_id=parent_uuid,
+                                runtime_generation=expected_generation,
+                                subagent_status=terminal_kind,
+                                outcome=outcome,
+                                turns=turns,
+                                tokens=tokens,
+                                report_path=report_path,
+                                error=error,
+                            )
+                        await stamp_recovered_child(
+                            conn, child_uuid, expected_generation
+                        )
+                        return {
+                            "result": "already_delivered",
+                            "thread_id": str(child_uuid),
+                            "runtime_generation": str(expected_generation),
+                            "delivery_id": None,
+                            "delivery_state": None,
+                        }
+                    # No result and no final answer, but the turn's
+                    # ``turn.completed`` frame: the turn ended, and the pinned
+                    # loop broadcast the frame before a reconcile that failed.
+                    # The result is written and no continuation, as the batch
+                    # settle does (parallel_subagents.md §14.1). Lane-agnostic:
+                    # a stateless frame follows its committed reconcile.
+                    frame_only = (
+                        not parent_result_already_durable
+                        and await turn_completed_frame_journaled(
+                            conn,
+                            parent_thread_id=parent_uuid,
+                            parent_iteration=int(parent_iteration or 0),
+                            parent_ai_message_id=parent_ai_message_id,
+                        )
+                    )
                 if deliver_event:
                     if (
                         delivery_id is not None
@@ -38383,6 +38449,36 @@ class PostgresDB:
                             "runtime_generation": str(expected_generation),
                         }
 
+                if frame_only:
+                    # The member's text becomes the call's result; nothing
+                    # is queued. The source was consumed above.
+                    await write_recovered_result(
+                        conn,
+                        parent_thread_id=parent_uuid,
+                        parent_input_message_id=parent_input_message_id,
+                        parent_iteration=int(parent_iteration or 0),
+                        tool_call_id=call_id,
+                        content=reply_message,
+                        call_class=CALL_ENDED if already_terminal else CALL_LIVE,
+                        thread_id=str(child_uuid),
+                        handle=child.get("subagent_handle"),
+                        subagent_type=child.get("subagent_type"),
+                        subagent_status=(
+                            str(child["subagent_status"] or "")
+                            if already_terminal
+                            else terminal_kind
+                        ),
+                        report_path=report_path or child.get("report_path"),
+                    )
+                    await stamp_recovered_child(conn, child_uuid, expected_generation)
+                    return {
+                        "result": "already_delivered",
+                        "thread_id": str(child_uuid),
+                        "runtime_generation": str(expected_generation),
+                        "delivery_id": None,
+                        "delivery_state": None,
+                    }
+
                 delivery: Mapping[str, Any] | None = None
                 existing_delivery: Mapping[str, Any] | None = None
                 if deliver_event:
@@ -38440,7 +38536,16 @@ class PostgresDB:
                             role="event",
                             content=reply_message,
                             source="subagent",
-                            turn_number=recovery_turn_number,
+                            # A recovery continuation carries the abandoned
+                            # turn's number on both lanes, as the batch's does
+                            # (invariant 12). The pinned loop renumbers it to
+                            # the turn that admits it, so only the stateless
+                            # retry above compares it.
+                            turn_number=(
+                                parent_iteration
+                                if foreground_orphan_recovery
+                                else recovery_turn_number
+                            ),
                             agent_id=parsed.agent_id,
                             pod_uid=parsed.pod_uid,
                             runtime_generation=parsed.session_runtime_generation,

@@ -19,6 +19,7 @@ existing recovery path (continuation event, watermark advance).
 
 from __future__ import annotations
 
+import asyncio
 import json
 from uuid import UUID, uuid4
 
@@ -28,6 +29,19 @@ import pytest
 from orchestrator.database.migrate import run_migrations
 from shared.run_queue import UNIT_KIND_SESSION_TURN, claim_unit, record_input_seq
 from shared.session_subagent_authority import session_subagent_delivery_id
+from shared.session_subagent_batch import (
+    RECOVERY_METRICS_KEY,
+    session_subagent_batch_result_id,
+)
+from tests.test_session_subagent_batch_settle_pg import (
+    _journal_turn_completed,
+    _members,
+    _plan,
+    _settle,
+    _source_state,
+    _successor,
+    _tool_rows,
+)
 from tests.test_session_subagent_batch_settle_pg import _seed as _seed_delegation_turn
 from tests.test_subagent_thread_migration import (  # noqa: F401  (scratch_pg_dsn fixture)
     MIGRATIONS,
@@ -487,7 +501,8 @@ async def test_pinned_ended_child_with_a_durable_result_owes_the_turn_its_answer
             async with pool.acquire() as conn:
                 return await conn.fetch(
                     "SELECT delivery.delivery_id, delivery.state, "
-                    "       delivery.supersedes_input_seq, message.content "
+                    "       delivery.supersedes_input_seq, message.content, "
+                    "       message.turn_number "
                     "  FROM thread_input_deliveries AS delivery "
                     "  JOIN thread_messages AS message "
                     "    ON message.id = delivery.message_id "
@@ -523,6 +538,8 @@ async def test_pinned_ended_child_with_a_durable_result_owes_the_turn_its_answer
             assert event["state"] == "owned"
             assert event["supersedes_input_seq"] == seed.input_seq
             assert event["content"] == _DURABLE_RESULT_CONTINUATION
+            # Invariant 12: the abandoned turn's number, as the batch writes.
+            assert event["turn_number"] == 1
             # The child's terminal facts are untouched.
             async with pool.acquire() as conn:
                 assert (
@@ -544,5 +561,262 @@ async def test_pinned_ended_child_with_a_durable_result_owes_the_turn_its_answer
             assert again["result"] == "idempotent"
             assert again["delivery_id"] == expected_delivery
         assert await subagent_events() == events
+    finally:
+        await pool.close()
+
+
+# ---------------------------------------------------------------------------
+# One continuation per turn across the batch and the single-child path
+# ---------------------------------------------------------------------------
+
+
+def _single_child_request(seed, call_id: str, *, ended: bool, authority=None) -> dict:
+    """What a single-child recovery sends for one child of the seeded turn:
+    the stored terminal status of an ended child, or the interrupted
+    parent-restart outcome of a live one (the facts the batch members use)."""
+
+    child = seed.children[call_id]
+    request = dict(
+        parent_thread_id=str(seed.session),
+        parent_authority=authority or seed.authority,
+        thread_id=child["thread_id"],
+        runtime_generation=child["runtime_generation"],
+        delivery_id=str(
+            session_subagent_delivery_id(
+                UUID(child["thread_id"]), UUID(child["runtime_generation"])
+            )
+        ),
+        message=f"[subagent {child['handle']} · reader] the report envelope",
+        foreground_orphan_recovery=True,
+    )
+    if ended:
+        request.update(subagent_status="completed", outcome="completed")
+    else:
+        request.update(
+            subagent_status="interrupted",
+            outcome="interrupted:parent_restart",
+            turns=2,
+            tokens=300,
+            error="the parent runtime restarted",
+        )
+    return request
+
+
+async def _superseding(pool: asyncpg.Pool, seed) -> list[asyncpg.Record]:
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            "SELECT delivery.delivery_id, message.turn_number "
+            "  FROM thread_input_deliveries AS delivery "
+            "  JOIN thread_messages AS message ON message.id = delivery.message_id "
+            " WHERE delivery.thread_id = $1 AND delivery.source = 'subagent' "
+            "   AND delivery.supersedes_input_seq = $2",
+            seed.session,
+            seed.input_seq,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("which", [0, 1])
+async def test_pinned_single_child_after_the_batch_continuation_adds_none(
+    pg_dsn: str, which: int
+) -> None:
+    """The batch resumed a pinned turn whose results were all durable (a
+    continuation alone). A stale single-child recovery of either child then
+    finds the turn's continuation and writes no second one; the model would
+    otherwise answer the input twice."""
+
+    pool = await _fresh_pool(pg_dsn)
+    try:
+        orchestrator = _orchestrator_db(pool)
+        seed = await _seed_delegation_turn(
+            pool, orchestrator, ["delivered", "delivered_running"], lane="pinned"
+        )
+        plan = await _plan(orchestrator, seed, seed.authority)
+        batch = await _settle(orchestrator, seed, seed.authority, _members(plan))
+        assert batch["result"] == "applied"
+        call_id = seed.call_ids[which]
+        # The batch ended the live child as interrupted by the restart.
+        request = _single_child_request(seed, call_id, ended=which == 0)
+
+        single = await orchestrator.terminalize_session_subagent_thread(**request)
+
+        assert single["result"] == "already_delivered"
+        assert single["delivery_id"] is None
+        assert len(await _superseding(pool, seed)) == 1
+        child = seed.children[call_id]
+        assert (
+            await _child_stamp(pool, child["thread_id"]) == child["runtime_generation"]
+        )
+    finally:
+        await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_pinned_batch_after_a_single_child_continuation_adds_none(
+    pg_dsn: str,
+) -> None:
+    """The other order. A single-child recovery of the ended child resumed the
+    turn first (its own continuation, the abandoned turn's number). The batch
+    then answers ``idempotent``, and the agent recovers the remaining live
+    child on its own: it is ended and closed with no second continuation."""
+
+    pool = await _fresh_pool(pg_dsn)
+    try:
+        orchestrator = _orchestrator_db(pool)
+        seed = await _seed_delegation_turn(
+            pool, orchestrator, ["delivered", "delivered_running"], lane="pinned"
+        )
+        ended_call, live_call = seed.call_ids
+        plan = await _plan(orchestrator, seed, seed.authority)
+
+        first = await orchestrator.terminalize_session_subagent_thread(
+            **_single_child_request(seed, ended_call, ended=True)
+        )
+        assert first["result"] in {"applied", "idempotent"}
+        assert first["delivery_id"] is not None
+        (continuation,) = await _superseding(pool, seed)
+        assert continuation["turn_number"] == 1
+        assert await _source_state(pool, seed) == "settled"
+
+        batch = await _settle(orchestrator, seed, seed.authority, _members(plan))
+        assert batch["result"] == "idempotent"
+        live = await orchestrator.terminalize_session_subagent_thread(
+            **_single_child_request(seed, live_call, ended=False)
+        )
+
+        assert live["result"] == "already_delivered"
+        assert await _superseding(pool, seed) == [continuation]
+        async with pool.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT status || '/' || subagent_outcome FROM threads WHERE id=$1",
+                    UUID(seed.children[live_call]["thread_id"]),
+                )
+                == "ended/interrupted:parent_restart"
+            )
+        assert (
+            await orchestrator.list_live_session_subagent_threads(
+                str(seed.session), parent_authority=seed.authority
+            )
+            == []
+        )
+    finally:
+        await pool.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("concurrent", [False, True])
+async def test_pinned_sibling_single_child_recoveries_write_one_continuation(
+    pg_dsn: str, concurrent: bool
+) -> None:
+    """Two stale single-child recoveries of two ended siblings with durable
+    results. They serialize on the parent lock; the second sees the first's
+    continuation and adds none."""
+
+    pool = await _fresh_pool(pg_dsn)
+    try:
+        orchestrator = _orchestrator_db(pool)
+        seed = await _seed_delegation_turn(
+            pool, orchestrator, ["delivered", "delivered"], lane="pinned"
+        )
+        requests = [
+            _single_child_request(seed, call, ended=True) for call in seed.call_ids
+        ]
+        if concurrent:
+            results = await asyncio.gather(
+                *(
+                    orchestrator.terminalize_session_subagent_thread(**request)
+                    for request in requests
+                )
+            )
+        else:
+            results = [
+                await orchestrator.terminalize_session_subagent_thread(**request)
+                for request in requests
+            ]
+
+        verdicts = sorted(result["result"] for result in results)
+        assert verdicts.count("already_delivered") == 1
+        (continuation,) = await _superseding(pool, seed)
+        assert continuation["turn_number"] == 1
+        assert await _source_state(pool, seed) == "settled"
+        for call_id in seed.call_ids:
+            child = seed.children[call_id]
+            assert (
+                await _child_stamp(pool, child["thread_id"])
+                == child["runtime_generation"]
+            )
+    finally:
+        await pool.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["pinned", "stateless"])
+@pytest.mark.parametrize("state", ["completed", "running"])
+async def test_single_call_turn_completed_frame_without_a_result_writes_it(
+    pg_dsn: str, lane: str, state: str
+) -> None:
+    """The batch rule on the single-child path: the turn's ``turn.completed``
+    frame, no saved result, no final answer. The member's text becomes the
+    call's result and no continuation is queued (one queued turns later would
+    re-answer an old request at the end of the conversation). The input is
+    consumed as before. Lane-agnostic, as the batch is."""
+
+    pool = await _fresh_pool(pg_dsn)
+    try:
+        orchestrator = _orchestrator_db(pool)
+        seed = await _seed_delegation_turn(pool, orchestrator, [state], lane=lane)
+        await _journal_turn_completed(pool, seed)
+        authority = (
+            await _successor(pool, seed) if lane == "stateless" else seed.authority
+        )
+        (call_id,) = seed.call_ids
+        request = _single_child_request(
+            seed, call_id, ended=state == "completed", authority=authority
+        )
+
+        recovered = await orchestrator.terminalize_session_subagent_thread(**request)
+
+        assert recovered["result"] == "already_delivered"
+        assert recovered["delivery_id"] is None
+        assert await _superseding(pool, seed) == []
+        (row,) = await _tool_rows(pool, seed)
+        assert row["tool_call_id"] == call_id
+        assert row["content"] == request["message"]
+        assert row["turn_number"] == 1
+        assert row["id"] == session_subagent_batch_result_id(
+            seed.session, seed.input_id, call_id
+        )
+        metrics = row["metrics"]
+        metrics = json.loads(metrics) if isinstance(metrics, str) else metrics
+        marker = metrics[RECOVERY_METRICS_KEY]
+        assert marker["class"] == (
+            "completed" if state == "completed" else "interrupted"
+        )
+        assert marker["thread_id"] == seed.children[call_id]["thread_id"]
+        if lane == "pinned":
+            assert await _source_state(pool, seed) == "settled"
+        else:
+            assert (await _queue_row(pool, seed.session))["consumed_seq"] == (
+                seed.input_seq
+            )
+        child = seed.children[call_id]
+        assert (
+            await _child_stamp(pool, child["thread_id"]) == child["runtime_generation"]
+        )
+        assert (
+            await orchestrator.list_live_session_subagent_threads(
+                str(seed.session), parent_authority=authority
+            )
+            == []
+        )
+
+        # A retry converges: the result is durable and the frame proves the
+        # turn ended, so nothing more is written.
+        rows = await _tool_rows(pool, seed)
+        again = await orchestrator.terminalize_session_subagent_thread(**request)
+        assert again["result"] == "already_delivered"
+        assert await _tool_rows(pool, seed) == rows
+        assert await _superseding(pool, seed) == []
     finally:
         await pool.close()

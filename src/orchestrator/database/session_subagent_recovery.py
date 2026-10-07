@@ -471,6 +471,90 @@ async def final_parent_response_seq(
     return int(final_seq) if final_seq is not None else None
 
 
+async def recovery_input_continued(
+    conn: Any, *, parent_thread_id: UUID, supersedes_input_seq: int
+) -> bool:
+    """Whether a continuation already supersedes this input.
+
+    The batch settle's idempotency key (§5.3 step 2), whoever wrote it: the
+    batch, or the single-child recovery of a sibling. Read under the parent
+    lock, so two recoveries of one turn see each other's continuation.
+    """
+
+    return bool(
+        await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                  FROM thread_input_deliveries
+                 WHERE thread_id = $1
+                   AND source = 'subagent'
+                   AND supersedes_input_seq = $2
+            )
+            """,
+            parent_thread_id,
+            int(supersedes_input_seq),
+        )
+    )
+
+
+async def write_recovered_result(
+    conn: Any,
+    *,
+    parent_thread_id: UUID,
+    parent_input_message_id: UUID,
+    parent_iteration: int,
+    tool_call_id: str,
+    content: str,
+    call_class: str,
+    thread_id: str | None,
+    handle: str | None,
+    subagent_type: str | None,
+    subagent_status: str | None,
+    report_path: str | None,
+) -> UUID:
+    """Write one recovered ``delegate_agent`` result into the parent transcript.
+
+    Its id is a function of the input and the call, so the batch and the
+    single-child path can never both write one. It carries the abandoned
+    turn's number (invariant 12) and the ``subagent_recovery`` marker. The
+    marker's ``delivery_id`` is the turn's batch continuation id even when no
+    continuation follows (a ``turn.completed`` frame alone ended the turn).
+    """
+
+    row_id = session_subagent_batch_result_id(
+        parent_thread_id, parent_input_message_id, tool_call_id
+    )
+    await conn.execute(
+        """
+        INSERT INTO thread_messages
+            (id, thread_id, role, content, tool_call_id, turn_number,
+             metrics)
+        VALUES ($1, $2, 'tool', $3, $4, $5, $6::jsonb)
+        """,
+        row_id,
+        parent_thread_id,
+        content,
+        tool_call_id,
+        parent_iteration,
+        json.dumps(
+            result_metrics(
+                result_class=RESULT_CLASS_BY_CALL_CLASS[call_class],
+                tool_call_id=tool_call_id,
+                delivery_id=session_subagent_batch_delivery_id(
+                    parent_thread_id, parent_input_message_id
+                ),
+                thread_id=thread_id,
+                handle=handle,
+                subagent_type=subagent_type,
+                subagent_status=subagent_status,
+                report_path=report_path,
+            )
+        ),
+    )
+    return row_id
+
+
 async def end_session_child(
     conn: Any,
     *,
@@ -1225,35 +1309,20 @@ async def settle_session_subagent_batch(
                 not_started += 1
                 content = not_started_result_text()
             view = call.view()
-            row_id = session_subagent_batch_result_id(
-                parent_thread_id, parent_input_message_id, call.tool_call_id
+            written[call.tool_call_id] = await write_recovered_result(
+                conn,
+                parent_thread_id=parent_thread_id,
+                parent_input_message_id=parent_input_message_id,
+                parent_iteration=parent_iteration,
+                tool_call_id=call.tool_call_id,
+                content=content,
+                call_class=call.call_class,
+                thread_id=view["thread_id"],
+                handle=view["handle"],
+                subagent_type=view["subagent_type"],
+                subagent_status=subagent_status,
+                report_path=report_path,
             )
-            await conn.execute(
-                """
-                INSERT INTO thread_messages
-                    (id, thread_id, role, content, tool_call_id, turn_number,
-                     metrics)
-                VALUES ($1, $2, 'tool', $3, $4, $5, $6::jsonb)
-                """,
-                row_id,
-                parent_thread_id,
-                content,
-                call.tool_call_id,
-                parent_iteration,
-                json.dumps(
-                    result_metrics(
-                        result_class=RESULT_CLASS_BY_CALL_CLASS[call.call_class],
-                        tool_call_id=call.tool_call_id,
-                        delivery_id=delivery_id,
-                        thread_id=view["thread_id"],
-                        handle=view["handle"],
-                        subagent_type=view["subagent_type"],
-                        subagent_status=subagent_status,
-                        report_path=report_path,
-                    )
-                ),
-            )
-            written[call.tool_call_id] = row_id
 
     if write_continuation:
         # Then the one continuation that supersedes the abandoned input. It
@@ -1378,8 +1447,10 @@ __all__ = [
     "load_recovery_parent_input",
     "parent_turn_completed",
     "plan_recovery_turns",
+    "recovery_input_continued",
     "settle_recovery_source",
     "settle_session_subagent_batch",
     "stamp_recovered_child",
     "turn_completed_frame_journaled",
+    "write_recovered_result",
 ]
