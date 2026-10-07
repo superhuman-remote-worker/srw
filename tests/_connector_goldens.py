@@ -66,15 +66,23 @@ OTHER_PROJECT_ID = "00000000-0000-0000-0000-0000000000b2"
 DATASOURCE_ID = "00000000-0000-0000-0000-0000000000d1"
 FIXED_TS = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
 
-#: Structurally valid (BEGIN/END markers, base64 body) and nothing more: the
-#: API's ``validate_private_key`` is a structural check, not a parse.
+#: A real, unencrypted Ed25519 key (private bytes 00..1f, check ints fixed by
+#: pasting it once). C1 parses every SSH key to fingerprint it for the
+#: workspace ssh-agent and refuses one it cannot parse, so a key that is only
+#: structurally valid no longer stands in for a usable one.
 SSH_PRIVATE_KEY = (
     "-----BEGIN OPENSSH PRIVATE KEY-----\n"
-    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n"
-    "QyNTUxOQAAACBnb2xkZW4tdGVzdC1rZXktbm90LWEtcmVhbC1rZXktMDAwMDAwAAAA\n"
+    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtz\n"
+    "c2gtZWQyNTUxOQAAACADoQe/884Qvh1w3RjnS8CZZ+TWMJulDV8d3IZkElUxuAAA\n"
+    "AIjyQbTU8kG01AAAAAtzc2gtZWQyNTUxOQAAACADoQe/884Qvh1w3RjnS8CZZ+TW\n"
+    "MJulDV8d3IZkElUxuAAAAEAAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0e\n"
+    "HwOhB7/zzhC+HXDdGOdLwJln5NYwm6UNXx3chmQSVTG4AAAAAAECAwQF\n"
     "-----END OPENSSH PRIVATE KEY-----\n"
 )
-SSH_PUBLIC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGdvbGRlbg golden@test\n"
+SSH_PUBLIC_KEY = (
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAOhB7/zzhC+HXDdGOdLwJln5NYwm6UNXx3chmQSVTG4 "
+    "golden@test\n"
+)
 
 _ERROR_REF = re.compile(r"^[0-9a-f]{12}$")
 _ERROR_REF_IN_TEXT = re.compile(r"error_ref=([0-9a-f]{12})")

@@ -176,19 +176,24 @@
           "files": [
             {
               "name": "deploy-key",
-              "contents": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACBnb2xkZW4tdGVzdC1rZXktbm90LWEtcmVhbC1rZXktMDAwMDAwAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
               "target_path": "/home/srw/.ssh/deploy-key",
               "mode": "0600"
             },
             {
               "name": "deploy-key.pub",
-              "contents": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGdvbGRlbg golden@test\n",
               "target_path": "/home/srw/.ssh/deploy-key.pub",
               "mode": "0644"
             }
           ]
         },
-        "project_read_only": false
+        "project_read_only": false,
+        "ssh_identity": {
+          "alias": "srw-repo-86349e2c62065ae297413689e29f78ee",
+          "authority_id": "86349e2c-6206-5ae2-9741-3689e29f78ee",
+          "fingerprint": "SHA256:lbmsoA0yIEcEiVDRnMWuzm+nV+3ZEEpVIURqFoeSspg",
+          "host_key_pinned": false,
+          "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAOhB7/zzhC+HXDdGOdLwJln5NYwm6UNXx3chmQSVTG4"
+        }
       }
     ]
   },
@@ -203,19 +208,24 @@
           "files": [
             {
               "name": "deploy-key",
-              "contents": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACBnb2xkZW4tdGVzdC1rZXktbm90LWEtcmVhbC1rZXktMDAwMDAwAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
               "target_path": "/home/srw/.ssh/deploy-key",
               "mode": "0600"
             },
             {
               "name": "deploy-key.pub",
-              "contents": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGdvbGRlbg golden@test\n",
               "target_path": "/home/srw/.ssh/deploy-key.pub",
               "mode": "0644"
             }
           ]
         },
-        "project_read_only": true
+        "project_read_only": true,
+        "ssh_identity": {
+          "alias": "srw-repo-86349e2c62065ae297413689e29f78ee",
+          "authority_id": "86349e2c-6206-5ae2-9741-3689e29f78ee",
+          "fingerprint": "SHA256:lbmsoA0yIEcEiVDRnMWuzm+nV+3ZEEpVIURqFoeSspg",
+          "host_key_pinned": false,
+          "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAOhB7/zzhC+HXDdGOdLwJln5NYwm6UNXx3chmQSVTG4"
+        }
       }
     ]
   },
@@ -267,15 +277,24 @@
         "description": "Gadgets service",
         "connection_url": "ssh://git@git.example.test:2222/acme/gadgets.git",
         "credentials": {
-          "auth_method": "ssh",
-          "ssh_key": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACBnb2xkZW4tdGVzdC1rZXktbm90LWEtcmVhbC1rZXktMDAwMDAwAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
+          "auth_method": "ssh"
         },
         "project_read_only": false,
         "datasource_id": "d5000007-0000-0000-0000-000000000007",
         "config": {
           "forge": "gitea"
         },
-        "default_branch": "develop"
+        "default_branch": "develop",
+        "ssh_identity": {
+          "alias": "srw-repo-cd512eb253ae54ef904ea73abe12261f",
+          "authority_id": "cd512eb2-53ae-54ef-904e-a73abe12261f",
+          "fingerprint": "SHA256:lbmsoA0yIEcEiVDRnMWuzm+nV+3ZEEpVIURqFoeSspg",
+          "host_key_pinned": false,
+          "clone_url": "ssh://srw-repo-cd512eb253ae54ef904ea73abe12261f/acme/gadgets.git",
+          "host": "git.example.test",
+          "port": 2222,
+          "user": "git"
+        }
       }
     ]
   },
@@ -287,15 +306,24 @@
         "description": "Gadgets service",
         "connection_url": "ssh://git@git.example.test:2222/acme/gadgets.git",
         "credentials": {
-          "auth_method": "ssh",
-          "ssh_key": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACBnb2xkZW4tdGVzdC1rZXktbm90LWEtcmVhbC1rZXktMDAwMDAwAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
+          "auth_method": "ssh"
         },
         "project_read_only": true,
         "datasource_id": "d5000007-0000-0000-0000-000000000007",
         "config": {
           "forge": "gitea"
         },
-        "default_branch": "develop"
+        "default_branch": "develop",
+        "ssh_identity": {
+          "alias": "srw-repo-cd512eb253ae54ef904ea73abe12261f",
+          "authority_id": "cd512eb2-53ae-54ef-904e-a73abe12261f",
+          "fingerprint": "SHA256:lbmsoA0yIEcEiVDRnMWuzm+nV+3ZEEpVIURqFoeSspg",
+          "host_key_pinned": false,
+          "clone_url": "ssh://srw-repo-cd512eb253ae54ef904ea73abe12261f/acme/gadgets.git",
+          "host": "git.example.test",
+          "port": 2222,
+          "user": "git"
+        }
       }
     ]
   },
@@ -1081,19 +1109,24 @@
           "files": [
             {
               "name": "deploy-key",
-              "contents": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACBnb2xkZW4tdGVzdC1rZXktbm90LWEtcmVhbC1rZXktMDAwMDAwAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
               "target_path": "/home/srw/.ssh/deploy-key",
               "mode": "0600"
             },
             {
               "name": "deploy-key.pub",
-              "contents": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGdvbGRlbg golden@test\n",
               "target_path": "/home/srw/.ssh/deploy-key.pub",
               "mode": "0644"
             }
           ]
         },
-        "project_read_only": false
+        "project_read_only": false,
+        "ssh_identity": {
+          "alias": "srw-repo-86349e2c62065ae297413689e29f78ee",
+          "authority_id": "86349e2c-6206-5ae2-9741-3689e29f78ee",
+          "fingerprint": "SHA256:lbmsoA0yIEcEiVDRnMWuzm+nV+3ZEEpVIURqFoeSspg",
+          "host_key_pinned": false,
+          "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAOhB7/zzhC+HXDdGOdLwJln5NYwm6UNXx3chmQSVTG4"
+        }
       },
       {
         "type": "repository",
@@ -1117,15 +1150,24 @@
         "description": "Gadgets service",
         "connection_url": "ssh://git@git.example.test:2222/acme/gadgets.git",
         "credentials": {
-          "auth_method": "ssh",
-          "ssh_key": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACBnb2xkZW4tdGVzdC1rZXktbm90LWEtcmVhbC1rZXktMDAwMDAwAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
+          "auth_method": "ssh"
         },
         "project_read_only": false,
         "datasource_id": "d5000007-0000-0000-0000-000000000007",
         "config": {
           "forge": "gitea"
         },
-        "default_branch": "develop"
+        "default_branch": "develop",
+        "ssh_identity": {
+          "alias": "srw-repo-cd512eb253ae54ef904ea73abe12261f",
+          "authority_id": "cd512eb2-53ae-54ef-904e-a73abe12261f",
+          "fingerprint": "SHA256:lbmsoA0yIEcEiVDRnMWuzm+nV+3ZEEpVIURqFoeSspg",
+          "host_key_pinned": false,
+          "clone_url": "ssh://srw-repo-cd512eb253ae54ef904ea73abe12261f/acme/gadgets.git",
+          "host": "git.example.test",
+          "port": 2222,
+          "user": "git"
+        }
       },
       {
         "type": "postgresql",
@@ -1337,19 +1379,24 @@
           "files": [
             {
               "name": "deploy-key",
-              "contents": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACBnb2xkZW4tdGVzdC1rZXktbm90LWEtcmVhbC1rZXktMDAwMDAwAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
               "target_path": "/home/srw/.ssh/deploy-key",
               "mode": "0600"
             },
             {
               "name": "deploy-key.pub",
-              "contents": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGdvbGRlbg golden@test\n",
               "target_path": "/home/srw/.ssh/deploy-key.pub",
               "mode": "0644"
             }
           ]
         },
-        "project_read_only": true
+        "project_read_only": true,
+        "ssh_identity": {
+          "alias": "srw-repo-86349e2c62065ae297413689e29f78ee",
+          "authority_id": "86349e2c-6206-5ae2-9741-3689e29f78ee",
+          "fingerprint": "SHA256:lbmsoA0yIEcEiVDRnMWuzm+nV+3ZEEpVIURqFoeSspg",
+          "host_key_pinned": false,
+          "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAOhB7/zzhC+HXDdGOdLwJln5NYwm6UNXx3chmQSVTG4"
+        }
       },
       {
         "type": "repository",
@@ -1373,15 +1420,24 @@
         "description": "Gadgets service",
         "connection_url": "ssh://git@git.example.test:2222/acme/gadgets.git",
         "credentials": {
-          "auth_method": "ssh",
-          "ssh_key": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACBnb2xkZW4tdGVzdC1rZXktbm90LWEtcmVhbC1rZXktMDAwMDAwAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
+          "auth_method": "ssh"
         },
         "project_read_only": true,
         "datasource_id": "d5000007-0000-0000-0000-000000000007",
         "config": {
           "forge": "gitea"
         },
-        "default_branch": "develop"
+        "default_branch": "develop",
+        "ssh_identity": {
+          "alias": "srw-repo-cd512eb253ae54ef904ea73abe12261f",
+          "authority_id": "cd512eb2-53ae-54ef-904e-a73abe12261f",
+          "fingerprint": "SHA256:lbmsoA0yIEcEiVDRnMWuzm+nV+3ZEEpVIURqFoeSspg",
+          "host_key_pinned": false,
+          "clone_url": "ssh://srw-repo-cd512eb253ae54ef904ea73abe12261f/acme/gadgets.git",
+          "host": "git.example.test",
+          "port": 2222,
+          "user": "git"
+        }
       },
       {
         "type": "postgresql",
@@ -1588,19 +1644,24 @@
           "files": [
             {
               "name": "deploy-key",
-              "contents": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACBnb2xkZW4tdGVzdC1rZXktbm90LWEtcmVhbC1rZXktMDAwMDAwAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
               "target_path": "/home/srw/.ssh/deploy-key",
               "mode": "0600"
             },
             {
               "name": "deploy-key.pub",
-              "contents": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGdvbGRlbg golden@test\n",
               "target_path": "/home/srw/.ssh/deploy-key.pub",
               "mode": "0644"
             }
           ]
         },
-        "project_read_only": false
+        "project_read_only": false,
+        "ssh_identity": {
+          "alias": "srw-repo-86349e2c62065ae297413689e29f78ee",
+          "authority_id": "86349e2c-6206-5ae2-9741-3689e29f78ee",
+          "fingerprint": "SHA256:lbmsoA0yIEcEiVDRnMWuzm+nV+3ZEEpVIURqFoeSspg",
+          "host_key_pinned": false,
+          "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAOhB7/zzhC+HXDdGOdLwJln5NYwm6UNXx3chmQSVTG4"
+        }
       },
       {
         "type": "repository",
@@ -1624,15 +1685,24 @@
         "description": "Gadgets service",
         "connection_url": "ssh://git@git.example.test:2222/acme/gadgets.git",
         "credentials": {
-          "auth_method": "ssh",
-          "ssh_key": "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACBnb2xkZW4tdGVzdC1rZXktbm90LWEtcmVhbC1rZXktMDAwMDAwAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
+          "auth_method": "ssh"
         },
         "project_read_only": false,
         "datasource_id": "d5000007-0000-0000-0000-000000000007",
         "config": {
           "forge": "gitea"
         },
-        "default_branch": "develop"
+        "default_branch": "develop",
+        "ssh_identity": {
+          "alias": "srw-repo-cd512eb253ae54ef904ea73abe12261f",
+          "authority_id": "cd512eb2-53ae-54ef-904e-a73abe12261f",
+          "fingerprint": "SHA256:lbmsoA0yIEcEiVDRnMWuzm+nV+3ZEEpVIURqFoeSspg",
+          "host_key_pinned": false,
+          "clone_url": "ssh://srw-repo-cd512eb253ae54ef904ea73abe12261f/acme/gadgets.git",
+          "host": "git.example.test",
+          "port": 2222,
+          "user": "git"
+        }
       },
       {
         "type": "postgresql",

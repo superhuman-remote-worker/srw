@@ -12,7 +12,8 @@ existing tests use (``tests/test_codeql_error_disclosure.py``,
   modules, replaced in ``sys.modules`` (they are imported inside the probe);
 * email: ``imaplib``/``smtplib`` classes, or ``probe_email_connection`` for the
   outer timeout and crash classes;
-* repository: ``shared.runtime.services.forge._transport``;
+* repository: ``shared.runtime.services.forge._transport``; an SSH-key
+  repository's host-key exchange: ``asyncssh.get_server_host_key``;
 * KB: ``orchestrator.services.kb_datasources.kb_source_from_datasource``;
 * MCP: the SDK's transport clients and ``ClientSession``.
 
@@ -260,6 +261,41 @@ def forge(
             return httpx.Response(200, json=repo)
 
         monkeypatch.setattr(forge_module, "_transport", httpx.MockTransport(handler))
+
+    return install
+
+
+#: Deterministic Ed25519 host keys a mocked SSH endpoint presents (C1).
+def _host_key(seed: int) -> str:
+    import base64
+
+    name = b"ssh-ed25519"
+    blob = len(name).to_bytes(4, "big") + name + (32).to_bytes(4, "big")
+    return "ssh-ed25519 " + base64.b64encode(blob + bytes([seed]) * 32).decode()
+
+
+GITEA_HOST_KEY = _host_key(7)
+OTHER_HOST_KEY = _host_key(9)
+
+
+def ssh_host_key(*, error: Exception | None = None) -> Scenario:
+    """C1 Test: the SSH key exchange that reports the host key to pin."""
+
+    def install(monkeypatch, calls):
+        import asyncssh
+
+        class Key:
+            def export_public_key(self, fmt):
+                calls.append({"export_public_key": fmt})
+                return (GITEA_HOST_KEY + " host\n").encode()
+
+        async def get_server_host_key(host, port):
+            calls.append({"asyncssh.get_server_host_key": [host, port]})
+            if error is not None:
+                raise error
+            return Key()
+
+        monkeypatch.setattr(asyncssh, "get_server_host_key", get_server_host_key)
 
     return install
 
@@ -602,7 +638,35 @@ CASES: dict[str, ProbeCase] = {
             config={},
         )
     ),
-    "repository/ssh_key_not_probed": ProbeCase(_stored("repository_ssh")),
+    # C1: no forge API takes a deploy key; Test reaches the SSH endpoint and
+    # reports the host key the connector form offers to pin.
+    "repository/ssh_host_key_reported": ProbeCase(
+        _stored("repository_ssh"), ssh_host_key()
+    ),
+    "repository/ssh_host_key_matches_pin": ProbeCase(
+        _stored(
+            "repository_ssh",
+            config={"forge": "gitea", "known_hosts": GITEA_HOST_KEY},
+        ),
+        ssh_host_key(),
+    ),
+    "repository/ssh_host_key_differs_from_pin": ProbeCase(
+        _stored(
+            "repository_ssh",
+            config={"forge": "gitea", "known_hosts": OTHER_HOST_KEY},
+        ),
+        ssh_host_key(),
+    ),
+    "repository/ssh_host_unreachable": ProbeCase(
+        _stored("repository_ssh"),
+        ssh_host_key(error=OSError("no route to git.example.test")),
+    ),
+    "repository/ssh_key_unparseable": ProbeCase(
+        _stored(
+            "repository_ssh",
+            credentials={"auth_method": "ssh", "ssh_key": "not a key"},
+        )
+    ),
     "repository/no_credentials_not_probed": ProbeCase(
         _stored("repository_token", credentials={})
     ),

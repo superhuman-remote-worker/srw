@@ -714,11 +714,104 @@
     },
     "probe_calls": []
   },
-  "repository/ssh_key_not_probed": {
+  "repository/ssh_host_key_reported": {
     "status": 200,
     "body": {
       "status": "ok",
-      "message": "No API probe for SSH-key repository connectors; the clone at job start is the test"
+      "message": "Reached git.example.test:2222; host key SHA256:gNSIRW+2Iyiuvsdp/bgjy38bvWHw6wQm3tuoXrl3WjQ is not pinned (workspaces trust it on first use). Pin it to refuse a changed key",
+      "details": {
+        "host": "git.example.test",
+        "port": 2222,
+        "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH",
+        "host_key_fingerprint": "SHA256:gNSIRW+2Iyiuvsdp/bgjy38bvWHw6wQm3tuoXrl3WjQ",
+        "host_key_pinned": false,
+        "host_key_matches_pin": null
+      }
+    },
+    "probe_calls": [
+      {
+        "asyncssh.get_server_host_key": [
+          "git.example.test",
+          2222
+        ]
+      },
+      {
+        "export_public_key": "openssh"
+      }
+    ]
+  },
+  "repository/ssh_host_key_matches_pin": {
+    "status": 200,
+    "body": {
+      "status": "ok",
+      "message": "Reached git.example.test:2222; host key SHA256:gNSIRW+2Iyiuvsdp/bgjy38bvWHw6wQm3tuoXrl3WjQ matches the pin",
+      "details": {
+        "host": "git.example.test",
+        "port": 2222,
+        "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH",
+        "host_key_fingerprint": "SHA256:gNSIRW+2Iyiuvsdp/bgjy38bvWHw6wQm3tuoXrl3WjQ",
+        "host_key_pinned": true,
+        "host_key_matches_pin": true
+      }
+    },
+    "probe_calls": [
+      {
+        "asyncssh.get_server_host_key": [
+          "git.example.test",
+          2222
+        ]
+      },
+      {
+        "export_public_key": "openssh"
+      }
+    ]
+  },
+  "repository/ssh_host_key_differs_from_pin": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "git.example.test:2222 presented host key SHA256:gNSIRW+2Iyiuvsdp/bgjy38bvWHw6wQm3tuoXrl3WjQ, which is not the pinned key; workspaces will refuse to connect",
+      "details": {
+        "host": "git.example.test",
+        "port": 2222,
+        "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH",
+        "host_key_fingerprint": "SHA256:gNSIRW+2Iyiuvsdp/bgjy38bvWHw6wQm3tuoXrl3WjQ",
+        "host_key_pinned": true,
+        "host_key_matches_pin": false
+      }
+    },
+    "probe_calls": [
+      {
+        "asyncssh.get_server_host_key": [
+          "git.example.test",
+          2222
+        ]
+      },
+      {
+        "export_public_key": "openssh"
+      }
+    ]
+  },
+  "repository/ssh_host_unreachable": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "Could not reach SSH host git.example.test:2222"
+    },
+    "probe_calls": [
+      {
+        "asyncssh.get_server_host_key": [
+          "git.example.test",
+          2222
+        ]
+      }
+    ]
+  },
+  "repository/ssh_key_unparseable": {
+    "status": 200,
+    "body": {
+      "status": "error",
+      "message": "Invalid SSH key: SSH private key is too short — expected BEGIN/body/END lines"
     },
     "probe_calls": []
   },

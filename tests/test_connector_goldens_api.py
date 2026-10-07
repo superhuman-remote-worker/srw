@@ -46,6 +46,7 @@ from tests._connector_goldens import (
     OTHER_PROJECT_ID,
     PROJECT_ID,
     SSH_PRIVATE_KEY,
+    SSH_PUBLIC_KEY,
     UPDATE,
     USER,
     USER_ID,
@@ -472,8 +473,8 @@ CASES: dict[str, ApiCase] = {
     "create/ssh_key/private_only": _create(
         SSH_KEY,
         pinned_defect=(
-            "C1 changes this: ssh_key file contents are stored as given (no "
-            "key validation or newline normalisation)"
+            "C1 validates the key (it must parse, without a passphrase); the "
+            "file contents are still stored as given (no newline normalisation)"
         ),
     ),
     "create/ssh_key/private_and_public": _create(
@@ -487,9 +488,8 @@ CASES: dict[str, ApiCase] = {
             },
         )
     ),
-    "create/ssh_key/not_a_key_accepted": _create(
+    "create/ssh_key/not_a_key_refused": _create(
         _with(SSH_KEY, credentials={"files": [{"contents": "not a key"}]}),
-        pinned_defect="C1 changes this: any file content is accepted as a key",
     ),
     "create/ssh_key/three_files": _create(
         _with(
@@ -828,14 +828,24 @@ CASES.update(
             _stored("kubeconfig"),
             {"credentials": {"files": [{"contents": "a"}, {"contents": "b"}]}},
         ),
-        "update/ssh_key/replace_with_pair": _update(
+        "update/ssh_key/replace_with_unparseable_key_refused": _update(
             _stored("ssh_key"),
             {
                 "credentials": {
                     "files": [{"contents": "new private"}, {"contents": "new pub"}]
                 }
             },
-            pinned_defect="C1 changes this: ssh_key file contents are not validated",
+        ),
+        "update/ssh_key/replace_with_pair": _update(
+            _stored("ssh_key"),
+            {
+                "credentials": {
+                    "files": [
+                        {"contents": SSH_PRIVATE_KEY},
+                        {"contents": SSH_PUBLIC_KEY},
+                    ]
+                }
+            },
         ),
         "update/ssh_key/three_files": _update(
             _stored("ssh_key"),
