@@ -140,23 +140,35 @@ class TestSettings:
         assert text.startswith(CODEX_HEAD)
         assert text.endswith("Do not call any tools. Reply with the summary only.")
 
+    def test_claude_recipe_is_anthropics_client_side_instruction(self):
+        text = recipe_instruction("claude")
+        assert text.startswith(
+            "Summarize the transcript inside <summary></summary> tags."
+        )
+        assert "(6) specific details that would be hard to reconstruct" in text
+        assert text.endswith("Do not call any tools.")
+
     def test_unknown_recipe_names_never_become_paths(self):
-        for name in ("claude", "../codex", None, ""):
+        for name in ("gemini", "../codex", None, ""):
             assert recipe_instruction(name) is None
 
     def test_family_matrix_routes_compaction_to_llm(self):
         from shared.runtime.core.loader import _apply_settings_matrix
 
-        for model, strategy in (
-            ("gpt-6-sol", "native"),
-            ("gpt-6.1-sol", "native"),
-            ("gpt-5-mini", "native"),
-            ("claude-opus-5-5", "auxiliary"),
-            ("muse-spark-1.3-contributor", "auxiliary"),
+        for model, expected in (
+            ("gpt-6-sol", {"strategy": "native", "recipe": "codex"}),
+            ("gpt-6.1-sol", {"strategy": "native", "recipe": "codex"}),
+            ("gpt-5-mini", {"strategy": "native", "recipe": "codex"}),
+            ("claude-opus-5-5", {"strategy": "native", "recipe": "claude"}),
+            ("claude-sonnet-5-5", {"strategy": "native", "recipe": "claude"}),
+            ("claude-fable-5-1", {"strategy": "native", "recipe": "claude"}),
+            ("claude-haiku-4-5-20251001", {"strategy": "native", "recipe": "claude"}),
+            ("muse-spark-1.3-contributor", {"strategy": "auxiliary"}),
+            ("MiniMax-M3", {"strategy": "auxiliary"}),
         ):
             data = {"llm": {"model": model}}
             _apply_settings_matrix(data, set())
-            assert data["llm"]["compaction"]["strategy"] == strategy, model
+            assert data["llm"]["compaction"] == expected, model
 
     def test_an_expert_setting_wins_over_the_family(self):
         from shared.runtime.core.loader import _apply_settings_matrix
@@ -258,6 +270,12 @@ class TestHelpers:
                 "tool_call",
             ),
             (AIMessage(content="", additional_kwargs={"refusal": "no"}), "refusal"),
+            (
+                AIMessage(
+                    content="", response_metadata={"finish_reason": "content_filter"}
+                ),
+                "refusal",
+            ),
             (AIMessage(content="   "), "empty"),
             (
                 AIMessage(
@@ -269,6 +287,32 @@ class TestHelpers:
     )
     def test_unusable_replies(self, reply, reason):
         assert summary_from_reply(reply) == (None, reason)
+
+    def test_claude_summary_is_the_last_summary_block(self):
+        reply = AIMessage(
+            content=[
+                {"type": "thinking", "thinking": "plan"},
+                {
+                    "type": "text",
+                    "text": "<analysis>notes</analysis>\n<summary>draft</summary>\n"
+                    "<summary>\n## State\n- done\n</summary>",
+                },
+            ]
+        )
+        assert summary_from_reply(reply, "claude") == ("## State\n- done", None)
+
+    @pytest.mark.parametrize(
+        "text", ["Here is where we are: done.", "<summary>  </summary>"]
+    )
+    def test_a_claude_reply_without_a_summary_block_is_rejected(self, text):
+        assert summary_from_reply(AIMessage(content=text), "claude") == (
+            None,
+            "no_summary",
+        )
+        assert summary_from_reply(AIMessage(content=text), "codex")[1] in (
+            None,
+            "empty",
+        )
 
     def test_reasoning_blocks_are_not_the_summary(self):
         reply = AIMessage(

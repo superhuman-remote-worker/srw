@@ -584,6 +584,7 @@ claude-opus:
   # control), so this changes the proxied/OpenRouter paths only.
   reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   settings:
+    compaction: { strategy: native, recipe: claude }  # the model summarizes itself with Anthropic's client-side instruction (compaction WP6)
     shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0  # Anthropic: just use temperature, leave top_p/top_k at defaults
     multimodal: true  # Claude Opus 4.6 supports vision
@@ -615,6 +616,7 @@ claude-opus-5:
   # ignores this block — see the claude-opus note above.
   reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high, xhigh, max] }
   settings:
+    compaction: { strategy: native, recipe: claude }  # the model summarizes itself with Anthropic's client-side instruction (compaction WP6)
     shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0  # Anthropic: just use temperature, leave top_p/top_k at defaults
     multimodal: true
@@ -644,6 +646,7 @@ claude-opus-5:
 claude-opus-5-5:
   reasoning: { method: effort_enum, delivery: native, default: medium, options: [low, medium, high, xhigh, max] }
   settings:
+    compaction: { strategy: native, recipe: claude }  # the model summarizes itself with Anthropic's client-side instruction (compaction WP6)
     shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0  # Anthropic: just use temperature, leave top_p/top_k at defaults
     multimodal: true
@@ -662,6 +665,7 @@ claude-sonnet:
   # Effort-driven adaptive thinking — see the claude-opus note above.
   reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   settings:
+    compaction: { strategy: native, recipe: claude }  # the model summarizes itself with Anthropic's client-side instruction (compaction WP6)
     shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0
     multimodal: true
@@ -700,6 +704,7 @@ claude-sonnet:
 claude-sonnet-5:
   reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high, xhigh, max] }
   settings:
+    compaction: { strategy: native, recipe: claude }  # the model summarizes itself with Anthropic's client-side instruction (compaction WP6)
     shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0  # the API default; anything else is a 400
     multimodal: true
@@ -714,6 +719,7 @@ claude-haiku:
   # Effort-driven adaptive thinking — see the claude-opus note above.
   reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   settings:
+    compaction: { strategy: native, recipe: claude }  # the model summarizes itself with Anthropic's client-side instruction (compaction WP6)
     shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0
     multimodal: true
@@ -740,6 +746,7 @@ claude-haiku:
 claude-fable:
   reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high, xhigh, max] }
   settings:
+    compaction: { strategy: native, recipe: claude }  # the model summarizes itself with Anthropic's client-side instruction (compaction WP6)
     shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     # 1.0 mirrors the other Claude families and is accepted on the proxy path
     # (verified 2026-09-11). Anthropic's native API rejects sampling params on

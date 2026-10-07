@@ -1970,7 +1970,7 @@ class ContextManager:
             _archive_native(auxiliary, fork, model, latency_ms, meta, error=e)
             return None, failure
         latency_ms = int((time.monotonic() - start) * 1000)
-        summary, reason = summary_from_reply(reply)
+        summary, reason = summary_from_reply(reply, settings.recipe)
         _archive_native(
             auxiliary,
             fork,

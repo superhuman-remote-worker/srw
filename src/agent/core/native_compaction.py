@@ -22,6 +22,7 @@ See knowledge-base/knowledge/features/compaction_refactor_fidelity_and_fork_stra
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Callable, FrozenSet, Iterable, List, Optional, Sequence, Tuple
@@ -46,9 +47,16 @@ logger = logging.getLogger(__name__)
 STRATEGY_NATIVE = "native"
 STRATEGY_AUXILIARY = "auxiliary"
 
-# Recipes with an instruction file under config/prompts/compaction/<name>/.
-# Only these names are ever turned into a path.
-KNOWN_RECIPES = ("codex",)
+# Recipes with an instruction file under config/prompts/compaction/<name>/
+# (sources in that directory's README). Only these names are ever turned into
+# a path.
+KNOWN_RECIPES = ("codex", "claude")
+
+# Recipes whose instruction asks for the summary inside <summary></summary>:
+# the summary is the last such block (as Claude Code reads it); a reply
+# without one is not a summary.
+_TAGGED_RECIPES = ("claude",)
+_SUMMARY_BLOCK = re.compile(r"<summary>\s*(.*?)\s*</summary>", re.S | re.I)
 
 # Output room assumed when the client's own output cap cannot be read
 # (Codex keeps the same 16k buffer for its own fallback).
@@ -229,20 +237,30 @@ def fork_input_tokens(
     return base + count(list(tail))
 
 
-def summary_from_reply(reply: Any) -> Tuple[Optional[str], Optional[str]]:
+def summary_from_reply(
+    reply: Any, recipe: Optional[str] = None
+) -> Tuple[Optional[str], Optional[str]]:
     """The summary text of the fork's reply, or the reason it is unusable."""
     if getattr(reply, "tool_calls", None):
         return None, "tool_call"
     metadata = getattr(reply, "response_metadata", None) or {}
     finish = str(metadata.get("finish_reason") or metadata.get("stop_reason") or "")
+    # A blocked Claude reply arrives as stop_reason "refusal", or through the
+    # OpenAI-format proxy as finish_reason "content_filter" with no text.
     if (getattr(reply, "additional_kwargs", None) or {}).get("refusal") or (
-        finish.lower() == "refusal"
+        finish.lower() in ("refusal", "content_filter")
     ):
         return None, "refusal"
     try:
-        return validate_summary_message(reply, expect_sections=False), None
+        text = validate_summary_message(reply, expect_sections=False)
     except SummaryRejected as e:
         return None, e.reason
+    if recipe in _TAGGED_RECIPES:
+        blocks = _SUMMARY_BLOCK.findall(text)
+        if not blocks or not blocks[-1].strip():
+            return None, "no_summary"
+        text = blocks[-1].strip()
+    return text, None
 
 
 def history_for(
