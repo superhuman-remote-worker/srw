@@ -997,6 +997,155 @@ async def test_a_turn_with_its_final_answer_closes_members_without_results(
         await pool.close()
 
 
+async def _journal_turn_completed(pool: asyncpg.Pool, seed: Seed) -> None:
+    """The loop's ``turn.completed`` frame for turn 1, after the delegating
+    row. The pinned loop broadcasts it before its best-effort reconcile."""
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO thread_events (thread_id, epoch, seq, kind, payload) "
+            "VALUES ($1, 0, 900, 'turn.completed', "
+            '\'{"turn_id": 1, "metrics": {}}\'::jsonb)',
+            seed.session,
+        )
+
+
+async def _source_state(pool: asyncpg.Pool, seed: Seed) -> str:
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT state FROM thread_input_deliveries WHERE delivery_id=$1",
+            seed.source_delivery_id,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["stateless", "pinned"])
+async def test_a_turn_completed_frame_alone_writes_the_missing_results_no_event(
+    pg_dsn: str, lane: str
+) -> None:
+    """§14.1: the pinned loop broadcasts ``turn.completed`` before its
+    best-effort reconcile. With the strict result saves and the reconcile both
+    failed, the frame is journaled and no result reached the transcript. The
+    frame proves the turn ended, not that the parent saw the reports: the
+    settle writes them, queues no continuation (the turn is over) and consumes
+    the input as before. Lane-agnostic; the stateless loop broadcasts only
+    after its authoritative reconcile, so there it cannot leave a result out."""
+
+    pool = await _fresh_pool(pg_dsn)
+    try:
+        orchestrator = _orchestrator_db(pool)
+        seed = await _seed(pool, orchestrator, ["completed", "running"], lane=lane)
+        await _journal_turn_completed(pool, seed)
+        authority = (
+            await _successor(pool, seed) if lane == "stateless" else seed.authority
+        )
+        plan = await _plan(orchestrator, seed, authority)
+        assert [call["class"] for call in plan["calls"]] == ["ended", "live"]
+        assert [call["needs_message"] for call in plan["calls"]] == [True, True]
+
+        result = await _settle(orchestrator, seed, authority, _members(plan))
+
+        assert result["result"] == "already_delivered"
+        assert result["delivery_id"] is None
+        rows = await _tool_rows(pool, seed)
+        assert [row["tool_call_id"] for row in rows] == seed.call_ids
+        assert [row["content"] for row in rows] == [
+            _report(plan["calls"][0]),
+            _interrupted(plan["calls"][1]),
+        ]
+        assert [_metrics(row)["class"] for row in rows] == [
+            "completed",
+            "interrupted",
+        ]
+        assert {row["turn_number"] for row in rows} == {1}
+        assert [row["id"] for row in rows] == [
+            session_subagent_batch_result_id(seed.session, seed.input_id, call)
+            for call in seed.call_ids
+        ]
+        assert [call["result_message_id"] for call in result["calls"]] == [
+            str(row["id"]) for row in rows
+        ]
+        assert await _continuations(pool, seed) == []
+        if lane == "stateless":
+            assert await _consumed(pool, seed) == seed.input_seq
+        else:
+            assert await _source_state(pool, seed) == "settled"
+        for call_id in seed.call_ids:
+            child = await _child(pool, seed, call_id)
+            assert child["stamp"] == str(child["runtime_generation"])
+        assert (await _child(pool, seed, seed.call_ids[1]))["subagent_outcome"] == (
+            "interrupted:parent_restart"
+        )
+        await _assert_invariants(pool, orchestrator, seed, authority, settled=False)
+
+        # Converged: a stale retry with the same members writes nothing, and
+        # an empty one (nothing is listed any more) changes nothing either.
+        before = await _snapshot(pool, seed)
+        stale = await _settle(orchestrator, seed, authority, _members(plan))
+        assert stale["result"] == "stale"
+        empty = await _settle(orchestrator, seed, authority, [])
+        assert empty["result"] == "already_delivered"
+        assert await _snapshot(pool, seed) == before
+    finally:
+        await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_pinned_all_results_with_a_live_member_queue_one_continuation(
+    pg_dsn: str,
+) -> None:
+    """§14.1: every call has its result, a member is still live, and the
+    turn has no final answer. The pinned lane never serves an admitted input
+    again, so leaving the source admitted strands the request. As the
+    single-child path does for a live child with a durable result, the settle
+    ends the member, writes the continuation alone and settles the source."""
+
+    pool = await _fresh_pool(pg_dsn)
+    try:
+        orchestrator = _orchestrator_db(pool)
+        seed = await _seed(
+            pool, orchestrator, ["delivered", "delivered_running"], lane="pinned"
+        )
+        authority = seed.authority
+        plan = await _plan(orchestrator, seed, authority)
+        assert [call["class"] for call in plan["calls"]] == ["delivered", "delivered"]
+        assert [call["needs_entry"] for call in plan["calls"]] == [False, True]
+        tool_rows = await _tool_rows(pool, seed)
+
+        result = await _settle(orchestrator, seed, authority, _members(plan))
+
+        assert result["result"] == "applied"
+        assert result["delivery_id"] == str(seed.delivery_id)
+        assert [call["result_message_id"] for call in result["calls"]] == [None, None]
+        assert await _tool_rows(pool, seed) == tool_rows
+        (continuation,) = await _continuations(pool, seed)
+        assert continuation["state"] == "owned"
+        assert continuation["turn_number"] == 1
+        assert continuation["supersedes_input_seq"] == seed.input_seq
+        assert continuation["content"] == batch_continuation_text(
+            calls=2, interrupted=0, not_started=0, declined=0, retired=0
+        )
+        assert "All 2 delegated tasks finished" in continuation["content"]
+        assert _metrics(continuation)["kind"] == "continuation"
+        assert await _source_state(pool, seed) == "settled"
+        live = await _child(pool, seed, seed.call_ids[1])
+        assert (live["status"], live["subagent_outcome"]) == (
+            "ended",
+            "interrupted:parent_restart",
+        )
+        assert live["stamp"] == str(live["runtime_generation"])
+        await _assert_invariants(pool, orchestrator, seed, authority, settled=True)
+
+        before = await _snapshot(pool, seed)
+        again = await _settle(orchestrator, seed, authority, _members(plan))
+        assert again["result"] == "idempotent"
+        assert again["delivery_id"] == str(seed.delivery_id)
+        assert await _snapshot(pool, seed) == before
+        assert len(await _continuations(pool, seed)) == 1
+    finally:
+        await pool.close()
+
+
 @pytest.mark.asyncio
 async def test_s5_crash_before_commit_rolls_back_and_a_lost_response_is_idempotent(
     pg_dsn: str, monkeypatch: pytest.MonkeyPatch

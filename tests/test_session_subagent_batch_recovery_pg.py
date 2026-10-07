@@ -46,7 +46,9 @@ from agent.subagents import SessionHost, SubagentRuntime
 from agent.subagents.batch_recovery import INTERRUPTED_HEADER
 from agent.subagents.session_persistence import SessionSubagentLedger
 from shared.persistent_input_delivery import (
+    claim_pending_input_deliveries,
     claim_stateless_input_delivery,
+    message_row_id,
     persist_input_delivery,
     transition_stateless_input_delivery,
 )
@@ -67,6 +69,7 @@ from shared.session_subagent_batch import (
 from tests._fake_chat_model import FakeChatModel, text_turn
 from tests.test_persistent_delegation_batch import _callbacks, _config, _context_manager
 from tests.test_session_subagent_batch_settle_pg import (
+    QUEUED_BEHIND_THE_INPUT,
     S1,
     TYPED_DURING_THE_BATCH,
     Seed,
@@ -965,5 +968,222 @@ async def test_a_report_the_successor_cannot_read_comes_from_the_transcript(
             assert REPORT in by_call[ended_call]
             assert "Report source: the child's stored transcript" in by_call[ended_call]
             assert "report unavailable" not in by_call[ended_call]
+    finally:
+        await pool.close()
+
+
+# ---------------------------------------------------------------------------
+# The pinned lane (parallel_subagents.md §14.1, §14.2 P1)
+# ---------------------------------------------------------------------------
+
+
+async def _pinned_agent(pool, orchestrator, seed: Seed, tmp_path, stack, monkeypatch):
+    """The attached pinned runtime's agent side (the same pod, re-attached)."""
+
+    agent = _Agent(pool, orchestrator, seed, seed.authority, tmp_path, stack)
+    await agent.connect(monkeypatch)
+    agent.context._subagent_execution_lane = "pinned"
+
+    def no_child(*_args, **_kwargs):
+        raise AssertionError("recovery built a child")
+
+    monkeypatch.setattr(runtime_module, "build_child", no_child)
+    return agent
+
+
+async def _pinned_claim(pool, seed: Seed) -> list[dict[str, Any]]:
+    """What the attached pinned runtime claims, in serving order."""
+
+    authority = seed.authority
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            return await claim_pending_input_deliveries(
+                conn,
+                thread_id=seed.session,
+                agent_id=authority["agent_id"],
+                pod_uid=authority["pod_uid"],
+                runtime_generation=authority["session_runtime_generation"],
+                session_runtime_generation=authority["session_runtime_generation"],
+                runtime_attach_token=authority["runtime_attach_token"],
+            )
+
+
+async def _pinned_restored(agent: _Agent) -> list:
+    """What a pinned attach restores: owned input is not history yet."""
+
+    rows = await agent.agent_db.get_thread_messages_history(
+        thread_id=str(agent.seed.session), limit=1000, newest_first=True
+    )
+    restored = repair_tool_pairing(_db_rows_to_lc_messages(rows))
+    return sanitize_history_for_provider_boundary(restored, MODEL)
+
+
+async def _pinned_source_state(pool, seed: Seed) -> str:
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT state FROM thread_input_deliveries WHERE delivery_id=$1",
+            seed.source_delivery_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_pinned_turn_with_durable_results_resumes_once_from_its_continuation(
+    pg_dsn: str, tmp_path, monkeypatch
+) -> None:
+    """Every call has its result, one child is still live, the turn has no
+    final answer. The settle queues the continuation alone; the runtime claims
+    it before the message queued behind the turn, and one provider turn
+    follows with each result once."""
+
+    pool = await _fresh_pool(pg_dsn)
+    try:
+        async with AsyncExitStack() as stack:
+            orchestrator = _orchestrator_db(pool)
+            seed = await _seed(
+                pool,
+                orchestrator,
+                ["delivered", "delivered_running"],
+                lane="pinned",
+                queued_behind_the_input=True,
+            )
+            results = {
+                row["tool_call_id"]: row["content"]
+                for row in await _tool_rows(pool, seed)
+            }
+            agent = await _pinned_agent(
+                pool, orchestrator, seed, tmp_path, stack, monkeypatch
+            )
+            runtime = agent.runtime()
+
+            recovered = await runtime.recover_orphans()
+
+            assert agent.settle_requests() == 1
+            assert not any(path.endswith("/terminal") for path in agent.requests)
+            live_call = seed.call_ids[1]
+            delivery_id = str(
+                session_subagent_batch_delivery_id(seed.session, seed.input_id)
+            )
+            assert [
+                (entry["thread_id"], entry["status"], entry["delivery_id"])
+                for entry in recovered
+            ] == [(seed.children[live_call]["thread_id"], "interrupted", delivery_id)]
+            assert {
+                row["tool_call_id"]: row["content"]
+                for row in await _tool_rows(pool, seed)
+            } == results
+            (continuation,) = await _continuations(pool, seed)
+            assert str(continuation["delivery_id"]) == delivery_id
+            assert await _pinned_source_state(pool, seed) == "settled"
+            assert await agent.runtime().recover_orphans() == []
+            assert agent.settle_requests() == 1
+
+            claimed = await _pinned_claim(pool, seed)
+            assert [row["message_id"] for row in claimed] == [
+                str(message_row_id(UUID(delivery_id))),
+                str(message_row_id(seed.queued_delivery_id)),
+            ]
+            target = claimed[0]
+            restored = await _pinned_restored(agent)
+            continuation_input = HumanMessage(
+                content=target["content"], id=target["message_id"]
+            )
+            continuation_input.additional_kwargs[PERSIST_ROLE_KEY] = "event"
+
+            provider_input = await _run_turn(
+                agent, restored, continuation_input, "The comparison: ..."
+            )
+
+            assert [message.type for message in provider_input] == (
+                ["system", "human", "ai", "tool", "tool", "human"]
+            )
+            assert [message.tool_call_id for message in provider_input[3:5]] == (
+                seed.call_ids
+            )
+            assert provider_input[-1].content == target["content"]
+            assert "All 2 delegated tasks finished" in target["content"]
+            text = [str(message.content) for message in provider_input]
+            for result in results.values():
+                assert text.count(result) == 1
+            assert not any(QUEUED_BEHIND_THE_INPUT in part for part in text)
+    finally:
+        await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_pinned_turn_completed_frame_without_results_keeps_every_report(
+    pg_dsn: str, tmp_path, monkeypatch
+) -> None:
+    """The pinned loop broadcast ``turn.completed``, then the strict result
+    saves and the best-effort reconcile both failed. The settle writes each
+    report as its call's result and queues nothing; the next message the user
+    sends is answered with each report once."""
+
+    pool = await _fresh_pool(pg_dsn)
+    try:
+        async with AsyncExitStack() as stack:
+            orchestrator = _orchestrator_db(pool)
+            seed = await _seed(
+                pool, orchestrator, ["completed", "running"], lane="pinned"
+            )
+            ended_call, live_call = seed.call_ids
+            agent_db = _agent_db(pool)
+            live_child = seed.children[live_call]["thread_id"]
+            await agent_db.save_thread_message(
+                thread_id=live_child, role="human", content="brief", turn_number=1
+            )
+            await agent_db.save_thread_message(
+                thread_id=live_child, role="ai", content=LAST_WORDS, turn_number=1
+            )
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO thread_events (thread_id, epoch, seq, kind, "
+                    "payload) VALUES ($1, 0, 900, 'turn.completed', "
+                    '\'{"turn_id": 1, "metrics": {}}\'::jsonb)',
+                    seed.session,
+                )
+            agent = await _pinned_agent(
+                pool, orchestrator, seed, tmp_path, stack, monkeypatch
+            )
+            (agent.root / ".subagents" / "reader-0000").mkdir(parents=True)
+            (agent.root / ".subagents" / "reader-0000" / "report.md").write_text(REPORT)
+
+            recovered = await agent.runtime().recover_orphans()
+
+            assert agent.settle_requests() == 1
+            assert [entry["thread_id"] for entry in recovered] == [
+                seed.children[ended_call]["thread_id"],
+                seed.children[live_call]["thread_id"],
+            ]
+            assert {entry["delivery_id"] for entry in recovered} == {None}
+            by_call = {
+                row["tool_call_id"]: row["content"]
+                for row in await _tool_rows(pool, seed)
+            }
+            assert list(by_call) == seed.call_ids
+            assert REPORT in by_call[ended_call]
+            assert by_call[live_call].startswith(INTERRUPTED_HEADER)
+            assert LAST_WORDS in by_call[live_call]
+            assert await _continuations(pool, seed) == []
+            assert await _pinned_source_state(pool, seed) == "settled"
+            assert await _pinned_claim(pool, seed) == []
+            assert await agent.runtime().recover_orphans() == []
+
+            restored = await _pinned_restored(agent)
+            provider_input = await _run_turn(
+                agent,
+                restored,
+                HumanMessage(content=QUEUED_BEHIND_THE_INPUT, id=str(uuid4())),
+                "Switzerland is included now.",
+            )
+
+            assert [message.type for message in provider_input] == (
+                ["system", "human", "ai", "tool", "tool", "human"]
+            )
+            assert [message.tool_call_id for message in provider_input[3:5]] == (
+                seed.call_ids
+            )
+            text = [str(message.content) for message in provider_input]
+            assert sum(REPORT in part for part in text) == 1
+            assert sum(LAST_WORDS in part for part in text) == 1
     finally:
         await pool.close()

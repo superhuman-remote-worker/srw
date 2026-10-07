@@ -38196,6 +38196,18 @@ class PostgresDB:
                             parent_ai_message_id=parent_ai_message_id,
                             parent_ai_seq=int(parent_ai_seq),
                         )
+                        if (
+                            parsed.execution_lane == "pinned"
+                            and not parent_turn_completed
+                        ):
+                            # The pinned lane never serves an admitted input
+                            # again: settling the source here without a
+                            # continuation would mark a turn answered that
+                            # still owes its answer. Like a live child whose
+                            # result is durable, fall through to the
+                            # saved-result continuation below (and like the
+                            # batch settle; parallel_subagents.md §14.1).
+                            delivered_by_tool_message = False
 
                     if (
                         parsed.execution_lane == "stateless"

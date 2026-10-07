@@ -28,6 +28,7 @@ import pytest
 from orchestrator.database.migrate import run_migrations
 from shared.run_queue import UNIT_KIND_SESSION_TURN, claim_unit, record_input_seq
 from shared.session_subagent_authority import session_subagent_delivery_id
+from tests.test_session_subagent_batch_settle_pg import _seed as _seed_delegation_turn
 from tests.test_subagent_thread_migration import (  # noqa: F401  (scratch_pg_dsn fixture)
     MIGRATIONS,
     _orchestrator_db,
@@ -413,5 +414,135 @@ async def test_child_without_tool_message_is_still_a_real_orphan(
             )
             == []
         )
+    finally:
+        await pool.close()
+
+
+_DURABLE_RESULT_CONTINUATION = (
+    "[subagent recovery] The original delegate_agent ToolMessage is already "
+    "durable in this conversation, but the parent turn ended before its final "
+    "response was recorded. Continue from that tool result and answer the "
+    "original request directly. Do not delegate replacement work for this "
+    "recovery turn."
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turn_completed", [False, True])
+async def test_pinned_ended_child_with_a_durable_result_owes_the_turn_its_answer(
+    pg_dsn: str, turn_completed: bool
+) -> None:
+    """The pinned variant (parallel_subagents.md §14.1). The ToolMessage is
+    still the child's delivery, but without proof that the turn answered its
+    input the turn is owed: the pinned lane never serves an admitted input
+    again, so settling the source alone would mark it answered. Like a live
+    child with a durable result, the ended one queues the saved-result
+    continuation and settles the source. With the turn's ``turn.completed``
+    frame it stays ``already_delivered`` (and the source is settled), as the
+    batch settle does. Only a racing caller reaches this: the listing never
+    offers an ended child whose result is durable."""
+
+    pool = await _fresh_pool(pg_dsn)
+    try:
+        orchestrator = _orchestrator_db(pool)
+        seed = await _seed_delegation_turn(
+            pool, orchestrator, ["delivered"], lane="pinned"
+        )
+        (call_id,) = seed.call_ids
+        child = seed.children[call_id]
+        if turn_completed:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO thread_events (thread_id, epoch, seq, kind, "
+                    "payload) VALUES ($1, 0, 900, 'turn.completed', "
+                    '\'{"turn_id": 1, "metrics": {}}\'::jsonb)',
+                    seed.session,
+                )
+        assert (
+            await orchestrator.list_live_session_subagent_threads(
+                str(seed.session), parent_authority=seed.authority
+            )
+            == []
+        )
+        expected_delivery = str(
+            session_subagent_delivery_id(
+                UUID(child["thread_id"]), UUID(child["runtime_generation"])
+            )
+        )
+        request = dict(
+            parent_thread_id=str(seed.session),
+            parent_authority=seed.authority,
+            thread_id=child["thread_id"],
+            runtime_generation=child["runtime_generation"],
+            subagent_status="completed",
+            outcome="completed",
+            delivery_id=expected_delivery,
+            message="[subagent reader-0000 · reader · completed] transcript envelope",
+            foreground_orphan_recovery=True,
+        )
+
+        recovered = await orchestrator.terminalize_session_subagent_thread(**request)
+
+        async def subagent_events() -> list[asyncpg.Record]:
+            async with pool.acquire() as conn:
+                return await conn.fetch(
+                    "SELECT delivery.delivery_id, delivery.state, "
+                    "       delivery.supersedes_input_seq, message.content "
+                    "  FROM thread_input_deliveries AS delivery "
+                    "  JOIN thread_messages AS message "
+                    "    ON message.id = delivery.message_id "
+                    " WHERE delivery.thread_id = $1 "
+                    "   AND delivery.source = 'subagent'",
+                    seed.session,
+                )
+
+        async def source_state() -> str:
+            async with pool.acquire() as conn:
+                return await conn.fetchval(
+                    "SELECT state FROM thread_input_deliveries WHERE delivery_id=$1",
+                    seed.source_delivery_id,
+                )
+
+        assert recovered is not None
+        assert await source_state() == "settled"
+        assert (
+            await _child_stamp(pool, child["thread_id"]) == child["runtime_generation"]
+        )
+        if turn_completed:
+            assert recovered["result"] == "already_delivered"
+            assert recovered["delivery_id"] is None
+            assert await subagent_events() == []
+        else:
+            # An ended child's first recovery reports ``idempotent`` (its
+            # terminal row predates the call), as on the stateless lane.
+            assert recovered["result"] in {"applied", "idempotent"}
+            assert recovered["delivery_id"] == expected_delivery
+            assert recovered["supersedes_input_seq"] == seed.input_seq
+            (event,) = await subagent_events()
+            assert str(event["delivery_id"]) == expected_delivery
+            assert event["state"] == "owned"
+            assert event["supersedes_input_seq"] == seed.input_seq
+            assert event["content"] == _DURABLE_RESULT_CONTINUATION
+            # The child's terminal facts are untouched.
+            async with pool.acquire() as conn:
+                assert (
+                    await conn.fetchval(
+                        "SELECT status || '/' || subagent_status FROM threads "
+                        "WHERE id=$1",
+                        UUID(child["thread_id"]),
+                    )
+                    == "ended/completed"
+                )
+
+        # A retry converges on the same verdict and writes nothing new.
+        events = await subagent_events()
+        again = await orchestrator.terminalize_session_subagent_thread(**request)
+        assert again is not None
+        if turn_completed:
+            assert again["result"] == "already_delivered"
+        else:
+            assert again["result"] == "idempotent"
+            assert again["delivery_id"] == expected_delivery
+        assert await subagent_events() == events
     finally:
         await pool.close()

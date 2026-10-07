@@ -167,6 +167,47 @@ async def load_recovery_parent_input(
     )
 
 
+# The loop's ``turn.completed`` frame for turn ``$2`` of thread ``$1``,
+# journaled after the delegating AI row ``$3``.
+_TURN_COMPLETED_FRAME_SQL = """
+SELECT 1
+  FROM thread_events AS frame
+ WHERE frame.thread_id = $1
+   AND frame.kind = 'turn.completed'
+   AND (frame.payload->>'turn_id') = $2::text
+   AND frame.created_at >= (
+       SELECT created_at
+         FROM thread_messages
+        WHERE id = $3
+   )
+"""
+
+
+async def turn_completed_frame_journaled(
+    conn: Any,
+    *,
+    parent_thread_id: UUID,
+    parent_iteration: int,
+    parent_ai_message_id: UUID,
+) -> bool:
+    """Whether the loop journaled ``turn.completed`` after the delegating call.
+
+    The frame proves the turn ended, not that its rows are durable: the
+    pinned loop broadcasts it BEFORE its best-effort transcript reconcile,
+    which swallows errors (parallel_subagents.md §14.1). The stateless loop
+    broadcasts only after its authoritative reconcile committed.
+    """
+
+    return bool(
+        await conn.fetchval(
+            f"SELECT EXISTS ({_TURN_COMPLETED_FRAME_SQL})",
+            parent_thread_id,
+            str(int(parent_iteration)),
+            parent_ai_message_id,
+        )
+    )
+
+
 async def parent_turn_completed(
     conn: Any,
     *,
@@ -181,23 +222,13 @@ async def parent_turn_completed(
     journaled after the delegating AI row (the only evidence when the final
     answer carries its own tool call — ad7eb761), or the turn's own final
     answer row — same turn_number, after the delegating call, no tool calls.
+    The batch settle reads the two apart (``turn_completed_frame_journaled``).
     """
 
     return bool(
         await conn.fetchval(
-            """
-            SELECT EXISTS (
-                SELECT 1
-                  FROM thread_events AS frame
-                 WHERE frame.thread_id = $1
-                   AND frame.kind = 'turn.completed'
-                   AND (frame.payload->>'turn_id') = $2::text
-                   AND frame.created_at >= (
-                       SELECT created_at
-                         FROM thread_messages
-                        WHERE id = $3
-                   )
-            )
+            f"""
+            SELECT EXISTS ({_TURN_COMPLETED_FRAME_SQL})
             OR EXISTS (
                 SELECT 1
                   FROM thread_messages AS answer
@@ -952,10 +983,15 @@ async def settle_session_subagent_batch(
     refusal after a write can only be an exception, which rolls the whole
     transaction back. No provider or network call happens here.
 
-    Results: ``applied`` (results and continuation written now),
-    ``idempotent`` (a continuation for this input already exists; it is
-    returned and nothing is touched), ``already_delivered`` (the turn has its
-    answer, or every call its result: members are closed, nothing is queued),
+    Results: ``applied`` (the missing results and the continuation written
+    now; on the pinned lane possibly the continuation alone, when every call
+    has its result but members are still owed), ``idempotent`` (a
+    continuation for this input already exists; it is returned and nothing is
+    touched), ``already_delivered`` (no continuation: the turn has its final
+    answer, or only its ``turn.completed`` frame, or every call has its
+    result and either the lane is stateless or no member is owed; members
+    are closed, and with the frame alone the missing results are written;
+    nothing is queued),
     ``nothing_to_recover`` (no call of the turn ever got a child), and
     ``stale`` (the request does not name exactly the server's members; the
     server's view is returned and nothing is written).
@@ -1076,12 +1112,18 @@ async def settle_session_subagent_batch(
             "calls": [call.view() for call in calls],
         }
 
-    # 7. The turn-level facts, once for the whole turn.
+    # 7. The turn-level facts, once for the whole turn. A final-answer row
+    #    and a ``turn.completed`` frame are different facts. The answer row
+    #    proves the parent saw every result it answered from. The frame proves
+    #    only that the turn ended: the pinned loop broadcasts it before its
+    #    best-effort reconcile, so with a failed strict save and a failed
+    #    reconcile the frame exists while the results never reached the
+    #    transcript (§14.1).
     first = calls[0]
     input_end_seq = await conn.fetchval(
         _INPUT_END_SQL, parent_thread_id, parent_input.seq
     )
-    answered = (
+    final_answer = (
         await final_parent_response_seq(
             conn,
             execution_lane=lane,
@@ -1092,15 +1134,26 @@ async def settle_session_subagent_batch(
             before_seq=input_end_seq,
         )
         is not None
-    ) or await parent_turn_completed(
+    )
+    turn_ended = final_answer or await turn_completed_frame_journaled(
         conn,
         parent_thread_id=parent_thread_id,
         parent_iteration=parent_iteration,
         parent_ai_message_id=first.parent_ai_message_id,
-        parent_ai_seq=first.parent_ai_seq,
     )
     undelivered = [call for call in calls if call.call_class != CALL_DELIVERED]
-    settle = not answered and bool(undelivered)
+    # The missing results are written unless the turn has its final answer.
+    write_results = not final_answer and bool(undelivered)
+    # The continuation is written only while the turn still owes its answer.
+    # The pinned lane never serves an admitted input again, so a turn whose
+    # calls all have results but whose members are still owed is settled
+    # with a continuation alone, as the single-child path does for a live
+    # child with a durable result. The stateless lane replays the input with
+    # the results in the transcript instead.
+    write_continuation = not turn_ended and (
+        bool(undelivered)
+        or (lane == "pinned" and any(call.needs_entry for call in calls))
+    )
 
     # 8. Apply. End every live member as interrupted by the restart.
     for call in calls:
@@ -1121,19 +1174,23 @@ async def settle_session_subagent_batch(
         ):
             raise RuntimeError("batch settle lost a locked child generation")
 
+    from shared.persistent_input_delivery import (
+        message_row_id,
+        persist_input_delivery,
+    )
+
     written: dict[str, UUID] = {}
     delivery: Mapping[str, Any] | None = None
-    if settle:
-        from shared.persistent_input_delivery import (
-            message_row_id,
-            persist_input_delivery,
-        )
-
+    interrupted = not_started = declined = retired = 0
+    if write_results or write_continuation:
         # What the parent will see: one result per undelivered call, in
         # provider order, each stamped with the abandoned turn's number so a
         # restore places it behind its call and ahead of input typed during
-        # the batch (invariant 12).
-        interrupted = not_started = declined = retired = 0
+        # the batch (invariant 12). A continuation alone (every call already
+        # has its result) writes no row here: there is no undelivered call.
+        # The result metrics name the batch's delivery id even when only the
+        # frame proved the turn ended and no continuation follows: it is the
+        # turn's recovery identity, as the result row ids are.
         for call in calls:
             if call.permission_status == "denied" and call.call_class in {
                 CALL_DELIVERED,
@@ -1198,6 +1255,7 @@ async def settle_session_subagent_batch(
             )
             written[call.tool_call_id] = row_id
 
+    if write_continuation:
         # Then the one continuation that supersedes the abandoned input. It
         # keeps ``source='subagent'`` and ``supersedes_input_seq``, so the
         # stateless executor serves it before input typed during the batch,
@@ -1246,10 +1304,11 @@ async def settle_session_subagent_batch(
             ),
         )
 
-    if settle or answered:
+    if write_continuation or turn_ended:
         # The input is consumed with the continuation that supersedes it, or
-        # because the turn answered it; never otherwise, so a turn whose calls
-        # all have results replays with them in the transcript. The stateless
+        # because the turn ended (its final answer, or the ``turn.completed``
+        # frame); never otherwise, so a stateless turn whose calls all have
+        # results replays with them in the transcript. The stateless
         # watermark counts human input only. An event input (the continuation
         # of an earlier settle, whose recovery turn delegated again) is
         # consumed by settling its own delivery below; moving the watermark
@@ -1322,4 +1381,5 @@ __all__ = [
     "settle_recovery_source",
     "settle_session_subagent_batch",
     "stamp_recovered_child",
+    "turn_completed_frame_journaled",
 ]
