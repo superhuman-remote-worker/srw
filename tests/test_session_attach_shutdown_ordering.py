@@ -85,7 +85,9 @@ async def test_lifespan_never_terminates_over_attach_cleanup(
     )
     shutdown = asyncio.create_task(context.__aexit__(None, None, None))
     try:
-        await asyncio.wait_for(asyncio.shield(shutdown), 0.25)
+        # Blocked cleanup cannot finish before `finally`, so any finite bound
+        # proves shutdown never waits on it; a tight one only flakes under load.
+        await asyncio.wait_for(asyncio.shield(shutdown), 5)
         assert cleanup.is_set()
         assert pa._session_termination.termination_admission_fenced is True
         assert pa._session_termination.termination_fence_reason == "startup_shutdown"

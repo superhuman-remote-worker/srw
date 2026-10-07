@@ -316,6 +316,25 @@ async def wait_for_checkpoint_cleanup_admission(app_pg, job_id: UUID) -> None:
     raise AssertionError("checkpoint cleanup did not publish its durable admission")
 
 
+async def wait_for_checkpoint_prune_row_lock(app_pg) -> None:
+    """Return once the prune holds the owner lock and waits on a checkpoint row.
+
+    The admission commits before the prune's own transaction takes the owner
+    lock, so a visible admission alone does not prove the lock is held yet.
+    """
+    for _ in range(500):
+        async with app_pg.acquire() as conn:
+            blocked = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                "WHERE datname=current_database() AND wait_event_type='Lock' "
+                "AND query LIKE 'DELETE FROM checkpoints %')"
+            )
+        if blocked:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("checkpoint prune did not reach the checkpoint row lock")
+
+
 async def checkpoint_cleanup_outcome(app_pg, job_id: UUID, source: str) -> str | None:
     async with app_pg.acquire() as conn:
         return await conn.fetchval(
@@ -1215,7 +1234,7 @@ async def test_terminal_checkpoint_prune_serializes_cleanup_before_recovery(
     prune_task = asyncio.create_task(db.delete_checkpoint_thread(str(job_id)))
     hold_task = None
     try:
-        await wait_for_checkpoint_cleanup_admission(app_pg, job_id)
+        await wait_for_checkpoint_prune_row_lock(app_pg)
         hold_task = asyncio.create_task(
             store.admit_hold(**admission_kwargs(job_id, lease_token))
         )
@@ -1292,7 +1311,7 @@ async def test_global_checkpoint_prune_serializes_cleanup_before_recovery(
     prune_task = asyncio.create_task(db.prune_checkpoints_keep_last(1))
     hold_task = None
     try:
-        await wait_for_checkpoint_cleanup_admission(app_pg, job_id)
+        await wait_for_checkpoint_prune_row_lock(app_pg)
         hold_task = asyncio.create_task(
             store.admit_hold(**admission_kwargs(job_id, lease_token))
         )
