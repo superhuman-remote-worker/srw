@@ -338,14 +338,40 @@ class TestRepositoryConnectorEndpoint:
         assert TOKEN not in result["message"]
 
     @pytest.mark.asyncio
-    async def test_ssh_connector_is_not_probed(self):
+    async def test_ssh_connector_reports_its_host_key(self, monkeypatch):
+        """C1: no forge API takes a deploy key; Test reports the host key."""
+        from orchestrator.services import workspace_ssh_connector
+        from shared.runtime.utils.ssh_key import generate_ed25519_keypair
+
+        host_key = generate_ed25519_keypair().public_key.split()
+        reached = []
+
+        async def fetch(host, port):
+            reached.append((host, port))
+            return " ".join(host_key[:2])
+
+        monkeypatch.setattr(workspace_ssh_connector, "fetch_ssh_host_key", fetch)
+        private_key = generate_ed25519_keypair().private_key
+        row = self._row(credentials={"auth_method": "ssh", "ssh_key": private_key})
+        result = await probe_datasource_endpoint(
+            object(), self.DS_ID, dependencies=_route_deps(row)
+        )
+
+        assert reached == [("github.com", 22)]
+        assert result["status"] == "ok"
+        assert result["details"]["host_key"] == " ".join(host_key[:2])
+        assert result["details"]["host_key_pinned"] is False
+        assert "PRIVATE KEY" not in json.dumps(result)
+
+    @pytest.mark.asyncio
+    async def test_unusable_ssh_connector_is_an_error_result(self):
         row = self._row(credentials={"ssh_key": "-----BEGIN OPENSSH PRIVATE KEY-----"})
         result = await probe_datasource_endpoint(
             object(), self.DS_ID, dependencies=_route_deps(row)
         )
 
-        assert result["status"] == "ok"
-        assert "No API probe for SSH-key" in result["message"]
+        assert result["status"] == "error"
+        assert "Invalid SSH key" in result["message"]
 
     @pytest.mark.asyncio
     async def test_self_hosted_without_forge_is_an_error_not_a_guess(self):

@@ -1867,6 +1867,10 @@ spec:
             - name: KB_GIT_SSH_KNOWN_HOSTS
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.orchestrator.workspaceSshKnownHosts }}
+            - name: WORKSPACE_SSH_KNOWN_HOSTS
+              value: {{ . | quote }}
+            {{- end }}
             - name: KB_EXTERNAL_REINDEX_CONCURRENCY
               value: {{ .Values.orchestrator.kbExternalReindexConcurrency | quote }}
             - name: KB_REINDEX_SWEEP_SECONDS

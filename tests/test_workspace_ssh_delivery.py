@@ -271,3 +271,22 @@ async def test_thread_delivery_builds_both_halves_from_one_authorization():
     assert await thread_mount_rows.resolve_thread_datasource_delivery(
         {"id": "t"}, {}, dependencies=deps
     ) == (None, None)
+
+
+def test_chart_default_pins_reach_the_orchestrator():
+    """``orchestrator.workspaceSshKnownHosts``, modelled on kbGitSshKnownHosts."""
+    from tests.test_persistent_lifecycle_helm import (
+        _orchestrator_env,
+        _render_orchestrator,
+    )
+
+    assert WORKSPACE_SSH_KNOWN_HOSTS_ENV not in _orchestrator_env(
+        _render_orchestrator()
+    )
+    pins = "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+    env = _orchestrator_env(
+        _render_orchestrator(
+            "--set-string", f"orchestrator.workspaceSshKnownHosts={pins}"
+        )
+    )
+    assert env[WORKSPACE_SSH_KNOWN_HOSTS_ENV] == pins

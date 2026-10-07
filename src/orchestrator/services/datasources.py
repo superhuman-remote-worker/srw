@@ -74,6 +74,7 @@ from orchestrator.services.email_datasource import (
 )
 from orchestrator.services.workspace_ssh_connector import (
     WorkspaceSshConnectorError,
+    probe_workspace_ssh_connector,
     repository_uses_ssh_key,
     validate_workspace_ssh_connector,
 )
@@ -1256,7 +1257,9 @@ async def test_repository_datasource(
     branch, with warnings for the two configurations that silently defeat
     the guardrails: an administrator token (bypasses branch rules) and a
     connector that is not read-only but cannot push. SSH-key connectors have
-    no API to ask; their clone at job start is the test.
+    no API to ask: Test reaches their SSH endpoint and reports its host key
+    (``workspace_ssh_connector.probe_workspace_ssh_connector``); the clone at
+    job start proves the key.
     """
     from shared.runtime.services.forge import (  # noqa: PLC0415
         ForgeError,
@@ -1270,6 +1273,12 @@ async def test_repository_datasource(
     auth_method = str(creds.get("auth_method") or "").lower()
     if not auth_method:
         auth_method = "ssh" if creds.get("ssh_key") else ("token" if token else "")
+    if auth_method == "ssh":
+        # No forge API takes a deploy key; reach the SSH endpoint and report
+        # the host key the connector form offers to pin.
+        probed = await probe_workspace_ssh_connector({**ds, "credentials": creds})
+        if probed is not None:
+            return probed
     if auth_method != "token" or not token:
         return {
             "status": "ok",
@@ -1476,6 +1485,12 @@ async def test_datasource(
                 "status": "ok",
                 "message": "No connectivity test for generic connectors",
             }
+        elif (
+            ds_type == "ssh_key"
+            and (probed := await probe_workspace_ssh_connector(ds)) is not None
+        ):
+            # Only a declared host has an endpoint to test.
+            return probed
 
         else:
             return {"status": "error", "message": f"Unknown connector type: {ds_type}"}

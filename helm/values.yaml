@@ -319,6 +319,13 @@ orchestrator:
   # -- Optional OpenSSH known_hosts content for external OKF KB deploy-key
   # remotes. Non-empty content switches SSH from accept-new to strict pinning.
   kbGitSshKnownHosts: ""
+  # -- Optional OpenSSH known_hosts content pinning the host keys of external
+  # SSH hosts that SSH-key repository and ssh_key connectors reach from a
+  # workspace (e.g. GitHub's and GitLab.com's published keys). Only lines that
+  # name a connector's host apply to it; a connector's own known_hosts field
+  # wins. A pinned connector gets StrictHostKeyChecking yes, any other one
+  # accept-new into its own per-connector known_hosts file.
+  workspaceSshKnownHosts: ""
   # -- Maximum simultaneous external OKF Git snapshot/embed operations per
   # orchestrator replica (create/update/manual/test plus the leader sweep).
   kbExternalReindexConcurrency: 2

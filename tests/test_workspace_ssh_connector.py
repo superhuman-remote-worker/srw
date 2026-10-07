@@ -632,3 +632,118 @@ class TestUpdateEndpoint:
         assert response.status_code < 300, response.text
         update.assert_awaited_once()
         assert update.await_args.kwargs["config"] is None
+
+
+# =============================================================================
+# Test connection: reach the endpoint, report the host key to pin.
+# =============================================================================
+
+
+def _ssh_key_row(config: dict) -> dict:
+    return {
+        "id": "77777777-7777-4777-8777-777777777777",
+        "name": "Bastion",
+        "type": "ssh_key",
+        "connection_url": None,
+        "credentials": {
+            "files": [{"contents": generate_ed25519_keypair().private_key}]
+        },
+        "config": config,
+    }
+
+
+class TestProbe:
+    @pytest.mark.asyncio
+    async def test_fetches_the_real_host_key_without_authenticating(self):
+        import asyncssh
+
+        from orchestrator.services.workspace_ssh_connector import fetch_ssh_host_key
+
+        host_key = asyncssh.generate_private_key("ssh-ed25519")
+        server = await asyncssh.create_server(
+            asyncssh.SSHServer,
+            "127.0.0.1",
+            0,
+            server_host_keys=[host_key],
+        )
+        try:
+            port = server.sockets[0].getsockname()[1]
+            fetched = await fetch_ssh_host_key("127.0.0.1", port)
+        finally:
+            server.close()
+            await server.wait_closed()
+        expected = host_key.export_public_key("openssh").decode().split()[:2]
+        assert fetched == " ".join(expected)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("pin", [None, "match", "other"])
+    async def test_pin_outcomes(self, monkeypatch, pin):
+        from orchestrator.services import workspace_ssh_connector
+
+        presented = _host_key()
+        monkeypatch.setattr(
+            workspace_ssh_connector,
+            "fetch_ssh_host_key",
+            AsyncMock(return_value=presented),
+        )
+        config = {"host": "bastion.example.com", "port": 2200}
+        if pin is not None:
+            config["known_hosts"] = presented if pin == "match" else _host_key()
+
+        result = await workspace_ssh_connector.probe_workspace_ssh_connector(
+            _ssh_key_row(config)
+        )
+
+        assert result["details"]["host_key"] == presented
+        assert result["details"]["port"] == 2200
+        if pin == "other":
+            assert result["status"] == "error"
+            assert "not the pinned key" in result["message"]
+        else:
+            assert result["status"] == "ok"
+            assert result["details"]["host_key_pinned"] is (pin == "match")
+
+    @pytest.mark.asyncio
+    async def test_unreachable_host_is_an_error_without_detail(self, monkeypatch):
+        from orchestrator.services import workspace_ssh_connector
+
+        monkeypatch.setattr(
+            workspace_ssh_connector,
+            "fetch_ssh_host_key",
+            AsyncMock(side_effect=OSError("internal dns detail")),
+        )
+        result = await workspace_ssh_connector.probe_workspace_ssh_connector(
+            _ssh_key_row({"host": "bastion.example.com"})
+        )
+        assert result == {
+            "status": "error",
+            "message": "Could not reach SSH host bastion.example.com:22",
+        }
+
+    @pytest.mark.asyncio
+    async def test_route_probes_an_ssh_key_with_a_host(self, monkeypatch):
+        from orchestrator.routers.datasources import test_datasource as route
+        from orchestrator.services import workspace_ssh_connector
+        from tests.test_repository_probe import _route_deps
+
+        presented = _host_key()
+        monkeypatch.setattr(
+            workspace_ssh_connector,
+            "fetch_ssh_host_key",
+            AsyncMock(return_value=presented),
+        )
+        row = _ssh_key_row({"host": "bastion.example.com"})
+        result = await route(object(), row["id"], dependencies=_route_deps(row))
+        assert result["status"] == "ok"
+        assert result["details"]["host_key"] == presented
+
+    @pytest.mark.asyncio
+    async def test_ssh_key_without_host_has_nothing_to_probe(self):
+        from orchestrator.services import workspace_ssh_connector
+
+        assert (
+            await workspace_ssh_connector.probe_workspace_ssh_connector(
+                _ssh_key_row({})
+            )
+            is None
+        )

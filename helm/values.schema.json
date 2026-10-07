@@ -1590,6 +1590,10 @@
         "workspaceCleanupReconciliationEnabled": {
           "type": "boolean"
         },
+        "workspaceSshKnownHosts": {
+          "type": "string",
+          "description": "OpenSSH known_hosts lines pinning external SSH hosts for workspace connector identities (connector drivers C1)."
+        },
         "containerStartupStageAuthority": {
           "type": "object",
           "required": ["enabled"],

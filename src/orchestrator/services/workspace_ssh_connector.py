@@ -20,6 +20,9 @@ over unchanged:
   of its key. Both re-validate the stored row, so a row that predates the
   validation degrades to an unavailable connector instead of reaching a
   workspace's SSH config.
+* :func:`probe_workspace_ssh_connector` is Test connection: it reaches the
+  connector's host and reports the host key, which the connector form offers
+  to pin.
 
 Errors are :class:`WorkspaceSshConnectorError` (a ``ValueError``) whose message
 is the API's 400 detail; it never echoes key material.
@@ -441,6 +444,93 @@ def build_workspace_ssh_identities(
     return identities or None
 
 
+# ---------------------------------------------------------------------------
+# Test connection
+# ---------------------------------------------------------------------------
+
+_HOST_KEY_PROBE_TIMEOUT_S = 10
+
+
+async def fetch_ssh_host_key(host: str, port: int) -> str:
+    """Return the ``"<type> <base64>"`` host key ``host:port`` presents.
+
+    Only the key exchange runs; nothing authenticates and no connector key
+    is offered. The answer is what the connector form offers to pin.
+    """
+
+    import asyncio
+
+    import asyncssh
+
+    async with asyncio.timeout(_HOST_KEY_PROBE_TIMEOUT_S):
+        key = await asyncssh.get_server_host_key(host, port)
+    if key is None:
+        raise ValueError("the server presented no host key")
+    exported = key.export_public_key("openssh").decode("ascii").split()
+    (entry,) = parse_known_hosts(" ".join(exported[:2]))
+    return entry
+
+
+async def probe_workspace_ssh_connector(ds: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Test an SSH connector's endpoint: reach it and report its host key.
+
+    ``None`` means there is no endpoint to test (an ``ssh_key`` without a
+    host). The reported ``details.host_key`` is the bare ``<type> <base64>``
+    pair the connector's ``known_hosts`` field accepts. A pinned connector
+    whose host now presents another key fails, as its workspace clone would.
+    """
+
+    import base64
+    import hashlib
+
+    try:
+        identity = workspace_ssh_identity(ds)
+    except WorkspaceSshConnectorError as exc:
+        return {"status": "error", "message": str(exc)}
+    if identity.host is None or identity.port is None:
+        return None
+    try:
+        host_key = await fetch_ssh_host_key(identity.host, identity.port)
+    except Exception:
+        logger.warning(
+            "SSH host key probe failed for connector %r", ds.get("name"), exc_info=True
+        )
+        return {
+            "status": "error",
+            "message": f"Could not reach SSH host {identity.host}:{identity.port}",
+        }
+    digest = hashlib.sha256(base64.b64decode(host_key.split()[1])).digest()
+    fingerprint = "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+    pinned = bool(identity.known_hosts)
+    matches = host_key in identity.known_hosts
+    details = {
+        "host": identity.host,
+        "port": identity.port,
+        "host_key": host_key,
+        "host_key_fingerprint": fingerprint,
+        "host_key_pinned": pinned,
+        "host_key_matches_pin": matches if pinned else None,
+    }
+    endpoint = f"{identity.host}:{identity.port}"
+    if pinned and not matches:
+        return {
+            "status": "error",
+            "message": (
+                f"{endpoint} presented host key {fingerprint}, which is not the "
+                "pinned key; workspaces will refuse to connect"
+            ),
+            "details": details,
+        }
+    if pinned:
+        message = f"Reached {endpoint}; host key {fingerprint} matches the pin"
+    else:
+        message = (
+            f"Reached {endpoint}; host key {fingerprint} is not pinned "
+            "(workspaces trust it on first use). Pin it to refuse a changed key"
+        )
+    return {"status": "ok", "message": message, "details": details}
+
+
 __all__ = [
     "SSH_KEY_CONFIG_FIELDS",
     "WORKSPACE_SSH_KNOWN_HOSTS_ENV",
@@ -448,9 +538,11 @@ __all__ = [
     "WorkspaceSshIdentity",
     "build_workspace_ssh_identities",
     "default_workspace_ssh_known_hosts",
+    "fetch_ssh_host_key",
     "is_workspace_ssh_connector",
     "repository_uses_ssh_key",
     "ssh_key_connector_private_key",
+    "probe_workspace_ssh_connector",
     "validate_workspace_ssh_connector",
     "workspace_ssh_authority_id",
     "workspace_ssh_descriptor",
