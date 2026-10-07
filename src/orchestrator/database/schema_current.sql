@@ -31224,6 +31224,8 @@ CREATE TABLE public.thread_input_deliveries (
     owner_executor_pod_uid text,
     supersedes_input_seq bigint,
     conversation_revision bigint,
+    admission_count integer DEFAULT 0 NOT NULL,
+    CONSTRAINT thread_input_deliveries_admission_count_nonnegative CHECK ((admission_count >= 0)),
     CONSTRAINT thread_input_deliveries_admission_shape CHECK ((((state <> ALL (ARRAY['admitted'::text, 'settled'::text])) AND (admitted_at IS NULL) AND (admitted_turn_number IS NULL)) OR ((state = ANY (ARRAY['admitted'::text, 'settled'::text])) AND (admitted_at IS NOT NULL) AND (admitted_turn_number IS NOT NULL)))),
     CONSTRAINT thread_input_deliveries_claim_generation_check CHECK ((claim_generation >= 0)),
     CONSTRAINT thread_input_deliveries_claim_shape CHECK ((((execution_lane = 'pinned'::text) AND (((claim_generation = 0) AND (owner_agent_id IS NULL)) OR ((claim_generation > 0) AND (owner_agent_id IS NOT NULL)))) OR (execution_lane = 'stateless'::text))),
@@ -31317,6 +31319,13 @@ COMMENT ON COLUMN public.thread_input_deliveries.supersedes_input_seq IS 'For a 
 --
 
 COMMENT ON COLUMN public.thread_input_deliveries.conversation_revision IS 'Conversation revision captured when this durable input identity was first admitted. NULL identifies pre-0249 history.';
+
+
+--
+-- Name: COLUMN thread_input_deliveries.admission_count; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_input_deliveries.admission_count IS 'Pinned provider admissions of this delivery since its owner last retried it. Summed along the supersedes_input_seq chain to bound repeated recovery; the stateless lane leaves it 0.';
 
 
 --
