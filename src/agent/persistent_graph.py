@@ -649,8 +649,8 @@ class PersistentLoopCallbacks:
 
     # Notify the client that a workspace upgrade is available. Fires for BOTH a
     # sandbox sudo intercept asking for a VM (freeze_type=vm_upgrade_required)
-    # and a lite agent's request_workspace_upgrade asking for a sandbox
-    # (freeze_type=workspace_upgrade_required, workspace_tier_upgrade.md §4.2 S5).
+    # and a lite agent's request_workspace_upgrade asking for an upgrade (a VM in
+    # a Session, a container in a Job) (freeze_type=workspace_upgrade_required, workspace_tier_upgrade.md §4.2 S5).
     # The freeze_data carries freeze_type + (target_tier|command) + reason.
     on_workspace_upgrade_needed: Optional[
         Callable[[Dict[str, Any]], Awaitable[None]]
@@ -4692,7 +4692,8 @@ async def _execute_turn(
 
             # Check for a freeze request — a sudo intercept asking for a VM
             # (vm_upgrade_required) or a lite agent's request_workspace_upgrade
-            # asking for a sandbox (workspace_upgrade_required, §4.2 S5). Both
+            # asking for an upgrade (a VM in a Session, a container in a Job)
+            # (workspace_upgrade_required, §4.2 S5). Both
             # surface as an upgrade OFFER; the agent only requests, never flips
             # the tier (§4.4 Sec-4).
             if tool_context and callbacks.on_workspace_upgrade_needed:

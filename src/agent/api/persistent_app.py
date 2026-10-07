@@ -8466,7 +8466,8 @@ async def _loop_on_workspace_upgrade_needed(freeze_data: Dict[str, Any]) -> None
 
     - ``workspace_upgrade_required`` — a lite agent called
       ``request_workspace_upgrade`` → emit ``workspace_upgrade.needed`` (the
-      sandbox offer; accept sends ``upgrade-to-workspace``).
+      upgrade offer: a VM in a Session, a container in a Job; accept sends
+      ``upgrade-to-workspace``).
     - ``vm_upgrade_required`` — a sandbox sudo intercept → emit
       ``vm_upgrade.needed`` (the existing VM offer; accept sends
       ``upgrade-to-vm``). Unchanged behavior.
