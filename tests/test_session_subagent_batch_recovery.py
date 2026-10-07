@@ -973,6 +973,115 @@ async def test_attach_recovers_children_before_it_restores_the_transcript():
     assert session_kwargs["subagent_batch_settle_contract"] is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stateless", [False, True], ids=["pinned", "stateless"])
+async def test_pinned_attach_serves_stale_admissions_between_recovery_and_restore(
+    monkeypatch, stateless
+):
+    """P3 (parallel_subagents.md §14.2): a pinned event admitted by a dead
+    process is handed back after the batch recovery (whose settle supersedes
+    an input that delegated) and before restore (which then leaves out the
+    handed-back copy), with the queue still closed, under the exact identity
+    the reclaim uses. The stateless executor has its own claim path."""
+
+    from pathlib import Path
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    import agent.api.persistent_app as mod
+
+    order: list[tuple[str, Any]] = []
+    identity = ("agent-1", "pod-uid-1", "process-1", "attach-1")
+
+    class FakeConn:
+        async def reserve_stale_pinned_admissions(self, **kwargs):
+            order.append(("reserve", mod._session_input.queue))
+            assert (
+                kwargs["agent_id"],
+                kwargs["pod_uid"],
+                kwargs["runtime_generation"],
+                kwargs["runtime_attach_token"],
+            ) == identity
+            return {"settled": [], "reserved": ["d-1"], "parked": []}
+
+        async def claim_pending_pinned_input_deliveries(self, **kwargs):
+            order.append(("reclaim", mod._session_input.queue is not None))
+            return []
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            self.cloud_mount_manager = None
+            self.cloud_mount_error = None
+            self.workspace_manager = SimpleNamespace(
+                path=Path("/workspace"), backend=MagicMock()
+            )
+            self.workspace_sync = None
+            self.postgres_conn = FakeConn()
+            self.tool_context = None
+
+        async def setup(self, **kwargs):
+            return None
+
+        async def recover_subagents(self):
+            order.append(("recover", mod._session_input.queue))
+
+    async def restore():
+        order.append(("restore", mod._session_input.queue))
+
+    if stateless:
+        monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+    else:
+        monkeypatch.delenv("STATELESS_EXECUTOR", raising=False)
+    workspace_override = {"remote": {"host": "10.42.0.10"}}
+    fake_agent = SimpleNamespace(
+        config=object(),
+        _tactical_llm=None,
+        _llm=object(),
+        _auxiliary_llm=object(),
+        postgres_conn=None,
+        vector_conn=None,
+    )
+    fake_orchestrator = SimpleNamespace(
+        get_thread_workspace=AsyncMock(return_value=workspace_override),
+        agent_id=None,
+    )
+    mod._session = None
+    mod._session_identity._thread_id = None
+    with (
+        patch.object(mod, "_agent", fake_agent),
+        patch.object(mod, "_orchestrator_client", fake_orchestrator),
+        patch.object(mod, "PersistentSession", FakeSession),
+        patch.object(
+            session_workspace,
+            "poll_workspace_ready",
+            new=AsyncMock(return_value=workspace_override),
+        ),
+        patch.object(mod, "_build_sync_coordinator"),
+        patch.object(mod, "_restore_session_messages", new=restore),
+        patch.object(mod, "_update_thread_status", new=AsyncMock()),
+        patch.object(mod._session_termination, "start_watchdogs"),
+        patch.object(mod, "_open_event_journal", new=AsyncMock()),
+        patch.object(mod._session_input, "pinned_identity", return_value=identity),
+        patch.object(mod._session_input, "_pinned_fields", return_value=identity),
+    ):
+        try:
+            await mod._session_attach.attach("thread-1")
+        finally:
+            mod._session = None
+            mod._session_identity._thread_id = None
+            mod._session_input.teardown()
+
+    if stateless:
+        assert order == [("recover", None), ("restore", None)]
+    else:
+        assert order == [
+            ("recover", None),
+            ("reserve", None),
+            ("restore", None),
+            ("reclaim", True),
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Pinned: the continuation's turn number after it ran (invariant 12)
 # ---------------------------------------------------------------------------
