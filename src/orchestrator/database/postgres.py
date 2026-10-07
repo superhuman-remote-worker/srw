@@ -58,6 +58,9 @@ from orchestrator.database.dispatch_discovery import (
 )
 from shared.session_subagent_batch import CALL_ENDED, CALL_LIVE
 from orchestrator.database.session_subagent_recovery import (
+    PARENT_RESTART_ERROR,
+    PARENT_RESTART_OUTCOME,
+    PARENT_RESTART_STATUS,
     advance_recovery_watermark,
     delivery_disposition,
     end_session_child,
@@ -36651,6 +36654,7 @@ class PostgresDB:
         execution_lane: str,
         disposition: str,
         touch_parent_activity: bool = True,
+        runtime_lost: bool = False,
     ) -> Dict[str, int]:
         """Cancel live session children inside their parent's retirement tx.
 
@@ -36671,10 +36675,23 @@ class PostgresDB:
         nonreciprocal. Such a caller bumps ``last_activity`` in its own
         unbinding UPDATE when ``deliveries`` is non-zero: a delivery is counted
         only for a background child ended here, whose event message is new.
+
+        ``runtime_lost`` (pinned only) is a retirement whose context names
+        ``cause: runtime_lost``: the orchestrator retired a runtime it lost,
+        nobody ended the session. A live foreground child (it answers a
+        parent tool call and is not a background run) then ends
+        ``interrupted:parent_restart`` instead of ``cancelled:parent_retired``.
+        That keeps it on the live list's ended branch until its result reaches
+        the parent, so the successor's batch settle answers the interrupted
+        turn. Background children keep their retirement event either way.
+        Only ``created``/``active`` rows are touched; a child its own runtime
+        already ended keeps its terminal facts.
         """
 
         if execution_lane not in {"pinned", "stateless"}:
             raise ValueError("session child retirement lane is invalid")
+        if runtime_lost and execution_lane != "pinned":
+            raise ValueError("only a pinned retirement can lose its runtime")
         if disposition not in {"ended", "suspended"}:
             raise ValueError("session child retirement disposition is invalid")
 
@@ -36692,7 +36709,8 @@ class PostgresDB:
         children = await conn.fetch(
             """
             SELECT id, runtime_generation, subagent_handle, subagent_type,
-                   total_turns, total_tokens, report_path, metadata
+                   total_turns, total_tokens, report_path, metadata,
+                   parent_tool_call_id
               FROM threads
              WHERE kind = 'subagent'
                AND parent_job_id IS NULL
@@ -36711,12 +36729,22 @@ class PostgresDB:
             child = dict(raw_child)
             child_id = UUID(str(child["id"]))
             generation = UUID(str(child["runtime_generation"]))
+            metadata = _json_object_or_empty(child.get("metadata"))
+            spawn = metadata.get("subagent")
+            background = bool(
+                isinstance(spawn, Mapping) and spawn.get("run_in_background") is True
+            )
+            interrupted = bool(
+                runtime_lost
+                and not background
+                and child.get("parent_tool_call_id") is not None
+            )
             changed = await conn.execute(
                 """
                 UPDATE threads
                    SET status = 'ended',
-                       subagent_status = 'cancelled',
-                       subagent_outcome = 'cancelled:parent_retired',
+                       subagent_status = $5,
+                       subagent_outcome = $6,
                        subagent_error = COALESCE(subagent_error, $4),
                        ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP),
                        last_activity = CURRENT_TIMESTAMP
@@ -36730,17 +36758,14 @@ class PostgresDB:
                 child_id,
                 parent_thread_id,
                 generation,
-                cancellation_error,
+                PARENT_RESTART_ERROR if interrupted else cancellation_error,
+                PARENT_RESTART_STATUS if interrupted else "cancelled",
+                (PARENT_RESTART_OUTCOME if interrupted else "cancelled:parent_retired"),
             )
             if changed != "UPDATE 1":
                 raise RuntimeError("session child retirement lost a locked generation")
             terminalized += 1
 
-            metadata = _json_object_or_empty(child.get("metadata"))
-            spawn = metadata.get("subagent")
-            background = bool(
-                isinstance(spawn, Mapping) and spawn.get("run_in_background") is True
-            )
             if not background or execution_lane != "pinned":
                 continue
 
@@ -41562,6 +41587,7 @@ class PostgresDB:
         initiator: str = "owner",
         require_agent_offline: bool = False,
         authorize_immediately: bool = False,
+        cause: str | None = None,
         _connection: Any | None = None,
     ) -> Dict[str, Any]:
         """Atomically close one pinned runtime and capture cleanup authority.
@@ -41581,6 +41607,13 @@ class PostgresDB:
             raise ValueError("invalid pinned retirement initiator")
         if authorize_immediately and initiator != "agent":
             raise ValueError("only the exact agent may authorize retirement at Begin")
+        # ``runtime_lost``: the orchestrator retires a runtime it lost (the
+        # stale-agent detector). Absent means a person, the agent or another
+        # owner of End; only the first Begin of a token writes the context.
+        if cause not in {None, "runtime_lost"}:
+            raise ValueError("invalid pinned retirement cause")
+        if cause is not None and initiator != "owner":
+            raise ValueError("only an orchestrator Begin may name a cause")
 
         try:
             parsed_thread_id = UUID(str(thread_id))
@@ -42766,6 +42799,8 @@ class PostgresDB:
                     },
                     "protected_ro": protected_ro,
                 }
+                if cause is not None:
+                    context["cause"] = cause
                 token = uuid4()
                 admitted = await conn.fetchrow(
                     """
@@ -43922,6 +43957,7 @@ class PostgresDB:
                         execution_lane="pinned",
                         disposition=final_status,
                         touch_parent_activity=False,
+                        runtime_lost=context.get("cause") == "runtime_lost",
                     )
                 )
                 outcome_inserted = await conn.execute(

@@ -1493,6 +1493,7 @@ async def test_retire_orphaned_runtime_ends_the_exact_offline_incarnation(
         expected_agent_id=_OFFLINE_AGENT_ID,
         expected_attach_token=_OFFLINE_ATTACH_TOKEN,
         require_expected_agent_offline=True,
+        retirement_cause="runtime_lost",
         settle_status=settle_status,
     )
 

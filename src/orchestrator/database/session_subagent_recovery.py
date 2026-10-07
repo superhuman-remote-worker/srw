@@ -50,8 +50,15 @@ from shared.session_subagent_batch import (
 )
 
 _RETIRED_OUTCOME = "cancelled:parent_retired"
-_PARENT_RESTART_STATUS = "interrupted"
-_PARENT_RESTART_OUTCOME = "interrupted:parent_restart"
+#: How a live child ends when its parent's runtime was lost rather than ended:
+#: the batch settle ends a live member so, and a retirement whose context says
+#: ``cause: runtime_lost`` ends a live foreground child so. The agent states
+#: the same values (``agent.subagents.batch_recovery.PARENT_RESTART_*``).
+PARENT_RESTART_STATUS = "interrupted"
+PARENT_RESTART_OUTCOME = "interrupted:parent_restart"
+PARENT_RESTART_ERROR = "the parent runtime restarted"
+_PARENT_RESTART_STATUS = PARENT_RESTART_STATUS
+_PARENT_RESTART_OUTCOME = PARENT_RESTART_OUTCOME
 
 
 def _json_object(value: Any) -> dict[str, Any]:
@@ -1436,6 +1443,9 @@ async def settle_session_subagent_batch(
 
 
 __all__ = [
+    "PARENT_RESTART_ERROR",
+    "PARENT_RESTART_OUTCOME",
+    "PARENT_RESTART_STATUS",
     "BatchMember",
     "DelegationCall",
     "RecoveryParentInput",

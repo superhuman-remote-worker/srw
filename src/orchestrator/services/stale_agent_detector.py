@@ -144,6 +144,10 @@ async def retire_orphaned_pinned_runtime(
             expected_agent_id=agent_id,
             expected_attach_token=attach_token,
             require_expected_agent_offline=True,
+            # The runtime was lost, not ended: its interrupted foreground
+            # delegations stay recoverable by the successor (parallel
+            # subagents P0b; a person's End keeps cancelling them).
+            retirement_cause="runtime_lost",
             settle_status=settle_status,
         )
     except HTTPException as exc:

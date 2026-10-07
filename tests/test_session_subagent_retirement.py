@@ -87,13 +87,16 @@ async def test_foreground_retirement_locks_parent_then_children_without_lane_b_e
     assert "ORDER BY created_at, id FOR UPDATE" in child_lock
     assert "parent_job_id IS NULL" in child_lock
     assert "parent_thread_id = $1::uuid" in child_lock
-    assert "subagent_status = 'cancelled'" in child_update
-    assert "subagent_outcome = 'cancelled:parent_retired'" in child_update
+    # An End, not a lost runtime: the child is cancelled, not interrupted.
+    assert "subagent_status = $5" in child_update
+    assert "subagent_outcome = $6" in child_update
     assert conn.execute.await_args_list[0].args[1:] == (
         CHILD,
         PARENT,
         GENERATION,
         "the parent session retired before child completion",
+        "cancelled",
+        "cancelled:parent_retired",
     )
     assert all(
         "thread_messages" not in _compact(call.args[0])
@@ -308,6 +311,7 @@ async def test_pinned_soft_settlement_invokes_child_tombstone_in_same_transactio
         execution_lane="pinned",
         disposition="ended",
         touch_parent_activity=False,
+        runtime_lost=False,
     )
     append.assert_awaited_once()
 

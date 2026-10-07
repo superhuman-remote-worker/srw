@@ -1362,6 +1362,7 @@ async def end_thread_flow(
     expected_agent_id: str | None = None,
     expected_attach_token: str | None = None,
     require_expected_agent_offline: bool = False,
+    retirement_cause: Literal["runtime_lost"] | None = None,
     settle_status: Literal["ended", "suspended"] = "ended",
     local_runtime_quiesced: bool = False,
     retiring_agent_response_pending: bool = False,
@@ -1381,6 +1382,7 @@ async def end_thread_flow(
         expected_agent_id=expected_agent_id,
         expected_attach_token=expected_attach_token,
         require_expected_agent_offline=require_expected_agent_offline,
+        retirement_cause=retirement_cause,
         settle_status=settle_status,
         local_runtime_quiesced=local_runtime_quiesced,
         retiring_agent_response_pending=retiring_agent_response_pending,
@@ -1496,6 +1498,7 @@ async def _end_thread_flow_owned(
     expected_agent_id: str | None = None,
     expected_attach_token: str | None = None,
     require_expected_agent_offline: bool = False,
+    retirement_cause: Literal["runtime_lost"] | None = None,
     settle_status: Literal["ended", "suspended"] = "ended",
     local_runtime_quiesced: bool = False,
     retiring_agent_response_pending: bool = False,
@@ -1772,6 +1775,11 @@ async def _end_thread_flow_owned(
                 "expected_attach_token": expected_attach_token,
                 "require_agent_offline": require_expected_agent_offline,
             }
+        # Only an orchestrator that lost the runtime names a cause. It is
+        # written once into the immutable context; a person's End writes none
+        # and a later End reusing a pending token inherits the first Begin's.
+        if retirement_cause is not None:
+            begin_identity["cause"] = retirement_cause
         retirement = await _begin_pinned_thread_retirement(
             thread_id,
             permanent=permanent,

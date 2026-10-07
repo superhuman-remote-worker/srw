@@ -48,6 +48,12 @@ BATCHES = {
     # finished but whose report never reached the parent.
     "mixed_batch": ["running", "running", "queued", "completed"],
 }
+# Not in the matrices: one child its own runtime already ended interrupted
+# (what P4's graceful hand-over will leave), one still running.
+HANDED_OVER = ["agent_interrupted", "running"]
+#: Who retired the dead life: a person's End (no cause) or the stale-agent
+#: detector's orphan path (``cause: runtime_lost``).
+CAUSES = ["person", "runtime_lost"]
 
 
 def _pinned_authority(ids):
@@ -106,6 +112,19 @@ async def _delegate(db, ids, source_delivery_id, states):
             initial_status="queued" if state in {"queued", "background"} else "running",
         )
         assert child is not None
+        if state == "agent_interrupted":
+            ended = await db.terminalize_session_subagent_thread(
+                parent_thread_id=ids["thread"],
+                parent_authority=authority,
+                thread_id=child["thread_id"],
+                runtime_generation=child["runtime_generation"],
+                subagent_status="interrupted",
+                outcome="interrupted:parent_restart",
+                turns=1,
+                tokens=200,
+                error="handed over at shutdown",
+            )
+            assert ended is not None and ended["result"] == "applied"
         if state == "completed":
             ended = await db.terminalize_session_subagent_thread(
                 parent_thread_id=ids["thread"],
@@ -147,8 +166,10 @@ async def _settle_source(db, ids, delivery_id):
 def _delegating(db, batch, children):
     """A pre-Begin hook for the shared killed-life helpers."""
 
+    states = BATCHES[batch] if isinstance(batch, str) else list(batch)
+
     async def before_retirement(ids, deliveries):
-        children.extend(await _delegate(db, ids, deliveries[0], BATCHES[batch]))
+        children.extend(await _delegate(db, ids, deliveries[0], states))
         if batch == "delegated_once":
             await _settle_source(db, ids, deliveries[0])
 
@@ -166,7 +187,16 @@ async def _children(db, thread_id):
     ]
 
 
-async def _killed_delegating_life(db, monkeypatch, *, batch, backend, binding):
+async def _killed_delegating_life(
+    db, monkeypatch, *, batch, backend, binding, cause="person"
+):
+    """A SIGKILLed life that delegated.
+
+    ``cause="person"``: an owner End began its retirement (no cause).
+    ``cause="runtime_lost"``: nothing began it; the stale-agent detector's own
+    orphan path will (``_retire_through_detector``), and ``retirement`` is None.
+    """
+
     children: list[str] = []
     ids, retirement, deliveries, api, _ = await killed_life(
         db,
@@ -175,10 +205,32 @@ async def _killed_delegating_life(db, monkeypatch, *, batch, backend, binding):
         partial=True,
         with_virtual_binding=binding,
         before_retirement=_delegating(db, batch, children),
+        begin=cause == "person",
     )
-    assert len(children) == len(BATCHES[batch])
+    states = BATCHES[batch] if isinstance(batch, str) else batch
+    assert len(children) == len(states)
     ids["k8s"] = api
     return ids, retirement, deliveries, children
+
+
+async def _retire_through_detector(db, monkeypatch, ids):
+    """Heartbeats stopped, the Pod is proven killed: run the real detector."""
+
+    for pod in ids["k8s"].pods.values():
+        pod.spec.restart_policy = "Never"
+    monkeypatch.setattr(detector, "PINNED_RETIREMENT_TERMINAL_PROBE_GRACE_SECONDS", 0)
+    await db.execute(
+        "UPDATE agents SET last_heartbeat=now()-interval '5 minutes' WHERE id=$1::uuid",
+        ids["agent"],
+    )
+    # One pass marks the agent offline, begins (orphan path) and retries the
+    # pending retirement; a second pass is allowed for a Begin that lands
+    # after the pass's retry listing.
+    for _ in range(2):
+        await _run_one_detector_pass()
+        if (await db.get_thread(ids["thread"]))["status"] == "ended":
+            return
+    raise AssertionError("the detector did not settle the killed life")
 
 
 def _receipt_args(ids, retirement):
@@ -275,21 +327,28 @@ async def _subagent_events(db, thread_id):
     ]
 
 
-def _assert_retired_children(rows, batch, events):
-    """What the settle leaves: live children cancelled, finished ones kept."""
+def _retired_state(state, cause):
+    """How the settle leaves one child the dead runtime held."""
 
-    expected = {
-        "interrupted_batch": [("ended", "cancelled", "cancelled:parent_retired")] * 3,
-        "delegated_once": [("ended", "completed", "completed")],
-        "background": [("ended", "cancelled", "cancelled:parent_retired")],
-        "mixed_batch": [("ended", "cancelled", "cancelled:parent_retired")] * 3
-        + [("ended", "completed", "completed")],
-    }[batch]
+    if state == "completed":
+        return ("ended", "completed", "completed")
+    if state == "agent_interrupted":
+        return ("ended", "interrupted", "interrupted:parent_restart")
+    if state in {"running", "queued"} and cause == "runtime_lost":
+        return ("ended", "interrupted", "interrupted:parent_restart")
+    return ("ended", "cancelled", "cancelled:parent_retired")
+
+
+def _assert_retired_children(rows, batch, events, cause="person"):
+    """What the settle leaves: per cause for live foreground children;
+    finished ones kept; a background child cancelled with its event."""
+
+    states = BATCHES[batch] if isinstance(batch, str) else batch
     assert [
         (row["status"], row["subagent_status"], row["subagent_outcome"]) for row in rows
-    ] == expected
+    ] == [_retired_state(state, cause) for state in states]
     # Only a pinned background child leaves an event; it is owed to Resume.
-    assert len(events) == int(batch == "background")
+    assert len(events) == states.count("background")
     for event in events:
         assert "cancelled:parent_retired" in event["content"]
         assert event["state"] == "persisted"
@@ -298,35 +357,29 @@ def _assert_retired_children(rows, batch, events):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend,binding", TIERS)
 @pytest.mark.parametrize("batch", sorted(BATCHES))
+@pytest.mark.parametrize("cause", CAUSES)
 async def test_detector_retires_a_killed_life_that_delegated(
-    db, monkeypatch, batch, backend, binding
+    db, monkeypatch, cause, batch, backend, binding
 ):
     """The real durable retry after a SIGKILL: receipt, End funnel, settle.
 
-    What the settle does to live children is existing behaviour
-    (``_terminalize_live_session_subagents_for_retirement``): it ends them
-    ``cancelled:parent_retired``, and a pinned background child also gets its
-    retirement event. Pinned here so a later package changes it on purpose.
+    A person's End cancels the live children (``cancelled:parent_retired``);
+    the detector's own retirement of a lost runtime ends live foreground
+    children ``interrupted:parent_restart`` so the successor recovers them.
+    A background child is cancelled with its retirement event either way.
     """
 
-    ids, retirement, _, children = await _killed_delegating_life(
-        db, monkeypatch, batch=batch, backend=backend, binding=binding
+    ids, _, _, children = await _killed_delegating_life(
+        db, monkeypatch, batch=batch, backend=backend, binding=binding, cause=cause
     )
     # Children made by the real writers never look like producers.
     for child in children:
         assert not await db.fetchval(
             "SELECT public.pinned_session_child_may_produce($1::uuid)", child
         )
-    for pod in ids["k8s"].pods.values():
-        pod.spec.restart_policy = "Never"
-    monkeypatch.setattr(detector, "PINNED_RETIREMENT_TERMINAL_PROBE_GRACE_SECONDS", 0)
-    await db.execute(
-        "UPDATE agents SET last_heartbeat=now()-interval '5 minutes' WHERE id=$1::uuid",
-        ids["agent"],
-    )
     before = (await db.get_thread(ids["thread"]))["last_activity"]
 
-    await _run_one_detector_pass()
+    await _retire_through_detector(db, monkeypatch, ids)
 
     thread = await db.get_thread(ids["thread"])
     # A retirement event is new transcript activity; nothing else is.
@@ -336,7 +389,9 @@ async def test_detector_retires_a_killed_life_that_delegated(
     assert thread["agent_id"] is None
     rows = await _children(db, ids["thread"])
     assert [str(row["id"]) for row in rows] == children
-    _assert_retired_children(rows, batch, await _subagent_events(db, ids["thread"]))
+    _assert_retired_children(
+        rows, batch, await _subagent_events(db, ids["thread"]), cause
+    )
 
 
 @pytest.mark.asyncio
@@ -394,58 +449,162 @@ async def test_soft_retirement_with_a_live_background_child_settles(
     )
 
 
+async def _successor_authority(db, thread_id):
+    """Resume the ended session and bind a fresh dedicated actor (new life)."""
+
+    assert await db.resume_thread(thread_id)
+    successor = await _bind_cold_agent(db, thread_id)
+    actor = await db.get_agent(str(successor["agent_id"]))
+    return {
+        "version": 1,
+        "execution_lane": "pinned",
+        "parent_thread_id": thread_id,
+        "agent_id": str(successor["agent_id"]),
+        "pod_uid": str(actor["pod_uid"]),
+        "session_runtime_generation": str(successor["runtime_generation"]),
+        "runtime_attach_token": str(successor["runtime_attach_token"]),
+    }
+
+
+def _listed(listing):
+    return [str(row.get("thread_id") or row.get("id")) for row in listing["subagents"]]
+
+
+async def _tool_results(db, thread_id):
+    return [
+        dict(row)
+        for row in await db.fetch(
+            "SELECT tool_call_id, content FROM thread_messages "
+            "WHERE thread_id=$1::uuid AND role='tool' AND rewound_at IS NULL "
+            "ORDER BY seq",
+            thread_id,
+        )
+    ]
+
+
+async def _continuations(db, thread_id):
+    return [
+        dict(row)
+        for row in await db.fetch(
+            "SELECT delivery_id, state, supersedes_input_seq "
+            "FROM thread_input_deliveries "
+            "WHERE thread_id=$1::uuid AND source='subagent'",
+            thread_id,
+        )
+    ]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("batch", ["interrupted_batch", "mixed_batch"])
-async def test_a_sigkilled_batch_leaves_its_successor_nothing_to_recover(
+async def test_successor_recovers_the_batch_its_lost_runtime_left(
     db, monkeypatch, batch
 ):
-    """Characterizes the P0b gap; P0b is meant to change these assertions.
+    """P0b: SIGKILL mid-batch, the detector retires the lost runtime, Resume.
 
-    The retirement settle ends every live child ``cancelled:parent_retired``
-    whatever retired the runtime, and the live list excludes that outcome. So
-    after a SIGKILL mid-batch the successor's listing names no interrupted
-    child: with nothing finished it has no plan at all, and with a finished
-    child its plan reports the other calls as ``retired`` (cancelled), which
-    nobody did. Restore then drops the unanswered calls.
+    The interrupted foreground children end ``interrupted:parent_restart``, so
+    the successor's listing names the turn and its batch settle answers every
+    call once, with one continuation, and settles the abandoned source input.
     """
 
-    ids, retirement, deliveries, children = await _killed_delegating_life(
-        db, monkeypatch, batch=batch, backend="none", binding=True
+    ids, _, deliveries, children = await _killed_delegating_life(
+        db, monkeypatch, batch=batch, backend="none", binding=True, cause="runtime_lost"
     )
-    for pod in ids["k8s"].pods.values():
-        pod.spec.restart_policy = "Never"
-    monkeypatch.setattr(detector, "PINNED_RETIREMENT_TERMINAL_PROBE_GRACE_SECONDS", 0)
-    await db.execute(
-        "UPDATE agents SET last_heartbeat=now()-interval '5 minutes' WHERE id=$1::uuid",
-        ids["agent"],
+    await _retire_through_detector(db, monkeypatch, ids)
+    _assert_retired_children(
+        await _children(db, ids["thread"]),
+        batch,
+        await _subagent_events(db, ids["thread"]),
+        "runtime_lost",
     )
-    await _run_one_detector_pass()
-    assert (await db.get_thread(ids["thread"]))["status"] == "ended"
 
-    assert await db.resume_thread(ids["thread"])
-    successor = await _bind_cold_agent(db, ids["thread"])
-    actor = await db.get_agent(str(successor["agent_id"]))
+    authority = await _successor_authority(db, ids["thread"])
     listing = await db.list_live_session_subagent_recovery(
-        ids["thread"],
-        parent_authority={
-            "version": 1,
-            "execution_lane": "pinned",
-            "parent_thread_id": ids["thread"],
-            "agent_id": str(successor["agent_id"]),
-            "pod_uid": str(actor["pod_uid"]),
-            "session_runtime_generation": str(successor["runtime_generation"]),
-            "runtime_attach_token": str(successor["runtime_attach_token"]),
-        },
+        ids["thread"], parent_authority=authority
     )
-    listed = [
-        str(row.get("thread_id") or row.get("id")) for row in listing["subagents"]
+    assert sorted(_listed(listing)) == sorted(children)
+    [plan] = listing["recovery_turns"]
+    assert plan.get("error") is None
+    source_seq = await db.fetchval(
+        "SELECT seq FROM thread_messages WHERE id=$1::uuid",
+        message_row_id(deliveries[0]),
+    )
+    assert plan["supersedes_input_seq"] == source_seq
+    # Every call has a child that ended without a result reaching the parent.
+    assert [call["class"] for call in plan["calls"]] == ["ended"] * len(children)
+    assert [call["thread_id"] for call in plan["calls"]] == children
+    assert all(call["needs_entry"] and call["needs_message"] for call in plan["calls"])
+    assert [call["outcome"] for call in plan["calls"]] == [
+        _retired_state(state, "runtime_lost")[2] for state in BATCHES[batch]
     ]
+
+    members = [
+        {
+            "thread_id": call["thread_id"],
+            "runtime_generation": call["runtime_generation"],
+            "subagent_status": call["subagent_status"],
+            "outcome": call["outcome"],
+            "message": f"replayed result of {call['handle']}",
+        }
+        for call in plan["calls"]
+    ]
+    settle = dict(
+        parent_thread_id=ids["thread"],
+        parent_authority=authority,
+        parent_input_message_id=plan["parent_input_message_id"],
+        parent_iteration=plan["parent_iteration"],
+        members=members,
+    )
+    result = await db.settle_session_subagent_batch(**settle)
+    assert result["result"] == "applied"
+    results = await _tool_results(db, ids["thread"])
+    assert [row["tool_call_id"] for row in results] == [
+        call["tool_call_id"] for call in plan["calls"]
+    ]
+    assert [row["content"] for row in results] == [m["message"] for m in members]
+    [continuation] = await _continuations(db, ids["thread"])
+    assert str(continuation["delivery_id"]) == plan["delivery_id"]
+    assert continuation["supersedes_input_seq"] == source_seq
+    assert (
+        await db.fetchval(
+            "SELECT state FROM thread_input_deliveries WHERE delivery_id=$1::uuid",
+            deliveries[0],
+        )
+        == "settled"
+    )
+
+    # A retry (a lost response, a second recoverer) writes nothing more.
+    again = await db.settle_session_subagent_batch(**settle)
+    assert again["result"] == "idempotent"
+    assert await _tool_results(db, ids["thread"]) == results
+    assert len(await _continuations(db, ids["thread"])) == 1
+    relisted = await db.list_live_session_subagent_recovery(
+        ids["thread"], parent_authority=authority
+    )
+    assert _listed(relisted) == [] and relisted["recovery_turns"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch", ["interrupted_batch", "mixed_batch"])
+async def test_a_persons_end_of_a_killed_batch_still_cancels_it(db, monkeypatch, batch):
+    """D4: a person's End of the same dead batch cancels it (unchanged).
+
+    The live list excludes ``cancelled:parent_retired``: with nothing finished
+    there is no plan; a finished child's plan reports the others retired.
+    """
+
+    ids, _, deliveries, children = await _killed_delegating_life(
+        db, monkeypatch, batch=batch, backend="none", binding=True, cause="person"
+    )
+    await _retire_through_detector(db, monkeypatch, ids)
+    authority = await _successor_authority(db, ids["thread"])
+    listing = await db.list_live_session_subagent_recovery(
+        ids["thread"], parent_authority=authority
+    )
     if batch == "interrupted_batch":
-        assert listed == []
+        assert _listed(listing) == []
         assert listing["recovery_turns"] == []
     else:
-        # Only the finished child is still owed; the interrupted ones are not.
-        assert listed == [children[3]]
+        assert _listed(listing) == [children[3]]
         [plan] = listing["recovery_turns"]
         assert [call["class"] for call in plan["calls"]] == [
             "retired",
@@ -453,7 +612,6 @@ async def test_a_sigkilled_batch_leaves_its_successor_nothing_to_recover(
             "retired",
             "ended",
         ]
-    # The abandoned source input stays admitted and unanswered.
     assert (
         await db.fetchval(
             "SELECT state FROM thread_input_deliveries WHERE delivery_id=$1::uuid",
@@ -461,6 +619,130 @@ async def test_a_sigkilled_batch_leaves_its_successor_nothing_to_recover(
         )
         == "admitted"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cause", CAUSES)
+async def test_the_settle_keeps_a_child_its_runtime_already_ended(
+    db, monkeypatch, cause
+):
+    """Only created/active children are retired; terminal ones keep their facts.
+
+    A child its own runtime ended ``interrupted:parent_restart`` before the
+    retirement (P4's graceful hand-over) stays so under either cause, and
+    the successor's live list still offers it until its result is delivered.
+    """
+
+    ids, _, _, children = await _killed_delegating_life(
+        db, monkeypatch, batch=HANDED_OVER, backend="none", binding=True, cause=cause
+    )
+    await _retire_through_detector(db, monkeypatch, ids)
+    rows = await _children(db, ids["thread"])
+    _assert_retired_children(rows, HANDED_OVER, [], cause)
+    assert await db.fetchval(
+        "SELECT subagent_error FROM threads WHERE id=$1::uuid", children[0]
+    ) == ("handed over at shutdown")
+
+    authority = await _successor_authority(db, ids["thread"])
+    listing = await db.list_live_session_subagent_recovery(
+        ids["thread"], parent_authority=authority
+    )
+    expected = children if cause == "runtime_lost" else children[:1]
+    assert sorted(_listed(listing)) == sorted(expected)
+    [plan] = listing["recovery_turns"]
+    assert [call["class"] for call in plan["calls"]] == [
+        "ended",
+        "ended" if cause == "runtime_lost" else "retired",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ["detector", "person"])
+async def test_only_the_detectors_begin_names_the_lost_runtime(db, monkeypatch, first):
+    """The cause is written once, by the first Begin, into the context."""
+
+    ids, retirement, _, _ = await _killed_delegating_life(
+        db,
+        monkeypatch,
+        batch="interrupted_batch",
+        backend="none",
+        binding=True,
+        cause="runtime_lost" if first == "detector" else "person",
+    )
+    # The Pod still runs: recovery cannot prove process zero, so the
+    # retirement stays pending and its immutable context can be read.
+    for pod in ids["k8s"].pods.values():
+        pod.spec.restart_policy = "Never"
+    ids["k8s"].mark_ready(*next(iter(ids["k8s"].pods)))
+    monkeypatch.setattr(detector, "PINNED_RETIREMENT_TERMINAL_PROBE_GRACE_SECONDS", 0)
+    await db.execute(
+        "UPDATE agents SET last_heartbeat=now()-interval '5 minutes' WHERE id=$1::uuid",
+        ids["agent"],
+    )
+    await _run_one_detector_pass()
+
+    thread = await db.get_thread(ids["thread"])
+    assert thread["status"] == "active"
+    assert thread["runtime_retirement_token"] is not None
+    if retirement is not None:
+        assert str(thread["runtime_retirement_token"]) == retirement["token"]
+    context = fixtures._json(thread["runtime_retirement_context"])
+    assert context["initiator"] == "owner"
+    if first == "detector":
+        assert context["cause"] == "runtime_lost"
+    else:
+        # A person's End began it: no cause, and the detector's later Begin
+        # reused that token without writing one.
+        assert "cause" not in context
+
+
+@pytest.mark.asyncio
+async def test_a_lost_runtime_cancels_a_child_that_answers_no_call(db, monkeypatch):
+    """Only a child answering a parent tool call can be recovered as a result."""
+
+    orphan = uuid4()
+
+    async def before_retirement(ids, deliveries):
+        await _replica(
+            db,
+            "INSERT INTO threads (id,user_id,kind,parent_thread_id,status,"
+            "execution_lane,subagent_status,metadata) VALUES ($1,$2::uuid,"
+            "'subagent',$3::uuid,'active','pinned','running','{}'::jsonb)",
+            orphan,
+            ids["user"],
+            ids["thread"],
+        )
+
+    ids, _, _, api, _ = await killed_life(
+        db,
+        monkeypatch,
+        backend="none",
+        partial=True,
+        before_retirement=before_retirement,
+        begin=False,
+    )
+    ids["k8s"] = api
+    await _retire_through_detector(db, monkeypatch, ids)
+    [row] = await _children(db, ids["thread"])
+    assert row["id"] == orphan
+    assert (row["status"], row["subagent_status"], row["subagent_outcome"]) == (
+        "ended",
+        "cancelled",
+        "cancelled:parent_retired",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "initiator,cause", [("owner", "person"), ("agent", "runtime_lost")]
+)
+async def test_begin_accepts_only_an_orchestrator_runtime_lost_cause(
+    db, initiator, cause
+):
+    with pytest.raises(ValueError):
+        await db.begin_pinned_thread_retirement(
+            str(uuid4()), permanent=False, initiator=initiator, cause=cause
+        )
 
 
 async def _replica(db, sql, *args):

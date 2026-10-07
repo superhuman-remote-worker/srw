@@ -68,6 +68,7 @@ async def killed_life(
     authorized=True,
     before_retirement=None,
     settle_status="ended",
+    begin=True,
 ):
     pod_uid = str(uuid4())
     ids = await fixtures._seed(
@@ -133,10 +134,16 @@ async def killed_life(
         ids["generation"] = generation
         ids["process_generation"] = process_generation
         await before_retirement(ids, deliveries)
-    retirement = await db.begin_pinned_thread_retirement(
-        ids["thread"], permanent=False, settle_status=settle_status
+    # ``begin=False`` leaves the Begin to whoever retires the dead life (the
+    # stale-agent detector's own orphan path); there is no retirement yet.
+    retirement = (
+        await db.begin_pinned_thread_retirement(
+            ids["thread"], permanent=False, settle_status=settle_status
+        )
+        if begin
+        else None
     )
-    if authorized:
+    if authorized and begin:
         assert await db.authorize_pinned_thread_retirement(
             ids["thread"],
             token=retirement["token"],
