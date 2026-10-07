@@ -613,7 +613,8 @@ export interface DatasourceTestEdits {
 }
 
 export interface DatasourceTestResult {
-  status: 'ok' | 'error';
+  /** 'unsupported': the connector type has no connection test. */
+  status: 'ok' | 'error' | 'unsupported';
   message: string;
   /** Probe-specific facts; an SSH connector reports the host key it saw. */
   details?: {

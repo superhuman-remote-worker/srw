@@ -29,23 +29,21 @@
     },
     "probe_calls": []
   },
-  "generic_file/unknown_type": {
+  "generic_file/no_connection_test": {
     "status": 200,
     "body": {
-      "status": "error",
-      "message": "Unknown connector type: generic_file"
+      "status": "unsupported",
+      "message": "Generic file connectors have no connection test; the file's path and size are checked when it is saved"
     },
-    "probe_calls": [],
-    "pinned_defect": "D1 fixes (L1 §6 #1): credential-file connectors answer Test with 'Unknown connector type' while the cockpit offers Test on every row"
+    "probe_calls": []
   },
-  "kubeconfig/unknown_type": {
+  "kubeconfig/no_connection_test": {
     "status": 200,
     "body": {
-      "status": "error",
-      "message": "Unknown connector type: kubeconfig"
+      "status": "unsupported",
+      "message": "Kubeconfig connectors have no connection test; the file's path and size are checked when it is saved"
     },
-    "probe_calls": [],
-    "pinned_defect": "D1 fixes (L1 §6 #1): credential-file connectors answer Test with 'Unknown connector type' while the cockpit offers Test on every row"
+    "probe_calls": []
   },
   "ssh_key/unknown_type": {
     "status": 200,
@@ -54,7 +52,7 @@
       "message": "Unknown connector type: ssh_key"
     },
     "probe_calls": [],
-    "pinned_defect": "D1 fixes (L1 §6 #1): credential-file connectors answer Test with 'Unknown connector type' while the cockpit offers Test on every row"
+    "pinned_defect": "C1 changes this: ssh_key stays on the legacy path, where Test answers 'Unknown connector type' while the cockpit offers Test on every row; generic_file and kubeconfig answer 'unsupported' since D1a"
   },
   "postgresql/connected": {
     "status": 200,

@@ -238,6 +238,11 @@ def parse_output_line(text: str) -> dict[str, Any]:
     return line
 
 
+#: The statuses Test connection answers with over the API.
+ApiCheckStatus = Literal["ok", "error", "unsupported"]
+API_CHECK_STATUSES: tuple[str, ...] = get_args(ApiCheckStatus)
+
+
 @dataclass(frozen=True, slots=True)
 class DriverOutcome:
     """A finished operation: its result or its error, plus logs and updates."""
@@ -289,6 +294,33 @@ def _expiry_problems(result: Mapping[str, Any], *, required: bool) -> list[str]:
         elif not isinstance(value, str):
             problems.append(f"{key} must be an RFC 3339 timestamp string")
     return problems
+
+
+def api_check_result(outcome: DriverOutcome) -> dict[str, Any]:
+    """A ``check`` outcome as the Test connection API reports it.
+
+    ``SUCCEEDED`` is ``ok`` and ``FAILED`` (the driver ran; the config or the
+    target is wrong) is ``error``.  An ``unsupported`` error is its own
+    status: the driver has no test, which is neither a pass nor a failure.
+    Any other error is ``error`` with its class; ``detail`` is operator-only
+    and stays out.
+    """
+    if outcome.error is not None:
+        if outcome.error.error_class == "unsupported":
+            return {"status": "unsupported", "message": outcome.error.message}
+        return {
+            "status": "error",
+            "message": outcome.error.message,
+            "error_class": outcome.error.error_class,
+        }
+    result = outcome.result or {}
+    status = "ok" if result.get("status") == "SUCCEEDED" else "error"
+    return {"status": status, "message": str(result.get("message") or "")}
+
+
+def unsupported_check(message: str) -> dict[str, Any]:
+    """The Test connection answer of a driver that has no test."""
+    return api_check_result(DriverOutcome(error=DriverError("unsupported", message)))
 
 
 def read_output(stdout: str, exit_code: int, *, operation: str) -> DriverOutcome:

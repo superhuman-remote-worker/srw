@@ -19,6 +19,7 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from shared.connectors import (
+    API_CHECK_STATUSES,
     BUILTIN_SPECS,
     DATASOURCE_SPECS,
     ERROR_CLASSES,
@@ -29,9 +30,11 @@ from shared.connectors import (
     BindingEntry,
     CredentialSlot,
     DriverError,
+    DriverOutcome,
     DriverRequest,
     EnvelopeError,
     ExecutionRef,
+    api_check_result,
     binding_schema,
     load_binding_schema,
     parse_output_line,
@@ -578,3 +581,73 @@ def test_the_contract_imports_only_the_standard_library():
                 if module.split(".")[0] not in sys.stdlib_module_names:
                     offenders.append(f"{path.name}: {module}")
     assert offenders == []
+
+
+# =============================================================================
+# Test connection over the API
+# =============================================================================
+
+
+class TestApiCheckResult:
+    @pytest.mark.parametrize(
+        ("outcome", "expected"),
+        [
+            (
+                DriverOutcome(result={"status": "SUCCEEDED", "message": "Connected"}),
+                {"status": "ok", "message": "Connected"},
+            ),
+            (
+                DriverOutcome(result={"status": "FAILED", "message": "No such table"}),
+                {"status": "error", "message": "No such table"},
+            ),
+            (
+                DriverOutcome(error=DriverError("unsupported", "No test")),
+                {"status": "unsupported", "message": "No test"},
+            ),
+            (
+                DriverOutcome(
+                    error=DriverError(
+                        "credentials", "Login refused", detail="pw=hunter2"
+                    )
+                ),
+                {
+                    "status": "error",
+                    "message": "Login refused",
+                    "error_class": "credentials",
+                },
+            ),
+        ],
+    )
+    def test_envelope_outcomes_map_to_api_statuses(self, outcome, expected):
+        assert api_check_result(outcome) == expected
+
+    def test_an_image_driver_answer_maps_through_the_same_function(self):
+        stdout = json.dumps(
+            {"type": "error", "error": {"class": "unsupported", "message": "n/a"}}
+        )
+        outcome = read_output(stdout, 1, operation="check")
+        assert api_check_result(outcome) == {"status": "unsupported", "message": "n/a"}
+
+    def test_built_in_answers_use_only_the_api_statuses(self):
+        golden = json.loads(
+            (
+                Path(__file__).parent / "fixtures" / "connector_goldens" / "probe.json"
+            ).read_text()
+        )
+        statuses = {
+            case["body"]["status"]
+            for case in golden.values()
+            if case["status"] == 200 and "status" in case["body"]
+        }
+        assert statuses <= set(API_CHECK_STATUSES)
+        assert "unsupported" in statuses
+
+    @pytest.mark.parametrize(
+        ("status", "headline"),
+        [("ok", "OK"), ("unsupported", "NOT TESTABLE"), ("error", "FAILED")],
+    )
+    def test_the_mcp_tool_says_what_the_status_means(self, status, headline):
+        from shared.orch_surface.formatters import format_datasource_test
+
+        text = format_datasource_test("d1", {"status": status, "message": "m"})
+        assert text.splitlines()[0] == f"Connector test: {headline}"

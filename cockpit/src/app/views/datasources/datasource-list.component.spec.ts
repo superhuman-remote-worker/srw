@@ -1208,3 +1208,28 @@ describe('DatasourceListComponent token permission guidance', () => {
     expect(component.patScopeHintKey()).toBe('');
   });
 });
+
+describe('DatasourceListComponent Test connection results', () => {
+  it('shows a type without a test as neither a pass nor a failure', () => {
+    const {component} = createComponent();
+
+    expect(component.testResultIcon({status: 'ok', message: 'Connected'})).toBe('check_circle');
+    expect(component.testResultIcon({status: 'error', message: 'refused'})).toBe('error');
+    expect(
+      component.testResultIcon({status: 'unsupported', message: 'no connection test'}),
+    ).toBe('info');
+  });
+
+  it('keeps an unsupported answer as it came from the API', () => {
+    const {api, component} = createComponent();
+    const answer = {
+      status: 'unsupported' as const,
+      message: 'Kubeconfig connectors have no connection test',
+    };
+    api.testDatasource.mockReturnValue(of(answer));
+
+    component.testDatasource('kube-1');
+
+    expect(component.testResults()['kube-1']).toEqual(answer);
+  });
+});

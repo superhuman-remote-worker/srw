@@ -26,6 +26,7 @@ from orchestrator.services.connector_drivers.base import (
     ValidationContext,
 )
 from shared.connectors.builtin import GENERIC_FILE_SPEC, KUBECONFIG_SPEC
+from shared.connectors.envelope import unsupported_check
 
 
 class CredentialFileDriver(DatasourceDriver):
@@ -63,7 +64,12 @@ class CredentialFileDriver(DatasourceDriver):
     async def check(
         self, row: Mapping[str, Any], credentials: dict[str, Any], *, ctx: CheckContext
     ) -> dict[str, Any]:
-        return {"status": "error", "message": f"Unknown connector type: {self.type_id}"}
+        # Nothing to connect to: the file is the credential, and its path and
+        # size were checked when it was saved.
+        return unsupported_check(
+            f"{self.spec.title} connectors have no connection test; the "
+            "file's path and size are checked when it is saved"
+        )
 
 
 def drivers() -> tuple[CredentialFileDriver, ...]:

@@ -472,8 +472,9 @@ _SEND_CONFIG = {
     "unattended_send": False,
 }
 _UNKNOWN_TYPE = (
-    "D1 fixes (L1 §6 #1): credential-file connectors answer Test with "
-    "'Unknown connector type' while the cockpit offers Test on every row"
+    "C1 changes this: ssh_key stays on the legacy path, where Test answers "
+    "'Unknown connector type' while the cockpit offers Test on every row; "
+    "generic_file and kubeconfig answer 'unsupported' since D1a"
 )
 _GITHUB_REPO = {"default_branch": "main", "permissions": {"push": True}}
 
@@ -486,12 +487,8 @@ CASES: dict[str, ProbeCase] = {
         _stored("credentials", credentials={"env_vars": {"PATH": "x"}})
     ),
     # ---- credential files --------------------------------------------------
-    "generic_file/unknown_type": ProbeCase(
-        _stored("generic_file"), pinned_defect=_UNKNOWN_TYPE
-    ),
-    "kubeconfig/unknown_type": ProbeCase(
-        _stored("kubeconfig"), pinned_defect=_UNKNOWN_TYPE
-    ),
+    "generic_file/no_connection_test": ProbeCase(_stored("generic_file")),
+    "kubeconfig/no_connection_test": ProbeCase(_stored("kubeconfig")),
     "ssh_key/unknown_type": ProbeCase(_stored("ssh_key"), pinned_defect=_UNKNOWN_TYPE),
     # ---- managed databases -------------------------------------------------
     "postgresql/connected": ProbeCase(_stored("postgresql"), postgres()),

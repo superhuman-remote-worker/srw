@@ -40,19 +40,23 @@ from .contract import (
     validate_spec,
 )
 from .envelope import (
+    API_CHECK_STATUSES,
     ERROR_CLASSES,
     DriverError,
     DriverOutcome,
     DriverRequest,
     EnvelopeError,
     ExecutionRef,
+    api_check_result,
     parse_output_line,
     read_output,
+    unsupported_check,
     validate_request,
     validate_result,
 )
 
 __all__ = [
+    "API_CHECK_STATUSES",
     "BUILTIN_SPECS",
     "DATASOURCE_SPECS",
     "ERROR_CLASSES",
@@ -71,6 +75,7 @@ __all__ = [
     "EnvelopeError",
     "ExecutionRef",
     "ServiceSpec",
+    "api_check_result",
     "binding_schema",
     "legacy_types_with_form",
     "load_binding_schema",
@@ -79,6 +84,7 @@ __all__ = [
     "read_output",
     "spec_for_type",
     "tool_map",
+    "unsupported_check",
     "validate_binding",
     "validate_driver_name",
     "validate_entry",

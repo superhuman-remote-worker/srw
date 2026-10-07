@@ -1151,7 +1151,8 @@ def format_datasource_test(datasource_id: str, result: dict[str, Any]) -> str:
     """Format a connector test result."""
     status = result.get("status", "unknown")
     message = result.get("message", "")
-    icon = "OK" if status == "ok" else "FAILED"
+    # "unsupported" means the connector type has no test, not that it failed.
+    icon = {"ok": "OK", "unsupported": "NOT TESTABLE"}.get(status, "FAILED")
     lines = [
         f"Connector test: {icon}",
         f"Connector ID: {datasource_id}",

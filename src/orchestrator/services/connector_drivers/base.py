@@ -34,6 +34,7 @@ from fastapi import HTTPException
 from orchestrator.services import datasource_config
 from shared.connectors.binding import BindingDescriptor
 from shared.connectors.contract import DriverSpec
+from shared.connectors.envelope import unsupported_check
 
 logger = logging.getLogger(__name__)
 
@@ -246,10 +247,9 @@ class DatasourceDriver:
     async def check(
         self, row: Mapping[str, Any], credentials: dict[str, Any], *, ctx: CheckContext
     ) -> dict[str, Any]:
-        return {
-            "status": "unsupported",
-            "message": f"{self.spec.title} connectors have no connection test",
-        }
+        return unsupported_check(
+            f"{self.spec.title} connectors have no connection test"
+        )
 
     def effective_access(self, row: Mapping[str, Any]) -> str | None:
         """``ReadOnly`` on a read-only project link, else ``ReadWrite``."""
@@ -326,10 +326,9 @@ class ManifestDeliveryDriver:
         return None
 
     async def check(self, connector: Mapping[str, Any]) -> dict[str, Any]:
-        return {
-            "status": "unsupported",
-            "message": f"{self.spec.title} connectors have no connection test",
-        }
+        return unsupported_check(
+            f"{self.spec.title} connectors have no connection test"
+        )
 
     async def revoke(self, binding: BindingDescriptor) -> None:
         """The pod's Secret goes with the pod."""

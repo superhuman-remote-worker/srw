@@ -1393,8 +1393,9 @@ type KeyValueRow = {key: string; value: string};
                 class="test-result"
                 [class.test-ok]="formTestResult()!.status === 'ok'"
                 [class.test-error]="formTestResult()!.status === 'error'"
+                [class.test-unsupported]="formTestResult()!.status === 'unsupported'"
               >
-                <app-icon size="sm">{{ formTestResult()!.status === 'ok' ? 'check_circle' : 'error' }}</app-icon>
+                <app-icon size="sm">{{ testResultIcon(formTestResult()!) }}</app-icon>
                 {{ formTestResult()!.message }}
               </div>
               @if (testedHostKeyToPin(); as hostKey) {
@@ -1642,9 +1643,10 @@ type KeyValueRow = {key: string; value: string};
                           class="inline-test"
                           [class.test-ok]="result.status === 'ok'"
                           [class.test-error]="result.status === 'error'"
+                          [class.test-unsupported]="result.status === 'unsupported'"
                           title="{{ result.message }}"
                         >
-                          <app-icon size="sm">{{ result.status === 'ok' ? 'check_circle' : 'error' }}</app-icon>
+                          <app-icon size="sm">{{ testResultIcon(result) }}</app-icon>
                         </span>
                       }
                     </td>
@@ -2253,6 +2255,11 @@ type KeyValueRow = {key: string; value: string};
         color: var(--danger);
       }
 
+      .test-unsupported {
+        background: var(--info-tint);
+        color: var(--text-secondary);
+      }
+
       /* Center States */
       .center-state {
         display: flex;
@@ -2415,6 +2422,7 @@ type KeyValueRow = {key: string; value: string};
 
       .inline-test.test-ok { color: var(--success); }
       .inline-test.test-error { color: var(--danger); }
+      .inline-test.test-unsupported { color: var(--text-muted); }
 
       /* ===== Mobile (≤768px) =====
          This page never had a responsive pass. Mirror the Jobs header (a single
@@ -2584,6 +2592,13 @@ export class DatasourceListComponent implements OnInit {
   readonly isTesting = signal(false);
   readonly isSaving = signal(false);
   readonly formTestResult = signal<DatasourceTestResult | null>(null);
+
+  /** A type without a test is neither a pass nor a failure. */
+  testResultIcon(result: DatasourceTestResult): string {
+    if (result.status === 'ok') return 'check_circle';
+    if (result.status === 'unsupported') return 'info';
+    return 'error';
+  }
   readonly successMessage = signal<string | null>(null);
   readonly errorMessage = signal<string | null>(null);
 
