@@ -483,6 +483,11 @@ async def probe_workspace_ssh_connector(ds: Mapping[str, Any]) -> dict[str, Any]
     import base64
     import hashlib
 
+    if (
+        ds.get("type") == "ssh_key"
+        and not str(_json_object(ds.get("config")).get("host") or "").strip()
+    ):
+        return None
     try:
         identity = workspace_ssh_identity(ds)
     except WorkspaceSshConnectorError as exc:
