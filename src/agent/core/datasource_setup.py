@@ -610,6 +610,9 @@ def create_datasource_connection(
             uri=url,
             username=creds.get("username", "neo4j"),
             password=creds.get("password", ""),
+            # A read-only link: every session reads, so the server refuses
+            # writes even though the login could make them.
+            read_only=bool(ds.get("project_read_only", False)),
         )
         db.connect()
         return db, None

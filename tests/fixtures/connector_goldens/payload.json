@@ -373,11 +373,13 @@
         "name": "Supply Graph",
         "description": "Supplier graph",
         "connection_url": "bolt://neo4j.example.test:7687",
-        "credentials": {},
+        "credentials": {
+          "username": "graph",
+          "password": "neo-secret"
+        },
         "project_read_only": true
       }
-    ],
-    "pinned_defect": "D1 fixes (L1 §6 #4): a read-only managed link withholds credentials, so a read-only neo4j/webdav connector reaches the agent without its username and password and cannot log in"
+    ]
   },
   "mongodb/read_write": {
     "payload": [
@@ -425,11 +427,13 @@
         "name": "Team files",
         "description": "Shared drive",
         "connection_url": "https://cloud.example.test/remote.php/dav/files/alice",
-        "credentials": {},
+        "credentials": {
+          "username": "alice",
+          "password": "dav-secret"
+        },
         "project_read_only": true
       }
-    ],
-    "pinned_defect": "D1 fixes (L1 §6 #4): a read-only managed link withholds credentials, so a read-only neo4j/webdav connector reaches the agent without its username and password and cannot log in"
+    ]
   },
   "email/read_write": {
     "payload": [
@@ -732,11 +736,13 @@
         "name": "Team files",
         "description": "Shared drive",
         "connection_url": "https://cloud.example.test/remote.php/dav/files/alice",
-        "credentials": {},
+        "credentials": {
+          "username": "alice",
+          "password": "dav-secret"
+        },
         "project_read_only": true
       }
-    ],
-    "pinned_defect": "D1 fixes (L1 §6 #4): a read-only managed link withholds credentials, so a read-only neo4j/webdav connector reaches the agent without its username and password and cannot log in"
+    ]
   },
   "webdav/cloud_storage_override_read_write": {
     "payload": [
@@ -1452,7 +1458,10 @@
         "name": "Supply Graph",
         "description": "Supplier graph",
         "connection_url": "bolt://neo4j.example.test:7687",
-        "credentials": {},
+        "credentials": {
+          "username": "graph",
+          "password": "neo-secret"
+        },
         "project_read_only": true
       },
       {
@@ -1468,7 +1477,10 @@
         "name": "Team files",
         "description": "Shared drive",
         "connection_url": "https://cloud.example.test/remote.php/dav/files/alice",
-        "credentials": {},
+        "credentials": {
+          "username": "alice",
+          "password": "dav-secret"
+        },
         "project_read_only": true
       },
       {
@@ -1563,8 +1575,7 @@
         },
         "project_read_only": true
       }
-    ],
-    "pinned_defect": "D1 fixes (L1 §6 #4): a read-only managed link withholds credentials, so a read-only neo4j/webdav connector reaches the agent without its username and password and cannot log in"
+    ]
   },
   "mixed/all_kinds_gates_off": {
     "payload": [

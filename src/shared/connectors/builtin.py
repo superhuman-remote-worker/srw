@@ -377,8 +377,8 @@ NEO4J_SPEC = _managed(
     ("cypher_query", "get_database_schema"),
     ("cypher_query", "cypher_execute", "get_database_schema"),
     read_only_enforced_by=(
-        "Only the read tools are bound, and cypher_query refuses statements "
-        "with write keywords; the login is the connector's own."
+        "Only the read tools are bound, and the connection opens only "
+        "read-access sessions, in which the Neo4j server refuses every write."
     ),
     credential_slots=(
         CredentialSlot("login", "secret_string", _LOGIN, update="replace"),

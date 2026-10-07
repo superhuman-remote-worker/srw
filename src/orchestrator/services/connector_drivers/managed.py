@@ -37,6 +37,9 @@ from shared.connectors.builtin import (
 class ManagedConnectionDriver(DatasourceDriver):
     #: What a failed probe reports, without the exception text.
     failure_message: str
+    #: Whether the client logs in with ``credentials`` (rather than a login
+    #: in the URL), so the agent needs them at every access level.
+    logs_in_with_credentials = False
 
     async def check(
         self, row: Mapping[str, Any], credentials: dict[str, Any], *, ctx: CheckContext
@@ -55,9 +58,13 @@ class ManagedConnectionDriver(DatasourceDriver):
         self, row: Mapping[str, Any], credentials: Any, *, ctx: BindContext
     ) -> dict[str, Any] | None:
         read_only = row.get("project_read_only", False)
-        # A read-only link withholds the credentials (tools hold them).
+        # Read-only is enforced by the tool surface, not by the login. A
+        # read-only link still withholds the credentials object of a client
+        # whose login is in its URL, as it always did; one that logs in with
+        # it keeps it, or it could not connect at all.
+        withhold = read_only and not self.logs_in_with_credentials
         return payload_entry(
-            row, credentials={} if read_only else credentials, read_only=read_only
+            row, credentials={} if withhold else credentials, read_only=read_only
         )
 
 
@@ -78,6 +85,7 @@ class PostgresDriver(ManagedConnectionDriver):
 
 class Neo4jDriver(ManagedConnectionDriver):
     failure_message = "Neo4j connection failed"
+    logs_in_with_credentials = True
 
     def __init__(self) -> None:
         super().__init__(NEO4J_SPEC)
@@ -114,6 +122,7 @@ class MongoDriver(ManagedConnectionDriver):
 
 class WebDavDriver(ManagedConnectionDriver):
     failure_message = "WebDAV connection failed"
+    logs_in_with_credentials = True
 
     def __init__(self) -> None:
         super().__init__(WEBDAV_SPEC)

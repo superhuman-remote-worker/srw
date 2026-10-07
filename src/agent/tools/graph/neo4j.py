@@ -102,7 +102,9 @@ def create_neo4j_tools(context: ToolContext) -> List[Any]:
         if not neo4j:
             return "Error: No Neo4j connection available"
 
-        # Block write operations
+        # A friendly early refusal for the obvious cases. The enforcement is
+        # the read-access session below: the server refuses every write in
+        # it (Neo.ClientError.Statement.AccessMode), however it is spelled.
         upper = query.strip().upper()
         if any(upper.startswith(kw) or f" {kw} " in upper for kw in _WRITE_KEYWORDS):
             return (
@@ -111,7 +113,7 @@ def create_neo4j_tools(context: ToolContext) -> List[Any]:
             )
 
         try:
-            results = neo4j.execute_query(query)
+            results = neo4j.execute_read(query)
             return _format_results(results)
         except Exception as e:
             return f"Error executing query: {str(e)}"

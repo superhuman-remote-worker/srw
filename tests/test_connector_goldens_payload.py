@@ -47,20 +47,13 @@ class PayloadCase:
     pinned_defect: str | None = None
 
 
-_RO_CREDENTIALS_DROPPED = (
-    "D1 fixes (L1 §6 #4): a read-only managed link withholds credentials, so a "
-    "read-only neo4j/webdav connector reaches the agent without its username "
-    "and password and cannot log in"
-)
-
 CASES: dict[str, PayloadCase] = {}
 for _kind in KINDS:
     CASES[f"{_kind}/read_write"] = PayloadCase([resolved_row(_kind)])
+    # Read-only Postgres and MongoDB links withhold the (unused) credentials
+    # object; Neo4j and WebDAV log in with theirs and keep it (D1a).
     CASES[f"{_kind}/read_only"] = PayloadCase(
-        [resolved_row(_kind, project_read_only=True)],
-        pinned_defect=(
-            _RO_CREDENTIALS_DROPPED if _kind in ("neo4j", "webdav") else None
-        ),
+        [resolved_row(_kind, project_read_only=True)]
     )
 CASES.update(
     {
@@ -91,7 +84,6 @@ CASES.update(
         "webdav/cloud_storage_override_read_only": PayloadCase(
             [resolved_row("webdav")],
             job_context={"cloud_storage_read_only": True},
-            pinned_defect=_RO_CREDENTIALS_DROPPED,
         ),
         "webdav/cloud_storage_override_read_write": PayloadCase(
             [resolved_row("webdav", project_read_only=True)],
@@ -172,9 +164,7 @@ CASES.update(
             [resolved_row("mcp_remote")], stdio=False
         ),
         "mixed/all_kinds_read_write": PayloadCase(all_rows()),
-        "mixed/all_kinds_read_only": PayloadCase(
-            all_rows(project_read_only=True), pinned_defect=_RO_CREDENTIALS_DROPPED
-        ),
+        "mixed/all_kinds_read_only": PayloadCase(all_rows(project_read_only=True)),
         "mixed/all_kinds_gates_off": PayloadCase(all_rows(), mcp=False, stdio=False),
         # Key order after the driver's own fields: cli_hint, default_branch,
         # then require_default_branch.

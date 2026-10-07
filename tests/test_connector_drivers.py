@@ -304,6 +304,31 @@ def test_connector_writes_see_the_real_stdio_gate():
     )
 
 
+_LOGIN = {"username": "u", "password": "p"}
+
+
+@pytest.mark.parametrize(
+    ("type_id", "keeps_login"),
+    [("postgresql", False), ("mongodb", False), ("neo4j", True), ("webdav", True)],
+)
+def test_a_read_only_link_keeps_the_login_only_where_the_client_needs_it(
+    type_id, keeps_login
+):
+    driver = _REGISTRY.for_type(type_id)
+    ctx = _bind_context()
+    row = {
+        "type": type_id,
+        "name": "x",
+        "connection_url": "scheme://host",
+        "project_read_only": True,
+    }
+    entry = driver.bind(row, dict(_LOGIN), ctx=ctx)
+    assert entry["credentials"] == (_LOGIN if keeps_login else {})
+    assert entry["project_read_only"] is True
+    assert driver.effective_access(row) == "ReadOnly"
+
+
+
 # =============================================================================
 # Spec metadata against driver behaviour
 # =============================================================================

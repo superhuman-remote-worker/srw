@@ -14,7 +14,7 @@ import logging
 from typing import List, Dict, Any, Optional
 
 try:
-    from neo4j import GraphDatabase
+    from neo4j import READ_ACCESS, GraphDatabase
     from neo4j.exceptions import ServiceUnavailable, AuthError
 except ImportError:  # pragma: no cover — exercised via tests/test_neo4j_import_guard.py
     # The orchestrator image ships without the neo4j package (graph features are
@@ -25,6 +25,7 @@ except ImportError:  # pragma: no cover — exercised via tests/test_neo4j_impor
     # failure to Neo4jDB construction instead, where it can raise loudly and
     # locally. Live forensics: KB sweeper silent death, dev 2026-07-05.
     GraphDatabase = None
+    READ_ACCESS = "READ"
 
     class ServiceUnavailable(Exception):
         """Stand-in so except-clauses below stay importable without neo4j."""
@@ -41,6 +42,13 @@ class Neo4jDB:
 
     Generic graph database client — no domain-specific namespaces.
     Used by graph tools (src/tools/graph/) via the datasource connector.
+
+    Reads (:meth:`execute_read`, :meth:`get_schema`) run in sessions opened
+    with ``READ_ACCESS``, so the server refuses a write in them
+    (``Neo.ClientError.Statement.AccessMode``) however the statement is
+    spelled.  ``read_only=True`` puts every session of the connection in
+    that mode and refuses :meth:`execute_write`: it is how a read-only
+    connector link is enforced.
 
     Example:
         ```python
@@ -63,6 +71,8 @@ class Neo4jDB:
         uri: str,
         username: str,
         password: str,
+        *,
+        read_only: bool = False,
     ):
         """Initialize Neo4j database manager.
 
@@ -70,6 +80,7 @@ class Neo4jDB:
             uri: Neo4j URI (e.g., bolt://localhost:7687)
             username: Neo4j username
             password: Neo4j password
+            read_only: Open every session with read access
         """
         if GraphDatabase is None:
             raise RuntimeError(
@@ -80,6 +91,7 @@ class Neo4jDB:
         self._uri = uri
         self._username = username
         self._password = password
+        self.read_only = read_only
 
         self.driver = None
 
@@ -125,6 +137,21 @@ class Neo4jDB:
             self.driver = None
             logger.info("Neo4j connection closed")
 
+    def _session(self, *, read: bool):
+        if read or self.read_only:
+            return self.driver.session(default_access_mode=READ_ACCESS)
+        return self.driver.session()
+
+    def execute_read(
+        self, query: str, parameters: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """Execute a Cypher query in a read-access session.
+
+        The server refuses any write in it, whatever the statement looks
+        like; use this for every query that must not change the graph.
+        """
+        return self._run(query, parameters, read=True)
+
     def execute_query(
         self, query: str, parameters: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
@@ -140,12 +167,17 @@ class Neo4jDB:
         Raises:
             RuntimeError: If not connected to database
         """
+        return self._run(query, parameters, read=False)
+
+    def _run(
+        self, query: str, parameters: Optional[Dict[str, Any]], *, read: bool
+    ) -> List[Dict[str, Any]]:
         if not self.driver:
             raise RuntimeError("Not connected to database. Call connect() first.")
 
         results = []
         try:
-            with self.driver.session() as session:
+            with self._session(read=read) as session:
                 result = session.run(query, parameters or {})
                 results = [dict(record) for record in result]
             return results
@@ -170,10 +202,12 @@ class Neo4jDB:
             List of result records as dictionaries
 
         Raises:
-            RuntimeError: If not connected to database
+            RuntimeError: If not connected, or the connection is read-only
         """
         if not self.driver:
             raise RuntimeError("Not connected to database. Call connect() first.")
+        if self.read_only:
+            raise RuntimeError("This Neo4j connection is read-only.")
 
         def _execute_tx(tx, q, p):
             result = tx.run(q, p or {})
@@ -199,17 +233,17 @@ class Neo4jDB:
 
         try:
             # Get node labels
-            result = self.execute_query("CALL db.labels()")
+            result = self.execute_read("CALL db.labels()")
             schema["node_labels"] = [record["label"] for record in result]
 
             # Get relationship types
-            result = self.execute_query("CALL db.relationshipTypes()")
+            result = self.execute_read("CALL db.relationshipTypes()")
             schema["relationship_types"] = [
                 record["relationshipType"] for record in result
             ]
 
             # Get property keys
-            result = self.execute_query("CALL db.propertyKeys()")
+            result = self.execute_read("CALL db.propertyKeys()")
             schema["property_keys"] = [record["propertyKey"] for record in result]
 
         except Exception as e:
