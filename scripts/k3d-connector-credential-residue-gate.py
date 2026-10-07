@@ -4,29 +4,36 @@
 Slice C0 of the connector drivers feature. Dry-run by default; ``--run`` with
 ``--confirm LOCAL-K3D-DISPOSABLE`` creates, through the orchestrator REST API
 and as the disposable ``test`` account, four connectors carrying recognisable
-fake secrets and one job that attaches all of them:
+fake secrets and one job (model ``--model``, default the Meta model k3d smokes
+use) that attaches all of them:
 
 - a token repository connector (``https://c0-gate.invalid/...``; the clone
-  fails on DNS, so the token never lands in a ``.git/config``),
+  fails on DNS, so the token never lands in a ``.git/config``, but it is
+  typed into the agent's git tab),
 - an SSH repository connector (its key is written to ``~/.ssh/repo_<slug>``),
 - an ``ssh_key`` credential-file connector,
 - an env (``generic``) connector (written to ``~/.srw-credentials/``).
 
-While the job runs the gate proves the runtime received the credentials (the
-env file and the SSH key are on the workspace), then fails if any secret
-appears in:
+The gate hashes the code of the pod that runs the job before any scan, proves
+the runtime received the credentials (the env file and the SSH key are on the
+workspace), then fails if any secret appears in:
 
 - the LangGraph checkpoint tables in the app database (``checkpoints``,
   ``checkpoint_blobs``, ``checkpoint_writes``; every row, not only this job's),
-- the pod-local SQLite checkpoint files of a pinned agent pod, when present,
-- a non-strict and a strict-terminal snapshot tarball of the job's workspace
-  home, captured by the real ``SnapshotService.capture_vm_snapshot`` from the
-  orchestrator pod (the upload is intercepted; nothing goes to S3), and the
-  job's own S3 snapshot when one exists.
+  while the job runs, once it settles and after it completes,
+- the pod-local SQLite checkpoint files of the pinned agent pod,
+- a non-strict and a strict-terminal snapshot of the workspace home, captured
+  by the real ``SnapshotService.capture_vm_snapshot`` from the orchestrator pod
+  (the upload is intercepted) while the job runs and again once it settles,
+- ``~/.bash_history`` on the workspace once the agent's shells have ended,
+- the job's real S3 snapshot, taken by the completion teardown after the gate
+  approves the job; it is reported as skipped only if it never appears.
 
-It then deletes the job and the connectors. Secrets travel only on
-``kubectl exec -i`` stdin, never in an argument, and the report names markers
-by label and files by path only. Child-process output is never printed.
+A job that fails, or pauses on an LLM outage, before the scans can run fails
+the gate as "LLM unavailable". The gate then deletes the job and the
+connectors. Secrets travel only on ``kubectl exec -i`` stdin, never in an
+argument, and the report names markers by label and files by path only.
+Child-process output is never printed.
 """
 
 from __future__ import annotations
@@ -54,15 +61,25 @@ ORCHESTRATOR = "deploy/srw-orchestrator"
 STATELESS_AGENT = "deploy/srw-agent-stateless"
 POSTGRES_POD = "srw-postgres-0"
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_MODEL = "muse-spark-1.3-contributor"
 # Files whose deployed copy must match this checkout before the gate means
-# anything: the strip and the snapshot excludes.
-AGENT_FILES = ("src/agent/core/state.py",)
+# anything: the strip, the shell history fix and the snapshot excludes.
+AGENT_FILES = (
+    "src/agent/core/state.py",
+    "src/shared/runtime/core/shell_protocol.py",
+    "src/shared/runtime/core/backends/remote.py",
+)
 ORCHESTRATOR_FILES = ("src/orchestrator/services/snapshot_service.py",)
-EXCLUDED_HOME_PATHS = (".srw-credentials", ".ssh/srw-managed", ".ssh/repo_")
+# Archive members the snapshot excludes must have dropped.
+EXCLUDED_MEMBER_PATTERN = (
+    r"(?:^|/)(?:\.srw-credentials(?:/|$)|\.ssh/srw-managed(?:/|$)|\.ssh/repo_"
+    r"|\.cache/srw/rclone/.+/(?:rclone\.conf$|\.?bearer\.token))"
+)
 _GATE_ID_RE = re.compile(r"srw-c0-[0-9a-f]{12}\Z")
 _MARKER_RE = re.compile(r"[A-Za-z0-9+/=]{20,}\Z")
 _POD_RE = re.compile(r"[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?\Z")
 _HOST_RE = re.compile(r"[A-Za-z0-9.:-]{1,253}\Z")
+_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,199}\Z")
 
 
 class SafetyError(RuntimeError):
@@ -77,9 +94,11 @@ class GateFailure(RuntimeError):
 class GateConfig:
     gate_id: str
     lane: str
+    model: str
     run: bool
     timeout_seconds: int
     settle_seconds: int
+    snapshot_wait_seconds: int
     keep: bool
     skip_code_check: bool
 
@@ -267,26 +286,71 @@ report(found, files=files)
     )
 
 
-def snapshot_script(
-    markers: dict[str, str],
-    *,
-    job_id: str,
-    ssh_host: str,
-    ssh_port: int,
-    include_product: bool,
+_ARCHIVE_SCANNER = r"""
+import asyncio, base64, hashlib, re, shutil, subprocess, tarfile, tempfile
+from orchestrator.services.snapshot_service import SnapshotService
+
+JOB = {job_id!r}
+EXCLUDED = re.compile({excluded!r})
+
+def _reader(data):
+    chunks = [data]
+    return lambda _size: chunks.pop() if chunks else b""
+
+def scan_archive(path):
+    # Stream the archive once: member names, pax headers and file bodies.
+    found, members, excluded = {{}}, 0, set()
+    ssh_config = history = False
+    unzstd = subprocess.Popen(["zstd", "-dc", "--", path], stdout=subprocess.PIPE)
+    with tarfile.open(fileobj=unzstd.stdout, mode="r|") as archive:
+        for member in archive:
+            members += 1
+            name = member.name
+            header = (name + "\\0" + member.linkname + "\\0"
+                      + json.dumps(member.pax_headers, sort_keys=True))
+            scan_stream(_reader(header.encode()), found, name)
+            if EXCLUDED.search(name):
+                excluded.add(name)
+            if not member.isfile():
+                continue
+            history = history or name.endswith("agent-host/.bash_history")
+            data = archive.extractfile(member)
+            if name.endswith("agent-host/.ssh/config"):
+                body = data.read()
+                ssh_config = b"c0-gate.invalid" in body
+                scan_stream(_reader(body), found, name)
+            else:
+                scan_stream(data.read, found, name)
+    if unzstd.wait() != 0:
+        raise RuntimeError("zstd failed")
+    return dict(members=members, excluded_paths=sorted(excluded),
+                ssh_config_kept=ssh_config, bash_history_present=history,
+                hits={{k: sorted(v) for k, v in sorted(found.items())}})
+"""
+
+
+def _archive_scanner(markers: dict[str, str], job_id: str) -> str:
+    return _SCAN_HELPERS.format(
+        markers=_markers_literal(markers)
+    ) + _ARCHIVE_SCANNER.format(
+        job_id=str(UUID(job_id)), excluded=EXCLUDED_MEMBER_PATTERN
+    )
+
+
+def snapshot_capture_script(
+    markers: dict[str, str], *, job_id: str, ssh_host: str, ssh_port: int
 ) -> str:
-    """Capture both snapshot modes with the real service, then scan them."""
-    job_id = str(UUID(job_id))
+    """Capture both snapshot modes with the real service, then scan them.
+
+    The upload is intercepted, so nothing reaches S3 and the job's own
+    snapshot history is untouched.
+    """
     if not _HOST_RE.fullmatch(ssh_host) or not 0 < int(ssh_port) < 65536:
         raise GateFailure("workspace endpoint is malformed")
     return (
-        _SCAN_HELPERS.format(markers=_markers_literal(markers))
+        _archive_scanner(markers, job_id)
         + f"""
-import asyncio, base64, hashlib, shutil, subprocess, tarfile, tempfile
-from orchestrator.services.snapshot_service import SnapshotService
-
-JOB, HOST, PORT = {job_id!r}, {ssh_host!r}, {int(ssh_port)}
-EXCLUDED = {list(EXCLUDED_HOME_PATHS)!r}
+HOST, PORT = {ssh_host!r}, {int(ssh_port)}
 
 def fingerprint():
     try:
@@ -301,39 +365,6 @@ def fingerprint():
             return "SHA256:" + base64.b64encode(
                 hashlib.sha256(raw).digest()).decode().rstrip("=")
     return None
-
-def scan_archive(path):
-    # Stream the archive once: member names, pax headers and file bodies.
-    found, members, excluded, ssh_config = {{}}, 0, set(), False
-    unzstd = subprocess.Popen(["zstd", "-dc", "--", path], stdout=subprocess.PIPE)
-    with tarfile.open(fileobj=unzstd.stdout, mode="r|") as archive:
-        for member in archive:
-            members += 1
-            name = member.name
-            header = (name + "\\0" + member.linkname + "\\0"
-                      + json.dumps(member.pax_headers, sort_keys=True))
-            scan_stream(_reader(header.encode()), found, name)
-            for prefix in EXCLUDED:
-                if "/" + prefix in "/" + name:
-                    excluded.add(name)
-            if not member.isfile():
-                continue
-            data = archive.extractfile(member)
-            if name.endswith("agent-host/.ssh/config"):
-                body = data.read()
-                ssh_config = b"c0-gate.invalid" in body
-                scan_stream(_reader(body), found, name)
-            else:
-                scan_stream(data.read, found, name)
-    if unzstd.wait() != 0:
-        raise RuntimeError("zstd failed")
-    return dict(members=members, excluded_paths=sorted(excluded),
-                ssh_config_kept=ssh_config,
-                hits={{k: sorted(v) for k, v in sorted(found.items())}})
-
-def _reader(data):
-    chunks = [data]
-    return lambda _size: chunks.pop() if chunks else b""
 
 async def capture(strict, workdir):
     out = os.path.join(workdir, ("strict" if strict else "nonstrict") + ".tar.zst")
@@ -356,22 +387,31 @@ async def capture(strict, workdir):
         return dict(captured=False)
     return dict(captured=True, **scan_archive(out))
 
-async def product(workdir):
-    service = SnapshotService()
-    await service.connect(None)
-    if not service.is_available:
-        return dict(available=False)
-    out = os.path.join(workdir, "product.tar.zst")
-    if not await service.download_snapshot(JOB, out):
-        return dict(available=False)
-    return dict(available=True, **scan_archive(out))
-
 async def main():
     with tempfile.TemporaryDirectory(prefix="srw-c0-gate-") as workdir:
         result = dict(non_strict=await capture(False, workdir),
                       strict=await capture(True, workdir))
-        if {include_product!r}:
-            result["s3_product"] = await product(workdir)
+    print(json.dumps(result, sort_keys=True))
+
+asyncio.run(main())
+"""
+    )
+
+
+def s3_snapshot_script(markers: dict[str, str], *, job_id: str) -> str:
+    """Download the job's real S3 snapshot, if one exists yet, and scan it."""
+    return (
+        _archive_scanner(markers, job_id)
+        + """
+async def main():
+    service = SnapshotService()
+    await service.connect(None)
+    result = dict(available=False)
+    if service.is_available:
+        with tempfile.TemporaryDirectory(prefix="srw-c0-gate-") as workdir:
+            out = os.path.join(workdir, "product.tar.zst")
+            if await service.download_snapshot(JOB, out):
+                result = dict(available=True, **scan_archive(out))
     print(json.dumps(result, sort_keys=True))
 
 asyncio.run(main())
@@ -588,6 +628,19 @@ def wait_for(check, *, timeout: int, operation: str, interval: float = 3.0):
     raise GateFailure(f"timed out: {operation}")
 
 
+_LLM_FAILURE_WORDS = (
+    "llm",
+    "model",
+    "provider",
+    "quota",
+    "credit",
+    "rate limit",
+    "401",
+    "402",
+    "429",
+)
+
+
 class Gate:
     def __init__(self, config: GateConfig, kube: Kube, password: str) -> None:
         self.config = config
@@ -596,6 +649,7 @@ class Gate:
         self.report = SafeReport(config.gate_id, "run", config.lane)
         self.datasource_ids: list[str] = []
         self.job_id: str | None = None
+        self.scans_started = False
 
     # -- preflight -------------------------------------------------------
 
@@ -633,27 +687,45 @@ class Gate:
             ),
             "datasource_ids": list(self.datasource_ids),
             "execution_lane": self.config.lane,
+            "config_override": {"llm": {"model": self.config.model}},
         }
         created = api.call("POST", "/api/jobs", job, operation="create job")
         self.job_id = str(UUID(str(created.get("id") or created.get("job_id"))))
         self.report.job_id = self.job_id
-        self.report.record("job_created", "pass")
+        self.report.record("job_created", "pass", model=self.config.model)
 
     def job_row(self) -> dict[str, Any]:
         raw = self.kube.sql(
             "SELECT json_build_object('status', status, 'container', "
-            "context->'workspace_container') FROM jobs "
-            f"WHERE id = '{self.job_id}';",
+            "context->'workspace_container', 'agent', (SELECT a.hostname FROM "
+            "agents a WHERE a.id = j.assigned_agent_id), 'leased_by', (SELECT "
+            "coalesce(q.leased_by, q.last_leased_by) FROM run_queue q WHERE "
+            "q.unit_id = j.id), 'llm_failure', lower(concat_ws(' ', "
+            "j.error_message, j.freeze_data::text, j.context->>'llm_outage')) "
+            f"~ '{'|'.join(_LLM_FAILURE_WORDS)}') FROM jobs j "
+            f"WHERE j.id = '{self.job_id}';",
             operation="read job",
         )
         return json.loads(raw) if raw else {}
 
+    def alive(self, row: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Fail clearly when the job stops before the scans could run."""
+        row = row if row is not None else self.job_row()
+        status = row.get("status")
+        stopped = status in {"failed", "cancelled"} or (
+            status == "paused" and row.get("llm_failure")
+        )
+        if stopped and not self.scans_started:
+            cause = "LLM unavailable" if row.get("llm_failure") else "job stopped"
+            raise GateFailure(
+                f"{cause}: job {status} before the scans could run "
+                f"(model {self.config.model})"
+            )
+        return row
+
     def workspace(self) -> dict[str, Any]:
         def ready():
-            row = self.job_row()
-            if row.get("status") in {"failed", "cancelled"}:
-                raise GateFailure(f"job ended early ({row['status']})")
-            container = row.get("container") or {}
+            container = self.alive().get("container") or {}
             host = container.get("host") or container.get("pod_ip")
             if (
                 container.get("status") == "ready"
@@ -671,35 +743,53 @@ class Gate:
         self.report.record("workspace_ready", "pass")
         return container
 
+    def agent_pod(self) -> str:
+        """The pod that runs this job, pinned or stateless, checked first.
+
+        A pinned pod idle since an older Tilt build keeps its old image, so
+        its own code is hashed before any scan; finding none fails the gate.
+        """
+        key = "agent" if self.config.lane == "pinned" else "leased_by"
+
+        def found():
+            pod = self.alive().get(key)
+            if not pod or not _POD_RE.fullmatch(str(pod)):
+                return None
+            exists = self.kube.run(
+                ["get", "pod", str(pod), "-o", "name", "--ignore-not-found"],
+                operation="find agent pod",
+            )
+            return str(pod) if exists else None
+
+        try:
+            pod = wait_for(
+                found,
+                timeout=self.config.timeout_seconds,
+                operation=f"{self.config.lane} agent pod",
+            )
+        except GateFailure:
+            raise GateFailure(
+                f"no {self.config.lane} agent pod found for the job"
+            ) from None
+        if not self.config.skip_code_check:
+            self.code_check(pod, "agent", AGENT_FILES)
+        self.report.record("agent_pod_code_matches", "pass", pod=pod)
+        return pod
+
     def runtime_received_credentials(self, pod: str, markers: dict[str, str]):
         """The env file and the SSH repository key are on the workspace."""
 
         def grep(labels: Sequence[str]) -> list[str]:
-            needles = "\n".join(markers[label] for label in labels) + "\n"
-            output = self.kube.run(
-                [
-                    "exec",
-                    "-i",
-                    pod,
-                    "-c",
-                    "workspace",
-                    "--",
-                    "grep",
-                    "-rlF",
-                    "-f",
-                    "-",
-                    "/home/agent-host/.srw-credentials",
-                    "/home/agent-host/.ssh",
-                ],
-                operation="workspace credential probe",
-                data=needles,
-                ok_codes=(0, 1, 2),
+            return self.workspace_grep(
+                pod,
+                [markers[label] for label in labels],
+                ["/home/agent-host/.srw-credentials", "/home/agent-host/.ssh"],
             )
-            return [line for line in output.splitlines() if line]
 
         ssh_labels = [label for label in markers if label.startswith("ssh_repo_key")]
 
         def materialized():
+            self.alive()
             env = grep(["env"])
             ssh = grep(ssh_labels)
             if any("/.srw-credentials/" in p for p in env) and any(
@@ -719,6 +809,19 @@ class Gate:
             paths=sorted(p.replace("/home/agent-host/", "~/") for p in paths),
         )
 
+    def workspace_grep(
+        self, pod: str, needles: Sequence[str], paths: Sequence[str]
+    ) -> list[str]:
+        """Files under ``paths`` on the workspace holding any needle."""
+        output = self.kube.run(
+            ["exec", "-i", pod, "-c", "workspace", "--", "grep", "-rlF", "-f", "-"]
+            + list(paths),
+            operation="workspace grep",
+            data="\n".join(needles) + "\n",
+            ok_codes=(0, 1, 2),
+        )
+        return [line for line in output.splitlines() if line]
+
     # -- scans -----------------------------------------------------------
 
     def scan_checkpoints(
@@ -728,12 +831,13 @@ class Gate:
 
         ``require_rows`` waits until this job's rows exist and its metadata
         channel holds the kept connector names. A terminal job has had its
-        rows pruned, so the settled scan only checks that nothing anywhere
-        holds a marker.
+        rows pruned, so a later scan only checks that nothing anywhere holds
+        a marker.
         """
         query = checkpoint_scan_sql(markers, job_id=self.job_id)
 
         def present():
+            self.alive()
             result = json.loads(self.kube.sql(query, operation="checkpoint scan"))
             if not require_rows or (result["job_rows"] and result["control"]):
                 return result
@@ -744,34 +848,13 @@ class Gate:
             timeout=self.config.timeout_seconds,
             operation="checkpoint rows with the metadata channel",
         )
+        self.scans_started = True
         if result["hits"]:
             self.report.record(phase, "fail", hits=sorted(result["hits"]))
             raise GateFailure(f"{phase}: credential found in checkpoint rows")
         self.report.record(phase, "pass", job_rows=result["job_rows"])
 
-    def pinned_agent_pod(self) -> str | None:
-        raw = self.kube.run(
-            ["get", "pods", "-l", "srw/managed-by=agent-provisioner", "-o", "json"],
-            operation="list agent pods",
-        )
-        for pod in json.loads(raw).get("items", []):
-            labels = (pod.get("metadata") or {}).get("labels") or {}
-            if any(
-                "job-id" in key and value and self.job_id.startswith(value)
-                for key, value in labels.items()
-            ):
-                name = pod["metadata"]["name"]
-                if _POD_RE.fullmatch(name):
-                    return name
-        return None
-
-    def scan_pinned_sqlite(self, markers: dict[str, str]) -> None:
-        pod = self.pinned_agent_pod()
-        if pod is None:
-            self.report.record("pinned_sqlite_scan", "skipped", reason="no pod")
-            return
-        if not self.config.skip_code_check:
-            self.code_check(pod, "agent", AGENT_FILES)
+    def scan_pinned_sqlite(self, pod: str, markers: dict[str, str]) -> None:
         # WORKSPACE_PATH is /workspace on agent pods (helm configmap).
         script = file_scan_script(
             markers, ["/workspace/checkpoints", "/workspace/phase_snapshots"]
@@ -782,70 +865,135 @@ class Gate:
             raise GateFailure("credential found in pinned checkpoint files")
         self.report.record("pinned_sqlite_scan", "pass", files=result["files"])
 
-    def scan_snapshots(self, markers: dict[str, str], container: dict) -> None:
+    def _archive_verdict(self, name: str, archive: dict[str, Any]) -> bool:
+        bad = bool(
+            archive["hits"]
+            or archive["excluded_paths"]
+            or not archive["ssh_config_kept"]
+        )
+        self.report.record(
+            name,
+            "fail" if bad else "pass",
+            members=archive["members"],
+            hits=archive["hits"],
+            excluded_paths=archive["excluded_paths"][:20],
+            ssh_config_kept=archive["ssh_config_kept"],
+            bash_history_present=archive["bash_history_present"],
+        )
+        return bad
+
+    def scan_live_snapshots(
+        self, markers: dict[str, str], container: dict, *, phase: str
+    ) -> None:
         host = str(container.get("host") or container.get("pod_ip"))
         port = int(container.get("port") or 22)
-        script = snapshot_script(
-            markers,
-            job_id=self.job_id,
-            ssh_host=host,
-            ssh_port=port,
-            include_product=True,
+        script = snapshot_capture_script(
+            markers, job_id=self.job_id, ssh_host=host, ssh_port=port
         )
         result = self.kube.python(
-            ORCHESTRATOR, "orchestrator", script, operation="snapshot scan"
+            ORCHESTRATOR, "orchestrator", script, operation="snapshot capture"
         )
         failed = False
         for mode in ("non_strict", "strict"):
             capture = result.get(mode) or {}
+            name = f"snapshot_{phase}_{mode}"
             if not capture.get("captured"):
-                self.report.record(f"snapshot_{mode}", "fail", reason="no capture")
+                self.report.record(name, "fail", reason="no capture")
                 failed = True
-                continue
-            bad = bool(capture["hits"] or capture["excluded_paths"])
-            if not capture["ssh_config_kept"]:
-                bad = True
-            self.report.record(
-                f"snapshot_{mode}",
-                "fail" if bad else "pass",
-                members=capture["members"],
-                hits=capture["hits"],
-                excluded_paths=capture["excluded_paths"][:20],
-                ssh_config_kept=capture["ssh_config_kept"],
-            )
-            failed = failed or bad
-        product = result.get("s3_product") or {}
-        if product.get("available"):
-            bad = bool(product["hits"] or product["excluded_paths"])
-            self.report.record(
-                "snapshot_s3_product",
-                "fail" if bad else "pass",
-                hits=product["hits"],
-                excluded_paths=product["excluded_paths"][:20],
-            )
-            failed = failed or bad
-        else:
-            self.report.record("snapshot_s3_product", "skipped", reason="none yet")
+            else:
+                failed = self._archive_verdict(name, capture) or failed
         if failed:
-            raise GateFailure("credential residue in a workspace snapshot")
+            raise GateFailure(f"credential residue in a {phase} workspace snapshot")
 
-    def settle(self) -> str | None:
-        """Let the job reach a resting status; return it (None if still running)."""
+    def scan_bash_history(self, pod: str, markers: dict[str, str]) -> None:
+        """Once the job's shells are gone, ~/.bash_history holds no secret."""
+
+        def shells_gone():
+            output = self.kube.run(
+                ["exec", pod, "-c", "workspace", "--", "pgrep", "-u", "agent-host"]
+                + ["-x", "tmux"],
+                operation="tmux probe",
+                ok_codes=(0, 1, 126, 127),
+            )
+            return not output
+
+        try:
+            wait_for(shells_gone, timeout=180, operation="agent shells ended")
+            shells = "ended"
+        except GateFailure:
+            shells = "still_running"
+        hits = self.workspace_grep(
+            pod, list(markers.values()), ["/home/agent-host/.bash_history"]
+        )
+        self.report.record(
+            "bash_history_scan",
+            "fail" if hits else "pass",
+            agent_shells=shells,
+            hits=[p.replace("/home/agent-host/", "~/") for p in hits],
+        )
+        if hits:
+            raise GateFailure("credential found in ~/.bash_history")
+
+    def scan_s3_snapshot(self, markers: dict[str, str]) -> None:
+        """Wait (bounded) for the job's real S3 snapshot, then scan it."""
+        script = s3_snapshot_script(markers, job_id=self.job_id)
+
+        def available():
+            result = self.kube.python(
+                ORCHESTRATOR, "orchestrator", script, operation="s3 snapshot"
+            )
+            return result if result.get("available") else None
+
+        try:
+            result = wait_for(
+                available,
+                timeout=self.config.snapshot_wait_seconds,
+                operation="job S3 snapshot",
+                interval=15,
+            )
+        except GateFailure:
+            self.report.record(
+                "snapshot_s3_product", "skipped", reason="never appeared"
+            )
+            return
+        if self._archive_verdict("snapshot_s3_product", result):
+            raise GateFailure("credential residue in the job's S3 snapshot")
+
+    def settle(self) -> str:
+        """Let the job reach a resting status and return it."""
         resting = {"pending_review", "paused", "completed", "failed", "waiting"}
 
         def rested():
             status = self.job_row().get("status")
             return status if status in resting else None
 
-        try:
-            status = wait_for(
-                rested, timeout=self.config.settle_seconds, operation="job settle"
+        status = wait_for(
+            rested, timeout=self.config.settle_seconds, operation="job settle"
+        )
+        row = self.job_row()
+        if status in {"paused", "failed"}:
+            cause = "LLM unavailable" if row.get("llm_failure") else "job stopped"
+            self.report.record("job_settled", "fail", status=status)
+            raise GateFailure(
+                f"{cause}: job {status} before it completed, so the settled "
+                f"snapshot and history checks could not run (model {self.config.model})"
             )
-        except GateFailure:
-            self.report.record("job_settled", "skipped", reason="still running")
-            return None
         self.report.record("job_settled", "pass", status=status)
         return status
+
+    def workspace_still_up(self, container: dict) -> bool:
+        current = self.job_row().get("container") or {}
+        if current.get("status") != "ready" or current.get("pod_name") != container.get(
+            "pod_name"
+        ):
+            return False
+        return bool(
+            self.kube.run(
+                ["get", "pod", str(container["pod_name"]), "-o", "name"]
+                + ["--ignore-not-found"],
+                operation="find workspace pod",
+            )
+        )
 
     # -- cleanup ---------------------------------------------------------
 
@@ -909,16 +1057,38 @@ class Gate:
         try:
             self.create(api, values)
             container = self.workspace()
-            self.runtime_received_credentials(str(container["pod_name"]), markers)
+            agent_pod = self.agent_pod()
+            workspace_pod = str(container["pod_name"])
+            self.runtime_received_credentials(workspace_pod, markers)
             self.scan_checkpoints(markers, phase="checkpoint_scan_running")
             if self.config.lane == "pinned":
-                self.scan_pinned_sqlite(markers)
-            self.scan_snapshots(markers, container)
+                self.scan_pinned_sqlite(agent_pod, markers)
+            self.scan_live_snapshots(markers, container, phase="running")
+
             status = self.settle()
+            if self.workspace_still_up(container):
+                self.scan_bash_history(workspace_pod, markers)
+                self.scan_live_snapshots(markers, container, phase="settled")
+            else:
+                self.report.record(
+                    "snapshot_settled", "skipped", reason="workspace released"
+                )
             self.scan_checkpoints(
                 markers,
                 phase="checkpoint_scan_settled",
                 require_rows=status not in {"completed", "failed"},
+            )
+            if status == "pending_review":
+                # Approval completes the job; its teardown takes the strict
+                # terminal snapshot the S3 scan below reads. Log in again: the
+                # first token has expired by now.
+                Api(self.kube, self.password).call(
+                    "POST", f"/api/jobs/{self.job_id}/approve", {}, operation="approve"
+                )
+                self.report.record("job_approved", "pass")
+            self.scan_s3_snapshot(markers)
+            self.scan_checkpoints(
+                markers, phase="checkpoint_scan_final", require_rows=False
             )
         finally:
             self.cleanup()
@@ -935,9 +1105,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--context", default=LOCAL_CONTEXT)
     parser.add_argument("--namespace", default=LOCAL_NAMESPACE)
     parser.add_argument("--lane", choices=("pinned", "stateless"), default="pinned")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--gate-id")
     parser.add_argument("--timeout-seconds", type=int, default=900)
-    parser.add_argument("--settle-seconds", type=int, default=600)
+    parser.add_argument("--settle-seconds", type=int, default=900)
+    parser.add_argument("--snapshot-wait-seconds", type=int, default=600)
     parser.add_argument("--keep", action="store_true")
     parser.add_argument("--skip-code-check", action="store_true")
     parser.add_argument("--run", action="store_true")
@@ -950,8 +1122,12 @@ def validate_config(args: argparse.Namespace) -> GateConfig:
         raise SafetyError("this harness is restricted to k3d-srw/srw")
     if not 120 <= args.timeout_seconds <= 3600:
         raise SafetyError("timeout must be between 120 and 3600 seconds")
-    if not 0 <= args.settle_seconds <= 3600:
-        raise SafetyError("settle time must be between 0 and 3600 seconds")
+    if not 60 <= args.settle_seconds <= 3600:
+        raise SafetyError("settle time must be between 60 and 3600 seconds")
+    if not 0 <= args.snapshot_wait_seconds <= 3600:
+        raise SafetyError("snapshot wait must be between 0 and 3600 seconds")
+    if not _MODEL_RE.fullmatch(args.model):
+        raise SafetyError("model id is malformed")
     if args.run and args.confirm != LOCAL_CONFIRMATION:
         raise SafetyError(f"--run requires --confirm {LOCAL_CONFIRMATION}")
     if not args.run and args.confirm is not None:
@@ -962,9 +1138,11 @@ def validate_config(args: argparse.Namespace) -> GateConfig:
     return GateConfig(
         gate_id=gate_id,
         lane=args.lane,
+        model=args.model,
         run=bool(args.run),
         timeout_seconds=args.timeout_seconds,
         settle_seconds=args.settle_seconds,
+        snapshot_wait_seconds=args.snapshot_wait_seconds,
         keep=bool(args.keep),
         skip_code_check=bool(args.skip_code_check),
     )
@@ -977,14 +1155,20 @@ def plan_report(config: GateConfig) -> SafeReport:
         "connectors_created",
         "job_created",
         "workspace_ready",
+        "agent_pod_code_matches",
         "runtime_received_credentials",
         "checkpoint_scan_running",
         *(["pinned_sqlite_scan"] if config.lane == "pinned" else []),
-        "snapshot_non_strict",
-        "snapshot_strict",
-        "snapshot_s3_product",
+        "snapshot_running_non_strict",
+        "snapshot_running_strict",
         "job_settled",
+        "bash_history_scan",
+        "snapshot_settled_non_strict",
+        "snapshot_settled_strict",
         "checkpoint_scan_settled",
+        "job_approved",
+        "snapshot_s3_product",
+        "checkpoint_scan_final",
     ]
     for phase in phases:
         report.record(phase, "planned")
