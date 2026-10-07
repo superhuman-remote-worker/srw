@@ -203,16 +203,26 @@ def test_the_application_composes_its_registry_into_both_seams():
     assert payload.connector_drivers is resources.connector_drivers
 
 
-def test_only_repository_and_ssh_key_remain_on_the_legacy_path():
-    """They move into drivers of their own after slice C1 (ssh-agent)."""
-    from orchestrator.services.connector_drivers.legacy import LegacyDatasourceDriver
+def test_every_type_has_a_driver_of_its_own():
+    """The legacy adapter is gone: no type falls back to shared code."""
+    from orchestrator.services.connector_drivers import builtin
 
-    legacy = {
-        type_id
-        for type_id in _REGISTRY.type_ids()
-        if isinstance(_REGISTRY.for_type(type_id), LegacyDatasourceDriver)
-    }
-    assert legacy == {"repository", "ssh_key"}
+    assert not hasattr(builtin, "LegacyDatasourceDriver")
+    assert len({type(_REGISTRY.for_type(t)) for t in ("repository", "ssh_key")}) == 2
+
+
+def test_only_ssh_key_connectors_deliver_workspace_ssh_identities():
+    from orchestrator.services.connector_drivers.base import (
+        SupportsTestOverrides,
+        SupportsWorkspaceSshIdentity,
+    )
+
+    for capability in (SupportsTestOverrides, SupportsWorkspaceSshIdentity):
+        assert {
+            type_id
+            for type_id in _REGISTRY.type_ids()
+            if isinstance(_REGISTRY.for_type(type_id), capability)
+        } == {"repository", "ssh_key"}
 
 
 def test_only_the_knowledge_base_has_index_capabilities():
@@ -326,7 +336,6 @@ def test_a_read_only_link_keeps_the_login_only_where_the_client_needs_it(
     assert entry["credentials"] == (_LOGIN if keeps_login else {})
     assert entry["project_read_only"] is True
     assert driver.effective_access(row) == "ReadOnly"
-
 
 
 # =============================================================================

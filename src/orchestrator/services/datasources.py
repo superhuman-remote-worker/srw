@@ -21,7 +21,6 @@ properties are load-bearing and moved unchanged:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -62,14 +61,9 @@ from orchestrator.services.connector_drivers.base import (
     DriverEnvironment,
     NormalizedConnector,
     SupportsIndexOperations,
+    SupportsTestOverrides,
     SupportsWriteEffects,
     ValidationContext,
-)
-from orchestrator.services.datasource_config import normalize_repository_config
-from orchestrator.services.workspace_ssh_connector import (
-    WorkspaceSshConnectorError,
-    apply_ssh_test_overrides,
-    probe_workspace_ssh_connector,
 )
 from shared.credential_connectors import CredentialConnectorAttachedError
 from shared.native_kb import native_kb_project_id
@@ -848,108 +842,6 @@ async def reindex_datasource_knowledge(
 # =============================================================================
 
 
-async def test_repository_datasource(
-    ds: dict[str, Any], url: str | None, creds: dict[str, Any]
-) -> dict[str, Any]:
-    """Probe a token-authenticated repository connector without exposing the token.
-
-    Reports the principal the agent will act as, its permission on the
-    repository, the token class (GitHub only), and the repository's default
-    branch, with warnings for the two configurations that silently defeat
-    the guardrails: an administrator token (bypasses branch rules) and a
-    connector that is not read-only but cannot push. SSH-key connectors have
-    no API to ask: Test reaches their SSH endpoint and reports its host key
-    (``workspace_ssh_connector.probe_workspace_ssh_connector``); the clone at
-    job start proves the key.
-    """
-    from shared.runtime.services.forge import (  # noqa: PLC0415
-        ForgeError,
-        ForgeRepo,
-        parse_owner_repo,
-        probe_repository_access,
-        resolve_api_base,
-    )
-
-    token = str(creds.get("token") or "")
-    auth_method = str(creds.get("auth_method") or "").lower()
-    if not auth_method:
-        auth_method = "ssh" if creds.get("ssh_key") else ("token" if token else "")
-    if auth_method == "ssh":
-        # No forge API takes a deploy key; reach the SSH endpoint and report
-        # the host key the connector form offers to pin.
-        probed = await probe_workspace_ssh_connector({**ds, "credentials": creds})
-        if probed is not None:
-            return probed
-    if auth_method != "token" or not token:
-        return {
-            "status": "ok",
-            "message": (
-                "No API probe for SSH-key repository connectors; "
-                "the clone at job start is the test"
-            ),
-        }
-
-    config = ds.get("config") or {}
-    if isinstance(config, str):
-        try:
-            config = json.loads(config)
-        except ValueError:
-            config = {}
-    try:
-        forge = normalize_repository_config(config, url)["forge"]
-        owner, repo = parse_owner_repo(url or "")
-        target = ForgeRepo(
-            forge=forge,
-            api_base=resolve_api_base(url or "", forge),
-            owner=owner,
-            repo=repo,
-            token=token,
-        )
-    except HTTPException as exc:
-        return {"status": "error", "message": str(exc.detail)}
-    except ForgeError as exc:
-        return {"status": "error", "message": str(exc)}
-
-    try:
-        facts = await asyncio.wait_for(probe_repository_access(target), timeout=15)
-    except asyncio.TimeoutError:
-        return {"status": "error", "message": "Repository probe timed out after 15s"}
-    except ForgeError as exc:
-        return {"status": "error", "message": str(exc)}
-
-    warnings = list(facts.get("warnings") or [])
-    if not facts["can_write"] and not ds.get("read_only"):
-        warnings.append(
-            f"{facts['principal'] or 'the token'} cannot push to {owner}/{repo} "
-            "but the connector is not marked read-only"
-        )
-    configured_branch = str(ds.get("default_branch") or "")
-    repo_default = facts.get("default_branch")
-    branch_note = ""
-    if repo_default:
-        branch_note = f"; repository default branch {repo_default}"
-        if configured_branch and configured_branch != repo_default:
-            branch_note += f" (connector targets {configured_branch})"
-
-    token_label = (
-        f"{facts['token_class']} token"
-        if facts["token_class"] != "unknown"
-        else "token"
-    )
-    access = "write" if facts["can_write"] else "read-only"
-    message = (
-        f"Authenticated as {facts['principal'] or 'unknown principal'} "
-        f"({token_label}); {access} access to {owner}/{repo}{branch_note}"
-    )
-    if warnings:
-        message += " — WARNING: " + "; ".join(warnings)
-    return {
-        "status": "ok",
-        "message": message,
-        "details": {**facts, "warnings": warnings},
-    }
-
-
 async def test_datasource(
     *,
     resolve_datasource: ResolveDatasourceOwner,
@@ -960,22 +852,19 @@ async def test_datasource(
 
     Attempts to connect using the stored connection details and returns
     the result. Does not modify any data. F3: creator/admin only (test
-    uses live credentials and probes the target). ``overrides`` is the SSH
-    endpoint a connector form is editing; it is validated like an update and
-    only an SSH connector's probe reads it.
+    uses live credentials and probes the target). ``overrides`` is the
+    endpoint a connector form is editing; a driver that can test an edit
+    validates it like an update, and every other driver ignores it.
     """
     try:
         _, ds = await resolve_datasource()
-        if overrides:
-            try:
-                ds = apply_ssh_test_overrides(ds, overrides)
-            except WorkspaceSshConnectorError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        driver = dependencies.connector_drivers.for_type(ds.get("type"))
+        if overrides and isinstance(driver, SupportsTestOverrides):
+            ds = driver.apply_test_overrides(ds, overrides)
         ds_type = ds["type"]
         creds = ds.get("credentials") or {}
         if isinstance(creds, str):
             creds = json.loads(creds)
-        driver = dependencies.connector_drivers.for_type(ds_type)
         if driver is None:
             return {"status": "error", "message": f"Unknown connector type: {ds_type}"}
         environment = dependencies.driver_environment()

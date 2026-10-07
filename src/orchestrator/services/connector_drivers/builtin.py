@@ -12,31 +12,33 @@ from orchestrator.services.connector_drivers.env import (
     GenericDriver,
 )
 from orchestrator.services.connector_drivers.kb import KnowledgeBaseDriver
-from orchestrator.services.connector_drivers.legacy import LegacyDatasourceDriver
 from orchestrator.services.connector_drivers.mail import EmailDriver
-from orchestrator.services.connector_drivers.mcp_client import McpDriver
 from orchestrator.services.connector_drivers.manifest import EnvDriver, FilesDriver
+from orchestrator.services.connector_drivers.mcp_client import McpDriver
+from orchestrator.services.connector_drivers.repository import RepositoryDriver
+from orchestrator.services.connector_drivers.ssh_key import SshKeyDriver
 from shared.connectors.builtin import DATASOURCE_SPECS
 
 
 def drivers() -> tuple[DatasourceDriver | ManifestDeliveryDriver, ...]:
-    """Fresh instances: the generic-hosting drivers, then catalogue order.
-
-    A datasource type without a driver of its own is served by the legacy
-    adapter, which keeps the code it had before drivers existed.
-    """
+    """Fresh instances: the generic-hosting drivers, then catalogue order."""
     own: dict[str, DatasourceDriver] = {
         driver.spec.name: driver
         for driver in (
             GenericDriver(),
             CredentialsDriver(),
-            *credential_files.drivers(),
+            RepositoryDriver(),
+            KnowledgeBaseDriver(),
             *managed.drivers(),
             EmailDriver(),
             McpDriver(),
-            KnowledgeBaseDriver(),
+            *credential_files.drivers(),
+            SshKeyDriver(),
         )
     }
+    missing = [spec.name for spec in DATASOURCE_SPECS if spec.name not in own]
+    if missing:
+        raise RuntimeError(f"Built-in specs without a driver: {missing}")
     return (EnvDriver(), FilesDriver()) + tuple(
-        own.get(spec.name) or LegacyDatasourceDriver(spec) for spec in DATASOURCE_SPECS
+        own[spec.name] for spec in DATASOURCE_SPECS
     )

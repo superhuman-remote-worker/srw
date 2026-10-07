@@ -354,6 +354,28 @@ class SupportsWriteEffects(Protocol):
 
 
 @runtime_checkable
+class SupportsTestOverrides(Protocol):
+    """Test connection of an endpoint a connector form is still editing."""
+
+    def apply_test_overrides(
+        self, row: Mapping[str, Any], overrides: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """The row Test probes; ``HTTPException(400)`` for an invalid edit."""
+        ...
+
+
+@runtime_checkable
+class SupportsWorkspaceSshIdentity(Protocol):
+    """A connector whose key is loaded into the workspace's ssh-agent."""
+
+    def workspace_ssh_identity(
+        self, row: Mapping[str, Any], *, default_known_hosts: str
+    ) -> Any:
+        """The identity for ``workspace_ssh_identities``, or ``None``."""
+        ...
+
+
+@runtime_checkable
 class SupportsIndexOperations(Protocol):
     """A connector SRW indexes: delete through the index fence, status, reindex."""
 
