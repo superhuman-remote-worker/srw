@@ -9708,6 +9708,28 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
     expect(lines.some((l: string) => l.includes('session settings'))).toBe(false);
   });
 
+  it('the system line names the tier readably, not by id', async () => {
+    const ctx = await readySession();
+    offer(ctx.es, { target_tier: 'vm', reason: 'need a shell' });
+    const lines = ctx.service
+      .turns()
+      .filter((t: any) => t.kind === 'system')
+      .map((t: any) => String(t.content));
+    expect(lines).toContain('The agent requested a VM workspace: need a shell');
+  });
+
+  it('a bare upgrade then .started replaces the "next" placeholder with the target tier', async () => {
+    const ctx = await readySession();
+    ctx.service.upgradeWorkspace(null);
+    expect(ctx.service.workspaceUpgradeInProgress()?.tier).toBe('next');
+    fireSseMessage(
+      ctx.es,
+      { method: 'workspace_upgrade.started', params: { target_tier: 'vm' } },
+      '1:9',
+    );
+    expect(ctx.service.workspaceUpgradeInProgress()?.tier).toBe('vm');
+  });
+
   it('old container offer on a pinned session raises no card', async () => {
     const ctx = await readySession();
     offer(ctx.es, { target_tier: 'sandbox', reason: 'need a shell' });

@@ -28,7 +28,7 @@ import {CitationRefDirective} from '../../core/markdown/citation-ref.directive';
 import {WorkspaceFileLinkDirective} from '../../core/markdown/workspace-file-link.directive';
 import {KatexDirective} from '../../core/markdown/katex.directive';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
-import {ChatAttachment, EndSessionOutcome, PermissionRequest, PersistentChatService, RewindPrefill, RunningToolInfo, ToolCallInfo,} from '../../core/services/persistent-chat.service';
+import {ChatAttachment, EndSessionOutcome, PermissionRequest, PersistentChatService, RewindPrefill, RunningToolInfo, ToolCallInfo, workspaceTierLabel,} from '../../core/services/persistent-chat.service';
 import {uploadSummary} from '../../core/services/upload-stage';
 import {
     AssistantTurn,
@@ -1979,7 +1979,7 @@ export function clearDraft(threadId: string | null): void {
             @switch (woc.state) {
               @case ('offer') {
                 <div class="mile-label">{{ 'chat.workspaceOffer.title' | transloco }}</div>
-                <div class="mile-title">{{ 'chat.workspaceOffer.detail' | transloco:{ tier: woc.tier } }}</div>
+                <div class="mile-title">{{ 'chat.workspaceOffer.detail' | transloco:{ tier: tierLabel(woc.tier) } }}</div>
                 <div class="mile-detail">
                   <app-icon size="sm" class="mile-detail-icon">terminal</app-icon>
                   <span class="mile-args">{{ woc.reason }}</span>
@@ -2001,7 +2001,7 @@ export function clearDraft(threadId: string | null): void {
                 <div class="mile-detail">
                   <span class="action-spinner-sm" aria-hidden="true"></span>
                   <span class="mile-args">
-                    {{ 'chat.workspaceOffer.provisioning' | transloco:{ tier: woc.tier } }}
+                    {{ 'chat.workspaceOffer.provisioning' | transloco:{ tier: tierLabel(woc.tier) } }}
                     @if (woc.elapsed) { ({{ woc.elapsed }}s) }
                   </span>
                 </div>
@@ -2623,6 +2623,9 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly runningCommandCards = computed(() =>
         pickRunningCommandCards(this.chat.runningTools(), this.chat.turns()),
     );
+
+    /** Reader-facing tier name for the offer card (vm -> VM, sandbox -> container). */
+    readonly tierLabel = workspaceTierLabel;
 
     /** The workspace-upgrade offer/provisioning card, or null. */
     readonly workspaceOfferCard = computed(() =>

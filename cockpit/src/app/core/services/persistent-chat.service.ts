@@ -118,6 +118,13 @@ function isCommittedCanvasControl(
 
 /** Session title from a landing draft's first message: first line, collapsed
  *  whitespace, capped at 60 chars (on a word boundary when one is near). */
+/** Reader-facing name for a workspace tier id: `vm` -> "VM", `sandbox` -> "container". */
+export function workspaceTierLabel(tier: string): string {
+  if (tier === 'vm') return 'VM';
+  if (tier === 'sandbox') return 'container';
+  return tier;
+}
+
 export function draftTitleFrom(message: string): string {
   const line = message.split('\n')[0].replace(/\s+/g, ' ').trim();
   if (!line) return 'Untitled Session';
@@ -8128,13 +8135,16 @@ export class PersistentChatService {
         // Keep a line in the stream so the ask survives in scroll-back
         // once the card resolves — but state the fact only. The card is
         // the verb now, and it says "files carry over" itself.
-        this._systemMessage(`The agent requested a ${tier} workspace: ${reason}`);
+        this._systemMessage(`The agent requested a ${workspaceTierLabel(tier)} workspace: ${reason}`);
         break;
       }
 
       case 'workspace_upgrade.started':
         this.workspaceUpgradeInProgress.update(
-          (p) => p ?? { tier: (params['target_tier'] as string) || 'sandbox' },
+          (p) =>
+            !p || p.tier === 'next'
+              ? { ...p, tier: (params['target_tier'] as string) || 'sandbox' }
+              : p,
         );
         this._systemMessage('Provisioning workspace, please wait...');
         break;
