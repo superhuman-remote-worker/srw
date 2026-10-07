@@ -10,6 +10,7 @@ workspace, command line, environment, tmux scrollback, or Git configuration.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 import shlex
 from typing import Any, Iterable, Mapping, MutableMapping
@@ -29,6 +30,22 @@ _SSH_CONFIG_VALUE = re.compile(r"^[^\s%#\"'\\]{1,4096}$")
 #: ``Host`` line may: config.d is read in slug order and the first matching
 #: block wins, so a declared host spelled like an alias would take it over.
 RESERVED_SSH_HOST_PREFIX = "srw-repo-"
+# An ``extra_hosts`` entry becomes a ``Host`` *pattern*: only plain ASCII DNS
+# labels or an IP literal, so ``*``, ``?``, ``!`` or a list can never widen
+# the block past the one host the connector declared.
+_SSH_HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+
+
+def _plain_ssh_host(value: Any) -> bool:
+    text = str(value)
+    if not text or len(text) > 253 or "%" in text:
+        return False
+    try:
+        ipaddress.ip_address(text)
+    except ValueError:
+        return all(_SSH_HOST_LABEL.fullmatch(label) for label in text.split("."))
+    return True
+
 
 #: Lifetime (``ssh-add -t``) of a connector identity's key in its workspace
 #: ``ssh-agent``. Every materialization re-adds a proven resident's key, which
@@ -675,7 +692,11 @@ def render_ssh_identity_config(
         lines.append(f"  HostName {_ssh_config_value(host)}")
     lines.extend(settings)
     for pattern in extra_hosts:
-        if str(pattern).lower().startswith(RESERVED_SSH_HOST_PREFIX):
+        # Second line of defence behind normalize_ssh_host: the same grammar,
+        # checked where the pattern is written.
+        if not _plain_ssh_host(pattern) or str(pattern).lower().startswith(
+            RESERVED_SSH_HOST_PREFIX
+        ):
             raise ManagedRepositoryMaterializationError(
                 "managed_repository_credential_invalid"
             )

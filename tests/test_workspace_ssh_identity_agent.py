@@ -496,6 +496,44 @@ def test_prune_on_a_fresh_home_is_a_no_op(home: Path) -> None:
     assert prune_workspace_ssh_identities([], _LocalShellBackend(home))
 
 
+@pytest.mark.parametrize(
+    "pattern",
+    ["*", "gitea.*", "git?a.example.com", "!gitea.example.com", "a,b", "-oops", ""],
+)
+def test_the_renderer_refuses_an_extra_host_that_is_a_pattern(pattern: str) -> None:
+    """A second line of defence behind normalize_ssh_host, where it is written."""
+
+    from shared.runtime.core.managed_repository import (
+        ManagedRepositoryMaterializationError,
+        render_ssh_identity_config,
+    )
+
+    with pytest.raises(ManagedRepositoryMaterializationError):
+        render_ssh_identity_config(
+            alias="srw-repo-" + "a" * 32,
+            socket_path="/home/agent-host/.ssh/srw-managed/sockets/a.sock",
+            known_hosts_path="/home/agent-host/.ssh/srw-managed/known_hosts.d/a",
+            host="gitea.example.com",
+            extra_hosts=[pattern],
+        )
+
+
+@pytest.mark.parametrize(
+    "host", ["gitea.example.com", "Bastion-1", "10.0.0.7", "2001:db8::1"]
+)
+def test_the_renderer_accepts_a_plain_extra_host(host: str) -> None:
+    from shared.runtime.core.managed_repository import render_ssh_identity_config
+
+    config = render_ssh_identity_config(
+        alias="srw-repo-" + "a" * 32,
+        socket_path="/home/agent-host/.ssh/srw-managed/sockets/a.sock",
+        known_hosts_path="/home/agent-host/.ssh/srw-managed/known_hosts.d/a",
+        host=host,
+        extra_hosts=[host],
+    )
+    assert f"\nHost {host}\n" in config
+
+
 def test_a_declared_host_can_never_shadow_an_identity_alias(home: Path) -> None:
     """Review blocker: an ssh_key host spelled like an alias took it over.
 
