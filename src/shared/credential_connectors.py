@@ -5,7 +5,10 @@ from __future__ import annotations
 import re
 from typing import Any
 
-ENV_CONNECTOR_TYPES = frozenset({"generic", "credentials"})
+from shared.connectors.builtin import legacy_types_with_form
+
+#: Stored types whose driver delivers an environment file to the workspace.
+ENV_CONNECTOR_TYPES = legacy_types_with_form("env_file")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RESERVED = frozenset(
     {

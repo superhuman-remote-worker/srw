@@ -5942,6 +5942,75 @@
       }
     ]
   },
+  "update/unknown_stored_type/config_refused": {
+    "request": {
+      "method": "PUT",
+      "path": "/api/datasources/d5000001-0000-0000-0000-000000000001",
+      "body": {
+        "config": {
+          "a": 1
+        }
+      }
+    },
+    "status": 400,
+    "body": {
+      "detail": "Connector config is only supported for OKF Knowledge Bases and email connectors"
+    },
+    "calls": []
+  },
+  "update/unknown_stored_type/credentials_stored": {
+    "request": {
+      "method": "PUT",
+      "path": "/api/datasources/d5000001-0000-0000-0000-000000000001",
+      "body": {
+        "credentials": {
+          "token": "ftp-secret"
+        },
+        "description": "Edited"
+      }
+    },
+    "status": 200,
+    "body": {
+      "id": "d5000001-0000-0000-0000-000000000001",
+      "name": "Billing API",
+      "description": "Edited",
+      "type": "ftp",
+      "connection_url": "https://billing.example.test/api",
+      "config": {},
+      "cli_hint": "curl -H \"Authorization: Bearer $BILLING_TOKEN\" $BILLING_URL",
+      "default_branch": null,
+      "read_only": null,
+      "created_by": "00000000-0000-0000-0000-0000000000c1",
+      "is_global": false,
+      "scope_mode": "all",
+      "auto_attach": false,
+      "policy_revision": 1,
+      "created_at": "2026-01-02T03:04:05Z",
+      "updated_at": "2026-01-02T03:04:05Z",
+      "project_ids": []
+    },
+    "calls": [
+      {
+        "call": "update_datasource",
+        "args": [
+          "d5000001-0000-0000-0000-000000000001"
+        ],
+        "kwargs": {
+          "name": null,
+          "description": "Edited",
+          "connection_url": null,
+          "credentials": {
+            "token": "ftp-secret"
+          },
+          "cli_hint": null,
+          "default_branch": null,
+          "config": null,
+          "is_global": null,
+          "read_only": null
+        }
+      }
+    ]
+  },
   "update/credentials/env_merged": {
     "request": {
       "method": "PUT",
@@ -6110,6 +6179,26 @@
         "call": "user_can_publish_datasource"
       }
     ]
+  },
+  "update/credentials/scope_refused_before_validation": {
+    "request": {
+      "method": "PUT",
+      "path": "/api/datasources/d5000002-0000-0000-0000-000000000002",
+      "body": {
+        "scope_mode": "all",
+        "policy_revision": 1,
+        "credentials": {
+          "env_vars": {
+            "HOME": "x"
+          }
+        }
+      }
+    },
+    "status": 403,
+    "body": {
+      "detail": "Access denied by MCP token scope"
+    },
+    "calls": []
   },
   "update/generic_file/files_renormalised": {
     "request": {

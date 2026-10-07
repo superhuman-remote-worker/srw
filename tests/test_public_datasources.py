@@ -52,6 +52,8 @@ def _route_deps(user: dict, db):
     )
     from orchestrator.routers.datasources import DatasourcesDependencies
     from orchestrator.services.datasources import DatasourceDependencies
+    from orchestrator.services.deployment_gates import mcp_stdio_enabled
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
     from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
     from orchestrator.services.knowledge_index import KnowledgeIndexDependencies
 
@@ -70,6 +72,8 @@ def _route_deps(user: dict, db):
             ),
             mcp_datasources_enabled=_mcp_datasources_enabled,
             validate_mcp_datasource=datasource_config_module.validate_mcp_datasource,
+            mcp_stdio_enabled=mcp_stdio_enabled,
+            connector_drivers=builtin_connector_drivers(),
         ),
         require_approved_user=AsyncMock(return_value=user),
     )

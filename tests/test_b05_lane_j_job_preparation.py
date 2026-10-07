@@ -133,6 +133,7 @@ def _datasource_payload_deps() -> (
         logger=preparation_composition.logger,
         mcp_datasources_enabled=deployment_gates_module.mcp_datasources_enabled,
         mcp_stdio_enabled=deployment_gates_module.mcp_stdio_enabled,
+        connector_drivers=main.app.state.resources.connector_drivers,
     )
 
 
@@ -3471,6 +3472,13 @@ LATE_BINDING_TABLE = [
         "mcp_stdio_enabled",
         _OWNER,
         (deployment_gates_module, "mcp_stdio_enabled"),
+        None,
+    ),
+    (
+        _datasource_payload_deps,
+        "connector_drivers",
+        _RESOURCE,
+        "connector_drivers",
         None,
     ),
     (_datasource_selection_deps, "store", _RESOURCE, "postgres_db", None),

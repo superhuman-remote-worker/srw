@@ -22,6 +22,7 @@ from orchestrator.services.completion_control import (
 )
 from orchestrator.services.job_mutation_controls import JobControlOperations
 from orchestrator.services.manifest_execution import ManifestExecutionService
+from orchestrator.services.connector_drivers import builtin_connector_drivers
 from tests import test_workspace_pull_failure_real_postgres as fixtures
 
 
@@ -144,7 +145,12 @@ async def _pre_ready_exit17(db, monkeypatch, *, active_claim: bool):
         )
         assert isinstance((await db.get_job(str(job)))["context"], str)
     monkeypatch.setattr(db, "manifests_ready", True, raising=False)
-    manifest = ManifestExecutionService(db, runtime=None, namespace="test")
+    manifest = ManifestExecutionService(
+        db,
+        runtime=None,
+        namespace="test",
+        connector_drivers=builtin_connector_drivers(),
+    )
     operations = JobControlOperations(
         SimpleNamespace(
             store=db,

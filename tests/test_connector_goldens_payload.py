@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 
 from orchestrator.services import agent_datasource_payload as payload_module
+from orchestrator.services.connector_drivers import builtin_connector_drivers
 from orchestrator.services.deployment_gates import (
     mcp_datasources_enabled,
     mcp_stdio_enabled,
@@ -175,6 +176,31 @@ CASES.update(
             all_rows(project_read_only=True), pinned_defect=_RO_CREDENTIALS_DROPPED
         ),
         "mixed/all_kinds_gates_off": PayloadCase(all_rows(), mcp=False, stdio=False),
+        # Key order after the driver's own fields: cli_hint, default_branch,
+        # then require_default_branch.
+        "generic/cli_hint_and_default_branch": PayloadCase(
+            [resolved_row("generic", default_branch="release")]
+        ),
+        "repository_token/every_trailing_key": PayloadCase(
+            [
+                resolved_row(
+                    "repository_token",
+                    cli_hint="clone with care",
+                    require_default_branch=True,
+                )
+            ]
+        ),
+        # A stored type no driver serves is forwarded as stored.
+        "unknown_type/forwarded_as_stored": PayloadCase(
+            [
+                resolved_row(
+                    "generic",
+                    type="ftp",
+                    default_branch="main",
+                    project_read_only=True,
+                )
+            ]
+        ),
         "empty": PayloadCase([]),
     }
 )
@@ -214,6 +240,7 @@ def build_payload(case: PayloadCase) -> tuple[list[dict] | None, list[str]]:
             logger=logger,
             mcp_datasources_enabled=mcp_datasources_enabled,
             mcp_stdio_enabled=mcp_stdio_enabled,
+            connector_drivers=builtin_connector_drivers(),
         ),
     )
     return payload, logged

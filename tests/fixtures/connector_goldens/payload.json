@@ -1804,6 +1804,64 @@
       }
     ]
   },
+  "generic/cli_hint_and_default_branch": {
+    "payload": [
+      {
+        "type": "generic",
+        "name": "Billing API",
+        "description": "Billing REST API",
+        "connection_url": "https://billing.example.test/api",
+        "credentials": {
+          "env_vars": {
+            "BILLING_TOKEN": "billing-secret"
+          }
+        },
+        "project_read_only": false,
+        "cli_hint": "curl -H \"Authorization: Bearer $BILLING_TOKEN\" $BILLING_URL",
+        "default_branch": "release"
+      }
+    ]
+  },
+  "repository_token/every_trailing_key": {
+    "payload": [
+      {
+        "type": "repository",
+        "name": "Widgets",
+        "description": "Widgets service",
+        "connection_url": "https://github.com/acme/widgets.git",
+        "credentials": {
+          "auth_method": "token",
+          "token": "ghp_widgets-secret"
+        },
+        "project_read_only": false,
+        "datasource_id": "d5000006-0000-0000-0000-000000000006",
+        "config": {
+          "forge": "github"
+        },
+        "cli_hint": "clone with care",
+        "default_branch": "main",
+        "require_default_branch": true
+      }
+    ]
+  },
+  "unknown_type/forwarded_as_stored": {
+    "payload": [
+      {
+        "type": "ftp",
+        "name": "Billing API",
+        "description": "Billing REST API",
+        "connection_url": "https://billing.example.test/api",
+        "credentials": {
+          "env_vars": {
+            "BILLING_TOKEN": "billing-secret"
+          }
+        },
+        "project_read_only": true,
+        "cli_hint": "curl -H \"Authorization: Bearer $BILLING_TOKEN\" $BILLING_URL",
+        "default_branch": "main"
+      }
+    ]
+  },
   "empty": {
     "payload": null
   }

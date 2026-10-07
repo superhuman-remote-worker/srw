@@ -495,6 +495,7 @@ def datasource_payload_dependencies(
         logger=logger,
         mcp_datasources_enabled=deployment_gates.mcp_datasources_enabled,
         mcp_stdio_enabled=deployment_gates.mcp_stdio_enabled,
+        connector_drivers=resources.connector_drivers,
     )
 
 

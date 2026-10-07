@@ -409,6 +409,7 @@ async def manifest_project(database, actor, spec):
 async def admit_generic_project_job(database, actor, monkeypatch, project_id):
     """Admit a generic-image Job that omits its workspace; record create_job."""
     from orchestrator.services.manifest_execution import ManifestExecutionService
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
     from orchestrator.services.manifest_execution_snapshot import read_execution
     from orchestrator.services.manifest_workspaces import ManifestWorkspaceService
 
@@ -433,6 +434,7 @@ async def admit_generic_project_job(database, actor, monkeypatch, project_id):
         namespace="agents",
         workspace=workspaces,
         native_hosting_enabled=True,
+        connector_drivers=builtin_connector_drivers(),
     )
     resources = ManifestResourceService(database, admit_job=execution.admit)
     assignment = job(expert={"inline": expert()["spec"]})
@@ -687,10 +689,15 @@ class ProcessRuntime:
 
 async def native_execution(database, actor, *, max_attempts=1, mode="ProcessExit"):
     from orchestrator.services.manifest_execution import ManifestExecutionService
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
 
     process = ProcessRuntime()
     execution = ManifestExecutionService(
-        database, runtime=process, namespace="test", native_hosting_enabled=True
+        database,
+        runtime=process,
+        namespace="test",
+        native_hosting_enabled=True,
+        connector_drivers=builtin_connector_drivers(),
     )
     resources = ManifestResourceService(database, admit_job=execution.admit)
     assignment = job(expert={"inline": expert()["spec"]})
@@ -985,9 +992,15 @@ async def test_unverified_network_profile_blocks_generic_admission_without_effec
     database, actor
 ):
     from orchestrator.services.manifest_execution import ManifestExecutionService
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
 
     processes = ProcessRuntime()
-    execution = ManifestExecutionService(database, runtime=processes, namespace="test")
+    execution = ManifestExecutionService(
+        database,
+        runtime=processes,
+        namespace="test",
+        connector_drivers=builtin_connector_drivers(),
+    )
     resources = ManifestResourceService(database, admit_job=execution.admit)
     with pytest.raises(HTTPException) as unavailable:
         await apply(resources, job(expert={"inline": expert()["spec"]}), actor)
@@ -1006,10 +1019,15 @@ async def test_unverified_network_profile_blocks_generic_admission_without_effec
 @pytest.mark.asyncio
 async def test_reapply_job_keeps_original_referenced_generation(database, actor):
     from orchestrator.services.manifest_execution import ManifestExecutionService
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
 
     process = ProcessRuntime()
     execution = ManifestExecutionService(
-        database, runtime=process, namespace="test", native_hosting_enabled=True
+        database,
+        runtime=process,
+        namespace="test",
+        native_hosting_enabled=True,
+        connector_drivers=builtin_connector_drivers(),
     )
     resources = ManifestResourceService(database, admit_job=execution.admit)
     authored = [expert(), job()]
@@ -1087,6 +1105,7 @@ async def native_workspace_execution(
     database, actor, *, retention="Retain", mode="ProcessExit", attempts=2
 ):
     from orchestrator.services.manifest_execution import ManifestExecutionService
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
     from orchestrator.services.manifest_workspaces import ManifestWorkspaceService
 
     processes, workspace_processes = ProcessRuntime(), WorkspaceProcessRuntime()
@@ -1103,6 +1122,7 @@ async def native_workspace_execution(
         namespace="agents",
         workspace=workspaces,
         native_hosting_enabled=True,
+        connector_drivers=builtin_connector_drivers(),
     )
     resources = ManifestResourceService(database, admit_job=executions.admit)
     recipe = {

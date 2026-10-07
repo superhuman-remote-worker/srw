@@ -75,6 +75,8 @@ def _datasource_wire(row: dict):
     from orchestrator.routers.datasources import DatasourcesDependencies as RouteDeps
     from orchestrator.routers.datasources import router
     from orchestrator.services.datasources import DatasourceDependencies as OpDeps
+    from orchestrator.services.deployment_gates import mcp_stdio_enabled
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
     from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
     from orchestrator.services.knowledge_index import KnowledgeIndexDependencies
 
@@ -105,6 +107,8 @@ def _datasource_wire(row: dict):
         ),
         mcp_datasources_enabled=lambda: False,
         validate_mcp_datasource=lambda _url, _creds: None,
+        mcp_stdio_enabled=mcp_stdio_enabled,
+        connector_drivers=builtin_connector_drivers(),
     )
     deps = RouteDeps(
         store=store,
@@ -148,11 +152,19 @@ def _exploding_module(attribute: str) -> MagicMock:
     ("ds_type", "target", "patcher"),
     [
         ("kb", "orchestrator.services.kb_datasources.test_kb_datasource", "attr"),
-        ("postgresql", "orchestrator.services.datasources.asyncpg.connect", "attr"),
+        (
+            "postgresql",
+            "orchestrator.services.connector_drivers.managed.asyncpg.connect",
+            "attr",
+        ),
         ("neo4j", "neo4j", "module"),
         ("mongodb", "pymongo", "module"),
         ("webdav", "webdav3.client", "module"),
-        ("email", "orchestrator.services.datasources.probe_email_connection", "attr"),
+        (
+            "email",
+            "orchestrator.services.connector_drivers.mail.probe_email_connection",
+            "attr",
+        ),
     ],
 )
 def test_a_failing_connector_probe_reports_without_the_exception_text(

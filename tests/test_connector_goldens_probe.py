@@ -7,7 +7,7 @@ existing tests use (``tests/test_codeql_error_disclosure.py``,
 ``tests/test_repository_probe.py``, ``tests/test_kb_datasource_api.py``,
 ``tests/test_mcp_datasource_api.py``):
 
-* PostgreSQL: ``orchestrator.services.datasources.asyncpg.connect``;
+* PostgreSQL: ``asyncpg.connect`` as the PostgreSQL driver module reaches it;
 * Neo4j, MongoDB, WebDAV: the ``neo4j``, ``pymongo`` and ``webdav3.client``
   modules, replaced in ``sys.modules`` (they are imported inside the probe);
 * email: ``imaplib``/``smtplib`` classes, or ``probe_email_connection`` for the
@@ -72,7 +72,7 @@ def _stored(kind: str, **over: Any) -> dict[str, Any]:
 
 def postgres(*, error: Exception | None = None) -> Scenario:
     def install(monkeypatch, calls):
-        from orchestrator.services import datasources
+        from orchestrator.services.connector_drivers import managed
 
         class Connection:
             async def fetchval(self, query):
@@ -91,7 +91,7 @@ def postgres(*, error: Exception | None = None) -> Scenario:
                 raise error
             return Connection()
 
-        monkeypatch.setattr(datasources.asyncpg, "connect", connect)
+        monkeypatch.setattr(managed.asyncpg, "connect", connect)
 
     return install
 
@@ -228,13 +228,13 @@ def mail(
 
 def mail_probe_raises(error: Exception) -> Scenario:
     def install(monkeypatch, calls):
-        from orchestrator.services import datasources
+        from orchestrator.services.connector_drivers import mail
 
         def probe(credentials, config):
             calls.append("probe_email_connection")
             raise error
 
-        monkeypatch.setattr(datasources, "probe_email_connection", probe)
+        monkeypatch.setattr(mail, "probe_email_connection", probe)
 
     return install
 
@@ -736,6 +736,8 @@ def run_case(case: ProbeCase, monkeypatch) -> dict[str, Any]:
     from orchestrator.services import knowledge_index
     from orchestrator.services.datasource_config import validate_mcp_datasource
     from orchestrator.services.datasources import DatasourceDependencies
+    from orchestrator.services.deployment_gates import mcp_stdio_enabled
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
     from orchestrator.services.deployment_gates import mcp_datasources_enabled
     from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
 
@@ -773,6 +775,8 @@ def run_case(case: ProbeCase, monkeypatch) -> dict[str, Any]:
             ),
             mcp_datasources_enabled=mcp_datasources_enabled,
             validate_mcp_datasource=validate_mcp_datasource,
+            mcp_stdio_enabled=mcp_stdio_enabled,
+            connector_drivers=builtin_connector_drivers(),
         ),
         require_datasource_owner=datasource_owner,
     )

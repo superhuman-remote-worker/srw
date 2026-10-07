@@ -4,12 +4,19 @@ The public product calls these resources connectors; ``datasource`` remains
 the internal API and database term. Keep this module descriptive and static:
 runtime availability, user grants, and attachment state belong to the later
 capability resolver rather than this build-level inventory.
+
+The inventory is derived from the built-in driver specs in
+``shared.connectors``, the one place a connector type is declared; this
+module keeps its historical names for existing importers.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal
+
+from shared.connectors.builtin import DATASOURCE_SPECS, tool_map_entry
+from shared.connectors.contract import DriverSpec
 
 DatasourceRuntimeKind = Literal[
     "generic_env",
@@ -32,42 +39,30 @@ class DatasourceTypeDefinition:
     runtime_kind: DatasourceRuntimeKind
 
 
-DATASOURCE_TYPE_CATALOG: tuple[DatasourceTypeDefinition, ...] = (
-    DatasourceTypeDefinition("generic", "Generic", "datasources", "generic_env"),
+_RUNTIME_KIND_BY_FORM: dict[str, DatasourceRuntimeKind] = {
+    "env_file": "generic_env",
+    "checkout": "repository",
+    "knowledge_index": "knowledge",
+    "managed_connection": "managed_tools",
+    "mcp_client": "mcp_tools",
+    "credential_file": "credential_file",
+}
+
+
+def _runtime_kind(spec: DriverSpec) -> DatasourceRuntimeKind:
+    kind = _RUNTIME_KIND_BY_FORM[spec.delivery_forms[0]]
+    # Tier-keyed managed tools (email) were catalogued as their own kind.
+    if kind == "managed_tools" and "tiers" in tool_map_entry(spec):
+        return "email_tools"
+    return kind
+
+
+DATASOURCE_TYPE_CATALOG: tuple[DatasourceTypeDefinition, ...] = tuple(
     DatasourceTypeDefinition(
-        "credentials", "Credentials", "datasources", "generic_env"
-    ),
-    DatasourceTypeDefinition("repository", "Repository", "datasources", "repository"),
-    DatasourceTypeDefinition(
-        "kb",
-        "OKF Knowledge Base",
-        "datasources-okf",
-        "knowledge",
-    ),
-    DatasourceTypeDefinition(
-        "postgresql",
-        "PostgreSQL",
-        "datasources",
-        "managed_tools",
-    ),
-    DatasourceTypeDefinition("neo4j", "Neo4j", "datasources", "managed_tools"),
-    DatasourceTypeDefinition("mongodb", "MongoDB", "datasources", "managed_tools"),
-    DatasourceTypeDefinition("webdav", "WebDAV", "datasources", "managed_tools"),
-    DatasourceTypeDefinition("email", "Email", "datasources-email", "email_tools"),
-    DatasourceTypeDefinition("mcp", "MCP Server", "datasources", "mcp_tools"),
-    DatasourceTypeDefinition(
-        "kubeconfig",
-        "Kubeconfig",
-        "datasources",
-        "credential_file",
-    ),
-    DatasourceTypeDefinition("ssh_key", "SSH Key", "datasources", "credential_file"),
-    DatasourceTypeDefinition(
-        "generic_file",
-        "Generic file",
-        "datasources",
-        "credential_file",
-    ),
+        spec.legacy_type, spec.title, spec.guide_topic or "", _runtime_kind(spec)
+    )
+    for spec in DATASOURCE_SPECS
+    if spec.legacy_type
 )
 
 DATASOURCE_TYPE_IDS: tuple[str, ...] = tuple(

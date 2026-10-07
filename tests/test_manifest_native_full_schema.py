@@ -21,6 +21,7 @@ from tests import _b09_control_seams as control_seams
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.services.generic_harness_runtime import GenericPodObservation
 from orchestrator.services.manifest_execution import ManifestExecutionService
+from orchestrator.services.connector_drivers import builtin_connector_drivers
 from orchestrator.services.manifest_execution_snapshot import read_execution
 from orchestrator.services.manifest_resources import ManifestResourceService
 from orchestrator.application import preparation as preparation_composition
@@ -158,6 +159,7 @@ async def admit(database, actor, document, *, harness_egress="[]"):
         srw_image=database.manifest_runtime_image,
         native_hosting_enabled=True,
         harness_egress=harness_egress,
+        connector_drivers=builtin_connector_drivers(),
     )
     resources = ManifestResourceService(database, admit_job=execution.admit)
     result = await resources.apply(json.dumps(document), actor, format="json")
@@ -396,6 +398,7 @@ async def test_retry_uses_current_operator_egress_while_image_settings_remain_op
         namespace="test",
         native_hosting_enabled=True,
         harness_egress=next_policy,
+        connector_drivers=builtin_connector_drivers(),
     )
     for _ in range(3):
         if len(runtime.launches) == 2:

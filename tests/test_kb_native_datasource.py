@@ -37,6 +37,8 @@ from orchestrator.schemas.datasources import DatasourceUpdate
 from orchestrator.schemas.projects import ExternalKnowledgeBase, ProjectCreate
 from orchestrator.services.datasource_config import normalize_kb_config
 from orchestrator.services.datasources import DatasourceDependencies
+from orchestrator.services.deployment_gates import mcp_stdio_enabled
+from orchestrator.services.connector_drivers import builtin_connector_drivers
 from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
 from orchestrator.services.knowledge_index import KnowledgeIndexDependencies
 from orchestrator.services.project_provisioning import (
@@ -145,6 +147,8 @@ def _ds_deps(store=None, **gates) -> DatasourcesDependencies:
             knowledge_index=_index_deps(db),
             mcp_datasources_enabled=deployment_gates_module.mcp_datasources_enabled,
             validate_mcp_datasource=datasource_config_module.validate_mcp_datasource,
+            mcp_stdio_enabled=mcp_stdio_enabled,
+            connector_drivers=builtin_connector_drivers(),
         ),
         **gates,
     )

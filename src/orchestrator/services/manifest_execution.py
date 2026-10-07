@@ -45,8 +45,10 @@ class ManifestExecutionService:
         cancel_srw=None,
         native_hosting_enabled=False,
         harness_egress="[]",
+        connector_drivers,
     ):
         self.db, self.store = db, ManifestStore(db)
+        self.connector_drivers = connector_drivers
         self.runtime, self.namespace = runtime, namespace
         self.authorize_datasources = authorize_datasources
         self.workspace = workspace
@@ -341,55 +343,37 @@ class ManifestExecutionService:
                 secret_env[name] = await self.secret(
                     value["secretRef"], authority, materialize=materialize
                 )
+
+        async def resolve_credential(ref):
+            return await self.secret(ref, authority, materialize=materialize)
+
         for alias, selection in spec["execution"]["connectors"].items():
             connector = selection["inline"]
-            driver, config = connector["driver"], connector.get("config", {})
-            if driver not in {"srw.env/v1", "srw.files/v1"}:
+            driver = self.connector_drivers.manifest_driver(connector["driver"])
+            if driver is None:
                 raise HTTPException(
                     422, "Connector driver is not installed for generic hosting."
                 )
-            if "access" in connector:
-                raise HTTPException(
-                    422,
-                    "Env/file delivery cannot enforce ReadOnly/ReadWrite; use credentials scoped by the external resource.",
-                )
-            values = config.get("env" if driver == "srw.env/v1" else "files", {})
-            if not isinstance(values, dict) or set(config) - {
-                "env" if driver == "srw.env/v1" else "files"
-            }:
-                raise HTTPException(422, "Invalid env/file connector configuration.")
-            credentials = connector.get("credentials", {})
-            for name, value in values.items():
-                if (
-                    isinstance(value, dict)
-                    and set(value) == {"credential"}
-                    and value["credential"] in credentials
-                ):
-                    value = await self.secret(
-                        credentials[value["credential"]]["secretRef"],
-                        authority,
-                        materialize=materialize,
-                    )
-                if not isinstance(value, str):
-                    raise HTTPException(
-                        422,
-                        "Connector values must be strings or declared credential selections.",
-                    )
-                if driver == "srw.env/v1":
+            driver.validate(connector)
+            binding = await driver.bind(
+                connector, alias=alias, resolve_credential=resolve_credential
+            )
+            names = []
+            for entry in binding.entries:
+                if entry.form == "pod_env":
+                    name = entry.value["name"]
                     if name in environment:
                         raise HTTPException(
                             422, "Connector environment bindings collide."
                         )
-                    environment[name] = value
+                    environment[name] = entry.value["value"]
                 else:
-                    if not name.startswith("/run/srw/bindings/"):
-                        raise HTTPException(
-                            422, "Connector files must be under /run/srw/bindings/."
-                        )
-                    files.append(GenericBoundFile(name, value))
+                    name = entry.value["path"]
+                    files.append(GenericBoundFile(name, entry.value["content"]))
+                names.append(name)
             descriptor["connectors"][alias] = {
-                "driver": driver,
-                "bindings": list(values),
+                "driver": driver.spec.name,
+                "bindings": names,
             }
         return GenericBindings(
             secret_env=secret_env,

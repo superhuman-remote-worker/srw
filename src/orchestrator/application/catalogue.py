@@ -235,6 +235,7 @@ def manifest_execution_service(resources: ApplicationResources):
         ).lower()
         == "true",
         harness_egress=os.environ.get("MANIFEST_HARNESS_EGRESS", "[]"),
+        connector_drivers=resources.connector_drivers,
     )
 
 

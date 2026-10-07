@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from orchestrator.services.manifest_execution import ManifestExecutionService
+from orchestrator.services.connector_drivers import builtin_connector_drivers
 from orchestrator.services.execution_deadline import ExecutionDeadline, expired_srw_jobs
 from tests.test_vm_creation_retry_real_postgres import (
     db as _db_fixture,
@@ -89,7 +90,11 @@ async def test_reconciler_sends_paused_vm_wait_to_guarded_cancel(db, kind):
         )
 
     service = ManifestExecutionService(
-        db, runtime=None, namespace="unused", cancel_srw=guarded_cancel
+        db,
+        runtime=None,
+        namespace="unused",
+        cancel_srw=guarded_cancel,
+        connector_drivers=builtin_connector_drivers(),
     )
     await service.reconcile()
     assert calls == [(job, ExecutionDeadline.from_row(row))]
@@ -222,7 +227,11 @@ async def test_blocked_deadline_cleanup_does_not_starve_next_candidate(db):
         await cancel(db, second, guard["expected_execution_deadline"], "stateless")
 
     service = ManifestExecutionService(
-        db, runtime=None, namespace="unused", cancel_srw=guarded
+        db,
+        runtime=None,
+        namespace="unused",
+        cancel_srw=guarded,
+        connector_drivers=builtin_connector_drivers(),
     )
     await service.reconcile()
     assert cancelled == [second]
@@ -305,7 +314,11 @@ async def test_blocked_prefix_advances_across_recreated_reconcilers(db):
 
     for _ in range(2):
         await ManifestExecutionService(
-            db, runtime=None, namespace="unused", cancel_srw=guarded
+            db,
+            runtime=None,
+            namespace="unused",
+            cancel_srw=guarded,
+            connector_drivers=builtin_connector_drivers(),
         ).reconcile()
     assert (await db.get_job(str(last)))["status"] == "cancelled"
 

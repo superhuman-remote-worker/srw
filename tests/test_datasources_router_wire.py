@@ -96,6 +96,8 @@ def _wire(
     from orchestrator.routers.datasources import DatasourcesDependencies as RouteDeps
     from orchestrator.routers.datasources import router
     from orchestrator.services.datasources import DatasourceDependencies as OpDeps
+    from orchestrator.services.deployment_gates import mcp_stdio_enabled
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
     from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
     from orchestrator.services.knowledge_index import KnowledgeIndexDependencies
 
@@ -136,6 +138,8 @@ def _wire(
         ),
         mcp_datasources_enabled=lambda: mcp_enabled,
         validate_mcp_datasource=validate_mcp or (lambda _url, _creds: None),
+        mcp_stdio_enabled=mcp_stdio_enabled,
+        connector_drivers=builtin_connector_drivers(),
     )
     deps = RouteDeps(
         store=db,
@@ -543,7 +547,7 @@ def test_delete_refuses_the_project_owned_knowledge_connector():
 def test_probe_of_an_unreachable_postgres_target_is_a_200_error_report():
     wire = _wire()
     with patch(
-        "orchestrator.services.datasources.asyncpg.connect",
+        "orchestrator.services.connector_drivers.managed.asyncpg.connect",
         AsyncMock(side_effect=OSError("connection refused")),
     ):
         body = wire.client.post(f"/api/datasources/{DATASOURCE_ID}/test").json()

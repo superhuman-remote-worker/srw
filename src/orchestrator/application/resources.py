@@ -37,6 +37,7 @@ if TYPE_CHECKING:
         CompletionRuntime,
     )
     from orchestrator.services.completion_session_memory import SessionMemoryRuntime
+    from orchestrator.services.connector_drivers import ConnectorDriverRegistry
     from orchestrator.services.expert_catalog_contracts import ExpertCatalogState
     from orchestrator.services.gitea import GiteaClient
     from orchestrator.services.infrastructure_metering.bootstrap import (
@@ -109,6 +110,9 @@ class ApplicationResources:
     thread_turn_locks: ThreadTurnLocks
     expert_catalog_state: ExpertCatalogState
     catalogue_resources: CatalogueResources
+    #: The installed connector drivers; services receive it through their
+    #: dependency dataclasses.
+    connector_drivers: ConnectorDriverRegistry
 
     # -- completion: one runtime and one control boundary per application,
     # wired right after construction because their callbacks close over this

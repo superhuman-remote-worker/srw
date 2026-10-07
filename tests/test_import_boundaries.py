@@ -126,8 +126,19 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     # 26 since R1.B11 added scheduling, reconciliation and task ownership;
     # 28 since R1.B12 closed the entrypoint and the composition boundary;
     # 29 since R3.2 fenced the session client transport off the runtime;
-    # 30 since R3.3a fenced the session input owner off the runtime and loop.
-    assert "Contracts: 31 kept, 0 broken" in result.stdout
+    # 30 since R3.3a fenced the session input owner off the runtime and loop;
+    # 32 since D1a kept the connector driver contract on the standard library.
+    assert "Contracts: 32 kept, 0 broken" in result.stdout
+
+
+def test_connector_contract_rejects_a_framework_import(boundary_tree):
+    (boundary_tree / "src/shared/connectors.py").write_text("import yaml\n")
+    result = lint_boundaries(boundary_tree)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert (
+        "The connector driver contract uses the standard library only BROKEN"
+        in result.stdout
+    )
 
 
 @pytest.mark.parametrize(

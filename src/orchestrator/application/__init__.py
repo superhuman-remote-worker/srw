@@ -44,6 +44,7 @@ from orchestrator.services import ssh_access as ssh_access_operations
 from orchestrator.services.catalogue_resources import CatalogueResources
 from orchestrator.services.cloud import MainCloudRouter, build_backend
 from orchestrator.services.cloud_task_registry import CloudTaskRegistry
+from orchestrator.services.connector_drivers import builtin_connector_drivers
 from orchestrator.services.expert_catalog_contracts import ExpertCatalogState
 from orchestrator.services.gitea import GiteaClient
 from orchestrator.services.infrastructure_metering import InfrastructureMeteringSettings
@@ -191,6 +192,7 @@ def build_application_resources(
         catalogue_resources=CatalogueResources(
             config_dir=lambda: catalogue_config_dir()
         ),
+        connector_drivers=builtin_connector_drivers(),
     )
     # Every infrastructure-metering gate defaults off until startup decides
     # which paths this process runs (``lifecycle.open_stores``).

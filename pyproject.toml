@@ -38,7 +38,7 @@ orchestrator = [
   "config/prompts/*.md",
 ]
 mcp_server = ["templates/*.html"]
-shared = ["**/*.sql", "manifests/schema.json"]
+shared = ["**/*.sql", "manifests/schema.json", "connectors/binding.schema.json"]
 
 [tool.ruff]
 # Preserve the formatter/linter target used before packaging metadata existed.
@@ -77,6 +77,15 @@ type = "forbidden"
 # Every other current or future shared child remains covered as a package.
 source_modules = ["shared.*"]
 forbidden_modules = ["shared.runtime"]
+
+[[tool.importlinter.contracts]]
+name = "The connector driver contract uses the standard library only"
+type = "forbidden"
+# Image drivers, the MCP server and generic hosting read these types. The
+# common frameworks are named here; tests/test_connector_contract.py checks
+# every import against the standard library.
+source_modules = ["shared.connectors"]
+forbidden_modules = ["fastapi", "httpx", "jsonschema", "pydantic", "starlette", "yaml"]
 
 [[tool.importlinter.contracts]]
 name = "Generic manifest operations do not load application startup or the legacy harness"
@@ -219,6 +228,7 @@ forbidden_modules = ["orchestrator.main"]
 name = "Projects, datasources, knowledge and citations do not import application startup"
 type = "forbidden"
 source_modules = [
+    "orchestrator.services.connector_drivers",
     "orchestrator.services.datasource_config",
     "orchestrator.services.datasources",
     "orchestrator.services.kb_task_registry",

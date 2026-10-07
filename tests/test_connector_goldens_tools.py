@@ -27,6 +27,7 @@ from typing import Any
 import pytest
 
 from orchestrator.services import agent_datasource_payload as payload_module
+from orchestrator.services.connector_drivers import builtin_connector_drivers
 from orchestrator.services.deployment_gates import (
     mcp_datasources_enabled,
     mcp_stdio_enabled,
@@ -167,6 +168,7 @@ def test_tool_categories_match_golden(case_id, golden, gates):
         logger=SimpleNamespace(warning=lambda *_args, **_kwargs: None),
         mcp_datasources_enabled=mcp_datasources_enabled,
         mcp_stdio_enabled=mcp_stdio_enabled,
+        connector_drivers=builtin_connector_drivers(),
     )
     rows = [dict(row) for row in case.rows]
 

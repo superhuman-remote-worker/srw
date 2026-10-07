@@ -30,6 +30,7 @@ import pytest
 
 from agent.core.datasource_setup import render_workspace_facts
 from orchestrator.services import agent_datasource_payload as payload_module
+from orchestrator.services.connector_drivers import builtin_connector_drivers
 from orchestrator.services import knowledge_projection
 from orchestrator.services.deployment_gates import (
     mcp_datasources_enabled,
@@ -265,6 +266,7 @@ def _payload(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 logger=SimpleNamespace(warning=lambda *_args, **_kwargs: None),
                 mcp_datasources_enabled=mcp_datasources_enabled,
                 mcp_stdio_enabled=mcp_stdio_enabled,
+                connector_drivers=builtin_connector_drivers(),
             ),
         )
         or []

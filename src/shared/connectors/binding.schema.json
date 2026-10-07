@@ -1,0 +1,428 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://srw.dev/schemas/connectors/binding/v1",
+  "title": "SRW connector binding descriptor",
+  "description": "What one bind of one connector delivers. Built from shared.connectors.binding; validate_binding() checks the same rules without a schema library.",
+  "type": "object",
+  "required": [
+    "driver",
+    "name",
+    "entries",
+    "access"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "driver": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*(?:\\.[a-z][a-z0-9-]*)+/v[1-9][0-9]*$",
+      "not": {
+        "pattern": "\\s"
+      }
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "access": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "connector_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "description": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "cli_hint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/entry"
+      }
+    }
+  },
+  "$defs": {
+    "entry": {
+      "type": "object",
+      "required": [
+        "form",
+        "value",
+        "recipient",
+        "collision"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "form": {
+          "enum": [
+            "env_file",
+            "credential_file",
+            "checkout",
+            "managed_connection",
+            "mcp_client",
+            "knowledge_index",
+            "pod_env",
+            "pod_file"
+          ]
+        },
+        "value": {
+          "type": "object"
+        },
+        "recipient": {
+          "enum": [
+            "harness",
+            "agent_pod",
+            "workspace",
+            "harness_pod"
+          ]
+        },
+        "collision": {
+          "enum": [
+            "error",
+            "skip_existing",
+            "suffix",
+            "last_wins"
+          ]
+        },
+        "refresh": {
+          "enum": [
+            "none",
+            "renew",
+            "on_backend_swap"
+          ]
+        },
+        "retire": {
+          "enum": [
+            "none",
+            "remove",
+            "close",
+            "drop_registration"
+          ]
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "form": {
+              "const": "env_file"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "value": {
+                  "type": "string",
+                  "writeOnly": true
+                }
+              },
+              "required": [
+                "name",
+                "value"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "form": {
+              "const": "credential_file"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "content": {
+                  "type": "string",
+                  "writeOnly": true
+                },
+                "mode": {
+                  "type": "integer"
+                },
+                "env_var": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "transform": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "kubeconfig_prefix",
+                    null
+                  ]
+                },
+                "merge_group": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "path",
+                "content"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "form": {
+              "const": "checkout"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "url": {
+                  "type": "string"
+                },
+                "name_hint": {
+                  "type": "string"
+                },
+                "auth": {
+                  "type": "string",
+                  "enum": [
+                    "none",
+                    "token_in_url",
+                    "ssh_agent"
+                  ]
+                },
+                "secret": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "writeOnly": true
+                },
+                "default_branch": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "require_default_branch": {
+                  "type": "boolean"
+                },
+                "forge": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "datasource_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "read_only": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "url",
+                "name_hint",
+                "auth",
+                "read_only"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "form": {
+              "const": "managed_connection"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "credentials": {
+                  "type": "object",
+                  "writeOnly": true
+                },
+                "config": {
+                  "type": "object"
+                },
+                "read_only": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "kind",
+                "url",
+                "credentials",
+                "config",
+                "read_only"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "form": {
+              "const": "mcp_client"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "transport": {
+                  "type": "string",
+                  "enum": [
+                    "http",
+                    "sse",
+                    "stdio"
+                  ]
+                },
+                "url": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "headers": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "writeOnly": true
+                },
+                "command": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "args": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "env": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "writeOnly": true
+                }
+              },
+              "required": [
+                "transport"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "form": {
+              "const": "knowledge_index"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "datasource_id": {
+                  "type": "string"
+                },
+                "config": {
+                  "type": "object"
+                },
+                "native_project_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "datasource_id",
+                "config"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "form": {
+              "const": "pod_env"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "value": {
+                  "type": "string",
+                  "writeOnly": true
+                }
+              },
+              "required": [
+                "name",
+                "value"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "form": {
+              "const": "pod_file"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "content": {
+                  "type": "string",
+                  "writeOnly": true
+                }
+              },
+              "required": [
+                "path",
+                "content"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ]
+    }
+  }
+}

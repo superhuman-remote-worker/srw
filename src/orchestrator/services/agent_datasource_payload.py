@@ -9,6 +9,11 @@ root-owned). That shared use is why they live in one module rather than being
 duplicated per lane — the two boundaries previously disagreed about read-write
 managed connectors, and a second copy is how that recurs.
 
+What one row becomes is its connector driver's ``bind``
+(``orchestrator.services.connector_drivers``); this module walks the rows,
+applies the drivers' deployment gates and per-execution limits, and keeps
+the wire format.
+
 What is deliberately NOT here: connector authorization. ``datasource_policy``
 remains the authority for whether a selection may be attached at all, and the
 job-side reauthorization lives in ``job_datasource_selection``. This module
@@ -27,11 +32,12 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from orchestrator.services.datasource_config import (
-    normalize_kb_config as _normalize_kb_config,
+from orchestrator.services.connector_drivers import ConnectorDriverRegistry
+from orchestrator.services.connector_drivers.base import (
+    BindContext,
+    DeploymentGates,
+    payload_entry,
 )
-from orchestrator.services.email_datasource import email_dispatch_config
-from orchestrator.services.workspace_ssh_connector import workspace_ssh_descriptor
 from shared.datasource_policy import datasource_tool_categories
 
 
@@ -47,6 +53,14 @@ class DatasourcePayloadDependencies:
     logger: logging.Logger
     mcp_datasources_enabled: Callable[[], bool]
     mcp_stdio_enabled: Callable[[], bool]
+    #: The application's installed connector drivers.
+    connector_drivers: ConnectorDriverRegistry
+
+    def deployment_gates(self) -> DeploymentGates:
+        return DeploymentGates(
+            mcp_datasources_enabled=self.mcp_datasources_enabled,
+            mcp_stdio_enabled=self.mcp_stdio_enabled,
+        )
 
 
 def mcp_datasource_runtime_allowed(
@@ -54,23 +68,14 @@ def mcp_datasource_runtime_allowed(
     *,
     dependencies: DatasourcePayloadDependencies,
 ) -> bool:
-    """Apply deployment gates to a resolved datasource without exposing secrets."""
-    if datasource.get("type") != "mcp":
-        return True
-    if not dependencies.mcp_datasources_enabled():
-        return False
-    credentials = datasource.get("credentials") or {}
-    if isinstance(credentials, str):
-        try:
-            credentials = json.loads(credentials)
-        except (json.JSONDecodeError, ValueError):
-            credentials = {}
-    transport = (
-        credentials.get("transport", "http")
-        if isinstance(credentials, dict)
-        else "http"
+    """Apply deployment gates to a resolved datasource without exposing secrets.
+
+    The connector's driver decides; only the MCP driver has gates today.
+    """
+    driver = dependencies.connector_drivers.for_type(datasource.get("type"))
+    return driver is None or driver.runtime_allowed(
+        datasource, dependencies.deployment_gates()
     )
-    return str(transport).lower() != "stdio" or dependencies.mcp_stdio_enabled()
 
 
 def build_datasource_tool_override(
@@ -133,9 +138,11 @@ def build_datasources_payload(
 ) -> list[dict[str, Any]] | None:
     """Build the datasources payload for sending to the agent.
 
-    Strips internal fields (id, job_id, created_at, updated_at) that the
-    agent doesn't need. For read-only managed connectors, credentials are
-    withheld (tools hold them internally).
+    Each resolved row's driver binds it to the entry the agent receives (or
+    to nothing); internal fields such as the row's id, job and timestamps
+    stay behind.  A driver that allows only so many connectors per execution
+    (email: one, because the agent keys connections by type) gets the first
+    ones, and the rest are skipped with a warning.
 
     Args:
         resolved_ds: List of resolved datasource dicts from the database
@@ -146,112 +153,48 @@ def build_datasources_payload(
     if not resolved_ds:
         return None
 
-    managed_types = {"postgresql", "neo4j", "mongodb", "webdav", "email"}
+    gates = dependencies.deployment_gates()
+    ctx = BindContext(gates=gates, logger=dependencies.logger)
     payload = []
-    email_forwarded = False
+    bound_per_driver: dict[str, int] = {}
     for ds in resolved_ds:
         creds = ds.get("credentials") or {}
         if isinstance(creds, str):
-            import json as json_module
-
             try:
-                creds = json_module.loads(creds)
+                creds = json.loads(creds)
             except (json.JSONDecodeError, ValueError):
                 creds = {}
 
-        is_read_only = ds.get("project_read_only", False)
-        ds_type = ds["type"]
-        if not mcp_datasource_runtime_allowed(ds, dependencies=dependencies):
+        driver = dependencies.connector_drivers.for_type(ds["type"])
+        if driver is None:
+            # A stored type no driver serves is forwarded as stored.
+            payload.append(
+                payload_entry(
+                    ds,
+                    credentials=creds,
+                    read_only=ds.get("project_read_only", False),
+                )
+            )
             continue
-
-        # Read-only managed connectors: withhold credentials (tools hold them).
-        # Email is exempt — its tools need a live IMAP login at every tier;
-        # read-only is expressed as the access floor on entry['config'] instead.
-        if ds_type in managed_types and is_read_only and ds_type != "email":
-            creds = {}
-
-        # External OKF KBs are centrally indexed and read-only in Slice 4 v1.
-        # The agent needs the stable index id + display metadata, never the
-        # remote URL or repository credentials.
-        if ds_type == "kb":
-            creds = {}
-            is_read_only = True
-
-        # SSH keys never ride ``datasources``: that list becomes job metadata
-        # and graph state. The key travels once, in the hidden
-        # ``workspace_ssh_identities`` field, into a workspace ssh-agent; the
-        # entry keeps only the non-secret alias it is reached through.
-        ssh_identity = workspace_ssh_descriptor(ds)
-        if ds_type == "repository" and ssh_identity is not None:
-            creds = {key: value for key, value in creds.items() if key != "ssh_key"}
-        if ds_type == "ssh_key":
-            creds = {
-                **creds,
-                "files": [
-                    {key: value for key, value in item.items() if key != "contents"}
-                    for item in creds.get("files") or []
-                    if isinstance(item, dict)
-                ],
-            }
-
-        entry = {
-            "type": ds_type,
-            "name": ds["name"],
-            "description": ds.get("description"),
-            "connection_url": None if ds_type == "kb" else ds.get("connection_url"),
-            "credentials": creds,
-            "project_read_only": is_read_only,
-        }
-        if ds_type == "kb":
-            entry["datasource_id"] = str(ds["id"])
-            # stored=True keeps the native-project marker in the payload: the
-            # agent's binding builder needs it to collapse a project's own KB
-            # row into the writable native binding instead of adding a second,
-            # read-only binding for the same notes.
-            entry["config"] = _normalize_kb_config(ds.get("config"), stored=True)
-        if ds_type == "repository":
-            # Repository identity is server-owned runtime authority.  Keep the
-            # raw database ``id`` out of the payload, but carry its exact value
-            # under the dedicated internal key consumed by the clone/tool
-            # binding.  ``resolved_ds`` comes from the authorization query;
-            # callers and models never select this field.
-            datasource_id = ds.get("id")
-            if datasource_id is not None:
-                entry["datasource_id"] = str(datasource_id)
-            # The clone reads config["forge"] to resolve the forge API base;
-            # without it every repository records forge="" and repo_open_pr
-            # can never be used. _datasource_row_to_dict already parsed the
-            # JSONB, so this is a real dict. No secrets live in config —
-            # credentials travel in `creds`.
-            entry["config"] = ds.get("config") or {}
-        if ds_type == "email":
-            # v1: one mailbox per job/session — the agent keys connections by
-            # type, so a second email datasource would silently shadow the
-            # first (knowledge-base/knowledge/features/email_datasource.md, open questions).
-            if email_forwarded:
+        if not driver.runtime_allowed(ds, gates):
+            continue
+        limit = driver.spec.max_per_execution
+        if limit is not None:
+            bound = bound_per_driver.get(driver.spec.name, 0)
+            if bound >= limit:
+                ds_type = ds["type"]
                 dependencies.logger.warning(
-                    "Skipping additional email datasource %r: only one email "
+                    "Skipping additional %s datasource %r: only %s %s "
                     "datasource per job/session is supported",
+                    ds_type,
                     ds.get("name"),
+                    "one" if limit == 1 else limit,
+                    ds_type,
                 )
                 continue
-            email_forwarded = True
-            entry["config"] = email_dispatch_config(
-                ds.get("config"),
-                project_read_only=bool(is_read_only),
-                owner_can_autonomous_send=bool(
-                    ds.get("_owner_can_autonomous_send", False)
-                ),
-            )
-        if ds.get("cli_hint"):
-            entry["cli_hint"] = ds["cli_hint"]
-        if ds.get("default_branch"):
-            entry["default_branch"] = ds["default_branch"]
-        if ds_type == "repository" and ds.get("require_default_branch") is True:
-            entry["require_default_branch"] = True
-        if ssh_identity is not None:
-            entry["ssh_identity"] = ssh_identity
-
-        payload.append(entry)
+            bound_per_driver[driver.spec.name] = bound + 1
+        entry = driver.bind(ds, creds, ctx=ctx)
+        if entry is not None:
+            payload.append(entry)
 
     return payload or None

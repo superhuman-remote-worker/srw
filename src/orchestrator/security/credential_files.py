@@ -22,9 +22,10 @@ import os
 import re
 from typing import Any
 
-CREDENTIAL_FILE_TYPES: frozenset[str] = frozenset(
-    {"kubeconfig", "ssh_key", "generic_file"}
-)
+from shared.connectors.builtin import legacy_types_with_form
+
+#: Stored types whose driver delivers credential files (from the driver specs).
+CREDENTIAL_FILE_TYPES: frozenset[str] = legacy_types_with_form("credential_file")
 
 MAX_FILES_PER_DATASOURCE = 5
 MAX_FILE_BYTES = 64 * 1024  # 64 KB UTF-8

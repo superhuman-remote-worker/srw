@@ -784,6 +784,14 @@ CASES.update(
         "update/generic/empty_config_ignored": _update(
             _stored("generic"), {"config": {}}
         ),
+        # A stored type no driver serves gets only the type-free rules.
+        "update/unknown_stored_type/config_refused": _update(
+            _stored("generic", type="ftp"), {"config": {"a": 1}}
+        ),
+        "update/unknown_stored_type/credentials_stored": _update(
+            _stored("generic", type="ftp"),
+            {"credentials": {"token": "ftp-secret"}, "description": "Edited"},
+        ),
         # ---- credentials -----------------------------------------------------
         "update/credentials/env_merged": _update(
             _stored("credentials"),
@@ -804,6 +812,19 @@ CASES.update(
         ),
         "update/credentials/publish_refused": _update(
             _stored("credentials"), {"is_global": True}
+        ),
+        # Authority before content: the scoped token may not widen the scope,
+        # and that refusal wins over the invalid variable (D1a reordered
+        # update validation after the policy checks, as on create).
+        "update/credentials/scope_refused_before_validation": _update(
+            _stored("credentials", scope_mode="projects"),
+            {
+                "scope_mode": "all",
+                "policy_revision": 1,
+                "credentials": {"env_vars": {"HOME": "x"}},
+            },
+            user=SCOPED_USER,
+            linked_project_ids=(PROJECT_ID,),
         ),
         # ---- credential files ------------------------------------------------
         "update/generic_file/files_renormalised": _update(
@@ -1151,6 +1172,8 @@ def _client(case: ApiCase, calls: list[dict[str, Any]], monkeypatch) -> TestClie
     from orchestrator.services import knowledge_index
     from orchestrator.services.datasource_config import validate_mcp_datasource
     from orchestrator.services.datasources import DatasourceDependencies
+    from orchestrator.services.deployment_gates import mcp_stdio_enabled
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
     from orchestrator.services.deployment_gates import mcp_datasources_enabled
     from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
 
@@ -1229,6 +1252,8 @@ def _client(case: ApiCase, calls: list[dict[str, Any]], monkeypatch) -> TestClie
         ),
         mcp_datasources_enabled=mcp_datasources_enabled,
         validate_mcp_datasource=validate_mcp_datasource,
+        mcp_stdio_enabled=mcp_stdio_enabled,
+        connector_drivers=builtin_connector_drivers(),
     )
     dependencies = DatasourcesDependencies(
         store=store,

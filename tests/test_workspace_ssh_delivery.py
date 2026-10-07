@@ -21,6 +21,7 @@ from orchestrator.services.agent_datasource_payload import (
     DatasourcePayloadDependencies,
     build_datasources_payload,
 )
+from orchestrator.services.connector_drivers import builtin_connector_drivers
 from orchestrator.services.workspace_ssh_connector import (
     WORKSPACE_SSH_KNOWN_HOSTS_ENV,
     build_workspace_ssh_identities,
@@ -38,6 +39,7 @@ def _deps() -> DatasourcePayloadDependencies:
         logger=logging.getLogger("test"),
         mcp_datasources_enabled=lambda: True,
         mcp_stdio_enabled=lambda: True,
+        connector_drivers=builtin_connector_drivers(),
     )
 
 
