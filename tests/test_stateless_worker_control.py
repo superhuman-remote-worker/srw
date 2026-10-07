@@ -2537,6 +2537,12 @@ async def test_cascade_cancel_retry_settles_existing_child_cleanup_marker(monkey
 async def test_cancel_settle_prunes_then_cleans_workspace(monkeypatch):
     from orchestrator import main
 
+    # This unit fixture has no admitted completion teardown to replay.
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "cancelled_container_completion_replay",
+        AsyncMock(return_value=None),
+    )
     monkeypatch.setattr(
         main.app.state.resources.postgres_db,
         "quiesce_cancelled_stateless_vm_parent",
@@ -2591,6 +2597,11 @@ async def test_cancel_settle_keeps_resume_block_until_workspace_cleanup_succeeds
 
     monkeypatch.setattr(
         main.app.state.resources.postgres_db,
+        "cancelled_container_completion_replay",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
         "quiesce_cancelled_stateless_vm_parent",
         AsyncMock(return_value=False),
     )
@@ -2639,6 +2650,11 @@ async def test_cancel_settle_keeps_resume_block_until_workspace_cleanup_succeeds
 async def test_concurrent_cancel_settlers_run_destructive_cleanup_once(monkeypatch):
     from orchestrator import main
 
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "cancelled_container_completion_replay",
+        AsyncMock(return_value=None),
+    )
     monkeypatch.setattr(
         main.app.state.resources.postgres_db,
         "quiesce_cancelled_stateless_vm_parent",
@@ -2708,7 +2724,7 @@ async def test_concurrent_cancel_settlers_run_destructive_cleanup_once(monkeypat
             poll_seconds=0.001,
         )
     )
-    await first_cleanup_entered.wait()
+    await asyncio.wait_for(first_cleanup_entered.wait(), 1)
     second = asyncio.create_task(
         control_seams.wait_for_stateless_cancel_settle(
             JOB_ID,
