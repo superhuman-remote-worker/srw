@@ -1423,6 +1423,7 @@ async def test_ready_binding_uses_exact_pod_and_keeps_overreserve_high_water(
         (False, "deleting_launcher"),
         (False, "bound_conflict"),
         (False, "old_owner_pod"),
+        (False, "premature_owner_ready"),
     ],
 )
 async def test_adopted_vm_binds_signed_physical_runtime_before_guest_ready(
@@ -1527,7 +1528,7 @@ async def test_adopted_vm_binds_signed_physical_runtime_before_guest_ready(
             conflicting_vm_uid,
         )
 
-    if invalid is None or invalid == "old_owner_pod":
+    if invalid is None or invalid in {"old_owner_pod", "premature_owner_ready"}:
         # Exercise the actual authenticated observation path, not a test-only
         # call to the binding primitive. Guest port 22 is still unready.
         from orchestrator.services.vm_provisioning_phases import (
@@ -1543,7 +1544,7 @@ async def test_adopted_vm_binds_signed_physical_runtime_before_guest_ready(
         )
         context["vm"].update(
             {
-                "status": "created",
+                "status": "ready" if invalid == "premature_owner_ready" else "created",
                 "provision_generation": generation,
                 "vm_uid": vm_uid,
                 "vmi_uid": vmi_uid,
@@ -1574,7 +1575,6 @@ async def test_adopted_vm_binds_signed_physical_runtime_before_guest_ready(
             await phase.apply_status(
                 token,
                 {
-                    "status": "created",
                     "provision_generation": generation,
                     "vm_uid": vm_uid,
                     "vmi_uid": vmi_uid,
@@ -1592,7 +1592,7 @@ async def test_adopted_vm_binds_signed_physical_runtime_before_guest_ready(
                 claim["job_id"],
             )
         )
-        assert after_phase["vm"]["status"] == "created"
+        assert after_phase["vm"]["status"] == context["vm"]["status"]
         assert after_phase["vm"].get("ssh_verified_at") is None
         assert after_phase["vm"].get("active_pod_uid") == context["vm"].get(
             "active_pod_uid"

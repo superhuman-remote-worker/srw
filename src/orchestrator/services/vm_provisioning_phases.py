@@ -732,7 +732,7 @@ class VMProvisioningPhaseStore:
                                     await resource.bind_observed_runtime_on_conn(
                                         conn, retry=creation,
                                         vm={
-                                            "status": status.get("status"),
+                                            "status": vm.get("status"),
                                             "vm_uid": status.get("vm_uid"),
                                             "vmi_uid": status.get("vmi_uid"),
                                             "rootdisk_pvc_uid": status.get("rootdisk_pvc_uid"),
