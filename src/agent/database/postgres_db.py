@@ -159,11 +159,22 @@ def _active_pinned_write_identity():
 
 # The pinned event journal's fence (``_LOCK_PINNED_EVENT_THREAD_SQL`` and
 # ``_LOCK_PINNED_CONTROL_AGENT_SQL`` in ``agent.api.persistent_app``) without
-# its event epoch: the thread row at mutation strength, matching the exact
-# agent, runtime generation and attach token of one life that no retirement
-# has closed, then the reciprocal agent row. The order is retirement's and
-# admission's (thread, agent, then the write), and the thread lock is taken
-# at the strength the activity bump needs, so the write never upgrades it.
+# its event epoch and without its retirement-token clause: the thread row at
+# mutation strength, matching the exact agent, runtime generation and attach
+# token of one live life, then the reciprocal agent row. The order is
+# retirement's and admission's (thread, agent, then the write), and the
+# thread lock is taken at the strength the activity bump needs, so the write
+# never upgrades it.
+#
+# An open retirement does not refuse a transcript write. Between Begin and
+# the settle the life still owns its turn: a forced End reaches the agent up
+# to a heartbeat later, and the stream or tool that finishes meanwhile must
+# keep its rows (a refused tool row would make restore strip a call whose
+# side effect happened). Nothing can duplicate in that window: the settle
+# needs this runtime's own quiescence receipt, writes only the results that
+# have no row, and nulls the agent and attach token in the same transaction,
+# and a successor exists only after it. From the settle on, every write of
+# the old life is refused.
 _PINNED_WRITE_THREAD_LOCK_SQL = """
     SELECT 1 FROM threads
     WHERE id = $1::uuid
@@ -171,7 +182,6 @@ _PINNED_WRITE_THREAD_LOCK_SQL = """
       AND agent_id = $2::uuid
       AND runtime_generation = $3::uuid
       AND runtime_attach_token = $4::uuid
-      AND runtime_retirement_token IS NULL
       AND status IN ('created', 'active', 'awaiting_user', 'suspended')
     FOR NO KEY UPDATE
 """
@@ -186,8 +196,8 @@ async def _require_pinned_write_fence(conn, thread_id: str, identity) -> None:
     """Prove the armed pinned life still owns ``thread_id`` inside a write tx.
 
     The caller's transaction then inserts and bumps activity under these
-    locks, so a retirement or rebind either waits for the write or commits
-    first and makes this refuse. A refusal raises
+    locks, so a rebind or a retirement settle either waits for the write or
+    commits first and makes this refuse. A refusal raises
     :class:`~agent.api.pinned_write_fence.PinnedWriteRefused` (a
     ``LeaseLostError``): the transaction rolls back and nothing lands.
     """
@@ -2468,7 +2478,7 @@ class PostgresDB:
             elif lease is None:
                 # Pinned lane: the thread row locked on this exact life, then
                 # the agent row, then the upsert and activity bump, in one
-                # transaction (P2). A replaced or retiring life writes nothing.
+                # transaction (P2). A replaced or settled life writes nothing.
                 async with conn.transaction():
                     await _require_pinned_write_fence(conn, thread_id, pinned)
                     row = await _write(conn)

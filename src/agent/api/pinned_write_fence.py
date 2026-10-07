@@ -6,8 +6,9 @@ identity instead: the registered agent id, the durable runtime generation and
 the attach token minted for this attach. :class:`SessionIdentityRuntime` arms
 the one process cell here when it adopts that identity, and the DB layer
 (``postgres_db``) locks the thread row on it in the same transaction as each
-write, so a replaced or retiring life can no longer add rows after its
-successor settled them (parallel_subagents.md §14.2, P2).
+write, so a life that was replaced, or whose retirement settled, can no
+longer add rows behind the settle (parallel_subagents.md §14.2, P2). An open
+retirement does not refuse: until the settle the life still owns its turn.
 
 States of the cell:
 
