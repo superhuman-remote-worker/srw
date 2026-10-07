@@ -29,6 +29,7 @@ from urllib.parse import urlparse
 from uuid import UUID
 
 from shared.runtime.core.managed_repository import (
+    _SSH_AGENT_RETIRE_PROGRAM,
     ManagedRepositoryMaterializationError,
     _backend_managed_home,
     _backend_runtime_authority,
@@ -640,7 +641,65 @@ def retire_workspace_ssh_identities(authority_ids: Iterable[str], backend: Any) 
             timeout=30,
             operation="connector SSH identity retirement",
         )
-    except (ManagedRepositoryMaterializationError, NotImplementedError, OSError):
+    except Exception:  # best effort: every terminal owner retires the rest
+        return False
+
+
+def prune_workspace_ssh_identities(
+    keep_authority_ids: Iterable[str], backend: Any
+) -> bool:
+    """Retire every connector identity this home holds except ``keep``.
+
+    For a session, which owns its workspace: a stateless session applies a
+    connector edit at its next claim's attach, never through the live
+    detach, so the attach itself must retire what is no longer delivered.
+    Only identities this module loaded are candidates. They are the ones
+    with a ``known_hosts.d/<slug>`` file, which managed repositories and the
+    IDE never write, so a managed agent in the same namespace is never
+    touched. Never used for jobs, whose workspace a root and its children
+    share.
+    """
+
+    keep = sorted({UUID(str(value)).hex for value in keep_authority_ids})
+    if not getattr(backend, "supports_shell", False):
+        return False
+    try:
+        home_path = _backend_managed_home(backend)
+        root = f"{home_path}/.ssh/srw-managed"
+        retire_one = " ".join(
+            [
+                "python3",
+                "-c",
+                shlex.quote(_SSH_AGENT_RETIRE_PROGRAM),
+                "exact",
+                '"$_srw_root/sockets/$_srw_slug.sock"',
+            ]
+        )
+        command = (
+            "set -eu; "
+            f"_srw_root={shlex.quote(root)}; "
+            f"_srw_keep=' {' '.join(keep)} '; "
+            'test -d "$_srw_root/known_hosts.d" || exit 0; '
+            'for _srw_path in "$_srw_root"/known_hosts.d/*; do '
+            'test -e "$_srw_path" || continue; '
+            "_srw_slug=${_srw_path##*/}; "
+            'case "$_srw_slug" in *[!0-9a-f]*) continue;; esac; '
+            'test "${#_srw_slug}" -eq 32 || continue; '
+            'case "$_srw_keep" in *" $_srw_slug "*) continue;; esac; '
+            f"{retire_one}; "
+            'rm -f -- "$_srw_root/sockets/$_srw_slug.sock" '
+            '"$_srw_root/agents/$_srw_slug.state" '
+            '"$_srw_root/config.d/$_srw_slug.conf" "$_srw_path"; '
+            "done"
+        )
+        return _execute_managed_secret_command(
+            backend,
+            command,
+            b"",
+            timeout=30,
+            operation="connector SSH identity retirement",
+        )
+    except Exception:  # best effort: every terminal owner retires the rest
         return False
 
 
@@ -659,6 +718,7 @@ __all__ = [
     "normalize_ssh_user",
     "parse_known_hosts",
     "parse_ssh_repository_url",
+    "prune_workspace_ssh_identities",
     "retire_workspace_ssh_identities",
     "workspace_ssh_identity_alias",
     "workspace_ssh_identity_socket",

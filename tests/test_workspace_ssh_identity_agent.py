@@ -26,6 +26,7 @@ from shared.runtime.core.managed_repository import (
 from shared.runtime.core.workspace_ssh_identity import (
     IDENTITY_READY,
     materialize_workspace_ssh_identities,
+    prune_workspace_ssh_identities,
     retire_workspace_ssh_identities,
     workspace_ssh_identity_alias,
     workspace_ssh_identity_socket,
@@ -124,7 +125,7 @@ def _agent_fingerprints(socket_path: str) -> list[str]:
         stderr=subprocess.DEVNULL,
         check=False,
     )
-    if listed.returncode == 1:
+    if listed.returncode in (1, 2):  # no identities, or no agent at all
         return []
     assert listed.returncode == 0
     return [line.split()[1] for line in listed.stdout.decode().splitlines() if line]
@@ -395,3 +396,75 @@ def test_runtime_authority_is_recorded_in_the_receipt(home: Path) -> None:
     assert f"workspace_generation={workspace_generation}" in state
     assert f"runtime_incarnation={runtime_incarnation}" in state
     assert retire_workspace_ssh_identities([payload["authority_id"]], backend)
+
+
+def test_session_attach_prunes_undelivered_identities_but_never_managed_ones(
+    home: Path,
+) -> None:
+    """A stateless session applies a detach at its next attach."""
+
+    from shared.runtime.core.managed_repository import (
+        managed_repository_agent_launch_command,
+    )
+
+    kept = _payload()
+    detached = _payload(kind="ssh_key", host=None, port=None, user=None)
+    backend = _LocalShellBackend(home)
+    materialize_workspace_ssh_identities([kept, detached], backend)
+    # A managed-repository resident in the same namespace (no known_hosts.d).
+    managed_id = str(uuid4())
+    managed_key = _deploy_keypair()[0]
+    assert (
+        subprocess.run(
+            [
+                "bash",
+                "-c",
+                managed_repository_agent_launch_command(
+                    home_path=str(home), authority_id=managed_id, generation=1
+                ),
+            ],
+            input=managed_key.encode(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=20,
+        ).returncode
+        == 0
+    )
+
+    assert prune_workspace_ssh_identities([kept["authority_id"]], backend)
+
+    root = home / ".ssh" / "srw-managed"
+    slug = detached["authority_id"].replace("-", "")
+    assert not (root / "config.d" / f"{slug}.conf").exists()
+    assert not (root / "known_hosts.d" / slug).exists()
+    assert (
+        _agent_fingerprints(
+            workspace_ssh_identity_socket(str(home), detached["authority_id"])
+        )
+        == []
+    )
+    assert _agent_fingerprints(
+        workspace_ssh_identity_socket(str(home), kept["authority_id"])
+    ) == [kept["public_key_fingerprint"]]
+    assert (
+        len(_agent_fingerprints(workspace_ssh_identity_socket(str(home), managed_id)))
+        == 1
+    )
+    # Idempotent, and an empty keep-list prunes the rest of the connectors.
+    assert prune_workspace_ssh_identities([kept["authority_id"]], backend)
+    assert prune_workspace_ssh_identities([], backend)
+    assert (
+        _agent_fingerprints(
+            workspace_ssh_identity_socket(str(home), kept["authority_id"])
+        )
+        == []
+    )
+    assert (
+        len(_agent_fingerprints(workspace_ssh_identity_socket(str(home), managed_id)))
+        == 1
+    )
+
+
+def test_prune_on_a_fresh_home_is_a_no_op(home: Path) -> None:
+    assert prune_workspace_ssh_identities([], _LocalShellBackend(home))

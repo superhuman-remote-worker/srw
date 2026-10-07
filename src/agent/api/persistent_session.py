@@ -898,7 +898,9 @@ class PersistentSession:
         )
         del managed_repository_credentials
         from shared.runtime.core.workspace_ssh_identity import (
+            IDENTITY_READY,
             materialize_workspace_ssh_identities,
+            prune_workspace_ssh_identities,
         )
 
         # Per-identity and never fatal: a broken connector key degrades only
@@ -907,6 +909,23 @@ class PersistentSession:
             workspace_ssh_identities, workspace_backend
         )
         del workspace_ssh_identities
+        # A session owns its workspace. A connector no longer delivered was
+        # detached (a stateless session applies connector edits here, at its
+        # next attach, never through the live detach), so its agent goes.
+        if getattr(
+            workspace_backend, "supports_shell", False
+        ) and not prune_workspace_ssh_identities(
+            [
+                authority
+                for authority, status in self.workspace_ssh_identity_status.items()
+                if status == IDENTITY_READY
+            ],
+            workspace_backend,
+        ):
+            logger.warning(
+                "Could not retire detached connector SSH identities; "
+                "terminal teardown retires them"
+            )
         if repository_url_has_credentials(git_remote_url):
             raise ManagedRepositoryMaterializationError(
                 "credentialed_managed_repository_url_refused"
