@@ -831,7 +831,6 @@ async def resume_job_on_agent(
             "git_remote_url": git_remote_url,
             "repositories": repositories_payload,
             "managed_repository_credentials": managed_repository_credentials,
-            "workspace_ssh_identities": workspace_ssh_identities,
             "runtime_actor": runtime_actor.to_payload(),
             WORKSPACE_RUNTIME_CONTEXT_KEY: workspace_decision.safe_projection(),
             "workspace_provisioner": (
@@ -870,6 +869,11 @@ async def resume_job_on_agent(
                 resume_payload["feedback_reason"] = queued_feedback_reason
         if delegation_results:
             resume_payload["delegation_results"] = delegation_results
+        if workspace_ssh_identities:
+            # Present only when there is something to load: a pinned agent
+            # from before C1 hashes the projection it parsed, so an always-
+            # present key would fail every resume as pinned_projection_mismatch.
+            resume_payload["workspace_ssh_identities"] = workspace_ssh_identities
 
         if not await dependencies.pinned_k8s_job_workspace_authority_is_current(
             durable_job, workspace_authority

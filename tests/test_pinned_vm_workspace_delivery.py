@@ -671,9 +671,11 @@ async def test_vm_attach_setup_loads_connector_ssh_identity(
         lambda self, path: f"/home/agent-host/{path}",
     )
     transferred = []
+    commands = []
 
     def secret_transport(self, command, secret, **kwargs):
         assert private_material not in command
+        commands.append(command)
         if secret:
             transferred.append(bytes(secret))
         return True
@@ -709,6 +711,10 @@ async def test_vm_attach_setup_loads_connector_ssh_identity(
     assert "private_key" not in identity
     assert private_material not in caplog.text
     assert session.workspace_ssh_identity_status == {identity["authority_id"]: "ready"}
+    # The attach prunes every connector identity it did not deliver (a
+    # stateless session applies a detach here) and keeps the delivered one.
+    (prune,) = [command for command in commands if "_srw_keep=" in command]
+    assert f"_srw_keep=' {identity['authority_id'].replace('-', '')} '" in prune
 
 
 @pytest.mark.asyncio

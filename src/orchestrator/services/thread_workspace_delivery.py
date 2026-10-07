@@ -1381,7 +1381,13 @@ async def agent_get_thread_workspace_locked(
         "namespace": ws.get("namespace"),
         "git_remote_url": git_remote_url,
         "managed_repository_credentials": managed_repository_credentials,
-        "workspace_ssh_identities": workspace_ssh_identities,
+        # Only when there is something to load, so an agent from before C1
+        # (whose allowlists name no such key) sees the response it knew.
+        **(
+            {"workspace_ssh_identities": workspace_ssh_identities}
+            if workspace_ssh_identities
+            else {}
+        ),
         # Public capability only. A ready endpoint without a paired trusted
         # binding must not cause the agent to advertise Canvas tools which can
         # never work.
