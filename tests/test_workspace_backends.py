@@ -3857,6 +3857,63 @@ class TestRemoteBackendShellOperations:
         assert backend._tabs["default"].tab_type == "shell"
         assert backend._tabs["default"].pane_id == "%1"
 
+    @pytest.mark.parametrize("disposition", ["created", "existing"])
+    def test_agent_shells_keep_no_history_file(self, remote_backend, disposition):
+        """A typed token clone URL must never reach ~/.bash_history.
+
+        Killing the session SIGHUPs bash, which writes history into the home
+        that snapshots and the PVC keep. The session environment covers every
+        later window (ssh/repl tabs included), and the setup preamble unsets
+        HISTFILE after .bashrc in every shell tab, fresh or opened later.
+        """
+        backend, _, _ = remote_backend
+        backend.connect()
+
+        with (
+            patch.object(
+                backend, "_create_or_observe_tmux_session", return_value=disposition
+            ),
+            patch.object(backend, "_promote_tmux_owner_token"),
+            patch.object(backend, "_attest_tmux_owner"),
+            patch.object(backend, "_ensure_prompt_token"),
+            patch.object(
+                backend,
+                "_read_tmux_session_option",
+                side_effect=lambda option: (
+                    _TMUX_SETUP_COMPLETE
+                    if option == _TMUX_SETUP_OPTION and disposition == "existing"
+                    else _TMUX_SETUP_PENDING
+                    if option == _TMUX_SETUP_OPTION
+                    else ""
+                ),
+            ),
+            patch.object(backend, "_rehydrate_tabs"),
+            patch.object(backend, "_discover_single_pane", return_value="%1"),
+            patch.object(backend, "_set_tmux_window_option"),
+            patch.object(backend, "_set_tmux_session_option"),
+            patch.object(backend, "_send_and_wait") as setup,
+            patch.object(backend, "_install_prompt_marker"),
+            patch.object(backend, "_tmux_mutate_checked") as mutate,
+        ):
+            backend._init_shell()
+            if disposition == "created":
+                backend.shell_open_tab("git")
+
+        assert any(
+            "set-environment" in call_.args[0] and "HISTFILE /dev/null" in call_.args[0]
+            for call_ in mutate.call_args_list
+        )
+        preambles = [call_.args[1] for call_ in setup.call_args_list]
+        if disposition == "created":
+            assert [call_.args[0] for call_ in setup.call_args_list] == [
+                "default",
+                "git",
+            ]
+            assert all("; unset HISTFILE" in p for p in preambles)
+        else:
+            # Reattach never types into a live pane.
+            assert preambles == []
+
     def test_reattach_restores_persisted_tab_type_and_pending_sentinel(
         self, remote_backend
     ):

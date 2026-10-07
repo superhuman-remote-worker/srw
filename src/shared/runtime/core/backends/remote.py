@@ -3880,9 +3880,13 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 raise WorkspaceUnavailableError(
                     "Remote tmux protocol is current but setup is incomplete"
                 )
+            # HISTFILE=/dev/null in the session environment reaches every window
+            # created from here on, including ssh/repl tabs that get no setup
+            # preamble; shell tabs also unset it after .bashrc (shell_protocol).
             self._tmux_mutate_checked(
                 f"tmux set-option -t {self._tmux_target()} "
-                f"history-limit {self._scrollback_limit}",
+                f"history-limit {self._scrollback_limit} "
+                f"\\; set-environment -t {self._tmux_target()} HISTFILE /dev/null",
                 operation="set history limit",
             )
 

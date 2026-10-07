@@ -122,10 +122,14 @@ HARD_TIMEOUT_CAP_SECONDS = 600
 # Non-interactive environment applied to every fresh shell, so that pagers,
 # progress bars and credential prompts can't stall the no-change detector or
 # hang the command. (Deliberately does NOT set TERM=dumb — too disruptive.)
+# Agent shells also keep no history file: bash writes ~/.bash_history when the
+# tab is killed, and a typed command (a token clone URL) would otherwise land
+# in the home that snapshots and the PVC keep. Unsetting HISTFILE after
+# .bashrc has run covers the whole life of the shell.
 NONINTERACTIVE_ENV_EXPORT = (
     "export PAGER=cat GIT_PAGER=cat GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= "
     "SSH_ASKPASS= DEBIAN_FRONTEND=noninteractive PIP_PROGRESS_BAR=off "
-    "PIP_DISABLE_PIP_VERSION_CHECK=1"
+    "PIP_DISABLE_PIP_VERSION_CHECK=1; unset HISTFILE"
 )
 
 # Returned when a command has produced no new output for NO_CHANGE_TIMEOUT_SECONDS
