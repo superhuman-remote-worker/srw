@@ -501,6 +501,26 @@ async def acquire_vm_cleanup_permit(
         permit = await recovery_store.acquire_cleanup_permit(**arguments)
     else:
         permit = await recovery_store.acquire_cleanup_permit_on_conn(_conn, **arguments)
+    if (
+        _conn is None
+        and owner_kind == "job"
+        and source == "job_terminal_vm_release"
+        and purge_disk is True
+        and not permit.allowed
+        and permit.reason == "workspace_cleanup_already_admitted"
+    ):
+        from orchestrator.services.vm_legacy_completion_cleanup import (
+            supersede_unissued_legacy_completion,
+        )
+
+        try:
+            return await supersede_unissued_legacy_completion(
+                recovery_store,
+                owner_id=canonical_owner,
+                identity=identity,
+            )
+        except (ResourceAdmissionError, ValueError, TypeError):
+            return permit
     bound = bind_vm_cleanup_permit(
         permit,
         request_id=getattr(permit, "request_id", None) or request_id,

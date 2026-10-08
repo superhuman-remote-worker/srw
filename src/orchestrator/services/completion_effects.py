@@ -694,13 +694,48 @@ async def run_completion_workspace_teardown(
             if not (
                 use_identity_fenced_vm_teardown or use_uid_fenced_kubernetes_teardown
             ):
+                from orchestrator.services.vm_legacy_completion_cleanup import (
+                    routes_terminal_vm_to_archive,
+                )
+
+                legacy_job = (
+                    await postgres_db.get_job(job_id) if effect_runner is None else None
+                )
+                if effect_runner is None and routes_terminal_vm_to_archive(legacy_job):
+                    # Archive already admits exact VM authority. A broad legacy
+                    # owner claim here would block that normal admission.
+                    cleanup_actions = await _archive_and_cleanup_workspace(job_id)
+                    return {
+                        "actions": list(cleanup_actions),
+                        "teardown_disposition": "completed",
+                    }
                 cleanup = await _admit_destructive_cleanup(
                     None,
                     resource="legacy_workspace",
                     intent={"purge_workspace": True},
                 )
                 replayed = completed_cleanup_outcome(cleanup)
-                if replayed is None:
+                if replayed is not None and replayed.startswith(
+                    "superseded_before_issue:"
+                ):
+                    from orchestrator.services.vm_legacy_completion_cleanup import (
+                        superseded_legacy_completion_matches,
+                    )
+
+                    current_job = await postgres_db.get_job(job_id)
+                    if (
+                        effect_runner is not None
+                        or not superseded_legacy_completion_matches(
+                            cleanup,
+                            job_id=job_id,
+                            vm=_get_vm_context(current_job),
+                        )
+                    ):
+                        raise RuntimeError("legacy VM cleanup supersession changed")
+                    # Logical supersession never proves physical completion.
+                    # The ordinary exact parent still owns archive/stop/release.
+                    cleanup_actions = await _archive_and_cleanup_workspace(job_id)
+                elif replayed is None:
                     cleanup_actions = await _archive_and_cleanup_workspace(job_id)
                     await _complete_destructive_cleanup(cleanup, "completed")
         except Exception as exc:

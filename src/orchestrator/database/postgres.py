@@ -5825,6 +5825,16 @@ class PostgresDB:
                       AND (
                         j.context ? '_job_terminal_vm_cleanup'
                         OR j.context ? '_stateless_cancel_cleanup_pending'
+                        OR (
+                            j.status IN ('failed','completed') AND j.execution_lane='stateless'
+                            AND EXISTS (
+                                SELECT 1 FROM vm_workspace_cleanup_admissions legacy
+                                WHERE legacy.owner_kind='job' AND legacy.owner_id=j.id
+                                  AND legacy.source='completion_workspace_teardown'
+                                  AND legacy.pvc_uid IS NULL AND legacy.parent_admission_id IS NULL
+                                  AND legacy.completed_at IS NULL
+                            )
+                        )
                         OR EXISTS (
                             SELECT 1 FROM vm_workspace_cleanup_admissions a
                             WHERE a.owner_kind='job' AND a.owner_id=j.id
