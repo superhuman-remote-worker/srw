@@ -32,16 +32,30 @@ class ConnectorDriverRegistry:
             if driver.spec.name in self._by_name:
                 raise ValueError(f"Driver {driver.spec.name} is registered twice")
             self._by_name[driver.spec.name] = driver
-            if isinstance(driver, DatasourceDriver):
+            if isinstance(driver, DatasourceDriver) and driver.serves_stored_type:
                 if driver.type_id in self._by_type:
                     raise ValueError(f"Type {driver.type_id} has two drivers")
                 self._by_type[driver.type_id] = driver
+        variants = [
+            driver.spec.name
+            for driver in self._by_name.values()
+            if isinstance(driver, DatasourceDriver)
+            and not driver.serves_stored_type
+            and driver.type_id not in self._by_type
+        ]
+        if variants:
+            raise ValueError(f"{variants} serve a type no driver owns")
 
     def get(self, name: str) -> ConnectorDriver | None:
         return self._by_name.get(name)
 
     def for_type(self, type_id: str | None) -> DatasourceDriver | None:
-        """The driver serving a stored ``datasources.type``, if installed."""
+        """The driver serving a stored ``datasources.type``, if installed.
+
+        A type with several drivers (``mcp``: stdio and remote) answers with
+        the one that owns it; the others serve some of its rows and are found
+        by name.
+        """
         return self._by_type.get(type_id or "")
 
     def manifest_driver(self, name: str) -> ManifestDeliveryDriver | None:

@@ -231,7 +231,13 @@
       ],
       "config_schema": {
         "type": "object",
-        "maxProperties": 0
+        "additionalProperties": false,
+        "properties": {
+          "endpoint": {
+            "type": "string",
+            "readOnly": true
+          }
+        }
       },
       "legacy_connection_url": "optional",
       "egress": {
@@ -328,7 +334,13 @@
       ],
       "config_schema": {
         "type": "object",
-        "maxProperties": 0
+        "additionalProperties": false,
+        "properties": {
+          "endpoint": {
+            "type": "string",
+            "readOnly": true
+          }
+        }
       },
       "legacy_connection_url": "optional",
       "egress": {
@@ -461,6 +473,18 @@
           "known_hosts": {
             "type": "string",
             "x-srw-multiline": true
+          },
+          "endpoint": {
+            "type": "string",
+            "readOnly": true
+          },
+          "default_branch": {
+            "type": "string",
+            "readOnly": true
+          },
+          "auth_method": {
+            "type": "string",
+            "readOnly": true
           }
         }
       },
@@ -585,6 +609,18 @@
               "github",
               "gitlab"
             ]
+          },
+          "endpoint": {
+            "type": "string",
+            "readOnly": true
+          },
+          "default_branch": {
+            "type": "string",
+            "readOnly": true
+          },
+          "auth_method": {
+            "type": "string",
+            "readOnly": true
           }
         }
       },
@@ -665,7 +701,13 @@
       "credential_slots": [],
       "config_schema": {
         "type": "object",
-        "maxProperties": 0
+        "additionalProperties": false,
+        "properties": {
+          "endpoint": {
+            "type": "string",
+            "readOnly": true
+          }
+        }
       },
       "legacy_connection_url": "optional",
       "egress": {
@@ -767,7 +809,13 @@
       ],
       "config_schema": {
         "type": "object",
-        "maxProperties": 0
+        "additionalProperties": false,
+        "properties": {
+          "endpoint": {
+            "type": "string",
+            "readOnly": true
+          }
+        }
       },
       "legacy_connection_url": "optional",
       "egress": {
@@ -849,7 +897,13 @@
       "credential_slots": [],
       "config_schema": {
         "type": "object",
-        "maxProperties": 0
+        "additionalProperties": false,
+        "properties": {
+          "endpoint": {
+            "type": "string",
+            "readOnly": true
+          }
+        }
       },
       "legacy_connection_url": "optional",
       "egress": {
@@ -954,7 +1008,13 @@
       ],
       "config_schema": {
         "type": "object",
-        "maxProperties": 0
+        "additionalProperties": false,
+        "properties": {
+          "endpoint": {
+            "type": "string",
+            "readOnly": true
+          }
+        }
       },
       "legacy_connection_url": "optional",
       "egress": {
@@ -1197,6 +1257,64 @@
           },
           "unattended_send": {
             "type": "boolean"
+          },
+          "endpoint": {
+            "type": "string",
+            "readOnly": true
+          },
+          "backend": {
+            "type": "string",
+            "readOnly": true
+          },
+          "username": {
+            "type": "string",
+            "readOnly": true
+          },
+          "imap": {
+            "type": "object",
+            "required": [
+              "host"
+            ],
+            "properties": {
+              "host": {
+                "type": "string"
+              },
+              "port": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535
+              },
+              "security": {
+                "enum": [
+                  "ssl",
+                  "starttls"
+                ]
+              }
+            },
+            "readOnly": true
+          },
+          "smtp": {
+            "type": "object",
+            "required": [
+              "host"
+            ],
+            "properties": {
+              "host": {
+                "type": "string"
+              },
+              "port": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535
+              },
+              "security": {
+                "enum": [
+                  "ssl",
+                  "starttls"
+                ]
+              }
+            },
+            "readOnly": true
           }
         }
       },
@@ -1245,7 +1363,114 @@
         "virtual",
         "vm"
       ],
-      "workspace_requirements": "None: the agent process is the MCP client; a stdio server runs as its subprocess.",
+      "workspace_requirements": "None: the agent process runs the server as its subprocess and is its MCP client.",
+      "tool_category": "mcp",
+      "operations": [],
+      "access_levels": [
+        {
+          "id": "ReadWrite",
+          "rank": 1,
+          "tools": "*",
+          "enforced_by": "The MCP server and its credentials are the access boundary; SRW binds every tool the server lists.",
+          "advisory": false
+        }
+      ],
+      "default_access": "ReadWrite",
+      "forced_read_only": false,
+      "holds_upstream_credentials": true,
+      "credential_slots": [
+        {
+          "name": "server",
+          "kind": "secret_string",
+          "required": false,
+          "rotatable": false,
+          "access_levels": [],
+          "delivery": null,
+          "update": "replace",
+          "names_field": null,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "transport": {
+                "enum": [
+                  "stdio"
+                ]
+              },
+              "command": {
+                "type": "string"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "env": {
+                "type": "object",
+                "writeOnly": true
+              }
+            }
+          }
+        }
+      ],
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "transport": {
+            "enum": [
+              "stdio"
+            ],
+            "readOnly": true
+          }
+        }
+      },
+      "legacy_connection_url": "optional",
+      "egress": {
+        "declared": {
+          "rules": [],
+          "needs_dns": null
+        },
+        "enforced": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        },
+        "installation": {
+          "status": "not_applicable",
+          "reason": "runs_in_srw_process"
+        }
+      },
+      "publishable": true,
+      "live_attach": true,
+      "live_detach": "immediate",
+      "delete_while_attached": true,
+      "max_per_execution": null,
+      "needs_knowledge_profile": false,
+      "deployment_gate": "mcp_datasources",
+      "service": null,
+      "trust": {
+        "tier": "builtin",
+        "trusted": true,
+        "image": null,
+        "claims_declared_by_author": false
+      }
+    },
+    {
+      "name": "srw.mcp-remote/v1",
+      "title": "MCP Server (remote)",
+      "legacy_type": "mcp",
+      "protocol_version": "1.0",
+      "plane": "harness",
+      "delivery_forms": [
+        "mcp_client"
+      ],
+      "supported_backends": [
+        "none",
+        "sandbox",
+        "virtual",
+        "vm"
+      ],
+      "workspace_requirements": "None: the agent process is the MCP client.",
       "tool_category": "mcp",
       "operations": [],
       "access_levels": [
@@ -1276,24 +1501,10 @@
               "transport": {
                 "enum": [
                   "http",
-                  "sse",
-                  "stdio"
+                  "sse"
                 ]
               },
               "auth": {
-                "type": "object",
-                "writeOnly": true
-              },
-              "command": {
-                "type": "string"
-              },
-              "args": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "env": {
                 "type": "object",
                 "writeOnly": true
               }
@@ -1303,9 +1514,37 @@
       ],
       "config_schema": {
         "type": "object",
-        "maxProperties": 0
+        "additionalProperties": false,
+        "properties": {
+          "endpoint": {
+            "type": "string",
+            "readOnly": true
+          },
+          "transport": {
+            "enum": [
+              "http",
+              "sse"
+            ],
+            "readOnly": true
+          },
+          "auth_type": {
+            "enum": [
+              "none",
+              "bearer",
+              "headers"
+            ],
+            "readOnly": true
+          },
+          "header_names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "readOnly": true
+          }
+        }
       },
-      "legacy_connection_url": "optional",
+      "legacy_connection_url": "required",
       "egress": {
         "declared": {
           "rules": [],
@@ -1424,7 +1663,36 @@
       ],
       "config_schema": {
         "type": "object",
-        "maxProperties": 0
+        "additionalProperties": false,
+        "properties": {
+          "endpoint": {
+            "type": "string",
+            "readOnly": true
+          },
+          "files": {
+            "type": "array",
+            "readOnly": true,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "target_path": {
+                  "type": "string"
+                },
+                "mode": {
+                  "type": "string",
+                  "pattern": "^0[0-7]{3}$"
+                },
+                "env_var": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
       },
       "legacy_connection_url": "optional",
       "egress": {
@@ -1561,6 +1829,33 @@
           "known_hosts": {
             "type": "string",
             "x-srw-multiline": true
+          },
+          "endpoint": {
+            "type": "string",
+            "readOnly": true
+          },
+          "files": {
+            "type": "array",
+            "readOnly": true,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "target_path": {
+                  "type": "string"
+                },
+                "mode": {
+                  "type": "string",
+                  "pattern": "^0[0-7]{3}$"
+                },
+                "env_var": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -1683,7 +1978,36 @@
       ],
       "config_schema": {
         "type": "object",
-        "maxProperties": 0
+        "additionalProperties": false,
+        "properties": {
+          "endpoint": {
+            "type": "string",
+            "readOnly": true
+          },
+          "files": {
+            "type": "array",
+            "readOnly": true,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "target_path": {
+                  "type": "string"
+                },
+                "mode": {
+                  "type": "string",
+                  "pattern": "^0[0-7]{3}$"
+                },
+                "env_var": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
       },
       "legacy_connection_url": "optional",
       "egress": {

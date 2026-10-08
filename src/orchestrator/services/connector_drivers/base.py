@@ -211,10 +211,14 @@ class DatasourceDriver:
 
     spec: DriverSpec
 
-    def __init__(self, spec: DriverSpec) -> None:
+    def __init__(self, spec: DriverSpec, *, serves_stored_type: bool = True) -> None:
         if not spec.legacy_type:
             raise ValueError(f"{spec.name} serves no datasource type")
         self.spec = spec
+        #: Whether the registry answers ``for_type`` with this driver. A
+        #: driver that serves only some rows of a type another driver owns
+        #: (the remote MCP transports) is found by name.
+        self.serves_stored_type = serves_stored_type
 
     @property
     def type_id(self) -> str:

@@ -24,8 +24,47 @@ SHELL_BACKENDS = frozenset({"sandbox", "vm"})
 #: Forges the repository and KB drivers accept (``shared.runtime.services.forge``).
 FORGES: tuple[str, ...] = ("gitea", "github", "gitlab")
 
-_NO_CONFIG: Mapping[str, Any] = {"type": "object", "maxProperties": 0}
 _SECRET: Mapping[str, Any] = {"type": "string", "writeOnly": True}
+
+# ---------------------------------------------------------------------------
+# Connector config a datasource row mirrors (slice D3a)
+#
+# A datasource row's Connector resource carries, besides the driver's own
+# config, what the row holds that is not secret: where the service is (the
+# row's connection URL cut to ``scheme://host[:port]``; the full URL stays a
+# secret), the branch, and the non-secret parts of the credentials. SRW
+# derives them from the row, so they are ``readOnly``.
+# ---------------------------------------------------------------------------
+
+_MIRROR: Mapping[str, Any] = {"type": "string", "readOnly": True}
+#: The service a connector reaches, ``scheme://host[:port]``.
+_ENDPOINT = _MIRROR
+#: Where each credential file lands; its contents are the secret.
+_FILE_TARGETS: Mapping[str, Any] = {
+    "type": "array",
+    "readOnly": True,
+    "items": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "name": {"type": "string"},
+            "target_path": {"type": "string"},
+            "mode": {"type": "string", "pattern": "^0[0-7]{3}$"},
+            "env_var": {"type": "string"},
+        },
+    },
+}
+#: A repository's stored auth method (token, ssh, none).
+_AUTH_METHOD = _MIRROR
+
+
+def _config(**properties: Mapping[str, Any]) -> Mapping[str, Any]:
+    """A closed config schema: these keys and no others."""
+    return {"type": "object", "additionalProperties": False, "properties": properties}
+
+
+#: A driver with no config of its own; its connector mirrors the endpoint.
+_ENDPOINT_CONFIG = _config(endpoint=_ENDPOINT)
 #: A secret the user pastes or uploads from a file (a key, a kubeconfig).
 _SECRET_FILE: Mapping[str, Any] = {
     **_SECRET,
@@ -179,7 +218,7 @@ GENERIC_SPEC = DriverSpec(
     guide_topic="datasources",
     plane="bind_time",
     delivery_forms=("env_file",),
-    config_schema=_NO_CONFIG,
+    config_schema=_ENDPOINT_CONFIG,
     legacy_connection_url="optional",
     credential_slots=(
         CredentialSlot(
@@ -202,7 +241,7 @@ CREDENTIALS_SPEC = DriverSpec(
     guide_topic="datasources",
     plane="bind_time",
     delivery_forms=("env_file",),
-    config_schema=_NO_CONFIG,
+    config_schema=_ENDPOINT_CONFIG,
     legacy_connection_url="optional",
     credential_slots=(
         CredentialSlot(
@@ -241,6 +280,9 @@ REPOSITORY_SPEC = DriverSpec(
         "properties": {
             "forge": {"enum": list(FORGES)},
             "known_hosts": {"type": "string", "x-srw-multiline": True},
+            "endpoint": _ENDPOINT,
+            "default_branch": _MIRROR,
+            "auth_method": _AUTH_METHOD,
         },
     },
     legacy_connection_url="required",
@@ -300,6 +342,9 @@ KB_SPEC = DriverSpec(
         "properties": {
             "root_path": {"type": ["string", "null"]},
             "forge": {"enum": list(FORGES)},
+            "endpoint": _ENDPOINT,
+            "default_branch": _MIRROR,
+            "auth_method": _AUTH_METHOD,
         },
     },
     legacy_connection_url="required",
@@ -354,7 +399,7 @@ def _managed(
         guide_topic="datasources",
         plane="harness",
         delivery_forms=("managed_connection",),
-        config_schema=_NO_CONFIG,
+        config_schema=_ENDPOINT_CONFIG,
         legacy_connection_url="optional",
         credential_slots=credential_slots,
         tool_category=category,
@@ -453,6 +498,11 @@ EMAIL_SPEC = DriverSpec(
                 "items": {"type": "string", "minLength": 1},
             },
             "unattended_send": {"type": "boolean"},
+            "endpoint": _ENDPOINT,
+            "backend": _MIRROR,
+            "username": _MIRROR,
+            "imap": {**_SERVER_BLOCK, "readOnly": True},
+            "smtp": {**_SERVER_BLOCK, "readOnly": True},
         },
     },
     credential_slots=(
@@ -516,6 +566,21 @@ EMAIL_SPEC = DriverSpec(
     holds_upstream_credentials=True,
 )
 
+_MCP_ACCESS = (
+    AccessLevel(
+        "ReadWrite",
+        1,
+        "The MCP server and its credentials are the access boundary; SRW "
+        "binds every tool the server lists.",
+        tools="*",
+    ),
+)
+
+# The stored ``mcp`` type has two drivers, by transport: a stdio server
+# (``srw.mcp/v1``, the type's catalogue entry, whose subprocess path managed
+# MCP images replace in D5) and a remote http or sse server
+# (``srw.mcp-remote/v1``). One control-plane driver implementation serves
+# both; a row's Connector resource names the one its transport needs.
 MCP_SPEC = DriverSpec(
     name="srw.mcp/v1",
     legacy_type="mcp",
@@ -523,7 +588,8 @@ MCP_SPEC = DriverSpec(
     guide_topic="datasources",
     plane="harness",
     delivery_forms=("mcp_client",),
-    config_schema=_NO_CONFIG,
+    config_schema=_config(transport={"enum": ["stdio"], "readOnly": True}),
+    # The stored type's column: a remote row of the type has its URL there.
     legacy_connection_url="optional",
     credential_slots=(
         CredentialSlot(
@@ -532,8 +598,7 @@ MCP_SPEC = DriverSpec(
             {
                 "type": "object",
                 "properties": {
-                    "transport": {"enum": ["http", "sse", "stdio"]},
-                    "auth": {"type": "object", "writeOnly": True},
+                    "transport": {"enum": ["stdio"]},
                     "command": {"type": "string"},
                     "args": {"type": "array", "items": {"type": "string"}},
                     "env": {"type": "object", "writeOnly": True},
@@ -543,29 +608,58 @@ MCP_SPEC = DriverSpec(
         ),
     ),
     tool_category="mcp",
-    access_levels=(
-        AccessLevel(
-            "ReadWrite",
-            1,
-            "The MCP server and its credentials are the access boundary; SRW "
-            "binds every tool the server lists.",
-            tools="*",
-        ),
-    ),
+    access_levels=_MCP_ACCESS,
     default_access="ReadWrite",
     supported_backends=ALL_BACKENDS,
     workspace_requirements=(
-        "None: the agent process is the MCP client; a stdio server runs as "
-        "its subprocess."
+        "None: the agent process runs the server as its subprocess and is "
+        "its MCP client."
     ),
     deployment_gate="mcp_datasources",
     holds_upstream_credentials=True,
 )
-#: The driver a remote (http or sse) MCP connector's resource names. The
-#: design gives remote and stdio servers separate drivers; stdio keeps
-#: ``srw.mcp/v1``, whose subprocess path managed MCP images replace (D5).
-#: Until that split, MCP_SPEC serves both names (slice D3a stores them).
-MCP_REMOTE_DRIVER = "srw.mcp-remote/v1"
+MCP_REMOTE_SPEC = DriverSpec(
+    name="srw.mcp-remote/v1",
+    legacy_type="mcp",
+    title="MCP Server (remote)",
+    guide_topic="datasources",
+    plane="harness",
+    delivery_forms=("mcp_client",),
+    config_schema=_config(
+        endpoint=_ENDPOINT,
+        transport={"enum": ["http", "sse"], "readOnly": True},
+        auth_type={"enum": ["none", "bearer", "headers"], "readOnly": True},
+        header_names={
+            "type": "array",
+            "items": {"type": "string"},
+            "readOnly": True,
+        },
+    ),
+    legacy_connection_url="required",
+    credential_slots=(
+        CredentialSlot(
+            "server",
+            "secret_string",
+            {
+                "type": "object",
+                "properties": {
+                    "transport": {"enum": ["http", "sse"]},
+                    "auth": {"type": "object", "writeOnly": True},
+                },
+            },
+            update="replace",
+        ),
+    ),
+    tool_category="mcp",
+    access_levels=_MCP_ACCESS,
+    default_access="ReadWrite",
+    supported_backends=ALL_BACKENDS,
+    workspace_requirements="None: the agent process is the MCP client.",
+    deployment_gate="mcp_datasources",
+    holds_upstream_credentials=True,
+)
+#: The driver a remote MCP connector's resource names.
+MCP_REMOTE_DRIVER = MCP_REMOTE_SPEC.name
 
 
 def _credential_file(
@@ -578,7 +672,7 @@ def _credential_file(
         guide_topic="datasources",
         plane="bind_time",
         delivery_forms=("credential_file",),
-        config_schema=_NO_CONFIG,
+        config_schema=_config(endpoint=_ENDPOINT, files=_FILE_TARGETS),
         legacy_connection_url="optional",
         credential_slots=(
             CredentialSlot(
@@ -619,6 +713,8 @@ SSH_KEY_SPEC = DriverSpec(
             "user": {"type": "string"},
             "port": {"type": "integer", "minimum": 1, "maximum": 65535},
             "known_hosts": {"type": "string", "x-srw-multiline": True},
+            "endpoint": _ENDPOINT,
+            "files": _FILE_TARGETS,
         },
     },
     legacy_connection_url="optional",
@@ -702,7 +798,17 @@ DATASOURCE_SPECS: tuple[DriverSpec, ...] = (
     GENERIC_FILE_SPEC,
 )
 MANIFEST_SPECS: tuple[DriverSpec, ...] = (ENV_SPEC, FILES_SPEC)
-BUILTIN_SPECS: tuple[DriverSpec, ...] = MANIFEST_SPECS + DATASOURCE_SPECS
+#: Drivers that serve some rows of a stored type whose catalogue entry is
+#: another driver's, each listed after that driver.
+TYPE_VARIANT_SPECS: tuple[DriverSpec, ...] = (MCP_REMOTE_SPEC,)
+BUILTIN_SPECS: tuple[DriverSpec, ...] = MANIFEST_SPECS + tuple(
+    variant
+    for spec in DATASOURCE_SPECS
+    for variant in (
+        spec,
+        *(v for v in TYPE_VARIANT_SPECS if v.legacy_type == spec.legacy_type),
+    )
+)
 #: Drivers an installation turns on for development only. Their stored types
 #: resolve (an agent must read what it is sent) but no catalogue lists them.
 DEVELOPMENT_SPECS: tuple[DriverSpec, ...] = (LEASE_PROBE_SPEC,)

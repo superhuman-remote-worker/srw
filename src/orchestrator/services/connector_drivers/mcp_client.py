@@ -8,10 +8,11 @@ both are validated before the caller is authenticated.  The server and its
 credentials are the access boundary: SRW binds every tool the server lists,
 so a read-only project link changes nothing.
 
-The design splits this into ``srw.mcp-remote/v1`` and a stdio driver once
-managed MCP images ship (D5); until then one driver serves the stored type.
-Its Connector resources already name the split (slice D3a): a remote server
-stores ``srw.mcp-remote/v1``, a stdio server ``srw.mcp/v1``.
+Two specs, one implementation: ``srw.mcp/v1`` (stdio) owns the stored
+``mcp`` type and ``srw.mcp-remote/v1`` (http and sse) serves its remote rows.
+A row's Connector resource names the one its transport needs, so an edit of
+the transport changes the resource's driver.  Managed MCP images replace the
+stdio subprocess path in D5.
 """
 
 from __future__ import annotations
@@ -33,14 +34,17 @@ from orchestrator.services.connector_drivers.base import (
     NormalizedConnector,
     ValidationContext,
 )
-from shared.connectors.builtin import MCP_REMOTE_DRIVER, MCP_SPEC
+from shared.connectors.builtin import MCP_REMOTE_SPEC, MCP_SPEC
+from shared.connectors.contract import DriverSpec
 
 _CONFIG_REFUSED = "Connector config is not supported for MCP connectors"
 
 
 class McpDriver(DatasourceDriver):
-    def __init__(self) -> None:
-        super().__init__(MCP_SPEC)
+    def __init__(
+        self, spec: DriverSpec = MCP_SPEC, *, serves_stored_type: bool = True
+    ) -> None:
+        super().__init__(spec, serves_stored_type=serves_stored_type)
 
     def disabled_detail(self) -> str:
         return "MCP connectors are disabled on this deployment"
@@ -134,19 +138,19 @@ class McpDriver(DatasourceDriver):
     def resource_driver(self, credentials: Mapping[str, Any]) -> str:
         """``srw.mcp/v1`` for a stdio server, ``srw.mcp-remote/v1`` otherwise."""
         if self._transport(credentials) == "stdio":
-            return self.spec.name
-        return MCP_REMOTE_DRIVER
+            return MCP_SPEC.name
+        return MCP_REMOTE_SPEC.name
 
     def credential_config(self, credentials: Mapping[str, Any]) -> dict[str, Any]:
-        """The transport and the stdio command, or the remote auth kind and
-        header names.  Arguments, environment values, the bearer token and
-        header values stay secret: arguments often carry a key."""
+        """The transport, and a remote server's auth kind and header names.
+
+        The stdio command and its arguments stay secret with the environment,
+        the bearer token and the header values: a pasted command line often
+        carries a key.
+        """
         transport = self._transport(credentials)
         config: dict[str, Any] = {"transport": transport}
         if transport == "stdio":
-            command = credentials.get("command")
-            if isinstance(command, str):
-                config["command"] = command
             return config
         auth = credentials.get("auth")
         auth = auth if isinstance(auth, Mapping) else {}

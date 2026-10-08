@@ -24,6 +24,8 @@ export const BESPOKE_CONNECTOR_FORMS: Readonly<Record<string, DatasourceType>> =
   'srw.webdav/v1': 'webdav',
   'srw.email/v1': 'email',
   'srw.mcp/v1': 'mcp',
+  // The remote transports of the same stored type: one bespoke form for both.
+  'srw.mcp-remote/v1': 'mcp',
   'srw.kubeconfig/v1': 'kubeconfig',
   'srw.ssh-key/v1': 'ssh_key',
   'srw.generic-file/v1': 'generic_file',
