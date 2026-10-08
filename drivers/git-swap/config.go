@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -169,23 +170,37 @@ func upstreamRoots(text string) (*x509.CertPool, error) {
 	rest := []byte(text)
 	found := 0
 	for {
+		// pem.Decode skips any text before a block: only whitespace may
+		// come between blocks, as SRW's validation of the connector holds.
+		rest = bytes.TrimLeft(rest, " \t\r\n")
+		if len(rest) == 0 {
+			break
+		}
+		if !bytes.HasPrefix(rest, []byte("-----BEGIN ")) {
+			return nil, fmt.Errorf("%w: it holds text that is not a PEM certificate", errBadUpstreamCA)
+		}
 		var block *pem.Block
 		block, rest = pem.Decode(rest)
 		if block == nil {
-			break
+			return nil, fmt.Errorf("%w: a PEM block does not decode", errBadUpstreamCA)
 		}
-		if block.Type != "CERTIFICATE" {
-			return nil, fmt.Errorf("the connector's upstream CA holds a %s block", block.Type)
+		if block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+			return nil, fmt.Errorf("%w: it holds a %s block", errBadUpstreamCA, block.Type)
 		}
 		certificate, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
-			return nil, fmt.Errorf("the connector's upstream CA: %w", err)
+			return nil, fmt.Errorf("%w: %v", errBadUpstreamCA, err)
 		}
 		pool.AddCert(certificate)
 		found++
 	}
-	if found == 0 || strings.TrimSpace(string(rest)) != "" {
-		return nil, errors.New("the connector's upstream CA is not PEM certificates")
+	if found == 0 {
+		return nil, fmt.Errorf("%w: it holds no certificate", errBadUpstreamCA)
 	}
 	return pool, nil
 }
+
+// errBadUpstreamCA: the connector's upstream CA is not PEM certificates.
+// The driver reports it as it reports an upstream it cannot trust (exit
+// code 78), so SRW stops the pod at once instead of a crash loop.
+var errBadUpstreamCA = errors.New("the connector's upstream CA is not usable")

@@ -51,6 +51,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -81,6 +82,13 @@ func dispatch(args []string) int {
 		return 0
 	case "serve":
 		cfg, err := loadConfig(os.Getenv)
+		if errors.Is(err, errBadUpstreamCA) {
+			// Reported like an upstream it cannot trust: SRW stops the pod
+			// at once and token repositories fall back.
+			fmt.Fprintf(os.Stderr, "srw-git-swap: %s\n", clean(err.Error()))
+			writeTermination(terminationLog, badCAReport)
+			return upstreamExitCode
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "srw-git-swap: %v\n", err)
 			return 2
@@ -90,9 +98,11 @@ func dispatch(args []string) int {
 		}
 		client := newUpstreamClient(cfg.upstreamRoots)
 		// An upstream the driver cannot reach or trust is reported, not
-		// served: SRW stops the pod and token repositories fall back.
-		if problem := probeUpstream(context.Background(), client, cfg.upstream, probeAttempts, probePause); problem != "" {
-			logf("%s", problem)
+		// served: SRW stops the pod and token repositories fall back. The
+		// termination message names a fixed class; the upstream's own
+		// words go to the log only, cleaned.
+		if problem, detail := probeUpstream(context.Background(), client, cfg.upstream, probeAttempts, probePause); problem != "" {
+			logf("%s (%s)", problem, detail)
 			writeTermination(terminationLog, problem)
 			return upstreamExitCode
 		}
