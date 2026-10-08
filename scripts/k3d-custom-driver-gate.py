@@ -136,6 +136,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import re
 import secrets
 import subprocess
@@ -169,6 +170,17 @@ IMAGE_TYPE = "image_driver"
 GATE_LABEL = "srw.io/gate"
 ACCOUNT_DOMAIN = "example.invalid"
 LOCAL_REGISTRY = "localhost:5005"
+#: What the k3d registry may answer for a pushed digest: an image index
+#: (docker's containerd image store) or a single image manifest.
+INDEX_TYPES = (
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+)
+MANIFEST_TYPES = (
+    *INDEX_TYPES,
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+)
 CLUSTER_REGISTRY = "srw-registry:5000"
 REPOSITORY = "srw-driver-example"
 SPEC_FILE = ROOT / "drivers/example/spec.json"
@@ -608,6 +620,10 @@ printf 'file_var=%s\n' "${EXAMPLE_TOKEN_FILE:-}"
 if [ -e "$GATE_FILE" ]; then
   printf 'file_sha=%s\n' "$(sha256sum < "$GATE_FILE" | cut -d' ' -f1)"
   printf 'file_mode=%s\n' "$(stat -L -c %a "$GATE_FILE")"
+  printf 'file_real=%s\n' "$(readlink -f "$GATE_FILE")"
+fi
+if [ -n "${EXAMPLE_TOKEN_FILE:-}" ]; then
+  printf 'var_real=%s\n' "$(readlink -f "$EXAMPLE_TOKEN_FILE")"
 fi
 printf 'notices=%s\n' "$(grep -rhF --include=README.md 'Not delivered' ~ 2>/dev/null | tr '\n' '|' | head -c 4000)"
 """
@@ -1790,7 +1806,36 @@ class CustomDriverGate:
         match = re.search(r"digest: (sha256:[0-9a-f]{64})", out)
         if match is None:
             raise GateError("docker push printed no digest")
-        return match.group(1)
+        return self.platform_digest(match.group(1))
+
+    def platform_digest(self, digest: str) -> str:
+        """The digest SRW binds for a pushed ``digest``. Docker's containerd
+        image store pushes an image index (the image plus attestations); SRW's
+        resolver reads the index and records the linux manifest it lists, so
+        that manifest's digest is the one to expect. A plain manifest is its
+        own answer."""
+        request = urllib.request.Request(
+            f"http://{LOCAL_REGISTRY}/v2/{REPOSITORY}/manifests/{digest}",
+            headers={"Accept": ", ".join(MANIFEST_TYPES)},
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            document = json.load(response)
+        if document.get("mediaType") not in INDEX_TYPES:
+            return digest
+        architecture = {"x86_64": "amd64", "aarch64": "arm64"}.get(
+            os.uname().machine, os.uname().machine
+        )
+        for manifest in document.get("manifests") or []:
+            platform = manifest.get("platform") or {}
+            if (
+                platform.get("os") == "linux"
+                and platform.get("architecture") == architecture
+                and not platform.get("variant")
+            ):
+                return str(manifest["digest"])
+        raise GateError(
+            f"the pushed index {digest} lists no linux/{architecture} image"
+        )
 
     def registry_tags(self) -> list[str]:
         url = f"http://{LOCAL_REGISTRY}/v2/{REPOSITORY}/tags/list"
@@ -1996,6 +2041,16 @@ class CustomDriverGate:
         thread = str(created.get("thread_id") or created["id"])
         self.threads[label] = thread
         print(f"session {label}: {thread}", flush=True)
+        if pinned:
+            # A pinned session refuses input (409 session_binding_invalid)
+            # until its agent has attached; /connection admits it then.
+            wait_for(
+                f"pinned session {label} admitted by /connection",
+                lambda: self.owner.call("GET", f"/api/sessions/{thread}/connection")[0]
+                == 200,
+                timeout=self.args.turn_timeout,
+                interval=5,
+            )
         self.owner.ok(
             "POST",
             f"/api/persistent/threads/{thread}/input",
@@ -2256,8 +2311,13 @@ class CustomDriverGate:
             and facts.get("file_sha")
             == hashlib.sha256((value + "\n").encode()).hexdigest()
             and facts.get("file_mode") == "600"
-            and facts.get("file_var", "").endswith("/.srw-files/example/token"),
-            json.dumps({k: facts.get(k) for k in ("file_mode", "file_var")}),
+            # The store keeps the file under ~/.srw-credentials and links the
+            # declared path to it; the variable names the stored file.
+            and bool(facts.get("file_real"))
+            and facts.get("file_real") == facts.get("var_real"),
+            json.dumps(
+                {k: facts.get(k) for k in ("file_mode", "file_var", "file_real")}
+            ),
         )
         process = process_facts(facts.get("process", ""))
         problems = unprivileged_process(process)
