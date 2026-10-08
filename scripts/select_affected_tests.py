@@ -119,6 +119,7 @@ ALWAYS_RUN = (
     "tests/test_endpoint_inventory.py",
     "tests/test_notification_producer_manifest.py",
     "tests/test_runtime_coordinate_inventory.py",
+    "tests/test_connector_type_branches.py",
 )
 
 

@@ -1,0 +1,121 @@
+# Connector-type branches outside the drivers: maintained by
+# scripts/check_connector_type_branches.py (its docstring says what it finds).
+# Regenerate with `python scripts/check_connector_type_branches.py --write`;
+# a new site is marked `unclassified` until reviewed, and fails the tests.
+#
+# Convert a branch to a spec flag or a driver capability rather than
+# classifying it. `legacy-pending` must reach zero at the end of slice D1.
+# Every other classification needs a reason:
+#   not-a-connector-type  the literal names something else
+#   sql                   a type test in SQL text (D3's platform-owned marker)
+#   kb-domain             OKF knowledge-base indexing, outside the driver
+#   platform-owned        a connector SRW provisions itself (D3's managed_key)
+#   driver-internal       a helper only drivers call, with their own type
+# SQL files, the cockpit and prompts are outside this gate.
+#
+# A site is identified by what it is, not where it is: reordering code keeps
+# a classification; reshaping the branch mints a new `unclassified` site.
+#
+# <file>  <qualname>  <kind>  <type ids>  <fingerprint>  #<ordinal>  <classification>  [<reason>]
+
+src/agent/agent.py  UniversalAgent._capture_worker_environment  type-keyed-dict  mongodb,neo4j,postgresql  9afc988116cd  #1  legacy-pending
+src/agent/agent.py  UniversalAgent._inject_typed_env_vars  compare  mongodb  d48c36eaf9dc  #1  legacy-pending
+src/agent/agent.py  UniversalAgent._inject_typed_env_vars  compare  neo4j  c613b9f68578  #1  legacy-pending
+src/agent/agent.py  UniversalAgent._inject_typed_env_vars  compare  postgresql  19f7b4775bc3  #1  legacy-pending
+src/agent/agent.py  UniversalAgent._setup_job_tools  compare  kb  f0ba2cb88402  #1  legacy-pending
+src/agent/agent.py  UniversalAgent._setup_job_tools  compare  kb,repository  f795185808e8  #1  legacy-pending
+src/agent/agent.py  UniversalAgent._setup_job_tools  compare  repository  40f10e30d9e7  #1  legacy-pending
+src/agent/api/persistent_session.py  PersistentSession._protected_cloud_config_valid  compare  webdav  dfe8cd429615  #1  not-a-connector-type  a cloud mount's rclone source.type, not a connector
+src/agent/api/persistent_session.py  PersistentSession._refresh_runtime_facts  compare  email  0bf903dadf2a  #1  legacy-pending
+src/agent/api/persistent_session.py  PersistentSession.resetup_datasources  compare  kb  f0ba2cb88402  #1  legacy-pending
+src/agent/api/persistent_session.py  PersistentSession.resetup_datasources  compare  kb,repository  f795185808e8  #1  legacy-pending
+src/agent/api/persistent_session.py  PersistentSession.resetup_datasources  compare  repository  40f10e30d9e7  #1  legacy-pending
+src/agent/api/persistent_session.py  PersistentSession.resetup_datasources  compare  repository  40f10e30d9e7  #2  legacy-pending
+src/agent/api/persistent_session.py  PersistentSession.resetup_datasources  compare  repository  40f10e30d9e7  #3  legacy-pending
+src/agent/api/session_attach.py  SessionAttachCoordinator._attach_inner  compare  kb  f0ba2cb88402  #1  legacy-pending
+src/agent/api/session_attach.py  SessionAttachCoordinator._attach_inner  compare  kb,repository  f795185808e8  #1  legacy-pending
+src/agent/api/session_attach.py  SessionAttachCoordinator._attach_inner  compare  repository  40f10e30d9e7  #1  legacy-pending
+src/agent/api/session_workspace.py  validate_protected_cloud_mount  compare  webdav  5490bf991804  #1  not-a-connector-type  a cloud mount's rclone source.type, not a connector
+src/agent/api/turn_executor.py  StatelessTurnExecutor._worker_mcp_attached  compare  mcp  8b2036a87573  #1  legacy-pending
+src/agent/core/datasource_setup.py  <module>  collection  generic_file,kubeconfig,ssh_key  0f812d603272  #1  legacy-pending
+src/agent/core/datasource_setup.py  _render_connector_lines  compare  email  a01f476537cf  #1  legacy-pending
+src/agent/core/datasource_setup.py  _render_connector_lines  compare  generic_file,kb,kubeconfig,mcp,mongodb,neo4j,postgresql,repository,ssh_key  1b908964b96b  #1  legacy-pending
+src/agent/core/datasource_setup.py  _render_connector_lines  compare  kb  f0ba2cb88402  #1  legacy-pending
+src/agent/core/datasource_setup.py  _render_connector_lines  compare  kubeconfig  2a42d5debf7a  #1  legacy-pending
+src/agent/core/datasource_setup.py  _render_connector_lines  compare  mcp  dfe842431dd3  #1  legacy-pending
+src/agent/core/datasource_setup.py  _render_connector_lines  compare  mongodb,neo4j,postgresql  d7b7c65d4648  #1  legacy-pending
+src/agent/core/datasource_setup.py  _render_connector_lines  compare  repository  40f10e30d9e7  #1  legacy-pending
+src/agent/core/datasource_setup.py  _render_connector_lines  compare  ssh_key  c53a27ade630  #1  legacy-pending
+src/agent/core/datasource_setup.py  _render_connector_lines  compare  webdav  f0d30cfe0c38  #1  legacy-pending
+src/agent/core/datasource_setup.py  _ssh_key_host  compare  ssh_key  a55e52044ce8  #1  legacy-pending
+src/agent/core/datasource_setup.py  create_datasource_connection  compare  email  a01f476537cf  #1  legacy-pending
+src/agent/core/datasource_setup.py  create_datasource_connection  compare  mongodb  d48c36eaf9dc  #1  legacy-pending
+src/agent/core/datasource_setup.py  create_datasource_connection  compare  neo4j  c613b9f68578  #1  legacy-pending
+src/agent/core/datasource_setup.py  create_datasource_connection  compare  postgresql  19f7b4775bc3  #1  legacy-pending
+src/agent/core/datasource_setup.py  create_datasource_connection  compare  webdav  f0d30cfe0c38  #1  legacy-pending
+src/agent/core/datasource_setup.py  process_credential_files  compare  kubeconfig  2a42d5debf7a  #1  legacy-pending
+src/agent/core/datasource_setup.py  process_credential_files  compare  kubeconfig  2a42d5debf7a  #2  legacy-pending
+src/agent/core/datasource_setup.py  process_credential_files  compare  ssh_key  c53a27ade630  #1  legacy-pending
+src/agent/core/datasource_setup.py  process_datasources  compare  kb  3ba263dda189  #1  legacy-pending
+src/agent/core/datasource_setup.py  process_datasources  compare  mcp  b941724056ac  #1  legacy-pending
+src/agent/core/datasource_setup.py  process_datasources  compare  repository  b9fa1c7f847e  #1  legacy-pending
+src/agent/database/postgres_db.py  JobsNamespace.record_pull_request  sql-literal  repository  c6e491f05375  #1  sql  PR record insert checks the attachment is a repository connector in SQL; type stays a mirror column (D3)
+src/agent/services/knowledge/bindings.py  build_knowledge_bindings  compare  kb  6e98445ca669  #1  legacy-pending
+src/agent/tools/email/tools.py  create_email_tools  registry-slot  email  77c512d4f6ae  #1  legacy-pending
+src/agent/tools/email/tools.py  create_email_tools._binding_refusal  registry-slot  email  77c512d4f6ae  #1  legacy-pending
+src/agent/tools/graph/neo4j.py  create_neo4j_tools  registry-slot  neo4j  0e43d7decd2f  #1  legacy-pending
+src/agent/tools/mongodb/mongo.py  create_mongo_tools  registry-slot  mongodb  0fc0de088303  #1  legacy-pending
+src/agent/tools/registry.py  load_tools  registry-slot  email  e52bcebfeaf4  #1  legacy-pending
+src/agent/tools/registry.py  load_tools  registry-slot  mcp  615e3cacc5e3  #1  legacy-pending
+src/agent/tools/registry.py  load_tools  registry-slot  mcp  abadb4f91060  #1  legacy-pending
+src/agent/tools/registry.py  load_tools  registry-slot  mongodb  ec888a628dca  #1  legacy-pending
+src/agent/tools/registry.py  load_tools  registry-slot  neo4j  cf5ea66585c7  #1  legacy-pending
+src/agent/tools/registry.py  load_tools  registry-slot  postgresql  2bd4cf6c228b  #1  legacy-pending
+src/agent/tools/registry.py  load_tools  registry-slot  webdav  5e933d241a1c  #1  legacy-pending
+src/agent/tools/sql/postgresql.py  create_postgresql_tools  registry-slot  postgresql  03e18ffc14fe  #1  legacy-pending
+src/agent/tools/webdav/tools.py  create_webdav_tools  registry-slot  webdav  e72ff2f3619b  #1  legacy-pending
+src/orchestrator/database/postgres.py  PostgresDB.delete_project  sql-literal  kb  ea9c71ab6b6f  #1  sql  native project KB marker (type kb + config.native_project_id) tested in SQL; D3 moves it to managed_key
+src/orchestrator/database/postgres.py  PostgresDB.get_native_project_kb_datasource_ref  sql-literal  kb  ea9c71ab6b6f  #1  sql  native project KB marker (type kb + config.native_project_id) tested in SQL; D3 moves it to managed_key
+src/orchestrator/database/postgres.py  PostgresDB.link_datasource_to_project  sql-literal  kb  ea9c71ab6b6f  #1  sql  native project KB marker (type kb + config.native_project_id) tested in SQL; D3 moves it to managed_key
+src/orchestrator/database/postgres.py  PostgresDB.list_default_datasource_candidates  sql-literal  kb  ea9c71ab6b6f  #1  sql  native project KB marker (type kb + config.native_project_id) tested in SQL; D3 moves it to managed_key
+src/orchestrator/database/postgres.py  PostgresDB.list_eligible_datasources  sql-literal  kb  18c962386fcf  #1  sql  native project KB marker (type kb + config.native_project_id) tested in SQL; D3 moves it to managed_key
+src/orchestrator/database/postgres.py  PostgresDB.list_project_linkable_datasources  sql-literal  kb  ea9c71ab6b6f  #1  sql  native project KB marker (type kb + config.native_project_id) tested in SQL; D3 moves it to managed_key
+src/orchestrator/database/postgres.py  PostgresDB.mark_job_pr_deliverable_verified  sql-literal  repository  c6e491f05375  #1  sql  PR authority verification joins repository connectors, as the pull-request authority triggers in migrations do; type stays a mirror column (D3)
+src/orchestrator/init.py  _seed_default_datasources  type-keyword  mongodb  09d1fbed38e1  #1  platform-owned  seeds a DEFAULT_DS_* platform row of a fixed type; the row goes through its driver's validate first
+src/orchestrator/init.py  _seed_default_datasources  type-keyword  neo4j  0de91ca2e721  #1  platform-owned  seeds a DEFAULT_DS_* platform row of a fixed type; the row goes through its driver's validate first
+src/orchestrator/init.py  _seed_default_datasources  type-keyword  postgresql  3b0630c7d02d  #1  platform-owned  seeds a DEFAULT_DS_* platform row of a fixed type; the row goes through its driver's validate first
+src/orchestrator/init.py  _seed_default_datasources  type-keyword  webdav  7ff7afb11c1a  #1  platform-owned  seeds a DEFAULT_DS_* platform row of a fixed type; the row goes through its driver's validate first
+src/orchestrator/security/credential_files.py  normalize_credential_files  compare  kubeconfig  2a42d5debf7a  #1  driver-internal  file layout rules of the kubeconfig, generic_file and ssh_key drivers; only those drivers call it, with their own type_id
+src/orchestrator/security/credential_files.py  normalize_credential_files  compare  ssh_key  c53a27ade630  #1  driver-internal  file layout rules of the kubeconfig, generic_file and ssh_key drivers; only those drivers call it, with their own type_id
+src/orchestrator/services/agent_datasource_payload.py  apply_cloud_storage_override  compare  webdav  31c49729257b  #1  platform-owned  job cloud_storage_read_only targets the main-cloud WebDAV connector; D3 managed_key project-cloud and D4 cloud_folder replace it
+src/orchestrator/services/datasource_policy.py  _native_project_id  compare  kb  6e98445ca669  #1  platform-owned  reads the native project KB marker, only meaningful on a kb row; D3's platform_owned(row) replaces it
+src/orchestrator/services/kb_datasources.py  reindex_kb_datasource  compare  kb  6e98445ca669  #1  kb-domain  the OKF KB indexer refuses to index a row that is not a KB repository
+src/orchestrator/services/kb_forge.py  kb_client_for_repo  compare  kb  449b038286e5  #1  kb-domain  a GitHub KB repository's token is read only from a KB connector row
+src/orchestrator/services/kb_reindex.py  kb_sweep_tick  type-keyword  kb  59912bb49d40  #1  kb-domain  the KB sweep enumerates the KB connectors it indexes
+src/orchestrator/services/kb_reindex.py  kb_sweep_tick.datasource_is_active  compare  kb  7f8fc6db370a  #1  kb-domain  the KB sweep re-checks at commit that the row is still an external KB
+src/orchestrator/services/knowledge_index.py  kb_datasource_is_active  compare  kb  e30ab025c0b5  #1  kb-domain  the KB index fence re-checks the row is still a KB before it mutates the index
+src/orchestrator/services/knowledge_index.py  run_scheduled_kb_datasource_reindex  compare  kb  449b038286e5  #1  kb-domain  the KB index fence re-checks the row is still a KB before it mutates the index
+src/orchestrator/services/knowledge_projection.py  build_datasource_note_content  compare  credentials,generic  84c2b2e13d27  #1  legacy-pending
+src/orchestrator/services/knowledge_projection.py  build_datasource_note_content  compare  kb  3ba263dda189  #1  legacy-pending
+src/orchestrator/services/knowledge_projection.py  build_datasource_note_content  compare  mongodb,neo4j,postgresql  397855496105  #1  legacy-pending
+src/orchestrator/services/knowledge_projection.py  build_datasource_note_content  compare  repository  b9fa1c7f847e  #1  legacy-pending
+src/orchestrator/services/knowledge_projection.py  build_datasource_note_content  compare  webdav  f0d30cfe0c38  #1  legacy-pending
+src/orchestrator/services/knowledge_projection.py  build_managed_readonly_note  type-keyed-dict  mongodb,neo4j,postgresql  9afc988116cd  #1  legacy-pending
+src/orchestrator/services/knowledge_projection.py  build_managed_readwrite_note  type-keyed-dict  mongodb,neo4j,postgresql  9afc988116cd  #1  legacy-pending
+src/orchestrator/services/knowledge_projection.py  sync_datasource_knowledge  compare  credentials,generic  84c2b2e13d27  #1  legacy-pending
+src/orchestrator/services/knowledge_projection.py  sync_datasource_knowledge  compare  kb  3ba263dda189  #1  legacy-pending
+src/orchestrator/services/knowledge_projection.py  sync_datasource_knowledge  compare  repository  b9fa1c7f847e  #1  legacy-pending
+src/orchestrator/services/manifest_user_retirement.py  retire_user_manifests  sql-literal  kb  ea9c71ab6b6f  #1  sql  native project KB marker (type kb + config.native_project_id) tested in SQL; D3 moves it to managed_key
+src/orchestrator/services/project_provisioning.py  plan_kb_vault_from_connector  compare  kb  8295e37d7780  #1  kb-domain  only an OKF KB repository can back a project knowledge base
+src/orchestrator/services/project_provisioning.py  provision_external_project_knowledge_repo  type-keyword  kb  1048cce392f8  #1  platform-owned  creates the project's native KB row (D3 managed_key project-kb)
+src/orchestrator/services/project_provisioning.py  provision_project_knowledge_repo  type-keyword  kb  1048cce392f8  #1  platform-owned  creates the project's native KB row (D3 managed_key project-kb)
+src/orchestrator/services/projects.py  update_project  compare  webdav  31c49729257b  #1  platform-owned  project cloud_storage_read_only syncs the project's main-cloud WebDAV link; D3 managed_key project-cloud and D4 cloud_folder replace it
+src/orchestrator/services/user_administration.py  create_user  type-keyword  webdav  95d7c870a563  #1  platform-owned  creates the user's personal cloud-storage WebDAV row (D3 managed_key user-cloud-root); validated by its driver first
+src/orchestrator/services/workspace_ssh_connector.py  apply_ssh_test_overrides  compare  repository  4b0c84e39241  #1  driver-internal  the ssh_key and SSH-key repository drivers' shared rules (C1); only WorkspaceSshDriver subclasses call it, with their own type_id
+src/orchestrator/services/workspace_ssh_connector.py  is_workspace_ssh_connector  compare  repository  b9fa1c7f847e  #1  driver-internal  the ssh_key and SSH-key repository drivers' shared rules (C1); only WorkspaceSshDriver subclasses call it, with their own type_id
+src/orchestrator/services/workspace_ssh_connector.py  is_workspace_ssh_connector  compare  ssh_key  c53a27ade630  #1  driver-internal  the ssh_key and SSH-key repository drivers' shared rules (C1); only WorkspaceSshDriver subclasses call it, with their own type_id
+src/orchestrator/services/workspace_ssh_connector.py  probe_workspace_ssh_connector  compare  ssh_key  1345831a533a  #1  driver-internal  the ssh_key and SSH-key repository drivers' shared rules (C1); only WorkspaceSshDriver subclasses call it, with their own type_id
+src/orchestrator/services/workspace_ssh_connector.py  validate_workspace_ssh_connector  compare  repository  77723592e402  #1  driver-internal  the ssh_key and SSH-key repository drivers' shared rules (C1); only WorkspaceSshDriver subclasses call it, with their own type_id
+src/orchestrator/services/workspace_ssh_connector.py  validate_workspace_ssh_connector  compare  ssh_key  c53a27ade630  #1  driver-internal  the ssh_key and SSH-key repository drivers' shared rules (C1); only WorkspaceSshDriver subclasses call it, with their own type_id
+src/orchestrator/services/workspace_ssh_connector.py  workspace_ssh_identity  compare  repository  40f10e30d9e7  #1  driver-internal  the ssh_key and SSH-key repository drivers' shared rules (C1); only WorkspaceSshDriver subclasses call it, with their own type_id
+src/orchestrator/services/workspace_ssh_connector.py  workspace_ssh_identity  compare  ssh_key  1345831a533a  #1  driver-internal  the ssh_key and SSH-key repository drivers' shared rules (C1); only WorkspaceSshDriver subclasses call it, with their own type_id
