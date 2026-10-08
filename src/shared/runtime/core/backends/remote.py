@@ -1500,7 +1500,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         ``~/.srw-credentials/`` (which a snapshot never captures) with their
         mode (never an execute bit), and ``link`` (home-relative, optional)
         becomes a symlink to the file. ``env`` names the variables that
-        point at stored files (``{"name", "files", "append"}``); they go into
+        point at stored files (``{"name", "files", "prepend"}``); they go into
         the work item's environment file, which every command sources.
         Contents travel on the secret stdin channel, never tmux or argv.
         What an earlier sync placed or set and this one does not is removed
@@ -1538,7 +1538,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 {
                     "name": str(item["name"]),
                     "files": [str(name) for name in item.get("files") or ()],
-                    "append": item.get("append") or None,
+                    "prepend": item.get("prepend") or None,
                 }
                 for item in env
             ],

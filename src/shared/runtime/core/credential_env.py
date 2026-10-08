@@ -27,7 +27,8 @@ values = json.loads(state.read_text()) if state.exists() else {}
 values.update(json.load(sys.stdin))
 for path, contents in (
     (state, json.dumps(values)),
-    (target, ''.join('export ' + key + '=' + shlex.quote(value) + '\n'
+    (target, ''.join('unset ' + key + '\n' if value is None
+                     else 'export ' + key + '=' + shlex.quote(value) + '\n'
                      for key, value in values.items())),
 ):
     fd, temporary = tempfile.mkstemp(dir=target.parent, prefix='.credentials-')
@@ -53,13 +54,13 @@ for path, contents in (
 #: through a symlinked directory. A link that cannot be placed is skipped
 #: with its reason; the others still are.
 #:
-#: Each ``env`` item (``name``, ``files``, ``append``) sets a variable in the
+#: Each ``env`` item (``name``, ``files``, ``prepend``) sets a variable in the
 #: work item's environment file (``~/.srw-credentials/<identity>.sh``) to its
-#: stored files, colon-separated, then ``append`` (a home-relative path) if
+#: stored files, colon-separated, after ``prepend`` (a home-relative path) if
 #: that path exists and is not this store's link. A variable belongs to the
 #: sync only while that file holds what the sync last wrote: one another
 #: connector set is skipped, never overwritten. A variable an earlier sync
-#: set and this one does not is emptied.
+#: set and this one does not is unset (``unset NAME``, never ``NAME=``).
 #:
 #: What an earlier sync placed and this one does not is removed, with the
 #: directories it created once they are empty. The state (links, directories,
@@ -224,6 +225,8 @@ def place(link, target, made):
         os.mkdir(directory, 0o700)
         made.append(os.path.relpath(directory, home))
     if os.path.lexists(path) and not ours(path) and not stale(path):
+        if os.path.islink(path) and os.readlink(path).startswith(root + '/'):
+            return 'another work item\'s file is there'
         return 'a file of the user is there'
     temporary = os.path.join(parent, '.srw-link-' + os.urandom(8).hex())
     os.symlink(target, temporary)
@@ -252,34 +255,39 @@ env, env_skipped, env_set = {}, {}, []
 for item in wanted_env:
     name = item['name']
     current = values.get(name)
-    # An empty variable is nobody's (a sync empties what it retires).
+    # An unset or empty variable is nobody's (a sync unsets what it retires).
     if current and previous_env.get(name) != current:
         env_skipped[name] = 'set by another connector'
         continue
     parts = [os.path.join(store, stored) for stored in item.get('files') or []]
-    extra = item.get('append')
-    if extra:
-        path = os.path.join(home, extra)
+    first = item.get('prepend')
+    if first:
+        # The user's own file, if ours could not take its place, comes first:
+        # a connector never replaces the user's default (kubectl's
+        # current-context is the first file's).
+        path = os.path.join(home, first)
         if os.path.lexists(path) and not ours(path):
-            parts.append(path)
+            parts.insert(0, path)
     env[name] = ':'.join(parts)
     env_set.append(name)
-retired = []
+retired = {}
 for name, value in previous_env.items():
     if name in env:
         continue
     if values.get(name) == value:
-        env[name] = ''
-        if value:
-            retired.append(name)
+        # Unset, never exported empty: an empty AWS_SHARED_CREDENTIALS_FILE
+        # would hide ~/.aws/credentials for the rest of the work item.
+        retired[name] = None
 values.update(env)
-if env or os.path.exists(env_json):
+values.update(retired)
+if env or retired or os.path.exists(env_json):
     write(root, env_json, json.dumps(values), 0o600)
-    write(root, env_sh, ''.join('export ' + key + '=' + shlex.quote(value) + '\n'
+    write(root, env_sh, ''.join('unset ' + key + '\n' if value is None
+                                else 'export ' + key + '=' + shlex.quote(value) + '\n'
                                 for key, value in values.items()), 0o600)
 
 state = {'links': kept, 'dirs': left, 'env': env}
-if names or kept or any(env.values()):
+if names or kept or env:
     write(store, os.path.join(store, '.links.json'), json.dumps(state), 0o600)
 else:
     try:

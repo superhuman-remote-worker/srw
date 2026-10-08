@@ -209,7 +209,7 @@ class TestPlan:
             {
                 "name": "KUBECONFIG",
                 "files": [MERGED_KUBECONFIG],
-                "append": ".kube/config",
+                "prepend": ".kube/config",
             }
         ]
 
@@ -482,7 +482,8 @@ class TestFacts:
             ({}, "merged into `~/.kube/config` (`$KUBECONFIG`)"),
             (
                 {"skipped": {".kube/config": "a file of the user is there"}},
-                "merged into `$KUBECONFIG`, ahead of your own `~/.kube/config`",
+                "merged into `$KUBECONFIG` after your own `~/.kube/config`, "
+                "whose current context stays the default",
             ),
             (
                 {"env_skipped": {"KUBECONFIG": "set by another connector"}},
@@ -584,10 +585,10 @@ def test_the_users_own_kubeconfig_stays_in_kubeconfig(workspace):
         _rt(workspace.backend),
     )
     value = _shell(workspace, 'printf %s "$KUBECONFIG"')
-    merged, own = value.split(":")
-    assert merged.endswith("/kubeconfig") and own == str(
-        workspace.home / ".kube/config"
-    )
+    own, merged = value.split(":")
+    # The user's own first: its current context stays the default.
+    assert own == str(workspace.home / ".kube/config")
+    assert merged.endswith("/kubeconfig")
     assert (workspace.home / ".kube/config").read_text() == "the user's own\n"
 
 
@@ -605,11 +606,12 @@ def test_a_detach_between_attaches_removes_the_files_and_the_variable(workspace)
     materializer.materialize(deliveries_from_payload([files]), _rt(workspace.backend))
     assert not os.path.lexists(workspace.home / ".kube/config")
     assert not (workspace.home / ".kube").exists()
-    assert _shell(workspace, 'printf %s "${KUBECONFIG-unset}"') == ""
+    assert _shell(workspace, 'printf %s "${KUBECONFIG-unset}"') == "unset"
     assert (workspace.home / ".config/gcloud/sa.json").exists()
 
     materializer.materialize([], _rt(workspace.backend))
     assert not os.path.lexists(workspace.home / ".config/gcloud/sa.json")
     assert (
-        _shell(workspace, 'printf %s "${GOOGLE_APPLICATION_CREDENTIALS-unset}"') == ""
+        _shell(workspace, 'printf %s "${GOOGLE_APPLICATION_CREDENTIALS-unset}"')
+        == "unset"
     )

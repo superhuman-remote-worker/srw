@@ -145,7 +145,7 @@ class TestFiles:
         _sync(home, [_file("a", ".netrc", "theirs")], store="files-other")
         report = _sync(home, [_file("a", ".netrc", "mine")])
         assert (home / ".netrc").read_text() == "theirs"
-        assert ".netrc" in report["skipped"]
+        assert report["skipped"] == {".netrc": "another work item's file is there"}
 
     def test_a_stale_link_from_a_restored_snapshot_is_replaced(self, home):
         """A snapshot keeps the link but never the store it points into."""
@@ -267,7 +267,8 @@ class TestVariables:
             home / ".srw-credentials" / f"{IDENTITY}.sh"
         ).stat().st_mode & 0o777 == 0o600
 
-    def test_the_users_own_kubeconfig_follows_the_merged_one(self, home):
+    def test_the_users_own_kubeconfig_comes_first(self, home):
+        """A shared connector's current-context never replaces the user's."""
         (home / ".kube").mkdir()
         (home / ".kube/config").write_text("the user's own")
         _sync(
@@ -277,15 +278,15 @@ class TestVariables:
                 {
                     "name": "KUBECONFIG",
                     "files": ["kubeconfig"],
-                    "append": ".kube/config",
+                    "prepend": ".kube/config",
                 }
             ],
         )
         assert _sourced(home, "KUBECONFIG") == (
-            f"{_store(home)}/kubeconfig:{home}/.kube/config"
+            f"{home}/.kube/config:{_store(home)}/kubeconfig"
         )
 
-    def test_our_own_link_is_not_appended(self, home):
+    def test_our_own_link_is_not_listed_twice(self, home):
         _sync(
             home,
             [_file("kubeconfig", ".kube/config")],
@@ -293,7 +294,7 @@ class TestVariables:
                 {
                     "name": "KUBECONFIG",
                     "files": ["kubeconfig"],
-                    "append": ".kube/config",
+                    "prepend": ".kube/config",
                 }
             ],
         )
@@ -339,7 +340,7 @@ class TestVariables:
         assert report["env_retired"] == []
         assert _sourced(home, "TOOL_FILE") == "from an env connector"
 
-    def test_a_variable_no_longer_delivered_is_emptied_from_the_record(self, home):
+    def test_a_variable_no_longer_delivered_is_unset_from_the_record(self, home):
         """Between attaches too: the record, not a live diff, retires it."""
         _sync(
             home,
@@ -348,9 +349,9 @@ class TestVariables:
         )
         report = _sync(home, [])
         assert report["env_retired"] == ["KUBECONFIG"]
-        assert _sourced(home, "KUBECONFIG") == ""
+        assert _sourced(home, "KUBECONFIG") == "unset"
         assert not _store(home).exists()
-        # Attaching again claims the emptied variable.
+        # Attaching again claims the unset variable.
         report = _sync(
             home,
             [_file("kubeconfig", ".kube/config")],
@@ -358,6 +359,52 @@ class TestVariables:
         )
         assert report["env"] == ["KUBECONFIG"] and report["env_skipped"] == {}
         assert _sourced(home, "KUBECONFIG") == f"{_store(home)}/kubeconfig"
+
+    def test_a_retired_variable_is_unset_even_in_a_shell_that_had_it(self, home):
+        """Never ``NAME=``: an empty AWS_SHARED_CREDENTIALS_FILE would hide
+        ~/.aws/credentials for the rest of the work item."""
+        (home / ".aws").mkdir()
+        (home / ".aws/credentials").write_text("[default]\nkey = user\n")
+        _sync(
+            home,
+            [_file("creds", ".srw-files/creds")],
+            env=[{"name": "AWS_SHARED_CREDENTIALS_FILE", "files": ["creds"]}],
+        )
+        _sync(home, [])
+        env_sh = home / ".srw-credentials" / f"{IDENTITY}.sh"
+        assert "unset AWS_SHARED_CREDENTIALS_FILE\n" in env_sh.read_text()
+        assert "AWS_SHARED_CREDENTIALS_FILE=" not in env_sh.read_text()
+        # The long-lived shell exported it earlier; sourcing unsets it.
+        out = subprocess.check_output(
+            [
+                "bash",
+                "-c",
+                "export AWS_SHARED_CREDENTIALS_FILE=old; "
+                f". {shlex.quote(str(env_sh))}; "
+                'printf %s "${AWS_SHARED_CREDENTIALS_FILE-unset}"',
+            ],
+            text=True,
+        )
+        assert out == "unset"
+
+    def test_the_env_installer_writes_an_unset_for_a_retired_name(self, home):
+        """The env connectors' program regenerates the file: it keeps the unset."""
+        _sync(
+            home,
+            [_file("creds", ".srw-files/creds")],
+            env=[{"name": "AWS_SHARED_CREDENTIALS_FILE", "files": ["creds"]}],
+        )
+        _sync(home, [])
+        env_sh = home / ".srw-credentials" / f"{IDENTITY}.sh"
+        subprocess.run(
+            ["python3", "-I", "-c", INSTALL_CREDENTIAL_ENV, str(env_sh)],
+            input=json.dumps({"API_KEY": "v"}),
+            text=True,
+            check=True,
+        )
+        text = env_sh.read_text()
+        assert "unset AWS_SHARED_CREDENTIALS_FILE\n" in text
+        assert "export API_KEY=v\n" in text
 
 
 class TestRetirement:
@@ -401,8 +448,12 @@ class TestRetirement:
         with patch.object(backend, "_tmux_exec_checked") as execute:
             backend.shell_cleanup()
         command = execute.call_args.args[0]
-        assert f"{self._store_name()} retire" in command
+        retire = command.index(f"{self._store_name()} retire")
         assert WORKSPACE_PYTHON in command
+        # After every check that can refuse the retirement (exit 7x) and
+        # after the kill: an aborted retirement leaves the files alone.
+        assert retire > command.rindex("|| exit 7")
+        assert retire > command.index("tmux kill-session")
 
     def test_the_stateless_terminal_shell_retirement_removes_them(self):
         parent = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
@@ -417,7 +468,12 @@ class TestRetirement:
             backend.shell_cleanup()
         command = execute.call_args.args[0]
         # The child's own store: a parent's files are not the child's.
-        assert f"{self._store_name()} retire" in command
+        retire = command.index(f"{self._store_name()} retire")
+        # After the ownership, token and generation checks (exit 73-80), the
+        # kill and the process-zero proof.
+        assert retire > command.rindex("|| exit 7")
+        assert retire > command.rindex("exit 8")
+        assert retire > command.index("tmux kill-session")
 
     @pytest.mark.parametrize("status", [0, 1, 77])
     def test_the_retirement_never_changes_the_scripts_status(self, home, status):

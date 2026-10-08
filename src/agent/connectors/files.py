@@ -24,8 +24,9 @@ with the work item (``RemoteBackend.shell_cleanup``).
 An entry's ``transform`` and ``merge_group`` carry what used to be a
 kubeconfig type check: kubeconfig names are prefixed with the connector's
 slug, and every kubeconfig is merged into one config that ``KUBECONFIG``
-names (ahead of the user's own ``~/.kube/config``, if there is one) and
-``~/.kube/config`` links to otherwise. An entry's ``env_var`` names the file
+names (after the user's own ``~/.kube/config``, if there is one, so the
+user's current context stays the default) and ``~/.kube/config`` links to
+otherwise. An entry's ``env_var`` names the file
 in the shell's environment, unless another connector already set it.
 """
 
@@ -172,9 +173,9 @@ class CredentialFilePlan:
 
     ``files`` is the backend's list (``name``, ``content``, ``mode``,
     ``link``); ``env`` its variables (``name``, ``files``: the store names
-    the variable lists, ``append``: a home path listed after them if it holds
-    a file of the user's). A ``KUBECONFIG`` whose kubeconfigs could not merge
-    lists every kubeconfig.
+    the variable lists, ``prepend``: a home path listed before them if it
+    holds a file of the user's). A ``KUBECONFIG`` whose kubeconfigs could not
+    merge lists every kubeconfig.
     """
 
     files: list[dict[str, Any]] = field(default_factory=list)
@@ -278,9 +279,10 @@ def plan_credential_files(
             )
             files = [MERGED_KUBECONFIG]
         # The user's own ~/.kube/config, if the merged one could not take its
-        # place, stays visible after the connectors' contexts.
+        # place, comes first: its current-context stays the default and a
+        # shared connector's never replaces it.
         plan.env.append(
-            {"name": KUBECONFIG_VAR, "files": files, "append": MERGED_KUBECONFIG_LINK}
+            {"name": KUBECONFIG_VAR, "files": files, "prepend": MERGED_KUBECONFIG_LINK}
         )
     return plan
 
@@ -403,7 +405,10 @@ def _kubeconfig_line(
             else "merged, but `~/.kube/config` and `$KUBECONFIG` are taken"
         )
     elif MERGED_KUBECONFIG_LINK in skipped:
-        where = "merged into `$KUBECONFIG`, ahead of your own `~/.kube/config`"
+        where = (
+            "merged into `$KUBECONFIG` after your own `~/.kube/config`, whose "
+            "current context stays the default"
+        )
     else:
         where = "merged into `~/.kube/config` (`$KUBECONFIG`)"
     slug = _ds_slug_hyphen(name)
