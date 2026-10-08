@@ -349,6 +349,11 @@ class _RouteDB:
                 database.execute_count += 1
                 return "UPDATE 1"
 
+            async def fetch(self, _sql: str, *_args):
+                # The terminal write's credential-lease revocation (connector
+                # drivers C2): this Job holds no lease.
+                return []
+
         yield _Connection()
 
     async def update_job_status(self, _job_id: str, **updates) -> bool:
