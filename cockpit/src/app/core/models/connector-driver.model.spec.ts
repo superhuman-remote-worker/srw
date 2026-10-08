@@ -1,0 +1,59 @@
+import {describe, expect, it} from 'vitest';
+import {ConnectorDriver, ConnectorDriverMatrix, driverForType, offeredAccess} from './connector-driver.model';
+// The API's own response for the built-in drivers
+// (tests/test_connector_capability_matrix.py pins it).
+import fixture from './fixtures/connector-drivers.json';
+
+const matrix = fixture as unknown as ConnectorDriverMatrix;
+const byName = (name: string): ConnectorDriver =>
+  matrix.drivers.find((driver) => driver.name === name)!;
+
+describe('offeredAccess', () => {
+  it('offers both choices for a read/read-write driver, each with its level', () => {
+    const access = offeredAccess(byName('srw.postgresql/v1'))!;
+    expect(access.readOnly?.id).toBe('ReadOnly');
+    expect(access.readWrite?.id).toBe('ReadWrite');
+    expect(access.readOnly?.enforced_by).toContain('READ ONLY transaction');
+  });
+
+  it('offers only read-only for a driver forced read-only', () => {
+    expect(offeredAccess(byName('srw.kb/v1'))).toEqual({
+      readOnly: byName('srw.kb/v1').access_levels[0],
+      readWrite: null,
+    });
+  });
+
+  it('offers no read-only switch for a driver with one level', () => {
+    const access = offeredAccess(byName('srw.mcp/v1'))!;
+    expect(access.readOnly).toBeNull();
+    expect(access.readWrite?.tools).toBe('*');
+  });
+
+  it('floors read-only at the lowest of several levels', () => {
+    const access = offeredAccess(byName('srw.email/v1'))!;
+    expect(access.readOnly?.id).toBe('read');
+    expect(access.readWrite?.id).toBe('send');
+  });
+
+  it('offers nothing for delivery that cannot enforce a level', () => {
+    expect(offeredAccess(byName('srw.env/v1'))).toEqual({readOnly: null, readWrite: null});
+  });
+
+  it('is unknown without a driver', () => {
+    expect(offeredAccess(null)).toBeNull();
+  });
+
+  it('marks the declared-only read-only levels advisory', () => {
+    for (const name of ['srw.generic/v1', 'srw.credentials/v1', 'srw.ssh-key/v1', 'srw.repository/v1']) {
+      expect(offeredAccess(byName(name))!.readOnly!.advisory).toBe(true);
+    }
+  });
+});
+
+describe('driverForType', () => {
+  it('finds a built-in driver by its stored type', () => {
+    expect(driverForType(matrix.drivers, 'ssh_key')?.name).toBe('srw.ssh-key/v1');
+    expect(driverForType(matrix.drivers, 'nope')).toBeNull();
+    expect(driverForType(null, 'kb')).toBeNull();
+  });
+});

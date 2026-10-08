@@ -119,6 +119,17 @@ describe('app.routes — settings sections', () => {
     expect(routes.find((route) => route.path === path)).toBeDefined();
   });
 
+  it('loads the connector driver matrix on demand for any signed-in user', async () => {
+    const route = routes.find((r) => r.path === 'settings/connector-drivers');
+    expect(route?.canActivate).toEqual([authGuard]);
+    expect(typeof route?.loadComponent).toBe('function');
+    const component = await route!.loadComponent!();
+    expect(component).toBe(
+      (await import('./views/connector-drivers/connector-drivers-page.component'))
+        .ConnectorDriversPageComponent,
+    );
+  });
+
   it('loads API key settings on demand behind the existing auth guard', async () => {
     const route = routes.find((r) => r.path === 'settings/api-keys');
     expect(route?.canActivate?.includes(authGuard) ?? false).toBe(true);

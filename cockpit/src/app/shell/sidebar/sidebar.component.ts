@@ -703,6 +703,7 @@ export class SidebarComponent {
           {path: '/settings/defaults', labelKey: 'settings.nav.defaults'},
           {path: '/settings/provider-keys', labelKey: 'settings.nav.providerKeys'},
           {path: '/settings/notifications', labelKey: 'settings.nav.notifications'},
+          {path: '/settings/connector-drivers', labelKey: 'settings.nav.connectorDrivers'},
         ],
       },
       {labelKey: 'settings.nav.groupAccess', items: access},

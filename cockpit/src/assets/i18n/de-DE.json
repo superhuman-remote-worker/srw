@@ -1210,6 +1210,7 @@
       "defaults": "Standardwerte",
       "providerKeys": "Anbieter-Schlüssel",
       "notifications": "Benachrichtigungen",
+      "connectorDrivers": "Konnektortreiber",
       "apiKeys": "API-Schlüssel",
       "mcp": "MCP-Tokens",
       "sshKeys": "SSH-Schlüssel",
@@ -2663,6 +2664,42 @@
     }
   },
   "datasources": {
+    "driversLink": "Treiber-Fähigkeiten",
+    "driversLinkHint": "Was jeder Konnektortreiber anbietet und was es durchsetzt",
+    "generic": {
+      "previewToggle": "Diesen Konnektor im generischen Formular anzeigen",
+      "previewHint": "Nur in Entwicklungs-Builds: zeigt die Spezifikation des Treibers statt seines eigenen Formulars.",
+      "connectionUrl": "Verbindungs-URL",
+      "config": "Konfiguration",
+      "keepStored": "Gespeichert — leer lassen, um ihn zu behalten",
+      "loadFile": "Aus Datei laden",
+      "add": "Hinzufügen",
+      "remove": "Entfernen",
+      "key": "Schlüssel",
+      "unset": "—",
+      "variant": "Variante",
+      "jsonHint": "JSON",
+      "slotLevels": "Benötigt für: {{levels}}",
+      "slotKind": {
+        "secret_string": "Geheimnis",
+        "file": "Datei",
+        "ssh_private_key": "Privater SSH-Schlüssel",
+        "oauth2": "OAuth 2",
+        "kubeconfig": "Kubeconfig"
+      },
+      "update": {
+        "keep_if_blank": "Leer lassen, um den gespeicherten Wert zu behalten.",
+        "merge": "Neue Einträge werden zu den gespeicherten hinzugefügt; leer lassen, um sie zu behalten.",
+        "replace": "Jeder eingegebene Wert ersetzt die gespeicherten Zugangsdaten; alles leer lassen, um sie zu behalten."
+      },
+      "problem": {
+        "required": "Erforderlich",
+        "pattern": "Entspricht nicht dem erwarteten Format",
+        "not_a_number": "Keine Zahl",
+        "invalid_json": "Kein gültiges JSON",
+        "too_few": "Mindestens einen Eintrag hinzufügen"
+      }
+    },
     "title": "Konnektoren",
     "new": "Neuer Konnektor",
     "refresh": "Aktualisieren",
@@ -2792,6 +2829,8 @@
       "visibilityPublic": "Öffentlich — für alle Benutzer sichtbar",
       "accessReadOnly": "Nur Lesen",
       "accessReadWrite": "Lesen & Schreiben",
+      "accessEnforcedBy": "Durchgesetzt durch:",
+      "accessAdvisory": "Nur ein Hinweis:",
       "visibilityCredentialHint": "Nur-Lesen ist deklariert, nicht erzwungen — verwenden Sie Nur-Lese-Zugangsdaten (Deploy-Token / eingeschränktes DB-Konto).",
       "visibilityKbHint": "Wissensdatenbank-Konnektoren sind immer schreibgeschützt; Zugangsdaten erreichen die Agenten nie.",
       "availabilityTitle": "Verfügbarkeit",
@@ -2973,6 +3012,65 @@
       "reindexed": "Neuindizierung der OKF Knowledge Base „{{name}}“ abgeschlossen ({{status}})",
       "reindexFailed": "Neuindizierung der OKF Knowledge Base fehlgeschlagen",
       "fileTooLarge": "Datei überschreitet 64 KB — Anmeldedaten-Dateien sind auf 64 KB begrenzt."
+    }
+  },
+  "connectorDrivers": {
+    "title": "Konnektortreiber",
+    "desc": "Jeder installierte Konnektortreiber, aus seiner eigenen Spezifikation: welche Zugriffsstufen er anbietet und was jede durchsetzt, wo er läuft, welche Zugangsdaten er hält und welche Netzwerkziele er deklariert.",
+    "toConnectors": "Zu den Konnektoren",
+    "search": "Treiber filtern",
+    "count": "{{count}} installiert",
+    "loading": "Treiber werden geladen…",
+    "loadFailed": "Die Treiberliste konnte nicht geladen werden.",
+    "retry": "Erneut versuchen",
+    "noMatch": "Kein Treiber passt zum Filter.",
+    "holdsCredentials": "Hält Zugangsdaten zum Zielsystem",
+    "alwaysReadOnly": "Immer nur Lesen",
+    "authorNote": "Dieser Treiber steht nicht auf der Vertrauensliste: Alles hier ist vom Autor des Treibers deklariert und nicht von SRW geprüft.",
+    "declaredByAuthor": "Vom Autor des Treibers deklariert",
+    "accessLevels": "Zugriffsstufen",
+    "noAccessLevels": "Keine Zugriffsstufen: Diese Zustellung kann keine durchsetzen.",
+    "advisory": "Hinweis",
+    "enforced": "Durchgesetzt",
+    "defaultLevel": "Standard",
+    "enforcedBy": "Durchgesetzt durch",
+    "toolsDiscovered": "Jedes Tool, das der Server anbietet",
+    "toolsNone": "Keine eingebauten Tools",
+    "plane": "Läuft",
+    "planes": {
+      "harness": "Im SRW-Prozess",
+      "bind_time": "Beim Binden",
+      "service": "Als Dienst",
+      "in_pod": "Im Workspace-Pod"
+    },
+    "delivery": "Zustellung",
+    "backends": "Workspace-Backends",
+    "trustLabel": "Vertrauen",
+    "trust": {
+      "builtin": "Eingebaut, vertrauenswürdig",
+      "trusted": "Vertrauenswürdiges Image",
+      "custom": "Eigenes, nicht geprüft"
+    },
+    "shipsWithSrw": "Wird mit SRW ausgeliefert",
+    "credentials": "Zugangsdaten-Slots",
+    "noSlots": "Keine",
+    "slotRequired": "erforderlich",
+    "slotOptional": "optional",
+    "slotDelivery": {
+      "env": "als Umgebungsvariablen zugestellt",
+      "file": "als Datei zugestellt",
+      "ssh_agent": "in einen ssh-agent geladen",
+      "held": "von SRW gehalten"
+    },
+    "egress": "Ausgehender Verkehr",
+    "egressDeclared": "Deklariert:",
+    "egressEnforced": "Durchgesetzt:",
+    "egressInstallation": "Installation:",
+    "egressNone": "Nichts deklariert",
+    "needsDns": "Benötigt DNS: {{reason}}",
+    "egressReason": {
+      "runs_in_srw_process": "Nicht anwendbar: läuft im SRW-Prozess",
+      "driver_hosting_not_available": "Nicht durchgesetzt: SRW betreibt noch keine Treiber-Pods"
     }
   },
   "contacts": {

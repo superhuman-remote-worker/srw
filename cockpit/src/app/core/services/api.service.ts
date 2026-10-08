@@ -143,6 +143,7 @@ import {
   ManifestApplyResult, WorkspaceBinding, WorkspaceTemplateDocument, WorkspaceTemplateItem,
   WorkspaceTemplateItems, WorkspaceTemplateSpec,
 } from '../models/workspace-template.model';
+import {ConnectorDriverMatrix} from '../models/connector-driver.model';
 import {environment} from '../environment';
 
 /**
@@ -1021,6 +1022,12 @@ export class ApiService {
     }
     return this.http
       .get<EligibleDatasource[]>(`${this.baseUrl}/datasources/eligible`, { params });
+  }
+
+  /** The capability matrix of every installed connector driver. Errors reach
+   * the caller, which keeps its pre-matrix behaviour. */
+  getConnectorDrivers(): Observable<ConnectorDriverMatrix> {
+    return this.http.get<ConnectorDriverMatrix>(`${this.baseUrl}/datasources/drivers`);
   }
 
   /** Projects the caller may use in a connector's availability policy. Current

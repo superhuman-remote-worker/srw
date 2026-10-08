@@ -184,6 +184,15 @@ describe('SidebarComponent settings rail', () => {
     ]);
   });
 
+  it('lists the connector driver matrix for every user, under Settings', () => {
+    const {component} = create({url: '/settings/general', isAdmin: false});
+    const settings = component.settingsGroups().find((g) => g.labelKey === 'settings.nav.groupSettings');
+    expect(settings?.items.at(-1)).toEqual({
+      path: '/settings/connector-drivers',
+      labelKey: 'settings.nav.connectorDrivers',
+    });
+  });
+
   it('shows a non-admin no Administration entry', () => {
     const {component} = create({url: '/settings/general', isAdmin: false});
     expect(paths(component).some((p) => p.startsWith('/admin'))).toBe(false);

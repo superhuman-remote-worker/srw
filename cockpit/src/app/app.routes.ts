@@ -160,6 +160,16 @@ export const routes: Routes = [
       ),
     canActivate: [authGuard],
   },
+  // The connector driver capability matrix (connector_drivers.md, D2): read
+  // by any signed-in user, linked from the Connectors page too.
+  {
+    path: 'settings/connector-drivers',
+    loadComponent: () =>
+      import('./views/connector-drivers/connector-drivers-page.component').then(
+        (m) => m.ConnectorDriversPageComponent,
+      ),
+    canActivate: [authGuard],
+  },
   // SSH key management also loads on demand; its key-generation instructions
   // are only needed when this page is opened.
   {
