@@ -887,7 +887,9 @@ _FRONT_HIDES_WRITE_TOOLS = (
 
 #: The read tools of the official Gitea MCP server (gitea-mcp 1.8). Exact
 #: names, never patterns: a tool the server adds is a write tool until it is
-#: classed here.
+#: classed here. ``attachment_read`` and ``actions_run_read`` read Gitea but
+#: write files in the shared pod (their download methods take a
+#: caller-chosen ``output_path``), so they are write tools.
 GITEA_MCP_READ_TOOLS: tuple[str, ...] = (
     "get_gitea_mcp_server_version",
     "get_me",
@@ -904,12 +906,10 @@ GITEA_MCP_READ_TOOLS: tuple[str, ...] = (
     "package_read",
     "project_read",
     "list_issues",
-    "attachment_read",
     "issue_read",
     "list_pull_requests",
     "pull_request_read",
     "actions_config_read",
-    "actions_run_read",
     "list_my_repos",
     "list_org_repos",
     "get_repository_tree",

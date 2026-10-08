@@ -11,15 +11,26 @@
 //   - authenticates the caller's lease token (Authorization: Bearer scl_...)
 //     with the lease exchange's introspection route, with the pod's own sdi_
 //     identity: the lease must be live and for this pod's connector, else 401;
-//   - refuses a JSON-RPC batch, and a tools/call of a tool the lease's access
-//     level does not allow (the spec's tool classes; a tool no class names is
-//     a write tool); hides those tools from tools/list;
-//   - caps the calls one binding has in flight (429);
+//   - caps the calls and streams one binding has open (429), before it
+//     reads a body, which must arrive within 30 s;
+//   - parses the message strictly (exact keys, no duplicate, no unknown key,
+//     valid UTF-8, no batch) and forwards a body re-encoded from what it
+//     checked, never the caller's bytes, so a server that reads JSON another
+//     way decides on the same message;
+//   - forwards only the methods it knows (initialize, ping, tools/list,
+//     tools/call and their notifications), and a tools/call only of a tool
+//     the lease's access level allows (the spec's tool classes; a tool no
+//     class names is a write tool);
+//   - hides the tools a lease may not call from every answer carrying a tool
+//     list, whatever its id, on JSON answers and streams alike;
 //   - exchanges the lease for the connector's upstream credential and hands
 //     it to the server in the header the spec names; the lease token never
-//     reaches the server, and the credential never reaches the caller: exact
-//     occurrences are scrubbed from every response;
-//   - keeps a session to the lease that opened it;
+//     reaches the server, and the credential never reaches the caller: it is
+//     scrubbed from every answer, plain, escaped, URL- or base64-encoded;
+//   - keeps a session to the lease that opened it; an unknown session is
+//     nobody's (404, the client initializes again);
+//   - buffers each answer (4 MiB at most, 96 MiB in all) and ends a stream
+//     when its lease ends or after 15 minutes;
 //   - logs each call's tool, class, status and duration, never an argument,
 //     a token or a credential.
 //
@@ -71,7 +82,10 @@ func dispatch(args []string) int {
 			Addr:              ":" + cfg.port,
 			Handler:           handler,
 			ReadHeaderTimeout: 10 * time.Second,
-			IdleTimeout:       2 * time.Minute,
+			// The whole request, its body included (a stream's answer is
+			// no read): a slow body never holds a call slot for long.
+			ReadTimeout: bodyReadDeadline + 5*time.Second,
+			IdleTimeout: 2 * time.Minute,
 		}
 		logf("serving %s for connector %s on :%s in front of %s", cfg.driver, cfg.connectorID, cfg.port, cfg.upstream)
 		if err := server.ListenAndServe(); err != nil {

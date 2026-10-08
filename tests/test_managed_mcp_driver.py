@@ -364,6 +364,9 @@ def test_the_server_runs_as_itself_with_nothing_of_srws():
     assert server["volumeMounts"] == [{"name": "tmp", "mountPath": "/tmp"}]
     assert "ports" not in server
     assert server["securityContext"]["capabilities"] == {"drop": ["ALL"]}
+    # It writes nowhere but its /tmp emptyDir: no file a tool writes stays
+    # in the shared pod's image.
+    assert server["securityContext"]["readOnlyRootFilesystem"] is True
     assert server["securityContext"]["allowPrivilegeEscalation"] is False
     assert TOKEN not in json.dumps(plan.pod) and IDENTITY not in json.dumps(plan.pod)
     assert {v["name"] for v in spec["volumes"]} == {"delivery", "tmp"}
@@ -388,6 +391,9 @@ def test_the_front_holds_the_identity_serves_the_port_and_probes_readiness():
     assert front["securityContext"]["readOnlyRootFilesystem"] is True
     env = {item["name"]: item["value"] for item in front["env"]}
     assert env["SRW_EXCHANGE_URL"] == "http://srw-orchestrator.srw.svc:8088"
+    # The front's buffers fit its limit: its heap is held below it.
+    assert env["GOMEMLIMIT"] == "200MiB"
+    assert front["resources"]["limits"]["memory"] == "256Mi"
 
 
 def test_the_pods_secret_holds_no_upstream_credential_and_the_front_block():

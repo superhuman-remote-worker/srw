@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"regexp"
@@ -28,6 +29,20 @@ var (
 	patternShape  = regexp.MustCompile(`\A[A-Za-z0-9_.*-]{1,128}\z`)
 	headerShape   = regexp.MustCompile(`\A[A-Za-z0-9-]{1,64}\z`)
 )
+
+// reservedHeaders are the headers the front forwards or the transport
+// owns: the credential may never be written over one of them.
+var reservedHeaders = func() map[string]bool {
+	reserved := map[string]bool{}
+	for _, name := range append([]string{
+		"Connection", "Content-Length", "Cookie", "Host", "Keep-Alive",
+		"Origin", "Proxy-Connection", "Te", "Trailer", "Transfer-Encoding",
+		"Upgrade",
+	}, forwardRequestHeaders...) {
+		reserved[http.CanonicalHeaderKey(name)] = true
+	}
+	return reserved
+}()
 
 // credentialRule is how the server receives the upstream credential.
 type credentialRule struct {
@@ -163,8 +178,11 @@ func parseConfig(request requestFile, identity string) (*config, error) {
 			access[level][class] = true
 		}
 	}
-	if block.Credential != nil && !headerShape.MatchString(block.Credential.Header) {
-		return nil, errors.New("the mcp credential header is no header name")
+	if block.Credential != nil {
+		header := http.CanonicalHeaderKey(block.Credential.Header)
+		if !headerShape.MatchString(block.Credential.Header) || reservedHeaders[header] {
+			return nil, errors.New("the mcp credential header is no header name the front may set")
+		}
 	}
 	inFlight := block.MaxInFlightPerBinding
 	if inFlight < 1 {

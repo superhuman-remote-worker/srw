@@ -87,6 +87,10 @@ type fakeServer struct {
 	stream    bool
 	status    int
 	toolNames []string
+	// The GET stream's events (data payloads), and whether it stays open
+	// until the caller goes.
+	getEvents []string
+	holdGet   bool
 }
 
 func (s *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -95,6 +99,7 @@ func (s *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.seen = append(s.seen, r.Clone(context.Background()))
 	s.bodies = append(s.bodies, string(body))
 	stream, status := s.stream, s.status
+	getEvents, holdGet := s.getEvents, s.holdGet
 	s.mu.Unlock()
 	if status != 0 {
 		w.WriteHeader(status)
@@ -106,7 +111,16 @@ func (s *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == http.MethodGet {
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprintf(w, "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"data\":%q}}\n\n", r.Header.Get("Authorization"))
+		if len(getEvents) == 0 {
+			fmt.Fprintf(w, "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"data\":%q}}\n\n", r.Header.Get("Authorization"))
+		}
+		for _, event := range getEvents {
+			fmt.Fprintf(w, "%s\n\n", event)
+		}
+		if holdGet {
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+		}
 		return
 	}
 	var message map[string]any
@@ -167,7 +181,7 @@ type harness struct {
 	server    *fakeServer
 	logs      *strings.Builder
 	logMu     *sync.Mutex
-	clock     *time.Time
+	clock     *testClock
 }
 
 func testConfig(t *testing.T, upstream string) *config {
@@ -197,7 +211,7 @@ func newHarness(t *testing.T) *harness {
 	t.Cleanup(upstream.Close)
 	cfg := testConfig(t, upstream.URL+"/mcp")
 	now := time.Now()
-	clock := &now
+	clock := &testClock{now: now}
 	logs := &strings.Builder{}
 	logMu := &sync.Mutex{}
 	logf := func(format string, a ...any) {
@@ -206,7 +220,7 @@ func newHarness(t *testing.T) *harness {
 		fmt.Fprintf(logs, format+"\n", a...)
 	}
 	authority := newFakeAuthority()
-	f := newFront(cfg, authority, newUpstreamClient(), logf, func() time.Time { return *clock })
+	f := newFront(cfg, authority, newUpstreamClient(), logf, clock.Now)
 	return &harness{front: f, authority: authority, server: server, logs: logs, logMu: logMu, clock: clock}
 }
 
@@ -309,18 +323,18 @@ func TestARefusalIsRememberedBrieflyAndADecisionForTheRevocationLag(t *testing.T
 	if h.authority.introspects != 1 {
 		t.Fatalf("introspected %d times", h.authority.introspects)
 	}
-	*h.clock = h.clock.Add(6 * time.Second)
+	h.advance(6 * time.Second)
 	h.do(t, http.MethodPost, tokenDead, rpc(1, "initialize", nil), nil)
 	if h.authority.introspects != 2 {
 		t.Fatal("a refusal was remembered past its window")
 	}
 	h.do(t, http.MethodPost, tokenA, rpc(1, "initialize", nil), nil)
-	*h.clock = h.clock.Add(29 * time.Second)
+	h.advance(29 * time.Second)
 	h.do(t, http.MethodPost, tokenA, rpc(1, "tools/list", nil), nil)
 	if h.authority.introspects != 3 {
 		t.Fatal("a live lease was introspected again within the revocation lag")
 	}
-	*h.clock = h.clock.Add(2 * time.Second)
+	h.advance(2 * time.Second)
 	h.do(t, http.MethodPost, tokenA, rpc(1, "tools/list", nil), nil)
 	if h.authority.introspects != 4 {
 		t.Fatal("a live lease was reused past the revocation lag")
@@ -396,7 +410,10 @@ func TestReadOnlyHidesWriteToolsAndRefusesThem(t *testing.T) {
 			t.Fatalf("stream=%v: ReadWrite sees %v", stream, readWrite)
 		}
 		before := h.server.count()
-		for _, name := range []string{"notes_write", "delete_everything", ""} {
+		if code := h.do(t, http.MethodPost, tokenRO, call(""), nil).Code; code != http.StatusBadRequest {
+			t.Fatalf("a call without a tool name: %d", code)
+		}
+		for _, name := range []string{"notes_write", "delete_everything"} {
 			response := h.do(t, http.MethodPost, tokenRO, call(name), nil)
 			var answer struct {
 				ID    int `json:"id"`
@@ -508,8 +525,11 @@ func TestASessionBelongsToTheLeaseThatOpenedIt(t *testing.T) {
 		t.Fatal("the owner could not use its session")
 	}
 	h.do(t, http.MethodDelete, tokenA, "", map[string]string{"Mcp-Session-Id": session})
-	if !h.front.sessions.mayUse(session, "lease-b") {
-		t.Fatal("a closed session stayed bound")
+	if h.front.sessions.mayUse(session, "lease-a") {
+		t.Fatal("a closed session stayed open")
+	}
+	if code := h.do(t, http.MethodPost, tokenA, rpc(3, "tools/list", nil), map[string]string{"Mcp-Session-Id": session}).Code; code != http.StatusNotFound {
+		t.Fatalf("a closed session answered %d", code)
 	}
 }
 
@@ -586,7 +606,7 @@ func TestReadinessIsARealMCPProbeAndPinsTheToolList(t *testing.T) {
 	}
 	// The tool list changes under the image: warn keeps it ready...
 	h.server.toolNames = append(h.server.toolNames, "new_tool")
-	*h.clock = h.clock.Add(6 * time.Second)
+	h.advance(6 * time.Second)
 	if code, _ := ready(); code != http.StatusOK {
 		t.Fatal("warn made the pod unready")
 	}
@@ -595,13 +615,13 @@ func TestReadinessIsARealMCPProbeAndPinsTheToolList(t *testing.T) {
 	}
 	// ...block does not.
 	h.front.cfg.toolPinning = "block"
-	*h.clock = h.clock.Add(6 * time.Second)
+	h.advance(6 * time.Second)
 	if code, body := ready(); code != http.StatusServiceUnavailable || !strings.Contains(body, "tool list changed") {
 		t.Fatalf("block: %d %s", code, body)
 	}
 	// A server that does not answer is not ready.
 	h.server.status = http.StatusInternalServerError
-	*h.clock = h.clock.Add(6 * time.Second)
+	h.advance(6 * time.Second)
 	if code, _ := ready(); code != http.StatusServiceUnavailable {
 		t.Fatal("a failing server was ready")
 	}

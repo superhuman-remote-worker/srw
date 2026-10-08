@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -38,6 +39,15 @@ type prober struct {
 	reason string
 	tools  int
 	pinned string
+	// Set once the tool list changed under tool_pinning "block": every
+	// request is refused, on new and kept-alive connections alike, until
+	// the pod is replaced.
+	held atomic.Bool
+}
+
+// blocked: the tool list changed under "block".
+func (p *prober) blocked() bool {
+	return p.held.Load()
 }
 
 func (f *front) serveReady(w http.ResponseWriter, r *http.Request) {
@@ -70,6 +80,7 @@ func (p *prober) check(ctx context.Context) (bool, string, int) {
 	case hash != p.pinned:
 		p.logf("the server's tool list changed under this image (%s, pinned %s)", hash[:16], p.pinned[:16])
 		if p.cfg.toolPinning == "block" {
+			p.held.Store(true)
 			p.ready, p.reason, p.tools = false, "the tool list changed under this image", 0
 		} else {
 			p.ready, p.reason, p.tools = true, "", tools

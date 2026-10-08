@@ -19,10 +19,10 @@ The block, ``ServiceSpec.mcp``, is plain JSON, so it can ride an image label:
     allows it; otherwise only the front's port is reachable from outside the
     pod, by its NetworkPolicy). Never the front's port.
 ``protocol``
-    ``legacy`` (initialize-based 2025 sessions), ``modern`` (the stateless
-    2026-07-28 protocol, ``server/discover``) or ``both``: how the front
-    probes readiness. SRW's own client is session-based (``mcp<2``), so a
-    managed server must accept ``initialize``.
+    ``legacy`` (initialize-based 2025 sessions) or ``both`` (it also speaks
+    the stateless 2026-07-28 protocol). SRW's own client is session-based
+    (``mcp<2``) and the front probes with ``initialize``, so a server that
+    speaks only the 2026 protocol (``modern``) is refused for now.
 ``tools``
     Tool classes: ``{"read": [names or patterns]}``. A tool no class names is
     ``write``, so a tool the image adds later stays hidden from a read-only
@@ -36,11 +36,14 @@ The block, ``ServiceSpec.mcp``, is plain JSON, so it can ride an image label:
 ``credential``
     How the front hands the server the upstream credential on each request:
     ``{"header": "Authorization", "scheme": "Bearer"}`` (``scheme`` may be
-    empty), or ``null`` for a server that needs none.
+    empty), or ``null`` for a server that needs none. Never a header the
+    front forwards or the transport owns (``Mcp-Session-Id``, ``Host``...).
 ``env``, ``args``, ``command``
     The server container's environment, arguments and (optional) program,
     else the image's own. ``${config.<key>}`` in a value is the connector's
     config value. They are never secret: the credential travels per request.
+    Never ``${config.access}``: the front decides access per lease, so an
+    access change starts no new pod.
 ``max_in_flight_per_binding``
     Calls one binding may have open at once (the front answers 429 past it).
 ``tool_pinning``
@@ -62,7 +65,35 @@ FRONT_PATH = "/mcp"
 READ = "read"
 WRITE = "write"
 TOOL_CLASSES: tuple[str, ...] = (READ, WRITE)
-PROTOCOLS: tuple[str, ...] = ("legacy", "modern", "both")
+#: Protocols a managed server may declare (``modern`` alone is refused
+#: until SRW's client and the front's probe speak the 2026 protocol).
+PROTOCOLS: tuple[str, ...] = ("legacy", "both")
+#: Headers the front forwards or the transport owns: the credential may
+#: never be written over one (lowercase; drivers/mcp-front reservedHeaders).
+RESERVED_HEADERS: frozenset[str] = frozenset(
+    {
+        "accept",
+        "connection",
+        "content-length",
+        "content-type",
+        "cookie",
+        "host",
+        "keep-alive",
+        "last-event-id",
+        "mcp-method",
+        "mcp-name",
+        "mcp-protocol-version",
+        "mcp-session-id",
+        "origin",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+#: Config keys a server's arguments and environment may not name.
+_UNTEMPLATED = frozenset({"access"})
 TOOL_PINNING: tuple[str, ...] = ("warn", "block")
 #: A tool name or pattern: the characters MCP tool names use, plus ``*``.
 _PATTERN = re.compile(r"[A-Za-z0-9_.*-]{1,128}\Z")
@@ -238,6 +269,12 @@ def _template_problems(where: str, value: str) -> list[str]:
     stripped = _TEMPLATE.sub("", value)
     if "${" in stripped:
         return [f"{where} has a placeholder that is not ${{config.<key>}}"]
+    named = sorted(set(_TEMPLATE.findall(value)) & _UNTEMPLATED)
+    if named:
+        return [
+            f"{where} names config.{named[0]}: the front decides access per "
+            "lease, never the server's configuration"
+        ]
     return []
 
 
@@ -301,6 +338,11 @@ def mcp_problems(
             credential["header"]
         ):
             problems.append("mcp credential.header must be a header name")
+        elif credential["header"].lower() in RESERVED_HEADERS:
+            problems.append(
+                f"mcp credential.header {credential['header']!r} is a header the "
+                "front forwards or the transport owns"
+            )
         elif not isinstance(credential.get("scheme", ""), str) or not _SCHEME.fullmatch(
             credential.get("scheme", "")
         ):
@@ -353,6 +395,7 @@ def managed_mcp(spec: Any) -> ManagedMcp | None:
 __all__ = [
     "FRONT_PATH",
     "PROTOCOLS",
+    "RESERVED_HEADERS",
     "READ",
     "TOOL_CLASSES",
     "TOOL_PINNING",

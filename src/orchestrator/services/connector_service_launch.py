@@ -601,10 +601,13 @@ def build_service_launch(
     )
 
 
+# The front buffers each answer (at most 4 MiB, 96 MiB in all) to filter
+# and scrub it: its Go heap is held under GOMEMLIMIT, below the limit.
 _FRONT_RESOURCES = {
-    "requests": {"cpu": "10m", "memory": "16Mi", "ephemeral-storage": "16Mi"},
-    "limits": {"cpu": "200m", "memory": "64Mi", "ephemeral-storage": "32Mi"},
+    "requests": {"cpu": "10m", "memory": "32Mi", "ephemeral-storage": "16Mi"},
+    "limits": {"cpu": "200m", "memory": "256Mi", "ephemeral-storage": "32Mi"},
 }
+_FRONT_GOMEMLIMIT = "200MiB"
 
 
 def _literal(value: str) -> str:
@@ -633,9 +636,13 @@ def _mcp_server_container(
             for key, value in sorted(mcp.server_env(config).items())
         ],
         "resources": resources,
+        # The image writes nowhere but /tmp, a small emptyDir: a tool that
+        # writes files (a download to a caller-chosen path) cannot leave
+        # them in the shared pod's image for another binding.
         "securityContext": {
             "allowPrivilegeEscalation": False,
             "privileged": False,
+            "readOnlyRootFilesystem": True,
             "capabilities": {"drop": ["ALL"]},
         },
         "volumeMounts": [{"name": "tmp", "mountPath": "/tmp"}],
@@ -660,7 +667,7 @@ def _mcp_front_container(
         "ports": [
             {"name": SERVICE_PORT_NAME, "containerPort": port, "protocol": "TCP"}
         ],
-        "env": deepcopy(env),
+        "env": [*deepcopy(env), {"name": "GOMEMLIMIT", "value": _FRONT_GOMEMLIMIT}],
         "resources": deepcopy(_FRONT_RESOURCES),
         "readinessProbe": {
             "httpGet": {"path": "/readyz", "port": SERVICE_PORT_NAME},

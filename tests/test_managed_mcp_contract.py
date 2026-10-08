@@ -123,6 +123,14 @@ def test_the_front_reads_its_own_block():
         ({"port": True}, "port"),
         ({"path": "mcp"}, "path"),
         ({"protocol": "v3"}, "protocol"),
+        # SRW's client and the front's probe speak initialize only.
+        ({"protocol": "modern"}, "protocol"),
+        ({"credential": {"header": "Mcp-Session-Id"}}, "front forwards"),
+        ({"credential": {"header": "host"}}, "front forwards"),
+        ({"credential": {"header": "Transfer-Encoding"}}, "front forwards"),
+        # Access is the front's, per lease: never the server's configuration.
+        ({"env": {"MODE": "${config.access}"}}, "per lease"),
+        ({"args": ["--mode=${config.access}"]}, "per lease"),
         ({"tools": {"admin": []}}, "tools"),
         ({"tools": {"read": ["get_[a]"]}}, "tools.read"),
         ({"access": {"ReadOnly": ["read"]}}, "does not name the access levels"),
@@ -164,7 +172,11 @@ def test_gitea_classes_only_its_read_tools_as_read():
     for name in GITEA_MCP_READ_TOOLS:
         assert mcp.allowed(name, "ReadOnly"), name
     # gitea-mcp 1.8's write tools: none is visible to a read-only binding.
+    # attachment_read and actions_run_read read Gitea, but their download
+    # methods write files at a caller-chosen output_path in the shared pod.
     for name in (
+        "attachment_read",
+        "actions_run_read",
         "create_repo",
         "fork_repo",
         "create_or_update_file",
