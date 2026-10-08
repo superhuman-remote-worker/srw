@@ -426,6 +426,18 @@ docker_build(
     only=['drivers/shim/', 'docker/Dockerfile.driver-shim'],
 )
 
+# Development echo service driver (connector drivers D5): the image behind
+# srw.echo-service/v1, which only the k3d profile installs
+# (connectors.drivers.echo) and scripts/k3d-service-driver-gate.py drives.
+# Dev-only: built here, never by CI or for production. The chart receives it
+# as tag@digest, so a pod launch needs no registry lookup.
+docker_build(
+    'srw-driver-echo',
+    context='.',
+    dockerfile='docker/Dockerfile.driver-echo',
+    only=['drivers/echo/', 'docker/Dockerfile.driver-echo'],
+)
+
 _srw_images = [
     ('srw-orchestrator', 'image.orchestrator.repository', 'image.orchestrator.tag'),
     ('srw-cockpit', 'image.cockpit.repository', 'image.cockpit.tag'),
@@ -436,6 +448,7 @@ _srw_images = [
     ('srw-vm-controller', 'vmController.image.repository', 'vmController.image.tag'),
     ('srw-vm-preparer', 'vmController.preparation.image.repository', 'vmController.preparation.image.tag'),
     ('srw-driver-shim', 'connectors.drivers.shim.image.repository', 'connectors.drivers.shim.image.tag'),
+    ('srw-driver-echo', 'connectors.drivers.echo.image.repository', 'connectors.drivers.echo.image.tag'),
 ]
 
 # Tilt fills in TILT_IMAGE_<i> (the freshly built+pushed ref) per image_deps
@@ -451,7 +464,7 @@ for i in range(len(_srw_images)):
     _srw_helm_env['TILT_IMAGE_KEY_TAG_%s' % i] = _srw_images[i][2]
     # These chart images also accept a digest, which outranks the tag. Tilt
     # owns the local image selection, including a pin saved by an earlier gate.
-    if _srw_images[i][0] in ['srw-mcp', 'srw-vm-preparer', 'srw-driver-shim']:
+    if _srw_images[i][0] in ['srw-mcp', 'srw-vm-preparer', 'srw-driver-shim', 'srw-driver-echo']:
         _srw_helm_env['TILT_IMAGE_KEY_DIGEST_%s' % i] = _srw_images[i][2][:-4] + '.digest'
 
 _srw_exposure_mode = os.getenv('SRW_EXPOSURE_MODE') or 'multi-host'

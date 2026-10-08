@@ -1,0 +1,25 @@
+# =============================================================================
+# srw-driver-echo — a DEVELOPMENT service driver image (connector drivers D5)
+# =============================================================================
+# The image behind srw.echo-service/v1, which the k3d gate
+# (scripts/k3d-service-driver-gate.py) uses to prove service-plane hosting.
+# Built by Tilt only; never published.
+#
+# The io.srw.driver.spec label is the contract a moved tag is checked
+# against at bind. The gate builds an incompatible variant by overriding it:
+#   docker build -f docker/Dockerfile.driver-echo \
+#     --build-arg SRW_DRIVER_SPEC='{"name":"srw.echo-service/v1","protocol_version":"2.0"}' .
+# =============================================================================
+FROM golang:1.22-alpine AS build
+
+WORKDIR /src
+COPY drivers/echo/ ./
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" \
+        -o /out/srw-driver-echo .
+
+FROM scratch
+ARG SRW_DRIVER_SPEC='{"name":"srw.echo-service/v1","protocol_version":"1.0","config_schema":{"type":"object","additionalProperties":false,"required":["host","port"],"properties":{"host":{"type":"string","minLength":1,"maxLength":253},"port":{"type":"integer","minimum":1,"maximum":65535},"message":{"type":"string","maxLength":256}}},"credential_slots":[{"name":"secret"}]}'
+LABEL io.srw.driver.spec=$SRW_DRIVER_SPEC
+COPY --from=build /out/srw-driver-echo /srw-driver-echo
+USER 65532:65532
+ENTRYPOINT ["/srw-driver-echo"]

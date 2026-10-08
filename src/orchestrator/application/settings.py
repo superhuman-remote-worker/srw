@@ -218,6 +218,9 @@ class DeploymentSettings:
     #: SRW's static driver shim image (``connectors.drivers.shim.image``):
     #: the canary wait, the shim install and every driver's command.
     connector_driver_shim_image: str = ""
+    #: Development only: install ``srw.echo-service/v1`` running this image
+    #: reference (``connectors.drivers.echo``); empty installs nothing.
+    connector_echo_driver_image: str = ""
 
     def session_subagent_fanout(self, lane: str | None) -> bool:
         """Whether a session on ``lane`` may fan out right now."""
@@ -304,6 +307,9 @@ class DeploymentSettings:
             connector_service_ipv6=_enabled("CONNECTOR_SERVICE_IPV6"),
             connector_driver_shim_image=os.environ.get(
                 "CONNECTOR_DRIVER_SHIM_IMAGE", ""
+            ).strip(),
+            connector_echo_driver_image=os.environ.get(
+                "CONNECTOR_ECHO_DRIVER_IMAGE", ""
             ).strip(),
         )
 

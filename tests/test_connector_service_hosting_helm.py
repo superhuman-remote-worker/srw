@@ -271,6 +271,90 @@ def test_tilt_builds_the_shim_and_pins_it_by_digest():
     assert "'srw-mcp', 'srw-vm-preparer', 'srw-driver-shim'" in tiltfile
 
 
+ECHO = (
+    "connectors.drivers.echo.enabled=true",
+    "connectors.drivers.echo.image.repository=srw-registry:5000/srw-driver-echo",
+    "connectors.drivers.echo.image.tag=tilt-1",
+)
+
+
+def test_the_echo_driver_is_off_by_default_and_follows_a_tag_or_pins_a_digest():
+    assert "CONNECTOR_ECHO_DRIVER_IMAGE" not in orchestrator_env(render())
+    env = orchestrator_env(render(EXCHANGE, ON, *ECHO))
+    assert (
+        env["CONNECTOR_ECHO_DRIVER_IMAGE"] == "srw-registry:5000/srw-driver-echo:tilt-1"
+    )
+    digest = "sha256:" + "b" * 64
+    env = orchestrator_env(
+        render(EXCHANGE, ON, *ECHO, f"connectors.drivers.echo.image.digest={digest}")
+    )
+    assert env["CONNECTOR_ECHO_DRIVER_IMAGE"] == (
+        f"srw-registry:5000/srw-driver-echo:tilt-1@{digest}"
+    )
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        ECHO,  # a service driver without service hosting
+        (EXCHANGE, ON, "connectors.drivers.echo.enabled=true"),  # no image
+    ],
+)
+def test_the_echo_driver_refuses_an_incomplete_setup(settings):
+    with pytest.raises(subprocess.CalledProcessError):
+        render(*settings)
+
+
+def test_tilt_builds_the_echo_driver_for_the_dev_profile_only():
+    import ast
+
+    tiltfile = (ROOT / "Tiltfile").read_text()
+    build = next(
+        node
+        for node in ast.walk(ast.parse(tiltfile))
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "docker_build"
+        and node.args
+        and getattr(node.args[0], "value", None) == "srw-driver-echo"
+    )
+    keywords = {item.arg: item.value for item in build.keywords}
+    assert ast.literal_eval(keywords["dockerfile"]) == "docker/Dockerfile.driver-echo"
+    assert "drivers/echo/" in ast.literal_eval(keywords["only"])
+    assert (
+        "('srw-driver-echo', 'connectors.drivers.echo.image.repository', "
+        "'connectors.drivers.echo.image.tag')" in tiltfile
+    )
+    assert "'srw-driver-shim', 'srw-driver-echo']" in tiltfile
+    # Never published: no CI workflow builds it.
+    for workflow in (ROOT / ".github/workflows").glob("*.yml"):
+        assert "driver-echo" not in workflow.read_text()
+    example = yaml.safe_load(
+        (ROOT / "deployment/values-local.yaml.example").read_text()
+    )
+    assert example["connectors"]["drivers"]["echo"]["enabled"] is True
+    env = orchestrator_env(
+        render(values=(ROOT / "deployment/values-local.yaml.example",))
+    )
+    assert env["CONNECTOR_ECHO_DRIVER_IMAGE"].startswith(
+        "srw-registry:5000/srw-driver-echo:"
+    )
+
+
+def test_the_echo_image_declares_its_spec_label():
+    import json
+
+    from shared.connectors.builtin import ECHO_SERVICE_SPEC
+
+    dockerfile = (ROOT / "docker/Dockerfile.driver-echo").read_text()
+    raw = dockerfile.split("ARG SRW_DRIVER_SPEC='", 1)[1].split("'\n", 1)[0]
+    label = json.loads(raw)
+    assert "LABEL io.srw.driver.spec=$SRW_DRIVER_SPEC" in dockerfile
+    assert label["name"] == ECHO_SERVICE_SPEC.name
+    assert label["protocol_version"] == ECHO_SERVICE_SPEC.protocol_version
+    assert label["config_schema"] == ECHO_SERVICE_SPEC.config_schema
+    assert [slot["name"] for slot in label["credential_slots"]] == ["secret"]
+
+
 def test_the_k3d_profile_resolves_from_the_k3d_registry_over_http():
     example = ROOT / "deployment/values-local.yaml.example"
     registry = yaml.safe_load(example.read_text())["connectors"]["drivers"]["registry"]

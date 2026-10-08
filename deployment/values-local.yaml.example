@@ -310,6 +310,14 @@ connectors:
       insecureHosts: ["srw-registry:5000"]
       # A re-pushed tag is seen within seconds (the gate's moved-tag check).
       resolveCacheSeconds: 5
+    # The development echo service driver (srw.echo-service/v1). Tilt builds
+    # srw-driver-echo and overrides repository, tag and digest; these
+    # placeholders only keep a plain `helm install` rendering.
+    echo:
+      enabled: true
+      image:
+        repository: srw-registry:5000/srw-driver-echo
+        tag: dev
 
 databases:
   # Non-HA local default. All five PostgreSQL engines continue to inherit

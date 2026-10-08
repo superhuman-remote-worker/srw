@@ -1439,6 +1439,21 @@
         "drivers": {
           "type": "object",
           "properties": {
+            "echo": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "image": {
+                  "type": "object",
+                  "properties": {
+                    "repository": {"type": "string"},
+                    "tag": {"type": "string"},
+                    "digest": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"}
+                  }
+                }
+              }
+            },
             "shim": {
               "type": "object",
               "properties": {

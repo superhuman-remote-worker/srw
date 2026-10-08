@@ -1912,6 +1912,20 @@ spec:
             {{- end }}
             - name: CONNECTOR_DRIVER_SHIM_IMAGE
               value: {{ include "srw.imageRef" (dict "image" .Values.connectors.drivers.shim.image) | quote }}
+            {{- with .Values.connectors.drivers.echo }}
+            {{- if .enabled }}
+            {{- if not $.Values.connectors.servicePods.enabled }}
+            {{- fail "connectors.drivers.echo.enabled needs connectors.servicePods.enabled: the echo driver is a service-plane driver" }}
+            {{- end }}
+            {{- if not .image.repository }}
+            {{- fail "connectors.drivers.echo.enabled needs connectors.drivers.echo.image.repository" }}
+            {{- end }}
+            # Development only: the srw.echo-service/v1 driver's image
+            # reference; a digest pins it (tag@digest), a tag alone follows.
+            - name: CONNECTOR_ECHO_DRIVER_IMAGE
+              value: {{ printf "%s:%s%s" .image.repository (.image.tag | default "latest") (ternary (printf "@%s" .image.digest) "" (ne (.image.digest | default "") "")) | quote }}
+            {{- end }}
+            {{- end }}
             - name: KB_EXTERNAL_REINDEX_CONCURRENCY
               value: {{ .Values.orchestrator.kbExternalReindexConcurrency | quote }}
             - name: KB_REINDEX_SWEEP_SECONDS

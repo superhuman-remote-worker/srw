@@ -74,11 +74,15 @@ class ConnectorDriverRegistry:
         return tuple(self._by_type)
 
 
-def builtin_connector_drivers(*, lease_probe: bool = False) -> ConnectorDriverRegistry:
+def builtin_connector_drivers(
+    *, lease_probe: bool = False, echo_service_image: str | None = None
+) -> ConnectorDriverRegistry:
     """The drivers SRW ships, in catalogue order.
 
     ``lease_probe`` adds the development lease probe driver after them
-    (``orchestrator.connectorLeases.probeDriver``, slice C2).
+    (``orchestrator.connectorLeases.probeDriver``, slice C2);
+    ``echo_service_image`` adds the development echo service driver running
+    that image (``connectors.drivers.echo``, D5).
     """
     from orchestrator.services.connector_drivers import builtin
 
@@ -89,4 +93,10 @@ def builtin_connector_drivers(*, lease_probe: bool = False) -> ConnectorDriverRe
         )
 
         drivers += (LeaseProbeDriver(),)
+    if echo_service_image:
+        from orchestrator.services.connector_drivers.echo_service import (
+            EchoServiceDriver,
+        )
+
+        drivers += (EchoServiceDriver(echo_service_image),)
     return ConnectorDriverRegistry(drivers)

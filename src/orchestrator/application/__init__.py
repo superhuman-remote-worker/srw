@@ -195,7 +195,8 @@ def build_application_resources(
             config_dir=lambda: catalogue_config_dir()
         ),
         connector_drivers=builtin_connector_drivers(
-            lease_probe=settings.connector_lease_probe_enabled
+            lease_probe=settings.connector_lease_probe_enabled,
+            echo_service_image=settings.connector_echo_driver_image or None,
         ),
     )
     # Credential leases (connector drivers C2): the window new leases are
@@ -213,6 +214,12 @@ def build_application_resources(
         logger.warning(
             "The development lease probe driver (srw.lease-probe/v1) is "
             "installed; it is for test clusters only"
+        )
+    if settings.connector_echo_driver_image:
+        logger.warning(
+            "The development echo service driver (srw.echo-service/v1) is "
+            "installed with image %s; it is for test clusters only",
+            settings.connector_echo_driver_image,
         )
     # Every infrastructure-metering gate defaults off until startup decides
     # which paths this process runs (``lifecycle.open_stores``).

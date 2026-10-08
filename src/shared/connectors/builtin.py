@@ -25,7 +25,14 @@ from __future__ import annotations
 
 from typing import Any, Callable, Mapping
 
-from .contract import AccessLevel, CredentialKind, CredentialSlot, DriverSpec
+from .contract import (
+    AccessLevel,
+    CredentialKind,
+    CredentialSlot,
+    DriverSpec,
+    EgressRule,
+    ServiceSpec,
+)
 
 ALL_BACKENDS = frozenset({"sandbox", "vm", "virtual", "none"})
 SHELL_BACKENDS = frozenset({"sandbox", "vm"})
@@ -790,6 +797,61 @@ LEASE_PROBE_SPEC = DriverSpec(
     credential_delivery="lease",
 )
 
+#: A development service-plane driver (connector drivers D5). Its pod runs
+#: SRW's srw-driver-echo image (built by Tilt only): an HTTP service that
+#: answers with its request file's non-secret fields, calls the lease exchange
+#: with its own driver identity when asked, and probes TCP addresses from
+#: inside its pod, so a k3d gate can prove the service plane's hosting,
+#: reachability, pinned egress and identity. Its fake upstream secret stays
+#: behind a lease, as the probe's does. The orchestrator installs it only when
+#: ``connectors.drivers.echo.enabled`` names its image; no catalogue lists it.
+ECHO_SERVICE_SPEC = DriverSpec(
+    name="srw.echo-service/v1",
+    legacy_type="echo_service",
+    title="Echo service (development)",
+    plane="service",
+    delivery_forms=("lease_token",),
+    config_schema={
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["host", "port"],
+        "properties": {
+            "host": {"type": "string", "minLength": 1, "maxLength": 253},
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "message": {"type": "string", "maxLength": 256},
+        },
+    },
+    credential_slots=(
+        CredentialSlot(
+            "secret",
+            "secret_string",
+            {"type": "object", "properties": {"secret": _SECRET}},
+            required=True,
+        ),
+    ),
+    access_levels=(
+        AccessLevel("ReadOnly", 0, "The lease exchange refuses a write operation."),
+        AccessLevel("ReadWrite", 1, "The lease exchange allows reads and writes."),
+    ),
+    default_access="ReadWrite",
+    supported_backends=SHELL_BACKENDS,
+    workspace_requirements=(
+        "A shell workspace: a lease token is written under "
+        "~/.srw-credentials/leases/; the echo pod is reached on its srw-driver "
+        "port from the agent pod and from this binding's workspace."
+    ),
+    egress=(EgressRule("${config.host}", ("${config.port}",)),),
+    publishable=False,
+    holds_upstream_credentials=True,
+    credential_delivery="lease",
+    service=ServiceSpec(
+        port=8080,
+        callers=("harness", "workspace"),
+        resources={"limits": {"cpu": "100m", "memory": "64Mi"}},
+        start_seconds=10,
+    ),
+)
+
 #: Datasource drivers in catalogue order.
 DATASOURCE_SPECS: tuple[DriverSpec, ...] = (
     GENERIC_SPEC,
@@ -820,7 +882,7 @@ BUILTIN_SPECS: tuple[DriverSpec, ...] = MANIFEST_SPECS + tuple(
 )
 #: Drivers an installation turns on for development only. Their stored types
 #: resolve (an agent must read what it is sent) but no catalogue lists them.
-DEVELOPMENT_SPECS: tuple[DriverSpec, ...] = (LEASE_PROBE_SPEC,)
+DEVELOPMENT_SPECS: tuple[DriverSpec, ...] = (LEASE_PROBE_SPEC, ECHO_SERVICE_SPEC)
 
 _BY_TYPE: dict[str, DriverSpec] = {
     spec.legacy_type: spec

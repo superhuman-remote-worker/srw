@@ -231,6 +231,18 @@ connectors:
       resolveCacheSeconds: 60
       # -- Deadline of one registry lookup at bind.
       resolveTimeoutSeconds: 10
+    # -- Development only: the srw.echo-service/v1 service driver, whose pod
+    # runs SRW's srw-driver-echo image (built by Tilt; never published). It
+    # keeps a fake secret behind a lease and answers with its request file,
+    # so scripts/k3d-service-driver-gate.py can prove service-plane hosting.
+    # A digest pins the reference (tag@digest); without one the tag follows.
+    # Needs servicePods.enabled. Never in production.
+    echo:
+      enabled: false
+      image:
+        repository: ""
+        tag: ""
+        digest: ""
 
 orchestrator:
   # -- 1 replica by default. NOT a statement about what HA needs: leader
