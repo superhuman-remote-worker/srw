@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -35,6 +36,10 @@ const (
 	probeIdle = 30 * time.Second
 	// How long a stopping process's group may take to be reaped.
 	reapWithin = 5 * time.Second
+	// The JSON-RPC error a call gets when its process stops before it
+	// answered: the SDKs' "connection closed", which SRW's client reads as
+	// a session that ended, not a tool that failed.
+	connectionClosed = -32000
 )
 
 // A binding id is the lease's id the front names (a UUID in SRW).
@@ -97,6 +102,8 @@ type session struct {
 	mu       sync.Mutex
 	lastUsed time.Time
 	active   int
+	// The front's calls the process has not answered yet.
+	pending map[jsonrpc.ID]bool
 
 	done     chan struct{}
 	stopOnce sync.Once
@@ -138,6 +145,44 @@ func (s *session) touch() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lastUsed = s.bridge.now()
+}
+
+// expect records a call of the front's the process must answer; answered
+// forgets it once the process did.
+func (s *session) expect(message jsonrpc.Message) {
+	if request, ok := message.(*jsonrpc.Request); ok && request.IsCall() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.pending[request.ID] = true
+	}
+}
+
+func (s *session) answered(message jsonrpc.Message) {
+	if response, ok := message.(*jsonrpc.Response); ok {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		delete(s.pending, response.ID)
+	}
+}
+
+// failPending answers each call the process will no longer answer with a
+// closed-connection error, so its caller learns at once that the session
+// ended (SRW's client reconnects within its budget) instead of waiting for
+// its call timeout.
+func (s *session) failPending(reason string) {
+	s.mu.Lock()
+	ids := make([]jsonrpc.ID, 0, len(s.pending))
+	for id := range s.pending {
+		ids = append(ids, id)
+	}
+	s.pending = map[jsonrpc.ID]bool{}
+	s.mu.Unlock()
+	for _, id := range ids {
+		s.server.Write(context.Background(), &jsonrpc.Response{
+			ID:    id,
+			Error: &jsonrpc.Error{Code: connectionClosed, Message: "the server's process stopped: " + reason},
+		})
+	}
 }
 
 func (s *session) idleFor(now time.Time) time.Duration {
@@ -362,6 +407,7 @@ func (b *bridge) start(binding, credential string) (*session, error) {
 		credential: credential != "",
 		started:    now,
 		lastUsed:   now,
+		pending:    map[jsonrpc.ID]bool{},
 		done:       make(chan struct{}),
 		stopped:    make(chan struct{}),
 	}
@@ -382,6 +428,7 @@ func (s *session) toProcess() {
 			s.stop("its session closed")
 			return
 		}
+		s.expect(message)
 		if err := s.child.Write(ctx, message); err != nil {
 			s.stop("its process stopped reading")
 			return
@@ -402,6 +449,7 @@ func (s *session) toFront() {
 			return
 		}
 		s.touch()
+		s.answered(message)
 		if err := s.server.Write(ctx, message); err != nil {
 			select {
 			case <-s.done:
@@ -412,11 +460,13 @@ func (s *session) toFront() {
 	}
 }
 
-// stop ends the session at once (its requests and streams end; its id is
-// unknown from now on) and its process within the grace: stdin closed,
-// then SIGTERM, then SIGKILL, and its process group killed after it.
+// stop ends the session at once (each call in flight is answered with a
+// closed-connection error, its requests and streams end, its id is unknown
+// from now on) and its process within the grace: stdin closed, then
+// SIGTERM, then SIGKILL, and its process group killed after it.
 func (s *session) stop(reason string) {
 	s.stopOnce.Do(func() {
+		s.failPending(reason)
 		close(s.done)
 		s.server.Close()
 		b := s.bridge

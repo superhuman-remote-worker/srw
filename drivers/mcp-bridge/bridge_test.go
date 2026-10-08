@@ -400,6 +400,29 @@ func TestAProcessEndsWithItsBinding(t *testing.T) {
 	}
 }
 
+func TestACallInFlightWhenItsBindingEndsIsAnsweredAtOnce(t *testing.T) {
+	h := newHarness(t, nil)
+	session := h.open("lease-a", "credential-a")
+	answers := make(chan string, 1)
+	go func() {
+		_, body := h.do(http.MethodPost, "lease-a", "credential-a", session, callBody(9, "slow"))
+		answers <- body
+	}()
+	time.Sleep(50 * time.Millisecond)
+	h.bridge.endBinding("lease-a", "its binding ended")
+	select {
+	case body := <-answers:
+		// Either the process answered first, or the call learned its
+		// session ended; never no answer.
+		message := answer(t, body)
+		if failure, failed := message["error"]; failed && !strings.Contains(string(failure), `"code":-32000`) {
+			t.Fatalf("%s", body)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the call in flight was never answered")
+	}
+}
+
 func TestTheClientEndingItsSessionStopsTheProcess(t *testing.T) {
 	h := newHarness(t, nil)
 	session := h.open("lease-a", "credential-a")
@@ -414,7 +437,12 @@ func TestAProcessThatExitsEndsItsSession(t *testing.T) {
 	h := newHarness(t, nil)
 	session := h.open("lease-a", "credential-a")
 	pid := h.whoami("lease-a", "credential-a", session).PID
-	h.do(http.MethodPost, "lease-a", "credential-a", session, callBody(8, "crash"))
+	// The call the process died on is answered at once, as a session that
+	// ended (never left to its caller's timeout).
+	_, crashed := h.do(http.MethodPost, "lease-a", "credential-a", session, callBody(8, "crash"))
+	if failure := answer(t, crashed)["error"]; !strings.Contains(string(failure), `"code":-32000`) || !strings.Contains(string(failure), "process stopped") {
+		t.Fatalf("the crashed call got %s", crashed)
+	}
 	waitGone(t, pid)
 	deadline := time.Now().Add(10 * time.Second)
 	for len(h.status().Processes) != 0 {
