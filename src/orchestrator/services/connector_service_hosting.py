@@ -26,14 +26,17 @@ Each leader-gated pass:
    backs the key off;
 3. records readiness; a pod not ready within the start timeout, or gone, is
    stopped (and replaced by the next pass while bindings remain);
-4. marks a pod idle when its last binding ends, or when a newer generation of
-   its connector supersedes it (it drains its bindings for the idle time),
-   and stops it after ``idleSeconds``: the identity is revoked first, so the
-   exchange refuses it at once, then the objects are deleted and their
-   absence recorded;
-5. keeps one ingress policy per binding for a workspace-facing driver,
+4. stops a pod at once when what its policy opens is no longer allowed:
+   the connector's projects lost private addresses, or its declared egress
+   (hosts, ports) changed; it does not drain;
+5. marks a pod idle when its last binding ends, or when a newer generation of
+   its connector supersedes it for a digest or credential change (it drains
+   its bindings for the idle time), and stops it after ``idleSeconds``: the
+   identity is revoked first, so the exchange refuses it at once, then the
+   objects are deleted and their absence recorded;
+6. keeps one ingress policy per binding for a workspace-facing driver,
    admitting only that binding's workspace;
-6. deletes every object it manages that no live row names (a connector
+7. deletes every object it manages that no live row names (a connector
    delete cascades its identities; this removes their pods).
 
 Design: knowledge-base/knowledge/features/connector_drivers.md, "Three
@@ -60,6 +63,7 @@ from orchestrator.services.connector_driver_identities import (
 from orchestrator.services.connector_egress import (
     EgressPolicy,
     EgressRefused,
+    expand_rule,
     pin_egress,
     private_addresses_allowed,
     system_resolver,
@@ -93,6 +97,7 @@ START_TIMEOUT = "start_timeout"
 POD_LOST = "pod_lost"
 NOT_READY = "not_ready"
 HOSTING_REFUSED = "hosting_refused"
+EGRESS_WITHDRAWN = "egress_withdrawn"
 #: Stops that back the key off before the next start.
 _BACKOFF_REASONS = (LAUNCH_REFUSED, LAUNCH_FAILED, START_TIMEOUT, CAPACITY)
 _CAPACITY_LOCK = "srw-connector-service-capacity"
@@ -518,6 +523,46 @@ def credential_generation(
     return credential_fingerprint(canonical)
 
 
+def egress_withdrawn(
+    spec: DriverSpec,
+    connector: Mapping[str, Any] | None,
+    recorded: Any,
+    *,
+    private_allowed: bool,
+) -> str | None:
+    """Why a running pod's pinned egress opens more than is allowed now.
+
+    A pod's policy is fixed when it starts. It may not keep private addresses
+    its connector's projects lost, nor destinations its connector's config no
+    longer declares: such a pod stops at once instead of draining. ``None``
+    when its egress still holds (or nothing was pinned to compare).
+    """
+    if connector is None:
+        return "its connector is gone"
+    if isinstance(recorded, str):
+        recorded = json.loads(recorded)
+    if not isinstance(recorded, Mapping):
+        return None
+    if recorded.get("private_allowed") and not private_allowed:
+        return "its connector's projects no longer allow private addresses"
+    config = connector.get("config") or {}
+    try:
+        declared = sorted(
+            (host, tuple(ports), rule.protocol)
+            for rule in spec.egress
+            for host, ports in (expand_rule(rule, config),)
+        )
+    except EgressRefused as exc:
+        return f"its declared egress no longer holds ({exc})"
+    pinned = sorted(
+        (str(item.get("host")), tuple(item.get("ports") or ()), item.get("protocol"))
+        for item in recorded.get("hosts") or ()
+    )
+    if declared != pinned:
+        return "its declared egress changed"
+    return None
+
+
 def _identity(row: Mapping[str, Any]) -> ServicePodIdentity:
     return ServicePodIdentity(
         identity_id=str(row["id"]),
@@ -537,7 +582,7 @@ SELECT connector_id, driver, image_digest, job_id, thread_id
 _POD_ROWS = """
 SELECT id, connector_id, driver, image_digest, credential_generation,
        image_reference, pod_namespace, pod_name, pod_uid, created_at, ready_at,
-       last_bound_at, idle_since, revoked_at, revoke_reason, removed_at
+       last_bound_at, idle_since, revoked_at, revoke_reason, removed_at, egress
   FROM connector_driver_identities
  WHERE credential_generation IS NOT NULL AND removed_at IS NULL
 """
@@ -953,19 +998,28 @@ class ServiceHostingReconciler:
                 report.swept = await self._sweep()
                 return report
 
+        # Each connector's config and tier, read once per pass.
+        connectors: dict[str, tuple[Mapping[str, Any] | None, bool]] = {}
+
+        async def connector_state(
+            connector_id: str,
+        ) -> tuple[Mapping[str, Any] | None, bool]:
+            if connector_id not in connectors:
+                connector = await self.store.get_datasource(connector_id)
+                async with self.store.acquire() as conn:
+                    private = await private_addresses_allowed(
+                        conn, connector_id, private_tiers=self.settings.private_tiers
+                    )
+                connectors[connector_id] = (connector, private)
+            return connectors[connector_id]
+
         # The connector's current generation for each bound (connector, digest).
         current: dict[tuple[str, str], tuple[str, bool, Mapping[str, Any]]] = {}
         for key, binding in bindings.items():
             spec = specs.get(binding.driver)
-            connector = await self.store.get_datasource(binding.connector_id)
+            connector, private = await connector_state(binding.connector_id)
             if spec is None or connector is None:
                 continue
-            async with self.store.acquire() as conn:
-                private = await private_addresses_allowed(
-                    conn,
-                    binding.connector_id,
-                    private_tiers=self.settings.private_tiers,
-                )
             current[key] = (
                 credential_generation(spec, connector, private_allowed=private),
                 private,
@@ -974,8 +1028,19 @@ class ServiceHostingReconciler:
 
         survivors: list[Mapping[str, Any]] = []
         for row in live:
-            if row["driver"] not in specs:
+            spec = specs.get(str(row["driver"]))
+            if spec is None:
                 await self._stop(row, IDLE, report)  # the driver was uninstalled
+                continue
+            connector, private = await connector_state(str(row["connector_id"]))
+            withdrawn = egress_withdrawn(
+                spec, connector, row["egress"], private_allowed=private
+            )
+            if withdrawn is not None:
+                logger.warning(
+                    "Driver pod %s stopped at once: %s", row["pod_name"], withdrawn
+                )
+                await self._stop(row, EGRESS_WITHDRAWN, report)
                 continue
             if not await self._observe(row, report):
                 continue
@@ -1178,6 +1243,7 @@ async def connector_egress_view(
 
 __all__ = [
     "CAPACITY",
+    "EGRESS_WITHDRAWN",
     "HOSTING_REFUSED",
     "IDLE",
     "LAUNCH_FAILED",
@@ -1195,4 +1261,5 @@ __all__ = [
     "connector_egress_view",
     "connector_service_reconciler",
     "credential_generation",
+    "egress_withdrawn",
 ]

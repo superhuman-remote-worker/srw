@@ -929,6 +929,109 @@ async def test_a_credential_change_starts_a_new_pod_and_the_old_one_drains(
     assert all(identity != str(new["id"]) for identity, _ in report.stopped)
 
 
+async def _set_config(db, connector: str, config: dict) -> None:
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE datasources SET config = $2::jsonb WHERE id = $1",
+            UUID(connector),
+            json.dumps(config),
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_lost_private_tier_stops_the_old_pod_at_once(db, reconciler):
+    """A tier downgrade: the pod pinned with private addresses allowed does
+    not drain for the idle time with them; its replacement has none."""
+    connector = await _echo_connector(db)
+    await _link(db, await _project(db, "home-allowed"), connector)
+    await _echo_image(db)
+    await _bind_echo(db, connector, await _thread(db))
+    await reconciler.reconcile_once()
+    (old,) = await _pods(db)
+    assert json.loads(old["egress"])["private_allowed"] is True
+    reconciler.fake.ready(str(old["id"]))
+    # One more project on the internet-only tier: the strictest decides.
+    await _link(db, await _project(db, "internet-only"), connector)
+    report = await reconciler.reconcile_once()
+    assert report.stopped == [(str(old["id"]), "egress_withdrawn")]
+    assert len(report.started) == 1
+    old, new = await _pods(db)
+    assert old["revoked_at"] is not None and old["removed_at"] is not None
+    assert json.loads(new["egress"])["private_allowed"] is False
+    assert new["revoked_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_private_tier_grant_starts_a_new_pod_and_the_old_one_drains(
+    db, reconciler
+):
+    """A tier upgrade is a new generation (the tier is in the fingerprint):
+    a pod with the wider policy starts, the narrower one drains."""
+    connector = await _echo_connector(db)
+    internet = await _project(db, "internet-only")
+    await _link(db, internet, connector)
+    await _echo_image(db)
+    await _bind_echo(db, connector, await _thread(db))
+    await reconciler.reconcile_once()
+    (old,) = await _pods(db)
+    assert json.loads(old["egress"])["private_allowed"] is False
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE projects SET network_tier = 'home-allowed' WHERE id = $1",
+            UUID(internet),
+        )
+    report = await reconciler.reconcile_once()
+    assert len(report.started) == 1 and report.stopped == []
+    old, new = await _pods(db)
+    assert old["credential_generation"] != new["credential_generation"]
+    assert json.loads(new["egress"])["private_allowed"] is True
+    assert old["idle_since"] is not None and old["revoked_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_an_egress_change_stops_the_old_pod_at_once(db, reconciler):
+    """A connector pointed elsewhere: the old destination closes now, not
+    after the idle time. A change that keeps the egress drains instead
+    (test_a_credential_change_starts_a_new_pod_and_the_old_one_drains)."""
+    ADDRESSES["dns.google"] = ["8.8.8.8"]
+    try:
+        connector = await _echo_connector(db)
+        await _echo_image(db)
+        await _bind_echo(db, connector, await _thread(db))
+        await reconciler.reconcile_once()
+        (old,) = await _pods(db)
+        await _set_config(db, connector, {"host": "dns.google", "port": 443})
+        report = await reconciler.reconcile_once()
+        assert report.stopped == [(str(old["id"]), "egress_withdrawn")]
+        assert len(report.started) == 1
+        old, new = await _pods(db)
+        assert json.loads(new["egress"])["hosts"][0]["addresses"] == ["8.8.8.8"]
+        # A port change is an egress change too.
+        await _set_config(db, connector, {"host": "dns.google", "port": 853})
+        report = await reconciler.reconcile_once()
+        assert report.stopped == [(str(new["id"]), "egress_withdrawn")]
+    finally:
+        ADDRESSES.pop("dns.google")
+
+
+@pytest.mark.asyncio
+async def test_an_unbound_pod_loses_its_private_egress_at_once(db, reconciler):
+    """Idle pods too: the downgrade does not wait for the idle stop."""
+    connector = await _echo_connector(db)
+    await _link(db, await _project(db, "home-allowed"), connector)
+    await _echo_image(db)
+    thread = await _thread(db)
+    await _bind_echo(db, connector, thread)
+    await reconciler.reconcile_once()
+    (pod,) = await _pods(db)
+    await _end(db, thread)
+    await reconciler.reconcile_once()
+    await _link(db, await _project(db, "internet-only"), connector)
+    report = await reconciler.reconcile_once()
+    assert report.stopped == [(str(pod["id"]), "egress_withdrawn")]
+    assert report.started == []
+
+
 @pytest.mark.asyncio
 async def test_an_egress_the_tier_forbids_refuses_the_launch_and_backs_off(
     db, reconciler

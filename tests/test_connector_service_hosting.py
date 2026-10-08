@@ -8,6 +8,7 @@ tests/test_connector_service_hosting_real_postgres.py.
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -296,6 +297,74 @@ def _settings(**over: Any) -> DeploymentSettings:
     )
     values.update(over)
     return DeploymentSettings(**values)
+
+
+class TestEgressWithdrawn:
+    @staticmethod
+    def _spec():
+        from shared.connectors.builtin import ECHO_SERVICE_SPEC
+
+        return ECHO_SERVICE_SPEC
+
+    @staticmethod
+    def _recorded(host="one.one.one.one", ports=(443,), private=False):
+        return {
+            "hosts": [
+                {
+                    "host": host,
+                    "addresses": ["1.1.1.1"],
+                    "ports": list(ports),
+                    "protocol": "tcp",
+                    "literal": False,
+                    "many_addresses": False,
+                }
+            ],
+            "dns": "none",
+            "dns_reason": None,
+            "private_allowed": private,
+            "resolved_at": "2026-10-08T00:00:00+00:00",
+        }
+
+    def _check(self, recorded, config, *, private_allowed=False):
+        from orchestrator.services.connector_service_hosting import egress_withdrawn
+
+        return egress_withdrawn(
+            self._spec(),
+            None if config is None else {"config": config},
+            recorded,
+            private_allowed=private_allowed,
+        )
+
+    def test_unchanged_egress_holds(self):
+        config = {"host": "one.one.one.one", "port": 443, "message": "v2"}
+        assert self._check(self._recorded(), config) is None
+        assert self._check(json.dumps(self._recorded()), config) is None
+        # Gaining private addresses is not a withdrawal (that pod drains).
+        assert self._check(self._recorded(), config, private_allowed=True) is None
+
+    def test_a_lost_private_tier_is_withdrawn(self):
+        config = {"host": "one.one.one.one", "port": 443}
+        found = self._check(self._recorded(private=True), config)
+        assert found is not None and "private" in found
+        assert (
+            self._check(self._recorded(private=True), config, private_allowed=True)
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"host": "dns.google", "port": 443},
+            {"host": "one.one.one.one", "port": 853},
+            {"port": 443},
+        ],
+    )
+    def test_a_changed_destination_is_withdrawn(self, config):
+        assert self._check(self._recorded(), config) is not None
+
+    def test_a_gone_connector_is_withdrawn_and_no_record_compares_nothing(self):
+        assert self._check(self._recorded(), None) == "its connector is gone"
+        assert self._check(None, {"host": "x.example", "port": 1}) is None
 
 
 def test_hosting_settings_come_from_the_deployment():
