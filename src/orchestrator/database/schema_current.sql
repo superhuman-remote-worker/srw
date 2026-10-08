@@ -27026,6 +27026,53 @@ COMMENT ON TABLE public.connector_driver_registrations IS 'Registered connector 
 
 
 --
+-- Name: connector_minted_credentials; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.connector_minted_credentials (
+    id uuid NOT NULL,
+    owner_kind text NOT NULL,
+    owner_id uuid NOT NULL,
+    connector_id uuid NOT NULL,
+    provider text NOT NULL,
+    access text NOT NULL,
+    config_digest text NOT NULL,
+    status text DEFAULT 'minting'::text NOT NULL,
+    material_ciphertext text NOT NULL,
+    token_ciphertext text,
+    token_last_four text,
+    expires_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    minted_at timestamp with time zone,
+    superseded_at timestamp with time zone,
+    revoke_requested_at timestamp with time zone,
+    revoke_reason text,
+    revoke_attempts integer DEFAULT 0 NOT NULL,
+    revoke_next_at timestamp with time zone,
+    revoked_at timestamp with time zone,
+    revoke_error text,
+    CONSTRAINT connector_minted_credentials_access_check CHECK ((access <> ''::text)),
+    CONSTRAINT connector_minted_credentials_attempts_check CHECK ((revoke_attempts >= 0)),
+    CONSTRAINT connector_minted_credentials_digest_check CHECK ((config_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT connector_minted_credentials_last_four_check CHECK (((token_last_four IS NULL) OR (char_length(token_last_four) = 4))),
+    CONSTRAINT connector_minted_credentials_material_check CHECK ((material_ciphertext <> ''::text)),
+    CONSTRAINT connector_minted_credentials_minted_check CHECK (((status <> ALL (ARRAY['live'::text, 'superseded'::text])) OR ((token_ciphertext IS NOT NULL) AND (expires_at IS NOT NULL) AND (minted_at IS NOT NULL)))),
+    CONSTRAINT connector_minted_credentials_owner_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text]))),
+    CONSTRAINT connector_minted_credentials_provider_check CHECK ((provider = ANY (ARRAY['kubernetes'::text, 'github_app'::text]))),
+    CONSTRAINT connector_minted_credentials_revoke_check CHECK ((((status <> ALL (ARRAY['revoking'::text, 'revoked'::text])) OR ((revoke_requested_at IS NOT NULL) AND (revoke_reason IS NOT NULL))) AND ((status = 'revoked'::text) = (revoked_at IS NOT NULL)))),
+    CONSTRAINT connector_minted_credentials_status_check CHECK ((status = ANY (ARRAY['minting'::text, 'live'::text, 'superseded'::text, 'revoking'::text, 'revoked'::text]))),
+    CONSTRAINT connector_minted_credentials_superseded_check CHECK (((status <> 'superseded'::text) OR (superseded_at IS NOT NULL)))
+);
+
+
+--
+-- Name: TABLE connector_minted_credentials; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.connector_minted_credentials IS 'Credentials SRW minted at a provider for one execution and connector (C5): a Kubernetes TokenRequest token bound to a per-row Secret, or a GitHub App installation token. Token and revoke inputs are APP_ENCRYPTION_KEY ciphertexts. No foreign keys: the revoke outlives the execution and the connector.';
+
+
+--
 -- Name: contact_addresses; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -33975,6 +34022,14 @@ ALTER TABLE ONLY public.connector_driver_registrations
 
 
 --
+-- Name: connector_minted_credentials connector_minted_credentials_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_minted_credentials
+    ADD CONSTRAINT connector_minted_credentials_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: contact_addresses contact_addresses_owner_user_id_channel_address_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -37203,6 +37258,41 @@ CREATE INDEX idx_connector_driver_operations_unread ON public.connector_driver_o
 
 
 --
+-- Name: idx_connector_minted_credentials_connector; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_minted_credentials_connector ON public.connector_minted_credentials USING btree (connector_id) WHERE (status <> 'revoked'::text);
+
+
+--
+-- Name: idx_connector_minted_credentials_expiry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_minted_credentials_expiry ON public.connector_minted_credentials USING btree (expires_at) WHERE (status = ANY (ARRAY['live'::text, 'superseded'::text]));
+
+
+--
+-- Name: idx_connector_minted_credentials_owner; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_minted_credentials_owner ON public.connector_minted_credentials USING btree (owner_kind, owner_id) WHERE (status <> 'revoked'::text);
+
+
+--
+-- Name: idx_connector_minted_credentials_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_minted_credentials_pending ON public.connector_minted_credentials USING btree (status, revoke_next_at) WHERE (status = ANY (ARRAY['minting'::text, 'revoking'::text]));
+
+
+--
+-- Name: idx_connector_minted_credentials_revoked; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_minted_credentials_revoked ON public.connector_minted_credentials USING btree (revoked_at) WHERE (status = 'revoked'::text);
+
+
+--
 -- Name: idx_contact_addresses_contact; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -38761,6 +38851,13 @@ CREATE UNIQUE INDEX uq_connector_driver_registrations_catalog ON public.connecto
 --
 
 CREATE UNIQUE INDEX uq_connector_driver_registrations_project ON public.connector_driver_registrations USING btree (project_id, name) WHERE (scope_kind = 'Project'::text);
+
+
+--
+-- Name: uq_connector_minted_credentials_live; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_connector_minted_credentials_live ON public.connector_minted_credentials USING btree (owner_kind, owner_id, connector_id) WHERE (status = 'live'::text);
 
 
 --
