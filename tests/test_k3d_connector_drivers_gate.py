@@ -779,3 +779,149 @@ def test_cleanup_and_residue_find_sessions_by_the_gate_id(monkeypatch):
     monkeypatch.setattr(gate, "command", lambda *a, **k: '{"items": []}')
     left = runner.residue()
     assert any(leftover in item for item in left)
+
+
+# -- the pinned pod is the assignment's, and the pool is checked first ----------
+
+
+def _pod(name: str, ip: str, *, ready: bool = True) -> dict:
+    return {
+        "metadata": {"name": name},
+        "status": {
+            "phase": "Running",
+            "podIP": ip,
+            "containerStatuses": [{"ready": ready}],
+        },
+    }
+
+
+def _once(label, probe, *, timeout, interval=3.0):
+    value = probe()
+    if not value:
+        raise gate.GateError(f"timed out: {label}")
+    return value
+
+
+def test_the_pinned_pod_is_found_through_the_threads_assignment(monkeypatch):
+    """A pooled pod carries no thread label: never select by one."""
+    runner = _runner()
+    runner.live_thread = "0cef23e4-0000-4000-8000-0000000000cc"
+    queries: list[str] = []
+    calls: list[list[str]] = []
+
+    def sql(query, **kwargs):
+        queries.append(query)
+        return json.dumps({"hostname": "srw-agent-j-08835181", "pod_ip": "10.42.0.51"})
+
+    def run(args, **kwargs):
+        calls.append(args)
+        return 0, json.dumps(_pod("srw-agent-j-08835181", "10.42.0.51")), ""
+
+    monkeypatch.setattr(gate, "sql", sql)
+    monkeypatch.setattr(gate, "run", run)
+    monkeypatch.setattr(gate, "wait_for", _once)
+
+    pod = runner.pinned_pod()
+
+    assert pod["metadata"]["name"] == "srw-agent-j-08835181"
+    assert "t.agent_id" in queries[0] and runner.live_thread in queries[0]
+    assert calls == [gate.K + ["get", "pod", "srw-agent-j-08835181", "-o", "json"]]
+    assert not any("-l" in call for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("assignment", "pod"),
+    [
+        ("", _pod("srw-agent-j-08835181", "10.42.0.51")),
+        (
+            json.dumps({"hostname": "srw-agent-j-08835181", "pod_ip": "10.42.0.99"}),
+            _pod("srw-agent-j-08835181", "10.42.0.51"),
+        ),
+        (
+            json.dumps({"hostname": "srw-agent-j-08835181", "pod_ip": "10.42.0.51"}),
+            _pod("srw-agent-j-08835181", "10.42.0.51", ready=False),
+        ),
+        (json.dumps({"hostname": "Bad Name;", "pod_ip": ""}), None),
+    ],
+    ids=["unassigned", "another pod at that name", "not ready", "malformed name"],
+)
+def test_only_the_assigned_ready_pod_is_the_pinned_pod(monkeypatch, assignment, pod):
+    runner = _runner()
+    runner.live_thread = "0cef23e4-0000-4000-8000-0000000000cc"
+    monkeypatch.setattr(gate, "sql", lambda query, **kwargs: assignment)
+    monkeypatch.setattr(gate, "run", lambda args, **kwargs: (0, json.dumps(pod), ""))
+    monkeypatch.setattr(gate, "wait_for", _once)
+    with pytest.raises(gate.GateError, match="pinned agent pod assigned"):
+        runner.pinned_pod()
+
+
+def _pool(monkeypatch, runner, *, stale: set[str], idle: list[str]):
+    pods = [
+        _pod("srw-agent-j-08835181", "10.42.0.51"),
+        _pod("srw-agent-j-11111111", "10.42.0.52"),
+        _pod("srw-agent-stateless-abc", "10.42.0.53"),
+        _pod("srw-orchestrator-xyz", "10.42.0.54"),
+    ]
+    monkeypatch.setattr(
+        gate, "command", lambda args, **kwargs: json.dumps({"items": pods})
+    )
+    checked: list[str] = []
+
+    def served(pod, served_set):
+        checked.append(pod)
+        assert served_set is gate.PINNED_AGENT
+        if pod in stale:
+            return [f"{pod} stale: ['src/agent/connectors/files.py']"]
+        return []
+
+    monkeypatch.setattr(runner, "served_problems", served)
+    queries: list[str] = []
+
+    def sql(query, **kwargs):
+        queries.append(query)
+        return "\n".join(idle)
+
+    monkeypatch.setattr(gate, "sql", sql)
+    return checked, queries
+
+
+def test_a_stale_pooled_pinned_pod_refuses_the_live_phase(monkeypatch):
+    runner = _runner()
+    checked, queries = _pool(
+        monkeypatch,
+        runner,
+        stale={"srw-agent-j-08835181"},
+        idle=["srw-agent-j-08835181"],
+    )
+    with pytest.raises(gate.GateError, match="stale connector code") as caught:
+        runner.check_pinned_pool()
+    assert checked == ["srw-agent-j-08835181", "srw-agent-j-11111111"]
+    message = str(caught.value)
+    assert "delete pod srw-agent-j-08835181" in message
+    assert "--context=k3d-srw -n srw" in message
+    assert "current_job_id IS NULL" in queries[0]
+    (name, ok, _detail) = runner.report.results[-1]
+    assert not ok and "pooled pinned" in name
+
+
+def test_a_fresh_pool_lets_the_live_phase_start(monkeypatch):
+    runner = _runner()
+    _pool(monkeypatch, runner, stale=set(), idle=[])
+    runner.check_pinned_pool()
+    assert runner.report.passed
+
+
+def test_the_pool_is_checked_before_the_live_session_exists(monkeypatch):
+    runner = _runner()
+    order: list[str] = []
+    monkeypatch.setattr(runner, "live_setup", lambda: order.append("setup"))
+    monkeypatch.setattr(runner, "check_pinned_pool", lambda: order.append("pool"))
+
+    def session():
+        order.append("session")
+        raise gate.GateError("stop here")
+
+    monkeypatch.setattr(runner, "live_session", session)
+    with pytest.raises(gate.GateError):
+        runner.live()
+    assert order == ["setup", "pool", "session"]

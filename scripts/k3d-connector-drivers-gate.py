@@ -51,9 +51,14 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
              deployed builder binds read tools only (a session's audit rows
              carry no tool list), a webdav_list call returns the marker, and
              asking for a webdav_write creates no file in Nextcloud
-  live       (D1b) a PINNED session (an Officer conference in the project,
-             sandbox workspace) whose own agent pod serves this checkout's
-             connector modules. A live ``config.update`` attaches the generic
+  live       (D1b) every pooled pinned agent pod (``srw-agent-j-*``, which
+             keeps its image after a Tilt rebuild while idle) serves this
+             checkout's connector modules, or the phase refuses and names the
+             idle ones to delete. Then a PINNED session (an Officer conference
+             in the project, sandbox workspace) whose agent pod, found through
+             the thread's assignment (threads.agent_id -> agents.hostname,
+             never a label: a pooled pod carries none), serves this
+             checkout's connector modules. A live ``config.update`` attaches the generic
              env connector, Postgres (linked read-only) and an SSH repository
              (a read deploy key on the private repository): the ack lists
              all three; the pod logs the read-only Postgres connection and
@@ -120,6 +125,10 @@ NEXTCLOUD_CONTAINER = "nextcloud"
 WORKSPACE_CONTAINER = "workspace"
 AGENT_CONTAINER = "agent"
 PINNED_THREAD_LABEL = "srw.io/thread-id"
+#: A pinned pool's pods: an idle one is reused for a new pinned thread and
+#: keeps the image it was created with after a Tilt rebuild.
+POOLED_PINNED_PREFIX = "srw-agent-j-"
+_POD_NAME_RE = re.compile(r"[a-z0-9]([-a-z0-9]{0,251}[a-z0-9])?\Z")
 AGENT_PORT = 8001
 HOME = "/home/agent-host"
 KEYCLOAK_TOKEN_URL = "http://srw-keycloak:8080/realms/srw/protocol/openid-connect/token"
@@ -809,7 +818,10 @@ PLAN = [
     "session: stateless, WebDAV read-only via the project; read-only "
     "connection logged; read tools only; webdav_list returns the marker; "
     "a requested write creates nothing",
-    "live (D1b): a pinned Officer-conference session; its pod serves this "
+    "live (D1b): every pooled pinned agent pod (srw-agent-j-*) serves this "
+    "checkout's materializers, or the phase refuses and names the idle ones to "
+    "delete; a pinned Officer-conference session; the pod its assignment names "
+    "(threads.agent_id -> agents.hostname, never a label) serves this "
     "checkout's materializers; a live config.update attaches the generic env "
     "connector, Postgres (read-only link) and an SSH repository (read deploy "
     "key), then a second one detaches all three: acks, pod logs, "
@@ -1786,6 +1798,7 @@ class ConnectorDriversGate:
     # -- live attach and detach on a pinned session (D1b) -----------------
     def live(self) -> None:
         self.live_setup()
+        self.check_pinned_pool()
         self.live_session()
         self.live_attached(
             self.live_update(
@@ -1865,27 +1878,121 @@ class ConnectorDriversGate:
             interval=5,
         )
 
+    def pinned_assignment(self) -> dict[str, str] | None:
+        """The agent the live thread is assigned to: ``hostname``, ``pod_ip``.
+
+        A pooled pinned pod (``srw-agent-j-*``) serves the thread without a
+        thread label, so the assignment, as C0 reads a pinned job's, is the
+        only reliable pointer.
+        """
+        row = sql(
+            "SELECT coalesce(json_build_object('hostname', a.hostname, "
+            "'pod_ip', a.pod_ip)::text, '') FROM threads t JOIN agents a ON "
+            f"a.id = t.agent_id WHERE t.id = {lit(self.live_thread)}"
+        )
+        if not row:
+            return None
+        assignment = json.loads(row)
+        hostname = str(assignment.get("hostname") or "")
+        if not _POD_NAME_RE.fullmatch(hostname):
+            return None
+        return {"hostname": hostname, "pod_ip": str(assignment.get("pod_ip") or "")}
+
     def pinned_pod(self) -> dict:
-        selector = f"{PINNED_THREAD_LABEL}={self.live_thread}"
+        """The running, ready pod the live thread's assignment names."""
 
         def probe() -> dict | None:
-            pods = json.loads(
-                command(K + ["get", "pods", "-l", selector, "-o", "json"])
-            )["items"]
-            ready = [
-                pod
-                for pod in pods
-                if not pod["metadata"].get("deletionTimestamp")
-                and pod.get("status", {}).get("phase") == "Running"
-                and pod["status"].get("podIP")
+            assignment = self.pinned_assignment()
+            if assignment is None:
+                return None
+            rc, out, _err = run(
+                K + ["get", "pod", assignment["hostname"], "-o", "json"], timeout=60
+            )
+            if rc:
+                return None
+            pod = json.loads(out)
+            status = pod.get("status", {})
+            ready = (
+                not pod["metadata"].get("deletionTimestamp")
+                and status.get("phase") == "Running"
+                and status.get("podIP")
                 and all(
-                    status.get("ready")
-                    for status in pod["status"].get("containerStatuses") or [{}]
+                    item.get("ready")
+                    for item in status.get("containerStatuses") or [{}]
                 )
-            ]
-            return ready[0] if len(ready) == 1 else None
+            )
+            if not ready:
+                return None
+            if assignment["pod_ip"] and assignment["pod_ip"] != status["podIP"]:
+                return None
+            return pod
 
-        return wait_for(f"pinned agent pod {selector}", probe, timeout=600, interval=5)
+        return wait_for(
+            f"pinned agent pod assigned to {self.live_thread}",
+            probe,
+            timeout=600,
+            interval=5,
+        )
+
+    def pooled_pinned_pods(self) -> list[str]:
+        """Running pinned-pool pods, by name (no label: the name is the pool's)."""
+        pods = json.loads(command(K + ["get", "pods", "-o", "json"]))["items"]
+        return sorted(
+            pod["metadata"]["name"]
+            for pod in pods
+            if pod["metadata"]["name"].startswith(POOLED_PINNED_PREFIX)
+            and not pod["metadata"].get("deletionTimestamp")
+            and pod.get("status", {}).get("phase") == "Running"
+        )
+
+    def idle_pinned_pods(self, names: list[str]) -> list[str]:
+        """Of ``names``, the pods with no current job and no live thread."""
+        if not names:
+            return []
+        listed = ", ".join(lit(name) for name in names if _POD_NAME_RE.fullmatch(name))
+        if not listed:
+            return []
+        rows = sql(
+            "SELECT a.hostname FROM agents a WHERE a.hostname IN ("
+            + listed
+            + ") AND a.current_job_id IS NULL AND NOT EXISTS (SELECT 1 FROM "
+            "threads t WHERE t.agent_id = a.id AND t.ended_at IS NULL) "
+            "ORDER BY a.hostname"
+        )
+        return [row for row in rows.splitlines() if row]
+
+    def check_pinned_pool(self) -> None:
+        """Refuse a pinned pool any of whose pods serves other connector code.
+
+        A new pinned thread may land on any idle pooled pod, and an idle one
+        keeps the image it was created with after a Tilt rebuild. The byte
+        check of the assigned pod (``live_session``) would then only fail
+        after the session exists; this names the pods to delete up front.
+        """
+        stale = [
+            name
+            for name in self.pooled_pinned_pods()
+            if self.served_problems(name, PINNED_AGENT)
+        ]
+        idle = self.idle_pinned_pods(stale)
+        detail = ""
+        if stale:
+            detail = (
+                f"stale: {stale}; idle pods keep their image after a Tilt "
+                "rebuild. Delete the idle ones and rerun: kubectl "
+                f"--context={LOCAL_CONTEXT} -n {LOCAL_NAMESPACE} delete pod "
+                + (" ".join(idle) if idle else "<none idle; wait for them to finish>")
+            )
+        self.report.check(
+            "live: every pooled pinned agent pod serves this checkout's "
+            "connector modules",
+            not stale,
+            detail,
+        )
+        if stale:
+            raise GateError(
+                "a pooled pinned agent pod serves stale connector code: " + detail
+            )
 
     def pinned_log_lines(self, needles: list[str]) -> list[str]:
         """The pinned agent pod's log lines since the gate started."""
