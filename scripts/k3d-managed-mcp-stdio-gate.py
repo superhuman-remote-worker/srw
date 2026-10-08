@@ -698,6 +698,21 @@ class StdioGate(base.ManagedMcpGate):
                 "k3d-srw-server-0 after a host network change)"
             ) from None
 
+    def stock_image(self, row: dict) -> str:
+        """The stock server at the digest its pod should run. The chart pins
+        an image index; the resolver launches the linux manifest it lists and
+        records it against the pinned reference, so that recorded digest is
+        the one to expect. Without such a record the index digest stays the
+        expectation, and the check fails."""
+        digest = str(row.get("image_digest") or "")
+        recorded = sql(
+            "SELECT count(*) FROM connector_driver_images WHERE "
+            f"reference LIKE {lit('%@' + STOCK_DIGEST)} AND digest = {lit(digest)}"
+        )
+        if digest and recorded.strip() not in ("", "0"):
+            return f"{STOCK_IMAGE}@{digest}"
+        return f"{STOCK_IMAGE}@{STOCK_DIGEST}"
+
     # -- phases --------------------------------------------------------------
     def preflight(self) -> None:
         problems: list[str] = []
@@ -962,7 +977,9 @@ class StdioGate(base.ManagedMcpGate):
                     token_env=PROBE_TOKEN_ENV,
                 )
             else:
-                problems = stdio_layout_problems(pod, self.front_image)
+                problems = stdio_layout_problems(
+                    pod, self.front_image, image=self.stock_image(row)
+                )
             self.report.check(
                 f"startup: {label}'s pod runs its image at its digest behind the "
                 "bridge from the pinned front image (on its socket, each process "
