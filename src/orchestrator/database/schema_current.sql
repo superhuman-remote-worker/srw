@@ -26898,6 +26898,9 @@ CREATE TABLE public.datasources (
     scope_mode text DEFAULT 'all'::text NOT NULL,
     auto_attach boolean DEFAULT false NOT NULL,
     policy_revision bigint DEFAULT 1 NOT NULL,
+    manifest_resource_id uuid,
+    managed_key text,
+    CONSTRAINT datasources_managed_key_shape CHECK (((managed_key IS NULL) OR (managed_key ~ '^[a-z][a-z0-9-]{0,62}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'::text))),
     CONSTRAINT datasources_policy_revision_positive CHECK ((policy_revision > 0)),
     CONSTRAINT datasources_scope_mode_check CHECK ((scope_mode = ANY (ARRAY['all'::text, 'projects'::text])))
 );
@@ -26936,6 +26939,20 @@ COMMENT ON COLUMN public.datasources.auto_attach IS 'Creator-owned creation-time
 --
 
 COMMENT ON COLUMN public.datasources.policy_revision IS 'Optimistic concurrency token for scope/default/project-link policy.';
+
+
+--
+-- Name: COLUMN datasources.manifest_resource_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.datasources.manifest_resource_id IS 'The manifest Connector resource this row is written through to; its uid is the datasource id. NULL until the row is written through or backfilled, and for rows left on the legacy path.';
+
+
+--
+-- Name: COLUMN datasources.managed_key; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.datasources.managed_key IS 'Stable platform identity of a connector SRW provisions itself (project-kb:<project>, ...). Platform-owned rows refuse policy edits, deletes, links and unlinks through the API.';
 
 
 --
@@ -30420,6 +30437,7 @@ CREATE TABLE public.srw_resources (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     installation_managed boolean DEFAULT false NOT NULL,
+    platform_managed text,
     CONSTRAINT srw_resources_document_check CHECK ((jsonb_typeof(document) = 'object'::text)),
     CONSTRAINT srw_resources_kind_check CHECK ((kind = ANY (ARRAY['Expert'::text, 'WorkspaceTemplate'::text, 'Connector'::text, 'Project'::text, 'Job'::text]))),
     CONSTRAINT srw_resources_resolved_check CHECK ((jsonb_typeof(resolved) = 'object'::text)),
@@ -30440,6 +30458,13 @@ COMMENT ON TABLE public.srw_resources IS 'Canonical SRW authored resources; defi
 --
 
 COMMENT ON COLUMN public.srw_resources.installation_managed IS 'TRUE for resources the installation owns. Only the startup reconciler writes them; the API refuses edits and deletes.';
+
+
+--
+-- Name: COLUMN srw_resources.platform_managed; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.srw_resources.platform_managed IS 'Managed key of the platform-owned domain row this resource mirrors (project-kb:<project>, ...). Only the platform write-through writes it; the API refuses edits and deletes.';
 
 
 --
@@ -38307,6 +38332,13 @@ CREATE UNIQUE INDEX uq_datasource_name_type_owner ON public.datasources USING bt
 
 
 --
+-- Name: uq_datasources_managed_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_datasources_managed_key ON public.datasources USING btree (managed_key) WHERE (managed_key IS NOT NULL);
+
+
+--
 -- Name: uq_docker_workspace_active_owner; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -41359,6 +41391,14 @@ ALTER TABLE ONLY public.datasources
 
 ALTER TABLE ONLY public.datasources
     ADD CONSTRAINT datasources_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: datasources datasources_manifest_resource_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.datasources
+    ADD CONSTRAINT datasources_manifest_resource_id_fkey FOREIGN KEY (manifest_resource_id) REFERENCES public.srw_resources(id) ON DELETE RESTRICT;
 
 
 --
