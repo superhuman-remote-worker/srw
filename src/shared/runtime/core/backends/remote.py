@@ -1665,6 +1665,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                     "id": str(item["id"]),
                     "include": str(item["include"]),
                     "ca": str(item["ca"]),
+                    **({"gitdir": str(item["gitdir"])} if item.get("gitdir") else {}),
                 }
                 for item in bindings
             ],

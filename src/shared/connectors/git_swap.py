@@ -65,11 +65,13 @@ class UnservedUpstream(ValueError):
 class SwapUpstream:
     """A repository URL the driver serves.
 
-    ``url`` is the clean form a checkout's remote keeps (lowercase scheme
-    and host, no credentials, no trailing slash); ``base`` is what a
-    workspace's ``insteadOf`` matches (``url`` without a trailing ``.git``);
-    ``path`` is the repository path the driver compares a request against
-    (no leading slash, no ``.git``).
+    ``url`` is the URL as the connector names it, cleaned (lowercase scheme
+    and host, no credentials, no trailing slash); ``base`` is it without a
+    trailing ``.git``; ``remote`` is the one form a swap checkout's origin
+    keeps, ``<base>.git``, and the exact string a workspace's ``insteadOf``
+    rewrites (so ``o/r.git`` never rewrites ``o/r-docs.git``); ``path`` is
+    the repository path the driver compares a request against (no leading
+    slash, no ``.git``).
     """
 
     url: str
@@ -79,6 +81,10 @@ class SwapUpstream:
     @property
     def base(self) -> str:
         return self.url.removesuffix(".git")
+
+    @property
+    def remote(self) -> str:
+        return f"{self.base}.git"
 
 
 def swap_upstream(url: object) -> SwapUpstream:

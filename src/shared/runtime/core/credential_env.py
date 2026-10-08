@@ -383,40 +383,42 @@ def main(argv):
 sys.exit(main(sys.argv))
 """
 
-#: Installs (``sync``) or removes (``retire``) the git swap driver's wiring
-#: in the workspace home (C3): everything under ``~/.srw-credentials/git/``
-#: (0700), which no snapshot captures, and one ``include.path`` line in
-#: ``~/.gitconfig``, so every git in the workspace reads it (the agent's, IDE
-#: terminals, ssh-gateway sessions).
+#: Installs the git swap driver's wiring in the workspace home (C3):
+#: everything under ``~/.srw-credentials/git/`` (0700), which no snapshot
+#: captures, and one ``include.path`` line in ``~/.gitconfig``, so every git
+#: in the workspace reads it (the agent's, IDE terminals, ssh-gateway
+#: sessions).
 #:
-#: ``argv``: the home and the action. ``sync`` reads ``{"helper": <the
-#: credential helper's source>, "bindings": [{"id", "include", "ca"}],
+#: ``argv``: the home and ``sync``. It reads ``{"helper": <the credential
+#: helper's source>, "bindings": [{"id", "include", "ca", "gitdir"?}],
 #: "remove": [ids], "prune": bool}`` on stdin and writes, each atomically
-#: and 0600, the helper, each binding's include (``bindings/<id>.gitconfig``)
-#: and the certificate authority it trusts (``bindings/<id>.ca.pem``). It
-#: removes the bindings ``remove`` names and, with ``prune``, every binding
-#: not in this set; rewrites ``config``, which includes the bindings
-#: present; and adds ``include.path = ~/.srw-credentials/git/config`` to
+#: and 0600, the helper, each binding's rules (``bindings/<id>.gitconfig``),
+#: the certificate authority it trusts (``bindings/<id>.ca.pem``) and, when
+#: given, the checkout its rules apply in (``bindings/<id>.gitdir``: an
+#: absolute directory with a trailing slash). It removes the bindings
+#: ``remove`` names and, with ``prune``, every binding not in this set;
+#: rewrites ``config``, which includes each present binding's rules under
+#: ``[includeIf "gitdir:<its checkout>"]`` (a binding without a recorded
+#: checkout applies nowhere but where a ``git -c include.path`` names it);
+#: and adds ``include.path = ~/.srw-credentials/git/config`` to
 #: ``~/.gitconfig`` with git itself unless it is there. It prints one JSON
 #: line naming the bindings present and removed, never a file's contents.
-#: ``retire`` removes the directory (git ignores an include that is gone).
+#: Removing the wiring at a terminal retirement is housekeeping the design
+#: leaves out: the lease is revoked server-side.
 GIT_SWAP_WIRING = r"""
-import json, os, re, shutil, subprocess, sys, tempfile
+import json, os, re, subprocess, sys, tempfile
 
 home = os.path.normpath(sys.argv[1])
-action = sys.argv[2]
-if action not in ('sync', 'retire'):
+if sys.argv[2:] != ['sync']:
     sys.exit(3)
 root = os.path.join(home, '.srw-credentials')
 wiring = os.path.join(root, 'git')
 bindings = os.path.join(wiring, 'bindings')
 INCLUDE = '~/.srw-credentials/git/config'
 CONNECTOR = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
-
-if action == 'retire':
-    shutil.rmtree(wiring, ignore_errors=True)
-    print(json.dumps({'retired': True}))
-    sys.exit(0)
+# An absolute checkout directory with its trailing slash: a gitdir: pattern
+# with no glob character, nothing to quote and no way out of its parent.
+GITDIR = re.compile(r'/(?:[A-Za-z0-9_-][A-Za-z0-9._-]*/)+')
 
 
 def write(path, contents):
@@ -439,11 +441,23 @@ def directory(path):
     os.chmod(path, 0o700)
 
 
+def checkout(name):
+    try:
+        with open(os.path.join(bindings, name + '.gitdir'), encoding='ascii') as handle:
+            found = handle.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return found if GITDIR.fullmatch(found) else None
+
+
 request = json.load(sys.stdin)
 wanted = request.get('bindings') or []
 ids = [item['id'] for item in wanted]
 for name in ids + list(request.get('remove') or []):
     if not CONNECTOR.fullmatch(name):
+        sys.exit(3)
+for item in wanted:
+    if 'gitdir' in item and not GITDIR.fullmatch(item['gitdir']):
         sys.exit(3)
 for path in (root, wiring, bindings):
     directory(path)
@@ -451,6 +465,8 @@ write(os.path.join(wiring, 'credential-helper'), request['helper'])
 for item in wanted:
     write(os.path.join(bindings, item['id'] + '.ca.pem'), item['ca'])
     write(os.path.join(bindings, item['id'] + '.gitconfig'), item['include'])
+    if 'gitdir' in item:
+        write(os.path.join(bindings, item['id'] + '.gitdir'), item['gitdir'] + '\n')
 present = sorted(
     entry[:-len('.gitconfig')]
     for entry in os.listdir(bindings)
@@ -460,15 +476,18 @@ gone = set(request.get('remove') or [])
 if request.get('prune'):
     gone |= set(present) - set(ids)
 for name in sorted(gone):
-    for suffix in ('.gitconfig', '.ca.pem'):
+    for suffix in ('.gitconfig', '.ca.pem', '.gitdir'):
         try:
             os.unlink(os.path.join(bindings, name + suffix))
         except FileNotFoundError:
             pass
 present = [name for name in present if name not in gone]
+scoped = [(name, checkout(name)) for name in present]
 write(os.path.join(wiring, 'config'),
       '# SRW git swap driver bindings: written on every attach; do not edit.\n'
-      + ''.join('[include]\n\tpath = bindings/%s.gitconfig\n' % name for name in present))
+      '# Each applies in its own checkout only.\n'
+      + ''.join('[includeIf "gitdir:%s"]\n\tpath = bindings/%s.gitconfig\n' % (where, name)
+                for name, where in scoped if where))
 gitconfig = os.path.join(home, '.gitconfig')
 found = subprocess.run(['git', 'config', '--file', gitconfig, '--get-all', 'include.path'],
                        stdin=subprocess.DEVNULL, capture_output=True, text=True)
@@ -479,5 +498,6 @@ if not included:
     if added.returncode != 0:
         sys.exit(5)
 print(json.dumps({'bindings': present, 'removed': sorted(gone),
+                  'unscoped': [name for name, where in scoped if not where],
                   'include': 'present' if included else 'added'}))
 """

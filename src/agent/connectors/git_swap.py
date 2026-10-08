@@ -1,20 +1,35 @@
 """The workspace side of the git swap driver (connector drivers C3).
 
 A token repository bound through ``srw.git-swap/v1`` keeps its clean
-upstream URL as its remote. What makes its git reach the driver instead is
-SRW's wiring under ``~/.srw-credentials/git/`` (written over the secret stdin
-channel, never tmux; no snapshot captures it), which ``~/.gitconfig``
-includes, so the agent's git, IDE terminals and ssh-gateway sessions all
-read it. One include per binding:
+upstream URL as its remote, normalised to ``<repository>.git``. What makes
+its git reach the driver instead is SRW's wiring under
+``~/.srw-credentials/git/`` (written over the secret stdin channel, never
+tmux; no snapshot captures it), which ``~/.gitconfig`` includes. One rule
+file per binding (``bindings/<connector>.gitconfig``):
 
-* ``url.<driver URL>.insteadOf = <upstream base>``: the clean remote is
-  rewritten to ``https://<endpoint>/<connector>/<repository>`` on use;
+* ``url.<driver URL>.git.insteadOf = <clean remote>``: the exact clean
+  remote is rewritten to ``https://<endpoint>/<connector>/<repository>.git``
+  on use. Git rewrites by prefix, and ``o/r.git`` is no prefix of
+  ``o/r-docs.git``;
 * ``credential.<driver origin>``: the list of helpers reset, then SRW's
   helper, which answers with the connector's lease token from
   ``~/.srw-credentials/leases/<connector>`` (``useHttpPath`` keeps two
   connectors apart);
 * ``http.<driver origin>/.sslCAInfo``: SRW's certificate authority, trusted
   for the driver's URL only, never globally.
+
+A rule file applies only inside its own checkout: the include git reads
+names it under ``[includeIf "gitdir:<workspace>/repos/<clone>/"]``. Two
+connectors may name one upstream (a ReadWrite and a ReadOnly binding of the
+same repository): each checkout gets its own connector's driver URL and
+lease, whatever the order of their ids. The condition is git's own, so it
+holds for every git that runs in the checkout: the agent's, an IDE
+terminal's and an ssh-gateway session's (they share the workspace home, and
+so ``~/.gitconfig``). Outside SRW's checkouts nothing is rewritten: a clone
+made by hand of the same URL reaches the forge directly, without the
+connector's credential. The clone itself, and the wait for a starting
+driver, run before the checkout exists; they name the binding's rule file
+with ``git -c include.path=<file>``.
 
 A checkout of such a repository also gets ``transfer.credentialsInUrl =
 die``, so a token in its remote URL fails loudly instead of working.
@@ -45,14 +60,18 @@ from shared.connectors.git_swap import (
 logger = logging.getLogger(__name__)
 
 HELPER_FILE = f"{WIRING_DIR}/credential-helper"
+BINDINGS_DIR = f"{WIRING_DIR}/bindings"
 #: How often the first clone retries a driver that is not serving yet.
 _WAIT_INTERVAL_SECONDS = 5.0
 #: One reachability try (a dropped SYN before the binding's ingress policy
 #: lands would otherwise hang for curl's default).
 _TRY_SECONDS = 20
-#: Paths and URLs written into git config: nothing that needs quoting.
+#: Paths and URLs written into git config: nothing that needs quoting and no
+#: glob character (a checkout path is a ``gitdir:`` pattern).
 _SAFE_PATH = re.compile(r"[A-Za-z0-9._/-]+")
 _SAFE_URL = re.compile(r"https://[A-Za-z0-9._:/~-]+")
+#: A checkout's ``gitdir:`` pattern (the wiring program checks the same).
+_GITDIR = re.compile(r"/(?:[A-Za-z0-9_-][A-Za-z0-9._-]*/)+")
 #: Git's report of an HTTP answer: once the driver answers at all, its pod is
 #: serving and its answer stands (the lease refused, the repository not
 #: served, the upstream refusing or redirecting), except a 503 (the driver
@@ -63,11 +82,15 @@ _FINAL_FAILURES = ("Authentication failed",)
 
 @dataclass(frozen=True)
 class SwapBinding:
-    """One repository connector bound through the git swap driver."""
+    """One repository connector bound through the git swap driver.
+
+    ``clean_url`` is the checkout's remote (``<repository>.git``), the exact
+    string the binding's ``insteadOf`` rewrites; ``driver_url`` is the
+    driver's URL for the repository, without ``.git``.
+    """
 
     connector_id: str
     clean_url: str
-    base: str
     driver_url: str
     origin: str
     ca: str
@@ -81,6 +104,8 @@ def swap_binding(entry: Mapping[str, Any]) -> tuple[SwapBinding | None, str]:
         return None, "the entry is not bound through the git swap driver"
     if "unavailable" in block:
         return None, str(block["unavailable"])
+    if "url" not in block:
+        return None, "the entry is not bound through the git swap driver"
     lease = (entry.get("credentials") or {}).get("lease")
     if not isinstance(lease, Mapping) or not lease.get("token"):
         return None, "the git swap driver's lease was not delivered"
@@ -110,8 +135,7 @@ def swap_binding(entry: Mapping[str, Any]) -> tuple[SwapBinding | None, str]:
     return (
         SwapBinding(
             connector_id=connector_id,
-            clean_url=upstream.url,
-            base=upstream.base,
+            clean_url=upstream.remote,
             driver_url=driver_url,
             origin=origin,
             ca=ca,
@@ -121,19 +145,29 @@ def swap_binding(entry: Mapping[str, Any]) -> tuple[SwapBinding | None, str]:
     )
 
 
-def render_include(binding: SwapBinding, *, home: str) -> str:
-    """The git config include one binding installs."""
+def _safe_home(home: str) -> str:
     if not _SAFE_PATH.fullmatch(home) or not home.startswith("/"):
         raise ValueError("the workspace home cannot be written into git config")
-    if not _SAFE_URL.fullmatch(binding.base):
+    return home
+
+
+def rule_file(binding: SwapBinding, *, home: str) -> str:
+    """Where a binding's rules live in the workspace (absolute)."""
+    return f"{_safe_home(home)}/{BINDINGS_DIR}/{binding.connector_id}.gitconfig"
+
+
+def render_include(binding: SwapBinding, *, home: str) -> str:
+    """The git config rules one binding installs."""
+    home = _safe_home(home)
+    if not _SAFE_URL.fullmatch(binding.clean_url):
         raise ValueError("the upstream URL cannot be written into git config")
     helper = f"{home}/{HELPER_FILE}"
-    ca = f"{home}/{WIRING_DIR}/bindings/{binding.connector_id}.ca.pem"
+    ca = f"{home}/{BINDINGS_DIR}/{binding.connector_id}.ca.pem"
     return (
         f"# SRW git swap driver: connector {binding.connector_id}. Written by SRW\n"
         "# on every attach; edits are overwritten.\n"
-        f'[url "{binding.driver_url}"]\n'
-        f"\tinsteadOf = {binding.base}\n"
+        f'[url "{binding.driver_url}.git"]\n'
+        f"\tinsteadOf = {binding.clean_url}\n"
         f'[credential "{binding.origin}"]\n'
         "\thelper =\n"
         f"\thelper = \"!/usr/bin/python3 -I '{helper}' {binding.connector_id}\"\n"
@@ -144,27 +178,51 @@ def render_include(binding: SwapBinding, *, home: str) -> str:
     )
 
 
+def checkout_gitdir(backend: Any, clone_name: str) -> str:
+    """The ``gitdir:`` pattern of a checkout: its absolute directory and a
+    trailing slash (the checkout's ``.git`` and everything under it, its
+    worktrees included)."""
+    gitdir = str(backend.resolve_path(f"repos/{clone_name}")).rstrip("/") + "/"
+    if not _GITDIR.fullmatch(gitdir):
+        raise ValueError("the checkout path cannot be written into git config")
+    return gitdir
+
+
 def install_wiring(
     backend: Any,
     bindings: Iterable[SwapBinding],
     *,
+    checkouts: Mapping[str, str] | None = None,
     remove: Iterable[str] = (),
     prune: bool = False,
 ) -> dict[str, Any]:
-    """Write the wiring of ``bindings`` (and drop ``remove``) on the workspace."""
+    """Write the wiring of ``bindings`` (and drop ``remove``) on the workspace.
+
+    ``checkouts`` maps a connector id to its checkout's clone name: the
+    binding's rules apply in that checkout only. A binding without one keeps
+    the checkout an earlier write recorded.
+    """
     home = posixpath.dirname(backend.resolve_home_path(".srw-credentials"))
-    return backend.install_git_swap_wiring(
-        [
-            {
-                "id": binding.connector_id,
-                "include": render_include(binding, home=home),
-                "ca": binding.ca,
-            }
-            for binding in bindings
-        ],
-        remove=list(remove),
-        prune=prune,
-    )
+    checkouts = checkouts or {}
+    items = []
+    for binding in bindings:
+        item = {
+            "id": binding.connector_id,
+            "include": render_include(binding, home=home),
+            "ca": binding.ca,
+        }
+        clone_name = checkouts.get(binding.connector_id)
+        if clone_name:
+            item["gitdir"] = checkout_gitdir(backend, clone_name)
+        items.append(item)
+    return backend.install_git_swap_wiring(items, remove=list(remove), prune=prune)
+
+
+def binding_options(backend: Any, binding: SwapBinding) -> list[str]:
+    """``git -c`` options that apply a binding's rules where no checkout
+    exists yet (the clone, the wait for a starting driver)."""
+    home = posixpath.dirname(backend.resolve_home_path(".srw-credentials"))
+    return [f"include.path={rule_file(binding, home=home)}"]
 
 
 def wait_for_driver(
@@ -185,8 +243,11 @@ def wait_for_driver(
     sleep = sleep or time.sleep
     clock = clock or time.monotonic
     deadline = clock() + binding.wait_seconds
+    options = " ".join(
+        f"-c {shlex.quote(option)}" for option in binding_options(backend, binding)
+    )
     command = (
-        f"timeout {_TRY_SECONDS} git ls-remote --quiet "
+        f"timeout {_TRY_SECONDS} git {options} ls-remote --quiet "
         f"{shlex.quote(binding.clean_url)} HEAD"
     )
     last = ""
@@ -211,12 +272,18 @@ def wait_for_driver(
 
 
 def swap_note(entry: Mapping[str, Any]) -> str:
-    """The README's note on a repository bound (or refused) through the driver."""
+    """The README's note on how a token repository is reached: through the
+    driver, refused, or on the installation's fallback (and why)."""
     block = entry.get("git_swap")
     if not isinstance(block, Mapping):
         return ""
     if "unavailable" in block:
         return f" — NOT cloned: {block['unavailable']}"
+    if "fallback" in block:
+        return (
+            " — cloned with the forge token in its remote URL, NOT through "
+            f"SRW's git swap driver: {block['fallback']}"
+        )
     return (
         " — fetches and pushes go through SRW's git swap driver with a lease "
         "(the forge token never enters the workspace): branch pushes only, "
@@ -225,10 +292,14 @@ def swap_note(entry: Mapping[str, Any]) -> str:
 
 
 __all__ = [
+    "BINDINGS_DIR",
     "HELPER_FILE",
     "SwapBinding",
+    "binding_options",
+    "checkout_gitdir",
     "install_wiring",
     "render_include",
+    "rule_file",
     "swap_binding",
     "swap_note",
     "wait_for_driver",

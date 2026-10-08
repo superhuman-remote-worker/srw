@@ -3,11 +3,14 @@
 Every operation runs on the workspace backend; there is no agent-local clone
 (knowledge-base/knowledge/features/no_workspace_agent_mode.md §9.4). A token
 repository bound through the git swap driver (C3) clones its clean upstream
-URL: SRW's wiring (``agent.connectors.git_swap``, installed before the
-clones) points it at the driver, a reused checkout's origin is reset to the
-clean URL (dropping any ``oauth2:`` token an earlier clone left), and the
-checkout refuses credentials in a URL from then on. Where the installation
-falls back, a token repository clones with the token in its URL as before.
+URL (``<repository>.git``): SRW's wiring (``agent.connectors.git_swap``,
+installed before the clones, scoped to each binding's own checkout) points
+it at the driver, a reused checkout's origin is reset to the clean URL
+(dropping any ``oauth2:`` token an earlier clone left; a checkout whose
+origin cannot be reset is not used), and the checkout refuses credentials
+in a URL from then on. Where the installation falls back, a token
+repository clones with the token in its URL as before, and the README says
+so and why. A repository that is not cloned says why in the README too.
 An SSH-key repository clones through the opaque alias of its workspace
 ``ssh-agent`` identity (``agent.connectors.ssh_identity``, slice C1), and a
 key file a pre-agent clone left in ``~/.ssh`` is retired once the repository
@@ -36,6 +39,7 @@ from agent.connectors.base import (
 )
 from agent.connectors.git_swap import (
     SwapBinding,
+    binding_options,
     install_wiring,
     swap_binding,
     swap_note,
@@ -288,13 +292,18 @@ def _retire_legacy_ssh_key_files(
 
 
 def _wire_swap_repositories(
-    backend: Any, repo_datasources: List[Dict[str, Any]], *, prune: bool
+    backend: Any,
+    repo_datasources: List[Dict[str, Any]],
+    clone_names: List[str],
+    *,
+    prune: bool,
 ) -> Tuple[Dict[int, SwapBinding], Dict[int, str]]:
     """Install the git swap wiring of every swap repository in the batch.
 
     Returns the bindings wired, by position, and why the others are not.
     Runs before any clone: the clone of a clean URL needs the wiring to
-    reach the driver. ``prune`` (the workspace owner's full set) also drops
+    reach the driver. Each binding's rules apply in its own checkout
+    (``clone_names``). ``prune`` (the workspace owner's full set) also drops
     bindings an earlier attach left that this one no longer has.
     """
     wired: Dict[int, SwapBinding] = {}
@@ -310,7 +319,15 @@ def _wire_swap_repositories(
     if not wired:
         return wired, reasons
     try:
-        install_wiring(backend, wired.values(), prune=prune)
+        install_wiring(
+            backend,
+            wired.values(),
+            checkouts={
+                binding.connector_id: clone_names[index]
+                for index, binding in wired.items()
+            },
+            prune=prune,
+        )
     except Exception as exc:  # the repositories are skipped, never cloned bare
         reason = (
             "the workspace's git wiring for the git swap driver could not be "
@@ -321,12 +338,45 @@ def _wire_swap_repositories(
     return wired, reasons
 
 
-def _secure_swap_checkout(git_mgr: Any, binding: SwapBinding, *, reused: bool) -> None:
+def _secure_swap_checkout(
+    git_mgr: Any, binding: SwapBinding, *, reused: bool
+) -> Optional[str]:
     """Keep a swap checkout's remote the clean upstream URL and make a token
-    in any of its URLs fail loudly (``transfer.credentialsInUrl``)."""
-    if reused and not git_mgr.add_remote("origin", binding.clean_url):
-        logger.warning("Could not reset the origin of a git swap checkout")
+    in any of its URLs fail loudly (``transfer.credentialsInUrl``).
+
+    ``None`` when the checkout is safe to use, else why not: a reused
+    checkout whose origin cannot be reset still holds whatever URL an
+    earlier clone left (an ``oauth2:<token>@`` one before C3), so it is not
+    used at all.
+    """
+    if reused:
+        reset = git_mgr.add_remote("origin", binding.clean_url)
+        found = git_mgr._run_git(["config", "--get", "remote.origin.url"])
+        current = str(getattr(found, "stdout", "") or "").strip()
+        if (
+            not reset
+            or getattr(found, "returncode", 1) != 0
+            or current != (binding.clean_url)
+        ):
+            return (
+                "its existing checkout's origin could not be reset to the clean "
+                "URL (it may still hold a token from an earlier clone); remove "
+                "the directory to clone it again"
+            )
     git_mgr._run_git(["config", "transfer.credentialsInUrl", "die"])
+    return None
+
+
+def _note_skipped(workspace_manager: Any, clone_name: str, reason: str) -> None:
+    """Record why a repository was not cloned, for the README."""
+    skipped = getattr(workspace_manager, "source_repo_skipped", None)
+    if not isinstance(skipped, dict):
+        skipped = {}
+        try:
+            workspace_manager.source_repo_skipped = skipped
+        except AttributeError:
+            return
+    skipped[clone_name] = " ".join(str(reason).split())[:400]
 
 
 def clone_repository_datasources(
@@ -420,7 +470,7 @@ def clone_repository_datasources(
 
     clone_names = resolve_repo_clone_names(repo_datasources)
     swap_wired, swap_reasons = _wire_swap_repositories(
-        backend, repo_datasources, prune=legacy_key_files == "sweep"
+        backend, repo_datasources, clone_names, prune=legacy_key_files == "sweep"
     )
     ssh_outcomes: List[List[Any]] = []
     for index, (ds, repo_name) in enumerate(zip(repo_datasources, clone_names)):
@@ -443,13 +493,13 @@ def clone_repository_datasources(
             if auth == "swap":
                 swap = swap_wired.get(index)
                 if swap is None:
-                    logger.warning(
-                        "Skipping repository datasource %r: %s",
-                        ds_name,
-                        swap_reasons.get(
-                            index, "not bound through the git swap driver"
-                        ),
+                    reason = swap_reasons.get(
+                        index, "not bound through the git swap driver"
                     )
+                    logger.warning(
+                        "Skipping repository datasource %r: %s", ds_name, reason
+                    )
+                    _note_skipped(workspace_manager, repo_name, reason)
                     continue
                 # The clean upstream URL: the wiring sends it to the driver.
                 repo_url = swap.clean_url
@@ -466,6 +516,7 @@ def clone_repository_datasources(
                         ds_name,
                         reason,
                     )
+                    _note_skipped(workspace_manager, repo_name, reason)
                     continue
                 repo_url = ssh_clone_url
 
@@ -502,8 +553,15 @@ def clone_repository_datasources(
                         )
                 if swap is not None:
                     # A checkout an earlier token-in-URL clone left carries
-                    # oauth2:<token>@ in its origin: reset to the clean URL.
-                    _secure_swap_checkout(git_mgr, swap, reused=True)
+                    # oauth2:<token>@ in its origin: reset to the clean URL,
+                    # or leave the checkout unused.
+                    unsafe = _secure_swap_checkout(git_mgr, swap, reused=True)
+                    if unsafe is not None:
+                        logger.warning(
+                            "Skipping repository datasource %r: %s", ds_name, unsafe
+                        )
+                        _note_skipped(workspace_manager, repo_name, unsafe)
+                        continue
                 logger.info(
                     "Reusing repository datasource %r from repos/%s",
                     ds_name,
@@ -519,12 +577,20 @@ def clone_repository_datasources(
                             ds_name,
                             unserved,
                         )
+                        _note_skipped(workspace_manager, repo_name, unserved)
                         continue
                 git_mgr = GitManager.clone(
                     repo_url,
                     target,
                     backend=backend,
                     remote_cwd=remote_cwd,
+                    # The checkout does not exist yet, so its gitdir-scoped
+                    # rules do not apply to the clone: name them.
+                    **(
+                        {"config": binding_options(backend, swap)}
+                        if swap is not None
+                        else {}
+                    ),
                 )
                 if ssh_outcome is not None and git_mgr:
                     ssh_outcome[1] = True
@@ -559,6 +625,9 @@ def clone_repository_datasources(
                     )
                     continue
                 workspace_manager.source_repos[repo_name] = git_mgr
+                skipped = getattr(workspace_manager, "source_repo_skipped", None)
+                if isinstance(skipped, dict):
+                    skipped.pop(repo_name, None)
                 try:
                     from shared.runtime.services.forge import (
                         parse_owner_repo,
@@ -614,11 +683,15 @@ def clone_repository_datasources(
                     ds_name,
                     repo_name,
                 )
+                _note_skipped(workspace_manager, repo_name, "the clone failed")
         except Exception as e:
             logger.warning(
                 "Failed to clone repository datasource %s: %s",
                 ds.get("name", "unnamed"),
                 e,
+            )
+            _note_skipped(
+                workspace_manager, repo_name, f"the clone failed ({type(e).__name__})"
             )
 
     if ssh_outcomes:
@@ -627,6 +700,15 @@ def clone_repository_datasources(
             [(name, outcome) for name, outcome in ssh_outcomes],
             mode=legacy_key_files,
         )
+
+
+def _skip_reason(workspace_manager: Any, clone_name: str) -> Optional[str]:
+    """Why the last clone call left a repository uncloned, if it did."""
+    skipped = getattr(workspace_manager, "source_repo_skipped", None)
+    if not isinstance(skipped, dict):
+        return None
+    reason = skipped.get(clone_name)
+    return reason if isinstance(reason, str) and reason else None
 
 
 def _repo_meta(workspace_manager: Any, clone_name: str) -> Dict[str, Any]:
@@ -727,17 +809,20 @@ class CheckoutMaterializer:
     def on_backend_swap(self, deliveries: Sequence[Delivery], backend: Any) -> None:
         """The git swap wiring lives under ``~/.srw-credentials``, which no
         snapshot carries: write it again on the new workspace (the clones
-        and their clean remotes moved with it)."""
-        bindings = [
-            binding
-            for delivery in deliveries
-            for binding in (swap_binding(delivery.entry)[0],)
-            if binding is not None
-        ]
+        and their clean remotes moved with it), each scoped to its checkout
+        on the new workspace."""
+        entries = [delivery.entry for delivery in deliveries]
+        bindings = []
+        checkouts: Dict[str, str] = {}
+        for entry, clone_name in zip(entries, resolve_repo_clone_names(entries)):
+            binding = swap_binding(entry)[0]
+            if binding is not None:
+                bindings.append(binding)
+                checkouts[binding.connector_id] = clone_name
         if not bindings:
             return
         try:
-            install_wiring(backend, bindings)
+            install_wiring(backend, bindings, checkouts=checkouts)
         except Exception as e:
             logger.warning(
                 "Could not write the git swap wiring on the new workspace: %s",
@@ -771,6 +856,14 @@ class CheckoutMaterializer:
                 else "writable — pull requests opened with repo_open_pr are "
                 "recorded for this job"
             )
+            skipped = _skip_reason(rt.workspace_manager, clone_name)
+            if skipped is not None:
+                line = (
+                    f"- **{ds.get('name')}** — repository NOT cloned "
+                    f"(`./repos/{clone_name}/` is not usable): {skipped}"
+                )
+                out.append(FactsLines("Repositories", delivery.index, [line]))
+                continue
             line = (
                 f"- **{ds.get('name')}** — repository cloned at "
                 f'`./repos/{clone_name}/` (use `repo="{clone_name}"` with the '

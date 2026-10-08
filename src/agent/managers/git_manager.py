@@ -25,7 +25,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence
 from uuid import UUID
 
 logger = logging.getLogger(__name__)
@@ -1640,6 +1640,7 @@ class GitManager:
         target_path: Path,
         backend=None,
         remote_cwd=None,
+        config: Sequence[str] = (),
     ) -> Optional["GitManager"]:
         """Clone a repository to a target path.
 
@@ -1651,6 +1652,9 @@ class GitManager:
             remote_cwd: Relative path within backend root for the clone
                 target (e.g. "repos/my-repo"). When None, clones into
                 the backend's root directory.
+            config: ``key=value`` settings for the clone command only
+                (``git -c``), never secrets: a command line is visible.
+                Backend clones only.
 
         Returns:
             GitManager instance for the cloned repo, or None on failure
@@ -1665,7 +1669,11 @@ class GitManager:
                 else:
                     remote_target = backend.root
 
-                cmd = f"git clone {shlex.quote(url)} {shlex.quote(remote_target)}"
+                options = "".join(f"-c {shlex.quote(item)} " for item in config)
+                cmd = (
+                    f"git {options}clone {shlex.quote(url)} "
+                    f"{shlex.quote(remote_target)}"
+                )
                 output = backend.shell_run(
                     cmd, timeout=_CLONE_SHELL_TIMEOUT_SECONDS, tab_name="git"
                 )

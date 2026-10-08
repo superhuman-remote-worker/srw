@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -23,6 +24,7 @@ import pytest
 from agent.connectors.checkout import CheckoutMaterializer, clone_repository_datasources
 from agent.connectors.git_swap import (
     SwapBinding,
+    binding_options,
     install_wiring,
     render_include,
     swap_binding,
@@ -79,7 +81,6 @@ class TestBinding:
         assert binding == SwapBinding(
             connector_id=CONNECTOR,
             clean_url="https://github.com/o/r.git",
-            base="https://github.com/o/r",
             driver_url=f"{ORIGIN}/{CONNECTOR}/o/r",
             origin=ORIGIN,
             ca=CA,
@@ -138,8 +139,8 @@ class TestBinding:
         binding, _ = swap_binding(_entry())
         text = render_include(binding, home="/home/agent-host")
         assert (
-            f'[url "{ORIGIN}/{CONNECTOR}/o/r"]\n\tinsteadOf = https://github.com/o/r\n'
-            in text
+            f'[url "{ORIGIN}/{CONNECTOR}/o/r.git"]\n'
+            "\tinsteadOf = https://github.com/o/r.git\n" in text
         )
         assert f'[credential "{ORIGIN}"]\n\thelper =\n' in text
         assert (
@@ -180,7 +181,8 @@ def _env(home: Path) -> dict[str, str]:
     }
 
 
-def _sync(home: Path, bindings, *, remove=(), prune=False) -> dict:
+def _sync(home: Path, bindings, *, remove=(), prune=False, checkouts=None) -> dict:
+    checkouts = checkouts or {}
     payload = {
         "helper": GIT_SWAP_CREDENTIAL_HELPER,
         "bindings": [
@@ -188,6 +190,11 @@ def _sync(home: Path, bindings, *, remove=(), prune=False) -> dict:
                 "id": binding.connector_id,
                 "include": render_include(binding, home=str(home)),
                 "ca": binding.ca,
+                **(
+                    {"gitdir": f"{checkouts[binding.connector_id]}/"}
+                    if binding.connector_id in checkouts
+                    else {}
+                ),
             }
             for binding in bindings
         ],
@@ -206,7 +213,13 @@ def _sync(home: Path, bindings, *, remove=(), prune=False) -> dict:
     return json.loads(done.stdout.strip().splitlines()[-1])
 
 
-def _git(home: Path, *args: str, cwd: Path | None = None, stdin: str = "") -> str:
+def _git(
+    home: Path,
+    *args: str,
+    cwd: Path | None = None,
+    stdin: str = "",
+    check: bool = True,
+) -> str:
     done = subprocess.run(
         ["git", *args],
         input=stdin,
@@ -216,8 +229,19 @@ def _git(home: Path, *args: str, cwd: Path | None = None, stdin: str = "") -> st
         cwd=cwd or home,
         check=False,
     )
-    assert done.returncode == 0, done.stderr
+    assert done.returncode == 0 or not check, done.stderr
     return done.stdout
+
+
+def _checkout(home: Path, repo: Path, url: str, remote: str = "origin") -> None:
+    if not (repo / ".git").exists():
+        _git(home, "init", "-q", str(repo))
+    _git(home, "remote", "remove", remote, cwd=repo, check=False)
+    _git(home, "remote", "add", remote, url, cwd=repo)
+
+
+def _url(home: Path, repo: Path, remote: str = "origin") -> str:
+    return _git(home, "remote", "get-url", remote, cwd=repo).strip()
 
 
 def _lease(home: Path, connector: str, token: str) -> None:
@@ -226,25 +250,33 @@ def _lease(home: Path, connector: str, token: str) -> None:
     (leases / connector).write_text(token)
 
 
-def _fill(home: Path, origin: str, path: str) -> dict[str, str]:
+def _fill(
+    home: Path, origin: str, path: str, *, cwd: Path | None = None
+) -> dict[str, str]:
     host = origin.removeprefix("https://")
     out = _git(
         home,
         "credential",
         "fill",
         stdin=f"protocol=https\nhost={host}\npath={path}\n\n",
+        cwd=cwd,
     )
     return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
 
 
 class TestWiring:
-    def test_every_git_in_the_workspace_goes_through_the_driver(self, home):
+    def test_every_git_in_the_checkout_goes_through_the_driver(self, home):
         binding, _ = swap_binding(_entry())
-        report = _sync(home, [binding])
-        assert report == {"bindings": [CONNECTOR], "removed": [], "include": "added"}
+        repo = home / "repos" / "r"
+        report = _sync(home, [binding], checkouts={CONNECTOR: repo})
+        assert report == {
+            "bindings": [CONNECTOR],
+            "removed": [],
+            "unscoped": [],
+            "include": "added",
+        }
         _lease(home, CONNECTOR, LEASE)
         # The remote stays clean; git uses it rewritten to the driver.
-        repo = home / "repos" / "r"
         _git(home, "init", "-q", str(repo))
         _git(home, "remote", "add", "origin", "https://github.com/o/r.git", cwd=repo)
         assert _git(home, "config", "--get", "remote.origin.url", cwd=repo).strip() == (
@@ -254,7 +286,7 @@ class TestWiring:
             f"{ORIGIN}/{CONNECTOR}/o/r.git"
         )
         # The helper answers with the lease, for this connector's path only.
-        answer = _fill(home, ORIGIN, f"{CONNECTOR}/o/r.git")
+        answer = _fill(home, ORIGIN, f"{CONNECTOR}/o/r.git", cwd=repo)
         assert answer["password"] == LEASE
         assert answer["username"] == "srw-lease"
         assert int(answer["password_expiry_utc"]) > 0
@@ -266,6 +298,7 @@ class TestWiring:
                 "--get-urlmatch",
                 "http.sslCAInfo",
                 f"{ORIGIN}/{CONNECTOR}/o/r",
+                cwd=repo,
             )
             .strip()
             .endswith(f"bindings/{CONNECTOR}.ca.pem")
@@ -281,6 +314,7 @@ class TestWiring:
             capture_output=True,
             text=True,
             env=_env(home),
+            cwd=repo,
             check=False,
         )
         assert other.stdout == ""
@@ -298,11 +332,17 @@ class TestWiring:
                 connector=OTHER, origin=OTHER_ORIGIN, url="https://github.com/o/s.git"
             )
         )
-        _sync(home, [first, second])
+        r, s = home / "repos" / "r", home / "repos" / "s"
+        _sync(home, [first, second], checkouts={CONNECTOR: r, OTHER: s})
+        _checkout(home, r, "https://github.com/o/r.git")
+        _checkout(home, s, "https://github.com/o/s.git")
         _lease(home, CONNECTOR, LEASE)
         _lease(home, OTHER, OTHER_LEASE)
-        assert _fill(home, ORIGIN, f"{CONNECTOR}/o/r.git")["password"] == LEASE
-        assert _fill(home, OTHER_ORIGIN, f"{OTHER}/o/s.git")["password"] == OTHER_LEASE
+        assert _fill(home, ORIGIN, f"{CONNECTOR}/o/r.git", cwd=r)["password"] == LEASE
+        assert (
+            _fill(home, OTHER_ORIGIN, f"{OTHER}/o/s.git", cwd=s)["password"]
+            == OTHER_LEASE
+        )
         # A path that is not the helper's connector gets nothing from it.
         done = subprocess.run(
             ["git", "credential", "fill"],
@@ -310,13 +350,67 @@ class TestWiring:
             capture_output=True,
             text=True,
             env=_env(home),
+            cwd=r,
             check=False,
         )
         assert done.returncode != 0 and LEASE not in done.stdout
 
+    def test_two_connectors_to_one_upstream_never_mix(self, home):
+        # A ReadWrite and a ReadOnly binding of the same repository: git
+        # would use the first-defined of two equally long insteadOf matches,
+        # so each checkout must see only its own binding, whatever the ids.
+        rw, _ = swap_binding(_entry())
+        ro, _ = swap_binding(_entry(connector=OTHER, origin=OTHER_ORIGIN))
+        rw_dir, ro_dir = home / "repos" / "r", home / "repos" / "r-2"
+        for order in ([rw, ro], [ro, rw]):
+            _sync(home, order, checkouts={CONNECTOR: rw_dir, OTHER: ro_dir})
+            _checkout(home, rw_dir, "https://github.com/o/r.git")
+            _checkout(home, ro_dir, "https://github.com/o/r.git")
+            assert _url(home, rw_dir) == f"{ORIGIN}/{CONNECTOR}/o/r.git"
+            assert _url(home, ro_dir) == f"{OTHER_ORIGIN}/{OTHER}/o/r.git"
+        _lease(home, CONNECTOR, LEASE)
+        _lease(home, OTHER, OTHER_LEASE)
+        assert _fill(home, ORIGIN, f"{CONNECTOR}/o/r.git", cwd=rw_dir)["password"] == (
+            LEASE
+        )
+        assert _fill(home, OTHER_ORIGIN, f"{OTHER}/o/r.git", cwd=ro_dir)[
+            "password"
+        ] == (OTHER_LEASE)
+
+    def test_a_longer_repository_name_is_not_rewritten(self, home):
+        # Git rewrites by prefix: o/r would rewrite o/r-docs. The rule names
+        # the exact remote, o/r.git, which no other repository starts with.
+        binding, _ = swap_binding(_entry(url="https://github.com/o/r"))
+        assert binding.clean_url == "https://github.com/o/r.git"
+        repo, docs = home / "repos" / "r", home / "repos" / "r-docs"
+        _sync(home, [binding], checkouts={CONNECTOR: repo})
+        _checkout(home, repo, "https://github.com/o/r.git")
+        _git(home, "remote", "add", "docs", "https://github.com/o/r-docs.git", cwd=repo)
+        assert _url(home, repo, "docs") == "https://github.com/o/r-docs.git"
+        _checkout(home, docs, "https://github.com/o/r-docs.git")
+        assert _url(home, docs) == "https://github.com/o/r-docs.git"
+        # Outside SRW's checkouts nothing is rewritten, not even the same URL.
+        outside = home / "elsewhere"
+        _checkout(home, outside, "https://github.com/o/r.git")
+        assert _url(home, outside) == "https://github.com/o/r.git"
+
+    def test_the_clone_names_the_rules_before_its_checkout_exists(self, home):
+        binding, _ = swap_binding(_entry())
+        _sync(home, [binding], checkouts={CONNECTOR: home / "repos" / "r"})
+        backend = MagicMock()
+        backend.resolve_home_path.side_effect = lambda rel: f"{home}/{rel}"
+        options = binding_options(backend, binding)
+        command = ["ls-remote", "--get-url", "https://github.com/o/r.git"]
+        assert _git(home, *command).strip() == "https://github.com/o/r.git"
+        assert _git(
+            home, *(arg for option in options for arg in ("-c", option)), *command
+        ).strip() == (f"{ORIGIN}/{CONNECTOR}/o/r.git")
+
     def test_without_a_lease_git_gets_nothing(self, home):
         binding, _ = swap_binding(_entry())
-        _sync(home, [binding])
+        repo = home / "repos" / "r"
+        _sync(home, [binding], checkouts={CONNECTOR: repo})
+        _checkout(home, repo, "https://github.com/o/r.git")
         _lease(home, CONNECTOR, "not-a-lease")
         done = subprocess.run(
             ["git", "credential", "fill"],
@@ -324,6 +418,7 @@ class TestWiring:
             capture_output=True,
             text=True,
             env=_env(home),
+            cwd=repo,
             check=False,
         )
         assert done.returncode != 0
@@ -336,39 +431,55 @@ class TestWiring:
             )
         )
         (home / ".gitconfig").write_text("[user]\n\tname = Agent Worker\n")
-        _sync(home, [first, second])
+        checkouts = {CONNECTOR: home / "repos" / "r", OTHER: home / "repos" / "s"}
+        _sync(home, [first, second], checkouts=checkouts)
+        # A later sync without checkouts keeps the ones recorded.
         report = _sync(home, [first])
         assert report["include"] == "present" and report["bindings"] == [
             CONNECTOR,
             OTHER,
         ]
+        assert report["unscoped"] == []
+        config = (home / ".srw-credentials/git/config").read_text()
+        assert f'[includeIf "gitdir:{home}/repos/r/"]' in config
+        assert f'[includeIf "gitdir:{home}/repos/s/"]' in config
         includes = _git(home, "config", "--global", "--get-all", "include.path").split()
         assert includes == ["~/.srw-credentials/git/config"]
         assert "Agent Worker" in (home / ".gitconfig").read_text()
         # The owner's attach prunes what it no longer binds.
         report = _sync(home, [first], prune=True)
         assert report["bindings"] == [CONNECTOR] and report["removed"] == [OTHER]
-        assert not (
-            home / ".srw-credentials/git/bindings" / f"{OTHER}.gitconfig"
-        ).exists()
+        assert not list((home / ".srw-credentials/git/bindings").glob(f"{OTHER}.*"))
         # A live detach removes exactly one.
         report = _sync(home, [], remove=[CONNECTOR])
         assert report["bindings"] == [] and report["removed"] == [CONNECTOR]
         assert _git(home, "config", "--global", "--list")  # still parses
 
-    def test_retire_removes_the_wiring_and_git_still_works(self, home):
+    def test_only_sync_runs_and_a_checkout_path_is_checked(self, home):
         binding, _ = swap_binding(_entry())
-        _sync(home, [binding])
-        done = subprocess.run(
-            [sys.executable, "-I", "-c", GIT_SWAP_WIRING, str(home), "retire"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert done.returncode == 0
-        assert not (home / ".srw-credentials" / "git").exists()
-        # The include that is gone is ignored.
-        assert "include.path" in _git(home, "config", "--global", "--list")
+        for argv, gitdir in (
+            (["retire"], None),
+            (["sync"], "/tmp/repos/*/"),
+            (["sync"], "/tmp/../etc/"),
+            (["sync"], "relative/r/"),
+            (["sync"], "/tmp/r"),
+        ):
+            item = {
+                "id": CONNECTOR,
+                "include": render_include(binding, home=str(home)),
+                "ca": CA,
+            }
+            if gitdir is not None:
+                item["gitdir"] = gitdir
+            done = subprocess.run(
+                [sys.executable, "-I", "-c", GIT_SWAP_WIRING, str(home), *argv],
+                input=json.dumps({"helper": "x", "bindings": [item]}),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert done.returncode == 3, (argv, gitdir)
+        assert not (home / ".srw-credentials").exists()
 
     def test_a_symlinked_wiring_directory_is_refused(self, home, tmp_path):
         elsewhere = tmp_path / "elsewhere"
@@ -415,6 +526,9 @@ def _workspace(*, exists=False, shell_outputs=("Exit code: 0",)):
     backend.resolve_home_path = MagicMock(
         side_effect=lambda rel: f"/home/agent-host/{rel}"
     )
+    backend.resolve_path = MagicMock(
+        side_effect=lambda rel: f"/home/agent-host/workspace/{rel}"
+    )
     backend.shell_run = MagicMock(side_effect=list(shell_outputs) * 20)
     backend.install_git_swap_wiring = MagicMock(
         return_value={"bindings": [CONNECTOR], "removed": [], "include": "added"}
@@ -436,11 +550,21 @@ class TestClone:
             calls.append(f"clone {url}")
             return git_mgr
 
-        with patch("agent.managers.git_manager.GitManager.clone", side_effect=clone):
+        with patch(
+            "agent.managers.git_manager.GitManager.clone", side_effect=clone
+        ) as cloned:
             clone_repository_datasources([_entry()], ws)
         assert calls == ["wiring", "clone https://github.com/o/r.git"]
+        # The clone names the binding's rules: its checkout does not exist yet.
+        assert cloned.call_args.kwargs["config"] == [
+            "include.path=/home/agent-host/.srw-credentials/git/bindings/"
+            f"{CONNECTOR}.gitconfig"
+        ]
         [bindings], kwargs = ws.backend.install_git_swap_wiring.call_args
         assert [item["id"] for item in bindings] == [CONNECTOR]
+        assert [item["gitdir"] for item in bindings] == [
+            "/home/agent-host/workspace/repos/r/"
+        ]
         assert kwargs == {"remove": [], "prune": True}
         git_mgr._run_git.assert_any_call(["config", "transfer.credentialsInUrl", "die"])
         # The token reaches the agent process's PR metadata, never a command.
@@ -451,17 +575,51 @@ class TestClone:
     def test_a_reused_checkout_loses_its_old_token_url(self):
         ws = _workspace(exists=True)
         reused = MagicMock()
+        reused._run_git.return_value = SimpleNamespace(
+            returncode=0, stdout="https://github.com/o/r.git\n"
+        )
         with patch(
             "agent.managers.git_manager.GitManager", return_value=reused
         ) as manager:
             manager.clone = MagicMock()
-            clone_repository_datasources([_entry()], ws)
+            clone_repository_datasources([_entry(url="https://github.com/o/r")], ws)
         manager.clone.assert_not_called()
         reused.add_remote.assert_called_once_with(
             "origin", "https://github.com/o/r.git"
         )
         reused._run_git.assert_any_call(["config", "transfer.credentialsInUrl", "die"])
         ws.backend.shell_run.assert_not_called()  # no wait for a reused checkout
+        assert ws.source_repos == {"r": reused}
+
+    @pytest.mark.parametrize(
+        ("reset", "found"),
+        [
+            (False, SimpleNamespace(returncode=0, stdout="https://github.com/o/r.git")),
+            (
+                True,
+                SimpleNamespace(
+                    returncode=0, stdout=f"https://oauth2:{TOKEN}@github.com/o/r.git"
+                ),
+            ),
+            (True, SimpleNamespace(returncode=1, stdout="")),
+        ],
+    )
+    def test_a_reused_checkout_that_keeps_its_token_is_not_used(
+        self, reset, found, caplog
+    ):
+        ws = _workspace(exists=True)
+        reused = MagicMock()
+        reused.add_remote.return_value = reset
+        reused._run_git.return_value = found
+        with patch("agent.managers.git_manager.GitManager", return_value=reused):
+            clone_repository_datasources([_entry()], ws)
+        assert ws.source_repos == {}
+        assert "origin could not be reset" in caplog.text
+        assert TOKEN not in caplog.text
+        rt = RuntimeContext(execution="session", workspace_manager=ws)
+        [facts] = CheckoutMaterializer().facts(deliveries_from_payload([_entry()]), rt)
+        assert "NOT cloned" in facts.lines[0]
+        assert "origin could not be reset" in facts.lines[0]
 
     def test_a_partial_set_never_prunes(self):
         ws = _workspace()
@@ -506,8 +664,17 @@ class TestClone:
         clone.assert_called_once()
         assert ws.backend.shell_run.call_count == 3 and len(sleeps) == 2
         command = ws.backend.shell_run.call_args_list[0].args[0]
-        assert command.startswith("timeout 20 git ls-remote --quiet ")
+        assert command.startswith(
+            "timeout 20 git -c include.path=/home/agent-host/.srw-credentials/git/"
+            f"bindings/{CONNECTOR}.gitconfig ls-remote --quiet "
+        )
         assert "https://github.com/o/r.git" in command
+
+
+def _home_backend():
+    backend = MagicMock()
+    backend.resolve_home_path.side_effect = lambda rel: f"/home/agent-host/{rel}"
+    return backend
 
 
 class TestWait:
@@ -516,7 +683,7 @@ class TestWait:
         return SwapBinding(**{**binding.__dict__, "wait_seconds": wait})
 
     def test_a_refusal_is_final_at_once(self):
-        backend = MagicMock()
+        backend = _home_backend()
         backend.shell_run.return_value = "Exit code: 128\nfatal: Authentication failed for 'https://github.com/o/r.git/'"
         reason = wait_for_driver(backend, self._binding(), sleep=lambda _s: None)
         assert "did not serve" in reason and backend.shell_run.call_count == 1
@@ -525,7 +692,7 @@ class TestWait:
     def test_any_answer_of_the_driver_is_final(self, status):
         # A redirecting upstream is a 502 the driver gives at once: waiting
         # minutes for it would only delay the attach.
-        backend = MagicMock()
+        backend = _home_backend()
         backend.shell_run.return_value = (
             "Exit code: 128\nfatal: unable to access 'https://github.com/o/r.git/': "
             f"The requested URL returned error: {status}"
@@ -534,7 +701,7 @@ class TestWait:
         assert status in reason and backend.shell_run.call_count == 1
 
     def test_a_503_is_retried(self):
-        backend = MagicMock()
+        backend = _home_backend()
         backend.shell_run.side_effect = [
             "Exit code: 128\nfatal: The requested URL returned error: 503",
             "Exit code: 0",
@@ -543,7 +710,7 @@ class TestWait:
         assert backend.shell_run.call_count == 2
 
     def test_it_gives_up_at_the_deadline(self):
-        backend = MagicMock()
+        backend = _home_backend()
         backend.shell_run.return_value = "Exit code: 124"
         now = [0.0]
 
@@ -572,6 +739,7 @@ class TestLiveChanges:
         )
         [bindings], kwargs = backend.install_git_swap_wiring.call_args
         assert [item["id"] for item in bindings] == [CONNECTOR]
+        assert bindings[0]["gitdir"] == "/home/agent-host/workspace/repos/r/"
         assert kwargs["prune"] is False
 
     def test_the_readme_says_how_the_repository_is_reached(self):
@@ -580,6 +748,29 @@ class TestLiveChanges:
         [facts] = CheckoutMaterializer().facts(deliveries, rt)
         assert "git swap driver with a lease" in facts.lines[0]
         assert "no ref deletes or tags" in facts.lines[0]
+
+    def test_a_repository_that_was_not_cloned_says_why(self, caplog):
+        ws = _workspace(
+            shell_outputs=(
+                "Exit code: 128\nfatal: The requested URL returned error: 502",
+            )
+        )
+        with patch("agent.managers.git_manager.GitManager.clone") as clone:
+            clone_repository_datasources([_entry()], ws)
+        clone.assert_not_called()
+        rt = RuntimeContext(execution="session", workspace_manager=ws)
+        [facts] = CheckoutMaterializer().facts(deliveries_from_payload([_entry()]), rt)
+        assert "repository NOT cloned" in facts.lines[0]
+        assert "did not serve the repository" in facts.lines[0]
+        assert "cloned at" not in facts.lines[0]
+        # A later clone that works clears it.
+        with patch(
+            "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
+        ):
+            ws.backend.shell_run.side_effect = ["Exit code: 0"] * 5
+            clone_repository_datasources([_entry()], ws)
+        [facts] = CheckoutMaterializer().facts(deliveries_from_payload([_entry()]), rt)
+        assert "cloned at" in facts.lines[0]
 
 
 def test_install_wiring_resolves_the_home_from_the_backend():

@@ -380,6 +380,10 @@ class WorkspaceManager:
         # Forge/auth metadata per cloned repo, keyed like _source_repos
         self._source_repo_meta: dict[str, dict] = {}
 
+        # Why a repository connector was left uncloned, keyed by clone name
+        # (the README says so instead of "cloned")
+        self.source_repo_skipped: dict[str, str] = {}
+
     @property
     def backend(self) -> "WorkspaceBackend":
         """Get the workspace backend."""
