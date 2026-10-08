@@ -72,21 +72,6 @@ class DatasourcePayloadDependencies:
         )
 
 
-def mcp_datasource_runtime_allowed(
-    datasource: dict[str, Any],
-    *,
-    dependencies: DatasourcePayloadDependencies,
-) -> bool:
-    """Apply deployment gates to a resolved datasource without exposing secrets.
-
-    The connector's driver decides; only the MCP driver has gates today.
-    """
-    driver = dependencies.connector_drivers.for_type(datasource.get("type"))
-    return driver is None or driver.runtime_allowed(
-        datasource, dependencies.deployment_gates()
-    )
-
-
 def forwarded_datasources(
     datasources: list[dict[str, Any]] | None,
     *,

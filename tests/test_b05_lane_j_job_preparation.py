@@ -15,7 +15,7 @@ Three things are proven here, in this order:
    (``_mask_repository_transport``, ``_redispatch_livelock_trip``,
    ``_get_vm_context``, ``_get_infra_transient_context``,
    ``_container_ssh_key_path``, the two workspace-config injectors,
-   ``_stateless_worker_workspace_owner``, ``_mcp_datasource_runtime_allowed``,
+   ``_stateless_worker_workspace_owner``, the MCP deployment gates,
    the two stateless attestations). Those are characterized against ``main``
    here, so the move is provably behaviour-preserving rather than
    assumption-preserving.
@@ -815,12 +815,15 @@ class TestDatasourcePayload:
     ):
         """B06 deleted the `main` bridge this used to compare against, so the
         gate is asserted against the two flags it actually reads instead of
-        against a second spelling of itself."""
+        against a second spelling of itself. The rows an agent receives
+        (``forwarded_datasources``) are where the gate applies."""
         monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "true" if mcp_on else "false")
         monkeypatch.setenv("MCP_STDIO_ENABLED", "true" if stdio_on else "false")
 
-        allowed = agent_datasource_payload.mcp_datasource_runtime_allowed(
-            datasource, dependencies=_datasource_payload_deps()
+        allowed = bool(
+            agent_datasource_payload.forwarded_datasources(
+                [datasource], dependencies=_datasource_payload_deps()
+            )
         )
 
         credentials = datasource.get("credentials") or {}
