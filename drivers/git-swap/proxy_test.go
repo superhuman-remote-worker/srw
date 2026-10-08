@@ -35,13 +35,25 @@ var (
 // fakeAuthority is the lease exchange: three live leases (ReadWrite,
 // ReadOnly, and one of another connector) and one dead.
 type fakeAuthority struct {
-	mu         sync.Mutex
-	operations []string
-	allowed    []string
-	revoked    bool
+	mu           sync.Mutex
+	operations   []string
+	allowed      []string
+	revoked      bool
+	ended        bool // introspection: every lease has ended
+	down         bool // introspection: the exchange does not answer
+	introspected int
 }
 
 func (f *fakeAuthority) introspect(_ context.Context, token string) (lease, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.introspected++
+	if f.down {
+		return lease{}, errUnavailable
+	}
+	if f.ended {
+		return lease{}, nil
+	}
 	switch token {
 	case readWriteLease:
 		return lease{active: true, id: "lease-rw", connectorID: testConnector, access: "ReadWrite"}, nil
@@ -679,6 +691,65 @@ func TestAnIdleTransferIsCut(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 5*time.Second {
 		t.Fatalf("cut after %s", elapsed)
+	}
+}
+
+func TestALeaseThatEndsDuringATransferCutsIt(t *testing.T) {
+	for name, end := range map[string]func(*fakeAuthority){
+		"revoked":     func(f *fakeAuthority) { f.ended = true },
+		"unconfirmed": func(f *fakeAuthority) { f.down = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t)
+			h.driver.recheck = 100 * time.Millisecond
+			stop := make(chan struct{})
+			t.Cleanup(func() { close(stop) })
+			sent := make(chan struct{})
+			h.stream = func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+				w.Write([]byte(pkt("NAK\n")))
+				w.(http.Flusher).Flush()
+				close(sent)
+				// A long clone keeps its bytes moving: never idle.
+				tick := time.NewTicker(20 * time.Millisecond)
+				defer tick.Stop()
+				for {
+					select {
+					case <-stop:
+						return
+					case <-r.Context().Done():
+						return
+					case <-tick.C:
+						if _, err := w.Write([]byte(pkt("\x02progress\n"))); err != nil {
+							return
+						}
+						w.(http.Flusher).Flush()
+					}
+				}
+			}
+			response := h.do("POST", repoPath+"/git-upload-pack", readWriteLease, strings.NewReader(flushPkt), rpc("git-upload-pack"))
+			<-sent
+			// The lease lives through several checks: the transfer goes on.
+			time.Sleep(350 * time.Millisecond)
+			h.auth.mu.Lock()
+			checks := h.auth.introspected
+			end(h.auth)
+			h.auth.mu.Unlock()
+			if checks < 3 {
+				t.Fatalf("the lease was asked about %d times during the transfer", checks)
+			}
+			started := time.Now()
+			_, err := io.ReadAll(response.Body)
+			if err == nil {
+				t.Fatal("the transfer ended as if complete")
+			}
+			if elapsed := time.Since(started); elapsed > 2*time.Second {
+				t.Fatalf("cut after %s", elapsed)
+			}
+			if !strings.Contains(h.logText(), "cut") {
+				t.Fatalf("log %q", h.logText())
+			}
+		})
 	}
 }
 

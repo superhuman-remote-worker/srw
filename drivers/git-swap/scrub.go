@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/hex"
 	"io"
 	"net/url"
+	"strings"
 )
 
 // scrubber writes a response through to dst with every occurrence of the
@@ -19,20 +21,25 @@ type scrubber struct {
 	held    []byte
 }
 
-// newScrubber scrubs the credential itself, its URL escape and the Basic
-// authorization value the driver sends upstream (base64 of
-// "oauth2:<credential>"), as the upstream could echo any of them.
+// newScrubber scrubs the credential itself, its URL escape, its base64 and
+// hex (either case), and the Basic authorization value the driver sends
+// upstream (base64 of "oauth2:<credential>"), as the upstream could echo
+// any of them. Git's answers are pkt-lines and packs, not JSON, so the
+// managed MCP front's JSON-escaped forms do not arise here.
 func newScrubber(dst io.Writer, credential string) *scrubber {
 	s := &scrubber{dst: dst}
 	if credential == "" {
 		return s
 	}
 	seen := map[string]bool{}
+	encoded := hex.EncodeToString([]byte(credential))
 	for _, needle := range []string{
 		credential,
 		url.QueryEscape(credential),
 		basicValue(credential),
 		base64.StdEncoding.EncodeToString([]byte(credential)),
+		encoded,
+		strings.ToUpper(encoded),
 	} {
 		if needle == "" || seen[needle] {
 			continue

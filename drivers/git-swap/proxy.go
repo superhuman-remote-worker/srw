@@ -27,7 +27,11 @@ const (
 	// A transfer may sit this long with no byte moving either way (GitLab's
 	// git ingress waits an hour; a large repository counts objects for
 	// minutes before its first progress line).
-	defaultIdleTimeout  = 15 * time.Minute
+	defaultIdleTimeout = 15 * time.Minute
+	// While a transfer runs, the lease is asked about again this often, past
+	// the cache: a revoked lease stops a long clone or push within about
+	// two intervals instead of at its end (the managed MCP front's rule).
+	defaultLeaseRecheck = maxCache
 	maxInFlightPerLease = 32
 	maxInFlight         = 512
 	copyBuffer          = 32 * 1024
@@ -49,6 +53,7 @@ type driver struct {
 	logf     func(string, ...any)
 	now      func() time.Time
 	idle     time.Duration
+	recheck  time.Duration
 	inflight *inflight
 }
 
@@ -60,6 +65,7 @@ func newDriver(cfg *config, a authority, upstream *http.Client, logf func(string
 		logf:     logf,
 		now:      now,
 		idle:     defaultIdleTimeout,
+		recheck:  defaultLeaseRecheck,
 		inflight: &inflight{perLease: map[string]int{}},
 	}
 }
@@ -220,12 +226,13 @@ func (d *driver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	controller := http.NewResponseController(w)
-	watch := startIdle(d.idle, func() {
+	cut := func() {
 		cancel()
 		past := time.Unix(1, 0)
 		_ = controller.SetReadDeadline(past)
 		_ = controller.SetWriteDeadline(past)
-	})
+	}
+	watch := startIdle(d.idle, cut)
 	defer watch.stop()
 
 	var body io.Reader = http.NoBody
@@ -272,8 +279,59 @@ func (d *driver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusForbidden, "the connector's repository changed; this driver pod is being replaced, retry in a moment")
 		return
 	}
+	watching := make(chan struct{})
+	go func() {
+		defer close(watching)
+		d.watchLease(ctx, token, found.id, cut)
+	}()
+	defer func() {
+		cancel()
+		<-watching
+	}()
 	status, size := d.forward(ctx, w, r, rt, body, issued.credential, found.id, watch)
 	d.logf("lease=%s %s %s status=%d bytes=%d duration=%s", found.id, r.Method, rt.label(), status, size, d.now().Sub(started).Round(time.Millisecond))
+}
+
+// watchLease asks the exchange about the lease every recheck interval while
+// a transfer runs, past the cache, and cuts the transfer once the lease has
+// ended or the exchange could not confirm it for a whole interval. It
+// returns when ctx ends.
+func (d *driver) watchLease(ctx context.Context, token, leaseID string, cut func()) {
+	ticker := time.NewTicker(d.recheck)
+	defer ticker.Stop()
+	var unconfirmed time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		check, done := context.WithTimeout(ctx, 10*time.Second)
+		found, err := d.auth.authority.introspect(check, token)
+		done()
+		if ctx.Err() != nil {
+			return
+		}
+		switch {
+		case err == nil && found.active && strings.EqualFold(found.connectorID, d.cfg.connectorID):
+			unconfirmed = time.Time{}
+			continue
+		case err != nil:
+			now := d.now()
+			if unconfirmed.IsZero() {
+				unconfirmed = now
+				continue
+			}
+			if now.Sub(unconfirmed) < d.recheck {
+				continue
+			}
+			d.logf("lease=%s: the exchange could not confirm it for %s; cut the transfer", leaseID, d.recheck)
+		default:
+			d.logf("lease=%s ended during a transfer; cut it", leaseID)
+		}
+		cut()
+		return
+	}
 }
 
 func (r route) label() string {

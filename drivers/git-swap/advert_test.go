@@ -3,6 +3,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
+	"encoding/hex"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -142,5 +145,16 @@ func TestScrubberHoldsOnlyAPossibleCredential(t *testing.T) {
 func TestScrubText(t *testing.T) {
 	if got := scrubText("dial https://oauth2:tok123456@host failed", "tok123456"); strings.Contains(got, "tok123456") {
 		t.Fatalf("got %q", got)
+	}
+	credential := "glpat-Secret_Token-9"
+	for _, form := range []string{
+		hex.EncodeToString([]byte(credential)),
+		strings.ToUpper(hex.EncodeToString([]byte(credential))),
+		base64.StdEncoding.EncodeToString([]byte(credential)),
+		url.QueryEscape(credential),
+	} {
+		if got := scrubText("remote: "+form+"\n", credential); strings.Contains(got, form) {
+			t.Fatalf("an encoded credential passed: %q", got)
+		}
 	}
 }
