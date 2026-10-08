@@ -317,12 +317,12 @@ def _wire_swap_repositories(
         else:
             wired[index] = binding
     if not wired:
-        if prune and any(
-            isinstance(ds.get("git_swap"), dict) for ds in repo_datasources
-        ):
+        if prune:
             # The owner's set has no binding now (every repository fell
-            # back, or was refused): an earlier attach's wiring goes, or its
-            # rewrite would keep sending a checkout to the driver.
+            # back or was refused, or the driver is off and no entry says
+            # anything about it): an earlier attach's wiring goes, or its
+            # rewrite would keep sending a checkout to the driver. A
+            # workspace that never had any wiring is left as it is.
             try:
                 install_wiring(backend, (), prune=True)
             except Exception as exc:
@@ -382,6 +382,17 @@ def _secure_swap_checkout(
 def _falls_back(ds: Dict[str, Any]) -> bool:
     block = ds.get("git_swap")
     return isinstance(block, dict) and "fallback" in block
+
+
+def _swap_era(git_mgr: Any) -> bool:
+    """Whether a reused checkout was the git swap driver's: it refuses
+    credentials in URLs (``transfer.credentialsInUrl=die``), which only a
+    swap checkout is set to. A pre-C3 token checkout is not."""
+    found = git_mgr._run_git(["config", "--get", "transfer.credentialsInUrl"])
+    return (
+        getattr(found, "returncode", 1) == 0
+        and str(getattr(found, "stdout", "") or "").strip() == "die"
+    )
 
 
 def _fallback_checkout(git_mgr: Any, token_url: str) -> Optional[str]:
@@ -649,13 +660,14 @@ def clone_repository_datasources(
                         continue
                 if (
                     auth == "token_in_url"
-                    and _falls_back(ds)
                     and legacy_key_files != "keep"
+                    and (_falls_back(ds) or _swap_era(git_mgr))
                 ):
                     # The driver served this checkout in an earlier attach:
                     # its remote is the clean URL and it refuses credentials
-                    # in URLs. On the fallback it clones as before C3 did,
-                    # with the token in its remote URL (as the README says).
+                    # in URLs. On the fallback (or with the driver turned
+                    # off since: no entry says anything about it) it clones
+                    # as before C3 did, with the token in its remote URL.
                     unusable = _fallback_checkout(git_mgr, repo_url)
                     if unusable is not None:
                         logger.warning(

@@ -805,6 +805,79 @@ class TestFallbackAfterSwap:
         ws.backend.install_git_swap_wiring.assert_not_called()
         reused.add_remote.assert_not_called()
 
+    @staticmethod
+    def _swap_era_checkout(credentials_in_url: str | None):
+        reused = MagicMock()
+        reused.add_remote.return_value = True
+
+        def run_git(args):
+            if args == ["config", "--get", "transfer.credentialsInUrl"]:
+                if credentials_in_url is None:
+                    return SimpleNamespace(returncode=1, stdout="")
+                return SimpleNamespace(returncode=0, stdout=f"{credentials_in_url}\n")
+            return SimpleNamespace(returncode=0, stdout="https://github.com/o/r.git\n")
+
+        reused._run_git.side_effect = run_git
+        return reused
+
+    @staticmethod
+    def _driver_off():
+        # gitSwap.enabled=false (or no driver CA): the pre-C3 token entry,
+        # no git_swap block at all.
+        entry = _entry(credentials={"token": TOKEN})
+        entry.pop("git_swap")
+        return entry
+
+    def test_the_driver_turned_off_after_a_swap_era(self):
+        """C3 re-review 2's probe: the entry says nothing about the driver,
+        yet the reused checkout was the driver's. The owner's sweep prunes
+        the old wiring, and the checkout takes the token URL, so git never
+        goes to a dead driver URL and the README's "cloned" is true."""
+        ws = _workspace(exists=True)
+        reused = self._swap_era_checkout("die")
+        entry = self._driver_off()
+        assert checkout_auth(entry) == "token_in_url"
+        with patch("agent.managers.git_manager.GitManager", return_value=reused):
+            clone_repository_datasources([entry], ws, legacy_key_files="sweep")
+        ws.backend.install_git_swap_wiring.assert_called_once_with(
+            [], remove=[], prune=True
+        )
+        reused._run_git.assert_any_call(
+            ["config", "--unset-all", "transfer.credentialsInUrl"]
+        )
+        reused.add_remote.assert_called_once_with(
+            "origin", f"https://oauth2:{TOKEN}@github.com/o/r.git"
+        )
+        assert ws.source_repos == {"r": reused}
+        rt = RuntimeContext(execution="session", workspace_manager=ws)
+        [facts] = CheckoutMaterializer().facts(deliveries_from_payload([entry]), rt)
+        assert "cloned at" in facts.lines[0] and "NOT cloned" not in facts.lines[0]
+        for call in ws.backend.shell_run.call_args_list:
+            assert TOKEN not in str(call)
+
+    def test_a_pre_c3_token_checkout_is_left_as_it_was(self):
+        # No swap-era trace: the checkout keeps its origin, as before C3.
+        ws = _workspace(exists=True)
+        reused = self._swap_era_checkout(None)
+        with patch("agent.managers.git_manager.GitManager", return_value=reused):
+            clone_repository_datasources(
+                [self._driver_off()], ws, legacy_key_files="sweep"
+            )
+        reused.add_remote.assert_not_called()
+        # The owner's sweep prunes all the same (nothing to prune here).
+        ws.backend.install_git_swap_wiring.assert_called_once_with(
+            [], remove=[], prune=True
+        )
+        # Someone else's workspace (a child on its parent's) is left alone.
+        ws = _workspace(exists=True)
+        reused = self._swap_era_checkout("die")
+        with patch("agent.managers.git_manager.GitManager", return_value=reused):
+            clone_repository_datasources(
+                [self._driver_off()], ws, legacy_key_files="keep"
+            )
+        reused.add_remote.assert_not_called()
+        ws.backend.install_git_swap_wiring.assert_not_called()
+
     def test_the_wiring_program_prunes_to_nothing_and_leaves_a_clean_home_alone(
         self, home
     ):
