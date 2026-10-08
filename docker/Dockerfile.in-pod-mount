@@ -35,3 +35,5 @@ FROM rclone/rclone:1.74.3@sha256:623378ad0ff3ebd5cebf77720843c0e02edfe46e2d5b5ac
 RUN rm -f /usr/bin/fusermount3 /usr/bin/fusermount
 COPY --from=build /out/srw-fuse-opener /usr/local/bin/srw-fuse-opener
 RUN ln -s srw-fuse-opener /usr/local/bin/fusermount3
+# The opener serves uid 65534 only (--client-uid); the Pod sets it as well.
+USER 65534:65534

@@ -6,12 +6,15 @@
 //
 //	srw-fuse-opener serve --socket S --target DIR --client-uid N [--read-only]
 //	    The privileged native sidecar. It owns one FUSE mountpoint, DIR, in an
-//	    emptyDir it mounts with Bidirectional propagation. For each request on
-//	    the unix socket S (a volume only the rclone sidecar shares) it detaches
-//	    a stale mount at DIR, opens /dev/fuse, mounts it at DIR with options it
-//	    chooses (nosuid, nodev, allow_other, ro when --read-only), and passes
-//	    the descriptor back over SCM_RIGHTS. It opens no network listener and
-//	    never reads what the filesystem serves. On SIGTERM it unmounts DIR.
+//	    emptyDir it mounts with Bidirectional propagation; on start it detaches
+//	    a dead mount it finds there. For each request on the unix socket S (a
+//	    volume the rclone sidecar mounts read-only) from uid N it detaches a
+//	    stale mount at DIR, opens /dev/fuse, mounts it on DIR through an
+//	    O_PATH|O_NOFOLLOW descriptor with options it chooses (nosuid, nodev,
+//	    default_permissions, allow_other, ro when --read-only), and passes the
+//	    descriptor back over SCM_RIGHTS. It opens no network listener and never
+//	    reads what the filesystem serves. It retries rather than exits when it
+//	    cannot serve yet, and on SIGTERM it unmounts DIR.
 //
 //	fusermount3 [-u] [-z] [-q] [-o OPTS] MOUNTPOINT   (argv[0] or subcommand)
 //	    The client in the unprivileged rclone sidecar, installed ahead of the

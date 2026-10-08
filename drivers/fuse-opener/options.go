@@ -29,15 +29,16 @@ type mountSpec struct {
 	Flags   uintptr
 	FSType  string
 	Source  string
-	MaxRead int
-	Default bool // default_permissions
+	MaxRead uint32
 }
 
 // planMount turns the client's fusermount3 options into a mount the policy
 // allows. Options that only take privilege away are honoured; options that
 // would add privilege, or that the opener does not know, are refused, as
 // fusermount3 refuses unknown options. The client never chooses the source,
-// the type, suid or dev, or whether others may enter.
+// the type, suid or dev, or whether others may enter. default_permissions is
+// always on: the kernel checks the mode bits rclone reports, so other users
+// of an allow_other mount get no more than the files' permissions say.
 func planMount(p policy, options string) (mountSpec, error) {
 	spec := mountSpec{
 		Flags:  msNoSuid | msNoDev,
@@ -60,16 +61,16 @@ func planMount(p policy, options string) (mountSpec, error) {
 		case key == "allow_other", key == "allow_root":
 			// The policy decides who may enter, not the client.
 		case key == "default_permissions":
-			spec.Default = true
+			// Always on.
 		case key == "fsname", key == "subtype":
 			// Fixed by the policy: a client-chosen type could pose as another
 			// filesystem in mountinfo.
 		case key == "max_read" && hasValue:
-			n, err := strconv.Atoi(value)
-			if err != nil || n <= 0 {
+			n, err := strconv.ParseUint(value, 10, 32)
+			if err != nil || n == 0 {
 				return mountSpec{}, fmt.Errorf("bad max_read %q", value)
 			}
-			spec.MaxRead = n
+			spec.MaxRead = uint32(n)
 		default:
 			return mountSpec{}, fmt.Errorf("option %q is not allowed", key)
 		}
@@ -89,11 +90,9 @@ func (s mountSpec) data(p policy, fd int, rootMode uint32, uid, gid int) string 
 	if p.AllowOther {
 		parts = append(parts, "allow_other")
 	}
-	if s.Default {
-		parts = append(parts, "default_permissions")
-	}
+	parts = append(parts, "default_permissions")
 	if s.MaxRead > 0 {
-		parts = append(parts, "max_read="+strconv.Itoa(s.MaxRead))
+		parts = append(parts, "max_read="+strconv.FormatUint(uint64(s.MaxRead), 10))
 	}
 	return strings.Join(parts, ",")
 }

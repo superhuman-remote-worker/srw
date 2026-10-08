@@ -8,32 +8,70 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 )
 
+// Missing from package syscall; the generic Linux values (amd64, arm64).
+const (
+	oPath          = 0x200000 // O_PATH
+	umountNoFollow = 0x8      // UMOUNT_NOFOLLOW
+)
+
 type systemMounter struct{}
 
-func (systemMounter) Mount(target string, spec mountSpec, p policy, uid, gid int) (int, error) {
-	// mount(2) follows a symlink at the target; whoever can write the
-	// emptyDir must not be able to point the mount elsewhere.
-	var st syscall.Stat_t
-	if err := syscall.Lstat(target, &st); err != nil {
-		return -1, fmt.Errorf("stat %s: %w", target, err)
+// openTarget opens the target itself, never what a symlink there names, and
+// only if it is a directory. Mounting through the descriptor closes the gap
+// between checking the path and using it.
+func openTarget(target string) (int, error) {
+	fd, err := syscall.Open(target, oPath|syscall.O_NOFOLLOW|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, fmt.Errorf("%s must be a directory, not a symlink: %w", target, err)
 	}
-	if st.Mode&syscall.S_IFMT != syscall.S_IFDIR {
-		return -1, fmt.Errorf("%s is not a directory", target)
+	return fd, nil
+}
+
+func (systemMounter) Check(target string) error {
+	fd, err := openTarget(target)
+	if err != nil {
+		return err
+	}
+	return syscall.Close(fd)
+}
+
+func (systemMounter) Mount(target string, spec mountSpec, p policy, uid, gid int) (int, error) {
+	dir, err := openTarget(target)
+	if err != nil {
+		return -1, err
+	}
+	defer syscall.Close(dir)
+	var st syscall.Stat_t
+	if err := syscall.Fstat(dir, &st); err != nil {
+		return -1, fmt.Errorf("stat %s: %w", target, err)
 	}
 	fd, err := syscall.Open("/dev/fuse", syscall.O_RDWR|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return -1, fmt.Errorf("open /dev/fuse: %w", err)
 	}
 	data := spec.data(p, fd, st.Mode, uid, gid)
-	if err := syscall.Mount(spec.Source, target, spec.FSType, spec.Flags, data); err != nil {
+	// The directory just opened, not whatever the path names by now.
+	at := "/proc/self/fd/" + strconv.Itoa(dir)
+	if err := syscall.Mount(spec.Source, at, spec.FSType, spec.Flags, data); err != nil {
 		syscall.Close(fd)
 		return -1, fmt.Errorf("mount %s: %w", target, err)
 	}
 	return fd, nil
+}
+
+func (systemMounter) Stale(target string) bool {
+	mounts, err := mountsAt("/proc/self/mountinfo", target)
+	if err != nil || len(mounts) == 0 || !strings.HasPrefix(mounts[len(mounts)-1], "fuse") {
+		return false
+	}
+	var st syscall.Stat_t
+	err = syscall.Lstat(target, &st)
+	return errors.Is(err, syscall.ENOTCONN) || errors.Is(err, syscall.ECONNABORTED)
 }
 
 func (systemMounter) Detach(target string) (int, error) {
@@ -51,7 +89,16 @@ func (systemMounter) Detach(target string) (int, error) {
 		if !strings.HasPrefix(top, "fuse") {
 			return detached, fmt.Errorf("%s holds a %s mount, not FUSE", target, top)
 		}
-		if err := syscall.Unmount(target, syscall.MNT_DETACH); err != nil && !errors.Is(err, syscall.EINVAL) {
+		err = syscall.Unmount(target, syscall.MNT_DETACH|umountNoFollow)
+		if errors.Is(err, syscall.EINVAL) {
+			// Gone meanwhile (the daemon unmounted it), or not a mount
+			// point after all: only the first is fine.
+			if again, _ := mountsAt("/proc/self/mountinfo", target); len(again) == len(mounts) {
+				return detached, fmt.Errorf("unmount %s: %w", target, err)
+			}
+			continue
+		}
+		if err != nil {
 			return detached, fmt.Errorf("unmount %s: %w", target, err)
 		}
 		detached++
