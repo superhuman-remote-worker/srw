@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -233,6 +234,63 @@ async def test_worker_setup_runs_the_worker_order(log):
         ("mcp_tools", "register"),
         ("readme", "inject"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        ("setup_worker", ["checkout"]),
+        (
+            "attach_workspace",
+            ["env_file", "lease_token", "checkout", "credential_file"],
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_setting_up_an_execution_clones_off_the_event_loop(
+    log, monkeypatch, entry, expected
+):
+    """A first clone through the git swap driver waits minutes for a
+    starting pod (C3), so the checkout runs in a worker thread wherever an
+    execution is set up."""
+    offloaded = []
+    real_to_thread = asyncio.to_thread
+
+    async def to_thread(func, *args, **kwargs):
+        offloaded.append(getattr(func, "__self__", None).form)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(registry_module.asyncio, "to_thread", to_thread)
+    await getattr(registry_module.connector_registry(), entry)(
+        deliveries_from_payload(PAYLOAD), RuntimeContext(execution="worker")
+    )
+    assert offloaded == expected
+
+
+@pytest.mark.parametrize("entry", ["setup_worker", "attach_workspace"])
+@pytest.mark.asyncio
+async def test_a_waiting_checkout_leaves_the_event_loop_running(entry):
+    """The C0 stateless gate's regression: a token repository whose driver
+    never started held the loop for the whole wait (210 s), so the worker's
+    lease heartbeat never ran and the unit was parked. Here the checkout
+    waits for a callback the loop runs: inline, it waits out its timeout."""
+    loop = asyncio.get_running_loop()
+    loop_ran = threading.Event()
+
+    class WaitingCheckout(_Recorder):
+        def materialize(self, deliveries, rt):
+            loop.call_soon_threadsafe(loop_ran.set)
+            self.log.append((self.form, "materialize", loop_ran.wait(timeout=5)))
+
+    calls: list = []
+    registry = ConnectorRegistry(
+        (WaitingCheckout if form == "checkout" else _Recorder)(form, calls)
+        for form in AGENT_FORMS
+    )
+    await getattr(registry, entry)(
+        deliveries_from_payload(PAYLOAD), RuntimeContext(execution="worker")
+    )
+    assert ("checkout", "materialize", True) in calls
 
 
 def test_worker_release_closes_the_connections_only(log):

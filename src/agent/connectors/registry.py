@@ -25,7 +25,9 @@ Lease tokens (slice C2) are written before any checkout, so a checkout whose
 driver swaps credentials can read its lease.
 
 Blocking steps that the async entry points ran off the event loop still do
-(``offload``); the rest run inline, as they did.
+(``offload``); the rest run inline, as they did. The checkouts run off it
+too where an execution is set up (worker setup, session attach): a first
+clone through the git swap driver waits for a starting pod for minutes (C3).
 """
 
 from __future__ import annotations
@@ -101,6 +103,14 @@ RELEASE_ORDER: tuple[str, ...] = ("managed_connection",)
 _SESSION_OFFLOAD = frozenset(
     {"env_file", "lease_token", "ssh_identity", "credential_file"}
 )
+#: The checkout, where an execution is set up. A git swap repository's first
+#: clone waits up to its binding's ``wait_seconds`` (minutes) for a starting
+#: driver pod (C3). Inline, that wait held the event loop: a stateless
+#: worker's run-queue lease (60 s) lapsed and the unit was parked as
+#: outcome-unknown, and the pod failed its liveness probe. A live update keeps
+#: its checkout inline, as before: a turn may be in flight, reading the
+#: checkouts the step replaces.
+_SETUP_OFFLOAD = frozenset({"checkout"})
 
 
 def routed(deliveries: Iterable[Delivery], form: str) -> list[Delivery]:
@@ -182,7 +192,7 @@ class ConnectorRegistry:
         self, deliveries: Sequence[Delivery], rt: RuntimeContext
     ) -> None:
         self._warn_unserved(deliveries)
-        await self._run(WORKER_ORDER, deliveries, rt)
+        await self._run(WORKER_ORDER, deliveries, rt, offload=_SETUP_OFFLOAD)
 
     async def attach_harness(
         self, deliveries: Sequence[Delivery], rt: RuntimeContext
@@ -194,7 +204,10 @@ class ConnectorRegistry:
         self, deliveries: Sequence[Delivery], rt: RuntimeContext
     ) -> None:
         await self._run(
-            SESSION_WORKSPACE_ORDER, deliveries, rt, offload=_SESSION_OFFLOAD
+            SESSION_WORKSPACE_ORDER,
+            deliveries,
+            rt,
+            offload=_SESSION_OFFLOAD | _SETUP_OFFLOAD,
         )
 
     async def replace_live(
