@@ -51533,7 +51533,10 @@ class PostgresDB:
         through Project A is not portable into Project B or projectless work.
         Restricted connectors use all-match semantics for multi-project work.
         ``default_selected`` is owner-only except for the server-owned native
-        project KB marker. Credentials are decrypted here; REST callers must
+        project KB marker and the target projects' connector defaults (a
+        default of every target project, linked to each), as in
+        ``default_datasource_selection``. Credentials are decrypted here; REST
+        callers must
         redact them before returning the rows.
         """
         try:
@@ -51576,6 +51579,24 @@ class PostgresDB:
                                              AND native_pm.user_id = $1
                                        )
                                    )
+                               )
+                           )
+                       )
+                       -- A default of every target project, linked to each
+                       -- (project_connector_defaults, slice D3c).
+                       OR (
+                           cardinality($2::uuid[]) > 0
+                           AND NOT EXISTS (
+                               SELECT 1
+                               FROM unnest($2::uuid[]) work_project_id
+                               WHERE NOT EXISTS (
+                                   SELECT 1
+                                   FROM project_connector_defaults default_pcd
+                                   JOIN project_datasources default_pd
+                                     ON default_pd.project_id = default_pcd.project_id
+                                    AND default_pd.datasource_id = d.id
+                                   WHERE default_pcd.project_id = work_project_id
+                                     AND d.id = ANY(default_pcd.connector_ids)
                                )
                            )
                        ) AS default_selected
@@ -51735,7 +51756,9 @@ class PostgresDB:
             rows = await conn.fetch(
                 """
                 WITH project_defaults AS (
-                    SELECT DISTINCT stored.connector_id
+                    -- A default of every target project, linked to each:
+                    -- one project's defaults never reach another's work.
+                    SELECT stored.connector_id
                     FROM project_connector_defaults pcd
                     CROSS JOIN LATERAL unnest(pcd.connector_ids)
                         AS stored(connector_id)
@@ -51743,6 +51766,10 @@ class PostgresDB:
                       ON linked.project_id = pcd.project_id
                      AND linked.datasource_id = stored.connector_id
                     WHERE pcd.project_id = ANY($3::uuid[])
+                    GROUP BY stored.connector_id
+                    HAVING count(DISTINCT pcd.project_id) = (
+                        SELECT count(DISTINCT target) FROM unnest($3::uuid[]) target
+                    )
                 )
                 SELECT d.id, d.type, d.created_by, d.is_global, d.config,
                        d.scope_mode, d.auto_attach, d.policy_revision,
