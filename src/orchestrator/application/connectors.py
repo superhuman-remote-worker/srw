@@ -216,6 +216,8 @@ def service_hosting_settings(
         refused_cidrs=tuple(settings.connector_service_refused_cidrs),
         pod_ip=settings.connector_service_pod_ip,
         node_ip=settings.connector_service_node_ip,
+        reresolve_seconds=settings.connector_service_reresolve_seconds,
+        repin_drain_seconds=settings.connector_service_repin_drain_seconds,
     )
 
 

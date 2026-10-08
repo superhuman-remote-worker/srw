@@ -1965,6 +1965,12 @@ spec:
               value: {{ .startTimeoutSeconds | quote }}
             - name: CONNECTOR_SERVICE_RECONCILE_SECONDS
               value: {{ .reconcileIntervalSeconds | quote }}
+            # Re-pinning: a serving pod's egress hosts are resolved again on
+            # this interval; a changed address set starts its replacement.
+            - name: CONNECTOR_SERVICE_RERESOLVE_SECONDS
+              value: {{ .reresolveSeconds | quote }}
+            - name: CONNECTOR_SERVICE_REPIN_DRAIN_SECONDS
+              value: {{ .repinDrainSeconds | quote }}
             # The lease exchange as driver pods dial it: the orchestrator
             # Service, pinned into each pod's hostAliases (no DNS there).
             - name: CONNECTOR_SERVICE_EXCHANGE_HOST

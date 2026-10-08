@@ -417,6 +417,24 @@ def test_the_reconciler_settings_reach_the_orchestrator():
     assert example["connectors"]["servicePods"]["idleSeconds"] <= 120
 
 
+def test_re_pinning_settings_reach_the_orchestrator():
+    env = orchestrator_env(render(EXCHANGE, ON))
+    assert env["CONNECTOR_SERVICE_RERESOLVE_SECONDS"] == "300"
+    assert env["CONNECTOR_SERVICE_REPIN_DRAIN_SECONDS"] == "30"
+    env = orchestrator_env(
+        render(
+            EXCHANGE,
+            ON,
+            "connectors.servicePods.reresolveSeconds=0",
+            "connectors.servicePods.repinDrainSeconds=5",
+        )
+    )
+    assert env["CONNECTOR_SERVICE_RERESOLVE_SECONDS"] == "0"
+    assert env["CONNECTOR_SERVICE_REPIN_DRAIN_SECONDS"] == "5"
+    with pytest.raises(subprocess.CalledProcessError):
+        render(EXCHANGE, ON, "connectors.servicePods.reresolveSeconds=-1")
+
+
 def test_hosting_without_a_pinned_shim_fails_to_render():
     with pytest.raises(subprocess.CalledProcessError) as raised:
         render(EXCHANGE, ON, "connectors.drivers.shim.image.digest=")

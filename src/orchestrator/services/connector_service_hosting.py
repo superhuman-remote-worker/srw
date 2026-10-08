@@ -34,9 +34,19 @@ Each leader-gated pass:
    its bindings for the idle time), and stops it after ``idleSeconds``: the
    identity is revoked first, so the exchange refuses it at once, then the
    objects are deleted and their absence recorded;
-6. keeps one ingress policy per binding for a workspace-facing driver,
+6. re-resolves a serving pod's pinned hosts every ``reresolveSeconds``
+   (D5a): a shared pod with live bindings never idles, so it would never
+   pick up an upstream that moved. When an address set changed, a
+   replacement starts for the same key with the new policy and
+   hostAliases (the old pod is marked ``replaced_at`` and keeps serving),
+   and the old pod stops ``repinDrainSeconds`` after the replacement is
+   ready;
+7. keeps one ingress policy per binding for a workspace-facing driver,
    admitting only that binding's workspace;
-7. deletes every object it manages that no live row names (a connector
+8. keeps one endpoint Service per connector and digest with a live pod,
+   pointing at the pod that serves now (the newest ready one): callers
+   reach the connector by that stable name while pods are replaced;
+9. deletes every object it manages that no live row names (a connector
    delete cascades its identities; this removes their pods).
 
 Design: knowledge-base/knowledge/features/connector_drivers.md, "Three
@@ -61,6 +71,7 @@ from orchestrator.services.connector_driver_identities import (
     revoke_driver_identity,
 )
 from orchestrator.services.connector_egress import (
+    EgressPins,
     EgressPolicy,
     EgressRefused,
     expand_rule,
@@ -79,6 +90,7 @@ from orchestrator.services.connector_service_launch import (
     ServicePodIdentity,
     binding_ingress_policy,
     build_service_launch,
+    endpoint_service,
 )
 from orchestrator.services.pinned_k8s_effect import (
     run_bounded_k8s_call,
@@ -101,6 +113,8 @@ HOSTING_DISABLED = "hosting_disabled"
 #: Passes in a row the cluster check must fail before every pod stops.
 CLUSTER_STRIKES = 2
 EGRESS_WITHDRAWN = "egress_withdrawn"
+#: A pinned host resolved to other addresses: a replacement serves now.
+EGRESS_REPINNED = "egress_repinned"
 #: Stops that back the key off before the next start.
 _BACKOFF_REASONS = (LAUNCH_REFUSED, LAUNCH_FAILED, START_TIMEOUT, CAPACITY)
 _CAPACITY_LOCK = "srw-connector-service-capacity"
@@ -324,12 +338,9 @@ class ServicePodRuntime:
         labels = _field(metadata, "labels") or {}
         if labels.get("srw.io/driver-identity") != identity.identity_id:
             return PodState("Replaced", uid=_field(metadata, "uid"))
+        statuses = list(_field(status, "containerStatuses") or [])
         driver = next(
-            (
-                item
-                for item in _field(status, "containerStatuses") or []
-                if _field(item, "name") == "driver"
-            ),
+            (item for item in statuses if _field(item, "name") == "driver"),
             None,
         )
         waiting = _field(_field(driver, "state"), "waiting")
@@ -351,7 +362,11 @@ class ServicePodRuntime:
             ),
             None,
         )
-        ready = bool(_field(driver, "ready", False))
+        # Every container: a managed MCP pod's front (whose /readyz is a real
+        # MCP probe of the server beside it) as well as the driver.
+        ready = bool(_field(driver, "ready", False)) and all(
+            bool(_field(item, "ready", False)) for item in statuses
+        )
         return PodState(
             phase=_field(status, "phase") or "Unknown",
             uid=_field(metadata, "uid"),
@@ -415,8 +430,54 @@ class ServicePodRuntime:
                 self.networking_api.delete_namespaced_network_policy, name
             )
 
+    async def sync_endpoint(self, body: dict) -> bool:
+        """Create a connector's endpoint Service, or point it at the pod its
+        selector names now; ``True`` when anything changed."""
+        name = body["metadata"]["name"]
+        try:
+            current = await run_bounded_k8s_call(
+                self.core_api.read_namespaced_service,
+                name=name,
+                namespace=self.namespace,
+            )
+        except Exception as exc:
+            if _status(exc) != 404:
+                raise ServiceRuntimeError(f"reading {name} failed") from None
+            await self._create(self.core_api.create_namespaced_service, body)
+            return True
+        selector = dict(_field(_field(current, "spec"), "selector") or {})
+        if selector == body["spec"]["selector"]:
+            return False
+        try:
+            await run_bounded_k8s_mutation(
+                self.core_api.patch_namespaced_service,
+                name=name,
+                namespace=self.namespace,
+                body={"spec": {"selector": body["spec"]["selector"]}},
+            )
+        except Exception:
+            raise ServiceRuntimeError(f"pointing {name} at its pod failed") from None
+        return True
+
+    async def endpoint_services(self) -> list[str]:
+        """The names of every endpoint Service this hosting created."""
+        listed = await run_bounded_k8s_call(
+            self.core_api.list_namespaced_service,
+            namespace=self.namespace,
+            label_selector=f"srw/managed-by={MANAGER},srw.io/endpoint=true",
+        )
+        return [
+            _field(_field(item, "metadata"), "name")
+            for item in _field(listed, "items") or []
+        ]
+
+    async def delete_endpoint(self, name: str) -> None:
+        await self._delete(self.core_api.delete_namespaced_service, name)
+
     async def managed_objects(self) -> list[tuple[Callable[..., Any], str, str]]:
-        """Every object this hosting created: ``(delete, name, identity)``."""
+        """Every object this hosting created for one pod: ``(delete, name,
+        identity)``. Endpoint Services belong to a connector and digest, not
+        to a pod; :meth:`endpoint_services` lists them."""
         selector = f"srw/managed-by={MANAGER}"
         found: list[tuple[Callable[..., Any], str, str]] = []
         for list_call, delete in (
@@ -443,6 +504,8 @@ class ServicePodRuntime:
             for item in _field(listed, "items") or []:
                 metadata = _field(item, "metadata")
                 labels = _field(metadata, "labels") or {}
+                if labels.get("srw.io/endpoint") == "true":
+                    continue
                 found.append(
                     (
                         delete,
@@ -483,6 +546,12 @@ class ServiceHostingSettings:
     pod_ip: str = ""
     #: The address of the node it runs on (status.hostIP).
     node_ip: str = ""
+    #: Seconds between re-resolutions of a ready pod's pinned egress hosts
+    #: (``servicePods.reresolveSeconds``); 0 never re-resolves.
+    reresolve_seconds: float = 300.0
+    #: Seconds a pod replaced after a re-pin keeps running once its
+    #: replacement serves (``servicePods.repinDrainSeconds``).
+    repin_drain_seconds: float = 30.0
 
     def cluster_problem(self, exchange_address: str) -> str | None:
         """Why this cluster's ranges are not the configured ``clusterCidrs``.
@@ -677,6 +746,49 @@ def egress_withdrawn(
     return None
 
 
+def _pod_key(row: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(row["connector_id"]),
+        str(row["image_digest"]),
+        str(row["credential_generation"]),
+    )
+
+
+def _address_sets(recorded: Any) -> dict[tuple, tuple[bool, frozenset[str]]]:
+    """A recorded egress as ``{(host, ports, protocol): (literal, addresses)}``."""
+    if not isinstance(recorded, Mapping):
+        return {}
+    return {
+        (
+            str(item.get("host")),
+            tuple(item.get("ports") or ()),
+            str(item.get("protocol") or "tcp"),
+        ): (
+            bool(item.get("literal")),
+            frozenset(str(address) for address in item.get("addresses") or ()),
+        )
+        for item in recorded.get("hosts") or ()
+        if isinstance(item, Mapping)
+    }
+
+
+def _serving(rows: list[Mapping[str, Any]]) -> Mapping[str, Any]:
+    """The pod a connector's endpoint at one digest points at: the newest
+    ready pod not being replaced, else the newest ready one, else the newest
+    (which gets traffic once it is ready). Newer pods supersede older ones:
+    a new credential generation, a re-pin's replacement, a lost pod's."""
+
+    def newest(candidates: list[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+        return max(candidates, key=lambda row: row["created_at"], default=None)
+
+    ready = [row for row in rows if row["ready_at"] is not None]
+    return (
+        newest([row for row in ready if row["replaced_at"] is None])
+        or newest(ready)
+        or newest(rows)
+    )
+
+
 def _identity(row: Mapping[str, Any]) -> ServicePodIdentity:
     return ServicePodIdentity(
         identity_id=str(row["id"]),
@@ -696,7 +808,8 @@ SELECT connector_id, driver, image_digest, job_id, thread_id
 _POD_ROWS = """
 SELECT id, connector_id, driver, image_digest, credential_generation,
        image_reference, pod_namespace, pod_name, pod_uid, created_at, ready_at,
-       last_bound_at, idle_since, revoked_at, revoke_reason, removed_at, egress
+       last_bound_at, idle_since, revoked_at, revoke_reason, removed_at, egress,
+       egress_resolved_at, replaced_at
   FROM connector_driver_identities
  WHERE credential_generation IS NOT NULL AND removed_at IS NULL
 """
@@ -840,12 +953,21 @@ class ServiceHostingReconciler:
         )
 
     async def _claim(
-        self, spec: DriverSpec, binding: _Binding, generation: str, reference: str
+        self,
+        spec: DriverSpec,
+        binding: _Binding,
+        generation: str,
+        reference: str,
+        *,
+        replaces: str | None = None,
     ) -> tuple[Any, Any] | None:
         """Mint the identity of a new pod under the capacity lock.
 
         ``None`` when a live pod already holds the key; raises
-        :class:`ServiceCapacityError` at the installation cap.
+        :class:`ServiceCapacityError` at the installation cap. With
+        ``replaces``, that live pod is marked replaced in the same
+        transaction, so the key is free for its replacement while it keeps
+        serving (``None`` if it was stopped or replaced meanwhile).
         """
         async with self.store.acquire() as conn:
             async with conn.transaction():
@@ -853,10 +975,20 @@ class ServiceHostingReconciler:
                     "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                     _CAPACITY_LOCK,
                 )
+                if replaces is not None:
+                    marked = await conn.fetchval(
+                        "UPDATE connector_driver_identities SET replaced_at = now() "
+                        "WHERE id = $1 AND revoked_at IS NULL AND replaced_at IS NULL "
+                        "RETURNING id",
+                        UUID(replaces),
+                    )
+                    if marked is None:
+                        return None
                 held = await conn.fetchval(
                     "SELECT 1 FROM connector_driver_identities "
                     "WHERE connector_id = $1 AND image_digest = $2 "
-                    "AND credential_generation = $3 AND revoked_at IS NULL",
+                    "AND credential_generation = $3 AND revoked_at IS NULL "
+                    "AND replaced_at IS NULL",
                     UUID(binding.connector_id),
                     binding.digest,
                     generation,
@@ -908,7 +1040,11 @@ class ServiceHostingReconciler:
         private_allowed: bool,
         exchange_address: str,
         report: ReconcileReport,
+        pins: EgressPins | None = None,
+        replaces: str | None = None,
     ) -> None:
+        """Start a pod for a key; with ``replaces``, a replacement for that
+        live pod, pinned with the ``pins`` its re-resolution found."""
         from orchestrator.services.connector_service_images import (
             image_reference_for,
         )
@@ -918,7 +1054,9 @@ class ServiceHostingReconciler:
             report.refused.append((binding.connector_id, "no image is configured"))
             return
         try:
-            claimed = await self._claim(spec, binding, generation, reference)
+            claimed = await self._claim(
+                spec, binding, generation, reference, replaces=replaces
+            )
         except ServiceCapacityError as exc:
             report.capacity += 1
             logger.warning(
@@ -931,20 +1069,8 @@ class ServiceHostingReconciler:
         identity = _identity(row)
         try:
             config = connector.get("config") or {}
-            policy = EgressPolicy.build(
-                self.settings.cluster_cidrs,
-                allow_private=private_allowed,
-                ipv6=self.settings.ipv6,
-                refused_cidrs=self.settings.refused_cidrs,
-            )
-            pins = await pin_egress(
-                spec.egress,
-                config,
-                policy=policy,
-                needs_dns=spec.needs_dns,
-                resolver=self.resolver,
-                now=self.clock,
-            )
+            if pins is None:
+                pins = await self._pin(spec, config, private_allowed=private_allowed)
             async with self.store.acquire() as conn:
                 image = await ensure_image(
                     conn, driver=spec.name, reference=reference, digest=binding.digest
@@ -1011,11 +1137,31 @@ class ServiceHostingReconciler:
             )
         report.started.append(identity.identity_id)
         logger.info(
-            "Driver pod %s started for connector %s (%s at %s)",
+            "Driver pod %s started for connector %s (%s at %s)%s",
             identity.pod_name,
             identity.connector_id,
             spec.name,
             binding.digest,
+            f", replacing {replaces} after a re-pin" if replaces else "",
+        )
+
+    async def _pin(
+        self, spec: DriverSpec, config: Mapping[str, Any], *, private_allowed: bool
+    ) -> EgressPins:
+        """Resolve and check the spec's egress for one connector's config."""
+        policy = EgressPolicy.build(
+            self.settings.cluster_cidrs,
+            allow_private=private_allowed,
+            ipv6=self.settings.ipv6,
+            refused_cidrs=self.settings.refused_cidrs,
+        )
+        return await pin_egress(
+            spec.egress,
+            config,
+            policy=policy,
+            needs_dns=spec.needs_dns,
+            resolver=self.resolver,
+            now=self.clock,
         )
 
     async def _observe(self, row: Mapping[str, Any], report: ReconcileReport) -> bool:
@@ -1130,6 +1276,7 @@ class ServiceHostingReconciler:
                 )
                 for row in live:
                     await self._stop(row, HOSTING_REFUSED, report)
+                await self._sync_endpoints(specs)
                 report.swept = await self._sweep()
                 return report
 
@@ -1162,6 +1309,7 @@ class ServiceHostingReconciler:
             )
 
         survivors: list[Mapping[str, Any]] = []
+        active_ids: set[str] = set()
         for row in live:
             spec = specs.get(str(row["driver"]))
             if spec is None:
@@ -1183,7 +1331,11 @@ class ServiceHostingReconciler:
             active = key in current and current[key][0] == row["credential_generation"]
             if await self._settle_idle(row, bound=active, report=report):
                 survivors.append(row)
+                if active:
+                    active_ids.add(str(row["id"]))
 
+        # A pod being replaced holds no key: if its replacement failed, the
+        # next start (after its back-off) replaces it again.
         held = {
             (
                 str(r["connector_id"]),
@@ -1191,6 +1343,7 @@ class ServiceHostingReconciler:
                 str(r["credential_generation"]),
             )
             for r in survivors
+            if r["replaced_at"] is None
         }
         for key, (generation, private, connector) in current.items():
             if exchange is None or (key[0], key[1], generation) in held:
@@ -1209,9 +1362,176 @@ class ServiceHostingReconciler:
                 report=report,
             )
 
+        if exchange is not None:
+            await self._repin(
+                survivors,
+                active_ids,
+                specs,
+                connector_state=connector_state,
+                exchange_address=exchange,
+                report=report,
+            )
         await self._sync_binding_policies(bindings, specs)
+        await self._sync_endpoints(specs)
         report.swept = await self._sweep()
         return report
+
+    def _repin_due(self, row: Mapping[str, Any]) -> bool:
+        interval = self.settings.reresolve_seconds
+        resolved = row["egress_resolved_at"]
+        if interval <= 0 or resolved is None:
+            return False
+        return (self.clock() - resolved).total_seconds() >= interval
+
+    async def _repin(
+        self,
+        survivors: list[Mapping[str, Any]],
+        active_ids: set[str],
+        specs: Mapping[str, DriverSpec],
+        *,
+        connector_state: Callable[[str], Any],
+        exchange_address: str,
+        report: ReconcileReport,
+    ) -> None:
+        """Re-resolve the pinned hosts of the pods that serve bindings, and
+        replace a pod whose addresses changed.
+
+        A shared pod with live bindings never goes idle, so it never rolls
+        on its own: an upstream that moved would stay unreachable. Every
+        ``reresolveSeconds`` its hosts are resolved again; when an address
+        set changed, a replacement starts for the same key with the new
+        policy and hostAliases, the endpoint Service moves to it once it is
+        ready, and the old pod stops ``repinDrainSeconds`` later. The old
+        pod serves throughout, so a caller loses at most the requests in
+        flight at the switch (and a stateful MCP session, which its client
+        starts again). A host that no longer resolves, or resolves to an
+        address SRW refuses, keeps the addresses already pinned.
+        """
+        replacements: dict[tuple[str, str, str], Mapping[str, Any]] = {}
+        for row in survivors:
+            if row["replaced_at"] is None and row["ready_at"] is not None:
+                key = _pod_key(row)
+                newest = replacements.get(key)
+                if newest is None or row["created_at"] > newest["created_at"]:
+                    replacements[key] = row
+        for row in survivors:
+            if row["replaced_at"] is not None:
+                replacement = replacements.get(_pod_key(row))
+                if replacement is not None and (
+                    (self.clock() - replacement["ready_at"]).total_seconds()
+                    >= self.settings.repin_drain_seconds
+                ):
+                    await self._stop(row, EGRESS_REPINNED, report)
+                continue
+            if (
+                str(row["id"]) not in active_ids
+                or row["ready_at"] is None
+                or not self._repin_due(row)
+            ):
+                continue
+            spec = specs[str(row["driver"])]
+            connector, private = await connector_state(str(row["connector_id"]))
+            if connector is None:
+                continue
+            pins = await self._re_resolve(row, spec, connector, private=private)
+            if pins is None:
+                continue
+            logger.warning(
+                "Driver pod %s: a pinned host resolves to other addresses now; "
+                "starting its replacement",
+                row["pod_name"],
+            )
+            await self._start(
+                spec,
+                _Binding(
+                    str(row["connector_id"]),
+                    str(row["driver"]),
+                    str(row["image_digest"]),
+                ),
+                connector,
+                generation=str(row["credential_generation"]),
+                private_allowed=private,
+                exchange_address=exchange_address,
+                report=report,
+                pins=pins,
+                replaces=str(row["id"]),
+            )
+
+    async def _re_resolve(
+        self,
+        row: Mapping[str, Any],
+        spec: DriverSpec,
+        connector: Mapping[str, Any],
+        *,
+        private: bool,
+    ) -> EgressPins | None:
+        """The pod's pins resolved again when an address set changed;
+        otherwise ``None``, with the resolution time recorded."""
+        recorded = row["egress"]
+        if isinstance(recorded, str):
+            recorded = json.loads(recorded)
+        pinned = _address_sets(recorded)
+        pins: EgressPins | None = None
+        if any(not literal for literal, _ in pinned.values()):
+            try:
+                pins = await self._pin(
+                    spec, connector.get("config") or {}, private_allowed=private
+                )
+            except EgressRefused as exc:
+                logger.warning(
+                    "Driver pod %s keeps its pinned egress: re-resolving it was "
+                    "refused (%s)",
+                    row["pod_name"],
+                    exc,
+                )
+        if pins is not None and _address_sets(pins.record()) != pinned:
+            return pins
+        async with self.store.acquire() as conn:
+            await conn.execute(
+                "UPDATE connector_driver_identities SET egress_resolved_at = $2 "
+                "WHERE id = $1 AND egress IS NOT NULL",
+                UUID(str(row["id"])),
+                self.clock(),
+            )
+        return None
+
+    async def _sync_endpoints(self, specs: Mapping[str, DriverSpec]) -> None:
+        """One endpoint Service per connector and digest with a live pod,
+        pointing at the pod that serves now; the rest are deleted."""
+        async with self.store.acquire() as conn:
+            rows = await conn.fetch(_POD_ROWS + " AND revoked_at IS NULL")
+        groups: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+        for row in rows:
+            if str(row["driver"]) in specs:
+                key = (str(row["connector_id"]), str(row["image_digest"]))
+                groups.setdefault(key, []).append(row)
+        desired: dict[str, dict] = {}
+        for (connector_id, digest), group in groups.items():
+            serving = _serving(group)
+            spec = specs[str(serving["driver"])]
+            body = endpoint_service(
+                connector_id=connector_id,
+                digest=digest,
+                identity_id=str(serving["id"]),
+                port=spec.service.port,
+                namespace=self.settings.namespace,
+            )
+            desired[body["metadata"]["name"]] = body
+        try:
+            existing = set(await self.runtime.endpoint_services())
+        except Exception as exc:
+            logger.warning("Endpoint Services not listed (%s)", exc)
+            existing = set()
+        for name, body in desired.items():
+            try:
+                await self.runtime.sync_endpoint(body)
+            except (ServiceRuntimeError, ServiceCapacityError) as exc:
+                logger.warning("Endpoint Service %s not synced (%s)", name, exc)
+        for name in sorted(existing - set(desired)):
+            try:
+                await self.runtime.delete_endpoint(name)
+            except ServiceRuntimeError as exc:
+                logger.warning("Endpoint Service %s not deleted (%s)", name, exc)
 
     async def _sync_binding_policies(
         self,
@@ -1434,6 +1754,7 @@ async def connector_egress_view(
 
 __all__ = [
     "CAPACITY",
+    "EGRESS_REPINNED",
     "EGRESS_WITHDRAWN",
     "HOSTING_DISABLED",
     "HOSTING_REFUSED",

@@ -1406,6 +1406,8 @@
             "idleSeconds": {"type": "integer", "minimum": 0},
             "startTimeoutSeconds": {"type": "integer", "minimum": 30},
             "reconcileIntervalSeconds": {"type": "integer", "minimum": 5},
+            "reresolveSeconds": {"type": "integer", "minimum": 0},
+            "repinDrainSeconds": {"type": "integer", "minimum": 0},
             "clusterCidrs": {
               "type": "array",
               "minItems": 1,

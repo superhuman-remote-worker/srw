@@ -414,6 +414,72 @@ def test_the_service_manifest():
     }
 
 
+def test_the_endpoint_service_outlives_its_pods():
+    """Bindings carry the endpoint's name: one per connector and digest,
+    never a pod's, its selector naming the pod that serves now."""
+    from orchestrator.services.connector_service_launch import (
+        endpoint_service,
+        endpoint_service_name,
+        endpoint_url,
+    )
+
+    name = endpoint_service_name(CONNECTOR, DIGEST)
+    assert name == "srw-ep-66666666777748888999aaaaaaaaaaaa-abababababab"
+    assert len(name) <= 63
+    body = endpoint_service(
+        connector_id=CONNECTOR,
+        digest=DIGEST,
+        identity_id=IDENTITY,
+        port=8080,
+        namespace="srw-connectors",
+    )
+    assert body == {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": name,
+            "namespace": "srw-connectors",
+            "labels": {
+                "srw/managed-by": "connector-service-hosting",
+                "srw.io/plane": "service",
+                "srw.io/endpoint": "true",
+                "srw.io/connector-id": CONNECTOR,
+                "srw.io/image-digest": "abababababab",
+            },
+        },
+        "spec": {
+            "type": "ClusterIP",
+            "selector": {"srw.io/driver-identity": IDENTITY},
+            "ports": [
+                {
+                    "name": "srw-driver",
+                    "protocol": "TCP",
+                    "port": 8080,
+                    "targetPort": "srw-driver",
+                }
+            ],
+        },
+    }
+    # No driver identity label: the per-pod sweep never deletes it.
+    assert "srw.io/driver-identity" not in body["metadata"]["labels"]
+    assert (
+        endpoint_url(
+            namespace="srw-connectors",
+            connector_id=CONNECTOR,
+            digest=DIGEST,
+            port=8080,
+            path="/mcp",
+        )
+        == f"http://{name}.srw-connectors.svc.cluster.local:8080/mcp"
+    )
+    with pytest.raises(ValueError):
+        endpoint_service_name(CONNECTOR, "latest")
+    with pytest.raises(ValueError):
+        endpoint_url(
+            namespace="Bad_NS", connector_id=CONNECTOR, digest=DIGEST, port=8080
+        )
+
+
 def test_a_declared_dns_need_keeps_the_cluster_resolver():
     plan = _plan(pins=replace(PINS, dns=True, dns_reason="SRV records"))
     assert "dnsPolicy" not in plan.pod["spec"]

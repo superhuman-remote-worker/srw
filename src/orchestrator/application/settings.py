@@ -291,6 +291,11 @@ class DeploymentSettings:
     #: Empty: Helm's description replaces only the same installation; see
     #: ``services.cloud.instance_registry``.
     main_cloud_replace_installation: str = ""
+    #: Re-pinning serving pods (D5a): seconds between re-resolutions of a
+    #: pod's pinned egress hosts (0 never re-resolves), and how long a pod
+    #: replaced after a re-pin runs on once its replacement serves.
+    connector_service_reresolve_seconds: float = 300.0
+    connector_service_repin_drain_seconds: float = 30.0
 
     def session_subagent_fanout(self, lane: str | None) -> bool:
         """Whether a session on ``lane`` may fan out right now."""
@@ -450,6 +455,18 @@ class DeploymentSettings:
             main_cloud_replace_installation=os.environ.get(
                 "MAIN_CLOUD_REPLACE_INSTALLATION", ""
             ).strip(),
+            connector_service_reresolve_seconds=parse_positive_number(
+                "CONNECTOR_SERVICE_RERESOLVE_SECONDS",
+                os.environ.get("CONNECTOR_SERVICE_RERESOLVE_SECONDS"),
+                default=300.0,
+                minimum=0.0,
+            ),
+            connector_service_repin_drain_seconds=parse_positive_number(
+                "CONNECTOR_SERVICE_REPIN_DRAIN_SECONDS",
+                os.environ.get("CONNECTOR_SERVICE_REPIN_DRAIN_SECONDS"),
+                default=30.0,
+                minimum=0.0,
+            ),
         )
 
 

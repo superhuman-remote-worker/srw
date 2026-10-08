@@ -416,6 +416,70 @@ async def test_managed_objects_lists_every_kind_by_its_manager_label(api, runtim
     assert selectors == {"srw/managed-by=connector-service-hosting"}
 
 
+def _endpoint(identity: str = IDENTITY.identity_id) -> dict:
+    from orchestrator.services.connector_service_launch import endpoint_service
+
+    return endpoint_service(
+        connector_id=IDENTITY.connector_id,
+        digest=IDENTITY.digest,
+        identity_id=identity,
+        port=8080,
+        namespace="srw-connectors",
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_endpoint_is_created_then_pointed_at_another_pod(api, runtime):
+    other = "22222222-3333-4444-8555-666666666666"
+    assert await runtime.sync_endpoint(_endpoint()) is True
+    name = _endpoint()["metadata"]["name"]
+    assert ("service", name) in api.objects
+    # The same pod again: nothing to do.
+    assert await runtime.sync_endpoint(_endpoint()) is False
+    assert not [call for call, _ in api.calls if call.startswith("patch_")]
+    # Another pod: only the selector is patched (no delete, no gap).
+    assert await runtime.sync_endpoint(_endpoint(other)) is True
+    (patch,) = [kwargs for call, kwargs in api.calls if call.startswith("patch_")]
+    assert patch["name"] == name
+    assert patch["body"] == {"spec": {"selector": {"srw.io/driver-identity": other}}}
+    assert not [call for call, _ in api.calls if call.startswith("delete_")]
+
+
+@pytest.mark.asyncio
+async def test_endpoints_are_listed_apart_from_any_pods_objects(api, runtime):
+    await runtime.launch(_plan())
+    await runtime.sync_endpoint(_endpoint())
+    name = _endpoint()["metadata"]["name"]
+    assert await runtime.endpoint_services() == [name]
+    # The identity sweep never sees it: it belongs to the connector.
+    assert name not in {found for _, found, _ in await runtime.managed_objects()}
+    # Removing the pod's objects leaves it too.
+    await runtime.remove(IDENTITY)
+    assert ("service", name) in api.objects
+    await runtime.delete_endpoint(name)
+    assert ("service", name) not in api.objects
+    await runtime.delete_endpoint(name)  # already gone: fine
+
+
+@pytest.mark.asyncio
+async def test_a_pod_is_ready_only_when_every_container_is(api, runtime):
+    """A managed MCP pod's front serves /readyz from a real MCP probe of
+    the server beside it: the pod is not ready before both are."""
+    api.objects[("pod", POD)] = {
+        "metadata": {"name": POD, "uid": "u", "labels": dict(IDENTITY.labels)},
+        "status": {
+            "phase": "Running",
+            "containerStatuses": [
+                {"name": "driver", "ready": True, "state": {}},
+                {"name": "front", "ready": False, "state": {}},
+            ],
+        },
+    }
+    assert (await runtime.observe(IDENTITY)).ready is False
+    api.objects[("pod", POD)]["status"]["containerStatuses"][1]["ready"] = True
+    assert (await runtime.observe(IDENTITY)).ready is True
+
+
 # =============================================================================
 # Composition and the loop
 # =============================================================================
@@ -540,6 +604,30 @@ def test_hosting_settings_come_from_the_deployment():
     assert settings.cluster_problem("10.43.0.20") is None
     assert "10.43.0.20" not in (settings.cluster_problem("10.96.0.10") or "")
     assert "Service address 10.96.0.10" in settings.cluster_problem("10.96.0.10")
+    assert settings.reresolve_seconds == 300.0
+    assert settings.repin_drain_seconds == 30.0
+
+
+def test_re_pinning_comes_from_the_deployment(monkeypatch):
+    monkeypatch.setenv("CONNECTOR_SERVICE_RERESOLVE_SECONDS", "120")
+    monkeypatch.setenv("CONNECTOR_SERVICE_REPIN_DRAIN_SECONDS", "5")
+    settings = DeploymentSettings.from_environment()
+    assert settings.connector_service_reresolve_seconds == 120.0
+    assert settings.connector_service_repin_drain_seconds == 5.0
+    monkeypatch.setenv("CONNECTOR_SERVICE_RERESOLVE_SECONDS", "0")
+    assert (
+        DeploymentSettings.from_environment().connector_service_reresolve_seconds == 0
+    )
+    hosting_settings = connectors_composition.service_hosting_settings(
+        SimpleNamespace(
+            settings=_settings(
+                connector_service_reresolve_seconds=45.0,
+                connector_service_repin_drain_seconds=7.0,
+            )
+        )
+    )
+    assert hosting_settings.reresolve_seconds == 45.0
+    assert hosting_settings.repin_drain_seconds == 7.0
 
 
 @pytest.mark.parametrize(

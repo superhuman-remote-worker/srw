@@ -38,6 +38,7 @@ from orchestrator.services.connector_service_hosting import (
     ServiceHostingSettings,
     connector_egress_view,
 )
+from orchestrator.services.connector_service_launch import endpoint_service_name
 from shared.connectors.contract import (
     AccessLevel,
     CredentialSlot,
@@ -728,6 +729,8 @@ class FakeRuntime:
         self.objects: list[tuple[object, str, str]] = []
         self.cluster_ips = {("srw-orchestrator", "srw"): "10.43.0.20"}
         self.deleted: list[str] = []
+        #: Endpoint Service name -> the identity its selector names.
+        self.endpoints: dict[str, str] = {}
 
     async def service_cluster_ip(self, name, namespace):
         if (name, namespace) not in self.cluster_ips:
@@ -756,6 +759,19 @@ class FakeRuntime:
 
     async def delete_object(self, delete, name):
         self.deleted.append(name)
+
+    async def sync_endpoint(self, body):
+        name = body["metadata"]["name"]
+        target = body["spec"]["selector"]["srw.io/driver-identity"]
+        changed = self.endpoints.get(name) != target
+        self.endpoints[name] = target
+        return changed
+
+    async def endpoint_services(self):
+        return list(self.endpoints)
+
+    async def delete_endpoint(self, name):
+        self.endpoints.pop(name, None)
 
     def ready(self, identity_id: str) -> None:
         self.states[identity_id] = PodState("Running", uid="u", ready=True)
@@ -824,11 +840,15 @@ def reconciler(db):
         images.ServiceImageSettings(references={ECHO: ECHO_REFERENCE})
     )
     offset = [timedelta()]
+    # Per-test overrides of ADDRESSES, so a test may move a host to other
+    # addresses (or to None: it no longer resolves).
+    addresses: dict[str, list[str] | None] = {}
 
     async def resolver(host, ipv6):
-        if host not in ADDRESSES:
+        answers = addresses[host] if host in addresses else ADDRESSES.get(host)
+        if answers is None:
             raise OSError("unknown host")
-        return ADDRESSES[host]
+        return answers
 
     runtime = FakeRuntime()
     built = ServiceHostingReconciler(
@@ -848,12 +868,15 @@ def reconciler(db):
             refused_cidrs=("10.0.50.0/24", "10.0.51.0/24"),
             pod_ip="10.42.0.9",
             node_ip="10.0.50.11",
+            reresolve_seconds=300,
+            repin_drain_seconds=30,
         ),
         resolver=resolver,
         clock=lambda: datetime.now(timezone.utc) + offset[0],
     )
     built.offset = offset
     built.fake = runtime
+    built.addresses = addresses
     return built
 
 
@@ -1446,6 +1469,247 @@ async def test_objects_no_live_row_names_are_swept(db, reconciler):
     report = await reconciler.reconcile_once()
     assert report.swept == 1
     assert reconciler.fake.deleted == ["srw-drv-orphan"]
+
+
+# =============================================================================
+# Re-pinning a serving pod, and the endpoint Service (D5a)
+# =============================================================================
+
+
+async def _serving_pod(db, reconciler, thread: str | None = None) -> tuple[str, dict]:
+    """A bound echo connector whose one pod is ready, its endpoint on it."""
+    connector = await _echo_connector(db)
+    await _echo_image(db)
+    await _bind_echo(db, connector, thread or await _thread(db))
+    await reconciler.reconcile_once()
+    (pod,) = await _pods(db)
+    reconciler.fake.ready(str(pod["id"]))
+    await reconciler.reconcile_once()
+    (pod,) = await _pods(db)
+    assert pod["ready_at"] is not None
+    return connector, pod
+
+
+def _egress_cidrs(plan) -> list[str]:
+    return [
+        peer["ipBlock"]["cidr"]
+        for rule in plan.network_policy["spec"]["egress"]
+        for peer in rule["to"]
+        if "ipBlock" in peer
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_endpoint_follows_the_serving_pod_and_goes_with_the_last(
+    db, reconciler
+):
+    thread = await _thread(db)
+    connector, pod = await _serving_pod(db, reconciler, thread)
+    name = endpoint_service_name(connector, D1)
+    assert reconciler.fake.endpoints == {name: str(pod["id"])}
+    # Lost behind SRW's back: the endpoint keeps its name and moves to the
+    # replacement once it is ready.
+    reconciler.fake.states.pop(str(pod["id"]))
+    await reconciler.reconcile_once()
+    _lost, replacement = await _pods(db)
+    reconciler.fake.ready(str(replacement["id"]))
+    await reconciler.reconcile_once()
+    assert reconciler.fake.endpoints == {name: str(replacement["id"])}
+    # The last pod of the connector and digest stops: the endpoint goes.
+    await _end(db, thread)
+    await reconciler.reconcile_once()
+    reconciler.offset[0] = timedelta(seconds=61)
+    report = await reconciler.reconcile_once()
+    assert (str(replacement["id"]), "idle") in report.stopped
+    assert reconciler.fake.endpoints == {}
+
+
+@pytest.mark.asyncio
+async def test_a_new_generation_takes_the_endpoint_once_it_is_ready(db, reconciler):
+    connector, old = await _serving_pod(db, reconciler)
+    name = endpoint_service_name(connector, D1)
+    await _set_config(
+        db, connector, {"host": "one.one.one.one", "port": 443, "message": "v2"}
+    )
+    await reconciler.reconcile_once()
+    _old, new = await _pods(db)
+    assert reconciler.fake.endpoints[name] == str(old["id"])
+    reconciler.fake.ready(str(new["id"]))
+    await reconciler.reconcile_once()
+    assert reconciler.fake.endpoints[name] == str(new["id"])
+
+
+@pytest.mark.asyncio
+async def test_a_moved_upstream_starts_a_replacement_that_takes_over(db, reconciler):
+    """A serving pod never idles: its hosts are resolved again on the
+    interval, and a changed address set starts a replacement with the new
+    policy and hostAliases; the old pod serves until the replacement does,
+    then stops after the drain."""
+    connector, old = await _serving_pod(db, reconciler)
+    name = endpoint_service_name(connector, D1)
+    reconciler.addresses["one.one.one.one"] = ["1.0.0.1"]
+    # Not due yet.
+    assert (await reconciler.reconcile_once()).started == []
+    reconciler.offset[0] = timedelta(seconds=301)
+    report = await reconciler.reconcile_once()
+    assert len(report.started) == 1
+    old, new = await _pods(db)
+    assert old["replaced_at"] is not None and old["revoked_at"] is None
+    assert new["replaced_at"] is None
+    assert new["credential_generation"] == old["credential_generation"]
+    assert json.loads(new["egress"])["hosts"][0]["addresses"] == ["1.0.0.1"]
+    plan = reconciler.fake.plans[str(new["id"])]
+    assert {"ip": "1.0.0.1", "hostnames": ["one.one.one.one"]} in plan.pod["spec"][
+        "hostAliases"
+    ]
+    assert "1.0.0.1/32" in _egress_cidrs(plan)
+    assert "1.1.1.1/32" not in _egress_cidrs(plan)
+    # The old pod serves until the replacement is ready ...
+    reconciler.offset[0] = timedelta()
+    report = await reconciler.reconcile_once()
+    assert report.stopped == [] and report.started == []
+    assert reconciler.fake.endpoints[name] == str(old["id"])
+    reconciler.fake.ready(str(new["id"]))
+    await reconciler.reconcile_once()
+    assert reconciler.fake.endpoints[name] == str(new["id"])
+    # ... and for the drain after it.
+    assert (await reconciler.reconcile_once()).stopped == []
+    reconciler.offset[0] = timedelta(seconds=31)
+    report = await reconciler.reconcile_once()
+    assert report.stopped == [(str(old["id"]), "egress_repinned")]
+    assert report.started == []
+    old, new = await _pods(db)
+    assert old["revoke_reason"] == "egress_repinned" and old["removed_at"]
+    assert new["revoked_at"] is None
+    assert reconciler.fake.endpoints == {name: str(new["id"])}
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_upstream_records_the_resolution_and_starts_nothing(
+    db, reconciler
+):
+    _connector, pod = await _serving_pod(db, reconciler)
+    before = pod["egress_resolved_at"]
+    reconciler.offset[0] = timedelta(seconds=301)
+    report = await reconciler.reconcile_once()
+    assert report.started == [] and report.stopped == []
+    (pod,) = await _pods(db)
+    assert pod["egress_resolved_at"] > before and pod["replaced_at"] is None
+    # Not due again until another interval has passed.
+    reconciler.addresses["one.one.one.one"] = ["1.0.0.1"]
+    assert (await reconciler.reconcile_once()).started == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", [["10.0.50.7"], None])
+async def test_a_refused_or_failed_re_resolution_keeps_the_pinned_addresses(
+    db, reconciler, answer
+):
+    """A host that now resolves into a refused range (a rebinding attempt)
+    or not at all keeps what was pinned and vetted; nothing is replaced."""
+    _connector, pod = await _serving_pod(db, reconciler)
+    reconciler.addresses["one.one.one.one"] = answer
+    reconciler.offset[0] = timedelta(seconds=301)
+    report = await reconciler.reconcile_once()
+    assert report.started == [] and report.stopped == []
+    (pod,) = await _pods(db)
+    assert pod["replaced_at"] is None
+    assert json.loads(pod["egress"])["hosts"][0]["addresses"] == ["1.1.1.1"]
+
+
+@pytest.mark.asyncio
+async def test_re_resolution_off_never_replaces(db, reconciler):
+    reconciler.settings = dataclasses.replace(reconciler.settings, reresolve_seconds=0)
+    _connector, _pod = await _serving_pod(db, reconciler)
+    reconciler.addresses["one.one.one.one"] = ["1.0.0.1"]
+    reconciler.offset[0] = timedelta(hours=1)
+    assert (await reconciler.reconcile_once()).started == []
+
+
+@pytest.mark.asyncio
+async def test_a_replacement_that_never_serves_leaves_the_old_pod_serving(
+    db, reconciler
+):
+    connector, old = await _serving_pod(db, reconciler)
+    name = endpoint_service_name(connector, D1)
+    reconciler.addresses["one.one.one.one"] = ["1.0.0.1"]
+    reconciler.offset[0] = timedelta(seconds=301)
+    await reconciler.reconcile_once()
+    _old, new = await _pods(db)
+    # Its start timeout passes: it is stopped, the key backs off, and the
+    # old pod keeps serving with what it pinned.
+    report = await reconciler.reconcile_once()
+    assert (str(new["id"]), "start_timeout") in report.stopped
+    assert report.started == []
+    old, _new = await _pods(db)
+    assert old["revoked_at"] is None and old["replaced_at"] is not None
+    assert reconciler.fake.endpoints[name] == str(old["id"])
+    # After the back-off (database time) a new start replaces it again,
+    # with fresh pins.
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE connector_driver_identities SET revoked_at = revoked_at "
+            "- interval '400 seconds' WHERE id = $1",
+            new["id"],
+        )
+    report = await reconciler.reconcile_once()
+    assert len(report.started) == 1
+    latest = (await _pods(db))[-1]
+    assert json.loads(latest["egress"])["hosts"][0]["addresses"] == ["1.0.0.1"]
+
+
+@pytest.mark.asyncio
+async def test_a_re_pin_at_the_installation_cap_leaves_the_pod_unmarked(db, reconciler):
+    _connector, pod = await _serving_pod(db, reconciler)
+    reconciler.addresses["two.example"] = ["8.8.8.8"]
+    await _bind_echo(
+        db, await _echo_connector(db, host="two.example"), await _thread(db)
+    )
+    report = await reconciler.reconcile_once()  # the cap (2) is reached
+    (other,) = report.started
+    reconciler.fake.ready(other)
+    await reconciler.reconcile_once()
+    reconciler.addresses["one.one.one.one"] = ["1.0.0.1"]
+    reconciler.offset[0] = timedelta(seconds=301)
+    report = await reconciler.reconcile_once()
+    assert report.capacity == 1
+    async with db.acquire() as conn:
+        replaced = await conn.fetchval(
+            "SELECT replaced_at FROM connector_driver_identities WHERE id = $1",
+            pod["id"],
+        )
+    assert replaced is None
+
+
+@pytest.mark.asyncio
+async def test_the_pod_key_is_unique_among_pods_not_being_replaced(db):
+    connector = await _echo_connector(db)
+    generation = "hmac-sha256:" + "a" * 64
+
+    async def mint(conn):
+        await conn.execute(
+            "INSERT INTO connector_driver_identities (token_hash, "
+            "token_last_four, connector_id, driver, image_digest, pod_namespace, "
+            "pod_name, credential_generation, image_reference) VALUES ($1, 'abcd', "
+            "$2, $3, $4, 'srw-connectors', $5, $6, 'ref')",
+            uuid4().bytes + uuid4().bytes,
+            UUID(connector),
+            ECHO,
+            D1,
+            f"srw-drv-{uuid4().hex}",
+            generation,
+        )
+
+    async with db.acquire() as conn:
+        await mint(conn)
+        with pytest.raises(asyncpg.UniqueViolationError):
+            await mint(conn)
+        await conn.execute(
+            "UPDATE connector_driver_identities SET replaced_at = now() "
+            "WHERE connector_id = $1",
+            UUID(connector),
+        )
+        await mint(conn)  # a replacement beside the pod being replaced
 
 
 @pytest.mark.asyncio

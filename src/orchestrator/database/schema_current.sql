@@ -26773,6 +26773,7 @@ CREATE TABLE public.connector_driver_identities (
     idle_since timestamp with time zone,
     removed_at timestamp with time zone,
     launch_error text,
+    replaced_at timestamp with time zone,
     CONSTRAINT connector_driver_identities_digest_check CHECK (((image_digest IS NULL) OR (image_digest ~ '^sha256:[0-9a-f]{64}$'::text))),
     CONSTRAINT connector_driver_identities_driver_check CHECK ((driver <> ''::text)),
     CONSTRAINT connector_driver_identities_egress_check CHECK ((((egress IS NULL) OR (jsonb_typeof(egress) = 'object'::text)) AND ((egress IS NULL) = (egress_resolved_at IS NULL)))),
@@ -26817,6 +26818,13 @@ COMMENT ON COLUMN public.connector_driver_identities.idle_since IS 'When the pod
 --
 
 COMMENT ON COLUMN public.connector_driver_identities.removed_at IS 'When the pod''s Kubernetes objects were seen gone, after its identity was revoked. A live row with removed_at NULL counts against the installation cap.';
+
+
+--
+-- Name: COLUMN connector_driver_identities.replaced_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.connector_driver_identities.replaced_at IS 'Service pods only: when the reconciler started a replacement for this pod because a pinned egress host now resolves to other addresses. The replacement holds the pod key; this pod keeps serving until the replacement is ready, then stops after a short drain (reason egress_repinned).';
 
 
 --
@@ -38460,10 +38468,10 @@ CREATE UNIQUE INDEX uq_connector_credential_leases_live_thread ON public.connect
 
 
 --
--- Name: uq_connector_driver_identities_live_service; Type: INDEX; Schema: public; Owner: -
+-- Name: uq_connector_driver_identities_serving_key; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX uq_connector_driver_identities_live_service ON public.connector_driver_identities USING btree (connector_id, image_digest, credential_generation) WHERE ((revoked_at IS NULL) AND (credential_generation IS NOT NULL));
+CREATE UNIQUE INDEX uq_connector_driver_identities_serving_key ON public.connector_driver_identities USING btree (connector_id, image_digest, credential_generation) WHERE ((revoked_at IS NULL) AND (credential_generation IS NOT NULL) AND (replaced_at IS NULL));
 
 
 --

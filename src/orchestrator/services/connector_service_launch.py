@@ -547,6 +547,70 @@ def build_service_launch(
     )
 
 
+def endpoint_service_name(connector_id: str, digest: str) -> str:
+    """The endpoint Service of one connector's pods at one image digest."""
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest or ""):
+        raise ValueError("an endpoint names one sha256 image digest")
+    return f"srw-ep-{UUID(str(connector_id)).hex}-{digest.removeprefix('sha256:')[:12]}"
+
+
+def endpoint_url(
+    *, namespace: str, connector_id: str, digest: str, port: int, path: str = ""
+) -> str:
+    """Where a binding's caller reaches its connector's pods, by name."""
+    if not _NAMESPACE.fullmatch(namespace or ""):
+        raise ValueError(f"invalid namespace {namespace!r}")
+    name = endpoint_service_name(connector_id, digest)
+    return f"http://{name}.{namespace}.svc.cluster.local:{int(port)}{path}"
+
+
+def endpoint_service(
+    *,
+    connector_id: str,
+    digest: str,
+    identity_id: str,
+    port: int,
+    namespace: str,
+) -> dict[str, Any]:
+    """The endpoint Service of a connector's pods at one digest.
+
+    Bindings carry its name, never a pod's: it outlives every pod of the
+    connector and digest, and its selector names the one pod that serves
+    now (the newest ready one). A pod replaced after a re-pin, a lost pod or
+    a new credential generation moves it, so a caller's address stays the
+    same while the pod behind it changes. It carries no driver identity
+    label: the sweep keeps it while a live pod of its key exists.
+    """
+    labels = {
+        "srw/managed-by": MANAGER,
+        "srw.io/plane": "service",
+        "srw.io/endpoint": "true",
+        "srw.io/connector-id": str(UUID(str(connector_id))),
+        "srw.io/image-digest": digest.removeprefix("sha256:")[:12],
+    }
+    return {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": endpoint_service_name(connector_id, digest),
+            "namespace": namespace,
+            "labels": labels,
+        },
+        "spec": {
+            "type": "ClusterIP",
+            "selector": {"srw.io/driver-identity": str(UUID(str(identity_id)))},
+            "ports": [
+                {
+                    "name": SERVICE_PORT_NAME,
+                    "protocol": "TCP",
+                    "port": int(port),
+                    "targetPort": SERVICE_PORT_NAME,
+                }
+            ],
+        },
+    }
+
+
 def binding_policy_name(identity: ServicePodIdentity, kind: str, owner_id: str) -> str:
     return f"{identity.pod_name}-{kind[0]}{UUID(str(owner_id)).hex[:12]}"
 
@@ -634,6 +698,9 @@ __all__ = [
     "binding_ingress_policy",
     "binding_policy_name",
     "build_service_launch",
+    "endpoint_service",
+    "endpoint_service_name",
+    "endpoint_url",
     "label_value",
     "service_request",
     "service_resources",

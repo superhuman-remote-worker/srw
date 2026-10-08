@@ -181,6 +181,17 @@ connectors:
     startTimeoutSeconds: 180
     # -- Seconds between the leader's reconcile passes.
     reconcileIntervalSeconds: 15
+    # -- Seconds between re-resolutions of a serving pod's pinned egress
+    # hosts. A shared pod with live bindings never idles, so without this an
+    # upstream that changed its addresses would stay unreachable from it.
+    # When an address set changed, a replacement pod starts with the new
+    # NetworkPolicy and hostAliases, the connector's endpoint Service moves
+    # to it once it is ready, and the old pod stops repinDrainSeconds later.
+    # 0 never re-resolves (a pod then keeps its addresses until it idles).
+    reresolveSeconds: 300
+    # -- Seconds a pod replaced after a re-pin keeps running once its
+    # replacement serves, so requests in flight on it can finish.
+    repinDrainSeconds: 30
     # -- The lease exchange server's second listener: every driver pod's
     # start-up wait must find it refused while the exchange answers. The same
     # server serves both, so they open and close together; the orchestrator
