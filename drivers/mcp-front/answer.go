@@ -42,17 +42,47 @@ func clean(payload []byte, allowed func(string) bool, scrub *scrubber) ([]byte, 
 	return scrub.apply(rewritten), nil
 }
 
-// mayNeedRewrite: a member named "tools" or "error" may be in the payload.
-// A key spelled with escapes ("tools") holds a backslash-u.
+// mayNeedRewrite: a member named "tools" or "error" may be in the payload,
+// in any case: a client that folds case (encoding/json does, and folds the
+// long s "ſ" to "s") reads "Tools" or "toolſ" as "tools". A key spelled with
+// escapes ("tools") holds a backslash-u.
 func mayNeedRewrite(payload []byte) bool {
-	return bytes.Contains(payload, []byte("tools")) ||
-		bytes.Contains(payload, []byte("error")) ||
-		bytes.Contains(payload, []byte(`\u`))
+	return containsFold(payload, "tools") ||
+		containsFold(payload, "error") ||
+		bytes.Contains(payload, []byte(`\u`)) ||
+		bytes.Contains(payload, []byte("ſ"))
+}
+
+// containsFold reports whether data holds word in any ASCII case, without
+// a copy (the payload's memory is the budget's).
+func containsFold(data []byte, word string) bool {
+	for i := 0; i+len(word) <= len(data); i++ {
+		if bytes.EqualFold(data[i:i+len(word)], []byte(word)) {
+			return true
+		}
+	}
+	return false
+}
+
+// foldedVariant reports whether an object has a key a case-folding client
+// reads as one of names without it being exactly that name ("Result",
+// "TOOLS", "namſ"): such a client would read a member the front did not.
+func foldedVariant(members map[string]json.RawMessage, names ...string) bool {
+	for key := range members {
+		for _, name := range names {
+			if key != name && strings.EqualFold(key, name) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // rewriteAnswers rewrites one message, or each message of a batch.
 // Members are read by their exact keys, the last of a duplicate winning,
-// as the SDK clients read them.
+// as the SDK clients read them; a key a case-folding client would read as
+// a member the front decides on, but spelled otherwise, makes the answer
+// one the front cannot read (it is never relayed), or its tool is dropped.
 func rewriteAnswers(data []byte, allowed func(string) bool) ([]byte, bool, error) {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 {
@@ -94,11 +124,17 @@ func rewriteAnswer(data []byte, allowed func(string) bool) ([]byte, bool, error)
 		}
 		return nil, false, errUnparseable
 	}
+	if foldedVariant(answer, "result", "error") {
+		return nil, false, errUnparseable
+	}
 	changed := false
 	var nested map[string]func(*bytes.Buffer)
 	if raw, ok := answer["result"]; ok {
 		var result map[string]json.RawMessage
 		if json.Unmarshal(raw, &result) == nil {
+			if foldedVariant(result, "tools") {
+				return nil, false, errUnparseable
+			}
 			if listed, ok := result["tools"]; ok {
 				// Each copy goes once read: the answer is written once,
 				// into a buffer sized for it, the kept tools inside it.
@@ -168,8 +204,9 @@ func writeArray(out *bytes.Buffer, items []json.RawMessage) {
 }
 
 // keptTools: the listed tools the binding may call, each read by its exact
-// "name" (the last one, as a client reads it). A list that is not a list
-// lists nothing.
+// "name" (the last one, as a client reads it); a tool with a key a
+// case-folding client reads as its name ("Name") is dropped. A list that is
+// not a list lists nothing.
 func keptTools(listed json.RawMessage, allowed func(string) bool) []json.RawMessage {
 	var tools []json.RawMessage
 	if json.Unmarshal(listed, &tools) != nil {
@@ -178,7 +215,7 @@ func keptTools(listed json.RawMessage, allowed func(string) bool) []json.RawMess
 	kept := make([]json.RawMessage, 0, len(tools))
 	for _, tool := range tools {
 		var members map[string]json.RawMessage
-		if json.Unmarshal(tool, &members) != nil {
+		if json.Unmarshal(tool, &members) != nil || foldedVariant(members, "name") {
 			continue
 		}
 		var name string
@@ -190,11 +227,16 @@ func keptTools(listed json.RawMessage, allowed func(string) bool) []json.RawMess
 }
 
 // reservedError: an error whose code a client would read as the front's
-// lease-ended code, as a number in any notation or a numeric string.
+// lease-ended code, as a number in any notation or a numeric string; an
+// error with a key a case-folding client reads as its code ("Code") is
+// rewritten too.
 func reservedError(raw json.RawMessage) bool {
 	var members map[string]json.RawMessage
 	if json.Unmarshal(raw, &members) != nil {
 		return false
+	}
+	if foldedVariant(members, "code") {
+		return true
 	}
 	code := members["code"]
 	var number float64

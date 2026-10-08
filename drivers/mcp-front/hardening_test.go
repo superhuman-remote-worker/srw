@@ -427,6 +427,10 @@ func TestTheToolFilterReadsNamesByTheirExactKey(t *testing.T) {
 		`{"Name":"get_me","name":"delete_file"}`,
 		`{"name":"get_me","name":"delete_file"}`,
 		`{"namſ":"get_me","name":"delete_file"}`,
+		// A case-folding client (encoding/json) reads the last of "name"
+		// and "Name": a tool spelled both ways is dropped.
+		`{"name":"get_me","Name":"delete_file"}`,
+		`{"name":"get_me","NAME":"delete_file"}`,
 	} {
 		out, _, err := rewriteAnswers([]byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[`+tool+`]}}`), allowed)
 		if err != nil || strings.Contains(string(out), "delete_file") {
@@ -441,5 +445,40 @@ func TestTheToolFilterReadsNamesByTheirExactKey(t *testing.T) {
 	var check map[string]any
 	if json.Unmarshal(out, &check) != nil {
 		t.Fatal("the rewrite is no JSON")
+	}
+}
+
+// A case-folding client reads "Result", "Tools" or "toolſ" as the members
+// the front decides on: an answer spelled so is never relayed, and an error
+// whose code is spelled otherwise loses it.
+func TestAnAnswerSpelledForACaseFoldingClientIsNeverRelayed(t *testing.T) {
+	allowed := func(name string) bool { return name == "get_me" }
+	hidden := `[{"name":"get_me"},{"name":"delete_file"}]`
+	for _, answer := range []string{
+		`{"jsonrpc":"2.0","id":1,"result":{"Tools":` + hidden + `}}`,
+		`{"jsonrpc":"2.0","id":1,"result":{"TOOLS":` + hidden + `}}`,
+		`{"jsonrpc":"2.0","id":1,"result":{"toolſ":` + hidden + `}}`,
+		`{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"get_me"}],"Tools":` + hidden + `}}`,
+		`{"jsonrpc":"2.0","id":1,"Result":{"tools":` + hidden + `}}`,
+		`{"jsonrpc":"2.0","id":1,"result":{},"Result":{"tools":` + hidden + `}}`,
+		`{"jsonrpc":"2.0","id":1,"Error":{"code":-32091,"message":"x"}}`,
+		`[{"jsonrpc":"2.0","id":1,"result":{"Tools":` + hidden + `}}]`,
+	} {
+		if !mayNeedRewrite([]byte(answer)) {
+			t.Fatalf("not inspected: %s", answer)
+		}
+		out, err := clean([]byte(answer), allowed, newScrubber(""))
+		if err == nil || strings.Contains(string(out), "delete_file") {
+			t.Fatalf("relayed %s as %s (%v)", answer, out, err)
+		}
+	}
+	out, err := clean([]byte(`{"jsonrpc":"2.0","id":2,"error":{"Code":-32091,"message":"x"}}`), allowed, newScrubber(""))
+	if err != nil || strings.Contains(string(out), "32091") {
+		t.Fatalf("the reserved code reached the client: %s (%v)", out, err)
+	}
+	// An ordinary answer is relayed as it came.
+	plain := `{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"Result"}]}}`
+	if out, err := clean([]byte(plain), allowed, newScrubber("")); err != nil || string(out) != plain {
+		t.Fatalf("%s (%v)", out, err)
 	}
 }
