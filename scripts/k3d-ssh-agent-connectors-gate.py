@@ -1538,7 +1538,9 @@ class SshAgentConnectorsGate:
                             "thread": self.thread,
                             "job": self.job,
                             "connectors": self.connectors,
-                            "repos": sorted(self.repos),
+                            # name -> creation intent marker: what a later
+                            # cleanup needs to delete each repository.
+                            "repos": self.repos,
                         }
                     )
                 )
