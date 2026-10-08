@@ -194,8 +194,10 @@ class _InventoryConnection:
         if (
             "FROM completion_effects" in sql
             or sql.startswith("SELECT id FROM agents WHERE thread_id=")
-            # delete_job revokes the Job's credential leases (C2): none here.
+            # delete_job revokes the Job's credential leases (C2) and its
+            # provider-minted credentials (C5): none here.
             or sql.startswith("UPDATE connector_credential_leases")
+            or sql.startswith("UPDATE connector_minted_credentials")
         ):
             return []
         raise AssertionError(f"unexpected fetch: {sql}")

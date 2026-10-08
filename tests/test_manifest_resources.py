@@ -146,9 +146,13 @@ async def database(pg_url, monkeypatch):
     await db.execute(
         migration.with_name("0380_project_connector_defaults.sql").read_text()
     )
-    # A final retire revokes the execution's credential leases (C2).
+    # A final retire revokes the execution's credential leases (C2) and its
+    # provider-minted credentials (C5).
     await db.execute(
         migration.with_name("0347_connector_credential_leases.sql").read_text()
+    )
+    await db.execute(
+        migration.with_name("0430_connector_minted_credentials.sql").read_text()
     )
     # 0350's srw_resources columns; that migration also alters datasources,
     # which this fixture does not create.

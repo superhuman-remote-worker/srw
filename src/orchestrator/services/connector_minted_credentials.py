@@ -229,10 +229,6 @@ def minted_marker(entry: Any) -> Mapping[str, Any] | None:
     return marker
 
 
-def needs_minting(entries: Sequence[Any] | None) -> bool:
-    return any(minted_marker(entry) is not None for entry in entries or ())
-
-
 def kubeconfig_marker(row: Mapping[str, Any], credentials: Any) -> dict[str, Any]:
     """What a minting kubeconfig connector's entry carries instead of its
     file: the provider, the connector and where the delivered file lands
@@ -1043,8 +1039,12 @@ async def revoke_owner_credentials(
     connector_ids: Sequence[str] | None = None,
 ) -> int:
     """Request the revoke of an execution's credentials (of ``connector_ids``
-    only, when given: a live detach), with the caller's decision."""
-    args: list[Any] = [kind, UUID(str(owner_id))]
+    only, when given: a live detach), with the caller's decision. An id
+    that is no uuid owns nothing here."""
+    owners = _uuids([owner_id])
+    if not owners:
+        return 0
+    args: list[Any] = [kind, owners[0]]
     where = "m.owner_kind = $1 AND m.owner_id = $2"
     if connector_ids is not None:
         ids = _uuids(connector_ids)
@@ -1059,9 +1059,10 @@ async def revoke_connector_credentials(
     conn: Any, *, connector_id: Any, reason: str
 ) -> int:
     """Request the revoke of every credential of one connector."""
-    return await _request_revoke(
-        conn, "m.connector_id = $1", [UUID(str(connector_id))], reason=reason
-    )
+    connectors = _uuids([connector_id])
+    if not connectors:
+        return 0
+    return await _request_revoke(conn, "m.connector_id = $1", connectors, reason=reason)
 
 
 async def connector_changed(conn: Any, connector_id: Any) -> int:
@@ -1088,10 +1089,13 @@ _OWNER_ENDED = f"""(
 async def revoke_terminal_owner_credentials(conn: Any, *, owner: LeaseOwner) -> int:
     """The idempotent backstop at a workspace's teardown: request the revoke
     of an execution's credentials only when it is terminal or gone."""
+    owners = _uuids([owner.id])
+    if not owners:
+        return 0
     return await _request_revoke(
         conn,
         f"m.owner_kind = $1 AND m.owner_id = $2 AND {_OWNER_ENDED}",
-        [owner.kind, UUID(owner.id)],
+        [owner.kind, owners[0]],
         reason="execution_terminal",
     )
 
@@ -1370,7 +1374,6 @@ __all__ = [
     "minted_lease_upstream",
     "minted_marker",
     "minted_runtime",
-    "needs_minting",
     "plan_for",
     "prepare_minted_entries",
     "prepare_thread_minted",

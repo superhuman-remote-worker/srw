@@ -168,6 +168,8 @@ class TestMintingKubeconfig:
                 "current-context: fake", "current-context: other"
             ),
         ],
+        # The fake CA is made per process: ids keep xdist's workers agreeing.
+        ids=["empty", "not-yaml", "a-list", "short-token", "http", "no-context"],
     )
     def test_a_kubeconfig_without_a_usable_cluster_or_token_is_refused(self, text):
         with pytest.raises(TokenRequestConfigError):

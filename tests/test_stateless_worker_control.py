@@ -71,6 +71,12 @@ def _db_with_conn(conn):
     return db
 
 
+def _fetch_with(conn, text):
+    """The one ``conn.fetch`` call whose statement holds ``text``."""
+    [call] = [c for c in conn.fetch.await_args_list if c.args and text in c.args[0]]
+    return call
+
+
 def test_omitted_lane_defaults_stateless_when_fully_capable(monkeypatch):
     from orchestrator import main
 
@@ -479,10 +485,12 @@ async def test_leased_cancel_publishes_status_without_pruning_checkpoint():
 
     assert await db.cancel_stateless_job(JOB_ID) == (True, False)
     db.delete_checkpoint_thread.assert_not_awaited()
-    # The cancel transaction revokes the Job's credential leases (C2).
-    revoke = conn.fetch.await_args
-    assert "UPDATE connector_credential_leases" in revoke.args[0]
+    # The cancel transaction revokes the Job's credential leases (C2) and
+    # requests the revoke of what SRW minted for it at a provider (C5).
+    revoke = _fetch_with(conn, "UPDATE connector_credential_leases")
     assert revoke.args[1:] == (str(UUID(JOB_ID)), "job_cancelled")
+    minted = _fetch_with(conn, "UPDATE connector_minted_credentials")
+    assert minted.args[1:] == ("job", UUID(JOB_ID), "job_cancelled")
     job_update = next(
         call
         for call in conn.fetchrow.await_args_list
@@ -693,10 +701,12 @@ async def test_prepare_delete_fences_queue_before_job_and_strictly_prunes():
     assert await db.prepare_stateless_job_for_delete(JOB_ID)
     assert calls == ["queue_lock", "queue_close", "job_cancel"]
     db.delete_checkpoint_thread.assert_awaited_once_with(JOB_ID, strict=True)
-    # The fence is the delete decision: it revokes the Job's leases (C2).
-    revoke = conn.fetch.await_args
-    assert "UPDATE connector_credential_leases" in revoke.args[0]
+    # The fence is the delete decision: it revokes the Job's leases (C2) and
+    # requests the revoke of its minted credentials (C5).
+    revoke = _fetch_with(conn, "UPDATE connector_credential_leases")
     assert revoke.args[1:] == (str(UUID(JOB_ID)), "job_deleted")
+    minted = _fetch_with(conn, "UPDATE connector_minted_credentials")
+    assert minted.args[1:] == ("job", UUID(JOB_ID), "job_deleted")
 
 
 @pytest.mark.asyncio
@@ -774,10 +784,12 @@ async def test_final_prepared_delete_removes_queue_and_job_atomically():
 
     assert await db.delete_job(JOB_ID, prepared_stateless=True)
     assert lock_order == ["queue", "docker_advisory", "job"]
-    # Revoked before the row goes: the lease rows cascade with the Job (C2).
-    revoke = conn.fetch.await_args
-    assert "UPDATE connector_credential_leases" in revoke.args[0]
+    # Revoked before the row goes: the lease rows cascade with the Job (C2);
+    # the minted credentials' records outlive it (C5).
+    revoke = _fetch_with(conn, "UPDATE connector_credential_leases")
     assert revoke.args[1:] == (str(UUID(JOB_ID)), "job_deleted")
+    minted = _fetch_with(conn, "UPDATE connector_minted_credentials")
+    assert minted.args[1:] == ("job", UUID(JOB_ID), "job_deleted")
     assert (
         conn.fetchrow.await_args_list[0]
         .args[0]
