@@ -97,6 +97,7 @@ START_TIMEOUT = "start_timeout"
 POD_LOST = "pod_lost"
 NOT_READY = "not_ready"
 HOSTING_REFUSED = "hosting_refused"
+HOSTING_DISABLED = "hosting_disabled"
 EGRESS_WITHDRAWN = "egress_withdrawn"
 #: Stops that back the key off before the next start.
 _BACKOFF_REASONS = (LAUNCH_REFUSED, LAUNCH_FAILED, START_TIMEOUT, CAPACITY)
@@ -1184,6 +1185,36 @@ async def connector_service_reconciler(
     logger.info("Connector service reconciler stopped")
 
 
+async def revoke_unhosted_identities(store: Any) -> list[str]:
+    """Hosting is off: revoke every live service-pod identity.
+
+    No reconciler runs to stop these pods, so the lease exchange must refuse
+    them now. Database only: their objects stay in the driver namespace
+    (which the chart keeps, ``helm.sh/resource-policy: keep``) until hosting
+    is turned back on, when the reconciler's first pass deletes the objects
+    of every revoked row, or until an operator deletes the namespace.
+    """
+    async with store.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id FROM connector_driver_identities "
+            "WHERE credential_generation IS NOT NULL AND revoked_at IS NULL"
+        )
+        revoked: list[str] = []
+        for row in rows:
+            async with conn.transaction():
+                revoked += await revoke_driver_identity(
+                    conn, identity_id=str(row["id"]), reason=HOSTING_DISABLED
+                )
+    if revoked:
+        logger.warning(
+            "Service-pod hosting is off: revoked %d driver pod identities; their "
+            "pods stay in the driver namespace until hosting is on again or the "
+            "namespace is deleted",
+            len(revoked),
+        )
+    return revoked
+
+
 async def connector_egress_view(
     store: Any, connector_id: str, *, spec: DriverSpec | None
 ) -> dict[str, Any]:
@@ -1244,6 +1275,7 @@ async def connector_egress_view(
 __all__ = [
     "CAPACITY",
     "EGRESS_WITHDRAWN",
+    "HOSTING_DISABLED",
     "HOSTING_REFUSED",
     "IDLE",
     "LAUNCH_FAILED",
@@ -1262,4 +1294,5 @@ __all__ = [
     "connector_service_reconciler",
     "credential_generation",
     "egress_withdrawn",
+    "revoke_unhosted_identities",
 ]

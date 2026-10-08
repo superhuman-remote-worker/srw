@@ -1150,6 +1150,44 @@ async def test_an_unresolvable_exchange_starts_nothing_and_stops_nothing(
 
 
 @pytest.mark.asyncio
+async def test_hosting_turned_off_revokes_every_live_identity_and_on_cleans_up(
+    db, reconciler
+):
+    """Off: the exchange refuses the pods at once (database only). Back on:
+    the first pass deletes the revoked pods' objects."""
+    from orchestrator.services.connector_service_hosting import (
+        revoke_unhosted_identities,
+    )
+
+    connector = await _echo_connector(db)
+    await _echo_image(db)
+    await _bind_echo(db, connector, await _thread(db))
+    await reconciler.reconcile_once()
+    (pod,) = await _pods(db)
+    revoked = await revoke_unhosted_identities(db)
+    assert revoked == [str(pod["id"])]
+    (pod,) = await _pods(db)
+    assert pod["revoke_reason"] == "hosting_disabled"
+    assert pod["removed_at"] is None  # nothing deleted while off
+    assert reconciler.fake.removed == []
+    async with db.acquire() as conn:
+        event = await conn.fetchrow(
+            "SELECT * FROM security_events "
+            "WHERE event_type = 'connector_driver_identity_revoked' "
+            "AND resource_id = $1",
+            str(pod["id"]),
+        )
+    assert event is not None and "reason=hosting_disabled" in event["detail"]
+    assert await revoke_unhosted_identities(db) == []  # idempotent
+
+    report = await reconciler.reconcile_once()
+    assert str(pod["id"]) in report.removed
+    assert reconciler.fake.removed[0] == str(pod["id"])
+    # The binding is still live: a fresh pod with a fresh identity starts.
+    assert len(report.started) == 1
+
+
+@pytest.mark.asyncio
 async def test_a_digest_launches_from_the_repository_it_was_resolved_from(
     db, reconciler
 ):

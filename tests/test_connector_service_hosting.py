@@ -398,6 +398,30 @@ def test_hosting_is_off_when_disabled_or_incomplete(over):
     assert connectors_composition.service_hosting_settings(resources) is None
 
 
+def test_startup_revokes_unhosted_identities_whenever_hosting_is_off():
+    """lifecycle.open_stores: hosting off (or not configured) revokes the
+    identities of pods no reconciler will stop, and never blocks startup."""
+    import ast
+    import inspect
+
+    from orchestrator.application import lifecycle
+
+    source = inspect.getsource(lifecycle.open_stores)
+    tree = ast.parse(source.lstrip())
+    text = ast.unparse(tree)
+    assert "connectors_composition.service_hosting_settings(resources) is None" in (
+        text
+    )
+    assert "await revoke_unhosted_identities(resources.postgres_db)" in text
+    guarded = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Try)
+        and "revoke_unhosted_identities" in ast.unparse(node.body)
+    ]
+    assert guarded and guarded[0].handlers
+
+
 def test_driver_images_resolve_at_public_addresses_unless_listed():
     from orchestrator.services.connector_drivers import builtin_connector_drivers
 

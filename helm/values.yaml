@@ -152,6 +152,13 @@ connectors:
     # Service, in their own namespace). Off by default. Needs
     # orchestrator.connectorLeases.exchangePort: drivers authenticate to the
     # lease exchange with their own identity.
+    #
+    # Turning it off: the orchestrator revokes every live driver pod identity
+    # at start (the exchange refuses those pods at once), but deletes nothing.
+    # The namespace is kept (helm.sh/resource-policy: keep) with whatever pods
+    # were running. Turning hosting back on removes them on the reconciler's
+    # first pass; to clean up for good instead, delete the namespace by hand:
+    #   kubectl delete namespace <release fullname>-connectors
     enabled: false
     # -- Empty selects orchestrator.connectorLeases.networkPolicy.driverNamespace,
     # else <release fullname>-connectors. Must be a dedicated namespace.

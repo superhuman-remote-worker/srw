@@ -397,6 +397,11 @@ def _lifespan_environment(
     monkeypatch.setattr(manifest_experts, "seed_bundled_expert_manifests", AsyncMock())
     monkeypatch.setattr(manifest_experts, "installed_srw_image", lambda: None)
     monkeypatch.setattr(manifest_projects, "migrate_projects", AsyncMock())
+    import orchestrator.services.connector_service_hosting as service_hosting
+
+    monkeypatch.setattr(
+        service_hosting, "revoke_unhosted_identities", AsyncMock(return_value=[])
+    )
     monkeypatch.setattr(
         default_experts_module,
         "seed_managed_default_experts",
