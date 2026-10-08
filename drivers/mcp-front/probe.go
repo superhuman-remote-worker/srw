@@ -21,6 +21,18 @@ import (
 // every few seconds, and a probe opens (and closes) an MCP session.
 const probeEvery = 5 * time.Second
 
+// Behind the stdio bridge every probe starts a process of the server, too
+// slow and too costly for the kubelet's every few seconds: the probe runs
+// in the background instead, every bridgeProbeRetry until the server
+// answered and every bridgeProbeEvery after, with a deadline that allows a
+// process's start. /readyz answers from its last result and the bridge's
+// own liveness (variables for the tests).
+var (
+	bridgeProbeEvery   = 5 * time.Minute
+	bridgeProbeRetry   = 5 * time.Second
+	bridgeProbeTimeout = 60 * time.Second
+)
+
 // prober answers /readyz from a real MCP probe of the server: initialize,
 // notifications/initialized, tools/list and, when the server opened a
 // session, DELETE. The probe carries no credential (the front has no lease
@@ -32,6 +44,8 @@ type prober struct {
 	client *http.Client
 	logf   func(string, ...any)
 	now    func() time.Time
+	// The stdio bridge's liveness (D5b).
+	alive func(context.Context) bool
 
 	mu     sync.Mutex
 	at     time.Time
@@ -60,6 +74,9 @@ func (f *front) serveReady(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *prober) check(ctx context.Context) (bool, string, int) {
+	if p.cfg.bridge {
+		return p.bridgeCheck(ctx)
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := p.now()
@@ -69,6 +86,57 @@ func (p *prober) check(ctx context.Context) (bool, string, int) {
 	probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
 	hash, tools, err := p.run(probeCtx)
+	p.record(now, hash, tools, err)
+	return p.ready, p.reason, p.tools
+}
+
+// bridgeCheck answers /readyz for a stdio server: the background probe's
+// last result, while the bridge answers.
+func (p *prober) bridgeCheck(ctx context.Context) (bool, string, int) {
+	p.mu.Lock()
+	probed, ready, reason, tools := !p.at.IsZero(), p.ready, p.reason, p.tools
+	p.mu.Unlock()
+	switch {
+	case !probed:
+		return false, "the server was not probed yet", 0
+	case !ready:
+		return false, reason, 0
+	case !p.alive(ctx):
+		return false, "the stdio bridge does not answer", 0
+	}
+	return true, "", tools
+}
+
+// loop probes a stdio server in the background until ctx ends.
+func (p *prober) loop(ctx context.Context) {
+	for {
+		ready := p.probeOnce(ctx)
+		wait := bridgeProbeRetry
+		if ready {
+			wait = bridgeProbeEvery
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+	}
+}
+
+// probeOnce runs one probe and records it; it reports readiness.
+func (p *prober) probeOnce(ctx context.Context) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, bridgeProbeTimeout)
+	defer cancel()
+	hash, tools, err := p.run(probeCtx)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.record(p.now(), hash, tools, err)
+	return p.ready
+}
+
+// record keeps a probe's result and pins the tool list's hash on the first
+// success; the caller holds p.mu.
+func (p *prober) record(now time.Time, hash string, tools int, err error) {
 	p.at = now
 	switch {
 	case err != nil:
@@ -88,7 +156,6 @@ func (p *prober) check(ctx context.Context) (bool, string, int) {
 	default:
 		p.ready, p.reason, p.tools = true, "", tools
 	}
-	return p.ready, p.reason, p.tools
 }
 
 // run opens one probe session and returns the tool list's hash and size.

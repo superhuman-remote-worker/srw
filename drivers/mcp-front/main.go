@@ -46,9 +46,21 @@
 // /readyz is a real MCP probe of the server (initialize and tools/list), and
 // /livez answers while the process runs. It is static (CGO off) and uses
 // only the Go standard library.
+//
+// In front of a stdio server (transport "stdio", D5b) the upstream is SRW's
+// stdio bridge (drivers/mcp-bridge), which runs one process of the server
+// per binding. Every check above stays here; the front also names each
+// request's binding (its lease) and hands over the binding's credential in
+// headers only it sets, for the bridge to put in that process's
+// environment, and tells the bridge when a lease ended (on a stream, and
+// in a sweep of the bindings with a process every 30 s), so the process
+// stops with its binding. Each probe starts a process, so it runs in the
+// background (every 5 s until the server answered, every 5 minutes after)
+// and /readyz answers from its last result and the bridge's liveness.
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
@@ -87,6 +99,10 @@ func dispatch(args []string) int {
 			log.Printf("srw-mcp-front: "+format, a...)
 		}
 		handler := newFront(cfg, newHTTPAuthority(cfg.exchangeURL, cfg.identity), newUpstreamClient(), logf, systemNow)
+		if cfg.bridge {
+			go handler.probe.loop(context.Background())
+			go handler.sweepBindings(context.Background())
+		}
 		server := &http.Server{
 			Addr:              ":" + cfg.port,
 			Handler:           handler,

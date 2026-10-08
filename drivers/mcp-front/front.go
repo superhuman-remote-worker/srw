@@ -65,10 +65,12 @@ type front struct {
 	sessions *sessionOwners
 	probe    *prober
 	buffers  *budget
+	// A stdio server's bindings with a process behind the bridge (D5b).
+	bindings *bridgeBindings
 }
 
 func newFront(cfg *config, a authority, upstream *http.Client, logf func(string, ...any), now func() time.Time) *front {
-	return &front{
+	f := &front{
 		cfg:      cfg,
 		auth:     newAuthCache(a, now),
 		upstream: upstream,
@@ -78,7 +80,10 @@ func newFront(cfg *config, a authority, upstream *http.Client, logf func(string,
 		sessions: newSessionOwners(now),
 		probe:    &prober{cfg: cfg, client: upstream, logf: logf, now: now},
 		buffers:  newBudget(bufferBudgetUnits),
+		bindings: newBridgeBindings(),
 	}
+	f.probe.alive = f.bridgeAlive
+	return f
 }
 
 // newUpstreamClient reaches the server beside the front: no redirect is
@@ -274,7 +279,9 @@ const (
 // exchange cannot confirm it for longer than a cached decision lasts, and
 // records why in reason. Every streamRecheck it asks the exchange past the
 // cache, so a revocation reaches an open stream within that interval.
-func (f *front) watchLease(ctx context.Context, cancel context.CancelFunc, token string, reason *atomic.Int32) {
+// Behind the stdio bridge, the lease's end also stops its binding's
+// process.
+func (f *front) watchLease(ctx context.Context, cancel context.CancelFunc, token, leaseID string, reason *atomic.Int32) {
 	ticker := time.NewTicker(streamRecheck)
 	defer ticker.Stop()
 	var unconfirmedSince time.Time
@@ -286,9 +293,12 @@ func (f *front) watchLease(ctx context.Context, cancel context.CancelFunc, token
 			found, err := f.auth.leaseFresh(ctx, token)
 			switch {
 			case errors.Is(err, errFrontRevoked), err == nil && (!found.active || !strings.EqualFold(found.connectorID, f.cfg.connectorID)):
-				f.logf("lease=%s ended: closing its stream", found.id)
+				f.logf("lease=%s ended: closing its stream", leaseID)
 				reason.Store(endLease)
 				cancel()
+				if f.cfg.bridge && !errors.Is(err, errFrontRevoked) {
+					go f.endBinding(leaseID)
+				}
 				return
 			case err != nil:
 				if ctx.Err() != nil {
@@ -344,6 +354,12 @@ func (f *front) streamEnded(w http.ResponseWriter, message *rpcMessage, streamin
 // server keeps each until told), in the background and best effort: the
 // DELETE carries the session id only.
 func (f *front) closeSessions(sessions []string) {
+	if f.cfg.bridge {
+		// Behind the stdio bridge a binding has one session, whose process
+		// its next initialize or its lease's end stops; a session id alone
+		// names no binding there.
+		return
+	}
 	for _, session := range sessions {
 		go func(session string) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -377,7 +393,7 @@ func (f *front) forward(w http.ResponseWriter, r *http.Request, message *rpcMess
 		defer cancel()
 	}
 	var ended atomic.Int32
-	go f.watchLease(ctx, cancel, token, &ended)
+	go f.watchLease(ctx, cancel, token, found.id, &ended)
 	var payload io.Reader = http.NoBody
 	if r.Method == http.MethodPost {
 		payload = bytes.NewReader(body)
@@ -393,7 +409,12 @@ func (f *front) forward(w http.ResponseWriter, r *http.Request, message *rpcMess
 			out.Header.Set(name, value)
 		}
 	}
-	if credential != "" {
+	switch {
+	case f.cfg.bridge:
+		// The bridge routes by binding and gives the binding's process its
+		// credential.
+		setBridgeHeaders(out.Header, found.id, credential)
+	case credential != "":
 		value := credential
 		if f.cfg.credential.Scheme != "" {
 			value = f.cfg.credential.Scheme + " " + credential
@@ -436,6 +457,11 @@ func (f *front) forward(w http.ResponseWriter, r *http.Request, message *rpcMess
 					forgotten = append(forgotten, issued)
 				}
 				f.closeSessions(forgotten)
+			}
+			if f.cfg.bridge {
+				// The bridge started the binding's process: the sweep
+				// stops it when the lease ends.
+				f.bindings.track(found.id, token)
 			}
 		}
 		if r.Method == http.MethodDelete && session != "" {

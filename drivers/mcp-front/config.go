@@ -30,32 +30,38 @@ var (
 	headerShape   = regexp.MustCompile(`\A[A-Za-z0-9-]{1,64}\z`)
 )
 
-// reservedHeaders are the headers the front forwards or the transport
-// owns: the credential may never be written over one of them.
+// reservedHeaders are the headers the front forwards or sets, or the
+// transport owns: the credential may never be written over one of them.
 var reservedHeaders = func() map[string]bool {
 	reserved := map[string]bool{}
 	for _, name := range append([]string{
 		"Connection", "Content-Length", "Cookie", "Host", "Keep-Alive",
 		"Origin", "Proxy-Connection", "Te", "Trailer", "Transfer-Encoding",
-		"Upgrade",
+		"Upgrade", bridgeBindingHeader, bridgeCredentialHeader,
 	}, forwardRequestHeaders...) {
 		reserved[http.CanonicalHeaderKey(name)] = true
 	}
 	return reserved
 }()
 
-// credentialRule is how the server receives the upstream credential.
+// credentialRule is how the server receives the upstream credential: in a
+// header on each request (an HTTP server), or in an environment variable
+// of its binding's process (a stdio server, through the bridge).
 type credentialRule struct {
 	Header string `json:"header"`
 	Scheme string `json:"scheme"`
+	Env    string `json:"env"`
 }
 
 // mcpBlock is the front's part of the pod's request file, written by the
 // orchestrator from the driver spec's mcp block (shared/connectors/mcp.py).
 type mcpBlock struct {
-	Upstream string `json:"upstream"`
-	Protocol string `json:"protocol"`
-	Tools    struct {
+	// "http", or "stdio": the upstream is SRW's stdio bridge, which runs
+	// one process of the server per binding (D5b).
+	Transport string `json:"transport"`
+	Upstream  string `json:"upstream"`
+	Protocol  string `json:"protocol"`
+	Tools     struct {
 		Read []string `json:"read"`
 	} `json:"tools"`
 	Access                map[string][]string `json:"access"`
@@ -81,6 +87,10 @@ type requestFile struct {
 }
 
 type config struct {
+	// The upstream is SRW's stdio bridge: each request names its binding,
+	// a binding's end stops its process, and readiness is probed in the
+	// background (each probe starts a process).
+	bridge      bool
 	driver      string
 	connectorID string
 	exchangeURL string
@@ -178,9 +188,25 @@ func parseConfig(request requestFile, identity string) (*config, error) {
 			access[level][class] = true
 		}
 	}
-	if block.Credential != nil {
+	bridge := false
+	switch block.Transport {
+	case "", "http":
+	case "stdio":
+		bridge = true
+	default:
+		return nil, fmt.Errorf("mcp transport %q is not one the front serves", block.Transport)
+	}
+	switch {
+	case block.Credential == nil:
+	case bridge:
+		// The bridge delivers it in the binding process's environment: the
+		// front only hands it over.
+		if block.Credential.Env == "" || block.Credential.Header != "" || block.Credential.Scheme != "" {
+			return nil, errors.New("a stdio server's credential is an environment variable of its process")
+		}
+	default:
 		header := http.CanonicalHeaderKey(block.Credential.Header)
-		if !headerShape.MatchString(block.Credential.Header) || reservedHeaders[header] {
+		if block.Credential.Env != "" || !headerShape.MatchString(block.Credential.Header) || reservedHeaders[header] {
 			return nil, errors.New("the mcp credential header is no header name the front may set")
 		}
 	}
@@ -193,6 +219,7 @@ func parseConfig(request requestFile, identity string) (*config, error) {
 		pinning = "warn"
 	}
 	return &config{
+		bridge:      bridge,
 		driver:      request.Driver,
 		connectorID: strings.ToLower(request.Connector.ID),
 		exchangeURL: strings.TrimRight(request.Exchange.URL, "/"),

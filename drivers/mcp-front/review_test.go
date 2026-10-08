@@ -65,17 +65,18 @@ func views(t *testing.T, body string) []string {
 	return names
 }
 
+var reviewersBodies = []string{
+	`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"notes_write","Name":"whoami","arguments":{}}}`,
+	`{"jsonrpc":"2.0","id":7,"method":"tools/call","Method":"ping","params":{"name":"notes_write","arguments":{}}}`,
+	`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"notes_write"},"Params":{"name":"whoami"}}`,
+	`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"notes_write"},"paramſ":{"name":"whoami"}}`,
+	// And the reviewer's go-sdk differential corpus.
+	`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"notes_write","name":"whoami","arguments":{}}}`,
+	`{"jsonrpc":"2.0","id":7,"method":"tools/call","method":"ping","params":{"name":"notes_write"}}`,
+}
+
 func TestTheReviewersFourBypassBodiesAreRefused(t *testing.T) {
-	bodies := []string{
-		`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"notes_write","Name":"whoami","arguments":{}}}`,
-		`{"jsonrpc":"2.0","id":7,"method":"tools/call","Method":"ping","params":{"name":"notes_write","arguments":{}}}`,
-		`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"notes_write"},"Params":{"name":"whoami"}}`,
-		`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"notes_write"},"paramſ":{"name":"whoami"}}`,
-		// And the reviewer's go-sdk differential corpus.
-		`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"notes_write","name":"whoami","arguments":{}}}`,
-		`{"jsonrpc":"2.0","id":7,"method":"tools/call","method":"ping","params":{"name":"notes_write"}}`,
-	}
-	for _, body := range bodies {
+	for _, body := range reviewersBodies {
 		h := newHarness(t)
 		response := h.do(t, http.MethodPost, tokenRO, body, nil)
 		if response.Code != http.StatusBadRequest {
@@ -100,7 +101,10 @@ func variants(key string) []string {
 	return out
 }
 
-func TestNoKeyVariantLetsAReadOnlyLeaseRunAWriteTool(t *testing.T) {
+// keyVariantBodies are the review's key variants of a call of notes_write
+// that some reading of names whoami, then duplicates in both orders,
+// escapes, whitespace, nesting and garbage.
+func keyVariantBodies() []string {
 	write, read := "notes_write", "whoami"
 	var bodies []string
 	for _, key := range []string{"jsonrpc", "id", "method", "params"} {
@@ -133,7 +137,11 @@ func TestNoKeyVariantLetsAReadOnlyLeaseRunAWriteTool(t *testing.T) {
 		`{"jsonrpc":"1.0","id":7,"method":"tools/call","params":{"name":"notes_write"}}`,
 		`{"id":7,"method":"tools/call","params":{"name":"notes_write"}}`,
 	)
-	for _, body := range bodies {
+	return bodies
+}
+
+func TestNoKeyVariantLetsAReadOnlyLeaseRunAWriteTool(t *testing.T) {
+	for _, body := range keyVariantBodies() {
 		h := newHarness(t)
 		response := h.do(t, http.MethodPost, tokenRO, body, nil)
 		answer := response.Body.String()
