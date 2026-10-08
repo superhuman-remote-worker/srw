@@ -16,16 +16,25 @@ from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
+from jsonschema import Draft202012Validator
 
 from orchestrator.services.connector_drivers import builtin_connector_drivers
+from orchestrator.services.connector_drivers.matrix import capability_matrix
 from orchestrator.services.manifest_connectors import (
     DESCRIPTION,
     DISPLAY_NAME,
     connector_document,
+    connector_endpoint,
     connector_resource_name,
     connector_scope,
+    declared_config,
 )
-from shared.connectors.builtin import DATASOURCE_SPECS, MCP_REMOTE_DRIVER
+from shared.connectors.builtin import (
+    BUILTIN_SPECS,
+    DATASOURCE_SPECS,
+    MCP_REMOTE_DRIVER,
+    MCP_SPEC,
+)
 from shared.connectors.platform import (
     managed_key_for,
     native_kb_project,
@@ -50,6 +59,10 @@ SECRETS = (
     "s3cret-header",
     "s3cret-arg",
     "s3cret-file",
+    "s3cret-cmd",
+    "s3cret-path",
+    "s3cret-query",
+    "s3cret-hint",
 )
 
 
@@ -75,15 +88,18 @@ def _row(ds_type: str, index: int = 1, **over) -> dict:
 
 
 def _document(row: dict, links=(), existing=None) -> dict:
+    """What persist_connector_resource writes for ``row``, minus the store."""
     driver = REGISTRY.for_type(row["type"])
     scope = connector_scope(row, list(links))
     assert scope is not None
+    name = driver.resource_driver(row["credentials"])
     return connector_document(
         row,
         scope=scope,
-        driver=driver.resource_driver(row["credentials"]),
+        driver=name,
         credential_config=driver.credential_config(row["credentials"]),
         existing=existing,
+        declared=declared_config(REGISTRY.get(name).spec),
     )
 
 
@@ -108,15 +124,13 @@ TYPE_CASES = [
             connection_url="https://bot:s3cret-token@git.example/acme/app.git",
             credentials={"auth_method": "token", "token": "s3cret-token"},
             config={"forge": "github"},
-            cli_hint="make test",
+            cli_hint="GITHUB_TOKEN=s3cret-hint make test",
             default_branch="main",
         ),
         "srw.repository/v1",
         {
             "forge": "github",
-            "connection_url": "https://git.example/acme/app.git",
-            "connection_url_redacted": True,
-            "cli_hint": "make test",
+            "endpoint": "https://git.example",
             "default_branch": "main",
             "auth_method": "token",
         },
@@ -132,8 +146,7 @@ TYPE_CASES = [
         "srw.repository/v1",
         {
             "known_hosts": "git.example ssh-ed25519 AAAA",
-            "connection_url": "ssh://git.example/acme/app.git",
-            "connection_url_redacted": True,
+            "endpoint": "ssh://git.example",
             "auth_method": "ssh",
         },
     ),
@@ -149,7 +162,7 @@ TYPE_CASES = [
         "srw.kb/v1",
         {
             "root_path": "knowledge",
-            "connection_url": "https://git.example/acme/kb.git",
+            "endpoint": "https://git.example",
             "auth_method": "token",
         },
     ),
@@ -160,10 +173,7 @@ TYPE_CASES = [
             connection_url="postgresql://app:s3cret-pass@db.internal:5432/app",
         ),
         "srw.postgresql/v1",
-        {
-            "connection_url": "postgresql://db.internal:5432/app",
-            "connection_url_redacted": True,
-        },
+        {"endpoint": "postgresql://db.internal:5432"},
     ),
     (
         "neo4j",
@@ -173,7 +183,7 @@ TYPE_CASES = [
             credentials={"username": "neo4j", "password": "s3cret-pass"},
         ),
         "srw.neo4j/v1",
-        {"connection_url": "bolt://graph.internal:7687"},
+        {"endpoint": "bolt://graph.internal:7687"},
     ),
     (
         "mongodb",
@@ -182,10 +192,7 @@ TYPE_CASES = [
             connection_url="mongodb://reader:s3cret-pass@mongo.internal/app",
         ),
         "srw.mongodb/v1",
-        {
-            "connection_url": "mongodb://mongo.internal/app",
-            "connection_url_redacted": True,
-        },
+        {"endpoint": "mongodb://mongo.internal"},
     ),
     (
         "webdav",
@@ -195,7 +202,7 @@ TYPE_CASES = [
             credentials={"username": "me", "password": "s3cret-pass"},
         ),
         "srw.webdav/v1",
-        {"connection_url": "https://cloud.example/remote.php/dav/files/me/"},
+        {"endpoint": "https://cloud.example"},
     ),
     (
         "email",
@@ -234,7 +241,7 @@ TYPE_CASES = [
         ),
         MCP_REMOTE_DRIVER,
         {
-            "connection_url": "https://mcp.example/mcp",
+            "endpoint": "https://mcp.example",
             "transport": "http",
             "auth_type": "headers",
             "header_names": ["Authorization", "X-Tenant"],
@@ -252,7 +259,7 @@ TYPE_CASES = [
         ),
         MCP_REMOTE_DRIVER,
         {
-            "connection_url": "https://mcp.example/sse",
+            "endpoint": "https://mcp.example",
             "transport": "sse",
             "auth_type": "bearer",
         },
@@ -263,13 +270,13 @@ TYPE_CASES = [
             "mcp",
             credentials={
                 "transport": "stdio",
-                "command": "npx",
+                "command": "s3cret-cmd-runner --token s3cret-cmd",
                 "args": ["server", "--key", "s3cret-arg"],
                 "env": {"API_KEY": "s3cret-env"},
             },
         ),
         "srw.mcp/v1",
-        {"transport": "stdio", "command": "npx"},
+        {"transport": "stdio"},
     ),
     (
         "kubeconfig",
@@ -374,6 +381,21 @@ class TestTheMapping:
         assert not [secret for secret in SECRETS if secret in text]
         validate_documents([document])
         preview_documents([document])
+
+    @pytest.mark.parametrize(
+        ("label", "row", "driver", "config"),
+        TYPE_CASES,
+        ids=[case[0] for case in TYPE_CASES],
+    )
+    def test_each_stored_config_validates_against_its_drivers_schema(
+        self, label, row, driver, config
+    ):
+        document = _document(row)
+        schema = REGISTRY.get(document["spec"]["driver"]).spec.config_schema
+        errors = list(
+            Draft202012Validator(dict(schema)).iter_errors(document["spec"]["config"])
+        )
+        assert errors == [], [error.message for error in errors]
 
     @pytest.mark.parametrize("read_only", [True, False, None])
     def test_access_is_read_only_only_for_a_read_only_row(self, read_only):
@@ -638,3 +660,115 @@ def test_the_policy_reads_the_native_project_from_the_managed_key():
     assert _native_project_id(MANAGED_ONLY) == PROJECT
     assert _native_project_id(MARKER_ONLY) == PROJECT
     assert _native_project_id(_row("postgresql")) is None
+
+
+# =============================================================================
+# Nothing secret-looking reaches a resource: the exact inputs a review found
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    ("url", "endpoint"),
+    [
+        # A token in the path.
+        ("https://mcp.zapier.com/api/mcp/s/s3cret-path/mcp", "https://mcp.zapier.com"),
+        # Query keys no allowlist knows.
+        (
+            "https://api.example.com/v1?code=s3cret-query&k=s3cret-query",
+            "https://api.example.com",
+        ),
+        # A JDBC URL's user and password.
+        (
+            "jdbc:postgresql://db.example:5432/app?user=admin&password=s3cret-pass",
+            "jdbc:postgresql://db.example:5432",
+        ),
+        # Userinfo and a fragment.
+        (
+            "https://bob:s3cret-pass@dav.example:8443/remote.php#s3cret-query",
+            "https://dav.example:8443",
+        ),
+        ("postgresql://app:s3cret-pass@[::1]:5432/app", "postgresql://[::1]:5432"),
+        # Nothing to cut a host from.
+        ("git@github.com:acme/s3cret-path.git", None),
+        ("host=db user=admin password=s3cret-pass", None),
+        ("mongodb://a:1,b:2/s3cret-path", None),
+        (None, None),
+    ],
+)
+def test_only_the_scheme_host_and_port_of_a_url_are_kept(url, endpoint):
+    assert connector_endpoint(url) == endpoint
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        _row(
+            "mcp",
+            connection_url="https://mcp.zapier.com/api/mcp/s/s3cret-path/mcp",
+            credentials={"transport": "http"},
+        ),
+        _row(
+            "webdav",
+            connection_url="https://cloud.example/remote.php/dav/files/s3cret-path/",
+        ),
+        _row(
+            "postgresql",
+            connection_url=(
+                "jdbc:postgresql://db.example:5432/app?user=s3cret-query"
+                "&password=s3cret-pass"
+            ),
+        ),
+        _row(
+            "generic",
+            connection_url="https://api.example.com/v1?code=s3cret-query&k=s3cret-query",
+            cli_hint="curl -H 'Authorization: Bearer s3cret-hint' https://api.example.com",
+        ),
+        _row(
+            "mcp",
+            credentials={
+                "transport": "stdio",
+                "command": "/usr/bin/env API_KEY=s3cret-cmd npx server",
+                "args": ["--token", "s3cret-arg"],
+            },
+        ),
+    ],
+    ids=[
+        "mcp-path-token",
+        "webdav-path",
+        "jdbc-user",
+        "generic-query-and-hint",
+        "stdio",
+    ],
+)
+def test_no_secret_looking_part_reaches_a_document(row):
+    text = json.dumps(_document(row))
+    assert not [secret for secret in SECRETS if secret in text]
+    assert "cli_hint" not in text and "command" not in text and "args" not in text
+
+
+class TestTheMcpDrivers:
+    def test_both_names_are_registered_and_one_owns_the_type(self):
+        assert REGISTRY.get(MCP_SPEC.name).spec is MCP_SPEC
+        remote = REGISTRY.get(MCP_REMOTE_DRIVER)
+        assert remote is not None and remote.spec.legacy_type == "mcp"
+        assert REGISTRY.for_type("mcp").spec is MCP_SPEC
+        assert remote.serves_stored_type is False
+        # Same implementation: either answers a row of either transport.
+        assert type(remote) is type(REGISTRY.for_type("mcp"))
+
+    def test_the_matrix_lists_the_remote_driver_after_the_stdio_one(self):
+        names = [driver["name"] for driver in capability_matrix(REGISTRY)["drivers"]]
+        assert names == [spec.name for spec in BUILTIN_SPECS]
+        assert names.index(MCP_REMOTE_DRIVER) == names.index(MCP_SPEC.name) + 1
+
+    @pytest.mark.parametrize(
+        ("credentials", "driver"),
+        [
+            ({"transport": "stdio", "command": "x"}, "srw.mcp/v1"),
+            ({"transport": "http"}, MCP_REMOTE_DRIVER),
+            ({"transport": "SSE"}, MCP_REMOTE_DRIVER),
+            ({}, MCP_REMOTE_DRIVER),
+        ],
+    )
+    def test_a_row_names_the_driver_of_its_transport(self, credentials, driver):
+        assert REGISTRY.for_type("mcp").resource_driver(credentials) == driver

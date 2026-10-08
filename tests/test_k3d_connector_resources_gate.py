@@ -179,6 +179,7 @@ def _row(**over):
             "access": None,
             "transport": None,
             "has_credentials": False,
+            "config": {"endpoint": "postgresql://db.internal:5432"},
             "platform_managed": None,
             "version": 1,
             "deleted": False,
@@ -222,7 +223,7 @@ def test_an_exact_name_follows_the_row_name():
     assert "slug" in gate.row_problems(renamed, exact_name=True)[0]
 
 
-def test_ownerless_rows_follow_their_one_link():
+def test_an_ownerless_rows_connector_keeps_its_project():
     linked = _row(
         created_by=None,
         links=[PROJECT],
@@ -230,10 +231,39 @@ def test_ownerless_rows_follow_their_one_link():
     )
     assert gate.row_problems(linked) == []
     for links in ([], [PROJECT, OWNER]):
+        # A link change neither moves nor retires an existing Connector...
+        kept = _row(
+            created_by=None,
+            links=links,
+            resource={"scope_kind": "Project", "scope_name": PROJECT},
+        )
+        assert gate.row_problems(kept) == []
+        # ...and without one, a row that has no one project stays legacy.
         legacy = _row(created_by=None, links=links, resource=None)
         assert gate.row_problems(legacy) == []
+        # An ownerless row never lives in an Account.
         stray = _row(created_by=None, links=links)
         assert "legacy path" in gate.row_problems(stray)[0]
+
+
+@pytest.mark.parametrize(
+    ("config", "problem"),
+    [
+        ({"connection_url": "postgresql://h/db"}, "connection_url"),
+        ({"cli_hint": "psql"}, "cli_hint"),
+        ({"endpoint": "https://mcp.example/api/mcp/s/token/mcp"}, "endpoint"),
+        ({"endpoint": "postgresql://user@db.internal"}, "endpoint"),
+        ({"unknown": 1}, "config"),
+    ],
+)
+def test_a_config_that_leaks_or_breaks_the_schema_is_named(config, problem):
+    problems = gate.row_problems(_row(resource={"config": config}))
+    assert problems and problem in problems[0]
+
+
+def test_an_endpoint_may_carry_a_port_or_a_jdbc_prefix():
+    for endpoint in ("postgresql://db.internal:5432", "jdbc:postgresql://db:5432"):
+        assert gate.config_problems("srw.postgresql/v1", {"endpoint": endpoint}) == []
 
 
 def test_a_native_kb_lives_in_its_project_with_the_platform_marker():
@@ -251,6 +281,7 @@ def test_a_native_kb_lives_in_its_project_with_the_platform_marker():
             "driver": "srw.kb/v1",
             "access": "ReadOnly",
             "platform_managed": key,
+            "config": {"root_path": "knowledge"},
         },
     )
     assert gate.row_problems(native) == []
@@ -271,7 +302,14 @@ def test_a_native_kb_lives_in_its_project_with_the_platform_marker():
 )
 def test_mcp_rows_name_the_driver_of_their_transport(transport, driver):
     expected = driver or "srw.mcp-remote/v1"
-    row = _row(type="mcp", resource={"driver": expected, "transport": transport})
+    row = _row(
+        type="mcp",
+        resource={
+            "driver": expected,
+            "transport": transport,
+            "config": {"transport": transport},
+        },
+    )
     assert gate.row_problems(row) == []
 
 
@@ -364,3 +402,26 @@ def test_residue_is_looked_up_by_the_gate_id(monkeypatch):
     assert "kind = 'Connector' AND deleted_at IS NULL" in joined
     assert f"FROM projects WHERE id = '{PROJECT}'" in joined
     assert f"datname = '{runner.pg_name}'" in joined
+
+
+def test_the_backfill_fails_only_on_this_runs_rows(monkeypatch):
+    runner = _runner()
+    runner.project = PROJECT
+    runner.connectors = {"legacy": ROW_ID}
+    legacy = _row()
+    foreign = _row(id="ffffffff-0000-4000-8000-000000000001", resource=None)
+    monkeypatch.setattr(gate, "rows", lambda where="": [legacy, foreign])
+    monkeypatch.setattr(gate, "sql", lambda query, **k: "[]")
+    monkeypatch.setattr(
+        gate,
+        "in_orchestrator",
+        lambda program, payload, **k: {"created": 1, "deferred": 3},
+    )
+    notes: list[str] = []
+    monkeypatch.setattr(runner.report, "note", notes.append)
+
+    runner.backfill()
+
+    assert runner.report.passed, runner.report.results
+    assert any("deferred 3 rows" in note for note in notes)
+    assert any("1 problems" in note and "no live Connector" in note for note in notes)

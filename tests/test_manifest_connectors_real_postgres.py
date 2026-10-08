@@ -1,20 +1,26 @@
 """Datasources become Connectors, slice D3a, on a real PostgreSQL.
 
-* the migrations (0350-0353) add the identity and marker columns to rows a
+* the migrations (0350-0354) add the identity and marker columns to rows a
   pre-D3a database already holds, and validate their constraints;
 * ``migrate_stored_connectors`` writes one Connector per eligible row with
   the right uid, name, scope, driver and access, touches no
-  ``policy_revision``, link or reconcile entry, and is idempotent;
+  ``policy_revision``, link or reconcile entry, is idempotent, works in
+  batches and skips rows already in step (timed at 1,500 and 6,000 rows);
 * the datasource store writes the row and its resource in one transaction
-  (create, update, policy update, link, unlink, delete), and a failure in
-  either half rolls both back;
+  (create, update, policy update, link, unlink, delete, default seeding), and
+  a failure in either half rolls both back; nothing secret-looking reaches a
+  stored revision;
+* a session settings save and a connector write, in either order, never
+  deadlock;
 * platform-owned and linked Connectors refuse the resource API.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+import time
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -30,10 +36,17 @@ from orchestrator.database.postgres import (
     _encrypt_credentials_dict,
 )
 from orchestrator.services import manifest_connectors
+from jsonschema import Draft202012Validator
+
+from orchestrator.services.connector_drivers import builtin_connector_drivers
 from orchestrator.services.manifest_connectors import (
+    _NEEDS_WORK,
     DISPLAY_NAME,
     migrate_stored_connectors,
     persist_connector_resource,
+)
+from orchestrator.services.manifest_execution_retirement import (
+    lock_manifest_execution_catalog,
 )
 from orchestrator.services.manifest_resources import ManifestResourceService
 from orchestrator.services.manifest_store import (
@@ -52,7 +65,17 @@ MIGRATIONS = (
     Path(__file__).resolve().parents[1] / "src/orchestrator/database/migrations/app"
 )
 FIRST_D3A_MIGRATION = "0350"
-SECRETS = ("s3cret-pass", "s3cret-header", "s3cret-arg", "s3cret-neo")
+SECRETS = (
+    "s3cret-pass",
+    "s3cret-header",
+    "s3cret-arg",
+    "s3cret-neo",
+    "s3cret-path",
+    "s3cret-query",
+    "s3cret-hint",
+    "s3cret-cmd",
+)
+REGISTRY = builtin_connector_drivers()
 
 
 # =============================================================================
@@ -160,6 +183,39 @@ async def _policy_state(db) -> dict:
             )
         ],
     }
+
+
+async def _needing_work(db) -> set[str]:
+    return {str(row["id"]) for row in await db.fetch(_NEEDS_WORK, UUID(int=0), 100_000)}
+
+
+async def _schema_problems(db) -> list[str]:
+    """Every live Connector's config against its driver's config_schema."""
+    problems = []
+    for row in await db.fetch(
+        "SELECT name, document FROM srw_resources WHERE kind='Connector' "
+        "AND deleted_at IS NULL"
+    ):
+        spec = json.loads(row["document"])["spec"]
+        driver = REGISTRY.get(spec["driver"])
+        if driver is None:
+            problems.append(f"{row['name']}: driver {spec['driver']} not installed")
+            continue
+        validator = Draft202012Validator(dict(driver.spec.config_schema))
+        problems += [
+            f"{row['name']}: {error.message}"
+            for error in validator.iter_errors(spec.get("config", {}))
+        ]
+    return problems
+
+
+async def _stored_revisions(db) -> str:
+    return (
+        await db.fetchval(
+            "SELECT string_agg(document::text, '') FROM srw_resource_revisions"
+        )
+        or ""
+    )
 
 
 def _name_of(row_name: str, datasource_id: str) -> str:
@@ -353,11 +409,15 @@ async def test_the_migrations_and_the_backfill_map_every_stored_row(legacy_datab
     for label in ("ownerless_global", "ownerless_two_links"):
         assert await _resource(db, rows[label]) is None
         assert (await _row(db, rows[label]))["manifest_resource_id"] is None
-    stored = await db.fetchval(
-        "SELECT string_agg(document::text, '') FROM srw_resource_revisions"
-    )
+    stored = await _stored_revisions(db)
     assert stored and not [secret for secret in SECRETS if secret in stored]
+    assert await _schema_problems(db) == []
     assert await _policy_state(db) == before
+    # Only the two legacy-path rows are looked at again.
+    assert await _needing_work(db) == {
+        rows["ownerless_global"],
+        rows["ownerless_two_links"],
+    }
 
     # A rerun is a no-op: same counts as unchanged, no new revision, no row write.
     versions = {
@@ -370,7 +430,7 @@ async def test_the_migrations_and_the_backfill_map_every_stored_row(legacy_datab
         for row in await db.fetch("SELECT id,updated_at FROM datasources")
     }
     again = await migrate_stored_connectors(db)
-    assert again == {**counts, "created": 0, "unchanged": 6}
+    assert again == {**counts, "created": 0}
     assert {
         str(row["id"]): row["resource_version"]
         for row in await db.fetch("SELECT id,resource_version FROM srw_resources")
@@ -423,9 +483,10 @@ async def test_writes_keep_the_row_and_its_connector_in_step(database):
     datasource_id = str(created["id"])
     resource = await _resource(database, datasource_id)
     assert resource["resource_version"] == 1
-    assert resource["document"]["spec"]["config"]["connection_url"] == (
-        "postgresql://wh.internal/wh"
-    )
+    assert resource["document"]["spec"]["config"] == {
+        "endpoint": "postgresql://wh.internal"
+    }
+    assert datasource_id not in await _needing_work(database)
     assert (await _row(database, datasource_id))["manifest_resource_id"] == UUID(
         datasource_id
     )
@@ -452,9 +513,12 @@ async def test_writes_keep_the_row_and_its_connector_in_step(database):
         auto_attach=True,
     )
     assert updated["project_ids"] == [project]
+    assert datasource_id not in await _needing_work(database)
     assert await database.unlink_datasource_from_project(project, datasource_id)
     assert await database.link_datasource_to_project(project, datasource_id)
     assert (await _resource(database, datasource_id))["resource_version"] == 2
+    # Every write left the resource in step: the startup backfill skips it.
+    assert datasource_id not in await _needing_work(database)
 
     assert await database.delete_datasource(datasource_id, deleted_by=owner)
     resource = await _resource(database, datasource_id)
@@ -523,7 +587,9 @@ async def test_a_failure_in_either_half_rolls_both_back(database, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_an_ownerless_row_follows_its_one_link(database):
+async def test_an_ownerless_rows_connector_keeps_the_project_it_was_made_in(
+    database,
+):
     first = await _project(database, "Alpha")
     second = await _project(database, "Beta")
     created = await database.create_datasource(
@@ -533,19 +599,43 @@ async def test_an_ownerless_row_follows_its_one_link(database):
     resource = await _resource(database, datasource_id)
     assert (resource["scope_kind"], resource["scope_name"]) == ("Project", first)
 
-    # A second link leaves no one project to own it: back to the legacy path.
+    # Links are sharing, never scope: neither a second link nor dropping the
+    # first moves or retires the Connector, so a reference to it holds.
     await database.link_datasource_to_project(second, datasource_id)
-    assert (await _resource(database, datasource_id))["deleted_at"] is not None
-
-    # One link again: the same uid is revived in that project.
     await database.unlink_datasource_from_project(first, datasource_id)
-    resource = await _resource(database, datasource_id)
-    assert resource["deleted_at"] is None
-    assert (resource["scope_kind"], resource["scope_name"]) == ("Project", second)
-    assert resource["document"]["metadata"]["scope"] == {
+    after = await _resource(database, datasource_id)
+    assert after["deleted_at"] is None
+    assert (after["scope_kind"], after["scope_name"]) == ("Project", first)
+    assert after["resource_version"] == resource["resource_version"]
+
+    # Deleting that project retires it with the project's other definitions;
+    # the row lives on, and its next write brings the same uid back in the
+    # one project it is linked to.
+    await database.delete_project(first)
+    assert (await _resource(database, datasource_id))["deleted_at"] is not None
+    assert datasource_id in await _needing_work(database)
+    assert await database.update_datasource(datasource_id, description="moved")
+    revived = await _resource(database, datasource_id)
+    assert revived["deleted_at"] is None
+    assert (revived["scope_kind"], revived["scope_name"]) == ("Project", second)
+    assert revived["document"]["metadata"]["scope"] == {
         "kind": "Project",
         "name": second,
     }
+
+
+@pytest.mark.asyncio
+async def test_an_ownerless_row_without_one_project_has_no_connector(database):
+    first = await _project(database, "Alpha")
+    second = await _project(database, "Beta")
+    created = await database.create_datasource(
+        name="wide",
+        ds_type="postgresql",
+        project_ids=[first, second],
+        scope_mode="projects",
+    )
+    assert await _resource(database, str(created["id"])) is None
+    assert (await _row(database, str(created["id"])))["manifest_resource_id"] is None
 
 
 @pytest.mark.asyncio
@@ -670,3 +760,313 @@ async def test_persisting_inside_a_transaction_is_idempotent(database):
         async with database.transaction_scope():
             outcomes.append(await persist_connector_resource(database, created))
     assert outcomes == ["created", "unchanged"]
+
+
+# =============================================================================
+# Driver changes, default seeding, secrets in stored revisions
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_a_transport_edit_changes_the_connectors_driver(database):
+    owner = await _user(database, "Owner")
+    created = await database.create_datasource(
+        name="tools",
+        ds_type="mcp",
+        connection_url="https://mcp.example/api/mcp/s/s3cret-path/mcp",
+        credentials={
+            "transport": "http",
+            "auth": {"type": "bearer", "token": "s3cret-header"},
+        },
+        created_by=owner,
+    )
+    datasource_id = str(created["id"])
+    remote = await _resource(database, datasource_id)
+    assert remote["document"]["spec"]["driver"] == "srw.mcp-remote/v1"
+    assert remote["document"]["spec"]["config"] == {
+        "endpoint": "https://mcp.example",
+        "transport": "http",
+        "auth_type": "bearer",
+    }
+
+    assert await database.update_datasource(
+        datasource_id,
+        connection_url=None,
+        connection_url_set=True,
+        credentials={"transport": "stdio", "command": "npx s3cret-cmd"},
+    )
+    stdio = await _resource(database, datasource_id)
+    assert (stdio["id"], stdio["name"]) == (remote["id"], remote["name"])
+    assert stdio["resource_version"] == remote["resource_version"] + 1
+    assert stdio["document"]["spec"]["driver"] == "srw.mcp/v1"
+    assert stdio["document"]["spec"]["config"] == {"transport": "stdio"}
+    assert await _schema_problems(database) == []
+    stored = await _stored_revisions(database)
+    assert not [secret for secret in SECRETS if secret in stored]
+
+
+@pytest.mark.asyncio
+async def test_default_seeding_writes_through_a_linked_seed(database):
+    project = await _project(database, "Alpha")
+    seeded = await database.upsert_default_datasource(
+        "Seeded DB", "postgresql", "postgresql://seed:s3cret-pass@one.internal/db"
+    )
+    datasource_id = str(seeded["id"])
+    # Ownerless, global and unlinked: the legacy path.
+    assert await _resource(database, datasource_id) is None
+    await database.link_datasource_to_project(project, datasource_id)
+    first = await _resource(database, datasource_id)
+    assert first["document"]["spec"]["config"]["endpoint"] == (
+        "postgresql://one.internal"
+    )
+    # Reseeding it rewrites the Connector it now has.
+    await database.upsert_default_datasource(
+        "Seeded DB", "postgresql", "postgresql://seed:s3cret-pass@two.internal/db"
+    )
+    second = await _resource(database, datasource_id)
+    assert second["document"]["spec"]["config"]["endpoint"] == (
+        "postgresql://two.internal"
+    )
+    assert second["resource_version"] == first["resource_version"] + 1
+    assert "s3cret-pass" not in await _stored_revisions(database)
+
+
+@pytest.mark.asyncio
+async def test_no_secret_looking_part_reaches_a_stored_revision(database):
+    owner = await _user(database, "Owner")
+    rows = [
+        dict(
+            name="zapier",
+            ds_type="mcp",
+            connection_url="https://mcp.zapier.com/api/mcp/s/s3cret-path/mcp",
+            credentials={"transport": "http"},
+        ),
+        dict(
+            name="api",
+            ds_type="generic",
+            connection_url="https://api.example.com/v1?code=s3cret-query&k=s3cret-query",
+            cli_hint="curl -H 'Authorization: Bearer s3cret-hint' https://api.example.com",
+        ),
+        dict(
+            name="warehouse",
+            ds_type="postgresql",
+            connection_url=(
+                "jdbc:postgresql://db.example:5432/app?user=s3cret-query"
+                "&password=s3cret-pass"
+            ),
+        ),
+        dict(
+            name="files",
+            ds_type="webdav",
+            connection_url="https://dav.example/remote.php/dav/files/s3cret-path/",
+        ),
+        dict(
+            name="local",
+            ds_type="mcp",
+            credentials={
+                "transport": "stdio",
+                "command": "env TOKEN=s3cret-cmd npx server",
+                "args": ["--key", "s3cret-arg"],
+            },
+        ),
+    ]
+    for body in rows:
+        await database.create_datasource(created_by=owner, **body)
+    stored = await _stored_revisions(database)
+    assert stored.count('"kind": "Connector"') == len(rows)
+    assert not [secret for secret in SECRETS if secret in stored]
+    assert await _schema_problems(database) == []
+
+
+# =============================================================================
+# The startup backfill at scale
+# =============================================================================
+
+
+async def _bulk_rows(db, owner: str, count: int) -> None:
+    """``count`` rows as an orchestrator without the write-through wrote them."""
+    await db.execute(
+        """INSERT INTO datasources (name, type, connection_url, created_by)
+           SELECT 'bulk ' || n, 'postgresql',
+                  'postgresql://app:s3cret-pass@db' || n || '.internal:5432/app', $1
+           FROM generate_series(1, $2) AS n""",
+        UUID(owner),
+        count,
+    )
+
+
+async def _timed_backfill(db) -> tuple[dict, float, int]:
+    """The backfill's counts, its wall time, and the most advisory locks any
+    one backend held while it ran."""
+    peak = 0
+    done = asyncio.Event()
+
+    async def sample() -> None:
+        nonlocal peak
+        connection = await asyncpg.connect(db._connection_string)
+        try:
+            while not done.is_set():
+                held = await connection.fetchval(
+                    "SELECT coalesce(max(n), 0) FROM (SELECT count(*) AS n "
+                    "FROM pg_locks WHERE locktype = 'advisory' GROUP BY pid) h"
+                )
+                peak = max(peak, int(held))
+                await asyncio.sleep(0.005)
+        finally:
+            await connection.close()
+
+    sampler = asyncio.create_task(sample())
+    started = time.perf_counter()
+    try:
+        counts = await migrate_stored_connectors(db)
+    finally:
+        elapsed = time.perf_counter() - started
+        done.set()
+        await sampler
+    return counts, elapsed, peak
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [1500, 6000])
+async def test_the_backfill_batches_and_skips_rows_in_step(database, count):
+    owner = await _user(database, "Owner")
+    await _bulk_rows(database, owner, count)
+
+    counts, first, peak = await _timed_backfill(database)
+    assert counts["created"] == count and counts["deferred"] == 0
+    # One batch at a time: the catalog lock plus an identity lock per row.
+    assert peak <= 2 * 50 + 2, peak
+
+    again, rerun, _ = await _timed_backfill(database)
+    assert again == dict.fromkeys(again, 0)
+    assert await _needing_work(database) == set()
+    print(
+        f"\nbackfill {count} rows: first {first:.2f}s, rerun {rerun:.3f}s, "
+        f"peak advisory locks per backend {peak}"
+    )
+
+
+# =============================================================================
+# A session settings save never deadlocks against a connector write
+# =============================================================================
+
+
+async def _blocked(db, *, timeout: float = 10.0) -> None:
+    """Wait until some backend waits for a lock."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if await db.fetchval("SELECT count(*) FROM pg_locks WHERE NOT granted"):
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("nothing ever waited for a lock")
+
+
+async def _settings_save(db, thread_id, datasource_id, entered, release, *, fixed):
+    """A session settings save's lock order (thread_config_update): the thread
+    row, the selected connectors' rows, then the catalog lock that capturing
+    the session revision takes. ``fixed=False`` is the order before this fix,
+    without the catalog lock up front."""
+    scope = (
+        db.thread_configuration_transaction(thread_id)
+        if fixed
+        else db.transaction_scope()
+    )
+    async with scope as conn:
+        await conn.fetchrow(
+            "SELECT 1 FROM threads WHERE id=$1 FOR UPDATE", UUID(thread_id)
+        )
+        await conn.fetchrow(
+            "SELECT 1 FROM datasources WHERE id=$1 FOR UPDATE", UUID(datasource_id)
+        )
+        entered.set()
+        await release.wait()
+        await lock_manifest_execution_catalog(conn)
+
+
+def _connector_write(db, op, datasource_id, project):
+    return {
+        "delete": lambda: db.delete_datasource(datasource_id),
+        "update": lambda: db.update_datasource(datasource_id, name="renamed"),
+        "link": lambda: db.link_datasource_to_project(project, datasource_id),
+        "unlink": lambda: db.unlink_datasource_from_project(project, datasource_id),
+    }[op]
+
+
+async def _deadlock_fixture(db):
+    owner = await _user(db, "Owner")
+    project = await _project(db, "Alpha")
+    created = await db.create_datasource(
+        name="selected", ds_type="postgresql", created_by=owner
+    )
+    datasource_id = str(created["id"])
+    await db.execute(
+        "INSERT INTO project_datasources (project_id, datasource_id) VALUES ($1,$2)",
+        UUID(project),
+        UUID(datasource_id),
+    )
+    thread_id = str(uuid4())
+    await db.execute(
+        "INSERT INTO threads (id, title, status, metadata, execution_lane) "
+        "VALUES ($1, 'settings', 'active', $2::jsonb, 'stateless')",
+        UUID(thread_id),
+        json.dumps({"datasource_ids": [datasource_id]}),
+    )
+    return thread_id, datasource_id, project
+
+
+async def _race(db, op, order, *, fixed, monkeypatch):
+    thread_id, datasource_id, project = await _deadlock_fixture(db)
+    write = _connector_write(db, op, datasource_id, project)
+    entered, release = asyncio.Event(), asyncio.Event()
+    if order == "save_first":
+        save = asyncio.create_task(
+            _settings_save(db, thread_id, datasource_id, entered, release, fixed=fixed)
+        )
+        await asyncio.wait_for(entered.wait(), 10)
+        writer = asyncio.create_task(write())
+        await _blocked(db)
+        release.set()
+    else:
+        holding, resume = asyncio.Event(), asyncio.Event()
+        catalog = db._lock_connector_catalog
+
+        async def paused_catalog():
+            await catalog()
+            holding.set()
+            await resume.wait()
+
+        monkeypatch.setattr(db, "_lock_connector_catalog", paused_catalog)
+        writer = asyncio.create_task(write())
+        await asyncio.wait_for(holding.wait(), 10)
+        release.set()
+        save = asyncio.create_task(
+            _settings_save(db, thread_id, datasource_id, entered, release, fixed=fixed)
+        )
+        if fixed:
+            await _blocked(db)
+        else:
+            await asyncio.wait_for(entered.wait(), 10)
+        resume.set()
+    return await asyncio.wait_for(
+        asyncio.gather(save, writer, return_exceptions=True), 30
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", ["save_first", "write_first"])
+@pytest.mark.parametrize("op", ["delete", "update", "link", "unlink"])
+async def test_a_settings_save_and_a_connector_write_never_deadlock(
+    database, op, order, monkeypatch
+):
+    outcomes = await _race(database, op, order, fixed=True, monkeypatch=monkeypatch)
+    assert [o for o in outcomes if isinstance(o, BaseException)] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", ["save_first", "write_first"])
+async def test_control_the_old_lock_order_deadlocks(database, order, monkeypatch):
+    """Without the catalog lock up front the same race is a 40P01."""
+    outcomes = await _race(
+        database, "delete", order, fixed=False, monkeypatch=monkeypatch
+    )
+    assert any(isinstance(o, asyncpg.DeadlockDetectedError) for o in outcomes), outcomes

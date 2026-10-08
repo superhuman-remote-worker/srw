@@ -24,17 +24,19 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
 
   preflight  Tilt reports the srw resource ``ok``; every orchestrator pod
              serves this checkout's D3a modules byte for byte; the migration
-             ledger holds 0350-0353 as applied; both accounts are approved
+             ledger holds 0350-0354 as applied; both accounts are approved
   backfill   the deployed ``migrate_stored_connectors``, rerun in the
-             orchestrator pod, creates the legacy row's Connector and defers
-             nothing; afterwards every datasource in the database has the
-             Connector the mapping names -- uid and linked id = the row id,
-             ``<slug>-<12 hex>`` name, scope (creator's Account, a native KB's
-             project, an ownerless row's one project), driver, access, the
-             platform marker -- or none when it stays on the legacy path, and
-             no resource carries credentials. The rerun changed no
-             ``policy_revision``, no project link and none of the legacy row's
-             reconcile entries
+             orchestrator pod, writes the legacy row's Connector; every
+             datasource of this run then has the Connector the mapping names
+             -- uid and linked id = the row id, ``<slug>-<12 hex>`` name,
+             scope (creator's Account, a native KB's project, an ownerless
+             row's one project), driver, access, the platform marker, a config
+             valid against the driver's schema with only ``scheme://host``
+             of a URL -- and no resource carries credentials. Other people's
+             rows are held to the same mapping, but a problem there (a row
+             the backfill deferred, say) is a NOTE, not a failure. The rerun
+             changed no ``policy_revision``, no project link and none of the
+             legacy row's reconcile entries
   write      through the API: create, update, link, unlink and delete keep the
              row and its Connector in step (a policy-only write leaves the
              resource version alone; delete retires it and keeps the
@@ -103,9 +105,10 @@ _NAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 
 MIGRATIONS = (
     "0350_datasource_manifest_identity.sql",
-    "0351_resource_platform_managed.sql",
-    "0352_validate_datasource_manifest_identity.sql",
-    "0353_datasources_managed_key_idx.notx.sql",
+    "0351_datasource_manifest_resource_fk.sql",
+    "0352_resource_platform_managed.sql",
+    "0353_validate_datasource_manifest_identity.sql",
+    "0354_datasources_managed_key_idx.notx.sql",
 )
 #: What the orchestrator must serve byte for byte for D3a.
 SERVED = (
@@ -118,6 +121,8 @@ SERVED = (
     "src/orchestrator/services/connector_drivers/base.py",
     "src/orchestrator/services/connector_drivers/kb.py",
     "src/orchestrator/services/connector_drivers/mcp_client.py",
+    "src/orchestrator/services/connector_drivers/registry.py",
+    "src/orchestrator/services/connector_drivers/builtin.py",
     "src/orchestrator/application/lifecycle.py",
     "src/shared/connectors/platform.py",
     "src/shared/connectors/builtin.py",
@@ -472,6 +477,38 @@ def expected_scope(row: dict[str, Any]) -> tuple[str, str] | None:
     return None
 
 
+#: An endpoint is ``scheme://host[:port]`` (a ``jdbc:`` prefix allowed).
+_ENDPOINT_RE = re.compile(r"(?:jdbc:)?[a-z][a-z0-9+.-]*://[a-z0-9.\-\[\]:]+\Z")
+#: Config keys a Connector never carries: the full URL, the pasted command
+#: line, the stdio command and its arguments stay on the row.
+_NEVER_IN_CONFIG = frozenset({"connection_url", "cli_hint", "command", "args"})
+
+
+def config_problems(driver: str, config: Any) -> list[str]:
+    """How a Connector's config breaks its driver's schema or leaks a URL."""
+    if str(ROOT / "src") not in sys.path:
+        sys.path.insert(0, str(ROOT / "src"))
+    from jsonschema import Draft202012Validator
+
+    from shared.connectors.builtin import BUILTIN_SPECS
+
+    config = config if isinstance(config, dict) else {}
+    spec = next((spec for spec in BUILTIN_SPECS if spec.name == driver), None)
+    if spec is None:
+        return [f"driver {driver} is not installed"]
+    problems = [
+        f"config {error.message}"
+        for error in Draft202012Validator(dict(spec.config_schema)).iter_errors(config)
+    ]
+    problems += [
+        f"config holds {key}" for key in sorted(_NEVER_IN_CONFIG & set(config))
+    ]
+    endpoint = config.get("endpoint")
+    if endpoint is not None and not _ENDPOINT_RE.fullmatch(str(endpoint)):
+        problems.append(f"endpoint {endpoint!r} is more than scheme://host[:port]")
+    return problems
+
+
 def row_problems(row: dict[str, Any], *, exact_name: bool = False) -> list[str]:
     """Everything wrong with one row's Connector against the D3a mapping."""
     label = f"{row.get('name')!r} ({row.get('id')})"
@@ -480,6 +517,16 @@ def row_problems(row: dict[str, Any], *, exact_name: bool = False) -> list[str]:
     if row.get("job_id"):
         return [f"{label}: a legacy job clone has a Connector"] if live else []
     scope = expected_scope(row)
+    native = row.get("type") == "kb" and _uuid(row.get("native"))
+    if (
+        live
+        and live.get("scope_kind") == "Project"
+        and not row.get("created_by")
+        and not native
+        and not row.get("managed_key")
+    ):
+        # An ownerless row's Connector keeps the project it was created in.
+        scope = ("Project", live.get("scope_name"))
     driver = driver_for(str(row.get("type")), (live or {}).get("transport"))
     if scope is None or driver is None:
         return [f"{label}: on the legacy path but has a Connector"] if live else []
@@ -508,6 +555,10 @@ def row_problems(row: dict[str, Any], *, exact_name: bool = False) -> list[str]:
         problems.append(f"{label}: access {live.get('access')}, expected {access}")
     if live.get("has_credentials"):
         problems.append(f"{label}: the Connector carries credentials")
+    problems += [
+        f"{label}: {problem}"
+        for problem in config_problems(str(live.get("driver")), live.get("config"))
+    ]
     if str(row.get("manifest_resource_id") or "") != str(row["id"]):
         problems.append(f"{label}: manifest_resource_id is not the resource")
     key = row.get("managed_key") or (
@@ -552,6 +603,7 @@ SELECT coalesce(json_agg(json_build_object(
       'driver', r.document->'spec'->>'driver',
       'access', r.document->'spec'->>'access',
       'transport', r.document->'spec'->'config'->>'transport',
+      'config', r.document->'spec'->'config',
       'has_credentials', (r.document->'spec') ? 'credentials',
       'platform_managed', r.platform_managed,
       'version', r.resource_version,
@@ -597,7 +649,7 @@ class Report:
 
 PLAN = [
     "preflight: Tilt srw ok; every orchestrator pod serves this checkout's D3a "
-    "modules and migrations; the ledger holds 0350-0353; both accounts approved",
+    "modules and migrations; the ledger holds 0350-0354; both accounts approved",
     "fixture: Postgres database + SELECT-only role, a project (with its native "
     "KB) owned by --user with --other-user as editor, and one legacy row "
     "written straight to the table and linked to the project",
@@ -679,6 +731,18 @@ class ConnectorResourcesGate:
                     line for line in out.splitlines() if any(n in line for n in needles)
                 ]
         return found
+
+    def own_rows(self, found: list[dict[str, Any]]) -> set[str]:
+        """This run's datasource ids among ``found``: what it created, and its
+        project's knowledge base."""
+        mine = set(self.connectors.values())
+        if self.project:
+            mine |= {
+                row["id"]
+                for row in found
+                if row.get("type") == "kb" and row.get("native") == self.project
+            }
+        return {row["id"] for row in found if row["id"] in mine}
 
     def row(self, label: str) -> dict[str, Any] | None:
         found = rows(f"WHERE d.id = {lit(self.connectors[label])}")
@@ -847,24 +911,48 @@ class ConnectorResourcesGate:
             f"WHERE datasource_id = {lit(legacy)}) q"
         )
         counts = in_orchestrator(_BACKFILL_PROGRAM, {})
-        self.report.check(
-            "backfill: the rerun wrote the legacy row's Connector and deferred nothing",
-            counts.get("created", 0) >= 1 and counts.get("deferred") == 0,
-            json.dumps(counts),
-        )
         after = rows()
         by_id = {row["id"]: row for row in after}
+        legacy_row = by_id.get(legacy)
+        self.report.check(
+            "backfill: the rerun wrote the legacy row's Connector",
+            bool(legacy_row)
+            and bool((legacy_row.get("resource") or {}).get("name"))
+            and not row_problems(legacy_row, exact_name=True),
+            json.dumps(counts),
+        )
+        if counts.get("deferred"):
+            self.report.note(
+                f"the rerun deferred {counts['deferred']} rows; none is this "
+                "run's (checked above and below)"
+            )
+        mine = self.own_rows(after)
         problems = [
             problem
             for row in after
+            if row["id"] in mine
             for problem in row_problems(row, exact_name=row["id"] == legacy)
-        ] + key_problems(after)
+        ] + key_problems([row for row in after if row["id"] in mine])
         self.report.check(
-            f"backfill: all {len(after)} datasources map to the Connector the "
-            "mapping names (uid, name, scope, driver, access, marker) or stay on "
-            "the legacy path",
-            not problems,
+            f"backfill: this run's {len(mine)} datasources map to the Connector "
+            "the mapping names (uid, name, scope, driver, access, marker, config "
+            "valid and URL-free)",
+            bool(mine) and not problems,
             "; ".join(problems[:5]),
+        )
+        others = [
+            problem
+            for row in after
+            if row["id"] not in mine
+            for problem in row_problems(row)
+        ] + key_problems([row for row in after if row["id"] not in mine])
+        self.report.note(
+            f"{len(after) - len(mine)} other datasources: "
+            + (
+                f"{len(others)} problems, e.g. {'; '.join(others[:3])}"
+                if others
+                else "all map to the Connector the mapping names"
+            )
         )
         changed = [
             row["id"]
