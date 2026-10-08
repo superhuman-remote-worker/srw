@@ -798,7 +798,11 @@ class TestFallbackAfterSwap:
         ws = _workspace()
         entry = _entry(
             git_swap={"fallback": "the driver is not installed"},
-            credentials={"token": TOKEN, "username": "x-access-token"},
+            credentials={
+                "token": TOKEN,
+                "username": "x-access-token",
+                "minted": True,
+            },
         )
         with patch(
             "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
@@ -1163,8 +1167,12 @@ class TestTokenUsername:
         from agent.connectors.checkout import token_username
 
         assert token_username({"token": TOKEN}) == "oauth2"
-        assert token_username({"username": "x-access-token"}) == "x-access-token"
+        minted = {"minted": True, "username": "x-access-token"}
+        assert token_username(minted) == "x-access-token"
+        # A static token's stored username is never honoured.
+        assert token_username({"username": "x-access-token"}) == "oauth2"
+        assert token_username({**minted, "minted": "yes"}) == "oauth2"
         # Nothing a URL's userinfo could be bent by.
         for odd in ("a:b", "a@b", "", "a/b", "x" * 65, 7, None):
-            assert token_username({"username": odd}) == "oauth2"
+            assert token_username({"minted": True, "username": odd}) == "oauth2"
         assert token_username("not a dict") == "oauth2"

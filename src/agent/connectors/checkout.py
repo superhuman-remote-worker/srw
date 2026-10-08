@@ -379,16 +379,20 @@ def _secure_swap_checkout(
     return None
 
 
-#: The username a token goes into the clone URL with, unless its entry names
-#: another: GitHub App installation tokens (C5) name ``x-access-token``.
+#: The username a token goes into the clone URL with, unless the entry is a
+#: credential SRW minted that names another: a GitHub App installation token
+#: (C5) is ``x-access-token``. A static forge token is always ``oauth2``.
 DEFAULT_TOKEN_USERNAME = "oauth2"
 _TOKEN_USERNAME = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 
 
 def token_username(creds: Dict[str, Any]) -> str:
-    """The username of a token-in-URL clone: the entry's, when it is one a
-    URL's userinfo may carry, else ``oauth2``."""
-    named = creds.get("username") if isinstance(creds, dict) else None
+    """The username of a token-in-URL clone: a minted credential's own
+    (``minted: true``), when it is one a URL's userinfo may carry, else
+    ``oauth2``."""
+    if not isinstance(creds, dict) or creds.get("minted") is not True:
+        return DEFAULT_TOKEN_USERNAME
+    named = creds.get("username")
     if isinstance(named, str) and _TOKEN_USERNAME.fullmatch(named):
         return named
     return DEFAULT_TOKEN_USERNAME
