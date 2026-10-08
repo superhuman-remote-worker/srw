@@ -622,8 +622,8 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
 
     # Repository datasource write tools. NOTE: unlike the other datasource
     # toolkits this cannot use context.has_datasource() — repository
-    # datasources never enter context.datasources (process_datasources skips
-    # them); the clones live on workspace_manager instead.
+    # datasources never enter context.datasources (they deliver a checkout, not
+    # a managed connection); the clones live on workspace_manager instead.
     if "repo" in tools_by_category:
         ws = context.workspace_manager
         if not getattr(ws, "source_repos", None):

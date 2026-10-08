@@ -53,7 +53,7 @@ def datasource_tool_categories(
       previously attached datasource never survive,
     - ALL datasources of a type read-only → read tools,
     - any read-write → write tools, backed by the real connection
-      process_datasources() now creates for read-write connectors too,
+      the managed-connection materializer opens for read-write connectors too,
     - tier-keyed types (email): highest effective tier across attached
       datasources of the type (the "any read-write → write" analog);
       per-datasource tiers come from ``config.access`` clamped by
