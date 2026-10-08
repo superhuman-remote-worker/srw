@@ -387,8 +387,12 @@ def _falls_back(ds: Dict[str, Any]) -> bool:
 def _swap_era(git_mgr: Any) -> bool:
     """Whether a reused checkout was the git swap driver's: it refuses
     credentials in URLs (``transfer.credentialsInUrl=die``), which only a
-    swap checkout is set to. A pre-C3 token checkout is not."""
-    found = git_mgr._run_git(["config", "--get", "transfer.credentialsInUrl"])
+    swap checkout is set to. A pre-C3 token checkout is not. Only the
+    checkout's own config counts (``--local``): a global or system setting
+    says nothing about how this checkout was made."""
+    found = git_mgr._run_git(
+        ["config", "--local", "--get", "transfer.credentialsInUrl"]
+    )
     return (
         getattr(found, "returncode", 1) == 0
         and str(getattr(found, "stdout", "") or "").strip() == "die"

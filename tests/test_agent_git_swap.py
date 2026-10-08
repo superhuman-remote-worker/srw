@@ -811,7 +811,7 @@ class TestFallbackAfterSwap:
         reused.add_remote.return_value = True
 
         def run_git(args):
-            if args == ["config", "--get", "transfer.credentialsInUrl"]:
+            if args == ["config", "--local", "--get", "transfer.credentialsInUrl"]:
                 if credentials_in_url is None:
                     return SimpleNamespace(returncode=1, stdout="")
                 return SimpleNamespace(returncode=0, stdout=f"{credentials_in_url}\n")
@@ -854,6 +854,36 @@ class TestFallbackAfterSwap:
         assert "cloned at" in facts.lines[0] and "NOT cloned" not in facts.lines[0]
         for call in ws.backend.shell_run.call_args_list:
             assert TOKEN not in str(call)
+
+    @pytest.mark.parametrize(
+        ("value", "swap_era"),
+        [
+            ("die", True),
+            ("die\n", True),
+            ("warn", False),
+            ("allow", False),
+            (None, False),
+        ],
+    )
+    def test_only_the_checkouts_own_die_is_a_swap_era_trace(self, value, swap_era):
+        """The reconciler review's surviving mutant: only ``die``, set in the
+        checkout's own config, is the driver's trace; ``warn`` (or a global
+        setting, which ``--local`` never reads) is not."""
+        from agent.connectors.checkout import _swap_era
+
+        git_mgr = self._swap_era_checkout(value.strip() if value else None)
+        assert _swap_era(git_mgr) is swap_era
+        git_mgr._run_git.assert_called_once_with(
+            ["config", "--local", "--get", "transfer.credentialsInUrl"]
+        )
+        # A "warn" checkout keeps its origin when reused.
+        if value == "warn":
+            ws = _workspace(exists=True)
+            with patch("agent.managers.git_manager.GitManager", return_value=git_mgr):
+                clone_repository_datasources(
+                    [self._driver_off()], ws, legacy_key_files="sweep"
+                )
+            git_mgr.add_remote.assert_not_called()
 
     def test_a_pre_c3_token_checkout_is_left_as_it_was(self):
         # No swap-era trace: the checkout keeps its origin, as before C3.
