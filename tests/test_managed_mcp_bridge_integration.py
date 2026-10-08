@@ -486,3 +486,46 @@ def test_the_review_corpus_never_reaches_a_process_as_a_write_call(pod):
     # The well-formed read call of the corpus did reach the process.
     assert any(_readings(line) == {("tools/call", "whoami")} for line in lines)
     assert ("/v1/leases/exchange", "write") not in pod.exchange.calls
+
+
+def _stdio_gate():
+    import importlib.util
+
+    name = "k3d_managed_mcp_stdio_gate"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(
+        name, ROOT / "scripts" / "k3d-managed-mcp-stdio-gate.py"
+    )
+    gate = importlib.util.module_from_spec(spec)
+    sys.modules[name] = gate
+    spec.loader.exec_module(gate)
+    return gate
+
+
+def test_the_gates_corpus_program_and_verdict_hold_against_the_real_pod(pod):
+    """The k3d gate's raw-body program and corpus verdict, here against the
+    real front and bridge: the corpus (named for this server's tools) and
+    the well-formed write control, with a ReadOnly lease."""
+    gate = _stdio_gate()
+    bodies = gate.corpus_bodies("notes_write", "whoami") + [
+        gate.control_body("notes_write", "d5b-0123456789-bypass")
+    ]
+    payload = {
+        "url": pod.url,
+        "bearer": pod.exchange.issue("ReadOnly"),
+        "bodies": [base64.b64encode(body).decode() for body in bodies],
+    }
+    done = subprocess.run(
+        [sys.executable, "-c", gate._RAW_PROGRAM],
+        input=json.dumps(payload) + "\n",
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    result = json.loads(done.stdout.splitlines()[-1])
+    ok, detail = gate.corpus_verdict(result, sent=len(bodies), write_tool="notes_write")
+    assert ok, detail
+    # (One body is a whoami call whose arguments name notes_write.)
+    for line in pod.received():
+        assert ("tools/call", "notes_write") not in _readings(line), line
