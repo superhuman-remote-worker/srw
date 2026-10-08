@@ -379,6 +379,21 @@ def _secure_swap_checkout(
     return None
 
 
+#: The username a token goes into the clone URL with, unless its entry names
+#: another: GitHub App installation tokens (C5) name ``x-access-token``.
+DEFAULT_TOKEN_USERNAME = "oauth2"
+_TOKEN_USERNAME = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
+
+
+def token_username(creds: Dict[str, Any]) -> str:
+    """The username of a token-in-URL clone: the entry's, when it is one a
+    URL's userinfo may carry, else ``oauth2``."""
+    named = creds.get("username") if isinstance(creds, dict) else None
+    if isinstance(named, str) and _TOKEN_USERNAME.fullmatch(named):
+        return named
+    return DEFAULT_TOKEN_USERNAME
+
+
 def _falls_back(ds: Dict[str, Any]) -> bool:
     block = ds.get("git_swap")
     return isinstance(block, dict) and "fallback" in block
@@ -609,8 +624,8 @@ def clone_repository_datasources(
             elif auth == "token_in_url":
                 parsed = urlparse(repo_url)
                 repo_url = parsed._replace(
-                    netloc=f"oauth2:{creds['token']}@{parsed.hostname}"
-                    + (f":{parsed.port}" if parsed.port else "")
+                    netloc=f"{token_username(creds)}:{creds['token']}"
+                    f"@{parsed.hostname}" + (f":{parsed.port}" if parsed.port else "")
                 ).geturl()
 
             target = workspace_manager.path / "repos" / repo_name

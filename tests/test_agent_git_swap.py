@@ -792,6 +792,22 @@ class TestFallbackAfterSwap:
             [], remove=[], prune=True
         )
 
+    def test_a_github_app_token_clones_as_x_access_token(self):
+        # C5: an installation token's entry names GitHub's documented user;
+        # a static token keeps oauth2.
+        ws = _workspace()
+        entry = _entry(
+            git_swap={"fallback": "the driver is not installed"},
+            credentials={"token": TOKEN, "username": "x-access-token"},
+        )
+        with patch(
+            "agent.managers.git_manager.GitManager.clone", return_value=MagicMock()
+        ) as clone:
+            clone_repository_datasources([entry], ws, legacy_key_files="sweep")
+        assert clone.call_args.args[0] == (
+            f"https://x-access-token:{TOKEN}@github.com/o/r.git"
+        )
+
     def test_someone_elses_workspace_is_left_alone(self):
         ws = _workspace(exists=True)
         reused = MagicMock()
@@ -1140,3 +1156,15 @@ class TestRemoteBackend:
 
         with pytest.raises(ValueError, match="sandbox or VM"):
             WorkspaceBackend.install_git_swap_wiring(MagicMock(), [])
+
+
+class TestTokenUsername:
+    def test_the_entrys_username_or_oauth2(self):
+        from agent.connectors.checkout import token_username
+
+        assert token_username({"token": TOKEN}) == "oauth2"
+        assert token_username({"username": "x-access-token"}) == "x-access-token"
+        # Nothing a URL's userinfo could be bent by.
+        for odd in ("a:b", "a@b", "", "a/b", "x" * 65, 7, None):
+            assert token_username({"username": odd}) == "oauth2"
+        assert token_username("not a dict") == "oauth2"

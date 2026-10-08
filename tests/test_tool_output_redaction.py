@@ -470,6 +470,19 @@ class TestWorkspaceSecrets:
 
         secrets = workspace_secrets(_workspace_context())
         assert TOKEN in secrets and f"oauth2:{TOKEN}" in secrets
+        # A GitHub App installation token's pair (C5).
+        assert f"x-access-token:{TOKEN}" in secrets
+
+    def test_an_installation_tokens_basic_header_is_caught(self):
+        import base64
+
+        from agent.core.tool_output_redaction import redact_tool_result
+
+        header = base64.b64encode(f"x-access-token:{TOKEN}".encode()).decode()
+        out = redact_tool_result(
+            f"> Authorization: Basic {header}\n", _workspace_context()
+        )
+        assert header not in out
 
     def test_a_credential_bearing_workspace_remote_contributes_its_pair(self):
         from agent.core.tool_output_redaction import workspace_secrets

@@ -64,7 +64,9 @@ def workspace_secrets(tool_context: Optional[Any]) -> List[str]:
         for meta in (getattr(workspace, "source_repo_meta", None) or {}).values():
             token = meta.get("token") if isinstance(meta, dict) else None
             if isinstance(token, str) and token:
-                secrets.extend((token, f"oauth2:{token}"))
+                # Either username a token-in-URL clone uses (a GitHub App
+                # installation token's is x-access-token, C5).
+                secrets.extend((token, f"oauth2:{token}", f"x-access-token:{token}"))
     except Exception:
         logger.debug("Repository tokens unavailable for redaction", exc_info=True)
     try:
