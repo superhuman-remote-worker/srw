@@ -16,6 +16,129 @@ import pytest
 from orchestrator.operator_cli import vm_retained_resume_acceptance as gate
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attestation", ["proved", "missing", "unavailable"])
+async def test_retire_predecessor_forwards_charged_stop_attestation(
+    monkeypatch,
+    attestation,
+) -> None:
+    """Drive the real recycle/completion path through the CLI's paused wrapper."""
+    from orchestrator.services import vm_workspace_recovery_store as recovery
+    from orchestrator.services.vm_provisioner import (
+        VMTeardownIdentity,
+        VMTeardownResult,
+    )
+
+    job_id, generation, vm_uid, pvc_uid = (str(uuid4()) for _ in range(4))
+    cleanup_id, zero_id = uuid4(), uuid4()
+    candidate = {
+        "owner_kind": "job",
+        "job_id": job_id,
+        "provision_generation": generation,
+        "vm_uid": vm_uid,
+        "pvc_uid": pvc_uid,
+        "vmi_uid": str(uuid4()),
+        "launcher_uid": str(uuid4()),
+    }
+    evidence = {
+        "vm_absent": True,
+        "vmi_absent": True,
+        "launcher_absent": True,
+        "pvc_disposition": "retained",
+    }
+    identity = VMTeardownIdentity(generation, vm_uid, pvc_uid)
+    state = {"owner_checked": False, "released": False}
+
+    @asynccontextmanager
+    async def transaction():
+        yield
+
+    conn = SimpleNamespace(transaction=transaction)
+
+    @asynccontextmanager
+    async def acquire():
+        yield conn
+
+    async def release_compute(connection, **kwargs):
+        assert connection is conn and kwargs["proof"] is evidence
+        state["released"] = True
+
+    resource = SimpleNamespace(
+        mark_cleanup_teardown_on_conn=AsyncMock(return_value=candidate),
+        release_cleanup_compute_on_conn=AsyncMock(side_effect=release_compute),
+    )
+
+    async def charged_scope(connection, store, permit):
+        assert connection is conn
+        assert permit.admission_id == cleanup_id
+        assert permit.parent_cleanup["intent"]["purge_disk"] is False
+        return resource, {}, {}, {}, permit.parent_cleanup
+
+    # Only database admission/scope and external transport are synthetic. Keep
+    # acquire/prepare/complete helpers and recycle_provisioning_vm intact.
+    monkeypatch.setattr(recovery, "_vm_cleanup_resource_scope", charged_scope)
+    monkeypatch.setattr(
+        recovery.VMWorkspaceRecoveryStore,
+        "acquire_cleanup_permit",
+        AsyncMock(return_value=recovery.CleanupPermit(True, cleanup_id)),
+    )
+    scenario = gate.LiveScenario.__new__(gate.LiveScenario)
+    scenario.args = SimpleNamespace(job_id=job_id, expected_pvc_uid=pvc_uid)
+    scenario.db = SimpleNamespace(
+        acquire=acquire,
+        begin_ready_vm_retirement_if_quiescent=AsyncMock(return_value=True),
+        merge_vm_context_if_provision_generation=AsyncMock(return_value=True),
+    )
+
+    async def owner_resume(*, expected_status):
+        assert expected_status == 409 and not state["released"]
+        state["owner_checked"] = True
+        return {}
+
+    async def stop(owner_id, captured, **kwargs):
+        assert state["owner_checked"]
+        assert owner_id == job_id and captured is identity
+        assert kwargs["purge_disk"] is False and kwargs["capture_snapshot"] is False
+        return VMTeardownResult("completed", False)
+
+    scenario.owner_resume = AsyncMock(side_effect=owner_resume)
+    scenario.provisioner = SimpleNamespace(
+        capture_vm_teardown_identity=AsyncMock(return_value=identity),
+        release_vm_captured=AsyncMock(side_effect=stop),
+        attest_vm_cleanup_stop=AsyncMock(
+            return_value=evidence if attestation == "proved" else None,
+            side_effect=TimeoutError if attestation == "unavailable" else None,
+        ),
+    )
+    observed = datetime.now(timezone.utc)
+    scenario.row = AsyncMock(
+        side_effect=[
+            {"id": cleanup_id, "pvc_uid": pvc_uid, "completed_at": None},
+            {"pvc_uid": pvc_uid, "completed_at": observed, "outcome": "completed"},
+            {"id": zero_id, "observed_at": observed},
+        ]
+    )
+    vm = {"status": "ready", "provision_generation": generation}
+    if attestation == "proved":
+        result = await scenario.retire_predecessor(vm)
+        assert result["cleanup_admission_id"] == str(cleanup_id)
+        assert result["process_zero_receipt_id"] == str(zero_id)
+        assert state["released"] is True
+        resource.release_cleanup_compute_on_conn.assert_awaited_once()
+    else:
+        with pytest.raises(gate.AcceptanceFailure, match="retirement did not settle"):
+            await scenario.retire_predecessor(vm)
+        assert state["released"] is False
+        resource.release_cleanup_compute_on_conn.assert_not_awaited()
+        assert scenario.row.await_count == 1
+        updates = scenario.db.merge_vm_context_if_provision_generation.await_args.args[
+            2
+        ]
+        assert updates["retirement_last_result"] == "cleanup_unavailable"
+    scenario.provisioner.attest_vm_cleanup_stop.assert_awaited_once_with(candidate)
+    assert scenario.provisioner.attest_vm_cleanup_stop.await_args.args[0] is candidate
+
+
 def test_execution_guard_requires_exact_disposable_context(tmp_path: Path) -> None:
     job_id, pvc_uid, cluster_uid, hold_id = (str(uuid4()) for _ in range(4))
     values = dict(

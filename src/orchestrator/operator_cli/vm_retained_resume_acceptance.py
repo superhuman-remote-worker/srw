@@ -535,6 +535,9 @@ class LiveScenario:
                 await release.wait()
                 return await delegate.release_vm_captured(*args, **kwargs)
 
+            async def attest_vm_cleanup_stop(self, candidate):
+                return await delegate.attest_vm_cleanup_stop(candidate)
+
         task = asyncio.create_task(recycle_provisioning_vm(
             self.args.job_id, vm, db=self.db, provisioner=PauseBeforeStop(),
             recovery_store=VMWorkspaceRecoveryStore(self.db),
