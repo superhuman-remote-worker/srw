@@ -521,6 +521,24 @@ async def test_a_pinned_retirement_begin_revokes_the_sessions_leases(db):
 
 
 @pytest.mark.asyncio
+async def test_a_stateless_delete_revokes_when_it_fences_the_job(db):
+    """The API delete fences a stateless Job (status cancelled) before its
+    workspace teardown; the revoke names the delete, not the teardown's
+    terminal-execution backstop."""
+    connector = await _connector(db)
+    job = await _job(db, "processing")
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET execution_lane = 'stateless' WHERE id = $1", UUID(job)
+        )
+    lease = await _issue(db, leases.LeaseOwner.job(job), connector)
+
+    assert await db.prepare_stateless_job_for_delete(job)
+
+    assert (await _lease(db, lease.id))["revoke_reason"] == "job_deleted"
+
+
+@pytest.mark.asyncio
 async def test_delete_revokes_before_the_cascade_removes_the_row(db):
     """The "to verify" item: a revoke inside delete_job's transaction runs
     before its cascade; the audit row survives, the lease row does not."""

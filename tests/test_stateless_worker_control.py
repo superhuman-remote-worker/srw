@@ -686,12 +686,17 @@ async def test_prepare_delete_fences_queue_before_job_and_strictly_prunes():
         raise AssertionError(normalized)
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
+    conn.fetch = AsyncMock(return_value=[])
     db = _db_with_conn(conn)
     db.quiesce_cancelled_stateless_vm_parent = AsyncMock(return_value=False)
 
     assert await db.prepare_stateless_job_for_delete(JOB_ID)
     assert calls == ["queue_lock", "queue_close", "job_cancel"]
     db.delete_checkpoint_thread.assert_awaited_once_with(JOB_ID, strict=True)
+    # The fence is the delete decision: it revokes the Job's leases (C2).
+    revoke = conn.fetch.await_args
+    assert "UPDATE connector_credential_leases" in revoke.args[0]
+    assert revoke.args[1:] == (str(UUID(JOB_ID)), "job_deleted")
 
 
 @pytest.mark.asyncio
@@ -710,6 +715,7 @@ async def test_prepare_delete_prune_failure_retains_fenced_job_for_retry():
         raise AssertionError(normalized)
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
+    conn.fetch = AsyncMock(return_value=[])
     db = _db_with_conn(conn)
     db.quiesce_cancelled_stateless_vm_parent = AsyncMock(return_value=False)
     db.delete_checkpoint_thread.side_effect = RuntimeError("prune unavailable")

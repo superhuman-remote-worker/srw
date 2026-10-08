@@ -6475,6 +6475,16 @@ class PostgresDB:
                     )
                     if row is None:
                         raise _DeleteCASLostError
+                    # The delete decision is durable here, before workspace
+                    # teardown: revoke the Job's credential leases now
+                    # (connector drivers C2), so the audit names the delete.
+                    from orchestrator.services.connector_credential_leases import (
+                        revoke_execution_leases,
+                    )
+
+                    await revoke_execution_leases(
+                        conn, job_id=job_uuid, reason="job_deleted"
+                    )
         except _DeleteCASLostError:
             return False
 
