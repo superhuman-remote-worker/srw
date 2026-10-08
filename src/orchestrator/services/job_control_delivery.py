@@ -585,8 +585,11 @@ async def resume_job_on_agent(
         # paused row only carries the bare backend — without this a resumed
         # `virtual` job would reach the agent with no mounts and fail to build
         # its backend. (Same rationale as the credential re-injection above.)
-        if dependencies.backend_from_override(config_override) in LITE_BACKENDS:
-            repo_names = dependencies.repository_datasource_names(resolved_ds)
+        lite_backend = dependencies.backend_from_override(config_override)
+        if lite_backend in LITE_BACKENDS:
+            repo_names = dependencies.repository_datasource_names(
+                resolved_ds, lite_backend
+            )
             if repo_names:
                 msg = (
                     "workspace.backend is a lite tier (virtual/none) but a "

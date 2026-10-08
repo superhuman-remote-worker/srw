@@ -208,28 +208,59 @@ class TestRepositoryDatasourceNames:
             {"type": "repository", "name": "repo1"},
             {"type": "credentials", "name": "api-key"},
         ]
-        assert job_datasource_selection_module.repository_datasource_names(ds) == [
+        assert job_datasource_selection_module.repository_datasource_names(
+            ds, "virtual"
+        ) == [
             "repo1",
             "api-key",
         ]
 
+    @pytest.mark.parametrize("backend", ["virtual", "none"])
+    def test_every_driver_needing_a_shell_is_named(self, backend):
+        # The drivers' supported_backends: generic environments and SSH keys
+        # need a shell too, which a lite tier cannot give them.
+        ds = [
+            {"type": "generic", "name": "env"},
+            {"type": "ssh_key", "name": "key"},
+            {"type": "kb", "name": "notes"},
+            {"type": "kubeconfig", "name": "cluster"},
+            {"type": "email", "name": "mail"},
+        ]
+        assert job_datasource_selection_module.repository_datasource_names(
+            ds, backend
+        ) == ["env", "key"]
+
+    @pytest.mark.parametrize("backend", ["sandbox", "vm", "remote", None])
+    def test_a_shell_backend_names_nothing(self, backend):
+        ds = [{"type": "repository", "name": "r"}, {"type": "generic", "name": "g"}]
+        assert (
+            job_datasource_selection_module.repository_datasource_names(ds, backend)
+            == []
+        )
+
     def test_case_insensitive(self):
         assert job_datasource_selection_module.repository_datasource_names(
-            [{"type": "Repository", "name": "r"}]
+            [{"type": "Repository", "name": "r"}], "virtual"
         ) == ["r"]
 
     def test_id_fallback_when_no_name(self):
         assert job_datasource_selection_module.repository_datasource_names(
-            [{"type": "repository", "id": "abc"}]
+            [{"type": "repository", "id": "abc"}], "virtual"
         ) == ["abc"]
 
     def test_empty_and_none(self):
-        assert job_datasource_selection_module.repository_datasource_names(None) == []
-        assert job_datasource_selection_module.repository_datasource_names([]) == []
+        assert (
+            job_datasource_selection_module.repository_datasource_names(None, "virtual")
+            == []
+        )
+        assert (
+            job_datasource_selection_module.repository_datasource_names([], "virtual")
+            == []
+        )
 
     def test_skips_non_dict_entries(self):
         assert job_datasource_selection_module.repository_datasource_names(
-            ["junk", {"type": "repository", "name": "r"}]
+            ["junk", {"type": "repository", "name": "r"}], "virtual"
         ) == ["r"]
 
 

@@ -36,6 +36,7 @@ from uuid import UUID
 
 from fastapi import HTTPException
 
+from orchestrator.services.datasource_policy import workspace_tier_refuses
 from shared.backend_kinds import LITE_BACKENDS
 
 
@@ -83,18 +84,21 @@ class JobDatasourceSelectionDependencies:
     ]
 
 
-def repository_datasource_names(datasources: Any) -> list[str]:
-    """Names of repository and credential sources requiring a shell workspace.
+def repository_datasource_names(
+    datasources: Any, workspace_backend: str | None
+) -> list[str]:
+    """Names of the connectors ``workspace_backend`` cannot serve.
 
-    Repositories need a clone target and credentials need a command environment;
-    the lite tiers provide neither (§4/§7).
+    Repositories need a clone target, and credential and generic environments
+    and SSH keys need a shell; the lite tiers provide neither (§4/§7). The rule
+    is the drivers' ``supported_backends`` (``workspace_tier_refuses``).
     Returns a (possibly empty) list of human-readable names for the error.
     """
     names: list[str] = []
     for ds in datasources or []:
         if not isinstance(ds, dict):
             continue
-        if (ds.get("type") or "").lower() in {"repository", "credentials"}:
+        if workspace_tier_refuses(ds, workspace_backend):
             names.append(str(ds.get("name") or ds.get("id") or "?"))
     return names
 
@@ -147,7 +151,7 @@ async def filter_implicit_lite_datasource_ids(
 
     Explicit selections fail loudly in the central policy service. Inherited
     and automatic choices are creation-time seeds, so lite tiers keep the
-    usable connectors while omitting repositories and credential environments.
+    usable connectors while omitting the ones their drivers say need a shell.
     Missing IDs remain in the list and therefore still fail closed when the
     complete set is authorized.
     """
@@ -155,9 +159,7 @@ async def filter_implicit_lite_datasource_ids(
         return datasource_ids
     rows = await dependencies.store.get_datasource_policy_rows(datasource_ids)
     repositories = {
-        str(row["id"])
-        for row in rows
-        if str(row.get("type") or "").lower() in {"repository", "credentials"}
+        str(row["id"]) for row in rows if workspace_tier_refuses(row, workspace_backend)
     }
     return [value for value in datasource_ids if str(value) not in repositories]
 

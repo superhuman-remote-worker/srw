@@ -23,8 +23,13 @@ export function isRepositoryDatasource(type: DatasourceType | string): boolean {
   return (type || '').toString().toLowerCase() === 'repository';
 }
 
+/** Connector types whose driver needs a shell workspace (its spec leaves the
+ *  lite tiers out of `supported_backends`). A copy of the server's
+ *  `workspace_tier_refuses` until the picker reads the driver specs (D2). */
+const SHELL_WORKSPACE_TYPES = new Set(['repository', 'credentials', 'generic', 'ssh_key']);
+
 export function requiresShellWorkspace(type: DatasourceType | string): boolean {
-  return isRepositoryDatasource(type) || type === 'credentials';
+  return SHELL_WORKSPACE_TYPES.has((type || '').toString().toLowerCase());
 }
 
 /** Stable identity of a datasource set (order-independent). */

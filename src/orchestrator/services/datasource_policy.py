@@ -11,9 +11,10 @@ and only then use the ordinary explicit datasource resolver to deliver secrets.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 from uuid import UUID
 
+from shared.connectors.builtin import spec_for_row
 
 LITE_WORKSPACE_BACKENDS = frozenset({"virtual", "none"})
 NATIVE_PROJECT_CONFIG_KEY = "native_project_id"
@@ -28,7 +29,8 @@ class DatasourceUnavailableError(PermissionError):
 
 
 class DatasourceWorkspaceTierError(ValueError):
-    """An explicit clone-based repository cannot run on a lite workspace."""
+    """An explicit connector whose driver needs a shell cannot run on a lite
+    workspace (repositories, credential and generic environments, SSH keys)."""
 
 
 def _normalized_ids(values: Iterable[str] | None) -> list[str]:
@@ -82,11 +84,23 @@ def _scope_matches(row: dict[str, Any], target_project_ids: set[str]) -> bool:
     return target_project_ids.issubset(_row_project_ids(row))
 
 
-def _is_lite_repository(row: dict[str, Any], workspace_backend: str | None) -> bool:
-    return (
-        str(row.get("type") or "").lower() in {"repository", "credentials"}
-        and str(workspace_backend or "").lower() in LITE_WORKSPACE_BACKENDS
-    )
+def workspace_tier_refuses(
+    row: Mapping[str, Any], workspace_backend: str | None
+) -> bool:
+    """Whether a lite workspace tier cannot serve this connector.
+
+    The connector's driver names the workspace backends it works with
+    (``spec.supported_backends``): repositories, credential and generic
+    environments and SSH keys need a shell, which the lite tiers (virtual,
+    none) do not have. Only a lite tier is ever refused here; the attach-time
+    revalidation passes no backend at all. The one rule behind create-time
+    authorization, implicit-default filtering and dispatch.
+    """
+    backend = str(workspace_backend or "").lower()
+    if backend not in LITE_WORKSPACE_BACKENDS:
+        return False
+    spec = spec_for_row(row)
+    return spec is not None and backend not in spec.supported_backends
 
 
 async def _validate_effective_owner(
@@ -222,7 +236,7 @@ async def classify_datasource_selection(
         if not execution_authorized:
             verdicts.append(ItemVerdict(datasource_id, True, "revoked"))
             continue
-        if _is_lite_repository(row, workspace_backend):
+        if workspace_tier_refuses(row, workspace_backend):
             verdicts.append(ItemVerdict(datasource_id, True, "workspace_tier"))
             continue
         try:
@@ -320,9 +334,10 @@ async def default_datasource_selection(
     """Return default IDs and the policy revisions used to select them.
 
     Shared/public connector publisher preferences never affect another user.
-    Native project KB rows are the sole v1 project-managed exception. Clone-
-    based repositories are silently omitted on lite workspace tiers because
-    this is an implicit default rather than an explicit user requirement.
+    Native project KB rows are the sole v1 project-managed exception.
+    Connectors a lite workspace tier cannot serve (``workspace_tier_refuses``)
+    are silently omitted because this is an implicit default rather than an
+    explicit user requirement.
 
     The revision snapshot comes from the exact candidate rows used for the
     decision. Callers pass both values to the atomic creation API, which locks
@@ -350,7 +365,7 @@ async def default_datasource_selection(
         )
         if not (owned or native_default):
             continue
-        if _is_lite_repository(row, workspace_backend):
+        if workspace_tier_refuses(row, workspace_backend):
             continue
         try:
             datasource_id = str(UUID(str(row["id"])))
@@ -391,4 +406,5 @@ __all__ = [
     "classify_datasource_selection",
     "default_datasource_ids",
     "default_datasource_selection",
+    "workspace_tier_refuses",
 ]

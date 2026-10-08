@@ -5,6 +5,7 @@ import {
   datasourceSelectionDifferenceCount,
   datasourceSetKey,
   isRepositoryDatasource,
+  requiresShellWorkspace,
   selectedDatasourceIds,
   DatasourcesGroupComponent,
 } from './datasources-group.component';
@@ -134,6 +135,24 @@ describe('datasources-group selection logic', () => {
     expect(isRepositoryDatasource('repository')).toBe(true);
     expect(isRepositoryDatasource('Repository')).toBe(true);
     expect(isRepositoryDatasource('postgresql')).toBe(false);
+  });
+
+  it('requiresShellWorkspace matches the drivers that need a shell', () => {
+    for (const type of ['repository', 'credentials', 'generic', 'ssh_key', 'Generic']) {
+      expect(requiresShellWorkspace(type)).toBe(true);
+    }
+    for (const type of ['kb', 'postgresql', 'email', 'mcp', 'kubeconfig', 'generic_file']) {
+      expect(requiresShellWorkspace(type)).toBe(false);
+    }
+  });
+
+  it('excludes generic and SSH-key connectors under a lite backend', () => {
+    const ds = [
+      makeDs('env', 'generic', true),
+      makeDs('key', 'ssh_key', true),
+      makeDs('pg', 'postgresql', true),
+    ];
+    expect(selectedDatasourceIds(ds, null, true, undefined, true)).toEqual(['pg']);
   });
 });
 

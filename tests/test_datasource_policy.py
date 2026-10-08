@@ -16,6 +16,7 @@ from orchestrator.services.datasource_policy import (
     classify_datasource_selection,
     default_datasource_ids,
     default_datasource_selection,
+    workspace_tier_refuses,
 )
 from orchestrator.application import preparation as preparation_composition
 from orchestrator.services import (
@@ -117,6 +118,43 @@ async def test_credentials_require_shell_workspace(backend):
         await authorize_datasource_ids(
             db, {"id": OWNER}, OWNER, [DS_OWNED], [], backend
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["none", "virtual"])
+@pytest.mark.parametrize("ds_type", ["generic", "ssh_key"])
+async def test_every_driver_needing_a_shell_is_refused_on_a_lite_tier(backend, ds_type):
+    """The lite-tier rule is the drivers' supported_backends, not a type list:
+    a generic environment used to pass admission and fail at setup."""
+    db = _db([_row(DS_OWNED, ds_type=ds_type)])
+    with pytest.raises(DatasourceWorkspaceTierError):
+        await authorize_datasource_ids(
+            db, {"id": OWNER}, OWNER, [DS_OWNED], [], backend
+        )
+
+
+@pytest.mark.parametrize(
+    ("ds_type", "backend", "refused"),
+    [
+        ("repository", "virtual", True),
+        ("credentials", "none", True),
+        ("generic", "virtual", True),
+        ("ssh_key", "none", True),
+        ("Repository", "VIRTUAL", True),
+        ("kb", "virtual", False),
+        ("postgresql", "none", False),
+        ("kubeconfig", "virtual", False),
+        ("email", "virtual", False),
+        ("unknown-type", "virtual", False),
+        ("repository", "sandbox", False),
+        ("repository", "vm", False),
+        ("repository", "remote", False),
+        # The attach-time revalidation passes no backend: never refused.
+        ("repository", None, False),
+    ],
+)
+def test_workspace_tier_refuses_follows_supported_backends(ds_type, backend, refused):
+    assert workspace_tier_refuses({"type": ds_type}, backend) is refused
 
 
 @pytest.mark.asyncio

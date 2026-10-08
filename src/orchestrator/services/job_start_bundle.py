@@ -471,8 +471,9 @@ async def build_job_start_request(
         # lite selection — but this re-checks the fully resolved set, covering
         # resume / VM-resume and any future path that could attach a repo the
         # submit guard never saw.
-        if dependencies.backend_from_override(config_override) in LITE_BACKENDS:
-            repo_names = repository_datasource_names(resolved_ds)
+        lite_backend = dependencies.backend_from_override(config_override)
+        if lite_backend in LITE_BACKENDS:
+            repo_names = repository_datasource_names(resolved_ds, lite_backend)
             if repo_names:
                 msg = (
                     "workspace.backend is a lite tier (virtual/none) but a "

@@ -692,8 +692,10 @@ class TestPureHelperParity:
     )
     def test_repository_datasource_names(self, rows):
         assert job_datasource_selection.repository_datasource_names(
-            rows
-        ) == job_datasource_selection_module.repository_datasource_names(rows)
+            rows, "virtual"
+        ) == job_datasource_selection_module.repository_datasource_names(
+            rows, "virtual"
+        )
 
 
 # =============================================================================
