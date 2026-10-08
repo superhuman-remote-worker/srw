@@ -40,6 +40,7 @@ from tests.test_vm_end_actuator_handoff_real_postgres import (
     pg_dsn as _pg_dsn,
 )
 from tests.test_vm_thread_retained_disk_purge_real_postgres import (
+    LEASE_TABLE_MIGRATIONS,
     RetainedDisk,
     predecessor_snapshot,
 )
@@ -449,7 +450,11 @@ async def test_populated_0297_retained_source_survives_0298(
         stage = tmp_path / "migrations"
         stage.mkdir()
         for path in migrations.glob("*.sql"):
-            if path.name.split("_", 1)[0] <= "0297":
+            # Today's Begin revokes credential leases (C2), so the old head
+            # carries the lease tables the code it runs needs.
+            if path.name.split("_", 1)[0] <= "0297" or path.name.startswith(
+                LEASE_TABLE_MIGRATIONS
+            ):
                 (stage / path.name).write_bytes(path.read_bytes())
         pool = await asyncpg.create_pool(dsn, min_size=1, max_size=3)
         await run_migrations(pool, stage)

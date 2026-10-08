@@ -126,6 +126,7 @@ async def database(pg_url, monkeypatch):
         CREATE TABLE jobs(id uuid PRIMARY KEY, status text DEFAULT 'created', error_message text,
             assigned_agent_id uuid, lease_expires_at timestamptz, execution_lane text DEFAULT 'pinned');
         CREATE TABLE threads(id uuid PRIMARY KEY, status text DEFAULT 'created');
+        CREATE TABLE datasources(id uuid PRIMARY KEY);
     """)
     migration = (
         Path(__file__).resolve().parents[1]
@@ -137,6 +138,10 @@ async def database(pg_url, monkeypatch):
     )
     await db.execute(
         migration.with_name("0308_project_workspace_defaults.sql").read_text()
+    )
+    # A final retire revokes the execution's credential leases (C2).
+    await db.execute(
+        migration.with_name("0347_connector_credential_leases.sql").read_text()
     )
     yield db
     await db.disconnect()

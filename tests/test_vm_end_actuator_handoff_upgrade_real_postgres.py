@@ -11,6 +11,9 @@ from tests.test_vm_end_actuator_handoff_real_postgres import pg_dsn as _pg_dsn, 
 from tests import test_persistent_recycler_real_postgres as fixtures
 from tests.test_b10_session_queries_real_postgres import _thread
 from tests.test_pinned_vm_initial_binding_real_postgres import _bind_protected_agent
+from tests.test_vm_thread_retained_disk_purge_real_postgres import (
+    LEASE_TABLE_MIGRATIONS,
+)
 
 
 pg_dsn = _pg_dsn
@@ -25,7 +28,11 @@ async def test_populated_0296_to_0298_preserves_pending_begin_and_old_outcome(
     stage = tmp_path / "migrations"
     stage.mkdir()
     for path in migrations.glob("*.sql"):
-        if path.name.split("_", 1)[0] <= "0296":
+        # Today's Begin revokes credential leases (C2), so the old head
+        # carries the lease tables the code it runs needs.
+        if path.name.split("_", 1)[0] <= "0296" or path.name.startswith(
+            LEASE_TABLE_MIGRATIONS
+        ):
             (stage / path.name).write_bytes(path.read_bytes())
     pool = await asyncpg.create_pool(pg_dsn, min_size=1, max_size=3)
     db = PostgresDB(connection_string=pg_dsn, min_connections=1, max_connections=3)

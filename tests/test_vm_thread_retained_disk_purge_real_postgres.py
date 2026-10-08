@@ -20,6 +20,9 @@ from tests.test_vm_resource_thread_cleanup_real_postgres import (
 
 db = _db
 pg_dsn = _pg_dsn
+#: Migrations an old-head stage still needs: the code these upgrade tests
+#: run is today's, and its retirement Begin revokes credential leases (C2).
+LEASE_TABLE_MIGRATIONS = ("0346_", "0347_")
 
 
 class RetainedDisk(PhysicalStop):
@@ -858,7 +861,11 @@ async def test_forward_upgrade_preserves_populated_soft_end_tables(
     stage.mkdir()
     try:
         for path in migrations.glob("*.sql"):
-            if path.name.split("_", 1)[0] <= head:
+            # Today's Begin revokes credential leases (C2), so the old head
+            # carries the lease tables the code it runs needs.
+            if path.name.split("_", 1)[0] <= head or path.name.startswith(
+                LEASE_TABLE_MIGRATIONS
+            ):
                 (stage / path.name).write_text(path.read_text())
         await run_migrations(pool, stage)
         await store.connect()

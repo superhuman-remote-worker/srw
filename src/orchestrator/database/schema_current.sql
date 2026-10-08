@@ -26705,6 +26705,81 @@ COMMENT ON COLUMN public.config_overrides.kind IS 'Resolver subsection (MatrixRe
 
 
 --
+-- Name: connector_credential_leases; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.connector_credential_leases (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    token_hash bytea NOT NULL,
+    token_ciphertext text NOT NULL,
+    token_last_four text NOT NULL,
+    job_id uuid,
+    thread_id uuid,
+    connector_id uuid NOT NULL,
+    driver text NOT NULL,
+    image_digest text,
+    access text NOT NULL,
+    issued_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    last_renewed_at timestamp with time zone,
+    last_exchanged_at timestamp with time zone,
+    exchange_count bigint DEFAULT 0 NOT NULL,
+    revoked_at timestamp with time zone,
+    revoke_reason text,
+    CONSTRAINT connector_credential_leases_access_check CHECK ((access <> ''::text)),
+    CONSTRAINT connector_credential_leases_ciphertext_check CHECK ((token_ciphertext <> ''::text)),
+    CONSTRAINT connector_credential_leases_count_check CHECK ((exchange_count >= 0)),
+    CONSTRAINT connector_credential_leases_digest_check CHECK (((image_digest IS NULL) OR (image_digest ~ '^sha256:[0-9a-f]{64}$'::text))),
+    CONSTRAINT connector_credential_leases_driver_check CHECK ((driver <> ''::text)),
+    CONSTRAINT connector_credential_leases_hash_check CHECK ((octet_length(token_hash) = 32)),
+    CONSTRAINT connector_credential_leases_last_four_check CHECK ((char_length(token_last_four) = 4)),
+    CONSTRAINT connector_credential_leases_owner_check CHECK ((num_nonnulls(job_id, thread_id) = 1)),
+    CONSTRAINT connector_credential_leases_revoke_check CHECK (((revoked_at IS NULL) = (revoke_reason IS NULL))),
+    CONSTRAINT connector_credential_leases_window_check CHECK ((expires_at > issued_at))
+);
+
+
+--
+-- Name: TABLE connector_credential_leases; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.connector_credential_leases IS 'Connector credential leases (scl_ tokens). token_hash is the lookup key; token_ciphertext lets SRW deliver the same token again. Renewed only by the server-side sweeper while the owning execution is live.';
+
+
+--
+-- Name: connector_driver_identities; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.connector_driver_identities (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    token_hash bytea NOT NULL,
+    token_last_four text NOT NULL,
+    connector_id uuid NOT NULL,
+    driver text NOT NULL,
+    image_digest text,
+    pod_namespace text,
+    pod_name text,
+    pod_uid text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_used_at timestamp with time zone,
+    revoked_at timestamp with time zone,
+    revoke_reason text,
+    CONSTRAINT connector_driver_identities_digest_check CHECK (((image_digest IS NULL) OR (image_digest ~ '^sha256:[0-9a-f]{64}$'::text))),
+    CONSTRAINT connector_driver_identities_driver_check CHECK ((driver <> ''::text)),
+    CONSTRAINT connector_driver_identities_hash_check CHECK ((octet_length(token_hash) = 32)),
+    CONSTRAINT connector_driver_identities_last_four_check CHECK ((char_length(token_last_four) = 4)),
+    CONSTRAINT connector_driver_identities_revoke_check CHECK (((revoked_at IS NULL) = (revoke_reason IS NULL)))
+);
+
+
+--
+-- Name: TABLE connector_driver_identities; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.connector_driver_identities IS 'Connector driver identities (sdi_ tokens, SHA-256 only). The lease exchange authenticates a driver by one of these plus a lease token; the binding is read from the row, never from the request.';
+
+
+--
 -- Name: contact_addresses; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -33510,6 +33585,38 @@ ALTER TABLE ONLY public.compute_shadow_observations
 
 
 --
+-- Name: connector_credential_leases connector_credential_leases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_credential_leases
+    ADD CONSTRAINT connector_credential_leases_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: connector_credential_leases connector_credential_leases_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_credential_leases
+    ADD CONSTRAINT connector_credential_leases_token_hash_key UNIQUE (token_hash);
+
+
+--
+-- Name: connector_driver_identities connector_driver_identities_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_identities
+    ADD CONSTRAINT connector_driver_identities_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: connector_driver_identities connector_driver_identities_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_identities
+    ADD CONSTRAINT connector_driver_identities_token_hash_key UNIQUE (token_hash);
+
+
+--
 -- Name: contact_addresses contact_addresses_owner_user_id_channel_address_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -36618,6 +36725,48 @@ CREATE INDEX idx_config_override_lookup ON public.config_overrides USING btree (
 
 
 --
+-- Name: idx_connector_credential_leases_connector; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_credential_leases_connector ON public.connector_credential_leases USING btree (connector_id);
+
+
+--
+-- Name: idx_connector_credential_leases_job; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_credential_leases_job ON public.connector_credential_leases USING btree (job_id) WHERE (job_id IS NOT NULL);
+
+
+--
+-- Name: idx_connector_credential_leases_live_expiry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_credential_leases_live_expiry ON public.connector_credential_leases USING btree (expires_at) WHERE (revoked_at IS NULL);
+
+
+--
+-- Name: idx_connector_credential_leases_thread; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_credential_leases_thread ON public.connector_credential_leases USING btree (thread_id) WHERE (thread_id IS NOT NULL);
+
+
+--
+-- Name: idx_connector_driver_identities_connector; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_driver_identities_connector ON public.connector_driver_identities USING btree (connector_id);
+
+
+--
+-- Name: idx_connector_driver_identities_pod; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_driver_identities_pod ON public.connector_driver_identities USING btree (pod_uid) WHERE ((revoked_at IS NULL) AND (pod_uid IS NOT NULL));
+
+
+--
 -- Name: idx_contact_addresses_contact; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -38127,6 +38276,20 @@ CREATE UNIQUE INDEX uq_canvases_origin_generation ON public.canvases USING btree
 --
 
 CREATE UNIQUE INDEX uq_config_override ON public.config_overrides USING btree (COALESCE(family, ''::character varying), kind, name);
+
+
+--
+-- Name: uq_connector_credential_leases_live_job; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_connector_credential_leases_live_job ON public.connector_credential_leases USING btree (job_id, connector_id) WHERE ((revoked_at IS NULL) AND (job_id IS NOT NULL));
+
+
+--
+-- Name: uq_connector_credential_leases_live_thread; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_connector_credential_leases_live_thread ON public.connector_credential_leases USING btree (thread_id, connector_id) WHERE ((revoked_at IS NULL) AND (thread_id IS NOT NULL));
 
 
 --
@@ -41124,6 +41287,38 @@ ALTER TABLE ONLY public.compute_shadow_observations
 
 ALTER TABLE ONLY public.compute_shadow_observations
     ADD CONSTRAINT compute_shadow_observations_snapshot_fkey FOREIGN KEY (snapshot_id, inventory_scope_id) REFERENCES public.resource_inventory_snapshots(id, inventory_scope_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: connector_credential_leases connector_credential_leases_connector_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_credential_leases
+    ADD CONSTRAINT connector_credential_leases_connector_id_fkey FOREIGN KEY (connector_id) REFERENCES public.datasources(id) ON DELETE CASCADE;
+
+
+--
+-- Name: connector_credential_leases connector_credential_leases_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_credential_leases
+    ADD CONSTRAINT connector_credential_leases_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: connector_credential_leases connector_credential_leases_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_credential_leases
+    ADD CONSTRAINT connector_credential_leases_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: connector_driver_identities connector_driver_identities_connector_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_identities
+    ADD CONSTRAINT connector_driver_identities_connector_id_fkey FOREIGN KEY (connector_id) REFERENCES public.datasources(id) ON DELETE CASCADE;
 
 
 --
