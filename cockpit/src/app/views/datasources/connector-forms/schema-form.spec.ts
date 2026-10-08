@@ -66,8 +66,11 @@ describe('every built-in spec', () => {
       expect(value.credentials).toBeUndefined();
       // Every config property and every slot key is a rendered field.
       const pointers = renderedPointers(model, state);
-      for (const key of Object.keys(spec.config_schema.properties ?? {})) {
-        expect(pointers).toContain(`/config/${key}`);
+      // Every authored config property is a rendered field; a readOnly one
+      // (a connector row's mirrored fields) is SRW's and never shown.
+      for (const [key, schema] of Object.entries(spec.config_schema.properties ?? {})) {
+        if (schema.readOnly) expect(pointers).not.toContain(`/config/${key}`);
+        else expect(pointers).toContain(`/config/${key}`);
       }
       for (const slot of spec.credential_slots) {
         for (const key of Object.keys(slot.schema.properties ?? {})) {
@@ -351,5 +354,32 @@ describe('the API refusal', () => {
     expect(errorAnchor('/config/imap/port', rendered)).toBe('/config/imap');
     expect(errorAnchor('/credentials/x', rendered)).toBeNull();
     expect(errorAnchor(null, rendered)).toBeNull();
+  });
+});
+
+describe('readOnly config', () => {
+  const MIRRORED: JsonSchema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      endpoint: {type: 'string', readOnly: true},
+      transport: {enum: ['http', 'sse'], readOnly: true},
+      region: {type: 'string'},
+    },
+  };
+
+  it('is neither shown nor sent', () => {
+    const model = buildFormModel(driver(MIRRORED));
+    const state = initialFormState(model);
+    expect([...renderedPointers(model, state)]).toEqual(['/config/region']);
+    setStateAt(state, 'config/region', 'eu');
+    expect(formValue(model, state, false)).toEqual({config: {region: 'eu'}, problems: []});
+  });
+
+  it('leaves a remote MCP spec nothing to author but its server slot', () => {
+    const model = buildFormModel(builtin('srw.mcp-remote/v1'));
+    const pointers = [...renderedPointers(model, initialFormState(model))];
+    expect(pointers.filter((p) => p.startsWith('/config/'))).toEqual([]);
+    expect(pointers).toContain('/credentials/transport');
   });
 });

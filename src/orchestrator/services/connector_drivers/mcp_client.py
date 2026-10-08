@@ -34,7 +34,7 @@ from orchestrator.services.connector_drivers.base import (
     NormalizedConnector,
     ValidationContext,
 )
-from shared.connectors.builtin import MCP_REMOTE_SPEC, MCP_SPEC
+from shared.connectors.builtin import MCP_SPEC, mcp_spec_for
 from shared.connectors.contract import DriverSpec
 
 _CONFIG_REFUSED = "Connector config is not supported for MCP connectors"
@@ -137,9 +137,7 @@ class McpDriver(DatasourceDriver):
 
     def resource_driver(self, credentials: Mapping[str, Any]) -> str:
         """``srw.mcp/v1`` for a stdio server, ``srw.mcp-remote/v1`` otherwise."""
-        if self._transport(credentials) == "stdio":
-            return MCP_SPEC.name
-        return MCP_REMOTE_SPEC.name
+        return mcp_spec_for(credentials).name
 
     def credential_config(self, credentials: Mapping[str, Any]) -> dict[str, Any]:
         """The transport, and a remote server's auth kind and header names.

@@ -34,6 +34,8 @@ export interface JsonSchema {
   maxProperties?: number;
   /** A secret: never read back, so an edit's blank keeps the stored value. */
   writeOnly?: boolean;
+  /** Derived by SRW (a connector row's mirrored fields): never authored. */
+  readOnly?: boolean;
   /** `file` (paste or upload), `textarea`, `password` or `json`. */
   'x-srw-widget'?: string;
   /** Sort key among siblings; unordered properties follow, in schema order. */
@@ -103,6 +105,9 @@ export interface ConnectorDriver {
   title: string;
   /** The `datasources.type` a built-in driver serves; null for the rest. */
   legacy_type: string | null;
+  /** Whether this driver owns its stored type; false for a variant serving
+   *  some of the type's rows (srw.mcp-remote/v1 beside srw.mcp/v1). */
+  serves_stored_type: boolean;
   protocol_version: string;
   plane: 'harness' | 'bind_time' | 'service' | 'in_pod';
   delivery_forms: string[];
@@ -183,11 +188,14 @@ export function publicReadWrite(
   return row.read_only === false;
 }
 
-/** The installed driver serving a stored connector type. */
+/** The installed driver that owns a stored connector type (not a variant
+ *  serving only some of its rows). */
 export function driverForType(
   drivers: readonly ConnectorDriver[] | null | undefined,
   type: string | null | undefined,
 ): ConnectorDriver | null {
   if (!drivers || !type) return null;
-  return drivers.find((driver) => driver.legacy_type === type) ?? null;
+  return (
+    drivers.find((driver) => driver.legacy_type === type && driver.serves_stored_type) ?? null
+  );
 }

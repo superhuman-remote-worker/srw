@@ -5,6 +5,7 @@
       "name": "srw.env/v1",
       "title": "Environment variables",
       "legacy_type": null,
+      "serves_stored_type": false,
       "protocol_version": "1.0",
       "plane": "bind_time",
       "delivery_forms": [
@@ -86,6 +87,7 @@
       "name": "srw.files/v1",
       "title": "Files",
       "legacy_type": null,
+      "serves_stored_type": false,
       "protocol_version": "1.0",
       "plane": "bind_time",
       "delivery_forms": [
@@ -170,6 +172,7 @@
       "name": "srw.generic/v1",
       "title": "Generic",
       "legacy_type": "generic",
+      "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "bind_time",
       "delivery_forms": [
@@ -273,6 +276,7 @@
       "name": "srw.credentials/v1",
       "title": "Credentials",
       "legacy_type": "credentials",
+      "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "bind_time",
       "delivery_forms": [
@@ -376,6 +380,7 @@
       "name": "srw.repository/v1",
       "title": "Repository",
       "legacy_type": "repository",
+      "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "bind_time",
       "delivery_forms": [
@@ -522,6 +527,7 @@
       "name": "srw.kb/v1",
       "title": "OKF Knowledge Base",
       "legacy_type": "kb",
+      "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "harness",
       "delivery_forms": [
@@ -658,6 +664,7 @@
       "name": "srw.postgresql/v1",
       "title": "PostgreSQL",
       "legacy_type": "postgresql",
+      "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "harness",
       "delivery_forms": [
@@ -743,6 +750,7 @@
       "name": "srw.neo4j/v1",
       "title": "Neo4j",
       "legacy_type": "neo4j",
+      "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "harness",
       "delivery_forms": [
@@ -851,6 +859,7 @@
       "name": "srw.mongodb/v1",
       "title": "MongoDB",
       "legacy_type": "mongodb",
+      "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "harness",
       "delivery_forms": [
@@ -939,6 +948,7 @@
       "name": "srw.webdav/v1",
       "title": "WebDAV",
       "legacy_type": "webdav",
+      "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "harness",
       "delivery_forms": [
@@ -1050,6 +1060,7 @@
       "name": "srw.email/v1",
       "title": "Email",
       "legacy_type": "email",
+      "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "harness",
       "delivery_forms": [
@@ -1352,6 +1363,7 @@
       "name": "srw.mcp/v1",
       "title": "MCP Server",
       "legacy_type": "mcp",
+      "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "harness",
       "delivery_forms": [
@@ -1459,6 +1471,7 @@
       "name": "srw.mcp-remote/v1",
       "title": "MCP Server (remote)",
       "legacy_type": "mcp",
+      "serves_stored_type": false,
       "protocol_version": "1.0",
       "plane": "harness",
       "delivery_forms": [
@@ -1578,6 +1591,7 @@
       "name": "srw.kubeconfig/v1",
       "title": "Kubeconfig",
       "legacy_type": "kubeconfig",
+      "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "bind_time",
       "delivery_forms": [
@@ -1728,6 +1742,7 @@
       "name": "srw.ssh-key/v1",
       "title": "SSH Key",
       "legacy_type": "ssh_key",
+      "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "bind_time",
       "delivery_forms": [
@@ -1893,6 +1908,7 @@
       "name": "srw.generic-file/v1",
       "title": "Generic file",
       "legacy_type": "generic_file",
+      "serves_stored_type": true,
       "protocol_version": "1.0",
       "plane": "bind_time",
       "delivery_forms": [

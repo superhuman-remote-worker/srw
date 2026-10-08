@@ -9,7 +9,9 @@
  * objects (edited as JSON), `oneOf`/`anyOf` choices — discriminated by one
  * `const` property or picked by position — and `writeOnly` secrets, plus the
  * UI hints `x-srw-widget` (`file`, `textarea`, `password`, `json`),
- * `x-srw-order`, `x-srw-group` and `x-srw-multiline`.
+ * `x-srw-order`, `x-srw-group` and `x-srw-multiline`. A `readOnly` property
+ * is SRW's to set (a connector row's mirrored fields), so the form neither
+ * shows nor sends it.
  *
  * The checks here stop an obviously incomplete submit (the editor's Save waits
  * for them), including an edit that would wipe stored secrets (`formValue`).
@@ -291,12 +293,14 @@ export function parseSchema(
 
 function parseProperties(schema: JsonSchema, secret: boolean): FieldGroup[] {
   const required = new Set(schema.required ?? []);
-  const entries = Object.entries(schema.properties ?? {}).map(([name, child], index) => ({
-    name,
-    index,
-    child,
-    order: typeof child['x-srw-order'] === 'number' ? child['x-srw-order'] : Infinity,
-  }));
+  const entries = Object.entries(schema.properties ?? {})
+    .map(([name, child], index) => ({
+      name,
+      index,
+      child,
+      order: typeof child['x-srw-order'] === 'number' ? child['x-srw-order'] : Infinity,
+    }))
+    .filter(({child}) => child.readOnly !== true);
   entries.sort((a, b) => a.order - b.order || a.index - b.index);
   // Groups appear where their first (sorted) property does.
   const groups: FieldGroup[] = [];

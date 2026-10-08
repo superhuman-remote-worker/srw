@@ -31,7 +31,7 @@ from typing import Any
 from agent.connectors.base import Delivery
 from agent.connectors.slots import connection_slot
 from shared.connectors.binding import BindingDescriptor, BindingEntry
-from shared.connectors.builtin import spec_for_type
+from shared.connectors.builtin import driver_spec_for_row, spec_for_type
 from shared.connectors.contract import DriverSpec, effective_access
 from shared.native_kb import native_kb_project_id
 
@@ -295,7 +295,8 @@ def binding_from_legacy_entry(entry: Mapping[str, Any]) -> BindingDescriptor | N
         for item in _ENTRY_BUILDERS.get(form, lambda _entry, _spec: [])(entry, spec)
     )
     return BindingDescriptor(
-        driver=spec.name,
+        # The row's own driver: a remote MCP server's is srw.mcp-remote/v1.
+        driver=(driver_spec_for_row(entry) or spec).name,
         name=str(entry.get("name") or "unnamed"),
         entries=entries,
         access=effective_access(entry, spec),

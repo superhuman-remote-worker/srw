@@ -80,4 +80,13 @@ describe('driverForType', () => {
     expect(driverForType(matrix.drivers, 'nope')).toBeNull();
     expect(driverForType(null, 'kb')).toBeNull();
   });
+
+  it('answers with the driver that owns the type, never a variant serving some of its rows', () => {
+    const remoteFirst = [...matrix.drivers].sort((a, b) =>
+      a.name === 'srw.mcp-remote/v1' ? -1 : b.name === 'srw.mcp-remote/v1' ? 1 : 0,
+    );
+    expect(remoteFirst[0].name).toBe('srw.mcp-remote/v1');
+    expect(remoteFirst[0].serves_stored_type).toBe(false);
+    expect(driverForType(remoteFirst, 'mcp')?.name).toBe('srw.mcp/v1');
+  });
 });

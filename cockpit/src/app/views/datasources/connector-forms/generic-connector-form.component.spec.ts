@@ -131,8 +131,12 @@ describe('GenericConnectorFormComponent', () => {
     (_name, driver) => {
       const {host, last} = render(driver);
       expect(host.querySelector('.generic-form')?.getAttribute('data-driver')).toBe(driver.name);
-      for (const key of Object.keys(driver.config_schema.properties ?? {})) {
-        expect(field(host, `/config/${key}`)).toBeTruthy();
+      for (const [key, schema] of Object.entries(driver.config_schema.properties ?? {})) {
+        // A readOnly property mirrors the connector row; SRW sets it.
+        if (schema.readOnly) {
+          expect(host.querySelector(`[data-pointer="/config/${key}"]`)).toBeNull();
+        }
+        else expect(field(host, `/config/${key}`)).toBeTruthy();
       }
       for (const slot of driver.credential_slots) {
         expect(host.querySelector(`[data-slot="${slot.name}"]`)).toBeTruthy();

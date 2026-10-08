@@ -37,7 +37,11 @@ from shared.connectors.binding import (
     load_binding_schema,
     validate_binding,
 )
-from shared.connectors.builtin import DATASOURCE_SPECS, spec_for_type
+from shared.connectors.builtin import (
+    DATASOURCE_SPECS,
+    driver_spec_for_row,
+    spec_for_type,
+)
 from tests._connector_goldens import KINDS, SSH_PRIVATE_KEY, all_rows, resolved_row
 
 
@@ -83,12 +87,21 @@ def test_every_canonical_entry_reads_as_a_valid_descriptor(read_only):
         descriptor = binding_from_legacy_entry(entry)
         assert descriptor is not None, kind
         spec = spec_for_type(entry["type"])
-        assert descriptor.driver == spec.name
+        assert descriptor.driver == driver_spec_for_row(entry).name
         assert descriptor.name == entry["name"]
         assert set(_forms(descriptor)) <= set(spec.delivery_forms), kind
         document = descriptor.to_json()
         assert validate_binding(document) == [], kind
         jsonschema.validate(document, schema)
+
+
+def test_a_remote_mcp_entry_names_the_remote_driver():
+    entries = _by_kind()
+    remote = binding_from_legacy_entry(entries["mcp_remote"])
+    stdio = binding_from_legacy_entry(entries["mcp_stdio"])
+    assert (remote.driver, stdio.driver) == ("srw.mcp-remote/v1", "srw.mcp/v1")
+    # One driver implementation, so the same delivery either way.
+    assert _forms(remote) == _forms(stdio) == ["mcp_client"]
 
 
 def test_reading_an_entry_never_mutates_it():

@@ -855,6 +855,31 @@ def spec_for_row(row: Any) -> DriverSpec | None:
     return spec_for_type(ds_type) if isinstance(ds_type, str) else None
 
 
+def mcp_spec_for(credentials: Any) -> DriverSpec:
+    """The MCP driver a server's stored credentials need: ``srw.mcp/v1`` for
+    a stdio server, ``srw.mcp-remote/v1`` for any other transport (http, the
+    default, or sse)."""
+    transport = (
+        credentials.get("transport") if isinstance(credentials, Mapping) else None
+    )
+    if str(transport or "http").lower().strip() == "stdio":
+        return MCP_SPEC
+    return MCP_REMOTE_SPEC
+
+
+def driver_spec_for_row(row: Any) -> DriverSpec | None:
+    """The driver serving one stored row or payload entry.
+
+    The type's driver (:func:`spec_for_row`), except where the row's own
+    fields pick a variant of it: an ``mcp`` row names its driver by
+    transport.
+    """
+    spec = spec_for_row(row)
+    if spec is MCP_SPEC:
+        return mcp_spec_for(row.get("credentials"))
+    return spec
+
+
 def delivers_in(row: Any, form: str) -> bool:
     """Whether a connector row's driver delivers in ``form`` (a checkout is
     what a pull request is opened from)."""

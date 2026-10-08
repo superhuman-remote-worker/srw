@@ -188,6 +188,13 @@ print(json.dumps({
 # ---------------------------------------------------------------------------
 
 
+def owns_type(driver: dict[str, Any]) -> bool:
+    """Whether a matrix entry is its stored type's own driver (a matrix from
+    before D3a has no ``serves_stored_type``: every typed driver owned its
+    type then)."""
+    return driver.get("serves_stored_type", True) is not False
+
+
 def offered(driver: dict[str, Any]) -> tuple[dict | None, dict | None]:
     """(read-only level, read-write level) the cockpit offers for a driver.
 
@@ -488,7 +495,9 @@ class MatrixGate:
         seen_literal: dict[str, list[str]] = {}
         for driver in self.matrix["drivers"]:
             kind = driver.get("legacy_type")
-            if not kind or kind in UNPUBLISHED_IN_FORM:
+            # The form picks a stored type, so only the driver that owns it
+            # (not a variant such as srw.mcp-remote/v1) is the type's.
+            if not kind or kind in UNPUBLISHED_IN_FORM or not owns_type(driver):
                 continue
             type_select.select_option(kind)
             choices, hint_key = picker_expectation(driver)
@@ -554,7 +563,9 @@ class MatrixGate:
             return
         project = str(active[0]["id"])
         drivers = {
-            d["legacy_type"]: d for d in self.matrix["drivers"] if d["legacy_type"]
+            d["legacy_type"]: d
+            for d in self.matrix["drivers"]
+            if d["legacy_type"] and owns_type(d)
         }
         rows = [
             {

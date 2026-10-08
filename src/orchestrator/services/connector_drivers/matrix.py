@@ -98,6 +98,12 @@ def driver_entry(driver: ConnectorDriver) -> dict[str, Any]:
         "name": spec.name,
         "title": spec.title,
         "legacy_type": spec.legacy_type,
+        # Whether this driver owns its stored type (the type's catalogue
+        # entry and form). False for a variant serving some of the type's
+        # rows: srw.mcp-remote/v1 next to srw.mcp/v1 for the mcp type.
+        "serves_stored_type": (
+            isinstance(driver, DatasourceDriver) and driver.serves_stored_type
+        ),
         "protocol_version": spec.protocol_version,
         "plane": spec.plane,
         "delivery_forms": list(spec.delivery_forms),

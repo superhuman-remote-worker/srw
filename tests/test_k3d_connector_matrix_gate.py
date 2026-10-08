@@ -31,6 +31,20 @@ def _driver(name: str) -> dict:
     return next(d for d in MATRIX["drivers"] if d["name"] == name)
 
 
+def test_a_type_variant_is_not_the_types_driver():
+    """srw.mcp-remote/v1 serves some mcp rows; the form and the link rows
+    still take srw.mcp/v1 as the mcp type's driver."""
+    owners = [
+        d["name"]
+        for d in MATRIX["drivers"]
+        if d["legacy_type"] == "mcp" and gate.owns_type(d)
+    ]
+    assert owners == ["srw.mcp/v1"]
+    assert gate.owns_type(_driver("srw.mcp-remote/v1")) is False
+    # A matrix from before D3a has no flag: every typed driver owned its type.
+    assert gate.owns_type({"legacy_type": "mcp"}) is True
+
+
 @pytest.fixture
 def no_cluster(monkeypatch):
     monkeypatch.setattr(

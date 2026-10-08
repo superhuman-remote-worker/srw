@@ -757,9 +757,34 @@ class TestTheMcpDrivers:
         assert type(remote) is type(REGISTRY.for_type("mcp"))
 
     def test_the_matrix_lists_the_remote_driver_after_the_stdio_one(self):
-        names = [driver["name"] for driver in capability_matrix(REGISTRY)["drivers"]]
+        drivers = capability_matrix(REGISTRY)["drivers"]
+        names = [driver["name"] for driver in drivers]
         assert names == [spec.name for spec in BUILTIN_SPECS]
         assert names.index(MCP_REMOTE_DRIVER) == names.index(MCP_SPEC.name) + 1
+        # Clients tell the two apart: only one owns the stored type.
+        owners = {
+            driver["name"]: driver["serves_stored_type"]
+            for driver in drivers
+            if driver["legacy_type"] == "mcp"
+        }
+        assert owners == {MCP_SPEC.name: True, MCP_REMOTE_DRIVER: False}
+        assert all(
+            driver["serves_stored_type"] is (driver["legacy_type"] is not None)
+            for driver in drivers
+            if driver["name"] != MCP_REMOTE_DRIVER
+        )
+
+    def test_a_row_and_a_payload_entry_name_the_same_driver(self):
+        from shared.connectors.builtin import driver_spec_for_row
+
+        for credentials, name in (
+            ({"transport": "stdio"}, MCP_SPEC.name),
+            ({"transport": "http"}, MCP_REMOTE_DRIVER),
+        ):
+            row = {"type": "mcp", "credentials": credentials}
+            assert driver_spec_for_row(row).name == name
+            assert REGISTRY.for_type("mcp").resource_driver(credentials) == name
+        assert driver_spec_for_row({"type": "postgresql"}).name == "srw.postgresql/v1"
 
     @pytest.mark.parametrize(
         ("credentials", "driver"),
