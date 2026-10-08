@@ -351,6 +351,8 @@ def _service(service: ServiceSpec | None) -> dict[str, Any] | None:
         "resources": _json(service.resources),
         "start_seconds": service.start_seconds,
         "mcp": _json(service.mcp) if service.mcp is not None else None,
+        "port": service.port,
+        "callers": list(service.callers),
     }
 
 

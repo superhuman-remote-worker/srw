@@ -167,20 +167,34 @@ class EgressRule:
     protocol: Literal["tcp", "udp"] = "tcp"
 
 
+#: Who calls a service driver's pod: the agent process (``harness``: managed
+#: MCP) or the bound workspace (``workspace``: the git and HTTP swaps).
+ServiceCaller = Literal["harness", "workspace"]
+SERVICE_CALLERS: tuple[str, ...] = get_args(ServiceCaller)
+#: The one named port every service driver pod listens on; static rules in
+#: the chart open exactly this name into the driver namespace.
+SERVICE_PORT_NAME = "srw-driver"
+
+
 @dataclass(frozen=True, slots=True)
 class ServiceSpec:
-    """How a service-plane driver's pod is run (hosting arrives in D5).
+    """How a service-plane driver's pod is run (connector drivers D5).
 
     ``instancing`` is ``per_execution`` when the driver keeps per-caller state
-    or hands out handles only one caller understands.  ``mcp`` carries the
-    managed-MCP block (transport, port, path, protocol, stdio mode, limits,
-    tool pinning) for MCP server images.
+    or hands out handles only one caller understands.  ``port`` is the
+    container port served under the fixed name ``srw-driver``; ``callers``
+    say who reaches it (agent pods, or each binding's own workspace).
+    ``resources`` are Kubernetes ``requests``/``limits``, capped by the
+    installation.  ``mcp`` carries the managed-MCP block (transport, port,
+    path, protocol, stdio mode, limits, tool pinning) for MCP server images.
     """
 
     instancing: Literal["shared", "per_execution"] = "shared"
     resources: Mapping[str, Any] = field(default_factory=dict)
     start_seconds: int = 30
     mcp: Mapping[str, Any] | None = None
+    port: int = 8080
+    callers: tuple[ServiceCaller, ...] = ("workspace",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,11 +363,21 @@ def validate_spec(spec: DriverSpec) -> list[str]:
     problems += _slot_problems(spec)
     if (spec.service is not None) != (spec.plane == "service"):
         problems.append("service is set exactly when plane is 'service'")
-    elif spec.service is not None and spec.service.instancing not in (
-        "shared",
-        "per_execution",
-    ):
-        problems.append(f"instancing {spec.service.instancing!r} is invalid")
+    elif spec.service is not None:
+        service = spec.service
+        if service.instancing not in ("shared", "per_execution"):
+            problems.append(f"instancing {service.instancing!r} is invalid")
+        if (
+            isinstance(service.port, bool)
+            or not isinstance(service.port, int)
+            or not 1 <= service.port <= 65535
+        ):
+            problems.append(f"service port {service.port!r} is not a port")
+        if not service.callers or set(service.callers) - set(SERVICE_CALLERS):
+            problems.append(
+                f"service callers {service.callers!r} must be a non-empty subset "
+                f"of {SERVICE_CALLERS}"
+            )
     for rule in spec.egress:
         if not rule.host or not rule.ports:
             problems.append("an egress rule needs a host and at least one port")
