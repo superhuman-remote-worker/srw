@@ -42,6 +42,27 @@ def test_conflicting_connector_names_are_rejected():
         )
 
 
+@pytest.mark.parametrize("env_vars", [{}, None])
+def test_a_credentials_connector_without_variables_is_refused(env_vars):
+    """The credentials spec's env_vars slot is required; generic's is not."""
+    credentials = {} if env_vars is None else {"env_vars": env_vars}
+    with pytest.raises(ValueError, match="Add at least one credential"):
+        collect_credential_env([{"type": "credentials", "credentials": credentials}])
+    assert (
+        collect_credential_env([{"type": "generic", "credentials": credentials}]) == {}
+    )
+
+
+def test_only_env_connectors_contribute_variables():
+    assert collect_credential_env(
+        [
+            {"type": "generic", "credentials": {"env_vars": {"A": "1"}}},
+            {"type": "credentials", "credentials": {"env_vars": {"B": "2"}}},
+            {"type": "postgresql", "credentials": {"env_vars": {"C": "3"}}},
+        ]
+    ) == {"A": "1", "B": "2"}
+
+
 def _install(target, values):
     subprocess.run(
         ["python3", "-c", INSTALL_CREDENTIAL_ENV, str(target)],
