@@ -100,10 +100,10 @@ CASES: dict[str, ToolCase] = {
     "email_unknown_access_fails_closed": ToolCase(
         [resolved_row("email", config={"access": "admin"})]
     ),
-    # The payload forwards only the first mailbox, but the categories come
-    # from every resolved row: the orchestrator grants the highest tier
-    # across both while the agent sees (and binds) only the first.
-    "email_two_mailboxes_max_tier": ToolCase(
+    # The payload forwards only the first mailbox, and the orchestrator's
+    # categories come from the forwarded rows: both sides grant the first
+    # mailbox's read tier, never the second one's send tier.
+    "email_two_mailboxes_forwarded_tier": ToolCase(
         [
             resolved_row("email", config={"access": "read", "folders": ["INBOX"]}),
             resolved_row(
@@ -113,10 +113,6 @@ CASES: dict[str, ToolCase] = {
                 config={"access": "send", "folders": ["INBOX"]},
             ),
         ],
-        pinned_defect=(
-            "the orchestrator override takes the max tier over every email row "
-            "while the payload forwards only the first mailbox"
-        ),
     ),
     "mcp_datasources_gate_off": ToolCase(
         [resolved_row("mcp_remote"), resolved_row("postgresql")], mcp=False

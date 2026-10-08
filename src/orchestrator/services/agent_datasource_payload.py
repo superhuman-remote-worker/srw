@@ -87,6 +87,49 @@ def mcp_datasource_runtime_allowed(
     )
 
 
+def forwarded_datasources(
+    datasources: list[dict[str, Any]] | None,
+    *,
+    dependencies: DatasourcePayloadDependencies,
+    log_skipped: bool = False,
+) -> list[dict[str, Any]]:
+    """The resolved rows an agent receives, in order.
+
+    A row whose driver's deployment gate is off is left out, and a driver
+    that allows only so many connectors per execution (email: one, because
+    the agent keys connections by type) keeps the first ones. Both the
+    payload and the tool categories are built from this, so a tool tier is
+    only granted for a connector that is delivered. A stored type no driver
+    serves is forwarded as stored.
+    """
+    gates = dependencies.deployment_gates()
+    forwarded: list[dict[str, Any]] = []
+    bound_per_driver: dict[str, int] = {}
+    for ds in datasources or []:
+        driver = dependencies.connector_drivers.for_type(ds.get("type"))
+        if driver is not None:
+            if not driver.runtime_allowed(ds, gates):
+                continue
+            limit = driver.spec.max_per_execution
+            if limit is not None:
+                bound = bound_per_driver.get(driver.spec.name, 0)
+                if bound >= limit:
+                    if log_skipped:
+                        ds_type = ds["type"]
+                        dependencies.logger.warning(
+                            "Skipping additional %s datasource %r: only %s %s "
+                            "datasource per job/session is supported",
+                            ds_type,
+                            ds.get("name"),
+                            "one" if limit == 1 else limit,
+                            ds_type,
+                        )
+                    continue
+                bound_per_driver[driver.spec.name] = bound + 1
+        forwarded.append(ds)
+    return forwarded
+
+
 def build_datasource_tool_override(
     datasources: list[dict[str, Any]],
     config_override: dict[str, Any] | None,
@@ -112,13 +155,11 @@ def build_datasource_tool_override(
     # Shared single source of truth with the agent's session attach path
     # (they previously disagreed on read-write managed connectors). Email is
     # tier-keyed inside the shared map (EMAIL_TIER_TOOLS keyed by
-    # config.access, clamped by project_read_only) — no extra handling here.
-    enabled_datasources = [
-        datasource
-        for datasource in datasources
-        if mcp_datasource_runtime_allowed(datasource, dependencies=dependencies)
-    ]
-    tools_override.update(datasource_tool_categories(enabled_datasources))
+    # config.access, clamped by project_read_only). The categories come from
+    # the rows the agent actually receives, so a second mailbox the payload
+    # leaves out cannot raise the email tier of the one it forwards.
+    forwarded = forwarded_datasources(datasources, dependencies=dependencies)
+    tools_override.update(datasource_tool_categories(forwarded))
     override["tools"] = tools_override
     return override
 
@@ -147,11 +188,10 @@ def build_datasources_payload(
 ) -> list[dict[str, Any]] | None:
     """Build the datasources payload for sending to the agent.
 
-    Each resolved row's driver binds it to the entry the agent receives (or
-    to nothing); internal fields such as the row's id, job and timestamps
-    stay behind.  A driver that allows only so many connectors per execution
-    (email: one, because the agent keys connections by type) gets the first
-    ones, and the rest are skipped with a warning.
+    Each forwarded row's driver (:func:`forwarded_datasources`) binds it to
+    the entry the agent receives (or to nothing); internal fields such as the
+    row's id, job and timestamps stay behind.  Rows over a driver's
+    per-execution limit are skipped with a warning.
 
     Args:
         resolved_ds: List of resolved datasource dicts from the database
@@ -169,8 +209,9 @@ def build_datasources_payload(
         default_known_hosts=dependencies.workspace_ssh_known_hosts(),
     )
     payload = []
-    bound_per_driver: dict[str, int] = {}
-    for ds in resolved_ds:
+    for ds in forwarded_datasources(
+        resolved_ds, dependencies=dependencies, log_skipped=True
+    ):
         creds = ds.get("credentials") or {}
         if isinstance(creds, str):
             try:
@@ -189,23 +230,6 @@ def build_datasources_payload(
                 )
             )
             continue
-        if not driver.runtime_allowed(ds, gates):
-            continue
-        limit = driver.spec.max_per_execution
-        if limit is not None:
-            bound = bound_per_driver.get(driver.spec.name, 0)
-            if bound >= limit:
-                ds_type = ds["type"]
-                dependencies.logger.warning(
-                    "Skipping additional %s datasource %r: only %s %s "
-                    "datasource per job/session is supported",
-                    ds_type,
-                    ds.get("name"),
-                    "one" if limit == 1 else limit,
-                    ds_type,
-                )
-                continue
-            bound_per_driver[driver.spec.name] = bound + 1
         entry = driver.bind(ds, creds, ctx=ctx)
         if entry is not None:
             payload.append(entry)

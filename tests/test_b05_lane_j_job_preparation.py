@@ -895,6 +895,61 @@ class TestDatasourcePayload:
             ),
         )
 
+    @pytest.mark.parametrize(
+        ("first", "second", "tools"),
+        [
+            (
+                "read",
+                "send",
+                ["email_list_folders", "email_list", "email_search", "email_read"],
+            ),
+            (
+                "send",
+                "read",
+                [
+                    "email_list_folders",
+                    "email_list",
+                    "email_search",
+                    "email_read",
+                    "email_move",
+                    "email_flag",
+                    "email_draft",
+                    "email_send",
+                ],
+            ),
+        ],
+    )
+    def test_email_tools_come_from_the_forwarded_mailbox(self, first, second, tools):
+        """Only the first mailbox is forwarded, so its tier is the one granted:
+        a read-only mailbox never gets the send tools of one left behind."""
+        rows = [
+            _ds(
+                type="email",
+                name="first",
+                config={"access": first, "folders": ["INBOX"]},
+            ),
+            _ds(
+                type="email",
+                name="second",
+                config={"access": second, "folders": ["INBOX"]},
+            ),
+        ]
+        deps = _datasource_payload_deps()
+        override = agent_datasource_payload.build_datasource_tool_override(
+            rows, None, dependencies=deps
+        )
+        payload = agent_datasource_payload.build_datasources_payload(
+            rows, dependencies=deps
+        )
+        assert [entry["name"] for entry in payload] == ["first"]
+        assert override["tools"]["email"] == tools
+        assert [
+            row["name"]
+            for row in agent_datasource_payload.forwarded_datasources(
+                rows, dependencies=deps
+            )
+        ] == ["first"]
+
     def test_kb_row_is_stripped_of_url_and_credentials(self):
         rows = [
             _ds(
