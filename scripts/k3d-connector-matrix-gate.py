@@ -25,11 +25,19 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
              the Connectors page links to it
   picker     Playwright: Connectors -> New connector -> Public, then for every
              publishable type: the access choices shown are exactly the levels
-             the driver's spec offers (MCP: read-write only; KB: read-only
-             only; Postgres: both), and the line under them is the bound
-             level's enforced_by. The form is closed without saving. An
-             account without the public_datasources grant gets the public
-             choice shown in the gate's own browser only (a NOTE says so).
+             the driver's spec offers, literally MCP read-write only, KB
+             read-only only, Postgres both. A public connector's read-only is
+             only declared, so no "enforced by" line shows there: the hint is
+             the scope-your-credentials advice, except the KB's always
+             read-only one. The form is closed without saving. An account
+             without the public_datasources grant gets the public choice
+             shown in the gate's own browser only (a NOTE says so).
+  links      Playwright: a project's Connectors tab shows, per linked type,
+             the access the driver offers (MCP a fixed read-write badge, KB a
+             fixed read-only badge, Postgres the switch) and the bound level's
+             "Enforced by" line, the one place it is true. The link rows are
+             synthetic, served to the gate's own browser over the test
+             account's first active project; nothing is linked.
 
 Run with the repository venv (Playwright and its Chromium installed):
 
@@ -66,6 +74,20 @@ SERVED = (
 )
 #: Types the connector form never publishes, so it shows them no access choice.
 UNPUBLISHED_IN_FORM = frozenset({"email", "credentials"})
+#: The gate's literal promise, besides the spec-derived expectation.
+LITERAL_CHOICES = {
+    "mcp": ["read_write"],
+    "kb": ["read_only"],
+    "postgresql": ["read_only", "read_write"],
+}
+#: Synthetic project links: (type, project_read_only, the switch or a badge).
+LINK_ROWS = (
+    ("mcp", None, "badge"),
+    ("kb", True, "badge"),
+    ("postgresql", True, "switch"),
+    ("postgresql", None, "switch"),
+)
+EN = ROOT / "cockpit/src/assets/i18n/en.json"
 _SECRETS: list[str] = []
 
 PLAN = [
@@ -77,8 +99,12 @@ PLAN = [
     "page: Playwright finds every driver and each level's 'Enforced by' line "
     "on Settings -> Connector drivers; the Connectors page links to it",
     "picker: Playwright opens New connector, makes it public and, per "
-    "publishable type, sees exactly the access levels the driver offers and "
-    "the bound level's enforced_by; closes without saving",
+    "publishable type, sees exactly the access levels the driver offers (MCP "
+    "read-write only, KB read-only only, Postgres both) and the declared-only "
+    "hint, no 'enforced by' line; closes without saving",
+    "links: Playwright opens a project's Connectors tab over synthetic link "
+    "rows and sees each driver's access with the bound level's 'Enforced by' "
+    "line; links nothing",
 ]
 
 
@@ -179,11 +205,12 @@ def offered(driver: dict[str, Any]) -> tuple[dict | None, dict | None]:
     return levels[0], levels[-1]
 
 
-def picker_expectation(driver: dict[str, Any]) -> tuple[list[str], str | None]:
-    """The access choices the form shows, and the enforced_by line under them.
+def picker_expectation(driver: dict[str, Any]) -> tuple[list[str], str]:
+    """The public access choices the form shows, and the hint key under them.
 
-    A new public connector starts read-only, so the line is the read-only
-    level's when the driver offers one.
+    A public connector's read-only is only declared (tool selection reads a
+    project link's read-only), so the hint is the advice to scope the
+    credentials, except for a driver that is read-only for everyone.
     """
     read_only, read_write = offered(driver)
     choices = [
@@ -191,8 +218,23 @@ def picker_expectation(driver: dict[str, Any]) -> tuple[list[str], str | None]:
         for name, level in (("read_only", read_only), ("read_write", read_write))
         if level
     ]
-    bound = read_only or read_write
-    return choices, bound["enforced_by"] if bound else None
+    hint = "visibilityCredentialHint" if read_write else "visibilityKbHint"
+    return choices, hint
+
+
+def link_expectation(
+    driver: dict[str, Any], project_read_only: bool | None
+) -> tuple[str, dict[str, Any] | None]:
+    """A project link's access ('badge' or 'switch') and the level it binds.
+
+    Mirrors ``linkAccessLevel`` in project-detail.component.ts for drivers
+    with at most two levels: a read-only link floors at the lowest level.
+    """
+    read_only, read_write = offered(driver)
+    shape = "switch" if read_only and read_write else "badge"
+    if read_only and (not read_write or project_read_only is True):
+        return shape, read_only
+    return shape, read_write
 
 
 def matrix_problems(matrix: dict[str, Any], spec_names: list[str]) -> list[str]:
@@ -294,24 +336,32 @@ class MatrixGate:
             f"stale or missing: {stale}" if stale else "",
         )
 
-    def api(self) -> None:
+    def api_get(self, path: str) -> tuple[int, Any]:
+        """``GET path`` as the test account, from inside the orchestrator."""
         result = in_orchestrator(
             _API_PROGRAM,
             {
                 "username": self.args.user,
                 "password": self.password,
                 "token_url": KEYCLOAK_TOKEN_URL,
-                "path": "/api/datasources/drivers",
+                "path": path,
             },
         )
-        status = int(result["status"])
+        try:
+            body = json.loads(result["body"])
+        except (TypeError, ValueError):
+            body = None
+        return int(result["status"]), body
+
+    def api(self) -> None:
+        status, body = self.api_get("/api/datasources/drivers")
         if not self.report.check(
             "api: GET /api/datasources/drivers answers 200",
             status == 200,
             f"HTTP {status}",
         ):
             return
-        self.matrix = json.loads(result["body"])
+        self.matrix = body
         sys.path.insert(0, str(ROOT / "src"))
         from shared.connectors.builtin import BUILTIN_SPECS
 
@@ -352,6 +402,7 @@ class MatrixGate:
                 page.click("#kc-login")
                 self.check_page(page)
                 self.check_picker(page)
+                self.check_links(page)
             except Exception as exc:  # noqa: BLE001 -- the check reports it
                 self.report.check(
                     "cockpit",
@@ -432,40 +483,137 @@ class MatrixGate:
         type_select.wait_for(timeout=30000)
         public = page.locator(".visibility-toggle input[type=checkbox]")
         public.check(timeout=30000)
+        hints = json.loads(EN.read_text())["datasources"]["form"]
         problems: list[str] = []
+        seen_literal: dict[str, list[str]] = {}
         for driver in self.matrix["drivers"]:
             kind = driver.get("legacy_type")
             if not kind or kind in UNPUBLISHED_IN_FORM:
                 continue
             type_select.select_option(kind)
-            choices, line = picker_expectation(driver)
-            seen = self.read_choices(page, choices)
-            if seen[0] != choices:
-                problems.append(f"{kind}: shows {seen[0]}, the spec offers {choices}")
-            if line and line not in seen[1]:
-                problems.append(f"{kind}: line {seen[1][:80]!r} is not {line[:60]!r}")
+            choices, hint_key = picker_expectation(driver)
+            seen, hint, claims = self.read_choices(page, choices)
+            seen_literal[kind] = seen
+            if seen != choices:
+                problems.append(f"{kind}: shows {seen}, the spec offers {choices}")
+            if hints[hint_key] not in hint:
+                problems.append(f"{kind}: hint {hint[:80]!r} is not {hint_key}")
+            if claims:
+                problems.append(f"{kind}: a public access claims {claims[:80]!r}")
+        problems += [
+            f"{kind}: shows {seen_literal.get(kind)}, the gate expects {expected}"
+            for kind, expected in LITERAL_CHOICES.items()
+            if seen_literal.get(kind) != expected
+        ]
         page.locator(".form-header app-icon-button button").first.click()
         self.report.check(
             "picker (Playwright): access choices are exactly the driver's levels "
-            "(MCP read-write only, KB read-only only, Postgres both)",
+            "(MCP read-write only, KB read-only only, Postgres both); no "
+            "'enforced by' claim on a public connector",
             not problems,
             "; ".join(problems[:5]),
         )
 
     @staticmethod
-    def read_choices(page: Any, expected: list[str]) -> tuple[list[str], str]:
-        """The rendered access choices and enforced line, once they settle."""
+    def read_choices(page: Any, expected: list[str]) -> tuple[list[str], str, str]:
+        """The rendered access choices, the hint under them and any
+        enforcement claim in the visibility block, once they settle."""
+        block = page.locator("app-form-field:has(.visibility-controls)")
         deadline = time.monotonic() + 5
         while True:
-            choices = page.locator(".access-radio label[data-access]").evaluate_all(
+            choices = block.locator(".access-radio label[data-access]").evaluate_all(
                 "els => els.map(e => e.dataset.access)"
             )
-            line = " ".join(
-                " ".join(page.locator(".access-enforced").all_inner_texts()).split()
+            hint = " ".join(
+                " ".join(
+                    block.locator(".app-form-field__hint").all_inner_texts()
+                ).split()
             )
             if choices == expected or time.monotonic() >= deadline:
-                return choices, line
+                text = " ".join(block.inner_text().split())
+                claims = (
+                    text[text.find("Enforced by") :] if "Enforced by" in text else ""
+                )
+                return choices, hint, claims
             time.sleep(0.2)
+
+    def check_links(self, page: Any) -> None:
+        """A project's Connectors tab over synthetic link rows (module doc)."""
+        status, projects = self.api_get("/api/projects")
+        active = [
+            p
+            for p in (projects if isinstance(projects, list) else [])
+            if isinstance(p, dict) and p.get("status", "active") == "active"
+        ]
+        if status != 200 or not active:
+            self.report.check(
+                "links (Playwright): a project's link access follows the driver",
+                False,
+                f"no active project for {self.args.user} (HTTP {status})",
+            )
+            return
+        project = str(active[0]["id"])
+        drivers = {
+            d["legacy_type"]: d for d in self.matrix["drivers"] if d["legacy_type"]
+        }
+        rows = [
+            {
+                "id": f"00000000-0000-4000-8000-{index:012d}",
+                "name": f"d2-gate-{kind}-{index}",
+                "description": None,
+                "type": kind,
+                "connection_url": None,
+                "cli_hint": None,
+                "default_branch": None,
+                "config": {},
+                "job_id": None,
+                "created_at": "",
+                "updated_at": "",
+                "linked_at": "",
+                "project_read_only": read_only,
+                "project_description": None,
+            }
+            for index, (kind, read_only, _shape) in enumerate(LINK_ROWS)
+        ]
+
+        def serve_links(route: Any) -> None:
+            if route.request.method == "GET":
+                route.fulfill(status=200, json=rows)
+            else:
+                route.abort()  # the gate links and changes nothing
+
+        page.route(f"**/api/projects/{project}/datasources", serve_links)
+        page.goto(
+            f"{self.args.base_url}/projects/{project}",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        tab = json.loads(EN.read_text())["projectDetail"]["tabs"]["datasources"]
+        page.locator(".tab-btn", has_text=tab).first.click(timeout=60000)
+        problems: list[str] = []
+        for row, (kind, read_only, shape) in zip(rows, LINK_ROWS):
+            cell = page.locator("tr", has_text=row["name"]).locator("td").nth(3)
+            cell.wait_for(timeout=30000)
+            expected_shape, level = link_expectation(drivers[kind], read_only)
+            switch = cell.locator("app-select").count() > 0
+            if expected_shape != shape or switch != (shape == "switch"):
+                problems.append(
+                    f"{kind}: {'switch' if switch else 'badge'}, not {shape}"
+                )
+            line = " ".join(cell.locator(".link-enforced").inner_text().split())
+            if not level or level["enforced_by"] not in line:
+                problems.append(f"{kind}: line {line[:80]!r}")
+        self.report.check(
+            "links (Playwright): each link shows the access its driver offers "
+            "(MCP read-write, KB read-only, Postgres the switch) and the bound "
+            "level's 'Enforced by' line",
+            not problems,
+            "; ".join(problems[:5]),
+        )
+        self.report.note(
+            "the link rows were synthetic, served to the gate's own browser; "
+            "nothing was linked"
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -54,7 +54,7 @@ def test_refuses_anything_outside_the_local_cluster(argv, no_cluster):
 def test_dry_run_prints_the_plan_and_touches_nothing(no_cluster, capsys):
     assert gate.main([]) == 0
     out = capsys.readouterr().out
-    for phase in ("preflight", "api", "page", "picker"):
+    for phase in ("preflight", "api", "page", "picker", "links"):
         assert f"- {phase}:" in out
 
 
@@ -78,12 +78,42 @@ class TestExpectations:
         assert gate.matrix_problems(MATRIX, NAMES) == []
 
     def test_offered_levels_mirror_the_cockpit(self):
-        assert gate.picker_expectation(_driver("srw.mcp/v1"))[0] == ["read_write"]
-        assert gate.picker_expectation(_driver("srw.kb/v1"))[0] == ["read_only"]
-        choices, line = gate.picker_expectation(_driver("srw.postgresql/v1"))
-        assert choices == ["read_only", "read_write"]
-        assert "READ ONLY transaction" in line
-        assert gate.picker_expectation(_driver("srw.env/v1")) == ([], None)
+        for kind, choices in gate.LITERAL_CHOICES.items():
+            driver = next(d for d in MATRIX["drivers"] if d["legacy_type"] == kind)
+            assert gate.picker_expectation(driver)[0] == choices
+        assert gate.LITERAL_CHOICES == {
+            "mcp": ["read_write"],
+            "kb": ["read_only"],
+            "postgresql": ["read_only", "read_write"],
+        }
+        assert gate.picker_expectation(_driver("srw.env/v1"))[0] == []
+
+    def test_a_public_connector_gets_the_declared_only_hint(self):
+        # Public read-only binds nothing, so no enforced_by line is expected:
+        # only an always read-only driver (the KB) gets the other hint.
+        for driver in MATRIX["drivers"]:
+            if not driver["legacy_type"]:
+                continue
+            hint = gate.picker_expectation(driver)[1]
+            expected = (
+                "visibilityKbHint"
+                if driver["forced_read_only"]
+                else "visibilityCredentialHint"
+            )
+            assert hint == expected, driver["name"]
+
+    def test_a_link_binds_the_level_its_read_only_says(self):
+        shape, level = gate.link_expectation(_driver("srw.postgresql/v1"), True)
+        assert shape == "switch" and "READ ONLY transaction" in level["enforced_by"]
+        assert gate.link_expectation(_driver("srw.postgresql/v1"), None)[1]["id"] == (
+            "ReadWrite"
+        )
+        assert gate.link_expectation(_driver("srw.mcp/v1"), True)[0] == "badge"
+        assert gate.link_expectation(_driver("srw.mcp/v1"), True)[1]["tools"] == "*"
+        assert gate.link_expectation(_driver("srw.kb/v1"), None)[1]["id"] == "ReadOnly"
+        for kind, read_only, shape in gate.LINK_ROWS:
+            driver = next(d for d in MATRIX["drivers"] if d["legacy_type"] == kind)
+            assert gate.link_expectation(driver, read_only)[0] == shape
 
     def test_a_drifted_matrix_is_reported(self):
         drifted = copy.deepcopy(MATRIX)
