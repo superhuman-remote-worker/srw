@@ -965,7 +965,7 @@
             {
               "name": "ca.pem",
               "contents": "ca",
-              "target_path": "/tmp/ca.pem",
+              "target_path": "~/.config/gcloud/ca.pem",
               "mode": "0644",
               "env_var": ""
             }
@@ -1014,7 +1014,7 @@
               {
                 "name": "ca.pem",
                 "contents": "ca",
-                "target_path": "/tmp/ca.pem",
+                "target_path": "/home/srw/.config/gcloud/ca.pem",
                 "mode": "0644"
               }
             ]
@@ -1192,11 +1192,60 @@
         }
       }
     },
-    "status": 400,
+    "status": 200,
     "body": {
-      "detail": "files[0]: target_path is required"
+      "id": "00000000-0000-0000-0000-0000000000d1",
+      "name": "Service account",
+      "description": null,
+      "type": "generic_file",
+      "connection_url": null,
+      "config": {},
+      "job_id": null,
+      "cli_hint": null,
+      "default_branch": null,
+      "created_by": "00000000-0000-0000-0000-0000000000c1",
+      "is_global": false,
+      "read_only": null,
+      "scope_mode": "all",
+      "auto_attach": false,
+      "policy_revision": 1,
+      "created_at": "2026-01-02T03:04:05Z",
+      "updated_at": "2026-01-02T03:04:05Z",
+      "project_ids": []
     },
-    "calls": []
+    "calls": [
+      {
+        "call": "create_datasource",
+        "kwargs": {
+          "name": "Service account",
+          "ds_type": "generic_file",
+          "connection_url": null,
+          "description": null,
+          "credentials": {
+            "files": [
+              {
+                "name": "file-0",
+                "contents": "x",
+                "target_path": "/home/srw/.srw-files/service-account/file-0",
+                "mode": "0600"
+              }
+            ]
+          },
+          "job_id": null,
+          "cli_hint": null,
+          "default_branch": null,
+          "config": {},
+          "created_by": "00000000-0000-0000-0000-0000000000c1",
+          "is_global": false,
+          "read_only": null,
+          "scope_mode": "all",
+          "auto_attach": false,
+          "project_ids": [],
+          "authority_user_id": "00000000-0000-0000-0000-0000000000c1",
+          "authority_is_admin": false
+        }
+      }
+    ]
   },
   "create/generic_file/relative_target_path": {
     "request": {
@@ -1240,7 +1289,7 @@
     },
     "status": 400,
     "body": {
-      "detail": "target_path is under a blocked system root (/etc): '/etc/hosts'"
+      "detail": "target_path '/etc/hosts' is outside the home: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/<app>/, ~/.netrc, ~/.pgpass"
     },
     "calls": []
   },
@@ -1263,7 +1312,7 @@
     },
     "status": 400,
     "body": {
-      "detail": "target_path is under a blocked system root (/etc): '~/../../etc/passwd'"
+      "detail": "target_path '~/../../etc/passwd' is outside the home: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/<app>/, ~/.netrc, ~/.pgpass"
     },
     "calls": []
   },
@@ -1286,7 +1335,7 @@
     },
     "status": 400,
     "body": {
-      "detail": "target_path must resolve under one of ('/home/srw', '/tmp', '/run', '/workspace'), got: /opt/x"
+      "detail": "target_path '/opt/x' is outside the home: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/<app>/, ~/.netrc, ~/.pgpass"
     },
     "calls": []
   },
@@ -1309,7 +1358,7 @@
     },
     "status": 400,
     "body": {
-      "detail": "target_path is a reserved agent-managed file: '~/.bashrc'"
+      "detail": "target_path '~/.bashrc' is not a credential-file location: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/<app>/, ~/.netrc, ~/.pgpass"
     },
     "calls": []
   },
@@ -1324,7 +1373,7 @@
           "files": [
             {
               "contents": "x",
-              "target_path": "/tmp/x",
+              "target_path": "~/.srw-files/x",
               "mode": "600"
             }
           ]
@@ -1348,7 +1397,7 @@
           "files": [
             {
               "contents": "x",
-              "target_path": "/tmp/x",
+              "target_path": "~/.srw-files/x",
               "env_var": "BAD-NAME"
             }
           ]
@@ -1358,6 +1407,123 @@
     "status": 400,
     "body": {
       "detail": "env_var must be a POSIX identifier ([A-Za-z_][A-Za-z0-9_]*), got 'BAD-NAME'"
+    },
+    "calls": []
+  },
+  "create/generic_file/ssh_config_refused": {
+    "request": {
+      "method": "POST",
+      "path": "/api/datasources",
+      "body": {
+        "name": "Service account",
+        "type": "generic_file",
+        "credentials": {
+          "files": [
+            {
+              "contents": "x",
+              "target_path": "~/.ssh/config"
+            }
+          ]
+        }
+      }
+    },
+    "status": 400,
+    "body": {
+      "detail": "target_path '~/.ssh/config' is not a credential-file location: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/<app>/, ~/.netrc, ~/.pgpass"
+    },
+    "calls": []
+  },
+  "create/generic_file/path_binary_refused": {
+    "request": {
+      "method": "POST",
+      "path": "/api/datasources",
+      "body": {
+        "name": "Service account",
+        "type": "generic_file",
+        "credentials": {
+          "files": [
+            {
+              "contents": "x",
+              "target_path": "~/.local/bin/git"
+            }
+          ]
+        }
+      }
+    },
+    "status": 400,
+    "body": {
+      "detail": "target_path '~/.local/bin/git' is not a credential-file location: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/<app>/, ~/.netrc, ~/.pgpass"
+    },
+    "calls": []
+  },
+  "create/generic_file/tmp_target_refused": {
+    "request": {
+      "method": "POST",
+      "path": "/api/datasources",
+      "body": {
+        "name": "Service account",
+        "type": "generic_file",
+        "credentials": {
+          "files": [
+            {
+              "contents": "x",
+              "target_path": "/tmp/x"
+            }
+          ]
+        }
+      }
+    },
+    "status": 400,
+    "body": {
+      "detail": "target_path '/tmp/x' is outside the home: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/<app>/, ~/.netrc, ~/.pgpass"
+    },
+    "calls": []
+  },
+  "create/generic_file/executable_mode_refused": {
+    "request": {
+      "method": "POST",
+      "path": "/api/datasources",
+      "body": {
+        "name": "Service account",
+        "type": "generic_file",
+        "credentials": {
+          "files": [
+            {
+              "contents": "x",
+              "target_path": "~/.srw-files/x",
+              "mode": "0755"
+            }
+          ]
+        }
+      }
+    },
+    "status": 400,
+    "body": {
+      "detail": "mode 0755 is refused: a credential file is never executable (use 0600 or 0644)"
+    },
+    "calls": []
+  },
+  "create/generic_file/reserved_env_var_refused": {
+    "request": {
+      "method": "POST",
+      "path": "/api/datasources",
+      "body": {
+        "name": "Service account",
+        "type": "generic_file",
+        "credentials": {
+          "files": [
+            {
+              "contents": "x",
+              "target_path": "~/.srw-files/x",
+              "env_var": "KUBECONFIG"
+            }
+          ]
+        }
+      }
+    },
+    "status": 400,
+    "body": {
+      "detail": "env_var KUBECONFIG is reserved: it names the merged kubeconfig"
     },
     "calls": []
   },
@@ -1378,7 +1544,7 @@
             {
               "name": "ca.pem",
               "contents": "ca",
-              "target_path": "/tmp/ca.pem",
+              "target_path": "~/.config/gcloud/ca.pem",
               "mode": "0644",
               "env_var": ""
             }
@@ -1480,7 +1646,7 @@
               "contents": "apiVersion: v1\n",
               "target_path": "/home/srw/.kube/prod.yaml",
               "mode": "0640",
-              "env_var": "KUBECONFIG"
+              "env_var": "PROD_KUBECONFIG"
             }
           ]
         }
@@ -1522,7 +1688,7 @@
                 "contents": "apiVersion: v1\n",
                 "target_path": "/home/srw/.kube/prod.yaml",
                 "mode": "0640",
-                "env_var": "KUBECONFIG"
+                "env_var": "PROD_KUBECONFIG"
               }
             ]
           },
@@ -4868,7 +5034,7 @@
             {
               "name": "ca.pem",
               "contents": "ca",
-              "target_path": "/tmp/ca.pem",
+              "target_path": "~/.config/gcloud/ca.pem",
               "mode": "0644",
               "env_var": ""
             }
@@ -4900,7 +5066,7 @@
               {
                 "name": "ca.pem",
                 "contents": "ca",
-                "target_path": "/tmp/ca.pem",
+                "target_path": "/home/srw/.config/gcloud/ca.pem",
                 "mode": "0644"
               }
             ]
@@ -6232,7 +6398,7 @@
           "files": [
             {
               "contents": "y",
-              "target_path": "~/y"
+              "target_path": "~/.srw-files/y"
             }
           ]
         }
@@ -6273,7 +6439,7 @@
               {
                 "name": "file-0",
                 "contents": "y",
-                "target_path": "/home/srw/y",
+                "target_path": "/home/srw/.srw-files/y",
                 "mode": "0600"
               }
             ]
@@ -6304,7 +6470,7 @@
     },
     "status": 400,
     "body": {
-      "detail": "target_path is under a blocked system root (/etc): '/etc/y'"
+      "detail": "target_path '/etc/y' is outside the home: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/<app>/, ~/.netrc, ~/.pgpass"
     },
     "calls": []
   },

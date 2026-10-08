@@ -151,7 +151,7 @@ GENERIC_FILE = {
             {
                 "name": "ca.pem",
                 "contents": "ca",
-                "target_path": "/tmp/ca.pem",
+                "target_path": "~/.config/gcloud/ca.pem",
                 "mode": "0644",
                 "env_var": "",
             },
@@ -429,7 +429,9 @@ CASES: dict[str, ApiCase] = {
         _with(
             GENERIC_FILE,
             credentials={
-                "files": [{"contents": "x", "target_path": "/tmp/x", "mode": "600"}]
+                "files": [
+                    {"contents": "x", "target_path": "~/.srw-files/x", "mode": "600"}
+                ]
             },
         )
     ),
@@ -438,7 +440,57 @@ CASES: dict[str, ApiCase] = {
             GENERIC_FILE,
             credentials={
                 "files": [
-                    {"contents": "x", "target_path": "/tmp/x", "env_var": "BAD-NAME"}
+                    {
+                        "contents": "x",
+                        "target_path": "~/.srw-files/x",
+                        "env_var": "BAD-NAME",
+                    }
+                ]
+            },
+        )
+    ),
+    # The credential-file allowlist (D1d review): .ssh is C1's, a mode
+    # never grants execute, /tmp was accepted but never delivered.
+    "create/generic_file/ssh_config_refused": _create(
+        _with(
+            GENERIC_FILE,
+            credentials={"files": [{"contents": "x", "target_path": "~/.ssh/config"}]},
+        )
+    ),
+    "create/generic_file/path_binary_refused": _create(
+        _with(
+            GENERIC_FILE,
+            credentials={
+                "files": [{"contents": "x", "target_path": "~/.local/bin/git"}]
+            },
+        )
+    ),
+    "create/generic_file/tmp_target_refused": _create(
+        _with(
+            GENERIC_FILE,
+            credentials={"files": [{"contents": "x", "target_path": "/tmp/x"}]},
+        )
+    ),
+    "create/generic_file/executable_mode_refused": _create(
+        _with(
+            GENERIC_FILE,
+            credentials={
+                "files": [
+                    {"contents": "x", "target_path": "~/.srw-files/x", "mode": "0755"}
+                ]
+            },
+        )
+    ),
+    "create/generic_file/reserved_env_var_refused": _create(
+        _with(
+            GENERIC_FILE,
+            credentials={
+                "files": [
+                    {
+                        "contents": "x",
+                        "target_path": "~/.srw-files/x",
+                        "env_var": "KUBECONFIG",
+                    }
                 ]
             },
         )
@@ -456,7 +508,7 @@ CASES: dict[str, ApiCase] = {
                         "contents": "apiVersion: v1\n",
                         "target_path": "/home/srw/.kube/prod.yaml",
                         "mode": "0640",
-                        "env_var": "KUBECONFIG",
+                        "env_var": "PROD_KUBECONFIG",
                     }
                 ]
             },
@@ -834,7 +886,11 @@ CASES.update(
         # ---- credential files ------------------------------------------------
         "update/generic_file/files_renormalised": _update(
             _stored("generic_file"),
-            {"credentials": {"files": [{"contents": "y", "target_path": "~/y"}]}},
+            {
+                "credentials": {
+                    "files": [{"contents": "y", "target_path": "~/.srw-files/y"}]
+                }
+            },
         ),
         "update/generic_file/invalid_files": _update(
             _stored("generic_file"),
