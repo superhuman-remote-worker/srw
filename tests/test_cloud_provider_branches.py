@@ -3,9 +3,12 @@
 ``scripts/check_cloud_provider_branches.py`` finds every place outside the
 main-cloud adapters that still names a provider to decide something;
 ``policy/cloud_provider_branches.txt`` is the reviewed inventory. The slice 2
-gate of main_cloud_as_connectors.md is that no code outside the adapters
-branches on ``backend_id``: what is left is SQL text bound to migration 0186
-and two frozen record-format classes, and a new site fails here.
+gate of main_cloud_as_connectors.md is that no Python code outside the adapter
+modules branches on ``backend_id``: what is left is SQL text bound to
+migration 0186, two frozen record-format classes, and the adapters' own
+configuration and registry in the modules that hold them. A new site fails
+here. The cockpit is outside this gate and still holds two provider branches
+for the protected toggle (see the script's docstring); slice 5 removes them.
 """
 
 from __future__ import annotations
@@ -85,21 +88,37 @@ def test_every_site_has_a_reviewed_classification(script, inventory):
 
 
 def test_no_code_outside_the_adapters_branches_on_a_provider(script, inventory):
-    """The slice 2 gate: only SQL and the frozen record formats remain."""
+    """The slice 2 gate: only SQL, the frozen record formats and the
+    adapters' own configuration and registry remain, each where it belongs."""
     sites, classifications = inventory
-    kinds = {
-        classifications[site.key][0]
-        for site in sites
-        if classifications[site.key][0] != "sql"
+    kinds = {classifications[site.key][0] for site in sites}
+    assert kinds <= {
+        "sql",
+        "protected-record",
+        "legacy-column",
+        "adapter-config",
+        "adapter-registry",
     }
-    assert kinds <= {"protected-record", "legacy-column"}
     branches = [
         site
         for site in sites
         if classifications[site.key][0] not in script.FROZEN_SITES
+        and site.file not in script.CLASS_FILES.get(classifications[site.key][0], ())
         and site.kind != "sql-literal"
     ]
     assert branches == []
+    outside_cloud = {
+        site.file
+        for site in sites
+        if classifications[site.key][0] in ("adapter-config", "adapter-registry")
+    }
+    assert outside_cloud <= {
+        "src/orchestrator/services/cloud/__init__.py",
+        "src/orchestrator/services/cloud/config.py",
+        "src/orchestrator/services/cloud/backend_instance_authority.py",
+        "src/orchestrator/services/cloud/ro_probe.py",
+        "src/agent/services/cloud_sync/__init__.py",
+    }
 
 
 def test_the_frozen_classes_hold_exactly_their_reviewed_sites(script, inventory):
@@ -121,13 +140,40 @@ def test_empty_source_discovery_is_an_error(script, monkeypatch, tmp_path):
         script.collect_sites()
 
 
-def test_the_adapters_are_allowlisted(script):
+def test_only_the_adapter_modules_are_allowlisted(script):
     scanned = {path.relative_to(REPO_ROOT).as_posix() for path in script.source_files()}
-    assert not any(path.startswith(script.ALLOWLIST) for path in scanned)
-    assert "src/orchestrator/services/agent_cloud_mounts.py" in scanned
-    assert "src/agent/api/session_workspace.py" in scanned
-    assert script.is_allowlisted("src/orchestrator/services/cloud/nextcloud.py")
-    assert script.is_allowlisted("src/agent/services/cloud_sync/protected_lower.py")
+    assert not scanned & set(script.ALLOWLIST)
+    for path in script.ADAPTER_MODULES:
+        assert (REPO_ROOT / path).is_file(), path
+        assert script.is_allowlisted(path)
+    # The rest of both cloud packages is scanned, not exempt.
+    for path in (
+        "src/orchestrator/services/cloud/__init__.py",
+        "src/orchestrator/services/cloud/config.py",
+        "src/orchestrator/services/cloud/instance_registry.py",
+        "src/agent/services/cloud_sync/__init__.py",
+        "src/agent/services/cloud_sync/protected_lower.py",
+        "src/orchestrator/services/agent_cloud_mounts.py",
+        "src/agent/api/session_workspace.py",
+    ):
+        assert path in scanned, path
+        assert not script.is_allowlisted(path)
+
+
+def test_the_vocabulary_knows_the_adapters_constants_and_classes(script):
+    vocab = script.vocabulary()
+    constants = {
+        (module, name): provider
+        for (module, name), provider in vocab.constants.items()
+        if name == "BACKEND_ID"
+    }
+    assert constants == {
+        ("orchestrator.services.cloud.nextcloud", "BACKEND_ID"): "nextcloud",
+        ("orchestrator.services.cloud.opencloud", "BACKEND_ID"): "opencloud",
+    }
+    assert vocab.classes["NextcloudBackend"] == "nextcloud"
+    assert vocab.classes["OpenCloudBackend"] == "opencloud"
+    assert vocab.classes["NextcloudWorkspaceSync"] == "nextcloud"
 
 
 def test_provider_ids_are_the_adapter_settings(script):
@@ -166,6 +212,29 @@ def test_a_new_provider_extends_the_gate(script, tmp_path):
         ('load(backend_override="opencloud")', "provider-keyword"),
         ('ALLOWED = {"nextcloud", "opencloud"}', "collection"),
         ('FIELDS = {"nextcloud": [], "opencloud": []}', "provider-keyed-dict"),
+        ('handler = {"nextcloud": f}.get(b)', "provider-keyed-dict"),
+        ('cls = REGISTRY["nextcloud"]', "provider-lookup"),
+        ('cls = REGISTRY.get("opencloud")', "provider-lookup"),
+        ("if isinstance(b, NextcloudBackend): pass", "adapter-isinstance"),
+        ("if issubclass(c, (OpenCloudBackend, X)): pass", "adapter-isinstance"),
+        ('if b.startswith("nextcloud"): pass', "compare"),
+        ('NC = "nextcloud"\nif row["backend"] == NC: pass', "compare"),
+        (
+            "from orchestrator.services.cloud.nextcloud import BACKEND_ID as NC\n"
+            "if row['backend'] == NC: pass",
+            "compare",
+        ),
+        (
+            "from orchestrator.services.cloud import nextcloud\n"
+            "if row['backend'] == nextcloud.BACKEND_ID: pass",
+            "compare",
+        ),
+        ("if row['backend'] == NextcloudBackend.backend_id: pass", "compare"),
+        (
+            "from orchestrator.services.cloud.opencloud import BACKEND_ID\n"
+            "x.for_backend_instance(i, expected_backend_id=BACKEND_ID)",
+            "provider-keyword",
+        ),
         ("q = \"SELECT 1 FROM t WHERE ro.backend = 'nextcloud'\"", "sql-literal"),
         ("q = \"SELECT 1 FROM t WHERE backend_id IN ('nextcloud')\"", "sql-literal"),
         (
@@ -196,6 +265,10 @@ def test_scanner_detects_a_match_on_a_provider(script):
         'if kind == "project": pass',
         'logger.info("mounted %s", "nextcloud")',
         "q = \"INSERT INTO t (backend) VALUES ('nextcloud')\"",
+        'backend_id: Literal["nextcloud"] = "nextcloud"',
+        "from orchestrator.services.cloud.nextcloud import BACKEND_ID",
+        "payload = {'backend': BACKEND_ID}",
+        "if isinstance(b, dict): pass",
     ],
 )
 def test_scanner_leaves_data_and_other_literals_alone(script, statement):
@@ -250,6 +323,10 @@ def test_review_problems_are_reported(script):
     assert (
         "unknown classification"
         in script.problems([site], {site.key: ("legacy-pending", "a reason")})[0]
+    )
+    assert (
+        "is allowed only in"
+        in script.problems([site], {site.key: ("adapter-config", "a reason")})[0]
     )
 
 

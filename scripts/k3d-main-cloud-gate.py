@@ -13,7 +13,11 @@ check by gate id.
 Slice 1 gate: "a session's connector eligibility is unchanged with
 thread_mounts emptied". Slice 2 gate: "the page shows the table on a
 bundled-Nextcloud (and a bundled-OpenCloud) k3d, and no code outside the
-adapters branches on backend_id".
+adapters branches on backend_id". This gate proves the second half for the
+Python sources only (the ratchet's scope): the cockpit still holds two
+provider branches for the protected-cloud toggle, in
+``session-create.component.ts`` and ``protected-folder-link.ts``, which slice 5
+removes with the toggle.
 
 Fixtures (all disposable, all named after the gate id):
 
@@ -43,6 +47,8 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               provider is the one ``--expect-provider`` names (default: the
               orchestrator's MAIN_CLOUD_BACKEND); this checkout's
               ``scripts/check_cloud_provider_branches.py --check`` passes
+              (Python only; the cockpit's two protected-toggle branches stay
+              until slice 5)
   account     both accounts are approved, the owner is an administrator, the
               second is not
   page        GET /api/admin/main-cloud as the owner: 200; the provider, its
@@ -754,7 +760,9 @@ PLAN = [
     "preflight: Tilt srw ok; every orchestrator pod serves this checkout's D4 "
     "modules and every stateless agent pod its reader-transport check, byte "
     "for byte; the active provider is the expected one; the provider-branch "
-    "ratchet (scripts/check_cloud_provider_branches.py --check) passes",
+    "ratchet (scripts/check_cloud_provider_branches.py --check) passes on the "
+    "Python sources (the cockpit's two protected-toggle branches stay until "
+    "slice 5)",
     "account: in the orchestrator pod, an OAuth client <gate id>-oauth and the "
     "disposable second account (a Keycloak user named the gate id, its app row "
     "admitted before its first login); the owner is an administrator, the "
@@ -913,8 +921,9 @@ class MainCloudGate:
             timeout=120,
         )
         self.report.check(
-            "preflight: no code outside the adapters branches on a provider "
-            "(the ratchet passes on the served checkout)",
+            "preflight: no Python code outside the adapter modules branches on "
+            "a provider (the ratchet passes on the served checkout; the cockpit's "
+            "two protected-toggle branches are outside it)",
             rc == 0,
             (out or err).strip().splitlines()[-1][:300] if (out or err) else "",
         )

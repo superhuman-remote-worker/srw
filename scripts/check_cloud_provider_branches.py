@@ -15,30 +15,44 @@ Modelled on ``scripts/check_connector_type_branches.py``.
 Literal["..."]`` in ``orchestrator/services/cloud/config.py``, read from its
 syntax tree, so a new provider extends the gate without an edit here.
 
+A *provider value* is a provider id literal, a name bound to one (a
+module constant such as ``NC = "nextcloud"``, or an adapter's ``BACKEND_ID``
+imported under any name), ``<adapter module>.BACKEND_ID`` and
+``<adapter class>.backend_id``.
+
 **What it finds**, in every Python module under ``src/``:
 
-* a comparison (``==``, ``!=``, ``in``, ``not in``) with a provider id or a
-  literal collection holding one, whatever the other side is
-  (``backend.backend_id == "nextcloud"``, ``row.get("backend") != "nextcloud"``,
-  ``source_config.get("vendor") == "nextcloud"``);
-* a ``match`` case naming a provider id;
+* a comparison (``==``, ``!=``, ``in``, ``not in``) with a provider value or
+  a literal collection holding one, whatever the other side is
+  (``backend.backend_id == "nextcloud"``, ``row.get("backend") != BACKEND_ID``,
+  ``source_config.get("vendor") == "nextcloud"``), and ``startswith`` /
+  ``endswith`` with one;
+* a ``match`` case naming a provider value;
 * a keyword argument whose name mentions ``backend``, ``provider`` or
-  ``vendor`` set to a provider id (``expected_backend_id="nextcloud"``);
-* a set, list or tuple literal naming two or more provider ids;
-* a dict literal with two or more provider-id keys (per-provider tables);
+  ``vendor`` set to a provider value (``expected_backend_id="nextcloud"``);
+* ``isinstance`` / ``issubclass`` against a class an adapter module defines
+  (``isinstance(backend, NextcloudBackend)``);
+* a lookup by a provider value: ``REGISTRY["nextcloud"]``, ``x.get(NC)``;
+* a set, list or tuple literal naming two or more provider values;
+* a dict literal with a provider-value key (a per-provider table);
 * a Python string holding SQL that tests a ``backend``/``backend_id``/
   ``main_cloud_backend`` column against a provider id.
 
-A provider id used as data (``"backend": "nextcloud"`` in a payload, a
-``BACKEND_ID`` constant) is not a branch and is not reported.
+A provider value used as data (``"backend": "nextcloud"`` in a payload, the
+``BACKEND_ID = "nextcloud"`` binding itself) is not a branch and is not
+reported.
 
-**Allowlisted**: the adapters, where deciding by provider is the point:
-``src/orchestrator/services/cloud/`` (the orchestrator-side adapters, their
-settings and contracts) and ``src/agent/services/cloud_sync/`` (the
-agent-side halves: per-provider sync and the protected reader transport).
+**Allowlisted**: the adapter modules themselves, where deciding by provider
+is the point (:data:`ADAPTER_MODULES`: the orchestrator's ``nextcloud.py`` and
+``opencloud.py``, the agent's ``nextcloud_sync.py`` and ``opencloud_sync.py``).
+The rest of the cloud package is scanned: its per-provider configuration and
+registry are classified, never exempt.
 
-**Outside the gate, by design**: SQL files (migrations), the cockpit
-(TypeScript) and prompts.
+**Outside the gate, by design**: SQL files (migrations), prompts, and the
+cockpit (TypeScript). The cockpit still holds two provider branches, both
+for the protected-cloud toggle that slice 5 replaces with the connector's
+access level: ``session-create.component.ts`` (projects eligible for
+protected mode) and ``protected-folder-link.ts`` (the protected source row).
 
 **Classifications** (there is no "to convert" class: a branch is converted
 to a declaration query or an adapter method, or it is one of these):
@@ -52,7 +66,12 @@ to a declaration query or an adapter method, or it is one of these):
   (:data:`PROTECTED_RECORD_SITES`): no new site may take it;
 * ``legacy-column``: the pre-abstraction Nextcloud columns
   (``nc_session_folder``, ``nc_share_id``), written for Nextcloud only until
-  they are dropped. Frozen at the reviewed sites (:data:`LEGACY_COLUMN_SITES`).
+  they are dropped. Frozen at the reviewed sites (:data:`LEGACY_COLUMN_SITES`);
+* ``adapter-config``: the adapters' configuration half, a per-provider table
+  of settings, environment variables and routing keys. Allowed only in the
+  modules that hold it (:data:`CLASS_FILES`);
+* ``adapter-registry``: the provider -> adapter registry and the agent's
+  sync factory, the one place each side picks an adapter. Allowed only there.
 
 A site is identified by what it is, not where: the enclosing qualname, the
 kind, the provider ids and a fingerprint of the node's structure. An ordinal
@@ -67,24 +86,48 @@ import hashlib
 import re
 import sys
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC = REPO_ROOT / "src"
 MANIFEST = REPO_ROOT / "policy" / "cloud_provider_branches.txt"
 SETTINGS = SRC / "orchestrator" / "services" / "cloud" / "config.py"
 
-#: The adapters: deciding by provider inside them is their job.
-ALLOWLIST: tuple[str, ...] = (
-    "src/orchestrator/services/cloud/",
-    "src/agent/services/cloud_sync/",
+#: The adapter modules: deciding by provider inside them is their job.
+ADAPTER_MODULES: tuple[str, ...] = (
+    "src/orchestrator/services/cloud/nextcloud.py",
+    "src/orchestrator/services/cloud/opencloud.py",
+    "src/agent/services/cloud_sync/nextcloud_sync.py",
+    "src/agent/services/cloud_sync/opencloud_sync.py",
 )
+ALLOWLIST: frozenset[str] = frozenset(ADAPTER_MODULES)
 
 UNCLASSIFIED = "unclassified"
 PROTECTED_RECORD = "protected-record"
 LEGACY_COLUMN = "legacy-column"
-ALLOWED_CLASSIFICATIONS = frozenset({"sql", PROTECTED_RECORD, LEGACY_COLUMN})
+ADAPTER_CONFIG = "adapter-config"
+ADAPTER_REGISTRY = "adapter-registry"
+ALLOWED_CLASSIFICATIONS = frozenset(
+    {"sql", PROTECTED_RECORD, LEGACY_COLUMN, ADAPTER_CONFIG, ADAPTER_REGISTRY}
+)
+#: The only modules a classification may be used in.
+CLASS_FILES: dict[str, frozenset[str]] = {
+    ADAPTER_CONFIG: frozenset(
+        {
+            "src/orchestrator/services/cloud/config.py",
+            "src/orchestrator/services/cloud/backend_instance_authority.py",
+            "src/orchestrator/services/cloud/ro_probe.py",
+        }
+    ),
+    ADAPTER_REGISTRY: frozenset(
+        {
+            "src/orchestrator/services/cloud/__init__.py",
+            "src/agent/services/cloud_sync/__init__.py",
+        }
+    ),
+}
 
 Key = tuple[str, str, str, str, str, int]
 
@@ -92,6 +135,46 @@ Key = tuple[str, str, str, str, str, int]
 #: signed effect intent): frozen, as the connector gate froze pending-d3-d4.
 PROTECTED_RECORD_SITES: frozenset[Key] = frozenset(
     {
+        (
+            "src/agent/services/cloud_sync/protected_lower.py",
+            "is_protected_reader_transport",
+            "compare",
+            "nextcloud",
+            "a2f0c6c226c5",
+            1,
+        ),
+        (
+            "src/agent/services/cloud_sync/protected_lower.py",
+            "is_protected_reader_transport",
+            "compare",
+            "nextcloud",
+            "beff238d525b",
+            1,
+        ),
+        (
+            "src/orchestrator/services/cloud/protected_effect_client.py",
+            "ProtectedNextcloudEffectExecutor.__init__",
+            "compare",
+            "nextcloud",
+            "8dcb9b528900",
+            1,
+        ),
+        (
+            "src/orchestrator/services/cloud/protected_reader_authority.py",
+            "ProtectedNextcloudReaderGrantPlan.__post_init__",
+            "compare",
+            "nextcloud",
+            "b1e17f0a2f6d",
+            1,
+        ),
+        (
+            "src/orchestrator/services/cloud/protected_reader_authority.py",
+            "ProtectedNextcloudReaderGrantPlan.from_ro_mount_row",
+            "compare",
+            "nextcloud",
+            "def42e6822d9",
+            1,
+        ),
         (
             "src/orchestrator/database/postgres.py",
             "PostgresDB.install_cloud_ro_effect_intent",
@@ -180,6 +263,58 @@ def provider_ids(settings: Path = SETTINGS) -> frozenset[str]:
     return frozenset(ids)
 
 
+@dataclass(frozen=True)
+class Vocabulary:
+    """What names a provider: ids, adapter constants, classes and modules."""
+
+    ids: frozenset[str]
+    #: ``(adapter module, name)`` -> provider, for module-level constants.
+    constants: dict[tuple[str, str], str] = field(default_factory=dict)
+    #: Class name defined in an adapter module -> its provider.
+    classes: dict[str, str] = field(default_factory=dict)
+
+
+def _dotted(rel_path: str) -> str:
+    return rel_path.removeprefix("src/").removesuffix(".py").replace("/", ".")
+
+
+def vocabulary(ids: frozenset[str] | None = None) -> Vocabulary:
+    """The adapter modules' provider constants and classes (syntax only)."""
+    ids = ids if ids is not None else provider_ids()
+    constants: dict[tuple[str, str], str] = {}
+    classes: dict[str, str] = {}
+    for rel in ADAPTER_MODULES:
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            continue
+        tree = ast.parse(path.read_text(), filename=rel)
+        provider = next((p for p in sorted(ids) if p in Path(rel).stem), "")
+        for node in tree.body:
+            for name, value in _bindings(node):
+                if value in ids:
+                    constants[(_dotted(rel), name)] = value
+            if isinstance(node, ast.ClassDef):
+                classes[node.name] = provider
+    return Vocabulary(ids, constants, classes)
+
+
+def _bindings(node: ast.AST) -> list[tuple[str, Any]]:
+    """``NAME = <constant>`` at module level, as ``(name, value)``."""
+    if (
+        isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Constant)
+        and all(isinstance(target, ast.Name) for target in node.targets)
+    ):
+        return [(target.id, node.value.value) for target in node.targets]
+    if (
+        isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and isinstance(node.value, ast.Constant)
+    ):
+        return [(node.target.id, node.value.value)]
+    return []
+
+
 def _skeleton(node: ast.AST | None, depth: int = 0) -> str:
     """A bounded, position-free structural sketch (stable across Pythons)."""
     if node is None:
@@ -220,6 +355,15 @@ def _skeleton(node: ast.AST | None, depth: int = 0) -> str:
     if isinstance(node, ast.MatchOr):
         return " | ".join(_skeleton(p, nxt) for p in node.patterns)
     return type(node).__name__
+
+
+def _terminal_name(node: ast.AST) -> str:
+    """The last identifier of a name or attribute chain (``a.b.c`` -> ``c``)."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return ""
 
 
 def _digest(text: str) -> str:
@@ -287,12 +431,20 @@ class Site:
 
 
 class _Visitor(ast.NodeVisitor):
-    def __init__(self, ids: frozenset[str]) -> None:
-        self.ids = ids
+    def __init__(self, vocab: Vocabulary) -> None:
+        self.vocab = vocab
+        self.ids = vocab.ids
         self.stack: list[str] = []
         self.raw: list[tuple[str, str, str, str]] = []
         self.consumed: set[int] = set()
         self.docstrings: set[int] = set()
+        #: Local name -> provider: this module's constants and imported
+        #: adapter constants (under any alias).
+        self.names: dict[str, str] = {}
+        #: Local name -> adapter module, for ``alias.BACKEND_ID``.
+        self.modules: dict[str, str] = {}
+        #: Local name -> provider, for adapter classes imported under an alias.
+        self.classes: dict[str, str] = dict(vocab.classes)
 
     def _record(self, kind: str, ids: set[str], shape: str) -> None:
         qualname = ".".join(self.stack) or "<module>"
@@ -300,6 +452,39 @@ class _Visitor(ast.NodeVisitor):
 
     def _ids(self, nodes: list[ast.Constant]) -> set[str]:
         return {node.value for node in nodes if node.value in self.ids}
+
+    def provider_of(self, node: ast.AST) -> set[str]:
+        """The providers one expression names (module docstring)."""
+        if isinstance(node, ast.Constant):
+            return {node.value} if node.value in self.ids else set()
+        if isinstance(node, ast.Name):
+            found = self.names.get(node.id)
+            return {found} if found else set()
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            module = self.modules.get(node.value.id)
+            if module is not None:
+                found = self.vocab.constants.get((module, node.attr))
+                return {found} if found else set()
+            if node.attr == "backend_id":
+                found = self.classes.get(node.value.id)
+                return {found} if found else set()
+        return set()
+
+    def _operand(self, node: ast.AST) -> set[str]:
+        """Providers of an operand or of a literal collection's elements."""
+        if isinstance(node, (ast.Set, ast.Tuple, ast.List)):
+            found: set[str] = set()
+            for element in node.elts:
+                found |= self.provider_of(element)
+            return found
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"frozenset", "set", "tuple", "list"}
+            and len(node.args) == 1
+        ):
+            return self._operand(node.args[0])
+        return self.provider_of(node)
 
     def _scope(self, node: ast.AST) -> None:
         body = getattr(node, "body", None)
@@ -313,6 +498,26 @@ class _Visitor(ast.NodeVisitor):
 
     def visit_Module(self, node: ast.Module) -> None:
         self._scope(node)
+        for statement in node.body:
+            for name, value in _bindings(statement):
+                if value in self.ids:
+                    self.names[name] = value
+        adapter_modules = {module for module, _name in self.vocab.constants}
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.ImportFrom) and inner.module:
+                for alias in inner.names:
+                    local = alias.asname or alias.name
+                    provider = self.vocab.constants.get((inner.module, alias.name))
+                    if provider:
+                        self.names[local] = provider
+                    if f"{inner.module}.{alias.name}" in adapter_modules:
+                        self.modules[local] = f"{inner.module}.{alias.name}"
+                    if alias.name in self.vocab.classes:
+                        self.classes[local] = self.vocab.classes[alias.name]
+            elif isinstance(inner, ast.Import):
+                for alias in inner.names:
+                    if alias.name in adapter_modules and alias.asname:
+                        self.modules[alias.asname] = alias.name
         self.generic_visit(node)
 
     def _enter(self, node: ast.AST) -> None:
@@ -329,8 +534,7 @@ class _Visitor(ast.NodeVisitor):
         operands = [node.left, *node.comparators]
         ids: set[str] = set()
         for operand in operands:
-            literals = _string_literals(operand)
-            ids |= self._ids(literals)
+            ids |= self._operand(operand)
             if isinstance(operand, (ast.Set, ast.Tuple, ast.List, ast.Call)):
                 self.consumed.add(id(operand))
                 if isinstance(operand, ast.Call) and operand.args:
@@ -346,12 +550,10 @@ class _Visitor(ast.NodeVisitor):
                 if isinstance(case.pattern, ast.MatchOr)
                 else [case.pattern]
             )
-            values = [
-                p.value
-                for p in patterns
-                if isinstance(p, ast.MatchValue) and isinstance(p.value, ast.Constant)
-            ]
-            ids = self._ids(values)
+            ids: set[str] = set()
+            for pattern in patterns:
+                if isinstance(pattern, ast.MatchValue):
+                    ids |= self.provider_of(pattern.value)
             if ids:
                 shape = f"{_skeleton(node.subject)} {_skeleton(case.pattern)}"
                 self._record("match", ids, shape)
@@ -359,7 +561,7 @@ class _Visitor(ast.NodeVisitor):
 
     def _collection(self, node: ast.Set | ast.Tuple | ast.List) -> None:
         if id(node) not in self.consumed:
-            ids = self._ids(_string_literals(node))
+            ids = self._operand(node)
             if len(ids) >= 2:
                 self._record("collection", ids, _skeleton(node))
         self.generic_visit(node)
@@ -369,28 +571,54 @@ class _Visitor(ast.NodeVisitor):
     visit_List = _collection
 
     def visit_Dict(self, node: ast.Dict) -> None:
-        keys = [
-            k
-            for k in node.keys
-            if isinstance(k, ast.Constant) and isinstance(k.value, str)
-        ]
-        ids = self._ids(keys)
-        if len(ids) >= 2:
-            self._record(
-                "provider-keyed-dict", ids, ", ".join(sorted(k.value for k in keys))
-            )
+        ids: set[str] = set()
+        for key in node.keys:
+            if key is not None:
+                ids |= self.provider_of(key)
+        if ids:
+            shape = ", ".join(sorted(_skeleton(k) for k in node.keys if k is not None))
+            self._record("provider-keyed-dict", ids, shape)
+        self.generic_visit(node)
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        # ``Literal["nextcloud"]`` is a type, not a lookup.
+        annotation = _terminal_name(node.value) == "Literal"
+        ids = set() if annotation else self.provider_of(node.slice)
+        if ids:
+            self._record("provider-lookup", ids, _skeleton(node))
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
+        func = node.func
         for keyword in node.keywords:
             if keyword.arg and _PROVIDER_KEYWORD.search(keyword.arg):
-                ids = self._ids(_string_literals(keyword.value))
+                ids = self._operand(keyword.value)
                 if ids:
                     shape = (
-                        f"{_skeleton(node.func)}({keyword.arg}="
-                        f"{_skeleton(keyword.value)})"
+                        f"{_skeleton(func)}({keyword.arg}={_skeleton(keyword.value)})"
                     )
                     self._record("provider-keyword", ids, shape)
+        if (
+            isinstance(func, ast.Name)
+            and func.id in {"isinstance", "issubclass"}
+            and len(node.args) == 2
+        ):
+            target = node.args[1]
+            names = target.elts if isinstance(target, ast.Tuple) else [target]
+            providers = {
+                self.classes[name.id]
+                for name in names
+                if isinstance(name, ast.Name) and name.id in self.classes
+            }
+            if providers:
+                ids = {p for p in providers if p} or {"adapter"}
+                self._record("adapter-isinstance", ids, _skeleton(node))
+        if isinstance(func, ast.Attribute) and node.args:
+            ids = self._operand(node.args[0])
+            if ids and func.attr in {"startswith", "endswith"}:
+                self._record("compare", ids, _skeleton(node))
+            elif ids and func.attr in {"get", "pop", "setdefault"}:
+                self._record("provider-lookup", ids, _skeleton(node))
         self.generic_visit(node)
 
     def visit_Constant(self, node: ast.Constant) -> None:
@@ -404,9 +632,12 @@ class _Visitor(ast.NodeVisitor):
 
 
 def sites_for_source(
-    rel_path: str, source: str, ids: frozenset[str] | None = None
+    rel_path: str,
+    source: str,
+    ids: frozenset[str] | None = None,
+    vocab: Vocabulary | None = None,
 ) -> list[Site]:
-    visitor = _Visitor(ids if ids is not None else provider_ids())
+    visitor = _Visitor(vocab if vocab is not None else vocabulary(ids))
     visitor.visit(ast.parse(source, filename=rel_path))
     counters: Counter[tuple[str, str, str, str]] = Counter()
     sites: list[Site] = []
@@ -417,7 +648,7 @@ def sites_for_source(
 
 
 def is_allowlisted(rel_path: str) -> bool:
-    return rel_path.startswith(ALLOWLIST)
+    return rel_path in ALLOWLIST
 
 
 def source_files() -> list[Path]:
@@ -433,11 +664,11 @@ def collect_sites() -> list[Site]:
     paths = source_files()
     if not paths:
         raise RuntimeError("No Python sources discovered for the provider inventory")
-    ids = provider_ids()
+    vocab = vocabulary()
     sites: list[Site] = []
     for path in paths:
         rel = path.relative_to(REPO_ROOT).as_posix()
-        sites.extend(sites_for_source(rel, path.read_text(), ids))
+        sites.extend(sites_for_source(rel, path.read_text(), vocab=vocab))
     sites.sort(key=lambda site: site.key)
     return sites
 
@@ -476,6 +707,10 @@ HEADER = """\
 #   protected-record  a protected record only the Nextcloud adapter writes;
 #                     frozen at its reviewed sites
 #   legacy-column     the pre-abstraction Nextcloud columns; frozen
+#   adapter-config    the adapters' per-provider configuration; only in the
+#                     modules that hold it
+#   adapter-registry  the provider -> adapter registry and the agent's sync
+#                     factory; only there
 # SQL files, the cockpit and prompts are outside this gate.
 #
 # <file>  <qualname>  <kind>  <provider ids>  <fingerprint>  #<ordinal>  <classification>  [<reason>]
@@ -516,6 +751,14 @@ def problems(
             )
         elif classification == "sql" and site.kind != "sql-literal":
             found.append(f"sql classifies SQL text only: {where}")
+        elif (
+            classification in CLASS_FILES
+            and site.file not in CLASS_FILES[classification]
+        ):
+            found.append(
+                f"{classification} is allowed only in "
+                f"{sorted(CLASS_FILES[classification])}: {where}"
+            )
         elif not reason:
             found.append(f"{classification} without a reason: {where}")
     return found

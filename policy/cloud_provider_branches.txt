@@ -10,10 +10,18 @@
 #   protected-record  a protected record only the Nextcloud adapter writes;
 #                     frozen at its reviewed sites
 #   legacy-column     the pre-abstraction Nextcloud columns; frozen
+#   adapter-config    the adapters' per-provider configuration; only in the
+#                     modules that hold it
+#   adapter-registry  the provider -> adapter registry and the agent's sync
+#                     factory; only there
 # SQL files, the cockpit and prompts are outside this gate.
 #
 # <file>  <qualname>  <kind>  <provider ids>  <fingerprint>  #<ordinal>  <classification>  [<reason>]
 
+src/agent/services/cloud_sync/__init__.py  build_workspace_sync  compare  nextcloud  6eca5d22a45f  #1  adapter-registry  the agent's sync factory: picks the provider's sync class for one cloud_sync entry (by its backend and auth type)
+src/agent/services/cloud_sync/__init__.py  build_workspace_sync  compare  opencloud  8a803666ff10  #1  adapter-registry  the agent's sync factory: picks the provider's sync class for one cloud_sync entry (by its backend and auth type)
+src/agent/services/cloud_sync/protected_lower.py  is_protected_reader_transport  compare  nextcloud  a2f0c6c226c5  #1  protected-record  the agent's check of the protected lower's reader transport, which only the Nextcloud adapter builds
+src/agent/services/cloud_sync/protected_lower.py  is_protected_reader_transport  compare  nextcloud  beff238d525b  #1  protected-record  the agent's check of the protected lower's reader transport, which only the Nextcloud adapter builds
 src/orchestrator/database/postgres.py  PostgresDB.install_cloud_ro_effect_intent  compare  nextcloud  57f72ffa720c  #1  protected-record  re-reads the signed effect intent this method inserts with the Nextcloud provider literal; the record is Nextcloud's format
 src/orchestrator/database/postgres.py  PostgresDB.install_cloud_ro_effect_intent  sql-literal  nextcloud  98ff2a28d06a  #1  sql  the protected tables are Nextcloud-only by trigger (migration 0186); a second protected provider brings a migration
 src/orchestrator/database/postgres.py  PostgresDB.install_ro_mount_engage_intent  sql-literal  nextcloud  4fe3c18255ee  #1  sql  the protected tables are Nextcloud-only by trigger (migration 0186); a second protected provider brings a migration
@@ -21,6 +29,27 @@ src/orchestrator/database/postgres.py  PostgresDB.install_ro_mount_engage_intent
 src/orchestrator/database/postgres.py  PostgresDB.pinned_thread_agent_is_reciprocal  sql-literal  nextcloud  5f7d7d24036a  #1  sql  the protected tables are Nextcloud-only by trigger (migration 0186); a second protected provider brings a migration
 src/orchestrator/database/postgres.py  PostgresDB.update_thread_main_cloud  compare  nextcloud  792c497b2a90  #1  legacy-column  nc_session_folder and nc_share_id, written for Nextcloud only until the pre-abstraction columns are dropped
 src/orchestrator/database/postgres.py  PostgresDB.update_thread_main_cloud  compare  nextcloud  792c497b2a90  #2  legacy-column  nc_session_folder and nc_share_id, written for Nextcloud only until the pre-abstraction columns are dropped
+src/orchestrator/services/cloud/__init__.py  <module>  provider-keyed-dict  nextcloud,opencloud  03cb31d459b6  #1  adapter-registry  REGISTRY, the provider -> adapter class table
+src/orchestrator/services/cloud/backend_instance_authority.py  <module>  provider-keyed-dict  nextcloud,opencloud  03cb31d459b6  #1  adapter-config  the installation authority's per-provider routing schema and secret-reference fields
+src/orchestrator/services/cloud/backend_instance_authority.py  <module>  provider-keyed-dict  nextcloud,opencloud  03cb31d459b6  #2  adapter-config  the installation authority's per-provider routing schema and secret-reference fields
+src/orchestrator/services/cloud/backend_instance_authority.py  _canonical_routing  compare  nextcloud  792c497b2a90  #1  adapter-config  the installation authority's per-provider routing schema and secret-reference fields
+src/orchestrator/services/cloud/backend_instance_authority.py  _canonical_routing  compare  nextcloud  792c497b2a90  #2  adapter-config  the installation authority's per-provider routing schema and secret-reference fields
+src/orchestrator/services/cloud/config.py  <module>  provider-keyed-dict  ms365,nextcloud,opencloud  46e574d5488b  #1  adapter-config  the per-provider settings loader: each provider's environment variables, required secrets and settings model
+src/orchestrator/services/cloud/config.py  load_main_cloud_config  compare  ms365  99105a048155  #1  adapter-config  the per-provider settings loader: each provider's environment variables, required secrets and settings model
+src/orchestrator/services/cloud/config.py  load_main_cloud_config  compare  nextcloud  792c497b2a90  #1  adapter-config  the per-provider settings loader: each provider's environment variables, required secrets and settings model
+src/orchestrator/services/cloud/config.py  load_main_cloud_config  compare  opencloud  811131385728  #1  adapter-config  the per-provider settings loader: each provider's environment variables, required secrets and settings model
+src/orchestrator/services/cloud/config.py  load_main_cloud_config_from_instance  compare  nextcloud  d1b7d02e0311  #1  adapter-config  the per-provider settings loader: each provider's environment variables, required secrets and settings model
+src/orchestrator/services/cloud/config.py  load_main_cloud_config_from_instance  compare  opencloud  f4682acefac1  #1  adapter-config  the per-provider settings loader: each provider's environment variables, required secrets and settings model
+src/orchestrator/services/cloud/config.py  load_main_cloud_config_from_instance  provider-keyword  nextcloud  2be8dab6540d  #1  adapter-config  the per-provider settings loader: each provider's environment variables, required secrets and settings model
+src/orchestrator/services/cloud/config.py  load_main_cloud_config_from_instance  provider-keyword  opencloud  6d3c05e5de93  #1  adapter-config  the per-provider settings loader: each provider's environment variables, required secrets and settings model
+src/orchestrator/services/cloud/config.py  main_cloud_secret_references  compare  nextcloud  792c497b2a90  #1  adapter-config  the per-provider settings loader: each provider's environment variables, required secrets and settings model
+src/orchestrator/services/cloud/protected_effect_client.py  ProtectedNextcloudEffectExecutor.__init__  compare  nextcloud  8dcb9b528900  #1  protected-record  the protected-effect executor binds to the Nextcloud adapter whose signed lane it drives
+src/orchestrator/services/cloud/protected_reader_authority.py  ProtectedNextcloudReaderGrantPlan.__post_init__  compare  nextcloud  b1e17f0a2f6d  #1  protected-record  the protected reader grant plan's format, which only the Nextcloud adapter mints
+src/orchestrator/services/cloud/protected_reader_authority.py  ProtectedNextcloudReaderGrantPlan.from_ro_mount_row  compare  nextcloud  def42e6822d9  #1  protected-record  the protected reader grant plan's format, which only the Nextcloud adapter mints
+src/orchestrator/services/cloud/ro_probe.py  <module>  provider-keyed-dict  nextcloud  452644f516ba  #1  adapter-config  the protected reader probe's per-provider version floors
+src/orchestrator/services/cloud/ro_probe.py  check_version_floors  compare  nextcloud  d82e27d5e2c0  #1  adapter-config  the protected reader probe's per-provider version floors
+src/orchestrator/services/cloud/ro_probe.py  check_version_floors  compare  opencloud  8a803666ff10  #1  adapter-config  the protected reader probe's per-provider version floors
+src/orchestrator/services/cloud/ro_probe.py  check_version_floors  provider-lookup  nextcloud  73ba185e818e  #1  adapter-config  the protected reader probe's per-provider version floors
 src/orchestrator/services/cloud_staging/source_identity.py  ProtectedMountSourceIdentity.__post_init__  compare  nextcloud  b1e17f0a2f6d  #1  protected-record  canonical identity of a protected Nextcloud source (folder id and mountpoint format); pure module in the Nextcloud adapter's import chain
 src/orchestrator/services/cloud_staging/source_identity.py  ProtectedMountSourceIdentity.from_mount_row  compare  nextcloud  1b692dcecbfb  #1  protected-record  parses a mount row and its serialized handle into the Nextcloud source format; refuses any other provider's handle
 src/orchestrator/services/cloud_staging/source_identity.py  ProtectedMountSourceIdentity.from_mount_row  compare  nextcloud  d2f0e7772cb5  #1  protected-record  parses a mount row and its serialized handle into the Nextcloud source format; refuses any other provider's handle
