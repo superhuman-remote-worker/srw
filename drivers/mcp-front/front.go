@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,6 +24,11 @@ const (
 	leaseRefused   = "the lease is revoked or expired: this execution no longer holds this connector"
 	leaseRequired  = "a live lease of this connector is required"
 	pinningRefused = "the server's tool list changed under this image; it is held until its pod is replaced"
+	// The JSON-RPC error a call in flight gets when its lease ends: an
+	// implementation-defined server error no MCP SDK uses. SRW's client
+	// reads it (with the message prefix) as the lease ending, not a fault.
+	leaseEndedCode    = -32091
+	leaseEndedMessage = "lease revoked: " + leaseRefused
 )
 
 // A stream re-checks its lease this often (a variable for the tests).
@@ -246,9 +253,10 @@ func (f *front) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// watchLease ends ctx when the lease stops being live; a stream re-checks
-// it every streamRecheck (from the cache, at most the revocation lag old).
-func (f *front) watchLease(ctx context.Context, cancel context.CancelFunc, token string) {
+// watchLease ends ctx when the lease stops being live, and says so in
+// ended; a stream re-checks it every streamRecheck (from the cache, at most
+// the revocation lag old).
+func (f *front) watchLease(ctx context.Context, cancel context.CancelFunc, token string, ended *atomic.Bool) {
 	ticker := time.NewTicker(streamRecheck)
 	defer ticker.Stop()
 	for {
@@ -259,10 +267,34 @@ func (f *front) watchLease(ctx context.Context, cancel context.CancelFunc, token
 			found, err := f.auth.lease(ctx, token)
 			if errors.Is(err, errFrontRevoked) || (err == nil && (!found.active || !strings.EqualFold(found.connectorID, f.cfg.connectorID))) {
 				f.logf("lease=%s ended: closing its stream", found.id)
+				ended.Store(true)
 				cancel()
 				return
 			}
 		}
+	}
+}
+
+// leaseEnded tells the caller its lease ended while it waited: a request
+// in flight on a stream gets a JSON-RPC error for its id (the client fails
+// that call with the reason instead of waiting for an answer that will not
+// come); a JSON answer not yet written becomes the 401 a new request gets.
+func (f *front) leaseEnded(w http.ResponseWriter, message *rpcMessage, streaming bool) {
+	if !streaming {
+		f.unauthorized(w, "lease_inactive", leaseRefused)
+		return
+	}
+	if message == nil || message.notification() || message.response {
+		return
+	}
+	event, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      message.ID,
+		"error":   map[string]any{"code": leaseEndedCode, "message": leaseEndedMessage},
+	})
+	fmt.Fprintf(w, "event: message\ndata: %s\n\n", event)
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
 	}
 }
 
@@ -277,7 +309,8 @@ func (f *front) forward(w http.ResponseWriter, r *http.Request, message *rpcMess
 		ctx, cancel = context.WithTimeout(ctx, maxStreamLife)
 		defer cancel()
 	}
-	go f.watchLease(ctx, cancel, token)
+	var ended atomic.Bool
+	go f.watchLease(ctx, cancel, token, &ended)
 	var payload io.Reader = http.NoBody
 	if r.Method == http.MethodPost {
 		payload = bytes.NewReader(body)
@@ -301,6 +334,10 @@ func (f *front) forward(w http.ResponseWriter, r *http.Request, message *rpcMess
 		out.Header.Set(f.cfg.credential.Header, value)
 	}
 	response, err := f.upstream.Do(out)
+	if err != nil && ended.Load() {
+		f.leaseEnded(w, message, false)
+		return http.StatusUnauthorized, 0
+	}
 	if err != nil {
 		if r.Context().Err() == nil {
 			f.logf("lease=%s: the server did not answer (%s)", found.id, scrubText(err.Error(), credential))
@@ -343,10 +380,17 @@ func (f *front) forward(w http.ResponseWriter, r *http.Request, message *rpcMess
 		if err != nil && r.Context().Err() == nil && ctx.Err() == nil {
 			f.logf("lease=%s: stream ended (%s)", found.id, scrubText(err.Error(), credential))
 		}
+		if ended.Load() && r.Context().Err() == nil {
+			f.leaseEnded(w, message, true)
+		}
 		return response.StatusCode, size
 	}
 	size, err := relayJSON(ctx, w, response, f.buffers, allowed, scrub)
 	switch {
+	case (errors.Is(err, errBusy) || errors.Is(err, errUnreadable)) && ended.Load():
+		// Nothing written yet: the lease ended while the answer was read.
+		f.leaseEnded(w, message, false)
+		return http.StatusUnauthorized, 0
 	case errors.Is(err, errBusy):
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "the front is busy; try again"})
 		return http.StatusServiceUnavailable, 0

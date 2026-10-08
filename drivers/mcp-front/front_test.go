@@ -91,6 +91,9 @@ type fakeServer struct {
 	// until the caller goes.
 	getEvents []string
 	holdGet   bool
+	// A streamed tools/call sends a progress event and then holds, never
+	// answering, until the caller goes.
+	holdCall bool
 }
 
 func (s *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -99,7 +102,7 @@ func (s *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.seen = append(s.seen, r.Clone(context.Background()))
 	s.bodies = append(s.bodies, string(body))
 	stream, status := s.stream, s.status
-	getEvents, holdGet := s.getEvents, s.holdGet
+	getEvents, holdGet, holdCall := s.getEvents, s.holdGet, s.holdCall
 	s.mu.Unlock()
 	if status != 0 {
 		w.WriteHeader(status)
@@ -151,6 +154,13 @@ func (s *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		result = map[string]any{"content": []any{map[string]any{"type": "text", "text": text}}}
 	}
 	answer, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
+	if stream && holdCall && method == "tools/call" {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":1,\"progress\":1}}\n\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+		return
+	}
 	if stream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprintf(w, ": comment\n\nevent: message\ndata: %s\n\n", answer)

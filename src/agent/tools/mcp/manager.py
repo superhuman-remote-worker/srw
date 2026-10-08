@@ -14,7 +14,10 @@ connect first waits for the front's ``/readyz`` (up to
 pod, a re-pin, a new credential generation) is reconnected transparently
 within a budget (:data:`MANAGED_MCP_RECONNECTS` per
 :data:`MANAGED_MCP_RECONNECT_WINDOW`) instead of the single reconnect a
-remote server gets.
+remote server gets. When the front refuses the lease (it was revoked or
+expired: a 401, or :data:`LEASE_ENDED_CODE` on a call in flight), the agent
+is told so in plain words and nothing reconnects until the entry carries
+another lease.
 """
 
 from __future__ import annotations
@@ -51,6 +54,15 @@ _TRANSPORTS = ("http", "sse", "stdio")
 #: the transport's "Session terminated" (a 404 from the server) and a
 #: closed connection.
 _SESSION_ERROR_CODES = frozenset({32600, -32000})
+#: The error a managed server's front gives a call in flight when its lease
+#: ends (drivers/mcp-front, ``leaseEndedCode``), with this message prefix.
+LEASE_ENDED_CODE = -32091
+_LEASE_ENDED_PREFIX = "lease revoked"
+#: What the agent is told when the front refuses this execution's lease.
+LEASE_REFUSED = (
+    "the connector's lease was revoked or has expired, so this execution no "
+    "longer holds this connector"
+)
 
 
 @dataclass
@@ -192,6 +204,9 @@ class _ServerHandle:
     #: When a managed server reconnected, within the budget's window.
     reconnects: deque[float] = field(default_factory=deque)
     generation: int = 0
+    #: The headers (its bearer) a managed server's front refused as a dead
+    #: lease; ``None`` while none was refused.
+    refused_lease: dict[str, str] | None = None
 
     @property
     def name(self) -> str:
@@ -387,13 +402,18 @@ class MCPManager:
                 raw_tools = await load_mcp_tools(session)
                 handle.generation += 1
                 handle.tools = self._namespace_and_wrap(handle, raw_tools)
+                handle.refused_lease = None
                 handle.status = "connected"
                 handle.ready.set()
                 await handle.shutdown.wait()
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
-            if not handle.shutdown.is_set():
+            if handle.shutdown.is_set():
+                pass
+            elif handle.managed and _lease_ended(exc):
+                _refuse_lease(handle)
+            else:
                 handle.status = f"unavailable: {type(exc).__name__}"
                 logger.warning(
                     "MCP server %s became unavailable (%s)",
@@ -508,6 +528,10 @@ class MCPManager:
         async with handle.restart_lock:
             if self._closing:
                 return False
+            if handle.refused_lease is not None and not _lease_renewed(handle):
+                # The same dead lease would be refused again: no reconnect,
+                # no budget spent.
+                return False
             if not self._may_reconnect(handle):
                 return self._is_live(handle)
             if not force and self._is_live(handle):
@@ -607,7 +631,12 @@ class MCPManager:
         async def _call(**kwargs):
             if not self._is_live(handle):
                 if not await self._restart_server(handle):
-                    return _tool_error(handle, original_name, "server unavailable")
+                    detail = (
+                        LEASE_REFUSED
+                        if handle.refused_lease is not None
+                        else "server unavailable"
+                    )
+                    return _tool_error(handle, original_name, detail)
                 try:
                     return await asyncio.wait_for(
                         self._call_current_session(handle, original_name, kwargs),
@@ -622,8 +651,7 @@ class MCPManager:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    _mark_failed(handle, exc)
-                    return _tool_error(handle, original_name, type(exc).__name__)
+                    return _tool_error(handle, original_name, _mark_failed(handle, exc))
 
             try:
                 return await asyncio.wait_for(
@@ -639,6 +667,12 @@ class MCPManager:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if handle.managed and (
+                    _lease_ended(exc) or handle.refused_lease is not None
+                ):
+                    # The front refused the lease (on this call, or the
+                    # session ended on it): a reconnect would be refused too.
+                    return _tool_error(handle, original_name, _mark_failed(handle, exc))
                 if handle.managed and _tool_level(exc):
                     # The server answered: the session is alive, the tool
                     # (or the front, for a tool this binding may not call)
@@ -660,12 +694,14 @@ class MCPManager:
                     except asyncio.CancelledError:
                         raise
                     except Exception as retry_exc:
-                        _mark_failed(handle, retry_exc)
                         return _tool_error(
                             handle,
                             original_name,
-                            type(retry_exc).__name__,
+                            _mark_failed(handle, retry_exc),
                         )
+                if handle.refused_lease is not None:
+                    # The reconnect was refused the lease.
+                    return _tool_error(handle, original_name, LEASE_REFUSED)
                 return _tool_error(handle, original_name, type(exc).__name__)
 
         return _call
@@ -679,11 +715,76 @@ def _ready_client() -> Any:
     return httpx.AsyncClient(timeout=5.0, follow_redirects=False)
 
 
-def _mark_failed(handle: _ServerHandle, exc: BaseException) -> None:
+def _mark_failed(handle: _ServerHandle, exc: BaseException) -> str:
     """A failed call marks the server unavailable, unless a managed server
-    answered with a tool error (its session is alive)."""
+    answered with a tool error (its session is alive). Returns what the
+    agent is told: the lease refusal in plain words, else the error type."""
+    if handle.managed and (_lease_ended(exc) or handle.refused_lease is not None):
+        _refuse_lease(handle)
+        return LEASE_REFUSED
     if not (handle.managed and _tool_level(exc)):
         handle.status = f"unavailable: {type(exc).__name__}"
+    return type(exc).__name__
+
+
+def _refuse_lease(handle: _ServerHandle) -> None:
+    """The front refused this execution's lease: say so in the server's
+    status, and remember the bearer, so only another lease reconnects."""
+    if handle.refused_lease is None:
+        logger.warning(
+            "Managed MCP server %s refused this execution's lease (revoked or "
+            "expired); it stays unavailable",
+            handle.name,
+        )
+    config = handle.config
+    handle.refused_lease = dict((config.headers if config else None) or {})
+    handle.status = f"unavailable: {LEASE_REFUSED}"
+    # A session that survived (the refusal came on one call) is of no
+    # further use: its owner task closes it.
+    handle.shutdown.set()
+
+
+def _lease_renewed(handle: _ServerHandle) -> bool:
+    """Whether the entry carries another lease than the refused one."""
+    try:
+        config = parse_mcp_config(handle.ds)
+    except ValueError:
+        return False
+    return dict(config.headers or {}) != handle.refused_lease
+
+
+def _lease_ended(exc: BaseException) -> bool:
+    """Whether a managed server's front refused the lease somewhere in this
+    failure: an HTTP 401 (a new request on a dead lease), or the front's
+    lease-ended error on a call in flight. Exception groups (the
+    transport's task group) and causes are searched."""
+    import httpx
+
+    try:
+        from mcp.shared.exceptions import McpError
+    except ImportError:  # pragma: no cover - the SDK is a dependency
+        McpError = None  # noqa: N806
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, httpx.HTTPStatusError):
+            if current.response.status_code == 401:
+                return True
+        elif McpError is not None and isinstance(current, McpError):
+            error = getattr(current, "error", None)
+            if getattr(error, "code", None) == LEASE_ENDED_CODE and str(
+                getattr(error, "message", "")
+            ).startswith(_LEASE_ENDED_PREFIX):
+                return True
+        grouped = getattr(current, "exceptions", None)  # an exception group
+        if isinstance(grouped, (list, tuple)):
+            pending.extend(e for e in grouped if isinstance(e, BaseException))
+        pending.extend((current.__cause__, current.__context__))
+    return False
 
 
 def _tool_level(exc: BaseException) -> bool:

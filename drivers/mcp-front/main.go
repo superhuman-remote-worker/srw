@@ -30,7 +30,8 @@
 //   - keeps a session to the lease that opened it; an unknown session is
 //     nobody's (404, the client initializes again);
 //   - buffers each answer (4 MiB at most, 96 MiB in all) and ends a stream
-//     when its lease ends or after 15 minutes;
+//     when its lease ends (a call still waiting gets a "lease revoked"
+//     JSON-RPC error, code -32091) or after 15 minutes;
 //   - logs each call's tool, class, status and duration, never an argument,
 //     a token or a credential.
 //

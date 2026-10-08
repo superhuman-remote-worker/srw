@@ -10,6 +10,7 @@ are exercised end to end in tests/test_managed_mcp_front_integration.py.
 from __future__ import annotations
 
 import asyncio
+import builtins
 from collections import deque
 
 import httpx
@@ -226,3 +227,83 @@ async def test_a_remote_servers_call_is_not_raced():
         return "ok"
 
     assert await MCPManager._raced(remote, answer()) == "ok"
+
+
+def _lease_ended_error(message: str = "lease revoked: the lease is revoked"):
+    from mcp.shared.exceptions import McpError
+    from mcp.types import ErrorData
+
+    return McpError(ErrorData(code=manager_module.LEASE_ENDED_CODE, message=message))
+
+
+def _http_error(status: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", URL)
+    return httpx.HTTPStatusError(
+        "refused", request=request, response=httpx.Response(status, request=request)
+    )
+
+
+def test_a_refused_lease_is_found_wherever_the_transport_put_it():
+    lease_ended = manager_module._lease_ended
+    # A new request on a dead lease: 401, inside the transport's task group.
+    assert lease_ended(_http_error(401))
+    group = builtins.BaseExceptionGroup(
+        "transport", [RuntimeError("x"), _http_error(401)]
+    )
+    assert lease_ended(group)
+    try:
+        raise ConnectionError("the server's session ended") from group
+    except ConnectionError as wrapped:
+        assert lease_ended(wrapped)
+    # A call in flight when the lease ended: the front's own error.
+    assert lease_ended(_lease_ended_error())
+    # Anything else is not the lease: a server's 403, the same code from a
+    # server with another message, a replaced pod.
+    assert not lease_ended(_http_error(403))
+    assert not lease_ended(_lease_ended_error("something else"))
+    assert not lease_ended(httpx.ConnectError("refused"))
+    assert not lease_ended(ConnectionError("gone"))
+
+
+@pytest.mark.asyncio
+async def test_a_call_told_its_lease_ended_says_so_and_never_reconnects():
+    manager = MCPManager([_entry()])
+    handle = manager._handles[0]
+    handle.status = "connected"
+    handle.session = object()
+    handle.task = asyncio.create_task(asyncio.sleep(3600))
+    restarts: list[bool] = []
+
+    async def restart(_handle, *, force=False):
+        restarts.append(force)
+        return False
+
+    manager._restart_server = restart
+
+    class Tool:
+        name = "whoami"
+
+        @staticmethod
+        async def coroutine(**_kwargs):
+            raise _lease_ended_error()
+
+    call = manager._guarded(handle, Tool())
+    answer = await call()
+    assert manager_module.LEASE_REFUSED in answer
+    assert handle.status == f"unavailable: {manager_module.LEASE_REFUSED}"
+    assert handle.refused_lease == handle.config.headers
+    assert restarts == []
+    # The next call is not live: the restart refuses the same lease, and the
+    # agent is told why again.
+    manager._restart_server = MCPManager._restart_server.__get__(manager)
+    assert manager_module.LEASE_REFUSED in await call()
+    assert len(handle.reconnects) == 0
+    handle.task.cancel()
+
+
+def test_only_another_lease_lifts_a_refusal():
+    handle = MCPManager([_entry()])._handles[0]
+    manager_module._refuse_lease(handle)
+    assert not manager_module._lease_renewed(handle)
+    handle.ds["credentials"]["lease"]["token"] = mint_token("scl")
+    assert manager_module._lease_renewed(handle)

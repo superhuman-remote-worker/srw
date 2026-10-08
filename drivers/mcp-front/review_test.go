@@ -424,6 +424,39 @@ func TestAStreamEndsWhenItsLeaseIsRevoked(t *testing.T) {
 	}
 }
 
+func TestACallInFlightIsToldItsLeaseEnded(t *testing.T) {
+	previous := streamRecheck
+	streamRecheck = 20 * time.Millisecond
+	defer func() { streamRecheck = previous }()
+	h := newHarness(t)
+	h.server.stream = true
+	h.server.holdCall = true
+	finished := make(chan *httptest.ResponseRecorder)
+	go func() {
+		finished <- h.do(t, http.MethodPost, tokenB, `{"jsonrpc":"2.0","id":"call-7","method":"tools/call","params":{"name":"whoami"}}`, nil)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	h.authority.mu.Lock()
+	delete(h.authority.leases, tokenB)
+	h.authority.mu.Unlock()
+	h.advance(31 * time.Second) // past the cached decision
+	var recorder *httptest.ResponseRecorder
+	select {
+	case recorder = <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the call outlived its lease")
+	}
+	body := recorder.Body.String()
+	// The progress event was relayed, then the call's own error.
+	if !strings.Contains(body, "notifications/progress") {
+		t.Fatalf("the stream so far was lost: %s", body)
+	}
+	want := `data: {"error":{"code":-32091,"message":"lease revoked: ` + leaseRefused + `"},"id":"call-7","jsonrpc":"2.0"}`
+	if !strings.Contains(body, want) {
+		t.Fatalf("the call was not told its lease ended: %s", body)
+	}
+}
+
 func TestStreamsCountTowardTheCaps(t *testing.T) {
 	h := newHarness(t)
 	release1, _ := h.front.inflight.acquire("lease-a", 2)

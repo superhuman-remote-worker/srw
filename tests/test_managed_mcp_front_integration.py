@@ -7,7 +7,8 @@ binding delivers it (the endpoint URL and a lease token). This proves on one
 machine what the k3d gate proves in the cluster: the client holds only the
 lease token, the server receives the upstream credential, ReadOnly hides and
 refuses write tools, a lease of another connector gets 401, the credential is
-scrubbed from answers, and a pod replaced mid-session reconnects.
+scrubbed from answers, a pod replaced mid-session reconnects, and a lease
+revoked mid-session is reported to the agent as such.
 
 Skipped where no Go toolchain is installed (the Python CI); the drivers' own
 Go tests run in their CI job.
@@ -25,6 +26,7 @@ import subprocess
 import threading
 import time
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -119,13 +121,18 @@ class Exchange:
         self.url = f"http://127.0.0.1:{self.server.server_port}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
-    def issue(self, access: str, connector: str = CONNECTOR) -> str:
+    def issue(
+        self,
+        access: str,
+        connector: str = CONNECTOR,
+        expires_at: str = "2099-01-01T00:00:00+00:00",
+    ) -> str:
         token = mint_token("scl")
         self.leases[token] = {
             "lease_id": f"lease-{len(self.leases)}",
             "connector_id": connector,
             "access": access,
-            "expires_at": "2099-01-01T00:00:00+00:00",
+            "expires_at": expires_at,
         }
         return token
 
@@ -325,8 +332,39 @@ async def test_an_execution_without_the_connector_gets_401(pod, kind):
     assert _status(pod.url, token) == 401
     manager = await _connected(_entry(pod, token))
     try:
-        assert manager.statuses["Notes"].startswith("unavailable")
+        assert manager.statuses["Notes"] == (
+            f"unavailable: {manager_module.LEASE_REFUSED}"
+        )
         assert manager.get_langchain_tools() == []
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_lease_revoked_mid_session_is_said_so_and_spends_no_reconnects(pod):
+    # The front keeps a live decision for up to 30 s, never past the
+    # lease's expiry: a lease expiring soon shows the revocation at once.
+    soon = (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat()
+    token = pod.exchange.issue("ReadWrite", expires_at=soon)
+    entry = _entry(pod, token)
+    manager = await _connected(entry)
+    try:
+        whoami = _tool(manager, "whoami")
+        assert "credential_sha256" in await _text(whoami)
+        del pod.exchange.leases[token]
+        await asyncio.sleep(2.5)
+        answer = await _text(whoami)
+        assert manager_module.LEASE_REFUSED in answer, answer
+        handle = manager._handles[0]
+        assert handle.status == f"unavailable: {manager_module.LEASE_REFUSED}"
+        assert len(handle.reconnects) == 0
+        # Every further call is told the same, and nothing reconnects.
+        assert manager_module.LEASE_REFUSED in await _text(whoami)
+        assert len(handle.reconnects) == 0
+        # The entry carries another lease (a redelivery): it reconnects.
+        entry["credentials"]["lease"]["token"] = pod.exchange.issue("ReadWrite")
+        assert "credential_sha256" in await _text(whoami)
+        assert handle.status == "connected" and handle.refused_lease is None
     finally:
         await manager.aclose()
 
