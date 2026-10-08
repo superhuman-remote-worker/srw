@@ -100,7 +100,9 @@ describe('ConnectorDriversPageComponent', () => {
     expect(text(postgres.querySelector('.driver-badges'))).toContain(page.trust.builtin);
     expect(text(postgres.querySelector('.driver-badges'))).toContain(page.holdsCredentials);
     expect(text(postgres)).toContain(page.shipsWithSrw);
-    expect(text(postgres.querySelector('[data-egress="declared"]'))).toContain(page.egressNone);
+    // In-process: no driver pod, so "none declared" would undersell it.
+    expect(text(postgres.querySelector('[data-egress="declared"]'))).toContain(page.egressNoDriverPod);
+    expect(text(postgres.querySelector('[data-egress="declared"]'))).not.toContain(page.egressNone);
     expect(text(postgres.querySelector('[data-egress="enforced"]'))).toContain(
       page.egressReason.runs_in_srw_process,
     );

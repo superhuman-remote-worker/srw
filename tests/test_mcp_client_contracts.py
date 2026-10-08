@@ -415,6 +415,9 @@ def test_connector_driver_formatter_names_what_enforces_each_level() -> None:
     assert "Access: none (this delivery cannot enforce a level)" in rendered
     assert "Trust: builtin  Holds upstream credentials: True" in rendered
     assert "every claim declared by its author" not in rendered
+    # In-process built-ins have no driver pod: not "declared: none".
+    assert "Egress: no driver pod" in rendered
+    assert "Egress declared: none" not in rendered
 
     custom = dict(matrix["drivers"][0])
     custom["trust"] = {"tier": "custom", "claims_declared_by_author": True}

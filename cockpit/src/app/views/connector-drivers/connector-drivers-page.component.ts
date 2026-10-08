@@ -215,7 +215,10 @@ export function driverAnchor(name: string): string {
                   <span class="egress-row" data-egress="declared">
                     <span class="egress-col">{{ 'connectorDrivers.egressDeclared' | transloco }}</span>
                     @if (driver.egress.declared.rules.length === 0) {
-                      {{ 'connectorDrivers.egressNone' | transloco }}
+                      <!-- An in-process driver has no pod: SRW or the workspace connects. -->
+                      {{ (driver.egress.enforced.reason === 'runs_in_srw_process'
+                        ? 'connectorDrivers.egressNoDriverPod'
+                        : 'connectorDrivers.egressNone') | transloco }}
                     }
                     @for (rule of driver.egress.declared.rules; track $index) {
                       <code>{{ rule.host }}:{{ rule.ports.join(',') }}/{{ rule.protocol }}</code>

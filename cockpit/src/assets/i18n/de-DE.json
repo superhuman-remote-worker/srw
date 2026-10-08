@@ -3063,6 +3063,7 @@
     "egressEnforced": "Durchgesetzt:",
     "egressInstallation": "Installation:",
     "egressNone": "Nichts deklariert",
+    "egressNoDriverPod": "Kein Treiber-Pod: Die Verbindungen baut der SRW-Agent, der Orchestrator oder der Workspace auf",
     "needsDns": "Benötigt DNS: {{reason}}",
     "egressReason": {
       "runs_in_srw_process": "Nicht anwendbar: läuft im SRW-Prozess",

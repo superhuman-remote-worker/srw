@@ -2027,6 +2027,14 @@ def format_connector_drivers(data: dict[str, Any]) -> str:
             for rule in rules
         )
         enforced = egress.get("enforced") or {}
+        if not declared and enforced.get("reason") == "runs_in_srw_process":
+            # No driver pod: SRW's agent or orchestrator, or the workspace,
+            # opens the connections, so the driver itself declares none.
+            lines.append(
+                "    Egress: no driver pod; SRW's agent or orchestrator, or the "
+                "workspace, makes the connections"
+            )
+            continue
         lines.append(
             f"    Egress declared: {declared or 'none'}  "
             f"enforced: {enforced.get('status', 'unknown')} "
