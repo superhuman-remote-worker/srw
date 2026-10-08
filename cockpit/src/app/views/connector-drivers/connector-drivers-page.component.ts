@@ -435,6 +435,8 @@ export function driverAnchor(name: string): string {
     .facts {
       display: grid;
       grid-template-columns: max-content minmax(0, 1fr);
+      /* Rows as tall as their text, not stretched to the access column. */
+      align-content: start;
       gap: 6px 12px;
       margin: 0;
       font-size: 0.85rem;

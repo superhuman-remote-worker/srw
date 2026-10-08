@@ -436,6 +436,7 @@ import {
     }
 
     .gf-required {
+      margin-left: 2px;
       color: var(--danger);
     }
 

@@ -1363,7 +1363,9 @@ type KeyValueRow = {key: string; value: string};
             }
             @if (capabilities.canPublishDatasources() && formData.type !== 'email' && formData.type !== 'credentials') {
               <div class="form-row">
+                <!-- Full width: the enforced-by line below the choice is a sentence. -->
                 <app-form-field
+                  class="flex-1"
                   [label]="'datasources.form.visibilityLabel' | transloco"
                   [hint]="formData.is_global && !publicAccessLevel()
                     ? ((offersReadWrite()
