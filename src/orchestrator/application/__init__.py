@@ -197,6 +197,7 @@ def build_application_resources(
         connector_drivers=builtin_connector_drivers(
             lease_probe=settings.connector_lease_probe_enabled,
             echo_service_image=settings.connector_echo_driver_image or None,
+            managed_mcp_images=settings.connector_managed_mcp_images,
         ),
     )
     # Credential leases (connector drivers C2): the window new leases are
@@ -221,6 +222,8 @@ def build_application_resources(
             "installed with image %s; it is for test clusters only",
             settings.connector_echo_driver_image,
         )
+    for name, reference in sorted(settings.connector_managed_mcp_images.items()):
+        logger.info("Managed MCP server %s is installed with image %s", name, reference)
     # Every infrastructure-metering gate defaults off until startup decides
     # which paths this process runs (``lifecycle.open_stores``).
     resources.metering = InfrastructureMeteringBootstrap(

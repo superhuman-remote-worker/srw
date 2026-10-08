@@ -1682,6 +1682,90 @@ async def test_a_re_pin_at_the_installation_cap_leaves_the_pod_unmarked(db, reco
 
 
 @pytest.mark.asyncio
+async def test_a_managed_mcp_binding_starts_the_server_behind_the_front(db):
+    """A managed MCP connector's binding (D5a): the reconciler starts its
+    pod with the server image and SRW's front, holds no token in the pod,
+    and points the connector's endpoint at it."""
+    from shared.connectors.builtin import GITEA_MCP_SPEC
+
+    gitea = "docker.gitea.com/gitea-mcp-server:1.8.0"
+    front = "srw-registry:5000/srw-driver-mcp-front@sha256:" + "f" * 64
+    images.configure_service_images(
+        images.ServiceImageSettings(references={GITEA_MCP_SPEC.name: gitea})
+    )
+    runtime = FakeRuntime()
+
+    async def resolver(host, ipv6):
+        return {"gitea.example.com": ["203.0.113.7"]}[host]
+
+    reconciler = ServiceHostingReconciler(
+        store=db,
+        runtime=runtime,
+        drivers=builtin_connector_drivers(
+            managed_mcp_images={GITEA_MCP_SPEC.name: gitea}
+        ),
+        settings=ServiceHostingSettings(
+            namespace="srw-connectors",
+            release_namespace="srw",
+            shim_image="srw-registry:5000/srw-driver-shim@sha256:" + "e" * 64,
+            exchange_host="srw-orchestrator.srw.svc",
+            exchange_port=8088,
+            orchestrator_labels={"app.kubernetes.io/component": "orchestrator"},
+            refused_cidrs=("10.0.50.0/24",),
+            pod_ip="10.42.0.9",
+            node_ip="10.0.50.11",
+            front_image=front,
+        ),
+        resolver=resolver,
+    )
+    connector = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO datasources (id, name, type, scope_mode, policy_revision, "
+            "credentials, config) VALUES ($1, 'gitea', 'gitea_mcp', 'all', 1, "
+            "$2::jsonb, $3::jsonb)",
+            connector,
+            json.dumps(encrypt(json.dumps({"token": "gitea-token"}))),
+            json.dumps(
+                {
+                    "url": "https://gitea.example.com",
+                    "host": "gitea.example.com",
+                    "port": 443,
+                }
+            ),
+        )
+        await conn.execute(
+            "INSERT INTO connector_driver_images (driver, reference, digest, "
+            "entrypoint, cmd, protocol_version) VALUES ($1, $2, $3, '[]'::jsonb, "
+            "'[\"/app/gitea-mcp\"]'::jsonb, '1.0')",
+            GITEA_MCP_SPEC.name,
+            gitea,
+            D1,
+        )
+        await leases.issue_or_redeliver(
+            conn,
+            owner=leases.LeaseOwner.thread(await _thread(db)),
+            connector_id=str(connector),
+            driver=GITEA_MCP_SPEC.name,
+            access="ReadOnly",
+            image_digest=D1,
+        )
+    report = await reconciler.reconcile_once()
+    (pod,) = await _pods(db)
+    assert report.started == [str(pod["id"])]
+    plan = runtime.plans[str(pod["id"])]
+    server, front_container = plan.pod["spec"]["containers"]
+    assert server["image"] == f"docker.gitea.com/gitea-mcp-server@{D1}"
+    assert server["command"] == ["/app/gitea-mcp"]
+    assert front_container["image"] == front
+    request = json.loads(base64.b64decode(plan.secret["data"]["request.json"]))
+    assert request["credentials"] == {} and "gitea-token" not in json.dumps(plan.pod)
+    assert runtime.endpoints == {
+        endpoint_service_name(str(connector), D1): str(pod["id"])
+    }
+
+
+@pytest.mark.asyncio
 async def test_the_pod_key_is_unique_among_pods_not_being_replaced(db):
     connector = await _echo_connector(db)
     generation = "hmac-sha256:" + "a" * 64

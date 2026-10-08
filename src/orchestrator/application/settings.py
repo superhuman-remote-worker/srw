@@ -272,6 +272,12 @@ class DeploymentSettings:
     #: Development only: install ``srw.echo-service/v1`` running this image
     #: reference (``connectors.drivers.echo``); empty installs nothing.
     connector_echo_driver_image: str = ""
+    #: Managed MCP servers to install (D5a), driver name -> image reference
+    #: (``connectors.drivers.managedMcp`` and ``connectors.drivers.mcpTest``),
+    #: and SRW's front image every such pod runs beside the server
+    #: (``connectors.drivers.mcpFront.image``, pinned by digest).
+    connector_managed_mcp_images: dict[str, str] = field(default_factory=dict)
+    connector_mcp_front_image: str = ""
     #: Where service pods run and how the leader reconciles them
     #: (``connectors.servicePods``): the driver and release namespaces, the
     #: installation cap, the idle and start timeouts, the pass interval, the
@@ -405,6 +411,17 @@ class DeploymentSettings:
             ).strip(),
             connector_echo_driver_image=os.environ.get(
                 "CONNECTOR_ECHO_DRIVER_IMAGE", ""
+            ).strip(),
+            connector_managed_mcp_images={
+                str(name): str(reference).strip()
+                for name, reference in parse_json_object(
+                    "CONNECTOR_MANAGED_MCP_IMAGES",
+                    os.environ.get("CONNECTOR_MANAGED_MCP_IMAGES"),
+                ).items()
+                if isinstance(reference, str) and reference.strip()
+            },
+            connector_mcp_front_image=os.environ.get(
+                "CONNECTOR_MCP_FRONT_IMAGE", ""
             ).strip(),
             connector_service_namespace=os.environ.get(
                 "CONNECTOR_SERVICE_NAMESPACE", ""

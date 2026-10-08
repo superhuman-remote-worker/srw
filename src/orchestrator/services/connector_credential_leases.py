@@ -54,7 +54,11 @@ from typing import Any, Literal
 from uuid import UUID
 
 from shared.connectors.builtin import spec_for_row
-from shared.connectors.contract import DriverSpec, effective_access
+from shared.connectors.contract import (
+    DriverSpec,
+    effective_access,
+    managed_mcp_driver,
+)
 from shared.connectors.leases import (
     LEASE_TOKEN_PREFIX,
     last_four,
@@ -526,8 +530,34 @@ async def deliver_connector_leases(
                 "token": lease.token,
             }
         }
+        if managed_mcp_driver(spec):
+            # The agent process connects to the connector's endpoint at this
+            # digest with the lease token as its bearer (D5a).
+            entry["connection_url"] = _managed_mcp_url(spec, connector_id, image_digest)
         delivered += 1
     return delivered
+
+
+def _managed_mcp_url(spec: DriverSpec, connector_id: str, digest: str | None) -> str:
+    """Where a managed MCP binding's client reaches the server's front."""
+    from orchestrator.services.connector_service_images import (
+        service_image_settings,
+    )
+    from orchestrator.services.connector_service_launch import endpoint_url
+    from shared.connectors.mcp import FRONT_PATH
+
+    namespace = service_image_settings().service_namespace
+    if not namespace or not digest or spec.service is None:
+        raise LeaseDeliveryError(
+            f"Service-pod hosting is off; {spec.name} cannot be served"
+        )
+    return endpoint_url(
+        namespace=namespace,
+        connector_id=connector_id,
+        digest=digest,
+        port=spec.service.port,
+        path=FRONT_PATH,
+    )
 
 
 async def prepare_lease_delivery(

@@ -8,7 +8,7 @@ mutating a shared one.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 from orchestrator.services.connector_drivers.base import (
     DatasourceDriver,
@@ -75,14 +75,20 @@ class ConnectorDriverRegistry:
 
 
 def builtin_connector_drivers(
-    *, lease_probe: bool = False, echo_service_image: str | None = None
+    *,
+    lease_probe: bool = False,
+    echo_service_image: str | None = None,
+    managed_mcp_images: Mapping[str, str] | None = None,
 ) -> ConnectorDriverRegistry:
     """The drivers SRW ships, in catalogue order.
 
     ``lease_probe`` adds the development lease probe driver after them
     (``orchestrator.connectorLeases.probeDriver``, slice C2);
     ``echo_service_image`` adds the development echo service driver running
-    that image (``connectors.drivers.echo``, D5).
+    that image (``connectors.drivers.echo``, D5); ``managed_mcp_images``
+    adds each managed MCP server it names, by driver name, running that image
+    (``connectors.drivers.managedMcp`` and ``mcpTest``, D5a). A name that is
+    no managed MCP driver SRW ships is refused.
     """
     from orchestrator.services.connector_drivers import builtin
 
@@ -99,4 +105,27 @@ def builtin_connector_drivers(
         )
 
         drivers += (EchoServiceDriver(echo_service_image),)
+    if managed_mcp_images:
+        from orchestrator.services.connector_drivers.managed_mcp import (
+            ManagedMcpDriver,
+        )
+        from shared.connectors.builtin import (
+            DEVELOPMENT_SPECS,
+            MANAGED_MCP_SPECS,
+        )
+        from shared.connectors.contract import managed_mcp_driver
+
+        shipped = {
+            spec.name: spec
+            for spec in MANAGED_MCP_SPECS + DEVELOPMENT_SPECS
+            if managed_mcp_driver(spec)
+        }
+        unknown = sorted(set(managed_mcp_images) - set(shipped))
+        if unknown:
+            raise ValueError(f"{unknown} are no managed MCP drivers SRW ships")
+        drivers += tuple(
+            ManagedMcpDriver(spec, managed_mcp_images[name])
+            for name, spec in shipped.items()
+            if managed_mcp_images.get(name)
+        )
     return ConnectorDriverRegistry(drivers)

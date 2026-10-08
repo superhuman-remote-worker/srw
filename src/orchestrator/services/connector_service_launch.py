@@ -27,6 +27,13 @@ it must reach answers), and the **shim install**, which copies the shim into
 an ``emptyDir``. The shim becomes the driver container's command, with the
 image's own entrypoint and command as its arguments.
 
+A **managed MCP** driver's pod (D5a, a spec with an ``mcp`` block) differs:
+the server image runs as itself, with the block's arguments and environment
+and nothing of SRW's (no identity, no request file, no credential), and
+SRW's **front** beside it holds the identity and the request file, serves
+the ``srw-driver`` port and is ready only when a real MCP probe of the
+server answers. Only the canary wait runs before them.
+
 Labels deliberately omit SRW's agent and chart labels, which grant access to
 internal services under existing NetworkPolicies.
 
@@ -51,6 +58,7 @@ from shared.connectors.contract import (
     SERVICE_PORT_NAME,
     DriverSpec,
 )
+from shared.connectors.mcp import ManagedMcp, TemplateError, managed_mcp
 
 MANAGER = "connector-service-hosting"
 REQUEST_PATH = "/run/srw/request.json"
@@ -152,6 +160,10 @@ class ServiceLaunchPolicy:
     max_cpu: str = "2"
     max_memory: str = "2Gi"
     termination_grace_seconds: int = 30
+    #: SRW's managed MCP front (D5a), pinned by digest: the pod's only
+    #: exposed port in front of an MCP server image.
+    front_image: str = ""
+    front_pull_policy: str = "IfNotPresent"
 
     def __post_init__(self) -> None:
         for name in (self.namespace, self.release_namespace):
@@ -235,7 +247,7 @@ def service_request(
     D5a) gets the connector's credentials.
     """
     held = spec.credential_delivery != "lease"
-    return {
+    request = {
         "protocol_version": PROTOCOL_VERSION,
         "plane": "service",
         "driver": spec.name,
@@ -248,6 +260,12 @@ def service_request(
         },
         "egress": pins.record(),
     }
+    mcp = managed_mcp(spec)
+    if mcp is not None:
+        # The front's own block: what it forwards to, the tool classes per
+        # access level and how it hands the server the credential.
+        request["mcp"] = mcp.front_config()
+    return request
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -336,7 +354,12 @@ def build_service_launch(
         raise ServiceLaunchError("a service pod launches its image by its digest")
     if not policy.shim_image or any(ch.isspace() for ch in policy.shim_image):
         raise ServiceLaunchError("no driver shim image is configured")
+    mcp = managed_mcp(spec)
+    if mcp is not None and not _DIGEST_REFERENCE.fullmatch(policy.front_image or ""):
+        raise ServiceLaunchError("no managed MCP front image is pinned by digest")
     program = [*entrypoint, *cmd]
+    if mcp is not None and mcp.command:
+        program = list(mcp.command)
     if not program:
         raise ServiceLaunchError(
             "the driver image declares no entrypoint or command for the shim to run"
@@ -500,6 +523,43 @@ def build_service_launch(
             },
         ],
     }
+    init_containers = [canary, install]
+    containers = [driver]
+    volumes: list[dict[str, Any]] = [
+        {"name": "srw-bin", "emptyDir": {"sizeLimit": "32Mi"}},
+        {
+            "name": "delivery",
+            "secret": {"secretName": name, "defaultMode": 0o444},
+        },
+    ]
+    if mcp is not None:
+        # A managed MCP server: the image runs as itself (no shim, no
+        # identity, no request file, no credential) beside SRW's front,
+        # which holds the identity and is the pod's only named port.
+        try:
+            server = _mcp_server_container(
+                image=image,
+                program=program,
+                mcp=mcp,
+                config=config,
+                resources=service_resources(spec.service.resources, policy),
+            )
+        except TemplateError as exc:
+            raise ServiceLaunchError(str(exc)) from None
+        init_containers = [canary]
+        containers = [
+            server,
+            _mcp_front_container(
+                policy=policy,
+                port=spec.service.port,
+                env=driver["env"],
+                mounts=driver["volumeMounts"][1:],
+            ),
+        ]
+        volumes = [
+            volumes[1],
+            {"name": "tmp", "emptyDir": {"sizeLimit": "256Mi"}},
+        ]
     host_aliases = pins.host_aliases()
     host_aliases.append(
         {"ip": policy.exchange_address, "hostnames": [policy.exchange_host]}
@@ -516,15 +576,9 @@ def build_service_launch(
         "securityContext": {"seccompProfile": {"type": "RuntimeDefault"}},
         "terminationGracePeriodSeconds": policy.termination_grace_seconds,
         "hostAliases": host_aliases,
-        "initContainers": [canary, install],
-        "containers": [driver],
-        "volumes": [
-            {"name": "srw-bin", "emptyDir": {"sizeLimit": "32Mi"}},
-            {
-                "name": "delivery",
-                "secret": {"secretName": name, "defaultMode": 0o444},
-            },
-        ],
+        "initContainers": init_containers,
+        "containers": containers,
+        "volumes": volumes,
     }
     if not pins.dns:
         # No DNS egress: a lookup fails at once instead of timing out against
@@ -545,6 +599,83 @@ def build_service_launch(
         network_policy=network_policy,
         secret=secret,
     )
+
+
+_FRONT_RESOURCES = {
+    "requests": {"cpu": "10m", "memory": "16Mi", "ephemeral-storage": "16Mi"},
+    "limits": {"cpu": "200m", "memory": "64Mi", "ephemeral-storage": "32Mi"},
+}
+
+
+def _literal(value: str) -> str:
+    """A value Kubernetes never expands ($(VAR) in args and env; $$ is $)."""
+    return value.replace("$", "$$")
+
+
+def _mcp_server_container(
+    *,
+    image: str,
+    program: Sequence[str],
+    mcp: ManagedMcp,
+    config: Mapping[str, Any],
+    resources: dict[str, Any],
+) -> dict[str, Any]:
+    """The MCP server image as it is: its own program, the block's arguments
+    and environment from the connector's config, nothing of SRW's."""
+    return {
+        "name": "driver",
+        "image": image,
+        "imagePullPolicy": "IfNotPresent",
+        "command": [_literal(part) for part in program],
+        "args": [_literal(part) for part in mcp.server_args(config)],
+        "env": [
+            {"name": key, "value": _literal(value)}
+            for key, value in sorted(mcp.server_env(config).items())
+        ],
+        "resources": resources,
+        "securityContext": {
+            "allowPrivilegeEscalation": False,
+            "privileged": False,
+            "capabilities": {"drop": ["ALL"]},
+        },
+        "volumeMounts": [{"name": "tmp", "mountPath": "/tmp"}],
+    }
+
+
+def _mcp_front_container(
+    *,
+    policy: ServiceLaunchPolicy,
+    port: int,
+    env: list[dict[str, str]],
+    mounts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """SRW's front: the request file, the identity, the named port, and
+    readiness from a real MCP probe of the server."""
+    return {
+        "name": "front",
+        "image": policy.front_image,
+        "imagePullPolicy": policy.front_pull_policy,
+        "command": ["/srw-mcp-front"],
+        "args": ["serve"],
+        "ports": [
+            {"name": SERVICE_PORT_NAME, "containerPort": port, "protocol": "TCP"}
+        ],
+        "env": deepcopy(env),
+        "resources": deepcopy(_FRONT_RESOURCES),
+        "readinessProbe": {
+            "httpGet": {"path": "/readyz", "port": SERVICE_PORT_NAME},
+            "periodSeconds": 5,
+            "timeoutSeconds": 4,
+            "failureThreshold": 3,
+        },
+        "livenessProbe": {
+            "httpGet": {"path": "/livez", "port": SERVICE_PORT_NAME},
+            "periodSeconds": 20,
+            "failureThreshold": 3,
+        },
+        "securityContext": _shim_security(),
+        "volumeMounts": deepcopy(mounts),
+    }
 
 
 def endpoint_service_name(connector_id: str, digest: str) -> str:

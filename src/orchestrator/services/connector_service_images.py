@@ -98,7 +98,9 @@ class ServiceImageSettings:
     ``store`` is the application's database: image rows and refusal audits
     are written on its connections, in their own short transactions, never in
     a caller's. ``bind_timeout_seconds`` caps a bind that finds no answer
-    prepared before its transaction.
+    prepared before its transaction. ``service_namespace`` is where service
+    pods and their endpoint Services run: a managed MCP binding carries its
+    endpoint's URL there (empty while hosting is off).
     """
 
     references: Mapping[str, str] = field(default_factory=dict)
@@ -107,6 +109,7 @@ class ServiceImageSettings:
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     bind_timeout_seconds: float = DEFAULT_BIND_TIMEOUT_SECONDS
     store: Any = None
+    service_namespace: str = ""
 
 
 @dataclass(frozen=True)

@@ -552,6 +552,9 @@ class ServiceHostingSettings:
     #: Seconds a pod replaced after a re-pin keeps running once its
     #: replacement serves (``servicePods.repinDrainSeconds``).
     repin_drain_seconds: float = 30.0
+    #: SRW's managed MCP front image, pinned by digest (D5a); a managed MCP
+    #: driver's pod is refused without it.
+    front_image: str = ""
 
     def cluster_problem(self, exchange_address: str) -> str | None:
         """Why this cluster's ranges are not the configured ``clusterCidrs``.
@@ -654,6 +657,7 @@ class ServiceHostingSettings:
             exchange_port=self.exchange_port,
             orchestrator_labels=dict(self.orchestrator_labels),
             canary_port=self.canary_port,
+            front_image=self.front_image,
             **overrides,
         )
 

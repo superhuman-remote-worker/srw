@@ -168,6 +168,12 @@ def service_image_settings(resources: ApplicationResources) -> ServiceImageSetti
         # Image rows and refusal audits are written on this store's own
         # connections, never in a bind's caller's transaction.
         store=resources.postgres_db,
+        # Managed MCP bindings carry their endpoint Service's URL.
+        service_namespace=(
+            settings.connector_service_namespace
+            if settings.connector_service_pods_enabled
+            else ""
+        ),
     )
 
 
@@ -218,6 +224,7 @@ def service_hosting_settings(
         node_ip=settings.connector_service_node_ip,
         reresolve_seconds=settings.connector_service_reresolve_seconds,
         repin_drain_seconds=settings.connector_service_repin_drain_seconds,
+        front_image=settings.connector_mcp_front_image,
     )
 
 
