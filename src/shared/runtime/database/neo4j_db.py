@@ -17,9 +17,9 @@ try:
     from neo4j import READ_ACCESS, GraphDatabase
     from neo4j.exceptions import ServiceUnavailable, AuthError
 except ImportError:  # pragma: no cover — exercised via tests/test_neo4j_import_guard.py
-    # The orchestrator image ships without the neo4j package (graph features are
-    # agent-side only), but this module sits on the import path of the eager
-    # src/tools registry — so a hard import failure here poisons EVERYTHING
+    # The orchestrator image shipped without the neo4j package until its
+    # connector probe needed it, and this module sits on the import path of
+    # the eager src/tools registry — so a hard import failure here poisons EVERYTHING
     # under src.tools for whichever import runs first in the process, then
     # heisenbergs (retries succeed off the partially-cached package). Defer the
     # failure to Neo4jDB construction instead, where it can raise loudly and
