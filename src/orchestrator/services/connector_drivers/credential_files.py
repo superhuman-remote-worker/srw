@@ -10,6 +10,7 @@ would no longer deliver (``shared.connectors.file_targets``).
 
 from __future__ import annotations
 
+import secrets
 from collections.abc import Mapping
 from typing import Any
 
@@ -66,12 +67,33 @@ def undeliverable_files(credentials: Mapping[str, Any] | None) -> list[str]:
     return problems
 
 
+def new_directory_token() -> str:
+    """A new connector's default-directory token (no id exists yet)."""
+    return secrets.token_hex(4)
+
+
+def directory_token(existing: Mapping[str, Any] | None) -> str:
+    """The token a connector's default directory carries: its id's first
+    eight hex digits once it has one, a fresh token while it is created."""
+    if existing is not None and existing.get("id"):
+        return str(existing["id"]).replace("-", "")[:8]
+    return new_directory_token()
+
+
 class CredentialFileDriver(DatasourceDriver):
     def _normalize_files(
-        self, name: str, credentials: dict[str, Any] | None
+        self,
+        name: str,
+        credentials: dict[str, Any] | None,
+        existing: Mapping[str, Any] | None,
     ) -> dict[str, Any] | None:
         try:
-            return normalize_credential_files(self.type_id, name, credentials)
+            return normalize_credential_files(
+                self.type_id,
+                name,
+                credentials,
+                directory_token=directory_token(existing),
+            )
         except CredentialFileValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -85,14 +107,14 @@ class CredentialFileDriver(DatasourceDriver):
         if existing is None:
             config = self.no_config(draft, existing)
             credentials = self._normalize_files(
-                draft.name or "", self.stored_credentials(draft, existing)
+                draft.name or "", self.stored_credentials(draft, existing), None
             )
             return NormalizedConnector(draft.connection_url, config, credentials)
         credentials = self.stored_credentials(draft, existing)
         if credentials is not None:
             # A rename moves the default target paths with the new name.
             credentials = self._normalize_files(
-                draft.name or existing.get("name", ""), credentials
+                draft.name or existing.get("name", ""), credentials, existing
             )
         return NormalizedConnector(
             draft.connection_url, self.no_config(draft, existing), credentials

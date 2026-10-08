@@ -17,7 +17,7 @@ is the single source of truth for:
 - ``env_var`` well-formedness (POSIX identifier), and for a file the
   workspace receives no reserved name and not ``KUBECONFIG``
 - type-specific defaults (e.g. ssh_key private at ``~/.ssh/<slug>`` with 0600,
-  a generic file without a target in ``~/.srw-files/<slug>/``)
+  a generic file without a target in ``~/.srw-files/<slug>-<token>/``)
 
 Used by ``src/orchestrator/main.py`` at the create/update endpoints so the agent only
 ever sees a fully-normalized payload.
@@ -39,7 +39,7 @@ from shared.connectors.file_targets import (
     mode_problem,
     target_problem,
 )
-from shared.credential_connectors import normalize_credential_env
+from shared.credential_connectors import credential_file_env_problem
 
 #: Stored types whose credentials are a ``files[]`` list, normalized here
 #: (from the driver specs). An ssh_key's first file is its private key: it is
@@ -167,15 +167,13 @@ def _validate_env_var(env_var: Any, *, written: bool = False) -> str | None:
         raise CredentialFileValidationError(
             f"env_var must be a POSIX identifier ([A-Za-z_][A-Za-z0-9_]*), got {env_var!r}"
         )
-    if written:
-        if env_var == "KUBECONFIG":
-            raise CredentialFileValidationError(
-                "env_var KUBECONFIG is reserved: it names the merged kubeconfig"
-            )
-        try:
-            normalize_credential_env({env_var: ""})
-        except ValueError as exc:
-            raise CredentialFileValidationError(f"env_var: {exc}") from exc
+    problem = credential_file_env_problem(env_var) if written else None
+    if problem is not None:
+        raise CredentialFileValidationError(
+            f"env_var {problem}"
+            if problem.startswith(env_var)
+            else f"env_var: {problem}"
+        )
     return env_var
 
 
@@ -232,19 +230,25 @@ def _normalize_one_file(
     return out
 
 
-def _default_generic_target(slug: str, entry: Any, idx: int) -> str:
-    """``~/.srw-files/<slug>/<file name>``: a neutral home for a file
-    the user gave no target."""
+def _default_generic_target(
+    slug: str, entry: Any, idx: int, directory_token: str | None
+) -> str:
+    """``~/.srw-files/<slug>-<token>/<file name>``: a neutral home for a file
+    the user gave no target. The token keeps two connectors whose names slug
+    alike apart (the driver passes one per connector)."""
     raw = entry.get("name") if isinstance(entry, dict) else None
     base = os.path.basename(str(raw or ""))
     name = _FILE_NAME_RE.sub("-", base).strip("-.") or f"file-{idx}"
-    return f"~/{DEFAULT_DIRECTORY}/{slug}/{name}"
+    directory = f"{slug}-{directory_token}" if directory_token else slug
+    return f"~/{DEFAULT_DIRECTORY}/{directory}/{name}"
 
 
 def normalize_credential_files(
     ds_type: str,
     ds_name: str,
     credentials: dict[str, Any] | None,
+    *,
+    directory_token: str | None = None,
 ) -> dict[str, Any] | None:
     """Apply per-type defaults and validate the ``credentials.files[]`` payload.
 
@@ -256,7 +260,9 @@ def normalize_credential_files(
     - For ``ssh_key``: expects 1 or 2 files (private, optional public);
       fills in ``~/.ssh/<slug>`` (0600) and ``~/.ssh/<slug>.pub`` (0644).
     - For ``generic_file``: an entry without a ``target_path`` goes to
-      ``~/.srw-files/<slug>/<file name>``; ``mode`` defaults to ``0600``.
+      ``~/.srw-files/<slug>-<directory_token>/<file name>`` (the driver
+      passes a token per connector, so two connectors never share it);
+      ``mode`` defaults to ``0600``.
 
     A kubeconfig's or generic file's target must be on the credential-file
     allowlist, its mode must not grant execute, and its ``env_var`` must be
@@ -331,7 +337,9 @@ def normalize_credential_files(
                 entry,
                 idx=idx,
                 default_name=f"file-{idx}",
-                default_target_path=_default_generic_target(slug, entry, idx),
+                default_target_path=_default_generic_target(
+                    slug, entry, idx, directory_token
+                ),
                 default_mode="0600",
                 written=written,
             )

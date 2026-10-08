@@ -42,7 +42,7 @@ from typing import Any
 from agent.connectors.base import Delivery, FactsLines, RuntimeContext
 from agent.connectors.legacy import unreadable_file_modes
 from shared.connectors.file_targets import mode_problem, safe_mode, target_problem
-from shared.credential_connectors import normalize_credential_env
+from shared.credential_connectors import credential_file_env_problem
 
 logger = logging.getLogger(__name__)
 
@@ -186,13 +186,9 @@ class CredentialFilePlan:
 
 
 def _usable_env_name(name: str) -> bool:
-    if name == KUBECONFIG_VAR:
-        return False
-    try:
-        normalize_credential_env({name: ""})
-    except ValueError:
-        return False
-    return True
+    """Not reserved, not KUBECONFIG, and no config or code pointer
+    (``credential_file_env_problem``: the orchestrator's rule at save)."""
+    return credential_file_env_problem(name) is None
 
 
 def plan_credential_files(

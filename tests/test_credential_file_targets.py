@@ -16,10 +16,15 @@ from orchestrator.services.connector_drivers.credential_files import (
     undeliverable_files,
 )
 from shared.connectors.builtin import GENERIC_FILE_SPEC
+from shared.credential_connectors import (
+    credential_file_env_problem,
+    normalize_credential_env,
+)
 from shared.connectors.file_targets import (
+    ALLOWED_CONFIG_APPS,
+    BAD_CHARACTERS,
     NOT_ALLOWED,
     OUTSIDE_HOME,
-    REFUSED_CONFIG_APPS,
     allowed_targets_text,
     home_relative,
     mode_problem,
@@ -37,8 +42,11 @@ from shared.connectors.file_targets import (
         ("/home/srw/.azure/azureProfile.json", ".azure/azureProfile.json"),
         ("/home/srw/.docker/config.json", ".docker/config.json"),
         ("/home/srw/.config/gcloud/application_default_credentials.json", None),
-        ("/home/srw/.config/gh/hosts.yml", ".config/gh/hosts.yml"),
-        ("/home/srw/.config/rclone/rclone.conf", ".config/rclone/rclone.conf"),
+        ("/home/srw/.config/helm/repositories.yaml", None),
+        ("/home/srw/.config/doctl/config.yaml", None),
+        ("/home/srw/.config/hcloud/cli.toml", None),
+        ("/home/srw/.config/sops/age/keys.txt", None),
+        ("/home/srw/.srw-files/vendor keys/a b.json", None),
         ("/home/srw/.netrc", ".netrc"),
         ("/home/srw/.pgpass", ".pgpass"),
         ("/home/srw/.srw-files/vendor/key.pem", ".srw-files/vendor/key.pem"),
@@ -75,6 +83,17 @@ def test_data_locations_are_allowed(path, relative):
         "/home/srw/.config/code-server/config.yaml",
         "/home/srw/.config/mimeapps.list",
         "/home/srw/.config",
+        # The re-review's list: a config that is code, or runs a command.
+        "/home/srw/.config/gh/hosts.yml",
+        "/home/srw/.config/rclone/rclone.conf",
+        "/home/srw/.config/pip/pip.conf",
+        "/home/srw/.config/uv/uv.toml",
+        "/home/srw/.config/pnpm/rc",
+        "/home/srw/.config/containers/systemd/x.container",
+        "/home/srw/.config/user-tmpfiles.d/x.conf",
+        "/home/srw/.config/mypy/config",
+        "/home/srw/.config/python_keyring/keyringrc.cfg",
+        "/home/srw/.config/anything-new/x",
         # Cloud sync uploads it.
         "/home/srw/workspace/creds.txt",
         # Code-loading subtrees of an allowed directory.
@@ -100,9 +119,28 @@ def test_outside_the_home_is_refused(path):
     assert target_problem(path) == (None, OUTSIDE_HOME)
 
 
-def test_every_refused_config_app_is_refused():
-    for app in REFUSED_CONFIG_APPS:
-        assert target_problem(f"/home/srw/.config/{app}/x") == (None, NOT_ALLOWED)
+def test_the_config_apps_are_an_explicit_short_list():
+    assert ALLOWED_CONFIG_APPS == {"doctl", "gcloud", "hcloud", "helm", "sops"}
+    for app in ALLOWED_CONFIG_APPS:
+        assert target_problem(f"/home/srw/.config/{app}/x")[1] is None
+        # The app's directory itself is no file target.
+        assert target_problem(f"/home/srw/.config/{app}") == (None, NOT_ALLOWED)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/home/srw/.srw-files/a\nb",
+        "/home/srw/.srw-files/a\x1b[31mred",
+        "/home/srw/.srw-files/$(id)",
+        "/home/srw/.srw-files/a*b",
+        "/home/srw/.srw-files/a;b",
+        "/home/srw/.srw-files/ü",
+        "~/.srw-files/a~b",
+    ],
+)
+def test_a_target_holds_only_safe_characters(path):
+    assert target_problem(path) == (None, BAD_CHARACTERS)
 
 
 def test_the_refusal_names_the_allowlist():
@@ -110,12 +148,13 @@ def test_the_refusal_names_the_allowlist():
     for part in (
         "~/.kube/",
         "~/.aws/",
-        "~/.config/<app>/",
+        "~/.config/gcloud/",
+        "~/.config/sops/",
         "~/.netrc",
         "~/.srw-files/",
     ):
         assert part in text
-    assert ".ssh" not in text
+    assert ".ssh" not in text and "<app>" not in text
 
 
 @pytest.mark.parametrize(
@@ -182,3 +221,134 @@ async def test_test_connection_says_why_a_saved_file_is_not_delivered():
         {}, {"files": [{"contents": "x", "target_path": "/home/srw/.netrc"}]}, ctx=ctx
     )
     assert fine["status"] == "unsupported"
+
+
+# =============================================================================
+# A credential file's env_var never points a tool at it as a config or code
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        # The re-review's list.
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "PSQLRC",
+        "PIP_CONFIG_FILE",
+        "NPM_CONFIG_USERCONFIG",
+        "npm_config_userconfig",
+        "INPUTRC",
+        "BASH_ENV",
+        "ENV",
+        "ZDOTDIR",
+        "PYTHONSTARTUP",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "NODE_OPTIONS",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "GIT_SSH_COMMAND",
+        "GIT_SSH",
+        "SSH_ASKPASS",
+        "GIT_ASKPASS",
+        "EDITOR",
+        "VISUAL",
+        "PAGER",
+        "GIT_PAGER",
+        "LESSOPEN",
+        "MANPAGER",
+        "BROWSER",
+        "PS1",
+        "PS0",
+        "PS4",
+        # Found with the same effect.
+        "PIP_INDEX_URL",
+        "PIP_FIND_LINKS",
+        "UV_CONFIG_FILE",
+        "GIT_EXEC_PATH",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_PROXY_COMMAND",
+        "PERL5LIB",
+        "RUBYOPT",
+        "JAVA_TOOL_OPTIONS",
+        "NODE_PATH",
+        "XDG_CONFIG_HOME",
+        "DOCKER_CONFIG",
+        "HELM_PLUGINS",
+        "CURL_HOME",
+        "LD_AUDIT",
+        # The workspace's own and the kubeconfig merge's.
+        "PATH",
+        "HOME",
+        "KUBECONFIG",
+        "SRW_TOKEN",
+    ],
+)
+def test_a_credential_files_variable_never_points_a_tool_at_code(name):
+    assert credential_file_env_problem(name) is not None
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_CONFIG_FILE",
+        "SOPS_AGE_KEY_FILE",
+        "NETRC",
+        "PGPASSFILE",
+        "VENDOR_TOKEN_FILE",
+    ],
+)
+def test_a_variable_that_names_a_credential_file_is_fine(name):
+    assert credential_file_env_problem(name) is None
+
+
+def test_environment_connectors_keep_their_own_rules():
+    """The owner decides whether they adopt the list; nothing changed yet."""
+    assert normalize_credential_env({"GIT_SSH_COMMAND": "x", "EDITOR": "vi"}) == {
+        "GIT_SSH_COMMAND": "x",
+        "EDITOR": "vi",
+    }
+
+
+# =============================================================================
+# The default directory is the connector's own
+# =============================================================================
+
+
+def test_a_new_connectors_default_directory_carries_a_fresh_token(monkeypatch):
+    from orchestrator.services.connector_drivers import credential_files as driver
+
+    tokens = iter(["aaaa1111", "bbbb2222"])
+    monkeypatch.setattr(driver, "new_directory_token", lambda: next(tokens))
+    first = driver.CredentialFileDriver(GENERIC_FILE_SPEC)._normalize_files(
+        "Vendor Keys", {"files": [{"contents": "x", "name": "key.pem"}]}, None
+    )
+    second = driver.CredentialFileDriver(GENERIC_FILE_SPEC)._normalize_files(
+        "vendor-keys", {"files": [{"contents": "y", "name": "key.pem"}]}, None
+    )
+    assert first["files"][0]["target_path"] == (
+        "/home/srw/.srw-files/vendor-keys-aaaa1111/key.pem"
+    )
+    assert second["files"][0]["target_path"] == (
+        "/home/srw/.srw-files/vendor-keys-bbbb2222/key.pem"
+    )
+
+
+def test_a_saved_connectors_default_directory_follows_its_id():
+    from orchestrator.services.connector_drivers import credential_files as driver
+
+    normalized = driver.CredentialFileDriver(GENERIC_FILE_SPEC)._normalize_files(
+        "Vendor Keys",
+        {"files": [{"contents": "x"}]},
+        {"id": "0d1e0d1e-2222-4333-8444-555566667777"},
+    )
+    assert normalized["files"][0]["target_path"] == (
+        "/home/srw/.srw-files/vendor-keys-0d1e0d1e/file-0"
+    )

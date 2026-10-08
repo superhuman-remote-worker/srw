@@ -174,6 +174,26 @@ class TestSshKey:
 
 
 class TestGenericFile:
+    def test_the_default_directory_carries_the_connectors_token(self):
+        out = normalize_credential_files(
+            "generic_file",
+            "Vendor Keys",
+            {"files": [{"contents": "data"}]},
+            directory_token="0d1e0d1e",
+        )
+        assert out["files"][0]["target_path"] == (
+            f"{AGENT_HOME}/.srw-files/vendor-keys-0d1e0d1e/file-0"
+        )
+
+    @pytest.mark.parametrize(
+        "path", ["~/.srw-files/a\nb", "~/.srw-files/$(id)", "~/.srw-files/a\x07"]
+    )
+    def test_a_target_with_an_unsafe_character_is_refused(self, path):
+        with pytest.raises(CredentialFileValidationError, match="character"):
+            normalize_credential_files(
+                "generic_file", "x", {"files": [{"contents": "x", "target_path": path}]}
+            )
+
     def test_a_file_without_a_target_goes_to_the_neutral_directory(self):
         out = normalize_credential_files(
             "generic_file",
@@ -326,6 +346,11 @@ def test_blocked_paths(bad_path):
         "~/.config/systemd/user/x.service",
         "~/.config/autostart/x.desktop",
         "~/.config/mimeapps.list",
+        # An explicit list of .config apps (D1d re-review): these hold code.
+        "~/.config/gh/hosts.yml",
+        "~/.config/pip/pip.conf",
+        "~/.config/containers/systemd/x.container",
+        "~/.config/user-tmpfiles.d/x.conf",
         # Cloud sync uploads the workspace.
         "~/workspace/creds.txt",
         # The subtrees CLIs load code from.
@@ -355,7 +380,8 @@ def test_targets_off_the_allowlist_are_refused(refused_path):
         "~/.azure/msal_token_cache.json",
         "~/.docker/config.json",
         "~/.config/gcloud/creds.json",
-        "~/.config/gh/hosts.yml",
+        "~/.config/helm/repositories.yaml",
+        "~/.config/sops/age/keys.txt",
         "~/.netrc",
         "~/.pgpass",
         "~/.srw-files/vendor/key.pem",
@@ -462,6 +488,15 @@ def test_env_var_accepted(good_env):
         "LD_PRELOAD",
         "SRW_TOKEN",
         "PYTHONPATH",
+        # A variable that points a tool at the file as a config or code.
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_KEY_0",
+        "PIP_CONFIG_FILE",
+        "npm_config_userconfig",
+        "NODE_OPTIONS",
+        "GIT_SSH_COMMAND",
+        "EDITOR",
+        "PS1",
     ],
 )
 def test_env_var_rejected(bad_env):
