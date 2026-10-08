@@ -685,7 +685,9 @@ class ServiceHostingReconciler:
             plan = build_service_launch(
                 identity,
                 spec=spec,
-                image=f"{_repository(reference)}@{binding.digest}",
+                # The repository the digest was resolved from, which may be an
+                # earlier reference's when the driver's image moved since.
+                image=f"{_repository(image.reference)}@{binding.digest}",
                 entrypoint=image.entrypoint,
                 cmd=image.cmd,
                 config=config,

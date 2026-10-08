@@ -755,6 +755,30 @@ async def test_an_egress_the_tier_forbids_refuses_the_launch_and_backs_off(
 
 
 @pytest.mark.asyncio
+async def test_a_digest_launches_from_the_repository_it_was_resolved_from(
+    db, reconciler
+):
+    """A binding made before the driver's image moved to another repository
+    keeps running its digest from where that digest lives."""
+    connector = await _echo_connector(db)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO connector_driver_images (driver, reference, digest, "
+            "entrypoint, cmd, protocol_version) VALUES ($1, $2, $3, "
+            "'[\"/old-echo\"]'::jsonb, '[]'::jsonb, '1.0')",
+            ECHO,
+            "old-registry:5000/old-echo:1",
+            D2,
+        )
+    await _bind_echo(db, connector, await _thread(db), digest=D2)
+    await reconciler.reconcile_once()
+    (plan,) = reconciler.fake.plans.values()
+    driver = plan.pod["spec"]["containers"][0]
+    assert driver["image"] == f"old-registry:5000/old-echo@{D2}"
+    assert driver["args"] == ["/old-echo"]
+
+
+@pytest.mark.asyncio
 async def test_an_unexpected_build_error_leaves_no_live_identity_and_backs_off(
     db, reconciler
 ):
