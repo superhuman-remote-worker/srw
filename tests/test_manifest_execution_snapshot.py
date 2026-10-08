@@ -789,14 +789,16 @@ async def test_configuration_transaction_locks_delivery_before_connection_and_ro
     async def execute(query, *args):
         assert connection.in_transaction
         assert "pg_advisory_xact_lock" in query
-        events.append("config")
+        # The catalog lock before the caller locks the thread row: the
+        # connector write-through takes it before the datasource rows.
+        events.append("catalog" if "srw-resource-catalog" in query else "config")
 
     db.thread_datasource_lock = delivery_lock
     connection.execute = execute
     async with db.thread_configuration_transaction(WORK) as current:
         assert current is connection
         events.append("row")
-    assert events == ["delivery", "config", "row"]
+    assert events == ["delivery", "config", "catalog", "row"]
 
 
 @pytest.mark.asyncio

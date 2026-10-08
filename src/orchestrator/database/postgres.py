@@ -3563,13 +3563,25 @@ class PostgresDB:
 
     @asynccontextmanager
     async def thread_configuration_transaction(self, thread_id: str):
-        """Acquire delivery/config locks before materializing one session revision."""
+        """Acquire delivery/config locks before materializing one session revision.
+
+        The manifest catalog lock comes before the thread row and the
+        datasource rows a session revision locks: capturing the revision takes
+        it anyway, and the datasource write-through holds it while it locks a
+        datasource row and, on a delete, the threads naming it. Taking it last
+        here would deadlock a settings save against a connector write.
+        """
+        from orchestrator.services.manifest_execution_retirement import (
+            lock_manifest_execution_catalog,
+        )
+
         async with self.thread_datasource_lock(thread_id):
             async with self.transaction_scope() as conn:
                 await conn.execute(
                     "SELECT pg_advisory_xact_lock($1)",
                     _thread_config_lock_key(thread_id),
                 )
+                await lock_manifest_execution_catalog(conn)
                 yield conn
 
     async def execute(self, query: str, *args) -> str:
@@ -50334,6 +50346,13 @@ class PostgresDB:
 
     async def get_datasource(self, datasource_id: str) -> Dict[str, Any] | None:
         """Get a single datasource by ID.
+
+        The one read that carries ``managed_key``: the platform-owned guards
+        (update, delete, link, unlink, reindex) read the row through it, so a
+        single GET shows the key too. The list, catalog and eligible reads do
+        not carry it yet; until D3c adds a managed reason to them, a client
+        that lists connectors tells a platform-owned one by its
+        ``config.native_project_id`` mirror.
 
         Args:
             datasource_id: Datasource UUID as string
