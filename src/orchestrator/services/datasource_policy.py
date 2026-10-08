@@ -19,6 +19,10 @@ from shared.connectors.builtin import spec_for_row
 LITE_WORKSPACE_BACKENDS = frozenset({"virtual", "none"})
 NATIVE_PROJECT_CONFIG_KEY = "native_project_id"
 GENERIC_UNAVAILABLE_DETAIL = "One or more selected connectors are unavailable"
+SHELL_WORKSPACE_DETAIL = (
+    "Connectors that need a shell (repositories, credential and generic "
+    "environments, SSH keys) require a sandbox or VM workspace"
+)
 
 
 class DatasourceUnavailableError(PermissionError):
@@ -292,9 +296,7 @@ async def authorize_datasource_selection(
         if not verdict.denied:
             continue
         if verdict.reason == "workspace_tier":
-            raise DatasourceWorkspaceTierError(
-                "Repository and credential connectors require a sandbox or VM workspace"
-            )
+            raise DatasourceWorkspaceTierError(SHELL_WORKSPACE_DETAIL)
         raise DatasourceUnavailableError()
     return [v.datasource_id for v in verdicts], revisions
 
@@ -400,6 +402,7 @@ __all__ = [
     "DatasourceUnavailableError",
     "DatasourceWorkspaceTierError",
     "GENERIC_UNAVAILABLE_DETAIL",
+    "SHELL_WORKSPACE_DETAIL",
     "ItemVerdict",
     "authorize_datasource_ids",
     "authorize_datasource_selection",

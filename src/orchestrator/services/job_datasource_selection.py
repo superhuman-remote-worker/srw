@@ -84,9 +84,7 @@ class JobDatasourceSelectionDependencies:
     ]
 
 
-def repository_datasource_names(
-    datasources: Any, workspace_backend: str | None
-) -> list[str]:
+def shell_connector_names(datasources: Any, workspace_backend: str | None) -> list[str]:
     """Names of the connectors ``workspace_backend`` cannot serve.
 
     Repositories need a clone target, and credential and generic environments

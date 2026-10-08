@@ -368,7 +368,7 @@ class TestAgentPatchDatasourceIds:
                 ),
             )
         assert exc.value.status_code == 400
-        assert "repository" in exc.value.detail.lower()
+        assert "repositories" in exc.value.detail.lower()
         db.set_thread_datasource_ids.assert_not_awaited()
 
     @pytest.mark.asyncio

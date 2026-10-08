@@ -405,7 +405,7 @@ def job_delivery_operations(
             authorize_job_repository_transport=managed_repository_authority.authorize_job_repository_transport,
             apply_sticky_sudo_denial=job_workspace_runtime.apply_sticky_sudo_denial,
             backend_from_override=workspace_tier_policy.backend_from_override,
-            repository_datasource_names=job_datasource_selection.repository_datasource_names,
+            shell_connector_names=job_datasource_selection.shell_connector_names,
             inject_lite_workspace_config=workspace_tier_policy.inject_lite_workspace_config,
             is_experts_db_enabled=deployment_gates.is_experts_db_enabled,
             user_experts_enabled=bound(

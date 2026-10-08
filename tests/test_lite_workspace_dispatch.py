@@ -199,18 +199,16 @@ class TestInjectLiteWorkspaceConfig:
 
 
 # ---------------------------------------------------------------------------
-# _repository_datasource_names
+# shell_connector_names
 # ---------------------------------------------------------------------------
-class TestRepositoryDatasourceNames:
+class TestShellConnectorNames:
     def test_filters_repository(self):
         ds = [
             {"type": "postgresql", "name": "pg"},
             {"type": "repository", "name": "repo1"},
             {"type": "credentials", "name": "api-key"},
         ]
-        assert job_datasource_selection_module.repository_datasource_names(
-            ds, "virtual"
-        ) == [
+        assert job_datasource_selection_module.shell_connector_names(ds, "virtual") == [
             "repo1",
             "api-key",
         ]
@@ -226,40 +224,36 @@ class TestRepositoryDatasourceNames:
             {"type": "kubeconfig", "name": "cluster"},
             {"type": "email", "name": "mail"},
         ]
-        assert job_datasource_selection_module.repository_datasource_names(
-            ds, backend
-        ) == ["env", "key"]
+        assert job_datasource_selection_module.shell_connector_names(ds, backend) == [
+            "env",
+            "key",
+        ]
 
     @pytest.mark.parametrize("backend", ["sandbox", "vm", "remote", None])
     def test_a_shell_backend_names_nothing(self, backend):
         ds = [{"type": "repository", "name": "r"}, {"type": "generic", "name": "g"}]
-        assert (
-            job_datasource_selection_module.repository_datasource_names(ds, backend)
-            == []
-        )
+        assert job_datasource_selection_module.shell_connector_names(ds, backend) == []
 
     def test_case_insensitive(self):
-        assert job_datasource_selection_module.repository_datasource_names(
+        assert job_datasource_selection_module.shell_connector_names(
             [{"type": "Repository", "name": "r"}], "virtual"
         ) == ["r"]
 
     def test_id_fallback_when_no_name(self):
-        assert job_datasource_selection_module.repository_datasource_names(
+        assert job_datasource_selection_module.shell_connector_names(
             [{"type": "repository", "id": "abc"}], "virtual"
         ) == ["abc"]
 
     def test_empty_and_none(self):
         assert (
-            job_datasource_selection_module.repository_datasource_names(None, "virtual")
-            == []
+            job_datasource_selection_module.shell_connector_names(None, "virtual") == []
         )
         assert (
-            job_datasource_selection_module.repository_datasource_names([], "virtual")
-            == []
+            job_datasource_selection_module.shell_connector_names([], "virtual") == []
         )
 
     def test_skips_non_dict_entries(self):
-        assert job_datasource_selection_module.repository_datasource_names(
+        assert job_datasource_selection_module.shell_connector_names(
             ["junk", {"type": "repository", "name": "r"}], "virtual"
         ) == ["r"]
 

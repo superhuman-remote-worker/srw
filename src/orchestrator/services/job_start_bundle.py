@@ -37,7 +37,8 @@ from orchestrator.logging_config import bind_log_context, reset_log_context
 from orchestrator.schemas.job_runtime import JobStartRequest
 from orchestrator.security.access import externalize_gitea_url, redact_config_override
 from orchestrator.services.config_resolver import unrouted_model_slots
-from orchestrator.services.job_datasource_selection import repository_datasource_names
+from orchestrator.services.datasource_policy import SHELL_WORKSPACE_DETAIL
+from orchestrator.services.job_datasource_selection import shell_connector_names
 from orchestrator.services.job_workspace_runtime import (
     JobWorkspaceRuntimeDependencies,
     apply_sticky_sudo_denial,
@@ -474,13 +475,12 @@ async def build_job_start_request(
         # submit guard never saw.
         lite_backend = dependencies.backend_from_override(config_override)
         if lite_backend in LITE_BACKENDS:
-            repo_names = repository_datasource_names(resolved_ds, lite_backend)
-            if repo_names:
+            shell_names = shell_connector_names(resolved_ds, lite_backend)
+            if shell_names:
                 msg = (
                     "workspace.backend is a lite tier (virtual/none) but a "
-                    f"connector requiring a shell is attached ({', '.join(repo_names)}). "
-                    "Repository and credential connectors need a full workspace — use "
-                    "backend='sandbox' or 'vm'."
+                    f"connector requiring a shell is attached ({', '.join(shell_names)}). "
+                    f"{SHELL_WORKSPACE_DETAIL} — use backend='sandbox' or 'vm'."
                 )
                 logger.error("Dispatch: job %s rejected — %s", job_id, msg)
                 if persist_dispatch_state:

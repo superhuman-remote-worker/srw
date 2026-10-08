@@ -367,7 +367,8 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
     });
 
     it('shows a 400 refusal and retries the retained message once after changing workspace', async () => {
-        const detail = 'Repository and credential connectors require a sandbox or VM workspace';
+        const detail = 'Connectors that need a shell (repositories, credential and generic '
+            + 'environments, SSH keys) require a sandbox or VM workspace';
         const opts = {createFails: true, createError: new HttpErrorResponse({status: 400, error: {detail}})};
         const ctx = createService(opts);
         ctx.service.enterDraftSession();

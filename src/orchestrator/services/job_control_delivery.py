@@ -22,6 +22,7 @@ from orchestrator.services.config_resolver import (
     resolve_config,
 )
 from orchestrator.services.container_provisioner import WorkspaceRuntimeAuthorityError
+from orchestrator.services.datasource_policy import SHELL_WORKSPACE_DETAIL
 from orchestrator.services.grant_enforcement import GrantDenied
 from orchestrator.services.managed_repository_authority import (
     ManagedRepositoryAuthorityError,
@@ -113,7 +114,7 @@ class JobDeliveryDependencies:
     authorize_job_repository_transport: Callable[..., Any]
     apply_sticky_sudo_denial: Callable[..., Any]
     backend_from_override: Callable[..., Any]
-    repository_datasource_names: Callable[..., Any]
+    shell_connector_names: Callable[..., Any]
     inject_lite_workspace_config: Callable[..., Any]
     is_experts_db_enabled: Callable[..., Any]
     user_experts_enabled: Callable[..., Any]
@@ -588,15 +589,12 @@ async def resume_job_on_agent(
         # its backend. (Same rationale as the credential re-injection above.)
         lite_backend = dependencies.backend_from_override(config_override)
         if lite_backend in LITE_BACKENDS:
-            repo_names = dependencies.repository_datasource_names(
-                resolved_ds, lite_backend
-            )
-            if repo_names:
+            shell_names = dependencies.shell_connector_names(resolved_ds, lite_backend)
+            if shell_names:
                 msg = (
                     "workspace.backend is a lite tier (virtual/none) but a "
-                    f"connector requiring a shell is attached ({', '.join(repo_names)}). "
-                    "Repository and credential connectors need a full workspace — use "
-                    "backend='sandbox' or 'vm'."
+                    f"connector requiring a shell is attached ({', '.join(shell_names)}). "
+                    f"{SHELL_WORKSPACE_DETAIL} — use backend='sandbox' or 'vm'."
                 )
                 dependencies.logger.error(
                     "Resume dispatch: job %s rejected — %s", job_id, msg

@@ -421,7 +421,10 @@ class TestCreationPreview:
         )
         assert rejected.status_code == 400
         assert rejected.json() == {
-            "detail": "Repository and credential connectors require a sandbox or VM workspace"
+            "detail": (
+                "Connectors that need a shell (repositories, credential and "
+                "generic environments, SSH keys) require a sandbox or VM workspace"
+            )
         }
         empty = client.post(
             "/api/persistent/threads/preview", json={"datasource_ids": []}

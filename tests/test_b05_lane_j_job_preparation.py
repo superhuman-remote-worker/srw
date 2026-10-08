@@ -690,12 +690,10 @@ class TestPureHelperParity:
             [{"type": "repository"}],
         ],
     )
-    def test_repository_datasource_names(self, rows):
-        assert job_datasource_selection.repository_datasource_names(
+    def test_shell_connector_names(self, rows):
+        assert job_datasource_selection.shell_connector_names(
             rows, "virtual"
-        ) == job_datasource_selection_module.repository_datasource_names(
-            rows, "virtual"
-        )
+        ) == job_datasource_selection_module.shell_connector_names(rows, "virtual")
 
 
 # =============================================================================
@@ -2399,6 +2397,10 @@ class TestJobStartBundle:
         )
         message = bundle_env.status_writes[0][1]["error_message"]
         assert "lite tier" in message and "app" in message
+        assert (
+            "Connectors that need a shell (repositories, credential and generic "
+            "environments, SSH keys) require a sandbox or VM workspace" in message
+        )
 
     @pytest.mark.asyncio
     async def test_a_lite_config_error_fails_the_job(self, bundle_env, monkeypatch):
