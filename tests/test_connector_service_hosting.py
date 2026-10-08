@@ -236,6 +236,76 @@ async def test_observe_reads_a_terminal_phase_and_when_the_pod_turned_unready(
 
 
 @pytest.mark.asyncio
+async def test_the_runtime_reads_the_kubernetes_clients_own_models():
+    """The API client returns models, not dicts: their attributes are named
+    by each model's attribute_map (cluster_ip for clusterIP), which a
+    camel-to-snake rule gets wrong. A dict fake hid that on k3d."""
+    from datetime import datetime, timezone
+
+    from kubernetes import client as k8s
+
+    service = k8s.V1Service(spec=k8s.V1ServiceSpec(cluster_ip="10.43.0.20"))
+    since = datetime(2026, 10, 8, 10, 0, tzinfo=timezone.utc)
+    pod = k8s.V1Pod(
+        metadata=k8s.V1ObjectMeta(name=POD, uid="u", labels=dict(IDENTITY.labels)),
+        status=k8s.V1PodStatus(
+            phase="Pending",
+            conditions=[
+                k8s.V1PodCondition(
+                    type="Ready", status="False", last_transition_time=since
+                )
+            ],
+            init_container_statuses=[
+                k8s.V1ContainerStatus(
+                    name="canary-wait",
+                    image="shim",
+                    image_id="",
+                    ready=False,
+                    restart_count=1,
+                    state=k8s.V1ContainerState(
+                        waiting=k8s.V1ContainerStateWaiting(reason="CrashLoopBackOff")
+                    ),
+                    last_state=k8s.V1ContainerState(
+                        terminated=k8s.V1ContainerStateTerminated(
+                            exit_code=1, message="srw-driver-shim: x\nthe verdict\n"
+                        )
+                    ),
+                )
+            ],
+            container_statuses=[
+                k8s.V1ContainerStatus(
+                    name="driver",
+                    image="echo",
+                    image_id="",
+                    ready=False,
+                    restart_count=0,
+                )
+            ],
+        ),
+    )
+
+    class Core:
+        def read_namespaced_service(self, name, namespace, **_kwargs):
+            assert (name, namespace) == ("srw-orchestrator", "srw")
+            return service
+
+        def read_namespaced_pod(self, name, namespace, **_kwargs):
+            return pod
+
+    runtime = hosting.ServicePodRuntime(Core(), object(), namespace="srw-connectors")
+    assert await runtime.service_cluster_ip("srw-orchestrator", "srw") == "10.43.0.20"
+    state = await runtime.observe(IDENTITY)
+    assert (state.phase, state.uid, state.ready) == ("Pending", "u", False)
+    assert state.reason == "CrashLoopBackOff"
+    assert state.message == "canary-wait: the verdict"
+    assert state.unready_since == since
+    pod.status.container_statuses[0].ready = True
+    pod.status.conditions[0].status = "True"
+    state = await runtime.observe(IDENTITY)
+    assert state.ready and state.unready_since is None
+
+
+@pytest.mark.asyncio
 async def test_the_exchange_cluster_ip_comes_from_the_api(api, runtime):
     """No DNS: the Service object says where the exchange is."""
     api.objects[("service", "srw-orchestrator")] = {

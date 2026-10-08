@@ -115,11 +115,19 @@ class ServiceRuntimeError(RuntimeError):
 
 
 def _field(obj: Any, name: str, default: Any = None) -> Any:
-    """A field of a Kubernetes object, as a dict (tests) or a client model."""
+    """A field of a Kubernetes object, as a dict or a client model.
+
+    ``name`` is the API's JSON name. A client model names its attributes in
+    its ``attribute_map`` (``cluster_ip`` for ``clusterIP``: no mechanical
+    camel-to-snake rule gets acronyms right).
+    """
     if obj is None:
         return default
     if isinstance(obj, Mapping):
         return obj.get(name, default)
+    for attribute, key in (getattr(type(obj), "attribute_map", None) or {}).items():
+        if key == name:
+            return getattr(obj, attribute, default)
     snake = "".join(f"_{ch.lower()}" if ch.isupper() else ch for ch in name)
     return getattr(obj, snake, default)
 
