@@ -39,6 +39,7 @@ from orchestrator.services.connector_drivers.lease_probe import LeaseProbeDriver
 from orchestrator.services.connector_lease_exchange import (
     EXCHANGE_PATH,
     INTROSPECT_PATH,
+    DenialLimiter,
     ExchangeOutcome,
     check_denial,
 )
@@ -387,7 +388,7 @@ class _FakeExchange:
 def exchange_client(monkeypatch):
     fake = _FakeExchange()
     monkeypatch.setattr(
-        connectors_composition, "connector_lease_exchange", lambda _resources: fake
+        connectors_composition, "connector_lease_exchange", lambda *_args: fake
     )
     app = connectors_composition.connector_lease_exchange_app(SimpleNamespace())
     return TestClient(app), fake
@@ -505,7 +506,7 @@ class TestServer:
         probe.close()
         fake = _FakeExchange()
         monkeypatch.setattr(
-            connectors_composition, "connector_lease_exchange", lambda _r: fake
+            connectors_composition, "connector_lease_exchange", lambda *_args: fake
         )
         shutdown = asyncio.Event()
         task = asyncio.create_task(
@@ -793,3 +794,122 @@ class TestLeaseOwner:
             await leases.revoke_execution_leases(
                 AsyncMock(), job_id="a", thread_id="b", reason="session_end"
             )
+
+
+# =============================================================================
+# Review hardening: the denial limiter, the bounded port, the settings
+# =============================================================================
+
+
+class TestDenialLimiter:
+    def test_repeats_in_a_window_are_held_and_counted_on_the_next_record(self):
+        now = [0.0]
+        limiter = DenialLimiter(window_seconds=60, clock=lambda: now[0])
+        key = ("identity-1", "lease_revoked")
+        assert limiter.admit(key) == (True, 0)
+        assert limiter.admit(key) == (False, 0)
+        assert limiter.admit(key) == (False, 0)
+        assert limiter.admit(("identity-1", "operation_not_allowed")) == (True, 0)
+        now[0] = 61.0
+        assert limiter.admit(key) == (True, 2)
+
+    def test_the_key_table_is_bounded(self):
+        now = [0.0]
+        limiter = DenialLimiter(window_seconds=60, max_keys=2, clock=lambda: now[0])
+        assert limiter.admit(("a", "r"))[0]
+        assert limiter.admit(("b", "r"))[0]
+        # Full of live keys: further identities share one overflow key.
+        assert limiter.admit(("c", "r")) == (True, 0)
+        assert limiter.admit(("d", "r")) == (False, 0)
+        now[0] = 120.0
+        assert limiter.admit(("e", "r")) == (True, 0)
+
+
+async def _asgi_call(app, *, body_chunks, headers=()):
+    sent: list[dict] = []
+    chunks = list(body_chunks)
+
+    async def receive():
+        if chunks:
+            chunk = chunks.pop(0)
+            return {"type": "http.request", "body": chunk, "more_body": bool(chunks)}
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": EXCHANGE_PATH,
+        "headers": [(k.encode(), v.encode()) for k, v in headers],
+    }
+    await app(scope, receive, send)
+    return sent
+
+
+async def _echo(scope, receive, send):
+    body = b""
+    while True:
+        message = await receive()
+        body += message.get("body", b"")
+        if not message.get("more_body"):
+            break
+    await send({"type": "http.response.start", "status": 200, "headers": []})
+    await send({"type": "http.response.body", "body": str(len(body)).encode()})
+
+
+class TestBoundedPort:
+    @pytest.mark.asyncio
+    async def test_a_declared_oversized_body_is_refused_before_reading(self):
+        read = []
+
+        async def app(scope, receive, send):
+            read.append(True)
+            await _echo(scope, receive, send)
+
+        sent = await _asgi_call(
+            connectors_composition.BodyLimit(app, limit=16),
+            body_chunks=[b"x" * 64],
+            headers=[("content-length", "64")],
+        )
+        assert sent[0]["status"] == 413 and not read
+        assert (b"cache-control", b"no-store") in sent[0]["headers"]
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_body_past_the_limit_is_refused(self):
+        sent = await _asgi_call(
+            connectors_composition.BodyLimit(_echo, limit=16),
+            body_chunks=[b"x" * 10, b"x" * 10, b"x" * 10],
+        )
+        assert sent[0]["status"] == 413
+
+    @pytest.mark.asyncio
+    async def test_a_small_body_passes(self):
+        sent = await _asgi_call(
+            connectors_composition.BodyLimit(_echo, limit=16),
+            body_chunks=[b"x" * 8, b"x" * 8],
+            headers=[("content-length", "16")],
+        )
+        assert sent[0]["status"] == 200 and sent[1]["body"] == b"16"
+
+    def test_the_real_port_refuses_a_large_post(self, exchange_client):
+        client, fake = exchange_client
+        bounded = TestClient(connectors_composition.BodyLimit(client.app))
+        response = bounded.post(
+            EXCHANGE_PATH,
+            content=b'{"lease_token": "' + b"x" * 8192 + b'", "operation": "read"}',
+            headers={"content-type": "application/json"},
+        )
+        assert response.status_code == 413 and fake.calls == []
+
+    def test_the_server_is_bounded(self):
+        config = connectors_composition.exchange_server_config(object())
+        assert isinstance(config.app, connectors_composition.BodyLimit)
+        assert config.app.limit == connectors_composition.MAX_BODY_BYTES == 4096
+        assert (
+            config.limit_concurrency
+            == connectors_composition.MAX_CONCURRENT_CONNECTIONS
+        )
+        assert config.timeout_graceful_shutdown == 5
+        assert config.ws == "none" and config.lifespan == "off"

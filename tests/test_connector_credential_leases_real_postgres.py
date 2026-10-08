@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -26,7 +27,10 @@ from orchestrator.services.connector_driver_identities import (
     revoke_driver_identity,
 )
 from orchestrator.services.connector_drivers import builtin_connector_drivers
-from orchestrator.services.connector_lease_exchange import ConnectorLeaseExchange
+from orchestrator.services.connector_lease_exchange import (
+    ConnectorLeaseExchange,
+    DenialLimiter,
+)
 from shared.connectors.leases import token_digest, token_shape_valid
 
 SCHEMA_FILE = (
@@ -646,8 +650,9 @@ async def test_the_exchange_refuses_and_audits_every_denial(db, exchange):
         401,
         {"error": "driver_identity_revoked"},
     )
+    # Five rows: an unknown identity writes none (only a rate-limited log).
     denials = await _events(db, "connector_lease_exchange_denied")
-    assert len(denials) == 6
+    assert len(denials) == 5
     assert all(lease.token not in (e["detail"] or "") for e in denials)
     assert (await _lease(db, lease.id))["exchange_count"] == 0
 
@@ -711,3 +716,56 @@ async def test_identities_store_only_a_digest_and_revoke_by_pod(db):
         assert identity.token not in repr(identity)
         assert await revoke_driver_identity(conn, pod_uid="pod-xyz") == [identity.id]
         assert await revoke_driver_identity(conn, pod_uid="pod-xyz") == []
+
+
+# =============================================================================
+# Review hardening
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_denials_are_coalesced_and_record_the_socket_peer(db):
+    connector = await _connector(db)
+    thread = await _thread(db)
+    lease = await _issue(db, leases.LeaseOwner.thread(thread), connector, "ReadOnly")
+    identity = await _identity(db, connector)
+    now = [0.0]
+    exchange = ConnectorLeaseExchange(
+        store=db,
+        drivers=builtin_connector_drivers(lease_probe=True),
+        limiter=DenialLimiter(window_seconds=60, clock=lambda: now[0]),
+    )
+    request = SimpleNamespace(
+        client=SimpleNamespace(host="10.42.9.9"),
+        headers={"x-forwarded-for": "203.0.113.7"},
+    )
+
+    async def write():
+        return await exchange.exchange(
+            identity_token=identity.token,
+            lease_token=lease.token,
+            operation="write",
+            request=request,
+        )
+
+    for _ in range(4):
+        assert (await write()).body == {"error": "operation_not_allowed"}
+    for _ in range(3):
+        await exchange.exchange(
+            identity_token="sdi_" + "1" * 49,
+            lease_token=lease.token,
+            operation="read",
+            request=request,
+        )
+    rows = await db.fetch(
+        "SELECT detail, client_ip FROM security_events "
+        "WHERE event_type = 'connector_lease_exchange_denied'"
+    )
+    assert len(rows) == 1 and rows[0]["client_ip"] == "10.42.9.9"
+    now[0] = 61.0
+    await write()
+    rows = await db.fetch(
+        "SELECT detail FROM security_events WHERE event_type = "
+        "'connector_lease_exchange_denied' ORDER BY created_at"
+    )
+    assert len(rows) == 2 and "coalesced=3" in rows[1]["detail"]

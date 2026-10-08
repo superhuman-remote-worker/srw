@@ -12,18 +12,25 @@ connector and driver, the lease is live, and the requested operation fits
 the lease's access level. The answer carries ``Cache-Control: no-store``; a
 driver may cache it for ``max_cache_seconds`` (the revocation lag).
 
-Audit: every denial and the first exchange of a lease go to
-``security_events``; later exchanges update the lease's counters only.
+Audit: a denial of a known identity and the first exchange of a lease go
+to ``security_events``; later exchanges update the lease's counters only.
+Repeated denials of one identity for one reason are coalesced to one row a
+minute (the next row carries the count). A caller with no known identity
+writes no row at all, only a rate-limited log line with a count, so the port
+cannot be used to fill the audit table. The client address is the socket
+peer: this port is never behind the ingress, so ``X-Forwarded-For`` is
+ignored.
 """
 
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
-from orchestrator.security.access import log_security_event
 from orchestrator.services.connector_credential_leases import EXPIRED
 from orchestrator.services.connector_drivers.base import SupportsCredentialLease
 from shared.connectors.leases import (
@@ -102,12 +109,89 @@ def check_denial(row: Any, *, operation: str | None) -> str | None:
     return None
 
 
+class DenialLimiter:
+    """Coalesces repeated denials: one record per key per window.
+
+    A key is ``(identity, reason)``; an unknown identity shares one key per
+    reason. :meth:`admit` answers whether to record now and how many denials
+    of that key were held back since its last record. One per exchange
+    application (process), so a burst on one replica is bounded there.
+    """
+
+    def __init__(
+        self,
+        *,
+        window_seconds: float = 60.0,
+        max_keys: int = 4096,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._window = float(window_seconds)
+        self._max_keys = int(max_keys)
+        self._clock = clock
+        self._keys: dict[tuple[str, str], list[float]] = {}
+
+    def admit(self, key: tuple[str, str]) -> tuple[bool, int]:
+        now = self._clock()
+        if key not in self._keys and len(self._keys) >= self._max_keys:
+            cutoff = now - self._window
+            for stale in [k for k, v in self._keys.items() if v[0] <= cutoff]:
+                del self._keys[stale]
+            if len(self._keys) >= self._max_keys:
+                # Still full of live keys: count it under one shared key.
+                key = ("overflow", key[1])
+        state = self._keys.get(key)
+        if state is not None and now - state[0] < self._window:
+            state[1] += 1
+            return False, 0
+        held = int(state[1]) if state is not None else 0
+        self._keys[key] = [now, 0]
+        return True, held
+
+
+def _client_host(request: Any) -> str | None:
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", None)
+    return host if isinstance(host, str) else None
+
+
 class ConnectorLeaseExchange:
     """The exchange port's operations, bound to one application's store."""
 
-    def __init__(self, *, store: Any, drivers: Any) -> None:
+    def __init__(
+        self, *, store: Any, drivers: Any, limiter: DenialLimiter | None = None
+    ) -> None:
         self._store = store
         self._drivers = drivers
+        self._limiter = limiter or DenialLimiter()
+
+    async def _audit(
+        self,
+        *,
+        event_type: str,
+        resource_id: str | None,
+        detail: str,
+        path: str,
+        request: Any,
+    ) -> None:
+        """One ``security_events`` row with the socket peer; never raises."""
+        logger.warning(
+            "security-event %s: resource=connector_lease/%s detail=%s",
+            event_type,
+            resource_id,
+            detail,
+        )
+        try:
+            await self._store.record_security_event(
+                event_type=event_type,
+                resource_type="connector_lease",
+                resource_id=resource_id,
+                method="POST",
+                path=path,
+                detail=detail,
+                client_ip=_client_host(request),
+            )
+        except Exception as exc:
+            logger.error("security-event DB write failed (deny proceeds): %s", exc)
 
     async def _checked_row(self, identity_token: str, lease_token: str) -> Any:
         identity_ok = token_shape_valid(identity_token, DRIVER_IDENTITY_PREFIX)
@@ -150,20 +234,29 @@ class ConnectorLeaseExchange:
             )
             if part
         )
-        await log_security_event(
-            self._store,
-            resource_type="connector_lease",
-            event_type=(
-                "connector_lease_exchange_denied"
-                if path == EXCHANGE_PATH
-                else "connector_lease_introspection_denied"
-            ),
-            resource_id=str(lease_id) if lease_id else None,
-            detail=detail,
-            request=request,
-            method="POST",
-            path=path,
+        identity = row["identity_id"] if row is not None else None
+        record, held = self._limiter.admit(
+            (str(identity) if identity else "unknown", reason)
         )
+        if record and identity:
+            await self._audit(
+                event_type=(
+                    "connector_lease_exchange_denied"
+                    if path == EXCHANGE_PATH
+                    else "connector_lease_introspection_denied"
+                ),
+                resource_id=str(lease_id) if lease_id else None,
+                detail=detail + (f" coalesced={held}" if held else ""),
+                path=path,
+                request=request,
+            )
+        elif record:
+            logger.warning(
+                "lease exchange: %s from %s (%d more in the last window)",
+                reason,
+                _client_host(request) or "unknown",
+                held,
+            )
         status = 401 if reason in _IDENTITY_DENIALS else 403
         return ExchangeOutcome(status, {"error": reason})
 
@@ -230,18 +323,15 @@ class ConnectorLeaseExchange:
                 request=request,
             )
         if int(counted["exchange_count"]) == 1:
-            await log_security_event(
-                self._store,
-                resource_type="connector_lease",
+            await self._audit(
                 event_type="connector_lease_first_exchange",
                 resource_id=str(row["lease_id"]),
                 detail=(
                     f"identity={row['identity_id']} connector={row['connector_id']} "
                     f"driver={row['driver']} operation={operation}"
                 ),
-                request=request,
-                method="POST",
                 path=EXCHANGE_PATH,
+                request=request,
             )
         return ExchangeOutcome(
             200,
@@ -296,6 +386,7 @@ __all__ = [
     "INTROSPECT_PATH",
     "NO_STORE",
     "ConnectorLeaseExchange",
+    "DenialLimiter",
     "ExchangeOutcome",
     "check_denial",
 ]
