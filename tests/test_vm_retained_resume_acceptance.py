@@ -235,25 +235,53 @@ async def test_execute_proves_worker_sentinel_before_terminal_vm_teardown(
                 state["vm_deleted"] = True
                 return VMTeardownResult("completed", True)
 
-            async def uncharged_source(query, *args):
+            async def completed_unrelated_source(query, *args):
+                if "FROM vm_job_retained_resumes op JOIN jobs" in query:
+                    assert tuple(map(str, args)) == (job_id,)
+                    return None
+                if "FROM vm_job_cancel_retention_authorities a" in query:
+                    assert "JOIN vm_workspace_cleanup_admissions c" in query
+                    assert tuple(map(str, args)) == (job_id,)
+                    return None
+                if query == "SELECT * FROM jobs WHERE id=$1":
+                    assert tuple(map(str, args)) == (job_id,)
+                    return {
+                        "id": job_id, "status": "completed",
+                        "execution_lane": "stateless", "assigned_agent_id": None,
+                        "parent_job_id": None, "context": {"vm": {
+                            "status": "ready", "provision_generation": new_gen,
+                            "vm_uid": new_vm_uid, "rootdisk_pvc_uid": pvc_uid,
+                        }},
+                    }
                 assert "FROM vm_creation_retries" in query
                 assert tuple(map(str, args)) == (job_id, new_gen)
                 return {"controller_configuration": {"version": 1}}
 
             async def no_retained_disk_hold(query, *args):
-                if query == "SELECT to_regclass('public.vm_idle_operations') IS NOT NULL":
+                if query in {
+                    "SELECT to_regclass('public.vm_idle_operations') IS NOT NULL",
+                    "SELECT to_regclass('public.vm_job_retained_resumes') IS NOT NULL",
+                    "SELECT to_regclass('public.vm_job_cancel_retention_authorities') IS NOT NULL",
+                }:
+                    assert not args
                     return True
                 assert "storage_disposition='retention_unknown'" in query
                 assert tuple(map(str, args)) == (job_id, new_gen, pvc_uid)
                 return None
+
+            async def owner_lock(query, *args):
+                assert query == "SELECT pg_advisory_xact_lock(hashtextextended($1,0))"
+                assert args == (f"workspace-recovery:job:{job_id}",)
+                return "SELECT 1"
 
             @asynccontextmanager
             async def transaction():
                 yield
 
             connection = SimpleNamespace(
-                fetchrow=AsyncMock(side_effect=uncharged_source),
+                fetchrow=AsyncMock(side_effect=completed_unrelated_source),
                 fetchval=AsyncMock(side_effect=no_retained_disk_hold),
+                execute=AsyncMock(side_effect=owner_lock),
                 transaction=transaction,
             )
 
@@ -282,8 +310,9 @@ async def test_execute_proves_worker_sentinel_before_terminal_vm_teardown(
             )
             assert teardown["teardown_disposition"] == "completed"
             cleanup.complete_cleanup_permit.assert_awaited_once()
-            assert connection.fetchrow.await_count == 2
-            assert connection.fetchval.await_count == 2
+            assert connection.fetchrow.await_count == 5
+            assert connection.fetchval.await_count == 4
+            assert connection.execute.await_count == 2
             state["terminal"] = True
             return {"id": str(uuid4()), "state": "done", "outcome": {},
                     "finalized_at": authorized_at, "accepted_lease_token": 1}

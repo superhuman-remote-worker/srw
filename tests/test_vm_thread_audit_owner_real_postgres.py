@@ -442,6 +442,12 @@ async def test_migration_backfills_live_identity_without_inventing_old_settlemen
         # 0297 adds a nullable Resume link without creating historical authority.
         assert "thread_retained_resume_id" not in dict(source)
         assert migrated_source.pop("thread_retained_resume_id") is None
+        # 0339's Job-only links must also leave this historical thread unbound.
+        for column in (
+            "job_retained_resume_id", "job_retained_resume_admitted_xact_id",
+        ):
+            assert column not in dict(source)
+            assert migrated_source.pop(column) is None
         assert migrated_source == dict(source)
         assert (
             await store.fetchrow(
