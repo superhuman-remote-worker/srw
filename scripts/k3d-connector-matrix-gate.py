@@ -17,26 +17,36 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
   api        GET /api/datasources/drivers as the test account answers 200
              with one entry per built-in spec of this checkout, in order;
              every datasource driver has access levels, each with an
-             enforced_by line; built-ins are built-in and trusted; a
-             development driver the deployment installs (the lease probe,
-             orchestrator.connectorLeases.probeDriver; the echo service,
-             connectors.drivers.echo) may follow, labelled development and
-             untrusted (a NOTE names it); the enforced and installation
-             egress columns say "not applicable", or for a service-plane
-             driver a hosting status (D5); no credential slot schema carries
-             a default or an example
+             enforced_by line; built-ins are built-in and trusted. Each list
+             below comes from shared.connectors.builtin, and its drivers are
+             there only where the deployment installs them (a NOTE names
+             them), each list in its own order:
+               OFFICIAL_SERVICE_SPECS (the git swap driver,
+                 connectors.drivers.gitSwap): tier trusted, trusted, image set;
+               MANAGED_MCP_SPECS (the Gitea MCP server,
+                 connectors.drivers.managedMcp): tier managed, untrusted, its
+                 claims not the author's, image set;
+               DEVELOPMENT_SPECS (the lease probe, the echo service, the MCP
+                 test servers): labelled development and untrusted.
+             A registered image driver (D6) the account can see may be
+             listed too, tier trusted or custom (a NOTE names it). The
+             enforced and installation egress columns say "not applicable",
+             or for a service-plane driver a hosting status (D5); no
+             credential slot schema carries a default or an example
   page       Playwright: Settings -> Connector drivers lists every driver the
              API returns, each access level with its "Enforced by" line, and
              the Connectors page links to it
   picker     Playwright: Connectors -> New connector -> Public, then for every
-             publishable type: the access choices shown are exactly the levels
-             the driver's spec offers, literally MCP read-write only, KB
-             read-only only, Postgres both. A public connector's read-only is
-             only declared, so no "enforced by" line shows there: the hint is
-             the scope-your-credentials advice, except the KB's always
-             read-only one. The form is closed without saving. An account
-             without the public_datasources grant gets the public choice
-             shown in the gate's own browser only (a NOTE says so).
+             publishable type, a managed MCP server's included: the access
+             choices shown are exactly the levels the driver's spec offers,
+             literally MCP read-write only, KB read-only only, Postgres both.
+             A managed MCP server takes the generic form, whose access choice
+             lists exactly the driver's levels too. A public connector's
+             read-only is only declared, so no "enforced by" line shows there:
+             the hint is the scope-your-credentials advice, except the KB's
+             always read-only one. The form is closed without saving. An
+             account without the public_datasources grant gets the public
+             choice shown in the gate's own browser only (a NOTE says so).
   links      Playwright: a project's Connectors tab shows, per linked type,
              the access the driver offers (MCP a fixed read-write badge, KB a
              fixed read-only badge, Postgres the switch) and the bound level's
@@ -99,14 +109,17 @@ PLAN = [
     "preflight: the orchestrator pod serves this checkout's matrix module, "
     "datasource router and built-in specs",
     "api: GET /api/datasources/drivers lists every built-in spec in order, "
-    "access levels with enforced_by, built-in trust, egress not applicable, "
-    "no value in a credential slot schema",
+    "then the official, managed and development specs it installs, each "
+    "labelled by its own trust tier; access levels with enforced_by, egress "
+    "not applicable or a hosting status, no value in a credential slot schema",
     "page: Playwright finds every driver and each level's 'Enforced by' line "
     "on Settings -> Connector drivers; the Connectors page links to it",
     "picker: Playwright opens New connector, makes it public and, per "
-    "publishable type, sees exactly the access levels the driver offers (MCP "
-    "read-write only, KB read-only only, Postgres both) and the declared-only "
-    "hint, no 'enforced by' line; closes without saving",
+    "publishable type (managed MCP servers included), sees exactly the access "
+    "levels the driver offers (MCP read-write only, KB read-only only, "
+    "Postgres both) and the declared-only hint, no 'enforced by' line; a "
+    "managed server's generic form offers exactly its levels; closes without "
+    "saving",
     "links: Playwright opens a project's Connectors tab over synthetic link "
     "rows and sees each driver's access with the bound level's 'Enforced by' "
     "line; links nothing",
@@ -217,6 +230,20 @@ def offered(driver: dict[str, Any]) -> tuple[dict | None, dict | None]:
     return levels[0], levels[-1]
 
 
+def level_ids(driver: dict[str, Any]) -> list[str]:
+    """A driver's access level ids, lowest rank first."""
+    levels = sorted(driver.get("access_levels") or [], key=lambda lv: lv["rank"])
+    return [level["id"] for level in levels]
+
+
+def access_choice(driver: dict[str, Any]) -> list[str] | None:
+    """The level ids a connector's config may name (its ``access`` property's
+    enum), or None when its config names no level."""
+    properties = (driver.get("config_schema") or {}).get("properties") or {}
+    access = properties.get("access")
+    return list(access.get("enum") or []) if isinstance(access, dict) else None
+
+
 def picker_expectation(driver: dict[str, Any]) -> tuple[list[str], str]:
     """The public access choices the form shows, and the hint key under them.
 
@@ -254,31 +281,126 @@ def is_development(driver: dict[str, Any]) -> bool:
     return (driver.get("trust") or {}).get("tier") == "development"
 
 
-def matrix_problems(
-    matrix: dict[str, Any],
-    spec_names: list[str],
-    development_names: frozenset[str] = frozenset(),
-) -> list[str]:
+def is_managed(driver: dict[str, Any]) -> bool:
+    """Whether the matrix labels a driver a managed MCP server (D5a)."""
+    return (driver.get("trust") or {}).get("tier") == "managed"
+
+
+def is_registered(driver: dict[str, Any]) -> bool:
+    """Whether a row is a registered image driver (D6), not a spec of SRW's."""
+    return isinstance(driver.get("registration"), dict)
+
+
+@dataclass(frozen=True)
+class SpecClasses:
+    """This checkout's driver names, by the trust the matrix must give them.
+
+    Only the built-ins are always installed; a deployment installs the others
+    by naming an image or turning on a switch.
+    """
+
+    builtin: tuple[str, ...]
+    #: SRW's own service driver images (the git swap driver).
+    official: tuple[str, ...] = ()
+    #: Managed MCP servers from SRW's catalogue (the Gitea MCP server).
+    managed: tuple[str, ...] = ()
+    #: Development drivers (the lease probe, the echo service, ...).
+    development: tuple[str, ...] = ()
+
+    def kind_of(self, name: str | None) -> str | None:
+        for kind in ("builtin", "official", "managed", "development"):
+            if name in getattr(self, kind):
+                return kind
+        return None
+
+
+def spec_classes() -> SpecClasses:
+    """The classes of this checkout's specs, from ``shared.connectors.builtin``."""
+    src = str(ROOT / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    from shared.connectors.builtin import (
+        BUILTIN_SPECS,
+        DEVELOPMENT_SPECS,
+        MANAGED_MCP_SPECS,
+        OFFICIAL_SERVICE_SPECS,
+    )
+
+    return SpecClasses(
+        builtin=tuple(spec.name for spec in BUILTIN_SPECS),
+        official=tuple(spec.name for spec in OFFICIAL_SERVICE_SPECS),
+        managed=tuple(spec.name for spec in MANAGED_MCP_SPECS),
+        development=tuple(spec.name for spec in DEVELOPMENT_SPECS),
+    )
+
+
+def _in_order(seen: list[str], expected: tuple[str, ...]) -> bool:
+    """Whether ``seen`` is ``expected`` with some names left out, in its order."""
+    remaining = iter(expected)
+    return all(name in remaining for name in seen)
+
+
+def trust_problem(driver: dict[str, Any], kind: str | None) -> str | None:
+    """What is wrong with a driver's trust for its class, if anything."""
+    name = driver.get("name")
+    trust = driver.get("trust") or {}
+    image = trust.get("image")
+    has_image = isinstance(image, str) and bool(image.strip())
+    if kind == "builtin":
+        if trust.get("tier") != "builtin" or trust.get("trusted") is not True:
+            return f"{name} is not built-in and trusted"
+    elif kind == "official":
+        if trust.get("tier") != "trusted" or trust.get("trusted") is not True:
+            return f"{name} is not labelled trusted"
+        if not has_image:
+            return f"{name} names no image"
+    elif kind == "managed":
+        if (
+            not is_managed(driver)
+            or trust.get("trusted") is not False
+            or trust.get("claims_declared_by_author") is not False
+        ):
+            return f"{name} is not labelled managed, untrusted and SRW's word"
+        if not has_image:
+            return f"{name} names no image"
+    elif kind == "development":
+        if not is_development(driver) or trust.get("trusted") is not False:
+            return f"{name} is not labelled development and untrusted"
+    elif is_registered(driver):
+        if trust.get("tier") not in ("trusted", "custom"):
+            return f"registered driver {name} is not labelled trusted or custom"
+    else:
+        return f"{name} is no driver spec of this checkout"
+    return None
+
+
+def matrix_problems(matrix: dict[str, Any], specs: SpecClasses) -> list[str]:
     """Everything the API matrix gets wrong against this checkout's specs.
 
-    The built-in specs are listed in order, each built-in and trusted. A
-    development driver (``DEVELOPMENT_SPECS``) may follow when the deployment
-    installs it, and must then be labelled development and untrusted; any
+    The built-in specs are listed in order, each built-in and trusted. An
+    official service driver, a managed MCP server or a development driver
+    may be listed where the deployment installs it, in its own list's
+    order and labelled by its own trust tier (:func:`trust_problem`); a
+    registered image driver (D6) the caller can see may be listed too. Any
     other driver is a problem.
     """
     problems: list[str] = []
     drivers = matrix.get("drivers") or []
-    names = [d.get("name") for d in drivers if d.get("name") not in development_names]
-    if names != spec_names:
-        problems.append(f"drivers {names} are not the built-in specs {spec_names}")
+    names = [d.get("name") for d in drivers]
+    builtins = [name for name in names if specs.kind_of(name) == "builtin"]
+    if builtins != list(specs.builtin):
+        problems.append(
+            f"drivers {builtins} are not the built-in specs {list(specs.builtin)}"
+        )
+    for kind in ("official", "managed", "development"):
+        expected = getattr(specs, kind)
+        seen = [name for name in names if specs.kind_of(name) == kind]
+        if not _in_order(seen, expected):
+            problems.append(f"{kind} drivers {seen} are not in the order of {expected}")
     for driver in drivers:
-        name = driver.get("name")
-        trust = driver.get("trust") or {}
-        if name in development_names:
-            if not is_development(driver) or trust.get("trusted") is not False:
-                problems.append(f"{name} is not labelled development and untrusted")
-        elif trust.get("tier") != "builtin" or trust.get("trusted") is not True:
-            problems.append(f"{name} is not built-in and trusted")
+        problem = trust_problem(driver, specs.kind_of(driver.get("name")))
+        if problem:
+            problems.append(problem)
     for driver in drivers:
         name = driver.get("name")
         levels = driver.get("access_levels") or []
@@ -289,10 +411,14 @@ def matrix_problems(
             for level in levels
             if not (level.get("enforced_by") or "").strip()
         ]
+        if is_managed(driver) and access_choice(driver) != level_ids(driver):
+            # The generic form offers the config's choice as the access.
+            problems.append(f"{name} config access is not its levels")
         egress = driver.get("egress") or {}
-        if driver.get("plane") == "service":
-            # A service-plane driver runs its own pods (D5): its columns say
-            # how they are pinned, or that this deployment hosts none.
+        if driver.get("plane") == "service" or is_registered(driver):
+            # A service-plane driver runs its own pods (D5), as does every
+            # registered image (D6): its columns say how they are pinned, or
+            # that this deployment hosts none.
             expected = {
                 "enforced": {"enforced", "not_enforced"},
                 "installation": {"verified", "unverified", "not_enforced"},
@@ -346,8 +472,8 @@ class MatrixGate:
         self.matrix: dict[str, Any] = {}
         #: Set when the account lacks the publish grant (see reveal_publish).
         self.revealed = False
-        #: This checkout's DEVELOPMENT_SPECS names (set by the api check).
-        self.development: frozenset[str] = frozenset()
+        #: This checkout's spec names by class (set by the api check).
+        self.specs = SpecClasses(builtin=())
 
     def run(self) -> int:
         try:
@@ -408,27 +534,28 @@ class MatrixGate:
         ):
             return
         self.matrix = body
-        sys.path.insert(0, str(ROOT / "src"))
-        from shared.connectors.builtin import BUILTIN_SPECS, DEVELOPMENT_SPECS
-
-        self.development = frozenset(spec.name for spec in DEVELOPMENT_SPECS)
-        problems = matrix_problems(
-            self.matrix, [spec.name for spec in BUILTIN_SPECS], self.development
-        )
+        self.specs = spec_classes()
+        problems = matrix_problems(self.matrix, self.specs)
         self.report.check(
-            "api: every built-in driver, levels with enforced_by, built-in trust "
-            "(a development driver labelled development), egress not applicable, "
-            "no slot values",
+            "api: every built-in driver, levels with enforced_by, each driver "
+            "labelled by its class (built-in trusted; an installed official one "
+            "trusted, a managed one managed, a development one development), "
+            "egress not applicable or a hosting status, no slot values",
             not problems,
             "; ".join(problems[:5]),
         )
-        installed = sorted(
-            d["name"] for d in self.matrix.get("drivers") or [] if is_development(d)
-        )
-        if installed:
-            self.report.note(
-                f"development drivers installed by this deployment: {installed}"
-            )
+        drivers = self.matrix.get("drivers") or []
+        for kind in ("official", "managed", "development"):
+            installed = [
+                d["name"] for d in drivers if self.specs.kind_of(d.get("name")) == kind
+            ]
+            if installed:
+                self.report.note(
+                    f"{kind} drivers installed by this deployment: {installed}"
+                )
+        registered = [d["name"] for d in drivers if is_registered(d)]
+        if registered:
+            self.report.note(f"registered drivers the account can see: {registered}")
 
     def cockpit(self) -> None:
         try:
@@ -541,23 +668,34 @@ class MatrixGate:
         public = page.locator(".visibility-toggle input[type=checkbox]")
         public.check(timeout=30000)
         hints = json.loads(EN.read_text())["datasources"]["form"]
-        offered_types = set(
-            type_select.locator("option").evaluate_all("els => els.map(e => e.value)")
+        # The form lists a managed MCP server once the matrix it fetched says
+        # it is installed, so wait for those options before reading them.
+        offered_types = self.read_types(
+            type_select,
+            {
+                driver["legacy_type"]
+                for driver in self.matrix["drivers"]
+                if is_managed(driver)
+                and driver.get("legacy_type")
+                and owns_type(driver)
+            },
         )
         problems: list[str] = []
         seen_literal: dict[str, list[str]] = {}
+        managed_seen: list[str] = []
         for driver in self.matrix["drivers"]:
             kind = driver.get("legacy_type")
             # The form picks a stored type, so only the driver that owns it
-            # (not a variant such as srw.mcp-remote/v1) is the type's; a
-            # development driver (the lease probe) is in no catalogue. Its
-            # label is the api check's business, so either sign skips it.
+            # (not a variant such as srw.mcp-remote/v1 or the git swap
+            # driver) is the type's; a development driver (the lease probe)
+            # is in no catalogue. Its label is the api check's business, so
+            # either sign skips it.
             if (
                 not kind
                 or kind in UNPUBLISHED_IN_FORM
                 or not owns_type(driver)
                 or is_development(driver)
-                or driver.get("name") in self.development
+                or driver.get("name") in self.specs.development
             ):
                 continue
             if kind not in offered_types:
@@ -573,6 +711,17 @@ class MatrixGate:
                 problems.append(f"{kind}: hint {hint[:80]!r} is not {hint_key}")
             if claims:
                 problems.append(f"{kind}: a public access claims {claims[:80]!r}")
+            if is_managed(driver):
+                # No bespoke section: the generic form renders its spec, and
+                # its access choice is the connector's level.
+                levels = level_ids(driver)
+                shown = self.read_generic_access(page, driver["name"], levels)
+                if shown != levels:
+                    problems.append(
+                        f"{kind}: the generic form offers access {shown}, "
+                        f"the spec's levels are {levels}"
+                    )
+                managed_seen.append(kind)
         problems += [
             f"{kind}: shows {seen_literal.get(kind)}, the gate expects {expected}"
             for kind, expected in LITERAL_CHOICES.items()
@@ -581,11 +730,44 @@ class MatrixGate:
         page.locator(".form-header app-icon-button button").first.click()
         self.report.check(
             "picker (Playwright): access choices are exactly the driver's levels "
-            "(MCP read-write only, KB read-only only, Postgres both); no "
-            "'enforced by' claim on a public connector",
+            "(MCP read-write only, KB read-only only, Postgres both; a managed "
+            "MCP server its own, in its generic form too); no 'enforced by' "
+            "claim on a public connector",
             not problems,
             "; ".join(problems[:5]),
         )
+        if managed_seen:
+            self.report.note(f"managed MCP types checked in the form: {managed_seen}")
+
+    @staticmethod
+    def read_types(select: Any, awaited: set[str]) -> set[str]:
+        """The type select's option values, once every ``awaited`` one shows
+        (or a few seconds passed: a missing one is then the check's FAIL)."""
+        deadline = time.monotonic() + 10
+        while True:
+            values = set(
+                select.locator("option").evaluate_all("els => els.map(e => e.value)")
+            )
+            if awaited <= values or time.monotonic() >= deadline:
+                return values
+            time.sleep(0.2)
+
+    @staticmethod
+    def read_generic_access(page: Any, name: str, expected: list[str]) -> list[str]:
+        """The access choices a driver's generic form offers (its config's
+        ``access`` select, the unset choice left out), once they settle."""
+        options = page.locator(
+            f'.generic-form[data-driver="{name}"] '
+            '[data-pointer="/config/access"] option'
+        )
+        deadline = time.monotonic() + 5
+        while True:
+            shown = options.evaluate_all(
+                "els => els.filter(e => e.value !== '').map(e => e.textContent.trim())"
+            )
+            if shown == expected or time.monotonic() >= deadline:
+                return shown
+            time.sleep(0.2)
 
     @staticmethod
     def read_choices(page: Any, expected: list[str]) -> tuple[list[str], str, str]:
