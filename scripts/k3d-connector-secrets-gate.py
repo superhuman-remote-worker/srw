@@ -18,13 +18,25 @@ the count.
 
 Fixtures (all disposable, all named after the gate id):
 
+  client     ``<gate id>-oauth``, a public Keycloak client of the srw realm
+             with direct access grants and the profile, email and roles
+             scopes, which every account logs in with (as the D3a gate does:
+             an admin-cli token carries no roles, and the JIT path then
+             records the owner as no administrator)
+  accounts   the second account (``<gate id>``) and the stranger
+             (``<gate id>-x``): Keycloak users of the srw realm created inside
+             the orchestrator pod with the pod's own Keycloak admin
+             credentials (they never leave the pod; the passwords go over
+             stdin), their app rows admitted before their first login, so no
+             cloud or Gitea account is provisioned. ``--other-user`` and
+             ``--stranger-user`` name existing approved non-administrators
+             instead
   postgres   a database and a login role on srw-postgres (SELECT on one
              marker table); every Postgres connector's URL carries the role's
              password, which the resource never may
   project    one project owned by the owner account (``--user``) with its
-             native knowledge base, and the second account (``--other-user``)
-             added as an editor; the third account (``--stranger-user``) is
-             not a member
+             native knowledge base, and the second account added as an editor;
+             the stranger is not a member
   legacy     one Postgres row written straight to the table, as an
              orchestrator without the write-through would; one connector
              written through the API whose resource is then put back to its
@@ -33,17 +45,18 @@ Fixtures (all disposable, all named after the gate id):
 Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
 
   preflight  Tilt reports the srw resource ``ok``; every orchestrator pod
-             serves this checkout's D3b modules byte for byte; the three
-             accounts are approved, the owner may publish, the others are not
-             administrators
+             serves this checkout's D3b modules byte for byte
+  account    the three accounts are approved, the owner may publish, the
+             other two are not administrators
   backfill   the deployed ``migrate_stored_connectors``, rerun in the
              orchestrator pod, gives the legacy row its Connector and its
              secret and restores the D3a-shaped one: each of this run's
              Connectors then has exactly one ``connector-<32 hex>`` secret,
              in the Connector's scope, whose keys are the ones its driver's
              slots name (stated per fixture), that the resource's
-             ``spec.credentials`` names and that rebuild the row's
-             credentials and full URL; the project's own knowledge base's
+             ``spec.credentials`` names (all but the row digest) and that
+             rebuild the row's credentials and full URL; the project's own
+             knowledge base's
              secret is in the project's scope; a rerun changes no secret
   write      through the API: a create writes the secret; an edit without
              credentials, or with an empty object, keeps it (same version);
@@ -53,26 +66,34 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
              resource API refuses to write a ``connector-`` secret
   shared     a public and a project-linked Postgres connector of the owner,
              each secret's URL marked (an ``application_name``) so it differs
-             from its row: the other account's session selecting both is
-             admitted; the deployed delivery path (the application's own
-             composition) delivers both to that session from their secrets;
-             after one turn the agent logs a connection to each
-  refused    the stranger's session selecting the linked or a private
-             connector is refused at creation, and the deployed delivery path
-             refuses a stranger's session that names the linked connector
+             from its row, the row digest kept: the other account's session
+             selecting both is admitted; the deployed delivery path (the
+             application's own composition) delivers both to that session
+             from their secrets; after one turn the agent logs a connection
+             to each. Then the same for the other account's stateless job:
+             admitted, delivered from the secrets by the deployed job
+             delivery path, and its agent logs a connection to each
+  refused    the stranger's session and job selecting the linked or a
+             private connector are refused at creation, and the deployed
+             delivery path refuses a stranger's session that names the
+             linked connector
   leaks      none of the gate's secret values appears in this run's
              ``srw_resource_revisions`` or ``srw_resources`` rows, in any
              connector or resource API response (reads, lists, Test, the
              driver matrix), or in the orchestrator's or the stateless agents'
              logs since the gate started
   cleanup    nothing this run created is left: sessions titled with the gate
-             id and their pods, connectors, their Connector resources and
-             secrets, the project, the database and the role
+             id and their pods, the job, connectors, their Connector
+             resources and secrets, the project, the disposable accounts
+             (their app rows through the user API, then their Keycloak
+             users), the OAuth client, the database and the role
 
 Run with the repository venv on the k3d-srw cluster, alone: this is a
 mutating gate. The owner must be able to publish (an administrator or the
-``public_datasources`` grant); the other two accounts must be approved
-non-administrators.
+``public_datasources`` grant) and, for the disposable accounts, be an
+administrator (it deletes their app rows); an account named with
+``--other-user`` or ``--stranger-user`` must be an approved
+non-administrator.
 
   .venv/bin/python scripts/k3d-connector-secrets-gate.py           # plan
   .venv/bin/python scripts/k3d-connector-secrets-gate.py \\
@@ -143,6 +164,14 @@ SERVED = (
 SECRET_PREFIX = "connector-"
 URL_KEY = "url"
 SHAPE_KEY = "shape"
+#: The digest of the row a secret was written from; no reference names it.
+ROW_KEY = "row"
+#: The disposable accounts' email domain (RFC 2606, never delivered).
+ACCOUNT_DOMAIN = "example.invalid"
+#: The second account's session: the most an approved user without grants
+#: may pick (``shared.runtime.core.capability_grants.CATALOG``).
+SESSION_PERMISSION_MODE = "auto_accept"
+JOB_TERMINAL = frozenset({"completed", "failed", "cancelled", "pending_review"})
 CONNECTOR_SECRET_DETAIL = (
     "This name belongs to a connector's credentials; change them on the "
     "Connectors page (/api/datasources), which writes the connector and its "
@@ -296,7 +325,7 @@ cap_memory()
 envelope = json.loads(sys.stdin.readline())
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 form = urllib.parse.urlencode({
-    "grant_type": "password", "client_id": "admin-cli", "scope": "openid",
+    "grant_type": "password", "client_id": envelope["client_id"], "scope": "openid",
     "username": envelope["username"], "password": envelope["password"],
 }).encode()
 with opener.open(envelope["token_url"], data=form, timeout=30) as response:
@@ -487,16 +516,20 @@ asyncio.run(main())
 """
 )
 
-# The deployed delivery path for one session, through the application's own
-# composition: authorize, resolve, read the secrets, build the payload. It
-# prints names, and which delivered URL carries the mark; never a value.
+# The deployed delivery path for one session or one job, through the
+# application's own composition: authorize, resolve, read the secrets, build
+# the payload. It prints names, and which delivered URL carries the mark;
+# never a value.
 _DELIVERY_PROGRAM = (
     _POD_MEMORY_CAP
     + r"""
 import asyncio, json, logging, sys
 from types import SimpleNamespace
 from fastapi import HTTPException
-from orchestrator.application.preparation import datasource_payload_dependencies
+from orchestrator.application.preparation import (
+    datasource_payload_dependencies,
+    job_datasource_selection_dependencies,
+)
 from orchestrator.application.sessions import (
     thread_datasource_authorization_dependencies,
 )
@@ -504,6 +537,9 @@ from orchestrator.application.settings import DeploymentSettings
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.services.agent_datasource_payload import build_datasources_payload
 from orchestrator.services.connector_drivers.registry import builtin_connector_drivers
+from orchestrator.services.job_datasource_selection import (
+    resolve_authorized_job_datasources,
+)
 from orchestrator.services.thread_datasource_authorization import (
     resolve_authorized_thread_datasources,
 )
@@ -516,17 +552,26 @@ async def main():
         server_settings={"default_transaction_read_only": "on"},
     )
     await db.connect()
+    resources = SimpleNamespace(postgres_db=db)
     try:
-        thread = request.get("thread") or await db.get_thread(request["thread_id"])
         try:
-            rows = await resolve_authorized_thread_datasources(
-                thread,
-                request["datasource_ids"],
-                target_project_ids=request["project_ids"],
-                dependencies=thread_datasource_authorization_dependencies(
-                    SimpleNamespace(postgres_db=db)
-                ),
-            )
+            if request.get("job_id"):
+                rows = await resolve_authorized_job_datasources(
+                    await db.get_job(request["job_id"]),
+                    dependencies=job_datasource_selection_dependencies(resources),
+                )
+            else:
+                thread = request.get("thread") or await db.get_thread(
+                    request["thread_id"]
+                )
+                rows = await resolve_authorized_thread_datasources(
+                    thread,
+                    request["datasource_ids"],
+                    target_project_ids=request["project_ids"],
+                    dependencies=thread_datasource_authorization_dependencies(
+                        resources
+                    ),
+                )
         except HTTPException as exc:
             print(json.dumps({"status": exc.status_code, "detail": str(exc.detail)}))
             return
@@ -549,6 +594,147 @@ async def main():
         ),
     }))
 asyncio.run(main())
+"""
+)
+
+# The run's Keycloak fixtures (the D3a gate's program, unchanged but for the
+# accounts' first name), through the orchestrator's own admin
+# credentials (KEYCLOAK_ADMIN_*, the KeycloakGroupSync ones): they stay in the
+# pod and are never printed.
+#
+#   client  ``<gate id>-oauth``: a public client with direct access grants and
+#           the profile, email and roles scopes, so a gate login carries the
+#           claims a cockpit login does. (admin-cli carries none: its tokens
+#           have no realm_access, and every such login makes the JIT path
+#           record the account as no administrator.) Marked with the gate id.
+#   user    the disposable second account, named the gate id. The local
+#           realm's user profile may drop custom attributes, so its ownership
+#           is the gate id in username and email, not a marker.
+#
+# Every action finds both by exact name; delete removes only what carries this
+# run's marker or email (and its recorded id, once known).
+_KEYCLOAK_PROGRAM = (
+    _POD_MEMORY_CAP
+    + r"""
+import json, os, sys, urllib.error, urllib.parse, urllib.request
+cap_memory()
+request = json.loads(sys.stdin.readline())
+base = os.environ.get("KEYCLOAK_URL", "").rstrip("/")
+realm = os.environ.get("KEYCLOAK_REALM", "") or "srw"
+admin = os.environ.get("KEYCLOAK_ADMIN_USER", "")
+admin_password = os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "")
+if not (base and admin and admin_password):
+    print(json.dumps({"error": "the orchestrator has no Keycloak admin credentials"}))
+    raise SystemExit(0)
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+form = urllib.parse.urlencode({
+    "grant_type": "password", "client_id": "admin-cli",
+    "username": admin, "password": admin_password,
+}).encode()
+with opener.open(
+    base + "/realms/master/protocol/openid-connect/token", data=form, timeout=30
+) as response:
+    token = json.load(response)["access_token"]
+admin_api = base + "/admin/realms/" + urllib.parse.quote(realm, safe="")
+def call(method, url, body=None):
+    message = urllib.request.Request(
+        url,
+        data=None if body is None else json.dumps(body).encode(),
+        method=method,
+        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+    )
+    try:
+        with opener.open(message, timeout=30) as response:
+            text = response.read().decode("utf-8", "replace")
+            return response.status, text, response.headers.get("Location") or ""
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode("utf-8", "replace"), ""
+def listing(path, query):
+    status, text, _location = call(
+        "GET", admin_api + path + "?" + urllib.parse.urlencode(query)
+    )
+    if status != 200:
+        raise SystemExit("%s lookup answered HTTP %d" % (path, status))
+    return json.loads(text)
+def users():
+    name = request["username"]
+    found = listing("/users", {"username": name, "exact": "true"})
+    return [u for u in found if u.get("username") == name]
+def clients():
+    name = request["client"]
+    return [c for c in listing("/clients", {"clientId": name}) if c.get("clientId") == name]
+def user_owned(user):
+    return user.get("email") == request["email"] and (
+        not request.get("user_id") or user.get("id") == request["user_id"]
+    )
+def client_owned(client):
+    return (client.get("attributes") or {}).get("srw-gate") == request["marker"] and (
+        not request.get("client_uuid") or client.get("id") == request["client_uuid"]
+    )
+def create(path, body, existing, owned):
+    if existing():
+        return {"exists": True}
+    status, text, location = call("POST", admin_api + path, body)
+    if status != 201:
+        return {"error": "%s create answered HTTP %d: %s" % (path, status, text[:200])}
+    return {
+        "id": location.rstrip("/").rsplit("/", 1)[-1] if location else "",
+        "found": [item["id"] for item in existing() if owned(item)],
+    }
+def counts():
+    return {
+        "users": len(users()) if request.get("user_started") else 0,
+        "clients": len(clients()) if request.get("client_started") else 0,
+    }
+action = request["action"]
+if action == "create-client":
+    print(json.dumps(create("/clients", {
+        "clientId": request["client"],
+        "name": request["client"],
+        "enabled": True,
+        "protocol": "openid-connect",
+        "publicClient": True,
+        "standardFlowEnabled": False,
+        "directAccessGrantsEnabled": True,
+        "serviceAccountsEnabled": False,
+        "fullScopeAllowed": True,
+        "defaultClientScopes": ["profile", "email", "roles"],
+        "optionalClientScopes": [],
+        "attributes": {"srw-gate": request["marker"]},
+    }, clients, client_owned)))
+elif action == "create-user":
+    print(json.dumps(create("/users", {
+        "username": request["username"],
+        "email": request["email"],
+        "emailVerified": True,
+        "enabled": True,
+        "firstName": "D3b",
+        "lastName": "Gate",
+        "requiredActions": [],
+        "credentials": [
+            {"type": "password", "value": request["password"], "temporary": False}
+        ],
+    }, users, user_owned)))
+elif action == "delete":
+    # The user first: the client is how the gate still logs in until the end.
+    deleted, refused = [], []
+    for path, found, owned in (
+        ("/users/", users() if request.get("user_started") else [], user_owned),
+        ("/clients/", clients() if request.get("client_started") else [], client_owned),
+    ):
+        for item in found:
+            if not owned(item):
+                refused.append(item.get("id"))
+                continue
+            status, _text, _location = call("DELETE", admin_api + path + item["id"])
+            if status not in (204, 404):
+                raise SystemExit("%s delete answered HTTP %d" % (path, status))
+            deleted.append(item["id"])
+    print(json.dumps({"deleted": deleted, "refused": refused, **counts()}))
+elif action == "count":
+    print(json.dumps(counts()))
+else:
+    print(json.dumps({"error": "unknown action"}))
 """
 )
 
@@ -587,17 +773,22 @@ class Api:
     def __init__(self, username: str, password: str) -> None:
         self.username = username
         self.password = secret(password)
+        # The run's own OAuth client, once it exists (see _KEYCLOAK_PROGRAM).
+        self.client_id: str | None = None
 
     def call_counting(
         self, method: str, path: str, body: Any = None
     ) -> tuple[int, Any, int]:
         """The answer and how many of this run's secret values its raw body
         held."""
+        if not self.client_id:
+            raise GateError("no OAuth client to log in with")
         result = in_orchestrator(
             _API_PROGRAM,
             {
                 "username": self.username,
                 "password": self.password,
+                "client_id": self.client_id,
                 "token_url": KEYCLOAK_TOKEN_URL,
                 "method": method,
                 "path": path,
@@ -659,7 +850,8 @@ def secret_problems(
 
     ``keys`` is what its driver's slots name for the fixture (``None``: any,
     for a row the gate did not write); an empty set means no secret at all.
-    ``scope`` is the scope the Connector must live in, when known.
+    The secret also holds the row digest (``ROW_KEY``), which no reference
+    names.  ``scope`` is the scope the Connector must live in, when known.
     """
     if not entry or not entry.get("row"):
         return ["no row"]
@@ -676,11 +868,15 @@ def secret_problems(
     elif not resource.get("refs_own"):
         problems.append("a credential is not a reference to its own secret")
     derived = entry.get("derived_keys")
-    if keys is not None and derived is not None and set(derived) != keys:
+    derived_keys = None if derived is None else set(derived) - {ROW_KEY}
+    if keys is not None and derived_keys is not None and derived_keys != keys:
         problems.append(
             f"the deployed mapping derives {derived}, expected {sorted(keys)}"
         )
-    want = set(derived) if keys is None and derived is not None else keys or set()
+    if keys is None and derived_keys is not None:
+        want = derived_keys
+    else:
+        want = keys or set()
     secrets_ = entry.get("secrets") or []
     elsewhere = [s for s in secrets_ if list(s.get("scope") or []) != own_scope]
     if elsewhere:
@@ -696,8 +892,10 @@ def secret_problems(
         return problems
     if len(mine) != 1:
         return problems + [f"{len(mine)} secrets in the Connector's scope"]
-    if set(mine[0].get("keys") or []) != want:
-        problems.append(f"secret keys {mine[0].get('keys')}, expected {sorted(want)}")
+    if set(mine[0].get("keys") or []) != want | {ROW_KEY}:
+        problems.append(
+            f"secret keys {mine[0].get('keys')}, expected {sorted(want | {ROW_KEY})}"
+        )
     if refs is not None and set(refs) != want:
         problems.append(f"the Connector names {refs}, expected {sorted(want)}")
     if not entry.get("rebuilds_row"):
@@ -744,12 +942,16 @@ class Report:
 
 
 PLAN = [
-    "preflight: Tilt srw ok; every orchestrator pod serves this checkout's D3b "
-    "modules; owner, other and stranger accounts approved, owner may publish",
+    "preflight: Tilt srw ok; every orchestrator pod serves this checkout's D3b modules",
+    "account: in the orchestrator pod, with its Keycloak admin credentials, an "
+    "OAuth client <gate id>-oauth (roles in the token) for every login, and "
+    "two disposable accounts -- <gate id> (the second) and <gate id>-x (the "
+    "stranger), app rows admitted before their first login -- or the named "
+    "--other-user/--stranger-user; all approved, the owner may publish",
     "fixture: Postgres database + SELECT-only role (its password in every "
-    "Postgres URL), a project owned by --user with --other-user as editor "
-    "(--stranger-user not a member), one legacy row written straight to the "
-    "table, and one connector put back to its D3a shape",
+    "Postgres URL), a project owned by --user with the second account as "
+    "editor (the stranger not a member), one legacy row written straight to "
+    "the table, and one connector put back to its D3a shape",
     "backfill: rerun the deployed migrate_stored_connectors: each of this "
     "run's Connectors has exactly one connector-<hex> secret in its scope with "
     "the keys its driver's slots name, named by spec.credentials, rebuilding "
@@ -759,15 +961,34 @@ PLAN = [
     "edit merges, a generic edit replaces; a URL edit reaches it; delete "
     "removes it; the resource API refuses a connector- secret",
     "shared: public and project-linked Postgres connectors with marked "
-    "secrets: --other-user's session is admitted, the deployed delivery path "
-    "delivers both from their secrets, the agent logs a connection to each",
-    "refused: --stranger-user's session with the linked or a private connector "
-    "is refused, and so is the deployed delivery path for a stranger's session",
+    "secrets: the second account's session and its stateless job are "
+    "admitted, the deployed delivery paths deliver both from their secrets, "
+    "the agents log a connection to each",
+    "refused: the stranger's session (linked or private connector) and job "
+    "(linked) are refused, and so is the deployed delivery path for a "
+    "stranger's session",
     "leaks: no gate secret value in this run's revisions or resources, in any "
     "connector or resource API answer, or in orchestrator and agent logs",
-    "cleanup: sessions, connectors (their resources and secrets), project, "
-    "database and role; residue check by gate id",
+    "cleanup: sessions, the job, connectors (their resources and secrets), "
+    "project, the disposable accounts (app rows, then Keycloak users), the "
+    "OAuth client, database and role; residue check by gate id",
 ]
+
+
+@dataclass
+class Account:
+    """The second account or the stranger: disposable (a Keycloak user named
+    after the gate id, its app row admitted before its first login) unless
+    the run names an existing one."""
+
+    api: Api
+    email: str
+    disposable: bool
+    label: str
+    id: str = ""
+    keycloak_id: str | None = None
+    started: bool = False  # its Keycloak user was asked for
+    row: bool = False  # its app row was written
 
 
 class ConnectorSecretsGate:
@@ -777,17 +998,26 @@ class ConnectorSecretsGate:
         self.suffix = self.gate_id.split("-", 1)[1]
         self.report = Report(self.gate_id)
         self.owner = Api(args.user, args.password)
-        self.other = Api(args.other_user, args.other_password)
-        self.stranger = Api(args.stranger_user, args.stranger_password)
+        self.second = self._account(
+            args.other_user, args.other_password, self.gate_id, "second account"
+        )
+        self.outsider = self._account(
+            args.stranger_user, args.stranger_password, f"{self.gate_id}-x", "stranger"
+        )
+        self.other, self.stranger = self.second.api, self.outsider.api
         self.started = (datetime.now(timezone.utc) - timedelta(seconds=30)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
         # Everything this run creates, recorded before it is created.
+        self.oauth_client = f"{self.gate_id}-oauth"
+        self.client_started = False  # the run's Keycloak OAuth client
+        self.client_uuid: str | None = None
         self.connectors: dict[str, str] = {}  # label -> datasource id
         # Ids this run deleted on purpose: their secrets must be gone.
         self.deleted: dict[str, str] = {}
         self.project: str | None = None
         self.threads: list[str] = []
+        self.jobs: dict[str, Api] = {}  # job id -> the account that owns it
         self.pg_name = f"d3b_{self.suffix}"
         self.pg_started = False
         self.owner_id = ""
@@ -800,6 +1030,17 @@ class ConnectorSecretsGate:
             name: secret(f"d3b-{name.lower()}-{secrets.token_hex(8)}")
             for name in ("token", "rotated", "a", "a2", "b")
         }
+
+    @staticmethod
+    def _account(
+        username: str | None, password: str | None, name: str, label: str
+    ) -> Account:
+        return Account(
+            api=Api(username or name, password or secrets.token_urlsafe(24)),
+            email=f"{name}@{ACCOUNT_DOMAIN}",
+            disposable=username is None,
+            label=label,
+        )
 
     # -- naming ------------------------------------------------------------
     def name(self, label: str) -> str:
@@ -822,14 +1063,17 @@ class ConnectorSecretsGate:
         )["items"]
         return [pod for pod in listing if not pod["metadata"].get("deletionTimestamp")]
 
-    def logs(self, component: str, container: str) -> list[str]:
-        """Raw log text since the gate started, per pod (never printed)."""
+    def logs(
+        self, component: str, container: str, *, since: str | None = None
+    ) -> list[str]:
+        """Raw log text since the gate started (or ``since``), per pod
+        (never printed)."""
         found: list[str] = []
         for pod in self.pods(component):
             rc, out, _err = run_raw(
                 K
                 + ["logs", pod["metadata"]["name"], "-c", container]
-                + [f"--since-time={self.started}"],
+                + [f"--since-time={since or self.started}"],
                 timeout=120,
             )
             if rc == 0:
@@ -907,15 +1151,103 @@ class ConnectorSecretsGate:
         )
         if problems:
             raise GateError("the deployment does not serve this checkout")
+
+    def keycloak(
+        self, action: str, account: Account | None = None, *, client: bool = False
+    ) -> dict[str, Any]:
+        """Run one action of the in-pod Keycloak program on one disposable
+        account and, with ``client``, on this run's OAuth client."""
+        payload: dict[str, Any] = {
+            "action": action,
+            "client": self.oauth_client,
+            "marker": self.gate_id,
+            "client_started": client and self.client_started,
+            "username": account.api.username if account else self.gate_id,
+            "email": account.email if account else "",
+            "user_started": bool(account and account.started),
+        }
+        if account and action == "create-user":
+            payload["password"] = account.api.password
+        if self.client_uuid:
+            payload["client_uuid"] = self.client_uuid
+        if account and account.keycloak_id:
+            payload["user_id"] = account.keycloak_id
+        result = in_orchestrator(_KEYCLOAK_PROGRAM, payload, timeout=120)
+        if result.get("error"):
+            raise GateError(f"Keycloak {action}: {result['error']}")
+        return result
+
+    @staticmethod
+    def receipt(created: dict[str, Any], what: str) -> str:
+        """The created object's id: its Location, and the one owned match."""
+        found = created.get("found") or []
+        made = created.get("id") or (found[0] if len(found) == 1 else "")
+        if not _UUID_RE.fullmatch(made or "") or found != [made]:
+            raise GateError(f"no Keycloak receipt for the {what}: {created}")
+        return made
+
+    def mint_client(self) -> None:
+        """The run's OAuth client: its logins carry the claims a cockpit login
+        does, so the JIT path keeps the owner an administrator."""
+        self.client_started = True
+        created = self.keycloak("create-client", client=True)
+        if created.get("exists"):
+            # Not this run's: never adopted, never cleaned up.
+            self.client_started = False
+            raise GateError(f"a Keycloak client {self.oauth_client} already exists")
+        self.client_uuid = self.receipt(created, "OAuth client")
+        for api in (self.owner, self.other, self.stranger):
+            api.client_id = self.oauth_client
+
+    def mint_account(self, account: Account) -> None:
+        """A disposable account: its Keycloak user, then its app row, admitted
+        by the owner before the first login, so the login takes the
+        existing-account path and provisions no cloud or Gitea account."""
+        account.started = True
+        created = self.keycloak("create-user", account)
+        if created.get("exists"):
+            # Not this run's: never adopted, never cleaned up.
+            account.started = False
+            raise GateError(f"a Keycloak user {account.api.username} already exists")
+        account.keycloak_id = self.receipt(created, account.label)
+        app_id = sql("SELECT gen_random_uuid()")
+        if not _UUID_RE.fullmatch(app_id):
+            raise GateError(f"no fresh id: {app_id!r}")
+        account.id = app_id
+        account.row = True
+        sql_script(
+            "INSERT INTO users (id, display_name, email, keycloak_sub, "
+            "preferred_username, is_approved, approved_at, approved_by) VALUES ("
+            f"{lit(app_id)}, {lit(account.api.username)}, {lit(account.email)}, "
+            f"{lit(account.keycloak_id)}, {lit(account.api.username)}, true, now(), "
+            f"{lit(self.owner_id)});\n"
+        )
+
+    def accounts(self) -> None:
+        self.mint_client()
         owner = self.owner.ok("GET", "/api/auth/me")["user"]
-        other = self.other.ok("GET", "/api/auth/me")["user"]
-        stranger = self.stranger.ok("GET", "/api/auth/me")["user"]
         self.owner_id = str(owner["id"])
-        self.other_id = str(other["id"])
-        self.stranger_id = str(stranger["id"])
         can_publish = can_publish_connectors(
             self.owner.ok("GET", "/api/users/me/capabilities")
         )
+        found: dict[str, dict[str, Any]] = {}
+        for account in (self.second, self.outsider):
+            if account.disposable:
+                if not owner.get("is_admin"):
+                    raise GateError(
+                        "the disposable accounts need an administrator owner"
+                    )
+                self.mint_account(account)
+            user = account.api.ok("GET", "/api/auth/me")["user"]
+            if account.disposable and str(user["id"]) != account.id:
+                raise GateError(
+                    f"the {account.label} logged in as {user['id']}, not the "
+                    f"admitted row {account.id}"
+                )
+            account.id = str(user["id"])
+            found[account.label] = user
+        self.other_id, self.stranger_id = self.second.id, self.outsider.id
+        other, stranger = found["second account"], found["stranger"]
         accounts_ok = (
             all(user.get("is_approved") for user in (owner, other, stranger))
             and not other.get("is_admin")
@@ -924,7 +1256,7 @@ class ConnectorSecretsGate:
             and can_publish
         )
         self.report.check(
-            "preflight: three approved accounts, the owner may publish, the "
+            "account: three approved accounts, the owner may publish, the "
             "other two are not administrators",
             bool(accounts_ok),
             f"owner admin={owner.get('is_admin')} publish={can_publish}, "
@@ -1216,12 +1548,19 @@ class ConnectorSecretsGate:
         marked = in_orchestrator(_MARK_PROGRAM, {"ids": ids, "marker": self.marker})
         if sorted(marked.get("marked") or []) != sorted(ids):
             raise GateError(f"could not mark the shared secrets: {marked}")
+        names = sorted(self.name(label) for label in ("public", "linked"))
+        self.shared_session(ids, names)
+        self.shared_job(ids, names)
+
+    def shared_session(self, ids: list[str], names: list[str]) -> None:
         status, created = self.other.call(
             "POST",
             "/api/persistent/threads",
             {
                 "title": f"D3b connector secrets gate {self.gate_id}",
-                "permission_mode": "autonomous",
+                # The ceiling of an approved user without grants (capability
+                # grants' default): autonomous needs a permission_mode grant.
+                "permission_mode": SESSION_PERMISSION_MODE,
                 "project_id": self.project,
                 "datasource_ids": ids,
                 "config_override": {"workspace": {"backend": "sandbox"}},
@@ -1251,7 +1590,6 @@ class ConnectorSecretsGate:
                 "marker": self.marker,
             },
         )
-        names = sorted(self.name(label) for label in ("public", "linked"))
         self.report.check(
             "shared: the deployed delivery path delivers both to the other "
             "account's session from their secrets",
@@ -1277,12 +1615,7 @@ class ConnectorSecretsGate:
             )
 
         wait_for("turn answered", answered, timeout=self.args.turn_timeout)
-        logs = "\n".join(self.logs("agent-stateless", "agent"))
-        connected = [
-            name
-            for name in names
-            if f"Connected to postgresql datasource: {name}" in logs
-        ]
+        connected = self.connected(names, self.started)
         self.report.check(
             "shared: the agent logs a connection to the public and the "
             "project-linked connector, through their secrets' URLs",
@@ -1295,6 +1628,89 @@ class ConnectorSecretsGate:
         )
         self.report.note(f"{seen} open connections carry the secret's mark")
 
+    def connected(self, names: list[str], since: str) -> list[str]:
+        """The connectors an agent logged a connection to since ``since``."""
+        logs = "\n".join(
+            self.logs("agent-stateless", "agent", since=since)
+            + self.logs("agent", "agent", since=since)
+        )
+        return [
+            name
+            for name in names
+            if f"Connected to postgresql datasource: {name}" in logs
+        ]
+
+    def job_status(self, job: str) -> str:
+        return sql(f"SELECT status FROM jobs WHERE id = {lit(job)}")
+
+    def shared_job(self, ids: list[str], names: list[str]) -> None:
+        """The same for a job: the job delivery path is its own code."""
+        since = (datetime.now(timezone.utc) - timedelta(seconds=5)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        status, created = self.other.call(
+            "POST",
+            "/api/jobs",
+            {
+                "description": (
+                    f"D3b connector secrets gate {self.gate_id}. Read the note "
+                    "in the d3b_marker table of each attached PostgreSQL "
+                    "connector with sql_query, then complete the job."
+                ),
+                "project_id": self.project,
+                "datasource_ids": ids,
+                "execution_lane": "stateless",
+                "config_override": {
+                    "workspace": {"backend": "sandbox"},
+                    "llm": {"model": self.args.model},
+                },
+            },
+        )
+        job = ""
+        if isinstance(created, dict):
+            job = str(created.get("job_id") or created.get("id") or "")
+        if _UUID_RE.fullmatch(job):
+            self.jobs[job] = self.other
+        else:
+            job = ""
+        self.report.check(
+            "shared: the other account's job selecting the public and the "
+            "project-linked connector is admitted",
+            status in (200, 201, 202) and bool(job),
+            f"HTTP {status}: {str(created)[:160]}" if not job else "",
+        )
+        if not job:
+            return
+        delivered = in_orchestrator(
+            _DELIVERY_PROGRAM, {"job_id": job, "marker": self.marker}
+        )
+        self.report.check(
+            "shared: the deployed job delivery path delivers both to the other "
+            "account's job from their secrets",
+            delivered.get("status") == 200
+            and delivered.get("delivered") == names
+            and delivered.get("from_secret") == names,
+            json.dumps(delivered),
+        )
+
+        def settled() -> bool:
+            return (
+                self.connected(names, since) == names
+                or self.job_status(job) in JOB_TERMINAL
+            )
+
+        try:
+            wait_for("job connected", settled, timeout=self.args.turn_timeout)
+        except GateError:
+            pass
+        connected = self.connected(names, since)
+        self.report.check(
+            "shared: the job's agent logs a connection to the public and the "
+            "project-linked connector",
+            connected == names,
+            f"connected {connected}, job {self.job_status(job)}",
+        )
+
     def refused(self) -> None:
         wrong: list[str] = []
         for label, body in (
@@ -1306,7 +1722,7 @@ class ConnectorSecretsGate:
                 "/api/persistent/threads",
                 {
                     "title": f"D3b connector secrets gate {self.gate_id} refused",
-                    "permission_mode": "autonomous",
+                    "permission_mode": SESSION_PERMISSION_MODE,
                     "config_override": {"workspace": {"backend": "sandbox"}},
                     "model": self.args.model,
                     **body,
@@ -1323,6 +1739,25 @@ class ConnectorSecretsGate:
             "connector is refused at creation",
             not wrong,
             "; ".join(wrong),
+        )
+        status, created = self.stranger.call(
+            "POST",
+            "/api/jobs",
+            {
+                "description": f"D3b connector secrets gate {self.gate_id} refused",
+                "datasource_ids": [self.connectors["linked"]],
+                "execution_lane": "stateless",
+                "config_override": {"workspace": {"backend": "sandbox"}},
+            },
+        )
+        job = str(created.get("job_id") or created.get("id") or "")
+        if _UUID_RE.fullmatch(job):
+            self.jobs[job] = self.stranger
+        self.report.check(
+            "refused: the stranger's job selecting the linked connector is "
+            "refused at creation",
+            status == 403 and created.get("detail") == UNAVAILABLE_DETAIL,
+            f"HTTP {status}: {str(created)[:100]}",
         )
         delivered = in_orchestrator(
             _DELIVERY_PROGRAM,
@@ -1420,9 +1855,11 @@ class ConnectorSecretsGate:
 
     def thread_owner(self, thread: str) -> Api:
         user = sql(f"SELECT user_id FROM threads WHERE id = {lit(thread)}")
-        return {self.stranger_id: self.stranger, self.owner_id: self.owner}.get(
-            user, self.other
-        )
+        if user and user == self.stranger_id:
+            return self.stranger
+        if user and user == self.owner_id:
+            return self.owner
+        return self.other
 
     def cleanup(self) -> list[str]:
         problems: list[str] = []
@@ -1438,6 +1875,23 @@ class ConnectorSecretsGate:
             step(
                 f"delete session {thread}",
                 lambda t=thread: self.delete_thread(t, self.thread_owner(t)),
+            )
+        for job, api in list(self.jobs.items()):
+            step(
+                f"cancel job {job}",
+                lambda job=job, api=api: api.call("PUT", f"/api/jobs/{job}/cancel")
+                and None,
+            )
+
+            def job_deleted(job=job, api=api) -> bool:
+                status, _body = api.call("DELETE", f"/api/jobs/{job}")
+                return status in (200, 204, 404)
+
+            step(
+                f"delete job {job}",
+                lambda job_deleted=job_deleted: bool(
+                    wait_for("job deleted", job_deleted, timeout=240, interval=10)
+                ),
             )
         for label, datasource_id in list(self.connectors.items()):
 
@@ -1464,6 +1918,42 @@ class ConnectorSecretsGate:
                     )
                 ),
             )
+        for account in (self.outsider, self.second):
+            if not account.row:
+                continue
+
+            def row_deleted(account=account) -> bool:
+                status, body = self.owner.call("DELETE", f"/api/users/{account.id}")
+                if status in (200, 204, 404):
+                    return True
+                if status == 409:  # its session's workspace is still releasing
+                    return False
+                raise GateError(f"HTTP {status}: {str(body)[:200]}")
+
+            step(
+                f"delete the {account.label}'s app row",
+                lambda row_deleted=row_deleted: bool(
+                    wait_for(
+                        "account row deleted", row_deleted, timeout=180, interval=10
+                    )
+                ),
+            )
+        # The users first: the client is how the gate logs in until the end.
+        for account in (self.outsider, self.second):
+            if account.started:
+
+                def user_deleted(account=account) -> bool:
+                    result = self.keycloak("delete", account)
+                    return not result.get("refused") and not result.get("users")
+
+                step(f"delete the {account.label}'s Keycloak user", user_deleted)
+        if self.client_started:
+
+            def client_deleted() -> bool:
+                result = self.keycloak("delete", client=True)
+                return not result.get("refused") and not result.get("clients")
+
+            step("delete the OAuth client", client_deleted)
         if self.pg_started:
             step(
                 "drop database and role",
@@ -1508,6 +1998,30 @@ class ConnectorSecretsGate:
             sql(f"SELECT count(*) FROM projects WHERE id = {lit(self.project)}") != "0"
         ):
             left.append(f"project {self.project}")
+        if self.jobs:
+            jobs = sql(
+                "SELECT count(*) FROM jobs WHERE id IN ("
+                + ", ".join(lit(job) for job in self.jobs)
+                + ")"
+            )
+            if jobs != "0":
+                left.append(f"{jobs} jobs")
+        for account in (self.second, self.outsider):
+            if account.row or account.started:
+                conditions = [f"lower(email) = lower({lit(account.email)})"]
+                if account.row:
+                    conditions.append(f"id = {lit(account.id)}")
+                if account.keycloak_id:
+                    conditions.append(f"keycloak_sub = {lit(account.keycloak_id)}")
+                if (
+                    sql(f"SELECT count(*) FROM users WHERE {' OR '.join(conditions)}")
+                    != "0"
+                ):
+                    left.append(f"the {account.label}'s app row {account.id}")
+            if account.started and self.keycloak("count", account).get("users"):
+                left.append(f"the Keycloak user {account.api.username}")
+        if self.client_started and self.keycloak("count", client=True).get("clients"):
+            left.append(f"the Keycloak client {self.oauth_client}")
         for thread in dict.fromkeys(self.threads + titled):
             try:
                 wait_for(
@@ -1540,6 +2054,7 @@ class ConnectorSecretsGate:
     def run(self) -> int:
         try:
             self.preflight()
+            self.accounts()
             self.fixture()
             self.backfill()
             self.write_through()
@@ -1557,6 +2072,19 @@ class ConnectorSecretsGate:
                             "connectors": self.connectors,
                             "project": self.project,
                             "threads": self.threads,
+                            "jobs": list(self.jobs),
+                            "accounts": {
+                                account.label: {
+                                    "username": account.api.username,
+                                    "keycloak_id": account.keycloak_id,
+                                    "app_id": account.id or None,
+                                }
+                                for account in (self.second, self.outsider)
+                                if account.started or account.row
+                            },
+                            "oauth_client": (
+                                self.oauth_client if self.client_started else None
+                            ),
                             "database": self.pg_name if self.pg_started else None,
                         }
                     )
@@ -1592,10 +2120,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gate-id")
     parser.add_argument("--user", default="test")
     parser.add_argument("--password", default="srw-k3d-dev-test")
-    parser.add_argument("--other-user", default="dev-user-1")
-    parser.add_argument("--other-password", default="srw-k3d-dev-usr1")
-    parser.add_argument("--stranger-user", default="dev-user-2")
-    parser.add_argument("--stranger-password", default="srw-k3d-dev-usr2")
+    parser.add_argument(
+        "--other-user",
+        help="an existing approved non-administrator as the second account "
+        "(default: a disposable account named the gate id)",
+    )
+    parser.add_argument("--other-password")
+    parser.add_argument(
+        "--stranger-user",
+        help="an existing approved non-administrator outside the project "
+        "(default: a disposable account named <gate id>-x)",
+    )
+    parser.add_argument("--stranger-password")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--turn-timeout", type=int, default=420)
     parser.add_argument("--keep", action="store_true", help="skip cleanup")
@@ -1613,11 +2149,19 @@ def validate(args: argparse.Namespace) -> None:
         raise SafetyError("--gate-id must be d3b- followed by 10 hex digits")
     if not _MODEL_RE.fullmatch(args.model):
         raise SafetyError("model id is malformed")
-    users = (args.user, args.other_user, args.stranger_user)
+    for user, password in (
+        (args.other_user, args.other_password),
+        (args.stranger_user, args.stranger_password),
+    ):
+        if (user is None) != (password is None):
+            raise SafetyError(
+                "--other-user/--stranger-user and their passwords go together"
+            )
+    users = [user for user in (args.user, args.other_user, args.stranger_user) if user]
     for user in users:
         if not _USER_RE.fullmatch(user):
             raise SafetyError("user name is malformed")
-    if len(set(users)) != 3:
+    if len(set(users)) != len(users):
         raise SafetyError("--user, --other-user and --stranger-user must differ")
     if not 60 <= args.turn_timeout <= 1800:
         raise SafetyError("--turn-timeout must be between 60 and 1800 seconds")

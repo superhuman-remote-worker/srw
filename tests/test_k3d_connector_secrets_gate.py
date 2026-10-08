@@ -53,9 +53,20 @@ def _runner(*extra):
         ["--gate-id", "d3b-xyz"],
         ["--model", "bad model"],
         ["--user", "Robert'); DROP"],
-        ["--other-user", "test"],
-        ["--stranger-user", "dev-user-1"],
-        ["--stranger-user", "test"],
+        ["--other-user", "dev-user-1"],
+        ["--other-password", "secret"],
+        ["--stranger-user", "dev-user-2"],
+        ["--other-user", "test", "--other-password", "x"],
+        [
+            "--other-user",
+            "dev-user-1",
+            "--other-password",
+            "x",
+            "--stranger-user",
+            "dev-user-1",
+            "--stranger-password",
+            "y",
+        ],
         ["--turn-timeout", "5"],
     ],
 )
@@ -68,12 +79,15 @@ def test_dry_run_prints_the_plan_and_touches_nothing(no_cluster, capsys):
     out = capsys.readouterr().out
     for phase in (
         "preflight",
+        "account",
+        "oauth",
         "fixture",
         "backfill",
         "write",
         "merges",
         "replaces",
         "shared",
+        "job",
         "refused",
         "--stranger-user",
         "leaks",
@@ -89,6 +103,7 @@ PROGRAMS = (
     "_MARK_PROGRAM",
     "_DELIVERY_PROGRAM",
     "_HASH_PROGRAM",
+    "_KEYCLOAK_PROGRAM",
 )
 
 
@@ -171,18 +186,19 @@ def _entry(**over):
         "resource": {
             "scope": list(OWN),
             "deleted": False,
+            # The row digest is in the secret, and no reference names it.
             "refs": ["shape", "token", "url"],
             "refs_own": True,
         },
         "secrets": [
             {
                 "scope": list(OWN),
-                "keys": ["shape", "token", "url"],
+                "keys": ["row", "shape", "token", "url"],
                 "version": 1,
                 "owner": OWNER,
             }
         ],
-        "derived_keys": ["shape", "token", "url"],
+        "derived_keys": ["row", "shape", "token", "url"],
         "rebuilds_row": True,
         "matches_mapping": True,
     }
@@ -224,7 +240,13 @@ def test_a_connector_with_nothing_secret_has_no_secret():
         (_entry(resource={"scope": ["Project", PROJECT]}), "Connector in"),
         (_entry(resource={"refs": None}), "before D3b"),
         (_entry(resource={"refs_own": False}), "own secret"),
-        (_entry(derived_keys=["url"]), "deployed mapping"),
+        (_entry(derived_keys=["row", "url"]), "deployed mapping"),
+        (
+            _entry(
+                secrets=[{**_entry()["secrets"][0], "keys": ["shape", "token", "url"]}]
+            ),
+            "secret keys",
+        ),
         (
             _entry(
                 secrets=[
@@ -274,6 +296,9 @@ def test_leaks_are_counted_and_scrubbed():
 
 def test_api_calls_count_this_runs_secrets_in_the_raw_answer(monkeypatch):
     runner = _runner()
+    with pytest.raises(gate.GateError):
+        runner.owner.call("GET", "/api/datasources")
+    runner.owner.client_id = "d3b-0123456789-oauth"
     sent = {}
 
     def in_orchestrator(program, payload, **_kwargs):
@@ -283,6 +308,7 @@ def test_api_calls_count_this_runs_secrets_in_the_raw_answer(monkeypatch):
     monkeypatch.setattr(gate, "in_orchestrator", in_orchestrator)
     status, body, leaks = runner.owner.call_counting("GET", "/api/datasources")
     assert (status, body, leaks) == (200, {}, 2)
+    assert sent["client_id"] == "d3b-0123456789-oauth"
     assert runner.pg_password in sent["needles"]
     assert set(runner.env_values.values()) <= set(sent["needles"])
 
@@ -318,11 +344,24 @@ def test_nothing_observed_never_passes():
 def test_cleanup_order_and_scope(monkeypatch):
     runner = _runner()
     runner.threads = ["00000000-0000-4000-8000-000000000001"]
+    runner.jobs = {"job-1": runner.other}
     runner.project = PROJECT
     runner.connectors = {"legacy": "ds-1", "public": "ds-2"}
     runner.pg_started = True
     runner.other_id = "other-id"
+    for account, app_id in ((runner.second, "other-id"), (runner.outsider, "x-id")):
+        account.id, account.row, account.started = app_id, True, True
+    runner.client_started = True
     order: list[str] = []
+
+    def keycloak(action, account=None, *, client=False):
+        order.append(
+            f"keycloak {action} {account.label if account else '-'}"
+            f"{' client' if client else ''}"
+        )
+        return {}
+
+    monkeypatch.setattr(runner, "keycloak", keycloak)
 
     def call(who):
         def record(method, path, body=None):
@@ -348,9 +387,17 @@ def test_cleanup_order_and_scope(monkeypatch):
     assert runner.cleanup() == []
     assert order == [
         f"other DELETE /api/persistent/threads/{runner.threads[0]}",
+        "other PUT /api/jobs/job-1/cancel",
+        "other DELETE /api/jobs/job-1",
         "owner DELETE /api/datasources/ds-1",
         "owner DELETE /api/datasources/ds-2",
         f"owner DELETE /api/projects/{PROJECT}",
+        "owner DELETE /api/users/x-id",
+        "owner DELETE /api/users/other-id",
+        # The users first: the client is how the gate logs in until the end.
+        "keycloak delete stranger",
+        "keycloak delete second account",
+        "keycloak delete - client",
         "drop database",
     ]
     # Leftover sessions are found by the gate id in their title.
@@ -366,6 +413,8 @@ def test_residue_is_looked_up_by_the_gate_id_and_the_secret_names(monkeypatch):
     runner.pg_started = True
     runner.connectors = {"legacy": ROW_ID}
     runner.deleted = {"orders": "ffffffff-0000-4000-8000-000000000002"}
+    runner.jobs = {"00000000-0000-4000-8000-0000000000e1": runner.other}
+    runner.second.row, runner.second.id = True, "00000000-0000-4000-8000-0000000000f1"
     statements: list[str] = []
 
     def sql(query, **_kwargs):
@@ -382,6 +431,62 @@ def test_residue_is_looked_up_by_the_gate_id_and_the_secret_names(monkeypatch):
     assert "'connector-ffffffff000040008000000000000002'" in joined
     assert f"FROM projects WHERE id = '{PROJECT}'" in joined
     assert f"datname = '{runner.pg_name}'" in joined
+    assert "FROM jobs WHERE id IN ('00000000-0000-4000-8000-0000000000e1')" in joined
+    assert f"lower(email) = lower('{runner.gate_id}@example.invalid')" in joined
+
+
+def test_the_disposable_accounts_are_named_after_the_gate_id():
+    runner = _runner("--gate-id", "d3b-0123456789")
+    assert runner.other.username == "d3b-0123456789"
+    assert runner.stranger.username == "d3b-0123456789-x"
+    assert runner.second.email == "d3b-0123456789@example.invalid"
+    assert runner.outsider.email == "d3b-0123456789-x@example.invalid"
+    assert runner.second.disposable and runner.outsider.disposable
+    assert runner.other.password != runner.stranger.password
+    named = _runner("--other-user", "dev-user-1", "--other-password", "pw-1")
+    assert named.other.username == "dev-user-1" and not named.second.disposable
+    assert named.outsider.disposable
+
+
+def test_a_disposable_account_needs_an_administrator_owner(monkeypatch):
+    runner = _runner()
+    monkeypatch.setattr(runner, "mint_client", lambda: None)
+    answers = {
+        "/api/auth/me": {"user": {"id": OWNER, "is_admin": False}},
+        "/api/users/me/capabilities": {"is_admin": False, "grants": {}},
+    }
+    monkeypatch.setattr(
+        runner.owner, "ok", lambda method, path, body=None: answers[path]
+    )
+    with pytest.raises(gate.GateError, match="administrator owner"):
+        runner.accounts()
+
+
+def test_an_account_row_is_admitted_before_its_first_login(monkeypatch):
+    runner = _runner()
+    runner.owner_id = OWNER
+    scripts: list[str] = []
+    monkeypatch.setattr(
+        runner,
+        "keycloak",
+        lambda action, account=None, client=False: {
+            "id": "00000000-0000-4000-8000-0000000000aa",
+            "found": ["00000000-0000-4000-8000-0000000000aa"],
+        },
+    )
+    monkeypatch.setattr(
+        gate, "sql", lambda query, **k: "00000000-0000-4000-8000-0000000000bb"
+    )
+    monkeypatch.setattr(
+        gate, "sql_script", lambda script, **k: scripts.append(script) or ""
+    )
+    runner.mint_account(runner.outsider)
+    assert runner.outsider.started and runner.outsider.row
+    assert runner.outsider.keycloak_id == "00000000-0000-4000-8000-0000000000aa"
+    assert runner.outsider.id == "00000000-0000-4000-8000-0000000000bb"
+    [script] = scripts
+    assert runner.outsider.email in script and "true, now()" in script
+    assert runner.outsider.api.password not in script
 
 
 def test_a_secret_left_behind_is_residue(monkeypatch):
