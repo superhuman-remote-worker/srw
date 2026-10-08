@@ -1216,6 +1216,23 @@ class TestWorkspaceFactsRepositoryLine:
             "ssh-agent holds (never on disk)"
         ) in content
 
+    def test_an_ssh_repository_that_was_not_cloned_still_names_its_alias(self):
+        # Its alias is how the agent diagnoses the failure (a wrong host-key
+        # pin fails verification through it), so the skip line keeps it.
+        ds = TestBackendClone._ssh_entry()
+        ws = make_workspace_manager()
+        ws.read_file.side_effect = FileNotFoundError
+        written = {}
+        ws.write_file.side_effect = lambda path, content: written.update(
+            {path: content}
+        )
+        ws.source_repo_skipped = {"repo": "Host key verification failed."}
+        inject_workspace_facts([ds], ws)
+        content = written["README.md"]
+        assert "repository NOT cloned" in content
+        assert "Host key verification failed." in content
+        assert f"git uses SSH alias `{ds['ssh_identity']['alias']}`" in content
+
     def test_ssh_key_lines_say_how_to_use_the_agent(self):
         from shared.runtime.utils.ssh_key import generate_ed25519_keypair
 

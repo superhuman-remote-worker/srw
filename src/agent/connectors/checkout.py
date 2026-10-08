@@ -987,7 +987,9 @@ class CheckoutMaterializer:
                 line = (
                     f"- **{ds.get('name')}** — repository NOT cloned "
                     f"(`./repos/{clone_name}/` is not usable): {skipped}"
-                    # How it was to be reached says why it may have failed.
+                    # How it was to be reached says why it may have failed:
+                    # the SSH alias (and its key's state) or the swap route.
+                    + ssh_identity_note(ds, rt.ssh_identity_status)
                     + (
                         swap_note(ds)
                         if isinstance(block, dict) and "fallback" in block
