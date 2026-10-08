@@ -65,15 +65,6 @@ src/orchestrator/services/kb_reindex.py  kb_sweep_tick  type-keyword  kb  59912b
 src/orchestrator/services/kb_reindex.py  kb_sweep_tick.datasource_is_active  compare  kb  7f8fc6db370a  #1  kb-domain  the KB sweep re-checks at commit that the row is still an external KB
 src/orchestrator/services/knowledge_index.py  kb_datasource_is_active  compare  kb  e30ab025c0b5  #1  kb-domain  the KB index fence re-checks the row is still a KB before it mutates the index
 src/orchestrator/services/knowledge_index.py  run_scheduled_kb_datasource_reindex  compare  kb  449b038286e5  #1  kb-domain  the KB index fence re-checks the row is still a KB before it mutates the index
-src/orchestrator/services/knowledge_projection.py  build_datasource_note_content  compare  credentials,generic  84c2b2e13d27  #1  legacy-pending
-src/orchestrator/services/knowledge_projection.py  build_datasource_note_content  compare  kb  3ba263dda189  #1  legacy-pending
-src/orchestrator/services/knowledge_projection.py  build_datasource_note_content  compare  mongodb,neo4j,postgresql  397855496105  #1  legacy-pending
-src/orchestrator/services/knowledge_projection.py  build_datasource_note_content  compare  repository  b9fa1c7f847e  #1  legacy-pending
-src/orchestrator/services/knowledge_projection.py  build_datasource_note_content  compare  webdav  f0d30cfe0c38  #1  legacy-pending
-src/orchestrator/services/knowledge_projection.py  build_managed_readonly_note  type-keyed-dict  mongodb,neo4j,postgresql  9afc988116cd  #1  legacy-pending
-src/orchestrator/services/knowledge_projection.py  sync_datasource_knowledge  compare  credentials,generic  84c2b2e13d27  #1  legacy-pending
-src/orchestrator/services/knowledge_projection.py  sync_datasource_knowledge  compare  kb  3ba263dda189  #1  legacy-pending
-src/orchestrator/services/knowledge_projection.py  sync_datasource_knowledge  compare  repository  b9fa1c7f847e  #1  legacy-pending
 src/orchestrator/services/manifest_user_retirement.py  retire_user_manifests  sql-literal  kb  ea9c71ab6b6f  #1  sql  native project KB marker (type kb + config.native_project_id) tested in SQL; D3 moves it to managed_key
 src/orchestrator/services/project_provisioning.py  plan_kb_vault_from_connector  compare  kb  8295e37d7780  #1  kb-domain  only an OKF KB repository can back a project knowledge base
 src/orchestrator/services/project_provisioning.py  provision_external_project_knowledge_repo  type-keyword  kb  1048cce392f8  #1  platform-owned  creates the project's native KB row (D3 managed_key project-kb)

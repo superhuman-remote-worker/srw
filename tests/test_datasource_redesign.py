@@ -4,9 +4,10 @@ Covers the three datasource categories (generic, repository, managed
 connectors). Managed connectors are tool-backed in both access modes; the
 former CLI mode (env vars in the agent process) is gone.
 
-The KB note builders are the real ones from
-``orchestrator.services.knowledge_projection``. The payload builder is
-replicated here (the original lives in the connector drivers now).
+The KB notes are the real ones: ``knowledge_projection`` asks each
+connector's driver for its note. The helpers below keep this module's old
+call shapes over that one entry point. The payload builder is replicated
+here (the original lives in the connector drivers now).
 """
 
 import json
@@ -15,12 +16,33 @@ import pytest
 
 from orchestrator.services.knowledge_projection import (
     build_datasource_note_content as _build_datasource_note_content,
-    build_generic_note as _build_generic_note,
-    build_managed_readonly_note as _build_managed_readonly_note,
-    build_managed_readwrite_note as _build_managed_readwrite_note,
-    build_repository_note as _build_repository_note,
-    build_webdav_note as _build_webdav_note,
 )
+
+
+def _note(ds_type: str, name: str, desc: str, row: dict | None = None) -> str:
+    return _build_datasource_note_content(
+        {**(row or {}), "type": ds_type, "name": name, "description": desc}
+    )
+
+
+def _build_generic_note(name: str, desc: str, ds: dict) -> str:
+    return _note("generic", name, desc, ds)
+
+
+def _build_repository_note(name: str, desc: str, ds: dict) -> str:
+    return _note("repository", name, desc, ds)
+
+
+def _build_managed_readwrite_note(name: str, desc: str, ds_type: str) -> str:
+    return _note(ds_type, name, desc, {"project_read_only": False})
+
+
+def _build_managed_readonly_note(name: str, desc: str, ds_type: str) -> str:
+    return _note(ds_type, name, desc, {"project_read_only": True})
+
+
+def _build_webdav_note(name: str, desc: str, is_read_only: bool) -> str:
+    return _note("webdav", name, desc, {"project_read_only": is_read_only})
 
 
 # =============================================================================

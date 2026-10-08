@@ -14,11 +14,18 @@ of asking for the failure to be raised instead of swallowed.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
-from shared.connectors.builtin import spec_for_type
+from orchestrator.services.connector_drivers import (
+    ConnectorDriverRegistry,
+    builtin_connector_drivers,
+)
+from orchestrator.services.connector_drivers.knowledge_note import (
+    bare_note,
+    connection_phrases,
+)
 
 
 class KnowledgeGraphHandle:
@@ -62,6 +69,9 @@ class KnowledgeProjectionDependencies:
     store: Any
     logger: Any
     graph: KnowledgeGraphHandle
+    #: The drivers that write each connector's note (the built-in set when
+    #: none is given).
+    connector_drivers: ConnectorDriverRegistry | None = None
 
 
 def get_knowledge_graph(*, dependencies: KnowledgeProjectionDependencies) -> Any | None:
@@ -69,182 +79,34 @@ def get_knowledge_graph(*, dependencies: KnowledgeProjectionDependencies) -> Any
     return dependencies.graph.get()
 
 
-def build_datasource_note_content(ds: dict[str, Any]) -> str:
+@lru_cache(maxsize=1)
+def _builtin_drivers() -> ConnectorDriverRegistry:
+    return builtin_connector_drivers()
+
+
+def build_datasource_note_content(
+    ds: dict[str, Any], *, drivers: ConnectorDriverRegistry | None = None
+) -> str:
     """Build markdown content for a connector knowledge entry.
 
-    Content varies by type and access mode:
-    - generic: lists env var names + CLI hint
-    - repository: cloned path + git usage
-    - managed connectors (read-write): read and write tools list
-    - managed connectors (read-only): read tools list
-    - webdav: always tools
+    The connector's driver writes it (``DatasourceDriver.knowledge_note``):
+    an environment connector lists its variable names, a repository where it
+    is cloned, a knowledge base how to search it, and a managed connection
+    the tools its access level binds, from the driver's spec. A type no
+    driver serves gets the bare note.
     """
-    ds_type = ds.get("type", "unknown")
-    ds_name = ds.get("name", "Unnamed")
-    desc = ds.get("description") or ""
-    is_read_only = ds.get("project_read_only", False)
-
-    if ds_type in {"generic", "credentials"}:
-        return build_generic_note(ds_name, desc, ds)
-    elif ds_type == "repository":
-        return build_repository_note(ds_name, desc, ds)
-    elif ds_type == "kb":
-        root = str((ds.get("config") or {}).get("root_path") or "")
-        lines = [f"## OKF Knowledge Base: {ds_name}"]
-        if desc:
-            lines.append(desc)
-        lines.append("Centrally indexed and read-only to agents in this release.")
-        if root:
-            lines.append(f"OKF root: `{root}`")
-        lines.append("Attach this connector explicitly, then use the `kb_*` tools.")
-        return "\n\n".join(lines)
-    elif ds_type == "webdav":
-        return build_webdav_note(ds_name, desc, is_read_only)
-    elif ds_type in ("postgresql", "neo4j", "mongodb"):
-        if is_read_only:
-            return build_managed_readonly_note(ds_name, desc, ds_type)
-        else:
-            return build_managed_readwrite_note(ds_name, desc, ds_type)
-    else:
-        return f"## Connector: {ds_name}\n{desc}"
+    driver = (drivers or _builtin_drivers()).for_type(ds.get("type"))
+    return driver.knowledge_note(ds) if driver is not None else bare_note(ds)
 
 
-def build_generic_note(name: str, desc: str, ds: dict) -> str:
-    """KB entry for generic connectors."""
-    lines = [f"## Connector: {name}"]
-    if desc:
-        lines.append(desc)
-
-    url = ds.get("connection_url")
-    cli_hint = ds.get("cli_hint")
-    if url or cli_hint:
-        lines.append("\n### Connection")
-        if url:
-            lines.append(f"- **URL:** {url} (credentials via env vars)")
-        if cli_hint:
-            lines.append(f"- **CLI:** `{cli_hint}`")
-
-    creds = ds.get("credentials") or {}
-    if isinstance(creds, str):
-        try:
-            creds = json.loads(creds)
-        except (json.JSONDecodeError, ValueError):
-            creds = {}
-    env_vars = creds.get("env_vars", {})
-    if env_vars:
-        lines.append("\n### Environment Variables")
-        for key in env_vars:
-            lines.append(f"- `{key}` — available in workspace")
-
-    return "\n".join(lines)
-
-
-def build_repository_note(name: str, desc: str, ds: dict) -> str:
-    """KB entry for repository connectors."""
-    import re
-
-    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-    lines = [f"## Repository: {name}"]
-    if desc:
-        lines.append(desc)
-    lines.append("\n### Location")
-    lines.append(f"Cloned to `./repos/{slug}/` — git is pre-authenticated.")
-    lines.append("\n### Usage")
-    lines.append("Use standard git commands:")
-    lines.append(f"- `cd repos/{slug} && git status`")
-    lines.append("- `git pull`, `git commit`, `git push`")
-    lines.append("- No login or credential setup required.")
-    branch = ds.get("default_branch")
-    if branch:
-        lines.append(f"- Default branch: `{branch}`")
-    return "\n".join(lines)
-
-
-#: What each managed-connection tool does, for the read-write KB note.
-_MANAGED_TOOL_HELP = {
-    "sql_query": "execute SELECT queries",
-    "sql_schema": "inspect tables, columns, types, constraints",
-    "sql_execute": "execute write statements (INSERT, UPDATE, DELETE, DDL)",
-    "cypher_query": "execute read-only Cypher queries",
-    "cypher_execute": "execute write Cypher statements (CREATE, MERGE, DELETE, SET)",
-    "get_database_schema": "inspect labels, relationships, properties",
-    "mongo_query": "document queries with filters",
-    "mongo_aggregate": "aggregation pipelines",
-    "mongo_schema": "collections, fields, indexes",
-    "mongo_insert": "insert documents",
-    "mongo_update": "update documents",
-}
-
-
-def build_managed_readwrite_note(name: str, desc: str, ds_type: str) -> str:
-    """KB entry for managed connectors in read-write mode: the tools the
-    driver's ReadWrite level binds (there is no CLI access)."""
-    spec = spec_for_type(ds_type)
-    level = spec.access_level("ReadWrite") if spec else None
-    level_tools = level.tools if level and level.tools != "*" else ()
-    tools = [
-        f"- `{tool}` — {_MANAGED_TOOL_HELP[tool]}"
-        for tool in level_tools
-        if tool in _MANAGED_TOOL_HELP
-    ] or ["- Check available tools for this connector type"]
-    lines = [
-        f"## Connector: {name}",
-        f"**Type:** {ds_type} | **Access:** read-write (tools)",
-    ]
-    if desc:
-        lines.append(f"\n{desc}")
-    lines.append("\n### Available Tools")
-    lines.extend(tools)
-    return "\n".join(lines)
-
-
-def build_managed_readonly_note(name: str, desc: str, ds_type: str) -> str:
-    """KB entry for managed connectors in read-only (tools) mode."""
-    tool_info = {
-        "postgresql": [
-            "- `sql_query` — execute SELECT queries",
-            "- `sql_schema` — inspect tables, columns, types, constraints",
-        ],
-        "neo4j": [
-            "- `cypher_query` — execute read-only Cypher queries",
-            "- `get_database_schema` — inspect labels, relationships, properties",
-        ],
-        "mongodb": [
-            "- `mongo_query` — document queries with filters",
-            "- `mongo_aggregate` — aggregation pipelines",
-            "- `mongo_schema` — collections, fields, indexes",
-        ],
-    }
-    tools = tool_info.get(ds_type, ["- Check available tools for this connector type"])
-    lines = [
-        f"## Connector: {name}",
-        f"**Type:** {ds_type} | **Access:** read-only (tools)",
-    ]
-    if desc:
-        lines.append(f"\n{desc}")
-    lines.append("\n### Available Tools")
-    lines.extend(tools)
-    lines.append("\nNo CLI access or write operations available.")
-    return "\n".join(lines)
-
-
-def build_webdav_note(name: str, desc: str, is_read_only: bool) -> str:
-    """KB entry for WebDAV connectors (always tools)."""
-    access = "read-only" if is_read_only else "read-write"
-    lines = [
-        f"## Connector: {name}",
-        f"**Type:** webdav | **Access:** {access}",
-    ]
-    if desc:
-        lines.append(f"\n{desc}")
-    lines.append("\n### Available Tools")
-    lines.append("- `webdav_list` — list files and directories")
-    lines.append("- `webdav_read` — read file contents")
-    lines.append("- `webdav_info` — get file metadata")
-    if not is_read_only:
-        lines.append("- `webdav_write` — write/upload files")
-        lines.append("- `webdav_delete` — delete files")
-    return "\n".join(lines)
+def datasource_retrieval_messages(
+    ds: dict[str, Any], *, drivers: ConnectorDriverRegistry | None = None
+) -> list[str]:
+    """The phrases a connector's knowledge entry is retrieved by."""
+    driver = (drivers or _builtin_drivers()).for_type(ds.get("type"))
+    return (
+        driver.retrieval_messages(ds) if driver is not None else connection_phrases(ds)
+    )
 
 
 async def sync_datasource_knowledge(
@@ -260,34 +122,9 @@ async def sync_datasource_knowledge(
     note_id = f"ds-{ds_id}"
     ds_name = datasource.get("name", "Unnamed")
     ds_type = datasource.get("type", "unknown")
-    content = build_datasource_note_content(datasource)
-
-    if ds_type == "repository":
-        retrieval_messages = [
-            f"{ds_name} repository",
-            f"git repo {ds_name}",
-            f"How to access {ds_name} code",
-            "available repositories",
-        ]
-    elif ds_type == "kb":
-        retrieval_messages = [
-            f"{ds_name} knowledge base",
-            f"Search {ds_name} with the KB tools",
-            "available OKF knowledge bases",
-        ]
-    elif ds_type in {"generic", "credentials"}:
-        retrieval_messages = [
-            f"{ds_name} connection",
-            f"How to access {ds_name}",
-            "available connectors",
-        ]
-    else:
-        retrieval_messages = [
-            f"{ds_name} database connection",
-            f"{ds_type} access",
-            f"How do I connect to {ds_name}?",
-            "What databases are available?",
-        ]
+    drivers = dependencies.connector_drivers
+    content = build_datasource_note_content(datasource, drivers=drivers)
+    retrieval_messages = datasource_retrieval_messages(datasource, drivers=drivers)
 
     # Write to Neo4j (upsert with deterministic note_id)
     kg = dependencies.graph.get()

@@ -21,12 +21,3 @@ src/agent/tools/registry.py  load_tools  registry-slot  postgresql  2bd4cf6c228b
 src/agent/tools/registry.py  load_tools  registry-slot  webdav  5e933d241a1c  #1
 src/agent/tools/sql/postgresql.py  create_postgresql_tools  registry-slot  postgresql  03e18ffc14fe  #1
 src/agent/tools/webdav/tools.py  create_webdav_tools  registry-slot  webdav  e72ff2f3619b  #1
-src/orchestrator/services/knowledge_projection.py  build_datasource_note_content  compare  credentials,generic  84c2b2e13d27  #1
-src/orchestrator/services/knowledge_projection.py  build_datasource_note_content  compare  kb  3ba263dda189  #1
-src/orchestrator/services/knowledge_projection.py  build_datasource_note_content  compare  mongodb,neo4j,postgresql  397855496105  #1
-src/orchestrator/services/knowledge_projection.py  build_datasource_note_content  compare  repository  b9fa1c7f847e  #1
-src/orchestrator/services/knowledge_projection.py  build_datasource_note_content  compare  webdav  f0d30cfe0c38  #1
-src/orchestrator/services/knowledge_projection.py  build_managed_readonly_note  type-keyed-dict  mongodb,neo4j,postgresql  9afc988116cd  #1
-src/orchestrator/services/knowledge_projection.py  sync_datasource_knowledge  compare  credentials,generic  84c2b2e13d27  #1
-src/orchestrator/services/knowledge_projection.py  sync_datasource_knowledge  compare  kb  3ba263dda189  #1
-src/orchestrator/services/knowledge_projection.py  sync_datasource_knowledge  compare  repository  b9fa1c7f847e  #1

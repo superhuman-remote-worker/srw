@@ -19,6 +19,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from orchestrator.services.connector_drivers import knowledge_note
 from orchestrator.services.connector_drivers.base import (
     BindContext,
     CheckContext,
@@ -48,6 +49,12 @@ class RepositoryDriver(WorkspaceSshDriver):
 
     def holds_ssh_key(self, row: Mapping[str, Any]) -> bool:
         return repository_uses_ssh_key(stored_json_object(row.get("credentials")))
+
+    def knowledge_note(self, row: Mapping[str, Any]) -> str:
+        return knowledge_note.repository_note(row)
+
+    def retrieval_messages(self, row: Mapping[str, Any]) -> list[str]:
+        return knowledge_note.repository_phrases(row)
 
     def unread_pins_dropped(
         self, config: dict[str, Any], credentials: Mapping[str, Any]

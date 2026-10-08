@@ -19,6 +19,7 @@ from typing import Any
 
 import asyncpg
 
+from orchestrator.services.connector_drivers import knowledge_note
 from orchestrator.services.connector_drivers.base import (
     BindContext,
     CheckContext,
@@ -53,6 +54,10 @@ class ManagedConnectionDriver(DatasourceDriver):
         self, url: str | None, credentials: dict[str, Any]
     ) -> dict[str, Any]:
         raise NotImplementedError
+
+    def knowledge_note(self, row: Mapping[str, Any]) -> str:
+        # The tools come from the access level the link binds at.
+        return knowledge_note.database_note(row, self.spec)
 
     def bind(
         self, row: Mapping[str, Any], credentials: Any, *, ctx: BindContext
@@ -126,6 +131,9 @@ class WebDavDriver(ManagedConnectionDriver):
 
     def __init__(self) -> None:
         super().__init__(WEBDAV_SPEC)
+
+    def knowledge_note(self, row: Mapping[str, Any]) -> str:
+        return knowledge_note.file_store_note(row, self.spec)
 
     async def probe(
         self, url: str | None, credentials: dict[str, Any]

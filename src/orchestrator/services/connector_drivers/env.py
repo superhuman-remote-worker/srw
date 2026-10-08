@@ -14,6 +14,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from orchestrator.services.connector_drivers import knowledge_note
 from orchestrator.services.connector_drivers.base import (
     CheckContext,
     ConnectorDraft,
@@ -25,7 +26,17 @@ from shared.connectors.builtin import CREDENTIALS_SPEC, GENERIC_SPEC
 from shared.credential_connectors import normalize_credential_env
 
 
-class GenericDriver(DatasourceDriver):
+class EnvironmentDriver(DatasourceDriver):
+    """What both environment drivers say about themselves."""
+
+    def knowledge_note(self, row: Mapping[str, Any]) -> str:
+        return knowledge_note.environment_note(row)
+
+    def retrieval_messages(self, row: Mapping[str, Any]) -> list[str]:
+        return knowledge_note.environment_phrases(row)
+
+
+class GenericDriver(EnvironmentDriver):
     def __init__(self) -> None:
         super().__init__(GENERIC_SPEC)
 
@@ -38,7 +49,7 @@ class GenericDriver(DatasourceDriver):
         }
 
 
-class CredentialsDriver(DatasourceDriver):
+class CredentialsDriver(EnvironmentDriver):
     def __init__(self) -> None:
         super().__init__(CREDENTIALS_SPEC)
 

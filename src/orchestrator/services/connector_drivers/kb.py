@@ -22,6 +22,7 @@ from fastapi import HTTPException
 
 # Called through the module so a patched function is the one that runs.
 from orchestrator.services import knowledge_index as kb_index
+from orchestrator.services.connector_drivers import knowledge_note
 from orchestrator.services.connector_drivers.base import (
     BindContext,
     CheckContext,
@@ -44,6 +45,12 @@ from shared.native_kb import NATIVE_PROJECT_CONFIG_KEY, native_kb_project_id
 class KnowledgeBaseDriver(DatasourceDriver):
     def __init__(self) -> None:
         super().__init__(KB_SPEC)
+
+    def knowledge_note(self, row: Mapping[str, Any]) -> str:
+        return knowledge_note.knowledge_base_note(row)
+
+    def retrieval_messages(self, row: Mapping[str, Any]) -> list[str]:
+        return knowledge_note.knowledge_base_phrases(row)
 
     async def validate(
         self,

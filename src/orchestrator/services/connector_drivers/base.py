@@ -32,6 +32,7 @@ from uuid import uuid4
 from fastapi import HTTPException
 
 from orchestrator.services import datasource_config
+from orchestrator.services.connector_drivers import knowledge_note
 from shared.connectors.binding import BindingDescriptor
 from shared.connectors.contract import DriverSpec
 from shared.connectors.envelope import unsupported_check
@@ -272,6 +273,17 @@ class DatasourceDriver:
 
     async def revoke(self, binding: Mapping[str, Any], *, ctx: BindContext) -> None:
         """Nothing a built-in driver delivers outlives its execution."""
+
+    def knowledge_note(self, row: Mapping[str, Any]) -> str:
+        """The project knowledge note that describes a stored connector.
+
+        Never a credential value. The default names the connector only.
+        """
+        return knowledge_note.bare_note(row)
+
+    def retrieval_messages(self, row: Mapping[str, Any]) -> list[str]:
+        """The phrases the connector's knowledge note is retrieved by."""
+        return knowledge_note.connection_phrases(row)
 
     # -- helpers shared by the built-in drivers -----------------------------
 

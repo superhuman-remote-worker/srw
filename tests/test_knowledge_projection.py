@@ -1,9 +1,9 @@
 """Connector knowledge projection: note content, and degradation without Neo4j.
 
 The note is what an agent retrieves when it asks "what can I connect to?", so
-its content is per-type by design: a repository names the clone path, a
-read-write managed connector names the CLI and its env vars, a read-only one
-names the tools instead, and a KB says it is read-only and centrally indexed.
+its content is the driver's to write: a repository names the clone path, a
+managed connector names the tools its access level binds (from the driver's
+spec), and a KB says it is read-only and centrally indexed.
 
 The projection has two legs and they fail independently. Neo4j is optional —
 absent, the pgvector row is still written and no caller sees an error. Only a
@@ -191,6 +191,55 @@ def test_an_unknown_type_still_produces_a_minimal_note():
     ds = {"type": "smoke-signal", "name": "Odd", "description": "who knows"}
 
     assert subject.build_datasource_note_content(ds) == "## Connector: Odd\nwho knows"
+    assert subject.datasource_retrieval_messages(ds)[0] == "Odd database connection"
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+@pytest.mark.parametrize("ds_type", ["postgresql", "neo4j", "mongodb", "webdav"])
+def test_a_managed_note_lists_exactly_its_access_levels_tools(ds_type, read_only):
+    """The tools come from the spec's access level, so a read-only link never
+    advertises a tool it does not bind (the Neo4j note used to)."""
+    from shared.connectors.builtin import spec_for_type
+
+    spec = spec_for_type(ds_type)
+    level = spec.access_level("ReadOnly" if read_only else "ReadWrite")
+    content = subject.build_datasource_note_content(
+        {"type": ds_type, "name": "X", "project_read_only": read_only}
+    )
+    listed = [
+        line.split("`")[1] for line in content.splitlines() if line.startswith("- `")
+    ]
+    assert listed == list(level.tools)
+
+
+def test_the_note_is_the_drivers_to_write():
+    """A registry passed in decides, as the application's own registry does."""
+    from orchestrator.services.connector_drivers import ConnectorDriverRegistry
+    from orchestrator.services.connector_drivers.env import GenericDriver
+
+    class Custom(GenericDriver):
+        def knowledge_note(self, row):
+            return f"custom note for {row['name']}"
+
+        def retrieval_messages(self, row):
+            return ["custom phrase"]
+
+    drivers = ConnectorDriverRegistry([Custom()])
+    ds = {"type": "generic", "name": "Mine"}
+    assert (
+        subject.build_datasource_note_content(ds, drivers=drivers)
+        == "custom note for Mine"
+    )
+    assert subject.datasource_retrieval_messages(ds, drivers=drivers) == [
+        "custom phrase"
+    ]
+    # A type the registry does not serve gets the bare note.
+    assert (
+        subject.build_datasource_note_content(
+            {"type": "kb", "name": "K", "description": "d"}, drivers=drivers
+        )
+        == "## Connector: K\nd"
+    )
 
 
 # =============================================================================

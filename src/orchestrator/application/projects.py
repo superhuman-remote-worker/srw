@@ -151,6 +151,7 @@ def knowledge_projection_dependencies(
         store=resources.vector_db,
         logger=logger,
         graph=resources.knowledge_graph,
+        connector_drivers=resources.connector_drivers,
     )
 
 
