@@ -43,6 +43,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CONNECTOR = "66666666-7777-4888-8999-aaaaaaaaaaaa"
 OTHER = "11111111-2222-4333-8444-555555555555"
 CREDENTIAL = "upstream-token-" + "x" * 24
+CONFIG = {"message": "d5a-0123456789"}
 
 pytestmark = pytest.mark.skipif(shutil.which("go") is None, reason="no Go toolchain")
 
@@ -155,7 +156,7 @@ class Pod:
             "protocol_version": "1.0",
             "plane": "service",
             "driver": MCP_TEST_SPEC.name,
-            "connector": {"id": CONNECTOR, "config": {}},
+            "connector": {"id": CONNECTOR, "config": CONFIG},
             "credentials": {},
             "service": {"port": self.front_port, "port_name": "srw-driver"},
             "exchange": {"url": exchange.url, "identity_file": "identity"},
@@ -170,6 +171,9 @@ class Pod:
         return f"http://127.0.0.1:{self.front_port}/mcp"
 
     def start(self) -> None:
+        # The server's environment as its pod gets it: what the spec renders
+        # from the connector's configuration.
+        server_env = managed_mcp(MCP_TEST_SPEC).server_env(CONFIG)
         self.processes.append(
             subprocess.Popen(
                 [
@@ -177,6 +181,7 @@ class Pod:
                     "-listen",
                     f"127.0.0.1:{self.server_port}",
                 ],
+                env={**os.environ, **server_env},
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -281,6 +286,9 @@ async def test_a_session_serves_through_the_front_with_only_a_lease(pod):
             "notes_delete",
         }
         answer = json.loads(await _text(_tool(manager, "whoami")))
+        # The server was told its connector's message (what the k3d gate
+        # checks), through the environment the spec renders.
+        assert answer["message"] == CONFIG["message"]
         # The server received the connector's credential; the client never
         # held it.
         assert (
