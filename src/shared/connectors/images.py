@@ -119,11 +119,12 @@ class ImageReference:
 def label_spec(labels: Mapping[str, Any] | None) -> dict[str, Any] | None:
     """The spec an image declares in its ``io.srw.driver.spec`` label.
 
-    ``None`` when the image carries none; ``ValueError`` when it carries one
+    ``None`` when the image carries none (an empty label is none: a build
+    that sets it from an unset variable); ``ValueError`` when it carries one
     SRW cannot read.
     """
     raw = (labels or {}).get(SPEC_LABEL)
-    if raw is None:
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
         return None
     if not isinstance(raw, str) or len(raw.encode("utf-8")) > MAX_SPEC_LABEL_BYTES:
         raise ValueError(f"the {SPEC_LABEL} label is not a bounded string")

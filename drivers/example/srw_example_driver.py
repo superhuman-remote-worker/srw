@@ -9,19 +9,25 @@ It reads its request from ``SRW_REQUEST_FILE`` (``/run/srw/request.json`` in
 its pod) and writes one JSON object per line to stdout:
 
 * ``spec``: the spec its image label declares (``spec.json`` beside it);
-* ``check``: SUCCEEDED when the connector holds a token and names a
-  variable, else FAILED with what is missing (a wrong config is a result,
-  never an error);
-* ``bind``: a binding descriptor for the workspace: the variable the
-  connector names, set to a credential derived for this binding from the
-  connector's token (never the token itself); optionally the same value in a
-  credential file; and ``EXAMPLE_DRIVER_PROCESS``, what the kernel says about
-  this process (user, capabilities, no-new-privs, seccomp), so a gate can
-  read in the workspace how the pod ran. ``driver_state`` names what was
-  minted, as a real driver would to revoke it later;
+* ``check``: SUCCEEDED when the connector holds a token, else FAILED with
+  what is missing (a wrong config is a result, never an error);
+* ``bind``: a binding descriptor for the workspace: ``EXAMPLE_TOKEN``, a
+  credential derived for this binding from the connector's token (never the
+  token itself); with ``file``, the same value in
+  ``~/.srw-files/example/token``, named by ``EXAMPLE_TOKEN_FILE``; and
+  ``EXAMPLE_DRIVER_PROCESS``, what the kernel says about this process (user,
+  capabilities, no-new-privs, seccomp), so a gate can read in the workspace
+  how the pod ran. Every name it sets is declared in ``env_names`` in its
+  spec. ``driver_state`` holds what ``revoke`` needs to revoke the minted
+  credential (SRW hands it back; a real driver puts the upstream id here);
 * ``revoke``: succeeds, whether or not the binding still exists;
-* ``gc``: retires nothing (it keeps no state of its own);
+* ``gc``: retires nothing (it keeps no state of its own; SRW never calls it,
+  the test kit does);
 * anything else: an ``unsupported`` error.
+
+``misbehave`` (config) is for SRW's own gate: it makes ``bind`` return a
+variable no driver may set, one the spec does not declare, a file outside
+the allowed locations, or fail with a ``config`` error.
 
 It needs no network: a real driver would call its upstream here (and declare
 it as egress in its spec).
@@ -38,8 +44,10 @@ from pathlib import Path
 from typing import Any
 
 SPEC_FILE = Path(__file__).with_name("spec.json")
-VARIABLE_FIELD = "variable"
-FILE_FIELD = "file"
+TOKEN_VARIABLE = "EXAMPLE_TOKEN"
+FILE_VARIABLE = "EXAMPLE_TOKEN_FILE"
+PROCESS_VARIABLE = "EXAMPLE_DRIVER_PROCESS"
+TOKEN_FILE = "~/.srw-files/example/token"
 
 
 def emit(line: dict[str, Any]) -> None:
@@ -93,14 +101,32 @@ def minted(token: str, binding_id: str) -> str:
 
 
 def check(request: dict[str, Any]) -> int:
-    config = request["connector"]["config"]
     if not request.get("credentials", {}).get("token"):
         return result({"status": "FAILED", "message": "The connector holds no token"})
-    if not config.get(VARIABLE_FIELD):
-        return result(
-            {"status": "FAILED", "message": "The connector names no variable"}
-        )
     return result({"status": "SUCCEEDED", "message": "The token is present"})
+
+
+def variable(name: str, value: str) -> dict[str, Any]:
+    return {
+        "recipient": "workspace",
+        "form": "env_file",
+        "value": {"name": name, "value": value},
+        "collision": "error",
+        "refresh": "on_backend_swap",
+    }
+
+
+def credential_file(path: str, content: str, env_var: str | None) -> dict[str, Any]:
+    value: dict[str, Any] = {"path": path, "content": content, "mode": 0o600}
+    if env_var:
+        value["env_var"] = env_var
+    return {
+        "recipient": "workspace",
+        "form": "credential_file",
+        "value": value,
+        "collision": "skip_existing",
+        "retire": "remove",
+    }
 
 
 def bind(request: dict[str, Any]) -> int:
@@ -108,43 +134,24 @@ def bind(request: dict[str, Any]) -> int:
     token = request.get("credentials", {}).get("token")
     if not token:
         return error("credentials", "The connector holds no token", field="token")
-    variable = config.get(VARIABLE_FIELD)
-    if not isinstance(variable, str) or not variable:
-        return error("config", "Name the variable to set", field=f"/{VARIABLE_FIELD}")
+    misbehave = config.get("misbehave")
+    if misbehave == "fail":
+        return error("config", "Told to fail (misbehave)", field="/misbehave")
     value = minted(token, request["binding_id"])
     entries: list[dict[str, Any]] = [
-        {
-            "recipient": "workspace",
-            "form": "env_file",
-            "value": {"name": variable, "value": value},
-            "collision": "error",
-            "refresh": "on_backend_swap",
-        },
-        {
-            "recipient": "workspace",
-            "form": "env_file",
-            "value": {"name": "EXAMPLE_DRIVER_PROCESS", "value": process_facts()},
-            "collision": "error",
-        },
+        variable(TOKEN_VARIABLE, value),
+        variable(PROCESS_VARIABLE, process_facts()),
     ]
-    path = config.get(FILE_FIELD)
-    if isinstance(path, str) and path:
-        entries.append(
-            {
-                "recipient": "workspace",
-                "form": "credential_file",
-                "value": {"path": path, "content": value + "\n", "mode": 0o600},
-                "collision": "skip_existing",
-                "retire": "remove",
-            }
-        )
-    emit(
-        {
-            "type": "log",
-            "level": "info",
-            "message": f"minted a credential for {variable}",
-        }
-    )
+    if config.get("file"):
+        entries.append(credential_file(TOKEN_FILE, value + "\n", FILE_VARIABLE))
+    if misbehave == "denied_variable":
+        entries.append(variable("GIT_SSH_COMMAND", "true"))
+    elif misbehave == "undeclared_variable":
+        entries.append(variable("EXAMPLE_UNDECLARED", value))
+    elif misbehave == "refused_file":
+        entries.append(credential_file("~/.kube/config", "{}\n", None))
+    emit({"type": "log", "level": "info", "message": "minted a credential"})
+    # What revoke needs to revoke the minted credential upstream.
     state = json.dumps({"minted": hashlib.sha256(value.encode()).hexdigest()[:16]})
     return result(
         {

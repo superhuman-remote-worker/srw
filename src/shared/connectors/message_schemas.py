@@ -43,6 +43,7 @@ from .contract import (
     WORKSPACE_BACKENDS,
 )
 from .envelope import BINDING_OPERATIONS, ERROR_CLASSES
+from .registration import MAX_ENV_NAMES
 
 _BASE = "https://srw.dev/schemas/connectors"
 _DIALECT = "https://json-schema.org/draft/2020-12/schema"
@@ -285,6 +286,15 @@ def spec_schema() -> dict[str, Any]:
             "credential_delivery": {"enum": list(CREDENTIAL_DELIVERY_MODES)},
             "tool_category": {"type": ["string", "null"]},
             "service": service,
+            # Every variable a bind-time driver's bind may set (a file's
+            # env_var included); registration refuses the ones a driver may
+            # not set (shared.connectors.env_names).
+            "env_names": {
+                "type": "array",
+                "maxItems": MAX_ENV_NAMES,
+                "uniqueItems": True,
+                "items": {"type": "string", "pattern": r"^[A-Za-z_][A-Za-z0-9_]*$"},
+            },
         },
     }
 

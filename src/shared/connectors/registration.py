@@ -15,10 +15,26 @@ someone registers must follow on top of :func:`~.contract.validate_spec`:
   only, in the forms :data:`IMAGE_BIND_FORMS` names, which SRW's own
   materializers deliver to the workspace. A service driver is a managed MCP
   server (imported from its ``server.json``).
+* **Environment names.** A bind-time driver that sets variables declares
+  every name its bind may return (``env_names`` in its spec), so the names
+  are visible when it is registered, and none may be one a driver must not
+  set (``env_names.driver_env_problem``: nothing that runs code, redirects
+  traffic or loosens TLS in the workspace).
+* **Schemas.** A registered schema is validated on SRW's event loop, so it
+  may not hold a regular expression (``pattern``, ``patternProperties``,
+  ``format: regex``) or a reference outside itself, and it is bounded in
+  size and depth (:func:`schema_problems`). A driver checks a pattern in its
+  own ``check``.
 
 What one ``bind`` of a bind-time image returns is checked by
-:func:`image_binding_problems` and turned into the wire entry the agent
-already reads for its stored type (:func:`wire_credentials`).
+:func:`image_binding_problems` (the one check SRW and the author test kit
+both run) and turned into the wire entry the agent already reads for its
+stored type (:func:`wire_credentials`). A file goes to ``~/.srw-files/``,
+``~/.netrc`` or ``~/.pgpass`` only (:data:`IMAGE_FILE_TARGETS`): the other
+credential-file locations hold formats that run a command (a kubeconfig's
+``exec``, an AWS ``credential_process``), which a shared driver's output
+must not carry until the owner rules on it. A moved tag's new spec is
+compared with the one bound before by :func:`moved_spec_problems`.
 
 Design: knowledge-base/knowledge/features/connector_drivers.md, "Trust and
 registration", "The driver contract" and slice D6.
@@ -40,8 +56,9 @@ from .contract import (
     managed_mcp_driver,
     validate_spec,
 )
+from .env_names import ENV_NAME, driver_env_problem, env_value_problem
 from .file_targets import STORED_HOME, mode_problem, target_problem
-from .images import ImageReference
+from .images import SPEC_LABEL, ImageReference, SpecContract, compatibility_problems
 
 #: The namespace of SRW's own drivers; no registration may use it.
 RESERVED_NAMESPACE = "srw"
@@ -71,6 +88,7 @@ SPEC_KEYS: frozenset[str] = frozenset(
         "credential_delivery",
         "tool_category",
         "service",
+        "env_names",
     }
 )
 _SLOT_KEYS = frozenset(
@@ -90,8 +108,17 @@ _EGRESS_KEYS = frozenset({"host", "ports", "protocol"})
 _SERVICE_KEYS = frozenset(
     {"instancing", "resources", "start_seconds", "mcp", "port", "callers"}
 )
-#: The most entries one bind may deliver.
+#: The most entries one bind may deliver, and names a spec may declare.
 MAX_BINDING_ENTRIES = 100
+MAX_ENV_NAMES = 100
+#: Where a bind-time image driver's file may land (home-relative): a
+#: directory SRW owns, and the two login files curl, git and libpq read.
+IMAGE_FILE_DIRECTORY = ".srw-files"
+IMAGE_FILE_NAMES: tuple[str, ...] = (".netrc", ".pgpass")
+IMAGE_FILE_TARGETS = f"~/{IMAGE_FILE_DIRECTORY}/, ~/.netrc or ~/.pgpass"
+#: Bounds on a registered schema (its canonical JSON, and its nesting).
+MAX_SCHEMA_BYTES = 32 * 1024
+MAX_SCHEMA_DEPTH = 12
 
 
 def reserved_name(name: Any) -> bool:
@@ -231,6 +258,7 @@ def spec_from_json(value: Any) -> DriverSpec:
         if not isinstance(items, list):
             raise ValueError(f"{key} must be a list")
     backends = _strings(spec.get("supported_backends"), "supported_backends")
+    declared_env_names(spec)
     return DriverSpec(
         name=_text(spec.get("name"), "name") or "",
         title=_text(spec.get("title"), "title") or "",
@@ -266,7 +294,25 @@ def spec_from_json(value: Any) -> DriverSpec:
     )
 
 
-def spec_to_json(spec: DriverSpec) -> dict[str, Any]:
+def declared_env_names(value: Mapping[str, Any]) -> tuple[str, ...]:
+    """The environment names a spec's JSON declares its bind may return.
+
+    ``ValueError`` when ``env_names`` is not a list of distinct variable
+    names, or holds more than :data:`MAX_ENV_NAMES`. Whether a driver may set
+    each is :func:`custom_driver_problems`' question.
+    """
+    names = _strings(value.get("env_names"), "env_names")
+    if len(names) > MAX_ENV_NAMES:
+        raise ValueError(f"env_names holds at most {MAX_ENV_NAMES} names")
+    if len(set(names)) != len(names):
+        raise ValueError("env_names lists a name twice")
+    for name in names:
+        if not ENV_NAME.fullmatch(name):
+            raise ValueError(f"env_names: {name!r} is not a variable name")
+    return names
+
+
+def spec_to_json(spec: DriverSpec, *, env_names: Iterable[str] = ()) -> dict[str, Any]:
     """``spec`` as the JSON a driver image declares (round-trips through
     :func:`spec_from_json` for every key in :data:`SPEC_KEYS`)."""
     out: dict[str, Any] = {
@@ -311,6 +357,7 @@ def spec_to_json(spec: DriverSpec) -> dict[str, Any]:
         "holds_upstream_credentials": spec.holds_upstream_credentials,
         "credential_delivery": spec.credential_delivery,
         "tool_category": spec.tool_category,
+        "env_names": list(env_names),
     }
     if spec.service is not None:
         out["service"] = {
@@ -342,13 +389,104 @@ def canonical_spec(value: Mapping[str, Any]) -> str:
 # =============================================================================
 
 
-def custom_driver_problems(spec: DriverSpec, *, privileged: bool) -> list[str]:
+_SUBSCHEMA_MAPS = frozenset(
+    {"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"}
+)
+_SUBSCHEMA_LISTS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
+_SUBSCHEMAS = frozenset(
+    {
+        "items",
+        "additionalItems",
+        "additionalProperties",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "propertyNames",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+    }
+)
+#: Keywords whose value is a regular expression SRW would run.
+_REGEX_KEYWORDS = ("pattern", "patternProperties")
+
+
+def schema_problems(schema: Any, where: str) -> list[str]:
+    """Why a registered JSON Schema cannot be validated on SRW's own loop.
+
+    A regular expression (``pattern``, ``patternProperties``, a ``regex``
+    format) can take time exponential in its input, a ``$ref`` outside the
+    document can make the validator fetch one, and size and depth bound
+    the rest (:data:`MAX_SCHEMA_BYTES`, :data:`MAX_SCHEMA_DEPTH`). Keywords
+    are found by the schema's own structure: a property *named* ``pattern``
+    is data, not a keyword.
+    """
+    if not isinstance(schema, Mapping):
+        return [f"{where} must be an object"]
+    try:
+        size = len(canonical_spec(schema).encode("utf-8"))
+    except (TypeError, ValueError):
+        return [f"{where} is not plain JSON"]
+    problems: list[str] = []
+    if size > MAX_SCHEMA_BYTES:
+        problems.append(f"{where} exceeds {MAX_SCHEMA_BYTES // 1024} KiB")
+
+    def walk(node: Any, path: str, depth: int) -> None:
+        if isinstance(node, bool):
+            return
+        if not isinstance(node, Mapping):
+            problems.append(f"{path} is not a schema")
+            return
+        if depth > MAX_SCHEMA_DEPTH:
+            problems.append(f"{where} nests deeper than {MAX_SCHEMA_DEPTH} levels")
+            return
+        for keyword in _REGEX_KEYWORDS:
+            if keyword in node:
+                problems.append(
+                    f"{path} uses {keyword}: a registered schema runs no regular "
+                    "expression (check it in the driver's check)"
+                )
+        if node.get("format") == "regex":
+            problems.append(f"{path} uses format regex")
+        for keyword in ("$ref", "$dynamicRef"):
+            ref = node.get(keyword)
+            if ref is not None and not (isinstance(ref, str) and ref.startswith("#")):
+                problems.append(f"{path}.{keyword} must point inside the schema")
+        for keyword, value in node.items():
+            at = f"{path}.{keyword}"
+            if keyword in _SUBSCHEMA_MAPS and isinstance(value, Mapping):
+                for name, child in value.items():
+                    walk(child, f"{at}.{name}", depth + 1)
+            elif keyword in _SUBSCHEMA_LISTS and isinstance(value, list):
+                for index, child in enumerate(value):
+                    walk(child, f"{at}[{index}]", depth + 1)
+            elif keyword in _SUBSCHEMAS:
+                if isinstance(value, list):
+                    for index, child in enumerate(value):
+                        walk(child, f"{at}[{index}]", depth + 1)
+                else:
+                    walk(value, at, depth + 1)
+
+    walk(schema, where, 1)
+    return list(dict.fromkeys(problems))
+
+
+def custom_driver_problems(
+    spec: DriverSpec, *, privileged: bool, env_names: Iterable[str] = ()
+) -> list[str]:
     """Every reason ``spec`` cannot be registered as an image driver.
 
     ``privileged`` is whether the image may have privilege: its repository
     is trusted, or the operator turned privilege on for custom drivers.
+    ``env_names`` are the variable names the spec declares
+    (:func:`declared_env_names`).
     """
+    env_names = tuple(env_names)
     problems = validate_spec(spec)
+    problems += schema_problems(spec.config_schema, "config_schema")
+    for slot in spec.credential_slots:
+        problems += schema_problems(slot.schema, f"credential slot {slot.name}")
     if reserved_name(spec.name):
         problems.append(
             f"driver names under {RESERVED_NAMESPACE}. are SRW's own; "
@@ -367,17 +505,27 @@ def custom_driver_problems(spec: DriverSpec, *, privileged: bool) -> list[str]:
             "connectors.customDrivers.privileged"
         )
     elif spec.plane == "bind_time":
-        problems += _bind_time_problems(spec)
+        problems += _bind_time_problems(spec, env_names)
     elif spec.plane == "service" and not managed_mcp_driver(spec):
         problems.append(
             "a registered service driver is a managed MCP server in this "
             "release: import its server.json"
         )
+    if env_names and spec.plane != "bind_time":
+        problems.append("only a bind-time driver declares env_names")
     return problems
 
 
-def _bind_time_problems(spec: DriverSpec) -> list[str]:
+def _bind_time_problems(spec: DriverSpec, env_names: tuple[str, ...]) -> list[str]:
     problems: list[str] = []
+    if "env_file" in spec.delivery_forms and not env_names:
+        problems.append(
+            "a bind-time image driver that sets variables declares every name "
+            "its bind may return in env_names"
+        )
+    problems += [
+        f"env_names: {why}" for why in map(driver_env_problem, env_names) if why
+    ]
     extra = sorted(set(spec.delivery_forms) - set(IMAGE_BIND_FORMS))
     if extra:
         problems.append(
@@ -402,10 +550,12 @@ def repository_trusted(reference: str, trusted: Iterable[str]) -> bool:
     ``trusted`` holds repositories (a full reference's tag and digest are
     ignored). A repository matches itself and everything below it on a path
     boundary: ``ghcr.io/org`` trusts ``ghcr.io/org/driver`` but never
-    ``ghcr.io/org-evil``. An unreadable reference is never trusted.
+    ``ghcr.io/org-evil``. Docker Hub's other host names are Docker Hub. A
+    registry host alone, a wildcard or an unreadable entry trusts nothing,
+    and an unreadable reference is never trusted.
     """
     try:
-        name = ImageReference.parse(reference).name
+        name = _hub(ImageReference.parse(reference).name)
     except ValueError:
         return False
     for item in trusted:
@@ -440,7 +590,18 @@ def _repository_root(item: str) -> str | None:
         ImageReference.parse(root)
     except ValueError:
         return None
-    return root
+    return _hub(root)
+
+
+#: Docker Hub's other host names.
+_HUB_ALIASES = ("index.docker.io/", "registry-1.docker.io/")
+
+
+def _hub(name: str) -> str:
+    for alias in _HUB_ALIASES:
+        if name.startswith(alias):
+            return "docker.io/" + name[len(alias) :]
+    return name
 
 
 # =============================================================================
@@ -448,16 +609,26 @@ def _repository_root(item: str) -> str | None:
 # =============================================================================
 
 
-def image_binding_problems(descriptor: Any, spec: DriverSpec) -> list[str]:
+def image_binding_problems(
+    descriptor: Any, spec: DriverSpec, *, env_names: Iterable[str] = ()
+) -> list[str]:
     """Why a bind-time image driver's descriptor cannot be delivered.
 
-    The descriptor schema's rules, plus: it names the registered driver,
-    every entry goes to the workspace in a form the spec declares (and SRW
-    delivers for images), and it stays within :data:`MAX_BINDING_ENTRIES`.
+    The one check of a bind's output, which SRW and the author test kit both
+    run: the descriptor schema's rules, plus: it names the registered
+    driver, every entry goes to the workspace in a form the spec declares
+    (and SRW delivers for images), it stays within
+    :data:`MAX_BINDING_ENTRIES`, every variable it sets (a file's
+    ``env_var`` included) is one the spec declares in ``env_names`` and one
+    a driver may set (``env_names.driver_env_problem``), with a value the
+    workspace takes, no name is set twice, and every file lands at
+    :data:`IMAGE_FILE_TARGETS`, never executable. The messages never show a
+    value.
     """
     problems = validate_binding(descriptor)
     if problems:
         return problems
+    declared = set(env_names)
     if descriptor.get("driver") != spec.name:
         problems.append(
             f"the binding names driver {descriptor.get('driver')!r}, not {spec.name}"
@@ -466,6 +637,7 @@ def image_binding_problems(descriptor: Any, spec: DriverSpec) -> list[str]:
     if len(entries) > MAX_BINDING_ENTRIES:
         problems.append(f"a binding holds at most {MAX_BINDING_ENTRIES} entries")
     allowed = set(spec.delivery_forms) & set(IMAGE_BIND_FORMS)
+    named: set[str] = set()
     for index, entry in enumerate(entries):
         if entry["recipient"] != "workspace":
             problems.append(f"entries[{index}] must go to the workspace")
@@ -474,17 +646,45 @@ def image_binding_problems(descriptor: Any, spec: DriverSpec) -> list[str]:
                 f"entries[{index}].form {entry['form']!r} is not one this "
                 f"driver declares ({sorted(allowed)})"
             )
-        if entry["form"] == "credential_file":
-            problems += _file_problems(entry["value"], index)
+        value = entry["value"]
+        name: Any = None
+        if entry["form"] == "env_file":
+            name = value.get("name")
+            if isinstance(name, str):
+                why = env_value_problem(name, value.get("value"))
+                if why is not None:
+                    problems.append(f"entries[{index}]: {why}")
+        elif entry["form"] == "credential_file":
+            problems += _file_problems(value, index)
+            name = value.get("env_var") or None
+        if name is None:
+            continue
+        why = driver_env_problem(name)
+        if why is not None:
+            problems.append(f"entries[{index}]: {why}")
+        elif name not in declared:
+            problems.append(
+                f"entries[{index}] sets {name}, which the driver's spec does not "
+                "declare in env_names"
+            )
+        elif name in named:
+            problems.append(f"the binding sets {name} twice")
+        named.add(str(name))
     return problems
 
 
 def _file_problems(value: Mapping[str, Any], index: int) -> list[str]:
     at = f"entries[{index}].value"
     problems: list[str] = []
-    _relative, why = target_problem(str(value.get("path") or ""))
+    relative, why = target_problem(str(value.get("path") or ""))
     if why is not None:
         problems.append(f"{at}.path is refused: {why}")
+    elif relative not in IMAGE_FILE_NAMES and not relative.startswith(
+        IMAGE_FILE_DIRECTORY + "/"
+    ):
+        problems.append(
+            f"{at}.path is refused: a driver's file goes to {IMAGE_FILE_TARGETS}"
+        )
     mode = value.get("mode")
     if mode is not None:
         why = mode_problem(int(mode))
@@ -532,16 +732,101 @@ def wire_credentials(descriptor: Mapping[str, Any]) -> dict[str, Any]:
     return out
 
 
+# =============================================================================
+# A moved tag
+# =============================================================================
+
+
+def _slots(value: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    return {
+        str(slot.get("name")): slot
+        for slot in value.get("credential_slots") or []
+        if isinstance(slot, Mapping)
+    }
+
+
+def _hosts(value: Mapping[str, Any]) -> set[str]:
+    return {
+        canonical_spec(rule)
+        for rule in value.get("egress") or []
+        if isinstance(rule, Mapping)
+    }
+
+
+def moved_spec_problems(
+    previous: Mapping[str, Any], new: Mapping[str, Any] | None
+) -> list[str]:
+    """Why the spec of an image a tag moved to cannot replace ``previous``.
+
+    ``previous`` is the spec the connector last bound with (its
+    registration's before any bind); ``new`` the new digest's label, or
+    ``None`` when it carries none (an empty label is none). Refused: no
+    label at all (SRW cannot check a contract it cannot read; an unlabelled
+    image stays at the digest it was registered at), a spec that does not
+    read, another driver name or plane, an unsupported or other protocol
+    major, a slot that disappeared, a new required slot, a slot whose kind
+    or schema changed, and more reach than before: new environment names,
+    delivery forms or egress. The stored config against the new
+    ``config_schema`` is the caller's (it owns the JSON Schema validator).
+    """
+    if new is None:
+        return [
+            f"the new image carries no {SPEC_LABEL} label, so SRW cannot check "
+            "it keeps the driver's contract"
+        ]
+    try:
+        spec_from_json(new)
+        new_contract = SpecContract.of_label(new)
+        previous_contract = SpecContract.of_label(previous)
+        new_names = set(declared_env_names(new))
+        old_names = set(declared_env_names(previous))
+    except ValueError as exc:
+        return [f"its spec label is malformed ({exc})"]
+    problems = compatibility_problems(previous_contract, new_contract)
+    if new.get("plane") != previous.get("plane"):
+        problems.append(
+            f"the plane changed ({previous.get('plane')} to {new.get('plane')})"
+        )
+    old_slots, new_slots = _slots(previous), _slots(new)
+    for name, slot in sorted(new_slots.items()):
+        before = old_slots.get(name)
+        if before is None:
+            if slot.get("required"):
+                problems.append(f"a new credential slot is required: {name}")
+        elif canonical_spec(
+            {key: slot.get(key) for key in ("kind", "schema")}
+        ) != canonical_spec({key: before.get(key) for key in ("kind", "schema")}):
+            problems.append(f"credential slot {name} changed its kind or schema")
+    added = sorted(new_names - old_names)
+    if added:
+        problems.append(f"it sets new environment names: {', '.join(added)}")
+    forms = sorted(
+        set(new.get("delivery_forms") or ()) - set(previous.get("delivery_forms") or ())
+    )
+    if forms:
+        problems.append(f"it delivers new forms: {', '.join(map(str, forms))}")
+    if _hosts(new) - _hosts(previous):
+        problems.append("it reaches new egress destinations")
+    return problems
+
+
 __all__ = [
     "IMAGE_BIND_FORMS",
+    "IMAGE_FILE_TARGETS",
     "MAX_BINDING_ENTRIES",
+    "MAX_ENV_NAMES",
+    "MAX_SCHEMA_BYTES",
+    "MAX_SCHEMA_DEPTH",
     "RESERVED_NAMESPACE",
     "SPEC_KEYS",
     "canonical_spec",
     "custom_driver_problems",
+    "declared_env_names",
     "image_binding_problems",
+    "moved_spec_problems",
     "repository_trusted",
     "reserved_name",
+    "schema_problems",
     "spec_from_json",
     "spec_to_json",
     "wire_credentials",

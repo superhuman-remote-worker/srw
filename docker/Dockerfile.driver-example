@@ -14,7 +14,9 @@
 # Built without the label, SRW asks the image for its spec instead (its spec
 # operation, in a sandboxed pod).
 # =============================================================================
-FROM python:3.11-slim
+# Pinned by digest (the MCP image's base): a driver image is someone's code
+# in SRW's namespace, so the example shows what a reproducible one looks like.
+FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 COPY drivers/example/srw_example_driver.py drivers/example/spec.json /driver/

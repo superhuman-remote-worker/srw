@@ -4,20 +4,19 @@
   "protocol_version": "1.0",
   "plane": "bind_time",
   "delivery_forms": ["env_file", "credential_file"],
+  "env_names": ["EXAMPLE_TOKEN", "EXAMPLE_TOKEN_FILE", "EXAMPLE_DRIVER_PROCESS"],
   "config_schema": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["variable"],
     "properties": {
-      "variable": {
-        "type": "string",
-        "pattern": "^[A-Z][A-Z0-9_]{0,63}$",
-        "description": "The environment variable the workspace receives the credential in",
+      "file": {
+        "type": "boolean",
+        "description": "Also write the credential to ~/.srw-files/example/token, named by EXAMPLE_TOKEN_FILE",
         "x-srw-order": 1
       },
-      "file": {
-        "type": "string",
-        "description": "Also write the credential to this file (for example ~/.srw-files/example/token)",
+      "misbehave": {
+        "enum": ["denied_variable", "undeclared_variable", "refused_file", "fail"],
+        "description": "For SRW's own gate only: make bind return what SRW refuses, or fail",
         "x-srw-order": 2
       }
     }
@@ -49,7 +48,7 @@
   ],
   "default_access": "ReadWrite",
   "supported_backends": ["sandbox", "vm"],
-  "workspace_requirements": "A shell workspace: the variable is sourced for every command.",
+  "workspace_requirements": "A shell workspace: the variables are sourced for every command.",
   "operations": ["gc"],
   "egress": [],
   "holds_upstream_credentials": true

@@ -284,6 +284,15 @@
           }
         }
       }
+    },
+    "env_names": {
+      "type": "array",
+      "maxItems": 100,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+      }
     }
   }
 }

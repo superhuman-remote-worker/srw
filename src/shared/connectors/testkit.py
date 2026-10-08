@@ -46,6 +46,7 @@ from .envelope import (
 from .images import SPEC_LABEL, label_spec
 from .registration import (
     custom_driver_problems,
+    declared_env_names,
     image_binding_problems,
     spec_from_json,
 )
@@ -186,6 +187,8 @@ class Kit:
         self.fixture = fixture
         self.schema_check = schema_check
         self.steps: list[Step] = []
+        #: The variable names the driver's spec declares (``env_names``).
+        self.env_names: tuple[str, ...] = ()
 
     def _request(self, operation: str, **fields: Any) -> dict[str, Any]:
         execution = self.fixture.get("execution") or {}
@@ -265,8 +268,12 @@ class Kit:
         except ValueError as exc:
             step.problems.append(f"the spec from {source} does not read: {exc}")
             return None
+        self.env_names = declared_env_names(spec_json)
         step.problems += [
-            f"registration: {p}" for p in custom_driver_problems(spec, privileged=False)
+            f"registration: {p}"
+            for p in custom_driver_problems(
+                spec, privileged=False, env_names=self.env_names
+            )
         ]
         return spec
 
@@ -295,7 +302,10 @@ class Kit:
             step.problems += self.schema_check("binding", descriptor)
         if spec is not None:
             step.problems += [
-                f"binding: {p}" for p in image_binding_problems(descriptor, spec)
+                f"binding: {p}"
+                for p in image_binding_problems(
+                    descriptor, spec, env_names=self.env_names
+                )
             ]
         return outcome.driver_state
 

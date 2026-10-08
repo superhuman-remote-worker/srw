@@ -27,7 +27,11 @@ from shared.connectors.message_schemas import (
     SCHEMA_FILES,
     load_message_schema,
 )
-from shared.connectors.registration import custom_driver_problems, spec_from_json
+from shared.connectors.registration import (
+    custom_driver_problems,
+    declared_env_names,
+    spec_from_json,
+)
 from shared.connectors.testkit import CommandDriver, Kit
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,7 +92,14 @@ class TestTheExampleDriver:
         assert all(step["ok"] for step in json.loads(capsys.readouterr().out))
 
     def test_its_spec_registers_and_matches_the_spec_schema(self):
-        assert custom_driver_problems(spec_from_json(SPEC), privileged=False) == []
+        assert (
+            custom_driver_problems(
+                spec_from_json(SPEC),
+                privileged=False,
+                env_names=declared_env_names(SPEC),
+            )
+            == []
+        )
         assert (
             list(Draft202012Validator(load_message_schema("spec")).iter_errors(SPEC))
             == []
@@ -145,7 +156,7 @@ else:
 """
 WORKSPACE_ENV = (
     '{"recipient": "workspace", "form": "env_file", '
-    '"value": {"name": "A", "value": "b"}, "collision": "error"}'
+    '"value": {"name": "EXAMPLE_TOKEN", "value": "b"}, "collision": "error"}'
 )
 
 
@@ -160,6 +171,31 @@ class TestBrokenDrivers:
         failures = _failures(Kit(driver, FIXTURE).run())
         assert list(failures) == ["bind"]
         assert "workspace" in failures["bind"][0]
+
+    @pytest.mark.parametrize(
+        ("name", "message"),
+        [
+            ("GIT_SSH_COMMAND", "not a variable a driver may set"),
+            ("EXAMPLE_UNDECLARED", "does not declare"),
+        ],
+    )
+    def test_the_kit_runs_srw_s_own_bind_checks(self, tmp_path, name, message):
+        """What SRW refuses at bind fails the kit's bind step, word for word."""
+        entry = WORKSPACE_ENV.replace("EXAMPLE_TOKEN", name)
+        driver = _driver(tmp_path, GOOD.replace("ENTRY", entry))
+        failures = _failures(Kit(driver, FIXTURE).run())
+        assert list(failures) == ["bind"]
+        assert any(message in problem for problem in failures["bind"])
+
+    def test_a_file_outside_the_driver_s_locations_fails_bind(self, tmp_path):
+        kubeconfig = (
+            '{"recipient": "workspace", "form": "credential_file", '
+            '"value": {"path": "~/.kube/config", "content": "{}"}, '
+            '"collision": "skip_existing"}'
+        )
+        driver = _driver(tmp_path, GOOD.replace("ENTRY", kubeconfig))
+        failures = _failures(Kit(driver, FIXTURE).run())
+        assert any("~/.srw-files/" in problem for problem in failures["bind"])
 
     def test_revoke_must_succeed_when_already_gone(self, tmp_path):
         marker = str(tmp_path / "revoked")
