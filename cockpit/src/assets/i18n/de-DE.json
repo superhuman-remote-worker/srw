@@ -3068,6 +3068,10 @@
       "scopeCatalog": "Geteilt (alle)",
       "submit": "Registrieren",
       "delete": "Registrierung löschen",
+      "disable": "Deaktivieren",
+      "enable": "Aktivieren",
+      "disabled": "Deaktiviert: bindet nichts Neues",
+      "envNames": "Setzt:",
       "scopeKind": {
         "Account": "In einem Konto registriert",
         "Project": "In einem Projekt registriert",

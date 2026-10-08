@@ -111,6 +111,10 @@ export interface ConnectorDriverRegistration {
   image_reference: string;
   image_digest: string;
   spec_source: 'label' | 'spec_operation' | 'server_json';
+  /** The variables its bind may set, declared in its spec. */
+  env_names?: string[];
+  /** Disabled: it binds nothing new and its bindings are revoked. */
+  disabled?: boolean;
 }
 
 /** `POST /api/connector-drivers`: the spec comes from the image itself. */

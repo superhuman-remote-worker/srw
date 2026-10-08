@@ -44,6 +44,7 @@ function mount(drivers: ConnectorDriver[] | null, loadFailed = false, admin = fa
   const api = {
     registerConnectorDriver: vi.fn(() => of({id: 'r1'})),
     deleteConnectorDriver: vi.fn(() => of({status: 'deleted'})),
+    setConnectorDriverDisabled: vi.fn(() => of({id: 'r1'})),
   };
   const users = {currentUser: signal({id: 'u1', is_admin: admin})};
   TestBed.configureTestingModule({
@@ -263,6 +264,53 @@ describe('ConnectorDriversPageComponent', () => {
       expect(errorDetail({status: 409, error: {detail: 'in use'}})).toBe('in use');
       expect(errorDetail({status: 500, error: {}})).toBe('HTTP 500');
       expect(errorDetail(null)).toBe('Request failed');
+    });
+
+    it("renders a validation 422's list of messages, and an object's message", () => {
+      const list = {
+        status: 422,
+        error: {detail: [{loc: ['body', 'image'], msg: 'Field required'}, {msg: 'too long'}]},
+      };
+      expect(errorDetail(list)).toBe('Field required; too long');
+      const ambiguous = {
+        status: 409,
+        error: {detail: {message: 'Ambiguous driver name', registrations: []}},
+      };
+      expect(errorDetail(ambiguous)).toBe('Ambiguous driver name');
+    });
+
+    const catalogDriver = (disabled = false): ConnectorDriver => ({
+      ...CUSTOM,
+      registration: {
+        id: 'r2',
+        scope: {kind: 'Catalog', name: 'shared'},
+        image_reference: 'ghcr.io/acme/ticketing:1',
+        image_digest: 'sha256:' + '2'.repeat(64),
+        spec_source: 'label',
+        env_names: ['TICKETS_TOKEN'],
+        disabled,
+      },
+    });
+
+    it("offers a Catalog registration's Delete and Disable to administrators only", () => {
+      const user = card(mount([catalogDriver()]).host, CUSTOM.name);
+      expect(text(user)).not.toContain(page.register.delete);
+      expect(text(user)).not.toContain(page.register.disable);
+      expect(text(user)).toContain('TICKETS_TOKEN');
+      TestBed.resetTestingModule();
+      const admin = card(mount([catalogDriver()], false, true).host, CUSTOM.name);
+      expect(text(admin)).toContain(page.register.delete);
+      expect(text(admin)).toContain(page.register.disable);
+    });
+
+    it('disables and enables a registration, and shows it disabled', () => {
+      const {fixture, host, api, service} = mount([catalogDriver(true)], false, true);
+      const section = card(host, CUSTOM.name);
+      expect(section.querySelector('[data-registration="disabled"]')).not.toBeNull();
+      expect(text(section)).toContain(page.register.enable);
+      fixture.componentInstance.setDisabled('r2', false);
+      expect(api.setConnectorDriverDisabled).toHaveBeenCalledWith('r2', false);
+      expect(service.load).toHaveBeenLastCalledWith(true);
     });
   });
 });

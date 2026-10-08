@@ -3068,6 +3068,10 @@
       "scopeCatalog": "Shared (everyone)",
       "submit": "Register",
       "delete": "Delete registration",
+      "disable": "Disable",
+      "enable": "Enable",
+      "disabled": "Disabled: binds nothing new",
+      "envNames": "Sets:",
       "scopeKind": {
         "Account": "Registered in an account",
         "Project": "Registered in a project",

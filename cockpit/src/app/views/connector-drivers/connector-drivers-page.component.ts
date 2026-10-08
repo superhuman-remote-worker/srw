@@ -29,10 +29,19 @@ export function driverAnchor(name: string): string {
   return 'driver-' + name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
 }
 
-/** The server's reason for a refused registration or delete. */
+/** The server's reason for a refused registration or delete: a string, a
+ * request validation's list of messages, or an object with a message. */
 export function errorDetail(error: unknown): string {
   const detail = (error as {error?: {detail?: unknown}} | null)?.error?.detail;
   if (typeof detail === 'string' && detail) return detail;
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => (typeof item === 'string' ? item : (item as {msg?: unknown})?.msg))
+      .filter((message): message is string => typeof message === 'string' && !!message);
+    if (messages.length) return messages.join('; ');
+  }
+  const message = (detail as {message?: unknown} | null)?.message;
+  if (typeof message === 'string' && message) return message;
   const status = (error as {status?: unknown} | null)?.status;
   return typeof status === 'number' ? `HTTP ${status}` : 'Request failed';
 }
@@ -165,15 +174,34 @@ export function errorDetail(error: unknown): string {
                 <span>
                   {{ 'connectorDrivers.register.scopeKind.' + registration.scope.kind | transloco }}
                   · <code>{{ registration.image_digest }}</code>
+                  @if (registration.disabled) {
+                    · <strong data-registration="disabled">{{ 'connectorDrivers.register.disabled' | transloco }}</strong>
+                  }
+                  @if (registration.env_names?.length) {
+                    <br />{{ 'connectorDrivers.register.envNames' | transloco }}
+                    <code data-registration="env">{{ registration.env_names!.join(', ') }}</code>
+                  }
                 </span>
-                <app-button
-                  variant="secondary"
-                  size="sm"
-                  [disabled]="deleting() === registration.id"
-                  (clicked)="remove(registration.id)"
-                >
-                  {{ 'connectorDrivers.register.delete' | transloco }}
-                </app-button>
+                @if (canManage(registration.scope.kind)) {
+                  <span class="registration-actions">
+                    <app-button
+                      variant="secondary"
+                      size="sm"
+                      [disabled]="deleting() === registration.id"
+                      (clicked)="setDisabled(registration.id, !registration.disabled)"
+                    >
+                      {{ (registration.disabled ? 'connectorDrivers.register.enable' : 'connectorDrivers.register.disable') | transloco }}
+                    </app-button>
+                    <app-button
+                      variant="secondary"
+                      size="sm"
+                      [disabled]="deleting() === registration.id"
+                      (clicked)="remove(registration.id)"
+                    >
+                      {{ 'connectorDrivers.register.delete' | transloco }}
+                    </app-button>
+                  </span>
+                }
               </div>
             }
 
@@ -396,6 +424,11 @@ export function errorDetail(error: unknown): string {
     .register-error {
       color: var(--danger);
       font-size: 0.85rem;
+    }
+
+    .registration-actions {
+      display: flex;
+      gap: 8px;
     }
 
     .registration {
@@ -673,6 +706,27 @@ export class ConnectorDriversPageComponent implements OnInit {
       },
       error: (error) => {
         this.registering.set(false);
+        this.registerError.set(errorDetail(error));
+      },
+    });
+  }
+
+  /** Whether this page offers Disable and Delete: the Catalog's are the
+   *  administrators'; the server decides for a Project's (editors and up). */
+  canManage(kind: 'Account' | 'Project' | 'Catalog'): boolean {
+    return kind !== 'Catalog' || this.isAdmin();
+  }
+
+  setDisabled(id: string, disabled: boolean): void {
+    this.deleting.set(id);
+    this.registerError.set(null);
+    this.api.setConnectorDriverDisabled(id, disabled).subscribe({
+      next: () => {
+        this.deleting.set(null);
+        this.service.load(true);
+      },
+      error: (error) => {
+        this.deleting.set(null);
         this.registerError.set(errorDetail(error));
       },
     });

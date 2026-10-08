@@ -1039,9 +1039,17 @@ export class ApiService {
     return this.http.post<{id: string}>(`${this.baseUrl}/connector-drivers`, body);
   }
 
-  /** Delete a driver registration no connector uses (409 while one does). */
+  /** Delete a driver registration whose bindings are revoked and which no
+   * connector uses, or which is disabled (409 otherwise, with the reason). */
   deleteConnectorDriver(id: string): Observable<{status: string}> {
     return this.http.delete<{status: string}>(`${this.baseUrl}/connector-drivers/${id}`);
+  }
+
+  /** Disable (or enable again) a driver registration: disabled, it binds
+   * nothing new and its live bindings are revoked. */
+  setConnectorDriverDisabled(id: string, disabled: boolean): Observable<{id: string}> {
+    const action = disabled ? 'disable' : 'enable';
+    return this.http.post<{id: string}>(`${this.baseUrl}/connector-drivers/${id}/${action}`, {});
   }
 
   /** Projects the caller may use in a connector's availability policy. Current
