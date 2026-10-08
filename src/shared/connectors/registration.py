@@ -127,6 +127,22 @@ IMAGE_FILE_TARGETS = f"~/{IMAGE_FILE_DIRECTORY}/, ~/.netrc or ~/.pgpass"
 #: Bounds on a registered schema (its canonical JSON, and its nesting).
 MAX_SCHEMA_BYTES = 32 * 1024
 MAX_SCHEMA_DEPTH = 12
+#: The most schema nodes one validation may apply, every ``$ref`` followed
+#: (each reference counts its target again), and how deep they may nest
+#: so: what one instance value costs at most. With
+#: :data:`MAX_INSTANCE_NODES` one validation stays under about a second
+#: (measured: 243 failing ``anyOf`` branches against 510 values, 0.8 s).
+MAX_SCHEMA_NODES = 256
+MAX_EXPANDED_DEPTH = 32
+#: The widest ``allOf``, ``anyOf``, ``oneOf`` or ``prefixItems``.
+MAX_SCHEMA_WIDTH = 64
+#: Bounds on what is validated against a registered schema: a stored
+#: config's canonical JSON, and any value's JSON nodes. With
+#: :data:`MAX_SCHEMA_NODES` they bound one validation's work.
+MAX_CONFIG_BYTES = 64 * 1024
+MAX_INSTANCE_NODES = 512
+#: How long SRW waits for one validation, which runs off its event loop.
+VALIDATION_SECONDS = 5.0
 
 
 def reserved_name(name: Any) -> bool:
@@ -436,7 +452,10 @@ _RESOLUTION_KEYWORDS = (
 _DIALECT = "https://json-schema.org/draft/2020-12/schema"
 #: The only references a registered schema may hold: into its own ``$defs``
 #: or ``definitions``, by a plain name.
-_LOCAL_REF = re.compile(r"#/(\$defs|definitions)/([A-Za-z0-9_.-]{1,128})\Z")
+_LOCAL_REF = re.compile(r"#/(\$defs|definitions)/([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})\Z")
+#: Keywords whose cost grows faster than the document it validates: SRW
+#: refuses them in a registered schema (a driver checks them in ``check``).
+_COSTLY_KEYWORDS = ("unevaluatedProperties", "unevaluatedItems")
 #: How deeply JSON containers (a default's, an enum's) may nest at all.
 _MAX_CONTAINER_DEPTH = 64
 
@@ -494,8 +513,14 @@ def schema_problems(schema: Any, where: str) -> list[str]:
     no ``$id``, ``$anchor``, ``$dynamicAnchor``, ``$dynamicRef`` or
     ``$recursiveRef`` may name another target: a reference can reach
     nothing the structural walk did not check, and never fetches. Size and
-    depth bound the rest (:data:`MAX_SCHEMA_BYTES`,
-    :data:`MAX_SCHEMA_DEPTH`).
+    depth bound the document (:data:`MAX_SCHEMA_BYTES`,
+    :data:`MAX_SCHEMA_DEPTH`), and the cost of one validation is bounded
+    too: no ``$ref`` loops, no combinator is wider than
+    :data:`MAX_SCHEMA_WIDTH`, at most :data:`MAX_SCHEMA_NODES` schemas apply
+    (:data:`MAX_EXPANDED_DEPTH` deep) once every ``$ref`` is followed, and
+    no ``uniqueItems``, ``unevaluatedProperties`` or ``unevaluatedItems``
+    (their cost grows faster than the document). What is validated is
+    bounded by :func:`instance_problem`.
     """
     if not isinstance(schema, Mapping):
         return [f"{where} must be an object"]
@@ -528,6 +553,17 @@ def schema_problems(schema: Any, where: str) -> list[str]:
             return
         if "$schema" in node and depth > 1:
             problems.append(f"{path}.$schema is the root's only")
+        for keyword in _COSTLY_KEYWORDS:
+            if keyword in node:
+                problems.append(
+                    f"{path} uses {keyword}: its cost grows faster than the "
+                    "document (use additionalProperties or items)"
+                )
+        if node.get("uniqueItems") is True:
+            problems.append(
+                f"{path} uses uniqueItems: its cost is quadratic in the array "
+                "(check it in the driver's check)"
+            )
         if "$ref" in node:
             ref = node["$ref"]
             match = _LOCAL_REF.fullmatch(ref) if isinstance(ref, str) else None
@@ -554,7 +590,148 @@ def schema_problems(schema: Any, where: str) -> list[str]:
                     walk(value, at, depth + 1)
 
     walk(schema, where, 1)
+    if not problems:
+        problems += _cost_problems(schema, where)
     return list(dict.fromkeys(problems))
+
+
+def _applied(
+    node: Any,
+) -> tuple[int, int, list[tuple[tuple[str, str], int]], list[str]]:
+    """What validating against ``node`` applies without following a
+    ``$ref``: its schema nodes, how deep they nest, the references it makes
+    (each with the depth it is made at) and the keywords wider than
+    :data:`MAX_SCHEMA_WIDTH`. A nested ``$defs`` is applied only by
+    reference, so it is not counted here."""
+    count = 0
+    deepest = 0
+    refs: list[tuple[tuple[str, str], int]] = []
+    wide: list[str] = []
+    stack: list[tuple[Any, int]] = [(node, 1)]
+    while stack:
+        current, depth = stack.pop()
+        if not isinstance(current, (Mapping, bool)):
+            continue
+        count += 1
+        deepest = max(deepest, depth)
+        if isinstance(current, bool):
+            continue
+        ref = current.get("$ref")
+        match = _LOCAL_REF.fullmatch(ref) if isinstance(ref, str) else None
+        if match is not None:
+            refs.append(((match.group(1), match.group(2)), depth))
+        for keyword, value in current.items():
+            if keyword in ("$defs", "definitions"):
+                continue
+            if keyword in _SUBSCHEMA_MAPS and isinstance(value, Mapping):
+                stack.extend((child, depth + 1) for child in value.values())
+            elif keyword in _SUBSCHEMA_LISTS or (
+                keyword in _SUBSCHEMAS and isinstance(value, list)
+            ):
+                if isinstance(value, list):
+                    if len(value) > MAX_SCHEMA_WIDTH:
+                        wide.append(keyword)
+                    stack.extend((child, depth + 1) for child in value)
+            elif keyword in _SUBSCHEMAS:
+                stack.append((value, depth + 1))
+    return count, deepest, refs, wide
+
+
+def _cost_problems(schema: Mapping[str, Any], where: str) -> list[str]:
+    """Why validating against ``schema`` could cost more than SRW allows:
+    a ``$ref`` that loops (a definition reaching itself), a combinator
+    wider than :data:`MAX_SCHEMA_WIDTH`, or more than
+    :data:`MAX_SCHEMA_NODES` schema nodes (or deeper than
+    :data:`MAX_EXPANDED_DEPTH`) once every reference is followed, each
+    definition's cost computed once."""
+    definitions = {
+        (keyword, str(name)): child
+        for keyword in ("$defs", "definitions")
+        if isinstance(schema.get(keyword), Mapping)
+        for name, child in schema[keyword].items()
+    }
+    local = {key: _applied(child) for key, child in definitions.items()}
+    root = _applied(schema)
+    problems = [
+        f"{where}: a {keyword} holds more than {MAX_SCHEMA_WIDTH} schemas"
+        for keyword in sorted(
+            set(root[3]).union(*(entry[3] for entry in local.values()))
+        )
+    ]
+    # Each definition's cost once every reference is followed, computed in
+    # dependency order (Kahn): one that never becomes computable loops.
+    cost: dict[tuple[str, str], tuple[int, int]] = {}
+    waiting = {
+        key: {target for target, _depth in entry[2] if target in local}
+        for key, entry in local.items()
+    }
+    users: dict[tuple[str, str], set[tuple[str, str]]] = {key: set() for key in local}
+    for key, targets in waiting.items():
+        for target in targets:
+            users[target].add(key)
+    ready = [key for key, targets in waiting.items() if not targets]
+    cap = MAX_SCHEMA_NODES + 1
+    while ready:
+        key = ready.pop()
+        count, deepest, refs, _wide = local[key]
+        for target, depth in refs:
+            if target in cost:
+                count = min(cap, count + cost[target][0])
+                deepest = max(deepest, depth + cost[target][1])
+        cost[key] = (count, min(deepest, MAX_EXPANDED_DEPTH + 1))
+        for user in users[key]:
+            waiting[user].discard(key)
+            if not waiting[user]:
+                ready.append(user)
+    looping = sorted(f"#/{kind}/{name}" for kind, name in set(local) - set(cost))
+    if looping:
+        problems.append(
+            f"{where} has a $ref that loops (through {', '.join(looping[:5])})"
+        )
+        return problems
+    count, deepest, refs, _wide = root
+    for target, depth in refs:
+        if target in cost:
+            count = min(cap, count + cost[target][0])
+            deepest = max(deepest, depth + cost[target][1])
+    if count > MAX_SCHEMA_NODES:
+        problems.append(
+            f"{where} applies more than {MAX_SCHEMA_NODES} schemas once its "
+            "$refs are followed"
+        )
+    if deepest > MAX_EXPANDED_DEPTH:
+        problems.append(
+            f"{where} nests deeper than {MAX_EXPANDED_DEPTH} levels once its "
+            "$refs are followed"
+        )
+    return problems
+
+
+def instance_problem(
+    value: Any, what: str, *, max_bytes: int | None = None
+) -> str | None:
+    """Why ``value`` is not validated against a registered schema: more
+    than :data:`MAX_INSTANCE_NODES` JSON nodes, or (``max_bytes``) a larger
+    canonical JSON. ``None`` when it may be."""
+    nodes = 0
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        nodes += 1
+        if nodes > MAX_INSTANCE_NODES:
+            return f"{what} holds more than {MAX_INSTANCE_NODES} values"
+        if isinstance(current, Mapping):
+            stack.extend(current.values())
+        elif isinstance(current, (list, tuple)):
+            stack.extend(current)
+    if max_bytes is not None:
+        try:
+            size = len(canonical_spec(value).encode("utf-8"))
+        except (TypeError, ValueError, RecursionError):
+            return f"{what} is not plain JSON"
+        if size > max_bytes:
+            return f"{what} exceeds {max_bytes // 1024} KiB"
+    return None
 
 
 def custom_driver_problems(
@@ -952,20 +1129,27 @@ __all__ = [
     "IMAGE_FILE_TARGETS",
     "MAX_BINDING_ENTRIES",
     "MAX_ENV_NAMES",
+    "MAX_CONFIG_BYTES",
+    "MAX_EXPANDED_DEPTH",
     "MAX_IMAGE_FILE_PATH",
+    "MAX_INSTANCE_NODES",
     "MAX_SCHEMA_BYTES",
     "MAX_SCHEMA_DEPTH",
+    "MAX_SCHEMA_NODES",
+    "MAX_SCHEMA_WIDTH",
     "RESERVED_NAMESPACE",
     "SPEC_KEYS",
     "canonical_spec",
     "custom_driver_problems",
     "declared_env_names",
     "image_binding_problems",
+    "instance_problem",
     "moved_spec_problems",
     "repository_trusted",
     "reserved_name",
     "schema_problems",
     "spec_from_json",
     "spec_to_json",
+    "VALIDATION_SECONDS",
     "wire_credentials",
 ]

@@ -137,7 +137,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .env_names import CODE_ENV, CODE_ENV_PREFIXES, loads_code
+from .env_names import CODE_ENV, CODE_ENV_PREFIXES
 
 #: The path the front serves MCP at, on the ``srw-driver`` port.
 FRONT_PATH = "/mcp"
@@ -469,11 +469,13 @@ def program_name(program: Sequence[str]) -> str:
 
 
 def code_env(name: str) -> bool:
-    """Whether a variable loads code, names a command, a config file or a
-    package index: :func:`shared.connectors.env_names.loads_code`, the one
-    list a driver's variables are checked against (it holds
-    :data:`CODE_ENV`, which the bridge refuses on its own)."""
-    return loads_code(name)
+    """Whether a variable loads code, names a command or a package index:
+    :data:`CODE_ENV` and :data:`CODE_ENV_PREFIXES` (kept in
+    ``shared.connectors.env_names``), the list the bridge refuses on its
+    own. The server's process is the server's: a workspace's longer list
+    (``env_names.loads_code``) does not apply to it."""
+    upper = name.upper()
+    return upper in CODE_ENV or upper.startswith(CODE_ENV_PREFIXES)
 
 
 def _shell(item: str) -> bool:

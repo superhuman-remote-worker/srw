@@ -13,14 +13,21 @@ three layers, from the loosest:
   ``env_var`` names its stored file, so it may name none of these (slice
   D1d).
 * **What a driver may not set** (:func:`driver_env_problem`,
-  :func:`loads_code`): for variables a *driver* puts in a workspace's or a
-  process's environment, a registered image driver's bind (D6) and a managed
-  MCP server's stdio template and credential variable (D5b,
-  ``shared.connectors.mcp`` uses this list): the two layers above, the
-  runtime hooks the MCP bridge refuses on its own (:data:`CODE_ENV`), the
-  whole ``GIT_*`` and ``SSH_*`` families, every ``*_PROXY`` in any case, the
-  CA bundles, and the option, flag, command, config and home variables of
-  the common runtimes, build tools and package managers.
+  :func:`loads_code`): for variables a registered image driver's bind puts
+  in a *workspace* (D6): the two layers above, the runtime hooks the MCP
+  bridge refuses on its own (:data:`CODE_ENV`), the whole ``GIT_*`` and
+  ``SSH_*`` families, every ``*_PROXY`` in any case, the CA bundles, the rc
+  files, and the option, flag, command, config and home variables of the
+  common runtimes, build tools and package managers. Within a prefix
+  family a credential-shaped name (``NODE_AUTH_TOKEN``,
+  ``CARGO_REGISTRY_TOKEN``: :data:`CREDENTIAL_SUFFIXES`) stays a driver's to
+  set; a name the list spells out never does.
+
+A managed MCP server's own process (D5b's templated variables, its stdio
+credential variable, a ``server.json`` import) is checked against
+:data:`CODE_ENV` and :data:`CODE_ENV_PREFIXES` only, the list its bridge
+refuses: those variables never reach a workspace, and a server's
+``NODE_ENV`` or ``JAVA_HOME`` is its own business.
 
 This is a **best-effort lint against known tool hooks**, never a sandbox: a
 tool this list does not know may read a variable it does not name, and a
@@ -281,6 +288,31 @@ DRIVER_DENIED_NAMES: frozenset[str] = CODE_ENV | frozenset(
         "CONFIG_SITE",
         "CONFIG_SHELL",
         "COMPOSER",
+        # rc files a tool reads from the variable that names them.
+        "INPUTRC",
+        "CONDARC",
+        "WGETRC",
+        "SCREENRC",
+        "MAILRC",
+        "PSQLRC",
+        "IRBRC",
+        "GEMRC",
+        "NETRC",
+        "NPMRC",
+        "TIGRC_USER",
+        "TIGRC_SYSTEM",
+        "LYNX_CFG",
+        # A remote shell, a merge tool, an editor or a runtime a tool starts,
+        # a runtime's debug switches, and libpq's TLS settings.
+        "RSYNC_RSH",
+        "CVS_RSH",
+        "SVN_SSH",
+        "FCEDIT",
+        "HGMERGE",
+        "PIPX_DEFAULT_PYTHON",
+        "GODEBUG",
+        "PGSSLMODE",
+        "PGSSLROOTCERT",
         # Where temporary and history files go.
         "TMP",
         "TEMP",
@@ -398,7 +430,8 @@ DRIVER_DENIED_PREFIXES: tuple[str, ...] = CODE_ENV_PREFIXES + (
 #: browser, options or flags handed to a program, a command, a config file
 #: or directory, or a tool's home, in any tool (``HTTPS_PROXY``,
 #: ``GH_PAGER``, ``MAVEN_OPTS``, ``CFLAGS``, ``FZF_DEFAULT_COMMAND``,
-#: ``CONDARC``, ``BOTO_CONFIG``, ``GH_CONFIG_DIR``, ``HELM_DATA_HOME``...).
+#: ``HGRCPATH``, ``BOTO_CONFIG``, ``GH_CONFIG_DIR``, ``HELM_DATA_HOME``...).
+#: An rc file is named, never matched by ``RC`` (``DATA_SRC`` is data).
 DRIVER_DENIED_SUFFIXES: tuple[str, ...] = (
     "_PROXY",
     "ASKPASS",
@@ -410,7 +443,6 @@ DRIVER_DENIED_SUFFIXES: tuple[str, ...] = (
     "FLAGS",
     "_COMMAND",
     "_ARGS",
-    "RC",
     "RCPATH",
     "_CONFIG",
     "_CONFIG_FILE",
@@ -420,21 +452,50 @@ DRIVER_DENIED_SUFFIXES: tuple[str, ...] = (
 )
 #: The longest name a driver may set.
 MAX_DRIVER_ENV_NAME = 128
+#: A credential's name: within a prefix family (``NODE_*``, ``CARGO_*``,
+#: ``UV_*``...), a name ending so is the credential a tool sends upstream
+#: (``NODE_AUTH_TOKEN``, ``CARGO_REGISTRY_TOKEN``, ``UV_PUBLISH_TOKEN``,
+#: ``GEM_HOST_API_KEY``), never a hook: a driver may set it. A name the list
+#: spells out is refused whatever it ends with.
+CREDENTIAL_SUFFIXES: tuple[str, ...] = (
+    "_TOKEN",
+    "_API_KEY",
+    "_PASSWORD",
+    "_SECRET",
+    "_ACCESS_KEY",
+    "_SECRET_KEY",
+)
+#: Prefix families no credential-shaped name escapes: the dynamic loader's,
+#: Python's and git's config entries (the workspace's own, or code).
+_NEVER_EXEMPT_PREFIXES: tuple[str, ...] = ("LD_", "DYLD_", "PYTHON", "GIT_CONFIG_")
+
+
+def credential_shaped(name: str) -> bool:
+    """Whether ``name`` ends like a credential (:data:`CREDENTIAL_SUFFIXES`)."""
+    return name.upper().endswith(CREDENTIAL_SUFFIXES)
 
 
 def loads_code(name: str) -> bool:
     """Whether ``name`` is on the list of variables a driver may not set (a
-    known tool hook, compared in upper case). The workspace's own names are
-    :func:`workspace_name_problem`'s."""
+    known tool hook, compared in upper case). Every name the list spells
+    out and every suffix family is refused; a prefix family spares a
+    credential-shaped name (:data:`CREDENTIAL_SUFFIXES`). The workspace's
+    own names are :func:`workspace_name_problem`'s."""
     upper = name.upper()
-    return (
-        points_a_tool_at_code(name)
-        or upper in WORKSPACE_RESERVED_NAMES
-        or upper.startswith(WORKSPACE_RESERVED_PREFIXES)
+    if (
+        upper in WORKSPACE_RESERVED_NAMES
+        or upper in CONFIG_POINTER_ENV_NAMES
         or upper in DRIVER_DENIED_NAMES
-        or upper.startswith(DRIVER_DENIED_PREFIXES)
+        or upper.startswith(_NEVER_EXEMPT_PREFIXES)
+        or upper.startswith(WORKSPACE_RESERVED_PREFIXES)
         or upper.endswith(DRIVER_DENIED_SUFFIXES)
-    )
+    ):
+        return True
+    if upper.startswith(DRIVER_DENIED_PREFIXES) or upper.startswith(
+        CONFIG_POINTER_ENV_PREFIXES
+    ):
+        return not credential_shaped(upper)
+    return False
 
 
 def driver_env_problem(name: object) -> str | None:
@@ -470,6 +531,7 @@ def env_value_problem(name: str, value: object) -> str | None:
 __all__ = [
     "CODE_ENV",
     "CODE_ENV_PREFIXES",
+    "CREDENTIAL_SUFFIXES",
     "CONFIG_POINTER_ENV_NAMES",
     "CONFIG_POINTER_ENV_PREFIXES",
     "DRIVER_DENIED_NAMES",
@@ -482,6 +544,7 @@ __all__ = [
     "WORKSPACE_RESERVED_PREFIXES",
     "driver_env_problem",
     "driver_env_problems",
+    "credential_shaped",
     "env_value_problem",
     "loads_code",
     "points_a_tool_at_code",

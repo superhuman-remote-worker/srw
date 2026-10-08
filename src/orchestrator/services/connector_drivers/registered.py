@@ -20,6 +20,7 @@ so by capability.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from typing import Any, Protocol, runtime_checkable
@@ -38,7 +39,12 @@ from orchestrator.services.connector_drivers.base import (
 from shared.connectors.builtin import IMAGE_DRIVER_SPEC
 from shared.connectors.contract import DriverSpec, effective_access
 from shared.connectors.envelope import unsupported_check
-from shared.connectors.registration import schema_problems
+from shared.connectors.registration import (
+    MAX_CONFIG_BYTES,
+    VALIDATION_SECONDS,
+    instance_problem,
+    schema_problems,
+)
 
 #: The longest value a registered driver's credential may hold.
 _MAX_CREDENTIAL = 64 * 1024
@@ -153,10 +159,18 @@ class RegisteredImageDriver(RegisteredDriverHost):
 
     # -- config and credentials ------------------------------------------
 
-    def _refuse_invalid(self, schema: Mapping[str, Any], value: Any, what: str) -> None:
-        from jsonschema import Draft202012Validator
-        from jsonschema.exceptions import SchemaError
-
+    async def _refuse_invalid(
+        self,
+        schema: Mapping[str, Any],
+        value: Any,
+        what: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> None:
+        """Refuse ``value`` that ``schema`` refuses. The validation is
+        bounded before it runs (the schema's cost, :func:`schema_problems`;
+        the value's size, :func:`instance_problem`) and runs off the event
+        loop, for at most :data:`VALIDATION_SECONDS`."""
         # Registration refused these; a stored schema is never run unread.
         if schema_problems(schema, what):
             raise HTTPException(
@@ -164,28 +178,35 @@ class RegisteredImageDriver(RegisteredDriverHost):
                 detail=f"The driver {self.spec.name} declares a {what} schema "
                 "SRW does not run",
             )
+        problem = instance_problem(value, f"The {what}", max_bytes=max_bytes)
+        if problem is not None:
+            raise HTTPException(status_code=400, detail=problem)
         try:
-            Draft202012Validator.check_schema(schema)
-        except SchemaError:
+            error = await asyncio.wait_for(
+                asyncio.to_thread(_first_error, schema, value),
+                timeout=VALIDATION_SECONDS,
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Validating the {what} took longer than "
+                f"{VALIDATION_SECONDS:g} s",
+            ) from None
+        except _InvalidSchema:
             raise HTTPException(
                 status_code=400,
                 detail=f"The driver {self.spec.name} declares an invalid {what} schema",
             ) from None
-        errors = sorted(
-            Draft202012Validator(schema).iter_errors(value),
-            key=lambda error: list(error.path),
-        )
-        if errors:
-            error = errors[0]
-            where = "/".join(str(part) for part in error.path)
+        if error is not None:
+            where, rule, rule_value = error
             # The message names the rule, never the value (it may be secret).
             raise HTTPException(
                 status_code=400,
                 detail=f"{self.spec.title} {what}{f' {where}' if where else ''}: "
-                f"{error.validator} {error.validator_value!r} not satisfied",
+                f"{rule} {rule_value!r} not satisfied",
             )
 
-    def _checked_credentials(
+    async def _checked_credentials(
         self, credentials: Mapping[str, Any], *, creating: bool
     ) -> None:
         owned = {key for slot in self.spec.credential_slots for key in _slot_keys(slot)}
@@ -210,7 +231,7 @@ class RegisteredImageDriver(RegisteredDriverHost):
                         detail=f"{self.spec.title} needs its {slot.name} credential",
                     )
                 continue
-            self._refuse_invalid(slot.schema, part, f"credential {slot.name}")
+            await self._refuse_invalid(slot.schema, part, f"credential {slot.name}")
 
     async def validate(
         self,
@@ -229,9 +250,9 @@ class RegisteredImageDriver(RegisteredDriverHost):
             )
         credentials = self.stored_credentials(draft, existing)
         if credentials is not None:
-            self._checked_credentials(credentials, creating=existing is None)
+            await self._checked_credentials(credentials, creating=existing is None)
         elif existing is None:
-            self._checked_credentials({}, creating=True)
+            await self._checked_credentials({}, creating=True)
         config = draft.config
         if config is None and existing is None:
             config = {}
@@ -239,7 +260,9 @@ class RegisteredImageDriver(RegisteredDriverHost):
             if not isinstance(config, Mapping):
                 raise HTTPException(status_code=400, detail="config must be an object")
             config = dict(config)
-            self._refuse_invalid(self.spec.config_schema, config, "config")
+            await self._refuse_invalid(
+                self.spec.config_schema, config, "config", max_bytes=MAX_CONFIG_BYTES
+            )
         return NormalizedConnector(
             connection_url=None, config=config, credentials=credentials
         )
@@ -253,6 +276,31 @@ class RegisteredImageDriver(RegisteredDriverHost):
                 "installation runs none (connectors.servicePods.enabled)"
             )
         return await self._check_runner(self.registration, row, credentials)
+
+
+class _InvalidSchema(Exception):
+    """The registered schema is not a valid JSON Schema."""
+
+
+def _first_error(schema: Mapping[str, Any], value: Any) -> tuple[str, str, Any] | None:
+    """The first error (by path) of ``value`` against ``schema``: where, the
+    rule and its argument, never the value. Runs in a worker thread."""
+    from jsonschema import Draft202012Validator
+    from jsonschema.exceptions import SchemaError
+
+    try:
+        Draft202012Validator.check_schema(schema)
+    except SchemaError:
+        raise _InvalidSchema() from None
+    errors = sorted(
+        Draft202012Validator(schema).iter_errors(value),
+        key=lambda error: list(error.path),
+    )
+    if not errors:
+        return None
+    error = errors[0]
+    where = "/".join(str(part) for part in error.path)
+    return where, str(error.validator), error.validator_value
 
 
 __all__ = [

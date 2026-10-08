@@ -727,7 +727,8 @@ REREVIEW_DENIED = [
     "ACME_OPTIONS",
     "ACME_COMMAND",
     "ACME_ARGS",
-    "ACMERC",
+    "INPUTRC",
+    "WGETRC",
     "ACME_RCPATH",
     "ACME_CONFIG",
     "ACME_CONFIG_FILE",
@@ -745,7 +746,6 @@ CREDENTIAL_SHAPED = [
     "PGPASSWORD",
     "PGUSER",
     "PGDATABASE",
-    "PGSSLMODE",
     "DATABASE_URL",
     "GITHUB_TOKEN",
     "GH_TOKEN",
@@ -785,16 +785,22 @@ class TestTheOneEnvironmentList:
         with pytest.raises(ValueError, match="at most 128"):
             _spec(env_names=["A" * 5000])
 
-    def test_the_mcp_stdio_checks_use_the_same_list(self):
-        """D5b's credential variable and templated variables read env_names:
-        what a driver may not set, a stdio template may not fill."""
+    def test_an_mcp_server_s_own_process_is_checked_against_the_bridge_s_list(
+        self,
+    ):
+        """D6 re-review 2: D5b's templated and credential variables set the
+        MCP server's own process, never a workspace: they are checked
+        against CODE_ENV (the bridge's own list, kept in env_names), not the
+        workspace's longer one."""
         from shared.connectors import env_names, mcp
 
         assert mcp.CODE_ENV is env_names.CODE_ENV
         assert mcp.CODE_ENV_PREFIXES is env_names.CODE_ENV_PREFIXES
         assert env_names.CODE_ENV <= env_names.DRIVER_DENIED_NAMES
-        for name in ("MAVEN_OPTS", "GRADLE_USER_HOME", "JAVA_HOME", "CFLAGS"):
+        for name in ("NODE_OPTIONS", "PYTHONPATH", "GIT_SSH_COMMAND", "PIP_INDEX_URL"):
             assert mcp.code_env(name)
+        for name in ("NODE_ENV", "JAVA_HOME", "DATA_HOME", "FEATURE_FLAGS"):
+            assert not mcp.code_env(name)
             assert env_names.loads_code(name)
         for name in CREDENTIAL_SHAPED:
             assert not mcp.code_env(name)
@@ -918,7 +924,8 @@ class TestAReferenceReachesOnlyWhatWasChecked:
         assert schema_problems(schema, "s") == []
         assert _problems(config_schema=schema) == []
 
-    def test_the_registered_driver_never_runs_an_unsafe_stored_schema(self):
+    @pytest.mark.asyncio
+    async def test_the_registered_driver_never_runs_an_unsafe_stored_schema(self):
         """probe_schema_reg.py: a schema that slipped past registration
         (stored before this check) is refused before the validator runs."""
         import time
@@ -939,7 +946,7 @@ class TestAReferenceReachesOnlyWhatWasChecked:
         driver = RegisteredImageDriver(Registration())
         started = time.monotonic()
         with pytest.raises(HTTPException) as caught:
-            driver._refuse_invalid(
+            await driver._refuse_invalid(
                 Registration.spec.config_schema, {"a": "a" * 40 + "!"}, "config"
             )
         assert caught.value.status_code == 400
@@ -1007,3 +1014,403 @@ class TestReReviewMovedTags:
         assert any("newly needs DNS" in p for p in problems)
         before = _json(needs_dns="resolves its API")
         assert moved_spec_problems(before, _moved(needs_dns="still")) == []
+
+
+# =============================================================================
+# The D6 re-review 2's probes (scratchpad d6-rereview2/)
+# =============================================================================
+
+
+def _chain(n: int, combinator: str = "anyOf", leaf=None) -> dict:
+    """probe_schema2.py: each definition references the next twice, so the
+    work doubles per level."""
+    defs = {}
+    for index in range(n):
+        defs[f"a{index}"] = {
+            combinator: [
+                {"$ref": f"#/$defs/a{index + 1}"},
+                {"$ref": f"#/$defs/a{index + 1}"},
+            ]
+        }
+    defs[f"a{n}"] = leaf or {"type": "integer"}
+    return {
+        "type": "object",
+        "properties": {"x": {"$ref": "#/$defs/a0"}},
+        "$defs": defs,
+    }
+
+
+EXPENSIVE = {
+    "self_cycle": {
+        "type": "object",
+        "properties": {"x": {"$ref": "#/$defs/a"}},
+        "$defs": {"a": {"$ref": "#/$defs/a"}},
+    },
+    "mutual_cycle": {
+        "type": "object",
+        "properties": {"x": {"$ref": "#/$defs/a"}},
+        "$defs": {"a": {"$ref": "#/$defs/b"}, "b": {"$ref": "#/$defs/a"}},
+    },
+    "cycle_through_a_property": {
+        "type": "object",
+        "properties": {"x": {"$ref": "#/$defs/tree"}},
+        "$defs": {
+            "tree": {
+                "type": "object",
+                "properties": {"child": {"$ref": "#/$defs/tree"}},
+            }
+        },
+    },
+    "anyOf_chain_18": _chain(18),
+    "anyOf_chain_25": _chain(25),
+    "oneOf_chain_20": _chain(20, "oneOf"),
+    "allOf_chain_20": _chain(20, "allOf", {"type": "string"}),
+    # probe_noref.py: no $ref, one wide allOf applied to every item.
+    "wide_allOf_items": {
+        "type": "object",
+        "properties": {
+            "x": {
+                "type": "array",
+                "items": {"allOf": [{"minimum": -index} for index in range(1400)]},
+            }
+        },
+    },
+    "nested_width_past_the_budget": {
+        "type": "object",
+        "properties": {
+            "x": {
+                "type": "array",
+                "items": {
+                    "anyOf": [
+                        {"anyOf": [{"minLength": j} for j in range(10)]}
+                        for _ in range(60)
+                    ]
+                },
+            }
+        },
+    },
+    "a_long_single_chain": {
+        "type": "object",
+        "properties": {"x": {"$ref": "#/$defs/a0"}},
+        "$defs": {
+            **{
+                f"a{index}": {"properties": {"y": {"$ref": f"#/$defs/a{index + 1}"}}}
+                for index in range(40)
+            },
+            "a40": {"type": "string"},
+        },
+    },
+    "uniqueItems": {
+        "type": "object",
+        "properties": {"x": {"type": "array", "uniqueItems": True}},
+    },
+    "unevaluatedProperties": {
+        "type": "object",
+        "unevaluatedProperties": False,
+    },
+    "unevaluatedItems": {
+        "type": "object",
+        "properties": {"x": {"type": "array", "unevaluatedItems": False}},
+    },
+    "ref_dot_dot": {
+        "type": "object",
+        "properties": {"x": {"$ref": "#/$defs/.."}},
+        "$defs": {"..": {"type": "string"}},
+    },
+}
+
+
+class TestAValidationsCostIsBounded:
+    @pytest.mark.parametrize("case", sorted(EXPENSIVE))
+    def test_the_config_schema_is_refused_fast(self, case):
+        import time
+
+        started = time.monotonic()
+        assert _problems(config_schema=EXPENSIVE[case]), case
+        assert time.monotonic() - started < 0.5
+
+    @pytest.mark.parametrize("case", sorted(EXPENSIVE))
+    def test_a_credential_slot_schema_is_refused(self, case):
+        slot = copy.deepcopy(EXAMPLE["credential_slots"][0])
+        slot["schema"] = copy.deepcopy(EXPENSIVE[case])
+        assert _problems(credential_slots=[slot]), case
+
+    def test_the_reasons_say_what_costs(self):
+        assert any("loops" in p for p in schema_problems(EXPENSIVE["self_cycle"], "s"))
+        assert any(
+            "applies more than" in p
+            for p in schema_problems(EXPENSIVE["anyOf_chain_25"], "s")
+        )
+        assert any(
+            "holds more than" in p
+            for p in schema_problems(EXPENSIVE["wide_allOf_items"], "s")
+        )
+        assert any(
+            "deeper than" in p
+            for p in schema_problems(EXPENSIVE["a_long_single_chain"], "s")
+        )
+
+    def test_shared_definitions_within_the_budget_are_fine(self):
+        """A definition used twice costs twice, and fits the budget."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "primary": {"$ref": "#/$defs/endpoint"},
+                "fallback": {"$ref": "#/$defs/endpoint"},
+            },
+            "$defs": {
+                "endpoint": {
+                    "type": "object",
+                    "properties": {
+                        "host": {"$ref": "#/$defs/host"},
+                        "port": {"type": "integer"},
+                    },
+                },
+                "host": {"type": "string", "maxLength": 253},
+            },
+        }
+        assert schema_problems(schema, "s") == []
+        assert _problems(config_schema=schema) == []
+
+    def test_what_is_validated_is_bounded_too(self):
+        from shared.connectors.registration import (
+            MAX_CONFIG_BYTES,
+            MAX_INSTANCE_NODES,
+            instance_problem,
+        )
+
+        assert instance_problem({"a": [1] * 10}, "the config") is None
+        many = {"a": [1] * MAX_INSTANCE_NODES}
+        assert "more than" in instance_problem(many, "the config")
+        big = {"a": "x" * MAX_CONFIG_BYTES}
+        assert instance_problem(big, "the config") is None
+        assert "KiB" in instance_problem(big, "the config", max_bytes=MAX_CONFIG_BYTES)
+
+    @pytest.mark.asyncio
+    async def test_a_cycle_stored_before_this_check_is_a_400_not_a_500(self):
+        """probe_schema_reg2.py: a looping $ref gave a RecursionError (500)."""
+        from fastapi import HTTPException
+
+        from orchestrator.services.connector_drivers.registered import (
+            RegisteredImageDriver,
+        )
+
+        value = _json(config_schema=EXPENSIVE["self_cycle"])
+
+        class Registration:
+            spec = spec_from_json(value)
+            image_reference = "ghcr.io/acme/driver:1"
+
+        driver = RegisteredImageDriver(Registration())
+        with pytest.raises(HTTPException) as caught:
+            await driver._refuse_invalid(
+                Registration.spec.config_schema, {"x": 1}, "config"
+            )
+        assert caught.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_a_validation_runs_off_the_loop_and_has_a_deadline(self, monkeypatch):
+        import asyncio
+        import threading
+        import time
+
+        from fastapi import HTTPException
+
+        from orchestrator.services.connector_drivers import registered
+
+        class Registration:
+            spec = _spec()
+            image_reference = "ghcr.io/acme/driver:1"
+
+        driver = registered.RegisteredImageDriver(Registration())
+        loop_thread = threading.get_ident()
+        seen: list[int] = []
+
+        def slow(schema, value):
+            seen.append(threading.get_ident())
+            time.sleep(0.5)
+            return None
+
+        monkeypatch.setattr(registered, "_first_error", slow)
+        monkeypatch.setattr(registered, "VALIDATION_SECONDS", 0.1)
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        running = asyncio.create_task(ticker())
+        try:
+            with pytest.raises(HTTPException) as caught:
+                await driver._refuse_invalid({"type": "object"}, {}, "config")
+        finally:
+            running.cancel()
+        assert caught.value.status_code == 400
+        assert "took longer than" in caught.value.detail
+        assert seen and seen[0] != loop_thread
+        # The loop kept running while the validation did.
+        assert ticks >= 3
+
+    @pytest.mark.asyncio
+    async def test_a_stored_config_is_bounded_in_size(self):
+        from fastapi import HTTPException
+
+        from orchestrator.services.connector_drivers.registered import (
+            RegisteredImageDriver,
+        )
+        from shared.connectors.registration import MAX_CONFIG_BYTES
+
+        schema = {
+            "type": "object",
+            "properties": {"note": {"type": "string"}},
+        }
+
+        class Registration:
+            spec = _spec(config_schema=schema)
+            image_reference = "ghcr.io/acme/driver:1"
+
+        driver = RegisteredImageDriver(Registration())
+        with pytest.raises(HTTPException) as caught:
+            await driver._refuse_invalid(
+                schema,
+                {"note": "x" * MAX_CONFIG_BYTES},
+                "config",
+                max_bytes=MAX_CONFIG_BYTES,
+            )
+        assert "KiB" in caught.value.detail
+
+
+#: probe_serverjson.py: variables a server.json import sets for the MCP
+#: server's own process, which the workspace list refused.
+SERVER_PROCESS_NAMES = [
+    "WEATHER_UNITS",
+    "NODE_ENV",
+    "LOG_LEVEL",
+    "JAVA_HOME",
+    "DATA_HOME",
+    "FEATURE_FLAGS",
+    "OPENAPI_MCP_HEADERS",
+    "REDIS_CONFIG",
+    "TF_WORKSPACE",
+    "DATA_SRC",
+    "SEARCH_OPTIONS",
+    "DOTNET_ENVIRONMENT",
+    "ANSIBLE_HOST",
+    "NODE_AUTH_TOKEN",
+    "DOCKER_HOST",
+    "KUBECONFIG",
+]
+
+
+class TestAnMcpServersOwnVariables:
+    @pytest.mark.parametrize("name", SERVER_PROCESS_NAMES)
+    def test_a_server_json_import_sets_them_again(self, name):
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).parent))
+        from test_connector_server_json import _server
+
+        from shared.connectors.server_json import spec_from_server_json
+
+        server = _server(environmentVariables=[{"name": name, "description": "x"}])
+        spec_json, _ = spec_from_server_json(server)
+        assert custom_driver_problems(spec_from_json(spec_json), privileged=False) == []
+
+    @pytest.mark.parametrize("name", ["NODE_OPTIONS", "PYTHONPATH", "GIT_SSH_COMMAND"])
+    def test_the_bridge_s_own_list_still_holds(self, name):
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).parent))
+        from test_connector_server_json import _server
+
+        from shared.connectors.server_json import spec_from_server_json
+
+        server = _server(environmentVariables=[{"name": name, "description": "x"}])
+        try:
+            spec_json, _ = spec_from_server_json(server)
+        except ValueError:
+            return  # refused at import
+        problems = custom_driver_problems(spec_from_json(spec_json), privileged=False)
+        assert problems
+
+
+#: D6 re-review 2 (b): credentials within a prefix family, and the names the
+#: list now spells out.
+CREDENTIALS_IN_A_FAMILY = [
+    "NODE_AUTH_TOKEN",
+    "CARGO_REGISTRY_TOKEN",
+    "UV_PUBLISH_TOKEN",
+    "GEM_HOST_API_KEY",
+    "YARN_NPM_AUTH_TOKEN",
+    "PIP_PASSWORD",
+    "TF_TOKEN_APP_TERRAFORM_IO_TOKEN",
+    "ANSIBLE_VAULT_PASSWORD",
+    "CLOUDSDK_ACCESS_KEY",
+    "DENO_AUTH_SECRET",
+]
+SPELLED_OUT = [
+    "PGSSLMODE",
+    "PGSSLROOTCERT",
+    "GODEBUG",
+    "RSYNC_RSH",
+    "CVS_RSH",
+    "SVN_SSH",
+    "FCEDIT",
+    "HGMERGE",
+    "PIPX_DEFAULT_PYTHON",
+    "INPUTRC",
+    "CONDARC",
+    "WGETRC",
+    "NETRC",
+    "PSQLRC",
+]
+
+
+class TestTheListsReach:
+    @pytest.mark.parametrize("name", CREDENTIALS_IN_A_FAMILY)
+    def test_a_credential_in_a_prefix_family_is_a_driver_s_to_set(self, name):
+        assert driver_env_problem(name) is None
+        assert _check(_env(name=name), names=(name,)) == []
+
+    @pytest.mark.parametrize("name", SPELLED_OUT)
+    def test_names_the_list_spells_out_are_refused(self, name):
+        assert driver_env_problem(name) is not None
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "PYTHON_TOKEN",
+            "LD_PRELOAD_TOKEN",
+            "DYLD_SECRET",
+            "GIT_CONFIG_TOKEN",
+            "SRW_TOKEN",
+        ],
+    )
+    def test_the_workspace_s_own_families_spare_no_credential(self, name):
+        assert driver_env_problem(name) is not None
+
+    def test_an_exact_entry_is_refused_whatever_it_ends_with(self):
+        from shared.connectors import env_names
+
+        exact = [
+            name
+            for name in env_names.DRIVER_DENIED_NAMES
+            if env_names.credential_shaped(name)
+        ]
+        for name in exact:
+            assert driver_env_problem(name) is not None
+
+    @pytest.mark.parametrize("name", ["DATA_SRC", "MY_SRC", "RESOURCE_SRC", "ORC"])
+    def test_rc_is_named_never_matched_as_a_suffix(self, name):
+        assert driver_env_problem(name) is None
+
+    def test_the_exemption_is_documented(self):
+        from shared.connectors import env_names
+
+        doc = " ".join(env_names.__doc__.split())
+        assert "credential-shaped" in doc
+        assert "CODE_ENV" in doc
