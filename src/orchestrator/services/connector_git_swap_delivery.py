@@ -671,9 +671,14 @@ async def git_swap_problem(
         swap_upstream(entry.get("connection_url"))
     except UnservedUpstream as exc:
         return Problem("url_not_served", str(exc))
+    from orchestrator.services.connector_minted_credentials import minted_marker
+
     token = (entry.get("credentials") or {}).get("token")
-    if not isinstance(token, str) or len(token) < MIN_TOKEN_LENGTH:
-        # The driver refuses it (it masks the token in every answer).
+    if minted_marker(entry) is None and (
+        not isinstance(token, str) or len(token) < MIN_TOKEN_LENGTH
+    ):
+        # The driver refuses it (it masks the token in every answer). A
+        # GitHub App connector stores no token: the exchange mints one (C5).
         return Problem("token_too_short")
     problem = await owner_workspace_problem(conn, owner)
     if problem is not None:

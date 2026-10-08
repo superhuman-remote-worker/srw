@@ -560,6 +560,26 @@ class SupportsCredentialLease(Protocol):
 
 
 @runtime_checkable
+class SupportsMintedLeaseUpstream(Protocol):
+    """A lease driver some of whose connectors' upstream credential SRW
+    mints at a provider per execution (C5: a GitHub App connector served by
+    the git swap driver). The exchange asks this before ``lease_upstream``.
+    """
+
+    def mints_upstream(self, row: Mapping[str, Any]) -> bool:
+        """Whether a decrypted connector row's credential is minted."""
+        ...
+
+    async def minted_lease_upstream(
+        self, row: Mapping[str, Any], *, store: Any, owner: Any, access: str
+    ) -> dict[str, Any]:
+        """``lease_upstream``'s answer with the credential the lease's owner
+        holds at ``access`` (minted, or minted again past half its life);
+        ``MintFailure`` when it cannot be minted."""
+        ...
+
+
+@runtime_checkable
 class SupportsServiceConnector(Protocol):
     """A service driver whose pods are built from what it derives from a
     stored row, not the row's own config (the git swap driver serves rows of

@@ -54,6 +54,7 @@ from orchestrator.security.access import (
 from orchestrator.services import (
     connector_bind_time,
     connector_driver_registrations,
+    connector_minted_credentials,
     knowledge_index,
 )
 from orchestrator.services.connector_drivers import ConnectorDriverRegistry
@@ -740,6 +741,18 @@ async def update_datasource(
             # each execution's next delivery binds afresh (D6).
             async with dependencies.store.acquire() as conn:
                 await connector_bind_time.connector_changed(conn, datasource_id)
+        if (
+            normalized.config is not None
+            or normalized.credentials is not None
+            or connection_url_set
+            or normalized.connection_url is not None
+        ) and connector_minted_credentials.row_provider(existing_ds) is not None:
+            # What SRW minted with the old minting inputs is revoked; each
+            # execution's next delivery mints afresh (C5).
+            async with dependencies.store.acquire() as conn:
+                await connector_minted_credentials.connector_changed(
+                    conn, datasource_id
+                )
 
         updated_ds = await dependencies.store.get_datasource(datasource_id)
         if not updated_ds:

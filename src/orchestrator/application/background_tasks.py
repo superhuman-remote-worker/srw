@@ -34,6 +34,7 @@ from orchestrator.services import (
     completion_recovery as completion_recovery_operations,
     connector_bind_time,
     connector_credential_leases,
+    connector_minted_credentials,
     connector_service_hosting,
     container_provisioner as container_provisioner_module,
     cron_dispatcher,
@@ -112,6 +113,7 @@ BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
     "security_events_prune",
     "ssh_attachments_prune",
     "connector_lease_sweeper",
+    "connector_minted_credential_sweeper",
     "connector_lease_exchange",
     "connector_service_reconciler",
     "connector_service_identity_revoker",
@@ -464,6 +466,21 @@ async def start_background_tasks(
             store=resources.postgres_db,
             ttl_seconds=resources.settings.connector_lease_ttl_seconds,
             interval_seconds=resources.settings.connector_lease_sweep_seconds,
+        ),
+    )
+    # Provider-minted credentials (C5): revoke at the provider what ended
+    # executions, expired credentials and connector changes left (a bound
+    # Secret deleted, an installation token revoked). Leader-gated on the
+    # lease sweep's cadence, and woken by every revoke request's NOTIFY.
+    tasks.start_leader_gated(
+        "connector_minted_credential_sweeper",
+        functools.partial(
+            connector_minted_credentials.connector_minted_credential_sweeper,
+            store=resources.postgres_db,
+            interval_seconds=connector_credential_leases.sweep_interval(
+                resources.settings.connector_lease_ttl_seconds,
+                resources.settings.connector_lease_sweep_seconds,
+            ),
         ),
     )
     # The lease exchange's own port, on every replica (drivers reach it

@@ -507,6 +507,7 @@ DEFAULT_CREATION = [
     ("security_events_prune_sweeper", False, None),
     ("ssh_attachments_prune_sweeper", False, None),
     ("connector_lease_sweeper", True, None),
+    ("connector_minted_credential_sweeper", True, None),
     # Service-pod hosting is off by default: its revoke loop runs instead.
     ("connector_service_identity_revoker", False, None),
     ("run_retention_sweeper", False, None),
@@ -560,6 +561,7 @@ DEFAULT_SHUTDOWN = [
     "security_events_prune_sweeper",
     "ssh_attachments_prune_sweeper",
     "connector_lease_sweeper",
+    "connector_minted_credential_sweeper",
     "connector_service_identity_revoker",
     "run_retention_sweeper",
     "thread_permission_notify_sweeper",

@@ -31,8 +31,12 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
-from orchestrator.services.connector_credential_leases import EXPIRED
-from orchestrator.services.connector_drivers.base import SupportsCredentialLease
+from orchestrator.services.connector_credential_leases import EXPIRED, LeaseOwner
+from orchestrator.services.connector_drivers.base import (
+    SupportsCredentialLease,
+    SupportsMintedLeaseUpstream,
+)
+from orchestrator.services.connector_minted_credentials import MintFailure
 from shared.connectors.leases import (
     DRIVER_IDENTITY_PREFIX,
     LEASE_TOKEN_PREFIX,
@@ -68,7 +72,9 @@ SELECT ident.id AS identity_id,
        lease.expires_at,
        lease.revoked_at IS NOT NULL AS lease_revoked,
        lease.revoke_reason,
-       lease.expires_at > now() AS lease_unexpired
+       lease.expires_at > now() AS lease_unexpired,
+       lease.job_id AS lease_job_id,
+       lease.thread_id AS lease_thread_id
   FROM (SELECT 1) AS anchor
   LEFT JOIN connector_driver_identities AS ident ON ident.token_hash = $1
   LEFT JOIN connector_credential_leases AS lease ON lease.token_hash = $2
@@ -156,6 +162,13 @@ class DenialLimiter:
         held = int(state[1]) if state is not None else 0
         self._keys[key] = [now, 0]
         return True, held
+
+
+def _lease_owner(row: Any) -> LeaseOwner:
+    """The execution a checked lease belongs to."""
+    if row["lease_job_id"] is not None:
+        return LeaseOwner.job(str(row["lease_job_id"]))
+    return LeaseOwner.thread(str(row["lease_thread_id"]))
 
 
 def _client_host(request: Any) -> str | None:
@@ -303,9 +316,38 @@ class ConnectorLeaseExchange:
             try:
                 if connector is None:
                     raise ValueError("connector missing")
-                upstream = driver.lease_upstream(connector)
+                if isinstance(
+                    driver, SupportsMintedLeaseUpstream
+                ) and driver.mints_upstream(connector):
+                    # A credential SRW mints per execution (C5): the lease
+                    # owner's, at the lease's level.
+                    upstream = await driver.minted_lease_upstream(
+                        connector,
+                        store=self._store,
+                        owner=_lease_owner(row),
+                        access=str(row["access"]),
+                    )
+                else:
+                    upstream = driver.lease_upstream(connector)
             except ValueError:
                 reason = "connector_holds_no_credential"
+            except MintFailure as exc:
+                # Not the lease's fault: the driver answers its client with
+                # a retry, and the reason stays in the server log.
+                logger.warning(
+                    "lease exchange: the upstream credential of lease %s could "
+                    "not be minted: %s",
+                    row["lease_id"],
+                    exc,
+                )
+                return ExchangeOutcome(
+                    503,
+                    {
+                        "error": "upstream_credential_refused"
+                        if exc.permanent
+                        else "upstream_credential_unavailable"
+                    },
+                )
         if reason is not None:
             return await self._deny(
                 reason,

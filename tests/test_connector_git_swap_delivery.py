@@ -1029,6 +1029,15 @@ class TestPinnedPathsPrepareFirst:
 
         conn = Conn()
         monkeypatch.setattr(leases, "prepare_lease_delivery", prepare)
+
+        async def no_minting(db, thread_id):  # C5's own preparation
+            return None
+
+        from orchestrator.services import connector_minted_credentials
+
+        monkeypatch.setattr(
+            connector_minted_credentials, "prepare_thread_minted", no_minting
+        )
         # Without the driver: nothing at all.
         await leases.prepare_thread_lease_delivery(_store(conn), JOB)
         assert prepared == [] and conn.queries == []

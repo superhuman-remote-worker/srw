@@ -271,12 +271,15 @@ def harness_credentials(entry: Mapping[str, Any], spec: DriverSpec) -> dict[str,
 
 
 def needs_leases(entries: Sequence[Any] | None) -> bool:
-    """Whether any entry of a datasources payload is delivered by lease, or
-    by a registered image driver's bind (D6), which the same delivery fills."""
+    """Whether any entry of a datasources payload is delivered by lease, by a
+    registered image driver's bind (D6), or with a credential SRW mints at a
+    provider (C5): the same delivery fills them all."""
     from orchestrator.services.connector_bind_time import registered_entry
+    from orchestrator.services.connector_minted_credentials import minted_marker
 
     return any(
-        isinstance(e, Mapping) and (lease_spec(e) or registered_entry(e))
+        isinstance(e, Mapping)
+        and (lease_spec(e) or registered_entry(e) or minted_marker(e) is not None)
         for e in entries or ()
     )
 
@@ -660,6 +663,15 @@ async def deliver_connector_leases(
     from orchestrator.services.connector_bind_time import deliver_bind_time_entries
 
     delivered += await deliver_bind_time_entries(conn, entries, owner=owner)
+    # A connector whose credential SRW mints at a provider (C5) receives the
+    # execution's live one: a kubeconfig with a TokenRequest token, or a
+    # GitHub App token where the git swap driver did not take the entry
+    # above (whose lease the exchange mints for).
+    from orchestrator.services.connector_minted_credentials import (
+        deliver_minted_entries,
+    )
+
+    delivered += await deliver_minted_entries(conn, entries, owner=owner)
     return delivered
 
 
@@ -800,6 +812,9 @@ async def prepare_lease_delivery(
     applies the outcome).
     """
     from orchestrator.services.connector_bind_time import prepare_bind_time_bindings
+    from orchestrator.services.connector_minted_credentials import (
+        prepare_minted_entries,
+    )
 
     async def service_part() -> None:
         if not any(
@@ -822,6 +837,8 @@ async def prepare_lease_delivery(
     await asyncio.gather(
         prepare_bind_time_bindings(entries, owner=owner, wait=bind_wait),
         service_part(),
+        # What SRW mints at a provider (C5), on db's own connections.
+        prepare_minted_entries(db, entries, owner=owner),
     )
 
 
@@ -837,12 +854,18 @@ async def prepare_thread_lease_delivery(db: Any, thread_id: str) -> None:
     most the installation's bind wait (D6), concurrently with the git swap
     checks, so the two share one budget under the agent's 30 s request: a
     bind still running never takes an attach reservation's
-    release-and-successor path. Never raises."""
+    release-and-successor path. What SRW mints at a provider for the
+    session's selected connectors (C5) is minted here too, in the same
+    budget. Never raises."""
     from orchestrator.services.connector_bind_time import prepare_thread_bindings
+    from orchestrator.services.connector_minted_credentials import (
+        prepare_thread_minted,
+    )
 
     await asyncio.gather(
         prepare_thread_bindings(db, thread_id),
         _prepare_thread_git_swap(db, thread_id),
+        prepare_thread_minted(db, thread_id),
     )
 
 
@@ -1008,12 +1031,24 @@ async def revoke_execution_leases(
     column, owner = (
         ("job_id", job_id) if job_id is not None else ("thread_id", thread_id)
     )
-    return await _revoke(
+    revoked = await _revoke(
         conn,
         where=f"lease.{column} = $1::uuid",
         args=(str(owner),),
         reason=reason,
     )
+    # What SRW minted at a provider for the execution (C5) ends with it.
+    from orchestrator.services.connector_minted_credentials import (
+        revoke_owner_credentials,
+    )
+
+    await revoke_owner_credentials(
+        conn,
+        kind="job" if job_id is not None else "thread",
+        owner_id=owner,
+        reason=reason,
+    )
+    return revoked
 
 
 async def revoke_execution_leases_with(
@@ -1043,11 +1078,14 @@ async def revoke_connector_leases(
     connector_ids: Sequence[str],
     reason: RevokeReason = "connector_detached",
 ) -> list[str]:
-    """Revoke the leases of ``owner`` for the given connectors (live detach)."""
+    """Revoke the leases of ``owner`` for the given connectors (live detach),
+    and what SRW minted for them at a provider (C5), unless the connector
+    only moved to the git swap fallback: a GitHub App connector's minted
+    token is then what the fallback delivers."""
     ids = [str(value) for value in connector_ids]
     if not ids:
         return []
-    return await _revoke(
+    revoked = await _revoke(
         conn,
         where=(
             f"lease.{owner.column} = $1::uuid AND lease.connector_id = ANY($2::uuid[])"
@@ -1055,6 +1093,15 @@ async def revoke_connector_leases(
         args=(owner.id, ids),
         reason=reason,
     )
+    if reason != "served_by_fallback":
+        from orchestrator.services.connector_minted_credentials import (
+            revoke_owner_credentials,
+        )
+
+        await revoke_owner_credentials(
+            conn, kind=owner.kind, owner_id=owner.id, reason=reason, connector_ids=ids
+        )
+    return revoked
 
 
 async def revoke_all_connector_leases(
@@ -1064,14 +1111,22 @@ async def revoke_all_connector_leases(
 
     The connector delete transaction calls this (with the connector's driver
     identities) before the row goes: the foreign keys cascade, so revocation
-    is written first, as ``delete_job`` does.
+    is written first, as ``delete_job`` does. What SRW minted for the
+    connector at a provider (C5) is revoked too; those records outlive the
+    row (they hold their revoke's inputs).
     """
-    return await _revoke(
+    revoked = await _revoke(
         conn,
         where="lease.connector_id = $1::uuid",
         args=(str(connector_id),),
         reason=reason,
     )
+    from orchestrator.services.connector_minted_credentials import (
+        revoke_connector_credentials,
+    )
+
+    await revoke_connector_credentials(conn, connector_id=connector_id, reason=reason)
+    return revoked
 
 
 _TERMINAL_OWNER = f"""(
@@ -1098,12 +1153,18 @@ async def revoke_terminal_execution_leases(
     torn down while the session lives, and its lease must survive. So this
     revokes only when durable state already says the execution ended.
     """
-    return await _revoke(
+    revoked = await _revoke(
         conn,
         where=f"lease.{owner.column} = $1::uuid AND {_TERMINAL_OWNER}",
         args=(owner.id,),
         reason="execution_terminal",
     )
+    from orchestrator.services.connector_minted_credentials import (
+        revoke_terminal_owner_credentials,
+    )
+
+    await revoke_terminal_owner_credentials(conn, owner=owner)
+    return revoked
 
 
 async def revoke_terminal_execution_leases_with(db: Any, *, owner: LeaseOwner) -> None:

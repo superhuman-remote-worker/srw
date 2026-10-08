@@ -2217,9 +2217,14 @@ async def _until(events: Iterable[asyncio.Event], timeout: float) -> None:
 
 
 async def _listen(
-    store: Any, wake: asyncio.Event, shutdown_event: asyncio.Event
+    store: Any,
+    wake: asyncio.Event,
+    shutdown_event: asyncio.Event,
+    *,
+    channel: str = RECONCILE_CHANNEL,
 ) -> None:
-    """Hold one LISTEN connection for the loop's life.
+    """Hold one LISTEN connection on ``channel`` for the loop's life (the
+    minted-credential sweep listens on its own channel the same way).
 
     A connection the server ends (a restart, a failover,
     ``pg_terminate_backend``) is seen at once by its termination listener,
@@ -2241,9 +2246,7 @@ async def _listen(
 
         try:
             async with store.acquire() as conn:
-                await asyncio.wait_for(
-                    conn.add_listener(RECONCILE_CHANNEL, heard), timeout=10
-                )
+                await asyncio.wait_for(conn.add_listener(channel, heard), timeout=10)
                 watch = getattr(conn, "add_termination_listener", None)
                 if callable(watch):
                     watch(gone)
@@ -2260,7 +2263,7 @@ async def _listen(
                 finally:
                     try:
                         await asyncio.wait_for(
-                            conn.remove_listener(RECONCILE_CHANNEL, heard), timeout=5
+                            conn.remove_listener(channel, heard), timeout=5
                         )
                     except Exception:
                         pass  # a lost connection has no LISTEN to end
@@ -2272,15 +2275,15 @@ async def _listen(
                             pass
             if lost.is_set():
                 logger.warning(
-                    "Connector service reconciler: the LISTEN connection was "
-                    "lost; opening another"
+                    "LISTEN %s: the connection was lost; opening another", channel
                 )
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.warning(
-                "Connector service reconciler: LISTEN connection failed; passes "
-                "run on the interval until it is open again",
+                "LISTEN %s: the connection failed; passes run on the interval "
+                "until it is open again",
+                channel,
                 exc_info=True,
             )
         if shutdown_event.is_set():

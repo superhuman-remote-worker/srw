@@ -46,6 +46,7 @@ from orchestrator.services import (
     connector_credential_leases,
     connector_driver_ca,
     connector_git_swap_delivery,
+    connector_minted_credentials,
     connector_service_images,
 )
 from orchestrator.services import ssh_access as ssh_access_operations
@@ -233,6 +234,11 @@ def build_application_resources(
     # installation runs driver pods; process-wide like the image settings.
     connector_bind_time.configure_bind_time(
         connectors_composition.bind_time_runtime(resources)
+    )
+    # Provider-minted credentials (C5): a delivery that found nothing
+    # prepared mints on the application's store, never its transaction.
+    connector_minted_credentials.configure_minted_credentials(
+        connector_minted_credentials.MintedRuntime(store=resources.postgres_db)
     )
     if settings.connector_lease_probe_enabled:
         logger.warning(

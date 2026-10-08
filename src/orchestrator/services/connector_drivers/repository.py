@@ -48,6 +48,13 @@ from orchestrator.services.workspace_ssh_connector import (
     repository_uses_ssh_key,
 )
 from shared.connectors.builtin import REPOSITORY_SPEC
+from shared.connectors.github_app import (
+    AUTH_METHOD as GITHUB_APP_AUTH,
+    CONFIG_KEY as GITHUB_APP_CONFIG,
+    GitHubAppConfigError,
+    parse_github_app,
+    uses_github_app,
+)
 
 
 _URL_REQUIRED = "Repository connectors require a repository URL"
@@ -67,11 +74,74 @@ class RepositoryDriver(WorkspaceSshDriver):
         return knowledge_note.repository_phrases(row)
 
     def credential_config(self, credentials: Mapping[str, Any]) -> dict[str, Any]:
-        """The auth method; the token and the key stay secret."""
+        """The auth method; the token, the key and a GitHub App's private key
+        stay secret."""
         return auth_method_config(credentials)
 
     def secret_leaves(self, credentials: Mapping[str, Any]) -> list[SecretLeaf]:
-        return top_level_leaves(credentials, ("token", "ssh_key"))
+        return top_level_leaves(credentials, ("token", "ssh_key", "private_key"))
+
+    def github_app_checked(
+        self,
+        *,
+        connection_url: str | None,
+        config: Mapping[str, Any] | None,
+        credentials: Mapping[str, Any] | None,
+        check_key: bool,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """A GitHub App connector's config and credentials, normalized (C5):
+        a GitHub repository URL, ``github_app: {app_id, installation_id,
+        api_base?}`` and the App's unencrypted RSA private key, and nothing
+        else secret. HTTP 400 otherwise; a ``github_app`` config on a
+        connector that does not authenticate as an App is refused too."""
+        from orchestrator.services.connector_drivers.github_app import (
+            normalize_private_key,
+        )
+
+        out = dict(config or {})
+        if not uses_github_app(credentials):
+            if out.get(GITHUB_APP_CONFIG) is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "github_app config needs credentials with auth_method "
+                        "github_app"
+                    ),
+                )
+            return out, None
+        if out.get("forge") != "github":
+            raise HTTPException(
+                status_code=400,
+                detail="A GitHub App connector's forge is github",
+            )
+        try:
+            options = parse_github_app(out, connection_url)
+        except GitHubAppConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        configured = out[GITHUB_APP_CONFIG].get("api_base")
+        out[GITHUB_APP_CONFIG] = options.as_config(
+            configured_api_base=options.api_base if configured else None
+        )
+        if not check_key:
+            return out, None
+        extra = sorted(
+            key
+            for key in (credentials or {})
+            if key not in ("auth_method", "private_key")
+        )
+        if extra:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "A GitHub App connector stores the App's private key only, "
+                    f"not {', '.join(extra)}"
+                ),
+            )
+        try:
+            key = normalize_private_key((credentials or {}).get("private_key"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        return out, {"auth_method": GITHUB_APP_AUTH, "private_key": key}
 
     def unread_pins_dropped(
         self, config: dict[str, Any], credentials: Mapping[str, Any]
@@ -100,7 +170,15 @@ class RepositoryDriver(WorkspaceSshDriver):
             # URL-less connector valid.
             if not (draft.connection_url or "").strip():
                 raise HTTPException(status_code=400, detail=_URL_REQUIRED)
-            return NormalizedConnector(draft.connection_url, config, credentials)
+            config, app_credentials = self.github_app_checked(
+                connection_url=draft.connection_url,
+                config=config,
+                credentials=credentials,
+                check_key=True,
+            )
+            return NormalizedConnector(
+                draft.connection_url, config, app_credentials or credentials
+            )
 
         credentials = self.stored_credentials(draft, existing)
         config = draft.config
@@ -115,14 +193,46 @@ class RepositoryDriver(WorkspaceSshDriver):
         # clear it.
         if draft.connection_url is not None and not draft.connection_url.strip():
             raise HTTPException(status_code=400, detail=_URL_REQUIRED)
+        if (
+            config is not None
+            or credentials is not None
+            or "connection_url" in draft.supplied
+        ):
+            # A GitHub App connector's App, key and repository are checked
+            # as the edit leaves them (C5).
+            effective, app_credentials = self.github_app_checked(
+                connection_url=draft.connection_url or existing.get("connection_url"),
+                config=(
+                    config
+                    if config is not None
+                    else stored_json_object(existing.get("config"))
+                ),
+                credentials=(
+                    credentials
+                    if credentials is not None
+                    else stored_json_object(existing.get("credentials"))
+                ),
+                check_key=credentials is not None,
+            )
+            if config is not None:
+                config = effective
+            if app_credentials is not None:
+                credentials = app_credentials
         return NormalizedConnector(draft.connection_url, config, credentials)
 
     async def check(
         self, row: Mapping[str, Any], credentials: dict[str, Any], *, ctx: CheckContext
     ) -> dict[str, Any]:
-        result = await probe_repository(dict(row), row["connection_url"], credentials)
-        if not token_auth(row, credentials):
-            return result
+        if uses_github_app(credentials):
+            result = await probe_github_app(dict(row), credentials)
+            if result.get("status") != "ok":
+                return result
+        else:
+            result = await probe_repository(
+                dict(row), row["connection_url"], credentials
+            )
+            if not token_auth(row, credentials):
+                return result
         # Where the git swap driver is installed, Test says how the token is
         # delivered now (through the driver, or the fallback and why) and
         # probes the upstream's TLS without a credential (C3).
@@ -146,9 +256,14 @@ class RepositoryDriver(WorkspaceSshDriver):
         ssh_identity = self.ssh_identity_descriptor(
             row, default_known_hosts=ctx.default_known_hosts
         )
+        github_app = uses_github_app(credentials)
         if isinstance(credentials, Mapping):
+            # Nor does a GitHub App's private key: SRW mints the execution's
+            # installation token with it at delivery (C5).
             credentials = {
-                key: value for key, value in credentials.items() if key != "ssh_key"
+                key: value
+                for key, value in credentials.items()
+                if key not in ("ssh_key", "private_key")
             }
         fields: dict[str, Any] = {}
         # Repository identity is server-owned runtime authority.  Keep the
@@ -175,6 +290,13 @@ class RepositoryDriver(WorkspaceSshDriver):
             entry["require_default_branch"] = True
         if ssh_identity is not None:
             entry["ssh_identity"] = ssh_identity
+        if github_app:
+            from orchestrator.services.connector_minted_credentials import (
+                MINTED_KEY,
+                github_app_marker,
+            )
+
+            entry[MINTED_KEY] = github_app_marker(row)
         # A token repository goes through the git swap driver where it is
         # installed and serves the URL; otherwise the installation's fallback.
         route_token_repository(
@@ -277,4 +399,53 @@ async def probe_repository(
         "status": "ok",
         "message": message,
         "details": {**facts, "warnings": warnings},
+    }
+
+
+async def probe_github_app(
+    ds: dict[str, Any], credentials: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Test a GitHub App connector (C5): mint a read token for its one
+    repository, read the repository with it, and revoke it again. Never
+    discloses the key or the token."""
+    from orchestrator.services.connector_drivers.github_app import (
+        mint_installation_token,
+        normalize_private_key,
+        repository_facts,
+        revoke_installation_token,
+    )
+    from orchestrator.services.connector_drivers.provider_http import ProviderError
+
+    try:
+        options = parse_github_app(
+            stored_json_object(ds.get("config")), ds.get("connection_url")
+        )
+        key = normalize_private_key(credentials.get("private_key"))
+    except (GitHubAppConfigError, ValueError) as exc:
+        return {"status": "error", "message": str(exc)}
+    try:
+        minted = await mint_installation_token(options, key, "ReadOnly")
+    except ProviderError as exc:
+        return {"status": "error", "message": str(exc)}
+    try:
+        facts = await repository_facts(options, minted.token)
+    except ProviderError as exc:
+        return {"status": "error", "message": str(exc)}
+    finally:
+        try:
+            await revoke_installation_token(options.api_base, minted.token)
+        except ProviderError:
+            pass  # it expires within the hour
+    branch = facts.get("default_branch")
+    return {
+        "status": "ok",
+        "message": (
+            f"GitHub App {options.app_id} (installation {options.installation_id}) "
+            f"minted a one-hour token for {facts['repository']} with contents: "
+            "read, read it"
+            + (f" (default branch {branch})" if branch else "")
+            + " and revoked the token; each execution gets its own, with "
+            "contents: read or write by its access level"
+        ),
+        "details": {**facts, "api_base": options.api_base, "auth": "github_app"},
     }

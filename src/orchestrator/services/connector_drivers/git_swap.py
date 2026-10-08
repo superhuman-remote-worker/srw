@@ -22,7 +22,14 @@ update, its Test are ``srw.repository/v1``'s); what changes is delivery:
   why. An installation without the driver sends what it always sent (or
   refuses, where its fallback says so);
 * :meth:`GitSwapDriver.lease_upstream` answers the lease exchange: the forge
-  token and the one upstream the driver may reach;
+  token and the one upstream the driver may reach. A GitHub App connector
+  (C5) stores no token: :meth:`GitSwapDriver.minted_lease_upstream` answers
+  with the installation token SRW minted for the lease's execution at its
+  access level, minted again before it expires
+  (``connector_minted_credentials``). Its entry is a swap candidate like a
+  token repository's; where the driver cannot serve it, the same fallback
+  applies, and visibly even where the driver is not installed: the
+  one-hour token in the clone URL, or nothing;
 * :meth:`GitSwapDriver.service_connector` is the connector its pods are built
   from: the clean upstream URL and its host, which the pod's egress pins,
   and the connector's ``upstream_ca`` (a forge behind a private CA).
@@ -81,6 +88,25 @@ class GitSwapDriver(DatasourceDriver):
             "allowed_upstream": [upstream.url],
         }
 
+    def mints_upstream(self, row: Mapping[str, Any]) -> bool:
+        from orchestrator.services.connector_minted_credentials import (
+            PROVIDER_GITHUB_APP,
+            row_provider,
+        )
+
+        return row_provider(row) == PROVIDER_GITHUB_APP
+
+    async def minted_lease_upstream(
+        self, row: Mapping[str, Any], *, store: Any, owner: Any, access: str
+    ) -> dict[str, Any]:
+        from orchestrator.services.connector_minted_credentials import (
+            minted_lease_upstream,
+        )
+
+        upstream = swap_upstream(row.get("connection_url"))
+        minted = await minted_lease_upstream(store, row, owner=owner, access=access)
+        return {"credential": minted.token, "allowed_upstream": [upstream.url]}
+
     def service_connector(self, row: Mapping[str, Any]) -> Mapping[str, Any]:
         return swap_service_connector(row)
 
@@ -116,7 +142,8 @@ def route_token_repository(
     """Route a repository payload entry, in place (see the module docstring).
 
     ``git_swap`` is the installed :class:`GitSwapDriver` or ``None``. An entry
-    that does not clone with a token is left alone. A fallback is logged
+    that does not clone with a token (or a GitHub App's minted one) is left
+    alone. A fallback is logged
     once per connector and reason (every claim of a session binds again);
     the ``token-in-url`` entry is the one SRW sent before C3 plus the block
     that says why.
@@ -125,14 +152,20 @@ def route_token_repository(
         Problem,
         apply_fallback,
     )
+    from orchestrator.services.connector_minted_credentials import minted_marker
 
     credentials = entry.get("credentials")
-    if not isinstance(credentials, Mapping) or not token_auth(entry, credentials):
+    minted = minted_marker(entry) is not None
+    if not minted and (
+        not isinstance(credentials, Mapping) or not token_auth(entry, credentials)
+    ):
         return
     if git_swap is None:
         # An installation without the driver: the entry SRW always sent,
-        # untouched (or refused, where the installation says so).
-        if fallback == FALLBACK_REFUSE:
+        # untouched (or refused, where the installation says so). A GitHub
+        # App connector's is new (C5): its fallback is stated, so the
+        # README says why the minted token is in the clone URL.
+        if fallback == FALLBACK_REFUSE or minted:
             apply_fallback(entry, Problem("not_installed"), fallback=fallback)
         return
     try:
