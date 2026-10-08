@@ -117,11 +117,11 @@ def _file_entries(entry: Mapping[str, Any], spec: DriverSpec) -> list[BindingEnt
             value["mode"] = mode
         entries.append(
             BindingEntry(
-                # D1d moves credential files to the workspace.
-                recipient="agent_pod",
+                recipient="workspace",
                 form="credential_file",
                 value=value,
                 collision="skip_existing",
+                refresh="on_backend_swap",
                 retire="remove",
             )
         )

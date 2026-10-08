@@ -22,6 +22,7 @@ from agent.connectors import RuntimeContext, deliveries_from_payload
 from agent.connectors.registry import (
     BACKEND_SWAP_ORDER,
     LIVE_ORDER,
+    RELEASE_ORDER,
     SESSION_HARNESS_ORDER,
     SESSION_WORKSPACE_ORDER,
     WORKER_ORDER,
@@ -124,8 +125,9 @@ def test_the_orders_are_the_runtime_orders():
         "credential_file",
     )
     assert SESSION_HARNESS_ORDER == ("managed_connection", "mcp_client")
-    # Sessions never materialize credential files (slice D1d).
-    assert SESSION_WORKSPACE_ORDER == ("env_file", "checkout")
+    # Credential files reach the session workspace too (slice D1d), after
+    # the checkouts as on a worker.
+    assert SESSION_WORKSPACE_ORDER == ("env_file", "checkout", "credential_file")
     assert LIVE_ORDER == (
         "env_file",
         "ssh_identity",
@@ -133,8 +135,11 @@ def test_the_orders_are_the_runtime_orders():
         "managed_connection",
         "mcp_client",
         "checkout",
+        "credential_file",
     )
-    assert BACKEND_SWAP_ORDER == ("env_file",)
+    assert BACKEND_SWAP_ORDER == ("env_file", "credential_file")
+    # What lives in the workspace lives as long as it does.
+    assert RELEASE_ORDER == ("managed_connection",)
 
 
 def test_a_form_has_one_materializer():
@@ -203,23 +208,21 @@ async def test_worker_setup_runs_the_worker_order(log):
     ]
 
 
-def test_worker_release_closes_connections_then_files(log):
+def test_worker_release_closes_the_connections_only(log):
+    """The workspace's files outlive the shell the release follows."""
     from agent.agent import UniversalAgent
 
     agent = object.__new__(UniversalAgent)
     agent._knowledge_graph = None
     agent._datasource_connections = {"postgresql": MagicMock()}
     agent._datasource_clients = {}
-    agent._datasource_files_manifest = {"files": [], "dirs": [], "env_vars": []}
 
     UniversalAgent._close_datasource_connections(agent)
 
     assert [(form, step) for form, step, _ in log] == [
         ("managed_connection", "release"),
-        ("credential_file", "release"),
     ]
     assert agent._datasource_connections == {}
-    assert agent._datasource_files_manifest is None
 
 
 def test_workspace_init_loads_identities_after_the_managed_repository():
@@ -332,6 +335,7 @@ async def test_session_attach_runs_the_harness_phase_then_the_workspace_phase(
         ("workspace", "initialize"),
         ("env_file", "materialize"),
         ("checkout", "materialize"),
+        ("credential_file", "materialize"),
         ("readme", "inject"),
     ]
 
@@ -393,6 +397,7 @@ async def test_live_update_swaps_the_harness_before_the_checkouts(log):
         ("mcp_client", "ready"),
         ("harness", "swap"),
         ("checkout", "replace"),
+        ("credential_file", "replace"),
         ("readme", "inject"),
     ]
     session.resetup_tools_for_backend.assert_called_once()
@@ -400,7 +405,8 @@ async def test_live_update_swaps_the_harness_before_the_checkouts(log):
 
 @pytest.mark.asyncio
 async def test_live_update_offloads_the_workspace_round_trips(log, monkeypatch):
-    """The environment and identity steps ran in worker threads, as before."""
+    """The workspace round trips run in worker threads: the environment
+    and identity steps as before, and the credential files."""
     offloaded = []
     real_to_thread = asyncio.to_thread
 
@@ -415,7 +421,7 @@ async def test_live_update_offloads_the_workspace_round_trips(log, monkeypatch):
         RuntimeContext(execution="session"),
         on_harness_replaced=lambda connections, clients: None,
     )
-    assert offloaded == ["env_file", "ssh_identity"]
+    assert offloaded == ["env_file", "ssh_identity", "credential_file"]
 
 
 # =============================================================================
@@ -423,7 +429,9 @@ async def test_live_update_offloads_the_workspace_round_trips(log, monkeypatch):
 # =============================================================================
 
 
-def test_backend_swap_delivers_the_environment_before_the_old_backend_retires(log):
+def test_backend_swap_delivers_the_workspace_forms_before_the_old_one_retires(
+    log,
+):
     session = _live_session([dict(entry) for entry in PAYLOAD])
     old_backend = MagicMock()
     old_backend.retire.side_effect = lambda: log.append(("backend", "retire", []))
@@ -436,6 +444,8 @@ def test_backend_swap_delivers_the_environment_before_the_old_backend_retires(lo
 
     assert [(form, step) for form, step, _ in log] == [
         ("env_file", "on_backend_swap"),
+        ("credential_file", "on_backend_swap"),
         ("backend", "retire"),
     ]
     assert log[0][2] == ["Env"]
+    assert log[1][2] == ["Kube"]

@@ -1,34 +1,76 @@
-"""``credential_file``: credential files (kubeconfig, generic file).
+"""``credential_file``: credential files (kubeconfig, generic file), in the workspace.
 
-Each entry's ``recipient`` says where the file goes. Today that is only the
-agent pod, for worker jobs (sessions never materialize credential files);
-slice D1d moves them to the workspace for jobs and sessions alike, and an
-entry addressed elsewhere is skipped until then. Writes never clobber a
-file this materializer did not write, and a manifest records everything
-written so :func:`cleanup_credential_files` can undo it at job end.
+The files go to the workspace the shell runs in, for jobs and sessions
+alike, and never to the agent pod. Each file's contents go, with the mode
+its connector names, into a private store under ``~/.srw-credentials/``
+over the backend's secret stdin channel
+(``RemoteBackend.install_credential_files``); its target path becomes a
+symlink to it. A snapshot never captures the store, only the links.
+
+The orchestrator stores each target resolved against ``/home/srw``
+(:data:`AGENT_HOME`); here it becomes the same path under the workspace
+home. A target outside the home, inside SRW's own credential namespaces, or
+on a file the shell or sshd runs is refused, and a target that already
+exists is left alone (the contents still reach the store).
+
+Every delivery syncs the whole current set: a live detach removes a file,
+and a backend swap writes the set again on the new host before the old one
+retires. The files live as long as the workspace does, as the environment
+file does; an ended execution does not reach back into a workspace whose
+shell it has already torn down.
 
 An entry's ``transform`` and ``merge_group`` carry what used to be a
 kubeconfig type check: kubeconfig names are prefixed with the connector's
-slug, and every kubeconfig is merged into ``~/.kube/config``.
+slug, and every kubeconfig is merged into one config that ``KUBECONFIG``
+names and ``~/.kube/config`` links to (unless the home has its own). An
+entry's ``env_var`` names the file in the shell's environment.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
-import os
+import posixpath
 import re
-import subprocess
 from collections.abc import Sequence
-from typing import Any, Callable, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any
 
 from agent.connectors.base import AGENT_HOME, Delivery, FactsLines, RuntimeContext
-from agent.connectors.legacy import deliveries_from_payload, unreadable_file_modes
+from agent.connectors.legacy import unreadable_file_modes
+from shared.credential_connectors import normalize_credential_env
 
 logger = logging.getLogger(__name__)
 
+#: Home-relative targets a connector never links: shell and sshd start-up
+#: files, and the tmux configuration SRW's shell runs with.
+REFUSED_TARGETS: frozenset[str] = frozenset(
+    {
+        ".bashrc",
+        ".bash_profile",
+        ".bash_login",
+        ".bash_logout",
+        ".profile",
+        ".tmux.conf",
+        ".ssh/rc",
+        ".ssh/environment",
+        ".ssh/authorized_keys",
+        ".ssh/authorized_keys2",
+    }
+)
+#: Home-relative directories SRW owns: the credential store and the
+#: managed repositories' ssh-agent namespace.
+REFUSED_ROOTS: tuple[str, ...] = (".srw-credentials", ".ssh/srw-managed")
+
+#: The merged kubeconfig, in the store and at its link.
+MERGED_KUBECONFIG = "kubeconfig"
+MERGED_KUBECONFIG_LINK = ".kube/config"
+
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+
 
 def _ds_slug_hyphen(name: str) -> str:
-    """Hyphenated slug for filenames and kubeconfig context prefixes.
+    """Hyphenated slug for kubeconfig context prefixes.
 
     Matches ``slugify_datasource_name`` in
     ``src/orchestrator/security/credential_files.py``.
@@ -37,47 +79,38 @@ def _ds_slug_hyphen(name: str) -> str:
     return s or "unnamed"
 
 
-def _retarget(path: str, home_dir: str) -> str:
-    """Swap ``/home/srw`` for ``home_dir`` so tests can use a tmp directory.
+def home_target(path: str) -> tuple[str | None, str | None]:
+    """``(home-relative target, None)``, or ``(None, why it is refused)``."""
+    if path.startswith("~/"):
+        relative = path[2:]
+    elif path.startswith(AGENT_HOME + "/"):
+        relative = path[len(AGENT_HOME) + 1 :]
+    else:
+        return None, "outside the home"
+    relative = posixpath.normpath(relative)
+    if relative in ("", ".") or relative == ".." or relative.startswith("../"):
+        return None, "outside the home"
+    if relative in REFUSED_TARGETS or any(
+        relative == root or relative.startswith(root + "/") for root in REFUSED_ROOTS
+    ):
+        return None, "reserved by the workspace"
+    return relative, None
 
-    The orchestrator's validator already resolved ``~`` against
-    ``/home/srw``; in production no swap is needed. In tests we pass a
-    tmp ``home_dir`` and rewrite the prefix at write time.
-    """
-    if not path or home_dir == AGENT_HOME:
-        return path
-    if path == AGENT_HOME:
-        return home_dir
-    if path.startswith(AGENT_HOME + "/"):
-        return home_dir + path[len(AGENT_HOME) :]
-    return path
 
-
-def _mkdir_tracking(path: str, created_dirs: List[str]) -> None:
-    """``mkdir -p`` while recording each directory we (not the OS image) created.
-
-    Cleanup uses this list to ``rmdir`` only the directories we made, leaving
-    pre-existing ones like ``~/.ssh`` (which may have ``known_hosts``) intact.
-    """
-    if not path or path == "/" or os.path.isdir(path):
-        return
-    parent = os.path.dirname(path)
-    if parent and parent != path:
-        _mkdir_tracking(parent, created_dirs)
-    try:
-        os.mkdir(path)
-        created_dirs.append(path)
-    except FileExistsError:
-        pass
+def _store_name(relative: str) -> str:
+    """A stable, unique store name for a target: its digest and basename."""
+    digest = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:12]
+    base = _SAFE_NAME.sub("-", posixpath.basename(relative)).strip("-.") or "file"
+    return f"{digest}-{base}"[:96]
 
 
 def _prefix_kubeconfig_yaml(yaml_str: str, prefix: str) -> str:
     """Prefix every cluster/user/context name in a kubeconfig with ``<prefix>-``.
 
-    Multi-cluster jobs merge several kubeconfigs into ``~/.kube/config``;
-    without prefixing, two uploads with a context named ``default`` would
-    collide. We pre-prefix per-datasource so the agent sees deterministic,
-    collision-free context names like ``prod-eu-default``.
+    Several kubeconfigs merge into one config; without prefixing, two
+    uploads with a context named ``default`` would collide. We pre-prefix
+    per connector so the agent sees deterministic, collision-free context
+    names like ``prod-eu-default``.
 
     Returns the re-emitted YAML. On a parse failure the original string is
     returned and a warning is logged — the upload may still be usable,
@@ -122,254 +155,219 @@ def _prefix_kubeconfig_yaml(yaml_str: str, prefix: str) -> str:
     return yaml.safe_dump(doc, sort_keys=False)
 
 
-def _merge_kubeconfigs(
-    kubeconfig_paths: List[str],
-    home_dir: str,
-    manifest: Dict[str, Any],
-) -> Optional[str]:
-    """Merge per-datasource kubeconfigs into ``~/.kube/config`` using ``kubectl``.
-
-    Returns the merged absolute path on success. On failure (no kubectl,
-    bad input) returns ``None`` and the per-datasource files remain
-    available individually — the caller falls back to a colon-separated
-    ``KUBECONFIG`` so kubectl can still find them.
+def merge_kubeconfigs(contents: Sequence[str]) -> str | None:
+    """One kubeconfig holding every cluster, user and context, as kubectl
+    merges them (the first of a name wins, so does the first
+    ``current-context``). ``None`` if any input is not a kubeconfig mapping.
     """
-    if not kubeconfig_paths:
-        return None
-    merged_path = os.path.join(home_dir, ".kube", "config")
-    if os.path.exists(merged_path):
-        logger.warning(
-            "Refusing to overwrite existing %s; agent will use per-ds KUBECONFIG list",
-            merged_path,
-        )
-        return None
-    _mkdir_tracking(os.path.dirname(merged_path), manifest["dirs"])
-    env = {**os.environ, "KUBECONFIG": ":".join(kubeconfig_paths)}
+    import yaml
+
+    merged: dict[str, Any] = {
+        "apiVersion": "v1",
+        "kind": "Config",
+        "preferences": {},
+        "clusters": [],
+        "users": [],
+        "contexts": [],
+        "current-context": "",
+    }
+    seen: dict[str, set[Any]] = {"clusters": set(), "users": set(), "contexts": set()}
+    for text in contents:
+        try:
+            doc = yaml.safe_load(text)
+        except yaml.YAMLError:
+            return None
+        if not isinstance(doc, dict):
+            return None
+        for key in ("clusters", "users", "contexts"):
+            for item in doc.get(key) or []:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                if name in seen[key]:
+                    continue
+                seen[key].add(name)
+                merged[key].append(item)
+        if not merged["current-context"] and doc.get("current-context"):
+            merged["current-context"] = doc["current-context"]
+    return yaml.safe_dump(merged, sort_keys=False)
+
+
+@dataclass
+class CredentialFilePlan:
+    """What one sync sends to the workspace.
+
+    ``files`` is the backend's list (``name``, ``content``, ``mode``,
+    ``link``); ``env`` maps a variable to the store names it lists (a
+    ``KUBECONFIG`` that could not merge lists every kubeconfig).
+    """
+
+    files: list[dict[str, Any]] = field(default_factory=list)
+    env: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
+
+def _usable_env_name(name: str) -> bool:
     try:
-        result = subprocess.run(
-            ["kubectl", "config", "view", "--flatten", "--merge"],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
-        )
-    except FileNotFoundError:
-        logger.warning("kubectl not installed; falling back to KUBECONFIG=<colon-list>")
-        return None
-    except subprocess.CalledProcessError as e:
-        logger.warning("kubectl config view failed: %s", e.stderr.strip())
-        return None
-    except subprocess.TimeoutExpired:
-        logger.warning("kubectl config view timed out")
-        return None
-
-    try:
-        with open(merged_path, "w") as f:
-            f.write(result.stdout)
-        os.chmod(merged_path, 0o600)
-    except OSError as e:
-        logger.warning("Failed to write merged kubeconfig %s: %s", merged_path, e)
-        return None
-    manifest["files"].append(merged_path)
-    return merged_path
+        normalize_credential_env({name: ""})
+    except ValueError:
+        return False
+    return True
 
 
-def _merge_kubeconfig_group(
-    paths: List[str], home_dir: str, manifest: Dict[str, Any]
-) -> None:
-    """Point ``KUBECONFIG`` at the merged config, or at every file."""
-    merged = _merge_kubeconfigs(paths, home_dir, manifest)
-    os.environ["KUBECONFIG"] = merged if merged else ":".join(paths)
-    manifest["env_vars"].append("KUBECONFIG")
+def plan_credential_files(
+    deliveries: Sequence[Delivery], *, quiet: bool = False
+) -> CredentialFilePlan:
+    """The files and variables the deliveries put in the workspace."""
 
+    def warn(message: str, *args: Any) -> None:
+        if not quiet:
+            logger.warning(message, *args)
 
-#: How each merge group combines its files once all are written.
-_MERGE_GROUPS: Dict[str, Callable[[List[str], str, Dict[str, Any]], None]] = {
-    "kubeconfig": _merge_kubeconfig_group,
-}
-
-
-def _write_files(
-    deliveries: Sequence[Delivery], home_dir: str, manifest: Dict[str, Any]
-) -> None:
-    groups: Dict[str, List[str]] = {}
+    plan = CredentialFilePlan()
+    targets: set[str] = set()
+    groups: dict[str, list[tuple[str, str]]] = {}
     for delivery in deliveries:
-        ds_name = delivery.name
-        ds_slug = _ds_slug_hyphen(ds_name)
-        entries = [
-            entry
-            for entry in (delivery.binding.entries if delivery.binding else ())
-            if entry.form == "credential_file"
-        ]
+        name = delivery.name
         bad_modes = unreadable_file_modes(delivery.entry)
-        for index, entry in enumerate(entries):
-            if entry.recipient != "agent_pod":
-                logger.warning(
-                    "Skipping a credential file for '%s': delivery to %s is "
-                    "not supported yet",
-                    ds_name,
-                    entry.recipient,
+        for index, value in enumerate(delivery.values("credential_file")):
+            relative, refused = home_target(str(value.get("path") or ""))
+            if relative is None:
+                warn(
+                    "Skipping a credential file for '%s': its target is %s",
+                    name,
+                    refused,
                 )
                 continue
-            value = entry.value
-            absolute = _retarget(value["path"], home_dir)
-            if not absolute:
-                logger.warning(
-                    "Skipping file entry with empty target_path on '%s'", ds_name
+            if relative in targets:
+                warn(
+                    "Skipping a credential file for '%s': another connector "
+                    "already delivers ~/%s",
+                    name,
+                    relative,
                 )
                 continue
-            if os.path.exists(absolute):
-                logger.warning(
-                    "Refusing to overwrite existing file at %s (datasource '%s')",
-                    absolute,
-                    ds_name,
-                )
-                continue
-            contents = value["content"]
+            targets.add(relative)
+            contents = str(value.get("content") or "")
             if value.get("transform") == "kubeconfig_prefix":
-                contents = _prefix_kubeconfig_yaml(contents, ds_slug)
+                contents = _prefix_kubeconfig_yaml(contents, _ds_slug_hyphen(name))
             bad_mode = bad_modes[index] if index < len(bad_modes) else None
             if bad_mode is not None:
-                logger.warning("Bad mode %r on '%s'; using 0600", bad_mode, ds_name)
-            mode = int(value.get("mode", 0o600))
-
-            parent = os.path.dirname(absolute)
-            if parent:
-                _mkdir_tracking(parent, manifest["dirs"])
-            try:
-                with open(absolute, "w") as f:
-                    f.write(contents)
-                os.chmod(absolute, mode)
-            except OSError as e:
-                logger.warning(
-                    "Failed to write credential file %s for '%s': %s",
-                    absolute,
-                    ds_name,
-                    e,
-                )
-                continue
-            manifest["files"].append(absolute)
-            logger.info(
-                "Materialized credential file for '%s' at %s (mode %04o)",
-                ds_name,
-                absolute,
-                mode,
+                warn("Bad mode %r on '%s'; using 0600", bad_mode, name)
+            stored = _store_name(relative)
+            plan.files.append(
+                {
+                    "name": stored,
+                    "content": contents,
+                    "mode": int(value.get("mode", 0o600)),
+                    "link": relative,
+                }
             )
-
             env_var = value.get("env_var")
             if env_var:
-                os.environ[env_var] = absolute
-                manifest["env_vars"].append(env_var)
-
+                if not _usable_env_name(env_var):
+                    warn("Skipping %s for '%s': the name is reserved", env_var, name)
+                elif env_var in plan.env:
+                    warn("Skipping %s for '%s': already set", env_var, name)
+                else:
+                    plan.env[env_var] = (stored,)
             group = value.get("merge_group")
             if group:
-                groups.setdefault(group, []).append(absolute)
+                groups.setdefault(group, []).append((stored, contents))
 
-    for group, paths in groups.items():
-        merge = _MERGE_GROUPS.get(group)
-        if merge is not None:
-            merge(paths, home_dir, manifest)
+    kubeconfigs = groups.get("kubeconfig")
+    if kubeconfigs:
+        merged = merge_kubeconfigs([contents for _stored, contents in kubeconfigs])
+        if "KUBECONFIG" in plan.env:
+            warn("KUBECONFIG names the merged kubeconfig, not a connector file")
+        if merged is None:
+            warn("Kubeconfigs could not be merged; KUBECONFIG lists each file")
+            plan.env["KUBECONFIG"] = tuple(stored for stored, _ in kubeconfigs)
+        else:
+            plan.files.append(
+                {
+                    "name": MERGED_KUBECONFIG,
+                    "content": merged,
+                    "mode": 0o600,
+                    "link": MERGED_KUBECONFIG_LINK,
+                }
+            )
+            plan.env["KUBECONFIG"] = (MERGED_KUBECONFIG,)
+    return plan
 
 
-def materialize_credential_files(
-    deliveries: Sequence[Delivery], home_dir: str = AGENT_HOME
-) -> Dict[str, Any]:
-    """Write the deliveries' credential files and return their manifest::
+def sync_credential_files(
+    deliveries: Sequence[Delivery],
+    backend: Any,
+    *,
+    retired_env: Sequence[str] = (),
+) -> None:
+    """Make the workspace hold exactly the deliveries' files.
 
-        {
-            "files":    [abs paths written],
-            "dirs":     [abs dirs we created],
-            "env_vars": [env var names we set],
-        }
-
-    Each file's parent is created (and recorded), a kubeconfig's names are
-    prefixed, the file is written with its mode, and its ``env_var`` (if
-    any) points at it. A path that already exists is skipped with a
-    warning. Once every file is written, the kubeconfigs are merged with
-    ``kubectl config view --flatten --merge`` into ``~/.kube/config`` and
-    ``KUBECONFIG`` points there (or at every file, if the merge fails).
+    ``retired_env`` names variables an earlier delivery set and this one no
+    longer does: they are emptied, since the environment file only merges.
     """
-    manifest: Dict[str, Any] = {"files": [], "dirs": [], "env_vars": []}
-    _write_files(deliveries, home_dir, manifest)
-    return manifest
-
-
-def process_credential_files(
-    ds_configs: List[Dict[str, Any]],
-    home_dir: str = AGENT_HOME,
-) -> Dict[str, Any]:
-    """:func:`materialize_credential_files` for payload entries.
-
-    ``home_dir`` overrides the ``/home/srw`` prefix of the stored target
-    paths; production leaves the default and tests pass a tmp directory.
-    """
-    deliveries = [
-        delivery
-        for delivery in deliveries_from_payload(ds_configs)
-        if delivery.routes_to("credential_file")
-    ]
-    return materialize_credential_files(deliveries, home_dir)
-
-
-def cleanup_credential_files(manifest: Optional[Dict[str, Any]]) -> None:
-    """Undo a credential-file manifest. Best-effort, never raises.
-
-    Removes materialized files, unsets env vars, and ``rmdir``s only the
-    directories the materialization step created (pre-existing dirs like
-    ``~/.ssh`` are left alone).
-    """
-    if not manifest:
-        return
-
-    for env_var in manifest.get("env_vars", []) or []:
-        os.environ.pop(env_var, None)
-
-    for path in manifest.get("files", []) or []:
-        try:
-            os.unlink(path)
-            logger.debug("Removed credential file %s", path)
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            logger.warning("Failed to remove credential file %s: %s", path, e)
-
-    # Deepest first so children come out before their parents.
-    for d in sorted(manifest.get("dirs", []) or [], key=lambda p: -len(p)):
-        try:
-            os.rmdir(d)
-        except OSError:
-            # Non-empty or already gone; either way, nothing to do.
-            pass
-
-
-def _files_slot_kind(delivery: Delivery) -> str | None:
-    if delivery.spec is None:
-        return None
-    return next(
-        (slot.kind for slot in delivery.spec.credential_slots if slot.name == "files"),
-        None,
+    plan = plan_credential_files(deliveries)
+    store = backend.install_credential_files(plan.files)
+    env = {
+        name: ":".join(posixpath.join(store, stored) for stored in names)
+        for name, names in plan.env.items()
+    }
+    env.update({name: "" for name in retired_env if name not in env})
+    if env:
+        backend.install_credential_environment(env)
+    logger.info(
+        "Credential files in the workspace: %d file(s), variables %s",
+        len(plan.files),
+        sorted(plan.env) or "none",
     )
+
+
+def _deliver(
+    deliveries: Sequence[Delivery],
+    backend: Any,
+    *,
+    retired_env: Sequence[str] = (),
+) -> None:
+    """Best effort: a file that cannot be delivered never fails the work."""
+    if backend is None or not getattr(backend, "supports_shell", False):
+        if deliveries:
+            logger.warning(
+                "Credential files need a sandbox or VM workspace; not delivered: %s",
+                ", ".join(repr(delivery.name) for delivery in deliveries),
+            )
+        return
+    try:
+        sync_credential_files(deliveries, backend, retired_env=retired_env)
+    except Exception as e:
+        logger.warning("Failed to deliver credential files to the workspace: %s", e)
 
 
 class CredentialFileMaterializer:
     form = "credential_file"
 
     def materialize(self, deliveries: Sequence[Delivery], rt: RuntimeContext) -> None:
-        # Best effort: a file that cannot be written never fails the job.
-        try:
-            rt.files_manifest = materialize_credential_files(deliveries, rt.home_dir)
-        except Exception as e:
-            logger.warning("Failed to materialize credential files: %s", e)
-            rt.files_manifest = None
+        if deliveries:
+            _deliver(deliveries, rt.workspace_backend)
 
-    def release(self, rt: RuntimeContext) -> None:
-        if rt.files_manifest:
-            try:
-                cleanup_credential_files(rt.files_manifest)
-            except Exception as e:
-                logger.warning("Error cleaning up credential files: %s", e)
-            rt.files_manifest = None
+    def replace(
+        self,
+        old: Sequence[Delivery],
+        new: Sequence[Delivery],
+        rt: RuntimeContext,
+    ) -> None:
+        if not old and not new:
+            return
+        before = plan_credential_files(old, quiet=True).env
+        after = plan_credential_files(new, quiet=True).env
+        _deliver(
+            new,
+            rt.workspace_backend,
+            retired_env=[name for name in before if name not in after],
+        )
+
+    def on_backend_swap(self, deliveries: Sequence[Delivery], backend: Any) -> None:
+        if deliveries:
+            _deliver(deliveries, backend)
 
     def facts(
         self, deliveries: Sequence[Delivery], rt: RuntimeContext
@@ -377,7 +375,7 @@ class CredentialFileMaterializer:
         out: list[FactsLines] = []
         for delivery in deliveries:
             ds = delivery.entry
-            name = ds.get("name", "Unnamed")
+            name = delivery.name
             if _files_slot_kind(delivery) == "kubeconfig":
                 slug = _ds_slug_hyphen(name)
                 line = (
@@ -392,3 +390,12 @@ class CredentialFileMaterializer:
                 line = f"- **{name}** (file) — {paths}"
             out.append(FactsLines("Credential Files", delivery.index, [line]))
         return out
+
+
+def _files_slot_kind(delivery: Delivery) -> str | None:
+    if delivery.spec is None:
+        return None
+    return next(
+        (slot.kind for slot in delivery.spec.credential_slots if slot.name == "files"),
+        None,
+    )

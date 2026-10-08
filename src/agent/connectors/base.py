@@ -26,8 +26,9 @@ from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 from shared.connectors.binding import BindingDescriptor
 from shared.connectors.contract import DriverSpec
 
-#: The agent pod's home. The orchestrator stores credential-file paths
-#: resolved against it; tests retarget writes with ``RuntimeContext.home_dir``.
+#: The home the orchestrator resolves credential-file target paths against
+#: (``orchestrator.security.credential_files``). The credential-file
+#: materializer maps them to the same paths under the workspace home.
 AGENT_HOME = "/home/srw"
 
 Execution = Literal["worker", "session"]
@@ -93,15 +94,12 @@ class RuntimeContext:
     workspace_manager: Any = None
     connections: dict[str, Any] = field(default_factory=dict)
     clients: dict[str, Any] = field(default_factory=dict)
-    home_dir: str = AGENT_HOME
     backend: Any = None
     ssh_identities: list[Any] | None = None
     ssh_identity_status: dict[str, str] | None = None
     #: How far a clone may retire pre-agent key files (``sweep``, ``own``,
     #: ``keep``; see ``agent.connectors.checkout``).
     legacy_key_files: str = "sweep"
-    #: What the credential-file materializer wrote, for its release.
-    files_manifest: dict[str, Any] | None = None
     #: Forms whose live change waits for the next attach.
     deferred: set[str] = field(default_factory=set)
 

@@ -11,13 +11,15 @@ records the calls through every entry point:
 * **session attach**, in two phases (``agent.api.session_attach``): the
   harness phase (managed connections, MCP) runs before the workspace exists,
   so the tool set can be resolved; the workspace phase (environment,
-  checkouts) after it is initialized. Sessions never materialize credential
-  files (slice D1d);
+  checkouts, credential files) after it is initialized;
 * **live update** (``PersistentSession.resetup_datasources``): environment,
   SSH identities, the KB deferral, a fresh harness that the caller swaps in
-  place, then checkouts;
-* **backend swap** (``PersistentSession.swap_backend``): the environment
-  follows the physical workspace.
+  place, then checkouts and credential files;
+* **backend swap** (``PersistentSession.swap_backend``): the environment and
+  the credential files follow the physical workspace.
+
+Credential files reach the workspace, never the agent pod (slice D1d). They
+come after the checkouts in every order, as they always did on a worker.
 
 Blocking steps that the async entry points ran off the event loop still do
 (``offload``); the rest run inline, as they did.
@@ -62,7 +64,11 @@ WORKER_ORDER: tuple[str, ...] = (
     "credential_file",
 )
 SESSION_HARNESS_ORDER: tuple[str, ...] = ("managed_connection", "mcp_client")
-SESSION_WORKSPACE_ORDER: tuple[str, ...] = ("env_file", "checkout")
+SESSION_WORKSPACE_ORDER: tuple[str, ...] = (
+    "env_file",
+    "checkout",
+    "credential_file",
+)
 #: The harness forms a live update rebuilds whole and hands to the caller.
 LIVE_HARNESS_FORMS: tuple[str, ...] = ("managed_connection", "mcp_client")
 LIVE_ORDER: tuple[str, ...] = (
@@ -71,13 +77,15 @@ LIVE_ORDER: tuple[str, ...] = (
     "knowledge_index",
     *LIVE_HARNESS_FORMS,
     "checkout",
+    "credential_file",
 )
-BACKEND_SWAP_ORDER: tuple[str, ...] = ("env_file",)
-#: What the entry points release when an execution ends.
-RELEASE_ORDER: tuple[str, ...] = ("managed_connection", "credential_file")
+BACKEND_SWAP_ORDER: tuple[str, ...] = ("env_file", "credential_file")
+#: What the entry points release when an execution ends. What lives in the
+#: workspace (environment, credential files) lives as long as it does.
+RELEASE_ORDER: tuple[str, ...] = ("managed_connection",)
 
 #: Steps an async entry point runs in a worker thread.
-_SESSION_OFFLOAD = frozenset({"env_file", "ssh_identity"})
+_SESSION_OFFLOAD = frozenset({"env_file", "ssh_identity", "credential_file"})
 
 
 def routed(deliveries: Iterable[Delivery], form: str) -> list[Delivery]:
@@ -192,7 +200,6 @@ class ConnectorRegistry:
         fresh = RuntimeContext(
             execution=rt.execution,
             workspace_manager=rt.workspace_manager,
-            home_dir=rt.home_dir,
         )
         for form in LIVE_ORDER:
             materializer = self._materializer(form)

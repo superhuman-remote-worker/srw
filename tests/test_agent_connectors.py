@@ -11,7 +11,6 @@ README lines are pinned by the facts golden, the runtime order by
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -19,7 +18,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agent.connectors import (
-    Delivery,
     RuntimeContext,
     binding_from_legacy_entry,
     connector_registry,
@@ -36,7 +34,6 @@ from orchestrator.services import agent_datasource_payload as payload_module
 from orchestrator.services.connector_drivers import builtin_connector_drivers
 from shared.connectors.binding import (
     BindingDescriptor,
-    BindingEntry,
     load_binding_schema,
     validate_binding,
 )
@@ -116,8 +113,9 @@ def test_the_descriptor_carries_each_forms_values():
     assert kube["merge_group"] == "kubeconfig"
     assert kube["mode"] == 0o600
     (kube_entry,) = binding_from_legacy_entry(entries["kubeconfig"]).entries
-    # D1d moves the file to the workspace; until then the recipient says so.
-    assert kube_entry.recipient == "agent_pod"
+    # The workspace, never the agent pod (D1d); it follows a backend swap.
+    assert kube_entry.recipient == "workspace"
+    assert kube_entry.refresh == "on_backend_swap"
 
     files = binding_from_legacy_entry(entries["generic_file"])
     assert [value["transform"] for value in (e.value for e in files.entries)] == [
@@ -322,53 +320,29 @@ def test_a_live_change_installs_the_new_set():
 # =============================================================================
 
 
-def test_a_credential_file_for_another_recipient_waits_for_d1d(tmp_path, caplog):
-    entry = BindingEntry(
-        recipient="workspace",
-        form="credential_file",
-        value={"path": "/home/srw/x", "content": "c"},
+def test_credential_files_go_to_the_workspace_backend():
+    """Never the agent pod: the files ride the workspace's own transport.
+
+    The planning, the workspace program and the failure paths are pinned in
+    ``tests/test_credential_file_materialization.py``.
+    """
+    synced: list = []
+    backend = SimpleNamespace(
+        supports_shell=True,
+        install_credential_files=lambda files: synced.append(files) or "/s",
+        install_credential_environment=lambda values: None,
     )
-    delivery = Delivery(
-        index=0,
-        entry={"type": "generic_file", "name": "Later"},
-        binding=BindingDescriptor(
-            driver="srw.generic-file/v1", name="Later", entries=(entry,)
-        ),
-        spec=spec_for_type("generic_file"),
+    rt = RuntimeContext(
+        execution="session", workspace_manager=SimpleNamespace(backend=backend)
     )
-    rt = RuntimeContext(execution="worker", home_dir=str(tmp_path))
-    with caplog.at_level(logging.WARNING):
-        CredentialFileMaterializer().materialize([delivery], rt)
-    assert rt.files_manifest == {"files": [], "dirs": [], "env_vars": []}
-    assert not (tmp_path / "x").exists()
-    assert "not supported yet" in caplog.text
-
-
-def test_credential_file_failures_never_fail_the_job(tmp_path, caplog):
-    deliveries = deliveries_from_payload([resolved_row("generic_file")])
-    rt = RuntimeContext(execution="worker", home_dir=str(tmp_path))
-    with (
-        patch(
-            "agent.connectors.files.materialize_credential_files",
-            side_effect=RuntimeError("disk"),
-        ),
-        caplog.at_level(logging.WARNING),
-    ):
-        CredentialFileMaterializer().materialize(deliveries, rt)
-    assert rt.files_manifest is None
-    assert "Failed to materialize credential files" in caplog.text
-
-
-def test_released_files_are_removed(tmp_path):
-    deliveries = deliveries_from_payload([resolved_row("generic_file")])
-    rt = RuntimeContext(execution="worker", home_dir=str(tmp_path))
-    CredentialFileMaterializer().materialize(deliveries, rt)
-    written = [Path(path) for path in rt.files_manifest["files"]]
-    assert len(written) == 2
-    assert all(path.is_relative_to(tmp_path) and path.exists() for path in written)
-    CredentialFileMaterializer().release(rt)
-    assert rt.files_manifest is None
-    assert not any(path.exists() for path in written)
+    CredentialFileMaterializer().materialize(
+        deliveries_from_payload([resolved_row("generic_file")]), rt
+    )
+    (files,) = synced
+    assert [item["link"] for item in files] == [
+        ".config/gcloud/sa.json",
+        ".config/gcloud/ca.pem",
+    ]
 
 
 # =============================================================================
@@ -511,22 +485,6 @@ def test_facts_list_an_unserved_type_under_other():
 def test_facts_state_the_empty_set():
     lines = connector_registry().facts([], RuntimeContext(execution="session"))
     assert lines == ["_No connectors attached._", ""]
-
-
-def test_a_bad_file_mode_warns_and_falls_back_to_0600(tmp_path, caplog):
-    """The warning the agent always gave for an unreadable mode."""
-    import os
-
-    row = resolved_row("generic_file")
-    row["credentials"]["files"][0]["mode"] = "0999"
-    deliveries = deliveries_from_payload([row])
-    rt = RuntimeContext(execution="worker", home_dir=str(tmp_path))
-    with caplog.at_level(logging.WARNING):
-        CredentialFileMaterializer().materialize(deliveries, rt)
-    assert "Bad mode '0999'" in caplog.text
-    first = Path(rt.files_manifest["files"][0])
-    assert os.stat(first).st_mode & 0o777 == 0o600
-    CredentialFileMaterializer().release(rt)
 
 
 def test_knowledge_bindings_skip_a_connector_that_is_no_knowledge_base():

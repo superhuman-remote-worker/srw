@@ -2288,7 +2288,6 @@ async def test_agent_finalization_hold_retires_admission_then_disposes_shell_onc
         )
     }
     agent._datasource_clients = {}
-    agent._datasource_files_manifest = None
     agent._checkpoint_conn = None
     agent._checkpointer = object()
     agent._worker_env_restore = {}
@@ -2393,7 +2392,6 @@ async def test_agent_hold_drains_admitted_resource_io_and_retires_original_backe
     agent._knowledge_graph = None
     agent._datasource_connections = {}
     agent._datasource_clients = {}
-    agent._datasource_files_manifest = None
     agent._checkpoint_conn = None
     agent._checkpointer = None
     agent._worker_env_restore = {}

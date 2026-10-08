@@ -444,10 +444,6 @@ class UniversalAgent:
         self._datasource_clients: Dict[
             str, Any
         ] = {}  # Parent clients for cleanup (e.g. MongoClient)
-        # Manifest of materialized credential files (kubeconfig /
-        # generic_file). Written by the credential-file materializer at job
-        # start; released with the connections at job end.
-        self._datasource_files_manifest: Optional[Dict[str, Any]] = None
         # ``{authority_id: status}`` of the connector SSH identities loaded
         # into workspace ssh-agents for this job (C1); credential-free.
         self._workspace_ssh_identity_status: Dict[str, str] = {}
@@ -2166,7 +2162,7 @@ class UniversalAgent:
         values lets teardown restore the pod baseline instead of leaking one
         tenant's credentials into the next claim.  Managed connectors hold a
         connection rather than environment variables, and credential files
-        unset their own variables when they are cleaned up.
+        and connector variables live in the workspace, never this process.
         """
 
         self._restore_worker_environment()
@@ -2381,7 +2377,6 @@ class UniversalAgent:
                 "_knowledge_graph",
                 "_datasource_connections",
                 "_datasource_clients",
-                "_datasource_files_manifest",
             )
         ):
             self._close_datasource_connections()
@@ -4284,8 +4279,8 @@ class UniversalAgent:
         """
         # Deliver the connectors in the job's payload (sent by the
         # orchestrator), in the worker order: environment, managed
-        # connections, MCP discovery, repository checkouts (onto the
-        # workspace backend, never the agent pod), credential files.
+        # connections, MCP discovery, repository checkouts and credential
+        # files (onto the workspace backend, never the agent pod).
         from agent.connectors import (
             RuntimeContext,
             connector_registry,
@@ -4316,11 +4311,10 @@ class UniversalAgent:
             await connector_registry().setup_worker(deliveries, connectors)
         finally:
             # Tracked for cleanup, including what a failed step left open;
-            # _close_datasource_connections() closes them and removes the
-            # credential files.
+            # _close_datasource_connections() closes them. The environment
+            # and the credential files live in the workspace, as long as it.
             self._datasource_connections.update(connectors.connections)
             self._datasource_clients.update(connectors.clients)
-            self._datasource_files_manifest = connectors.files_manifest
         datasources_dict = connectors.connections
 
         from agent.tools.registry import register_mcp_tools
@@ -5324,8 +5318,7 @@ class UniversalAgent:
                 logger.warning(f"Error closing knowledge graph: {e}")
             self._knowledge_graph = None
 
-        # The connections and parent clients (e.g. MongoClient), then the
-        # credential files materialized for this job (best-effort).
+        # The connections and parent clients (e.g. MongoClient).
         from agent.connectors import RuntimeContext, connector_registry
 
         connector_registry().release(
@@ -5333,12 +5326,10 @@ class UniversalAgent:
                 execution="worker",
                 connections=self._datasource_connections,
                 clients=self._datasource_clients,
-                files_manifest=self._datasource_files_manifest,
             )
         )
         self._datasource_connections = {}
         self._datasource_clients = {}
-        self._datasource_files_manifest = None
 
     async def _resume_from_checkpoint(
         self,
