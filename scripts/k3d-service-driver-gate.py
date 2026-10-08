@@ -33,7 +33,8 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               and the cluster enforces it: a busybox pod under that deny never
               reaches the orchestrator's API port (without enforcement every
               driver pod's canary wait refuses to start the driver); the
-              canary port is set and refusedCidrs covers the node
+              canary port is set and refusedCidrs covers the node; the egress
+              host resolves and answers from the orchestrator
   pod         session 1 binds A and B; A gets exactly one service pod in the
               driver namespace, ready, its canary wait passed (exit 0, "default
               deny enforced"), no ServiceAccount token (spec and in the pod),
@@ -1126,6 +1127,30 @@ class ServiceDriverGate:
         )
         if not _IPV4_RE.fullmatch(self.orchestrator_ip):
             raise GateError("the orchestrator Service has no IPv4 ClusterIP")
+        # The orchestrator pins a driver pod's egress from its own lookup of
+        # the egress host: a dead cluster DNS upstream refuses every launch.
+        (upstream,) = self.from_orchestrator(
+            [
+                {
+                    "kind": "connect",
+                    "host": self.args.egress_host,
+                    "port": self.args.egress_port,
+                    "timeout": 15,
+                }
+            ]
+        )
+        self.report.check(
+            "preflight: the egress host resolves and answers from the "
+            "orchestrator (driver pods are pinned from its lookup)",
+            upstream.get("reachable") is True,
+            "reachable"
+            if upstream.get("reachable")
+            else f"{upstream.get('error')}: on k3d a dead DNS upstream after a "
+            "host network change; restart the node: docker restart "
+            "k3d-srw-server-0",
+        )
+        if not upstream.get("reachable"):
+            raise GateError(f"{self.args.egress_host} is not reachable")
         enforced = self.default_deny_enforced()
         self.report.check(
             "preflight: the cluster enforces NetworkPolicy (a pod under the driver "
