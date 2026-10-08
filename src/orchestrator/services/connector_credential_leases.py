@@ -779,7 +779,11 @@ def _managed_mcp_url(spec: DriverSpec, connector_id: str, digest: str | None) ->
 
 
 async def prepare_lease_delivery(
-    db: Any, entries: Sequence[Any] | None, *, owner: LeaseOwner
+    db: Any,
+    entries: Sequence[Any] | None,
+    *,
+    owner: LeaseOwner,
+    bind_wait: float | None = None,
 ) -> None:
     """What a delivery needs done before its caller opens a transaction.
 
@@ -789,12 +793,14 @@ async def prepare_lease_delivery(
     caller's transaction does no network and no write of its own. A git
     swap candidate's upstream is checked here too (its egress and its TLS,
     C3), and a registered image driver's connector is bound, in its own pod
-    (D6). No-op without such an entry; never raises (the delivery applies
-    the outcome).
+    (D6), waiting for a new bind at most ``bind_wait`` seconds (the
+    installation's bind wait when ``None``; ``0`` never blocks the caller).
+    No-op without such an entry; never raises (the delivery applies the
+    outcome).
     """
     from orchestrator.services.connector_bind_time import prepare_bind_time_bindings
 
-    await prepare_bind_time_bindings(entries, owner=owner)
+    await prepare_bind_time_bindings(entries, owner=owner, wait=bind_wait)
     if not any(
         isinstance(entry, Mapping)
         and (spec := lease_spec(entry)) is not None

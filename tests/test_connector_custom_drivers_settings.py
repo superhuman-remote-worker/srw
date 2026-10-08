@@ -19,6 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from orchestrator.application.settings import (
+    MAX_BIND_WAIT_SECONDS,
     DeploymentSettings,
     parse_repository_list,
 )
@@ -36,6 +37,7 @@ class TestSettings:
             "CONNECTOR_BIND_TIME_MAX_PODS",
             "CONNECTOR_BIND_TIME_DEADLINE_SECONDS",
             "CONNECTOR_BIND_TIME_WAIT_SECONDS",
+            "CONNECTOR_BIND_TIME_SPEC_PODS_PER_USER",
         ):
             monkeypatch.delenv(name, raising=False)
         settings = DeploymentSettings.from_environment()
@@ -43,7 +45,19 @@ class TestSettings:
         assert settings.connector_custom_drivers_privileged is False
         assert settings.connector_bind_time_max_pods == 10
         assert settings.connector_bind_time_deadline_seconds == 120.0
-        assert settings.connector_bind_time_wait_seconds == 60.0
+        # Under the agent's 30 s request to the orchestrator.
+        assert settings.connector_bind_time_wait_seconds == 20.0
+        assert settings.connector_bind_time_spec_pods_per_user == 2
+
+    def test_the_bind_wait_never_outlasts_the_agent_s_request(self, monkeypatch):
+        monkeypatch.setenv("CONNECTOR_BIND_TIME_WAIT_SECONDS", "60")
+        settings = DeploymentSettings.from_environment()
+        assert settings.connector_bind_time_wait_seconds == MAX_BIND_WAIT_SECONDS
+        assert MAX_BIND_WAIT_SECONDS < 30
+        monkeypatch.setenv("CONNECTOR_BIND_TIME_WAIT_SECONDS", "0")
+        assert (
+            DeploymentSettings.from_environment().connector_bind_time_wait_seconds == 0
+        )
 
     def test_the_environment_sets_them(self, monkeypatch):
         monkeypatch.setenv(
@@ -53,6 +67,7 @@ class TestSettings:
         monkeypatch.setenv("CONNECTOR_BIND_TIME_MAX_PODS", "3")
         monkeypatch.setenv("CONNECTOR_BIND_TIME_DEADLINE_SECONDS", "5")
         monkeypatch.setenv("CONNECTOR_BIND_TIME_WAIT_SECONDS", "15")
+        monkeypatch.setenv("CONNECTOR_BIND_TIME_SPEC_PODS_PER_USER", "1")
         settings = DeploymentSettings.from_environment()
         assert settings.connector_driver_trusted_repositories == (
             "ghcr.io/acme",
@@ -63,6 +78,7 @@ class TestSettings:
         # A pod needs time for its canary wait: never under 30 seconds.
         assert settings.connector_bind_time_deadline_seconds == 30.0
         assert settings.connector_bind_time_wait_seconds == 15.0
+        assert settings.connector_bind_time_spec_pods_per_user == 1
 
     @pytest.mark.parametrize("raw", ["yes please", "1", "on", "TRUE"])
     def test_privilege_is_opt_in(self, monkeypatch, raw):
@@ -95,7 +111,8 @@ class TestChart:
         assert json.loads(env["CONNECTOR_DRIVER_TRUSTED_REPOSITORIES"]) == []
         assert env["CONNECTOR_CUSTOM_DRIVERS_PRIVILEGED"] == "false"
         assert env["CONNECTOR_BIND_TIME_DEADLINE_SECONDS"] == "120"
-        assert env["CONNECTOR_BIND_TIME_WAIT_SECONDS"] == "60"
+        assert env["CONNECTOR_BIND_TIME_WAIT_SECONDS"] == "20"
+        assert env["CONNECTOR_BIND_TIME_SPEC_PODS_PER_USER"] == "2"
         # The orchestrator's cap is the namespace's Terminating pod quota.
         assert env["CONNECTOR_BIND_TIME_MAX_PODS"] == "10"
 
@@ -122,6 +139,14 @@ class TestChart:
 
         with pytest.raises(subprocess.CalledProcessError):
             render("connectors.customDrivers.bindDeadlineSeconds=5")
+
+    def test_a_bind_wait_past_the_agent_s_request_fails_the_schema(self):
+        import subprocess
+
+        with pytest.raises(subprocess.CalledProcessError):
+            render("connectors.customDrivers.bindWaitSeconds=30")
+        env = orchestrator_env(render("connectors.customDrivers.bindWaitSeconds=0"))
+        assert env["CONNECTOR_BIND_TIME_WAIT_SECONDS"] == "0"
 
 
 USER = {"id": "00000000-0000-0000-0000-0000000000d6", "is_admin": False}
@@ -244,3 +269,18 @@ class TestRoutes:
                 == 403
             )
         registered.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("action", "disabled"), [("disable", True), ("enable", False)]
+    )
+    def test_disable_and_enable_are_the_service_s(self, action, disabled):
+        client, deps = _client()
+        with patch(
+            "orchestrator.services.connector_driver_registrations."
+            "set_registration_disabled",
+            AsyncMock(return_value=_registration()),
+        ) as switched:
+            response = client.post(f"/api/connector-drivers/r1/{action}")
+        assert response.status_code == 200
+        assert switched.await_args.args == (deps.store, USER, "r1")
+        assert switched.await_args.kwargs["disabled"] is disabled

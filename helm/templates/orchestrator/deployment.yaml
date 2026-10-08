@@ -1999,6 +1999,8 @@ spec:
               value: {{ .bindDeadlineSeconds | quote }}
             - name: CONNECTOR_BIND_TIME_WAIT_SECONDS
               value: {{ .bindWaitSeconds | quote }}
+            - name: CONNECTOR_BIND_TIME_SPEC_PODS_PER_USER
+              value: {{ .specPodsPerUser | quote }}
             {{- end }}
             - name: CONNECTOR_BIND_TIME_MAX_PODS
               value: {{ .Values.connectors.servicePods.quota.bindTimePods | quote }}

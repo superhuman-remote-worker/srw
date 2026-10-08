@@ -36,7 +36,7 @@ from fastapi import HTTPException
 from orchestrator.logging_config import bind_log_context, reset_log_context
 from orchestrator.schemas.job_runtime import JobStartRequest
 from orchestrator.security.access import externalize_gitea_url, redact_config_override
-from orchestrator.services import connector_credential_leases
+from orchestrator.services import connector_bind_time, connector_credential_leases
 from orchestrator.services.config_resolver import unrouted_model_slots
 from orchestrator.services.datasource_policy import SHELL_WORKSPACE_DETAIL
 from orchestrator.services.job_datasource_selection import shell_connector_names
@@ -740,15 +740,29 @@ async def build_job_start_request(
         if deliver_connector_leases:
             lease_owner = connector_credential_leases.job_lease_owner(job)
             # A service driver's image is looked up first, outside any
-            # transaction (D5); the delivery then only applies it.
+            # transaction (D5); the delivery then only applies it. A
+            # registered driver's bind is never waited for here: the
+            # dispatcher's preflight held the job until it was bound (D6).
             await connector_credential_leases.prepare_lease_delivery(
-                postgres_db, datasources_payload, owner=lease_owner
+                postgres_db, datasources_payload, owner=lease_owner, bind_wait=0
             )
-            await connector_credential_leases.deliver_connector_leases_with(
-                postgres_db,
-                datasources_payload,
-                owner=lease_owner,
-            )
+            try:
+                await connector_credential_leases.deliver_connector_leases_with(
+                    postgres_db,
+                    datasources_payload,
+                    owner=lease_owner,
+                )
+            except connector_bind_time.BindTimeError as exc:
+                # A bind still running or retrying waits for a later dispatch;
+                # one that failed for good fails the job with its reason.
+                logger.warning("Dispatch: job %s connector binds: %s", job_id, exc)
+                if persist_dispatch_state and isinstance(
+                    exc, connector_bind_time.BindTimeRefused
+                ):
+                    await postgres_db.update_job_status(
+                        job_id, status="failed", error_message=str(exc)[:1000]
+                    )
+                return None
 
         # Build job start request. resolved_config and config_override are
         # mutually exclusive on the wire: a delivered blob is complete, so we

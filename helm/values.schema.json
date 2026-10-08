@@ -1453,7 +1453,8 @@
           "properties": {
             "privileged": {"type": "boolean"},
             "bindDeadlineSeconds": {"type": "integer", "minimum": 30},
-            "bindWaitSeconds": {"type": "integer", "minimum": 1}
+            "bindWaitSeconds": {"type": "integer", "minimum": 0, "maximum": 25},
+            "specPodsPerUser": {"type": "integer", "minimum": 1}
           }
         },
         "drivers": {

@@ -1482,6 +1482,35 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             raise WorkspaceUnavailableError("Could not install workspace credentials")
         self._credential_env_path = path
 
+    def unset_credential_environment(self, names: Sequence[str]) -> None:
+        """Unset variables an earlier install set, for every command from now
+        on (a detached registered driver's, connector drivers D6). Running
+        processes keep their environment."""
+        import json
+
+        from shared.connectors.env_names import workspace_name_problem
+        from shared.runtime.core.credential_env import (
+            INSTALL_CREDENTIAL_ENV,
+            WORKSPACE_PYTHON,
+        )
+
+        stale = {name: None for name in names if workspace_name_problem(name) is None}
+        if not stale:
+            return
+        self._init_shell()
+        path = self._resolve_home_path(
+            f".srw-credentials/{self._credential_identity()}.sh"
+        )
+        command = (
+            f"{WORKSPACE_PYTHON} -c {shlex.quote(INSTALL_CREDENTIAL_ENV)} "
+            f"{shlex.quote(path)}"
+        )
+        if not self.execute_claim_resource_with_secret_stdin(
+            command, json.dumps(stale), timeout=30
+        ):
+            raise WorkspaceUnavailableError("Could not update workspace credentials")
+        self._credential_env_path = path
+
     def _credential_identity(self) -> str:
         """The work item's name under ``~/.srw-credentials`` (job or session)."""
         return hashlib.sha256(

@@ -328,6 +328,39 @@ def test_a_live_change_installs_the_new_set():
     assert installed == [{"NEW": "2"}]
 
 
+def test_a_detached_registered_driver_s_variables_are_unset():
+    """Its driver revokes the credential behind them (D6): the workspace
+    stops setting them for new commands. Other connectors' stay, as agreed
+    for v1."""
+    installed: list = []
+    unset: list = []
+    workspace = _workspace(installed)
+    workspace.backend.unset_credential_environment = unset.append
+    driver = {
+        "type": "image_driver",
+        "datasource_id": "c1",
+        "credentials": {"env_vars": {"ACME_TOKEN": "minted", "ACME_URL": "u"}},
+    }
+    other = {"type": "generic", "credentials": {"env_vars": {"OLD": "1"}}}
+    kept = {"type": "image_driver", "datasource_id": "c2"}
+    kept["credentials"] = {"env_vars": {"KEPT": "k"}}
+    EnvFileMaterializer().replace(
+        deliveries_from_payload([driver, other, kept]),
+        deliveries_from_payload([kept]),
+        RuntimeContext(execution="session", workspace_manager=workspace),
+    )
+    assert unset == [["ACME_TOKEN", "ACME_URL"]]
+    assert installed == [{"KEPT": "k"}]
+    # An older backend without the method keeps them (and the revoke still
+    # kills the credential).
+    del workspace.backend.unset_credential_environment
+    EnvFileMaterializer().replace(
+        deliveries_from_payload([driver]),
+        [],
+        RuntimeContext(execution="session", workspace_manager=workspace),
+    )
+
+
 # =============================================================================
 # Credential files
 # =============================================================================

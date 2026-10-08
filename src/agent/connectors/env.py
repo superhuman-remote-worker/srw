@@ -18,6 +18,7 @@ from agent.connectors.base import (
     declared_read_only_note,
 )
 from agent.connectors.legacy import env_vars_unreadable
+from shared.connectors.builtin import IMAGE_DRIVER_SPEC
 from shared.credential_connectors import normalize_credential_env
 
 
@@ -51,6 +52,16 @@ def credential_environment(deliveries: Sequence[Delivery]) -> dict[str, str]:
     return result
 
 
+def _driver_names(deliveries: Sequence[Delivery]) -> set[str]:
+    """The variables registered image drivers' bindings set."""
+    return {
+        str(value["name"])
+        for delivery in deliveries
+        if delivery.spec is IMAGE_DRIVER_SPEC
+        for value in delivery.values("env_file")
+    }
+
+
 class EnvFileMaterializer:
     form = "env_file"
 
@@ -73,7 +84,15 @@ class EnvFileMaterializer:
         # it into what earlier installs left: a detached connector's values
         # stay in the session workspace, as agreed for v1
         # (shared.runtime.core.credential_env), and a ``credentials``
-        # connector cannot be detached live at all.
+        # connector cannot be detached live at all. A registered image
+        # driver's variables are unset when it is detached (D6): its driver
+        # revokes the credential behind them, and the names are its own.
+        stale = sorted(_driver_names(old) - _driver_names(new))
+        workspace = rt.workspace_manager
+        if stale and workspace is not None and workspace.backend.supports_shell:
+            unset = getattr(workspace.backend, "unset_credential_environment", None)
+            if unset is not None:
+                unset(stale)
         self.materialize(new, rt)
 
     def on_backend_swap(self, deliveries: Sequence[Delivery], backend: Any) -> None:

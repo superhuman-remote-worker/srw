@@ -560,6 +560,7 @@ class TestRegisteredDrivers:
             delivery_forms=["env_file"],
             credential_delivery="inline",
             supported_backends=["sandbox"],
+            env_names=["ACME_TOKEN"],
         )
         row = {
             "id": "00000000-0000-0000-0000-00000000d6d6",
@@ -580,6 +581,8 @@ class TestRegisteredDrivers:
             "created_by": USER["id"],
             "created_at": None,
             "updated_at": None,
+            "disabled_at": None,
+            "disabled_by": None,
             **over,
         }
         return row, registration_from_row(row)
@@ -612,6 +615,9 @@ class TestRegisteredDrivers:
             "kind": "Account",
             "name": USER["id"],
         }
+        # The variables its bind may set are visible before anyone uses it.
+        assert entry["registration"]["env_names"] == ["ACME_TOKEN"]
+        assert entry["registration"]["disabled"] is False
         # Its pods pin their egress like service pods.
         assert entry["egress"]["enforced"]["status"] == "enforced"
         trusted = DriverTrustPolicy(trusted_repositories=("ghcr.io/acme",))

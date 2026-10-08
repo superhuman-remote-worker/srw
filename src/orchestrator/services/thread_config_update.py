@@ -65,7 +65,7 @@ from orchestrator.schemas.thread_config import (
     ThreadWorkspaceUpgradeRequest,
 )
 from orchestrator.security.access import redact_config_override
-from orchestrator.services import connector_credential_leases
+from orchestrator.services import connector_bind_time, connector_credential_leases
 from orchestrator.services.config_overrides import deep_merge_dicts
 from orchestrator.services.manifest_runtime_ownership import require_srw_runtime
 from orchestrator.services.session_class_policy import (
@@ -90,7 +90,7 @@ from orchestrator.services.vm_workspace_recovery_store import (
     complete_vm_cleanup_permit,
 )
 from shared.backend_kinds import LITE_BACKENDS, VM_BACKENDS
-from shared.connectors.builtin import spec_for_row
+from shared.connectors.builtin import IMAGE_DRIVER_SPEC, spec_for_row
 from shared.run_queue import LANE_PINNED
 from shared.runtime.core.loader import canonical_config_name
 
@@ -442,6 +442,7 @@ async def apply_thread_config_update_locked(
     selected_ds_revisions: dict[str, int] | None = None
     datasource_selection_provenance: dict[str, Any] | None = None
     detached_lease_ids: list[str] = []
+    detached_bound_ids: list[str] = []
     grant_fragment = config_override
     if datasource_ids is not None:
         if thread_row is None:
@@ -472,6 +473,13 @@ async def apply_thread_config_update_locked(
             # git swap driver's, decided at delivery), and revoking where no
             # lease exists does nothing.
             detached_lease_ids = [str(row["id"]) for row in removed_rows]
+            # A registered image driver's binding is revoked too (D6): its
+            # driver revokes what it minted.
+            detached_bound_ids = [
+                str(row["id"])
+                for row in removed_rows
+                if spec_for_row(row) is IMAGE_DRIVER_SPEC
+            ]
         target_project_ids = await dependencies.thread_project_ids(thread_id)
         if thread_row.get("user_id"):
             owner = await dependencies.store.get_user(str(thread_row["user_id"]))
@@ -654,13 +662,25 @@ async def apply_thread_config_update_locked(
         # in this configuration transaction: any lease of any removed
         # connector (a git swap repository's included).
         detached = [cid for cid in detached_lease_ids if cid not in selected_ds_ids]
-        if detached:
+        unbound = [cid for cid in detached_bound_ids if cid not in selected_ds_ids]
+        if detached or unbound:
+            owner = connector_credential_leases.LeaseOwner.thread(thread_id)
             async with dependencies.store.acquire() as conn:
-                await connector_credential_leases.revoke_connector_leases(
-                    conn,
-                    owner=connector_credential_leases.LeaseOwner.thread(thread_id),
-                    connector_ids=detached,
-                )
+                if detached:
+                    await connector_credential_leases.revoke_connector_leases(
+                        conn, owner=owner, connector_ids=detached
+                    )
+                if unbound:
+                    # Within one reconciler pass its driver's revoke runs.
+                    await connector_bind_time.revoke_owner_bindings(
+                        conn,
+                        owner=owner,
+                        connector_ids=unbound,
+                        reason="connector_detached",
+                    )
+        # A registered driver's connector selected live binds now; the
+        # agent's refetch of the workspace waits for it.
+        connector_bind_time.start_thread_bindings(thread_id)
 
     # Config-change audit (live_session_settings.md Slice C): key paths only,
     # fired after every persist step succeeded. log_security_event never

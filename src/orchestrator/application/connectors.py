@@ -423,6 +423,7 @@ def bind_time_runtime(resources: ApplicationResources) -> BindTimeRuntime | None
                 max_pods=settings.connector_bind_time_max_pods,
                 deadline_seconds=settings.connector_bind_time_deadline_seconds,
                 wait_seconds=settings.connector_bind_time_wait_seconds,
+                max_spec_pods_per_user=settings.connector_bind_time_spec_pods_per_user,
             ),
             runtime=bind_time_pod_runtime_builder(hosting),
         ),
@@ -505,6 +506,8 @@ def connector_lease_exchange_app(resources: ApplicationResources) -> FastAPI:
     )
     # Bind-time driver pods post their outcome here (D6).
     app.state.driver_operations_store_factory = lambda: resources.postgres_db
+    # Its denials are logged coalesced, as the exchange's are recorded.
+    app.state.driver_result_limiter = DenialLimiter()
 
     @app.exception_handler(RequestValidationError)
     async def _invalid(_request: Request, _exc: RequestValidationError) -> JSONResponse:

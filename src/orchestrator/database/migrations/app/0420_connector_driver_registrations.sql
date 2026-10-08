@@ -8,26 +8,30 @@
 --                  Catalog, with the spec its io.srw.driver.spec label (or
 --                  its spec operation, or an imported server.json) declared
 --                  and the digest its reference resolved to then. One name
---                  per scope; srw.* stays SRW's own;
+--                  per scope; srw.* stays SRW's own. A disabled one binds
+--                  nothing new and its bindings are revoked;
 --                * connector_driver_assignments: which registration a
 --                  connector runs (a connector pins it by id when it is
 --                  created, so a registration added later under the same
 --                  name never moves it);
---                * connector_bind_time_bindings: one per workspace-owning
---                  execution and connector of a bind-time image driver. It
---                  records the bind ({reference, digest, resolved_at,
---                  spec_hash, protocol_version}), the delivery the driver
---                  returned and its driver_state (APP_ENCRYPTION_KEY
---                  ciphertexts), or why the bind was refused, and its
---                  revocation. Owners and connectors carry no foreign key:
---                  a revoke still runs after the job, thread or connector
---                  is gone;
+--                * connector_bind_time_bindings: one per bind of a
+--                  workspace-owning execution and a connector of a bind-time
+--                  image driver. It records the bind ({reference, digest,
+--                  resolved_at, spec_hash, protocol_version}) and the spec it
+--                  ran with, the delivery the driver returned, its
+--                  driver_state and the connector's config and credentials
+--                  as they were at bind (APP_ENCRYPTION_KEY ciphertexts, the
+--                  revoke's inputs, kept until it is revoked), or why the
+--                  bind was refused and when it may run again, and its
+--                  revocation. Owners and connectors carry no foreign key: a
+--                  revoke still runs after the job, thread, connector or
+--                  registration is gone;
 --                * connector_driver_operations: one short-lived driver pod
 --                  per operation (spec, check, bind, revoke, gc). It holds
 --                  the pod's sdi_ identity (SHA-256 only), the outcome the
---                  shim posted (encrypted) and the pod's lifecycle, so the
---                  installation cap counts live pods and a sweep removes
---                  what a restart left behind.
+--                  shim posted (encrypted, until it is read) and the pod's
+--                  lifecycle, so the installation cap counts live pods and a
+--                  sweep removes what a restart left behind.
 -- depends-on:    0392_drop_connector_service_pod_key_idx.notx.sql
 -- expected:      < 1s (four empty tables and their indexes).
 -- locks:         catalog locks; SHARE ROW EXCLUSIVE on users, projects and
@@ -59,6 +63,8 @@ CREATE TABLE public.connector_driver_registrations (
     created_by        UUID REFERENCES public.users(id) ON DELETE SET NULL,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    disabled_at       TIMESTAMPTZ,
+    disabled_by       UUID REFERENCES public.users(id) ON DELETE SET NULL,
     CONSTRAINT connector_driver_registrations_name_check
         CHECK (name ~ '^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)+/v[1-9][0-9]*$'
                AND name NOT LIKE 'srw.%'),
@@ -102,7 +108,8 @@ CREATE UNIQUE INDEX uq_connector_driver_registrations_project
 COMMENT ON TABLE public.connector_driver_registrations IS
     'Registered connector driver images (D6): one name per Account, Project '
     'or the shared Catalog, the spec the image declared and the digest its '
-    'reference resolved to at registration. srw.* names are SRW''s own.';
+    'reference resolved to at registration. srw.* names are SRW''s own. A '
+    'disabled registration binds nothing new.';
 
 CREATE TABLE public.connector_driver_assignments (
     connector_id     UUID PRIMARY KEY
@@ -118,9 +125,10 @@ CREATE INDEX idx_connector_driver_assignments_registration
 
 COMMENT ON TABLE public.connector_driver_assignments IS
     'The registration a connector of a registered image driver runs, pinned '
-    'by id when the connector is created. The API refuses to delete a '
-    'registration a connector uses; a user or project delete cascades, and '
-    'the connector then refuses to bind.';
+    'by id when the connector is created. The API deletes a registration only '
+    'when no connector uses it or it is disabled, and no binding of it is '
+    'unrevoked; a user or project delete cascades, and the connector then '
+    'refuses to bind.';
 
 CREATE TABLE public.connector_bind_time_bindings (
     id                         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -132,21 +140,29 @@ CREATE TABLE public.connector_bind_time_bindings (
                                    ON DELETE SET NULL,
     driver                     TEXT NOT NULL,
     status                     TEXT NOT NULL DEFAULT 'pending',
+    attempt                    INTEGER NOT NULL DEFAULT 1,
+    read_only                  BOOLEAN NOT NULL DEFAULT false,
     image_reference            TEXT,
     image_digest               TEXT,
+    image_stale                BOOLEAN NOT NULL DEFAULT false,
     resolved_at                TIMESTAMPTZ,
+    spec                       JSONB,
     spec_hash                  TEXT,
     protocol_version           TEXT,
     access                     TEXT,
+    inputs_ciphertext          TEXT,
     delivery_ciphertext        TEXT,
     driver_state_ciphertext    TEXT,
     error_class                TEXT,
     error_message              TEXT,
+    retry_at                   TIMESTAMPTZ,
     created_at                 TIMESTAMPTZ NOT NULL DEFAULT now(),
     bound_at                   TIMESTAMPTZ,
     failed_at                  TIMESTAMPTZ,
     revoke_requested_at        TIMESTAMPTZ,
     revoke_reason              TEXT,
+    revoke_attempts            INTEGER NOT NULL DEFAULT 0,
+    revoke_next_at             TIMESTAMPTZ,
     revoked_at                 TIMESTAMPTZ,
     revoke_error               TEXT,
     CONSTRAINT connector_bind_time_bindings_owner_check
@@ -155,17 +171,24 @@ CREATE TABLE public.connector_bind_time_bindings (
         CHECK (driver <> ''),
     CONSTRAINT connector_bind_time_bindings_status_check
         CHECK (status IN ('pending', 'bound', 'failed', 'revoking', 'revoked')),
+    CONSTRAINT connector_bind_time_bindings_attempt_check
+        CHECK (attempt >= 0 AND revoke_attempts >= 0),
     CONSTRAINT connector_bind_time_bindings_digest_check
         CHECK (image_digest IS NULL OR image_digest ~ '^sha256:[0-9a-f]{64}$'),
+    CONSTRAINT connector_bind_time_bindings_spec_check
+        CHECK (spec IS NULL OR jsonb_typeof(spec) = 'object'),
     CONSTRAINT connector_bind_time_bindings_bound_check
-        CHECK (status NOT IN ('bound', 'revoking')
+        CHECK (status <> 'bound'
                OR (delivery_ciphertext IS NOT NULL AND image_digest IS NOT NULL
                    AND bound_at IS NOT NULL)),
     CONSTRAINT connector_bind_time_bindings_failed_check
-        CHECK ((status = 'failed') = (failed_at IS NOT NULL)
-               AND (status <> 'failed' OR error_message IS NOT NULL)),
+        CHECK (status <> 'failed'
+               OR (failed_at IS NOT NULL AND error_message IS NOT NULL)),
+    -- A revoke may be asked while the bind still runs (pending): the bind
+    -- then ends in revoking, never bound.
     CONSTRAINT connector_bind_time_bindings_revoke_check
-        CHECK ((status IN ('revoking', 'revoked')) = (revoke_requested_at IS NOT NULL)
+        CHECK ((status NOT IN ('revoking', 'revoked') OR revoke_requested_at IS NOT NULL)
+               AND (status NOT IN ('bound', 'failed') OR revoke_requested_at IS NULL)
                AND (status = 'revoked') = (revoked_at IS NOT NULL))
 );
 
@@ -174,11 +197,17 @@ CREATE TABLE public.connector_bind_time_bindings (
 CREATE UNIQUE INDEX uq_connector_bind_time_bindings_live
     ON public.connector_bind_time_bindings (owner_kind, owner_id, connector_id)
     WHERE status IN ('pending', 'bound');
--- The connector page (each execution's digest) and the moved-tag check (the
--- digest of the connector's newest binding).
+-- A delivery's look at its newest binding, and the connector page.
+CREATE INDEX idx_connector_bind_time_bindings_owner
+    ON public.connector_bind_time_bindings
+       (owner_kind, owner_id, connector_id, created_at DESC);
 CREATE INDEX idx_connector_bind_time_bindings_connector
     ON public.connector_bind_time_bindings (connector_id, created_at DESC);
--- The reconciler's scan: bindings to revoke, and bound ones whose execution
+-- A registration's delete and disable.
+CREATE INDEX idx_connector_bind_time_bindings_registration
+    ON public.connector_bind_time_bindings (registration_id)
+    WHERE registration_id IS NOT NULL;
+-- The reconciler's scan: bindings to revoke, and live ones whose execution
 -- may have ended.
 CREATE INDEX idx_connector_bind_time_bindings_open
     ON public.connector_bind_time_bindings (status)
@@ -186,8 +215,9 @@ CREATE INDEX idx_connector_bind_time_bindings_open
 
 COMMENT ON TABLE public.connector_bind_time_bindings IS
     'Bind-time image driver bindings (D6): what one bind recorded and '
-    'delivered (encrypted), and its revocation. Owner and connector are '
-    'plain ids so a revoke can run after either is gone.';
+    'delivered, the inputs its revoke needs (encrypted until revoked), its '
+    'failure and retry, and its revocation. Owner, connector and '
+    'registration are kept by value so a revoke runs after any is gone.';
 
 CREATE TABLE public.connector_driver_operations (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -201,6 +231,7 @@ CREATE TABLE public.connector_driver_operations (
     binding_id          UUID
                             REFERENCES public.connector_bind_time_bindings(id)
                             ON DELETE SET NULL,
+    requested_by        UUID REFERENCES public.users(id) ON DELETE SET NULL,
     image_reference     TEXT NOT NULL,
     image_digest        TEXT NOT NULL,
     pod_namespace       TEXT NOT NULL,
@@ -235,10 +266,14 @@ CREATE INDEX idx_connector_driver_operations_live
 CREATE INDEX idx_connector_driver_operations_binding
     ON public.connector_driver_operations (binding_id)
     WHERE binding_id IS NOT NULL;
+-- An outcome no runner read (its runner died): the reconciler recovers it.
+CREATE INDEX idx_connector_driver_operations_unread
+    ON public.connector_driver_operations (finished_at)
+    WHERE outcome_ciphertext IS NOT NULL;
 
 COMMENT ON TABLE public.connector_driver_operations IS
     'Short-lived connector driver pods (D6), one per operation: the pod''s '
-    'sdi_ identity (SHA-256 only), the outcome its shim posted (encrypted) '
-    'and its lifecycle.';
+    'sdi_ identity (SHA-256 only), the outcome its shim posted (encrypted, '
+    'cleared once read) and its lifecycle.';
 
 COMMIT;

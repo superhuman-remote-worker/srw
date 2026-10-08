@@ -131,6 +131,11 @@ def parse_name_list(raw: str | None) -> frozenset[str]:
     return frozenset(item.strip() for item in (raw or "").split(",") if item.strip())
 
 
+#: The longest a delivery waits for a bind: under the agent's 30 s request
+#: to the orchestrator, with room for the rest of the answer.
+MAX_BIND_WAIT_SECONDS = 25.0
+
+
 def parse_repository_list(raw: str | None) -> tuple[str, ...]:
     """Image repositories from a JSON list (``connectors.drivers.
     trustedRepositories``). Anything that is not a list of non-empty strings
@@ -366,11 +371,13 @@ class DeploymentSettings:
     connector_custom_drivers_privileged: bool = False
     #: Bind-time driver pods (D6): the installation cap (the namespace's
     #: Terminating pod quota is the backstop), each pod's
-    #: activeDeadlineSeconds, and how long a delivery waits for a bind before
-    #: it is refused and retried (the bind goes on).
+    #: activeDeadlineSeconds, how long a session's attach or claim waits for
+    #: a bind (the bind goes on; never past the agent's 30 s request, so at
+    #: most :data:`MAX_BIND_WAIT_SECONDS`), and a user's live spec pods.
     connector_bind_time_max_pods: int = 10
     connector_bind_time_deadline_seconds: float = 120.0
-    connector_bind_time_wait_seconds: float = 60.0
+    connector_bind_time_wait_seconds: float = 20.0
+    connector_bind_time_spec_pods_per_user: int = 2
 
     def session_subagent_fanout(self, lane: str | None) -> bool:
         """Whether a session on ``lane`` may fan out right now."""
@@ -586,11 +593,22 @@ class DeploymentSettings:
                 default=120.0,
                 minimum=30.0,
             ),
-            connector_bind_time_wait_seconds=parse_positive_number(
-                "CONNECTOR_BIND_TIME_WAIT_SECONDS",
-                os.environ.get("CONNECTOR_BIND_TIME_WAIT_SECONDS"),
-                default=60.0,
-                minimum=1.0,
+            connector_bind_time_wait_seconds=min(
+                MAX_BIND_WAIT_SECONDS,
+                parse_positive_number(
+                    "CONNECTOR_BIND_TIME_WAIT_SECONDS",
+                    os.environ.get("CONNECTOR_BIND_TIME_WAIT_SECONDS"),
+                    default=20.0,
+                    minimum=0.0,
+                ),
+            ),
+            connector_bind_time_spec_pods_per_user=int(
+                parse_positive_number(
+                    "CONNECTOR_BIND_TIME_SPEC_PODS_PER_USER",
+                    os.environ.get("CONNECTOR_BIND_TIME_SPEC_PODS_PER_USER"),
+                    default=2,
+                    minimum=1,
+                )
             ),
         )
 
@@ -598,6 +616,7 @@ class DeploymentSettings:
 __all__ = [
     "CONNECTOR_LEASE_CANARY_PORT_ENV",
     "CONNECTOR_LEASE_EXCHANGE_PORT_ENV",
+    "MAX_BIND_WAIT_SECONDS",
     "SESSION_SUBAGENT_FANOUT_LANES_ENV",
     "DeploymentSettings",
     "parse_canary_port",

@@ -288,9 +288,14 @@ connectors:
     # -- A bind-time pod's activeDeadlineSeconds: the longest one driver
     # operation (bind, revoke, check, spec) may run, canary wait included.
     bindDeadlineSeconds: 120
-    # -- How long a delivery (a claim, an attach) waits for a new bind
-    # before it is refused and retried; the bind goes on meanwhile.
-    bindWaitSeconds: 60
+    # -- How long a session's attach or claim waits for a new bind; the bind
+    # goes on meanwhile and the session gets the connector at a later
+    # delivery (a job waits in the dispatcher instead, never blocking it).
+    # Below the agent's 30 s request to the orchestrator: at most 25.
+    bindWaitSeconds: 20
+    # -- How many spec-operation pods (registering an image without a spec
+    # label) one user may run at once.
+    specPodsPerUser: 2
   drivers:
     # -- Repositories whose driver images are trusted (D6), matched on a
     # path boundary: ghcr.io/acme trusts ghcr.io/acme/driver but never

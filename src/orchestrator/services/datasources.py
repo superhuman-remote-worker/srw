@@ -51,7 +51,11 @@ from orchestrator.security.access import (
     redact_datasources,
     user_visible_project_ids,
 )
-from orchestrator.services import connector_driver_registrations, knowledge_index
+from orchestrator.services import (
+    connector_bind_time,
+    connector_driver_registrations,
+    knowledge_index,
+)
 from orchestrator.services.connector_drivers import ConnectorDriverRegistry
 from orchestrator.services.connector_drivers.base import (
     CheckContext,
@@ -498,6 +502,9 @@ async def create_datasource(
         ) from exc
     except DatasourcePolicyValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except DatasourcePolicyConflictError as exc:
+        # The registration was deleted or disabled meanwhile (D6).
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except HTTPException:
         raise
     except Exception as e:
@@ -713,6 +720,13 @@ async def update_datasource(
                 created=False,
                 knowledge_index=dependencies.knowledge_index,
             )
+        if isinstance(driver, SupportsDriverRegistration) and (
+            normalized.config is not None or normalized.credentials is not None
+        ):
+            # Its bindings ran on the old config or credentials: revoke them;
+            # each execution's next delivery binds afresh (D6).
+            async with dependencies.store.acquire() as conn:
+                await connector_bind_time.connector_changed(conn, datasource_id)
 
         updated_ds = await dependencies.store.get_datasource(datasource_id)
         if not updated_ds:

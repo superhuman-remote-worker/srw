@@ -177,6 +177,7 @@ def _deps(
     agent_provisioner: Any = None,
     manifest_service: Any = None,
     prepare_repository: Any = None,
+    bind_gate: Any = None,
 ) -> JobDispatchDependencies:
     delivery = delivery or FakeDelivery()
 
@@ -211,6 +212,7 @@ def _deps(
         prepare_job_repository_before_claim=prepare_repository
         or AsyncMock(return_value=True),
         job_delivery_operations=lambda: delivery,
+        **({"job_bind_gate": bind_gate} if bind_gate is not None else {}),
     )
 
 
@@ -511,6 +513,39 @@ class TestClaimAndDelivery:
         prepare.assert_awaited_once_with(job)
         assert store.called("claim_job_for_agent") == []
         assert store.called("get_available_agents") == []
+
+    @pytest.mark.asyncio
+    async def test_a_bind_still_running_holds_the_job_before_claim(
+        self, no_dispatcher_error
+    ):
+        """A registered driver's connector binds first (D6): the preflight
+        starts it without waiting and retries at later ticks."""
+        job = _job("j1")
+        store = FakeStore(pinned=[job], agents=[{"id": "a1", "metadata": {}}])
+        gate = AsyncMock(return_value=("wait", None))
+
+        await dispatch_pending_jobs(dependencies=_deps(store, bind_gate=gate))
+
+        gate.assert_awaited_once_with(job)
+        assert store.called("claim_job_for_agent") == []
+        assert store.called("update_job_status") == []
+
+    @pytest.mark.asyncio
+    async def test_a_bind_that_failed_for_good_fails_the_job_with_its_reason(
+        self, no_dispatcher_error
+    ):
+        job = _job("j1", status="created")
+        store = FakeStore(pinned=[job], agents=[{"id": "a1", "metadata": {}}])
+        gate = AsyncMock(return_value=("fail", "Connector acme: No such tenant"))
+
+        await dispatch_pending_jobs(dependencies=_deps(store, bind_gate=gate))
+
+        assert store.called("claim_job_for_agent") == []
+        ((args, kwargs),) = store.called("update_job_status")
+        assert args == ("j1",)
+        assert kwargs["status"] == "failed"
+        assert kwargs["error_message"] == "Connector acme: No such tenant"
+        assert kwargs["expected_status"] == "created"
 
 
 # =============================================================================

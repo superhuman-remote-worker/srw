@@ -105,6 +105,36 @@ def test_install_retains_fields_and_quotes_shell_content(tmp_path):
     assert target.with_suffix(".json").stat().st_mode & 0o777 == 0o600
 
 
+def test_a_detached_driver_s_variables_are_unset_for_new_commands(
+    tmp_path, monkeypatch
+):
+    """A registered image driver detached live (D6): its names are unset in
+    the work item's environment file; the others stay, and a reserved name is
+    never touched."""
+    backend = RemoteBackend(host="unused", job_id="job-detach")
+    monkeypatch.setattr(backend, "_init_shell", lambda: None)
+    monkeypatch.setattr(
+        backend, "_resolve_home_path", lambda path: str(tmp_path / path)
+    )
+    sent = []
+
+    def send(command, secret, **kwargs):
+        sent.append(json.loads(secret))
+        subprocess.run(["bash", "-c", command], input=secret, text=True, check=True)
+        return True
+
+    monkeypatch.setattr(backend, "execute_claim_resource_with_secret_stdin", send)
+    backend.install_credential_environment({"ACME_TOKEN": "minted", "KEEP": "k"})
+    backend.unset_credential_environment(["ACME_TOKEN", "PATH"])
+    assert sent[-1] == {"ACME_TOKEN": None}
+    assert _read_vars(Path(backend._credential_env_path), ["ACME_TOKEN", "KEEP"]) == {
+        "ACME_TOKEN": None,
+        "KEEP": "k",
+    }
+    backend.unset_credential_environment(["PATH"])
+    assert len(sent) == 2  # nothing to unset: no command
+
+
 def test_remote_delivery_uses_private_transport_and_work_identity(
     tmp_path, monkeypatch
 ):

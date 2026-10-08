@@ -177,6 +177,8 @@ POST   /api/connector-drivers                                                   
 POST   /api/connector-drivers/import                                                    pat=admin           gated:require_approved_user
 DELETE /api/connector-drivers/{registration_id}                                         pat=admin           gated:require_approved_user
 GET    /api/connector-drivers/{registration_id}                                         pat=jobs:read       gated:require_approved_user
+POST   /api/connector-drivers/{registration_id}/disable                                 pat=admin           gated:require_approved_user
+POST   /api/connector-drivers/{registration_id}/enable                                  pat=admin           gated:require_approved_user
 GET    /api/contacts                                                                    pat=admin           gated:require_approved_user
 POST   /api/contacts                                                                    pat=admin           gated:require_approved_user
 DELETE /api/contacts/addresses/{address_id}                                             pat=admin           gated:require_approved_user

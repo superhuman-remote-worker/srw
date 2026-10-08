@@ -6,9 +6,13 @@ policy): the control is privilege, never admission.
 **Who registers where** follows the manifest scopes
 (``ManifestAuthority.scope(write=True)``, decision 5): the caller in their own
 Account, editors and up in a Project, unrestricted administrators in the
-shared Catalog. Reading follows the same scopes: an Account's registrations
-are its user's (an administrator's too), a Project's are its members', the
-Catalog's are everyone's.
+shared Catalog. The same authority disables, enables and deletes. Reading
+follows the scopes too: an Account's registrations are its user's, a
+Project's are its members', the Catalog's are everyone's. An administrator
+may also read any Account's registration *by id* (the list never shows
+another user's): support needs to see what a connector of that user runs,
+and a manifest scope's administrator reads an Account's resources the same
+way.
 
 **The spec** comes from the image's ``io.srw.driver.spec`` label, read from
 the registry without running the image. An image without one has its
@@ -27,10 +31,19 @@ Catalog name that Accounts or Projects already use.
 **Which registration a connector runs.** A connector pins its registration
 by id when it is created (``connector_driver_assignments``), so a
 registration added later under the same name never moves an existing
-connector to another image. A connector created by driver *name* resolves it
-in the order Catalog, then the Project it is created for (when it names
-exactly one), then the creator's Account: the widest scope wins, the same
-rule that keeps a narrower scope from shadowing it.
+connector to another image. A connector created by driver *name* takes the
+Catalog's registration of that name; without one, the name must resolve to
+exactly one registration in the Project it is created for and the creator's
+Account, else the request is refused as ambiguous and names the ids to
+pick from.
+
+**Disable and delete.** A disabled registration binds nothing new: its
+connectors show "registration disabled", and its live bindings are revoked
+(``connector_bind_time.registration_disabled``). It is deleted only when
+none of its bindings is unrevoked (a revoke needs the binding's own
+inputs, not the registration) and no connector uses it, or it is disabled.
+Delete and connector creation lock the registration's row, so neither can
+slip past the other.
 
 **Versions.** The registration keeps its image reference as written; SRW
 never rewrites it. Each bind resolves it to a digest and checks a moved tag
@@ -66,6 +79,7 @@ from shared.connectors.contract import DriverSpec
 from shared.connectors.images import ImageReference, label_spec, spec_hash
 from shared.connectors.registration import (
     custom_driver_problems,
+    declared_env_names,
     repository_trusted,
     reserved_name,
     spec_from_json,
@@ -79,14 +93,15 @@ _NAME_LOCK = "srw-connector-driver-name:"
 _ROW = (
     "id, name, scope_kind, owner_id, project_id, title, description, "
     "image_reference, image_digest, spec, spec_hash, spec_source, "
-    "protocol_version, plane, source_document, created_by, created_at, updated_at"
+    "protocol_version, plane, source_document, created_by, created_at, "
+    "updated_at, disabled_at, disabled_by"
 )
 #: Resolves one image reference for registration: the registry's answer
 #: (digest, labels, entrypoint, command), ``shared.oci_registry.ResolvedImage``.
 ResolveImage = Callable[[str], Awaitable[Any]]
 #: Runs an unlabelled image's ``spec`` operation in a sandboxed pod:
 #: ``(reference, resolved image) -> the spec JSON``.
-RunSpec = Callable[[str, Any], Awaitable[dict[str, Any]]]
+RunSpec = Callable[..., Awaitable[dict[str, Any]]]
 
 
 @dataclass(frozen=True)
@@ -140,6 +155,17 @@ class Registration:
     created_at: datetime | None = None
     updated_at: datetime | None = None
     source_document: Mapping[str, Any] | None = field(default=None, repr=False)
+    disabled_at: datetime | None = None
+    disabled_by: str | None = None
+
+    @property
+    def disabled(self) -> bool:
+        return self.disabled_at is not None
+
+    @property
+    def env_names(self) -> tuple[str, ...]:
+        """The variable names its spec declares a bind may return."""
+        return declared_env_names(self.spec_json)
 
     @property
     def scope(self) -> dict[str, str]:
@@ -164,7 +190,10 @@ class Registration:
             "spec_hash": self.spec_hash,
             "protocol_version": self.protocol_version,
             "plane": self.plane,
+            "env_names": list(self.env_names),
             "trust": policy.trust(self.image_reference),
+            "disabled": self.disabled,
+            "disabled_at": self.disabled_at.isoformat() if self.disabled_at else None,
             "created_by": self.created_by,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
@@ -198,6 +227,8 @@ def registration_from_row(row: Mapping[str, Any]) -> Registration:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         source_document=_json(row["source_document"]),
+        disabled_at=row["disabled_at"],
+        disabled_by=str(row["disabled_by"]) if row["disabled_by"] else None,
     )
 
 
@@ -257,6 +288,8 @@ async def _can_read(
         return True
     token_project = mcp_scope_project_id(dict(user))
     if registration.scope_kind == "Account":
+        # An administrator reads another user's by id on purpose (the
+        # module docstring); a project-scoped token reads no Account's.
         return token_project is None and (
             registration.owner_id == str(user["id"]) or bool(user.get("is_admin"))
         )
@@ -310,6 +343,7 @@ async def _spec_of_image(
     resolved: Any,
     *,
     run_spec: RunSpec | None,
+    requested_by: str,
 ) -> tuple[dict[str, Any], str]:
     """The spec JSON an image declares and where it came from."""
     try:
@@ -327,7 +361,10 @@ async def _spec_of_image(
                 "(connectors.servicePods.enabled)"
             ),
         )
-    return await run_spec(reference, resolved), "spec_operation"
+    return (
+        await run_spec(reference, resolved, requested_by=requested_by),
+        "spec_operation",
+    )
 
 
 async def register_driver(
@@ -371,15 +408,18 @@ async def register_driver(
         ) from None
     if spec_json is None:
         spec_json, spec_source = await _spec_of_image(
-            reference, resolved, run_spec=run_spec
+            reference, resolved, run_spec=run_spec, requested_by=str(user["id"])
         )
     try:
         spec = spec_from_json(spec_json)
+        env_names = declared_env_names(spec_json)
     except ValueError as exc:
         raise HTTPException(
             status_code=422, detail=_problems_detail([str(exc)])
         ) from None
-    problems = custom_driver_problems(spec, privileged=policy.privileged(reference))
+    problems = custom_driver_problems(
+        spec, privileged=policy.privileged(reference), env_names=env_names
+    )
     if problems:
         raise HTTPException(status_code=422, detail=_problems_detail(problems))
     if name is not None and name != spec.name:
@@ -467,25 +507,60 @@ async def register_driver(
     return registration
 
 
-async def delete_registration(
-    db: Any, user: Mapping[str, Any], registration_id: Any, *, request: Any = None
-) -> None:
-    """Delete a registration no connector uses (409 while any does)."""
+async def _writable(
+    db: Any, user: Mapping[str, Any], registration_id: Any, request: Any
+) -> Registration:
+    """A registration the caller may change: visible, and in a scope the
+    caller may write (an administrator for the Catalog, the owner for an
+    Account, editors and up for a Project)."""
     registration = await get_visible_registration(db, user, registration_id)
     authority = ManifestAuthority(db, dict(user), request=request)
     await authority.scope(registration.scope, write=True)
+    return registration
+
+
+async def delete_registration(
+    db: Any, user: Mapping[str, Any], registration_id: Any, *, request: Any = None
+) -> None:
+    """Delete a registration whose every binding was revoked, and which no
+    connector uses or which is disabled (409 otherwise). Its row is locked
+    against a connector being created on it meanwhile."""
+    registration = await _writable(db, user, registration_id, request)
     async with db.transaction_scope():
+        locked = await db.fetchrow(
+            "SELECT disabled_at FROM connector_driver_registrations "
+            "WHERE id = $1 FOR UPDATE",
+            UUID(registration.id),
+        )
+        if locked is None:
+            raise _not_found()
+        live = await db.fetchval(
+            "SELECT count(*) FROM connector_bind_time_bindings "
+            "WHERE registration_id = $1 AND status IN ('pending', 'bound', 'revoking')",
+            UUID(registration.id),
+        )
+        if live:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{live} binding(s) of this driver are not revoked yet. "
+                    "Disable it (POST /api/connector-drivers/"
+                    f"{registration.id}/disable), let SRW revoke them, then delete it"
+                ),
+            )
         used = await db.fetchval(
             "SELECT count(*) FROM connector_driver_assignments "
             "WHERE registration_id = $1",
             UUID(registration.id),
         )
-        if used:
+        if used and locked["disabled_at"] is None:
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"{used} connector(s) use this driver; delete them or move "
-                    "them to another registration first"
+                    f"{used} connector(s) use this driver. Delete them, or disable "
+                    "the driver first (POST /api/connector-drivers/"
+                    f"{registration.id}/disable): its connectors then stay, "
+                    "without a driver"
                 ),
             )
         await db.execute(
@@ -501,6 +576,63 @@ async def delete_registration(
         detail=f"name={registration.name} scope={registration.scope_kind}",
         request=request,
     )
+
+
+async def set_registration_disabled(
+    db: Any,
+    user: Mapping[str, Any],
+    registration_id: Any,
+    *,
+    disabled: bool,
+    request: Any = None,
+) -> Registration:
+    """Disable (or enable again) a registration: the kill switch. Disabled,
+    it binds nothing new and every live binding of it is revoked; enabled
+    again, its connectors' failed binds get a fresh try."""
+    from orchestrator.services import connector_bind_time
+
+    registration = await _writable(db, user, registration_id, request)
+    async with db.transaction_scope():
+        row = await db.fetchrow(
+            f"""
+            UPDATE connector_driver_registrations
+               SET disabled_at = CASE WHEN $2 THEN COALESCE(disabled_at, now())
+                                      ELSE NULL END,
+                   disabled_by = CASE WHEN $2 THEN COALESCE(disabled_by, $3)
+                                      ELSE NULL END,
+                   updated_at = now()
+             WHERE id = $1
+            RETURNING {_ROW}
+            """,
+            UUID(registration.id),
+            disabled,
+            UUID(str(user["id"])),
+        )
+        if row is None:
+            raise _not_found()
+        async with db.acquire() as conn:
+            if disabled:
+                revoked = await connector_bind_time.registration_disabled(
+                    conn, registration.id
+                )
+            else:
+                revoked = 0
+                await connector_bind_time.registration_enabled(conn, registration.id)
+    await log_security_event(
+        db,
+        resource_type="connector_driver",
+        event_type=(
+            "connector_driver_disabled" if disabled else "connector_driver_enabled"
+        ),
+        user=dict(user),
+        resource_id=registration.id,
+        detail=(
+            f"name={registration.name} scope={registration.scope_kind} "
+            f"revoked_bindings={revoked}"
+        ),
+        request=request,
+    )
+    return registration_from_row(row)
 
 
 # =============================================================================
@@ -534,17 +666,27 @@ async def resolve_registration_for_use(
             item
             for item in await list_visible_registrations(db, user)
             if item.name == name
+            and (item.scope_kind != "Project" or item.project_id == project_id)
         ]
-        order = {"Catalog": 0, "Project": 1, "Account": 2}
-        candidates = [
-            item
-            for item in candidates
-            if item.scope_kind != "Project" or item.project_id == project_id
-        ]
-        candidates.sort(key=lambda item: order[item.scope_kind])
+        catalog = [item for item in candidates if item.scope_kind == "Catalog"]
+        if catalog:
+            candidates = catalog
         if not candidates:
             raise HTTPException(
                 status_code=404, detail=f"No driver named {name} is visible to you"
+            )
+        if len(candidates) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        f"Ambiguous driver name {name}: pick the registration "
+                        "(driver_registration_id)"
+                    ),
+                    "registrations": [
+                        {"id": item.id, "scope": item.scope_kind} for item in candidates
+                    ],
+                },
             )
         registration = candidates[0]
     else:
@@ -562,6 +704,11 @@ async def resolve_registration_for_use(
                 f"{registration.name} runs on the {registration.plane} plane; "
                 "registered connectors are bind-time drivers in this release"
             ),
+        )
+    if registration.disabled:
+        raise HTTPException(
+            status_code=409,
+            detail=f"The driver registration {registration.name} is disabled",
         )
     return registration
 
@@ -594,9 +741,10 @@ async def registration_for_connector(db: Any, connector_id: Any) -> Registration
 
 
 _BINDINGS = """
-SELECT owner_kind, owner_id, status, image_reference, image_digest,
-       resolved_at, spec_hash, protocol_version, error_class, error_message,
-       created_at, bound_at, failed_at, revoked_at, revoke_reason
+SELECT owner_kind, owner_id, status, attempt, image_reference, image_digest,
+       image_stale, resolved_at, spec_hash, protocol_version, error_class,
+       error_message, retry_at, created_at, bound_at, failed_at, revoked_at,
+       revoke_reason, revoke_error
   FROM connector_bind_time_bindings
  WHERE connector_id = $1
  ORDER BY created_at DESC
@@ -617,13 +765,18 @@ def _binding_view(row: Mapping[str, Any], *, with_owner: bool) -> dict[str, Any]
         "resolved_at": _iso(row["resolved_at"]),
         "spec_hash": row["spec_hash"],
         "protocol_version": row["protocol_version"],
+        # The registry was unreachable: the bind reused the last digest.
+        "stale": bool(row["image_stale"]),
+        "attempt": row["attempt"],
         "error_class": row["error_class"],
         "message": row["error_message"],
+        "retry_at": _iso(row["retry_at"]),
         "created_at": _iso(row["created_at"]),
         "bound_at": _iso(row["bound_at"]),
         "failed_at": _iso(row["failed_at"]),
         "revoked_at": _iso(row["revoked_at"]),
         "revoke_reason": row["revoke_reason"],
+        "revoke_error": row["revoke_error"],
     }
     if with_owner:
         view["owner"] = {"kind": row["owner_kind"], "id": str(row["owner_id"])}
@@ -636,23 +789,37 @@ async def connector_driver_status(
     """Which registration a connector runs and how its binds went.
 
     ``last_bind`` is the newest bind of any execution, a refusal included:
-    what a reader of the connector sees when a moved tag broke it.
-    ``bindings`` (the connector's owner and administrators only: they name
-    other users' executions) lists recent binds with the digest each used.
+    what a reader of the connector sees when a moved tag broke it, a bind
+    failed for good (a session skips the connector then) or the registry was
+    unreachable (``stale``). ``bindings`` (the connector's owner and
+    administrators only: they name other users' executions) lists recent
+    binds with the digest each used, and only they see an Account
+    registration's owner.
     """
     registration = await registration_for_connector(db, connector_id)
     rows = await db.fetch(_BINDINGS, UUID(str(connector_id)), 20)
+    scope = registration.scope if registration is not None else None
+    if scope is not None and scope["kind"] == "Account" and not with_bindings:
+        scope = {"kind": "Account"}
     status: dict[str, Any] = {
         "registration": (
             {
                 "id": registration.id,
                 "name": registration.name,
                 "title": registration.title,
-                "scope": registration.scope,
+                "scope": scope,
                 "image_reference": registration.image_reference,
                 "plane": registration.plane,
+                "disabled": registration.disabled,
             }
             if registration is not None
+            else None
+        ),
+        "notice": (
+            "registration disabled"
+            if registration is not None and registration.disabled
+            else "registration gone"
+            if registration is None
             else None
         ),
         "last_bind": _binding_view(rows[0], with_owner=False) if rows else None,
@@ -691,6 +858,7 @@ __all__ = [
     "Registration",
     "connector_driver_status",
     "delete_registration",
+    "set_registration_disabled",
     "driver_for_row",
     "get_visible_registration",
     "list_visible_registrations",

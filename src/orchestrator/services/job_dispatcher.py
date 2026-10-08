@@ -194,6 +194,10 @@ class JobDispatchState:
         self.completed.clear()
 
 
+async def _dispatch_without_binds(_job: Any) -> tuple[str, str | None]:
+    return "dispatch", None
+
+
 @dataclass(frozen=True, slots=True)
 class JobDispatchDependencies:
     """Per-invocation collaborators for one dispatch pass.
@@ -224,6 +228,12 @@ class JobDispatchDependencies:
     provision_parent_workspace_for_scholar: Callable[..., Awaitable[Any]]
     prepare_job_repository_before_claim: Callable[..., Awaitable[bool]]
     job_delivery_operations: Callable[[], Any]
+    #: A job's registered driver binds before its claim (connector drivers
+    #: D6, ``connector_bind_time.job_bind_gate``): ``("dispatch", None)``,
+    #: ``("wait", None)`` or ``("fail", reason)``.
+    job_bind_gate: Callable[[Any], Awaitable[tuple[str, str | None]]] = (
+        _dispatch_without_binds
+    )
 
 
 def _needs_mutation(job: dict[str, Any], dependencies: JobDispatchDependencies) -> bool:
@@ -1218,6 +1228,26 @@ async def _preflight_job(
         # Retry on the next dispatcher tick. A Gitea/SSH outage is
         # not a worker failure and must not make the job cross the
         # processing boundary with unproven repository authority.
+        return None
+    # A registered driver's connector binds in its own pod before the claim:
+    # started here without waiting (this preflight never blocks a dispatch
+    # loop), the job waits for later ticks while it runs, and one that fails
+    # for good fails the job with the driver's reason (D6).
+    action, reason = await dependencies.job_bind_gate(job)
+    if action == "wait":
+        return None
+    if action == "fail":
+        logger.warning(
+            "Dispatcher: job %s connector bind failed: %s. Failing job.",
+            job_id,
+            reason,
+        )
+        await dependencies.store.update_job_status(
+            job_id,
+            status="failed",
+            error_message=reason,
+            expected_status=str(job.get("status")),
+        )
         return None
     return job
 

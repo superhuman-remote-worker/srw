@@ -1,8 +1,9 @@
 """HTTP adapters for registered connector drivers (connector drivers D6).
 
-``/api/connector-drivers`` lists, registers, reads and deletes driver images
-someone registered in their Account, a Project or the shared Catalog
-(``orchestrator.services.connector_driver_registrations``), and imports an
+``/api/connector-drivers`` lists, registers, reads, disables, enables and
+deletes driver images someone registered in their Account, a Project or the
+shared Catalog (``orchestrator.services.connector_driver_registrations``),
+and imports an
 MCP Registry ``server.json`` as a managed MCP driver
 (``orchestrator.services.connector_driver_imports``). A connector of a
 registered driver is created through the datasource API with type
@@ -202,9 +203,47 @@ async def delete_connector_driver(
         get_connector_drivers_dependencies
     ),
 ) -> dict[str, str]:
-    """Delete a registration no connector uses."""
+    """Delete a registration whose bindings are all revoked, and which no
+    connector uses or which is disabled."""
     user = await dependencies.require_approved_user(request, dependencies.store)
     await connector_driver_registrations.delete_registration(
         dependencies.store, user, registration_id, request=request
     )
     return {"status": "deleted"}
+
+
+@router.post("/api/connector-drivers/{registration_id}/disable")
+async def disable_connector_driver(
+    registration_id: str,
+    request: Request,
+    *,
+    dependencies: ConnectorDriversDependencies = Depends(
+        get_connector_drivers_dependencies
+    ),
+) -> dict[str, Any]:
+    """Disable a registration (the kill switch): it binds nothing new and
+    every live binding of it is revoked. Its connectors stay, shown as
+    "registration disabled"; it may then be deleted once its bindings are
+    revoked."""
+    user = await dependencies.require_approved_user(request, dependencies.store)
+    registration = await connector_driver_registrations.set_registration_disabled(
+        dependencies.store, user, registration_id, disabled=True, request=request
+    )
+    return registration.view(dependencies.trust)
+
+
+@router.post("/api/connector-drivers/{registration_id}/enable")
+async def enable_connector_driver(
+    registration_id: str,
+    request: Request,
+    *,
+    dependencies: ConnectorDriversDependencies = Depends(
+        get_connector_drivers_dependencies
+    ),
+) -> dict[str, Any]:
+    """Enable a disabled registration again; its connectors bind afresh."""
+    user = await dependencies.require_approved_user(request, dependencies.store)
+    registration = await connector_driver_registrations.set_registration_disabled(
+        dependencies.store, user, registration_id, disabled=False, request=request
+    )
+    return registration.view(dependencies.trust)

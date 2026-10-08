@@ -881,8 +881,13 @@ async def resume_job_on_agent(
         # still live is delivered again. In place, in ``datasources``.
         try:
             lease_owner = connector_credential_leases.job_lease_owner(job)
+            # Never waits for a registered driver's bind: the dispatcher's
+            # preflight held the job until it was bound (D6).
             await connector_credential_leases.prepare_lease_delivery(
-                dependencies.store, datasources_payload, owner=lease_owner
+                dependencies.store,
+                datasources_payload,
+                owner=lease_owner,
+                bind_wait=0,
             )
             await connector_credential_leases.deliver_connector_leases_with(
                 dependencies.store,

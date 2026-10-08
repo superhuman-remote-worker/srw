@@ -1,11 +1,14 @@
 """Real-PostgreSQL proofs for registered image drivers (connector drivers D6).
 
-Registration under the manifest scopes, names and shadowing, which
-registration a connector runs, and the bind-time binding: one pod per
-execution and connector whose result the delivery fills in, a moved tag
-refused at bind with the reason on the connector, the result route, and the
-reconciler's revoke. Everything runs against ``schema_current.sql``; the
-registry and the driver pods are fakes at their boundary.
+Registration under the manifest scopes, names, shadowing and ambiguity,
+disable and delete, which registration a connector runs, and the bind-time
+binding: one pod per execution and connector whose result the delivery fills
+in, a moved tag refused at bind with the reason on the connector, retries and
+final failures (a job fails, a session gets a notice), what a refused or
+orphaned bind minted ending in revoking, the result route, and the
+reconciler's revoke from the binding's own inputs. Everything runs against
+``schema_current.sql``; the registry and the driver pods are fakes at their
+boundary.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import asyncio
 import base64
 import copy
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -35,15 +39,23 @@ from orchestrator.services.connector_credential_leases import (
     deliver_connector_leases,
     prepare_lease_delivery,
 )
+from orchestrator.services.connector_driver_identities import mint_driver_identity
 from orchestrator.services.connector_driver_imports import import_server_json
 from orchestrator.services.connector_drivers import builtin_connector_drivers
+from orchestrator.services.connector_lease_exchange import ConnectorLeaseExchange
 from orchestrator.services.connector_service_hosting import (
     PodState,
     ServiceHostingSettings,
 )
-from orchestrator.schemas.datasources import DatasourceCreate
+from orchestrator.schemas.datasources import DatasourceCreate, DatasourceUpdate
 from shared.connectors.envelope import DriverError, DriverOutcome
 from shared.connectors.images import SPEC_LABEL
+from shared.connectors.leases import (
+    DRIVER_IDENTITY_PREFIX,
+    LEASE_TOKEN_PREFIX,
+    mint_token,
+    token_digest,
+)
 from shared.oci_registry import ResolvedImage
 
 pytestmark = pytest.mark.asyncio
@@ -65,6 +77,7 @@ SPEC = {
     "protocol_version": "1.0",
     "plane": "bind_time",
     "delivery_forms": ["env_file", "credential_file"],
+    "env_names": ["ACME_TOKEN", "ACME_TOKEN_FILE"],
     "config_schema": {
         "type": "object",
         "additionalProperties": False,
@@ -104,10 +117,12 @@ def _labelled(spec: dict | None = None) -> dict[str, str]:
 
 
 class FakeRegistry:
-    """The registry: each reference answers its current digest and label."""
+    """The registry: each reference answers its current digest and label;
+    ``down`` makes it unreachable."""
 
     def __init__(self) -> None:
         self.images: dict[str, ResolvedImage] = {}
+        self.down = False
 
     def push(self, reference: str, digest: str, labels: dict | None = None) -> None:
         self.images[reference] = ResolvedImage(
@@ -119,6 +134,8 @@ class FakeRegistry:
         )
 
     async def resolve_image(self, lookup: str) -> ResolvedImage:
+        if self.down:
+            raise ConnectionError("registry unreachable")
         name, _, digest = lookup.partition("@")
         if digest:
             for image in self.images.values():
@@ -166,13 +183,14 @@ async def db(pg_dsn, _schema_applied):
         await conn.execute(
             "TRUNCATE connector_driver_operations, connector_bind_time_bindings, "
             "connector_driver_assignments, connector_driver_registrations, "
-            "connector_driver_images, security_events, srw_resource_secrets, "
-            "srw_resources, datasources, jobs, threads, project_members, projects, "
-            "users CASCADE"
+            "connector_driver_images, connector_driver_identities, security_events, "
+            "srw_resource_secrets, srw_resources, datasources, jobs, threads, "
+            "project_members, projects, users CASCADE"
         )
     try:
         yield store
     finally:
+        await asyncio.gather(*list(bind_time._background), return_exceptions=True)
         bind_time.configure_bind_time(None)
         images.configure_service_images(images.ServiceImageSettings())
         await store.close()
@@ -271,15 +289,43 @@ async def _connector(
     return str(created["id"])
 
 
-async def _job(db, status: str = "processing") -> str:
+async def _job(db, status: str = "processing", *, connector: str | None = None) -> str:
     job_id = uuid4()
     await db.execute(
-        "INSERT INTO jobs (id, description, status, context) "
-        "VALUES ($1, 'd6', $2, '{}'::jsonb)",
+        "INSERT INTO jobs (id, description, status, context, config_override) "
+        "VALUES ($1, 'd6', $2, '{}'::jsonb, "
+        '\'{"workspace": {"backend": "sandbox"}}\'::jsonb)',
         job_id,
         status,
     )
+    if connector is not None:
+        await db.link_datasource_to_job(str(job_id), connector)
     return str(job_id)
+
+
+async def _thread(db, user, *, connectors: list[str]) -> str:
+    thread_id = uuid4()
+    await db.execute(
+        "INSERT INTO threads (id, user_id, status, metadata) "
+        "VALUES ($1, $2, 'active', $3::jsonb)",
+        thread_id,
+        user["id"],
+        json.dumps({"datasource_ids": connectors}),
+    )
+    return str(thread_id)
+
+
+async def _binding(db, **where) -> dict:
+    rows = await db.fetch(
+        "SELECT * FROM connector_bind_time_bindings ORDER BY created_at DESC"
+    )
+    rows = [
+        dict(row)
+        for row in rows
+        if all(str(row[key]) == str(value) for key, value in where.items())
+    ]
+    assert rows, where
+    return rows[0]
 
 
 # =============================================================================
@@ -297,6 +343,7 @@ class TestRegistration:
         assert registration.image_digest == D1
         assert registration.spec_source == "label"
         assert registration.spec.name == "acme.env/v1"
+        assert registration.env_names == ("ACME_TOKEN", "ACME_TOKEN_FILE")
         assert [
             r.id for r in await registrations.list_visible_registrations(db, alice)
         ] == [registration.id]
@@ -304,9 +351,12 @@ class TestRegistration:
         with pytest.raises(HTTPException) as caught:
             await registrations.get_visible_registration(db, bob, registration.id)
         assert caught.value.status_code == 404
+        # An administrator reads another user's by id, on purpose (support);
+        # the list never shows it.
         assert (
             await registrations.get_visible_registration(db, admin, registration.id)
         ).id
+        assert await registrations.list_visible_registrations(db, admin) == []
         # Bob cannot use it for a connector, by id or by name.
         for kwargs in ({"registration_id": registration.id}, {"driver": "acme.env/v1"}):
             with pytest.raises(HTTPException) as caught:
@@ -333,6 +383,12 @@ class TestRegistration:
         ] == [registration.id]
         outsider = await _user(db, "outsider")
         assert await registrations.list_visible_registrations(db, outsider) == []
+        # A viewer may not disable it either.
+        with pytest.raises(HTTPException) as caught:
+            await registrations.set_registration_disabled(
+                db, viewer, registration.id, disabled=True
+            )
+        assert caught.value.status_code == 403
 
     async def test_only_administrators_publish_to_the_catalog(self, db, registry):
         user = await _user(db, "user")
@@ -345,6 +401,11 @@ class TestRegistration:
         assert [
             r.id for r in await registrations.list_visible_registrations(db, user)
         ] == [shared.id]
+        with pytest.raises(HTTPException) as caught:
+            await registrations.set_registration_disabled(
+                db, user, shared.id, disabled=True
+            )
+        assert caught.value.status_code == 403
 
     async def test_srw_names_are_refused(self, db, registry):
         user = await _user(db, "user")
@@ -352,6 +413,31 @@ class TestRegistration:
             await _register(db, user, registry, spec={**SPEC, "name": "srw.git/v2"})
         assert caught.value.status_code == 422
         assert "SRW's own" in caught.value.detail
+
+    @pytest.mark.parametrize(
+        ("change", "message"),
+        [
+            ({"env_names": ["GIT_SSH_COMMAND"]}, "not a variable a driver may set"),
+            ({"env_names": []}, "declares every name"),
+            (
+                {
+                    "config_schema": {
+                        "type": "object",
+                        "properties": {"a": {"type": "string", "pattern": "^(a+)+$"}},
+                    }
+                },
+                "regular expression",
+            ),
+        ],
+    )
+    async def test_a_spec_that_could_run_code_is_refused(
+        self, db, registry, change, message
+    ):
+        user = await _user(db, "user")
+        with pytest.raises(HTTPException) as caught:
+            await _register(db, user, registry, spec={**SPEC, **change})
+        assert caught.value.status_code == 422
+        assert message in caught.value.detail
 
     async def test_no_shadowing_of_the_catalog_and_one_name_per_scope(
         self, db, registry
@@ -371,7 +457,7 @@ class TestRegistration:
         assert caught.value.status_code == 409
         assert "cannot shadow" in caught.value.detail
 
-    async def test_a_name_resolves_catalog_then_project_then_account(
+    async def test_a_name_in_two_of_the_caller_s_scopes_is_ambiguous(
         self, db, registry
     ):
         user = await _user(db, "user")
@@ -383,16 +469,28 @@ class TestRegistration:
         )
         resolve = registrations.resolve_registration_for_use
         assert (await resolve(db, user, name="acme.env/v1")).id == account.id
-        assert (
+        # The project's would shadow the member's own: neither wins.
+        with pytest.raises(HTTPException) as caught:
             await resolve(db, user, name="acme.env/v1", project_id=project)
+        assert caught.value.status_code == 409
+        assert "pick the registration" in caught.value.detail["message"]
+        assert {item["id"] for item in caught.value.detail["registrations"]} == {
+            account.id,
+            in_project.id,
+        }
+        # An explicit id picks one.
+        assert (
+            await resolve(db, user, registration_id=in_project.id, project_id=project)
         ).id == in_project.id
         # A connector pins what it resolved: a later Catalog registration of
-        # the name never moves it.
+        # the name never moves it, and wins by name from then on.
         pinned = await _connector(db, user, driver="acme.env/v1")
         shared = await _register(
             db, admin, registry, scope={"kind": "Catalog", "name": "shared"}
         )
-        assert (await resolve(db, user, name="acme.env/v1")).id == shared.id
+        assert (
+            await resolve(db, user, name="acme.env/v1", project_id=project)
+        ).id == shared.id
         assert (
             await registrations.registration_for_connector(db, pinned)
         ).id == account.id
@@ -411,8 +509,9 @@ class TestRegistration:
             )
         assert "no io.srw.driver.spec label" in caught.value.detail
 
-        async def run_spec(reference, resolved):
+        async def run_spec(reference, resolved, *, requested_by):
             assert resolved.digest == D2
+            assert requested_by == str(user["id"])
             return SPEC
 
         registration = await registrations.register_driver(
@@ -425,10 +524,22 @@ class TestRegistration:
             run_spec=run_spec,
         )
         assert registration.spec_source == "spec_operation"
+        # An empty label is no label, not malformed JSON.
+        registry.push("registry.example/acme/empty:1", D2, labels={SPEC_LABEL: " "})
+        empty = await registrations.register_driver(
+            db,
+            user,
+            scope={"kind": "Account", "name": str(user["id"])},
+            image_reference="registry.example/acme/empty:1",
+            policy=registrations.DriverTrustPolicy(),
+            resolve_image=registry.resolve_image,
+            run_spec=lambda *_args, **_kw: _spec_with(name="acme.empty/v1"),
+        )
+        assert empty.spec_source == "spec_operation"
 
     async def test_the_in_pod_plane_needs_trust(self, db, registry):
         user = await _user(db, "user")
-        spec = {**SPEC, "plane": "in_pod"}
+        spec = {**SPEC, "plane": "in_pod", "env_names": []}
         registry.push(REFERENCE, D1, _labelled(spec))
         for policy, expected in (
             (registrations.DriverTrustPolicy(), "trustedRepositories"),
@@ -454,16 +565,113 @@ class TestRegistration:
                 )
             assert expected in caught.value.detail
 
-    async def test_a_registration_in_use_is_not_deleted(self, db, registry):
+
+async def _spec_with(**over) -> dict:
+    return {**SPEC, **over}
+
+
+class TestDisableAndDelete:
+    async def test_a_registration_in_use_is_deleted_only_once_disabled(
+        self, db, registry
+    ):
         user = await _user(db, "user")
         registration = await _register(db, user, registry)
         connector = await _connector(db, user, registration_id=registration.id)
         with pytest.raises(HTTPException) as caught:
             await registrations.delete_registration(db, user, registration.id)
         assert caught.value.status_code == 409
-        await db.delete_datasource(connector)
+        # The message names the API that exists.
+        assert f"/api/connector-drivers/{registration.id}/disable" in (
+            caught.value.detail
+        )
+        disabled = await registrations.set_registration_disabled(
+            db, user, registration.id, disabled=True
+        )
+        assert disabled.disabled
+        status = await registrations.connector_driver_status(db, connector)
+        assert status["notice"] == "registration disabled"
         await registrations.delete_registration(db, user, registration.id)
         assert await registrations.list_visible_registrations(db, user) == []
+        status = await registrations.connector_driver_status(db, connector)
+        assert status["notice"] == "registration gone"
+
+    async def test_unrevoked_bindings_hold_the_registration(self, db, registry):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        operations = FakeOperations(
+            {"bind": _bound(ENV), "revoke": DriverOutcome(result={})}
+        )
+        runtime = _runtime(db, operations)
+        job = await _job(db)
+        await prepare_lease_delivery(db, [_entry(connector)], owner=LeaseOwner.job(job))
+        await registrations.set_registration_disabled(
+            db, user, registration.id, disabled=True
+        )
+        row = await _binding(db)
+        assert row["status"] == "revoking"
+        assert row["revoke_reason"] == "registration_disabled"
+        with pytest.raises(HTTPException) as caught:
+            await registrations.delete_registration(db, user, registration.id)
+        assert caught.value.status_code == 409
+        assert "not revoked yet" in caught.value.detail
+        with mock.patch.object(bind_time, "_sweep", return_value=0):
+            report = await bind_time.reconcile_bind_time_once(runtime, object())
+        assert len(report.revoked) == 1
+        await registrations.delete_registration(db, user, registration.id)
+
+    async def test_a_disabled_registration_binds_nothing_new(self, db, registry):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        operations = FakeOperations({"bind": _bound(ENV)})
+        _runtime(db, operations)
+        await registrations.set_registration_disabled(
+            db, user, registration.id, disabled=True
+        )
+        # No new connector on it...
+        with pytest.raises(HTTPException) as caught:
+            await _connector(db, user, name="b", registration_id=registration.id)
+        assert caught.value.status_code == 409
+        # ...and no bind: a job fails with why.
+        job = await _job(db, "created", connector=connector)
+        assert await bind_time.job_bind_gate({"id": job}) == ("wait", None)
+        await _settled()
+        action, reason = await bind_time.job_bind_gate({"id": job})
+        assert action == "fail" and "disabled" in reason
+        assert operations.calls == []
+        # Enabled again, the failed bind gets a fresh try.
+        await registrations.set_registration_disabled(
+            db, user, registration.id, disabled=False
+        )
+        assert await bind_time.job_bind_gate({"id": job}) == ("wait", None)
+        await _settled()
+        assert await bind_time.job_bind_gate({"id": job}) == ("dispatch", None)
+
+    async def test_create_and_delete_lock_the_registration(self, db, registry):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        # A delete holding the row lock makes a concurrent connector create
+        # wait, then see the registration gone.
+        async with db.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT 1 FROM connector_driver_registrations "
+                    "WHERE id = $1 FOR UPDATE",
+                    UUID(registration.id),
+                )
+                create = asyncio.create_task(
+                    _connector(db, user, registration_id=registration.id)
+                )
+                await asyncio.sleep(0.3)
+                assert not create.done()
+                await conn.execute(
+                    "DELETE FROM connector_driver_registrations WHERE id = $1",
+                    UUID(registration.id),
+                )
+        with pytest.raises(HTTPException) as caught:
+            await create
+        assert caught.value.status_code == 409
 
 
 class TestConnectors:
@@ -517,9 +725,15 @@ class TestConnectors:
         assert document["spec"]["config"] == {"variable": "ACME_TOKEN"}
         # The secret's keys follow the registered slot (and the shape SRW keeps).
         assert "token" in document["spec"]["credentials"]
-        status = await registrations.connector_driver_status(db, connector)
+        status = await registrations.connector_driver_status(
+            db, connector, with_bindings=True
+        )
         assert status["registration"]["id"] == registration.id
+        assert status["registration"]["scope"]["name"] == str(user["id"])
         assert status["last_bind"] is None
+        # A reader of a shared connector never sees the owner's id.
+        shared = await registrations.connector_driver_status(db, connector)
+        assert shared["registration"]["scope"] == {"kind": "Account"}
 
     async def test_only_a_registered_type_names_a_driver(self, db, registry):
         user = await _user(db, "user")
@@ -547,17 +761,23 @@ class TestConnectors:
 class FakeOperations:
     """The pod runner's boundary: the outcome of each operation it runs."""
 
-    def __init__(self, outcomes: dict[str, DriverOutcome]):
+    def __init__(self, outcomes: dict[str, DriverOutcome], **settings):
         self.outcomes = outcomes
         self.calls: list[dict] = []
-        self.settings = bind_time.BindTimeSettings(hosting=HOSTING, wait_seconds=5)
+        self.settings = bind_time.BindTimeSettings(
+            hosting=HOSTING, **{"wait_seconds": 5, **settings}
+        )
+        self.before: dict[str, object] = {}
 
     async def run(self, **kwargs) -> DriverOutcome:
         self.calls.append(kwargs)
+        hook = self.before.get(kwargs["operation"])
+        if hook is not None:
+            await hook(kwargs)
         return self.outcomes[kwargs["operation"]]
 
 
-def _bound(*entries, driver="acme.env/v1") -> DriverOutcome:
+def _bound(*entries, driver="acme.env/v1", state="state-1") -> DriverOutcome:
     return DriverOutcome(
         result={
             "binding": {
@@ -567,7 +787,7 @@ def _bound(*entries, driver="acme.env/v1") -> DriverOutcome:
                 "entries": list(entries),
             }
         },
-        driver_state="state-1",
+        driver_state=state,
     )
 
 
@@ -585,14 +805,33 @@ def _runtime(db, operations) -> bind_time.BindTimeRuntime:
     return runtime
 
 
-def _entry(connector: str) -> dict:
+def _entry(connector: str, *, read_only: bool = False) -> dict:
     return {
         "type": "image_driver",
         "name": "acme",
         "credentials": {},
-        "project_read_only": False,
+        "project_read_only": read_only,
         "datasource_id": connector,
     }
+
+
+async def _settled() -> None:
+    """Let binds started in the background finish."""
+    for _ in range(200):
+        runtime = bind_time.bind_time_runtime()
+        busy = [task for task in bind_time._background if not task.done()]
+        if runtime is not None:
+            busy += [task for task in runtime.inflight.values() if not task.done()]
+        if not busy:
+            return
+        await asyncio.gather(*busy, return_exceptions=True)
+    raise AssertionError("binds did not settle")
+
+
+async def _deliver(db, entries, owner) -> int:
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            return await deliver_connector_leases(conn, entries, owner=owner)
 
 
 class TestBinding:
@@ -607,11 +846,7 @@ class TestBinding:
         for _ in range(2):
             entries = [_entry(connector)]
             await prepare_lease_delivery(db, entries, owner=owner)
-            async with db.acquire() as conn:
-                async with conn.transaction():
-                    assert (
-                        await deliver_connector_leases(conn, entries, owner=owner) == 1
-                    )
+            assert await _deliver(db, entries, owner) == 1
             assert entries[0]["credentials"] == {
                 "env_vars": {"ACME_TOKEN": "minted-for-this-binding"}
             }
@@ -622,15 +857,24 @@ class TestBinding:
         assert request.credentials == {"token": "upstream-secret"}
         assert request.access == "ReadWrite"
         assert request.execution.kind == "job" and request.execution.id == job
-        row = await db.fetchrow("SELECT * FROM connector_bind_time_bindings")
+        assert request.execution.workspace_backend == "sandbox"
+        row = await _binding(db)
         assert str(row["id"]) == request.binding_id
-        # The record of the bind: reference, digest, time, spec hash, protocol.
+        # The record of the bind: reference, digest, time, spec hash,
+        # protocol, and the spec it ran with.
         assert row["image_reference"] == REFERENCE
         assert row["image_digest"] == D1
         assert row["resolved_at"] is not None
         assert row["spec_hash"].startswith("sha256:")
         assert row["protocol_version"] == "1.0"
+        assert json.loads(row["spec"])["env_names"] == SPEC["env_names"]
+        assert row["image_stale"] is False
         assert "minted" not in (row["delivery_ciphertext"] or "")
+        # The revoke's inputs are kept, encrypted.
+        assert "upstream-secret" not in (row["inputs_ciphertext"] or "")
+        assert bind_time._decrypt(row["inputs_ciphertext"])["credentials"] == {
+            "token": "upstream-secret"
+        }
         status = await registrations.connector_driver_status(
             db, connector, with_bindings=True
         )
@@ -638,65 +882,62 @@ class TestBinding:
         assert status["bindings"][0]["digest"] == D1
         assert status["bindings"][0]["owner"] == {"kind": "job", "id": job}
 
-    async def test_a_moved_tag_with_an_incompatible_spec_is_refused(self, db, registry):
-        user = await _user(db, "user")
-        registration = await _register(db, user, registry)
-        connector = await _connector(db, user, registration_id=registration.id)
-        operations = FakeOperations({"bind": _bound(ENV)})
-        _runtime(db, operations)
-        incompatible = copy.deepcopy(SPEC)
-        incompatible["credential_slots"] = []
-        incompatible["config_schema"]["required"] = ["variable", "region"]
-        registry.push(REFERENCE, D2, _labelled(incompatible))
-        owner = LeaseOwner.job(await _job(db))
-        entries = [_entry(connector)]
-        await prepare_lease_delivery(db, entries, owner=owner)
-        assert operations.calls == []  # no pod runs
-        async with db.acquire() as conn:
-            with pytest.raises(bind_time.BindTimeRefused) as caught:
-                await deliver_connector_leases(conn, entries, owner=owner)
-        assert "changed its contract" in str(caught.value)
-        assert "credential slots disappeared: token" in str(caught.value)
-        assert entries[0]["credentials"] == {}
-        status = await registrations.connector_driver_status(db, connector)
-        assert status["last_bind"]["status"] == "failed"
-        assert "changed its contract" in status["last_bind"]["message"]
-        assert status["last_bind"]["digest"] == D2
-        audit = await db.fetchval(
-            "SELECT count(*) FROM security_events "
-            "WHERE event_type='connector_driver_image_refused'"
-        )
-        assert audit == 1
-
-    async def test_a_compatible_moved_tag_binds_on_the_new_digest(self, db, registry):
-        user = await _user(db, "user")
-        registration = await _register(db, user, registry)
-        connector = await _connector(db, user, registration_id=registration.id)
-        operations = FakeOperations({"bind": _bound(ENV)})
-        _runtime(db, operations)
-        registry.push(REFERENCE, D2, _labelled({**SPEC, "title": "Acme 1.1"}))
-        owner = LeaseOwner.job(await _job(db))
-        await prepare_lease_delivery(db, [_entry(connector)], owner=owner)
-        assert operations.calls[0]["image"].digest == D2
-
-    async def test_a_binding_srw_will_not_deliver_fails_with_why(self, db, registry):
-        user = await _user(db, "user")
-        registration = await _register(db, user, registry)
-        connector = await _connector(db, user, registration_id=registration.id)
-        harness = {**ENV, "recipient": "harness"}
-        reserved = {**ENV, "value": {"name": "SRW_TOKEN", "value": "x"}}
-        for entry, why in ((harness, "workspace"), (reserved, "reserved")):
-            operations = FakeOperations({"bind": _bound(entry)})
-            _runtime(db, operations)
-            owner = LeaseOwner.job(await _job(db))
-            await prepare_lease_delivery(db, [_entry(connector)], owner=owner)
-            status = await registrations.connector_driver_status(db, connector)
-            assert "will not deliver" in status["last_bind"]["message"]
-            assert why in status["last_bind"]["message"]
-
-    async def test_a_driver_error_is_shown_and_retried_after_a_pause(
-        self, db, registry
+    @pytest.mark.parametrize(
+        ("entry", "why"),
+        [
+            ({**ENV, "recipient": "harness"}, "workspace"),
+            ({**ENV, "value": {"name": "SRW_TOKEN", "value": "x"}}, "reserved"),
+            (
+                {**ENV, "value": {"name": "GIT_SSH_COMMAND", "value": "x"}},
+                "not a variable a driver may set",
+            ),
+            (
+                {**ENV, "value": {"name": "ACME_OTHER", "value": "x"}},
+                "does not declare",
+            ),
+            (
+                {
+                    "recipient": "workspace",
+                    "form": "credential_file",
+                    "value": {"path": "~/.kube/config", "content": "{}"},
+                    "collision": "skip_existing",
+                },
+                "~/.srw-files/",
+            ),
+        ],
+    )
+    async def test_a_binding_srw_will_not_deliver_is_revoked_with_why(
+        self, db, registry, entry, why
     ):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        operations = FakeOperations(
+            {"bind": _bound(entry), "revoke": DriverOutcome(result={})}
+        )
+        runtime = _runtime(db, operations)
+        job = await _job(db, "created", connector=connector)
+        owner = LeaseOwner.job(job)
+        await prepare_lease_delivery(db, [_entry(connector)], owner=owner)
+        status = await registrations.connector_driver_status(db, connector)
+        assert "will not deliver" in status["last_bind"]["message"]
+        assert why in status["last_bind"]["message"]
+        # What it minted is revoked with its state, never dropped.
+        row = await _binding(db)
+        assert row["status"] == "revoking"
+        assert row["revoke_reason"] == "binding_refused"
+        assert bind_time._decrypt(row["driver_state_ciphertext"]) == "state-1"
+        # Final: the job fails with the reason, the bind does not run again.
+        action, reason = await bind_time.job_bind_gate({"id": job})
+        assert action == "fail" and why in reason and "Connector acme" in reason
+        with mock.patch.object(bind_time, "_sweep", return_value=0):
+            await bind_time.reconcile_bind_time_once(runtime, object())
+        revoke = operations.calls[-1]
+        assert revoke["operation"] == "revoke"
+        assert revoke["request"].driver_state == "state-1"
+        assert [call["operation"] for call in operations.calls] == ["bind", "revoke"]
+
+    async def test_a_final_driver_error_is_shown_and_never_retried(self, db, registry):
         user = await _user(db, "user")
         registration = await _register(db, user, registry)
         connector = await _connector(db, user, registration_id=registration.id)
@@ -711,41 +952,88 @@ class TestBinding:
         entries = [_entry(connector)]
         await prepare_lease_delivery(db, entries, owner=owner)
         await prepare_lease_delivery(db, entries, owner=owner)
-        assert len(operations.calls) == 1  # failed moments ago: no second pod
-        async with db.acquire() as conn:
-            with pytest.raises(bind_time.BindTimeRefused, match="token was refused"):
-                await deliver_connector_leases(conn, entries, owner=owner)
-        row = await db.fetchrow("SELECT * FROM connector_bind_time_bindings")
+        assert len(operations.calls) == 1
+        with pytest.raises(bind_time.BindTimeRefused, match="token was refused"):
+            await _deliver(db, entries, owner)
+        row = await _binding(db)
         assert row["error_class"] == "credentials"
+        assert row["retry_at"] is None  # final
         assert "401" not in row["error_message"]  # detail is operator-only
-        with mock.patch.object(bind_time, "BIND_RETRY_SECONDS", 0):
-            operations.outcomes["bind"] = _bound(ENV)
-            await prepare_lease_delivery(db, entries, owner=owner)
+        # A change of the connector gives it a fresh try.
+        async with db.acquire() as conn:
+            await bind_time.connector_changed(conn, connector)
+        operations.outcomes["bind"] = _bound(ENV)
+        await prepare_lease_delivery(db, entries, owner=owner)
         assert len(operations.calls) == 2
+        assert (await _binding(db))["status"] == "bound"
+
+    async def test_a_transient_failure_retries_with_backoff_and_gives_up(
+        self, db, registry
+    ):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        operations = FakeOperations(
+            {"bind": DriverOutcome(error=DriverError("transient", "upstream busy"))}
+        )
+        _runtime(db, operations)
+        owner = LeaseOwner.job(await _job(db))
+        entries = [_entry(connector)]
+        await prepare_lease_delivery(db, entries, owner=owner)
+        first = await _binding(db)
+        assert first["attempt"] == 1
+        assert first["retry_at"] > datetime.now(timezone.utc)
+        with pytest.raises(bind_time.BindTimePending):
+            await _deliver(db, entries, owner)
+        await prepare_lease_delivery(db, entries, owner=owner)
+        assert len(operations.calls) == 1  # waits for its retry
+        for attempt in range(2, bind_time.MAX_BIND_ATTEMPTS + 1):
+            await db.execute(
+                "UPDATE connector_bind_time_bindings SET retry_at = now() "
+                "WHERE retry_at IS NOT NULL"
+            )
+            await prepare_lease_delivery(db, entries, owner=owner)
+            assert (await _binding(db))["attempt"] == attempt
+        last = await _binding(db)
+        assert last["retry_at"] is None
+        assert "gave up after 6 attempts" in last["error_message"]
+        with pytest.raises(bind_time.BindTimeRefused, match="gave up"):
+            await _deliver(db, entries, owner)
 
     async def test_a_delivery_that_prepared_nothing_starts_the_bind(self, db, registry):
         user = await _user(db, "user")
         registration = await _register(db, user, registry)
         connector = await _connector(db, user, registration_id=registration.id)
         operations = FakeOperations({"bind": _bound(ENV)})
-        runtime = _runtime(db, operations)
+        _runtime(db, operations)
         owner = LeaseOwner.job(await _job(db))
         entries = [_entry(connector)]
-        async with db.acquire() as conn:
-            with pytest.raises(bind_time.BindTimePending):
-                await deliver_connector_leases(conn, entries, owner=owner)
-        for _ in range(100):
-            if (
-                await db.fetchval("SELECT status FROM connector_bind_time_bindings")
-                == "bound"
-                and not runtime.inflight
-            ):
-                break
-            await asyncio.sleep(0.05)
-        async with db.acquire() as conn:
-            assert await deliver_connector_leases(conn, entries, owner=owner) == 1
+        with pytest.raises(bind_time.BindTimePending):
+            await _deliver(db, entries, owner)
+        await _settled()
+        assert await _deliver(db, entries, owner) == 1
 
-    async def test_without_driver_pods_a_registered_connector_is_refused(
+    async def test_a_changed_access_binds_again(self, db, registry):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        operations = FakeOperations({"bind": _bound(ENV)})
+        _runtime(db, operations)
+        owner = LeaseOwner.job(await _job(db))
+        await prepare_lease_delivery(db, [_entry(connector)], owner=owner)
+        # The project link turned read-only: the ReadWrite binding is revoked
+        # (on its own connection: the delivery's transaction rolls back) and
+        # a ReadOnly one binds.
+        with pytest.raises(bind_time.BindTimePending):
+            await _deliver(db, [_entry(connector, read_only=True)], owner)
+        await _settled()
+        old = await _binding(db, access="ReadWrite")
+        assert old["status"] == "revoking"
+        assert old["revoke_reason"] == "access_changed"
+        assert (await _binding(db, access="ReadOnly"))["status"] == "bound"
+        assert operations.calls[-1]["request"].access == "ReadOnly"
+
+    async def test_without_driver_pods_a_job_is_refused_and_a_session_noticed(
         self, db, registry
     ):
         user = await _user(db, "user")
@@ -753,9 +1041,413 @@ class TestBinding:
         connector = await _connector(db, user, registration_id=registration.id)
         bind_time.configure_bind_time(None)
         owner = LeaseOwner.job(await _job(db))
+        with pytest.raises(bind_time.BindTimeRefused, match="no driver pods"):
+            await _deliver(db, [_entry(connector)], owner)
+        thread = await _thread(db, user, connectors=[connector])
+        entries = [_entry(connector)]
+        assert await _deliver(db, entries, LeaseOwner.thread(thread)) == 0
+        assert "no driver pods" in entries[0]["cli_hint"]
+
+    async def test_an_unreachable_registry_binds_at_the_last_digest_marked_stale(
+        self, db, registry
+    ):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        operations = FakeOperations({"bind": _bound(ENV)})
+        _runtime(db, operations)
+        await prepare_lease_delivery(
+            db, [_entry(connector)], owner=LeaseOwner.job(await _job(db))
+        )
+        registry.down = True
+        job = await _job(db)
+        await prepare_lease_delivery(db, [_entry(connector)], owner=LeaseOwner.job(job))
+        row = await _binding(db, owner_id=job)
+        assert row["status"] == "bound" and row["image_digest"] == D1
+        assert row["image_stale"] is True
+        status = await registrations.connector_driver_status(db, connector)
+        assert status["last_bind"]["stale"] is True
+
+
+class TestSessions:
+    async def test_a_session_never_waits_on_a_failed_driver(self, db, registry):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        operations = FakeOperations(
+            {"bind": DriverOutcome(error=DriverError("config", "No such tenant"))}
+        )
+        _runtime(db, operations)
+        thread = await _thread(db, user, connectors=[connector])
+        await bind_time.prepare_thread_bindings(db, thread)
+        entries = [_entry(connector)]
+        # Skipped with a notice in the README's line, never refused.
+        assert await _deliver(db, entries, LeaseOwner.thread(thread)) == 0
+        assert entries[0]["credentials"] == {}
+        assert entries[0]["cli_hint"] == "Not delivered: No such tenant"
+        assert len(operations.calls) == 1
+
+    async def test_a_session_s_bind_still_running_is_skipped_with_a_notice(
+        self, db, registry
+    ):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        release = asyncio.Event()
+        operations = FakeOperations({"bind": _bound(ENV)})
+
+        async def slow(_call):
+            await release.wait()
+
+        operations.before["bind"] = slow
+        _runtime(db, operations)
+        thread = await _thread(db, user, connectors=[connector])
+        await bind_time.prepare_thread_bindings(db, thread, wait=0.1)
+        entries = [_entry(connector)]
+        assert await _deliver(db, entries, LeaseOwner.thread(thread)) == 0
+        assert "still binding" in entries[0]["cli_hint"]
+        release.set()
+        await _settled()
+        entries = [_entry(connector)]
+        assert await _deliver(db, entries, LeaseOwner.thread(thread)) == 1
+        assert "cli_hint" not in entries[0]
+
+    async def test_a_live_detach_revokes_with_the_inputs_of_its_bind(
+        self, db, registry
+    ):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        operations = FakeOperations(
+            {"bind": _bound(ENV), "revoke": DriverOutcome(result={})}
+        )
+        runtime = _runtime(db, operations)
+        thread = await _thread(db, user, connectors=[connector])
+        await bind_time.prepare_thread_bindings(db, thread)
+        assert (await _binding(db))["status"] == "bound"
         async with db.acquire() as conn:
-            with pytest.raises(bind_time.BindTimeRefused, match="no driver pods"):
-                await deliver_connector_leases(conn, [_entry(connector)], owner=owner)
+            assert (
+                await bind_time.revoke_owner_bindings(
+                    conn,
+                    owner=LeaseOwner.thread(thread),
+                    connector_ids=[connector],
+                    reason="connector_detached",
+                )
+                == 1
+            )
+        row = await _binding(db)
+        assert row["status"] == "revoking"
+        assert row["revoke_reason"] == "connector_detached"
+        # The connector is then deleted: the revoke still runs, with the
+        # config and credentials as they were at bind.
+        await db.delete_datasource(connector)
+        with mock.patch.object(bind_time, "_sweep", return_value=0):
+            report = await bind_time.reconcile_bind_time_once(runtime, object())
+        assert len(report.revoked) == 1
+        revoke = operations.calls[-1]["request"]
+        assert revoke.operation == "revoke"
+        assert revoke.credentials == {"token": "upstream-secret"}
+        assert revoke.config == {"variable": "ACME_TOKEN"}
+        assert revoke.driver_state == "state-1"
+        row = await _binding(db)
+        assert row["status"] == "revoked"
+        assert row["inputs_ciphertext"] is None
+
+    async def test_a_revoke_asked_while_binding_ends_in_revoking(self, db, registry):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        operations = FakeOperations({"bind": _bound(ENV)})
+        thread = await _thread(db, user, connectors=[connector])
+
+        async def detach_meanwhile(_call):
+            async with db.acquire() as conn:
+                await bind_time.revoke_owner_bindings(
+                    conn,
+                    owner=LeaseOwner.thread(thread),
+                    connector_ids=[connector],
+                    reason="connector_detached",
+                )
+
+        operations.before["bind"] = detach_meanwhile
+        _runtime(db, operations)
+        await bind_time.prepare_thread_bindings(db, thread)
+        row = await _binding(db)
+        assert row["status"] == "revoking"
+        assert row["revoke_reason"] == "connector_detached"
+        assert bind_time._decrypt(row["driver_state_ciphertext"]) == "state-1"
+
+    async def test_a_bind_that_lost_to_the_reconciler_is_revoked(self, db, registry):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        operations = FakeOperations({"bind": _bound(ENV)})
+
+        async def orphaned(_call):
+            # The leader gave up on it as orphaned while the pod still ran.
+            await db.execute(
+                "UPDATE connector_bind_time_bindings SET status = 'failed', "
+                "failed_at = now(), error_class = 'transient', "
+                "error_message = 'The bind did not finish', retry_at = now()"
+            )
+
+        operations.before["bind"] = orphaned
+        _runtime(db, operations)
+        owner = LeaseOwner.job(await _job(db))
+        await prepare_lease_delivery(db, [_entry(connector)], owner=owner)
+        row = await _binding(db)
+        assert row["status"] == "revoking"
+        assert row["revoke_reason"] == "bind_orphaned"
+        assert bind_time._decrypt(row["driver_state_ciphertext"]) == "state-1"
+
+    async def test_a_runner_that_died_has_its_outcome_recovered(self, db, registry):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        runtime = _runtime(db, FakeOperations({}))
+        job = await _job(db)
+        binding = await db.fetchval(
+            "INSERT INTO connector_bind_time_bindings "
+            "(owner_kind, owner_id, connector_id, driver, status, failed_at, "
+            " error_class, error_message, retry_at) "
+            "VALUES ('job', $1, $2, 'acme.env/v1', 'failed', now(), 'transient', "
+            "        'The bind did not finish', now()) RETURNING id",
+            UUID(job),
+            UUID(connector),
+        )
+        posted = {
+            "exit_code": 0,
+            "lines": [
+                {"type": "result", "result": {"binding": {}}, "driver_state": "lost"}
+            ],
+        }
+        await db.execute(
+            "INSERT INTO connector_driver_operations "
+            "(token_hash, token_last_four, operation, binding_id, image_reference, "
+            " image_digest, pod_namespace, pod_name, status, deadline_at, "
+            " finished_at, outcome_ciphertext) "
+            "VALUES ($1, 'abcd', 'bind', $2, $3, $4, 'ns', 'pod', 'finished', "
+            "        now(), now() - interval '10 minutes', $5)",
+            b"x" * 32,
+            binding,
+            REFERENCE,
+            D1,
+            bind_time._encrypt(posted),
+        )
+        with mock.patch.object(bind_time, "_sweep", return_value=0):
+            report = await bind_time.reconcile_bind_time_once(runtime, None)
+        assert report.recovered == 1
+        row = await _binding(db)
+        assert row["status"] == "revoking"
+        assert bind_time._decrypt(row["driver_state_ciphertext"]) == "lost"
+        assert (
+            await db.fetchval(
+                "SELECT outcome_ciphertext FROM connector_driver_operations"
+            )
+            is None
+        )
+
+    async def test_a_session_created_with_the_connector_starts_binding_at_once(
+        self, db, registry
+    ):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        operations = FakeOperations({"bind": _bound(ENV)})
+        runtime = _runtime(db, operations)
+        await _thread(db, user, connectors=[connector])
+        await _job(db, "created", connector=connector)
+        with mock.patch.object(bind_time, "_sweep", return_value=0):
+            report = await bind_time.reconcile_bind_time_once(runtime, object())
+        assert report.started == 2
+        await _settled()
+        assert len(operations.calls) == 2
+
+
+class TestJobs:
+    async def test_the_dispatcher_waits_for_the_bind_then_dispatches(
+        self, db, registry
+    ):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        operations = FakeOperations({"bind": _bound(ENV)})
+        _runtime(db, operations)
+        job = await _job(db, "created", connector=connector)
+        # Started without waiting: the dispatch loop never blocks.
+        assert await bind_time.job_bind_gate({"id": job}) == ("wait", None)
+        await _settled()
+        assert await bind_time.job_bind_gate({"id": job}) == ("dispatch", None)
+        plain = await _job(db, "created")
+        assert await bind_time.job_bind_gate({"id": plain}) == ("dispatch", None)
+
+    async def test_a_job_fails_with_the_driver_s_reason(self, db, registry):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        operations = FakeOperations(
+            {"bind": DriverOutcome(error=DriverError("config", "No such tenant"))}
+        )
+        _runtime(db, operations)
+        job = await _job(db, "created", connector=connector)
+        await bind_time.job_bind_gate({"id": job})
+        await _settled()
+        assert await bind_time.job_bind_gate({"id": job}) == (
+            "fail",
+            "Connector acme: No such tenant",
+        )
+
+    async def test_a_changed_connector_revokes_its_bindings(self, db, registry):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        operations = FakeOperations({"bind": _bound(ENV)})
+        _runtime(db, operations)
+        job = await _job(db)
+        await prepare_lease_delivery(db, [_entry(connector)], owner=LeaseOwner.job(job))
+        existing = await db.get_datasource(connector)
+
+        async def owner(_project):
+            return None
+
+        await datasource_operations.update_datasource(
+            request=None,
+            datasource_id=connector,
+            body=DatasourceUpdate(credentials={"token": "rotated"}),
+            user=user,
+            existing_ds=existing,
+            require_project_owner=owner,
+            dependencies=_dependencies(db),
+        )
+        row = await _binding(db)
+        assert row["status"] == "revoking"
+        assert row["revoke_reason"] == "connector_updated"
+        # The next delivery binds afresh, with the new credential.
+        await prepare_lease_delivery(db, [_entry(connector)], owner=LeaseOwner.job(job))
+        assert operations.calls[-1]["request"].credentials == {"token": "rotated"}
+        # A rename alone revokes nothing.
+        await datasource_operations.update_datasource(
+            request=None,
+            datasource_id=connector,
+            body=DatasourceUpdate(name="acme-renamed"),
+            user=user,
+            existing_ds=await db.get_datasource(connector),
+            require_project_owner=owner,
+            dependencies=_dependencies(db),
+        )
+        assert (await _binding(db))["status"] == "bound"
+
+
+class TestMovedTags:
+    async def _bound_once(self, db, registry, user):
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        operations = FakeOperations({"bind": _bound(ENV)})
+        _runtime(db, operations)
+        await prepare_lease_delivery(
+            db, [_entry(connector)], owner=LeaseOwner.job(await _job(db))
+        )
+        return registration, connector, operations
+
+    async def test_an_incompatible_moved_tag_is_refused_at_bind(self, db, registry):
+        user = await _user(db, "user")
+        registration, connector, operations = await self._bound_once(db, registry, user)
+        incompatible = copy.deepcopy(SPEC)
+        incompatible["credential_slots"] = []
+        registry.push(REFERENCE, D2, _labelled(incompatible))
+        owner = LeaseOwner.job(await _job(db))
+        entries = [_entry(connector)]
+        await prepare_lease_delivery(db, entries, owner=owner)
+        assert len(operations.calls) == 1  # no pod runs
+        with pytest.raises(bind_time.BindTimeRefused) as caught:
+            await _deliver(db, entries, owner)
+        assert "changed its contract" in str(caught.value)
+        assert "credential slots disappeared: token" in str(caught.value)
+        status = await registrations.connector_driver_status(db, connector)
+        assert status["last_bind"]["status"] == "failed"
+        assert "changed its contract" in status["last_bind"]["message"]
+        audit = await db.fetchval(
+            "SELECT count(*) FROM security_events "
+            "WHERE event_type='connector_driver_image_refused'"
+        )
+        assert audit == 1
+
+    @pytest.mark.parametrize(
+        ("labels", "message"),
+        [
+            ({}, "carries no io.srw.driver.spec label"),
+            ({SPEC_LABEL: ""}, "carries no io.srw.driver.spec label"),
+            (_labelled({**SPEC, "plane": "service"}), "plane changed"),
+            (
+                _labelled({**SPEC, "env_names": [*SPEC["env_names"], "ACME_MORE"]}),
+                "new environment names: ACME_MORE",
+            ),
+            (
+                _labelled(
+                    {
+                        **SPEC,
+                        "credential_slots": [
+                            *SPEC["credential_slots"],
+                            {
+                                "name": "second",
+                                "kind": "secret_string",
+                                "required": True,
+                            },
+                        ],
+                    }
+                ),
+                "new credential slot is required: second",
+            ),
+            (
+                _labelled(
+                    {
+                        **SPEC,
+                        "config_schema": {
+                            **SPEC["config_schema"],
+                            "required": ["variable", "region"],
+                        },
+                    }
+                ),
+                "stored config no longer validates",
+            ),
+        ],
+    )
+    async def test_every_contract_change_is_refused(
+        self, db, registry, labels, message
+    ):
+        user = await _user(db, "user")
+        _registration, connector, operations = await self._bound_once(
+            db, registry, user
+        )
+        registry.push(REFERENCE, D2, labels)
+        await prepare_lease_delivery(
+            db, [_entry(connector)], owner=LeaseOwner.job(await _job(db))
+        )
+        assert len(operations.calls) == 1
+        status = await registrations.connector_driver_status(db, connector)
+        assert message in status["last_bind"]["message"], status["last_bind"]
+
+    async def test_a_compatible_moved_tag_binds_on_the_new_digest(self, db, registry):
+        user = await _user(db, "user")
+        _registration, connector, operations = await self._bound_once(
+            db, registry, user
+        )
+        registry.push(REFERENCE, D2, _labelled({**SPEC, "title": "Acme 1.1"}))
+        await prepare_lease_delivery(
+            db, [_entry(connector)], owner=LeaseOwner.job(await _job(db))
+        )
+        assert operations.calls[-1]["image"].digest == D2
+
+    async def test_test_connection_checks_the_image_before_its_pod(self, db, registry):
+        user = await _user(db, "user")
+        registration, connector, operations = await self._bound_once(db, registry, user)
+        registry.push(REFERENCE, D2, {})
+        answer = await bind_time.run_check(
+            registration, await db.get_datasource(connector), {"token": "t"}
+        )
+        assert answer["status"] == "error"
+        assert "changed its contract" in answer["message"]
+        assert len(operations.calls) == 1
 
 
 class TestRevocation:
@@ -769,7 +1461,8 @@ class TestRevocation:
         runtime = _runtime(db, operations)
         job = await _job(db)
         await prepare_lease_delivery(db, [_entry(connector)], owner=LeaseOwner.job(job))
-        report = await bind_time.reconcile_bind_time_once(runtime, object())
+        with mock.patch.object(bind_time, "_sweep", return_value=0):
+            report = await bind_time.reconcile_bind_time_once(runtime, object())
         assert report.marked == 0
         await db.execute("UPDATE jobs SET status='completed' WHERE id=$1", UUID(job))
         with mock.patch.object(bind_time, "_sweep", return_value=0):
@@ -779,12 +1472,12 @@ class TestRevocation:
         assert revoke["operation"] == "revoke"
         assert revoke["request"].driver_state == "state-1"
         assert revoke["image"].digest == D1
-        row = await db.fetchrow("SELECT * FROM connector_bind_time_bindings")
+        row = await _binding(db)
         assert row["status"] == "revoked"
         assert row["revoke_reason"] == "execution_ended"
         assert row["delivery_ciphertext"] is None
 
-    async def test_a_transient_revoke_failure_waits_for_the_next_pass(
+    async def test_a_transient_revoke_failure_backs_off_and_gives_up(
         self, db, registry
     ):
         user = await _user(db, "user")
@@ -802,11 +1495,24 @@ class TestRevocation:
         await db.delete_datasource(connector)
         with mock.patch.object(bind_time, "_sweep", return_value=0):
             report = await bind_time.reconcile_bind_time_once(runtime, object())
-        assert report.marked == 1 and report.revoked == []
-        row = await db.fetchrow("SELECT * FROM connector_bind_time_bindings")
-        assert row["status"] == "revoking"
-        assert row["revoke_reason"] == "connector_deleted"
-        assert row["revoke_error"] == "try later"
+            assert report.marked == 1 and report.revoked == []
+            row = await _binding(db)
+            assert row["status"] == "revoking"
+            assert row["revoke_reason"] == "connector_deleted"
+            assert row["revoke_error"] == "try later"
+            assert row["revoke_attempts"] == 1
+            assert row["revoke_next_at"] > datetime.now(timezone.utc)
+            # Not due: the next pass leaves it alone.
+            await bind_time.reconcile_bind_time_once(runtime, object())
+            assert (await _binding(db))["revoke_attempts"] == 1
+            for _ in range(bind_time.MAX_REVOKE_ATTEMPTS):
+                await db.execute(
+                    "UPDATE connector_bind_time_bindings SET revoke_next_at = now()"
+                )
+                await bind_time.reconcile_bind_time_once(runtime, object())
+        row = await _binding(db)
+        assert row["status"] == "revoked"
+        assert "gave up after 12 attempts" in row["revoke_error"]
 
 
 # =============================================================================
@@ -861,6 +1567,11 @@ class TestTheRunner:
             runtime=lambda: pods,
         )
 
+    async def _image(self, db):
+        return await images.resolve_driver_image(
+            db, driver="acme.env/v1", reference=REFERENCE
+        )
+
     async def test_an_operation_runs_in_its_own_pod_and_reads_its_post(
         self, db, registry
     ):
@@ -872,13 +1583,10 @@ class TestTheRunner:
             ),
         )
         operations = self._operations(db, pods)
-        image = await images.resolve_driver_image(
-            db, driver="acme.env/v1", reference=REFERENCE
-        )
         outcome = await operations.run(
             operation="check",
             driver="acme.env/v1",
-            image=image,
+            image=await self._image(db),
             request=bind_time.DriverRequest(
                 operation="check", config={"variable": "X"}
             ),
@@ -893,7 +1601,13 @@ class TestTheRunner:
         assert row["exit_code"] == 0
         assert row["removed_at"] is not None
         assert row["token_hash"] != pods.token.encode()
-        # One post per identity: a second is refused.
+        # Read once, the outcome is not kept at rest.
+        assert row["outcome_ciphertext"] is None
+        # One post per identity: a replay is refused, before its body is read.
+        assert await bind_time.operation_identity(db, pods.token) == (
+            409,
+            "operation_closed",
+        )
         again = await bind_time.record_operation_result(
             db,
             identity_token=pods.token,
@@ -908,44 +1622,149 @@ class TestTheRunner:
             posted={"operation": "bind", "exit_code": 0, "lines": []},
         )
         assert status == 401
-        status, _ = await bind_time.record_operation_result(
-            db, identity_token="not-a-token", posted={}
+        assert await bind_time.operation_identity(db, "not-a-token") == (
+            401,
+            "unknown_driver_identity",
         )
-        assert status == 401
+
+    async def test_identities_never_cross_between_the_exchange_and_the_result_route(
+        self, db, registry
+    ):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        # A running bind pod's identity is unknown to the lease exchange...
+        bind_pod = mint_token(DRIVER_IDENTITY_PREFIX)
+        await db.execute(
+            "INSERT INTO connector_driver_operations "
+            "(token_hash, token_last_four, operation, image_reference, "
+            " image_digest, pod_namespace, pod_name, deadline_at) "
+            "VALUES ($1, 'abcd', 'bind', $2, $3, 'ns', 'p', "
+            "        now() + interval '1 minute')",
+            token_digest(bind_pod),
+            REFERENCE,
+            D1,
+        )
+        assert await bind_time.operation_identity(db, bind_pod) is None
+        exchange = ConnectorLeaseExchange(store=db, drivers=REGISTRY)
+        for answer in (
+            await exchange.exchange(
+                identity_token=bind_pod,
+                lease_token=mint_token(LEASE_TOKEN_PREFIX),
+                operation="read",
+            ),
+            await exchange.introspect(
+                identity_token=bind_pod, lease_token=mint_token(LEASE_TOKEN_PREFIX)
+            ),
+        ):
+            assert answer.status in (401, 403)
+            assert answer.body["error"] == "unknown_driver_identity"
+        # ...and a service pod's identity is unknown to the result route.
+        async with db.acquire() as conn:
+            minted = await mint_driver_identity(
+                conn, connector_id=connector, driver="acme.env/v1"
+            )
+        assert await bind_time.operation_identity(db, minted.token) == (
+            401,
+            "unknown_driver_identity",
+        )
 
     async def test_the_installation_cap_is_a_capacity_error(self, db, registry):
         pods = FakePods(db, lambda request: ([], 1))
         operations = self._operations(db, pods, max_pods=0)
-        image = await images.resolve_driver_image(
-            db, driver="acme.env/v1", reference=REFERENCE
-        )
         with pytest.raises(bind_time.BindTimeCapacity, match="cap of 0"):
             await operations.run(
                 operation="check",
                 driver="acme.env/v1",
-                image=image,
+                image=await self._image(db),
                 request=bind_time.DriverRequest(operation="check"),
                 spec=None,
                 config={},
             )
         assert pods.plans == []
 
+    async def test_a_user_s_spec_pods_are_capped(self, db, registry):
+        user = await _user(db, "user")
+        pods = FakePods(db, lambda request: ([], 1))
+        operations = self._operations(db, pods, max_spec_pods_per_user=1)
+        image = await self._image(db)
+        pod = bind_time.BindTimePod(
+            operation_id=str(uuid4()), operation="spec", driver="x", digest=D1
+        )
+        await operations._claim(
+            pod,
+            image=image,
+            registration_id=None,
+            binding_id=None,
+            requested_by=str(user["id"]),
+        )
+        second = bind_time.BindTimePod(
+            operation_id=str(uuid4()), operation="spec", driver="x", digest=D1
+        )
+        with pytest.raises(bind_time.BindTimeCapacity, match="spec pods"):
+            await operations._claim(
+                second,
+                image=image,
+                registration_id=None,
+                binding_id=None,
+                requested_by=str(user["id"]),
+            )
+        # Another user's are not counted against them.
+        other = await _user(db, "other")
+        await operations._claim(
+            second,
+            image=image,
+            registration_id=None,
+            binding_id=None,
+            requested_by=str(other["id"]),
+        )
+
     async def test_a_protocol_breach_is_a_system_error(self, db, registry):
         pods = FakePods(db, lambda request: ([{"type": "result", "result": {}}], 0))
         operations = self._operations(db, pods)
-        image = await images.resolve_driver_image(
-            db, driver="acme.env/v1", reference=REFERENCE
-        )
         outcome = await operations.run(
             operation="bind",
             driver="acme.env/v1",
-            image=image,
+            image=await self._image(db),
             request=bind_time.DriverRequest(operation="bind", binding_id="b"),
             spec=None,
             config={},
         )
         assert outcome.error is not None
         assert outcome.error.error_class == "system"
+
+    async def test_the_sweep_never_deletes_a_pod_that_is_just_starting(
+        self, db, registry
+    ):
+        """An operation recorded between the sweep's listing and its read of
+        the running operations keeps its objects."""
+
+        class Racing:
+            deleted: list[str] = []
+
+            async def operation_objects(self):
+                # The pod's objects exist when listed; its row is written
+                # (as _claim does, before the objects) right after.
+                operation = uuid4()
+                await db.execute(
+                    "INSERT INTO connector_driver_operations "
+                    "(id, token_hash, token_last_four, operation, image_reference, "
+                    " image_digest, pod_namespace, pod_name, deadline_at) "
+                    "VALUES ($1, $2, 'abcd', 'bind', $3, $4, 'ns', 'p', "
+                    "        now() + interval '1 minute')",
+                    operation,
+                    uuid4().bytes * 2,
+                    REFERENCE,
+                    D1,
+                )
+                return [(None, "srw-bnd-new", str(operation))]
+
+            async def delete_object(self, delete, name):
+                self.deleted.append(name)
+
+        racing = Racing()
+        assert await bind_time._sweep(db, racing) == 0
+        assert racing.deleted == []
 
 
 class TestServerJsonImport:

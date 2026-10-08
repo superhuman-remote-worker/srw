@@ -199,3 +199,181 @@ class TestRefusals:
         )
         with pytest.raises(ServiceLaunchError, match="512 KiB"):
             _plan(request=big.to_json())
+
+
+# =============================================================================
+# The result route and the pod's state
+# =============================================================================
+
+
+def _result(**over) -> bytes:
+    body = {
+        "protocol_version": "1.0",
+        "operation": "bind",
+        "exit_code": 0,
+        "lines": [{"type": "result", "result": {}}],
+        **over,
+    }
+    return json.dumps(body).encode()
+
+
+class TestTheResultBody:
+    def test_the_shim_s_post_reads(self):
+        from orchestrator.services.connector_bind_time import parse_result_body
+
+        assert parse_result_body(_result())["operation"] == "bind"
+        assert parse_result_body(_result(protocol_error="bad line"))
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            b'{"protocol_version":"1.0","operation":"bind","exit_code":0,'
+            b'"lines":[],"exit_code":1}',
+            b'{"protocol_version":"1.0","operation":"bind","exit_code":0,'
+            b'"lines":[{"type":"result","type":"error"}]}',
+            _result(extra=True),
+            b'{"operation":"bind","exit_code":0,"lines":[]}',
+            _result(exit_code=True),
+            _result(operation="discover"),
+            _result(lines=["not an object"]),
+            _result(protocol_error=7),
+            b"[]",
+            b"not json",
+            b"\xff\xfe",
+        ],
+    )
+    def test_anything_else_is_refused(self, raw):
+        """Exact keys, no duplicate key at any depth, typed (as D5a's front
+        reads what it is sent)."""
+        from orchestrator.services.connector_bind_time import parse_result_body
+
+        assert parse_result_body(raw) is None
+
+
+@pytest.fixture
+def result_client(monkeypatch):
+    from types import SimpleNamespace
+
+    from fastapi.testclient import TestClient
+
+    from orchestrator.application import connectors as connectors_composition
+    from orchestrator.routers import connector_lease_exchange as routes
+
+    calls = {"identity": [], "record": []}
+    answers = {"identity": None}
+
+    async def identity(store, token):
+        calls["identity"].append(token)
+        return answers["identity"]
+
+    async def record(store, *, identity_token, posted):
+        calls["record"].append(posted)
+        return 200, {"status": "recorded"}
+
+    monkeypatch.setattr(routes, "operation_identity", identity)
+    monkeypatch.setattr(routes, "record_operation_result", record)
+    app = connectors_composition.connector_lease_exchange_app(
+        SimpleNamespace(postgres_db=object())
+    )
+    return TestClient(app), calls, answers
+
+
+class TestTheResultRoute:
+    def test_an_unknown_identity_is_refused_before_its_body_is_read(
+        self, result_client
+    ):
+        client, calls, answers = result_client
+        answers["identity"] = (401, "unknown_driver_identity")
+        response = client.post(
+            RESULT_PATH,
+            content=b"{not json at all",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+        assert response.status_code == 401
+        assert response.json() == {"error": "unknown_driver_identity"}
+        assert response.headers["cache-control"] == "no-store"
+        assert calls["identity"] == [TOKEN]
+        assert calls["record"] == []
+
+    def test_a_replay_is_refused(self, result_client):
+        client, calls, answers = result_client
+        answers["identity"] = (409, "operation_closed")
+        response = client.post(
+            RESULT_PATH, content=_result(), headers={"Authorization": f"Bearer {TOKEN}"}
+        )
+        assert response.status_code == 409
+        assert calls["record"] == []
+
+    def test_a_running_operation_s_post_is_read_strictly(self, result_client):
+        client, calls, _ = result_client
+        duplicate = (
+            b'{"protocol_version":"1.0","operation":"bind","exit_code":0,'
+            b'"lines":[],"lines":[{"type":"result","result":{}}]}'
+        )
+        response = client.post(
+            RESULT_PATH, content=duplicate, headers={"Authorization": f"Bearer {TOKEN}"}
+        )
+        assert response.status_code == 422
+        assert calls["record"] == []
+        response = client.post(
+            RESULT_PATH, content=_result(), headers={"Authorization": f"Bearer {TOKEN}"}
+        )
+        assert response.status_code == 200
+        assert calls["record"][0]["exit_code"] == 0
+
+    def test_denials_are_logged_once_a_window(self, result_client, caplog):
+        client, _, answers = result_client
+        answers["identity"] = (401, "unknown_driver_identity")
+        with caplog.at_level("WARNING"):
+            for _ in range(5):
+                client.post(RESULT_PATH, content=b"{}")
+        refused = [r for r in caplog.records if "Driver result refused" in r.message]
+        assert len(refused) == 1
+
+
+class TestThePodsState:
+    def test_an_image_that_cannot_be_pulled_says_so(self):
+        from orchestrator.services.connector_bind_time import _pull_failure
+
+        for reason in ("ErrImagePull", "ImagePullBackOff"):
+            status = {"containerStatuses": [{"state": {"waiting": {"reason": reason}}}]}
+            assert _pull_failure(status) == (
+                f"the driver image could not be pulled ({reason})"
+            )
+        init = {
+            "initContainerStatuses": [
+                {"state": {"waiting": {"reason": "ErrImagePull"}}}
+            ]
+        }
+        assert "ErrImagePull" in _pull_failure(init)
+        assert (
+            _pull_failure({"containerStatuses": [{"state": {"running": {}}}]}) is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_observing_a_pod_that_cannot_pull_ends_it_at_once(self):
+        from types import SimpleNamespace
+
+        from orchestrator.services.connector_bind_time import BindTimePodRuntime
+
+        pod = {
+            "metadata": {"uid": "u1"},
+            "status": {
+                "phase": "Pending",
+                "containerStatuses": [
+                    {
+                        "name": "driver",
+                        "state": {"waiting": {"reason": "ImagePullBackOff"}},
+                    }
+                ],
+            },
+        }
+        core = SimpleNamespace(read_namespaced_pod=lambda **_kw: pod)
+        runtime = BindTimePodRuntime(
+            core, SimpleNamespace(), namespace="srw-connectors"
+        )
+        state = await runtime.observe_operation(POD)
+        assert state.phase == "Failed"
+        assert state.message == (
+            "the driver image could not be pulled (ImagePullBackOff)"
+        )

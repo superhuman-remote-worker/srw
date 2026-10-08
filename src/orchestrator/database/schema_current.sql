@@ -26716,29 +26716,39 @@ CREATE TABLE public.connector_bind_time_bindings (
     registration_id uuid,
     driver text NOT NULL,
     status text DEFAULT 'pending'::text NOT NULL,
+    attempt integer DEFAULT 1 NOT NULL,
+    read_only boolean DEFAULT false NOT NULL,
     image_reference text,
     image_digest text,
+    image_stale boolean DEFAULT false NOT NULL,
     resolved_at timestamp with time zone,
+    spec jsonb,
     spec_hash text,
     protocol_version text,
     access text,
+    inputs_ciphertext text,
     delivery_ciphertext text,
     driver_state_ciphertext text,
     error_class text,
     error_message text,
+    retry_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     bound_at timestamp with time zone,
     failed_at timestamp with time zone,
     revoke_requested_at timestamp with time zone,
     revoke_reason text,
+    revoke_attempts integer DEFAULT 0 NOT NULL,
+    revoke_next_at timestamp with time zone,
     revoked_at timestamp with time zone,
     revoke_error text,
-    CONSTRAINT connector_bind_time_bindings_bound_check CHECK (((status <> ALL (ARRAY['bound'::text, 'revoking'::text])) OR ((delivery_ciphertext IS NOT NULL) AND (image_digest IS NOT NULL) AND (bound_at IS NOT NULL)))),
+    CONSTRAINT connector_bind_time_bindings_attempt_check CHECK (((attempt >= 0) AND (revoke_attempts >= 0))),
+    CONSTRAINT connector_bind_time_bindings_bound_check CHECK (((status <> 'bound'::text) OR ((delivery_ciphertext IS NOT NULL) AND (image_digest IS NOT NULL) AND (bound_at IS NOT NULL)))),
     CONSTRAINT connector_bind_time_bindings_digest_check CHECK (((image_digest IS NULL) OR (image_digest ~ '^sha256:[0-9a-f]{64}$'::text))),
     CONSTRAINT connector_bind_time_bindings_driver_check CHECK ((driver <> ''::text)),
-    CONSTRAINT connector_bind_time_bindings_failed_check CHECK ((((status = 'failed'::text) = (failed_at IS NOT NULL)) AND ((status <> 'failed'::text) OR (error_message IS NOT NULL)))),
+    CONSTRAINT connector_bind_time_bindings_failed_check CHECK (((status <> 'failed'::text) OR ((failed_at IS NOT NULL) AND (error_message IS NOT NULL)))),
     CONSTRAINT connector_bind_time_bindings_owner_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text]))),
-    CONSTRAINT connector_bind_time_bindings_revoke_check CHECK ((((status = ANY (ARRAY['revoking'::text, 'revoked'::text])) = (revoke_requested_at IS NOT NULL)) AND ((status = 'revoked'::text) = (revoked_at IS NOT NULL)))),
+    CONSTRAINT connector_bind_time_bindings_revoke_check CHECK ((((status <> ALL (ARRAY['revoking'::text, 'revoked'::text])) OR (revoke_requested_at IS NOT NULL)) AND ((status <> ALL (ARRAY['bound'::text, 'failed'::text])) OR (revoke_requested_at IS NULL)) AND ((status = 'revoked'::text) = (revoked_at IS NOT NULL)))),
+    CONSTRAINT connector_bind_time_bindings_spec_check CHECK (((spec IS NULL) OR (jsonb_typeof(spec) = 'object'::text))),
     CONSTRAINT connector_bind_time_bindings_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'bound'::text, 'failed'::text, 'revoking'::text, 'revoked'::text])))
 );
 
@@ -26747,7 +26757,7 @@ CREATE TABLE public.connector_bind_time_bindings (
 -- Name: TABLE connector_bind_time_bindings; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.connector_bind_time_bindings IS 'Bind-time image driver bindings (D6): what one bind recorded and delivered (encrypted), and its revocation. Owner and connector are plain ids so a revoke can run after either is gone.';
+COMMENT ON TABLE public.connector_bind_time_bindings IS 'Bind-time image driver bindings (D6): what one bind recorded and delivered, the inputs its revoke needs (encrypted until revoked), its failure and retry, and its revocation. Owner, connector and registration are kept by value so a revoke runs after any is gone.';
 
 
 --
@@ -26807,7 +26817,7 @@ CREATE TABLE public.connector_driver_assignments (
 -- Name: TABLE connector_driver_assignments; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.connector_driver_assignments IS 'The registration a connector of a registered image driver runs, pinned by id when the connector is created. The API refuses to delete a registration a connector uses; a user or project delete cascades, and the connector then refuses to bind.';
+COMMENT ON TABLE public.connector_driver_assignments IS 'The registration a connector of a registered image driver runs, pinned by id when the connector is created. The API deletes a registration only when no connector uses it or it is disabled, and no binding of it is unrevoked; a user or project delete cascades, and the connector then refuses to bind.';
 
 
 --
@@ -26936,6 +26946,7 @@ CREATE TABLE public.connector_driver_operations (
     registration_id uuid,
     connector_id uuid,
     binding_id uuid,
+    requested_by uuid,
     image_reference text NOT NULL,
     image_digest text NOT NULL,
     pod_namespace text NOT NULL,
@@ -26961,7 +26972,7 @@ CREATE TABLE public.connector_driver_operations (
 -- Name: TABLE connector_driver_operations; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.connector_driver_operations IS 'Short-lived connector driver pods (D6), one per operation: the pod''s sdi_ identity (SHA-256 only), the outcome its shim posted (encrypted) and its lifecycle.';
+COMMENT ON TABLE public.connector_driver_operations IS 'Short-lived connector driver pods (D6), one per operation: the pod''s sdi_ identity (SHA-256 only), the outcome its shim posted (encrypted, cleared once read) and its lifecycle.';
 
 
 --
@@ -26987,6 +26998,8 @@ CREATE TABLE public.connector_driver_registrations (
     created_by uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    disabled_at timestamp with time zone,
+    disabled_by uuid,
     CONSTRAINT connector_driver_registrations_digest_check CHECK ((image_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
     CONSTRAINT connector_driver_registrations_name_check CHECK (((name ~ '^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)+/v[1-9][0-9]*$'::text) AND (name !~~ 'srw.%'::text))),
     CONSTRAINT connector_driver_registrations_plane_check CHECK ((plane = ANY (ARRAY['bind_time'::text, 'service'::text, 'in_pod'::text]))),
@@ -27005,7 +27018,7 @@ CREATE TABLE public.connector_driver_registrations (
 -- Name: TABLE connector_driver_registrations; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.connector_driver_registrations IS 'Registered connector driver images (D6): one name per Account, Project or the shared Catalog, the spec the image declared and the digest its reference resolved to at registration. srw.* names are SRW''s own.';
+COMMENT ON TABLE public.connector_driver_registrations IS 'Registered connector driver images (D6): one name per Account, Project or the shared Catalog, the spec the image declared and the digest its reference resolved to at registration. srw.* names are SRW''s own. A disabled registration binds nothing new.';
 
 
 --
@@ -37088,6 +37101,20 @@ CREATE INDEX idx_connector_bind_time_bindings_open ON public.connector_bind_time
 
 
 --
+-- Name: idx_connector_bind_time_bindings_owner; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_bind_time_bindings_owner ON public.connector_bind_time_bindings USING btree (owner_kind, owner_id, connector_id, created_at DESC);
+
+
+--
+-- Name: idx_connector_bind_time_bindings_registration; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_bind_time_bindings_registration ON public.connector_bind_time_bindings USING btree (registration_id) WHERE (registration_id IS NOT NULL);
+
+
+--
 -- Name: idx_connector_credential_leases_connector; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -37162,6 +37189,13 @@ CREATE INDEX idx_connector_driver_operations_binding ON public.connector_driver_
 --
 
 CREATE INDEX idx_connector_driver_operations_live ON public.connector_driver_operations USING btree (created_at) WHERE (removed_at IS NULL);
+
+
+--
+-- Name: idx_connector_driver_operations_unread; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_connector_driver_operations_unread ON public.connector_driver_operations USING btree (finished_at) WHERE (outcome_ciphertext IS NOT NULL);
 
 
 --
@@ -41802,11 +41836,27 @@ ALTER TABLE ONLY public.connector_driver_operations
 
 
 --
+-- Name: connector_driver_operations connector_driver_operations_requested_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_operations
+    ADD CONSTRAINT connector_driver_operations_requested_by_fkey FOREIGN KEY (requested_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
 -- Name: connector_driver_registrations connector_driver_registrations_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.connector_driver_registrations
     ADD CONSTRAINT connector_driver_registrations_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: connector_driver_registrations connector_driver_registrations_disabled_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.connector_driver_registrations
+    ADD CONSTRAINT connector_driver_registrations_disabled_by_fkey FOREIGN KEY (disabled_by) REFERENCES public.users(id) ON DELETE SET NULL;
 
 
 --

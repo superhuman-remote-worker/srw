@@ -14,13 +14,18 @@ included, carries ``Cache-Control: no-store``.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+import logging
+from typing import Literal
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from orchestrator.services.connector_bind_time import record_operation_result
+from orchestrator.services.connector_bind_time import (
+    operation_identity,
+    parse_result_body,
+    record_operation_result,
+)
 from orchestrator.services.connector_bind_time_launch import RESULT_PATH
 from orchestrator.services.connector_lease_exchange import (
     EXCHANGE_PATH,
@@ -29,6 +34,8 @@ from orchestrator.services.connector_lease_exchange import (
     ConnectorLeaseExchange,
     ExchangeOutcome,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -83,25 +90,32 @@ async def introspect_connector_lease(
     return _respond(outcome)
 
 
-class DriverResultBody(BaseModel):
-    """What a bind-time driver pod's shim posts (drivers/shim/run.go)."""
-
-    protocol_version: str = Field("", max_length=16)
-    operation: Literal["spec", "check", "bind", "revoke", "gc"]
-    exit_code: int
-    lines: list[dict[str, Any]] = Field(..., max_length=20000)
-    protocol_error: str | None = Field(None, max_length=2000)
+def _result_denied(request: Request, status: int, error: str) -> JSONResponse:
+    """A refused post, logged once per reason a window (never a token)."""
+    limiter = getattr(request.app.state, "driver_result_limiter", None)
+    record, held = limiter.admit(("driver-result", error)) if limiter else (True, 0)
+    if record:
+        logger.warning("Driver result refused: %s (%d more held back)", error, held)
+    return JSONResponse({"error": error}, status_code=status, headers=NO_STORE)
 
 
 @router.post(RESULT_PATH)
-async def record_driver_result(
-    request: Request, body: DriverResultBody
-) -> JSONResponse:
+async def record_driver_result(request: Request) -> JSONResponse:
     """A bind-time driver pod's outcome (D6). Its identity names the
-    operation; each identity posts once, while its operation runs."""
+    operation and is checked before the body is read; each identity posts
+    once, while its operation runs. The body is the shim's exact keys, no
+    duplicate key anywhere (drivers/shim/run.go)."""
+    store = request.app.state.driver_operations_store_factory()
+    identity = _identity(request)
+    refused = await operation_identity(store, identity)
+    if refused is not None:
+        return _result_denied(request, *refused)
+    posted = parse_result_body(await request.body())
+    if posted is None:
+        return _result_denied(request, 422, "invalid_outcome")
     status, answer = await record_operation_result(
-        request.app.state.driver_operations_store_factory(),
-        identity_token=_identity(request),
-        posted=body.model_dump(),
+        store, identity_token=identity, posted=posted
     )
+    if status != 200:
+        return _result_denied(request, status, str(answer.get("error")))
     return JSONResponse(answer, status_code=status, headers=NO_STORE)

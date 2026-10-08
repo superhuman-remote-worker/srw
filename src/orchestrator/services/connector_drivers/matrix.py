@@ -167,6 +167,9 @@ def registered_driver_entry(
         "image_reference": registration.image_reference,
         "image_digest": registration.image_digest,
         "spec_source": registration.spec_source,
+        # The variables its bind may set, visible before anyone uses it.
+        "env_names": list(registration.env_names),
+        "disabled": registration.disabled,
     }
     return entry
 

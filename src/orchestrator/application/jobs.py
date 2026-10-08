@@ -37,6 +37,7 @@ from orchestrator.schemas.job_create import JobCreate
 from orchestrator.security import access, auth
 from orchestrator.services import (
     agent_provisioner as agent_provisioner_module,
+    connector_bind_time,
     container_provisioner as container_provisioner_module,
     default_experts,
     deployment_gates,
@@ -158,6 +159,8 @@ def job_dispatch_dependencies(
         job_delivery_operations=functools.partial(
             controls_composition.job_delivery_operations, resources
         ),
+        # Registered driver binds before the claim (D6).
+        job_bind_gate=connector_bind_time.job_bind_gate,
     )
 
 

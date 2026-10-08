@@ -7,44 +7,70 @@ driver's ``bind`` in a short-lived pod (``connector_bind_time_launch``) whose
 shim posts the driver's typed JSON lines to the result route on the lease
 exchange's port. What the driver returns is data: a binding descriptor of
 ``env_file`` and ``credential_file`` entries, checked
-(``shared.connectors.registration.image_binding_problems``), stored encrypted
-on the binding row and delivered by SRW's own materializers in the agent,
-keyed by delivery form, as an environment or credential-file connector's.
-No driver image gets a shell in a workspace.
+(``shared.connectors.registration.image_binding_problems``: only the
+variable names the spec declares, none a driver may not set, files only in
+``~/.srw-files/``, ``~/.netrc`` or ``~/.pgpass``), stored encrypted on the
+binding row and delivered by SRW's own materializers in the agent, keyed by
+delivery form, as an environment or credential-file connector's. No driver
+image gets a shell in a workspace.
 
-**When.** :func:`prepare_bind_time_bindings` runs before a delivery opens its
-transaction (``prepare_lease_delivery``) and waits for a new bind at most
-``wait_seconds``; the bind goes on in the background past that.
-:func:`deliver_bind_time_entries` runs inside the delivery's transaction
-(``deliver_connector_leases``): a bound binding fills its entry's
-credentials; a pending one refuses the delivery for a retry
-(:class:`BindTimePending`); a failed one refuses it with the driver's reason
-(:class:`BindTimeRefused`), which the connector shows. A delivery path that
-prepares nothing starts the bind there and is refused until it finishes.
-Re-delivery (every claim, attach and pod recycle) reuses the binding: one
-pod per execution and connector, not per turn.
+**When.** A bind starts as early as SRW knows the execution needs it: the
+leader's pass starts binds for live executions that select a registered
+connector (a job when it is created, a session when it is created or the
+connector is selected live, which also starts it at once), the job
+dispatcher's preflight starts a job's binds before it claims the job and
+holds the job until they finished (:func:`job_bind_gate`), and a session's
+attach starts and waits for its binds before it reserves an agent
+(:func:`prepare_thread_bindings`, at most ``wait_seconds``, under the
+agent's 30 s request). :func:`deliver_bind_time_entries` runs inside the
+delivery's transaction: a bound binding fills its entry's credentials. A
+job's delivery is refused while a bind runs (:class:`BindTimePending`) or
+after it failed for good (:class:`BindTimeRefused`); a session's never is:
+the connector is skipped, with a notice in the workspace README (the
+entry's ``cli_hint``) and on the connector, and arrives at a later
+delivery. Re-delivery (every claim, attach and pod recycle) reuses the
+binding: one pod per execution and connector, not per turn.
+
+**Failures.** A ``transient`` failure (SRW's capacity, a registry outage, a
+pod that did not finish) is retried with backoff, at most
+:data:`MAX_BIND_ATTEMPTS` times. Any other class is final for that
+execution and connector until the connector, its registration or the
+binding's access changes: a job then fails with the driver's reason (the
+dispatcher's preflight, as for other dispatch-time refusals), a session
+skips the connector with the notice.
 
 **Versions.** Each bind resolves the registration's reference to a digest
 (``connector_service_images.resolve_driver_image``: a digest pins, a tag
-follows, an unreachable registry reuses the last digest). A digest new to
-the connector is checked against its previous binding's image (else the
-registration's spec): a moved tag whose spec no longer validates the stored
-config, drops a credential slot or changes the protocol major is refused
-with "the image behind this tag changed its contract" and audited, and no
-pod runs. The binding records ``{reference, digest, resolved_at, spec_hash,
-protocol_version}``: the per-execution record of the bind (the immutable
-execution snapshot is written at admission, before any bind).
+follows, an unreachable registry reuses the last digest and the binding
+says it is stale). A digest new to the connector is compared with the spec
+it last bound with (else its registration's,
+``registration.moved_spec_problems``): no label, another name or plane, a
+protocol major, a disappeared, newly required or changed slot, new
+variable names, forms or egress, or a stored config the new schema refuses
+is refused with "the image behind this tag changed its contract" and
+audited, and no pod runs. Test (:func:`run_check`) applies the same check.
+The binding records ``{reference, digest, resolved_at, spec_hash,
+protocol_version}`` and the spec it ran with.
 
-**Revocation.** The leader's :func:`bind_time_reconciler` marks a bound
-binding for revocation once its execution is terminal or gone or its
-connector was deleted, runs the driver's ``revoke`` with the stored
-``driver_state`` (best effort: an ``unsupported`` or any non-transient error
-retires it with the reason recorded), fails binds a restart orphaned, and
-removes every pod and object an operation left behind.
+**Revocation.** A binding is revoked when its execution ends or is gone,
+its connector is deleted, detached from a live session, changed (config or
+credentials), or its access changed, or its registration is disabled. A
+revoke requested while the bind runs takes effect when it ends: a bind that
+minted something always ends in ``revoking``, never dropped (a descriptor
+SRW refuses, a bind the reconciler gave up on, a runner that died: the
+leader recovers its posted outcome). The leader's
+:func:`bind_time_reconciler` runs the driver's ``revoke`` from the binding
+alone: its own image digest and spec, and the connector's config and
+credentials as they were at bind (kept encrypted on the binding until it is
+revoked), with the stored ``driver_state``. A transient failure is retried
+with backoff, at most :data:`MAX_REVOKE_ATTEMPTS` times; anything else
+retires it with the reason recorded. The pass also fails binds a restart
+orphaned and removes every pod and object an operation left behind.
 
 **Capacity.** Live operation pods are counted under an advisory lock against
-``connectors.servicePods.quota.bindTimePods`` for a clear message; the
-namespace's Terminating pod quota is the backstop, and its refusal is a
+``connectors.servicePods.quota.bindTimePods`` for a clear message (and a
+user's spec pods against :attr:`BindTimeSettings.max_spec_pods_per_user`);
+the namespace's Terminating pod quota is the backstop, and its refusal is a
 capacity error, never retried as "creation unconfirmed".
 
 Design: knowledge-base/knowledge/features/connector_drivers.md, "Three
@@ -59,14 +85,15 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from orchestrator.services.connector_credential_leases import (
     LeaseDeliveryError,
     LeaseOwner,
+    job_lease_owner,
     record_lease_event,
 )
 from orchestrator.services.connector_egress import (
@@ -96,8 +123,8 @@ from orchestrator.services.connector_service_images import (
     BoundImage,
     ServiceImageRefused,
     ServiceImageUnavailable,
+    config_errors,
     ensure_image,
-    moved_image_problems,
     resolve_driver_image,
 )
 from orchestrator.services.connector_service_launch import ServiceLaunchError
@@ -115,7 +142,7 @@ from shared.connectors.envelope import (
     api_check_result,
     read_output,
 )
-from shared.connectors.images import ImageReference, refusal_message
+from shared.connectors.images import ImageReference, refusal_message, spec_hash
 from shared.connectors.leases import (
     DRIVER_IDENTITY_PREFIX,
     last_four,
@@ -125,28 +152,44 @@ from shared.connectors.leases import (
 )
 from shared.connectors.registration import (
     custom_driver_problems,
+    declared_env_names,
     image_binding_problems,
+    moved_spec_problems,
     spec_from_json,
     wire_credentials,
 )
 
 logger = logging.getLogger(__name__)
 
-#: How long a failed bind is answered from its row before a delivery tries
-#: again (a driver error, a refused moved tag, a registry outage).
-BIND_RETRY_SECONDS = 30.0
+#: A transient bind failure waits ``BASE * 2**(attempt - 1)`` seconds (at
+#: most ``MAX``) before the next attempt, and gives up after
+#: :data:`MAX_BIND_ATTEMPTS`.
+BIND_RETRY_BASE_SECONDS = 30.0
+BIND_RETRY_MAX_SECONDS = 900.0
+MAX_BIND_ATTEMPTS = 6
+#: The same for a revoke that failed transiently.
+REVOKE_RETRY_BASE_SECONDS = 30.0
+REVOKE_RETRY_MAX_SECONDS = 3600.0
+MAX_REVOKE_ATTEMPTS = 12
 #: Seconds between looks at an operation's row and pod while it runs.
 POLL_SECONDS = 0.5
 OBSERVE_SECONDS = 3.0
 #: A pod that ended without posting gets this long for a late post.
 LATE_RESULT_SECONDS = 5.0
+#: An outcome no runner read this long after it was posted was orphaned.
+UNREAD_OUTCOME_SECONDS = 120.0
 #: The most a posted outcome may hold (the driver's output cap plus framing).
 MAX_RESULT_BYTES = 1024 * 1024 + 64 * 1024
 _CAPACITY_LOCK = "srw-connector-bind-time-capacity"
-#: Revoke attempts per pass, and how long a transient failure waits.
+#: Work per leader pass.
 REVOKES_PER_PASS = 10
+STARTS_PER_PASS = 10
 #: Retention of finished rows: what the connector page shows.
 RETENTION_DAYS = 30
+#: Waiting reasons that mean the image never runs.
+_PULL_FAILURES = frozenset(
+    {"ErrImagePull", "ImagePullBackOff", "InvalidImageName", "ErrImageNeverPull"}
+)
 
 
 class BindTimeError(LeaseDeliveryError):
@@ -154,11 +197,13 @@ class BindTimeError(LeaseDeliveryError):
 
 
 class BindTimePending(BindTimeError):
-    """The bind is still running; the delivery is refused for a retry."""
+    """The bind is still running (or waits to retry); the delivery is
+    refused for a retry."""
 
 
 class BindTimeRefused(BindTimeError):
-    """The bind failed: a refused image, a driver error or SRW's refusal."""
+    """The bind failed for good: a refused image, a driver error or SRW's
+    refusal."""
 
 
 class BindTimeUnavailable(RuntimeError):
@@ -177,12 +222,24 @@ class BindTimeSettings:
     hosting: ServiceHostingSettings
     max_pods: int = 10
     deadline_seconds: float = 120.0
-    wait_seconds: float = 60.0
+    wait_seconds: float = 20.0
+    max_spec_pods_per_user: int = 2
 
 
 # =============================================================================
 # Kubernetes effects
 # =============================================================================
+
+
+def _pull_failure(status: Any) -> str | None:
+    """Why the pod's image cannot be pulled, if that is why it waits."""
+    for key in ("initContainerStatuses", "containerStatuses"):
+        for item in _field(status, key) or []:
+            waiting = _field(_field(item, "state"), "waiting")
+            reason = _field(waiting, "reason")
+            if reason in _PULL_FAILURES:
+                return f"the driver image could not be pulled ({reason})"
+    return None
 
 
 class BindTimePodRuntime(ServicePodRuntime):
@@ -235,6 +292,14 @@ class BindTimePodRuntime(ServicePodRuntime):
                 return PodState("Absent")
             raise ServiceRuntimeError("reading a driver pod failed") from None
         status = _field(pod, "status")
+        pulling = _pull_failure(status)
+        if pulling is not None:
+            # It would wait for its deadline: say why now.
+            return PodState(
+                phase="Failed",
+                uid=_field(_field(pod, "metadata"), "uid"),
+                message=pulling,
+            )
         driver = next(
             (
                 item
@@ -318,6 +383,10 @@ def _decrypt(ciphertext: str | None) -> Any:
         return None
 
 
+def _json(value: Any) -> Any:
+    return json.loads(value) if isinstance(value, str) else value
+
+
 def _repository(reference: str) -> str:
     return ImageReference.parse(reference).name
 
@@ -398,6 +467,7 @@ class DriverOperations:
         image: BoundImage | Any,
         registration_id: str | None,
         binding_id: str | None,
+        requested_by: str | None,
     ) -> str:
         """Record the operation and mint its identity under the capacity
         lock; returns the identity token (shown once, stored hashed)."""
@@ -416,16 +486,28 @@ class DriverOperations:
                         f"the installation runs its cap of {self.settings.max_pods} "
                         "bind-time driver pods; try again shortly"
                     )
+                if pod.operation == "spec" and requested_by:
+                    mine = await conn.fetchval(
+                        "SELECT count(*) FROM connector_driver_operations "
+                        "WHERE removed_at IS NULL AND operation = 'spec' "
+                        "AND requested_by = $1",
+                        UUID(requested_by),
+                    )
+                    if int(mine) >= self.settings.max_spec_pods_per_user:
+                        raise BindTimeCapacity(
+                            f"you have {int(mine)} driver spec pods running; "
+                            "try again when they finish"
+                        )
                 token = mint_token(DRIVER_IDENTITY_PREFIX)
                 await conn.execute(
                     """
                     INSERT INTO connector_driver_operations
                         (id, token_hash, token_last_four, operation,
-                         registration_id, connector_id, binding_id,
+                         registration_id, connector_id, binding_id, requested_by,
                          image_reference, image_digest, pod_namespace, pod_name,
                          deadline_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                            now() + make_interval(secs => $12::float8))
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                            now() + make_interval(secs => $13::float8))
                     """,
                     UUID(pod.operation_id),
                     token_digest(token),
@@ -434,6 +516,7 @@ class DriverOperations:
                     UUID(registration_id) if registration_id else None,
                     UUID(pod.connector_id) if pod.connector_id else None,
                     UUID(binding_id) if binding_id else None,
+                    UUID(requested_by) if requested_by else None,
                     image.reference,
                     image.digest,
                     self.settings.hosting.namespace,
@@ -507,7 +590,9 @@ class DriverOperations:
                 ):
                     ended_at = now
                     ended_message = (
-                        "the driver pod ended without posting a result"
+                        state.message
+                        if state.message and "could not be pulled" in state.message
+                        else "the driver pod ended without posting a result"
                         + (f" ({state.message})" if state.message else "")
                         + (f": {state.reason}" if state.reason else "")
                     )
@@ -526,12 +611,15 @@ class DriverOperations:
         registration_id: str | None = None,
         binding_id: str | None = None,
         private_allowed: bool = False,
+        requested_by: str | None = None,
     ) -> DriverOutcome:
         """Run ``operation`` in its own pod; the outcome, or SRW's error.
 
         Raises :class:`BindTimeUnavailable` without hosting and
-        :class:`BindTimeCapacity` at the cap; every other failure is a
-        ``system`` error in the outcome.
+        :class:`BindTimeCapacity` at the cap; every other failure is an
+        error in the outcome: ``transient`` when the pod could not run or
+        answer, ``system`` when SRW cannot launch it at all. The posted
+        outcome is cleared from its row once read.
         """
         runtime = self.runtime()
         if runtime is None:
@@ -549,7 +637,11 @@ class DriverOperations:
             connector_id=connector_id,
         )
         token = await self._claim(
-            pod, image=image, registration_id=registration_id, binding_id=binding_id
+            pod,
+            image=image,
+            registration_id=registration_id,
+            binding_id=binding_id,
+            requested_by=requested_by,
         )
         try:
             plan = build_bind_time_launch(
@@ -576,20 +668,35 @@ class DriverOperations:
         except ServiceRuntimeError as exc:
             await self._finish(pod.operation_id, error=str(exc))
             await self._remove(runtime, pod)
-            return DriverOutcome(error=DriverError("system", str(exc)))
+            return DriverOutcome(
+                error=DriverError("transient", f"The driver pod did not start: {exc}")
+            )
         try:
             row = await self._wait(runtime, pod)
         finally:
             await self._remove(runtime, pod)
         if row is None:
-            return DriverOutcome(error=DriverError("system", "the operation vanished"))
+            return DriverOutcome(
+                error=DriverError("transient", "The driver operation vanished")
+            )
         if row["status"] == "failed":
             return DriverOutcome(
                 error=DriverError(
-                    "system", "The connector driver did not answer", row["error"]
+                    "transient", f"The connector driver did not answer: {row['error']}"
                 )
             )
-        return _outcome_from_post(_decrypt(row["outcome_ciphertext"]), operation)
+        outcome = _outcome_from_post(_decrypt(row["outcome_ciphertext"]), operation)
+        await self._consumed(pod.operation_id)
+        return outcome
+
+    async def _consumed(self, operation_id: str) -> None:
+        """The outcome was read: it stays at rest no longer."""
+        async with self.store.acquire() as conn:
+            await conn.execute(
+                "UPDATE connector_driver_operations SET outcome_ciphertext = NULL "
+                "WHERE id = $1",
+                UUID(operation_id),
+            )
 
     async def _mark_removed(self, pod: BindTimePod) -> None:
         async with self.store.acquire() as conn:
@@ -604,6 +711,69 @@ class DriverOperations:
 # The result route (on the lease exchange's port)
 # =============================================================================
 
+#: The keys a shim posts (drivers/shim/run.go); ``protocol_error`` only
+#: when the driver broke the protocol.
+RESULT_KEYS = frozenset({"protocol_version", "operation", "exit_code", "lines"})
+RESULT_OPTIONAL_KEYS = frozenset({"protocol_error"})
+
+
+async def operation_identity(store: Any, identity_token: str) -> tuple[int, str] | None:
+    """Whether ``identity_token`` may post now, before its body is read:
+    ``None`` when it names a running operation within its deadline, else
+    ``(status, error)``."""
+    if not token_shape_valid(identity_token, DRIVER_IDENTITY_PREFIX):
+        return 401, "unknown_driver_identity"
+    async with store.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, deadline_at > now() AS open "
+            "FROM connector_driver_operations WHERE token_hash = $1",
+            token_digest(identity_token),
+        )
+    if row is None:
+        return 401, "unknown_driver_identity"
+    if row["status"] != "running" or not row["open"]:
+        return 409, "operation_closed"
+    return None
+
+
+def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    seen: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate key {key!r}")
+        seen[key] = value
+    return seen
+
+
+def parse_result_body(raw: bytes) -> dict[str, Any] | None:
+    """A shim's post read strictly: JSON with no duplicate key anywhere, the
+    shim's keys exactly, typed. ``None`` when it is anything else."""
+    try:
+        posted = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicates)
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(posted, dict):
+        return None
+    keys = set(posted)
+    if not RESULT_KEYS <= keys or keys - RESULT_KEYS - RESULT_OPTIONAL_KEYS:
+        return None
+    lines = posted["lines"]
+    exit_code = posted["exit_code"]
+    error = posted.get("protocol_error")
+    if (
+        not isinstance(posted["protocol_version"], str)
+        or len(posted["protocol_version"]) > 16
+        or posted["operation"] not in ("spec", "check", "bind", "revoke", "gc")
+        or isinstance(exit_code, bool)
+        or not isinstance(exit_code, int)
+        or not isinstance(lines, list)
+        or len(lines) > 20000
+        or not all(isinstance(line, dict) for line in lines)
+        or (error is not None and not isinstance(error, str))
+    ):
+        return None
+    return posted
+
 
 async def record_operation_result(
     store: Any, *, identity_token: str, posted: Mapping[str, Any]
@@ -613,23 +783,13 @@ async def record_operation_result(
     The pod's identity authenticates it and names the operation (the request
     never does). Each identity posts once, while its operation runs and
     before its deadline; the outcome is stored encrypted (a bind's result
-    holds what reaches the workspace).
+    holds what reaches the workspace) until its runner reads it.
     """
     if not token_shape_valid(identity_token, DRIVER_IDENTITY_PREFIX):
         return 401, {"error": "unknown_driver_identity"}
-    lines = posted.get("lines")
-    exit_code = posted.get("exit_code")
-    if (
-        not isinstance(lines, list)
-        or not all(isinstance(line, Mapping) for line in lines)
-        or isinstance(exit_code, bool)
-        or not isinstance(exit_code, int)
-        or not isinstance(posted.get("operation"), str)
-    ):
-        return 422, {"error": "invalid_outcome"}
     outcome = {
-        "exit_code": exit_code,
-        "lines": list(lines),
+        "exit_code": posted["exit_code"],
+        "lines": list(posted["lines"]),
         "protocol_error": str(posted.get("protocol_error") or "")[:500] or None,
     }
     async with store.acquire() as conn:
@@ -644,7 +804,7 @@ async def record_operation_result(
             """,
             token_digest(identity_token),
             posted["operation"],
-            exit_code,
+            posted["exit_code"],
             _encrypt(outcome),
         )
         if row is None:
@@ -693,14 +853,15 @@ def bind_time_runtime() -> BindTimeRuntime | None:
 
 
 _LATEST = """
-SELECT id, status, image_reference, image_digest, delivery_ciphertext,
-       error_class, error_message, failed_at, created_at
+SELECT id, status, attempt, read_only, image_reference, image_digest,
+       delivery_ciphertext, error_class, error_message, retry_at, created_at
   FROM connector_bind_time_bindings
  WHERE owner_kind = $1 AND owner_id = $2 AND connector_id = $3
-   AND status IN ('pending', 'bound', 'failed')
- ORDER BY (status <> 'failed') DESC, created_at DESC
+ ORDER BY created_at DESC
  LIMIT 1
 """
+
+Decision = Literal["start", "pending", "bound", "waiting", "failed"]
 
 
 async def _latest(conn: Any, owner: LeaseOwner, connector_id: str) -> Any:
@@ -709,107 +870,249 @@ async def _latest(conn: Any, owner: LeaseOwner, connector_id: str) -> Any:
     )
 
 
-def _recent_failure(row: Any) -> bool:
-    if row is None or row["status"] != "failed" or row["failed_at"] is None:
-        return False
-    failed = row["failed_at"]
-    if failed.tzinfo is None:
-        failed = failed.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - failed).total_seconds() < BIND_RETRY_SECONDS
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def decide(row: Any) -> Decision:
+    """What a delivery does with the newest binding of an execution and a
+    connector: ``start`` a bind, wait for one ``pending``, deliver a
+    ``bound`` one, wait for a transient failure's retry (``waiting``), or
+    stop at a final one (``failed``)."""
+    if row is None:
+        return "start"
+    if row["status"] == "pending":
+        return "pending"
+    if row["status"] == "bound":
+        return "bound"
+    if row["error_message"]:
+        if row["retry_at"] is None:
+            return "failed"
+        if _aware(row["retry_at"]) > _now():
+            return "waiting"
+    # Revoked for a reason other than a failure (a detach, a changed
+    # connector, an ended execution), or a retry that is due.
+    return "start"
+
+
+def _next_attempt(row: Any) -> int:
+    if row is not None and row["error_message"] and row["error_class"] == "transient":
+        return int(row["attempt"] or 0) + 1
+    return 1
+
+
+def _backoff(attempt: int, base: float, ceiling: float) -> float:
+    return min(base * (2 ** max(0, attempt - 1)), ceiling)
 
 
 async def _execution(conn: Any, owner: LeaseOwner) -> ExecutionRef:
-    table = "jobs" if owner.kind == "job" else "threads"
-    project_id = await conn.fetchval(
-        f"SELECT project_id FROM {table} WHERE id = $1", UUID(owner.id)
+    from orchestrator.services.workspace_tier_policy import (
+        backend_from_override,
+        thread_workspace_backend,
     )
+
+    if owner.kind == "job":
+        row = await conn.fetchrow(
+            "SELECT project_id, config_override FROM jobs WHERE id = $1",
+            UUID(owner.id),
+        )
+        backend = backend_from_override(row["config_override"]) if row else None
+    else:
+        row = await conn.fetchrow(
+            "SELECT project_id, metadata FROM threads WHERE id = $1", UUID(owner.id)
+        )
+        backend = thread_workspace_backend(dict(row)) if row else None
+    project_id = row["project_id"] if row else None
     return ExecutionRef(
         kind="job" if owner.kind == "job" else "session",
         id=owner.id,
         project_id=str(project_id) if project_id else None,
+        workspace_backend=backend,
     )
 
 
 async def _fail(
-    store: Any,
-    binding_id: str,
-    *,
-    error_class: str,
-    message: str,
-    image: BoundImage | None = None,
+    store: Any, binding_id: str, *, error_class: str, message: str, attempt: int
 ) -> None:
+    """End a bind that minted nothing: a transient failure waits for a
+    retry (until :data:`MAX_BIND_ATTEMPTS`), any other is final. A revoke
+    asked meanwhile retires it instead."""
+    retry_at: datetime | None = None
+    if error_class == "transient":
+        if attempt < MAX_BIND_ATTEMPTS:
+            retry_at = _now() + timedelta(
+                seconds=_backoff(
+                    attempt, BIND_RETRY_BASE_SECONDS, BIND_RETRY_MAX_SECONDS
+                )
+            )
+        else:
+            message = f"{message} (gave up after {attempt} attempts)"
     async with store.acquire() as conn:
         await conn.execute(
             """
             UPDATE connector_bind_time_bindings
-               SET status = 'failed', failed_at = now(), error_class = $2,
-                   error_message = $3,
-                   image_reference = COALESCE($4, image_reference),
-                   image_digest = COALESCE($5, image_digest),
-                   resolved_at = COALESCE($6, resolved_at),
-                   spec_hash = COALESCE($7, spec_hash),
-                   protocol_version = COALESCE($8, protocol_version)
+               SET status = CASE WHEN revoke_requested_at IS NULL
+                                 THEN 'failed' ELSE 'revoked' END,
+                   revoked_at = CASE WHEN revoke_requested_at IS NULL
+                                     THEN NULL ELSE now() END,
+                   failed_at = now(), error_class = $2, error_message = $3,
+                   retry_at = $4, inputs_ciphertext = NULL
              WHERE id = $1 AND status = 'pending'
             """,
             UUID(binding_id),
             error_class,
             message[:1000],
-            image.reference if image else None,
-            image.digest if image else None,
-            image.resolved_at if image else None,
-            image.spec_hash if image else None,
-            image.protocol_version if image else None,
+            retry_at,
         )
 
 
-async def _previous_bound_digest(conn: Any, connector_id: str, binding_id: str) -> Any:
-    return await conn.fetchval(
+async def _settle(
+    store: Any,
+    binding_id: str,
+    *,
+    delivery: Mapping[str, Any] | None,
+    driver_state: str | None,
+    refusal: str | None = None,
+) -> str:
+    """End a bind whose driver answered with a binding: ``bound``, or
+    ``revoking`` when SRW refused the binding, a revoke was asked while it
+    ran, or the reconciler gave up on it meanwhile. Whatever it minted is
+    never dropped: its ``driver_state`` stays for the revoke."""
+    state = _encrypt(driver_state) if driver_state is not None else None
+    async with store.acquire() as conn:
+        if refusal is None and delivery is not None:
+            bound = await conn.fetchval(
+                """
+                UPDATE connector_bind_time_bindings
+                   SET status = 'bound', bound_at = now(), delivery_ciphertext = $2,
+                       driver_state_ciphertext = $3
+                 WHERE id = $1 AND status = 'pending' AND revoke_requested_at IS NULL
+                RETURNING id
+                """,
+                UUID(binding_id),
+                _encrypt(dict(delivery)),
+                state,
+            )
+            if bound is not None:
+                return "bound"
+        await conn.execute(
+            """
+            UPDATE connector_bind_time_bindings
+               SET status = 'revoking',
+                   revoke_requested_at = COALESCE(revoke_requested_at, now()),
+                   revoke_reason = COALESCE(
+                       revoke_reason,
+                       CASE WHEN $3::text IS NULL THEN 'bind_orphaned'
+                            ELSE 'binding_refused' END),
+                   driver_state_ciphertext = $2,
+                   error_class = CASE WHEN $3::text IS NULL THEN error_class
+                                      ELSE 'system' END,
+                   error_message = COALESCE($3, error_message),
+                   failed_at = CASE WHEN $3::text IS NULL THEN failed_at
+                                    ELSE now() END,
+                   retry_at = CASE WHEN $3::text IS NULL THEN retry_at ELSE NULL END
+             WHERE id = $1 AND status IN ('pending', 'failed')
+            """,
+            UUID(binding_id),
+            state,
+            refusal[:1000] if refusal else None,
+        )
+    return "revoking"
+
+
+async def _previous_bind(conn: Any, connector_id: str) -> Any:
+    """The connector's newest bind that delivered: its digest and spec."""
+    return await conn.fetchrow(
         """
-        SELECT image_digest FROM connector_bind_time_bindings
-         WHERE connector_id = $1 AND id <> $2 AND image_digest IS NOT NULL
-           AND status IN ('bound', 'revoking', 'revoked')
-         ORDER BY bound_at DESC NULLS LAST, created_at DESC LIMIT 1
+        SELECT image_digest, spec FROM connector_bind_time_bindings
+         WHERE connector_id = $1 AND bound_at IS NOT NULL
+           AND image_digest IS NOT NULL AND spec IS NOT NULL
+         ORDER BY bound_at DESC LIMIT 1
         """,
         UUID(str(connector_id)),
-        UUID(binding_id),
     )
 
 
-def _binding_problems(descriptor: Any, spec: DriverSpec) -> list[str]:
-    """The registration's rules, plus the environment and file-variable
-    rules every connector's delivery keeps."""
-    from shared.credential_connectors import (
-        credential_file_env_problem,
-        normalize_credential_env,
-    )
+@dataclass
+class CheckedImage:
+    """The image a bind or Test runs and the spec it runs with."""
 
-    problems = image_binding_problems(descriptor, spec)
-    if problems:
-        return problems
-    env = {
-        entry["value"]["name"]: entry["value"]["value"]
-        for entry in descriptor["entries"]
-        if entry["form"] == "env_file"
-    }
-    try:
-        normalize_credential_env(env)
-    except ValueError as exc:
-        problems.append(str(exc))
-    for entry in descriptor["entries"]:
-        name = (
-            entry["value"].get("env_var")
-            if entry["form"] == "credential_file"
-            else None
-        )
-        if name:
-            why = credential_file_env_problem(name)
-            if why:
-                problems.append(why)
-    try:
-        wire_credentials(descriptor)
-    except ValueError as exc:
-        problems.append(str(exc))
-    return problems
+    image: BoundImage
+    spec_json: Mapping[str, Any]
+    spec: DriverSpec | None
+    env_names: tuple[str, ...]
+    problems: list[str]
+
+
+async def check_image(
+    runtime: BindTimeRuntime, registration: Any, connector_id: str
+) -> CheckedImage:
+    """Resolve ``registration``'s reference and check the image against the
+    spec the connector last bound with (its registration's before any
+    bind). Raises ``ServiceImageRefused``/``ServiceImageUnavailable`` as
+    the resolution does; a refused contract is in ``problems`` (audited)."""
+    image = await resolve_driver_image(
+        runtime.store, driver=registration.name, reference=registration.image_reference
+    )
+    async with runtime.store.acquire() as conn:
+        previous = await _previous_bind(conn, connector_id)
+        if previous is not None:
+            previous_digest = str(previous["image_digest"])
+            previous_spec = _json(previous["spec"]) or {}
+        else:
+            previous_digest = registration.image_digest
+            previous_spec = registration.spec_json
+        problems: list[str] = []
+        if image.digest == previous_digest:
+            spec_json: Mapping[str, Any] = previous_spec
+        else:
+            problems = moved_spec_problems(previous_spec, image.spec)
+            spec_json = image.spec or previous_spec
+        spec: DriverSpec | None = None
+        env_names: tuple[str, ...] = ()
+        if not problems:
+            try:
+                spec = spec_from_json(spec_json)
+                env_names = declared_env_names(spec_json)
+            except ValueError as exc:
+                problems = [f"its spec is malformed ({exc})"]
+        if spec is not None:
+            problems = custom_driver_problems(
+                spec,
+                privileged=runtime.privileged(registration.image_reference),
+                env_names=env_names,
+            )
+            if not problems and image.digest != previous_digest:
+                config = await conn.fetchval(
+                    "SELECT config FROM datasources WHERE id = $1",
+                    UUID(str(connector_id)),
+                )
+                problems = [
+                    f"the stored config no longer validates: {error}"
+                    for error in config_errors(spec.config_schema, _json(config) or {})
+                ]
+        if problems:
+            await record_lease_event(
+                conn,
+                event_type="connector_driver_image_refused",
+                resource_type="connector",
+                resource_id=str(UUID(str(connector_id))),
+                detail=(
+                    f"driver={registration.name} reference={image.reference} "
+                    f"digest={image.digest} problems={'; '.join(problems)}"
+                ),
+            )
+    return CheckedImage(
+        image=image,
+        spec_json=spec_json,
+        spec=spec,
+        env_names=env_names,
+        problems=problems,
+    )
 
 
 async def _bind(
@@ -817,7 +1120,8 @@ async def _bind(
     owner: LeaseOwner,
     connector_id: str,
     *,
-    project_read_only: bool,
+    read_only: bool,
+    attempt: int,
 ) -> None:
     """Run one binding of ``owner`` for ``connector_id`` to its end."""
     from orchestrator.services.connector_driver_registrations import (
@@ -834,8 +1138,9 @@ async def _bind(
         binding_id = await conn.fetchval(
             """
             INSERT INTO connector_bind_time_bindings
-                (owner_kind, owner_id, connector_id, registration_id, driver)
-            VALUES ($1, $2, $3, $4, $5)
+                (owner_kind, owner_id, connector_id, registration_id, driver,
+                 attempt, read_only)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (owner_kind, owner_id, connector_id)
                 WHERE status IN ('pending', 'bound') DO NOTHING
             RETURNING id
@@ -845,84 +1150,88 @@ async def _bind(
             UUID(str(connector_id)),
             UUID(registration.id) if registration else None,
             registration.name if registration else IMAGE_DRIVER_SPEC.name,
+            attempt,
+            read_only,
         )
     if binding_id is None:
         return  # another delivery binds it
     binding_id = str(binding_id)
-    if registration is None:
+
+    async def fail(error_class: str, message: str) -> None:
         await _fail(
             store,
             binding_id,
-            error_class="config",
-            message="This connector's driver registration is gone; it cannot bind",
+            error_class=error_class,
+            message=message,
+            attempt=attempt,
+        )
+
+    if registration is None:
+        await fail(
+            "config", "This connector's driver registration is gone; it cannot bind"
+        )
+        return
+    if registration.disabled:
+        await fail(
+            "config",
+            f"The driver registration {registration.name} is disabled; it binds "
+            "nothing new",
         )
         return
     try:
-        image = await resolve_driver_image(
-            store, driver=registration.name, reference=registration.image_reference
-        )
-    except (ServiceImageRefused, ServiceImageUnavailable) as exc:
-        await _fail(store, binding_id, error_class="transient", message=str(exc))
+        checked = await check_image(runtime, registration, str(connector_id))
+    except ServiceImageRefused as exc:
+        await fail("config", str(exc))
         return
-    spec = registration.spec
-    async with store.acquire() as conn:
-        previous = await _previous_bound_digest(conn, connector_id, binding_id)
-        problems = await moved_image_problems(
-            conn,
-            spec=spec,
-            connector_id=connector_id,
-            image=image,
-            previous_digest=previous or registration.image_digest,
-        )
-        if not problems and image.spec is not None:
-            # The new image's own spec drives this bind; it must still be one
-            # SRW registers.
-            try:
-                spec = spec_from_json(image.spec)
-            except ValueError as exc:
-                problems = [f"its spec label is malformed ({exc})"]
-            else:
-                problems = custom_driver_problems(
-                    spec, privileged=runtime.privileged(registration.image_reference)
-                )
-        if problems:
-            await record_lease_event(
-                conn,
-                event_type="connector_driver_image_refused",
-                resource_type="connector",
-                resource_id=str(UUID(str(connector_id))),
-                detail=(
-                    f"driver={registration.name} reference={image.reference} "
-                    f"digest={image.digest} owner={owner.kind}:{owner.id} "
-                    f"problems={'; '.join(problems)}"
-                ),
-            )
-        execution = await _execution(conn, owner)
-        hosting = runtime.operations.settings.hosting
-        private_allowed = await private_addresses_allowed(
-            conn, str(connector_id), private_tiers=hosting.private_tiers
-        )
-    if problems:
-        await _fail(
-            store,
-            binding_id,
-            error_class="config",
-            message=refusal_message(registration.image_reference, problems),
-            image=image,
+    except ServiceImageUnavailable as exc:
+        await fail("transient", str(exc))
+        return
+    if checked.problems or checked.spec is None:
+        await fail(
+            "config", refusal_message(registration.image_reference, checked.problems)
         )
         return
+    spec, image = checked.spec, checked.image
     await read_connector_credentials(
         [row], authorized=[str(row["id"])], dependencies=SimpleNamespace(store=store)
     )
     credentials = (
         row.get("credentials") if isinstance(row.get("credentials"), dict) else {}
     )
-    access = effective_access(
-        {"project_read_only": project_read_only, "config": row.get("config")}, spec
-    )
+    config = dict(row.get("config") or {})
+    access = effective_access({"project_read_only": read_only, "config": config}, spec)
+    hosting = runtime.operations.settings.hosting
+    async with store.acquire() as conn:
+        execution = await _execution(conn, owner)
+        private_allowed = await private_addresses_allowed(
+            conn, str(connector_id), private_tiers=hosting.private_tiers
+        )
+        # Everything the revoke needs, before anything can be minted: the
+        # image at its digest, the spec it runs with, the inputs.
+        await conn.execute(
+            """
+            UPDATE connector_bind_time_bindings
+               SET image_reference = $2, image_digest = $3, image_stale = $4,
+                   resolved_at = $5, spec = $6::jsonb, spec_hash = $7,
+                   protocol_version = $8, access = $9, inputs_ciphertext = $10,
+                   driver = $11
+             WHERE id = $1 AND status = 'pending'
+            """,
+            UUID(binding_id),
+            image.reference,
+            image.digest,
+            bool(image.stale),
+            image.resolved_at,
+            json.dumps(dict(checked.spec_json)),
+            spec_hash(checked.spec_json),
+            spec.protocol_version,
+            access,
+            _encrypt({"config": config, "credentials": credentials}),
+            spec.name,
+        )
     request = DriverRequest(
         operation="bind",
-        config=dict(row.get("config") or {}),
+        config=config,
         access=access,
         credentials=credentials,
         binding_id=binding_id,
@@ -935,21 +1244,17 @@ async def _bind(
             image=image,
             request=request,
             spec=spec,
-            config=row.get("config") or {},
+            config=config,
             connector_id=str(connector_id),
             registration_id=registration.id,
             binding_id=binding_id,
             private_allowed=private_allowed,
         )
     except BindTimeCapacity as exc:
-        await _fail(
-            store, binding_id, error_class="transient", message=str(exc), image=image
-        )
+        await fail("transient", str(exc))
         return
     except BindTimeUnavailable as exc:
-        await _fail(
-            store, binding_id, error_class="system", message=str(exc), image=image
-        )
+        await fail("system", str(exc))
         return
     if outcome.error is not None:
         if outcome.error.detail:
@@ -960,25 +1265,7 @@ async def _bind(
                 outcome.error.message,
                 outcome.error.detail,
             )
-        await _fail(
-            store,
-            binding_id,
-            error_class=outcome.error.error_class,
-            message=outcome.error.message,
-            image=image,
-        )
-        return
-    descriptor = (outcome.result or {}).get("binding")
-    problems = _binding_problems(descriptor, spec)
-    if problems:
-        await _fail(
-            store,
-            binding_id,
-            error_class="system",
-            message="The driver returned a binding SRW will not deliver: "
-            + "; ".join(problems[:5]),
-            image=image,
-        )
+        await fail(outcome.error.error_class, outcome.error.message)
         return
     if outcome.updates:
         logger.warning(
@@ -986,35 +1273,31 @@ async def _bind(
             spec.name,
             len(outcome.updates),
         )
-    async with store.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE connector_bind_time_bindings
-               SET status = 'bound', bound_at = now(), delivery_ciphertext = $2,
-                   driver_state_ciphertext = $3, image_reference = $4,
-                   image_digest = $5, resolved_at = $6, spec_hash = $7,
-                   protocol_version = $8, access = $9, driver = $10
-             WHERE id = $1 AND status = 'pending'
-            """,
-            UUID(binding_id),
-            _encrypt(wire_credentials(descriptor)),
-            _encrypt(outcome.driver_state)
-            if outcome.driver_state is not None
-            else None,
-            image.reference,
-            image.digest,
-            image.resolved_at,
-            # An image without a label runs the registration's spec.
-            image.spec_hash if image.spec is not None else registration.spec_hash,
-            image.protocol_version
-            if image.spec is not None
-            else registration.protocol_version,
-            access,
-            spec.name,
+    descriptor = (outcome.result or {}).get("binding")
+    problems = image_binding_problems(descriptor, spec, env_names=checked.env_names)
+    if problems:
+        # It minted something SRW will not deliver: revoke it.
+        message = "The driver returned a binding SRW will not deliver: " + "; ".join(
+            problems[:5]
         )
+        await _settle(
+            store,
+            binding_id,
+            delivery=None,
+            driver_state=outcome.driver_state,
+            refusal=message,
+        )
+        return
+    settled = await _settle(
+        store,
+        binding_id,
+        delivery=wire_credentials(descriptor),
+        driver_state=outcome.driver_state,
+    )
     logger.info(
-        "Driver %s bound connector %s for %s %s at %s",
+        "Driver %s %s connector %s for %s %s at %s",
         spec.name,
+        "bound" if settled == "bound" else "bound (and is revoking)",
         connector_id,
         owner.kind,
         owner.id,
@@ -1027,26 +1310,29 @@ async def ensure_binding(
     owner: LeaseOwner,
     connector_id: str,
     *,
-    project_read_only: bool = False,
+    read_only: bool = False,
     wait: float | None = None,
-) -> None:
-    """Start the binding of ``owner`` for ``connector_id`` unless one is live
-    or failed moments ago, and wait for it at most ``wait`` seconds (the bind
-    goes on past that). Never raises: the delivery reads the outcome."""
+) -> Decision:
+    """Start the binding of ``owner`` for ``connector_id`` unless one is live,
+    waits for a retry or failed for good, and wait for it at most ``wait``
+    seconds (the bind goes on past that). Never raises; returns the
+    decision for the newest binding once the wait is over."""
     key = (owner.kind, owner.id, str(connector_id))
     task = runtime.inflight.get(key)
     if task is None or task.done():
         async with runtime.store.acquire() as conn:
             row = await _latest(conn, owner, connector_id)
-        if row is not None and (row["status"] == "bound" or _recent_failure(row)):
-            return
-        if row is None or row["status"] == "failed":
+        decision = decide(row)
+        if decision in ("bound", "waiting", "failed"):
+            return decision
+        if decision == "start":
             task = asyncio.create_task(
                 _bind(
                     runtime,
                     owner,
                     str(connector_id),
-                    project_read_only=project_read_only,
+                    read_only=read_only,
+                    attempt=_next_attempt(row),
                 ),
                 name=f"connector-bind-{connector_id}",
             )
@@ -1065,52 +1351,37 @@ async def ensure_binding(
         else:
             task = None  # pending elsewhere: poll its row
     limit = runtime.operations.settings.wait_seconds if wait is None else wait
-    if task is not None:
+    if task is not None and limit > 0:
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=limit)
         except (TimeoutError, asyncio.TimeoutError):
             pass
         except Exception:
             pass
-        return
-    end = time.monotonic() + limit
-    while time.monotonic() < end:
-        async with runtime.store.acquire() as conn:
-            row = await _latest(conn, owner, connector_id)
-        if row is None or row["status"] != "pending":
-            return
-        await asyncio.sleep(POLL_SECONDS)
+    elif task is None:
+        end = time.monotonic() + limit
+        while time.monotonic() < end:
+            async with runtime.store.acquire() as conn:
+                row = await _latest(conn, owner, connector_id)
+            if decide(row) != "pending":
+                break
+            await asyncio.sleep(POLL_SECONDS)
+    async with runtime.store.acquire() as conn:
+        return decide(await _latest(conn, owner, connector_id))
 
 
 #: Binds a delivery started without waiting, kept until they finish.
 _background: set[asyncio.Task] = set()
 
 
-async def prepare_bind_time_bindings(
-    entries: Sequence[Any] | None, *, owner: LeaseOwner
+def _start_in_background(
+    runtime: BindTimeRuntime, owner: LeaseOwner, connector_id: str, read_only: bool
 ) -> None:
-    """Bind every registered driver's connector in ``entries`` before the
-    delivery opens its transaction, waiting at most ``wait_seconds`` for a
-    new bind. Never raises."""
-    runtime = bind_time_runtime()
-    if runtime is None:
-        return
-    wanted = [entry for entry in entries or () if registered_entry(entry)]
-    if not wanted:
-        return
-    await asyncio.gather(
-        *(
-            ensure_binding(
-                runtime,
-                owner,
-                str(entry.get("datasource_id") or ""),
-                project_read_only=bool(entry.get("project_read_only")),
-            )
-            for entry in wanted
-            if _uuid(entry.get("datasource_id"))
-        ),
-        return_exceptions=True,
+    started = asyncio.create_task(
+        ensure_binding(runtime, owner, connector_id, read_only=read_only, wait=0)
     )
+    _background.add(started)
+    started.add_done_callback(_background.discard)
 
 
 def _uuid(value: Any) -> bool:
@@ -1121,18 +1392,176 @@ def _uuid(value: Any) -> bool:
     return True
 
 
+async def prepare_bind_time_bindings(
+    entries: Sequence[Any] | None, *, owner: LeaseOwner, wait: float | None = None
+) -> None:
+    """Bind every registered driver's connector in ``entries`` before the
+    delivery opens its transaction, waiting at most ``wait`` seconds
+    (``wait_seconds`` when ``None``) for a new bind. Never raises."""
+    runtime = bind_time_runtime()
+    if runtime is None:
+        return
+    wanted = [
+        entry
+        for entry in entries or ()
+        if registered_entry(entry) and _uuid(entry.get("datasource_id"))
+    ]
+    if not wanted:
+        return
+    await asyncio.gather(
+        *(
+            ensure_binding(
+                runtime,
+                owner,
+                str(entry.get("datasource_id")),
+                read_only=bool(entry.get("project_read_only")),
+                wait=wait,
+            )
+            for entry in wanted
+        ),
+        return_exceptions=True,
+    )
+
+
+_JOB_TARGETS = """
+SELECT a.connector_id, COALESCE(pd.read_only, false) AS read_only, d.name
+  FROM job_datasources jd
+  JOIN jobs j ON j.id = jd.job_id
+  JOIN datasources d ON d.id = jd.datasource_id
+  JOIN connector_driver_assignments a ON a.connector_id = jd.datasource_id
+  LEFT JOIN project_datasources pd
+    ON pd.datasource_id = a.connector_id AND pd.project_id = j.project_id
+ WHERE jd.job_id = $1
+"""
+_THREAD_TARGETS = """
+SELECT a.connector_id, COALESCE(pd.read_only, false) AS read_only, NULL AS name
+  FROM threads t
+  JOIN connector_driver_assignments a
+    ON COALESCE(t.metadata->'datasource_ids', '[]'::jsonb) ? a.connector_id::text
+  LEFT JOIN project_datasources pd
+    ON pd.datasource_id = a.connector_id AND pd.project_id = t.project_id
+ WHERE t.id = $1
+"""
+
+
+async def _targets(conn: Any, kind: str, execution_id: str) -> list[Any]:
+    """The registered connectors an execution selected (``connector_id``,
+    ``read_only``: whether its project links one read-only, a multi-project
+    session's other links checked again at delivery; ``name``)."""
+    return await conn.fetch(
+        _JOB_TARGETS if kind == "job" else _THREAD_TARGETS, UUID(execution_id)
+    )
+
+
+async def prepare_thread_bindings(
+    store: Any, thread_id: str, *, wait: float | None = None
+) -> None:
+    """Start a session's binds and wait for them at most ``wait`` seconds
+    (``wait_seconds`` when ``None``), before its attach reserves an agent or
+    answers the agent's poll (under the agent's 30 s request). Never
+    raises."""
+    runtime = bind_time_runtime()
+    if runtime is None or not _uuid(thread_id):
+        return
+    try:
+        async with runtime.store.acquire() as conn:
+            targets = await _targets(conn, "thread", str(thread_id))
+        if targets:
+            await asyncio.gather(
+                *(
+                    ensure_binding(
+                        runtime,
+                        LeaseOwner.thread(str(thread_id)),
+                        str(target["connector_id"]),
+                        read_only=bool(target["read_only"]),
+                        wait=wait,
+                    )
+                    for target in targets
+                ),
+                return_exceptions=True,
+            )
+    except Exception as exc:
+        logger.warning("Preparing session %s binds failed: %s", thread_id, exc)
+
+
+def start_thread_bindings(thread_id: str) -> None:
+    """Start a session's binds in the background (a live selection), without
+    waiting. No-op without driver pods."""
+    if bind_time_runtime() is None:
+        return
+    started = asyncio.create_task(prepare_thread_bindings(None, thread_id, wait=0))
+    _background.add(started)
+    started.add_done_callback(_background.discard)
+
+
+GateAction = Literal["dispatch", "wait", "fail"]
+
+
+async def job_bind_gate(job: Mapping[str, Any]) -> tuple[GateAction, str | None]:
+    """The dispatcher's preflight for a job's binds, before it claims the
+    job: ``dispatch`` once every registered connector is bound, ``wait``
+    while a bind runs or waits to retry (it is started here, without
+    waiting: the dispatch loop never blocks), ``fail`` with the driver's
+    reason once one failed for good. Without driver pods it dispatches,
+    and the delivery refuses."""
+    runtime = bind_time_runtime()
+    if runtime is None:
+        return "dispatch", None
+    owner = job_lease_owner(job)
+    async with runtime.store.acquire() as conn:
+        targets = await _targets(conn, "job", str(job["id"]))
+        rows = [
+            (target, await _latest(conn, owner, str(target["connector_id"])))
+            for target in targets
+        ]
+    action: GateAction = "dispatch"
+    for target, row in rows:
+        decision = decide(row)
+        if decision == "failed":
+            return "fail", f"Connector {target['name']}: {row['error_message']}"
+        if decision != "bound":
+            action = "wait"
+        if decision == "start":
+            await ensure_binding(
+                runtime,
+                owner,
+                str(target["connector_id"]),
+                read_only=bool(target["read_only"]),
+                wait=0,
+            )
+    return action, None
+
+
+def _notice(decision: Decision, row: Any) -> str:
+    """Why a session's registered connector is not in its workspace."""
+    if decision == "failed":
+        return f"Not delivered: {row['error_message']}"
+    if decision == "waiting":
+        return (
+            f"Not delivered yet: {row['error_message']} (SRW tries again; it "
+            "arrives at a later attach or connector change)"
+        )
+    return (
+        "Not delivered yet: its driver is still binding; it arrives at a later "
+        "attach or connector change"
+    )
+
+
 async def deliver_bind_time_entries(
     conn: Any, entries: Sequence[Any] | None, *, owner: LeaseOwner
 ) -> int:
     """Fill every registered driver's entry with its bound delivery, in place.
 
-    Runs on the delivery's connection, in its transaction. Raises
-    :class:`BindTimePending` while a bind runs (one is started here when
-    none is) and :class:`BindTimeRefused` with the reason when it failed;
-    either refuses the delivery, as a lease that cannot be issued does.
+    Runs on the delivery's connection, in its transaction. A bound binding
+    of the entry's access fills it (one of another access is revoked and
+    bound again). Otherwise a bind is started where none runs, and a job's
+    delivery raises :class:`BindTimePending` (one runs or waits to retry) or
+    :class:`BindTimeRefused` (it failed for good); a session's skips the
+    entry with a notice in its ``cli_hint`` (the workspace README's line).
     Returns how many entries were filled.
     """
     filled = 0
+    runtime = bind_time_runtime()
     wanted = [entry for entry in entries or () if registered_entry(entry)]
     wanted.sort(key=lambda entry: str(entry.get("datasource_id") or "").lower())
     for entry in wanted:
@@ -1140,40 +1569,140 @@ async def deliver_bind_time_entries(
         connector_id = str(entry.get("datasource_id") or "")
         if not _uuid(connector_id):
             raise BindTimeRefused("A registered driver's entry names no connector")
+        read_only = bool(entry.get("project_read_only"))
         row = await _latest(conn, owner, connector_id)
-        if row is not None and row["status"] == "bound":
+        decision = decide(row)
+        if decision == "bound":
             delivery = _decrypt(row["delivery_ciphertext"])
-            if not isinstance(delivery, dict):
-                raise BindTimeRefused(
-                    "The connector's bound delivery is unreadable; it binds again "
-                    "at the next delivery"
-                )
-            entry["credentials"] = delivery
-            filled += 1
-            continue
-        if row is not None and row["status"] == "failed":
-            if _recent_failure(row):
-                raise BindTimeRefused(str(row["error_message"] or "The bind failed"))
-        runtime = bind_time_runtime()
+            stale = None
+            if bool(row["read_only"]) != read_only:
+                stale = "access_changed"  # the project link's access changed
+            elif not isinstance(delivery, dict):
+                stale = "delivery_unreadable"
+            if stale is None:
+                entry["credentials"] = delivery
+                filled += 1
+                continue
+            if runtime is not None:
+                # On the store's own connection: this transaction may roll
+                # back, and the revoke must hold for the next bind to start.
+                async with runtime.store.acquire() as own:
+                    await _request_revoke(own, "id = $1", [row["id"]], reason=stale)
+            decision = "start"
         if runtime is None:
-            raise BindTimeRefused(
+            message = (
                 "This installation runs no driver pods; a registered driver's "
                 "connector cannot bind (connectors.servicePods.enabled)"
             )
-        # Started on the store's own connections, never this transaction's.
-        started = asyncio.create_task(
-            ensure_binding(
-                runtime,
-                owner,
-                connector_id,
-                project_read_only=bool(entry.get("project_read_only")),
-                wait=0,
-            )
-        )
-        _background.add(started)
-        started.add_done_callback(_background.discard)
+            if owner.kind == "thread":
+                entry["cli_hint"] = f"Not delivered: {message}"
+                continue
+            raise BindTimeRefused(message)
+        if decision == "start":
+            # Started on the store's own connections, never this transaction's.
+            _start_in_background(runtime, owner, connector_id, read_only)
+        if owner.kind == "thread":
+            entry["cli_hint"] = _notice(decision, row)
+            continue
+        if decision == "failed":
+            raise BindTimeRefused(str(row["error_message"]))
         raise BindTimePending("The connector's driver is still binding; retry shortly")
     return filled
+
+
+# =============================================================================
+# Revocation requests
+# =============================================================================
+
+
+async def _request_revoke(
+    conn: Any, where: str, args: Sequence[Any], *, reason: str
+) -> int:
+    """Revoke the live bindings ``where`` selects (``$1``.. are ``args``):
+    a bound one is revoked by the next pass, a pending one when its bind
+    ends. Returns how many."""
+    reason_at = len(args) + 1
+    bound = await conn.fetch(
+        f"""
+        UPDATE connector_bind_time_bindings
+           SET status = 'revoking', revoke_requested_at = now(),
+               revoke_reason = ${reason_at}
+         WHERE status = 'bound' AND ({where})
+        RETURNING id
+        """,
+        *args,
+        reason,
+    )
+    pending = await conn.fetch(
+        f"""
+        UPDATE connector_bind_time_bindings
+           SET revoke_requested_at = now(), revoke_reason = ${reason_at}
+         WHERE status = 'pending' AND revoke_requested_at IS NULL AND ({where})
+        RETURNING id
+        """,
+        *args,
+        reason,
+    )
+    return len(bound) + len(pending)
+
+
+async def revoke_owner_bindings(
+    conn: Any, *, owner: LeaseOwner, connector_ids: Sequence[str], reason: str
+) -> int:
+    """Revoke an execution's bindings of ``connector_ids`` (a live detach)."""
+    ids = [UUID(str(value)) for value in connector_ids if _uuid(value)]
+    if not ids:
+        return 0
+    return await _request_revoke(
+        conn,
+        "owner_kind = $1 AND owner_id = $2 AND connector_id = ANY($3::uuid[])",
+        [owner.kind, UUID(owner.id), ids],
+        reason=reason,
+    )
+
+
+async def connector_changed(conn: Any, connector_id: str) -> int:
+    """A connector's config or credentials changed: revoke every binding of
+    it, and give a failed one a fresh try at the next delivery."""
+    if not _uuid(connector_id):
+        return 0
+    uid = UUID(str(connector_id))
+    await conn.execute(
+        """
+        UPDATE connector_bind_time_bindings
+           SET retry_at = now(), attempt = 0
+         WHERE connector_id = $1 AND error_message IS NOT NULL
+           AND (retry_at IS NULL OR retry_at > now())
+        """,
+        uid,
+    )
+    return await _request_revoke(
+        conn, "connector_id = $1", [uid], reason="connector_updated"
+    )
+
+
+async def registration_disabled(conn: Any, registration_id: str) -> int:
+    """Revoke every binding of a registration that was disabled."""
+    return await _request_revoke(
+        conn,
+        "registration_id = $1",
+        [UUID(str(registration_id))],
+        reason="registration_disabled",
+    )
+
+
+async def registration_enabled(conn: Any, registration_id: str) -> None:
+    """A registration enabled again: its connectors' failed binds get a
+    fresh try at the next delivery."""
+    await conn.execute(
+        """
+        UPDATE connector_bind_time_bindings
+           SET retry_at = now(), attempt = 0
+         WHERE registration_id = $1 AND error_message IS NOT NULL
+           AND (retry_at IS NULL OR retry_at > now())
+        """,
+        UUID(str(registration_id)),
+    )
 
 
 # =============================================================================
@@ -1185,7 +1714,8 @@ async def run_check(
     registration: Any, row: Mapping[str, Any], credentials: dict
 ) -> dict:
     """Test connection of a registered driver's connector: its ``check`` in
-    a pod, on the digest its reference resolves to now."""
+    a pod, on the digest its reference resolves to now, after the same
+    image check a bind makes (a refused image starts no pod)."""
     runtime = bind_time_runtime()
     if runtime is None:
         return api_check_result(
@@ -1197,14 +1727,24 @@ async def run_check(
                 )
             )
         )
+    if registration.disabled:
+        return {
+            "status": "error",
+            "message": f"The driver registration {registration.name} is disabled",
+            "error_class": "config",
+        }
     try:
-        image = await resolve_driver_image(
-            runtime.store,
-            driver=registration.name,
-            reference=registration.image_reference,
-        )
-    except (ServiceImageRefused, ServiceImageUnavailable) as exc:
+        checked = await check_image(runtime, registration, str(row["id"]))
+    except ServiceImageRefused as exc:
+        return {"status": "error", "message": str(exc), "error_class": "config"}
+    except ServiceImageUnavailable as exc:
         return {"status": "error", "message": str(exc), "error_class": "transient"}
+    if checked.problems or checked.spec is None:
+        return {
+            "status": "error",
+            "message": refusal_message(registration.image_reference, checked.problems),
+            "error_class": "config",
+        }
     config = dict(row.get("config") or {})
     async with runtime.store.acquire() as conn:
         private_allowed = await private_addresses_allowed(
@@ -1215,15 +1755,15 @@ async def run_check(
     try:
         outcome = await runtime.operations.run(
             operation="check",
-            driver=registration.name,
-            image=image,
+            driver=checked.spec.name,
+            image=checked.image,
             request=DriverRequest(
                 operation="check",
                 config=config,
-                access=effective_access(row, registration.spec),
+                access=effective_access(row, checked.spec),
                 credentials=credentials,
             ),
-            spec=registration.spec,
+            spec=checked.spec,
             config=config,
             connector_id=str(row["id"]),
             registration_id=registration.id,
@@ -1234,9 +1774,12 @@ async def run_check(
     return api_check_result(outcome)
 
 
-async def run_spec_operation(reference: str, resolved: Any) -> dict[str, Any]:
+async def run_spec_operation(
+    reference: str, resolved: Any, *, requested_by: str | None = None
+) -> dict[str, Any]:
     """The spec an unlabelled image answers, run in a pod with no secret
-    and no egress but the result route (registration's fallback)."""
+    and no egress but the result route (registration's fallback). A user
+    runs at most ``max_spec_pods_per_user`` at once."""
     from fastapi import HTTPException
 
     runtime = bind_time_runtime()
@@ -1267,6 +1810,7 @@ async def run_spec_operation(reference: str, resolved: Any) -> dict[str, Any]:
             request=DriverRequest(operation="spec"),
             spec=None,
             config={},
+            requested_by=requested_by,
         )
     except (BindTimeCapacity, BindTimeUnavailable) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
@@ -1280,15 +1824,9 @@ async def run_spec_operation(reference: str, resolved: Any) -> dict[str, Any]:
 
 
 # =============================================================================
-# The leader's reconciler: revoke, fail orphans, sweep
+# The leader's reconciler: start, revoke, recover, fail orphans, sweep
 # =============================================================================
 
-_MARK_REVOKE = """
-UPDATE connector_bind_time_bindings AS b
-   SET status = 'revoking', revoke_requested_at = now(), revoke_reason = $1
- WHERE b.status = 'bound' AND ({where})
-RETURNING b.id
-"""
 _OWNER_ENDED = """(
     (b.owner_kind = 'job' AND NOT EXISTS (
         SELECT 1 FROM jobs AS j WHERE j.id = b.owner_id
@@ -1302,6 +1840,40 @@ _OWNER_ENDED = """(
 _CONNECTOR_GONE = (
     "NOT EXISTS (SELECT 1 FROM datasources AS d WHERE d.id = b.connector_id)"
 )
+#: Live executions that select a registered connector with no binding to
+#: deliver yet (a job on its parent's workspace binds as the parent, at its
+#: dispatch).
+_STARTS = """
+SELECT 'job' AS kind, j.id AS owner_id, a.connector_id,
+       COALESCE(pd.read_only, false) AS read_only
+  FROM jobs j
+  JOIN job_datasources jd ON jd.job_id = j.id
+  JOIN connector_driver_assignments a ON a.connector_id = jd.datasource_id
+  LEFT JOIN project_datasources pd
+    ON pd.datasource_id = a.connector_id AND pd.project_id = j.project_id
+ WHERE j.status::text NOT IN ('completed', 'failed', 'cancelled')
+   AND j.parent_job_id IS NULL
+   AND NOT EXISTS (SELECT 1 FROM connector_bind_time_bindings b
+                    WHERE b.owner_kind = 'job' AND b.owner_id = j.id
+                      AND b.connector_id = a.connector_id)
+UNION ALL
+SELECT 'thread', t.id, a.connector_id, COALESCE(pd.read_only, false)
+  FROM threads t
+  JOIN connector_driver_assignments a
+    ON COALESCE(t.metadata->'datasource_ids', '[]'::jsonb) ? a.connector_id::text
+  LEFT JOIN project_datasources pd
+    ON pd.datasource_id = a.connector_id AND pd.project_id = t.project_id
+ WHERE t.status::text <> 'ended'
+   AND NOT (t.runtime_retirement_token IS NOT NULL
+            AND t.runtime_retirement_authorized_at IS NOT NULL)
+   AND NOT EXISTS (SELECT 1 FROM connector_bind_time_bindings b
+                    WHERE b.owner_kind = 'thread' AND b.owner_id = t.id
+                      AND b.connector_id = a.connector_id
+                      AND (b.status IN ('pending', 'bound')
+                           OR (b.error_message IS NOT NULL
+                               AND (b.retry_at IS NULL OR b.retry_at > now()))))
+ LIMIT $1
+"""
 
 
 @dataclass
@@ -1309,54 +1881,57 @@ class BindTimeReport:
     revoked: list[str] = field(default_factory=list)
     marked: int = 0
     orphaned: int = 0
+    recovered: int = 0
+    started: int = 0
     swept: int = 0
 
     def __bool__(self) -> bool:
-        return bool(self.revoked or self.marked or self.orphaned or self.swept)
+        return bool(
+            self.revoked
+            or self.marked
+            or self.orphaned
+            or self.recovered
+            or self.started
+            or self.swept
+        )
 
 
 async def _revoke_one(runtime: BindTimeRuntime, row: Mapping[str, Any]) -> str | None:
-    """Run one binding's ``revoke``; ``None`` when it is retired, else why it
-    waits for the next pass (a transient failure)."""
-    from orchestrator.services.connector_driver_registrations import (
-        registration_by_id,
-    )
-    from orchestrator.services.connector_secrets import read_connector_credentials
-
+    """Run one binding's ``revoke`` from the binding alone (its image at its
+    digest, the spec it bound with, the connector's config and credentials
+    as they were at bind, its ``driver_state``): its connector, registration
+    or execution may all be gone. ``None`` when it is retired, else why it
+    waits for a later pass (a transient failure)."""
     store = runtime.store
     binding_id = str(row["id"])
-    connector = await store.get_datasource(str(row["connector_id"]))
-    # The binding's own registration: the connector (and with it its
-    # assignment) may be gone already.
-    registration = await registration_by_id(store, row["registration_id"])
-    if registration is None or not row["image_digest"]:
-        return await _retire(store, binding_id, "no driver registration to revoke with")
+    spec_json = _json(row["spec"])
+    if not row["image_digest"] or not isinstance(spec_json, Mapping):
+        # The bind never got as far as an image: it minted nothing.
+        return await _retire(store, binding_id, None)
+    try:
+        spec = spec_from_json(spec_json)
+    except ValueError as exc:
+        return await _retire(store, binding_id, f"its spec is unreadable ({exc})")
     async with store.acquire() as conn:
         try:
             image = await ensure_image(
                 conn,
-                driver=registration.name,
-                reference=row["image_reference"] or registration.image_reference,
-                digest=row["image_digest"],
+                driver=str(row["driver"]),
+                reference=str(row["image_reference"]),
+                digest=str(row["image_digest"]),
             )
         except ServiceImageUnavailable as exc:
             return str(exc)
-    config: dict[str, Any] = {}
-    credentials: dict[str, Any] = {}
-    if connector is not None:
-        await read_connector_credentials(
-            [connector],
-            authorized=[str(connector["id"])],
-            dependencies=SimpleNamespace(store=store),
-        )
-        config = dict(connector.get("config") or {})
-        found = connector.get("credentials")
-        credentials = found if isinstance(found, dict) else {}
+    inputs = _decrypt(row["inputs_ciphertext"]) or {}
+    config = inputs.get("config") if isinstance(inputs.get("config"), dict) else {}
+    credentials = (
+        inputs.get("credentials") if isinstance(inputs.get("credentials"), dict) else {}
+    )
     state = _decrypt(row["driver_state_ciphertext"])
     try:
         outcome = await runtime.operations.run(
             operation="revoke",
-            driver=registration.name,
+            driver=spec.name,
             image=image,
             request=DriverRequest(
                 operation="revoke",
@@ -1366,10 +1941,12 @@ async def _revoke_one(runtime: BindTimeRuntime, row: Mapping[str, Any]) -> str |
                 binding_id=binding_id,
                 driver_state=state if isinstance(state, str) else None,
             ),
-            spec=registration.spec,
+            spec=spec,
             config=config,
             connector_id=str(row["connector_id"]),
-            registration_id=registration.id,
+            registration_id=(
+                str(row["registration_id"]) if row["registration_id"] else None
+            ),
             binding_id=binding_id,
         )
     except BindTimeCapacity as exc:
@@ -1389,7 +1966,8 @@ async def _retire(store: Any, binding_id: str, error: str | None) -> None:
             """
             UPDATE connector_bind_time_bindings
                SET status = 'revoked', revoked_at = now(), revoke_error = $2,
-                   delivery_ciphertext = NULL, driver_state_ciphertext = NULL
+                   delivery_ciphertext = NULL, driver_state_ciphertext = NULL,
+                   inputs_ciphertext = NULL, revoke_next_at = NULL
              WHERE id = $1 AND status = 'revoking'
             """,
             UUID(binding_id),
@@ -1398,10 +1976,91 @@ async def _retire(store: Any, binding_id: str, error: str | None) -> None:
     return None
 
 
+async def _revoke_later(store: Any, row: Mapping[str, Any], why: str) -> None:
+    """A transient revoke failure: back off, and give up at the bound."""
+    attempts = int(row["revoke_attempts"] or 0) + 1
+    if attempts >= MAX_REVOKE_ATTEMPTS:
+        await _retire(
+            store, str(row["id"]), f"gave up after {attempts} attempts: {why}"
+        )
+        return
+    async with store.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE connector_bind_time_bindings
+               SET revoke_error = $2, revoke_attempts = $3,
+                   revoke_next_at = now() + make_interval(secs => $4::float8)
+             WHERE id = $1 AND status = 'revoking'
+            """,
+            row["id"],
+            why[:500],
+            attempts,
+            _backoff(attempts, REVOKE_RETRY_BASE_SECONDS, REVOKE_RETRY_MAX_SECONDS),
+        )
+
+
+async def _recover_unread(runtime: BindTimeRuntime) -> int:
+    """Bind outcomes no runner read (it died): whatever the driver minted
+    is moved to revoking with its ``driver_state``, never dropped."""
+    store = runtime.store
+    async with store.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, binding_id, operation, outcome_ciphertext
+              FROM connector_driver_operations
+             WHERE outcome_ciphertext IS NOT NULL
+               AND finished_at < now() - make_interval(secs => $1::float8)
+             ORDER BY finished_at LIMIT 20
+            """,
+            UNREAD_OUTCOME_SECONDS,
+        )
+    recovered = 0
+    for row in rows:
+        posted = _decrypt(row["outcome_ciphertext"])
+        lines = posted.get("lines") if isinstance(posted, dict) else None
+        # A result line means the driver may have minted something, whatever
+        # SRW would have made of its binding; an error line minted nothing.
+        result = next(
+            (
+                line
+                for line in lines or ()
+                if isinstance(line, dict) and line.get("type") == "result"
+            ),
+            None,
+        )
+        if (
+            row["operation"] == "bind"
+            and row["binding_id"] is not None
+            and result is not None
+        ):
+            async with store.acquire() as conn:
+                status = await conn.fetchval(
+                    "SELECT status FROM connector_bind_time_bindings WHERE id = $1",
+                    row["binding_id"],
+                )
+            if status in ("pending", "failed"):
+                state = result.get("driver_state")
+                await _settle(
+                    store,
+                    str(row["binding_id"]),
+                    delivery=None,
+                    driver_state=state if isinstance(state, str) else None,
+                )
+                recovered += 1
+        async with store.acquire() as conn:
+            await conn.execute(
+                "UPDATE connector_driver_operations SET outcome_ciphertext = NULL "
+                "WHERE id = $1",
+                row["id"],
+            )
+    return recovered
+
+
 async def reconcile_bind_time_once(
     runtime: BindTimeRuntime, pod_runtime: BindTimePodRuntime | None
 ) -> BindTimeReport:
-    """One leader pass: mark, revoke, fail orphans, sweep, prune."""
+    """One leader pass: mark, fail orphans, recover, revoke, start, sweep,
+    prune."""
     report = BindTimeReport()
     store = runtime.store
     settings = runtime.operations.settings
@@ -1410,17 +2069,26 @@ async def reconcile_bind_time_once(
             ("execution_ended", _OWNER_ENDED),
             ("connector_deleted", _CONNECTOR_GONE),
         ):
-            rows = await conn.fetch(_MARK_REVOKE.format(where=where), reason)
-            report.marked += len(rows)
+            report.marked += await _request_revoke(
+                conn,
+                f"id IN (SELECT b.id FROM connector_bind_time_bindings b "
+                f"WHERE b.status IN ('bound', 'pending') AND {where})",
+                [],
+                reason=reason,
+            )
         # No bind outlives its pod's deadline by this much: one still pending
-        # was orphaned by a restart.
+        # was orphaned by a restart. Its retry is due at once; a revoke asked
+        # meanwhile retires it.
         stale = settings.deadline_seconds + settings.wait_seconds + 60.0
         orphaned = await conn.fetch(
             """
             UPDATE connector_bind_time_bindings
-               SET status = 'failed', failed_at = now(), error_class = 'transient',
+               SET status = CASE WHEN revoke_requested_at IS NULL
+                                 THEN 'failed' ELSE 'revoking' END,
+                   failed_at = now(), error_class = 'transient',
                    error_message = 'The bind did not finish; it runs again at the '
-                                   'next delivery'
+                                   'next delivery',
+                   retry_at = now()
              WHERE status = 'pending'
                AND created_at < now() - make_interval(secs => $1::float8)
             RETURNING id
@@ -1430,27 +2098,35 @@ async def reconcile_bind_time_once(
         report.orphaned = len(orphaned)
         revoking = await conn.fetch(
             """
-            SELECT id, connector_id, registration_id, image_reference,
-                   image_digest, access, driver_state_ciphertext
+            SELECT id, connector_id, registration_id, driver, image_reference,
+                   image_digest, spec, access, inputs_ciphertext,
+                   driver_state_ciphertext, revoke_attempts
               FROM connector_bind_time_bindings
              WHERE status = 'revoking'
-             ORDER BY revoke_requested_at LIMIT $1
+               AND (revoke_next_at IS NULL OR revoke_next_at <= now())
+             ORDER BY revoke_next_at NULLS FIRST, revoke_requested_at LIMIT $1
             """,
             REVOKES_PER_PASS,
         )
+        starts = await conn.fetch(_STARTS, STARTS_PER_PASS)
+    report.recovered = await _recover_unread(runtime)
     if pod_runtime is not None:
         for row in revoking:
             waiting = await _revoke_one(runtime, row)
             if waiting is None:
                 report.revoked.append(str(row["id"]))
             else:
-                async with store.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE connector_bind_time_bindings SET revoke_error = $2 "
-                        "WHERE id = $1",
-                        row["id"],
-                        waiting[:500],
-                    )
+                await _revoke_later(store, row, waiting)
+        for row in starts:
+            owner = LeaseOwner(row["kind"], str(row["owner_id"]))
+            await ensure_binding(
+                runtime,
+                owner,
+                str(row["connector_id"]),
+                read_only=bool(row["read_only"]),
+                wait=0,
+            )
+            report.started += 1
         report.swept = await _sweep(store, pod_runtime)
     async with store.acquire() as conn:
         await conn.execute(
@@ -1464,7 +2140,7 @@ async def reconcile_bind_time_once(
         await conn.execute(
             """
             DELETE FROM connector_driver_operations
-             WHERE removed_at IS NOT NULL
+             WHERE removed_at IS NOT NULL AND outcome_ciphertext IS NULL
                AND created_at < now() - make_interval(days => $1)
             """,
             RETENTION_DAYS,
@@ -1474,7 +2150,17 @@ async def reconcile_bind_time_once(
 
 async def _sweep(store: Any, pod_runtime: BindTimePodRuntime) -> int:
     """Close operations past their deadline and delete every object no
-    running operation names (a restart's leftovers)."""
+    running operation names (a restart's leftovers).
+
+    The objects are listed before the running operations are read: an
+    operation's row is written before its objects exist, so an object
+    created after the listing is never seen here, and one listed is seen
+    with its running row."""
+    try:
+        objects = await pod_runtime.operation_objects()
+    except Exception as exc:
+        logger.warning("Listing bind-time driver objects failed: %s", exc)
+        return 0
     async with store.acquire() as conn:
         await conn.execute(
             """
@@ -1491,11 +2177,6 @@ async def _sweep(store: Any, pod_runtime: BindTimePodRuntime) -> int:
             )
         }
     swept = 0
-    try:
-        objects = await pod_runtime.operation_objects()
-    except Exception as exc:
-        logger.warning("Listing bind-time driver objects failed: %s", exc)
-        return 0
     present = {operation_id for _delete, _name, operation_id in objects}
     for delete, name, operation_id in objects:
         if operation_id in running:
@@ -1537,10 +2218,13 @@ async def bind_time_reconciler(
                 report = await reconcile_bind_time_once(runtime, pod_runtime())
                 if report:
                     logger.info(
-                        "bind-time drivers: marked=%d revoked=%d orphaned=%d swept=%d",
+                        "bind-time drivers: marked=%d revoked=%d orphaned=%d "
+                        "recovered=%d started=%d swept=%d",
                         report.marked,
                         len(report.revoked),
                         report.orphaned,
+                        report.recovered,
+                        report.started,
                         report.swept,
                     )
             except Exception as exc:
@@ -1554,8 +2238,9 @@ async def bind_time_reconciler(
 
 
 __all__ = [
-    "BIND_RETRY_SECONDS",
+    "MAX_BIND_ATTEMPTS",
     "MAX_RESULT_BYTES",
+    "MAX_REVOKE_ATTEMPTS",
     "BindTimeCapacity",
     "BindTimeError",
     "BindTimePending",
@@ -1564,16 +2249,28 @@ __all__ = [
     "BindTimeRuntime",
     "BindTimeSettings",
     "BindTimeUnavailable",
+    "CheckedImage",
     "DriverOperations",
     "bind_time_reconciler",
     "bind_time_runtime",
+    "check_image",
     "configure_bind_time",
+    "connector_changed",
+    "decide",
     "deliver_bind_time_entries",
     "ensure_binding",
+    "job_bind_gate",
+    "operation_identity",
+    "parse_result_body",
     "prepare_bind_time_bindings",
+    "prepare_thread_bindings",
     "reconcile_bind_time_once",
     "record_operation_result",
     "registered_entry",
+    "registration_disabled",
+    "registration_enabled",
+    "revoke_owner_bindings",
     "run_check",
+    "start_thread_bindings",
     "run_spec_operation",
 ]

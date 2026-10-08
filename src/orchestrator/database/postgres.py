@@ -50588,6 +50588,16 @@ class PostgresDB:
                 )
                 datasource_uuid = row["id"]
                 if driver_registration_id is not None:
+                    # Locked against a delete or disable racing this create.
+                    usable = await conn.fetchval(
+                        "SELECT disabled_at IS NULL FROM "
+                        "connector_driver_registrations WHERE id = $1 FOR SHARE",
+                        UUID(str(driver_registration_id)),
+                    )
+                    if not usable:
+                        raise DatasourcePolicyConflictError(
+                            "The driver registration was deleted or disabled"
+                        )
                     await conn.execute(
                         "INSERT INTO connector_driver_assignments "
                         "(connector_id, registration_id) VALUES ($1, $2)",
