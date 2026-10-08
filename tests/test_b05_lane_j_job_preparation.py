@@ -1025,6 +1025,43 @@ class TestDatasourcePayload:
         )
         assert override == {"tools": {"custom": ["x"]}}
 
+    @pytest.mark.parametrize(
+        ("link_read_only", "override", "read_only"),
+        [
+            # The job may make a writable link read-only...
+            (False, True, True),
+            (None, True, True),
+            (False, False, False),
+            # ...but never lift the project owner's read-only link.
+            (True, False, True),
+            (True, True, True),
+            (True, None, True),
+            (False, None, False),
+        ],
+    )
+    def test_cloud_storage_override_only_tightens(
+        self, link_read_only, override, read_only
+    ):
+        context = {} if override is None else {"cloud_storage_read_only": override}
+        rows = [
+            _ds(type="webdav", project_read_only=link_read_only),
+            _ds(type="postgresql", project_read_only=False),
+        ]
+        agent_datasource_payload.apply_cloud_storage_override(rows, context)
+        assert bool(rows[0]["project_read_only"]) is read_only
+        assert rows[1]["project_read_only"] is False
+
+    def test_a_job_cannot_get_webdav_write_tools_past_a_read_only_link(self):
+        rows = [_ds(type="webdav", name="cloud", project_read_only=True)]
+        agent_datasource_payload.apply_cloud_storage_override(
+            rows, {"cloud_storage_read_only": False}
+        )
+        override = agent_datasource_payload.build_datasource_tool_override(
+            rows, None, dependencies=_datasource_payload_deps()
+        )
+        assert "webdav_write" not in override["tools"]["webdav"]
+        assert "webdav_read" in override["tools"]["webdav"]
+
     @pytest.mark.parametrize("override", [None, True, False])
     def test_cloud_storage_override_parity(self, override):
         context = {} if override is None else {"cloud_storage_read_only": override}

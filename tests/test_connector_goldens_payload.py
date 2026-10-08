@@ -85,7 +85,8 @@ CASES.update(
             [resolved_row("webdav")],
             job_context={"cloud_storage_read_only": True},
         ),
-        "webdav/cloud_storage_override_read_write": PayloadCase(
+        # The job's override only tightens: it cannot lift a read-only link.
+        "webdav/cloud_storage_override_cannot_lift_read_only": PayloadCase(
             [resolved_row("webdav", project_read_only=True)],
             job_context={"cloud_storage_read_only": False},
         ),

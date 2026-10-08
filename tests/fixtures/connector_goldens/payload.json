@@ -744,7 +744,7 @@
       }
     ]
   },
-  "webdav/cloud_storage_override_read_write": {
+  "webdav/cloud_storage_override_cannot_lift_read_only": {
     "payload": [
       {
         "type": "webdav",
@@ -755,7 +755,7 @@
           "username": "alice",
           "password": "dav-secret"
         },
-        "project_read_only": false
+        "project_read_only": true
       }
     ]
   },

@@ -167,10 +167,11 @@ def build_datasource_tool_override(
 def apply_cloud_storage_override(
     resolved_ds: list[dict[str, Any]], job_context: dict[str, Any]
 ) -> None:
-    """Apply job-level cloud_storage_read_only override to WebDAV datasources.
+    """Apply a job's cloud_storage_read_only to its WebDAV datasources.
 
-    If the job's context contains cloud_storage_read_only, it overrides the
-    project-level read_only setting on any webdav datasource in the resolved list.
+    The key is the job creator's, unchecked at admission, so it can only
+    tighten: a WebDAV connector is read-only when its project link is or the
+    job asks for it. A job cannot lift a read-only link the project owner set.
     Mutates resolved_ds in place.
     """
     override = job_context.get("cloud_storage_read_only")
@@ -178,7 +179,9 @@ def apply_cloud_storage_override(
         return
     for ds in resolved_ds:
         if ds["type"] == "webdav":
-            ds["project_read_only"] = bool(override)
+            ds["project_read_only"] = bool(ds.get("project_read_only")) or bool(
+                override
+            )
 
 
 def build_datasources_payload(
