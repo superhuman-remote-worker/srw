@@ -735,6 +735,47 @@ class TestUpdateEndpoint:
         assert response.status_code == 400, response.text
         update.assert_not_awaited()
 
+    @pytest.mark.parametrize("kind", ["ssh_key", "repository"])
+    def test_a_config_only_edit_does_not_recheck_the_stored_key(
+        self, monkeypatch, kind
+    ):
+        """A key stored before C1 (here passphrase-protected) survives an edit
+        that keeps it; only a key the edit supplies is checked."""
+        if kind == "ssh_key":
+            credentials = {"files": [{"contents": _encrypted_openssh_key()}]}
+            existing = {"connection_url": None, "config": {}}
+            config = {"host": "bastion.example.com"}
+        else:
+            credentials = {"auth_method": "ssh", "ssh_key": _encrypted_pkcs8_key()}
+            existing = {
+                "connection_url": "git@github.com:acme/widget.git",
+                "config": {"forge": "github"},
+            }
+            config = {"forge": "github", "known_hosts": f"github.com {_host_key()}"}
+        existing.update(
+            id="44444444-4444-4444-4444-444444444446",
+            name="legacy-key",
+            type=kind,
+            credentials=credentials,
+            is_global=False,
+            read_only=None,
+        )
+        client, update = self._patch_update(monkeypatch, existing)
+        response = client.put(
+            f"/api/datasources/{existing['id']}", json={"config": config}
+        )
+        assert response.status_code < 300, response.text
+        assert update.await_args.kwargs["config"] == config
+
+        update.reset_mock()
+        response = client.put(
+            f"/api/datasources/{existing['id']}",
+            json={"config": config, "credentials": credentials},
+        )
+        assert response.status_code == 400, response.text
+        assert "passphrase" in response.json()["detail"]
+        update.assert_not_awaited()
+
     def test_host_edit_to_an_identity_alias_is_refused(self, monkeypatch):
         existing = {
             "id": "44444444-4444-4444-4444-444444444445",
