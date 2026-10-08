@@ -1511,10 +1511,13 @@ class ManagedMcpGate:
     def create_connector(self, label: str, body: dict[str, Any], who: str) -> str:
         """POST a connector; its id is recorded before anything checks it."""
         api = self.owner if who == "owner" else self.other
+        # The owner's connectors as the D5 gate makes them; the second
+        # account's as the D3c gate makes its own (no scope mode).
+        scope = {"scope_mode": "all"} if who == "owner" else {}
         status, parsed = api.call(
             "POST",
             "/api/datasources",
-            {"name": self.name(label), "scope_mode": "all", **body},
+            {"name": self.name(label), **scope, **body},
         )
         if isinstance(parsed, dict) and parsed.get("id"):
             self.connectors[label] = str(parsed["id"])

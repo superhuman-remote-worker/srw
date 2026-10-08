@@ -251,9 +251,11 @@ connectors:
       limitsCpu: "16"
       limitsMemory: "32Gi"
       ephemeralStorage: "40Gi"
-      # -- One Secret and one Service per service pod, plus room for D6.
+      # -- One Secret per service pod, plus room for D6. Services: one per
+      # service pod and one endpoint Service per connector and image digest
+      # with a live pod (D5a), so at least twice maxInstallation.
       secrets: 64
-      services: 32
+      services: 48
   drivers:
     # -- SRW's static driver shim (docker/Dockerfile.driver-shim): the
     # canary-wait and shim-install init containers of every driver pod, and
