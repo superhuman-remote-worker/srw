@@ -94,6 +94,9 @@ type fakeServer struct {
 	// A streamed tools/call sends a progress event and then holds, never
 	// answering, until the caller goes.
 	holdCall bool
+	// A tools/call answered with this body (a JSON-RPC message), framed
+	// as an event when stream is set.
+	callAnswer string
 }
 
 func (s *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -103,6 +106,7 @@ func (s *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.bodies = append(s.bodies, string(body))
 	stream, status := s.stream, s.status
 	getEvents, holdGet, holdCall := s.getEvents, s.holdGet, s.holdCall
+	callAnswer := s.callAnswer
 	s.mu.Unlock()
 	if status != 0 {
 		w.WriteHeader(status)
@@ -154,6 +158,9 @@ func (s *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		result = map[string]any{"content": []any{map[string]any{"type": "text", "text": text}}}
 	}
 	answer, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
+	if callAnswer != "" && method == "tools/call" {
+		answer = []byte(callAnswer)
+	}
 	if stream && holdCall && method == "tools/call" {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":1,\"progress\":1}}\n\n")

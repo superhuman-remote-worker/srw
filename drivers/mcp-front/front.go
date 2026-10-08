@@ -75,7 +75,7 @@ func newFront(cfg *config, a authority, upstream *http.Client, logf func(string,
 		logf:     logf,
 		now:      now,
 		inflight: &inflight{perLease: map[string]int{}},
-		sessions: newSessionOwners(),
+		sessions: newSessionOwners(now),
 		probe:    &prober{cfg: cfg, client: upstream, logf: logf, now: now},
 		buffers:  newBudget(bufferBudgetUnits),
 	}
@@ -216,7 +216,17 @@ func (f *front) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if message.Method == "tools/call" && !f.cfg.allowed(message.tool, found.access) {
 			f.logf("refused call lease=%s tool=%q class=%s access=%s", found.id, message.tool, f.cfg.toolClass(message.tool), found.access)
-			rpcError(w, message, -32602, "Unknown tool: "+message.tool)
+			if message.notification() {
+				// A notification is never answered.
+				w.WriteHeader(http.StatusAccepted)
+			} else {
+				rpcError(w, message, -32602, "Unknown tool: "+message.tool)
+			}
+			return
+		}
+		if message.Method == "initialize" && !f.sessions.room(found.id) {
+			f.logf("refused a session lease=%s: the front holds its most sessions", found.id)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "too many sessions on this server; try again later"})
 			return
 		}
 	}
@@ -253,48 +263,105 @@ func (f *front) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// watchLease ends ctx when the lease stops being live, and says so in
-// ended; a stream re-checks it every streamRecheck (from the cache, at most
-// the revocation lag old).
-func (f *front) watchLease(ctx context.Context, cancel context.CancelFunc, token string, ended *atomic.Bool) {
+// Why the front ended a request's stream before the server did.
+const (
+	endNone        int32 = iota
+	endLease             // the lease is no longer live
+	endUnconfirmed       // the exchange could not confirm it for maxCache
+)
+
+// watchLease ends ctx when the lease stops being live, or when the
+// exchange cannot confirm it for longer than a cached decision lasts, and
+// records why in reason. Every streamRecheck it asks the exchange past the
+// cache, so a revocation reaches an open stream within that interval.
+func (f *front) watchLease(ctx context.Context, cancel context.CancelFunc, token string, reason *atomic.Int32) {
 	ticker := time.NewTicker(streamRecheck)
 	defer ticker.Stop()
+	var unconfirmedSince time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			found, err := f.auth.lease(ctx, token)
-			if errors.Is(err, errFrontRevoked) || (err == nil && (!found.active || !strings.EqualFold(found.connectorID, f.cfg.connectorID))) {
+			found, err := f.auth.leaseFresh(ctx, token)
+			switch {
+			case errors.Is(err, errFrontRevoked), err == nil && (!found.active || !strings.EqualFold(found.connectorID, f.cfg.connectorID)):
 				f.logf("lease=%s ended: closing its stream", found.id)
-				ended.Store(true)
+				reason.Store(endLease)
 				cancel()
 				return
+			case err != nil:
+				if ctx.Err() != nil {
+					return
+				}
+				now := f.now()
+				if unconfirmedSince.IsZero() {
+					unconfirmedSince = now
+				}
+				if now.Sub(unconfirmedSince) >= maxCache {
+					f.logf("a lease could not be confirmed for %s (%v): closing its stream", maxCache, err)
+					reason.Store(endUnconfirmed)
+					cancel()
+					return
+				}
+			default:
+				unconfirmedSince = time.Time{}
 			}
 		}
 	}
 }
 
-// leaseEnded tells the caller its lease ended while it waited: a request
+// streamEnded tells the caller why the front ended its request: a request
 // in flight on a stream gets a JSON-RPC error for its id (the client fails
 // that call with the reason instead of waiting for an answer that will not
-// come); a JSON answer not yet written becomes the 401 a new request gets.
-func (f *front) leaseEnded(w http.ResponseWriter, message *rpcMessage, streaming bool) {
+// come); a JSON answer not yet written becomes what a new request would
+// get (401 for an ended lease, 503 while the exchange cannot confirm it).
+func (f *front) streamEnded(w http.ResponseWriter, message *rpcMessage, streaming bool, why int32) int {
 	if !streaming {
-		f.unauthorized(w, "lease_inactive", leaseRefused)
-		return
+		if why == endLease {
+			f.unauthorized(w, "lease_inactive", leaseRefused)
+			return http.StatusUnauthorized
+		}
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "the lease exchange is unavailable"})
+		return http.StatusServiceUnavailable
 	}
 	if message == nil || message.notification() || message.response {
-		return
+		return 0
 	}
-	event, _ := json.Marshal(map[string]any{
-		"jsonrpc": "2.0",
-		"id":      message.ID,
-		"error":   map[string]any{"code": leaseEndedCode, "message": leaseEndedMessage},
-	})
+	failure := map[string]any{"code": leaseEndedCode, "message": leaseEndedMessage}
+	if why != endLease {
+		failure = map[string]any{"code": -32603, "message": "the lease could not be confirmed: the lease exchange is unavailable"}
+	}
+	event, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": message.ID, "error": failure})
 	fmt.Fprintf(w, "event: message\ndata: %s\n\n", event)
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
+	}
+	return 0
+}
+
+// closeSessions ends sessions the front forgot on the server (a stateful
+// server keeps each until told), in the background and best effort: the
+// DELETE carries the session id only.
+func (f *front) closeSessions(sessions []string) {
+	for _, session := range sessions {
+		go func(session string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			request, err := http.NewRequestWithContext(ctx, http.MethodDelete, f.cfg.upstream.String(), http.NoBody)
+			if err != nil {
+				return
+			}
+			request.Host = f.cfg.upstream.Host
+			request.Header.Set("Mcp-Session-Id", session)
+			response, err := f.upstream.Do(request)
+			if err != nil {
+				f.logf("a forgotten session was not closed on the server (%v)", err)
+				return
+			}
+			io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+			response.Body.Close()
+		}(session)
 	}
 }
 
@@ -309,7 +376,7 @@ func (f *front) forward(w http.ResponseWriter, r *http.Request, message *rpcMess
 		ctx, cancel = context.WithTimeout(ctx, maxStreamLife)
 		defer cancel()
 	}
-	var ended atomic.Bool
+	var ended atomic.Int32
 	go f.watchLease(ctx, cancel, token, &ended)
 	var payload io.Reader = http.NoBody
 	if r.Method == http.MethodPost {
@@ -334,9 +401,8 @@ func (f *front) forward(w http.ResponseWriter, r *http.Request, message *rpcMess
 		out.Header.Set(f.cfg.credential.Header, value)
 	}
 	response, err := f.upstream.Do(out)
-	if err != nil && ended.Load() {
-		f.leaseEnded(w, message, false)
-		return http.StatusUnauthorized, 0
+	if why := ended.Load(); err != nil && why != endNone {
+		return f.streamEnded(w, message, false, why), 0
 	}
 	if err != nil {
 		if r.Context().Err() == nil {
@@ -363,7 +429,13 @@ func (f *front) forward(w http.ResponseWriter, r *http.Request, message *rpcMess
 	if response.StatusCode < 300 {
 		if message != nil && message.Method == "initialize" {
 			if issued := response.Header.Get("Mcp-Session-Id"); issued != "" {
-				f.sessions.bind(issued, found.id)
+				forgotten, bound := f.sessions.bind(issued, found.id)
+				if !bound {
+					// No room after all (another lease took it since the
+					// check): the client's next request gets 404.
+					forgotten = append(forgotten, issued)
+				}
+				f.closeSessions(forgotten)
 			}
 		}
 		if r.Method == http.MethodDelete && session != "" {
@@ -376,21 +448,23 @@ func (f *front) forward(w http.ResponseWriter, r *http.Request, message *rpcMess
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("X-Accel-Buffering", "no")
 		w.WriteHeader(response.StatusCode)
-		size, err := relayEvents(ctx, w, response.Body, f.buffers, allowed, scrub)
+		dropped := func() {
+			f.logf("lease=%s: dropped a stream event the front cannot read as JSON", found.id)
+		}
+		size, err := relayEvents(ctx, w, response.Body, f.buffers, allowed, scrub, dropped)
 		if err != nil && r.Context().Err() == nil && ctx.Err() == nil {
 			f.logf("lease=%s: stream ended (%s)", found.id, scrubText(err.Error(), credential))
 		}
-		if ended.Load() && r.Context().Err() == nil {
-			f.leaseEnded(w, message, true)
+		if why := ended.Load(); why != endNone && r.Context().Err() == nil {
+			f.streamEnded(w, message, true, why)
 		}
 		return response.StatusCode, size
 	}
 	size, err := relayJSON(ctx, w, response, f.buffers, allowed, scrub)
 	switch {
-	case (errors.Is(err, errBusy) || errors.Is(err, errUnreadable)) && ended.Load():
+	case (errors.Is(err, errBusy) || errors.Is(err, errUnreadable)) && ended.Load() != endNone:
 		// Nothing written yet: the lease ended while the answer was read.
-		f.leaseEnded(w, message, false)
-		return http.StatusUnauthorized, 0
+		return f.streamEnded(w, message, false, ended.Load()), 0
 	case errors.Is(err, errBusy):
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "the front is busy; try again"})
 		return http.StatusServiceUnavailable, 0

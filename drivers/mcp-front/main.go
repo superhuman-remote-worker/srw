@@ -22,16 +22,24 @@
 //     the lease's access level allows (the spec's tool classes; a tool no
 //     class names is a write tool);
 //   - hides the tools a lease may not call from every answer carrying a tool
-//     list, whatever its id, on JSON answers and streams alike;
+//     list, whatever its id, on JSON answers and streams alike (an answer
+//     where one may hide that it cannot read as JSON is not relayed), and
+//     never relays a server's own use of its lease-ended code;
 //   - exchanges the lease for the connector's upstream credential and hands
 //     it to the server in the header the spec names; the lease token never
 //     reaches the server, and the credential never reaches the caller: it is
-//     scrubbed from every answer, plain, escaped, URL- or base64-encoded;
+//     scrubbed from every answer, plain, escaped, URL-, percent-, hex- or
+//     base64-encoded, in either case, and across line breaks;
 //   - keeps a session to the lease that opened it; an unknown session is
-//     nobody's (404, the client initializes again);
-//   - buffers each answer (4 MiB at most, 96 MiB in all) and ends a stream
-//     when its lease ends (a call still waiting gets a "lease revoked"
-//     JSON-RPC error, code -32091) or after 15 minutes;
+//     nobody's (404, the client initializes again); a full front takes room
+//     only from a lease at its own cap or an idle session, and closes what
+//     it forgets on the server;
+//   - buffers each answer (4 MiB at most) within a budget that claims every
+//     copy relaying it makes, taken only once its bytes arrive; ends a
+//     stream when its lease ends (re-checked past the cache every 30 s; a
+//     call still waiting gets a "lease revoked" JSON-RPC error, code
+//     -32091), when the exchange cannot confirm the lease for 30 s, or after
+//     15 minutes;
 //   - logs each call's tool, class, status and duration, never an argument,
 //     a token or a credential.
 //

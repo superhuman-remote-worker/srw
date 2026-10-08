@@ -190,6 +190,18 @@ func (c *authCache) lease(ctx context.Context, token string) (lease, error) {
 	if ok && now.Before(cached.until) {
 		return cached.lease, nil
 	}
+	return c.introspect(ctx, token)
+}
+
+// leaseFresh asks the exchange, past the cache (a stream's re-check: its
+// lag is then the re-check interval at most), and caches the answer.
+func (c *authCache) leaseFresh(ctx context.Context, token string) (lease, error) {
+	return c.introspect(ctx, token)
+}
+
+func (c *authCache) introspect(ctx context.Context, token string) (lease, error) {
+	key := tokenKey(token)
+	now := c.now()
 	found, err := c.authority.introspect(ctx, token)
 	if err != nil {
 		return lease{}, err

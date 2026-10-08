@@ -243,7 +243,7 @@ func TestAnUnknownSessionIsNobodys(t *testing.T) {
 }
 
 func TestOneLeaseCannotEvictAnothersSessions(t *testing.T) {
-	owners := newSessionOwners()
+	owners := newSessionOwners(time.Now)
 	owners.bind("b-1", "lease-b")
 	for i := 0; i < maxSessionsPerLease+5; i++ {
 		owners.bind(fmt.Sprintf("a-%d", i), "lease-a")
@@ -545,8 +545,10 @@ func (c *testClock) Now() time.Time {
 	return c.now
 }
 
-func (h *harness) advance(d time.Duration) {
-	h.clock.mu.Lock()
-	defer h.clock.mu.Unlock()
-	h.clock.now = h.clock.now.Add(d)
+func (c *testClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
 }
+
+func (h *harness) advance(d time.Duration) { h.clock.advance(d) }
