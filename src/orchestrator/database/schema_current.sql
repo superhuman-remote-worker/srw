@@ -23370,7 +23370,11 @@ BEGIN
        OR vm->>'provision_generation' IS DISTINCT FROM generation::text
        OR vm->>'vm_uid' IS DISTINCT FROM expected_vm::text
        OR vm->>'rootdisk_pvc_uid' IS DISTINCT FROM pvc::text
-       OR vm->>'status' IS NULL OR vm->>'status' NOT IN ('created','ssh_pending','ssh_unreachable','retiring_process_zero')
+       OR vm->>'status' IS NULL OR (vm->>'status' NOT IN ('created','ssh_pending','ssh_unreachable','retiring_process_zero')
+           AND NOT (vm->>'status'='deleted' AND v.state='teardown'
+               AND public.vm_job_deleted_retention_replay_allowed(1,owner,generation,
+                   expected_vm,pvc,retaining_parent,existing_stop,r.request_id,
+                   v.id,v.revision,v.vmi_uid,v.launcher_uid,v.node_uid)))
        OR vm->'identity_authenticated' IS DISTINCT FROM 'true'::jsonb
        OR vm->>'identity_provision_generation' IS DISTINCT FROM generation::text
        OR COALESCE(vm->'workspace_storage','null'::jsonb)<>'null'::jsonb
@@ -23591,6 +23595,42 @@ $$;
 
 
 --
+-- Name: vm_job_deleted_retention_replay_allowed(integer, uuid, uuid, uuid, uuid, uuid, boolean, uuid, uuid, bigint, uuid, uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_job_deleted_retention_replay_allowed(p_policy integer, p_owner uuid, p_generation uuid, p_expected_vm uuid, p_pvc uuid, p_retaining_parent uuid, p_existing_stop boolean, p_creation_request uuid, p_reservation uuid, p_reservation_revision bigint, p_vmi uuid, p_launcher uuid, p_node uuid) RETURNS boolean
+    LANGUAGE sql
+    AS $$
+    SELECT p_existing_stop IS TRUE AND p_retaining_parent IS NOT NULL
+       AND EXISTS (
+           SELECT 1 FROM public.vm_job_cancel_retention_authorities a
+           JOIN public.vm_workspace_cleanup_admissions c
+             ON c.id=a.cleanup_admission_id
+           JOIN public.managed_repository_process_zero_receipts z
+             ON z.owner_kind='job' AND z.owner_id=a.job_id
+            AND z.scope='vm' AND z.provisioner='vm'
+            AND z.runtime_incarnation=a.provision_generation::text
+           WHERE a.cleanup_admission_id=p_retaining_parent
+             AND a.admitted_xact_id<>pg_current_xact_id()
+             AND a.policy_version=p_policy AND a.job_id=p_owner
+             AND a.provision_generation=p_generation
+             AND a.creation_request_id=p_creation_request
+             AND a.reservation_id=p_reservation
+             AND a.reservation_revision=p_reservation_revision
+             AND a.vm_uid=p_expected_vm AND a.vmi_uid=p_vmi
+             AND a.launcher_uid=p_launcher AND a.node_uid=p_node
+             AND a.pvc_uid=p_pvc
+             AND c.owner_kind='job' AND c.owner_id=p_owner
+             AND c.pvc_uid=p_pvc AND c.source='job_terminal_vm_release'
+             AND c.parent_admission_id IS NULL
+             AND c.request_id=a.cleanup_request_id
+             AND c.intent_digest=a.intent_digest
+             AND c.completed_at IS NULL AND c.outcome IS NULL
+       );
+$$;
+
+
+--
 -- Name: vm_job_execution_chain_evidence(uuid); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -23643,7 +23683,11 @@ BEGIN
        OR vm->>'provision_generation' IS DISTINCT FROM generation::text
        OR vm->>'vm_uid' IS DISTINCT FROM expected_vm::text
        OR vm->>'rootdisk_pvc_uid' IS DISTINCT FROM pvc::text
-       OR vm->>'status' IS NULL OR vm->>'status' NOT IN ('created','ssh_pending','ssh_unreachable','ready','retiring_process_zero')
+       OR vm->>'status' IS NULL OR (vm->>'status' NOT IN ('created','ssh_pending','ssh_unreachable','ready','retiring_process_zero')
+           AND NOT (vm->>'status'='deleted' AND v.state='teardown'
+               AND public.vm_job_deleted_retention_replay_allowed(3,owner,generation,
+                   expected_vm,pvc,retaining_parent,existing_stop,r.request_id,
+                   v.id,v.revision,v.vmi_uid,v.launcher_uid,v.node_uid)))
        OR vm->'identity_authenticated' IS DISTINCT FROM 'true'::jsonb
        OR vm->>'identity_provision_generation' IS DISTINCT FROM generation::text
        OR COALESCE(vm->'workspace_storage','null'::jsonb)<>'null'::jsonb
@@ -24322,7 +24366,11 @@ BEGIN
        OR vm->>'provision_generation' IS DISTINCT FROM generation::text
        OR vm->>'vm_uid' IS DISTINCT FROM expected_vm::text
        OR vm->>'rootdisk_pvc_uid' IS DISTINCT FROM pvc::text
-       OR vm->>'status' IS NULL OR vm->>'status' NOT IN ('created','ssh_pending','ssh_unreachable','ready','retiring_process_zero')
+       OR vm->>'status' IS NULL OR (vm->>'status' NOT IN ('created','ssh_pending','ssh_unreachable','ready','retiring_process_zero')
+           AND NOT (vm->>'status'='deleted' AND v.state='teardown'
+               AND public.vm_job_deleted_retention_replay_allowed(2,owner,generation,
+                   expected_vm,pvc,retaining_parent,existing_stop,r.request_id,
+                   v.id,v.revision,v.vmi_uid,v.launcher_uid,v.node_uid)))
        OR vm->'identity_authenticated' IS DISTINCT FROM 'true'::jsonb
        OR vm->>'identity_provision_generation' IS DISTINCT FROM generation::text
        OR COALESCE(vm->'workspace_storage','null'::jsonb)<>'null'::jsonb

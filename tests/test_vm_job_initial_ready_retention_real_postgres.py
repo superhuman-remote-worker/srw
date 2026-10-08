@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
@@ -42,6 +42,11 @@ async def initial_ready_schema(pg_dsn, resume_schema):  # noqa: F811
             "SELECT to_regprocedure('public.vm_job_initial_ready_retention_candidate(uuid,uuid,uuid,uuid,uuid,uuid,boolean)') IS NOT NULL"
         ):
             await conn.execute(path.read_text())
+        forward = path.with_name("0341_vm_job_deleted_retention_replay.sql")
+        if forward.exists() and not await conn.fetchval(
+            "SELECT to_regprocedure('public.vm_job_deleted_retention_replay_allowed(integer,uuid,uuid,uuid,uuid,uuid,boolean,uuid,uuid,bigint,uuid,uuid,uuid)') IS NOT NULL"
+        ):
+            await conn.execute(forward.read_text())
         yield
     finally:
         await conn.close()
@@ -647,6 +652,382 @@ async def ssh_settled_ready(db):
     assert await db.complete_stateless_cancel_cleanup(state["job_id"])
     state["retention"] = permit
     return state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", [2, 3])
+async def test_deleted_controller_status_replays_exact_open_ready_cleanup(db, policy):
+    """Controller DELETE may precede a conclusive whole-runtime stop probe."""
+    from orchestrator.services.vm_job_retained_resume import (
+        read_current_ready_preflight,
+    )
+    from orchestrator.services.vm_workspace_recovery_store import (
+        complete_vm_cleanup_permit,
+        prepare_vm_cleanup_resource,
+    )
+    from shared.vm_cancel_retention import retained_rootdisk_from_preflight
+    from tests.test_vm_job_retained_resume_real_postgres import ready_keep
+
+    if policy == 2:
+        state = await ready_keep(db)
+        permit = state["keep"]
+    else:
+        state = await ready_root(db)
+        provisioner = SimpleNamespace(
+            qualify_retained_ready_stop=AsyncMock(side_effect=ready_root_witness)
+        )
+        permit = await acquire_retained_terminal_cleanup(
+            state["recovery"],
+            provisioner,
+            job_id=state["job_id"],
+            identity=state["identity"],
+        )
+    assert permit.allowed
+    candidate = await prepare_vm_cleanup_resource(state["recovery"], permit)
+    assert (
+        candidate["retention_preflight"] == permit.parent_cleanup["retention_preflight"]
+    )
+    assert await db.claim_managed_repository_workspace_retirement(
+        state["job_id"],
+        owner_kind="job",
+        scope="vm",
+        provisioner="vm",
+        runtime_incarnation=state["identity"].provision_generation,
+    )
+    assert await db.record_managed_repository_workspace_process_zero(
+        state["job_id"],
+        owner_kind="job",
+        scope="vm",
+        provisioner="vm",
+        runtime_incarnation=state["identity"].provision_generation,
+    )
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,status}','\"deleted\"') WHERE id=$1",
+        UUID(state["job_id"]),
+    )
+    # Ordinary retry must recover its same committed parent and frozen proof.
+    assert (
+        await read_current_ready_preflight(
+            db,
+            permit.parent_cleanup,
+            job_id=state["job_id"],
+            generation=state["identity"].provision_generation,
+        )
+        == permit.parent_cleanup["retention_preflight"]
+    )
+    replay = await acquire_cancel_retention(
+        state["recovery"],
+        job_id=state["job_id"],
+        identity=state["identity"],
+    )
+    assert replay == permit
+    assert await prepare_vm_cleanup_resource(state["recovery"], replay) == candidate
+    evidence = dict(
+        version=1,
+        kind="vm_cleanup_physical_stop",
+        **{
+            key: candidate[key]
+            for key in (
+                "job_id",
+                "provision_generation",
+                "vm_uid",
+                "vmi_uid",
+                "launcher_uid",
+                "pvc_uid",
+            )
+        },
+        vm_absent=True,
+        vmi_absent=True,
+        launcher_absent=True,
+        same_generation_replacement=False,
+        pvc_disposition="retained",
+        controller_authenticated=True,
+        retained_rootdisk=retained_rootdisk_from_preflight(
+            candidate["retention_preflight"]
+        ),
+    )
+    witness = SimpleNamespace(attest_vm_cleanup_stop=AsyncMock(return_value=evidence))
+    await complete_vm_cleanup_permit(
+        state["recovery"],
+        replay,
+        outcome="completed",
+        provisioner=witness,
+    )
+    assert await db.fetchval(
+        "SELECT public.vm_job_cancel_retention_settled($1)", permit.admission_id
+    )
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE id=$1",
+            UUID(
+                permit.parent_cleanup["retention_preflight"]["frozen"]["reservation_id"]
+            ),
+        )
+        == "released"
+    )
+    assert await db.complete_stateless_cancel_cleanup(state["job_id"])
+
+
+@pytest.mark.asyncio
+async def test_deleted_controller_status_replays_exact_open_never_ready_cleanup(db):
+    from orchestrator.services.vm_workspace_recovery_store import (
+        complete_vm_cleanup_permit,
+        prepare_vm_cleanup_resource,
+    )
+    from tests.test_vm_job_cancel_retention_real_postgres import positive_retention
+
+    state = await positive_retention(db)
+    permit = state["retention"]
+    assert await prepare_vm_cleanup_resource(state["recovery"], permit)
+    assert await db.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM managed_repository_process_zero_receipts "
+        "WHERE owner_kind='job' AND owner_id=$1 AND scope='vm' AND provisioner='vm' "
+        "AND runtime_incarnation=$2)",
+        UUID(state["job_id"]),
+        state["generation"],
+    )
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,status}','\"deleted\"') WHERE id=$1",
+        UUID(state["job_id"]),
+    )
+    replay = await acquire_cancel_retention(
+        state["recovery"],
+        job_id=state["job_id"],
+        identity=state["identity"],
+    )
+    assert replay == permit
+    witness = SimpleNamespace(
+        attest_vm_cleanup_stop=AsyncMock(return_value=state["evidence"])
+    )
+    await complete_vm_cleanup_permit(
+        state["recovery"],
+        replay,
+        outcome="completed",
+        provisioner=witness,
+    )
+    assert await db.fetchval(
+        "SELECT public.vm_job_cancel_retention_settled($1)", permit.admission_id
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", [1, 2, 3])
+async def test_deleted_status_never_admits_fresh_retention(db, policy):
+    from tests.test_vm_job_retained_resume_real_postgres import (
+        adopted_resume,
+        ready_witness,
+    )
+    from orchestrator.services.vm_job_retained_resume import retained_ready_candidate
+
+    if policy == 1:
+        state = await cancelled(db, old=False, retiring=False)
+    elif policy == 2:
+        state = await adopted_resume(db)
+        proof = ready_witness(
+            await retained_ready_candidate(
+                db,
+                job_id=state["job_id"],
+                identity=state["identity"],
+            )
+        )
+    else:
+        state = await ready_root(db)
+    assert await db.claim_managed_repository_workspace_retirement(
+        state["job_id"],
+        owner_kind="job",
+        scope="vm",
+        provisioner="vm",
+        runtime_incarnation=state["identity"].provision_generation,
+    )
+    assert await db.record_managed_repository_workspace_process_zero(
+        state["job_id"],
+        owner_kind="job",
+        scope="vm",
+        provisioner="vm",
+        runtime_incarnation=state["identity"].provision_generation,
+    )
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,status}','\"deleted\"') WHERE id=$1",
+        UUID(state["job_id"]),
+    )
+    prior_count = await db.fetchval(
+        "SELECT count(*) FROM vm_job_cancel_retention_authorities WHERE job_id=$1",
+        UUID(state["job_id"]),
+    )
+    if policy == 3:
+        permit = await acquire_retained_terminal_cleanup(
+            state["recovery"],
+            SimpleNamespace(
+                qualify_retained_ready_stop=AsyncMock(side_effect=ready_root_witness)
+            ),
+            job_id=state["job_id"],
+            identity=state["identity"],
+        )
+    else:
+        permit = await acquire_cancel_retention(
+            state["recovery"],
+            job_id=state["job_id"],
+            identity=state["identity"],
+            retention_preflight=proof if policy == 2 else None,
+        )
+    assert permit is not None and not permit.allowed
+    assert prior_count == await db.fetchval(
+        "SELECT count(*) FROM vm_job_cancel_retention_authorities WHERE job_id=$1",
+        UUID(state["job_id"]),
+    )
+
+
+@pytest.mark.asyncio
+async def test_deleted_replay_stays_held_without_process_zero_or_physical_absence(db):
+    from orchestrator.services.vm_job_retained_resume import (
+        read_current_ready_preflight,
+    )
+    from orchestrator.services.vm_workspace_recovery_store import (
+        complete_vm_cleanup_permit,
+        prepare_vm_cleanup_resource,
+    )
+    from shared.vm_resource_admission import ResourceAdmissionError
+
+    state = await ready_root(db)
+    permit = await acquire_retained_terminal_cleanup(
+        state["recovery"],
+        SimpleNamespace(
+            qualify_retained_ready_stop=AsyncMock(side_effect=ready_root_witness)
+        ),
+        job_id=state["job_id"],
+        identity=state["identity"],
+    )
+    candidate = await prepare_vm_cleanup_resource(state["recovery"], permit)
+    with pytest.raises(asyncpg.CheckViolationError, match="process-zero authority"):
+        await db.execute(
+            "UPDATE jobs SET context=jsonb_set(context,'{vm,status}','\"deleted\"') WHERE id=$1",
+            UUID(state["job_id"]),
+        )
+    assert await db.claim_managed_repository_workspace_retirement(
+        state["job_id"],
+        owner_kind="job",
+        scope="vm",
+        provisioner="vm",
+        runtime_incarnation=state["identity"].provision_generation,
+    )
+    assert await db.record_managed_repository_workspace_process_zero(
+        state["job_id"],
+        owner_kind="job",
+        scope="vm",
+        provisioner="vm",
+        runtime_incarnation=state["identity"].provision_generation,
+    )
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,status}','\"deleted\"') WHERE id=$1",
+        UUID(state["job_id"]),
+    )
+    assert (
+        await read_current_ready_preflight(
+            db,
+            permit.parent_cleanup,
+            job_id=state["job_id"],
+            generation=state["identity"].provision_generation,
+        )
+        == permit.parent_cleanup["retention_preflight"]
+    )
+    with pytest.raises(ResourceAdmissionError, match="stop_unproven"):
+        await complete_vm_cleanup_permit(
+            state["recovery"],
+            permit,
+            outcome="completed",
+            provisioner=SimpleNamespace(
+                attest_vm_cleanup_stop=AsyncMock(return_value=None)
+            ),
+        )
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE id=$1",
+            UUID(candidate["retention_preflight"]["frozen"]["reservation_id"]),
+        )
+        == "teardown"
+    )
+    assert await db.fetchval(
+        "SELECT completed_at IS NULL FROM vm_workspace_cleanup_admissions WHERE id=$1",
+        permit.admission_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_deleted_replay_refuses_changed_parent_revision_and_storage(db):
+    from orchestrator.services.vm_workspace_recovery_store import (
+        prepare_vm_cleanup_resource,
+    )
+
+    state = await ready_root(db)
+    permit = await acquire_retained_terminal_cleanup(
+        state["recovery"],
+        SimpleNamespace(
+            qualify_retained_ready_stop=AsyncMock(side_effect=ready_root_witness)
+        ),
+        job_id=state["job_id"],
+        identity=state["identity"],
+    )
+    await prepare_vm_cleanup_resource(state["recovery"], permit)
+    assert await db.claim_managed_repository_workspace_retirement(
+        state["job_id"],
+        owner_kind="job",
+        scope="vm",
+        provisioner="vm",
+        runtime_incarnation=state["identity"].provision_generation,
+    )
+    assert await db.record_managed_repository_workspace_process_zero(
+        state["job_id"],
+        owner_kind="job",
+        scope="vm",
+        provisioner="vm",
+        runtime_incarnation=state["identity"].provision_generation,
+    )
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,status}','\"deleted\"') WHERE id=$1",
+        UUID(state["job_id"]),
+    )
+    authority = await db.fetchrow(
+        "SELECT * FROM vm_job_cancel_retention_authorities WHERE cleanup_admission_id=$1",
+        permit.admission_id,
+    )
+    query = (
+        "SELECT public.vm_job_deleted_retention_replay_allowed("
+        "$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)"
+    )
+    args = [
+        3,
+        authority["job_id"],
+        authority["provision_generation"],
+        authority["vm_uid"],
+        authority["pvc_uid"],
+        permit.admission_id,
+        True,
+        authority["creation_request_id"],
+        authority["reservation_id"],
+        authority["reservation_revision"],
+        authority["vmi_uid"],
+        authority["launcher_uid"],
+        authority["node_uid"],
+    ]
+    assert await db.fetchval(query, *args)
+    for index, wrong in ((5, uuid4()), (9, args[9] + 1), (2, uuid4())):
+        changed = args.copy()
+        changed[index] = wrong
+        assert not await db.fetchval(query, *changed)
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,workspace_storage}',"
+        '\'{"id":"changed"}\'::jsonb) WHERE id=$1',
+        UUID(state["job_id"]),
+    )
+    with pytest.raises(asyncpg.CheckViolationError, match="current authority changed"):
+        await db.fetchval(
+            "SELECT public.validate_vm_job_cancel_retention($1,false)",
+            permit.admission_id,
+        )
+    assert await db.fetchval(
+        "SELECT completed_at IS NULL FROM vm_workspace_cleanup_admissions WHERE id=$1",
+        permit.admission_id,
+    )
 
 
 @pytest.mark.asyncio
