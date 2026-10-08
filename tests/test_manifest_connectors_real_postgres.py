@@ -1092,11 +1092,13 @@ D3A_FILES = (
 
 
 async def _ledger(db) -> list[tuple[str, bool]]:
+    # D3a's range only: later slices' migrations (0360 on) apply in the same
+    # run and are not what these tests are about.
     return [
         (row["filename"], row["success"])
         for row in await db.fetch(
             "SELECT filename, success FROM schema_migrations "
-            "WHERE filename >= '0350' ORDER BY filename"
+            "WHERE filename >= '0350' AND filename < '0360' ORDER BY filename"
         )
     ]
 
