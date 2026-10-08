@@ -601,6 +601,50 @@ def scan_snapshot_object(
     )
 
 
+#: Orchestrator log words that say what a workspace teardown did.
+TEARDOWN_LOG_WORDS = (
+    "snapshot",
+    "deletion",
+    "cleanup",
+    "teardown",
+    "capture",
+    "refusing",
+    "error",
+)
+
+
+def orchestrator_log_excerpt(
+    subject: str, *, since: str = "30m", limit: int = 25
+) -> list[str]:
+    """The orchestrator's recent log lines about ``subject`` (a job id).
+
+    Lines naming it with a teardown word, plus the snapshot service's own
+    availability lines; a repeated line is shown once with its count. Never
+    raises: a diagnostic must not turn a FAIL into a crash.
+    """
+
+    try:
+        logs = command(
+            K
+            + ["logs", ORCHESTRATOR, "-c", ORCHESTRATOR_CONTAINER, f"--since={since}"],
+            timeout=120,
+        )
+    except GateError as exc:
+        return [f"orchestrator logs unavailable ({exc})"]
+    counts: dict[str, int] = {}
+    for line in logs.splitlines():
+        lowered = line.lower()
+        about = subject in line and any(word in lowered for word in TEARDOWN_LOG_WORDS)
+        if about or "snapshot service" in lowered:
+            key = re.sub(r"^\S+ \S+ ", "", line)[:240]
+            counts[key] = counts.get(key, 0) + 1
+    lines = [
+        _scrub(key) + (f"  (x{count})" if count > 1 else "")
+        for key, count in counts.items()
+    ]
+    return lines[-limit:] or [f"no orchestrator log line about {subject}"]
+
+
 def in_orchestrator(
     program: str, payload: dict[str, Any], *, timeout: int = 180
 ) -> dict:
@@ -1382,8 +1426,13 @@ class SshAgentConnectorsGate:
             current = self.job_status()
             return current if current and current not in JOB_RUNNING else None
 
+        cancel_started = time.monotonic()
         self.api.ok("PUT", f"/api/jobs/{self.job}/cancel")
-        print(f"job {self.job} cancelled to take its snapshot", flush=True)
+        print(
+            f"job {self.job} cancelled to take its snapshot "
+            f"({time.monotonic() - cancel_started:.0f}s)",
+            flush=True,
+        )
         try:
             stopped = wait_for(
                 "cancelled job stops",
@@ -1413,6 +1462,10 @@ class SshAgentConnectorsGate:
                 False,
                 f"no settled {prefix} objects after {self.args.snapshot_timeout}s",
             )
+            # The orchestrator's account of the cancel, before cleanup (or a
+            # restart) loses it: whether it captured, and if not, why not.
+            for line in orchestrator_log_excerpt(self.job):
+                print(f"diagnostic: {line}", flush=True)
             return
         self.scan_snapshot("snapshot (job)", prefix)
 

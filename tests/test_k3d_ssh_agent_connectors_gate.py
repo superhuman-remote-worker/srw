@@ -1038,3 +1038,53 @@ def test_cleanup_deletes_the_session_thread_permanently(monkeypatch):
             f"/api/persistent/threads/{runner.thread}?force=true&permanent=true",
         )
     ]
+
+
+def test_the_log_excerpt_says_what_the_teardown_did(monkeypatch):
+    job = "00000000-0000-4000-8000-0000000000aa"
+    logs = "\n".join(
+        [
+            "2026-10-08 09:00:00 INFO snapshot_service: Snapshot service ready: x",
+            f"2026-10-08 09:00:01 INFO http: GET /api/jobs/{job} 200",
+            f"2026-10-08 09:00:02 WARNING controls: Workspace cleanup failed for {job}",
+            f"2026-10-08 09:00:03 WARNING controls: Workspace cleanup failed for {job}",
+            f"2026-10-08 09:00:04 INFO provisioner: deletion accepted (job {job})",
+            "2026-10-08 09:00:05 INFO other: Workspace cleanup failed for another job",
+        ]
+    )
+    monkeypatch.setattr(gate, "command", lambda args, **kwargs: logs)
+
+    lines = gate.orchestrator_log_excerpt(job)
+
+    assert lines == [
+        "INFO snapshot_service: Snapshot service ready: x",
+        f"WARNING controls: Workspace cleanup failed for {job}  (x2)",
+        f"INFO provisioner: deletion accepted (job {job})",
+    ]
+
+
+def test_the_log_excerpt_never_raises(monkeypatch):
+    def broken(args, **kwargs):
+        raise gate.GateError("kubectl logs failed")
+
+    monkeypatch.setattr(gate, "command", broken)
+
+    assert gate.orchestrator_log_excerpt("x") == [
+        "orchestrator logs unavailable (kubectl logs failed)"
+    ]
+
+
+def test_a_missing_cancel_snapshot_prints_the_orchestrator_account(
+    monkeypatch, clocked, capsys
+):
+    runner = _gate_runner("--snapshot-timeout", "30")
+    _statuses(monkeypatch, runner, "processing", "cancelled")
+    _api(monkeypatch, runner)
+    _store(monkeypatch, job=([],))
+    monkeypatch.setattr(
+        gate, "orchestrator_log_excerpt", lambda job: [f"deletion accepted ({job})"]
+    )
+
+    runner.job_snapshot()
+
+    assert f"diagnostic: deletion accepted ({runner.job})" in capsys.readouterr().out
