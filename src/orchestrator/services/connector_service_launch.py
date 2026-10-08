@@ -230,6 +230,20 @@ def service_resources(
     return {"requests": requests, "limits": limits}
 
 
+def pod_config(spec: DriverSpec, config: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The connector config a service pod is built from.
+
+    A lease driver's pod never reads ``access``: each binding's lease
+    carries its access level, which the pod (the managed MCP front) applies
+    per call. Leaving it out keeps an access change from starting a pod and
+    a pod from acting on a level its connector no longer has.
+    """
+    out = dict(config or {})
+    if spec.credential_delivery == "lease":
+        out.pop("access", None)
+    return out
+
+
 def service_request(
     identity: ServicePodIdentity,
     *,
@@ -251,7 +265,7 @@ def service_request(
         "protocol_version": PROTOCOL_VERSION,
         "plane": "service",
         "driver": spec.name,
-        "connector": {"id": identity.connector_id, "config": dict(config)},
+        "connector": {"id": identity.connector_id, "config": pod_config(spec, config)},
         "credentials": dict(credentials or {}) if held else {},
         "service": {"port": spec.service.port, "port_name": SERVICE_PORT_NAME},
         "exchange": {
@@ -357,6 +371,7 @@ def build_service_launch(
     mcp = managed_mcp(spec)
     if mcp is not None and not _DIGEST_REFERENCE.fullmatch(policy.front_image or ""):
         raise ServiceLaunchError("no managed MCP front image is pinned by digest")
+    config = pod_config(spec, config)
     program = [*entrypoint, *cmd]
     if mcp is not None and mcp.command:
         program = list(mcp.command)
@@ -840,6 +855,7 @@ __all__ = [
     "endpoint_service_name",
     "endpoint_url",
     "label_value",
+    "pod_config",
     "service_request",
     "service_resources",
 ]

@@ -731,6 +731,8 @@ class FakeRuntime:
         self.deleted: list[str] = []
         #: Endpoint Service name -> the identity its selector names.
         self.endpoints: dict[str, str] = {}
+        #: Set by a test: pointing an endpoint Service elsewhere fails.
+        self.endpoint_sync_fails = False
 
     async def service_cluster_ip(self, name, namespace):
         if (name, namespace) not in self.cluster_ips:
@@ -764,8 +766,13 @@ class FakeRuntime:
         name = body["metadata"]["name"]
         target = body["spec"]["selector"]["srw.io/driver-identity"]
         changed = self.endpoints.get(name) != target
+        if changed and self.endpoint_sync_fails and name in self.endpoints:
+            raise ServiceRuntimeError(f"pointing {name} at its pod failed")
         self.endpoints[name] = target
         return changed
+
+    async def endpoint_target(self, name):
+        return self.endpoints.get(name)
 
     async def endpoint_services(self):
         return list(self.endpoints)
@@ -1679,6 +1686,171 @@ async def test_a_re_pin_at_the_installation_cap_leaves_the_pod_unmarked(db, reco
             pod["id"],
         )
     assert replaced is None
+    # The failed re-pin backs off: the next pass does not try again ...
+    assert (await reconciler.reconcile_once()).capacity == 0
+    # ... until another interval has passed.
+    reconciler.offset[0] = timedelta(seconds=602)
+    assert (await reconciler.reconcile_once()).capacity == 1
+
+
+async def _two_address_pod(db, reconciler) -> tuple[str, dict]:
+    """A serving pod whose one host was pinned at two addresses."""
+    reconciler.addresses["one.one.one.one"] = ["1.1.1.1", "1.0.0.1"]
+    connector, pod = await _serving_pod(db, reconciler)
+    assert json.loads(pod["egress"])["hosts"][0]["addresses"] == [
+        "1.0.0.1",
+        "1.1.1.1",
+    ]
+    return connector, pod
+
+
+@pytest.mark.asyncio
+async def test_a_rotating_answer_that_keeps_a_pinned_address_rolls_nothing(
+    db, reconciler
+):
+    """DNS round-robin answers a different subset each time: while an
+    answer still holds a pinned address the pod can reach its upstream, so
+    nothing is replaced; only an answer seen twice in a row is adopted."""
+    _connector, pod = await _two_address_pod(db, reconciler)
+    for step, answer in enumerate(
+        (["1.1.1.1", "9.9.9.9"], ["1.0.0.1", "9.9.9.9"], ["1.1.1.1", "8.8.8.8"]),
+        start=1,
+    ):
+        reconciler.addresses["one.one.one.one"] = answer
+        reconciler.offset[0] = timedelta(seconds=301 * step)
+        report = await reconciler.reconcile_once()
+        assert report.started == [] and report.stopped == [], answer
+    (pod,) = await _pods(db)
+    assert pod["replaced_at"] is None
+    # The same changed answer twice in a row: the upstream did move.
+    reconciler.offset[0] = timedelta(seconds=301 * 4)
+    report = await reconciler.reconcile_once()
+    assert len(report.started) == 1
+    old, new = await _pods(db)
+    assert old["replaced_at"] is not None
+    assert json.loads(new["egress"])["hosts"][0]["addresses"] == [
+        "1.1.1.1",
+        "8.8.8.8",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_answer_sharing_no_pinned_address_replaces_at_once(db, reconciler):
+    _connector, _pod = await _two_address_pod(db, reconciler)
+    reconciler.addresses["one.one.one.one"] = ["9.9.9.9"]
+    reconciler.offset[0] = timedelta(seconds=301)
+    report = await reconciler.reconcile_once()
+    assert len(report.started) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_answer_forgets_an_earlier_changed_one(db, reconciler):
+    """Seen twice means in a row: back to the pinned set in between and the
+    earlier sighting no longer counts."""
+    _connector, _pod = await _two_address_pod(db, reconciler)
+    for step, answer in enumerate(
+        (["1.1.1.1", "9.9.9.9"], ["1.0.0.1", "1.1.1.1"], ["1.1.1.1", "9.9.9.9"]),
+        start=1,
+    ):
+        reconciler.addresses["one.one.one.one"] = answer
+        reconciler.offset[0] = timedelta(seconds=301 * step)
+        assert (await reconciler.reconcile_once()).started == [], answer
+
+
+@pytest.mark.asyncio
+async def test_a_range_refused_later_stops_a_pod_pinned_into_it(db, reconciler):
+    """refusedCidrs grows (a node or load balancer moved into an upstream's
+    range): a pod that pinned an address in it stops at once, and its
+    replacement is refused instead of pinning it again."""
+    _connector, pod = await _serving_pod(db, reconciler)
+    reconciler.settings = dataclasses.replace(
+        reconciler.settings,
+        refused_cidrs=(*reconciler.settings.refused_cidrs, "1.1.1.0/24"),
+    )
+    report = await reconciler.reconcile_once()
+    assert report.stopped == [(str(pod["id"]), "egress_withdrawn")]
+    assert report.started == []
+    assert any("1.1.1.1" in reason for _connector_id, reason in report.refused)
+    (pod, refused) = await _pods(db)
+    assert pod["revoke_reason"] == "egress_withdrawn"
+    assert refused["revoke_reason"] == "launch_refused"
+
+
+@pytest.mark.asyncio
+async def test_the_current_generation_takes_the_endpoint_back(db, reconciler):
+    """A config change and back: the first pod is the current generation
+    again, so the endpoint returns to it, not to the newer superseded pod."""
+    first_config = {"host": "one.one.one.one", "port": 443}
+    connector, first = await _serving_pod(db, reconciler)
+    name = endpoint_service_name(connector, D1)
+    await _set_config(db, connector, {**first_config, "message": "v2"})
+    await reconciler.reconcile_once()
+    _first, second = await _pods(db)
+    reconciler.fake.ready(str(second["id"]))
+    await reconciler.reconcile_once()
+    assert reconciler.fake.endpoints[name] == str(second["id"])
+    await _set_config(db, connector, first_config)
+    report = await reconciler.reconcile_once()
+    assert report.started == []
+    assert reconciler.fake.endpoints[name] == str(first["id"])
+    first, second = await _pods(db)
+    assert first["idle_since"] is None and second["idle_since"] is not None
+
+
+@pytest.mark.asyncio
+async def test_an_access_change_starts_no_pod_for_a_lease_driver(db, reconciler):
+    """The pod applies each lease's access: a connector's access level is
+    not in its generation, nor in the config the pod is given."""
+    thread = await _thread(db)
+    connector, pod = await _serving_pod(db, reconciler, thread)
+    await _set_config(
+        db, connector, {"host": "one.one.one.one", "port": 443, "access": "ReadOnly"}
+    )
+    report = await reconciler.reconcile_once()
+    assert report.started == [] and report.stopped == []
+    (same,) = await _pods(db)
+    assert same["credential_generation"] == pod["credential_generation"]
+    # A pod started with the access set is given no access either.
+    await _end(db, thread)
+    await reconciler.reconcile_once()
+    reconciler.offset[0] = timedelta(seconds=61)
+    assert (await reconciler.reconcile_once()).stopped == [(str(pod["id"]), "idle")]
+    await _bind_echo(db, connector, await _thread(db))
+    (started,) = (await reconciler.reconcile_once()).started
+    plan = reconciler.fake.plans[started]
+    request = json.loads(base64.b64decode(plan.secret["data"]["request.json"]))
+    assert request["connector"]["config"] == {"host": "one.one.one.one", "port": 443}
+
+
+@pytest.mark.asyncio
+async def test_the_old_pod_serves_until_its_endpoint_names_the_replacement(
+    db, reconciler
+):
+    """Moving the endpoint Service failed: the drain is over, but stopping
+    the old pod would leave the endpoint naming a pod that is gone."""
+    connector, old = await _serving_pod(db, reconciler)
+    name = endpoint_service_name(connector, D1)
+    reconciler.addresses["one.one.one.one"] = ["1.0.0.1"]
+    reconciler.offset[0] = timedelta(seconds=301)
+    await reconciler.reconcile_once()
+    _old, new = await _pods(db)
+    # ready_at is database time: the drain counts from now.
+    reconciler.offset[0] = timedelta()
+    reconciler.fake.endpoint_sync_fails = True
+    reconciler.fake.ready(str(new["id"]))
+    await reconciler.reconcile_once()
+    reconciler.offset[0] = timedelta(seconds=31)
+    report = await reconciler.reconcile_once()
+    assert report.stopped == []
+    assert reconciler.fake.endpoints[name] == str(old["id"])
+    # The Service moves on the next pass that can; the pass after it stops
+    # the old pod.
+    reconciler.fake.endpoint_sync_fails = False
+    report = await reconciler.reconcile_once()
+    assert report.stopped == []
+    assert reconciler.fake.endpoints[name] == str(new["id"])
+    report = await reconciler.reconcile_once()
+    assert report.stopped == [(str(old["id"]), "egress_repinned")]
 
 
 @pytest.mark.asyncio

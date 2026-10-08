@@ -27,24 +27,31 @@ Each leader-gated pass:
 3. records readiness; a pod not ready within the start timeout, or gone, is
    stopped (and replaced by the next pass while bindings remain);
 4. stops a pod at once when what its policy opens is no longer allowed:
-   the connector's projects lost private addresses, or its declared egress
-   (hosts, ports) changed; it does not drain;
+   the connector's projects lost private addresses, its declared egress
+   (hosts, ports) changed, or an address it pinned is one the installation
+   refuses now (a range added to ``refusedCidrs``); it does not drain;
 5. marks a pod idle when its last binding ends, or when a newer generation of
    its connector supersedes it for a digest or credential change (it drains
    its bindings for the idle time), and stops it after ``idleSeconds``: the
    identity is revoked first, so the exchange refuses it at once, then the
-   objects are deleted and their absence recorded;
+   objects are deleted and their absence recorded. A lease driver's
+   generation leaves ``access`` out: its pod applies each lease's access,
+   so an access change starts no pod;
 6. re-resolves a serving pod's pinned hosts every ``reresolveSeconds``
    (D5a): a shared pod with live bindings never idles, so it would never
-   pick up an upstream that moved. When an address set changed, a
+   pick up an upstream that moved. When a host's answer shares no address
+   with what was pinned, or the same changed answer comes twice in a row
+   (a rotating answer that still includes a pinned address does not), a
    replacement starts for the same key with the new policy and
    hostAliases (the old pod is marked ``replaced_at`` and keeps serving),
    and the old pod stops ``repinDrainSeconds`` after the replacement is
-   ready;
+   ready and its endpoint Service names it. A replacement that does not
+   start waits another interval;
 7. keeps one ingress policy per binding for a workspace-facing driver,
    admitting only that binding's workspace;
 8. keeps one endpoint Service per connector and digest with a live pod,
-   pointing at the pod that serves now (the newest ready one): callers
+   pointing at the pod that serves now (the newest ready one of the
+   connector's current generation, else the newest ready one): callers
    reach the connector by that stable name while pods are replaced;
 9. deletes every object it manages that no live row names (a connector
    delete cascades its identities; this removes their pods).
@@ -77,6 +84,7 @@ from orchestrator.services.connector_egress import (
     expand_rule,
     pin_egress,
     private_addresses_allowed,
+    refusal,
     system_resolver,
 )
 from orchestrator.services.connector_service_images import (
@@ -91,6 +99,8 @@ from orchestrator.services.connector_service_launch import (
     binding_ingress_policy,
     build_service_launch,
     endpoint_service,
+    endpoint_service_name,
+    pod_config,
 )
 from orchestrator.services.pinned_k8s_effect import (
     run_bounded_k8s_call,
@@ -459,6 +469,23 @@ class ServicePodRuntime:
             raise ServiceRuntimeError(f"pointing {name} at its pod failed") from None
         return True
 
+    async def endpoint_target(self, name: str) -> str | None:
+        """The pod identity an endpoint Service's selector names now, or
+        ``None`` when the Service does not exist."""
+        try:
+            current = await run_bounded_k8s_call(
+                self.core_api.read_namespaced_service,
+                name=name,
+                namespace=self.namespace,
+            )
+        except Exception as exc:
+            if _status(exc) == 404:
+                return None
+            raise ServiceRuntimeError(f"reading {name} failed") from None
+        selector = _field(_field(current, "spec"), "selector") or {}
+        target = dict(selector).get("srw.io/driver-identity")
+        return str(target) if target else None
+
     async def endpoint_services(self) -> list[str]:
         """The names of every endpoint Service this hosting created."""
         listed = await run_bounded_k8s_call(
@@ -690,8 +717,9 @@ def credential_generation(
     """A keyed fingerprint of what a pod's immutable Secret and policy hold.
 
     A driver holding its credential in the pod includes it; a lease driver
-    does not (its pod exchanges each binding's lease). The egress tier is in
-    it too, so a project tier change starts a pod with the new policy.
+    does not (its pod exchanges each binding's lease), nor its ``access``
+    (each lease carries its own, see :func:`pod_config`). The egress tier is
+    in it too, so a project tier change starts a pod with the new policy.
     """
     from orchestrator.security.crypto import credential_fingerprint
 
@@ -699,7 +727,7 @@ def credential_generation(
     canonical = json.dumps(
         {
             "driver": spec.name,
-            "config": connector.get("config") or {},
+            "config": pod_config(spec, connector.get("config")),
             "credentials": (connector.get("credentials") or {}) if held else None,
             "private_allowed": private_allowed,
         },
@@ -716,12 +744,15 @@ def egress_withdrawn(
     recorded: Any,
     *,
     private_allowed: bool,
+    policy: EgressPolicy | None = None,
 ) -> str | None:
     """Why a running pod's pinned egress opens more than is allowed now.
 
     A pod's policy is fixed when it starts. It may not keep private addresses
     its connector's projects lost, nor destinations its connector's config no
-    longer declares: such a pod stops at once instead of draining. ``None``
+    longer declares, nor (given the installation's current ``policy``) an
+    address that policy refuses now, such as one in a range added to
+    ``refusedCidrs``: such a pod stops at once instead of draining. ``None``
     when its egress still holds (or nothing was pinned to compare).
     """
     if connector is None:
@@ -747,6 +778,19 @@ def egress_withdrawn(
     )
     if declared != pinned:
         return "its declared egress changed"
+    if policy is not None:
+        for item in recorded.get("hosts") or ():
+            for address in item.get("addresses") or ():
+                try:
+                    network = ipaddress.ip_network(str(address), strict=False)
+                except ValueError:
+                    return f"its pinned address {address!r} is not an address"
+                reason = refusal(network, policy)
+                if reason:
+                    return (
+                        f"its pinned address {address} for {item.get('host')} "
+                        f"{reason} now"
+                    )
     return None
 
 
@@ -776,18 +820,47 @@ def _address_sets(recorded: Any) -> dict[tuple, tuple[bool, frozenset[str]]]:
     }
 
 
-def _serving(rows: list[Mapping[str, Any]]) -> Mapping[str, Any]:
-    """The pod a connector's endpoint at one digest points at: the newest
-    ready pod not being replaced, else the newest ready one, else the newest
-    (which gets traffic once it is ready). Newer pods supersede older ones:
-    a new credential generation, a re-pin's replacement, a lost pod's."""
+def _moved(
+    pinned: Mapping[tuple, tuple[bool, frozenset[str]]],
+    fresh: Mapping[tuple, tuple[bool, frozenset[str]]],
+) -> bool:
+    """Whether a host's new answer shares no address with what was pinned
+    (or a host is not pinned at all): the pod cannot reach it any more."""
+    if set(pinned) != set(fresh):
+        return True
+    return any(
+        not (pinned[key][1] & fresh[key][1]) for key in pinned if not pinned[key][0]
+    )
+
+
+def _serving(
+    rows: list[Mapping[str, Any]], generation: str | None = None
+) -> Mapping[str, Any]:
+    """The pod a connector's endpoint at one digest points at.
+
+    The newest ready pod of the connector's current ``generation`` not being
+    replaced, else the newest ready one of it; failing those, the newest
+    ready pod of any generation not being replaced, the newest ready one,
+    and last the newest (which gets traffic once it is ready). A pod of the
+    current generation wins over a newer superseded one: after a config
+    change and back, the older pod is the current one again. Within a
+    generation newer pods supersede older ones (a re-pin's replacement, a
+    lost pod's).
+    """
 
     def newest(candidates: list[Mapping[str, Any]]) -> Mapping[str, Any] | None:
         return max(candidates, key=lambda row: row["created_at"], default=None)
 
     ready = [row for row in rows if row["ready_at"] is not None]
+    current = [
+        row
+        for row in ready
+        if generation is not None and str(row["credential_generation"]) == generation
+    ]
     return (
-        newest([row for row in ready if row["replaced_at"] is None])
+        newest([row for row in current if row["replaced_at"] is None])
+        or newest(current)
+        or newest([row for row in ready if row["replaced_at"] is None])
         or newest(ready)
         or newest(rows)
     )
@@ -839,7 +912,7 @@ class ServiceHostingReconciler:
         settings: ServiceHostingSettings,
         resolver: Callable[[str, bool], Any] = system_resolver,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-        strikes: dict[str, int] | None = None,
+        strikes: dict[str, Any] | None = None,
     ) -> None:
         self.store = store
         self.runtime = runtime
@@ -847,8 +920,11 @@ class ServiceHostingReconciler:
         self.settings = settings
         self.resolver = resolver
         self.clock = clock
-        #: Passes in a row the cluster check failed; shared across the
-        #: per-pass reconcilers of one loop.
+        #: What one pass remembers for the next, shared across the per-pass
+        #: reconcilers of one loop: ``"cluster"``, the passes in a row the
+        #: cluster check failed; ``"repin:<identity>"``, the changed answer
+        #: a pod's last re-resolution saw. A new leader starts afresh, which
+        #: only delays a re-pin by an interval.
         self.strikes = strikes if strikes is not None else {}
 
     def _service_specs(self) -> dict[str, DriverSpec]:
@@ -1149,20 +1225,23 @@ class ServiceHostingReconciler:
             f", replacing {replaces} after a re-pin" if replaces else "",
         )
 
-    async def _pin(
-        self, spec: DriverSpec, config: Mapping[str, Any], *, private_allowed: bool
-    ) -> EgressPins:
-        """Resolve and check the spec's egress for one connector's config."""
-        policy = EgressPolicy.build(
+    def _policy(self, private_allowed: bool) -> EgressPolicy:
+        """What a pod's egress may reach on this installation now."""
+        return EgressPolicy.build(
             self.settings.cluster_cidrs,
             allow_private=private_allowed,
             ipv6=self.settings.ipv6,
             refused_cidrs=self.settings.refused_cidrs,
         )
+
+    async def _pin(
+        self, spec: DriverSpec, config: Mapping[str, Any], *, private_allowed: bool
+    ) -> EgressPins:
+        """Resolve and check the spec's egress for one connector's config."""
         return await pin_egress(
             spec.egress,
             config,
-            policy=policy,
+            policy=self._policy(private_allowed),
             needs_dns=spec.needs_dns,
             resolver=self.resolver,
             now=self.clock,
@@ -1321,7 +1400,11 @@ class ServiceHostingReconciler:
                 continue
             connector, private = await connector_state(str(row["connector_id"]))
             withdrawn = egress_withdrawn(
-                spec, connector, row["egress"], private_allowed=private
+                spec,
+                connector,
+                row["egress"],
+                private_allowed=private,
+                policy=self._policy(private),
             )
             if withdrawn is not None:
                 logger.warning(
@@ -1376,7 +1459,9 @@ class ServiceHostingReconciler:
                 report=report,
             )
         await self._sync_binding_policies(bindings, specs)
-        await self._sync_endpoints(specs)
+        await self._sync_endpoints(
+            specs, {key: generation for key, (generation, _, _) in current.items()}
+        )
         report.swept = await self._sweep()
         return report
 
@@ -1386,6 +1471,16 @@ class ServiceHostingReconciler:
         if interval <= 0 or resolved is None:
             return False
         return (self.clock() - resolved).total_seconds() >= interval
+
+    async def _endpoint_target(self, row: Mapping[str, Any]) -> str | None:
+        """The identity the endpoint Service of a pod's connector and digest
+        names now; ``None`` when it is missing or cannot be read."""
+        name = endpoint_service_name(str(row["connector_id"]), str(row["image_digest"]))
+        try:
+            return await self.runtime.endpoint_target(name)
+        except Exception as exc:
+            logger.warning("Endpoint Service %s not read (%s)", name, exc)
+            return None
 
     async def _repin(
         self,
@@ -1398,19 +1493,29 @@ class ServiceHostingReconciler:
         report: ReconcileReport,
     ) -> None:
         """Re-resolve the pinned hosts of the pods that serve bindings, and
-        replace a pod whose addresses changed.
+        replace a pod whose upstream moved.
 
         A shared pod with live bindings never goes idle, so it never rolls
         on its own: an upstream that moved would stay unreachable. Every
-        ``reresolveSeconds`` its hosts are resolved again; when an address
-        set changed, a replacement starts for the same key with the new
-        policy and hostAliases, the endpoint Service moves to it once it is
-        ready, and the old pod stops ``repinDrainSeconds`` later. The old
-        pod serves throughout, so a caller loses at most the requests in
-        flight at the switch (and a stateful MCP session, which its client
-        starts again). A host that no longer resolves, or resolves to an
-        address SRW refuses, keeps the addresses already pinned.
+        ``reresolveSeconds`` its hosts are resolved again. A replacement
+        starts for the same key with the new policy and hostAliases when a
+        host's answer shares no address with what was pinned (the pod
+        cannot reach it), or when the same changed answer comes twice in a
+        row; a rotating answer that still holds a pinned address replaces
+        nothing, so DNS round-robin does not roll the pod every interval.
+        The endpoint Service moves to the replacement once it is ready, and
+        the old pod stops ``repinDrainSeconds`` later, once the Service is
+        seen to name another pod (if moving it failed, the old pod keeps
+        serving). The old pod serves throughout, so a caller loses at most
+        the requests in flight at the switch (and a stateful MCP session,
+        which its client starts again). A host that no longer resolves, or
+        resolves to an address SRW refuses, keeps the addresses already
+        pinned; a replacement that could not start waits another interval.
         """
+        live = {str(row["id"]) for row in survivors if row["replaced_at"] is None}
+        for key in [k for k in self.strikes if k.startswith("repin:")]:
+            if key.removeprefix("repin:") not in live:
+                self.strikes.pop(key, None)
         replacements: dict[tuple[str, str, str], Mapping[str, Any]] = {}
         for row in survivors:
             if row["replaced_at"] is None and row["ready_at"] is not None:
@@ -1421,11 +1526,20 @@ class ServiceHostingReconciler:
         for row in survivors:
             if row["replaced_at"] is not None:
                 replacement = replacements.get(_pod_key(row))
-                if replacement is not None and (
+                if replacement is None or (
                     (self.clock() - replacement["ready_at"]).total_seconds()
-                    >= self.settings.repin_drain_seconds
+                    < self.settings.repin_drain_seconds
                 ):
-                    await self._stop(row, EGRESS_REPINNED, report)
+                    continue
+                target = await self._endpoint_target(row)
+                if target is None or target == str(row["id"]):
+                    logger.warning(
+                        "Driver pod %s keeps serving: its endpoint Service does "
+                        "not name its replacement yet",
+                        row["pod_name"],
+                    )
+                    continue
+                await self._stop(row, EGRESS_REPINNED, report)
                 continue
             if (
                 str(row["id"]) not in active_ids
@@ -1469,12 +1583,20 @@ class ServiceHostingReconciler:
         *,
         private: bool,
     ) -> EgressPins | None:
-        """The pod's pins resolved again when an address set changed;
-        otherwise ``None``, with the resolution time recorded."""
+        """The pod's pins resolved again when its upstream moved; otherwise
+        ``None``.
+
+        Moved: a host's answer shares no address with what was pinned, or
+        the answer differs from what was pinned and equals the one the last
+        re-resolution saw. The resolution time is recorded either way, so a
+        replacement that does not start is tried again an interval later,
+        not every pass.
+        """
         recorded = row["egress"]
         if isinstance(recorded, str):
             recorded = json.loads(recorded)
         pinned = _address_sets(recorded)
+        sighting = f"repin:{row['id']}"
         pins: EgressPins | None = None
         if any(not literal for literal, _ in pinned.values()):
             try:
@@ -1488,8 +1610,24 @@ class ServiceHostingReconciler:
                     row["pod_name"],
                     exc,
                 )
-        if pins is not None and _address_sets(pins.record()) != pinned:
-            return pins
+        moved: EgressPins | None = None
+        if pins is not None:
+            fresh = _address_sets(pins.record())
+            if fresh == pinned:
+                self.strikes.pop(sighting, None)
+            elif _moved(pinned, fresh) or self.strikes.get(sighting) == fresh:
+                self.strikes.pop(sighting, None)
+                moved = pins
+            else:
+                # It still answers a pinned address: wait for a second
+                # look before rolling a pod that serves.
+                self.strikes[sighting] = fresh
+                logger.info(
+                    "Driver pod %s: a pinned host answers other addresses that "
+                    "still include a pinned one; replacing it if the next "
+                    "resolution agrees",
+                    row["pod_name"],
+                )
         async with self.store.acquire() as conn:
             await conn.execute(
                 "UPDATE connector_driver_identities SET egress_resolved_at = $2 "
@@ -1497,11 +1635,18 @@ class ServiceHostingReconciler:
                 UUID(str(row["id"])),
                 self.clock(),
             )
-        return None
+        return moved
 
-    async def _sync_endpoints(self, specs: Mapping[str, DriverSpec]) -> None:
+    async def _sync_endpoints(
+        self,
+        specs: Mapping[str, DriverSpec],
+        generations: Mapping[tuple[str, str], str] | None = None,
+    ) -> None:
         """One endpoint Service per connector and digest with a live pod,
-        pointing at the pod that serves now; the rest are deleted."""
+        pointing at the pod that serves now (``generations``: each bound
+        connector and digest's current credential generation); the rest are
+        deleted."""
+        generations = generations or {}
         async with self.store.acquire() as conn:
             rows = await conn.fetch(_POD_ROWS + " AND revoked_at IS NULL")
         groups: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
@@ -1511,7 +1656,7 @@ class ServiceHostingReconciler:
                 groups.setdefault(key, []).append(row)
         desired: dict[str, dict] = {}
         for (connector_id, digest), group in groups.items():
-            serving = _serving(group)
+            serving = _serving(group, generations.get((connector_id, digest)))
             spec = specs[str(serving["driver"])]
             body = endpoint_service(
                 connector_id=connector_id,

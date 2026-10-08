@@ -411,6 +411,14 @@ def test_the_pods_secret_holds_no_upstream_credential_and_the_front_block():
     assert credential_generation(
         GITEA_MCP_SPEC, connector, private_allowed=False
     ) == credential_generation(GITEA_MCP_SPEC, rotated, private_allowed=False)
+    # Nor an access change: the front reads each lease's access.
+    read_only = {"config": {**CONFIG, "access": "ReadOnly"}, "credentials": {}}
+    assert credential_generation(
+        GITEA_MCP_SPEC, connector, private_allowed=False
+    ) == credential_generation(GITEA_MCP_SPEC, read_only, private_allowed=False)
+    given = _plan(config={**CONFIG, "access": "ReadOnly"})
+    request = json.loads(base64.b64decode(given.secret["data"]["request.json"]))
+    assert request["connector"]["config"] == CONFIG
 
 
 def test_only_agent_pods_and_the_orchestrator_reach_the_front():

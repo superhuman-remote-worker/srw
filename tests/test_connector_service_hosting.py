@@ -446,6 +446,17 @@ async def test_an_endpoint_is_created_then_pointed_at_another_pod(api, runtime):
 
 
 @pytest.mark.asyncio
+async def test_an_endpoints_target_is_read_from_its_selector(api, runtime):
+    name = _endpoint()["metadata"]["name"]
+    assert await runtime.endpoint_target(name) is None
+    await runtime.sync_endpoint(_endpoint())
+    assert await runtime.endpoint_target(name) == IDENTITY.identity_id
+    api.fail["read_namespaced_service"] = ApiError(500)
+    with pytest.raises(hosting.ServiceRuntimeError):
+        await runtime.endpoint_target(name)
+
+
+@pytest.mark.asyncio
 async def test_endpoints_are_listed_apart_from_any_pods_objects(api, runtime):
     await runtime.launch(_plan())
     await runtime.sync_endpoint(_endpoint())
@@ -585,6 +596,123 @@ class TestEgressWithdrawn:
     def test_a_gone_connector_is_withdrawn_and_no_record_compares_nothing(self):
         assert self._check(self._recorded(), None) == "its connector is gone"
         assert self._check(None, {"host": "x.example", "port": 1}) is None
+
+    def test_a_pinned_address_the_policy_refuses_now_is_withdrawn(self):
+        from orchestrator.services.connector_egress import EgressPolicy
+        from orchestrator.services.connector_service_hosting import egress_withdrawn
+
+        config = {"config": {"host": "one.one.one.one", "port": 443}}
+
+        def check(*refused: str, private: bool = False):
+            policy = EgressPolicy.build(
+                ("10.42.0.0/16", "10.43.0.0/16"),
+                allow_private=private,
+                refused_cidrs=refused,
+            )
+            return egress_withdrawn(
+                self._spec(),
+                config,
+                self._recorded(),
+                private_allowed=private,
+                policy=policy,
+            )
+
+        assert check() is None
+        assert check("10.0.50.0/24") is None
+        found = check("10.0.50.0/24", "1.1.1.0/24")
+        assert found is not None and "1.1.1.1" in found and "refuses" in found
+
+
+def test_a_re_resolution_moves_only_when_no_pinned_address_answers():
+    from orchestrator.services.connector_service_hosting import _moved
+
+    key = ("one.one.one.one", (443,), "tcp")
+    literal = ("192.0.2.0/24", (443,), "tcp")
+    pinned = {
+        key: (False, frozenset({"1.1.1.1", "1.0.0.1"})),
+        literal: (True, frozenset({"192.0.2.0/24"})),
+    }
+
+    def fresh(*addresses):
+        return {**pinned, key: (False, frozenset(addresses))}
+
+    assert not _moved(pinned, fresh("1.1.1.1", "9.9.9.9"))
+    assert not _moved(pinned, fresh("1.0.0.1"))
+    assert _moved(pinned, fresh("9.9.9.9", "8.8.8.8"))
+    # A host the pod never pinned (or lost) is a move.
+    assert _moved(pinned, {key: pinned[key]})
+
+
+def test_the_endpoint_ranks_the_current_generation_first():
+    from datetime import datetime, timedelta, timezone
+
+    from orchestrator.services.connector_service_hosting import _serving
+
+    t0 = datetime(2026, 10, 8, tzinfo=timezone.utc)
+
+    def pod(name, generation, minutes, *, ready=True, replaced=False):
+        return {
+            "id": name,
+            "credential_generation": generation,
+            "created_at": t0 + timedelta(minutes=minutes),
+            "ready_at": t0 if ready else None,
+            "replaced_at": t0 if replaced else None,
+        }
+
+    old_a = pod("a", "A", 0)
+    new_b = pod("b", "B", 5)
+    assert _serving([old_a, new_b])["id"] == "b"
+    assert _serving([old_a, new_b], "A")["id"] == "a"
+    assert _serving([old_a, new_b], "B")["id"] == "b"
+    # A current pod being replaced still beats a superseded generation; its
+    # ready replacement beats it.
+    replaced_a = pod("a", "A", 0, replaced=True)
+    assert _serving([replaced_a, new_b], "A")["id"] == "a"
+    assert _serving([replaced_a, new_b, pod("a2", "A", 6)], "A")["id"] == "a2"
+    # No ready pod of the current generation: the newest ready one serves
+    # until it is.
+    assert _serving([pod("a", "A", 9, ready=False), new_b], "A")["id"] == "b"
+    assert _serving([pod("a", "A", 9, ready=False)], "A")["id"] == "a"
+
+
+def test_a_lease_drivers_pod_is_never_given_an_access_level():
+    from orchestrator.services.connector_service_hosting import credential_generation
+    from orchestrator.services.connector_service_launch import pod_config
+    from shared.connectors.builtin import ECHO_SERVICE_SPEC
+
+    assert ECHO_SERVICE_SPEC.credential_delivery == "lease"
+    config = {"host": "one.one.one.one", "port": 443}
+    assert pod_config(ECHO_SERVICE_SPEC, {**config, "access": "ReadOnly"}) == config
+    assert pod_config(ECHO_SERVICE_SPEC, None) == {}
+
+    def generation(access):
+        return credential_generation(
+            ECHO_SERVICE_SPEC,
+            {"config": {**config, "access": access}},
+            private_allowed=False,
+        )
+
+    assert generation("ReadOnly") == generation("ReadWrite")
+
+
+def test_the_pod_key_index_is_built_without_if_not_exists():
+    """An invalid shell of a failed concurrent build must not count as
+    applied (0391 follows 0203's runbook)."""
+    from pathlib import Path
+
+    sql = (
+        Path(__file__).resolve().parents[1]
+        / "src/orchestrator/database/migrations/app"
+        / "0391_connector_service_pod_key_v2_idx.notx.sql"
+    ).read_text()
+    statement = "\n".join(
+        line for line in sql.splitlines() if not line.startswith("--")
+    ).strip()
+    assert statement.startswith(
+        "CREATE UNIQUE INDEX CONCURRENTLY uq_connector_driver_identities_serving_key"
+    )
+    assert "IF NOT EXISTS" not in statement
+    assert "indisvalid" in sql
 
 
 def test_hosting_settings_come_from_the_deployment():
