@@ -1363,6 +1363,10 @@ def golden():
 
 @pytest.mark.parametrize("case_id", list(CASES))
 def test_connector_api_matches_golden(case_id, golden, monkeypatch):
+    # A new generic file's default directory carries a fresh token; pin it.
+    from orchestrator.services.connector_drivers import credential_files
+
+    monkeypatch.setattr(credential_files, "new_directory_token", lambda: "0d1e0d1e")
     golden.check(case_id, run_case(CASES[case_id], monkeypatch))
 
 

@@ -1226,7 +1226,7 @@
               {
                 "name": "file-0",
                 "contents": "x",
-                "target_path": "/home/srw/.srw-files/service-account/file-0",
+                "target_path": "/home/srw/.srw-files/service-account-0d1e0d1e/file-0",
                 "mode": "0600"
               }
             ]
@@ -1289,7 +1289,7 @@
     },
     "status": 400,
     "body": {
-      "detail": "target_path '/etc/hosts' is outside the home: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/<app>/, ~/.netrc, ~/.pgpass"
+      "detail": "target_path '/etc/hosts' is outside the home: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/doctl/, ~/.config/gcloud/, ~/.config/hcloud/, ~/.config/helm/, ~/.config/sops/, ~/.netrc, ~/.pgpass"
     },
     "calls": []
   },
@@ -1312,7 +1312,7 @@
     },
     "status": 400,
     "body": {
-      "detail": "target_path '~/../../etc/passwd' is outside the home: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/<app>/, ~/.netrc, ~/.pgpass"
+      "detail": "target_path '~/../../etc/passwd' is outside the home: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/doctl/, ~/.config/gcloud/, ~/.config/hcloud/, ~/.config/helm/, ~/.config/sops/, ~/.netrc, ~/.pgpass"
     },
     "calls": []
   },
@@ -1335,7 +1335,7 @@
     },
     "status": 400,
     "body": {
-      "detail": "target_path '/opt/x' is outside the home: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/<app>/, ~/.netrc, ~/.pgpass"
+      "detail": "target_path '/opt/x' is outside the home: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/doctl/, ~/.config/gcloud/, ~/.config/hcloud/, ~/.config/helm/, ~/.config/sops/, ~/.netrc, ~/.pgpass"
     },
     "calls": []
   },
@@ -1358,7 +1358,7 @@
     },
     "status": 400,
     "body": {
-      "detail": "target_path '~/.bashrc' is not a credential-file location: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/<app>/, ~/.netrc, ~/.pgpass"
+      "detail": "target_path '~/.bashrc' is not a credential-file location: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/doctl/, ~/.config/gcloud/, ~/.config/hcloud/, ~/.config/helm/, ~/.config/sops/, ~/.netrc, ~/.pgpass"
     },
     "calls": []
   },
@@ -1429,7 +1429,7 @@
     },
     "status": 400,
     "body": {
-      "detail": "target_path '~/.ssh/config' is not a credential-file location: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/<app>/, ~/.netrc, ~/.pgpass"
+      "detail": "target_path '~/.ssh/config' is not a credential-file location: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/doctl/, ~/.config/gcloud/, ~/.config/hcloud/, ~/.config/helm/, ~/.config/sops/, ~/.netrc, ~/.pgpass"
     },
     "calls": []
   },
@@ -1452,7 +1452,7 @@
     },
     "status": 400,
     "body": {
-      "detail": "target_path '~/.local/bin/git' is not a credential-file location: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/<app>/, ~/.netrc, ~/.pgpass"
+      "detail": "target_path '~/.local/bin/git' is not a credential-file location: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/doctl/, ~/.config/gcloud/, ~/.config/hcloud/, ~/.config/helm/, ~/.config/sops/, ~/.netrc, ~/.pgpass"
     },
     "calls": []
   },
@@ -1475,7 +1475,7 @@
     },
     "status": 400,
     "body": {
-      "detail": "target_path '/tmp/x' is outside the home: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/<app>/, ~/.netrc, ~/.pgpass"
+      "detail": "target_path '/tmp/x' is outside the home: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/doctl/, ~/.config/gcloud/, ~/.config/hcloud/, ~/.config/helm/, ~/.config/sops/, ~/.netrc, ~/.pgpass"
     },
     "calls": []
   },
@@ -6470,7 +6470,7 @@
     },
     "status": 400,
     "body": {
-      "detail": "target_path '/etc/y' is outside the home: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/<app>/, ~/.netrc, ~/.pgpass"
+      "detail": "target_path '/etc/y' is outside the home: credential files go under ~/.kube/, ~/.aws/, ~/.azure/, ~/.docker/, ~/.srw-files/, ~/.config/doctl/, ~/.config/gcloud/, ~/.config/hcloud/, ~/.config/helm/, ~/.config/sops/, ~/.netrc, ~/.pgpass"
     },
     "calls": []
   },
