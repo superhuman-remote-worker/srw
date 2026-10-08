@@ -69,7 +69,12 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
   readonly    session two's ReadOnly binding of the stock image lists only
               Gitea's read tools; a call of create_repo is answered "Unknown
               tool" without reaching the server, and the exchange never saw a
-              write for that lease; session one's ReadWrite binding lists it
+              write for that lease; session one's ReadWrite binding lists it.
+              The D5a review's parsing-differential bodies (delete_file with
+              a "Name", "Method", "Params" or "paramſ" key beside the real
+              one) are refused as malformed (400) by the front before the
+              stock image sees them, and the well-formed delete_file is
+              "Unknown tool"
   replace     the notes pod is deleted mid-session: the agent's client keeps
               calling whoami and gets an answer from the new pod (a new pod
               name, the same token digest) without a tool error, reconnecting
@@ -535,6 +540,55 @@ print(json.dumps([
 """
 )
 
+# Raw JSON-RPC bodies against one endpoint with one bearer, after an
+# initialize (and its notification): each body is sent exactly as given
+# (UTF-8, never re-encoded), and each answer's status and whether it holds a
+# result come back (with its first bytes; the gate scrubs what it prints).
+_RAW_PROGRAM = (
+    _POD_MEMORY_CAP
+    + r"""
+import json, sys, urllib.error, urllib.request
+cap_memory()
+request = json.loads(sys.stdin.readline())
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+def post(body, session=None):
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "Authorization": "Bearer " + request["bearer"],
+    }
+    if session:
+        headers["Mcp-Session-Id"] = session
+    req = urllib.request.Request(
+        request["url"], data=body.encode("utf-8"), method="POST", headers=headers
+    )
+    try:
+        with opener.open(req, timeout=20) as response:
+            text = response.read(65536).decode("utf-8", "replace")
+            return response.status, response.headers.get("Mcp-Session-Id"), text
+    except urllib.error.HTTPError as error:
+        return error.code, None, error.read(65536).decode("utf-8", "replace")
+    except Exception as error:
+        return 0, None, type(error).__name__
+
+status, session, _ = post(json.dumps({
+    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+    "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+               "clientInfo": {"name": "srw-gate", "version": "1"}},
+}))
+out = {"initialize": status, "answers": []}
+if status == 200:
+    post(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}), session)
+    for body in request["bodies"]:
+        code, _, text = post(body, session)
+        out["answers"].append(
+            {"status": code, "result": '"result"' in text, "body": text[:240]}
+        )
+print(json.dumps(out))
+"""
+)
+
 # Whether any of the given secrets is held by a pod: in a process's
 # environment or command line, or in a file under the listed roots (files
 # up to 4 MiB; /proc, /sys and /dev are never walked). Counts only: never a
@@ -897,6 +951,59 @@ def readonly_verdict(read_only: dict, read_write_tools: list[str]) -> tuple[bool
     )
 
 
+def bypass_bodies(gate_id: str) -> list[str]:
+    """The D5a review's parsing-differential bodies, then a well-formed
+    control: each asks Gitea to run delete_file (a write tool) with a
+    ReadOnly lease. Go's encoding/json matches keys case-insensitively,
+    folds ``ſ`` to ``s`` and keeps the last duplicate; gitea-mcp reads exact
+    keys. A front that checked one reading and forwarded the caller's bytes
+    would let the server run the other. Harmless if one ever got through:
+    the connector's token is a random fake and the repository does not
+    exist."""
+    arguments = json.dumps(
+        {
+            "owner": gate_id,
+            "repo": gate_id,
+            "filepath": "README.md",
+            "message": "srw gate",
+            "sha": "0" * 40,
+            "branch": "main",
+        }
+    )
+    call = '"method":"tools/call","params":{"name":"delete_file","arguments":%s}'
+    return [
+        '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":'
+        '"delete_file","Name":"get_file_contents","arguments":%s}}' % arguments,
+        '{"jsonrpc":"2.0","id":12,"method":"tools/call","Method":"ping","params":'
+        '{"name":"delete_file","arguments":%s}}' % arguments,
+        '{"jsonrpc":"2.0","id":13,%s,"Params":{"name":"get_me"}}' % (call % arguments),
+        '{"jsonrpc":"2.0","id":14,%s,"paramſ":{"name":"get_me"}}' % (call % arguments),
+        '{"jsonrpc":"2.0","id":15,%s}' % (call % arguments),
+    ]
+
+
+def bypass_verdict(result: dict) -> tuple[bool, str]:
+    """Every differential body is refused as malformed (400) before the
+    server; the well-formed control is the front's "Unknown tool". None of
+    them holds a result."""
+    answers = result.get("answers") or []
+    statuses = [answer.get("status") for answer in answers]
+    control = answers[-1] if answers else {}
+    ok = (
+        result.get("initialize") == 200
+        and len(answers) == 5
+        and statuses[:4] == [400] * 4
+        and control.get("status") == 200
+        and "Unknown tool" in (control.get("body") or "")
+        and not any(answer.get("result") for answer in answers)
+    )
+    return ok, (
+        f"initialize={result.get('initialize')} statuses={statuses} "
+        f"results={[bool(a.get('result')) for a in answers]} "
+        f"control={(control.get('body') or '')[:120]}"
+    )
+
+
 class Api:
     def __init__(self, username: str, password: str) -> None:
         self.username = username
@@ -1006,7 +1113,8 @@ PLAN = [
     "connector get 401 from both endpoints",
     "workspace: session one's workspace cannot connect to either endpoint",
     "readonly: session two's ReadOnly Gitea binding lists only read tools and "
-    "create_repo is refused without a write exchange; session one lists it",
+    "create_repo is refused without a write exchange; session one lists it; "
+    "the parsing-differential delete_file bodies are refused 400 by the front",
     "replace: the notes pod is deleted mid-session; the client reconnects within "
     "its budget, waits for the new pod and answers without a tool error; the "
     "endpoint names the new pod",
@@ -1819,6 +1927,25 @@ class ManagedMcpGate:
             "only read tools; create_repo is answered 'Unknown tool' by the front; "
             "session one's ReadWrite binding lists every write tool",
             ok and lease.get("access") == "ReadOnly",
+            detail,
+        )
+        raw = in_pod(
+            self.agent_pod(),
+            AGENT_CONTAINER,
+            _RAW_PROGRAM,
+            {
+                "url": self.endpoint("gitea-ro"),
+                "bearer": self.lease_token("gitea-ro", "two"),
+                "bodies": bypass_bodies(self.gate_id),
+            },
+        )
+        ok, detail = bypass_verdict(raw)
+        self.report.check(
+            "readonly: the parsing-differential bodies (a Name, Method, Params or "
+            "paramſ key beside the real one) asking the stock image to run "
+            "delete_file are refused as malformed by the front; the well-formed "
+            "call is 'Unknown tool'; none holds a result",
+            ok,
             detail,
         )
         writes = sql(

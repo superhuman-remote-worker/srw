@@ -23,6 +23,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -367,6 +368,38 @@ async def test_a_lease_revoked_mid_session_is_said_so_and_spends_no_reconnects(p
         assert handle.status == "connected" and handle.refused_lease is None
     finally:
         await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_the_gates_bypass_bodies_are_refused_by_the_real_front(pod):
+    """The k3d gate's raw-body program and verdict, here against the real
+    front: the review's four differential bodies are refused as malformed
+    and the well-formed write call is 'Unknown tool' for a ReadOnly lease."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "k3d_managed_mcp_gate", ROOT / "scripts" / "k3d-managed-mcp-gate.py"
+    )
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    payload = {
+        "url": pod.url,
+        "bearer": pod.exchange.issue("ReadOnly"),
+        "bodies": gate.bypass_bodies("d5a-0123456789"),
+    }
+    done = await asyncio.to_thread(
+        subprocess.run,
+        [sys.executable, "-c", gate._RAW_PROGRAM],
+        input=json.dumps(payload) + "\n",
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    result = json.loads(done.stdout.splitlines()[-1])
+    ok, detail = gate.bypass_verdict(result)
+    assert ok, detail
+    assert ("/v1/leases/exchange", "write") not in pod.exchange.calls
+    assert "refused a malformed message" in pod.logs.read_text()
 
 
 def _status(url: str, token: str) -> int:

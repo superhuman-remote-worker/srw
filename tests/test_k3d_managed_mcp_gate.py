@@ -30,6 +30,7 @@ PROGRAMS = {
     "scan": gate._SCAN_PROGRAM,
     "keycloak": gate._KEYCLOAK_PROGRAM,
     "hash": gate._HASH_PROGRAM,
+    "raw": gate._RAW_PROGRAM,
 }
 CONNECTOR = "66666666-7777-4888-8999-aaaaaaaaaaaa"
 DIGEST = "sha256:" + "ab" * 32
@@ -289,6 +290,42 @@ def test_the_readonly_verdict():
     assert not gate.readonly_verdict(forwarded, read_write)[0]
     assert not gate.readonly_verdict(good, sorted(GITEA_MCP_READ_TOOLS))[0]
     assert not gate.readonly_verdict({**good, "tools": []}, read_write)[0]
+
+
+def test_the_bypass_bodies_are_the_reviewers_four_and_a_control():
+    bodies = gate.bypass_bodies("d5a-0123456789")
+    assert len(bodies) == 5
+    for body in bodies:
+        # Valid JSON to an exact-key reader, which runs delete_file.
+        parsed = json.loads(body)
+        assert parsed["method"] == "tools/call"
+        assert parsed["params"]["name"] == "delete_file"
+        assert parsed["params"]["arguments"]["repo"] == "d5a-0123456789"
+    extra = [
+        set(json.loads(body)) - {"jsonrpc", "id", "method", "params"} for body in bodies
+    ]
+    assert extra == [set(), {"Method"}, {"Params"}, {"paramſ"}, set()]
+    assert '"Name":"get_file_contents"' in bodies[0]
+    # The folded key is sent as UTF-8, not as a JSON escape.
+    assert "paramſ" in bodies[3] and "\\u017f" not in bodies[3]
+
+
+def test_the_bypass_verdict():
+    refused = {"status": 400, "result": False, "body": '{"error":"..."}'}
+    control = {
+        "status": 200,
+        "result": False,
+        "body": '{"error":{"code":-32602,"message":"Unknown tool: delete_file"}}',
+    }
+    good = {"initialize": 200, "answers": [refused] * 4 + [control]}
+    assert gate.bypass_verdict(good)[0]
+    ran = {"status": 200, "result": True, "body": '{"result":{"isError":true}}'}
+    assert not gate.bypass_verdict(
+        {**good, "answers": [ran] + [refused] * 3 + [control]}
+    )[0]
+    assert not gate.bypass_verdict({**good, "answers": [refused] * 4 + [ran]})[0]
+    assert not gate.bypass_verdict({**good, "initialize": 401})[0]
+    assert not gate.bypass_verdict({**good, "answers": [refused] * 4})[0]
 
 
 def test_secrets_reach_the_cluster_only_on_stdin(monkeypatch):
