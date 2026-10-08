@@ -274,6 +274,27 @@ connectors:
       # maxInstallation, whatever this says.
       secrets: 64
       services: 48
+  # -- The in-pod plane (connector drivers D7), a SPIKE PROTOTYPE: a FUSE
+  # mount in a workspace Pod from two native sidecars, so the workspace
+  # container needs no FUSE and never holds the cloud credential. The opener
+  # (docker/Dockerfile.in-pod-mount, target opener) is privileged and only
+  # opens /dev/fuse, mounts and passes the descriptor on; rclone (target
+  # rclone) runs unprivileged and holds the credential. The workspace
+  # namespace must admit privileged Pods, as it does for the FUSE profile.
+  # Nothing asks for a mount yet; scripts/k3d-in-pod-plane-spike.py runs the
+  # sidecars directly. Off by default.
+  inPodPlane:
+    enabled: false
+    opener:
+      image:
+        repository: ""
+        tag: ""
+        digest: ""
+    rclone:
+      image:
+        repository: ""
+        tag: ""
+        digest: ""
   # -- Driver images users register themselves (connector drivers D6): in
   # their Account, as Project editors in a Project, as administrators in the
   # shared Catalog. Any image may be registered; the control is privilege,

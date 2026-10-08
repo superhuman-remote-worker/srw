@@ -2078,6 +2078,19 @@ spec:
               value: /run/srw/connector-driver-ca
             {{- end }}
             {{- end }}
+            # The in-pod plane's mount sidecars (connector drivers D7, spike
+            # prototype): the workspace provisioner adds them only with both.
+            {{- with .Values.connectors.inPodPlane }}
+            {{- if .enabled }}
+            {{- if or (not .opener.image.repository) (not .rclone.image.repository) }}
+            {{- fail "connectors.inPodPlane.enabled needs connectors.inPodPlane.opener.image.repository and connectors.inPodPlane.rclone.image.repository" }}
+            {{- end }}
+            - name: CONNECTOR_IN_POD_OPENER_IMAGE
+              value: {{ printf "%s:%s%s" .opener.image.repository (.opener.image.tag | default "latest") (ternary (printf "@%s" .opener.image.digest) "" (ne (.opener.image.digest | default "") "")) | quote }}
+            - name: CONNECTOR_IN_POD_RCLONE_IMAGE
+              value: {{ printf "%s:%s%s" .rclone.image.repository (.rclone.image.tag | default "latest") (ternary (printf "@%s" .rclone.image.digest) "" (ne (.rclone.image.digest | default "") "")) | quote }}
+            {{- end }}
+            {{- end }}
             - name: KB_EXTERNAL_REINDEX_CONCURRENCY
               value: {{ .Values.orchestrator.kbExternalReindexConcurrency | quote }}
             - name: KB_REINDEX_SWEEP_SECONDS

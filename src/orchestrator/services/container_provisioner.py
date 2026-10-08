@@ -69,6 +69,11 @@ from orchestrator.services.ssh_helpers import (
 )
 from orchestrator.services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 from orchestrator.services.ide_credentials import IDE_CREDENTIAL_ENV, ide_credential
+from orchestrator.services.in_pod_mount import (
+    CloudMountSidecar,
+    InPodPlaneImages,
+    add_cloud_mount_sidecars,
+)
 from orchestrator.services.workspace_lifecycle import (
     SessionWorkspaceObservationYielded,
     WorkspaceOwner,
@@ -700,6 +705,9 @@ class ContainerProvisioner:
         # custom image may take to pull. See sandbox_workspace_settings.
         self._custom_image_policy = SandboxImagePolicy.from_env()
         self._image_pull_timeout: int = self._custom_image_policy.pull_timeout_seconds
+        # Connector drivers D7 (spike prototype): the in-pod plane's mount
+        # sidecar images, None unless connectors.inPodPlane is on.
+        self._in_pod_plane_images = InPodPlaneImages.from_env()
 
     @property
     def is_available(self) -> bool:
@@ -15830,6 +15838,7 @@ class ContainerProvisioner:
         pinned_runtime_generation: str | None = None,
         pinned_provision_attempt: str | None = None,
         profile: SandboxPodProfile | None = None,
+        cloud_mount: CloudMountSidecar | None = None,
     ) -> dict:
         """Build the Kubernetes Pod manifest for a workspace container.
 
@@ -15837,6 +15846,9 @@ class ContainerProvisioner:
         ``seed.sh`` that writes the user's code-server config) is mounted at
         ``/mnt/code-server-config`` so the entrypoint can apply it before
         code-server starts.
+
+        ``cloud_mount`` (connector drivers D7, spike prototype) adds the
+        in-pod plane's mount sidecars; no caller passes one yet.
         """
         code_server_credential = ide_credential(
             namespace=self._namespace,
@@ -16119,6 +16131,12 @@ class ContainerProvisioner:
             workspace_container["resources"]["requests"]["ephemeral-storage"] = (
                 profile.storage
             )
+        if cloud_mount is not None:
+            if self._in_pod_plane_images is None:
+                raise ValueError(
+                    "a cloud mount sidecar needs connectors.inPodPlane enabled"
+                )
+            add_cloud_mount_sidecars(manifest, cloud_mount, self._in_pod_plane_images)
         return manifest
 
     def _workspace_capabilities(self, fuse_enabled: bool | None = None) -> list[str]:
