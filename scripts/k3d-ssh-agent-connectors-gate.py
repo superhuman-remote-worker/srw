@@ -77,6 +77,7 @@ import re
 import secrets
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -350,6 +351,8 @@ print(json.dumps(sorted(
 
 
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+#: Found anywhere, it may be a key the gate does not know about.
+GENERIC_KEY_NEEDLE = b"PRIVATE KEY"
 STREAM_CHUNK = 1 << 20
 
 
@@ -384,9 +387,68 @@ def scan_stream(
 @dataclass
 class ObjectScan:
     complete: bool
-    hit: bool
+    #: needle label -> where it was found: tar member paths, or "(object)"
+    #: for an object that is not a tar archive. Never the needle itself.
+    hits: dict[str, list[str]]
     size: int
+    members: int = 0
     detail: str = ""
+
+    @property
+    def hit(self) -> bool:
+        return bool(self.hits)
+
+
+#: At most this many member paths are kept per needle label.
+HIT_PATHS_KEPT = 20
+
+
+class _Counted:
+    """A read-through wrapper that counts the bytes read."""
+
+    def __init__(self, stream: Any) -> None:
+        self._stream, self.size = stream, 0
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._stream.read(size)
+        self.size += len(chunk)
+        return chunk
+
+
+def scan_tar_stream(
+    stream: Any, needles: list[bytes]
+) -> tuple[dict[int, set[str]], int, int]:
+    """Scan a tar stream member by member: ``(hits, members, size)``.
+
+    ``hits`` maps a needle's index to the member paths it was found in: a
+    member's name, link name and pax headers, then its body 1 MiB at a time
+    (:func:`scan_stream`), so no member is ever held whole. Whatever follows
+    the end-of-archive marker is drained, so the decoder feeding the stream
+    finishes cleanly.
+    """
+
+    hits: dict[int, set[str]] = {}
+    members = 0
+    counted = _Counted(stream)
+    with tarfile.open(fileobj=counted, mode="r|") as archive:
+        for member in archive:
+            members += 1
+            header = "\0".join(
+                [
+                    member.name,
+                    member.linkname,
+                    json.dumps(member.pax_headers, sort_keys=True),
+                ]
+            ).encode("utf-8", "surrogateescape")
+            found = {index for index, needle in enumerate(needles) if needle in header}
+            body = archive.extractfile(member) if member.isfile() else None
+            if body is not None:
+                found |= scan_stream(body.read, needles)[0]
+            for index in found:
+                hits.setdefault(index, set()).add(member.name)
+    while counted.read(STREAM_CHUNK):
+        pass
+    return hits, members, counted.size
 
 
 def snapshot_stream_command() -> list[str]:
@@ -399,7 +461,11 @@ def snapshot_stream_command() -> list[str]:
 
 
 def scan_snapshot_object(
-    key: str, needles: list[bytes], *, timeout: int = 900
+    key: str,
+    needles: list[bytes],
+    labels: list[str] | None = None,
+    *,
+    timeout: int = 900,
 ) -> ObjectScan:
     """Stream one snapshot object out of the pod and scan it here.
 
@@ -407,10 +473,19 @@ def scan_snapshot_object(
     producer's stdout directly; both exit codes must be 0, so a truncated
     transfer or archive is never read as clean. A raw object that turns out
     to be zstd-compressed is not complete either: its bytes were never
-    looked at decompressed. Raises FileNotFoundError when zstd is missing.
+    looked at decompressed. A ``.tar`` object is scanned member by member
+    (:func:`scan_tar_stream`), so a hit names the member it is in; any other
+    object as one byte stream. Hits are reported by ``labels`` (parallel to
+    ``needles``), never by needle. Raises FileNotFoundError when zstd is
+    missing.
     """
 
-    compressed = ".zst" in key.rsplit("/", 1)[-1]
+    labels = labels or [f"needle {index}" for index in range(len(needles))]
+    name = key.rsplit("/", 1)[-1]
+    compressed = ".zst" in name
+    archive = ".tar" in name
+    members = 0
+    failure = ""
     request = (json.dumps({"mode": "stream", "key": key}) + "\n").encode()
     with tempfile.TemporaryFile() as errors:
         producer = subprocess.Popen(
@@ -441,7 +516,15 @@ def scan_snapshot_object(
             )
             watchdog.start()
             try:
-                found, size, head = scan_stream(source.read, needles)
+                if archive:
+                    by_member, members, size = scan_tar_stream(source, needles)
+                    head = b""
+                else:
+                    found, size, head = scan_stream(source.read, needles)
+                    by_member = {index: {"(object)"} for index in found}
+            except (tarfile.TarError, OSError) as error:
+                by_member, size, head = {}, 0, b""
+                failure = type(error).__name__
             finally:
                 watchdog.cancel()
             codes = [process.wait(timeout=60) for process in processes]
@@ -453,12 +536,29 @@ def scan_snapshot_object(
         errors.seek(0)
         stderr = _scrub(errors.read()[-300:].decode("utf-8", "replace").strip())
     complete = (
-        all(code == 0 for code in codes)
+        not failure
+        and all(code == 0 for code in codes)
         and size > 0
         and (compressed or not head.startswith(ZSTD_MAGIC))
+        # Zeros read as an empty tar; a snapshot never is one.
+        and (not archive or members > 0)
     )
-    detail = "" if complete else f"exit {codes}, {size} bytes; {stderr}".rstrip("; ")
-    return ObjectScan(complete=complete, hit=bool(found), size=size, detail=detail)
+    detail = (
+        ""
+        if complete
+        else f"exit {codes}, {size} bytes; {failure} {stderr}".rstrip("; ")
+    )
+    hits: dict[str, list[str]] = {}
+    for index, paths in by_member.items():
+        merged = hits.setdefault(labels[index], [])
+        merged.extend(path for path in sorted(paths) if path not in merged)
+    return ObjectScan(
+        complete=complete,
+        hits={label: paths[:HIT_PATHS_KEPT] for label, paths in sorted(hits.items())},
+        size=size,
+        members=members,
+        detail=detail,
+    )
 
 
 def in_orchestrator(
@@ -1248,17 +1348,17 @@ class SshAgentConnectorsGate:
         """Stream every object under ``prefix`` out of the pod and scan it here."""
 
         objects = self.snapshot_objects(prefix).get("objects") or []
-        needles = [needle.encode() for needle in self.needles() + ["PRIVATE KEY"]]
+        needles, labels = self.labelled_needles()
         hits: list[str] = []
         incomplete: list[str] = []
         for key in objects:
             try:
-                scanned = scan_snapshot_object(key, needles)
+                scanned = scan_snapshot_object(key, needles, labels)
             except FileNotFoundError:
                 self.report.check(f"{name}: zstd decoder available", False)
                 return
-            if scanned.hit:
-                hits.append(key)
+            for label, paths in scanned.hits.items():
+                hits.append(f"{key}: {label} in {paths}")
             if not scanned.complete:
                 incomplete.append(f"{key} ({scanned.detail})")
         self.report.check(
@@ -1267,6 +1367,19 @@ class SshAgentConnectorsGate:
             f"{len(objects)} objects; hits {hits}"
             + (f"; incomplete {incomplete}" if incomplete else ""),
         )
+
+    def labelled_needles(self) -> tuple[list[bytes], list[str]]:
+        """Every needle with the label a report may print instead of it."""
+
+        needles: list[bytes] = []
+        labels: list[str] = []
+        for label, key in sorted(self.keys.items()):
+            for needle in key.needles:
+                needles.append(needle.encode())
+                labels.append(f"key {label.upper()}")
+        needles.append(GENERIC_KEY_NEEDLE)
+        labels.append("generic PRIVATE KEY")
+        return needles, labels
 
     def snapshot_settled(self, prefix: str) -> bool:
         """True once objects exist and the listing held still for one poll."""

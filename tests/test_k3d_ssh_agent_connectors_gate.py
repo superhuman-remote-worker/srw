@@ -314,7 +314,11 @@ def _store(monkeypatch, *, configured=True, job=([],), thread=(), hits=()):
     def scan_object(key, needles, timeout=900):
         assert b"PRIVATE KEY" in needles
         log.append(("job" if key.startswith("jobs/") else "thread", "scan"))
-        return gate.ObjectScan(complete=True, hit=key in hits, size=1)
+        return gate.ObjectScan(
+            complete=True,
+            hits={"key A": ["home/agent-host/x"]} if key in hits else {},
+            size=1,
+        )
 
     monkeypatch.setattr(gate, "in_orchestrator", program)
     monkeypatch.setattr(gate, "scan_snapshot_object", scan_object)
@@ -627,6 +631,51 @@ def _compressed(tmp_path: Path, size: int, tail: bytes) -> Path:
     return out
 
 
+class _Zeros:
+    """A file-like run of zeros, read lazily."""
+
+    def __init__(self, size: int) -> None:
+        self.left = size
+
+    def read(self, size: int = -1) -> bytes:
+        size = self.left if size < 0 else min(size, self.left)
+        self.left -= size
+        return bytes(size)
+
+
+def _compressed_tar(tmp_path: Path, members: list[tuple[str, int, bytes]]) -> Path:
+    """A zstd tar of ``(name, zeros, tail)`` members, written as a stream."""
+    import io
+    import tarfile
+
+    out = tmp_path / "archive.tar.zst"
+    with out.open("wb") as handle:
+        compressor = subprocess.Popen(
+            ["zstd", "-q", "-c"], stdin=subprocess.PIPE, stdout=handle
+        )
+        assert compressor.stdin is not None
+        with tarfile.open(fileobj=compressor.stdin, mode="w|") as archive:
+            for name, zeros, tail in members:
+                info = tarfile.TarInfo(name)
+                info.size = zeros + len(tail)
+
+                class _Member(io.RawIOBase):
+                    def __init__(self, zeros=zeros, tail=tail):
+                        self._zeros, self._tail = _Zeros(zeros), tail
+
+                    def read(self, size=-1):
+                        chunk = self._zeros.read(size)
+                        rest = len(self._tail) if size < 0 else size - len(chunk)
+                        chunk += self._tail[:rest]
+                        self._tail = self._tail[rest:]
+                        return chunk
+
+                archive.addfile(info, _Member())
+        compressor.stdin.close()
+        assert compressor.wait() == 0
+    return out
+
+
 def _run_capped(script: str, env: dict) -> str:
     """Run ``script`` in a fresh python under the pod programs' memory cap."""
     import os
@@ -721,6 +770,9 @@ def test_the_pod_program_passes_an_object_larger_than_the_cap_through(tmp_path):
     assert found == {0}
 
 
+_GENERIC = b"-----BEGIN RSA " + b"PRIVATE KEY-----"
+
+
 def _local_scan(tmp_path, segments, key="jobs/x/env.tar.zst") -> dict:
     """scan_snapshot_object, capped, with the pod program run locally."""
     import json
@@ -729,7 +781,8 @@ def _local_scan(tmp_path, segments, key="jobs/x/env.tar.zst") -> dict:
     script = (
         "gate.snapshot_stream_command = lambda: "
         "[sys.executable, '-c', gate._SNAPSHOT_PROGRAM]\n"
-        f"scan = gate.scan_snapshot_object({key!r}, [{_NEEDLE!r}])\n"
+        f"scan = gate.scan_snapshot_object({key!r}, "
+        f"[{_NEEDLE!r}, gate.GENERIC_KEY_NEEDLE], ['key A', 'generic PRIVATE KEY'])\n"
         "print(json.dumps(scan.__dict__))\n"
     )
     return json.loads(
@@ -740,30 +793,93 @@ def _local_scan(tmp_path, segments, key="jobs/x/env.tar.zst") -> dict:
     )
 
 
-def test_the_local_scan_streams_an_object_larger_than_the_cap(tmp_path):
+def test_the_local_scan_names_the_member_and_the_label_of_each_hit(tmp_path):
     """Both ends capped. The object is larger than the cap compressed (a
-    skippable frame in front) and decompressed, so a whole read on either
-    side fails with a MemoryError."""
+    skippable frame in front), and one member alone is larger than the cap
+    decompressed, so a whole read on either side fails with a MemoryError."""
+    _needs_zstd()
+    archive = _compressed_tar(
+        tmp_path,
+        [
+            ("home/agent-host/big.bin", _BIG, b""),
+            ("home/agent-host/.cache/leak", 3, _NEEDLE),
+            ("usr/local/lib/python3/site-packages/lib/tls.py", 10, _GENERIC),
+            ("home/agent-host/clean.txt", 100, b"nothing here"),
+        ],
+    )
+
+    scan = _local_scan(tmp_path, [["skip", _BIG], ["file", str(archive)]])
+
+    assert scan["complete"] is True, scan["detail"]
+    assert scan["members"] == 4
+    assert scan["hits"] == {
+        "generic PRIVATE KEY": ["usr/local/lib/python3/site-packages/lib/tls.py"],
+        "key A": ["home/agent-host/.cache/leak"],
+    }
+    assert scan["size"] > _BIG
+    assert _NEEDLE.decode() not in __import__("json").dumps(scan)
+
+
+def test_a_needle_in_a_member_name_is_attributed_too(tmp_path):
+    _needs_zstd()
+    archive = _compressed_tar(
+        tmp_path, [(f"home/agent-host/{_NEEDLE.decode()}", 0, b"")]
+    )
+
+    scan = _local_scan(tmp_path, [["file", str(archive)]])
+
+    assert list(scan["hits"]) == ["key A"]
+
+
+def test_a_compressed_object_that_is_not_a_tar_is_scanned_whole(tmp_path):
     _needs_zstd()
     payload = _compressed(tmp_path, _BIG, _NEEDLE)
 
-    scan = _local_scan(tmp_path, [["skip", _BIG], ["file", str(payload)]])
+    scan = _local_scan(
+        tmp_path, [["skip", _BIG], ["file", str(payload)]], key="jobs/x/blob.zst"
+    )
 
     assert scan == {
         "complete": True,
-        "hit": True,
+        "hits": {"key A": ["(object)"]},
         "size": _BIG + len(_NEEDLE),
+        "members": 0,
         "detail": "",
     }
 
 
+def test_a_failed_producer_is_never_read_as_clean(tmp_path, monkeypatch):
+    """The whole archive arrived, but the pod side did not exit cleanly."""
+    _needs_zstd()
+    archive = _compressed_tar(tmp_path, [("home/agent-host/a", 10, b"clean")])
+    monkeypatch.setattr(
+        gate,
+        "snapshot_stream_command",
+        lambda: ["sh", "-c", f"cat {archive}; exit 7"],
+    )
+
+    scan = gate.scan_snapshot_object("jobs/x/env.tar.zst", [_NEEDLE])
+
+    assert scan.members == 1 and not scan.hits
+    assert scan.complete is False
+
+
 def test_a_truncated_object_is_never_read_as_clean(tmp_path):
     _needs_zstd()
-    payload = _compressed(tmp_path, 1 << 20, _NEEDLE)
+    archive = _compressed_tar(tmp_path, [("home/agent-host/a", 1 << 20, _NEEDLE)])
     cut = tmp_path / "cut.zst"
-    cut.write_bytes(payload.read_bytes()[:-8])
+    cut.write_bytes(archive.read_bytes()[:-8])
 
     scan = _local_scan(tmp_path, [["file", str(cut)]])
+
+    assert scan["complete"] is False
+
+
+def test_an_object_named_tar_that_is_not_one_is_not_complete(tmp_path):
+    _needs_zstd()
+    payload = _compressed(tmp_path, 1 << 20, _NEEDLE)
+
+    scan = _local_scan(tmp_path, [["file", str(payload)]])
 
     assert scan["complete"] is False
 
@@ -775,3 +891,14 @@ def test_a_compressed_object_without_a_zst_name_is_not_complete(tmp_path):
     scan = _local_scan(tmp_path, [["file", str(payload)]], key="jobs/x/odd-name")
 
     assert scan["complete"] is False
+
+
+def test_labelled_needles_name_each_gate_key_and_the_generic_header():
+    runner = _gate_runner()
+    needles, labels = runner.labelled_needles()
+
+    assert len(needles) == len(labels)
+    assert set(labels) == {"key A", "key B", "key C", "key D", "generic PRIVATE KEY"}
+    for label, key in runner.keys.items():
+        for needle in key.needles:
+            assert labels[needles.index(needle.encode())] == f"key {label.upper()}"
