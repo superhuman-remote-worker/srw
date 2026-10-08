@@ -1632,6 +1632,62 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         if not self.execute_claim_resource_with_secret_stdin(command, "", timeout=30):
             raise WorkspaceUnavailableError("Could not remove a connector lease")
 
+    def install_git_swap_wiring(
+        self,
+        bindings: Sequence[Mapping[str, str]],
+        *,
+        remove: Sequence[str] = (),
+        prune: bool = False,
+    ) -> dict[str, Any]:
+        """Install the git swap driver's wiring under ``~/.srw-credentials/git``.
+
+        Everything travels on the secret stdin channel, never in a command
+        line or tmux (C3); returns the program's report (binding ids only).
+        """
+        import json
+
+        from shared.runtime.core.credential_env import (
+            GIT_SWAP_CREDENTIAL_HELPER,
+            GIT_SWAP_WIRING,
+            WORKSPACE_PYTHON,
+        )
+
+        self._init_shell()
+        home = self._get_home_dir()
+        command = (
+            f"{WORKSPACE_PYTHON} -c {shlex.quote(GIT_SWAP_WIRING)} "
+            f"{shlex.quote(home)} sync"
+        )
+        payload = {
+            "helper": GIT_SWAP_CREDENTIAL_HELPER,
+            "bindings": [
+                {
+                    "id": str(item["id"]),
+                    "include": str(item["include"]),
+                    "ca": str(item["ca"]),
+                }
+                for item in bindings
+            ],
+            "remove": [str(item) for item in remove],
+            "prune": bool(prune),
+        }
+        returncode, output = self.execute_claim_resource_with_secret_stdin_output(
+            command, json.dumps(payload), timeout=30
+        )
+        if returncode != 0:
+            raise WorkspaceUnavailableError(
+                "Could not install the git swap driver's wiring"
+            )
+        try:
+            report = json.loads(output.strip().splitlines()[-1])
+        except (IndexError, ValueError) as exc:
+            raise WorkspaceUnavailableError(
+                "The git swap wiring gave no report"
+            ) from exc
+        if not isinstance(report, dict):
+            raise WorkspaceUnavailableError("The git swap wiring gave no report")
+        return report
+
     def open_forward_channel(self, dest_host: str = "127.0.0.1", dest_port: int = 8080):
         """Open a ``direct-tcpip`` channel to a loopback port on the workspace.
 

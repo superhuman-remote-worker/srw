@@ -353,6 +353,25 @@ class WorkspaceBackend(ABC):
         del connector_id
         raise ValueError("Connector leases require a sandbox or VM workspace")
 
+    def install_git_swap_wiring(
+        self,
+        bindings: Sequence[Mapping[str, str]],
+        *,
+        remove: Sequence[str] = (),
+        prune: bool = False,
+    ) -> dict[str, Any]:
+        """Install the git swap driver's wiring for ``bindings`` (C3).
+
+        Each binding is ``{"id", "include", "ca"}``: its connector id, the
+        git config include that points its upstream at the driver, and the
+        certificate authority it trusts for the driver's URL. ``remove``
+        names bindings to drop; ``prune`` drops every binding not in the set.
+        Written over the secret stdin channel only; returns the program's
+        credential-free report. Fails closed without a shell workspace.
+        """
+        del bindings, remove, prune
+        raise ValueError("The git swap driver requires a sandbox or VM workspace")
+
     def execute_with_secret_stdin(
         self, command: str, secret: str | bytes, *, timeout: int = 30
     ) -> bool:

@@ -31,7 +31,12 @@ from typing import Any
 from agent.connectors.base import Delivery
 from agent.connectors.slots import connection_slot
 from shared.connectors.binding import BindingDescriptor, BindingEntry
-from shared.connectors.builtin import driver_spec_for_row, spec_for_type
+from shared.connectors.builtin import (
+    GIT_SWAP_SPEC,
+    driver_spec_for_row,
+    git_swap_entry,
+    spec_for_type,
+)
 from shared.connectors.contract import DriverSpec, effective_access
 from shared.native_kb import native_kb_project_id
 
@@ -129,11 +134,17 @@ def _file_entries(entry: Mapping[str, Any], spec: DriverSpec) -> list[BindingEnt
 
 
 def checkout_auth(entry: Mapping[str, Any]) -> str:
-    """How the clone authenticates: ``ssh_agent``, ``token_in_url`` or ``none``.
+    """How the clone authenticates: ``swap``, ``ssh_agent``, ``token_in_url``
+    or ``none``.
 
-    An explicit ``auth_method`` wins; otherwise a delivered SSH identity or a
-    stored key means SSH, and a token means a token in the clone URL.
+    A ``git_swap`` block means the git swap driver (C3): the workspace's git
+    reaches it with a lease, or the installation refused the repository and
+    the block says why. Otherwise an explicit ``auth_method`` wins; a
+    delivered SSH identity or a stored key means SSH, and a token means a
+    token in the clone URL.
     """
+    if isinstance(entry.get("git_swap"), Mapping):
+        return "swap"
     credentials = _credentials(entry)
     method = credentials.get("auth_method")
     if not method:
@@ -281,12 +292,21 @@ _ENTRY_BUILDERS = {
 }
 
 
+def routing_spec(entry: Mapping[str, Any]) -> DriverSpec | None:
+    """The spec whose delivery forms an entry routes by: its type's driver,
+    or the git swap driver for a repository bound through it (which also
+    delivers a lease token, before the checkout)."""
+    if git_swap_entry(entry):
+        return GIT_SWAP_SPEC
+    return spec_for_type(entry.get("type"))
+
+
 def binding_from_legacy_entry(entry: Mapping[str, Any]) -> BindingDescriptor | None:
     """The binding descriptor one wire entry stands for.
 
     ``None`` when no installed driver serves the entry's type. Never raises.
     """
-    spec = spec_for_type(entry.get("type"))
+    spec = routing_spec(entry)
     if spec is None:
         return None
     entries = tuple(
@@ -321,7 +341,7 @@ def deliveries_from_payload(entries: Iterable[Any] | None) -> list[Delivery]:
                 index=len(deliveries),
                 entry=entry,
                 binding=binding_from_legacy_entry(entry),
-                spec=spec_for_type(entry.get("type")),
+                spec=routing_spec(entry),
             )
         )
     return deliveries

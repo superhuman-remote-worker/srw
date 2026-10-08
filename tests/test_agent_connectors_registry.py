@@ -157,7 +157,12 @@ def test_the_orders_are_the_runtime_orders():
         "checkout",
         "credential_file",
     )
-    assert BACKEND_SWAP_ORDER == ("env_file", "lease_token", "credential_file")
+    assert BACKEND_SWAP_ORDER == (
+        "env_file",
+        "lease_token",
+        "checkout",
+        "credential_file",
+    )
     # What lives in the workspace lives as long as it does.
     assert RELEASE_ORDER == ("managed_connection",)
 
@@ -469,9 +474,12 @@ def test_backend_swap_delivers_the_workspace_forms_before_the_old_one_retires(
     assert [(form, step) for form, step, _ in log] == [
         ("env_file", "on_backend_swap"),
         ("lease_token", "on_backend_swap"),
+        # The git swap wiring of checkouts (C3) follows the workspace too.
+        ("checkout", "on_backend_swap"),
         ("credential_file", "on_backend_swap"),
         ("backend", "retire"),
     ]
     assert log[0][2] == ["Env"]
     assert log[1][2] == ["Lease"]
-    assert log[2][2] == ["Kube"]
+    assert log[2][2] == ["Repo"]
+    assert log[3][2] == ["Kube"]

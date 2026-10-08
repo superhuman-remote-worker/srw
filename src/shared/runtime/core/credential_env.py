@@ -4,7 +4,8 @@ Only the program and destination paths appear in the command. Values travel
 in stdin. Environment values are retained in the session workspace as
 explicitly agreed for v1; credential files are synced (removed once no
 longer delivered) and retired with the work item; a connector's credential
-lease token (slice C2) is one file under ``~/.srw-credentials/leases/``.
+lease token (slice C2) is one file under ``~/.srw-credentials/leases/``; the
+git swap driver's wiring (C3) lives under ``~/.srw-credentials/git/``.
 
 Everything these programs write lives under ``~/.srw-credentials/`` (0700),
 which a workspace snapshot never captures (``CREDENTIAL_EXCLUDE_PATTERNS`` in
@@ -333,4 +334,150 @@ try:
 finally:
     if os.path.exists(temporary):
         os.unlink(temporary)
+"""
+
+#: The git swap driver's credential helper (C3), written by
+#: :data:`GIT_SWAP_WIRING` to ``~/.srw-credentials/git/credential-helper`` and
+#: run by git as ``/usr/bin/python3 -I <helper> <connector id> <action>`` for
+#: the driver's URL only. For ``get`` it answers with the connector's lease
+#: token (``~/.srw-credentials/leases/<connector id>``, which the lease
+#: materializer writes) when the request's path is that connector's, with a
+#: ``password_expiry_utc`` five minutes out, so no storing helper keeps it
+#: (the lease itself lives server-side). Nothing else: ``store`` and
+#: ``erase`` are no-ops, and a missing or malformed lease answers nothing,
+#: so git fails on the driver's refusal instead of prompting.
+GIT_SWAP_CREDENTIAL_HELPER = r"""
+import os, re, sys, time
+
+CONNECTOR = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+LEASE = re.compile(r'scl_[0-9A-Za-z]{49}')
+
+
+def main(argv):
+    if len(argv) != 3 or argv[2] != 'get' or not CONNECTOR.fullmatch(argv[1]):
+        return 0
+    attributes = {}
+    for line in sys.stdin:
+        line = line.rstrip('\n')
+        if not line:
+            break
+        key, _, value = line.partition('=')
+        attributes[key] = value
+    if attributes.get('protocol') != 'https':
+        return 0
+    if attributes.get('path', '').split('/', 1)[0] != argv[1]:
+        return 0
+    lease = os.path.join(os.path.expanduser('~'), '.srw-credentials', 'leases', argv[1])
+    try:
+        with open(lease, encoding='ascii') as handle:
+            token = handle.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return 0
+    if not LEASE.fullmatch(token):
+        return 0
+    sys.stdout.write('username=srw-lease\npassword=%s\npassword_expiry_utc=%d\n'
+                     % (token, int(time.time()) + 300))
+    return 0
+
+
+sys.exit(main(sys.argv))
+"""
+
+#: Installs (``sync``) or removes (``retire``) the git swap driver's wiring
+#: in the workspace home (C3): everything under ``~/.srw-credentials/git/``
+#: (0700), which no snapshot captures, and one ``include.path`` line in
+#: ``~/.gitconfig``, so every git in the workspace reads it (the agent's, IDE
+#: terminals, ssh-gateway sessions).
+#:
+#: ``argv``: the home and the action. ``sync`` reads ``{"helper": <the
+#: credential helper's source>, "bindings": [{"id", "include", "ca"}],
+#: "remove": [ids], "prune": bool}`` on stdin and writes, each atomically
+#: and 0600, the helper, each binding's include (``bindings/<id>.gitconfig``)
+#: and the certificate authority it trusts (``bindings/<id>.ca.pem``). It
+#: removes the bindings ``remove`` names and, with ``prune``, every binding
+#: not in this set; rewrites ``config``, which includes the bindings
+#: present; and adds ``include.path = ~/.srw-credentials/git/config`` to
+#: ``~/.gitconfig`` with git itself unless it is there. It prints one JSON
+#: line naming the bindings present and removed, never a file's contents.
+#: ``retire`` removes the directory (git ignores an include that is gone).
+GIT_SWAP_WIRING = r"""
+import json, os, re, shutil, subprocess, sys, tempfile
+
+home = os.path.normpath(sys.argv[1])
+action = sys.argv[2]
+if action not in ('sync', 'retire'):
+    sys.exit(3)
+root = os.path.join(home, '.srw-credentials')
+wiring = os.path.join(root, 'git')
+bindings = os.path.join(wiring, 'bindings')
+INCLUDE = '~/.srw-credentials/git/config'
+CONNECTOR = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+
+if action == 'retire':
+    shutil.rmtree(wiring, ignore_errors=True)
+    print(json.dumps({'retired': True}))
+    sys.exit(0)
+
+
+def write(path, contents):
+    fd, temporary = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.write-')
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as output:
+            output.write(contents)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def directory(path):
+    # A symlinked directory could lead anywhere.
+    if os.path.islink(path):
+        sys.exit(4)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+request = json.load(sys.stdin)
+wanted = request.get('bindings') or []
+ids = [item['id'] for item in wanted]
+for name in ids + list(request.get('remove') or []):
+    if not CONNECTOR.fullmatch(name):
+        sys.exit(3)
+for path in (root, wiring, bindings):
+    directory(path)
+write(os.path.join(wiring, 'credential-helper'), request['helper'])
+for item in wanted:
+    write(os.path.join(bindings, item['id'] + '.ca.pem'), item['ca'])
+    write(os.path.join(bindings, item['id'] + '.gitconfig'), item['include'])
+present = sorted(
+    entry[:-len('.gitconfig')]
+    for entry in os.listdir(bindings)
+    if entry.endswith('.gitconfig') and CONNECTOR.fullmatch(entry[:-len('.gitconfig')])
+)
+gone = set(request.get('remove') or [])
+if request.get('prune'):
+    gone |= set(present) - set(ids)
+for name in sorted(gone):
+    for suffix in ('.gitconfig', '.ca.pem'):
+        try:
+            os.unlink(os.path.join(bindings, name + suffix))
+        except FileNotFoundError:
+            pass
+present = [name for name in present if name not in gone]
+write(os.path.join(wiring, 'config'),
+      '# SRW git swap driver bindings: written on every attach; do not edit.\n'
+      + ''.join('[include]\n\tpath = bindings/%s.gitconfig\n' % name for name in present))
+gitconfig = os.path.join(home, '.gitconfig')
+found = subprocess.run(['git', 'config', '--file', gitconfig, '--get-all', 'include.path'],
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True)
+included = INCLUDE in found.stdout.splitlines()
+if not included:
+    added = subprocess.run(['git', 'config', '--file', gitconfig, '--add', 'include.path', INCLUDE],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    if added.returncode != 0:
+        sys.exit(5)
+print(json.dumps({'bindings': present, 'removed': sorted(gone),
+                  'include': 'present' if included else 'added'}))
 """

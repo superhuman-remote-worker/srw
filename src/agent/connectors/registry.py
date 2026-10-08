@@ -16,7 +16,8 @@ records the calls through every entry point:
   lease tokens, SSH identities, the KB deferral, a fresh harness that the
   caller swaps in place, then checkouts and credential files;
 * **backend swap** (``PersistentSession.swap_backend``): the environment, the
-  lease tokens and the credential files follow the physical workspace.
+  lease tokens, the git swap wiring of checkouts (C3) and the credential
+  files follow the physical workspace.
 
 Credential files reach the workspace, never the agent pod (slice D1d). They
 come after the checkouts in every order, as they always did on a worker.
@@ -85,7 +86,12 @@ LIVE_ORDER: tuple[str, ...] = (
     "checkout",
     "credential_file",
 )
-BACKEND_SWAP_ORDER: tuple[str, ...] = ("env_file", "lease_token", "credential_file")
+BACKEND_SWAP_ORDER: tuple[str, ...] = (
+    "env_file",
+    "lease_token",
+    "checkout",
+    "credential_file",
+)
 #: What the entry points release when an execution ends. What lives in the
 #: workspace (environment, lease tokens, credential files) lives as long as
 #: it does.

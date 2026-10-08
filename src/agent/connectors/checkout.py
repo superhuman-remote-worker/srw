@@ -2,7 +2,12 @@
 
 Every operation runs on the workspace backend; there is no agent-local clone
 (knowledge-base/knowledge/features/no_workspace_agent_mode.md §9.4). A token
-repository clones with the token in its URL until the git swap driver (C3).
+repository bound through the git swap driver (C3) clones its clean upstream
+URL: SRW's wiring (``agent.connectors.git_swap``, installed before the
+clones) points it at the driver, a reused checkout's origin is reset to the
+clean URL (dropping any ``oauth2:`` token an earlier clone left), and the
+checkout refuses credentials in a URL from then on. Where the installation
+falls back, a token repository clones with the token in its URL as before.
 An SSH-key repository clones through the opaque alias of its workspace
 ``ssh-agent`` identity (``agent.connectors.ssh_identity``, slice C1), and a
 key file a pre-agent clone left in ``~/.ssh`` is retired once the repository
@@ -28,6 +33,13 @@ from agent.connectors.base import (
     FactsLines,
     RuntimeContext,
     declared_read_only_note,
+)
+from agent.connectors.git_swap import (
+    SwapBinding,
+    install_wiring,
+    swap_binding,
+    swap_note,
+    wait_for_driver,
 )
 from agent.connectors.legacy import checkout_auth
 from agent.connectors.ssh_identity import ssh_clone_target, ssh_identity_note
@@ -275,6 +287,48 @@ def _retire_legacy_ssh_key_files(
         )
 
 
+def _wire_swap_repositories(
+    backend: Any, repo_datasources: List[Dict[str, Any]], *, prune: bool
+) -> Tuple[Dict[int, SwapBinding], Dict[int, str]]:
+    """Install the git swap wiring of every swap repository in the batch.
+
+    Returns the bindings wired, by position, and why the others are not.
+    Runs before any clone: the clone of a clean URL needs the wiring to
+    reach the driver. ``prune`` (the workspace owner's full set) also drops
+    bindings an earlier attach left that this one no longer has.
+    """
+    wired: Dict[int, SwapBinding] = {}
+    reasons: Dict[int, str] = {}
+    for index, ds in enumerate(repo_datasources):
+        if checkout_auth(ds) != "swap":
+            continue
+        binding, reason = swap_binding(ds)
+        if binding is None:
+            reasons[index] = reason
+        else:
+            wired[index] = binding
+    if not wired:
+        return wired, reasons
+    try:
+        install_wiring(backend, wired.values(), prune=prune)
+    except Exception as exc:  # the repositories are skipped, never cloned bare
+        reason = (
+            "the workspace's git wiring for the git swap driver could not be "
+            f"installed ({type(exc).__name__})"
+        )
+        reasons.update({index: reason for index in wired})
+        wired = {}
+    return wired, reasons
+
+
+def _secure_swap_checkout(git_mgr: Any, binding: SwapBinding, *, reused: bool) -> None:
+    """Keep a swap checkout's remote the clean upstream URL and make a token
+    in any of its URLs fail loudly (``transfer.credentialsInUrl``)."""
+    if reused and not git_mgr.add_remote("origin", binding.clean_url):
+        logger.warning("Could not reset the origin of a git swap checkout")
+    git_mgr._run_git(["config", "transfer.credentialsInUrl", "die"])
+
+
 def clone_repository_datasources(
     repo_datasources: List[Dict[str, Any]],
     workspace_manager: Any,
@@ -365,8 +419,11 @@ def clone_repository_datasources(
         )
 
     clone_names = resolve_repo_clone_names(repo_datasources)
+    swap_wired, swap_reasons = _wire_swap_repositories(
+        backend, repo_datasources, prune=legacy_key_files == "sweep"
+    )
     ssh_outcomes: List[List[Any]] = []
-    for ds, repo_name in zip(repo_datasources, clone_names):
+    for index, (ds, repo_name) in enumerate(zip(repo_datasources, clone_names)):
         # ds_name is the safe form of the user-supplied datasource label.
         ds_name = (
             re.sub(r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()).strip("-")
@@ -382,7 +439,22 @@ def clone_repository_datasources(
 
             ssh_clone_url: Optional[str] = None
             ssh_outcome: Optional[List[Any]] = None
-            if auth == "ssh_agent":
+            swap: Optional[SwapBinding] = None
+            if auth == "swap":
+                swap = swap_wired.get(index)
+                if swap is None:
+                    logger.warning(
+                        "Skipping repository datasource %r: %s",
+                        ds_name,
+                        swap_reasons.get(
+                            index, "not bound through the git swap driver"
+                        ),
+                    )
+                    continue
+                # The clean upstream URL: the wiring sends it to the driver.
+                repo_url = swap.clean_url
+
+            elif auth == "ssh_agent":
                 ssh_clone_url, reason = ssh_clone_target(ds, ssh_identity_status)
                 # A key file a pre-agent clone wrote goes only once this
                 # repository is proven through its alias (after the loop).
@@ -428,12 +500,26 @@ def clone_repository_datasources(
                             "Could not point reused repos/%s at its SSH identity",
                             repo_name,
                         )
+                if swap is not None:
+                    # A checkout an earlier token-in-URL clone left carries
+                    # oauth2:<token>@ in its origin: reset to the clean URL.
+                    _secure_swap_checkout(git_mgr, swap, reused=True)
                 logger.info(
                     "Reusing repository datasource %r from repos/%s",
                     ds_name,
                     repo_name,
                 )
             else:
+                if swap is not None:
+                    # A new binding's pod may still be starting.
+                    unserved = wait_for_driver(backend, swap)
+                    if unserved is not None:
+                        logger.warning(
+                            "Skipping repository datasource %r: %s",
+                            ds_name,
+                            unserved,
+                        )
+                        continue
                 git_mgr = GitManager.clone(
                     repo_url,
                     target,
@@ -442,6 +528,8 @@ def clone_repository_datasources(
                 )
                 if ssh_outcome is not None and git_mgr:
                     ssh_outcome[1] = True
+                if swap is not None and git_mgr:
+                    _secure_swap_checkout(git_mgr, swap, reused=False)
             if git_mgr:
                 branch_ready = True
                 if branch and (not reused or ds.get("require_default_branch")):
@@ -617,6 +705,44 @@ class CheckoutMaterializer:
                     # leaving it behind keeps a detached credential live on
                     # the workspace manager for the rest of the session.
                     workspace_manager.source_repo_meta.pop(clone_name, None)
+            # A detached swap repository's wiring goes too (housekeeping: its
+            # lease is already revoked). The clean remote stays.
+            detached = [
+                binding.connector_id
+                for delivery in old
+                if _key(delivery) in removed
+                for binding in (swap_binding(delivery.entry)[0],)
+                if binding is not None
+            ]
+            backend = rt.workspace_backend
+            if detached and backend is not None:
+                try:
+                    install_wiring(backend, (), remove=detached)
+                except Exception as e:
+                    logger.warning(
+                        "Could not remove a detached repository's git swap wiring: %s",
+                        type(e).__name__,
+                    )
+
+    def on_backend_swap(self, deliveries: Sequence[Delivery], backend: Any) -> None:
+        """The git swap wiring lives under ``~/.srw-credentials``, which no
+        snapshot carries: write it again on the new workspace (the clones
+        and their clean remotes moved with it)."""
+        bindings = [
+            binding
+            for delivery in deliveries
+            for binding in (swap_binding(delivery.entry)[0],)
+            if binding is not None
+        ]
+        if not bindings:
+            return
+        try:
+            install_wiring(backend, bindings)
+        except Exception as e:
+            logger.warning(
+                "Could not write the git swap wiring on the new workspace: %s",
+                type(e).__name__,
+            )
 
     def facts(
         self, deliveries: Sequence[Delivery], rt: RuntimeContext
@@ -650,6 +776,7 @@ class CheckoutMaterializer:
                 f'`./repos/{clone_name}/` (use `repo="{clone_name}"` with the '
                 f"repo_* tools){branch_clause}; {access}{declared_read_only_note(ds)}"
                 + ssh_identity_note(ds, rt.ssh_identity_status)
+                + swap_note(ds)
             )
             out.append(FactsLines("Repositories", delivery.index, [line]))
         return out
