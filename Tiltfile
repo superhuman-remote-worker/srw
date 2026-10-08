@@ -458,6 +458,17 @@ docker_build(
     only=['drivers/mcp-test/', 'docker/Dockerfile.driver-mcp-test'],
 )
 
+# Git swap driver (connector drivers C3): srw.git-swap/v1, the smart-HTTP
+# reverse proxy token repositories are cloned through. A product driver (CI
+# publishes it); the k3d profile turns it on (connectors.drivers.gitSwap) and
+# scripts/k3d-git-swap-gate.py drives it. The chart receives it as tag@digest.
+docker_build(
+    'srw-driver-git-swap',
+    context='.',
+    dockerfile='docker/Dockerfile.driver-git-swap',
+    only=['drivers/git-swap/', 'docker/Dockerfile.driver-git-swap'],
+)
+
 _srw_images = [
     ('srw-orchestrator', 'image.orchestrator.repository', 'image.orchestrator.tag'),
     ('srw-cockpit', 'image.cockpit.repository', 'image.cockpit.tag'),
@@ -471,6 +482,7 @@ _srw_images = [
     ('srw-driver-echo', 'connectors.drivers.echo.image.repository', 'connectors.drivers.echo.image.tag'),
     ('srw-driver-mcp-front', 'connectors.drivers.mcpFront.image.repository', 'connectors.drivers.mcpFront.image.tag'),
     ('srw-driver-mcp-test', 'connectors.drivers.mcpTest.image.repository', 'connectors.drivers.mcpTest.image.tag'),
+    ('srw-driver-git-swap', 'connectors.drivers.gitSwap.image.repository', 'connectors.drivers.gitSwap.image.tag'),
 ]
 
 # Tilt fills in TILT_IMAGE_<i> (the freshly built+pushed ref) per image_deps
@@ -486,7 +498,7 @@ for i in range(len(_srw_images)):
     _srw_helm_env['TILT_IMAGE_KEY_TAG_%s' % i] = _srw_images[i][2]
     # These chart images also accept a digest, which outranks the tag. Tilt
     # owns the local image selection, including a pin saved by an earlier gate.
-    if _srw_images[i][0] in ['srw-mcp', 'srw-vm-preparer', 'srw-driver-shim', 'srw-driver-echo', 'srw-driver-mcp-front', 'srw-driver-mcp-test']:
+    if _srw_images[i][0] in ['srw-mcp', 'srw-vm-preparer', 'srw-driver-shim', 'srw-driver-echo', 'srw-driver-mcp-front', 'srw-driver-mcp-test', 'srw-driver-git-swap']:
         _srw_helm_env['TILT_IMAGE_KEY_DIGEST_%s' % i] = _srw_images[i][2][:-4] + '.digest'
 
 _srw_exposure_mode = os.getenv('SRW_EXPOSURE_MODE') or 'multi-host'

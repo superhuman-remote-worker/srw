@@ -359,6 +359,19 @@ connectors:
       image:
         repository: srw-registry:5000/srw-driver-mcp-test
         tag: dev
+    # The git swap driver (C3): token repositories on HTTPS port 443 are
+    # cloned through it. Tilt builds srw-driver-git-swap and overrides
+    # repository, tag and digest; these placeholders only keep a plain
+    # `helm install` rendering. The chart generates SRW's driver CA. Token
+    # repositories it cannot serve (the in-cluster Gitea over http) keep the
+    # token-in-URL fallback, so the other gates' repositories still clone.
+    # scripts/k3d-git-swap-gate.py drives it.
+    gitSwap:
+      enabled: true
+      image:
+        repository: srw-registry:5000/srw-driver-git-swap
+        tag: dev
+      fallback: token-in-url
 
 databases:
   # Non-HA local default. All five PostgreSQL engines continue to inherit

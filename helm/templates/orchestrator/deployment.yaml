@@ -2031,6 +2031,27 @@ spec:
             - name: CONNECTOR_MCP_FRONT_IMAGE
               value: {{ include "srw.imageRef" (dict "image" .Values.connectors.drivers.mcpFront.image) | quote }}
             {{- end }}
+            # The git swap driver (connector drivers C3): what a token
+            # repository it cannot serve gets (always rendered: it applies
+            # with the driver off too), and, when it is on, its image and
+            # SRW's connector driver certificate authority.
+            - name: CONNECTOR_GIT_SWAP_FALLBACK
+              value: {{ .Values.connectors.drivers.gitSwap.fallback | quote }}
+            {{- with .Values.connectors.drivers.gitSwap }}
+            {{- if .enabled }}
+            {{- if not $.Values.connectors.servicePods.enabled }}
+            {{- fail "connectors.drivers.gitSwap.enabled needs connectors.servicePods.enabled: the git swap driver is a service-plane driver" }}
+            {{- end }}
+            {{- if not .image.repository }}
+            {{- fail "connectors.drivers.gitSwap.enabled needs connectors.drivers.gitSwap.image.repository" }}
+            {{- end }}
+            # A digest pins it (tag@digest; CI stamps it), a tag alone follows.
+            - name: CONNECTOR_GIT_SWAP_IMAGE
+              value: {{ printf "%s:%s%s" .image.repository (.image.tag | default "latest") (ternary (printf "@%s" .image.digest) "" (ne (.image.digest | default "") "")) | quote }}
+            - name: CONNECTOR_DRIVER_CA_DIR
+              value: /run/srw/connector-driver-ca
+            {{- end }}
+            {{- end }}
             - name: KB_EXTERNAL_REINDEX_CONCURRENCY
               value: {{ .Values.orchestrator.kbExternalReindexConcurrency | quote }}
             - name: KB_REINDEX_SWEEP_SECONDS
@@ -2126,6 +2147,11 @@ spec:
               mountPath: {{ include "srw.sshGatewayHostKeyDir" . }}
               readOnly: true
             {{- end }}
+            {{- if .Values.connectors.drivers.gitSwap.enabled }}
+            - name: connector-driver-ca
+              mountPath: /run/srw/connector-driver-ca
+              readOnly: true
+            {{- end }}
           lifecycle:
             preStop:
               exec:
@@ -2200,4 +2226,18 @@ spec:
               - key: {{ printf "%s.pub" . | quote }}
                 path: {{ printf "%s.pub" . | quote }}
               {{- end }}
+        {{- end }}
+        {{- if .Values.connectors.drivers.gitSwap.enabled }}
+        # SRW's connector driver certificate authority (C3): it signs each
+        # TLS driver pod's certificate. This pod only; 0444 for the non-root
+        # orchestrator user, as vm-ssh-key above.
+        - name: connector-driver-ca
+          secret:
+            secretName: {{ include "srw.connectorDriverCaSecretName" . }}
+            defaultMode: 0444
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
         {{- end }}

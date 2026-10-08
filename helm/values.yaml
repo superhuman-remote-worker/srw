@@ -340,6 +340,34 @@ connectors:
         repository: ""
         tag: ""
         digest: ""
+    # -- The git swap driver, srw.git-swap/v1 (connector drivers C3;
+    # docker/Dockerfile.driver-git-swap): a git smart-HTTP reverse proxy in a
+    # shared service pod per repository connector. A token repository on
+    # HTTPS port 443 is cloned through it: the workspace keeps the clean
+    # upstream URL as its remote and holds only a lease token; the driver
+    # exchanges it for the forge token per request. ReadOnly refuses every
+    # push; ReadWrite allows branch pushes only (no deletes, no tags). Needs
+    # servicePods.enabled; the chart creates SRW's driver certificate
+    # authority (ca below). CI stamps tag and digest.
+    gitSwap:
+      enabled: false
+      image:
+        repository: ghcr.io/superhuman-remote-worker/srw-driver-git-swap
+        tag: latest
+        digest: ""
+      # -- What a token repository the driver cannot serve gets (the driver
+      # is off, or the repository is not HTTPS on port 443): "token-in-url",
+      # its token in the clone URL as before C3 (logged per connector), or
+      # "refuse", no clone and the reason in the agent's README.
+      fallback: token-in-url
+    # -- SRW's connector driver certificate authority (C3): signs each TLS
+    # driver pod's certificate; workspaces trust it for the driver's URL
+    # only. Generated once at install and kept (resource-policy keep) when
+    # gitSwap is on, unless secretName names an existing Secret with tls.crt
+    # and tls.key (Vault, ESO). Mounted into the orchestrator only.
+    ca:
+      secretName: ""
+      validityDays: 3650
 
 orchestrator:
   # -- 1 replica by default. NOT a statement about what HA needs: leader

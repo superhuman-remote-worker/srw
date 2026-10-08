@@ -1684,3 +1684,12 @@ exchange's ingress policy and the static egress rules into it.
 {{- $explicit := .Values.connectors.servicePods.namespace | default .Values.orchestrator.connectorLeases.networkPolicy.driverNamespace -}}
 {{- $explicit | default (printf "%s-connectors" (include "srw.fullname" . | trunc 52 | trimSuffix "-")) -}}
 {{- end }}
+
+{{/*
+SRW's connector driver certificate authority (connector drivers C3): the
+operator's Secret (connectors.drivers.ca.secretName), else the one the chart
+generates once and keeps (templates/connector-driver-ca.yaml).
+*/}}
+{{- define "srw.connectorDriverCaSecretName" -}}
+{{- .Values.connectors.drivers.ca.secretName | default (printf "%s-connector-driver-ca" (include "srw.fullname" . | trunc 42 | trimSuffix "-")) -}}
+{{- end }}

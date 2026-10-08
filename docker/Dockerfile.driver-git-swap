@@ -1,0 +1,44 @@
+# =============================================================================
+# srw-driver-git-swap — SRW's git swap driver (srw.git-swap/v1)
+# =============================================================================
+# Connector drivers C3: a git smart-HTTP reverse proxy in the service pod of
+# one repository connector. A workspace's git reaches it with a lease token;
+# it exchanges the lease for the forge token per request, injects it
+# upstream (HTTPS only, the connector's configured repository only, no
+# redirect followed), refuses every push on a ReadOnly binding and deletes
+# and non-branch refs on a ReadWrite one, and scrubs the token from every
+# answer. One static Go binary (standard library only) on scratch with the
+# CA bundle it verifies upstreams against, run as an unprivileged user; the
+# pod drops every capability. SRW's driver shim starts it (its entrypoint and
+# command below are what the shim runs).
+#
+#   docker build -f docker/Dockerfile.driver-git-swap -t srw-driver-git-swap .
+#
+# The Go toolchain is the shim's (docker/Dockerfile.driver-shim): a supported
+# release pinned by digest (bump both together). It runs on the build
+# platform and cross-compiles for the target platform BuildKit names.
+# =============================================================================
+FROM --platform=$BUILDPLATFORM golang:1.26.8-alpine3.24@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c AS build
+
+ARG SRW_SOURCE_REVISION="dev"
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /src
+COPY drivers/git-swap/ ./
+RUN set -eu; \
+    test -s /etc/ssl/certs/ca-certificates.crt; \
+    goarch="${TARGETARCH:-$(go env GOARCH)}"; \
+    CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="$goarch" go build -trimpath \
+        -ldflags "-s -w -X main.version=${SRW_SOURCE_REVISION}" \
+        -o /out/srw-git-swap .; \
+    if [ "$goarch" = "$(go env GOHOSTARCH)" ]; then /out/srw-git-swap version; fi
+
+FROM scratch
+# The upstream forges' certificates are checked against this bundle; the
+# workspace-facing side is SRW's own authority, delivered per pod.
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /out/srw-git-swap /srw-git-swap
+USER 65532:65532
+ENTRYPOINT ["/srw-git-swap"]
+CMD ["serve"]

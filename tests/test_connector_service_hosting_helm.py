@@ -698,7 +698,7 @@ def test_tilt_builds_the_front_and_the_test_server_and_pins_both():
         "('srw-driver-mcp-test', 'connectors.drivers.mcpTest.image.repository', "
         "'connectors.drivers.mcpTest.image.tag')" in tiltfile
     )
-    assert "'srw-driver-mcp-front', 'srw-driver-mcp-test']" in tiltfile
+    assert "'srw-driver-mcp-front', 'srw-driver-mcp-test'" in tiltfile
 
 
 def test_the_k3d_profile_installs_the_test_server_and_gitea_behind_the_front():
