@@ -827,7 +827,12 @@ async def prepare_thread_lease_delivery(db: Any, thread_id: str) -> None:
     here, before that lock, a pool connection and an attach reservation are
     taken; the delivery under them then finds the answers remembered. Reads
     only the selected repository rows' URL and config (no credential).
-    Never raises."""
+    A registered image driver's binds start and are waited for here too, at
+    most the installation's bind wait (D6): a bind still running never takes
+    an attach reservation's release-and-successor path. Never raises."""
+    from orchestrator.services.connector_bind_time import prepare_thread_bindings
+
+    await prepare_thread_bindings(db, thread_id)
     try:
         from orchestrator.services.connector_git_swap_delivery import (
             candidate_entry,

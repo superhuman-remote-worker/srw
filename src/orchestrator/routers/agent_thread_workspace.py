@@ -14,7 +14,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from orchestrator.services import connector_bind_time, thread_workspace_delivery
+from orchestrator.services import thread_workspace_delivery
 
 # No `tags=`: the declaration this replaces carried none, and a tag would
 # change the published OpenAPI operation for a route whose identity this
@@ -45,10 +45,6 @@ async def agent_get_thread_workspace(
     presented_agent_id = request_headers.get("X-Agent-ID")
     presented_runtime_generation = request_headers.get("X-Session-Runtime-Generation")
     presented_attach_token = request_headers.get("X-Session-Runtime-Attach-Token")
-    # A registered driver's connector binds in its own pod (D6): waited for
-    # here, outside the lock and under the agent's request timeout; one
-    # still binding is delivered later with a README notice meanwhile.
-    await connector_bind_time.prepare_thread_bindings(dependencies.store, thread_id)
     # This response is a credential-delivery boundary for cold/dedicated
     # sessions.  Use the same lock as live selection replacement and do every
     # authoritative read + response build beneath it.  Once an A -> B/[] save

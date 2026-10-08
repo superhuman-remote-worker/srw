@@ -76,7 +76,7 @@ from uuid import UUID, uuid4
 
 import httpx
 
-from orchestrator.services import connector_bind_time, connector_credential_leases
+from orchestrator.services import connector_credential_leases
 from orchestrator.services.container_provisioner import (
     WORKSPACE_RUNTIME_INCARNATION_KEY,
 )
@@ -300,6 +300,9 @@ async def send_session_attach(
     # The network part of a lease delivery (a driver image, a git swap
     # upstream's DNS and TLS) runs before the lock, the pool connection and
     # the attach reservation; the delivery under them finds it remembered.
+    # A registered driver's bind is started and waited for there too (D6),
+    # so one still running never takes the release-and-successor path; one
+    # that outlasts the wait is delivered later, with a README notice.
     await connector_credential_leases.prepare_thread_lease_delivery(
         dependencies.store, thread_id
     )
@@ -908,11 +911,6 @@ async def send_session_attach_locked(
         allow_schedule=False,
     ):
         return False
-    # A registered driver's connector binds in its own pod (D6): started and
-    # waited for here, before the reservation, so a bind still running never
-    # takes the release-and-successor path below. One that outlasts the wait
-    # is delivered later; the session gets a README notice meanwhile.
-    await connector_bind_time.prepare_thread_bindings(store, thread_id)
     thread = await store.get_thread(thread_id)
     if not thread_uses_pinned_execution(thread) or not same_thread_runtime_authority(
         thread, runtime_authority

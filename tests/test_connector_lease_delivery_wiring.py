@@ -222,6 +222,42 @@ async def test_a_refused_lease_refuses_the_bundle():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("final", "fails"), [(True, True), (False, False)])
+async def test_a_registered_driver_s_bind_refuses_the_bundle(final, fails):
+    """D6: a bind still running waits for a later dispatch; one that failed
+    for good fails the job with its reason. Never a traceback."""
+    from orchestrator.services import connector_bind_time
+
+    error = (
+        connector_bind_time.BindTimeRefused("No such tenant")
+        if final
+        else connector_bind_time.BindTimePending("still binding")
+    )
+    resources = orch_main.app.state.resources
+    failed = AsyncMock(return_value=True)
+    with ExitStack() as stack:
+        _dispatch_patches(stack, _probe_row())
+        _lease_patches(stack, _issued())
+        stack.enter_context(
+            patch.object(
+                leases, "deliver_connector_leases_with", AsyncMock(side_effect=error)
+            )
+        )
+        stack.enter_context(
+            patch.object(resources.postgres_db, "update_job_status", failed)
+        )
+        request = await control_seams.build_job_start_request(_job())
+
+    assert request is None
+    if fails:
+        failed.assert_awaited_once_with(
+            JOB_ID, status="failed", error_message="No such tenant"
+        )
+    else:
+        failed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_the_claim_transaction_helper_refuses_generically():
     conn = MagicMock()
     with patch.object(
@@ -569,6 +605,66 @@ async def test_a_live_detach_revokes_every_removed_connectors_lease():
     assert revoked == [
         ("conn", leases.LeaseOwner.thread(THREAD), [PROBE_ID, GENERIC_ID, REPO_ID])
     ]
+
+
+IMAGE_ID = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+
+
+@pytest.mark.asyncio
+async def test_a_live_detach_revokes_a_registered_driver_s_binding():
+    """D6: the session's binding of a detached registered image driver moves
+    to revoking in the same step, so its driver's revoke runs within one
+    reconciler pass; a selected one starts binding at once."""
+    from orchestrator.services import connector_bind_time
+    from tests.test_b06_lane_b_thread_config_update import THREAD, _pinned_thread
+
+    deps = _detach_dependencies()
+    deps.store.get_datasource_policy_rows = AsyncMock(
+        return_value=[
+            {"id": IMAGE_ID, "type": "image_driver"},
+            {"id": GENERIC_ID, "type": "generic"},
+        ]
+    )
+    unbound: list = []
+
+    async def revoke_bindings(conn, *, owner, connector_ids, reason):
+        unbound.append((conn, owner, list(connector_ids), reason))
+        return 1
+
+    started = MagicMock()
+    row = _pinned_thread(metadata={"datasource_ids": [IMAGE_ID, GENERIC_ID, KEPT_ID]})
+    with (
+        patch.object(leases, "revoke_connector_leases", AsyncMock(return_value=[])),
+        patch.object(connector_bind_time, "revoke_owner_bindings", revoke_bindings),
+        patch.object(connector_bind_time, "start_thread_bindings", started),
+    ):
+        await tcu.apply_thread_config_update_locked(
+            THREAD,
+            row,
+            {},
+            [KEPT_ID],
+            request=MagicMock(),
+            actor=None,
+            dependencies=deps,
+        )
+
+    assert unbound == [
+        ("conn", leases.LeaseOwner.thread(THREAD), [IMAGE_ID], "connector_detached")
+    ]
+    started.assert_called_once_with(THREAD)
+
+
+@pytest.mark.asyncio
+async def test_a_session_s_binds_are_prepared_before_the_lock_and_reservation():
+    """D6: the attach and the workspace poll start and wait for a registered
+    driver's bind in the prepare step that runs before the datasource lock
+    and the warm reservation, git swap installed or not."""
+    from orchestrator.services import connector_bind_time
+
+    prepared = AsyncMock()
+    with patch.object(connector_bind_time, "prepare_thread_bindings", prepared):
+        await leases.prepare_thread_lease_delivery("db", "thread-1")
+    prepared.assert_awaited_once_with("db", "thread-1")
 
 
 # =============================================================================
