@@ -468,6 +468,9 @@ export interface Datasource {
   credentials?: Record<string, unknown>;
   /** Configured names only; values are never returned by connector reads. */
   env_var_names?: string[];
+  /** A registered image driver's connector (D6): the variables its driver
+   *  declares its bind sets in the workspace, shown before it is attached. */
+  driver_env_names?: string[];
   cli_hint: string | null;
   default_branch: string | null;
   config?: DatasourceConfig;

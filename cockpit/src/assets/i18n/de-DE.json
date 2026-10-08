@@ -2675,6 +2675,7 @@
   "datasources": {
     "driversLink": "Treiber-Fähigkeiten",
     "driversLinkHint": "Was jeder Konnektortreiber anbietet und was es durchsetzt",
+    "driverEnvNames": "Setzt:",
     "generic": {
       "previewToggle": "Diesen Konnektor im generischen Formular anzeigen",
       "previewHint": "Nur in Entwicklungs-Builds: zeigt die Spezifikation des Treibers statt seines eigenen Formulars.",
@@ -2723,7 +2724,8 @@
       "kubeconfig": "Kubeconfig",
       "ssh_key": "SSH-Schlüssel",
       "generic_file": "Datei",
-      "credentials": "Zugangsdaten"
+      "credentials": "Zugangsdaten",
+      "image_driver": "Registrierter Treiber"
     },
     "catalog": {
       "search": "Konnektoren durchsuchen…",
@@ -3072,6 +3074,7 @@
       "enable": "Aktivieren",
       "disabled": "Deaktiviert: bindet nichts Neues",
       "envNames": "Setzt:",
+      "disableConfirm": "{{image}} deaktivieren? SRW widerruft jetzt seine {{bindings}} aktiven Bindungen über {{connectors}} Konnektor(en) und bindet nichts Neues, bis er wieder aktiviert ist.",
       "scopeKind": {
         "Account": "In einem Konto registriert",
         "Project": "In einem Projekt registriert",

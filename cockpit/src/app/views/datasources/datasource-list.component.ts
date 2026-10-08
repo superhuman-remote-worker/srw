@@ -1536,6 +1536,12 @@ type KeyValueRow = {key: string; value: string};
                       @if (ds.description) {
                         <span class="ds-desc">{{ ds.description }}</span>
                       }
+                      @if (ds.driver_env_names?.length) {
+                        <span class="ds-desc" data-driver-env>
+                          {{ 'datasources.driverEnvNames' | transloco }}
+                          <code>{{ ds.driver_env_names!.join(', ') }}</code>
+                        </span>
+                      }
                       @if (ds.type === 'kb' && indexStatuses()[ds.id]; as indexStatus) {
                         <div class="index-status-row">
                           <app-badge [tone]="indexStatusTone(indexStatus.status)" size="xs">

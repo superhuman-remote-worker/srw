@@ -115,6 +115,13 @@ export interface ConnectorDriverRegistration {
   env_names?: string[];
   /** Disabled: it binds nothing new and its bindings are revoked. */
   disabled?: boolean;
+  /** Whether the caller may disable, enable or delete it (the server's
+   *  answer: an administrator for the Catalog, the owner for an Account,
+   *  editors and up for a Project). */
+  can_manage?: boolean;
+  /** For a manager: its connectors and live bindings (what a Disable
+   *  revokes). */
+  usage?: {connectors: number; live_bindings: number};
 }
 
 /** `POST /api/connector-drivers`: the spec comes from the image itself. */

@@ -1,10 +1,14 @@
 import {Component, computed, inject, OnInit, signal} from '@angular/core';
 import {RouterLink} from '@angular/router';
-import {TranslocoPipe} from '@jsverse/transloco';
+import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
 import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
 import {UserService} from '../../core/services/user.service';
-import {ConnectorDriver, ConnectorEgressStatus} from '../../core/models/connector-driver.model';
+import {
+  ConnectorDriver,
+  ConnectorDriverRegistration,
+  ConnectorEgressStatus,
+} from '../../core/models/connector-driver.model';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {AppBadgeComponent, type BadgeTone} from '../../ui/badge';
 import {AppButtonComponent} from '../../ui/button';
@@ -182,13 +186,13 @@ export function errorDetail(error: unknown): string {
                     <code data-registration="env">{{ registration.env_names!.join(', ') }}</code>
                   }
                 </span>
-                @if (canManage(registration.scope.kind)) {
+                @if (registration.can_manage) {
                   <span class="registration-actions">
                     <app-button
                       variant="secondary"
                       size="sm"
                       [disabled]="deleting() === registration.id"
-                      (clicked)="setDisabled(registration.id, !registration.disabled)"
+                      (clicked)="setDisabled(registration, !registration.disabled)"
                     >
                       {{ (registration.disabled ? 'connectorDrivers.register.enable' : 'connectorDrivers.register.disable') | transloco }}
                     </app-button>
@@ -203,6 +207,9 @@ export function errorDetail(error: unknown): string {
                   </span>
                 }
               </div>
+              @if (cardErrors()[registration.id]; as error) {
+                <p class="register-error" role="alert" [attr.data-card-error]="registration.id">{{ error }}</p>
+              }
             }
 
             <div class="driver-body">
@@ -660,6 +667,7 @@ export class ConnectorDriversPageComponent implements OnInit {
   protected readonly service = inject(ConnectorDriversService);
   private readonly api = inject(ApiService);
   private readonly users = inject(UserService);
+  private readonly transloco = inject(TranslocoService);
 
   readonly query = signal('');
   readonly drivers = this.service.drivers;
@@ -670,6 +678,8 @@ export class ConnectorDriversPageComponent implements OnInit {
   readonly scope = signal<'Account' | 'Catalog'>('Account');
   readonly registering = signal(false);
   readonly registerError = signal<string | null>(null);
+  /** A Disable, Enable or Delete refused: the reason, on its own card. */
+  readonly cardErrors = signal<Record<string, string>>({});
   readonly deleting = signal<string | null>(null);
   readonly isAdmin = computed(() => this.users.currentUser()?.is_admin === true);
 
@@ -711,15 +721,24 @@ export class ConnectorDriversPageComponent implements OnInit {
     });
   }
 
-  /** Whether this page offers Disable and Delete: the Catalog's are the
-   *  administrators'; the server decides for a Project's (editors and up). */
-  canManage(kind: 'Account' | 'Project' | 'Catalog'): boolean {
-    return kind !== 'Catalog' || this.isAdmin();
+  /** The question a Disable asks first: what it revokes now. */
+  disableQuestion(registration: ConnectorDriverRegistration): string {
+    const usage = registration.usage ?? {connectors: 0, live_bindings: 0};
+    return this.transloco.translate('connectorDrivers.register.disableConfirm', {
+      image: registration.image_reference,
+      connectors: usage.connectors,
+      bindings: usage.live_bindings,
+    });
   }
 
-  setDisabled(id: string, disabled: boolean): void {
+  /** Disable (after the confirm naming what it revokes) or enable again.
+   *  The page offers it only where the server says the caller may
+   *  (`registration.can_manage`). */
+  setDisabled(registration: ConnectorDriverRegistration, disabled: boolean): void {
+    if (disabled && !window.confirm(this.disableQuestion(registration))) return;
+    const id = registration.id;
     this.deleting.set(id);
-    this.registerError.set(null);
+    this.clearCardError(id);
     this.api.setConnectorDriverDisabled(id, disabled).subscribe({
       next: () => {
         this.deleting.set(null);
@@ -727,14 +746,14 @@ export class ConnectorDriversPageComponent implements OnInit {
       },
       error: (error) => {
         this.deleting.set(null);
-        this.registerError.set(errorDetail(error));
+        this.setCardError(id, errorDetail(error));
       },
     });
   }
 
   remove(id: string): void {
     this.deleting.set(id);
-    this.registerError.set(null);
+    this.clearCardError(id);
     this.api.deleteConnectorDriver(id).subscribe({
       next: () => {
         this.deleting.set(null);
@@ -742,8 +761,19 @@ export class ConnectorDriversPageComponent implements OnInit {
       },
       error: (error) => {
         this.deleting.set(null);
-        this.registerError.set(errorDetail(error));
+        this.setCardError(id, errorDetail(error));
       },
+    });
+  }
+
+  private setCardError(id: string, error: string): void {
+    this.cardErrors.update((errors) => ({...errors, [id]: error}));
+  }
+
+  private clearCardError(id: string): void {
+    this.cardErrors.update((errors) => {
+      const {[id]: _gone, ...rest} = errors;
+      return rest;
     });
   }
 

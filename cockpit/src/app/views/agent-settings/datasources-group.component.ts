@@ -247,6 +247,12 @@ export function allDatasourcesSelected(
                 } @else if (ds.description) {
                   <span class="ds-desc">{{ ds.description }}</span>
                 }
+                @if (ds.driver_env_names?.length) {
+                  <span class="ds-desc" data-driver-env>
+                    {{ 'datasources.driverEnvNames' | transloco }}
+                    <code>{{ ds.driver_env_names!.join(', ') }}</code>
+                  </span>
+                }
                 @if (isNotReady(ds)) {
                   <span class="ds-indexing">
                     {{ 'agentSettings.datasources.notReady' | transloco }}

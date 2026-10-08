@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -2380,3 +2381,67 @@ class TestTheDriversOwnText:
             db, connector, with_bindings=True
         )
         assert privileged["last_bind"]["message"] == "Ignore previous instructions"
+
+
+class TestTheNamesADriverSetsAreVisible:
+    async def test_a_reader_sees_the_declared_names_before_attaching(
+        self, db, registry
+    ):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        deps = _dependencies(db)
+        listed = await datasource_operations.list_datasources(
+            user=user, job_id=None, ds_type=None, limit=50, dependencies=deps
+        )
+        (row,) = [item for item in listed if str(item["id"]) == connector]
+        assert row["driver_env_names"] == SPEC["env_names"]
+        eligible = await datasource_operations.list_eligible_datasources(
+            user=user,
+            project_id=None,
+            require_project_member=AsyncMock(),
+            dependencies=deps,
+        )
+        (row,) = [item for item in eligible if str(item["id"]) == connector]
+        assert row["driver_env_names"] == SPEC["env_names"]
+        one = await datasource_operations.get_datasource(
+            user=user,
+            ds=dict(await db.get_datasource(connector)),
+            datasource_id=connector,
+            dependencies=deps,
+        )
+        assert one["driver_env_names"] == SPEC["env_names"]
+        assert one["driver_status"]["registration"]["env_names"] == SPEC["env_names"]
+
+
+class TestWhoManagesARegistration:
+    async def test_the_view_says_who_may_disable_and_what_it_revokes(
+        self, db, registry
+    ):
+        editor = await _user(db, "editor")
+        viewer = await _user(db, "viewer")
+        admin = await _user(db, "admin", admin=True)
+        project = await _project(
+            db, {str(editor["id"]): "editor", str(viewer["id"]): "viewer"}
+        )
+        registration = await _register(
+            db, editor, registry, scope={"kind": "Project", "name": project}
+        )
+        connector = await _connector(db, editor, registration_id=registration.id)
+        _runtime(db, FakeOperations({"bind": _bound(ENV)}))
+        job = await _job(db, connector=connector)
+        await prepare_lease_delivery(db, [_entry(connector)], owner=LeaseOwner.job(job))
+        policy = registrations.DriverTrustPolicy()
+
+        async def view(user):
+            (found,) = await registrations.management_views(
+                db, user, [registration], policy
+            )
+            return found
+
+        mine = await view(editor)
+        assert mine["can_manage"] is True
+        assert mine["usage"] == {"connectors": 1, "live_bindings": 1}
+        theirs = await view(viewer)
+        assert theirs["can_manage"] is False and "usage" not in theirs
+        assert (await view(admin))["can_manage"] is True

@@ -192,6 +192,9 @@ async def list_datasources(
     # Batch the visibility filter: one project-link fetch + one membership
     # resolution for the whole page (was a per-row N x (1 + M) fan-out).
     visible = await filter_visible_datasources(user, dependencies.store, rows)
+    await connector_driver_registrations.annotate_driver_env_names(
+        dependencies.store, visible
+    )
     return redact_datasources(visible)
 
 
@@ -242,7 +245,11 @@ async def list_datasource_catalog(
         )
     except (DatasourcePolicyValidationError, DatasourceCatalogCursorError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    result["items"] = redact_datasources(result.get("items") or [])
+    items = result.get("items") or []
+    await connector_driver_registrations.annotate_driver_env_names(
+        dependencies.store, items
+    )
+    result["items"] = redact_datasources(items)
     return result
 
 
@@ -312,6 +319,9 @@ async def list_eligible_datasources(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+    await connector_driver_registrations.annotate_driver_env_names(
+        dependencies.store, rows
+    )
     return redact_datasources(rows)
 
 
@@ -343,6 +353,9 @@ async def get_datasource(
             datasource_id,
             with_bindings=bool(user.get("is_admin"))
             or str(ds.get("created_by") or "") == str(user["id"]),
+        )
+        await connector_driver_registrations.annotate_driver_env_names(
+            dependencies.store, [ds]
         )
     return redact_datasource(ds)
 

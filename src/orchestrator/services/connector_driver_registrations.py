@@ -281,6 +281,74 @@ async def list_visible_registrations(
     return _readable(rows)
 
 
+async def management_views(
+    db: Any,
+    user: Mapping[str, Any],
+    registrations: Iterable[Registration],
+    policy: DriverTrustPolicy,
+) -> list[dict[str, Any]]:
+    """Each registration's view for ``user``, with ``can_manage`` (whether
+    they may disable, enable or delete it: an unrestricted administrator for
+    the Catalog, the owner for an Account, editors and up for a Project; a
+    project-scoped token only its project's) and, where they may, ``usage``:
+    how many connectors run it and how many of its bindings are live, which
+    a Disable would revoke."""
+    registrations = list(registrations)
+    token_project = mcp_scope_project_id(dict(user))
+    admin = bool(user.get("is_admin"))
+    roles: dict[str, Any] = {}
+    manageable: set[str] = set()
+    for registration in registrations:
+        kind = registration.scope_kind
+        if kind == "Catalog":
+            allowed = admin and token_project is None
+        elif kind == "Account":
+            allowed = token_project is None and (
+                registration.owner_id == str(user["id"]) or admin
+            )
+        else:
+            project = str(registration.project_id)
+            if token_project is not None and str(token_project) != project:
+                allowed = False
+            elif admin:
+                allowed = True
+            else:
+                if project not in roles:
+                    roles[project] = await db.get_user_role_in_project(
+                        project, str(user["id"])
+                    )
+                allowed = _role_satisfies(roles[project], "editor")
+        if allowed:
+            manageable.add(registration.id)
+    usage: dict[str, dict[str, int]] = {}
+    if manageable:
+        for row in await db.fetch(
+            """
+            SELECT r.id,
+                   (SELECT count(*) FROM connector_driver_assignments a
+                     WHERE a.registration_id = r.id) AS connectors,
+                   (SELECT count(*) FROM connector_bind_time_bindings b
+                     WHERE b.registration_id = r.id
+                       AND b.status IN ('pending', 'bound')) AS live_bindings
+              FROM connector_driver_registrations r
+             WHERE r.id = ANY($1::uuid[])
+            """,
+            [UUID(value) for value in manageable],
+        ):
+            usage[str(row["id"])] = {
+                "connectors": int(row["connectors"]),
+                "live_bindings": int(row["live_bindings"]),
+            }
+    views = []
+    for registration in registrations:
+        view = registration.view(policy)
+        view["can_manage"] = registration.id in manageable
+        if registration.id in usage:
+            view["usage"] = usage[registration.id]
+        views.append(view)
+    return views
+
+
 async def _can_read(
     db: Any, user: Mapping[str, Any], registration: Registration
 ) -> bool:
@@ -830,6 +898,7 @@ async def connector_driver_status(
                 "image_reference": registration.image_reference,
                 "plane": registration.plane,
                 "disabled": registration.disabled,
+                "env_names": list(registration.env_names),
             }
             if registration is not None
             else None
@@ -852,6 +921,41 @@ async def connector_driver_status(
             _binding_view(row, with_owner=True, privileged=True) for row in rows
         ]
     return status
+
+
+_ENV_NAMES = """
+SELECT a.connector_id, r.spec
+  FROM connector_driver_assignments a
+  JOIN connector_driver_registrations r ON r.id = a.registration_id
+ WHERE a.connector_id = ANY($1::uuid[])
+"""
+
+
+async def annotate_driver_env_names(db: Any, rows: Iterable[Any]) -> None:
+    """Give each registered image driver's connector in ``rows`` the
+    variable names its driver declares it sets (``driver_env_names``), in
+    place: what a reader sees on the connector and in the attach picker
+    before selecting it. One query for the page; a row whose registration
+    is gone lists none."""
+    wanted: dict[str, dict] = {}
+    for row in rows:
+        if isinstance(row, dict) and row.get("type") == "image_driver":
+            try:
+                wanted[str(UUID(str(row.get("id"))))] = row
+            except ValueError:
+                continue
+    if not wanted:
+        return
+    found = {
+        str(record["connector_id"]): record["spec"]
+        for record in await db.fetch(_ENV_NAMES, [UUID(value) for value in wanted])
+    }
+    for connector_id, row in wanted.items():
+        try:
+            names = declared_env_names(_json(found.get(connector_id)) or {})
+        except ValueError:
+            names = ()
+        row["driver_env_names"] = list(names)
 
 
 async def driver_for_row(
@@ -878,6 +982,8 @@ async def driver_for_row(
 
 __all__ = [
     "CATALOG",
+    "annotate_driver_env_names",
+    "management_views",
     "SCOPE_KINDS",
     "DriverTrustPolicy",
     "Registration",

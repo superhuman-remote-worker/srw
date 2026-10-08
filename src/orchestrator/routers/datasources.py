@@ -234,16 +234,24 @@ async def list_connector_drivers(
         dependencies.operations.connector_drivers,
         hosting=dependencies.service_hosting,
     )
-    for registration in await connector_driver_registrations.list_visible_registrations(
+    registrations = await connector_driver_registrations.list_visible_registrations(
         dependencies.store, user
-    ):
-        matrix["drivers"].append(
-            registered_driver_entry(
-                registration,
-                trust=dependencies.driver_trust.trust(registration.image_reference),
-                hosting=dependencies.service_hosting,
-            )
+    )
+    # Whether the caller may disable or delete each, and what a Disable
+    # revokes (the page offers its buttons and names that in its confirm).
+    views = await connector_driver_registrations.management_views(
+        dependencies.store, user, registrations, dependencies.driver_trust
+    )
+    for registration, view in zip(registrations, views, strict=True):
+        entry = registered_driver_entry(
+            registration,
+            trust=dependencies.driver_trust.trust(registration.image_reference),
+            hosting=dependencies.service_hosting,
         )
+        entry["registration"]["can_manage"] = view["can_manage"]
+        if "usage" in view:
+            entry["registration"]["usage"] = view["usage"]
+        matrix["drivers"].append(entry)
     return matrix
 
 

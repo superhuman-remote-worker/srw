@@ -165,7 +165,8 @@ def _client(**over):
         return USER
 
     values = {
-        "store": SimpleNamespace(),
+        # The usage a manager's view shows (none here).
+        "store": SimpleNamespace(fetch=AsyncMock(return_value=[])),
         "resolve_image": AsyncMock(),
         "run_spec": None,
         "trust": DriverTrustPolicy(trusted_repositories=("ghcr.io/acme",)),
@@ -181,10 +182,13 @@ def _client(**over):
 
 def _registration():
     return SimpleNamespace(
-        id="r1",
+        id="00000000-0000-0000-0000-0000000000e1",
+        scope_kind="Account",
+        owner_id=USER["id"],
+        project_id=None,
         image_reference="ghcr.io/acme/env:1",
         view=lambda policy: {
-            "id": "r1",
+            "id": "00000000-0000-0000-0000-0000000000e1",
             "trust": policy.trust("ghcr.io/acme/env:1"),
         },
     )
@@ -203,7 +207,7 @@ class TestRoutes:
         assert response.json() == {
             "registrations": [
                 {
-                    "id": "r1",
+                    "id": "00000000-0000-0000-0000-0000000000e1",
                     "trust": {
                         "tier": "trusted",
                         "trusted": True,
@@ -211,6 +215,8 @@ class TestRoutes:
                         "image": "ghcr.io/acme/env:1",
                         "claims_declared_by_author": False,
                     },
+                    # The caller's own Account: they may disable it.
+                    "can_manage": True,
                 }
             ]
         }

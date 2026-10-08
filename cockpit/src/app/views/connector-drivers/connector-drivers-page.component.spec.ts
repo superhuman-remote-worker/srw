@@ -279,7 +279,7 @@ describe('ConnectorDriversPageComponent', () => {
       expect(errorDetail(ambiguous)).toBe('Ambiguous driver name');
     });
 
-    const catalogDriver = (disabled = false): ConnectorDriver => ({
+    const catalogDriver = (disabled = false, can_manage = true): ConnectorDriver => ({
       ...CUSTOM,
       registration: {
         id: 'r2',
@@ -289,18 +289,37 @@ describe('ConnectorDriversPageComponent', () => {
         spec_source: 'label',
         env_names: ['TICKETS_TOKEN'],
         disabled,
+        can_manage,
+        ...(can_manage ? {usage: {connectors: 2, live_bindings: 3}} : {}),
       },
     });
 
-    it("offers a Catalog registration's Delete and Disable to administrators only", () => {
-      const user = card(mount([catalogDriver()]).host, CUSTOM.name);
-      expect(text(user)).not.toContain(page.register.delete);
-      expect(text(user)).not.toContain(page.register.disable);
-      expect(text(user)).toContain('TICKETS_TOKEN');
+    it("offers Delete and Disable only where the server says the caller may", () => {
+      const reader = card(mount([catalogDriver(false, false)], false, true).host, CUSTOM.name);
+      expect(text(reader)).not.toContain(page.register.delete);
+      expect(text(reader)).not.toContain(page.register.disable);
+      expect(text(reader)).toContain('TICKETS_TOKEN');
       TestBed.resetTestingModule();
-      const admin = card(mount([catalogDriver()], false, true).host, CUSTOM.name);
-      expect(text(admin)).toContain(page.register.delete);
-      expect(text(admin)).toContain(page.register.disable);
+      const manager = card(mount([catalogDriver()]).host, CUSTOM.name);
+      expect(text(manager)).toContain(page.register.delete);
+      expect(text(manager)).toContain(page.register.disable);
+    });
+
+    it("hides a Project registration's buttons from the project's viewers", () => {
+      const viewer: ConnectorDriver = {
+        ...CUSTOM,
+        registration: {
+          id: 'r3',
+          scope: {kind: 'Project', name: 'p1'},
+          image_reference: 'ghcr.io/acme/ticketing:1',
+          image_digest: 'sha256:' + '3'.repeat(64),
+          spec_source: 'label',
+          can_manage: false,
+        },
+      };
+      const section = card(mount([viewer]).host, CUSTOM.name);
+      expect(text(section)).not.toContain(page.register.disable);
+      expect(text(section)).not.toContain(page.register.delete);
     });
 
     it('disables and enables a registration, and shows it disabled', () => {
@@ -308,9 +327,44 @@ describe('ConnectorDriversPageComponent', () => {
       const section = card(host, CUSTOM.name);
       expect(section.querySelector('[data-registration="disabled"]')).not.toBeNull();
       expect(text(section)).toContain(page.register.enable);
-      fixture.componentInstance.setDisabled('r2', false);
+      const confirm = vi.spyOn(window, 'confirm');
+      fixture.componentInstance.setDisabled(catalogDriver(true).registration!, false);
+      // Enabling revokes nothing: no question.
+      expect(confirm).not.toHaveBeenCalled();
       expect(api.setConnectorDriverDisabled).toHaveBeenCalledWith('r2', false);
       expect(service.load).toHaveBeenLastCalledWith(true);
+      confirm.mockRestore();
+    });
+
+    it('asks before a Disable, naming what it revokes', () => {
+      const {fixture, api} = mount([catalogDriver()]);
+      const registration = catalogDriver().registration!;
+      const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+      fixture.componentInstance.setDisabled(registration, true);
+      expect(api.setConnectorDriverDisabled).not.toHaveBeenCalled();
+      const question = confirm.mock.calls[0][0] as string;
+      expect(question).toContain('ghcr.io/acme/ticketing:1');
+      expect(question).toContain('3 live binding');
+      expect(question).toContain('2 connector');
+      confirm.mockReturnValue(true);
+      fixture.componentInstance.setDisabled(registration, true);
+      expect(api.setConnectorDriverDisabled).toHaveBeenCalledWith('r2', true);
+      confirm.mockRestore();
+    });
+
+    it("shows a refused Disable or Delete on the registration's own card", () => {
+      const {fixture, host, api} = mount([catalogDriver()]);
+      api.deleteConnectorDriver.mockReturnValueOnce(
+        throwError(() => ({status: 409, error: {detail: '1 binding(s) of this driver are not revoked yet'}})),
+      );
+      fixture.componentInstance.remove('r2');
+      fixture.detectChanges();
+      const section = card(host, CUSTOM.name);
+      expect(text(section.querySelector('[data-card-error="r2"]'))).toBe(
+        '1 binding(s) of this driver are not revoked yet',
+      );
+      // Not in the Register section.
+      expect(host.querySelector('[data-section="register"] .register-error')).toBeNull();
     });
   });
 });

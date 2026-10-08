@@ -2675,6 +2675,7 @@
   "datasources": {
     "driversLink": "Driver capabilities",
     "driversLinkHint": "What each connector driver offers, and what enforces it",
+    "driverEnvNames": "Sets:",
     "generic": {
       "previewToggle": "Show this connector through the generic form",
       "previewHint": "Development builds only: renders the driver's spec instead of its bespoke form.",
@@ -2723,7 +2724,8 @@
       "kubeconfig": "Kubeconfig",
       "ssh_key": "SSH Key",
       "generic_file": "File",
-      "credentials": "Credentials"
+      "credentials": "Credentials",
+      "image_driver": "Registered driver"
     },
     "catalog": {
       "search": "Search connectors…",
@@ -3072,6 +3074,7 @@
       "enable": "Enable",
       "disabled": "Disabled: binds nothing new",
       "envNames": "Sets:",
+      "disableConfirm": "Disable {{image}}? SRW revokes its {{bindings}} live binding(s) now, across {{connectors}} connector(s), and binds nothing new until it is enabled again.",
       "scopeKind": {
         "Account": "Registered in an account",
         "Project": "Registered in a project",

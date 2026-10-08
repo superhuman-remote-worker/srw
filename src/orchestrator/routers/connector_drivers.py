@@ -116,7 +116,11 @@ async def list_connector_drivers(
     registrations = await connector_driver_registrations.list_visible_registrations(
         dependencies.store, user
     )
-    return {"registrations": [item.view(dependencies.trust) for item in registrations]}
+    return {
+        "registrations": await connector_driver_registrations.management_views(
+            dependencies.store, user, registrations, dependencies.trust
+        )
+    }
 
 
 @router.post("/api/connector-drivers", status_code=201)
@@ -185,7 +189,9 @@ async def get_connector_driver(
     registration = await connector_driver_registrations.get_visible_registration(
         dependencies.store, user, registration_id
     )
-    view = registration.view(dependencies.trust)
+    (view,) = await connector_driver_registrations.management_views(
+        dependencies.store, user, [registration], dependencies.trust
+    )
     view["driver"] = registered_driver_entry(
         registration,
         trust=dependencies.trust.trust(registration.image_reference),
@@ -229,7 +235,10 @@ async def disable_connector_driver(
     registration = await connector_driver_registrations.set_registration_disabled(
         dependencies.store, user, registration_id, disabled=True, request=request
     )
-    return registration.view(dependencies.trust)
+    (view,) = await connector_driver_registrations.management_views(
+        dependencies.store, user, [registration], dependencies.trust
+    )
+    return view
 
 
 @router.post("/api/connector-drivers/{registration_id}/enable")
@@ -246,4 +255,7 @@ async def enable_connector_driver(
     registration = await connector_driver_registrations.set_registration_disabled(
         dependencies.store, user, registration_id, disabled=False, request=request
     )
-    return registration.view(dependencies.trust)
+    (view,) = await connector_driver_registrations.management_views(
+        dependencies.store, user, [registration], dependencies.trust
+    )
+    return view
