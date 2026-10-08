@@ -869,7 +869,7 @@ def _pool(monkeypatch, runner, *, stale: set[str], idle: list[str]):
 
     def served(pod, served_set):
         checked.append(pod)
-        assert served_set is gate.PINNED_AGENT
+        assert served_set is runner.pinned_served
         if pod in stale:
             return [f"{pod} stale: ['src/agent/connectors/files.py']"]
         return []
@@ -902,6 +902,15 @@ def test_a_stale_pooled_pinned_pod_refuses_the_live_phase(monkeypatch):
     assert "current_job_id IS NULL" in queries[0]
     (name, ok, _detail) = runner.report.results[-1]
     assert not ok and "pooled pinned" in name
+
+
+def test_a_busy_stale_pooled_pod_is_only_noted(monkeypatch):
+    """A pod with a current job or a live thread cannot take the thread."""
+    runner = _runner()
+    _pool(monkeypatch, runner, stale={"srw-agent-j-08835181"}, idle=[])
+    runner.check_pinned_pool()
+    assert runner.report.passed
+    assert any("srw-agent-j-08835181" in note for note in runner.report.notes)
 
 
 def test_a_fresh_pool_lets_the_live_phase_start(monkeypatch):

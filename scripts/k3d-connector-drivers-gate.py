@@ -858,6 +858,9 @@ class TypeCase:
 
 
 class ConnectorDriversGate:
+    #: What a pinned agent pod must serve (a gate for a later slice extends it).
+    pinned_served: ServedSet = PINNED_AGENT
+
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.gate_id = args.gate_id or f"d1a-{secrets.token_hex(5)}"
@@ -1863,7 +1866,7 @@ class ConnectorDriversGate:
         if lane != "pinned":
             raise GateError(f"live session lane is {lane!r}, not pinned")
         pod = self.pinned_pod()["metadata"]["name"]
-        problems = self.served_problems(pod, PINNED_AGENT)
+        problems = self.served_problems(pod, self.pinned_served)
         self.report.check(
             "live: the pinned agent pod serves this checkout's connector modules",
             not problems,
@@ -1962,36 +1965,44 @@ class ConnectorDriversGate:
         return [row for row in rows.splitlines() if row]
 
     def check_pinned_pool(self) -> None:
-        """Refuse a pinned pool any of whose pods serves other connector code.
+        """Refuse a pinned pool whose idle pods serve other connector code.
 
         A new pinned thread may land on any idle pooled pod, and an idle one
         keeps the image it was created with after a Tilt rebuild. The byte
         check of the assigned pod (``live_session``) would then only fail
-        after the session exists; this names the pods to delete up front.
+        after the session exists; this names the pods to delete up front. A
+        busy stale pod (a current job or a live thread) cannot receive the
+        thread, so it is only noted.
         """
         stale = [
             name
             for name in self.pooled_pinned_pods()
-            if self.served_problems(name, PINNED_AGENT)
+            if self.served_problems(name, self.pinned_served)
         ]
         idle = self.idle_pinned_pods(stale)
+        busy = [name for name in stale if name not in idle]
+        if busy:
+            self.report.note(
+                f"live: busy pooled pinned pods serve stale connector code {busy}; "
+                "they cannot take the live session's thread"
+            )
         detail = ""
-        if stale:
+        if idle:
             detail = (
-                f"stale: {stale}; idle pods keep their image after a Tilt "
-                "rebuild. Delete the idle ones and rerun: kubectl "
+                f"idle and stale: {idle}; idle pods keep their image after a "
+                "Tilt rebuild. Delete them and rerun: kubectl "
                 f"--context={LOCAL_CONTEXT} -n {LOCAL_NAMESPACE} delete pod "
-                + (" ".join(idle) if idle else "<none idle; wait for them to finish>")
+                + " ".join(idle)
             )
         self.report.check(
-            "live: every pooled pinned agent pod serves this checkout's "
+            "live: every idle pooled pinned agent pod serves this checkout's "
             "connector modules",
-            not stale,
+            not idle,
             detail,
         )
-        if stale:
+        if idle:
             raise GateError(
-                "a pooled pinned agent pod serves stale connector code: " + detail
+                "an idle pooled pinned agent pod serves stale connector code: " + detail
             )
 
     def pinned_log_lines(self, needles: list[str]) -> list[str]:

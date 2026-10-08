@@ -27,7 +27,7 @@ Fixtures (all disposable, all named after the gate id ``d1d-<10 hex>``):
   project    one project owned by the test account
   connectors a kubeconfig connector (default target
              ``~/.kube/configs/<slug>.yaml``) and a generic-file connector
-             (``~/.config/d1d/<suffix>.json`` with an ``env_var``)
+             (``~/.srw-files/d1d/<suffix>.json`` with an ``env_var``)
 
 Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
 
@@ -137,10 +137,12 @@ AGENT_FILES = (
     "src/shared/runtime/core/backends/remote.py",
     "src/shared/connectors/builtin.py",
     "src/shared/connectors/file_targets.py",
+    "src/shared/credential_connectors.py",
 )
 ORCHESTRATOR_FILES = (
     "src/shared/connectors/builtin.py",
     "src/shared/connectors/file_targets.py",
+    "src/shared/credential_connectors.py",
     "src/orchestrator/security/credential_files.py",
     "src/orchestrator/services/connector_drivers/credential_files.py",
 )
@@ -318,7 +320,25 @@ def apply(manifests: list[dict]) -> None:
     )
 
 
+#: A pinned agent pod serves the drivers gate's set plus the D1d workspace
+#: programs and their transport.
+PINNED_SERVED = base.ServedSet(
+    base.PINNED_AGENT.label,
+    base.PINNED_AGENT.component,
+    base.PINNED_AGENT.container,
+    base.PINNED_AGENT.dirs,
+    (
+        *base.PINNED_AGENT.files,
+        "src/shared/runtime/core/credential_env.py",
+        "src/shared/runtime/core/backends/remote.py",
+    ),
+    base.PINNED_AGENT.contains,
+)
+
+
 class KubeconfigConnectorGate(base.ConnectorDriversGate):
+    pinned_served = PINNED_SERVED
+
     def __init__(self, args: argparse.Namespace) -> None:
         args.gate_id = args.gate_id or f"d1d-{secrets.token_hex(5)}"
         super().__init__(args)
@@ -442,7 +462,7 @@ class KubeconfigConnectorGate(base.ConnectorDriversGate):
                     "files": [
                         {
                             "contents": self.file_marker,
-                            "target_path": f"~/.config/d1d/{self.suffix}.json",
+                            "target_path": f"~/.srw-files/d1d/{self.suffix}.json",
                             "env_var": self.file_var,
                         }
                     ]
@@ -497,7 +517,7 @@ class KubeconfigConnectorGate(base.ConnectorDriversGate):
             'echo "storemode=$(stat -c %a "$(dirname "$store")")"\n'
             'echo "filemode=$(stat -c %a "$store")"\n'
             'echo "kubeconfig=${KUBECONFIG-}"\n'
-            f'echo "file=$(cat ~/.config/d1d/{self.suffix}.json)"\n'
+            f'echo "file=$(cat ~/.srw-files/d1d/{self.suffix}.json)"\n'
             f'echo "var=$(cat "${{{self.file_var}-}}")"\n'
             'echo "context=$(kubectl config current-context 2>&1)"\n'
             f'echo "marker=$({self.kubectl_command} 2>&1)"\n'
@@ -718,7 +738,7 @@ class KubeconfigConnectorGate(base.ConnectorDriversGate):
             pod,
             'for env in ~/.srw-credentials/*.sh; do . "$env"; done\n'
             'test -L ~/.kube/config && echo "kubelink=yes" || echo "kubelink=no"\n'
-            f"test -e ~/.config/d1d/{self.suffix}.json "
+            f"test -e ~/.srw-files/d1d/{self.suffix}.json "
             '&& echo "filelink=yes" || echo "filelink=no"\n'
             "ls ~/.srw-credentials/files-*/ >/dev/null 2>&1 "
             '&& echo "store=yes" || echo "store=no"\n'

@@ -106,6 +106,40 @@ def test_the_served_modules_exist_in_this_checkout():
         assert (_ROOT / path).is_file(), path
 
 
+def test_a_pinned_pod_is_checked_for_the_workspace_programs_too():
+    runner = gate.KubeconfigConnectorGate(_args())
+    files = set(runner.pinned_served.files)
+    assert {
+        "src/shared/runtime/core/credential_env.py",
+        "src/shared/runtime/core/backends/remote.py",
+    } <= files
+    assert set(gate.base.PINNED_AGENT.files) <= files
+    assert runner.pinned_served.dirs == gate.base.PINNED_AGENT.dirs
+    for path in gate.base.expected_bytes(runner.pinned_served):
+        assert (_ROOT / path).is_file(), path
+
+
+def test_the_gates_generic_file_lands_on_the_allowlist():
+    """The connector the gate creates must pass the save-time rule."""
+    from orchestrator.security.credential_files import normalize_credential_files
+
+    runner = gate.KubeconfigConnectorGate(_args())
+    out = normalize_credential_files(
+        "generic_file",
+        runner.name("file"),
+        {
+            "files": [
+                {
+                    "contents": "x",
+                    "target_path": f"~/.srw-files/d1d/{runner.suffix}.json",
+                    "env_var": runner.file_var,
+                }
+            ]
+        },
+    )
+    assert out["files"][0]["env_var"] == runner.file_var
+
+
 def test_the_scratch_account_may_only_read_in_its_namespace():
     namespace = f"srw-gate-{GATE_ID}"
     manifests = gate.scratch_manifests(namespace, GATE_ID, "marker")
