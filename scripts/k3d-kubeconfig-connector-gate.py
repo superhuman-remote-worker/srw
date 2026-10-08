@@ -126,6 +126,8 @@ _GATE_ID_RE = re.compile(r"d1d-[0-9a-f]{10}\Z")
 KUBE = ["kubectl", f"--context={LOCAL_CONTEXT}"]
 API_SERVER = "https://kubernetes.default.svc"
 MARKER_CONFIGMAP = "srw-gate-marker"
+#: The tools that run a shell command (the shell tool category).
+SHELL_TOOLS = frozenset({"run_command", "shell_execute"})
 GATE_LABEL = "srw.io/gate"
 
 #: The D1d modules a deployment must serve, by pod.
@@ -347,6 +349,9 @@ class KubeconfigConnectorGate(base.ConnectorDriversGate):
         self.policies: list[str] = []
         self.kube_marker = f"d1d-marker-{self.suffix}"
         self.file_marker = secret(f"d1d-file-{secrets.token_hex(8)}")
+        #: Printed lines are scrubbed of the marker: the workspace reports
+        #: its digest.
+        self.file_digest = hashlib.sha256(self.file_marker.encode()).hexdigest()
         self.file_var = f"D1D_FILE_{self.suffix.upper()}"
         self.token = ""
 
@@ -517,8 +522,11 @@ class KubeconfigConnectorGate(base.ConnectorDriversGate):
             'echo "storemode=$(stat -c %a "$(dirname "$store")")"\n'
             'echo "filemode=$(stat -c %a "$store")"\n'
             'echo "kubeconfig=${KUBECONFIG-}"\n'
-            f'echo "file=$(cat ~/.srw-files/d1d/{self.suffix}.json)"\n'
-            f'echo "var=$(cat "${{{self.file_var}-}}")"\n'
+            f'echo "file=$(sha256sum < ~/.srw-files/d1d/{self.suffix}.json '
+            '| cut -c1-64)"\n'
+            f'echo "varpath=${{{self.file_var}-}}"\n'
+            f'echo "var=$(sha256sum < "${{{self.file_var}:-/dev/null}}" '
+            '| cut -c1-64)"\n'
             'echo "context=$(kubectl config current-context 2>&1)"\n'
             f'echo "marker=$({self.kubectl_command} 2>&1)"\n'
             'echo "cancreate=$(kubectl auth can-i create configmaps 2>&1)"\n'
@@ -547,9 +555,11 @@ class KubeconfigConnectorGate(base.ConnectorDriversGate):
         )
         self.report.check(
             f"{label} workspace: the generic file and its variable hold its contents",
-            facts.get("file") == self.file_marker
-            and facts.get("var") == self.file_marker,
-            "",
+            facts.get("file") == self.file_digest
+            and facts.get("var") == self.file_digest,
+            f"file {'matches' if facts.get('file') == self.file_digest else 'differs'}, "
+            f"{self.file_var} -> {facts.get('varpath', '').replace(HOME, '~')!r} "
+            f"{'matches' if facts.get('var') == self.file_digest else 'differs'}",
         )
         self.report.check(
             f"{label} workspace: the connector's context is current",
@@ -614,15 +624,40 @@ class KubeconfigConnectorGate(base.ConnectorDriversGate):
         pod = self.workspace_pod(f"app=srw-workspace,srw/thread-id={self.thread}")
         self.workspace_checks("session", pod)
         self.agent_pods_hold_no_token("session")
+        shell = self.session_shell_tools()
         called, returned = self.tool_use("run_command", self.kube_marker)
-        self.report.check(
-            "session agent: its own run_command reads the marker with kubectl",
-            called > 0 and returned > 0,
-            f"{called} run_command calls, {returned} tool results with the marker",
+        tools = self.session_tool_calls()
+        self.report.note(
+            "session agent: shell tools bound: "
+            f"{shell or 'none (the default session expert binds no shell)'}; "
+            f"{called} run_command calls, {returned} tool results with the "
+            f"marker; tools called: {sorted(tools) or 'none'} (not gated: the "
+            "workspace check above runs kubectl as agent-host with the same "
+            "environment)"
         )
         self.report.check(
             "session: ended and deleted", self.end_session(), "thread row"
         )
+
+    def session_shell_tools(self) -> list[str]:
+        """The shell tools the live session holds (its tool-groups report)."""
+        status, body = self.api.call(
+            "GET", f"/api/persistent/threads/{self.thread}/tool-groups"
+        )
+        if status != 200 or not isinstance(body, dict):
+            return []
+        categories = body.get("categories") or {}
+        shell = categories.get("shell") if isinstance(categories, dict) else None
+        return sorted(str(name) for name in shell or [])
+
+    def session_tool_calls(self) -> set[str]:
+        """The tool names the session's agent called (from its messages)."""
+        rows = sql(
+            "SELECT coalesce(string_agg(tool_calls::text, ' '), '') FROM "
+            f"thread_messages WHERE thread_id = {lit(self.thread)} AND role IN "
+            "('ai', 'assistant')"
+        )
+        return set(re.findall(r'"name": ?"([A-Za-z0-9_.:-]+)"', rows))
 
     def run_job(self) -> None:
         created = self.api.ok(
@@ -685,14 +720,21 @@ class KubeconfigConnectorGate(base.ConnectorDriversGate):
             self.workspace_checks("job", pod)
             self.agent_pods_hold_no_token("job")
         self.job_settle()
+        self.job_agent_checks_after_settle()
+
+    def job_agent_checks_after_settle(self) -> None:
+        """run_command offered is the gate; the model using it is a NOTE."""
+        offered = self.wait_audited_tools(self.job)
+        shell = sorted(name for name in offered if name in SHELL_TOOLS)
         used = audit_sql(
             f"SELECT count(*) FROM llm_requests WHERE job_id::text = {lit(self.job)} "
             f"AND position({lit(self.kube_marker)} in request::text) > 0"
         )
-        self.report.check(
-            "job agent: an audited request carries the marker kubectl read",
-            used.isdigit() and int(used) > 0,
-            f"{used} audited requests",
+        self.report.note(
+            "job agent: shell tools offered: "
+            f"{shell or 'none (the default worker expert binds no shell)'}; "
+            f"{used} audited requests carry the marker kubectl read (not gated: "
+            "the workspace check runs kubectl as agent-host)"
         )
 
     # -- live attach and detach on a pinned session -----------------------
@@ -742,8 +784,9 @@ class KubeconfigConnectorGate(base.ConnectorDriversGate):
             '&& echo "filelink=yes" || echo "filelink=no"\n'
             "ls ~/.srw-credentials/files-*/ >/dev/null 2>&1 "
             '&& echo "store=yes" || echo "store=no"\n'
-            'echo "kubeconfig=${KUBECONFIG-}"\n'
-            f'echo "var=${{{self.file_var}-}}"\n'
+            # Unset, never exported empty (an empty value masks a default).
+            'echo "kubeconfig=${KUBECONFIG-<unset>}"\n'
+            f'echo "var=${{{self.file_var}-<unset>}}"\n'
             f'echo "marker=$({self.kubectl_command} 2>&1 | head -c 200)"\n'
             "exit 0\n",
             check=False,
@@ -758,8 +801,8 @@ class KubeconfigConnectorGate(base.ConnectorDriversGate):
             f"{facts.get('filelink')}, store {facts.get('store')}",
         )
         self.report.check(
-            "live detach: KUBECONFIG and the file's variable are empty",
-            facts.get("kubeconfig") == "" and facts.get("var") == "",
+            "live detach: KUBECONFIG and the file's variable are unset",
+            facts.get("kubeconfig") == "<unset>" and facts.get("var") == "<unset>",
             f"KUBECONFIG {facts.get('kubeconfig', '').replace(HOME, '~')!r}, "
             f"{self.file_var} {facts.get('var', '').replace(HOME, '~')!r}",
         )

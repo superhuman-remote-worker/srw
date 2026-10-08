@@ -119,6 +119,94 @@ def test_a_pinned_pod_is_checked_for_the_workspace_programs_too():
         assert (_ROOT / path).is_file(), path
 
 
+def _workspace_out(runner, *, file_digest, var_digest, varpath):
+    store = "/home/agent-host/.srw-credentials/files-x"
+    return "\n".join(
+        [
+            f"link={store}/kubeconfig",
+            f"own={store}/0123-{runner.kube_slug}.yaml",
+            "storemode=700",
+            "filemode=600",
+            f"kubeconfig={store}/kubeconfig",
+            f"file={file_digest}",
+            f"varpath={varpath}",
+            f"var={var_digest}",
+            f"context={runner.kube_slug}-scratch",
+            f"marker={runner.kube_marker}",
+            "cancreate=no",
+            "srw=Error from server (Forbidden): pods is forbidden",
+            "readme=2",
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("file_ok", "var_ok", "passed"),
+    [(True, True, True), (False, True, False), (True, False, False)],
+)
+def test_the_generic_file_is_compared_by_digest(monkeypatch, file_ok, var_ok, passed):
+    """Printed lines are scrubbed of the secret contents: compare digests."""
+    runner = gate.KubeconfigConnectorGate(_args())
+    other = "0" * 64
+    out = _workspace_out(
+        runner,
+        file_digest=runner.file_digest if file_ok else other,
+        var_digest=runner.file_digest if var_ok else other,
+        varpath="/home/agent-host/.srw-credentials/files-x/abc-x.json",
+    )
+    assert runner.file_marker not in out
+    monkeypatch.setattr(runner, "ws", lambda pod, script, check=True: (0, out))
+    runner.workspace_checks("session", "ws-pod")
+    results = {name: ok for name, ok, _detail in runner.report.results}
+    assert (
+        results[
+            "session workspace: the generic file and its variable hold its contents"
+        ]
+        is passed
+    )
+    assert all(ok for name, ok in results.items() if "generic file" not in name)
+
+
+def test_whether_the_agent_calls_run_command_is_only_noted(monkeypatch):
+    """Model behaviour; the agent-host kubectl check is the gate."""
+    runner = gate.KubeconfigConnectorGate(_args())
+    runner.thread = "00000000-0000-4000-8000-0000000000aa"
+    runner.project = "p"
+    runner.connectors = {"kubeconfig": "k", "file": "f"}
+    monkeypatch.setattr(runner.api, "ok", lambda *a, **k: {"thread_id": runner.thread})
+    for name in ("open_egress", "turn", "workspace_checks", "agent_pods_hold_no_token"):
+        monkeypatch.setattr(runner, name, lambda *a, **k: None)
+    monkeypatch.setattr(runner, "workspace_pod", lambda selector: "ws-pod")
+    monkeypatch.setattr(runner, "tool_use", lambda tool, text: (0, 0))
+    monkeypatch.setattr(runner, "session_tool_calls", lambda: set())
+    monkeypatch.setattr(runner, "session_shell_tools", lambda: [])
+    monkeypatch.setattr(runner, "end_session", lambda: True)
+    runner.session()
+    assert runner.report.passed
+    assert any(
+        "0 run_command calls" in note and "binds no shell" in note
+        for note in runner.report.notes
+    )
+
+
+@pytest.mark.parametrize(
+    ("offered", "said"),
+    [
+        ({"run_command", "write_file"}, "['run_command']"),
+        ({"write_file"}, "none (the default worker expert binds no shell)"),
+    ],
+)
+def test_whether_the_job_agent_had_a_shell_is_only_noted(monkeypatch, offered, said):
+    """The default worker expert binds no shell; agent-host kubectl gates."""
+    runner = gate.KubeconfigConnectorGate(_args())
+    runner.job = "00000000-0000-4000-8000-0000000000bb"
+    monkeypatch.setattr(gate, "audit_sql", lambda query: "0")
+    monkeypatch.setattr(runner, "wait_audited_tools", lambda unit: offered)
+    runner.job_agent_checks_after_settle()
+    assert runner.report.results == []
+    assert any(said in note for note in runner.report.notes)
+
+
 def test_the_gates_generic_file_lands_on_the_allowlist():
     """The connector the gate creates must pass the save-time rule."""
     from orchestrator.security.credential_files import normalize_credential_files
@@ -292,22 +380,27 @@ def test_a_live_update_that_did_not_land_fails(monkeypatch, fault):
     ("out", "passed"),
     [
         (
-            "kubelink=no\nfilelink=no\nstore=no\nkubeconfig=\nvar=\n"
+            "kubelink=no\nfilelink=no\nstore=no\nkubeconfig=<unset>\nvar=<unset>\n"
             "marker=error: no configuration has been provided\n",
             True,
         ),
         (
-            "kubelink=yes\nfilelink=no\nstore=no\nkubeconfig=\nvar=\nmarker=x\n",
+            "kubelink=yes\nfilelink=no\nstore=no\nkubeconfig=<unset>\nvar=<unset>\nmarker=x\n",
             False,
         ),
         (
-            "kubelink=no\nfilelink=no\nstore=yes\nkubeconfig=\nvar=\nmarker=x\n",
+            "kubelink=no\nfilelink=no\nstore=yes\nkubeconfig=<unset>\nvar=<unset>\nmarker=x\n",
             False,
         ),
         (
             "kubelink=no\nfilelink=no\nstore=no\n"
             "kubeconfig=/home/agent-host/.srw-credentials/files-x/kubeconfig\n"
-            "var=\nmarker=x\n",
+            "var=<unset>\nmarker=x\n",
+            False,
+        ),
+        # Exported empty is not unset: an empty value masks a tool's default.
+        (
+            "kubelink=no\nfilelink=no\nstore=no\nkubeconfig=\nvar=\nmarker=x\n",
             False,
         ),
     ],

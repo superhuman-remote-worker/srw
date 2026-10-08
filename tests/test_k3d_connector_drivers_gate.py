@@ -225,6 +225,18 @@ def test_type_cases_expect_the_deliberate_unsupported_answers():
         assert cases[label].expect_status == "ok"
 
 
+def test_every_credential_file_the_gate_creates_passes_the_save_rule():
+    """The gate's connectors must be ones the API accepts (D1d allowlist)."""
+    from orchestrator.security.credential_files import normalize_credential_files
+
+    runner = _runner()
+    for case in runner.type_cases():
+        if case.body["type"] in ("kubeconfig", "generic_file", "ssh_key"):
+            normalize_credential_files(
+                case.body["type"], runner.name(case.label), case.body["credentials"]
+            )
+
+
 def test_every_secret_is_scrubbed():
     runner = _runner()
     cases = runner.type_cases()

@@ -1311,7 +1311,7 @@ class ConnectorDriversGate:
                         "files": [
                             {
                                 "contents": '{"gate": "d1a"}',
-                                "target_path": f"~/.config/d1a/{self.suffix}.json",
+                                "target_path": f"~/.srw-files/d1a/{self.suffix}.json",
                                 "env_var": f"D1A_FILE_{self.suffix.upper()}",
                             }
                         ]
@@ -2278,6 +2278,17 @@ class ConnectorDriversGate:
                 detail = f"classes {classes!r}, icon {icon!r}, title {title[:100]!r}"
             except Exception as exc:  # noqa: BLE001 -- the check reports it
                 detail = f"{type(exc).__name__}: {str(exc).splitlines()[0][:200]}"
+                try:
+                    import tempfile
+
+                    shot = Path(tempfile.mkdtemp(prefix=f"{self.gate_id}-")) / (
+                        "cockpit.png"
+                    )
+                    page.screenshot(path=str(shot), full_page=True)
+                    rows = page.locator("tr").count()
+                    detail += f" (page {page.url}, {rows} table rows, {shot})"
+                except Exception:  # noqa: BLE001 -- diagnostics only
+                    pass
             finally:
                 browser.close()
         self.report.check(
