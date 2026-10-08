@@ -745,6 +745,17 @@ class TestRemoteBackendLeaseFile:
         assert path == f"/home/agent/.srw-credentials/leases/{CONNECTOR}"
         assert " install " in command and path in command
 
+    def test_both_programs_run_on_the_isolated_workspace_python(self):
+        """Never a ``python3`` from the workspace's PATH: the token on stdin
+        must not reach a planted interpreter or ``.pth`` file."""
+        from shared.runtime.core.credential_env import WORKSPACE_PYTHON
+
+        backend = self._backend()
+        backend.install_connector_lease(CONNECTOR, "scl_x")
+        backend.remove_connector_lease(CONNECTOR)
+        for call in backend.execute_claim_resource_with_secret_stdin.call_args_list:
+            assert call[0][0].startswith(WORKSPACE_PYTHON + " -c ")
+
     def test_remove_sends_no_secret(self):
         backend = self._backend()
         backend.remove_connector_lease(CONNECTOR)
@@ -768,7 +779,7 @@ class TestRemoteBackendLeaseFile:
 
         target = tmp_path / ".srw-credentials" / "leases" / CONNECTOR
         subprocess.run(
-            [sys.executable, "-c", CONNECTOR_LEASE_FILE, "install", str(target)],
+            [sys.executable, "-I", "-c", CONNECTOR_LEASE_FILE, "install", str(target)],
             input="scl_file_token",
             text=True,
             check=True,
@@ -777,7 +788,7 @@ class TestRemoteBackendLeaseFile:
         assert os.stat(target).st_mode & 0o777 == 0o600
         assert os.stat(target.parent).st_mode & 0o777 == 0o700
         subprocess.run(
-            [sys.executable, "-c", CONNECTOR_LEASE_FILE, "remove", str(target)],
+            [sys.executable, "-I", "-c", CONNECTOR_LEASE_FILE, "remove", str(target)],
             input="",
             text=True,
             check=True,
