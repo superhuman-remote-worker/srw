@@ -1693,6 +1693,28 @@ describe('PersistentChatService — createAndConnect()', () => {
     expect(service.threadId()).toBe('thread-new');
   });
 
+  it('shows each create notice as a warning toast', async () => {
+    // unavailable_model_handling.md: a saved default model that can no longer
+    // run is replaced by the system default, and the create response says so.
+    const { service, mockHttp } = createService();
+    const notice =
+      'Your default model `MiniMax-M3` is no longer available, so this session uses `muse-spark-1.3-contributor`. Choose a new default in Settings → Preferences.';
+    mockHttp.post.mockImplementation((url: string) =>
+      url.endsWith('/persistent/threads')
+        ? of({ thread_id: 'thread-new', status: 'created', notices: [notice] })
+        : of({}),
+    );
+    mockHttp.get.mockImplementation((url: string) => {
+      if (url.endsWith('/messages')) return of({ messages: [], total: 0 });
+      return of({ status: 'active', total_turns: 0 });
+    });
+
+    await service.createAndConnect({ config_name: 'scholar' });
+
+    const toast = TestBed.inject(AppToastService) as any;
+    expect(toast.warning).toHaveBeenCalledWith(notice, { duration: 15000 });
+  });
+
   it('does not connect a newly-created thread after the user navigates elsewhere', async () => {
     const { service, mockHttp, sseInstances } = createService();
     const createResponse = new Subject<{ thread_id: string }>();

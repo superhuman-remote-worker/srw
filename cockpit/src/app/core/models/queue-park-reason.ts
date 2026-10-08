@@ -14,6 +14,8 @@ export function queueParkReasonKey(reason: string | null | undefined): string {
       return 'chat.parked.reason.stopped';
     case 'retry_exhausted':
       return 'chat.parked.reason.retryExhausted';
+    case 'model_unavailable':
+      return 'chat.parked.reason.modelUnavailable';
     default:
       return 'chat.parked.reason.generic';
   }

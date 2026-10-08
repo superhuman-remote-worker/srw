@@ -1499,6 +1499,7 @@ export class PersistentChatService {
       this._applyQueueState(tid, {
         state: outcome.state || 'queued',
         park_reason: null,
+        park_message: null,
         parked_at: null,
         retryable: false,
         attempts: 0,
@@ -2670,10 +2671,18 @@ export class PersistentChatService {
     this.isVmSession.set(opts.vm ?? (body?.['config_override'] as any)?.workspace?.backend === 'vm');
     try {
       const resp = await firstValueFrom(
-        this.http.post<{ thread_id: string }>(`${environment.apiUrl}/persistent/threads`, body),
+        this.http.post<{ thread_id: string; notices?: string[] }>(
+          `${environment.apiUrl}/persistent/threads`,
+          body,
+        ),
       );
       const threadId = resp.thread_id;
       createdThreadId = threadId;
+      // A saved default model that can no longer run was replaced by the
+      // system default; the server says which (unavailable_model_handling.md).
+      for (const notice of resp.notices ?? []) {
+        this.toast.warning(notice, { duration: 15000 });
+      }
       if (this.connectGeneration !== creationGeneration || this.threadId() !== null) {
         // The thread was created, but the user navigated elsewhere
         // while the POST was in flight. Return its id to the caller

@@ -1382,7 +1382,11 @@
       "reasoningHigh": "Hoch",
       "providerLocal": "Lokal",
       "providerOpenrouter": "OpenRouter",
-      "save": "Voreinstellungen speichern"
+      "save": "Voreinstellungen speichern",
+      "unavailable": "nicht verfügbar",
+      "modelUnavailable": "{{model}} ist nicht mehr verfügbar. Neue Arbeit verwendet den Systemstandard, bis Sie ein anderes Modell wählen und speichern.",
+      "unsaved": "Ungespeicherte Änderungen",
+      "saveFailed": "Die Voreinstellungen konnten nicht gespeichert werden."
     },
     "expertDefaults": {
       "title": "Standard-Assistenten",
@@ -1961,6 +1965,7 @@
         "shutdownCancelled": "Die Antwort wurde durch Wartungsarbeiten unterbrochen.",
         "stopped": "Die Sitzung wurde beendet, bevor diese Nachricht verarbeitet wurde.",
         "retryExhausted": "Diese Nachricht ist wiederholt auf dieselbe Weise fehlgeschlagen und wurde zurückgestellt.",
+        "modelUnavailable": "Das Modell dieser Sitzung ist nicht mehr verfügbar. Wählen Sie in den Einstellungen dieser Sitzung ein anderes Modell und versuchen Sie es dann erneut.",
         "generic": "Die Sitzung ist auf ein Problem gestoßen, das sie nicht selbst beheben kann — ein Administrator muss sie freigeben, bevor diese Nachricht ausgeführt werden kann."
       }
     },

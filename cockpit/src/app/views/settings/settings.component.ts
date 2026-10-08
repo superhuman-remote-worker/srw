@@ -43,6 +43,7 @@ import { AppThemeToggleComponent } from '../../ui/theme-toggle';
 import { AppAccentToggleComponent } from '../../ui/accent-toggle';
 import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
 import { AppButtonComponent } from '../../ui/button';
+import { AppToastService } from '../../ui/toast';
 import { AppInputComponent } from '../../ui/input';
 import { AppTextareaComponent } from '../../ui/textarea';
 import { AppSelectComponent } from '../../ui/select';
@@ -525,11 +526,19 @@ const EXPIRY_OPTIONS = [
 
               <div class="form-block">
                 <div class="form-row two-col">
-                  <app-form-field [label]="'settings.preferences.defaultModel' | transloco">
+                  <app-form-field
+                    [label]="'settings.preferences.defaultModel' | transloco"
+                    [error]="unavailableHint('default_model', prefModel())"
+                  >
                     <app-select
                       [value]="prefModel() ?? resolved().default_model ?? ''"
                       (changed)="onPrefChange(prefModel, resolved().default_model, $event)"
                     >
+                      @if (storedUnavailable('default_model'); as stale) {
+                        <option [value]="stale" data-testid="pref-model-unavailable-option">
+                          {{ stale }} ({{ 'settings.preferences.unavailable' | transloco }})
+                        </option>
+                      }
                       @for (group of modelService.models(); track group.group) {
                         <optgroup
                           [label]="
@@ -552,11 +561,19 @@ const EXPIRY_OPTIONS = [
                       }
                     </app-select>
                   </app-form-field>
-                  <app-form-field [label]="'settings.preferences.auxModel' | transloco">
+                  <app-form-field
+                    [label]="'settings.preferences.auxModel' | transloco"
+                    [error]="unavailableHint('default_auxiliary_model', prefAuxModel())"
+                  >
                     <app-select
                       [value]="prefAuxModel() ?? resolved().default_auxiliary_model ?? ''"
                       (changed)="onPrefChange(prefAuxModel, resolved().default_auxiliary_model, $event)"
                     >
+                      @if (storedUnavailable('default_auxiliary_model'); as stale) {
+                        <option [value]="stale">
+                          {{ stale }} ({{ 'settings.preferences.unavailable' | transloco }})
+                        </option>
+                      }
                       @for (m of modelService.auxiliaryModels(); track m.id) {
                         <option [value]="m.id">
                           {{ m.label
@@ -767,6 +784,10 @@ const EXPIRY_OPTIONS = [
                   </app-button>
                   @if (prefsSaved()) {
                     <app-badge tone="success" size="sm">{{ 'common.saved' | transloco }}</app-badge>
+                  } @else if (prefsDirty() && !savingPrefs()) {
+                    <app-badge tone="warning" size="sm" data-testid="prefs-unsaved">{{
+                      'settings.preferences.unsaved' | transloco
+                    }}</app-badge>
                   }
                 </div>
               </div>
@@ -780,6 +801,7 @@ const EXPIRY_OPTIONS = [
               <div class="form-block">
                 <app-form-field
                   [label]="'settings.persistent.model' | transloco"
+                  [error]="unavailableHint('persistent_agent.model', paModel())"
                   [hint]="
                     paModel()
                       ? ''
@@ -2436,6 +2458,7 @@ export class SettingsComponent implements OnInit, OnDestroy {
   private readonly router = inject(Router);
   private readonly route = inject(ActivatedRoute);
   private readonly transloco = inject(TranslocoService);
+  private readonly toast = inject(AppToastService);
 
   /** Each section is its own route config, so the router builds a new
    * component per section and the snapshot never goes stale. */
@@ -2821,6 +2844,26 @@ export class SettingsComponent implements OnInit, OnDestroy {
   /** Resolved defaults shortcut for template use. */
   readonly resolved = this.settingsService.resolvedDefaults;
 
+  /** Stored model preferences the server reports as no longer runnable. */
+  readonly unavailablePrefs = this.settingsService.unavailablePreferences;
+
+  /** The Preferences section differs from what is saved. The page only stores
+   * a change on Save; an unsaved pick looked saved in the 10-08 incident. */
+  readonly prefsDirty = computed(() => {
+    const saved = this.settingsService.preferences();
+    const pairs: [string | null, string | null | undefined][] = [
+      [this.prefModel(), saved.default_model],
+      [this.prefAuxModel(), saved.default_auxiliary_model],
+      [this.prefAutonomy(), saved.default_autonomy],
+      [this.prefReasoning(), saved.default_reasoning_level],
+      [this.prefVisionModel(), saved.default_vision_model],
+      [this.prefWhisperModel(), saved.default_whisper_model],
+      [this.prefEmbeddingModel(), saved.default_embedding_model],
+      [this.prefEmbeddingProvider(), saved.embedding_provider],
+    ];
+    return pairs.some(([current, stored]) => (current || null) !== (stored || null));
+  });
+
   // Persistent Agent form state — null = use resolved default
   readonly paModel = signal<string | null>(null);
   readonly paPermissionMode = signal<string | null>(null);
@@ -3137,6 +3180,36 @@ export class SettingsComponent implements OnInit, OnDestroy {
 
   // ── Preferences ───────────────────────────────────────────────────
 
+  /** The stored value of an unavailable model preference, so the select can
+   * show it instead of going blank; null when the stored value is fine. */
+  storedUnavailable(path: 'default_model' | 'default_auxiliary_model'): string | null {
+    if (!this.unavailablePrefs()[path]) return null;
+    return this.settingsService.preferences()[path] ?? null;
+  }
+
+  /** Warning under a model field while it still shows a stored preference
+   * that can no longer run. */
+  unavailableHint(path: string, current: string | null): string {
+    if (!this.unavailablePrefs()[path] || !current) return '';
+    const prefs = this.settingsService.preferences();
+    const stored =
+      path === 'persistent_agent.model'
+        ? prefs.persistent_agent?.model
+        : (prefs as Record<string, unknown>)[path];
+    if (current !== stored) return '';
+    return this.transloco.translate('settings.preferences.modelUnavailable', { model: current });
+  }
+
+  /** The server's refusal (it names the model) or a generic failure line. */
+  private preferenceSaveError(err: any): string {
+    const detail = err?.error?.detail;
+    if (detail && typeof detail === 'object' && typeof detail.message === 'string') {
+      return detail.message;
+    }
+    if (typeof detail === 'string' && detail) return detail;
+    return this.transloco.translate('settings.preferences.saveFailed');
+  }
+
   savePreferences(): void {
     this.savingPrefs.set(true);
     this.prefsSaved.set(false);
@@ -3157,7 +3230,10 @@ export class SettingsComponent implements OnInit, OnDestroy {
         this.prefsSaved.set(true);
         setTimeout(() => this.prefsSaved.set(false), 2000);
       },
-      error: () => this.savingPrefs.set(false),
+      error: (err) => {
+        this.savingPrefs.set(false);
+        this.toast.danger(this.preferenceSaveError(err));
+      },
     });
   }
 
@@ -3280,7 +3356,10 @@ export class SettingsComponent implements OnInit, OnDestroy {
         this.paSaved.set(true);
         setTimeout(() => this.paSaved.set(false), 2000);
       },
-      error: () => this.savingPA.set(false),
+      error: (err) => {
+        this.savingPA.set(false);
+        this.toast.danger(this.preferenceSaveError(err));
+      },
     });
   }
 

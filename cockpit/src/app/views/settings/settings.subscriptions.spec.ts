@@ -85,6 +85,7 @@ function makeSettingsService() {
     apiKeys: signal([]),
     preferences: signal({}),
     resolvedDefaults: signal({}),
+    unavailablePreferences: signal({}),
     loadApiKeys: vi.fn(),
     loadPreferences: vi.fn(),
     updatePreferences: vi.fn(() => of({status: 'ok'})),

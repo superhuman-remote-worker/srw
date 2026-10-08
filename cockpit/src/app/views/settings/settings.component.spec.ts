@@ -6,7 +6,7 @@
 import { CUSTOM_ELEMENTS_SCHEMA, Pipe, signal, ɵresolveComponentResources } from '@angular/core';
 import { TestBed } from '@angular/core/testing';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
-import { of } from 'rxjs';
+import { of, throwError } from 'rxjs';
 import { SettingsComponent, type SettingsSection } from './settings.component';
 import { SettingsService } from '../../core/services/settings.service';
 import { UserService } from '../../core/services/user.service';
@@ -19,12 +19,14 @@ import { I18nService } from '../../core/services/i18n.service';
 import { TranslocoService } from '@jsverse/transloco';
 import { ActivatedRoute, Router } from '@angular/router';
 import { User } from '../../core/models/api.model';
+import { AppToastService } from '../../ui/toast';
 
 function makeSettingsService() {
   return {
     apiKeys: signal([]),
     preferences: signal({}),
     resolvedDefaults: signal({}),
+    unavailablePreferences: signal({}),
     loadApiKeys: vi.fn(),
     loadPreferences: vi.fn(),
     updatePreferences: vi.fn(() => of({ status: 'ok' })),
@@ -179,5 +181,77 @@ describe('SettingsComponent — persistent agent workspace field', () => {
     );
     expect(hint).toBeTruthy();
     expect(hint!.querySelector('a')).toBeNull();
+  });
+});
+
+describe('SettingsComponent — unavailable model preferences', () => {
+  // unavailable_model_handling.md §7: a stored default naming a disabled model
+  // used to render as a blank select, and a failed or unsaved change was
+  // invisible (main-dev, 2026-10-08).
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  function staleService() {
+    const service = makeSettingsService();
+    service.preferences.set({ default_model: 'MiniMax-M3' } as never);
+    service.unavailablePreferences.set({ default_model: 'disabled' } as never);
+    return service;
+  }
+
+  it('keeps the stored model visible and explains it', () => {
+    const fixture = setup(staleService());
+    const component = fixture.componentInstance;
+
+    expect(component.storedUnavailable('default_model')).toBe('MiniMax-M3');
+    expect(component.storedUnavailable('default_auxiliary_model')).toBeNull();
+    expect(component.unavailableHint('default_model', component.prefModel())).toBe(
+      'settings.preferences.modelUnavailable',
+    );
+    // Once another model is picked the warning describes nothing on screen.
+    component.prefModel.set('gpt-6-astra');
+    expect(component.unavailableHint('default_model', component.prefModel())).toBe('');
+  });
+
+  it('renders the stored model as an unavailable option instead of a blank select', () => {
+    const fixture = setup(staleService(), true);
+    const option = (fixture.nativeElement as HTMLElement).querySelector(
+      '[data-testid="pref-model-unavailable-option"]',
+    );
+    expect(option?.textContent).toContain('MiniMax-M3');
+    expect(option?.textContent).toContain('settings.preferences.unavailable');
+  });
+
+  it('marks an unsaved pick', () => {
+    const fixture = setup(staleService());
+    const component = fixture.componentInstance;
+
+    expect(component.prefsDirty()).toBe(false);
+    component.prefModel.set('gpt-6-astra');
+    expect(component.prefsDirty()).toBe(true);
+  });
+
+  it("shows the server's refusal when a save fails", () => {
+    const service = staleService();
+    service.updatePreferences.mockReturnValue(
+      throwError(() => ({
+        error: {
+          detail: {
+            code: 'model.unavailable',
+            message: 'The model `MiniMax-M3` (main model) is no longer available.',
+          },
+        },
+      })) as never,
+    );
+    const fixture = setup(service);
+    const toast = TestBed.inject(AppToastService);
+    const danger = vi.spyOn(toast, 'danger');
+
+    fixture.componentInstance.savePreferences();
+
+    expect(danger).toHaveBeenCalledWith(
+      'The model `MiniMax-M3` (main model) is no longer available.',
+    );
+    expect(fixture.componentInstance.savingPrefs()).toBe(false);
   });
 });

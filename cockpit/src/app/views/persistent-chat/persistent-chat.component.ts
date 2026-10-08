@@ -1866,7 +1866,7 @@ export function clearDraft(threadId: string | null): void {
             </div>
             <div class="message-body turn-body parked-body">
               <div class="parked-line">{{ 'chat.parked.title' | transloco }}</div>
-              <div class="parked-reason">{{ parkedReasonKey() | transloco }}</div>
+              <div class="parked-reason">{{ chat.queueState()?.park_message || (parkedReasonKey() | transloco) }}</div>
               @if (chat.queueState()?.retryable) {
                 <div class="parked-actions">
                   <app-button variant="ghost" size="sm" data-testid="chat-parked-retry"

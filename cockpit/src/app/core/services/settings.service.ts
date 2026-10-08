@@ -32,6 +32,9 @@ export class SettingsService {
   /** Resolved framework/env defaults for every preference field. */
   readonly resolvedDefaults = signal<ResolvedDefaults>({});
 
+  /** Stored model preferences the server reports as unavailable (path → reason). */
+  readonly unavailablePreferences = signal<Record<string, string>>({});
+
   // ── User API Keys ──────────────────────────────────────────────────
 
   loadApiKeys(): void {
@@ -62,7 +65,10 @@ export class SettingsService {
       .subscribe((prefs) => {
         const resolved = prefs._resolved ?? {};
         delete prefs._resolved;
+        const unavailable = prefs._unavailable ?? {};
+        delete prefs._unavailable;
         this.resolvedDefaults.set(resolved);
+        this.unavailablePreferences.set(unavailable);
         this.preferences.set(prefs);
       });
   }

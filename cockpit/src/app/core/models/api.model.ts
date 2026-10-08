@@ -998,6 +998,10 @@ export interface UserSettings {
   /** How the aux LLM rewrites messages for read-aloud (reasoning + custom prompt). */
   read_aloud?: ReadAloudSettings | null;
   _resolved?: ResolvedDefaults;
+  /** Stored model preferences that can no longer run, keyed by dotted path
+   * (`default_model`, `default_auxiliary_model`, `persistent_agent.model`) →
+   * reason. New work falls back to the system default for these. */
+  _unavailable?: Record<string, string>;
 }
 
 /** A read-aloud reasoning level. 'off' (default) keeps the fast rewrite path;
@@ -3112,6 +3116,7 @@ export type SessionQueueParkReason =
   | 'completion_cas_failed'
   | 'reaper_max_attempts'
   | 'retry_exhausted'
+  | 'model_unavailable'
   | string;
 
 /**
@@ -3123,6 +3128,9 @@ export type SessionQueueParkReason =
 export interface SessionQueueState {
   state: string;
   park_reason: SessionQueueParkReason | null;
+  /** The owner-facing text of a `model_unavailable` park (the server's
+   * refusal naming the model); null for every other reason. */
+  park_message?: string | null;
   parked_at: string | null;
   retryable: boolean;
   attempts: number;
