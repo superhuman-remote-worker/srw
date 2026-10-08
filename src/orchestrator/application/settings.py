@@ -60,6 +60,25 @@ def parse_exchange_port(raw: str | None) -> int | None:
     return port
 
 
+def parse_positive_number(
+    name: str, raw: str | None, *, default: float, minimum: float
+) -> float:
+    """A number from an environment value, at least ``minimum``.
+
+    Unset or empty is ``default``; a value that is not a number is
+    ``default`` with a warning, never an import-time crash.
+    """
+    value = (raw or "").strip()
+    if not value:
+        return default
+    try:
+        number = float(value)
+    except ValueError:
+        logger.warning("%s=%r is not a number; using %s", name, raw, default)
+        return default
+    return max(minimum, number)
+
+
 def parse_session_subagent_fanout_lanes(raw: str | None) -> frozenset[str]:
     """The lanes named by ``SESSION_SUBAGENT_FANOUT_LANES``.
 
@@ -145,6 +164,13 @@ class DeploymentSettings:
     #: Install the development lease probe driver (``srw.lease-probe/v1``,
     #: ``orchestrator.connectorLeases.probeDriver``). Off by default.
     connector_lease_probe_enabled: bool = False
+    #: Seconds a credential lease lives after its last renewal
+    #: (``orchestrator.connectorLeases.ttlSeconds``; decision 9: 900).
+    connector_lease_ttl_seconds: int = 900
+    #: Seconds between lease sweeps
+    #: (``orchestrator.connectorLeases.sweepIntervalSeconds``); the sweeper
+    #: never waits longer than a quarter of the TTL.
+    connector_lease_sweep_seconds: float = 60.0
 
     def session_subagent_fanout(self, lane: str | None) -> bool:
         """Whether a session on ``lane`` may fan out right now."""
@@ -184,6 +210,20 @@ class DeploymentSettings:
                 os.environ.get(CONNECTOR_LEASE_EXCHANGE_PORT_ENV)
             ),
             connector_lease_probe_enabled=_enabled("CONNECTOR_LEASE_PROBE_ENABLED"),
+            connector_lease_ttl_seconds=int(
+                parse_positive_number(
+                    "CONNECTOR_LEASE_TTL_SECONDS",
+                    os.environ.get("CONNECTOR_LEASE_TTL_SECONDS"),
+                    default=900,
+                    minimum=60,
+                )
+            ),
+            connector_lease_sweep_seconds=parse_positive_number(
+                "CONNECTOR_LEASE_SWEEP_INTERVAL_SECONDS",
+                os.environ.get("CONNECTOR_LEASE_SWEEP_INTERVAL_SECONDS"),
+                default=60.0,
+                minimum=5.0,
+            ),
         )
 
 
@@ -192,5 +232,6 @@ __all__ = [
     "SESSION_SUBAGENT_FANOUT_LANES_ENV",
     "DeploymentSettings",
     "parse_exchange_port",
+    "parse_positive_number",
     "parse_session_subagent_fanout_lanes",
 ]

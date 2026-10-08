@@ -40,6 +40,7 @@ from orchestrator.database import (
     PostgresDB,
 )
 from orchestrator.security.auth import set_provisioning_backends
+from orchestrator.services import connector_credential_leases
 from orchestrator.services import ssh_access as ssh_access_operations
 from orchestrator.services.catalogue_resources import CatalogueResources
 from orchestrator.services.cloud import MainCloudRouter, build_backend
@@ -196,6 +197,17 @@ def build_application_resources(
             lease_probe=settings.connector_lease_probe_enabled
         ),
     )
+    # Credential leases (connector drivers C2): the window new leases are
+    # issued with, process-wide like the provisioning backends below.
+    connector_credential_leases.configure_lease_window(
+        ttl_seconds=settings.connector_lease_ttl_seconds,
+        sweep_seconds=settings.connector_lease_sweep_seconds,
+    )
+    if settings.connector_lease_probe_enabled:
+        logger.warning(
+            "The development lease probe driver (srw.lease-probe/v1) is "
+            "installed; it is for test clusters only"
+        )
     # Every infrastructure-metering gate defaults off until startup decides
     # which paths this process runs (``lifecycle.open_stores``).
     resources.metering = InfrastructureMeteringBootstrap(

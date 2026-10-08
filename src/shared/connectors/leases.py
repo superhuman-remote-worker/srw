@@ -26,7 +26,6 @@ import zlib
 from collections.abc import Mapping
 from typing import Any
 
-from .contract import DriverSpec
 
 LEASE_TOKEN_PREFIX = "scl"
 DRIVER_IDENTITY_PREFIX = "sdi"
@@ -117,20 +116,6 @@ def lease_file_name(connector_id: str) -> str:
     return f"{LEASE_FILE_DIR}/{connector_id.lower()}"
 
 
-def lease_access(entry: Mapping[str, Any], spec: DriverSpec) -> str | None:
-    """The access level a delivered connector's lease is issued at.
-
-    A read-only project link clamps to the driver's lowest level; otherwise
-    the driver's default, else its highest (as the agent reads a binding).
-    """
-    levels = spec.ranked_access_ids()
-    if not levels:
-        return None
-    if entry.get("project_read_only"):
-        return levels[0]
-    return spec.default_access or levels[-1]
-
-
 def operation_allowed(operation: str, access: str | None) -> bool:
     """Whether a lease at ``access`` may be exchanged for ``operation``."""
     return access in OPERATION_ACCESS.get(operation, frozenset())
@@ -146,7 +131,6 @@ __all__ = [
     "TOKEN_PATTERN",
     "TOKEN_PREFIXES",
     "last_four",
-    "lease_access",
     "lease_file_name",
     "mint_token",
     "operation_allowed",

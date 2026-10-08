@@ -502,9 +502,7 @@ async def test_cancel_revokes_in_the_cancel_transaction(db):
     assert (await _lease(db, lease.id))["revoke_reason"] == "job_cancelled"
 
 
-@pytest.mark.asyncio
-async def test_a_pinned_retirement_begin_revokes_the_sessions_leases(db):
-    connector = await _connector(db)
+async def _pinned_thread(db) -> str:
     thread = str(uuid4())
     async with db.acquire() as conn:
         await conn.execute(
@@ -513,15 +511,94 @@ async def test_a_pinned_retirement_begin_revokes_the_sessions_leases(db):
             UUID(thread),
             uuid4(),
         )
-    lease = await _issue(db, leases.LeaseOwner.thread(thread), connector)
+    return thread
+
+
+@pytest.mark.asyncio
+async def test_an_aborted_pinned_begin_leaves_the_lease_live_and_usable(db, exchange):
+    """A Begin is a hidden, abortable preflight (a non-force End during a
+    turn, lock contention, a stale preflight): it revokes nothing."""
+    connector = await _connector(db)
+    thread = await _pinned_thread(db)
+    owner = leases.LeaseOwner.thread(thread)
+    lease = await _issue(db, owner, connector)
+    identity = await _identity(db, connector)
 
     begun = await db.begin_pinned_thread_retirement(thread, permanent=False)
+    assert begun["state"] == "pending" and begun["authorized_at"] is None
+    assert (await _lease(db, lease.id))["revoked_at"] is None
+    # Still delivered during the preflight: the same token.
+    assert (await _issue(db, owner, connector)).token == lease.token
 
-    assert begun["state"] == "pending"
-    assert (await _lease(db, lease.id))["revoke_reason"] == "session_end"
-    # A delivery racing the retirement gets no new lease.
+    assert await db.abort_pinned_thread_retirement(
+        thread, token=begun["token"], generation=begun["generation"]
+    )
+    assert (await _lease(db, lease.id))["revoked_at"] is None
+    answer = await exchange.exchange(
+        identity_token=identity.token, lease_token=lease.token, operation="read"
+    )
+    assert answer.status == 200
+    assert await _events(db, "connector_lease_revoked") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("settle_status", "reason"),
+    [("ended", "session_end"), ("suspended", "session_suspended")],
+)
+async def test_the_authorization_edge_revokes(db, settle_status, reason):
+    connector = await _connector(db)
+    thread = await _pinned_thread(db)
+    owner = leases.LeaseOwner.thread(thread)
+    lease = await _issue(db, owner, connector)
+    begun = await db.begin_pinned_thread_retirement(
+        thread, permanent=False, settle_status=settle_status
+    )
+
+    assert await db.authorize_pinned_thread_retirement(
+        thread,
+        token=begun["token"],
+        generation=begun["generation"],
+        settle_status=settle_status,
+    )
+
+    assert (await _lease(db, lease.id))["revoke_reason"] == reason
+    # Authorized: no renewal, and a delivery racing it gets no new lease.
+    await _set_expiry(db, lease.id, 100)
+    assert await _renew(db) == 0
     with pytest.raises(leases.LeaseDeliveryError):
-        await _issue(db, leases.LeaseOwner.thread(thread), connector)
+        await _issue(db, owner, connector)
+    # A repeated authorization is harmless.
+    assert await db.authorize_pinned_thread_retirement(
+        thread,
+        token=begun["token"],
+        generation=begun["generation"],
+        settle_status=settle_status,
+    )
+    assert len(await _events(db, "connector_lease_revoked")) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["fresh", "reused"])
+async def test_an_immediately_authorized_begin_revokes(db, path):
+    """A Begin that authorizes in its own transaction (a fresh one, or the
+    agent's reuse of its own pending preflight) is the authorization edge."""
+    connector = await _connector(db)
+    thread = await _pinned_thread(db)
+    lease = await _issue(db, leases.LeaseOwner.thread(thread), connector)
+    if path == "reused":
+        pending = await db.begin_pinned_thread_retirement(
+            thread, permanent=False, initiator="agent"
+        )
+        assert pending["authorized_at"] is None
+        assert (await _lease(db, lease.id))["revoked_at"] is None
+
+    begun = await db.begin_pinned_thread_retirement(
+        thread, permanent=False, initiator="agent", authorize_immediately=True
+    )
+
+    assert begun["state"] == "pending" and begun["authorized_at"] is not None
+    assert (await _lease(db, lease.id))["revoke_reason"] == "session_end"
 
 
 @pytest.mark.asyncio
@@ -721,6 +798,140 @@ async def test_identities_store_only_a_digest_and_revoke_by_pod(db):
 # =============================================================================
 # Review hardening
 # =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_revokes_leases_of_executions_already_terminal(db):
+    """A terminal write no revoke point saw is bounded by one sweep."""
+    connector = await _connector(db)
+    job = await _job(db, "processing")
+    thread = await _pinned_thread(db)
+    job_lease = await _issue(db, leases.LeaseOwner.job(job), connector)
+    thread_lease = await _issue(db, leases.LeaseOwner.thread(thread), connector)
+    live = await _issue(db, leases.LeaseOwner.job(await _job(db)), connector)
+    # A preflight whose authorization was written by a path that did not
+    # revoke (the case the sweep bounds).
+    await db.begin_pinned_thread_retirement(thread, permanent=False)
+    async with db.acquire() as conn:
+        await conn.execute("UPDATE jobs SET status='failed' WHERE id=$1", UUID(job))
+        await conn.execute(
+            "UPDATE threads SET runtime_retirement_authorized_at = now() WHERE id = $1",
+            UUID(thread),
+        )
+        revoked = await leases.revoke_leases_of_terminal_executions(conn)
+    assert sorted(revoked) == sorted([job_lease.id, thread_lease.id])
+    assert (await _lease(db, job_lease.id))["revoke_reason"] == "execution_terminal"
+    assert (await _lease(db, live.id))["revoked_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_processing_child_never_renews_a_terminal_parent(db):
+    connector = await _connector(db)
+    parent = await _job(db, "processing")
+    await _job(db, "processing", parent=parent)
+    lease = await _issue(db, leases.LeaseOwner.job(parent), connector)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET status='completed' WHERE id=$1", UUID(parent)
+        )
+    await _set_expiry(db, lease.id, 100)
+    assert await _renew(db) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["garbage", "another_rows_copy"])
+async def test_an_unusable_stored_copy_is_retired_and_replaced(db, damage):
+    connector = await _connector(db)
+    other = await _connector(db)
+    thread = await _thread(db)
+    owner = leases.LeaseOwner.thread(thread)
+    lease = await _issue(db, owner, connector)
+    donor = await _issue(db, owner, other)
+    async with db.acquire() as conn:
+        if damage == "garbage":
+            await conn.execute(
+                "UPDATE connector_credential_leases SET token_ciphertext = 'v1:x' "
+                "WHERE id = $1",
+                UUID(lease.id),
+            )
+        else:
+            # A ciphertext moved from another row decrypts to that row's
+            # token: the row's own digest refuses it.
+            await conn.execute(
+                "UPDATE connector_credential_leases SET token_ciphertext = "
+                "(SELECT token_ciphertext FROM connector_credential_leases "
+                "WHERE id = $2) WHERE id = $1",
+                UUID(lease.id),
+                UUID(donor.id),
+            )
+
+    fresh = await _issue(db, owner, connector)
+
+    assert fresh.issued and fresh.id != lease.id and fresh.token != donor.token
+    assert (await _lease(db, lease.id))["revoke_reason"] == "unreadable"
+
+
+@pytest.mark.asyncio
+async def test_an_access_change_on_redelivery_is_audited(db):
+    connector = await _connector(db)
+    thread = await _thread(db)
+    owner = leases.LeaseOwner.thread(thread)
+    lease = await _issue(db, owner, connector, "ReadWrite")
+    await _issue(db, owner, connector, "ReadWrite")
+    assert await _events(db, "connector_lease_access_changed") == []
+    await _issue(db, owner, connector, "ReadOnly")
+    (event,) = await _events(db, "connector_lease_access_changed")
+    assert str(event["resource_id"]) == lease.id
+    assert "access_from=ReadWrite" in event["detail"]
+    assert "access_to=ReadOnly" in event["detail"]
+
+
+@pytest.mark.asyncio
+async def test_a_connector_delete_revokes_its_leases_and_identities_first(db):
+    connector = await _connector(db)
+    lease = await _issue(db, leases.LeaseOwner.job(await _job(db)), connector)
+    identity = await _identity(db, connector, pod_uid="pod-del")
+
+    assert await db.delete_datasource(connector)
+
+    assert await _lease(db, lease.id) is None
+    (revoked,) = await _events(db, "connector_lease_revoked")
+    assert str(revoked["resource_id"]) == lease.id
+    assert "reason=connector_deleted" in revoked["detail"]
+    (gone,) = await _events(db, "connector_driver_identity_revoked")
+    assert str(gone["resource_id"]) == identity.id
+    assert "reason=connector_deleted" in gone["detail"]
+
+
+@pytest.mark.asyncio
+async def test_an_issue_waits_for_a_terminal_transaction_and_then_refuses(db):
+    """The guard is atomic: the terminal write holds the Job row; an issue
+    locks it FOR SHARE first, so it sees the committed terminal state."""
+    connector = await _connector(db)
+    job = await _job(db, "processing")
+    async with db.acquire() as holder:
+        transaction = holder.transaction()
+        await transaction.start()
+        try:
+            await holder.execute(
+                "UPDATE jobs SET status='cancelled' WHERE id=$1", UUID(job)
+            )
+            issuing = asyncio.create_task(
+                _issue(db, leases.LeaseOwner.job(job), connector)
+            )
+            await asyncio.sleep(0.5)
+            assert not issuing.done()
+        finally:
+            await transaction.commit()
+    with pytest.raises(leases.LeaseDeliveryError):
+        await issuing
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM connector_credential_leases WHERE job_id = $1",
+            UUID(job),
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio

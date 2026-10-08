@@ -189,6 +189,8 @@ class TestSpec:
         from shared.connectors.builtin import BUILTIN_SPECS, DEVELOPMENT_SPECS
 
         assert agent_rule is effective_access
+        # The lease service issues at the same function.
+        assert leases.effective_access is effective_access
         shapes = [
             {},
             {"project_read_only": True},
@@ -570,8 +572,13 @@ class TestSweeper:
         async def acquire():
             yield conn
 
-        async def renew(c):
+        async def terminal(c):
             assert c is conn
+            calls.append("terminal")
+            return []
+
+        async def renew(c, *, ttl_seconds):
+            assert c is conn and ttl_seconds == 120
             calls.append("renew")
             return 1
 
@@ -580,16 +587,20 @@ class TestSweeper:
             shutdown.set()
             return 0
 
+        monkeypatch.setattr(leases, "revoke_leases_of_terminal_executions", terminal)
         monkeypatch.setattr(leases, "renew_live_leases", renew)
         monkeypatch.setattr(leases, "retire_expired_leases", retire)
         shutdown = asyncio.Event()
         await asyncio.wait_for(
             leases.connector_lease_sweeper(
-                shutdown, store=SimpleNamespace(acquire=acquire), interval_seconds=0.01
+                shutdown,
+                store=SimpleNamespace(acquire=acquire),
+                ttl_seconds=120,
+                interval_seconds=0.01,
             ),
             timeout=5,
         )
-        assert calls == ["renew", "retire"]
+        assert calls == ["terminal", "renew", "retire"]
 
     @pytest.mark.asyncio
     async def test_a_failed_pass_does_not_end_the_loop(self, monkeypatch):
@@ -614,8 +625,18 @@ class TestSweeper:
         assert attempts == 2
 
     def test_the_interval_keeps_a_renewal_in_every_second_half(self):
-        assert leases.SWEEP_INTERVAL_SECONDS <= leases.LEASE_TTL_SECONDS / 4
-        assert leases.RENEW_BELOW_SECONDS == leases.LEASE_TTL_SECONDS // 2
+        assert leases.sweep_interval(900, 60) == 60
+        assert leases.sweep_interval(120, 60) == 30
+        assert leases.sweep_interval(120, 1) == leases.MIN_SWEEP_SECONDS
+        try:
+            leases.configure_lease_window(ttl_seconds=10, sweep_seconds=600)
+            assert leases.lease_ttl_seconds() == leases.MIN_TTL_SECONDS
+            assert leases.lease_sweep_seconds() == leases.MIN_TTL_SECONDS / 4
+        finally:
+            leases.configure_lease_window(
+                ttl_seconds=leases.DEFAULT_TTL_SECONDS,
+                sweep_seconds=leases.DEFAULT_SWEEP_SECONDS,
+            )
 
     def test_both_tasks_have_a_shutdown_slot(self):
         order = background_tasks.BACKGROUND_TASK_SHUTDOWN_ORDER
@@ -937,3 +958,23 @@ class TestBoundedPort:
         )
         assert config.timeout_graceful_shutdown == 5
         assert config.ws == "none" and config.lifespan == "off"
+
+
+class TestWindowSettings:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [(None, 900.0), ("", 900.0), ("120", 120.0), ("10", 60.0), ("soon", 900.0)],
+    )
+    def test_a_bad_value_falls_back_instead_of_crashing(self, raw, expected):
+        from orchestrator.application.settings import parse_positive_number
+
+        assert parse_positive_number("X", raw, default=900, minimum=60) == expected
+
+    def test_the_settings_read_the_window(self, monkeypatch):
+        from orchestrator.application.settings import DeploymentSettings
+
+        monkeypatch.setenv("CONNECTOR_LEASE_TTL_SECONDS", "not-a-number")
+        monkeypatch.setenv("CONNECTOR_LEASE_SWEEP_INTERVAL_SECONDS", "15")
+        settings = DeploymentSettings.from_environment()
+        assert settings.connector_lease_ttl_seconds == 900
+        assert settings.connector_lease_sweep_seconds == 15.0

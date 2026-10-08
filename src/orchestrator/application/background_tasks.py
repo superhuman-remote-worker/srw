@@ -457,6 +457,8 @@ async def start_background_tasks(
         functools.partial(
             connector_credential_leases.connector_lease_sweeper,
             store=resources.postgres_db,
+            ttl_seconds=resources.settings.connector_lease_ttl_seconds,
+            interval_seconds=resources.settings.connector_lease_sweep_seconds,
         ),
     )
     # The lease exchange's own port, on every replica (drivers reach it

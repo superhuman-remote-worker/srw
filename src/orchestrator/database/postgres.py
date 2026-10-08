@@ -1653,6 +1653,26 @@ def _encrypt_credentials_dict(creds: Dict[str, Any] | None) -> str:
     return json.dumps(encrypt(json.dumps(creds)))
 
 
+async def _revoke_retiring_thread_leases(
+    conn: Any, thread_id: UUID, settle_status: str
+) -> None:
+    """Revoke a pinned session's credential leases at its authorization edge.
+
+    Connector drivers C2: a Begin is a hidden, abortable preflight, so the
+    leases go only once the retirement is authorized. A suspend revokes too;
+    the resumed runtime is issued new leases at its next attach.
+    """
+    from orchestrator.services.connector_credential_leases import (
+        revoke_execution_leases,
+    )
+
+    await revoke_execution_leases(
+        conn,
+        thread_id=thread_id,
+        reason="session_end" if settle_status == "ended" else "session_suspended",
+    )
+
+
 def _decrypt_credentials_field(
     raw: Any, *, field: str = "datasources.credentials"
 ) -> Dict[str, Any]:
@@ -5148,11 +5168,15 @@ class PostgresDB:
                 )
                 # Revoke before the row goes (connector drivers C2): the
                 # lease rows cascade with the Job below, so the audited
-                # revocation is written first, in this same transaction.
+                # revocation is written first, in this same transaction. The
+                # Job row is locked first, as every lease issue locks it.
                 from orchestrator.services.connector_credential_leases import (
                     revoke_execution_leases,
                 )
 
+                await conn.fetchval(
+                    "SELECT 1 FROM jobs WHERE id = $1 FOR UPDATE", uuid_val
+                )
                 await revoke_execution_leases(
                     conn, job_id=uuid_val, reason="job_deleted"
                 )
@@ -31995,6 +32019,9 @@ class PostgresDB:
                             "retirement_authority_changed",
                             "Officer retirement authority changed; retry.",
                         )
+                    await _revoke_retiring_thread_leases(
+                        conn, thread_uuid, str(retirement_settle_status)
+                    )
 
                 post_row = await conn.fetchrow(
                     "SELECT * FROM project_officers WHERE project_id = $1 FOR UPDATE",
@@ -41993,6 +42020,9 @@ class PostgresDB:
                                 "reason": "authorization_changed",
                                 "generation": generation,
                             }
+                        await _revoke_retiring_thread_leases(
+                            conn, parsed_thread_id, settle_status
+                        )
                         source = existing_context.get("vm_creation_source")
                         if source is not None:
                             await self._cancel_retiring_thread_creation_on_conn(
@@ -43075,19 +43105,13 @@ class PostgresDB:
                 )
                 if admitted is None:
                     return {"state": "conflict", "reason": "authority_changed"}
-                # End, cancel, drain and a lost runtime all Begin here: the
-                # earliest durable terminal decision revokes the session's
-                # credential leases (connector drivers C2) in its transaction.
-                from orchestrator.services.connector_credential_leases import (
-                    revoke_execution_leases,
-                )
-
-                await revoke_execution_leases(
-                    conn, thread_id=parsed_thread_id, reason="session_end"
-                )
                 # A hidden owner preflight is still abortable. It fences
                 # grants through the thread token, but cancellation becomes
                 # durable only at the irrevocable authorization edge.
+                if authorize_immediately:
+                    await _revoke_retiring_thread_leases(
+                        conn, parsed_thread_id, settle_status
+                    )
                 if authorize_immediately and vm_creation_source is not None:
                     await self._cancel_retiring_thread_creation_on_conn(
                         conn,
@@ -43209,6 +43233,13 @@ class PostgresDB:
                     settle_status,
                 )
                 if row is not None:
+                    # The irrevocable edge of End, cancel, drain, a lost
+                    # runtime and a suspend: the session's credential leases
+                    # (connector drivers C2) are revoked here, never at the
+                    # abortable Begin. Idempotent on a repeated authorization.
+                    await _revoke_retiring_thread_leases(
+                        conn, parsed_thread, settle_status
+                    )
                     context = row["runtime_retirement_context"]
                     if isinstance(context, str):
                         context = json.loads(context)
@@ -51093,6 +51124,21 @@ class PostgresDB:
                             raise CredentialConnectorAttachedError(
                                 "End the sessions and jobs using this credential connector before deleting it"
                             )
+                    if doomed:
+                        # Decision 12: a deleted connector is gone at once. Its
+                        # credential leases and driver identities cascade with
+                        # the row, so revoke both first, audited (C2).
+                        from orchestrator.services.connector_credential_leases import (
+                            revoke_all_connector_leases,
+                        )
+                        from orchestrator.services.connector_driver_identities import (
+                            revoke_connector_driver_identities,
+                        )
+
+                        await revoke_all_connector_leases(conn, connector_id=uuid_val)
+                        await revoke_connector_driver_identities(
+                            conn, connector_id=str(uuid_val), reason="connector_deleted"
+                        )
                     result = await conn.execute(
                         "DELETE FROM datasources WHERE id = $1",
                         uuid_val,

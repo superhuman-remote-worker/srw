@@ -13,21 +13,31 @@ credential on the dedicated exchange port
   revokes what the parent's workspace holds.
 * **Re-delivery, not rotation.** The token is stored as a SHA-256 digest for
   lookup and as an ``APP_ENCRYPTION_KEY`` ciphertext, so every claim, attach
-  and pod recycle receives the same token. Rotation happens only when a lease
-  ends and a new one is issued (resume after a pause or an End).
-* **Expiry.** A lease expires ``LEASE_TTL_SECONDS`` after its last renewal.
-  Only :func:`connector_lease_sweeper` renews, and only leases whose
-  execution is live in durable state (a processing Job, or one with a
-  processing child on its workspace; a thread that has not ended, idle or
-  not). It writes only leases in the second half of their window, as the
-  runtime-actor liveness slide does. A lease never renews itself, paused and
-  ``pending_review`` Jobs lapse, and there is no hard maximum.
-* **Revocation** is an UPDATE at the execution's terminal transactions (End,
-  cancel, delete, completion, a live detach); pod events never revoke. The
-  revoke functions take the caller's connection so they commit with the
-  terminal decision.
-* **Audit.** Issue, revoke, every denied exchange and the first exchange of
-  a lease go to ``security_events``; later exchanges only update counters.
+  and pod recycle receives the same token. A stored copy that no longer
+  decrypts to its own digest is retired and replaced. Rotation happens only
+  when a lease ends and a new one is issued (resume after a pause or an End).
+* **Atomic issue.** Every issue and re-delivery first locks the owner's row
+  ``FOR SHARE`` and refuses a terminal or retiring execution. The terminal
+  transactions lock the same row ``FOR UPDATE`` before they revoke, so an
+  issue either commits before the revoke (and is revoked by it) or sees the
+  terminal state.
+* **Expiry.** A lease expires ``configure_lease_window``'s TTL after its last
+  renewal (``DeploymentSettings``, 15 minutes by default). Only
+  :func:`connector_lease_sweeper` renews, and only leases whose execution is
+  live in durable state (a processing Job, or one with a processing child on
+  its workspace; a thread that has not ended or been authorized to retire,
+  idle or not). It writes only leases in the second half of their window, as
+  the runtime-actor liveness slide does. A lease never renews itself, paused
+  and ``pending_review`` Jobs lapse, and there is no hard maximum. The same
+  sweep revokes any live lease whose execution durable state already shows as
+  terminal, which bounds a missed terminal write by one sweep.
+* **Revocation** is an UPDATE at the execution's terminal transactions (an
+  authorized End or suspend, cancel, delete, completion, a live detach, a
+  connector delete); pod events never revoke. The revoke functions take the
+  caller's connection so they commit with the terminal decision.
+* **Audit.** Issue, revoke, an access change, a denied exchange of a known
+  identity and the first exchange of a lease go to ``security_events``;
+  later exchanges only update counters.
 
 Design: knowledge-base/knowledge/features/connector_drivers.md, "The lease
 service".
@@ -37,7 +47,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -45,11 +54,10 @@ from typing import Any, Literal
 from uuid import UUID
 
 from shared.connectors.builtin import spec_for_row
-from shared.connectors.contract import DriverSpec
+from shared.connectors.contract import DriverSpec, effective_access
 from shared.connectors.leases import (
     LEASE_TOKEN_PREFIX,
     last_four,
-    lease_access,
     mint_token,
     token_digest,
     token_shape_valid,
@@ -57,33 +65,57 @@ from shared.connectors.leases import (
 
 logger = logging.getLogger(__name__)
 
-#: Seconds a lease lives after its last renewal (decision 9: 15 minutes).
-LEASE_TTL_SECONDS = max(60, int(os.environ.get("CONNECTOR_LEASE_TTL_SECONDS", "900")))
-#: The renewal throttle: only leases with less than this left are written.
-RENEW_BELOW_SECONDS = LEASE_TTL_SECONDS // 2
-#: Seconds between sweeps. A quarter of the TTL at most, so a live lease is
-#: renewed at least once in its second half.
-SWEEP_INTERVAL_SECONDS = max(
-    5.0,
-    min(
-        float(os.environ.get("CONNECTOR_LEASE_SWEEP_INTERVAL_SECONDS", "60")),
-        LEASE_TTL_SECONDS / 4,
-    ),
-)
+#: Decision 9: a lease lives 15 minutes after its last renewal.
+DEFAULT_TTL_SECONDS = 900
+DEFAULT_SWEEP_SECONDS = 60.0
+MIN_TTL_SECONDS = 60
+MIN_SWEEP_SECONDS = 5.0
+#: The process's lease window, set from ``DeploymentSettings`` when the
+#: application is built (the most recently built application's settings
+#: answer, as ``set_provisioning_backends`` does).
+_window: dict[str, float] = {
+    "ttl": float(DEFAULT_TTL_SECONDS),
+    "sweep": DEFAULT_SWEEP_SECONDS,
+}
 
-#: Why a lease ended; ``expired`` is written by the sweeper, never revoked.
+#: Why a lease ended; ``expired`` is written for a lapse, never revoked.
 RevokeReason = Literal[
     "session_end",
+    "session_suspended",
     "job_cancelled",
     "job_deleted",
     "job_completed",
     "job_failed",
     "connector_detached",
+    "connector_deleted",
     "execution_ended",
     "execution_terminal",
+    "unreadable",
 ]
 EXPIRED = "expired"
 _OWNER_COLUMNS = {"job": "job_id", "thread": "thread_id"}
+_TERMINAL_JOB_STATUSES = ("completed", "failed", "cancelled")
+
+
+def sweep_interval(ttl_seconds: int, sweep_seconds: float) -> float:
+    """The sweep interval actually used: at most a quarter of the TTL, so a
+    live lease is renewed at least once in the second half of its window."""
+    return max(MIN_SWEEP_SECONDS, min(float(sweep_seconds), ttl_seconds / 4))
+
+
+def configure_lease_window(*, ttl_seconds: int, sweep_seconds: float) -> None:
+    """Set the TTL new leases are issued with and the sweep interval."""
+    ttl = max(MIN_TTL_SECONDS, int(ttl_seconds))
+    _window["ttl"] = float(ttl)
+    _window["sweep"] = sweep_interval(ttl, sweep_seconds)
+
+
+def lease_ttl_seconds() -> int:
+    return int(_window["ttl"])
+
+
+def lease_sweep_seconds() -> float:
+    return float(_window["sweep"])
 
 
 class LeaseDeliveryError(RuntimeError):
@@ -211,16 +243,54 @@ def _encrypt(token: str) -> str:
     return encrypt(token)
 
 
-def _decrypt(ciphertext: Any) -> str:
+def _stored_token(row: Mapping[str, Any]) -> str | None:
+    """The token a lease row stores, or ``None`` when its copy is unusable.
+
+    The ciphertext is bound to its row by the row's own digest: a copy that
+    does not decrypt, is no lease token, or decrypts to another token (a
+    ciphertext moved between rows) is unusable.
+    """
     from orchestrator.security.crypto import DecryptionError, decrypt
 
     try:
-        token = decrypt(str(ciphertext))
-    except (DecryptionError, RuntimeError, ValueError, TypeError) as exc:
-        raise LeaseDeliveryError("A stored lease token cannot be read") from exc
+        token = decrypt(str(row["token_ciphertext"]))
+    except (DecryptionError, RuntimeError, ValueError, TypeError):
+        return None
     if not token_shape_valid(token, LEASE_TOKEN_PREFIX):
-        raise LeaseDeliveryError("A stored lease token is malformed")
+        return None
+    if token_digest(token) != bytes(row["token_hash"]):
+        return None
     return token
+
+
+async def _lock_live_owner(conn: Any, owner: LeaseOwner) -> bool:
+    """Lock the owner's row ``FOR SHARE``; whether it may hold a lease.
+
+    The terminal transactions lock the same row ``FOR UPDATE`` before they
+    revoke, so this serializes an issue against them. A thread whose
+    retirement is only a hidden preflight still accepts leases: the
+    authorization edge revokes everything it holds.
+    """
+    if owner.kind == "job":
+        row = await conn.fetchrow(
+            "SELECT status::text AS status FROM jobs WHERE id = $1::uuid FOR SHARE",
+            UUID(owner.id),
+        )
+        return row is not None and row["status"] not in _TERMINAL_JOB_STATUSES
+    row = await conn.fetchrow(
+        "SELECT status::text AS status, runtime_retirement_token, "
+        "runtime_retirement_authorized_at FROM threads WHERE id = $1::uuid "
+        "FOR SHARE",
+        UUID(owner.id),
+    )
+    return (
+        row is not None
+        and row["status"] != "ended"
+        and not (
+            row["runtime_retirement_token"] is not None
+            and row["runtime_retirement_authorized_at"] is not None
+        )
+    )
 
 
 async def issue_or_redeliver(
@@ -235,17 +305,34 @@ async def issue_or_redeliver(
 ) -> DeliveredLease:
     """The live lease of ``owner`` for ``connector_id``, issuing one if none.
 
-    An expired lease is retired first (``revoked_at`` = its expiry, reason
-    ``expired``), so the one-live-lease index admits the new one. A live lease
-    is delivered again with its stored token; its access level follows the
-    connector's current one. A concurrent issuer that wins the unique index is
-    read back, never duplicated.
+    The owner's row is locked first; a terminal or retiring execution gets
+    nothing. An expired lease is retired (``revoked_at`` = its expiry, reason
+    ``expired``), and a live one whose stored copy is unusable is revoked
+    (``unreadable``), so the one-live-lease index admits a new one. A live
+    lease is delivered again with its stored token; its access level follows
+    the connector's current one, audited when it changes. A concurrent issuer
+    that wins the unique index is read back, never duplicated.
     """
-    ttl = int(ttl_seconds or LEASE_TTL_SECONDS)
+    ttl = int(ttl_seconds or lease_ttl_seconds())
     connector_uuid = UUID(str(connector_id))
     owner_uuid = UUID(owner.id)
     column = owner.column
     async with conn.transaction():
+        if not await _lock_live_owner(conn, owner):
+            # A terminal decision (End, cancel, completion) revoked the
+            # execution's leases; a delivery racing it must not mint one
+            # the sweeper would then keep alive.
+            raise LeaseDeliveryError("The execution no longer accepts leases")
+        # The connector next, before any lease row, in the order the connector
+        # delete takes them (its row, then its leases).
+        if (
+            await conn.fetchval(
+                "SELECT 1 FROM datasources WHERE id = $1 FOR KEY SHARE",
+                connector_uuid,
+            )
+            is None
+        ):
+            raise LeaseDeliveryError("The connector no longer exists")
         await conn.execute(
             f"""
             UPDATE connector_credential_leases
@@ -257,12 +344,16 @@ async def issue_or_redeliver(
             connector_uuid,
         )
         live = await _live_lease(conn, column, owner_uuid, connector_uuid)
+        token = _stored_token(live) if live is not None else None
+        if live is not None and token is None:
+            await _revoke(
+                conn,
+                where="lease.id = $1::uuid",
+                args=(str(live["id"]),),
+                reason="unreadable",
+            )
+            live = None
         if live is None:
-            if not await _owner_accepts_leases(conn, owner):
-                # A terminal decision (End, cancel, completion) revoked the
-                # execution's leases; a delivery racing it must not mint one
-                # the sweeper would then keep alive.
-                raise LeaseDeliveryError("The execution no longer accepts leases")
             token = mint_token(LEASE_TOKEN_PREFIX)
             inserted = await conn.fetchrow(
                 f"""
@@ -309,7 +400,8 @@ async def issue_or_redeliver(
                     issued=True,
                 )
             live = await _live_lease(conn, column, owner_uuid, connector_uuid)
-            if live is None:
+            token = _stored_token(live) if live is not None else None
+            if live is None or token is None:
                 raise LeaseDeliveryError("A concurrent lease vanished during issue")
         if str(live["access"]) != access:
             await conn.execute(
@@ -317,9 +409,21 @@ async def issue_or_redeliver(
                 live["id"],
                 access,
             )
+            await record_lease_event(
+                conn,
+                event_type="connector_lease_access_changed",
+                resource_type="connector_lease",
+                resource_id=str(live["id"]),
+                detail=_detail(
+                    owner=f"{owner.kind}:{owner.id}",
+                    connector=connector_id,
+                    access_from=live["access"],
+                    access_to=access,
+                ),
+            )
         return DeliveredLease(
             id=str(live["id"]),
-            token=_decrypt(live["token_ciphertext"]),
+            token=token,
             connector_id=str(connector_uuid),
             access=access,
             expires_at=live["expires_at"],
@@ -327,26 +431,12 @@ async def issue_or_redeliver(
         )
 
 
-async def _owner_accepts_leases(conn: Any, owner: LeaseOwner) -> bool:
-    if owner.kind == "job":
-        query = (
-            "SELECT 1 FROM jobs WHERE id = $1::uuid "
-            "AND status::text NOT IN ('completed', 'failed', 'cancelled')"
-        )
-    else:
-        query = (
-            "SELECT 1 FROM threads WHERE id = $1::uuid "
-            "AND status::text <> 'ended' AND runtime_retirement_token IS NULL"
-        )
-    return await conn.fetchval(query, UUID(owner.id)) is not None
-
-
 async def _live_lease(
     conn: Any, column: str, owner_uuid: UUID, connector_uuid: UUID
 ) -> Any:
     return await conn.fetchrow(
         f"""
-        SELECT id, token_ciphertext, access, expires_at
+        SELECT id, token_hash, token_ciphertext, access, expires_at
           FROM connector_credential_leases
          WHERE {column} = $1 AND connector_id = $2
            AND revoked_at IS NULL AND expires_at > now()
@@ -369,8 +459,9 @@ async def deliver_connector_leases(
     ``entries`` is a datasources payload built by the drivers' ``bind``. A
     lease entry's ``credentials`` become ``{"lease": {id, connector_id,
     token}}`` and nothing else, so no upstream secret can ride along; an
-    entry SRW cannot lease delivers no token. Returns how many entries carry
-    a lease. The caller holds the connection (and the transaction the
+    entry SRW cannot lease delivers no token. The access level is the one the
+    agent binds the entry at (``effective_access``). Returns how many entries
+    carry a lease. The caller holds the connection (and the transaction the
     delivery belongs to).
     """
     delivered = 0
@@ -382,7 +473,7 @@ async def deliver_connector_leases(
             continue
         entry["credentials"] = {}
         connector_id = str(entry.get("datasource_id") or "")
-        access = lease_access(entry, spec)
+        access = effective_access(entry, spec)
         try:
             UUID(connector_id)
         except ValueError:
@@ -554,6 +645,37 @@ async def revoke_connector_leases(
     )
 
 
+async def revoke_all_connector_leases(
+    conn: Any, *, connector_id: Any, reason: RevokeReason = "connector_deleted"
+) -> list[str]:
+    """Revoke every live lease of one connector, for every execution.
+
+    The connector delete transaction calls this (with the connector's driver
+    identities) before the row goes: the foreign keys cascade, so revocation
+    is written first, as ``delete_job`` does.
+    """
+    return await _revoke(
+        conn,
+        where="lease.connector_id = $1::uuid",
+        args=(str(connector_id),),
+        reason=reason,
+    )
+
+
+_TERMINAL_OWNER = f"""(
+    EXISTS (
+        SELECT 1 FROM jobs WHERE jobs.id = lease.job_id
+           AND jobs.status::text IN {_TERMINAL_JOB_STATUSES!r}
+    )
+    OR EXISTS (
+        SELECT 1 FROM threads WHERE threads.id = lease.thread_id
+           AND (threads.status::text = 'ended'
+                OR (threads.runtime_retirement_token IS NOT NULL
+                    AND threads.runtime_retirement_authorized_at IS NOT NULL))
+    )
+)"""
+
+
 async def revoke_terminal_execution_leases(
     conn: Any, *, owner: LeaseOwner
 ) -> list[str]:
@@ -564,19 +686,9 @@ async def revoke_terminal_execution_leases(
     torn down while the session lives, and its lease must survive. So this
     revokes only when durable state already says the execution ended.
     """
-    if owner.kind == "job":
-        terminal = (
-            "EXISTS (SELECT 1 FROM jobs WHERE jobs.id = lease.job_id "
-            "AND jobs.status::text IN ('completed', 'failed', 'cancelled'))"
-        )
-    else:
-        terminal = (
-            "EXISTS (SELECT 1 FROM threads WHERE threads.id = lease.thread_id "
-            "AND threads.status::text = 'ended')"
-        )
     return await _revoke(
         conn,
-        where=f"lease.{owner.column} = $1::uuid AND {terminal}",
+        where=f"lease.{owner.column} = $1::uuid AND {_TERMINAL_OWNER}",
         args=(owner.id,),
         reason="execution_terminal",
     )
@@ -596,30 +708,33 @@ async def revoke_terminal_execution_leases_with(db: Any, *, owner: LeaseOwner) -
         )
 
 
+async def revoke_leases_of_terminal_executions(conn: Any) -> list[str]:
+    """The sweeper's backstop: revoke every live lease whose execution durable
+    state already shows as terminal (a terminal write no revoke point saw)."""
+    return await _revoke(
+        conn, where=_TERMINAL_OWNER, args=(), reason="execution_terminal"
+    )
+
+
 # =============================================================================
 # Renewal
 # =============================================================================
 
 
-async def renew_live_leases(
-    conn: Any,
-    *,
-    ttl_seconds: int | None = None,
-    renew_below_seconds: int | None = None,
-) -> int:
+async def renew_live_leases(conn: Any, *, ttl_seconds: int | None = None) -> int:
     """Renew the leases whose execution is live in durable state.
 
     Only leases in the second half of their window are written (the
     runtime-actor throttle), and never an expired one: expiry is terminal.
-    A Job is live while it is ``processing`` or a ``processing`` child runs
-    on its workspace; ``paused`` and ``pending_review`` Jobs are not, so
-    their leases lapse. A thread is live until it has ``ended`` or begun a
-    pinned retirement, idle or not.
+    A Job is live while it is ``processing``, or while a ``processing``
+    child runs on its workspace and the Job itself is not terminal;
+    ``paused`` and ``pending_review`` Jobs are not, so their leases lapse. A
+    thread is live until it has ``ended`` or its retirement is authorized,
+    idle or not.
     """
-    ttl = int(ttl_seconds or LEASE_TTL_SECONDS)
-    below = int(renew_below_seconds or (ttl // 2))
+    ttl = int(ttl_seconds or lease_ttl_seconds())
     rows = await conn.fetch(
-        """
+        f"""
         UPDATE connector_credential_leases AS lease
            SET expires_at = now() + make_interval(secs => $1::int),
                last_renewed_at = now()
@@ -632,12 +747,15 @@ async def renew_live_leases(
                      WHERE job.id = lease.job_id
                        AND (
                             job.status::text = 'processing'
-                            OR EXISTS (
-                                SELECT 1 FROM jobs AS child
-                                 WHERE child.parent_job_id = job.id
-                                   AND child.status::text = 'processing'
-                                   AND child.context->>'inherits_parent_workspace'
-                                       = 'true'
+                            OR (
+                                job.status::text NOT IN {_TERMINAL_JOB_STATUSES!r}
+                                AND EXISTS (
+                                    SELECT 1 FROM jobs AS child
+                                     WHERE child.parent_job_id = job.id
+                                       AND child.status::text = 'processing'
+                                       AND child.context->>'inherits_parent_workspace'
+                                           = 'true'
+                                )
                             )
                        )
                 )
@@ -645,13 +763,16 @@ async def renew_live_leases(
                     SELECT 1 FROM threads AS thread
                      WHERE thread.id = lease.thread_id
                        AND thread.status::text <> 'ended'
-                       AND thread.runtime_retirement_token IS NULL
+                       AND NOT (
+                            thread.runtime_retirement_token IS NOT NULL
+                            AND thread.runtime_retirement_authorized_at IS NOT NULL
+                       )
                 )
            )
         RETURNING lease.id
         """,
         ttl,
-        below,
+        ttl // 2,
     )
     return len(rows)
 
@@ -673,28 +794,35 @@ async def connector_lease_sweeper(
     shutdown_event: asyncio.Event,
     *,
     store: Any,
+    ttl_seconds: int | None = None,
     interval_seconds: float | None = None,
 ) -> None:
-    """Leader-gated loop: renew live leases, retire expired ones.
+    """Leader-gated loop: revoke leases of terminal executions, renew live
+    ones, retire expired ones.
 
-    Best effort: a failed pass is logged and the next one runs on time. A
-    renewal is a pure server-side UPDATE re-derived from durable state, so a
-    pass cancelled by a leadership change is simply run again by the next
-    leader.
+    Best effort: a failed pass is logged and the next one runs on time. Every
+    step is a server-side UPDATE re-derived from durable state, so a pass
+    cancelled by a leadership change is simply run again by the next leader.
     """
-    interval = float(interval_seconds or SWEEP_INTERVAL_SECONDS)
+    ttl = int(ttl_seconds or lease_ttl_seconds())
+    # Settings already floor the interval; only the TTL cap applies here.
+    interval = min(float(interval_seconds or lease_sweep_seconds()), ttl / 4)
     logger.info(
-        "Connector lease sweeper started (ttl=%ds, interval=%.0fs)",
-        LEASE_TTL_SECONDS,
-        interval,
+        "Connector lease sweeper started (ttl=%ds, interval=%.0fs)", ttl, interval
     )
     while not shutdown_event.is_set():
         try:
             async with store.acquire() as conn:
-                renewed = await renew_live_leases(conn)
+                terminal = await revoke_leases_of_terminal_executions(conn)
+                renewed = await renew_live_leases(conn, ttl_seconds=ttl)
                 expired = await retire_expired_leases(conn)
-            if renewed or expired:
-                logger.info("connector leases: renewed=%d expired=%d", renewed, expired)
+            if terminal or renewed or expired:
+                logger.info(
+                    "connector leases: terminal=%d renewed=%d expired=%d",
+                    len(terminal),
+                    renewed,
+                    expired,
+                )
         except Exception as exc:
             logger.warning("connector lease sweep error (non-fatal): %s", exc)
         try:
@@ -706,24 +834,29 @@ async def connector_lease_sweeper(
 
 
 __all__ = [
+    "DEFAULT_SWEEP_SECONDS",
+    "DEFAULT_TTL_SECONDS",
     "EXPIRED",
-    "LEASE_TTL_SECONDS",
-    "RENEW_BELOW_SECONDS",
-    "SWEEP_INTERVAL_SECONDS",
     "DeliveredLease",
     "LeaseDeliveryError",
     "LeaseOwner",
+    "configure_lease_window",
     "connector_lease_sweeper",
     "deliver_connector_leases",
     "deliver_connector_leases_with",
     "issue_or_redeliver",
     "lease_spec",
+    "lease_sweep_seconds",
+    "lease_ttl_seconds",
     "needs_leases",
     "record_lease_event",
     "renew_live_leases",
     "retire_expired_leases",
+    "revoke_all_connector_leases",
     "revoke_connector_leases",
     "revoke_execution_leases",
+    "revoke_leases_of_terminal_executions",
     "revoke_terminal_execution_leases",
     "revoke_terminal_execution_leases_with",
+    "sweep_interval",
 ]

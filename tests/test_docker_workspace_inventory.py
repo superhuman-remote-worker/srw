@@ -215,6 +215,9 @@ class _InventoryConnection:
             # No represented job holds a durable backlog-ticket claim, so the
             # deletion audit stamps nothing and retains nothing.
             return None
+        if sql.startswith("SELECT 1 FROM jobs WHERE id = $1 FOR UPDATE"):
+            # delete_job locks the Job before revoking its leases (C2).
+            return 1
         raise AssertionError(f"unexpected fetchval: {sql}")
 
     async def execute(self, query: str, *args):
