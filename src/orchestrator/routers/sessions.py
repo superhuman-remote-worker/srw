@@ -1147,6 +1147,15 @@ async def get_connection(
         raise AssertionError("unreachable")
     _require_live_agent(current_binding)
 
+    if dependencies.session_tokens is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "session_token_service_unavailable",
+                "message": "Session control is unavailable: configure SESSION_JWT_SECRET",
+            },
+        )
+
     # Make /connection self-healing: any code path that binds an agent to a
     # thread (POST /prepare, the legacy resume in main.py, orchestrator restart
     # re-binding from DB) must end up routable. ensure_route is idempotent and

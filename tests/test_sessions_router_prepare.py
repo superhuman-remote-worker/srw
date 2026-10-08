@@ -1507,6 +1507,43 @@ def test_connection_returns_ws_url_and_token_when_ready(
     )
 
 
+def test_pinned_connection_without_token_service_refuses_before_route_mutation(
+    monkeypatch,
+):
+    """A Ready pinned session cannot create a route when tokens are unavailable."""
+    from orchestrator.routers import sessions as sessions_mod
+
+    _install_fake_auth(monkeypatch)
+    fake_db = AsyncMock()
+    fake_db.get_thread.return_value = _connection_thread()
+    fake_db.get_pinned_session_binding.return_value = _connection_binding()
+    fake_main = _fake_main(fake_db)
+    fake_main.session_tokens = None
+    fake_main.session_router.ensure_route = AsyncMock()
+    fake_main.session_router.teardown_route = AsyncMock()
+    probe = AsyncMock(return_value=True)
+    monkeypatch.setattr(sessions_mod, "probe_ready", probe, raising=True)
+
+    fastapi_app = FastAPI()
+    fastapi_app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
+    fastapi_app.include_router(sessions_mod.router)
+    response = TestClient(fastapi_app, raise_server_exceptions=False).get(
+        f"/api/sessions/{CONNECTION_THREAD_ID}/connection"
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {
+            "code": "session_token_service_unavailable",
+            "message": "Session control is unavailable: configure SESSION_JWT_SECRET",
+        }
+    }
+    probe.assert_awaited_once()
+    assert fake_db.get_pinned_session_binding.await_count == 2
+    fake_main.session_router.ensure_route.assert_not_awaited()
+    fake_main.session_router.teardown_route.assert_not_awaited()
+
+
 @pytest.mark.parametrize("mutation_phase", ["post_probe", "post_route"])
 @pytest.mark.parametrize(
     "changed_binding",
@@ -1800,6 +1837,7 @@ def test_connection_reports_stateless_ready_without_a_socket(monkeypatch):
         lane="stateless", agent_id=None
     )
     fake_main = _fake_main(fake_db)
+    fake_main.session_tokens = None
     fastapi_app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     fastapi_app.include_router(sessions_mod.router)
 
