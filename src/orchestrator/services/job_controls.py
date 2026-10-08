@@ -81,6 +81,10 @@ def resume_reject_should_requeue(status_code: int) -> bool:
     return status_code == 409
 
 
+async def _no_mint_gate(_job: Any) -> tuple[str, str | None]:
+    return "dispatch", None
+
+
 @dataclass(frozen=True, slots=True)
 class JobControlDependencies:
     """Stateful application collaborators used by job controls."""
@@ -122,6 +126,9 @@ class JobControlDependencies:
     get_vm_context: Callable[[Mapping[str, Any]], Mapping[str, Any]]
     recovery_store: Any
     validate_workspace_recovery_storage: Callable[[str], Awaitable[bool]] | None = None
+    #: A job's provider-minted credentials before its claim (connector
+    #: drivers C5, ``connector_minted_credentials.job_mint_gate``).
+    job_mint_gate: Callable[[Any], Awaitable[tuple[str, str | None]]] = _no_mint_gate
 
 
 @dataclass(frozen=True, slots=True)
@@ -1672,6 +1679,17 @@ class JobControlOperations:
             if not await self.dependencies.prepare_job_repository_before_claim(job):
                 return await _queue_for_dispatch(
                     "Repository authority is not ready; job remains queued"
+                )
+            # A provider-minted credential exists before the claim (C5), as the
+            # dispatcher's preflight requires; otherwise the dispatcher holds
+            # the job until it does (and fails it on a provider's refusal).
+            mint_action, mint_reason = await self.dependencies.job_mint_gate(job)
+            if mint_action != "dispatch":
+                return await _queue_for_dispatch(
+                    f"{mint_reason}; job queued for dispatch"
+                    if mint_reason
+                    else "A connector's credential is being minted; job queued "
+                    "for dispatch"
                 )
             if not await self.dependencies.store.claim_job_for_agent(
                 job_id,

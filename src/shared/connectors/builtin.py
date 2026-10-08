@@ -363,9 +363,10 @@ REPOSITORY_SPEC = DriverSpec(
             "repo_pr_status",
         ),
         read_only_enforced_by=(
-            "Only the repo tools are read-only; the workspace shell can still "
-            "push with the checkout's credentials. A GitHub App connector's "
-            "token is minted with contents: read."
+            "For a token or deploy-key connector only the repo tools are "
+            "read-only; the workspace shell can still push with the checkout's "
+            "credentials. A GitHub App connector's read-only is enforced: its "
+            "token is minted with contents: read, so no push succeeds."
         ),
         read_only_advisory=True,
         read_write_enforced_by=(
@@ -766,11 +767,13 @@ _TOKEN_REQUEST: Mapping[str, Any] = {
     "properties": {
         "namespace": {"type": "string"},
         "service_account": {"type": "string"},
+        # No "default": a blank form must send no config (minting off); the
+        # parser's lifetime is 3600 s when the config omits it.
         "expiration_seconds": {
             "type": "integer",
             "minimum": 600,
             "maximum": 86400,
-            "default": 3600,
+            "description": "Token lifetime in seconds (3600 when omitted).",
         },
         "audiences": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
     },

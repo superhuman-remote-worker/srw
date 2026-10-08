@@ -402,7 +402,7 @@
             "repo_pull",
             "repo_pr_status"
           ],
-          "enforced_by": "Only the repo tools are read-only; the workspace shell can still push with the checkout's credentials. A GitHub App connector's token is minted with contents: read.",
+          "enforced_by": "For a token or deploy-key connector only the repo tools are read-only; the workspace shell can still push with the checkout's credentials. A GitHub App connector's read-only is enforced: its token is minted with contents: read, so no push succeeds.",
           "advisory": true
         },
         {
@@ -1770,7 +1770,7 @@
                 "type": "integer",
                 "minimum": 600,
                 "maximum": 86400,
-                "default": 3600
+                "description": "Token lifetime in seconds (3600 when omitted)."
               },
               "audiences": {
                 "type": "array",

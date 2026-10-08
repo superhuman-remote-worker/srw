@@ -178,6 +178,7 @@ def _deps(
     manifest_service: Any = None,
     prepare_repository: Any = None,
     bind_gate: Any = None,
+    mint_gate: Any = None,
 ) -> JobDispatchDependencies:
     delivery = delivery or FakeDelivery()
 
@@ -213,6 +214,7 @@ def _deps(
         or AsyncMock(return_value=True),
         job_delivery_operations=lambda: delivery,
         **({"job_bind_gate": bind_gate} if bind_gate is not None else {}),
+        **({"job_mint_gate": mint_gate} if mint_gate is not None else {}),
     )
 
 
@@ -529,6 +531,72 @@ class TestClaimAndDelivery:
         gate.assert_awaited_once_with(job)
         assert store.called("claim_job_for_agent") == []
         assert store.called("update_job_status") == []
+
+    @pytest.mark.asyncio
+    async def test_a_mint_still_running_holds_the_job_before_claim(
+        self, no_dispatcher_error
+    ):
+        """A provider-minted credential is minted first (C5): the preflight
+        starts it without waiting, and the job is claimed only once its
+        delivery can hand it out."""
+        job = _job("j1")
+        store = FakeStore(pinned=[job], agents=[{"id": "a1", "metadata": {}}])
+        gate = AsyncMock(return_value=("wait", None))
+
+        await dispatch_pending_jobs(dependencies=_deps(store, mint_gate=gate))
+
+        gate.assert_awaited_once_with(job)
+        assert store.called("claim_job_for_agent") == []
+        assert store.called("update_job_status") == []
+
+    @pytest.mark.asyncio
+    async def test_a_mint_the_provider_refused_fails_the_job_with_its_reason(
+        self, no_dispatcher_error
+    ):
+        job = _job("j1", status="created")
+        store = FakeStore(pinned=[job], agents=[{"id": "a1", "metadata": {}}])
+        gate = AsyncMock(
+            return_value=("fail", "Connector gh: GitHub refused (HTTP 403)")
+        )
+
+        await dispatch_pending_jobs(dependencies=_deps(store, mint_gate=gate))
+
+        assert store.called("claim_job_for_agent") == []
+        ((args, kwargs),) = store.called("update_job_status")
+        assert args == ("j1",)
+        assert kwargs["status"] == "failed"
+        assert kwargs["error_message"] == "Connector gh: GitHub refused (HTTP 403)"
+
+    @pytest.mark.asyncio
+    async def test_the_mint_gate_runs_once_the_binds_are_done(
+        self, no_dispatcher_error
+    ):
+        job = _job("j1")
+        store = FakeStore(pinned=[job], agents=[{"id": "a1", "metadata": {}}])
+        bind = AsyncMock(return_value=("wait", None))
+        mint = AsyncMock(return_value=("dispatch", None))
+
+        await dispatch_pending_jobs(
+            dependencies=_deps(store, bind_gate=bind, mint_gate=mint)
+        )
+
+        mint.assert_not_awaited()
+        assert store.called("claim_job_for_agent") == []
+
+    @pytest.mark.asyncio
+    async def test_a_minted_job_is_claimed_once_its_credentials_are_live(
+        self, no_dispatcher_error
+    ):
+        job = _job("j1")
+        store = FakeStore(pinned=[job], agents=[{"id": "a1", "metadata": {}}])
+        mint = AsyncMock(return_value=("dispatch", None))
+
+        await dispatch_pending_jobs(dependencies=_deps(store, mint_gate=mint))
+
+        mint.assert_awaited_once_with(job)
+        assert [args for args, _ in store.called("claim_job_for_agent")] == [
+            ("j1", "a1")
+        ]
 
     @pytest.mark.asyncio
     async def test_a_bind_that_failed_for_good_fails_the_job_with_its_reason(

@@ -35,6 +35,10 @@ class JobAssignmentStore(Protocol):
     ) -> Any: ...
 
 
+async def _no_mint_gate(_job: Any) -> tuple[str, str | None]:
+    return "dispatch", None
+
+
 @dataclass(frozen=True, slots=True)
 class JobAssignmentDependencies:
     """Application-owned ports for the manual scheduling override."""
@@ -58,6 +62,9 @@ class JobAssignmentDependencies:
     dispatch_job_to_agent: Callable[[dict, dict], Awaitable[bool]]
     resume_job_on_agent: Callable[[dict, dict], Awaitable[bool]]
     trigger_dispatch: Callable[[], None]
+    #: A job's provider-minted credentials before its claim (connector
+    #: drivers C5, ``connector_minted_credentials.job_mint_gate``).
+    job_mint_gate: Callable[[Any], Awaitable[tuple[str, str | None]]] = _no_mint_gate
 
 
 class JobAssignmentOperations:
@@ -205,6 +212,19 @@ class JobAssignmentOperations:
             if not await dependencies.prepare_job_repository_before_claim(job):
                 raise HTTPException(
                     status_code=409, detail="Job repository authority is not ready"
+                )
+            # A provider-minted credential exists before the claim (C5): the
+            # mint starts now, and the assignment is refused until it is live
+            # (or with the provider's reason).
+            mint_action, mint_reason = await dependencies.job_mint_gate(job)
+            if mint_action != "dispatch":
+                raise HTTPException(
+                    status_code=409,
+                    detail=mint_reason
+                    or (
+                        "A connector's credential is being minted; assign the "
+                        "job again in a moment"
+                    ),
                 )
             if not await store.claim_job_for_agent(
                 job_id,

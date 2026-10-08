@@ -234,6 +234,12 @@ class JobDispatchDependencies:
     job_bind_gate: Callable[[Any], Awaitable[tuple[str, str | None]]] = (
         _dispatch_without_binds
     )
+    #: A job's provider-minted credentials exist before its claim (connector
+    #: drivers C5, ``connector_minted_credentials.job_mint_gate``), the same
+    #: three answers.
+    job_mint_gate: Callable[[Any], Awaitable[tuple[str, str | None]]] = (
+        _dispatch_without_binds
+    )
 
 
 def _needs_mutation(job: dict[str, Any], dependencies: JobDispatchDependencies) -> bool:
@@ -1234,6 +1240,11 @@ async def _preflight_job(
     # loop), the job waits for later ticks while it runs, and one that fails
     # for good fails the job with the driver's reason (D6).
     action, reason = await dependencies.job_bind_gate(job)
+    if action == "dispatch":
+        # A provider-minted credential is minted before the claim too (C5):
+        # started without waiting, the job waits for later ticks until its
+        # delivery hands it out, and a provider's refusal fails the job.
+        action, reason = await dependencies.job_mint_gate(job)
     if action == "wait":
         return None
     if action == "fail":

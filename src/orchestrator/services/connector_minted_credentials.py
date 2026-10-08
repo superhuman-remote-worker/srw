@@ -169,8 +169,12 @@ PREPARED_OUTCOME_SECONDS = 120.0
 TRANSIENT_OUTCOME_SECONDS = 30.0
 #: The shortest time between two Tests of one connector by one user.
 TEST_MINT_INTERVAL_SECONDS = 10.0
-#: How long shutdown waits for background mints to record what they made.
-SHUTDOWN_SETTLE_SECONDS = 20.0
+#: How long shutdown waits for background mints to record what they made:
+#: inside the orchestrator pod's terminationGracePeriodSeconds (60 s by
+#: default) with the preStop drain (15 s), uvicorn's graceful shutdown (10 s)
+#: and the rest of the lifespan shutdown. A mint cut off leaves a
+#: ``minting`` record the sweep treats as abandoned.
+SHUTDOWN_SETTLE_SECONDS = 10.0
 #: A ``minting`` row older than this was abandoned (a crash, a cancel).
 MINT_ABANDON_SECONDS = 300
 REVOKES_PER_PASS = 20
@@ -325,9 +329,17 @@ def github_app_marker(row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def connector_read_only(row: Mapping[str, Any]) -> bool:
-    """The connector's own read-only rule: its ``read_only``, always set on
-    a public one (checked too, should a row lack it)."""
-    return bool(row.get("read_only")) or bool(row.get("is_global"))
+    """The connector's own read-only rule: its ``read_only`` when set (a
+    public connector's owner may publish it read-write), and a public one
+    whose flag was never set is read-only."""
+    read_only = row.get("read_only")
+    if read_only is None:
+        return bool(row.get("is_global"))
+    return read_only is True
+
+
+#: The same rule in SQL, on ``d`` (a ``datasources`` row).
+_OWN_READ_ONLY_SQL = "(d.read_only IS TRUE OR (d.is_global AND d.read_only IS NULL))"
 
 
 def clamped_access(access: str, *, read_only: bool) -> str:
@@ -1153,7 +1165,9 @@ def _remembered(owner: LeaseOwner, connector_id: str) -> MintFailure | None:
 
 def forget_connector(connector_id: Any) -> None:
     """A connector changed: what this process remembers of its mints'
-    failures no longer holds."""
+    failures no longer holds. This replica's memory only: another
+    orchestrator replica forgets its own when the failure goes stale
+    (:data:`PREPARED_OUTCOME_SECONDS`, :data:`TRANSIENT_OUTCOME_SECONDS`)."""
     wanted = str(connector_id).lower()
     for key in [key for key in _prepared if key[2] == wanted]:
         _prepared.pop(key, None)
@@ -1277,17 +1291,95 @@ async def prepare_minted_entries(
     )
 
 
+_MINTING_ROWS_SQL = f"""
+((d.type = '{KUBECONFIG_SPEC.legacy_type}' AND d.config ? '{TOKEN_REQUEST_KEY}')
+ OR (d.type = '{REPOSITORY_SPEC.legacy_type}' AND d.config ? '{GITHUB_APP_KEY}'))
+"""
+
 _THREAD_TARGETS = f"""
 SELECT d.id,
-       COALESCE(d.read_only, false) OR COALESCE(d.is_global, false)
+       COALESCE({_OWN_READ_ONLY_SQL}, false)
        OR COALESCE((SELECT BOOL_OR(pd.read_only) FROM project_datasources AS pd
                      WHERE pd.datasource_id = d.id
                        AND pd.project_id = ANY($2::uuid[])), false) AS read_only
   FROM datasources AS d
- WHERE d.id = ANY($1::uuid[])
-   AND ((d.type = '{KUBECONFIG_SPEC.legacy_type}' AND d.config ? '{TOKEN_REQUEST_KEY}')
-        OR (d.type = '{REPOSITORY_SPEC.legacy_type}' AND d.config ? '{GITHUB_APP_KEY}'))
+ WHERE d.id = ANY($1::uuid[]) AND {_MINTING_ROWS_SQL}
 """
+
+#: A job's minting connectors as its delivery resolves them
+#: (``resolve_datasources_for_job``: its selection, its project's link).
+_JOB_TARGETS = f"""
+SELECT d.id, d.name,
+       COALESCE({_OWN_READ_ONLY_SQL}, false)
+       OR COALESCE(pd.read_only, false) AS read_only
+  FROM job_datasources AS jd
+  JOIN datasources AS d ON d.id = jd.datasource_id
+  LEFT JOIN project_datasources AS pd
+         ON pd.datasource_id = d.id AND pd.project_id = $2::uuid
+ WHERE jd.job_id = $1 AND {_MINTING_ROWS_SQL}
+ ORDER BY d.id
+"""
+
+
+async def job_mint_gate(job: Mapping[str, Any]) -> tuple[str, str | None]:
+    """The dispatcher's pre-claim step for a job's minting connectors (as
+    D6's ``job_bind_gate`` is for its binds), and the operator resume's:
+    ``dispatch`` once each has a live credential its delivery hands out,
+    ``wait`` while one is minted (started here, never waited for: a
+    dispatch loop never blocks on a provider), ``fail`` with the reason
+    once a provider refused it for good. A job is thus claimed only when
+    its delivery cannot answer :class:`BindTimePending` for a mint. A store
+    that cannot answer dispatches, as before this step: the delivery still
+    refuses what it cannot fill."""
+    try:
+        return await _job_mint_gate(job)
+    except Exception:
+        logger.warning(
+            "The mint gate of job %s failed; dispatching", job.get("id"), exc_info=True
+        )
+        return "dispatch", None
+
+
+async def _job_mint_gate(job: Mapping[str, Any]) -> tuple[str, str | None]:
+    from orchestrator.services.connector_credential_leases import job_lease_owner
+
+    runtime = minted_runtime()
+    if runtime is None:
+        # No minting here: the delivery refuses what it cannot fill.
+        return "dispatch", None
+    try:
+        job_id = UUID(str(job.get("id")))
+    except ValueError:
+        return "dispatch", None
+    projects = _uuids([job["project_id"]]) if job.get("project_id") else []
+    store = runtime.store
+    owner = job_lease_owner(job)
+    starts: list[tuple[str, str]] = []
+    action = "dispatch"
+    async with store.acquire() as conn:
+        targets = await conn.fetch(
+            _JOB_TARGETS, job_id, projects[0] if projects else None
+        )
+        for target in targets:
+            connector_id = str(target["id"])
+            access = "ReadOnly" if target["read_only"] else "ReadWrite"
+            live = await _live_row(conn, owner, UUID(connector_id))
+            if (
+                live is not None
+                and (_usable(live, access) or _still_valid(live, access))
+                and _credential(live) is not None
+            ):
+                if not _usable(live, access):
+                    starts.append((connector_id, access))  # renewed meanwhile
+                continue
+            failure = _remembered(owner, connector_id)
+            if failure is not None and failure.permanent:
+                return "fail", f"Connector {target['name']}: {failure}"
+            starts.append((connector_id, access))
+            action = "wait"
+    for connector_id, access in starts:
+        await _prepare_one(store, owner, connector_id, access, wait=0)
+    return action, None
 
 
 def _uuids(values: Sequence[Any]) -> list[UUID]:
@@ -2096,6 +2188,7 @@ __all__ = [
     "deliver_minted_entries",
     "ensure_minted",
     "forget_connector",
+    "job_mint_gate",
     "fresh",
     "github_app_marker",
     "kubeconfig_marker",

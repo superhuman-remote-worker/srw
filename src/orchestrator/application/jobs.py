@@ -38,6 +38,7 @@ from orchestrator.security import access, auth
 from orchestrator.services import (
     agent_provisioner as agent_provisioner_module,
     connector_bind_time,
+    connector_minted_credentials,
     container_provisioner as container_provisioner_module,
     default_experts,
     deployment_gates,
@@ -161,6 +162,8 @@ def job_dispatch_dependencies(
         ),
         # Registered driver binds before the claim (D6).
         job_bind_gate=connector_bind_time.job_bind_gate,
+        # Provider-minted credentials before the claim (C5).
+        job_mint_gate=connector_minted_credentials.job_mint_gate,
     )
 
 

@@ -352,10 +352,21 @@ class RepositoryDriver(WorkspaceSshDriver):
         # JSONB, so this is a real dict. No secrets live in config —
         # credentials travel in `creds`.
         fields["config"] = row.get("config") or {}
+        read_only = row.get("project_read_only", False)
+        if github_app:
+            from orchestrator.services.connector_minted_credentials import (
+                connector_read_only,
+            )
+
+            # A GitHub App connector's read-only is enforced by the token SRW
+            # mints (contents: read), so its own rule (a public one's
+            # included) is the entry's: the lease, the repo tools and the
+            # minted token all bind at the same level (C5).
+            read_only = bool(read_only) or connector_read_only(row)
         entry = payload_entry(
             row,
             credentials=credentials,
-            read_only=row.get("project_read_only", False),
+            read_only=read_only,
             fields=fields,
         )
         if row.get("require_default_branch") is True:

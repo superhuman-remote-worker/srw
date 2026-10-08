@@ -1022,6 +1022,27 @@ class TestResumeEndpointDelegation:
         )
 
     @pytest.mark.asyncio
+    async def test_a_credential_still_minting_queues_instead_of_claiming(
+        self, endpoint_collaborators, monkeypatch
+    ):
+        """C5: an operator resume claims only once the job's provider-minted
+        credentials are live; until then the dispatcher holds the job."""
+        from orchestrator.services import connector_minted_credentials
+
+        gate = AsyncMock(return_value=("wait", None))
+        monkeypatch.setattr(connector_minted_credentials, "job_mint_gate", gate)
+
+        result = await control_seams.resume_job(
+            MagicMock(), JOB_ID, job_controls_module.JobResumeRequest()
+        )
+
+        assert result["status"] == "queued"
+        assert "being minted" in result["message"]
+        gate.assert_awaited_once()
+        endpoint_collaborators.claim_job.assert_not_awaited()
+        endpoint_collaborators.delegate.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_declined_resume_falls_back_to_queue(self, endpoint_collaborators):
         endpoint_collaborators.delegate.return_value = False
 

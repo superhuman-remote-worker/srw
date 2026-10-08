@@ -456,42 +456,131 @@ async def test_a_dispatch_never_waits_on_a_provider(db, kube, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_dead_providers_job_never_stalls_another_jobs_dispatch(
-    db, kube, monkeypatch
-):
-    import time
+async def _select(db, job: str, *connectors: str) -> None:
+    async with db.acquire() as conn:
+        for connector in connectors:
+            await conn.execute(
+                "INSERT INTO job_datasources (job_id, datasource_id) VALUES ($1, $2)",
+                UUID(job),
+                UUID(connector),
+            )
 
+
+@pytest.mark.asyncio
+async def test_a_job_is_claimed_only_once_its_credential_is_live(db, kube, monkeypatch):
+    """The real pinned dispatch flow (the dispatcher's preflight, claim and
+    start delivery, as tests/test_b11_job_dispatcher.py drives it): a job
+    is claimed only once its minted credential is live, so its delivery
+    never answers BindTimePending; a job whose provider hangs is never
+    claimed and never holds up another job's dispatch."""
+    import time
+    from unittest.mock import AsyncMock
+
+    from tests import test_b11_job_dispatcher as b11
+
+    for var in ("AGENT_IMAGE", "PERSISTENT_AGENT_IMAGE", "VM_MODE"):
+        monkeypatch.delenv(var, raising=False)
     dead = await _kube_connector(db, kube)
     alive = await _kube_connector(db, kube, server="https://kube2.test:6443")
-    stuck = leases.LeaseOwner.job(await _job(db))
-    other = leases.LeaseOwner.job(await _job(db))
+    stuck, other = await _job(db, status="created"), await _job(db, status="created")
+    await _select(db, stuck, dead)
+    await _select(db, other, alive)
+    connector_of = {stuck: dead, other: alive}
     release = await _hanging_kube(kube, monkeypatch)
-    dispatch_lock = asyncio.Lock()  # the dispatcher's global lock
+    store = b11.FakeStore(
+        pinned=[b11._job(stuck), b11._job(other)],
+        agents=[{"id": "a1", "metadata": {}}, {"id": "a2", "metadata": {}}],
+    )
+    deliveries: dict[str, str] = {}
 
-    async def dispatch(owner, connector) -> bool:
-        entries = [copy.deepcopy(_kube_entry(connector))]
-        async with dispatch_lock:
-            await leases.prepare_lease_delivery(db, entries, owner=owner, bind_wait=0)
-            try:
-                await _deliver_only(db, entries, owner)
-            except BindTimePending:
-                return False
-            return True
+    async def start(job, agent) -> bool:
+        # The pinned start bundle's delivery: prepared with bind_wait=0.
+        owner = leases.LeaseOwner.job(str(job["id"]))
+        entries = [copy.deepcopy(_kube_entry(connector_of[str(job["id"])]))]
+        await leases.prepare_lease_delivery(db, entries, owner=owner, bind_wait=0)
+        try:
+            await _deliver_only(db, entries, owner)
+        except BindTimePending:
+            deliveries[str(job["id"])] = "pending"
+            return False
+        deliveries[str(job["id"])] = "delivered"
+        return True
+
+    delivery = b11.FakeDelivery()
+    delivery.dispatch = AsyncMock(side_effect=start)
+    dependencies = b11._deps(store, delivery=delivery, mint_gate=minted.job_mint_gate)
 
     started = time.monotonic()
-    assert not await dispatch(stuck, dead)
-    assert not await dispatch(other, alive)
-    # The other job's mint finishes in the background; the next tick
-    # dispatches it while the dead provider's mint still hangs.
-    for _ in range(50):
+    await b11.dispatch_pending_jobs(dependencies=dependencies)
+    assert time.monotonic() - started < 2
+    # Both mints started; neither job claimed.
+    assert store.called("claim_job_for_agent") == [] and deliveries == {}
+    for _ in range(100):
         if any(r["status"] == "live" for r in await _rows(db, alive)):
             break
-        await asyncio.sleep(0.05)
-    assert not await dispatch(stuck, dead)
-    assert await dispatch(other, alive)
-    assert time.monotonic() - started < 5
+        await asyncio.sleep(0.02)
+    started = time.monotonic()
+    await b11.dispatch_pending_jobs(dependencies=dependencies)
+    assert time.monotonic() - started < 2
+    claimed = [args[0] for args, _ in store.called("claim_job_for_agent")]
+    assert claimed == [other]
+    assert deliveries == {other: "delivered"}
+    # The hung mint is the only one, with one record.
+    assert len(await _rows(db, dead)) == 1
     release.set()
     await minted.settle_background_mints()
+
+
+@pytest.mark.asyncio
+async def test_the_mint_gate_answers(db, kube, github):
+    owner_job = await _job(db, status="created")
+    connector = await _kube_connector(db, kube)
+    await _select(db, owner_job, connector)
+    job = {"id": owner_job, "parent_job_id": None, "project_id": None}
+    # Nothing minted: the mint starts, the job waits.
+    assert await minted.job_mint_gate(job) == ("wait", None)
+    await minted.settle_background_mints()
+    assert await minted.job_mint_gate(job) == ("dispatch", None)
+    # A job without minting connectors dispatches at once.
+    plain = await _job(db, status="created")
+    assert await minted.job_mint_gate({"id": plain}) == ("dispatch", None)
+    # A provider's refusal fails the job with the reason.
+    refused_job = await _job(db, status="created")
+    refused = await _kube_connector(db, kube)
+    await _select(db, refused_job, refused)
+    kube.forbidden.add("token")
+    refused_dict = {"id": refused_job}
+    assert await minted.job_mint_gate(refused_dict) == ("wait", None)
+    await minted.settle_background_mints()
+    action, reason = await minted.job_mint_gate(refused_dict)
+    assert action == "fail" and "HTTP 403" in reason and reason.startswith("Connector ")
+
+
+@pytest.mark.asyncio
+async def test_the_mint_gate_mints_at_the_level_the_delivery_reads(db, github):
+    """A read-only project link, or the connector's own rule: the gate's
+    mint is the one the delivery hands out (no second mint at claim)."""
+    project = uuid4()
+    connector = await _github_connector(db)
+    async with db.acquire() as conn:
+        await conn.execute("INSERT INTO projects (id, name) VALUES ($1, 'c5')", project)
+        await conn.execute(
+            "INSERT INTO project_datasources (project_id, datasource_id, read_only) "
+            "VALUES ($1, $2, true)",
+            project,
+            UUID(connector),
+        )
+    job = await _job(db, status="created")
+    await _select(db, job, connector)
+    job_dict = {"id": job, "project_id": str(project)}
+    assert (await minted.job_mint_gate(job_dict))[0] == "wait"
+    await minted.settle_background_mints()
+    assert await minted.job_mint_gate(job_dict) == ("dispatch", None)
+    [row] = await _rows(db, connector)
+    assert row["access"] == "ReadOnly"
+    entry = _github_entry(connector, block={"fallback": "why"}, read_only=True)
+    assert await _deliver_only(db, [entry], leases.LeaseOwner.job(job)) == 1
+    assert len(github.tokens) == 1
 
 
 @pytest.mark.asyncio
@@ -1517,6 +1606,32 @@ async def test_a_sessions_stored_selection_is_minted_at_its_project_links_level(
     assert row["access"] == "ReadOnly" and row["status"] == "live"
     [token] = github.tokens
     assert github.tokens[token]["permissions"]["contents"] == "read"
+
+
+@pytest.mark.asyncio
+async def test_a_public_connector_published_read_write_mints_write(db, github):
+    connector = await _github_connector(db)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE datasources SET is_global = true, read_only = false WHERE id = $1",
+            UUID(connector),
+        )
+    row = await db.get_datasource(connector)
+    assert minted.github_app_marker(row)["read_only"] is False
+    upstream = await minted.minted_lease_upstream(
+        db, row, owner=leases.LeaseOwner.thread(await _thread(db)), access="ReadWrite"
+    )
+    assert github.live(upstream.token)["permissions"]["contents"] == "write"
+    # Public with the flag never set is read-only.
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE datasources SET read_only = NULL WHERE id = $1", UUID(connector)
+        )
+    row = await db.get_datasource(connector)
+    upstream = await minted.minted_lease_upstream(
+        db, row, owner=leases.LeaseOwner.thread(await _thread(db)), access="ReadWrite"
+    )
+    assert github.live(upstream.token)["permissions"]["contents"] == "read"
 
 
 @pytest.mark.asyncio

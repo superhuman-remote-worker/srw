@@ -80,6 +80,9 @@ from orchestrator.services import (
     agent_datasource_payload as agent_datasource_payload_module,
 )
 from orchestrator.services import config_resolver as config_resolver_module
+from orchestrator.services import (
+    connector_minted_credentials as connector_minted_credentials_module,
+)
 from orchestrator.services import connector_secrets as connector_secrets_module
 from orchestrator.services import container_provisioner as container_provisioner_module
 from orchestrator.services import deployment_gates as deployment_gates_module
@@ -378,6 +381,7 @@ def _job_assignment_deps() -> job_assignment_routes.JobAssignmentDependencies:
             jobs_composition.job_dispatch_dependencies,
             main.app.state.resources,
         ),
+        job_mint_gate=connector_minted_credentials_module.job_mint_gate,
     )
 
 
@@ -3469,6 +3473,27 @@ class TestAssignRouteBehaviour:
         claim.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("gate", "detail"),
+        [
+            (("wait", None), "being minted"),
+            (("fail", "Connector gh: GitHub refused (HTTP 403)"), "HTTP 403"),
+        ],
+    )
+    async def test_a_credential_not_yet_minted_blocks_the_claim(self, gate, detail):
+        """C5: a provider-minted credential exists before the claim, as the
+        dispatcher's preflight requires."""
+        claim = AsyncMock(return_value=True)
+        with pytest.raises(HTTPException) as exc:
+            await _assign(
+                READY_SANDBOX_JOB,
+                job_mint_gate=AsyncMock(return_value=gate),
+                store_overrides={"claim_job_for_agent": claim},
+            )
+        assert exc.value.status_code == 409 and detail in exc.value.detail
+        claim.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_a_lost_claim_race_is_a_409(self):
         with pytest.raises(HTTPException) as exc:
             await _assign(
@@ -4049,6 +4074,13 @@ LATE_BINDING_TABLE = [
         _BOUND,
         (job_dispatcher_module, "trigger_dispatch"),
         jobs_composition.job_dispatch_dependencies,
+    ),
+    (
+        _job_assignment_deps,
+        "job_mint_gate",
+        _OWNER,
+        (connector_minted_credentials_module, "job_mint_gate"),
+        None,
     ),
 ]
 

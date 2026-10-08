@@ -742,7 +742,8 @@ async def build_job_start_request(
             # A service driver's image is looked up first, outside any
             # transaction (D5); the delivery then only applies it. A
             # registered driver's bind is never waited for here: the
-            # dispatcher's preflight held the job until it was bound (D6).
+            # dispatcher's preflight held the job until it was bound (D6), and
+            # until each provider-minted credential was live (C5).
             await connector_credential_leases.prepare_lease_delivery(
                 postgres_db, datasources_payload, owner=lease_owner, bind_wait=0
             )

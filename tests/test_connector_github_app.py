@@ -189,20 +189,19 @@ class TestRules:
         )
         assert not granted_as_asked(None, wanted)
 
-    def test_the_connectors_own_read_only_clamps_the_level(self):
-        from shared.connectors.contract import effective_access
+    def test_the_connectors_own_rule(self):
+        from orchestrator.services.connector_minted_credentials import (
+            connector_read_only,
+        )
 
-        assert (
-            effective_access(
-                {"project_read_only": None, "read_only": True}, REPOSITORY_SPEC
-            )
-            == "ReadOnly"
-        )
-        assert effective_access({"is_global": True}, REPOSITORY_SPEC) == "ReadOnly"
-        assert (
-            effective_access({"project_read_only": True}, REPOSITORY_SPEC) == "ReadOnly"
-        )
-        assert effective_access({"read_only": False}, REPOSITORY_SPEC) == "ReadWrite"
+        assert connector_read_only({"read_only": True})
+        # Public with the flag never set is read-only; its owner may publish
+        # it read-write.
+        assert connector_read_only({"is_global": True, "read_only": None})
+        assert connector_read_only({"is_global": True})
+        assert not connector_read_only({"is_global": True, "read_only": False})
+        assert not connector_read_only({"read_only": False})
+        assert not connector_read_only({})
 
     def test_the_answer_must_cover_the_one_repository(self):
         assert covers_only([{"full_name": "Acme/Repo"}], "acme", "repo")
@@ -605,24 +604,44 @@ class TestRepositoryDriver:
                 _draft(credentials=credentials), existing=existing, ctx=_ctx()
             )
 
-    def test_a_public_or_read_only_connector_marks_its_entry(self):
-        for over in ({"read_only": True}, {"is_global": True}):
-            row = {
-                "id": CONNECTOR,
-                "type": "repository",
-                "name": "repo",
-                "connection_url": URL,
-                "config": {"forge": "github", "github_app": APP},
-                **over,
-            }
-            ctx = BindContext(
-                gates=DeploymentGates(lambda: True, lambda: True),
-                logger=logging.getLogger("test"),
-                default_known_hosts="",
-                git_swap=None,
-            )
-            entry = RepositoryDriver().bind(row, _app_credentials(), ctx=ctx)
-            assert entry["minted"]["read_only"] is True
+    @pytest.mark.parametrize(
+        ("over", "read_only"),
+        [
+            ({"read_only": True}, True),
+            ({"is_global": True, "read_only": None}, True),
+            ({"is_global": True, "read_only": False}, False),
+            ({"read_only": False, "project_read_only": True}, True),
+            ({}, False),
+        ],
+    )
+    def test_a_github_app_entry_binds_at_the_connectors_own_rule(self, over, read_only):
+        """The entry's project_read_only carries the connector's own rule, so
+        the lease, the repo tools and the minted token agree."""
+        row = {
+            "id": CONNECTOR,
+            "type": "repository",
+            "name": "repo",
+            "connection_url": URL,
+            "config": {"forge": "github", "github_app": APP},
+            **over,
+        }
+        ctx = BindContext(
+            gates=DeploymentGates(lambda: True, lambda: True),
+            logger=logging.getLogger("test"),
+            default_known_hosts="",
+            git_swap=None,
+        )
+        entry = RepositoryDriver().bind(row, _app_credentials(), ctx=ctx)
+        assert entry["project_read_only"] is read_only
+        own = read_only and "project_read_only" not in over
+        assert entry["minted"]["read_only"] is own
+        # A token repository keeps the link's level only (D2's rule).
+        static = RepositoryDriver().bind(
+            {**row, "config": {"forge": "github"}},
+            {"auth_method": "token", "token": "t" * 20},
+            ctx=ctx,
+        )
+        assert static["project_read_only"] == over.get("project_read_only", False)
 
     @pytest.mark.asyncio
     async def test_dropping_the_app_needs_new_credentials(self):

@@ -41,6 +41,7 @@ from orchestrator.services import (
     agent_provisioner as agent_provisioner_module,
     commissioned_officer_provisioning as commissioned_officer_provisioning_service,
     config_resolver,
+    connector_minted_credentials,
     container_provisioner as container_provisioner_module,
     deployment_gates,
     dispatch_credentials,
@@ -299,6 +300,7 @@ def job_control_operations(
             recovery_store=vm_workspace_recovery_store_module.VMWorkspaceRecoveryStore(
                 resources.postgres_db
             ),
+            job_mint_gate=connector_minted_credentials.job_mint_gate,
         )
     )
 
@@ -794,4 +796,5 @@ def job_assignment_dependencies(
             jobs_composition.job_dispatch_dependencies,
             resources,
         ),
+        job_mint_gate=connector_minted_credentials.job_mint_gate,
     )
