@@ -38,19 +38,7 @@ function makeSettingsService() {
     pollSubscriptionLogin: vi.fn(),
     submitSubscriptionCallback: vi.fn(),
     cancelSubscriptionLogin: vi.fn(),
-    getMainCloudSettings: vi.fn(() =>
-      of({
-        effective: { backend_id: 'nextcloud', is_initialized: false, is_configured: false },
-        activation_revision: 0,
-        backend_instance: null,
-        overlay: { present: false, value: {}, credentials_ref: null, updated_at: null, updated_by: null },
-        secrets: {},
-        allowed_backends: ['nextcloud'],
-      }),
-    ),
-    putMainCloudSettings: vi.fn(() => of({})),
-    testMainCloudSettings: vi.fn(() => of({})),
-    deleteMainCloudSettings: vi.fn(() => of({})),
+    getMainCloud: vi.fn(() => of(null)),
   };
 }
 

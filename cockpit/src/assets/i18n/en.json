@@ -1214,7 +1214,7 @@
       "mcp": "MCP tokens",
       "sshKeys": "SSH keys",
       "subscriptions": "Subscriptions",
-      "cloud": "Cloud storage"
+      "cloud": "Main cloud"
     },
     "appearance": {
       "title": "Appearance",
@@ -1550,42 +1550,50 @@
       }
     },
     "cloud": {
-      "title": "Cloud Storage (Main Cloud)",
-      "desc": "Configure the main-cloud backend used for user home folders, project folders, and session folders. Secrets are managed via environment variables (Vault/ESO/.env) and are shown here as provenance only.",
+      "title": "Main cloud",
+      "desc": "The cloud SRW creates project, user and session folders on. It is configured by Helm (the chart's cloud values), not here: this page shows what is active and what each provider supports.",
       "loading": "Loading…",
-      "active": "Active:",
-      "initialized": "initialized",
-      "notInitialized": "not initialized",
+      "loadFailed": "Could not load the main cloud.",
+      "retry": "Retry",
       "refresh": "Refresh",
-      "backend": "Backend",
-      "baseUrl": "Base URL (internal)",
-      "publicUrl": "Public URL (browser)",
-      "keycloakIssuer": "Keycloak issuer",
-      "keycloakClientId": "Keycloak client id",
-      "adminRole": "Admin role / claim value",
-      "spaceQuota": "Default Space quota (bytes)",
-      "adminUser": "Admin user",
-      "agentUser": "Agent user",
-      "credentialsRef": "Credentials ref (optional)",
-      "secretProvenance": "Secret provenance",
-      "secretSet": "set",
-      "secretUnset": "unset",
-      "testing": "Testing…",
-      "test": "Test",
-      "saving": "Saving…",
-      "saveReload": "Save + Reload",
-      "resetEnv": "Reset to env defaults",
-      "persistedOverlayLastSaved": "Persisted overlay last saved",
-      "messages": {
-        "loadFailed": "Failed to load cloud settings",
-        "testOk": "Test OK ({{ms}} ms) — healthy",
-        "testFailed": "Test failed: {{error}}",
-        "testRequestFailed": "Test request failed",
-        "saved": "Saved — active backend is now {{backend}}",
-        "savedReloaded": "Saved — active backend is now {{backend}} (reloaded)",
-        "saveFailed": "Save failed",
-        "overlayCleared": "Environment configuration attested and activated; backend history was retained",
-        "resetFailed": "Reset failed"
+      "active": "Active:",
+      "healthy": "healthy ({{ms}} ms)",
+      "notInitialized": "not initialized",
+      "unreachable": "unreachable",
+      "provider": "Provider",
+      "publicUrl": "Public URL",
+      "unknown": "unknown",
+      "installation": "Installation",
+      "activation": "activation {{revision}}",
+      "noInstallation": "No installation is active; cloud effects are disabled.",
+      "configuration": "Configuration",
+      "helmOnly": "Helm values",
+      "helm": {
+        "matches": "match the active installation",
+        "differs": "differ from the active installation",
+        "invalid": "incomplete"
+      },
+      "helmNote": {
+        "differs": "Helm's cloud values describe something other than the active installation. The orchestrator adopts them at its next start when they describe the same installation; for a different installation, set cloud.replaceInstallation to {{instance}} to confirm the move.",
+        "invalid": "Helm's cloud values are incomplete (a required secret is unset), so the active installation keeps serving."
+      },
+      "matrixTitle": "Provider support",
+      "matrixDesc": "What each provider delivers, declared by its adapter. A level is offered only where it is enforced; anything else is unsupported, with the reason.",
+      "connector": "Connector · folder · access",
+      "activeBadge": "active",
+      "status": {
+        "offered": "offered",
+        "planned": "planned (slice {{slice}})",
+        "unsupported": "unsupported"
+      },
+      "types": {
+        "cloud_folder": "Cloud folder",
+        "cloud_folder_checkout": "Folder checkout",
+        "cloud_outbox": "Outbox"
+      },
+      "kinds": {
+        "project": "project",
+        "user_root": "user root"
       }
     },
     "helpers": {

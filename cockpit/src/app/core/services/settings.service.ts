@@ -12,6 +12,7 @@ import {
   UserSettings,
 } from '../models/api.model';
 import { environment } from '../environment';
+import type { MainCloudPage } from '../models/main-cloud.model';
 import { AdminProvidersService } from './admin-providers.service';
 import { ReadinessService } from './readiness.service';
 
@@ -161,114 +162,10 @@ export class SettingsService {
     );
   }
 
-  // ── Main Cloud System Settings (Admin — Phase 4) ──────────────
+  // ── Main cloud (admin) ──────────────────────────────────────
 
-  getMainCloudSettings(): Observable<MainCloudSettingsResponse> {
-    return this.http.get<MainCloudSettingsResponse>(
-      `${this.baseUrl}/admin/system-settings/main_cloud`,
-    );
+  /** The read-only Main cloud page: Helm configures the main cloud. */
+  getMainCloud(): Observable<MainCloudPage> {
+    return this.http.get<MainCloudPage>(`${this.baseUrl}/admin/main-cloud`);
   }
-
-  putMainCloudSettings(body: MainCloudSettingsRequest): Observable<MainCloudPutResponse> {
-    return this.http.put<MainCloudPutResponse>(
-      `${this.baseUrl}/admin/system-settings/main_cloud`,
-      body,
-    );
-  }
-
-  testMainCloudSettings(body: MainCloudSettingsRequest): Observable<MainCloudTestResponse> {
-    return this.http.post<MainCloudTestResponse>(
-      `${this.baseUrl}/admin/system-settings/main_cloud/test`,
-      body,
-    );
-  }
-
-  deleteMainCloudSettings(): Observable<{ status: string; existed: boolean; backend_id?: string }> {
-    return this.http.delete<{ status: string; existed: boolean; backend_id?: string }>(
-      `${this.baseUrl}/admin/system-settings/main_cloud`,
-    );
-  }
-}
-
-// ── Main cloud settings types ──────────────────────────────────
-
-export interface MainCloudEffectiveConfig {
-  backend_id: string;
-  backend_instance_id?: string | null;
-  is_initialized: boolean;
-  is_configured: boolean;
-  base_url?: string | null;
-  public_url?: string | null;
-  admin_user?: string | null;
-  agent_user?: string | null;
-  keycloak_issuer?: string | null;
-  keycloak_client_id?: string | null;
-  admin_role_claim_value?: string | null;
-  default_quota_bytes?: number | null;
-}
-
-export interface MainCloudOverlay {
-  present: boolean;
-  value: Record<string, unknown>;
-  credentials_ref: string | null;
-  updated_at: string | null;
-  updated_by: string | null;
-}
-
-export interface MainCloudSecretProvenance {
-  env_var: string;
-  set: boolean;
-}
-
-export interface MainCloudSettingsResponse {
-  effective: MainCloudEffectiveConfig;
-  activation_revision: number;
-  backend_instance: {
-    id: string;
-    routing_sha256: string;
-    installation_proof_sha256: string;
-    secret_revision: number;
-  } | null;
-  overlay: MainCloudOverlay;
-  secrets: Record<string, MainCloudSecretProvenance>;
-  allowed_backends: string[];
-}
-
-export interface MainCloudSettingsRequest {
-  value: Record<string, unknown>;
-  credentials_ref: string | null;
-  expected_activation_revision?: number;
-}
-
-export interface MainCloudPutResponse {
-  status: string;
-  backend_id: string;
-  backend_instance_id: string;
-  activation_revision: number;
-  reloaded: boolean;
-}
-
-// Form state for the admin Cloud Storage section. Explicit named fields
-// (rather than `Record<string, unknown>`) so the template can dot-access
-// them under TypeScript's `noPropertyAccessFromIndexSignature` rule.
-// Every field is always present — strings default to '', quota to null —
-// so the template doesn't need optional-chaining gymnastics.
-export interface MainCloudFormState {
-  backend_id: string;
-  base_url: string;
-  public_url: string;
-  // Nextcloud-only
-  admin_user: string;
-  agent_user: string;
-  // OpenCloud-only
-  keycloak_issuer: string;
-  keycloak_client_id: string;
-  admin_role_claim_value: string;
-  default_quota_bytes: number | null;
-}
-
-export interface MainCloudTestResponse {
-  ok: boolean;
-  detail: string;
-  latency_ms?: number;
 }

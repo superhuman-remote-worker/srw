@@ -14,11 +14,7 @@ import { McpTokenService } from '../../core/services/mcp-token.service';
 import { UserService } from '../../core/services/user.service';
 import { ViewModeService } from '../../core/services/view-mode.service';
 import { ApiService } from '../../core/services/api.service';
-import {
-  SettingsService,
-  MainCloudSettingsResponse,
-  MainCloudFormState,
-} from '../../core/services/settings.service';
+import { SettingsService } from '../../core/services/settings.service';
 import { ModelService } from '../../core/services/model.service';
 import { CapabilitiesService } from '../../core/services/capabilities.service';
 import { I18nService, SupportedLang } from '../../core/services/i18n.service';
@@ -55,6 +51,7 @@ import { AppCheckboxComponent } from '../../ui/checkbox';
 import { AppFormFieldComponent } from '../../ui/form-field';
 import { AppBadgeComponent } from '../../ui/badge';
 import { AppIconComponent } from '../../ui/icon';
+import { MainCloudSettingsComponent } from './main-cloud/main-cloud-settings.component';
 
 const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
   { value: 'openai', label: 'OpenAI' },
@@ -116,6 +113,7 @@ const EXPIRY_OPTIONS = [
     AppFormFieldComponent,
     AppBadgeComponent,
     AppIconComponent,
+    MainCloudSettingsComponent,
   ],
   template: `
     <div class="settings-page">
@@ -1587,191 +1585,7 @@ const EXPIRY_OPTIONS = [
                 <p class="section-desc">
                   {{ 'settings.cloud.desc' | transloco }}
                 </p>
-
-                @if (cloudLoading()) {
-                  <p class="section-desc">{{ 'settings.cloud.loading' | transloco }}</p>
-                } @else if (cloudSettings(); as s) {
-                  <!-- Status row -->
-                  <div class="subs-status-card">
-                    <span
-                      class="subs-status-dot"
-                      [class.connected]="s.effective.is_initialized"
-                    ></span>
-                    <span class="subs-status-text">
-                      {{ 'settings.cloud.active' | transloco }}
-                      <strong>{{ s.effective.backend_id }}</strong>
-                      @if (s.effective.is_initialized) {
-                        &mdash; {{ 'settings.cloud.initialized' | transloco }}
-                      } @else {
-                        &mdash; {{ 'settings.cloud.notInitialized' | transloco }}
-                      }
-                    </span>
-                    <app-button
-                      variant="ghost"
-                      size="sm"
-                      [ariaLabel]="'settings.cloud.refresh' | transloco"
-                      (clicked)="loadCloudSettings()"
-                    >
-                      <app-icon size="sm">refresh</app-icon>
-                    </app-button>
-                  </div>
-
-                  <!-- Backend selector -->
-                  <app-form-field [label]="'settings.cloud.backend' | transloco">
-                    <app-select
-                      [value]="cloudForm().backend_id"
-                      (changed)="updateCloudForm('backend_id', $event ?? '')"
-                    >
-                      @for (backend of s.allowed_backends; track backend) {
-                        <option [value]="backend">{{ backend }}</option>
-                      }
-                    </app-select>
-                  </app-form-field>
-
-                  <!-- Common URL fields -->
-                  <app-form-field [label]="'settings.cloud.baseUrl' | transloco">
-                    <app-input
-                      [value]="cloudForm().base_url || ''"
-                      (changed)="updateCloudForm('base_url', $event)"
-                    />
-                  </app-form-field>
-                  <app-form-field [label]="'settings.cloud.publicUrl' | transloco">
-                    <app-input
-                      [value]="cloudForm().public_url || ''"
-                      (changed)="updateCloudForm('public_url', $event)"
-                    />
-                  </app-form-field>
-
-                  @if (cloudForm().backend_id === 'opencloud') {
-                    <app-form-field [label]="'settings.cloud.keycloakIssuer' | transloco">
-                      <app-input
-                        [value]="cloudForm().keycloak_issuer || ''"
-                        (changed)="updateCloudForm('keycloak_issuer', $event)"
-                      />
-                    </app-form-field>
-                    <app-form-field [label]="'settings.cloud.keycloakClientId' | transloco">
-                      <app-input
-                        [value]="cloudForm().keycloak_client_id || ''"
-                        (changed)="updateCloudForm('keycloak_client_id', $event)"
-                      />
-                    </app-form-field>
-                    <app-form-field [label]="'settings.cloud.adminRole' | transloco">
-                      <app-input
-                        [value]="cloudForm().admin_role_claim_value || ''"
-                        (changed)="updateCloudForm('admin_role_claim_value', $event)"
-                      />
-                    </app-form-field>
-                    <app-form-field [label]="'settings.cloud.spaceQuota' | transloco">
-                      <app-input
-                        type="number"
-                        [value]="cloudQuotaText()"
-                        (changed)="onCloudQuotaChange($event)"
-                      />
-                    </app-form-field>
-                  }
-
-                  @if (cloudForm().backend_id === 'nextcloud') {
-                    <app-form-field [label]="'settings.cloud.adminUser' | transloco">
-                      <app-input
-                        [value]="cloudForm().admin_user || ''"
-                        (changed)="updateCloudForm('admin_user', $event)"
-                      />
-                    </app-form-field>
-                    <app-form-field [label]="'settings.cloud.agentUser' | transloco">
-                      <app-input
-                        [value]="cloudForm().agent_user || ''"
-                        (changed)="updateCloudForm('agent_user', $event)"
-                      />
-                    </app-form-field>
-                  }
-
-                  <!-- Credentials ref -->
-                  <app-form-field [label]="'settings.cloud.credentialsRef' | transloco">
-                    <app-input
-                      [value]="cloudCredentialsRef()"
-                      placeholder="env:OPENCLOUD_KEYCLOAK_CLIENT_SECRET"
-                      (changed)="cloudCredentialsRef.set($event)"
-                    />
-                  </app-form-field>
-
-                  <!-- Secret provenance -->
-                  @if (secretProvenanceEntries().length > 0) {
-                    <div class="subs-accounts secret-provenance">
-                      <h3 class="form-title">{{ 'settings.cloud.secretProvenance' | transloco }}</h3>
-                      @for (entry of secretProvenanceEntries(); track entry.field) {
-                        <div class="subs-account-row">
-                          <span class="mono">{{ entry.field }}</span>
-                          <span class="mono">{{ entry.env_var }}</span>
-                          <span class="subs-account-state" [class.connected]="entry.set">
-                            {{
-                              entry.set
-                                ? ('settings.cloud.secretSet' | transloco)
-                                : ('settings.cloud.secretUnset' | transloco)
-                            }}
-                          </span>
-                        </div>
-                      }
-                    </div>
-                  }
-
-                  <!-- Buttons -->
-                  <div class="cloud-button-row">
-                    <app-button
-                      variant="primary"
-                      size="md"
-                      [loading]="cloudTesting()"
-                      [disabled]="cloudBusy()"
-                      (clicked)="testCloudSettings()"
-                    >
-                      {{
-                        (cloudTesting() ? 'settings.cloud.testing' : 'settings.cloud.test') | transloco
-                      }}
-                    </app-button>
-                    <app-button
-                      variant="primary"
-                      size="md"
-                      [loading]="cloudSaving()"
-                      [disabled]="cloudBusy()"
-                      (clicked)="saveCloudSettings()"
-                    >
-                      {{
-                        (cloudSaving() ? 'settings.cloud.saving' : 'settings.cloud.saveReload')
-                          | transloco
-                      }}
-                    </app-button>
-                    @if (s.overlay.present) {
-                      <app-button
-                        variant="danger"
-                        size="md"
-                        [disabled]="cloudBusy()"
-                        (clicked)="resetCloudSettings()"
-                      >
-                        {{ 'settings.cloud.resetEnv' | transloco }}
-                      </app-button>
-                    }
-                  </div>
-
-                  @if (cloudMessage()) {
-                    <p
-                      class="section-desc cloud-message"
-                      [class.subs-login-error]="cloudMessageIsError()"
-                    >
-                      {{ cloudMessage() }}
-                    </p>
-                  }
-
-                  @if (s.overlay.present) {
-                    <p class="section-desc cloud-overlay-info">
-                      {{ 'settings.cloud.persistedOverlayLastSaved' | transloco }}
-                      @if (s.overlay.updated_at) {
-                        {{ formatDate(s.overlay.updated_at) }}
-                      }
-                      @if (s.overlay.updated_by) {
-                        by {{ s.overlay.updated_by }}
-                      }
-                    </p>
-                  }
-                }
+                <app-main-cloud-settings />
               </section>
             }
           }
@@ -2069,8 +1883,7 @@ const EXPIRY_OPTIONS = [
         line-height: 1.5;
       }
 
-      /* AI Subscriptions (also reused by the Cloud Storage status/provenance
-         rows — these are section-agnostic status primitives, not provider UI) */
+      /* AI Subscriptions (section-agnostic status primitives, not provider UI) */
       .subs-status-card {
         display: flex;
         align-items: center;
@@ -2380,19 +2193,6 @@ const EXPIRY_OPTIONS = [
         margin: 6px 0 0 0;
       }
 
-      /* Cloud Storage */
-      .cloud-button-row {
-        display: flex;
-        gap: 12px;
-        margin-top: 20px;
-        flex-wrap: wrap;
-      }
-      .cloud-message {
-        margin-top: 12px;
-      }
-      .cloud-overlay-info {
-        margin-top: 8px;
-      }
 
       /* ---- Mobile (<=560px): this page's first responsive block ---- */
       @media (max-width: 560px) {
@@ -2492,7 +2292,7 @@ const EXPIRY_OPTIONS = [
           width: 100%;
         }
 
-        /* Subscription accounts & Cloud secret-provenance rows: let the long, unbreakable
+        /* Subscription account rows: let the long, unbreakable
          mono strings (e.g. OPENCLOUD_KEYCLOAK_CLIENT_SECRET) wrap instead of
          forcing the row -- and the whole page -- to scroll sideways. */
         .subs-account-row {
@@ -3077,41 +2877,6 @@ export class SettingsComponent implements OnInit, OnDestroy {
   readonly expandedUsage = signal<string | null>(null);
   private loginPollTimer: ReturnType<typeof setInterval> | null = null;
 
-  // Cloud storage state (admin-only, Phase 4)
-  readonly cloudSettings = signal<MainCloudSettingsResponse | null>(null);
-  readonly cloudLoading = signal(false);
-  readonly cloudSaving = signal(false);
-  readonly cloudTesting = signal(false);
-  readonly cloudMessage = signal('');
-  readonly cloudMessageIsError = signal(false);
-  readonly cloudCredentialsRef = signal('');
-  readonly cloudForm = signal<MainCloudFormState>({
-    backend_id: 'opencloud',
-    base_url: '',
-    public_url: '',
-    admin_user: '',
-    agent_user: '',
-    keycloak_issuer: '',
-    keycloak_client_id: '',
-    admin_role_claim_value: '',
-    default_quota_bytes: null,
-  });
-
-  readonly cloudBusy = computed(() => this.cloudSaving() || this.cloudTesting());
-  readonly cloudQuotaText = computed(() => {
-    const v = this.cloudForm().default_quota_bytes;
-    return v == null ? '' : String(v);
-  });
-  readonly secretProvenanceEntries = computed(() => {
-    const s = this.cloudSettings();
-    if (!s) return [];
-    return Object.entries(s.secrets).map(([field, prov]) => ({
-      field,
-      env_var: prov.env_var,
-      set: prov.set,
-    }));
-  });
-
   constructor() {
     // Reactively sync preference form fields when the preferences signal updates.
     // null = user hasn't overridden this field (show resolved default).
@@ -3186,7 +2951,6 @@ export class SettingsComponent implements OnInit, OnDestroy {
       if (user?.is_admin) {
         this._adminLoadersFired = true;
         if (this.section === 'subscriptions') this.loadSubscriptions();
-        if (this.section === 'cloud') this.loadCloudSettings();
         // Seed the Voice Library add-gate switch with its persisted state.
         if (this.section === 'general') {
           this.apiService.getTtsLibrarySetting().subscribe((row) => {
@@ -3231,7 +2995,7 @@ export class SettingsComponent implements OnInit, OnDestroy {
     if (this.section === 'mcp') this.tokenService.loadTokens();
     if (this.section === 'provider-keys') this.settingsService.loadApiKeys();
     if (this.section === 'defaults') this.loadExpertDefaults();
-    // Admin-only loaders (subscriptions + cloud settings) are triggered
+    // Admin-only loaders (subscriptions) are triggered
     // by the effect in the constructor — that path waits for currentUser()
     // to populate, which is the only thing that works on a hard F5 reload.
   }
@@ -3785,153 +3549,5 @@ export class SettingsComponent implements OnInit, OnDestroy {
       clearInterval(this.loginPollTimer);
       this.loginPollTimer = null;
     }
-  }
-
-  // ── Cloud Storage (Phase 4) ────────────────────────────────
-
-  loadCloudSettings(): void {
-    this.cloudLoading.set(true);
-    this.cloudMessage.set('');
-    this.cloudMessageIsError.set(false);
-    this.settingsService.getMainCloudSettings().subscribe({
-      next: (res) => {
-        this.cloudSettings.set(res);
-        // Seed the form from the persisted overlay if present; otherwise
-        // from the effective config. Both sources are JSON-shaped, so we
-        // bracket-access them through Record<> wrappers and coerce to the
-        // typed MainCloudFormState shape.
-        const overlayValue = (res.overlay?.value as Record<string, unknown>) || {};
-        const eff = res.effective as unknown as Record<string, unknown>;
-        const pickStr = (key: string): string => {
-          const v = overlayValue[key] ?? eff[key];
-          if (v === undefined || v === null) return '';
-          return typeof v === 'string' ? v : String(v);
-        };
-        const pickQuota = (): number | null => {
-          const v = overlayValue['default_quota_bytes'] ?? eff['default_quota_bytes'];
-          if (v === undefined || v === null) return null;
-          return typeof v === 'number' ? v : Number(v);
-        };
-        this.cloudForm.set({
-          backend_id: res.effective.backend_id,
-          base_url: pickStr('base_url'),
-          public_url: pickStr('public_url'),
-          admin_user: pickStr('admin_user'),
-          agent_user: pickStr('agent_user'),
-          keycloak_issuer: pickStr('keycloak_issuer'),
-          keycloak_client_id: pickStr('keycloak_client_id'),
-          admin_role_claim_value: pickStr('admin_role_claim_value'),
-          default_quota_bytes: pickQuota(),
-        });
-        this.cloudCredentialsRef.set(res.overlay?.credentials_ref ?? '');
-        this.cloudLoading.set(false);
-      },
-      error: (err) => {
-        this.cloudLoading.set(false);
-        this.cloudMessage.set(
-          err?.error?.detail || this.transloco.translate('settings.cloud.messages.loadFailed'),
-        );
-        this.cloudMessageIsError.set(true);
-      },
-    });
-  }
-
-  updateCloudForm<K extends keyof MainCloudFormState>(key: K, value: MainCloudFormState[K]): void {
-    this.cloudForm.update((form) => ({ ...form, [key]: value }));
-  }
-
-  onCloudQuotaChange(text: string): void {
-    if (text === '' || text == null) {
-      this.updateCloudForm('default_quota_bytes', null);
-      return;
-    }
-    const n = Number(text);
-    this.updateCloudForm('default_quota_bytes', Number.isFinite(n) ? n : null);
-  }
-
-  private buildCloudRequestBody() {
-    const form = this.cloudForm();
-    const credRef = this.cloudCredentialsRef().trim() || null;
-    return {
-      value: { ...form },
-      credentials_ref: credRef,
-      expected_activation_revision: this.cloudSettings()?.activation_revision ?? 0,
-    };
-  }
-
-  testCloudSettings(): void {
-    this.cloudTesting.set(true);
-    this.cloudMessage.set('');
-    this.cloudMessageIsError.set(false);
-    this.settingsService.testMainCloudSettings(this.buildCloudRequestBody()).subscribe({
-      next: (res) => {
-        this.cloudTesting.set(false);
-        this.cloudMessage.set(
-          res.ok
-            ? this.transloco.translate('settings.cloud.messages.testOk', {
-                ms: res.latency_ms?.toFixed(0) ?? '?',
-              })
-            : this.transloco.translate('settings.cloud.messages.testFailed', { error: res.detail }),
-        );
-        this.cloudMessageIsError.set(!res.ok);
-      },
-      error: (err) => {
-        this.cloudTesting.set(false);
-        this.cloudMessage.set(
-          err?.error?.detail ||
-            this.transloco.translate('settings.cloud.messages.testRequestFailed'),
-        );
-        this.cloudMessageIsError.set(true);
-      },
-    });
-  }
-
-  saveCloudSettings(): void {
-    this.cloudSaving.set(true);
-    this.cloudMessage.set('');
-    this.cloudMessageIsError.set(false);
-    this.settingsService.putMainCloudSettings(this.buildCloudRequestBody()).subscribe({
-      next: (res) => {
-        this.cloudSaving.set(false);
-        this.cloudMessage.set(
-          this.transloco.translate(
-            res.reloaded
-              ? 'settings.cloud.messages.savedReloaded'
-              : 'settings.cloud.messages.saved',
-            { backend: res.backend_id },
-          ),
-        );
-        this.cloudMessageIsError.set(false);
-        this.loadCloudSettings();
-      },
-      error: (err) => {
-        this.cloudSaving.set(false);
-        this.cloudMessage.set(
-          err?.error?.detail || this.transloco.translate('settings.cloud.messages.saveFailed'),
-        );
-        this.cloudMessageIsError.set(true);
-      },
-    });
-  }
-
-  resetCloudSettings(): void {
-    this.cloudSaving.set(true);
-    this.cloudMessage.set('');
-    this.cloudMessageIsError.set(false);
-    this.settingsService.deleteMainCloudSettings().subscribe({
-      next: () => {
-        this.cloudSaving.set(false);
-        this.cloudMessage.set(this.transloco.translate('settings.cloud.messages.overlayCleared'));
-        this.cloudMessageIsError.set(false);
-        this.loadCloudSettings();
-      },
-      error: (err) => {
-        this.cloudSaving.set(false);
-        this.cloudMessage.set(
-          err?.error?.detail || this.transloco.translate('settings.cloud.messages.resetFailed'),
-        );
-        this.cloudMessageIsError.set(true);
-      },
-    });
   }
 }

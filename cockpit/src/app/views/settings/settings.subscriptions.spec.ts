@@ -98,19 +98,7 @@ function makeSettingsService() {
     pollSubscriptionLogin: vi.fn(() => of(login())),
     submitSubscriptionCallback: vi.fn(() => of(login({status: 'verifying'}))),
     cancelSubscriptionLogin: vi.fn(() => of(login({status: 'cancelled'}))),
-    getMainCloudSettings: vi.fn(() =>
-      of({
-        effective: {backend_id: 'nextcloud', is_initialized: false, is_configured: false},
-        activation_revision: 0,
-        backend_instance: null,
-        overlay: {present: false, value: {}, credentials_ref: null, updated_at: null, updated_by: null},
-        secrets: {},
-        allowed_backends: ['nextcloud'],
-      }),
-    ),
-    putMainCloudSettings: vi.fn(() => of({})),
-    testMainCloudSettings: vi.fn(() => of({})),
-    deleteMainCloudSettings: vi.fn(() => of({})),
+    getMainCloud: vi.fn(() => of(null)),
   };
 }
 
@@ -504,19 +492,22 @@ describe('SettingsComponent — sections', () => {
     const general = makeSettingsService();
     setup(general, false, 'general');
     expect(general.getSubscriptionsStatus).not.toHaveBeenCalled();
-    expect(general.getMainCloudSettings).not.toHaveBeenCalled();
+    expect(general.getMainCloud).not.toHaveBeenCalled();
 
     const subscriptions = makeSettingsService();
     setup(subscriptions, false, 'subscriptions');
     expect(subscriptions.getSubscriptionsStatus).toHaveBeenCalled();
-    expect(subscriptions.getMainCloudSettings).not.toHaveBeenCalled();
+    expect(subscriptions.getMainCloud).not.toHaveBeenCalled();
   });
 
-  it('loads cloud settings only on the cloud page', () => {
+  it('renders the read-only Main cloud page, with no form, on the cloud page', () => {
     const service = makeSettingsService();
-    setup(service, false, 'cloud');
-    expect(service.getMainCloudSettings).toHaveBeenCalled();
+    const fixture = setup(service, true, 'cloud');
+    const host = fixture.nativeElement as HTMLElement;
+    expect(host.querySelector('app-main-cloud-settings')).not.toBeNull();
+    expect(host.querySelectorAll('input, select, app-input, app-select').length).toBe(0);
     expect(service.getSubscriptionsStatus).not.toHaveBeenCalled();
+    fixture.destroy();
   });
 
   it('loads provider keys only on their own page', () => {

@@ -1214,7 +1214,7 @@
       "mcp": "MCP-Tokens",
       "sshKeys": "SSH-Schlüssel",
       "subscriptions": "KI-Abos",
-      "cloud": "Cloud-Speicher"
+      "cloud": "Main Cloud"
     },
     "appearance": {
       "title": "Erscheinungsbild",
@@ -1550,42 +1550,50 @@
       }
     },
     "cloud": {
-      "title": "Cloud-Speicher (Hauptcloud)",
-      "desc": "Konfigurieren Sie das Hauptcloud-Backend, das für Benutzer-Home-Ordner, Projekt-Ordner und Sitzungs-Ordner verwendet wird. Secrets werden über Umgebungsvariablen (Vault/ESO/.env) verwaltet und hier nur zur Provenienz angezeigt.",
+      "title": "Main Cloud",
+      "desc": "Die Cloud, in der SRW Projekt-, Benutzer- und Sitzungsordner anlegt. Sie wird über Helm konfiguriert (die cloud-Werte des Charts), nicht hier: Diese Seite zeigt, was aktiv ist und was jeder Provider unterstützt.",
       "loading": "Wird geladen…",
-      "active": "Aktiv:",
-      "initialized": "initialisiert",
-      "notInitialized": "nicht initialisiert",
+      "loadFailed": "Die Main Cloud konnte nicht geladen werden.",
+      "retry": "Erneut versuchen",
       "refresh": "Aktualisieren",
-      "backend": "Backend",
-      "baseUrl": "Basis-URL (intern)",
-      "publicUrl": "Öffentliche URL (Browser)",
-      "keycloakIssuer": "Keycloak-Issuer",
-      "keycloakClientId": "Keycloak-Client-ID",
-      "adminRole": "Admin-Rolle / Claim-Wert",
-      "spaceQuota": "Standard-Space-Kontingent (Bytes)",
-      "adminUser": "Admin-Benutzer",
-      "agentUser": "Agent-Benutzer",
-      "credentialsRef": "Credentials-Referenz (optional)",
-      "secretProvenance": "Secret-Provenienz",
-      "secretSet": "gesetzt",
-      "secretUnset": "nicht gesetzt",
-      "testing": "Wird getestet…",
-      "test": "Testen",
-      "saving": "Wird gespeichert…",
-      "saveReload": "Speichern + neu laden",
-      "resetEnv": "Auf Env-Standards zurücksetzen",
-      "persistedOverlayLastSaved": "Persistierte Überlagerung zuletzt gespeichert",
-      "messages": {
-        "loadFailed": "Cloud-Einstellungen konnten nicht geladen werden",
-        "testOk": "Test OK ({{ms}} ms) — fehlerfrei",
-        "testFailed": "Test fehlgeschlagen: {{error}}",
-        "testRequestFailed": "Test-Anfrage fehlgeschlagen",
-        "saved": "Gespeichert — aktives Backend ist jetzt {{backend}}",
-        "savedReloaded": "Gespeichert — aktives Backend ist jetzt {{backend}} (neu geladen)",
-        "saveFailed": "Speichern fehlgeschlagen",
-        "overlayCleared": "Umgebungskonfiguration geprüft und aktiviert; der Backend-Verlauf wurde beibehalten",
-        "resetFailed": "Zurücksetzen fehlgeschlagen"
+      "active": "Aktiv:",
+      "healthy": "erreichbar ({{ms}} ms)",
+      "notInitialized": "nicht initialisiert",
+      "unreachable": "nicht erreichbar",
+      "provider": "Provider",
+      "publicUrl": "Öffentliche URL",
+      "unknown": "unbekannt",
+      "installation": "Installation",
+      "activation": "Aktivierung {{revision}}",
+      "noInstallation": "Keine Installation ist aktiv; Cloud-Aktionen sind deaktiviert.",
+      "configuration": "Konfiguration",
+      "helmOnly": "Helm-Werte",
+      "helm": {
+        "matches": "entsprechen der aktiven Installation",
+        "differs": "weichen von der aktiven Installation ab",
+        "invalid": "unvollständig"
+      },
+      "helmNote": {
+        "differs": "Die cloud-Werte in Helm beschreiben etwas anderes als die aktive Installation. Der Orchestrator übernimmt sie beim nächsten Start, wenn sie dieselbe Installation beschreiben; für eine andere Installation bestätigen Sie den Wechsel mit cloud.replaceInstallation = {{instance}}.",
+        "invalid": "Die cloud-Werte in Helm sind unvollständig (ein erforderliches Secret fehlt), daher bleibt die aktive Installation in Betrieb."
+      },
+      "matrixTitle": "Provider-Unterstützung",
+      "matrixDesc": "Was jeder Provider liefert, deklariert von seinem Adapter. Eine Stufe wird nur angeboten, wo sie durchgesetzt wird; alles andere ist mit Begründung nicht unterstützt.",
+      "connector": "Connector · Ordner · Zugriff",
+      "activeBadge": "aktiv",
+      "status": {
+        "offered": "angeboten",
+        "planned": "geplant (Slice {{slice}})",
+        "unsupported": "nicht unterstützt"
+      },
+      "types": {
+        "cloud_folder": "Cloud-Ordner",
+        "cloud_folder_checkout": "Ordner-Checkout",
+        "cloud_outbox": "Outbox"
+      },
+      "kinds": {
+        "project": "Projekt",
+        "user_root": "Benutzer-Root"
       }
     },
     "helpers": {
