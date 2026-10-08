@@ -697,6 +697,42 @@ def test_the_manifest_phase_follows_every_link_write(monkeypatch, refresh):
 
 
 @pytest.mark.parametrize("same", [True, False])
+def test_the_jobs_phase_reads_job_datasources_as_a_set(monkeypatch, same):
+    """job_datasources is a junction: the k3d run read it in another order
+    than the request named the connectors, for refs and ids alike."""
+    runner = _phase_runner(monkeypatch)
+    runner.connectors.update(public="ds-public", own="ds-own")
+    ids = ["ds-own", "ds-public", LINKED, KB]
+    monkeypatch.setattr(
+        runner,
+        "selection_refs",
+        lambda: (ids, gate.connector_refs({"db": {"uid": LINKED}})),
+    )
+    created = iter(("job-refs", "job-ids"))
+    monkeypatch.setattr(
+        runner.other,
+        "call",
+        lambda method, path, body=None: (200, {"job_id": next(created)}),
+    )
+    record = {
+        "ids": sorted(ids),
+        "selection": {"origin": "explicit", "datasource_ids": ids},
+        "resolved": sorted(ids),
+        "payload": sorted(runner.name(label) for label in ("public", "linked")),
+    }
+    other = {**record, "ids": sorted(ids) if same else sorted(ids)[:-1]}
+    monkeypatch.setattr(
+        runner,
+        "bindings",
+        lambda threads=None, jobs=None: {"refs": record, "ids": other},
+    )
+    monkeypatch.setattr(runner, "delete_job", lambda job: True)
+    runner.job_phase()
+    assert runner.report.passed is same, runner.report.results
+    assert runner.jobs == {}
+
+
+@pytest.mark.parametrize("same", [True, False])
 def test_the_sessions_phase_compares_the_two_creations(monkeypatch, same):
     runner = _phase_runner(monkeypatch)
     runner.connectors.update(public="ds-public", own="ds-own")

@@ -1297,11 +1297,15 @@ class ConnectorSelectionGate:
             if len(self.jobs) == 2:
                 found = self.bindings(jobs=self.jobs)
                 differences = same_bindings(found.get("refs", {}), found.get("ids", {}))
+                # job_datasources is a junction: a set, in the database's order.
+                # The selection record keeps the requested order.
+                attached = sorted(found["refs"].get("ids") or [])
                 self.report.check(
                     "jobs: refs and ids give the same job_datasources, selection "
                     "record, dispatch-time resolution and payload",
-                    not differences and found["refs"].get("ids") == ids,
-                    "; ".join(differences[:3]),
+                    not differences and attached == sorted(ids),
+                    "; ".join(differences[:3])
+                    or (f"attached {attached}" if attached != sorted(ids) else ""),
                 )
                 self.report.check(
                     "jobs: the public and the project-linked connector reach the "
