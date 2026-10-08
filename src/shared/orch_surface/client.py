@@ -1790,6 +1790,13 @@ class AsyncCockpitClient:
         return resp.json()
 
     @_create_retry_decorator()
+    async def list_connector_drivers(self) -> dict[str, Any]:
+        """The capability matrix of every installed connector driver."""
+        resp = await self._client.get("/api/datasources/drivers")
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
     async def list_datasources(
         self,
         ds_type: str | None = None,

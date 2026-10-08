@@ -610,6 +610,44 @@ async def test_list_datasources_tool_reports_full_ids_revisions_and_cursor():
 
 
 @pytest.mark.asyncio
+async def test_list_connector_drivers_tool_reports_levels_and_enforcement():
+    mock_client = AsyncMock()
+    mock_client.list_connector_drivers.return_value = {
+        "protocol_version": "1.0",
+        "drivers": [
+            {
+                "name": "srw.postgresql/v1",
+                "title": "PostgreSQL",
+                "legacy_type": "postgresql",
+                "plane": "harness",
+                "delivery_forms": ["managed_connection"],
+                "supported_backends": ["sandbox"],
+                "access_levels": [
+                    {
+                        "id": "ReadOnly",
+                        "enforced_by": "READ ONLY transaction",
+                        "advisory": False,
+                    }
+                ],
+                "trust": {"tier": "builtin", "claims_declared_by_author": False},
+            }
+        ],
+    }
+
+    with patch.object(_mcp_server_mod, "_get_client", return_value=mock_client):
+        result = await _mcp_server_mod.list_connector_drivers()
+
+    mock_client.list_connector_drivers.assert_awaited_once_with()
+    assert "srw.postgresql/v1" in result
+    assert "Access ReadOnly [enforced]: READ ONLY transaction" in result
+
+    mock_client.list_connector_drivers.side_effect = RuntimeError("down")
+    with patch.object(_mcp_server_mod, "_get_client", return_value=mock_client):
+        failed = await _mcp_server_mod.list_connector_drivers()
+    assert "list connector drivers" in failed
+
+
+@pytest.mark.asyncio
 async def test_get_datasource_tool_reports_exact_management_state():
     connector_id = "11111111-2222-4333-8444-555555555555"
     mock_client = AsyncMock()

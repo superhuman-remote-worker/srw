@@ -95,8 +95,9 @@ asyncio.run(main())
 
 def test_every_registered_tool_has_exactly_one_capability_contract() -> None:
     assert _registered_tool_names() == set(TOOL_CAPABILITIES)
-    # 115 existing tools plus seven native manifest/resource operations.
-    assert len(TOOL_CAPABILITIES) == 122
+    # 115 existing tools, seven native manifest/resource operations and the
+    # connector driver capability matrix.
+    assert len(TOOL_CAPABILITIES) == 123
 
 
 def test_capability_contract_records_required_risk_and_transport_fields() -> None:
@@ -159,11 +160,11 @@ def test_health_build_info_reports_digest_provenance_and_artifact_match(
 
     info = _build_info(artifact)
 
-    assert info["tool_schema_revision"] == "14"
+    assert info["tool_schema_revision"] == "15"
     assert info["tool_schema_digest"] == schema["digest"]
     assert info["schema_artifact_digest"] == schema["digest"]
     assert info["schema_artifact_status"] == "match"
-    assert info["tool_count"] == 122
+    assert info["tool_count"] == 123
     assert info["source_revision"] == "source-test-revision"
     assert info["release_version"] == "test-release"
     assert info["artifact_digest"] == "sha256:image-test-digest"

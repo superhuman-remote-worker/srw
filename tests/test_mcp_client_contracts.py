@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -10,10 +11,14 @@ import pytest
 
 from shared.orch_surface.client import AsyncCockpitClient, CockpitClient
 from shared.orch_surface.formatters import (
+    format_connector_drivers,
     format_created_datasource,
     format_datasource_detail,
     format_datasources,
 )
+
+ROOT = Path(__file__).resolve().parents[1]
+DRIVER_MATRIX = ROOT / "cockpit/src/app/core/models/fixtures/connector-drivers.json"
 
 
 @pytest.mark.asyncio
@@ -374,3 +379,57 @@ def test_connector_formatters_report_availability_and_default_separately() -> No
         assert "Published: False" in rendered
         assert "Policy revision: 17" in rendered
         assert "Scope: global" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_connector_driver_matrix_is_read_from_its_route() -> None:
+    requested_path = ""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requested_path
+        requested_path = request.url.path
+        return httpx.Response(200, json={"protocol_version": "1.0", "drivers": []})
+
+    client = AsyncCockpitClient(
+        "http://orchestrator.test", transport=httpx.MockTransport(handler)
+    )
+    try:
+        matrix = await client.list_connector_drivers()
+    finally:
+        await client.close()
+
+    assert requested_path == "/api/datasources/drivers"
+    assert matrix == {"protocol_version": "1.0", "drivers": []}
+
+
+def test_connector_driver_formatter_names_what_enforces_each_level() -> None:
+    matrix = json.loads(DRIVER_MATRIX.read_text())
+    rendered = format_connector_drivers(matrix)
+
+    assert f"Connector drivers ({len(matrix['drivers'])})" in rendered
+    for driver in matrix["drivers"]:
+        assert driver["name"] in rendered
+        for level in driver["access_levels"]:
+            assert level["enforced_by"] in rendered
+    assert "Access ReadOnly [advisory]" in rendered
+    assert "Access: none (this delivery cannot enforce a level)" in rendered
+    assert "Trust: builtin  Holds upstream credentials: True" in rendered
+    assert "every claim declared by its author" not in rendered
+
+    custom = dict(matrix["drivers"][0])
+    custom["trust"] = {"tier": "custom", "claims_declared_by_author": True}
+    custom["egress"] = {
+        "declared": {
+            "rules": [{"host": "${config.host}", "ports": [443], "protocol": "tcp"}]
+        },
+        "enforced": {
+            "status": "not_enforced",
+            "reason": "driver_hosting_not_available",
+        },
+    }
+    rendered = format_connector_drivers({"drivers": [custom]})
+    assert "Trust: custom (every claim declared by its author)" in rendered
+    assert "Egress declared: ${config.host}:443/tcp  enforced: not_enforced" in rendered
+    assert (
+        format_connector_drivers({"drivers": []}) == "No connector drivers installed."
+    )

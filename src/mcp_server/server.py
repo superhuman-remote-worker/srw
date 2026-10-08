@@ -203,7 +203,9 @@ def _format_action_error(action: str, target: str, error: Exception) -> str:
 # "14": create_job / create_project_job / create_persistent_thread take `workspace`
 # (a template name, "none", or a {"template": {"ref": ...}} binding; inline
 # recipes are refused: Slice A3, shared/orch_surface/workspace_choice.py).
-MCP_TOOL_SCHEMA_REVISION = "14"
+# "15": list_connector_drivers, the connector driver capability matrix
+# (connector drivers D2).
+MCP_TOOL_SCHEMA_REVISION = "15"
 _tool_schema_cache: tuple[list[dict[str, Any]], str] | None = None
 
 
@@ -771,6 +773,26 @@ async def list_datasources(
         return f"{rendered}\n\nNext cursor: {page.get('next_cursor') or 'none'}"
     except Exception as e:
         return fmt.format_monitoring_error("list connectors", e)
+
+
+@mcp_tool
+async def list_connector_drivers() -> str:
+    """List the installed connector drivers and what each one enforces.
+
+    The generated capability matrix: per driver, its access levels and the
+    mechanism enforcing each (advisory levels are only told to the agent),
+    where it runs, workspace backends, trust, credential slots (never
+    values) and declared egress. Use it to choose a connector type and
+    access level before create_datasource.
+
+    Returns:
+        Every installed driver with its access levels and enforcement
+    """
+    client = _get_client()
+    try:
+        return fmt.format_connector_drivers(await client.list_connector_drivers())
+    except Exception as e:
+        return fmt.format_monitoring_error("list connector drivers", e)
 
 
 @mcp_tool

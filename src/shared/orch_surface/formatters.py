@@ -1972,6 +1972,69 @@ def format_datasources(
     return "\n".join(lines)
 
 
+def format_connector_drivers(data: dict[str, Any]) -> str:
+    """Format the connector driver capability matrix (no credential values)."""
+    drivers = data.get("drivers") or []
+    if not drivers:
+        return "No connector drivers installed."
+
+    lines = [
+        f"Connector drivers ({len(drivers)}), driver protocol "
+        f"{data.get('protocol_version', 'unknown')}:\n"
+    ]
+    for driver in drivers:
+        trust = driver.get("trust") or {}
+        legacy = driver.get("legacy_type")
+        lines.append(
+            f"  {driver.get('name', 'unknown')}  {driver.get('title', '')}"
+            + (f" (type {legacy})" if legacy else "")
+        )
+        lines.append(
+            f"    Plane: {driver.get('plane')}  "
+            f"Delivery: {', '.join(driver.get('delivery_forms') or []) or 'none'}  "
+            f"Backends: {', '.join(driver.get('supported_backends') or []) or 'none'}"
+        )
+        author = " (every claim declared by its author)"
+        lines.append(
+            f"    Trust: {trust.get('tier', 'unknown')}"
+            f"{author if trust.get('claims_declared_by_author') else ''}  "
+            f"Holds upstream credentials: "
+            f"{bool(driver.get('holds_upstream_credentials'))}"
+        )
+        levels = driver.get("access_levels") or []
+        if not levels:
+            lines.append("    Access: none (this delivery cannot enforce a level)")
+        for level in levels:
+            kind = "advisory" if level.get("advisory") else "enforced"
+            lines.append(
+                f"    Access {level.get('id')} [{kind}]: {level.get('enforced_by')}"
+            )
+        slots = driver.get("credential_slots") or []
+        if slots:
+            lines.append(
+                "    Credential slots: "
+                + ", ".join(
+                    f"{slot.get('name')} ({slot.get('kind')}, "
+                    f"{'required' if slot.get('required') else 'optional'})"
+                    for slot in slots
+                )
+            )
+        egress = driver.get("egress") or {}
+        rules = (egress.get("declared") or {}).get("rules") or []
+        declared = ", ".join(
+            f"{rule.get('host')}:{','.join(str(p) for p in rule.get('ports') or [])}"
+            f"/{rule.get('protocol')}"
+            for rule in rules
+        )
+        enforced = egress.get("enforced") or {}
+        lines.append(
+            f"    Egress declared: {declared or 'none'}  "
+            f"enforced: {enforced.get('status', 'unknown')} "
+            f"({enforced.get('reason', '')})"
+        )
+    return "\n".join(lines)
+
+
 def format_datasource_detail(datasource: dict[str, Any]) -> str:
     """Format one connector's redacted management state without lossy IDs."""
     ds_id = str(datasource.get("id", "unknown"))
