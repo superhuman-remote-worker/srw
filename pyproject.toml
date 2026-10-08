@@ -38,7 +38,14 @@ orchestrator = [
   "config/prompts/*.md",
 ]
 mcp_server = ["templates/*.html"]
-shared = ["**/*.sql", "manifests/schema.json", "connectors/binding.schema.json"]
+shared = [
+  "**/*.sql",
+  "manifests/schema.json",
+  "connectors/binding.schema.json",
+  "connectors/request.schema.json",
+  "connectors/output-line.schema.json",
+  "connectors/spec.schema.json",
+]
 
 [tool.ruff]
 # Preserve the formatter/linter target used before packaging metadata existed.

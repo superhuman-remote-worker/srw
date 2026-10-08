@@ -1,0 +1,289 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://srw.dev/schemas/connectors/spec/v1",
+  "title": "SRW connector driver spec (the io.srw.driver.spec label)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "title",
+    "protocol_version",
+    "plane",
+    "delivery_forms"
+  ],
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*(?:\\.[a-z][a-z0-9-]*)+/v[1-9][0-9]*$",
+      "not": {
+        "pattern": "^srw\\."
+      }
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "protocol_version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+    },
+    "plane": {
+      "enum": [
+        "bind_time",
+        "service",
+        "in_pod"
+      ]
+    },
+    "delivery_forms": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "enum": [
+          "env_file",
+          "credential_file",
+          "checkout",
+          "managed_connection",
+          "mcp_client",
+          "knowledge_index",
+          "pod_env",
+          "pod_file",
+          "ssh_identity",
+          "lease_token"
+        ]
+      }
+    },
+    "config_schema": {
+      "type": "object"
+    },
+    "credential_slots": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "kind"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "enum": [
+              "secret_string",
+              "file",
+              "ssh_private_key",
+              "oauth2",
+              "kubeconfig"
+            ]
+          },
+          "schema": {
+            "type": "object"
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "rotatable": {
+            "type": "boolean"
+          },
+          "access_levels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "delivery": {
+            "enum": [
+              "env",
+              "file",
+              "ssh_agent",
+              null
+            ]
+          },
+          "update": {
+            "enum": [
+              "keep_if_blank",
+              "merge",
+              "replace"
+            ]
+          }
+        }
+      }
+    },
+    "access_levels": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "rank",
+          "enforced_by"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "rank": {
+            "type": "integer"
+          },
+          "enforced_by": {
+            "type": "string",
+            "minLength": 1
+          },
+          "tools": {
+            "oneOf": [
+              {
+                "const": "*"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ]
+          },
+          "advisory": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "default_access": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "supported_backends": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "none",
+          "sandbox",
+          "virtual",
+          "vm"
+        ]
+      }
+    },
+    "workspace_requirements": {
+      "type": "string"
+    },
+    "operations": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "discover",
+          "gc",
+          "reindex",
+          "renew",
+          "status"
+        ]
+      }
+    },
+    "egress": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "host",
+          "ports"
+        ],
+        "properties": {
+          "host": {
+            "type": "string",
+            "minLength": 1
+          },
+          "ports": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 65535
+                },
+                {
+                  "type": "string",
+                  "pattern": "^\\$\\{config\\.[a-z][a-z0-9_]*\\}$"
+                }
+              ]
+            }
+          },
+          "protocol": {
+            "enum": [
+              "tcp",
+              "udp"
+            ]
+          }
+        }
+      }
+    },
+    "needs_dns": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "holds_upstream_credentials": {
+      "type": "boolean"
+    },
+    "credential_delivery": {
+      "enum": [
+        "inline",
+        "lease"
+      ]
+    },
+    "tool_category": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "instancing": {
+          "enum": [
+            "shared",
+            "per_execution"
+          ]
+        },
+        "resources": {
+          "type": "object"
+        },
+        "start_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "mcp": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "callers": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "enum": [
+              "harness",
+              "workspace"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
