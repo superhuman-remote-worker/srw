@@ -61,7 +61,11 @@ from orchestrator.services.manifest_connectors import (
     connector_scope,
     declared_config,
 )
-from shared.connectors.builtin import DATASOURCE_SPECS, LEASE_PROBE_SPEC
+from shared.connectors.builtin import (
+    DATASOURCE_SPECS,
+    DEVELOPMENT_SPECS,
+    LEASE_PROBE_SPEC,
+)
 from shared.manifests import preview_documents, validate_documents
 
 REGISTRY = builtin_connector_drivers()
@@ -559,7 +563,7 @@ def test_secret_names():
 def test_every_built_in_slot_replaces_except_the_credentials_merge():
     rules = {
         (spec.name, slot.name): slot.update
-        for spec in (*DATASOURCE_SPECS, LEASE_PROBE_SPEC)
+        for spec in (*DATASOURCE_SPECS, *DEVELOPMENT_SPECS)
         for slot in spec.credential_slots
     }
     assert rules.pop(("srw.credentials/v1", "env_vars")) == "merge"

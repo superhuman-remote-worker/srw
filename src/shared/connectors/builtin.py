@@ -827,6 +827,7 @@ ECHO_SERVICE_SPEC = DriverSpec(
             "secret_string",
             {"type": "object", "properties": {"secret": _SECRET}},
             required=True,
+            update="replace",
         ),
     ),
     access_levels=(
