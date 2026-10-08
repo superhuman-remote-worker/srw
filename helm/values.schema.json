@@ -8,6 +8,16 @@
     "global"
   ],
   "definitions": {
+    "connectorDriverResources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu", "memory", "ephemeralStorage"],
+      "properties": {
+        "cpu": {"type": ["string", "number"]},
+        "memory": {"type": "string", "pattern": "^[1-9][0-9]*(Mi|Gi)$"},
+        "ephemeralStorage": {"type": "string", "pattern": "^[1-9][0-9]*(Mi|Gi)$"}
+      }
+    },
     "vmResourceSixBudget": {
       "type": "object",
       "additionalProperties": false,
@@ -1373,6 +1383,52 @@
     },
     "orchestratorId": {
       "type": "string"
+    },
+    "connectors": {
+      "type": "object",
+      "description": "Connector drivers: service-plane hosting (connector drivers D5).",
+      "properties": {
+        "servicePods": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "namespace": {
+              "type": "string",
+              "maxLength": 63,
+              "pattern": "^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+            },
+            "podSecurityVersion": {
+              "type": "string",
+              "pattern": "^v1\\.[0-9]+$"
+            },
+            "maxInstallation": {"type": "integer", "minimum": 1},
+            "driverResources": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "requests": {"$ref": "#/definitions/connectorDriverResources"},
+                "limits": {"$ref": "#/definitions/connectorDriverResources"},
+                "max": {"$ref": "#/definitions/connectorDriverResources"}
+              }
+            },
+            "quota": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "bindTimePods": {"type": "integer", "minimum": 0},
+                "requestsCpu": {"type": ["string", "number"]},
+                "requestsMemory": {"type": "string"},
+                "limitsCpu": {"type": ["string", "number"]},
+                "limitsMemory": {"type": "string"},
+                "ephemeralStorage": {"type": "string"},
+                "secrets": {"type": "integer", "minimum": 1},
+                "services": {"type": "integer", "minimum": 1}
+              }
+            }
+          }
+        }
+      }
     },
     "manifestHosting": {
       "type": "object",

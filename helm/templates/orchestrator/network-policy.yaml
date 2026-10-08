@@ -1,6 +1,6 @@
 {{- $leases := .Values.orchestrator.connectorLeases }}
 {{- if $leases.exchangePort }}
-{{- $driverNamespace := $leases.networkPolicy.driverNamespace | default (printf "%s-connectors" (include "srw.fullname" .)) }}
+{{- $driverNamespace := include "srw.connectorsNamespace" . }}
 # Orchestrator ingress (connector drivers C2, "Reachability").
 #
 # The API port stays open to every source, exactly as before this policy

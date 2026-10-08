@@ -143,6 +143,54 @@ manifestHosting:
   # Rules apply to new attempts. Cancel active attempts for immediate revocation.
   harnessEgress: []
 
+# =============================================================================
+# Connector drivers: service-plane hosting (connector drivers D5)
+# =============================================================================
+connectors:
+  servicePods:
+    # -- Host service-plane connector drivers (shared driver pods with a
+    # Service, in their own namespace). Off by default. Needs
+    # orchestrator.connectorLeases.exchangePort: drivers authenticate to the
+    # lease exchange with their own identity.
+    enabled: false
+    # -- Empty selects orchestrator.connectorLeases.networkPolicy.driverNamespace,
+    # else <release fullname>-connectors. Must be a dedicated namespace.
+    namespace: ""
+    # -- The Kubernetes minor the namespace's Pod Security `baseline` level is
+    # pinned to (enforce-version), so a cluster upgrade never changes it.
+    podSecurityVersion: "v1.31"
+    # -- Installation cap on live service pods (one per connector, image
+    # digest and credential generation). The orchestrator refuses past it
+    # with a capacity error; the namespace's NotTerminating pod quota is the
+    # backstop.
+    maxInstallation: 10
+    # -- Driver container defaults (LimitRange defaultRequest/default) and
+    # ceilings (max). A driver's spec may ask for less or more, up to max.
+    driverResources:
+      requests:
+        cpu: "50m"
+        memory: "64Mi"
+        ephemeralStorage: "64Mi"
+      limits:
+        cpu: "500m"
+        memory: "256Mi"
+        ephemeralStorage: "1Gi"
+      max:
+        cpu: "2"
+        memory: "2Gi"
+        ephemeralStorage: "4Gi"
+    quota:
+      # -- Bind-time driver pods (Terminating scope; D6).
+      bindTimePods: 10
+      requestsCpu: "4"
+      requestsMemory: "8Gi"
+      limitsCpu: "16"
+      limitsMemory: "32Gi"
+      ephemeralStorage: "40Gi"
+      # -- One Secret and one Service per service pod, plus room for D6.
+      secrets: 64
+      services: 32
+
 orchestrator:
   # -- 1 replica by default. NOT a statement about what HA needs: leader
   # election (M1) makes replicas:2 correctness-safe and removes the

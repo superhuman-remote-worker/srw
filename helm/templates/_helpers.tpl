@@ -1672,3 +1672,15 @@ Emits nothing.
 {{- fail "sshGateway.networkPolicy.enabled requires non-empty edgeNamespaceSelector and edgePodSelector; an empty selector matches everything, which is not a policy" -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+The connector driver namespace (connector drivers D5, "The driver namespace
+baseline"): connectors.servicePods.namespace, else the lease exchange's
+orchestrator.connectorLeases.networkPolicy.driverNamespace, else
+<fullname>-connectors. One answer for the namespace and its baseline, the
+exchange's ingress policy and the static egress rules into it.
+*/}}
+{{- define "srw.connectorsNamespace" -}}
+{{- $explicit := .Values.connectors.servicePods.namespace | default .Values.orchestrator.connectorLeases.networkPolicy.driverNamespace -}}
+{{- $explicit | default (printf "%s-connectors" (include "srw.fullname" . | trunc 52 | trimSuffix "-")) -}}
+{{- end }}

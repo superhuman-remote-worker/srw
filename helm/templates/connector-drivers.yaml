@@ -1,0 +1,150 @@
+{{- $pods := .Values.connectors.servicePods -}}
+{{- if $pods.enabled -}}
+{{- $namespace := include "srw.connectorsNamespace" . -}}
+{{- $native := .Values.manifestHosting.namespace | default (printf "%s-native" (include "srw.fullname" . | trunc 56 | trimSuffix "-")) -}}
+{{- if eq $namespace .Release.Namespace -}}
+{{- fail "the connector driver namespace must be separate from the SRW control-plane namespace" -}}
+{{- end -}}
+{{- if eq $namespace $native -}}
+{{- fail "the connector driver namespace must be separate from the generic-hosting (manifestHosting) namespace: quotas and Pod Security differ" -}}
+{{- end -}}
+{{- if not .Values.orchestrator.connectorLeases.exchangePort -}}
+{{- fail "connectors.servicePods.enabled needs orchestrator.connectorLeases.exchangePort: driver pods authenticate to the lease exchange, and the start-up wait proves the pod's policy by reaching it" -}}
+{{- end -}}
+{{- $quota := $pods.quota -}}
+{{- $resources := $pods.driverResources -}}
+# Connector driver namespace baseline (connector drivers D5, "The driver
+# namespace baseline"). Service-plane driver pods run here, separate from the
+# generic-hosting namespace so quotas and Pod Security differ.
+#
+# * Pod Security `baseline`, enforced and version-pinned: stock images that
+#   run as root keep working (`restricted` would refuse them); SRW drops every
+#   capability on every container it creates.
+# * A static default deny for ingress and egress, created with the namespace.
+#   Per-pod policies only add allows, so on a conformant CNI the worst case for
+#   a new pod is no connectivity yet, never unprotected. Each driver pod's
+#   first init container waits until its policy is enforced.
+# * Quotas: NotTerminating pods cap long-lived service pods, Terminating pods
+#   cap bind-time pods (they carry activeDeadlineSeconds); compute, Secret and
+#   Service counts; ClusterIP Services only. A LimitRange fills defaults.
+#   The orchestrator counts first (servicePods.maxInstallation) for a clear
+#   message; the quota is the backstop.
+# * A ServiceAccount with no RoleBindings and no automounted token.
+# * The orchestrator's Role here: what the reconciler creates, lists and
+#   deletes. No exec, attach or log access.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $namespace }}
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: {{ $pods.podSecurityVersion | quote }}
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: {{ $pods.podSecurityVersion | quote }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: srw-connectors-default-deny
+  namespace: {{ $namespace }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: srw-connector-driver
+  namespace: {{ $namespace }}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: srw-connector-service-pods
+  namespace: {{ $namespace }}
+spec:
+  scopes: [NotTerminating]
+  hard:
+    pods: {{ $pods.maxInstallation | quote }}
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: srw-connector-bind-time-pods
+  namespace: {{ $namespace }}
+spec:
+  scopes: [Terminating]
+  hard:
+    pods: {{ $quota.bindTimePods | quote }}
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: srw-connector-compute
+  namespace: {{ $namespace }}
+spec:
+  hard:
+    requests.cpu: {{ $quota.requestsCpu | quote }}
+    requests.memory: {{ $quota.requestsMemory | quote }}
+    limits.cpu: {{ $quota.limitsCpu | quote }}
+    limits.memory: {{ $quota.limitsMemory | quote }}
+    requests.ephemeral-storage: {{ $quota.ephemeralStorage | quote }}
+    count/secrets: {{ $quota.secrets | quote }}
+    count/services: {{ $quota.services | quote }}
+    services.loadbalancers: "0"
+    services.nodeports: "0"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: srw-connector-limits
+  namespace: {{ $namespace }}
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: {{ $resources.requests.cpu | quote }}
+        memory: {{ $resources.requests.memory | quote }}
+        ephemeral-storage: {{ $resources.requests.ephemeralStorage | quote }}
+      default:
+        cpu: {{ $resources.limits.cpu | quote }}
+        memory: {{ $resources.limits.memory | quote }}
+        ephemeral-storage: {{ $resources.limits.ephemeralStorage | quote }}
+      max:
+        cpu: {{ $resources.max.cpu | quote }}
+        memory: {{ $resources.max.memory | quote }}
+        ephemeral-storage: {{ $resources.max.ephemeralStorage | quote }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: srw-connector-hosting
+  namespace: {{ $namespace }}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [""]
+    resources: [secrets, services]
+    verbs: [get, list, create, delete, patch]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, list, create, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: srw-connector-hosting
+  namespace: {{ $namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: srw-connector-hosting
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "srw.orchestratorServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

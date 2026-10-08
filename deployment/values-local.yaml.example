@@ -293,6 +293,17 @@ orchestrator:
       memory: "1Gi"
       cpu: "500m"
 
+# -----------------------------------------------------------------------------
+# Connector drivers, service plane (connector drivers D5): the k3d profile
+# hosts shared driver pods in `srw-connectors` (Pod Security baseline, a
+# static default deny, quotas). Needs orchestrator.connectorLeases.exchangePort
+# above. scripts/k3d-service-driver-gate.py exercises it.
+# -----------------------------------------------------------------------------
+connectors:
+  servicePods:
+    enabled: true
+    maxInstallation: 4
+
 databases:
   # Non-HA local default. All five PostgreSQL engines continue to inherit
   # `statefulset`; no CloudNativePG operator is needed for this overlay.
