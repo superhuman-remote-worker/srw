@@ -2786,3 +2786,156 @@ class TestTheReReview2Nits:
         assert row["status"] == "failed"
         assert row["error_class"] == "transient" and row["retry_at"] is not None
         assert operations.calls == []
+
+
+# =============================================================================
+# Self-check of the access and clash fixes (D6 schema round)
+# =============================================================================
+
+
+async def _markers(db, owner_id: str) -> int:
+    return await db.fetchval(
+        "SELECT count(*) FROM connector_bind_time_bindings WHERE owner_id = $1 "
+        "AND revoke_reason = 'access_lost' AND image_digest IS NULL",
+        UUID(owner_id),
+    )
+
+
+async def _rejoin(db, project: str, member: dict) -> None:
+    await db.execute(
+        "INSERT INTO project_members(project_id,user_id,role) VALUES($1,$2,'editor')",
+        UUID(project),
+        member["id"],
+    )
+
+
+class TestAnAccessLostMarker:
+    async def test_it_never_blocks_a_job_once_its_owner_rejoins(self, db, registry):
+        operations = FakeOperations({"bind": _bound(ENV)})
+        _owner, member, project, connector, _rt = await _member_left(
+            db, registry, operations
+        )
+        job = await _owned_job(db, member, project, connector, status="created")
+        await db.execute("DELETE FROM project_members WHERE user_id = $1", member["id"])
+        assert await bind_time.job_bind_gate({"id": job}) == ("dispatch", None)
+        assert await _markers(db, job) == 1
+        await _rejoin(db, project, member)
+        assert await bind_time.job_bind_gate({"id": job}) == ("wait", None)
+        await _settled()
+        assert await bind_time.job_bind_gate({"id": job}) == ("dispatch", None)
+        assert (await _binding(db, owner_id=job))["status"] == "bound"
+        assert len(operations.calls) == 1
+
+    async def test_it_never_blocks_a_session_s_delivery_once_access_returns(
+        self, db, registry
+    ):
+        operations = FakeOperations({"bind": _bound(ENV)})
+        _owner, member, project, connector, runtime = await _member_left(
+            db, registry, operations
+        )
+        thread = await _project_thread(db, member, project, [connector])
+        await db.execute("DELETE FROM project_members WHERE user_id = $1", member["id"])
+        await bind_time.prepare_thread_bindings(db, thread)
+        assert await _markers(db, thread) == 1
+        await _rejoin(db, project, member)
+        # The leader skips the pair; a delivery checks it again and binds.
+        await _pass(runtime)
+        await _settled()
+        assert operations.calls == []
+        entries = [_entry(connector)]
+        await _deliver(db, entries, LeaseOwner.thread(thread))
+        await _settled()
+        assert len(operations.calls) == 1
+        entries = [_entry(connector)]
+        assert await _deliver(db, entries, LeaseOwner.thread(thread)) == 1
+
+    async def test_markers_never_grow_while_access_stays_lost(self, db, registry):
+        operations = FakeOperations({"bind": _bound(ENV)})
+        _owner, member, project, connector, runtime = await _member_left(
+            db, registry, operations
+        )
+        thread = await _project_thread(db, member, project, [connector])
+        job = await _owned_job(db, member, project, connector, status="created")
+        await db.execute("DELETE FROM project_members WHERE user_id = $1", member["id"])
+        for _ in range(5):
+            await bind_time.prepare_thread_bindings(db, thread)
+            await bind_time.job_bind_gate({"id": job})
+            await _deliver(db, [_entry(connector)], LeaseOwner.thread(thread))
+            await _pass(runtime)
+            await _settled()
+        assert await _markers(db, thread) == 1
+        assert await _markers(db, job) == 1
+        assert operations.calls == []
+        total = await db.fetchval("SELECT count(*) FROM connector_bind_time_bindings")
+        assert total == 2
+
+
+class TestTheGatesClashCheck:
+    async def _plain(self, db, user, env_vars: dict) -> str:
+        async def approve():
+            return user
+
+        async def owns(_project):
+            return None
+
+        created = await datasource_operations.create_datasource(
+            body=DatasourceCreate(
+                name="plain", type="credentials", credentials={"env_vars": env_vars}
+            ),
+            require_approved_user=approve,
+            require_project_owner=owns,
+            dependencies=_dependencies(db),
+        )
+        return str(created["id"])
+
+    async def test_it_reads_credentials_only_when_a_driver_sets_names(
+        self, db, registry
+    ):
+        from orchestrator.services import connector_secrets
+
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        plain = await self._plain(db, user, {"OTHER": "value"})
+        file_only = {
+            "recipient": "workspace",
+            "form": "credential_file",
+            "value": {"path": "~/.srw-files/acme/token", "content": "c"},
+            "collision": "skip_existing",
+        }
+        _runtime(db, FakeOperations({"bind": _bound(file_only)}))
+        job = await _job(db, "created", connectors=(connector, plain))
+        reads = mock.AsyncMock(wraps=connector_secrets.read_connector_credentials)
+        with mock.patch.object(connector_secrets, "read_connector_credentials", reads):
+            await bind_time.job_bind_gate({"id": job})
+            await _settled()
+            calls_after_bind = reads.await_count
+            # Bound, setting no variable: nothing to compare, nothing read.
+            assert await bind_time.job_bind_gate({"id": job}) == ("dispatch", None)
+            assert reads.await_count == calls_after_bind
+
+    async def test_it_reads_only_environment_connectors_and_names_no_value(
+        self, db, registry
+    ):
+        from orchestrator.services import connector_secrets
+
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        plain = await self._plain(db, user, {"ACME_TOKEN": "a-secret-value"})
+        _runtime(db, FakeOperations({"bind": _bound(ENV)}))
+        job = await _job(db, "created", connectors=(connector, plain))
+        await bind_time.job_bind_gate({"id": job})
+        await _settled()
+        reads = mock.AsyncMock(wraps=connector_secrets.read_connector_credentials)
+        with mock.patch.object(connector_secrets, "read_connector_credentials", reads):
+            action, reason = await bind_time.job_bind_gate({"id": job})
+        assert action == "fail"
+        # One read, of the environment connector only.
+        assert reads.await_count == 1
+        (rows,), kwargs = reads.await_args
+        assert [str(row["id"]) for row in rows] == [plain]
+        assert kwargs["authorized"] == [plain]
+        assert "ACME_TOKEN" in reason and "acme" in reason and "plain" in reason
+        assert "a-secret-value" not in reason
+        assert "minted-for-this-binding" not in reason
