@@ -418,13 +418,13 @@ async def test_native_project_refresh_keeps_authored_entries(database):
 
 
 @pytest.mark.asyncio
-async def test_a_member_reads_and_reapplies_refs_to_connectors_shared_with_them(
+async def test_a_member_references_and_reapplies_connectors_shared_with_them(
     database,
 ):
-    """A linked Connector is visible the way its datasource is (public, or
-    linked to a project the caller belongs to), not by its Account scope: a
-    Project editor re-applies the manifest that names the owner's connector,
-    and someone outside the project neither reads nor names it."""
+    """A linked Connector may be referenced the way its datasource is visible
+    (public, or linked to a project the caller belongs to), not by its Account
+    scope: a Project editor re-applies the manifest that names the owner's
+    connector, and someone outside the project cannot name it."""
     db = database
     owner = await _user(db, "Owner")
     editor = await _user(db, "Editor")
@@ -443,10 +443,10 @@ async def test_a_member_reads_and_reapplies_refs_to_connectors_shared_with_them(
         row = await ManifestStore(db).by_id(datasource_id)
         authority = ManifestAuthority(db, user)
         if visible:
-            await authority.resource(row)
+            await authority.resource(row, reference=True)
         else:
             with pytest.raises(HTTPException) as denied:
-                await authority.resource(row)
+                await authority.resource(row, reference=True)
             assert denied.value.status_code == 403
 
     resource = await _project_resource(db, project)
@@ -490,10 +490,11 @@ async def _catalog_connector(db, name: str) -> dict:
 async def test_a_connector_ref_is_authorized_by_the_connector_policy_and_leaks_nothing(
     database,
 ):
-    """``ManifestAuthority.resource`` and manifest ref resolution follow the
-    connector policy for a datasource's Connector: its owner, everyone when
-    public, members of a project it is linked to; a Catalog Connector is never
-    one. A ref the caller may not use answers exactly as a ref to nothing."""
+    """A reference to a datasource's Connector (``ManifestAuthority.resource``
+    with ``reference``, and manifest ref resolution) follows the connector
+    policy: its owner, everyone when public, members of a project it is linked
+    to; a Catalog Connector is never one. A ref the caller may not use answers
+    exactly as a ref to nothing. Reading the resource stays with its scope."""
     db = database
     owner = await _user(db, "Owner")
     member = await _user(db, "Member")
@@ -515,15 +516,28 @@ async def test_a_connector_ref_is_authorized_by_the_connector_policy_and_leaks_n
         "member": {linked, public, kb},
         "stranger": {public},
     }
+    readable = {
+        "owner": {private, linked, kb},
+        "member": {kb},
+        "stranger": set(),
+    }
     users = {"owner": owner, "member": member, "stranger": stranger}
     for label, user in users.items():
         for datasource_id in (private, linked, public, kb):
             row = await ManifestStore(db).by_id(datasource_id)
+            authority = ManifestAuthority(db, user)
             if datasource_id in visible[label]:
-                await ManifestAuthority(db, user).resource(row)
+                await authority.resource(row, reference=True)
             else:
                 with pytest.raises(HTTPException) as denied:
-                    await ManifestAuthority(db, user).resource(row)
+                    await authority.resource(row, reference=True)
+                assert denied.value.status_code == 403, (label, datasource_id)
+            # Reading it: its Account's owner, or a member of the KB's project.
+            if datasource_id in readable[label]:
+                await authority.resource(row)
+            else:
+                with pytest.raises(HTTPException) as denied:
+                    await authority.resource(row)
                 assert denied.value.status_code == 403, (label, datasource_id)
         # A datasource's Connector is never a Catalog resource.
         claimed = {
@@ -532,7 +546,7 @@ async def test_a_connector_ref_is_authorized_by_the_connector_policy_and_leaks_n
             "scope_name": "shared",
         }
         with pytest.raises(HTTPException):
-            await ManifestAuthority(db, user).resource(claimed)
+            await ManifestAuthority(db, user).resource(claimed, reference=True)
 
     async def resolve(user, ref):
         resolver = LiveManifestResolver(ManifestStore(db), ManifestAuthority(db, user))

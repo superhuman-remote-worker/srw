@@ -193,7 +193,7 @@ class LiveManifestResolver:
         if not row:
             raise HTTPException(422, REFERENCE_MISSING)
         try:
-            await self.authority.resource(row)
+            await self.authority.resource(row, reference=connector)
         except HTTPException as exc:
             # A Connector the caller may not see answers as one that does not
             # exist: a ref is never a probe for someone else's connectors.

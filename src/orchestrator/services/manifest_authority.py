@@ -95,7 +95,9 @@ class ManifestAuthority:
                 )
         return scope
 
-    async def resource(self, row, *, write=False):
+    async def resource(self, row, *, write=False, reference=False):
+        """Authority over a resource row: read (default), write, or with
+        ``reference`` naming it from another document."""
         if row["kind"] == "Expert" and row.get("linked_id") and not write:
             token_project = mcp_scope_project_id(self.user)
             if token_project:
@@ -123,13 +125,19 @@ class ManifestAuthority:
                         "The selected Expert is outside this token's Project scope."
                     )
             return
-        if row["kind"] == "Connector" and row.get("linked_id") and not write:
-            # A datasource's Connector is visible by the connector policy, as
-            # its datasource is to the link API: to its owner, an
-            # administrator, everyone when public, and the members of a project
-            # it is linked to; never as a Catalog resource (a datasource's
-            # Connector is never one). Writes stay with its scope (and the
-            # store refuses them: the datasource API writes it).
+        if (
+            row["kind"] == "Connector"
+            and row.get("linked_id")
+            and reference
+            and not write
+        ):
+            # A datasource's Connector may be referenced by the connector
+            # policy, as its datasource is visible to the link API: by its
+            # owner, an administrator, everyone when public, and the members
+            # of a project it is linked to; never as a Catalog resource (a
+            # datasource's Connector is never one). Reading the resource
+            # itself stays with its scope, as for any resource: its config
+            # holds what the datasource API shows only its owner.
             datasource = (
                 None
                 if row.get("scope_kind") == "Catalog"
