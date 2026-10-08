@@ -86,6 +86,7 @@ LAUNCH_FAILED = "launch_failed"
 CAPACITY = "capacity"
 START_TIMEOUT = "start_timeout"
 POD_LOST = "pod_lost"
+NOT_READY = "not_ready"
 #: Stops that back the key off before the next start.
 _BACKOFF_REASONS = (LAUNCH_REFUSED, LAUNCH_FAILED, START_TIMEOUT, CAPACITY)
 _CAPACITY_LOCK = "srw-connector-service-capacity"
@@ -111,14 +112,38 @@ def _field(obj: Any, name: str, default: Any = None) -> Any:
 
 @dataclass(frozen=True)
 class PodState:
+    """A driver pod as the API reports it.
+
+    ``unready_since`` is when its Ready condition last turned false (None
+    while ready, or when the API reports no condition).
+    """
+
     phase: str
     uid: str | None = None
     ready: bool = False
     reason: str | None = None
+    unready_since: datetime | None = None
 
     @property
     def absent(self) -> bool:
         return self.phase == "Absent"
+
+    @property
+    def lost(self) -> bool:
+        """Gone, replaced, or terminal: a ``restartPolicy: Always`` pod that
+        failed (evicted) or succeeded never runs again."""
+        return self.phase in ("Absent", "Replaced", "Failed", "Succeeded")
+
+
+def _timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
 
 
 def _status(exc: BaseException) -> int | None:
@@ -227,11 +252,37 @@ class ServicePodRuntime:
             None,
         )
         waiting = _field(_field(driver, "state"), "waiting")
+        # An init container stuck (Init:CrashLoopBackOff after a restart) is
+        # the likelier reason a pod that was ready is not any more.
+        init_waiting = next(
+            (
+                _field(_field(item, "state"), "waiting")
+                for item in _field(status, "initContainerStatuses") or []
+                if _field(_field(item, "state"), "waiting") is not None
+            ),
+            None,
+        )
+        condition = next(
+            (
+                item
+                for item in _field(status, "conditions") or []
+                if _field(item, "type") == "Ready"
+            ),
+            None,
+        )
+        ready = bool(_field(driver, "ready", False))
         return PodState(
             phase=_field(status, "phase") or "Unknown",
             uid=_field(metadata, "uid"),
-            ready=bool(_field(driver, "ready", False)),
-            reason=_field(waiting, "reason") or _field(status, "reason"),
+            ready=ready,
+            reason=_field(init_waiting, "reason")
+            or _field(waiting, "reason")
+            or _field(status, "reason"),
+            unready_since=(
+                None
+                if ready or _field(condition, "status") == "True"
+                else _timestamp(_field(condition, "lastTransitionTime"))
+            ),
         )
 
     async def _delete(self, delete: Callable[..., Any], name: str) -> None:
@@ -755,30 +806,44 @@ class ServiceHostingReconciler:
         """Record readiness; stop a lost or never-ready pod. Whether it lives."""
         identity = _identity(row)
         state = await self.runtime.observe(identity)
-        if state.absent or state.phase == "Replaced":
+        if state.lost:
+            # Evicted (Failed), gone or replaced: the next pass starts a new
+            # pod while bindings need one.
             await self._stop(row, POD_LOST, report)
             return False
-        if state.ready and row["ready_at"] is None:
-            async with self.store.acquire() as conn:
-                await conn.execute(
-                    "UPDATE connector_driver_identities SET ready_at = now() "
-                    "WHERE id = $1 AND ready_at IS NULL",
-                    UUID(identity.identity_id),
+        timeout = self.settings.start_timeout_seconds
+        if state.ready:
+            if row["ready_at"] is None:
+                async with self.store.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE connector_driver_identities SET ready_at = now() "
+                        "WHERE id = $1 AND ready_at IS NULL",
+                        UUID(identity.identity_id),
+                    )
+                report.ready.append(identity.identity_id)
+            return True
+        if row["ready_at"] is None:
+            if (self.clock() - row["created_at"]).total_seconds() > timeout:
+                logger.warning(
+                    "Driver pod %s not ready after %.0fs (%s); stopping it",
+                    identity.pod_name,
+                    timeout,
+                    state.reason or state.phase,
                 )
-            report.ready.append(identity.identity_id)
-        elif (
-            row["ready_at"] is None
-            and not state.ready
-            and (self.clock() - row["created_at"]).total_seconds()
-            > self.settings.start_timeout_seconds
-        ):
+                await self._stop(row, START_TIMEOUT, report)
+                return False
+            return True
+        # It was ready and is not any more (a node restart, Init:CrashLoop):
+        # the start timeout again, from when it turned unready.
+        since = state.unready_since
+        if since is not None and (self.clock() - since).total_seconds() > timeout:
             logger.warning(
-                "Driver pod %s not ready after %.0fs (%s); stopping it",
+                "Driver pod %s unready for %.0fs (%s); replacing it",
                 identity.pod_name,
-                self.settings.start_timeout_seconds,
+                timeout,
                 state.reason or state.phase,
             )
-            await self._stop(row, START_TIMEOUT, report)
+            await self._stop(row, NOT_READY, report)
             return False
         return True
 
@@ -1047,6 +1112,7 @@ __all__ = [
     "IDLE",
     "LAUNCH_FAILED",
     "LAUNCH_REFUSED",
+    "NOT_READY",
     "POD_LOST",
     "START_TIMEOUT",
     "PodState",

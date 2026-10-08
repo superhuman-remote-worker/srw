@@ -174,6 +174,46 @@ async def test_observe_reads_readiness_of_the_driver_container(api, runtime):
 
 
 @pytest.mark.asyncio
+async def test_observe_reads_a_terminal_phase_and_when_the_pod_turned_unready(
+    api, runtime
+):
+    pod = {
+        "metadata": {"name": POD, "uid": "u", "labels": dict(IDENTITY.labels)},
+        "status": {
+            "phase": "Failed",
+            "reason": "Evicted",
+            "containerStatuses": [{"name": "driver", "ready": False, "state": {}}],
+        },
+    }
+    api.objects[("pod", POD)] = pod
+    state = await runtime.observe(IDENTITY)
+    assert state.lost and state.reason == "Evicted"
+    pod["status"] = {
+        "phase": "Pending",
+        "conditions": [
+            {
+                "type": "Ready",
+                "status": "False",
+                "lastTransitionTime": "2026-10-08T10:00:00Z",
+            }
+        ],
+        "initContainerStatuses": [
+            {
+                "name": "canary-wait",
+                "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+            }
+        ],
+        "containerStatuses": [{"name": "driver", "ready": False, "state": {}}],
+    }
+    state = await runtime.observe(IDENTITY)
+    assert not state.lost and not state.ready
+    assert state.reason == "CrashLoopBackOff"
+    assert state.unready_since.isoformat() == "2026-10-08T10:00:00+00:00"
+    pod["status"]["phase"] = "Succeeded"
+    assert (await runtime.observe(IDENTITY)).lost
+
+
+@pytest.mark.asyncio
 async def test_remove_deletes_every_object_and_the_binding_policies(api, runtime):
     await runtime.launch(_plan())
     binding = {

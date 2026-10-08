@@ -1016,6 +1016,57 @@ async def test_a_lost_or_never_ready_pod_is_stopped_and_replaced(db, reconciler)
 
 
 @pytest.mark.asyncio
+async def test_an_evicted_pod_with_bindings_is_replaced(db, reconciler):
+    connector = await _echo_connector(db)
+    await _echo_image(db)
+    await _bind_echo(db, connector, await _thread(db))
+    await reconciler.reconcile_once()
+    (pod,) = await _pods(db)
+    reconciler.fake.ready(str(pod["id"]))
+    await reconciler.reconcile_once()
+    reconciler.fake.states[str(pod["id"])] = PodState(
+        "Failed", uid="u", reason="Evicted"
+    )
+    report = await reconciler.reconcile_once()
+    assert (str(pod["id"]), "pod_lost") in report.stopped
+    assert len(report.started) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_pod_that_stays_unready_is_replaced_one_that_recovers_is_kept(
+    db, reconciler
+):
+    connector = await _echo_connector(db)
+    await _echo_image(db)
+    await _bind_echo(db, connector, await _thread(db))
+    await reconciler.reconcile_once()
+    (pod,) = await _pods(db)
+    identity = str(pod["id"])
+    reconciler.fake.ready(identity)
+    await reconciler.reconcile_once()
+    # Long after it started, it turns unready (a node restart): within the
+    # start timeout it is kept ...
+    reconciler.offset[0] = timedelta(hours=1)
+    turned = datetime.now(timezone.utc) + timedelta(hours=1)
+    reconciler.fake.states[identity] = PodState(
+        "Pending", uid="u", reason="CrashLoopBackOff", unready_since=turned
+    )
+    report = await reconciler.reconcile_once()
+    assert report.stopped == [] and report.started == []
+    # ... and recovering keeps it.
+    reconciler.fake.ready(identity)
+    assert (await reconciler.reconcile_once()).stopped == []
+    # Unready past the start timeout, it is replaced.
+    reconciler.fake.states[identity] = PodState(
+        "Pending", uid="u", reason="CrashLoopBackOff", unready_since=turned
+    )
+    reconciler.offset[0] = timedelta(hours=1, seconds=121)
+    report = await reconciler.reconcile_once()
+    assert (identity, "not_ready") in report.stopped
+    assert len(report.started) == 1
+
+
+@pytest.mark.asyncio
 async def test_objects_no_live_row_names_are_swept(db, reconciler):
     connector = await _echo_connector(db)
     await _echo_image(db)
