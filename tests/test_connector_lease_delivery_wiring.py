@@ -505,6 +505,7 @@ async def test_any_lease_failure_releases_the_warm_reservation(failure):
 PROBE_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 GENERIC_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 KEPT_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+REPO_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
 
 
 def _detach_dependencies() -> tcu.ThreadConfigUpdateDependencies:
@@ -519,6 +520,13 @@ def _detach_dependencies() -> tcu.ThreadConfigUpdateDependencies:
             return_value=[
                 {"id": PROBE_ID, "type": "lease_probe"},
                 {"id": GENERIC_ID, "type": "generic"},
+                # A token repository: its stored row names no lease driver,
+                # yet the git swap driver's lease is its (C3 re-review B1).
+                {
+                    "id": REPO_ID,
+                    "type": "repository",
+                    "connection_url": "https://github.com/o/r.git",
+                },
             ]
         ),
         "get_user": AsyncMock(return_value={"id": OWNER}),
@@ -534,7 +542,7 @@ def _detach_dependencies() -> tcu.ThreadConfigUpdateDependencies:
 
 
 @pytest.mark.asyncio
-async def test_a_live_detach_revokes_only_the_lease_connectors_lease():
+async def test_a_live_detach_revokes_every_removed_connectors_lease():
     from tests.test_b06_lane_b_thread_config_update import THREAD, _pinned_thread
 
     revoked: list = []
@@ -543,7 +551,9 @@ async def test_a_live_detach_revokes_only_the_lease_connectors_lease():
         revoked.append((conn, owner, list(connector_ids)))
         return []
 
-    row = _pinned_thread(metadata={"datasource_ids": [PROBE_ID, GENERIC_ID, KEPT_ID]})
+    row = _pinned_thread(
+        metadata={"datasource_ids": [PROBE_ID, GENERIC_ID, REPO_ID, KEPT_ID]}
+    )
     with patch.object(leases, "revoke_connector_leases", revoke):
         await tcu.apply_thread_config_update_locked(
             THREAD,
@@ -555,7 +565,10 @@ async def test_a_live_detach_revokes_only_the_lease_connectors_lease():
             dependencies=_detach_dependencies(),
         )
 
-    assert revoked == [("conn", leases.LeaseOwner.thread(THREAD), [PROBE_ID])]
+    # Every removed connector: revoking where no lease exists does nothing.
+    assert revoked == [
+        ("conn", leases.LeaseOwner.thread(THREAD), [PROBE_ID, GENERIC_ID, REPO_ID])
+    ]
 
 
 # =============================================================================

@@ -467,11 +467,11 @@ async def apply_thread_config_update_locked(
                     status_code=409,
                     detail="Credential connectors stay attached for the lifetime of the session",
                 )
-            detached_lease_ids = [
-                str(row["id"])
-                for row in removed_rows
-                if connector_credential_leases.lease_spec(row) is not None
-            ]
+            # Every removed connector: whether one holds a lease is not a
+            # property of its stored row (a token repository's lease is the
+            # git swap driver's, decided at delivery), and revoking where no
+            # lease exists does nothing.
+            detached_lease_ids = [str(row["id"]) for row in removed_rows]
         target_project_ids = await dependencies.thread_project_ids(thread_id)
         if thread_row.get("user_id"):
             owner = await dependencies.store.get_user(str(thread_row["user_id"]))
@@ -651,7 +651,8 @@ async def apply_thread_config_update_locked(
         if not updated:
             raise HTTPException(status_code=404, detail="Thread not found")
         # A live detach revokes that connector's lease (connector drivers C2)
-        # in this configuration transaction. Only lease drivers hold leases.
+        # in this configuration transaction: any lease of any removed
+        # connector (a git swap repository's included).
         detached = [cid for cid in detached_lease_ids if cid not in selected_ds_ids]
         if detached:
             async with dependencies.store.acquire() as conn:

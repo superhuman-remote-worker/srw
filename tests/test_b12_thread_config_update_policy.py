@@ -27,6 +27,7 @@ import functools
 import json
 import uuid
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
 import pytest
@@ -93,6 +94,7 @@ class Fakes:
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
         self.results: dict[str, Any] = {
+            "store.acquire": None,
             "store.get_project_officer": None,
             "store.get_datasource_policy_rows": [],
             "store.get_user": dict(OWNER_ROW),
@@ -210,6 +212,22 @@ class _Store:
 
     async def refresh_session_execution(self, *args: Any, **kwargs: Any) -> Any:
         return self._fakes.invoke("store.refresh_session_execution", args, kwargs)
+
+    def acquire(self) -> Any:
+        """The live detach's lease revoke: any lease of every removed
+        connector (C3 re-review B1), on a connection of its own."""
+        fakes = self._fakes
+
+        @contextlib.asynccontextmanager
+        async def _connection():
+            fakes.invoke("store.acquire", (), {})
+
+            async def fetch(*_args: Any, **_kwargs: Any) -> list:
+                return []
+
+            yield SimpleNamespace(fetch=fetch)
+
+        return _connection()
 
     def thread_configuration_transaction(self, thread_id: str) -> Any:
         fakes = self._fakes
@@ -920,6 +938,9 @@ class TestDatasourceSelection:
             "enforce_session_create_grants",
             "store.merge_thread_config_override",
             "store.set_thread_datasource_ids",
+            # Any lease of the removed connector is revoked (none here: a
+            # no-op), whatever its stored type says (C3 re-review B1).
+            "store.acquire",
             "log_security_event",
         ]
 
