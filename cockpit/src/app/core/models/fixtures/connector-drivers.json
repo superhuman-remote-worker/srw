@@ -210,6 +210,7 @@
           "access_levels": [],
           "delivery": "env",
           "update": "replace",
+          "names_field": null,
           "schema": {
             "type": "object",
             "properties": {
@@ -306,6 +307,7 @@
           "access_levels": [],
           "delivery": "env",
           "update": "merge",
+          "names_field": "env_var_names",
           "schema": {
             "type": "object",
             "properties": {
@@ -413,6 +415,7 @@
           "access_levels": [],
           "delivery": "file",
           "update": "replace",
+          "names_field": null,
           "schema": {
             "type": "object",
             "properties": {
@@ -431,6 +434,7 @@
           "access_levels": [],
           "delivery": "ssh_agent",
           "update": "replace",
+          "names_field": null,
           "schema": {
             "type": "object",
             "properties": {
@@ -532,6 +536,7 @@
           "access_levels": [],
           "delivery": null,
           "update": "replace",
+          "names_field": null,
           "schema": {
             "type": "object",
             "properties": {
@@ -550,6 +555,7 @@
           "access_levels": [],
           "delivery": null,
           "update": "replace",
+          "names_field": null,
           "schema": {
             "type": "object",
             "properties": {
@@ -744,6 +750,7 @@
           "access_levels": [],
           "delivery": null,
           "update": "replace",
+          "names_field": null,
           "schema": {
             "type": "object",
             "properties": {
@@ -930,6 +937,7 @@
           "access_levels": [],
           "delivery": null,
           "update": "replace",
+          "names_field": null,
           "schema": {
             "type": "object",
             "properties": {
@@ -1067,6 +1075,7 @@
           "access_levels": [],
           "delivery": null,
           "update": "replace",
+          "names_field": null,
           "schema": {
             "type": "object",
             "required": [
@@ -1120,6 +1129,7 @@
           ],
           "delivery": null,
           "update": "replace",
+          "names_field": null,
           "schema": {
             "type": "object",
             "properties": {
@@ -1259,6 +1269,7 @@
           "access_levels": [],
           "delivery": null,
           "update": "replace",
+          "names_field": null,
           "schema": {
             "type": "object",
             "properties": {
@@ -1370,6 +1381,7 @@
           "access_levels": [],
           "delivery": "file",
           "update": "replace",
+          "names_field": null,
           "schema": {
             "type": "object",
             "required": [
@@ -1490,6 +1502,7 @@
           "access_levels": [],
           "delivery": "ssh_agent",
           "update": "replace",
+          "names_field": null,
           "schema": {
             "type": "object",
             "required": [
@@ -1629,6 +1642,7 @@
           "access_levels": [],
           "delivery": "file",
           "update": "replace",
+          "names_field": null,
           "schema": {
             "type": "object",
             "required": [

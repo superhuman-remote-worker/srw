@@ -252,6 +252,8 @@ def _slot(slot: CredentialSlot) -> dict[str, Any]:
         "access_levels": list(slot.access_levels),
         "delivery": slot.delivery,
         "update": slot.update,
+        # The read field listing the slot's key names, never their values.
+        "names_field": slot.names_field,
         "schema": public_schema(slot.schema),
     }
 

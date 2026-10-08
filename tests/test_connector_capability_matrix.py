@@ -234,6 +234,19 @@ class TestBuiltinMatrix:
         password = email["credential_slots"][0]["schema"]["properties"]["password"]
         assert password == {"type": "string", "writeOnly": True}
 
+    @pytest.mark.parametrize("spec", DATASOURCE_SPECS, ids=lambda s: s.name)
+    def test_each_slot_names_its_key_names_field(self, matrix, spec):
+        entry = next(d for d in matrix["drivers"] if d["name"] == spec.name)
+        assert [s["names_field"] for s in entry["credential_slots"]] == [
+            slot.names_field for slot in spec.credential_slots
+        ]
+
+    def test_the_credentials_slot_lists_its_names_under_env_var_names(self, matrix):
+        credentials = next(
+            d for d in matrix["drivers"] if d["name"] == "srw.credentials/v1"
+        )
+        assert credentials["credential_slots"][0]["names_field"] == "env_var_names"
+
     def test_the_matrix_is_json(self, matrix):
         assert json.loads(json.dumps(matrix)) == matrix
 

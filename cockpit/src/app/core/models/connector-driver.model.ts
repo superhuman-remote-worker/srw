@@ -68,6 +68,9 @@ export interface ConnectorCredentialSlot {
   delivery: 'env' | 'file' | 'ssh_agent' | null;
   /** How an edit treats the stored value. */
   update: 'keep_if_blank' | 'merge' | 'replace';
+  /** The connector read field listing the slot's key names (never values),
+   *  e.g. `env_var_names`; null when the read shows none. */
+  names_field: string | null;
   /** The keys of the credentials object this slot owns. */
   schema: JsonSchema;
 }
