@@ -21,8 +21,12 @@ Fixtures (all disposable, named after the gate id ``c5-<10 hex>``):
               ServiceAccount ``minter`` and its Role, the documented minimum:
               ``create`` on ``serviceaccounts/token`` for ``agent`` only, and
               ``create``/``delete`` on Secrets (SRW's bound Secrets live
-              there). Its one-hour token, minted here, is the connector's
-              minting credential
+              there), narrowed by the recommended ValidatingAdmissionPolicy
+              (``shared.connectors.token_request.admission_policy``, named
+              after the gate id): the minter may create only empty, immutable
+              ``srw-mint-`` Secrets labelled SRW's and delete only those. Its
+              one-hour token, minted here, is the connectors' minting
+              credential
   work        namespace ``srw-gate-<gate id>-work``: a Role that may get and
               list ConfigMaps and Pods, bound to ``agent``, and a marker
               ConfigMap
@@ -31,22 +35,27 @@ Fixtures (all disposable, named after the gate id ``c5-<10 hex>``):
               NetworkPolicy per unit selects only that unit's workspace pod
               and allows only the API server's Service IP and endpoints
   project     one project owned by the test account
-  connectors  ``kube``: a kubeconfig connector with ``token_request``
-              (``agent``, expiration_seconds 600). With --github-*:
-              ``gh-rw`` and ``gh-ro``, repository connectors authenticating
-              as the App on the given disposable repository, linked
-              ReadWrite and read-only
+  connectors  ``kube`` and ``kube-del``: kubeconfig connectors with
+              ``token_request`` (``agent``, expiration_seconds 600). With
+              --github-*: ``gh-rw`` and ``gh-ro``, repository connectors
+              authenticating as the App on the given disposable repository,
+              linked ReadWrite and read-only
 
 Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
 
   preflight   every orchestrator and stateless agent pod serves this
               checkout's C5 modules, byte for byte; migrations 0347 and 0430
-              applied; the lease sweep's interval read from the orchestrator
+              applied; minting on and ``kubernetes.default.svc`` in
+              connectors.providerMinting.privateHosts (the orchestrator
+              reaches its own cluster's API server at a cluster address);
+              the lease sweep's interval read from the orchestrator
   accounts    the owner logs in with the disposable OAuth client
   fixture     the minting account may create a token for ``agent`` only and
-              may not read Secrets; a token_request connector over an exec
-              kubeconfig is refused; Test of ``kube`` mints and revokes, and
-              leaves no Secret
+              may not read Secrets; the admission policy refuses the minter
+              a Secret with data and the delete of a Secret that is not
+              SRW's (server-side dry runs); a token_request connector over an
+              exec kubeconfig is refused; Test of ``kube`` mints and revokes,
+              and leaves no Secret
   mint        a stateless session (sandbox) with ``kube``; after its first
               turn: one live minted credential; the workspace's kubeconfig
               has one user holding a token and nothing else (no exec, no
@@ -59,9 +68,21 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
   renewal     past half the token's life, the next turn's claim delivers a
               new token (by digest) before the old one expires; the old one
               is superseded and still valid, the new one is live
-  end         End revokes: every credential of the session is revoked, its
-              bound Secrets are gone and both tokens get 401 from the API
-              server
+  detach      a live detach (PATCH the session's config without ``kube``)
+              revokes both of its credentials (connector_detached): 401
+  jobs        two stateless worker jobs with ``kube``: each workspace holds
+              the job's own minted token; a cancel revokes one job's
+              (job_cancelled), a delete the other's (job_deleted): 401
+  pinned      a pinned session (an Officer conference) with ``kube``, after
+              every pooled pinned agent pod is checked for this checkout's
+              connector modules: its attach delivers a kubeconfig with its
+              own minted token; End revokes it (session_end): 401
+  edit        a stateless session with ``kube`` and ``kube-del``: a
+              connector edit (the lifetime to 900 s) revokes ``kube``'s
+              credential (connector_changed) and leaves ``kube-del``'s; the
+              connector delete of ``kube-del`` revokes its own
+              (connector_deleted); the next turn mints ``kube`` afresh with
+              the new lifetime; End revokes it (session_end): 401 throughout
   github      only with --github-app-id, --github-installation-id,
               --github-key-file and --github-repo (else SKIPPED, saying why):
               Test mints, reads and revokes; a session with gh-rw and gh-ro
@@ -69,11 +90,18 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               else on the stated token-in-URL fallback); each connector's
               minted token covers the one repository, the read-only one cannot
               write (a blob create gets 403) and the ReadWrite one can; the
-              workspace never holds the App's key, and through the driver no
-              installation token either; End revokes both tokens (401)
-  cleanup     sessions, connectors, project, OAuth client, both namespaces
-              and the NetworkPolicies are gone; no credential of this run's
-              connectors is left unrevoked
+              workspace and the agent pods never hold the App's key, and
+              through the driver the workspace holds no installation token
+              either; End revokes both tokens (401)
+  logs        the orchestrator's, the stateless agents' and the pinned
+              agents' logs since the gate started hold no minting token, no
+              minted token and no App key
+  records     every revoked (or abandoned) record of this run's connectors
+              keeps no token and no minting credential
+  cleanup     sessions, jobs, connectors, project, OAuth client, both
+              namespaces, the admission policy and the NetworkPolicies are
+              gone; no credential of this run's connectors is left unrevoked
+              (an abandoned one counts as left)
 
 Run with the repository venv on the k3d-srw cluster, alone: this is a
 mutating gate. It needs the workspace image built from this checkout (full
@@ -171,6 +199,12 @@ MARKER_CONFIGMAP = "srw-gate-marker"
 EXPIRATION_SECONDS = 600
 SWAP_DRIVER = swap.SWAP_DRIVER
 GITHUB_API = "https://api.github.com"
+#: The host the orchestrator reaches its own cluster's API server at: the
+#: operator lists it in connectors.providerMinting.privateHosts.
+PRIVATE_HOST = "kubernetes.default.svc"
+#: Pooled pinned agent pods (no component label: the name is the pool's).
+POOLED_PINNED_PREFIX = "srw-agent-j-"
+JOB_TERMINAL = ("completed", "failed", "cancelled")
 MIGRATIONS = (
     "0347_connector_credential_leases.sql",
     "0430_connector_minted_credentials.sql",
@@ -214,10 +248,22 @@ SERVED_SETS = (
     ),
 )
 
+#: A pinned agent pod writes the kubeconfig into the workspace too.
+PINNED_SERVED = ServedSet(
+    "pinned agent",
+    "agent-pinned",
+    "agent",
+    (SHARED_CONNECTORS, AGENT_CONNECTORS),
+    (
+        "src/shared/runtime/core/credential_env.py",
+        "src/shared/runtime/core/backends/remote.py",
+    ),
+)
+
 _POD_MEMORY_CAP = swap._POD_MEMORY_CAP
 
-# The minted credentials of one session (and connector), from the app
-# database; ``tokens`` decrypts their tokens in the orchestrator (the key
+# The minted credentials of one execution (a session or a job) and
+# connector, from the app database; ``tokens`` decrypts their tokens in the orchestrator (the key
 # never leaves the pod). The gate registers every token as a secret before
 # it prints anything.
 _MINTED_PROGRAM = (
@@ -241,9 +287,9 @@ async def main():
                 "extract(epoch FROM minted_at) AS minted, "
                 "extract(epoch FROM now()) AS now "
                 "FROM connector_minted_credentials "
-                "WHERE owner_kind = 'thread' AND owner_id = $1 AND connector_id = $2 "
+                "WHERE owner_kind = $1 AND owner_id = $2 AND connector_id = $3 "
                 "ORDER BY created_at",
-                UUID(request["thread"]), UUID(request["connector"]),
+                request["kind"], UUID(request["owner"]), UUID(request["connector"]),
             )
     finally:
         await db.close()
@@ -260,6 +306,47 @@ async def main():
             item["token"] = decrypt(row["token_ciphertext"])
         found.append(item)
     return found
+print(json.dumps(asyncio.run(main())))
+"""
+)
+
+# What every done (revoked or abandoned) record of the given connectors
+# keeps: counts only, never a value.
+_DONE_ROWS_PROGRAM = (
+    _POD_MEMORY_CAP
+    + r"""
+import asyncio, json, sys
+from uuid import UUID
+from orchestrator.database.postgres import PostgresDB
+from orchestrator.security.crypto import decrypt
+cap_memory()
+request = json.loads(sys.stdin.readline())
+
+async def main():
+    db = PostgresDB(min_connections=1, max_connections=1)
+    await db.connect()
+    try:
+        async with db.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT status, token_ciphertext, material_ciphertext "
+                "FROM connector_minted_credentials WHERE connector_id = ANY($1::uuid[]) "
+                "AND status IN ('revoked', 'abandoned')",
+                [UUID(value) for value in request["connectors"]],
+            )
+    finally:
+        await db.close()
+    out = {"done": len(rows), "abandoned": 0, "with_token": 0,
+           "with_minting_credential": 0, "unreadable": 0}
+    for row in rows:
+        out["abandoned"] += row["status"] == "abandoned"
+        out["with_token"] += row["token_ciphertext"] is not None
+        try:
+            material = json.loads(decrypt(row["material_ciphertext"]))
+        except Exception:
+            out["unreadable"] += 1
+            continue
+        out["with_minting_credential"] += bool(material.get("token"))
+    return out
 print(json.dumps(asyncio.run(main())))
 """
 )
@@ -370,44 +457,64 @@ ALLOWED = {"get configmaps", "list pods"}
 
 PLAN = [
     "preflight: the orchestrator and the stateless agents serve this checkout's "
-    "C5 modules; migrations 0347 and 0430 applied; the lease sweep interval",
+    "C5 modules; migrations 0347 and 0430 applied; minting on and "
+    "kubernetes.default.svc in connectors.providerMinting.privateHosts; the "
+    "lease sweep interval",
     "accounts: a disposable OAuth client the owner logs in with",
     "fixture: namespaces srw-gate-<gate id>-ids (target ServiceAccount agent, "
     "minting ServiceAccount minter with the minimal Role: create "
-    "serviceaccounts/token for agent, create/delete secrets) and "
-    "srw-gate-<gate id>-work (a read Role bound to agent, a marker); a "
-    "project; a kubeconfig connector with token_request (600 s); the minter "
-    "may do nothing more; an exec kubeconfig with token_request is refused; "
-    "Test mints and revokes",
-    "egress: one NetworkPolicy per session letting only its workspace pod "
-    "reach the API server",
+    "serviceaccounts/token for agent, create/delete secrets, narrowed by the "
+    "recommended ValidatingAdmissionPolicy) and srw-gate-<gate id>-work (a read "
+    "Role bound to agent, a marker); a project; kubeconfig connectors kube and "
+    "kube-del with token_request (600 s); the minter may do nothing more, and "
+    "the policy refuses it a data-bearing Secret and another Secret's delete; "
+    "an exec kubeconfig with token_request is refused; Test mints and revokes",
+    "egress: one NetworkPolicy per session or job letting only its workspace "
+    "pod reach the API server",
     "mint: a stateless session; the workspace's kubeconfig holds one minted "
     "token (digest = SRW's), sub agent, bound to a srw-mint- Secret, exp 600 s, "
     "no exec; kubectl reads the marker and nothing more; no minting token in "
     "the workspace or the agent pods",
     "renewal: past half the token's life the next turn delivers a new token "
     "before the old one expires; the old one superseded and still valid",
-    "end: End revokes every credential of the session, deletes its bound "
-    "Secrets, and both tokens get 401",
+    "detach: a live detach of kube revokes both of the session's tokens: 401",
+    "jobs: two stateless worker jobs get their own minted tokens; a cancel and "
+    "a delete revoke them: 401",
+    "pinned: a pinned session's attach delivers its own minted token; End "
+    "revokes it: 401",
+    "edit: a connector edit revokes kube's token and leaves kube-del's; the "
+    "connector delete of kube-del revokes its own; the next turn mints kube "
+    "afresh (900 s); End revokes it: 401",
     "github (only with --github-*; else skipped): Test; a session with gh-rw "
     "and gh-ro clones both (swap driver or stated fallback); each token covers "
-    "the one repository, read-only cannot write, ReadWrite can; no App key (and "
-    "through the driver no token) in the workspace; End revokes both (401)",
-    "cleanup: sessions, connectors, project, OAuth client, namespaces and "
-    "NetworkPolicies gone; no credential of this run left unrevoked",
+    "the one repository, read-only cannot write, ReadWrite can; no App key in "
+    "the workspace or the agent pods (and through the driver no token in the "
+    "workspace); End revokes both (401)",
+    "logs: the orchestrator's and the agents' logs hold no minting token, no "
+    "minted token and no App key",
+    "records: revoked records keep no token and no minting credential",
+    "cleanup: sessions, jobs, connectors, project, OAuth client, namespaces, "
+    "admission policy and NetworkPolicies gone; no credential of this run left "
+    "unrevoked",
 ]
 
 VALUES_LOCAL_KEYS = """values-local.yaml keys (the k3d profile of values-local.yaml.example):
+  connectors.providerMinting.enabled          true (the default): minting is
+      offered and the leader's revoke sweep runs
+  connectors.providerMinting.privateHosts     ["kubernetes.default.svc"]: the
+      orchestrator mints from its own pod against
+      https://kubernetes.default.svc, a cluster address only a listed host may
+      have (the preflight refuses to run without it)
   orchestrator.connectorLeases.sweepIntervalSeconds   the minted-credential
       sweep's cadence too (a revoke request also wakes it at once); the gate
-      waits for End's revoke at most max(120, 3 x the interval) seconds
-  nothing else for the TokenRequest phase: the orchestrator mints from its
-      own pod against https://kubernetes.default.svc
+      waits for each revoke at most max(120, 3 x the interval) seconds
   for the GitHub phase through the git swap driver: the C3 gate's keys
       (orchestrator.connectorLeases.exchangePort, connectors.servicePods.enabled,
       connectors.drivers.gitSwap.enabled and its image); without them the
       phase runs on connectors.drivers.gitSwap.fallback (token-in-url, the
       default) and says so
+The cluster must serve admissionregistration.k8s.io/v1
+ValidatingAdmissionPolicy (Kubernetes 1.30 or later; k3d's k3s does).
 The GitHub App must be installed on the --github-repo repository with
 Contents: Read and write (and nothing else needed); the repository must be
 DISPOSABLE: the gate only clones it and creates unreferenced blobs.
@@ -543,6 +650,40 @@ def workspace_problems(
     return problems
 
 
+def gate_admission_policy(ids: str, gate_id: str) -> list[dict]:
+    """The recommended ValidatingAdmissionPolicy and binding
+    (``shared.connectors.token_request.admission_policy``) for this run's
+    identity namespace and minter, named and labelled after the gate id (a
+    cluster-scoped object: never the operator's own)."""
+    from shared.connectors.token_request import admission_policy
+
+    name = f"srw-gate-{gate_id}-minted-secrets"
+    policy, binding = admission_policy(ids, MINTER_SA)
+    for manifest in (policy, binding):
+        manifest["metadata"] = {"name": name, "labels": {GATE_LABEL: gate_id}}
+    binding["spec"]["policyName"] = name
+    return [policy, binding]
+
+
+def log_hits(text: str, needles: list[str]) -> int:
+    """How many of ``needles`` occur in ``text`` (never which)."""
+    return sum(1 for needle in needles if needle and needle in text)
+
+
+def private_hosts_problem(enabled: str, hosts: str) -> str:
+    """Why the orchestrator's minting settings cannot run the gate, or
+    ``""``."""
+    if enabled.strip().lower() in ("false", "0", "no", "off"):
+        return "connectors.providerMinting.enabled is false"
+    listed = {item.strip().lower() for item in hosts.split(",") if item.strip()}
+    if PRIVATE_HOST not in listed and f"{PRIVATE_HOST}:443" not in listed:
+        return (
+            f"{PRIVATE_HOST} is not in connectors.providerMinting.privateHosts "
+            f"(listed: {sorted(listed) or 'none'})"
+        )
+    return ""
+
+
 def jwt_claims(token: str) -> dict[str, Any]:
     segment = token.split(".")[1]
     segment += "=" * (-len(segment) % 4)
@@ -592,7 +733,18 @@ class ProviderMintedGate:
         self.project: str | None = None
         self.connectors: dict[str, str] = {}
         self.threads: dict[str, str] = {}
+        self.jobs: dict[str, str] = {}
+        #: Every session and job by label: ("thread" | "job", id).
+        self.units: dict[str, tuple[str, str]] = {}
         self.policies: list[str] = []
+        self.admission_started = False
+        #: The kubeconfig connectors' create body (kube-del reuses it).
+        self.kube_body: dict[str, Any] = {}
+        #: Every minted token this run saw: the log scan's needles.
+        self.seen_tokens: list[str] = []
+        #: A line of the App's private key: the GitHub phase's scan needle.
+        self.app_key_line = ""
+        self.started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self.ids = f"srw-gate-{self.gate_id}-ids"
         self.work = f"srw-gate-{self.gate_id}-work"
         self.namespaces_started = False
@@ -663,23 +815,28 @@ class ProviderMintedGate:
         )
         return out.strip() if rc == 0 else ""
 
-    def workspace_pod(self, thread: str) -> str:
+    def unit_selector(self, label: str) -> dict[str, str]:
+        kind, unit = self.units[label]
+        return {f"srw/{kind if kind == 'job' else 'thread'}-id": unit}
+
+    def workspace_pod(self, label: str) -> str:
+        [(key, value)] = self.unit_selector(label).items()
+
         def probe() -> str | None:
             running = [
                 pod["metadata"]["name"]
-                for pod in self.release_pods(
-                    f"app=srw-workspace,srw/thread-id={thread}"
-                )
+                for pod in self.release_pods(f"app=srw-workspace,{key}={value}")
                 if pod.get("status", {}).get("phase") == "Running"
             ]
             return running[0] if len(running) == 1 else None
 
-        return wait_for(f"workspace of {thread}", probe, timeout=300)
+        return wait_for(f"workspace of {label}", probe, timeout=300)
 
     def ws(self, session: str, script: str, *, timeout: int = 180) -> tuple[int, str]:
-        """``script`` as agent-host in a session's workspace (stdin, never
-        argv), with the credential environment sourced; output scrubbed."""
-        pod = self.workspace_pod(self.threads[session])
+        """``script`` as agent-host in a session's or job's workspace (stdin,
+        never argv), with the credential environment sourced; output
+        scrubbed."""
+        pod = self.workspace_pod(session)
         rc, out, err = run(
             K
             + ["exec", "-i", pod, "-c", WORKSPACE_CONTAINER, "--"]
@@ -711,13 +868,17 @@ class ProviderMintedGate:
         except (IndexError, ValueError):
             raise GateError(f"the workspace program failed (exit {rc}): {out[-300:]}")
 
-    def minted(self, session: str, label: str, *, tokens: bool = False) -> list[dict]:
+    def minted(self, unit: str, label: str, *, tokens: bool = False) -> list[dict]:
+        """The minted credentials of one session or job (``unit``) for one
+        connector (``label``)."""
+        kind, owner = self.units[unit]
         found = in_pod(
             ORCHESTRATOR,
             ORCHESTRATOR_CONTAINER,
             _MINTED_PROGRAM,
             {
-                "thread": self.threads[session],
+                "kind": kind,
+                "owner": owner,
                 "connector": self.connectors[label],
                 "tokens": tokens,
             },
@@ -725,7 +886,71 @@ class ProviderMintedGate:
         for row in found:
             if row.get("token"):
                 secret(row["token"])
+                if row["token"] not in self.seen_tokens:
+                    self.seen_tokens.append(row["token"])
         return found
+
+    def wait_live(self, unit: str, label: str, *, timeout: int | None = None) -> dict:
+        """The one live credential of ``unit`` for ``label``, with its token."""
+
+        def probe() -> dict | None:
+            live = [
+                row
+                for row in self.minted(unit, label, tokens=True)
+                if row["status"] == "live"
+            ]
+            return live[0] if len(live) == 1 else None
+
+        return wait_for(
+            f"a live credential of {unit} for {label}",
+            probe,
+            timeout=timeout or self.args.turn_timeout,
+            interval=5,
+        )
+
+    def expect_revoked(
+        self, what: str, unit: str, label: str, reason: str, tokens: list[str]
+    ) -> None:
+        """Every credential of ``unit`` for ``label`` is revoked for
+        ``reason``, and the API server refuses each of ``tokens``."""
+        budget = max(120, int(3 * self.sweep_seconds))
+
+        def done() -> list[dict] | None:
+            rows = self.minted(unit, label)
+            return (
+                rows if rows and all(r["status"] == "revoked" for r in rows) else None
+            )
+
+        try:
+            rows = wait_for(f"{what} revokes", done, timeout=budget)
+        except GateError:
+            rows = self.minted(unit, label)
+        reasons = sorted({str(row["revoke_reason"]) for row in rows})
+        self.report.check(
+            f"{what}: every credential of {unit} for {label} is revoked ({reason})",
+            bool(rows)
+            and all(row["status"] == "revoked" for row in rows)
+            and reason in reasons,
+            str([(row["status"], row["revoke_reason"]) for row in rows]),
+        )
+        tokens = [token for token in tokens if token]
+        if not tokens:
+            return
+        refused = [401] * len(tokens)
+        try:
+            statuses = wait_for(
+                f"{what}: tokens refused",
+                lambda: (s if (s := self.bearer(tokens)) == refused else None),
+                timeout=90,
+                interval=5,
+            )
+        except GateError:
+            statuses = self.bearer(tokens)
+        self.report.check(
+            f"{what}: the API server refuses the token(s) (401)",
+            statuses == refused,
+            str(statuses),
+        )
 
     def bearer(self, tokens: list[str]) -> list[Any]:
         """Each token's status at the API server (from the orchestrator pod,
@@ -792,7 +1017,13 @@ class ProviderMintedGate:
             {"read_only": read_only},
         )
 
-    def create_session(self, label: str, connectors: list[str]) -> str:
+    def create_session(
+        self, label: str, connectors: list[str], *, pinned: bool = False
+    ) -> str:
+        override: dict[str, Any] = {"workspace": {"backend": "sandbox"}}
+        if pinned:
+            # An Officer conference is pinned by rule: its own agent pod.
+            override["officer"] = {"conference": True}
         created = self.owner.ok(
             "POST",
             "/api/persistent/threads",
@@ -801,20 +1032,58 @@ class ProviderMintedGate:
                 "permission_mode": "autonomous",
                 "project_id": self.project,
                 "datasource_ids": [self.connectors[c] for c in connectors],
-                "config_override": {"workspace": {"backend": "sandbox"}},
+                "config_override": override,
                 "model": self.args.model,
             },
         )
         thread = str(created.get("thread_id") or created["id"])
         self.threads[label] = thread
+        self.units[label] = ("thread", thread)
         print(f"session {label}: {thread}", flush=True)
         lane = sql(f"SELECT execution_lane FROM threads WHERE id = {lit(thread)}")
-        if lane != "stateless":
-            raise GateError(f"session lane is {lane!r}, not stateless")
+        wanted = "pinned" if pinned else "stateless"
+        if lane != wanted:
+            raise GateError(f"session lane is {lane!r}, not {wanted}")
         return thread
 
+    def create_job(self, label: str, connectors: list[str]) -> str:
+        """A stateless worker job; ``review`` autonomy keeps it resting
+        (``pending_review``) rather than ending once its agent is done."""
+        created = self.owner.ok(
+            "POST",
+            "/api/jobs",
+            {
+                "description": (
+                    f"{self.title(label)}. Use the run_command tool to run "
+                    f"kubectl get configmap {MARKER_CONFIGMAP} -n {self.work} "
+                    "in the workspace shell, write its output to output/c5.txt, "
+                    "then complete the job."
+                ),
+                "project_id": self.project,
+                "datasource_ids": [self.connectors[c] for c in connectors],
+                "execution_lane": "stateless",
+                "config_override": {
+                    "workspace": {"backend": "sandbox"},
+                    "llm": {"model": self.args.model},
+                    "autonomy": "review",
+                },
+            },
+        )
+        job = str(created.get("job_id") or created["id"])
+        self.jobs[label] = job
+        self.units[label] = ("job", job)
+        print(f"job {label}: {job}", flush=True)
+        return job
+
+    def job_status(self, label: str) -> str:
+        return sql(
+            f"SELECT coalesce(status::text, '') FROM jobs WHERE id = "
+            f"{lit(self.jobs[label])}"
+        )
+
     def open_egress(self, session: str) -> None:
-        """Let this session's workspace pod reach the API server (only it)."""
+        """Let this session's or job's workspace pod reach the API server
+        (only it)."""
         service_ip = command(
             KUBE
             + ["-n", "default", "get", "service", "kubernetes"]
@@ -840,7 +1109,7 @@ class ProviderMintedGate:
                 d1d.egress_policy(
                     name,
                     self.gate_id,
-                    {"srw/thread-id": self.threads[session]},
+                    self.unit_selector(session),
                     service_ip,
                     pairs,
                 )
@@ -878,6 +1147,20 @@ class ProviderMintedGate:
         )
         if applied != str(len(MIGRATIONS)):
             raise GateError("migrations missing")
+        problem = private_hosts_problem(
+            self.orchestrator_env("CONNECTOR_PROVIDER_MINTING_ENABLED") or "true",
+            self.orchestrator_env("CONNECTOR_PROVIDER_MINTING_PRIVATE_HOSTS"),
+        )
+        self.report.check(
+            "preflight: minting is on and the orchestrator may reach "
+            f"{PRIVATE_HOST} (connectors.providerMinting)",
+            not problem,
+            problem,
+        )
+        if problem:
+            raise GateError(
+                problem + "; set it in deployment/values-local.yaml (see --help)"
+            )
         interval = self.orchestrator_env("CONNECTOR_LEASE_SWEEP_INTERVAL_SECONDS")
         try:
             self.sweep_seconds = max(5.0, float(interval or 60))
@@ -949,6 +1232,7 @@ class ProviderMintedGate:
             "create pods": self.can("create", "pods", self.ids, []),
             "get configmaps (work)": self.can("get", "configmaps", self.work, []),
         }
+        self.admission_checks()
         self.report.check(
             "fixture: the minting account may mint a token for agent only, may "
             "not read Secrets, and nothing else",
@@ -1002,17 +1286,16 @@ class ProviderMintedGate:
             status == 400 and "exec plugin" in json.dumps(parsed),
             f"HTTP {status}: {str(parsed)[:200]}",
         )
-        status, parsed = self.create_connector(
-            "kube",
-            {
-                "type": "kubeconfig",
-                "credentials": {"files": [{"contents": minting}]},
-                "config": {"token_request": token_request},
-            },
-        )
-        if status not in (200, 201) or "kube" not in self.connectors:
-            raise GateError(f"kube create answered HTTP {status}: {parsed}")
-        self.link("kube", read_only=False)
+        self.kube_body = {
+            "type": "kubeconfig",
+            "credentials": {"files": [{"contents": minting}]},
+            "config": {"token_request": token_request},
+        }
+        for label in ("kube", "kube-del"):
+            status, parsed = self.create_connector(label, self.kube_body)
+            if status not in (200, 201) or label not in self.connectors:
+                raise GateError(f"{label} create answered HTTP {status}: {parsed}")
+            self.link(label, read_only=False)
         tested = self.owner.ok(
             "POST", f"/api/datasources/{self.connectors['kube']}/test"
         )
@@ -1025,6 +1308,82 @@ class ProviderMintedGate:
             f"{tested.get('status')}: {str(tested.get('message'))[:200]}; secrets {left}",
         )
         print(f"fixture: {self.ids}, {self.work}, project {self.project}", flush=True)
+
+    def admission_checks(self) -> None:
+        """Install the recommended admission policy for this run's minter
+        and prove it narrows the Role (server-side dry runs: nothing is
+        written)."""
+        self.admission_started = True
+        d1d.apply(gate_admission_policy(self.ids, self.gate_id))
+        # A Secret that is not SRW's, for the delete the policy must refuse.
+        d1d.apply(
+            [
+                {
+                    "apiVersion": "v1",
+                    "kind": "Secret",
+                    "metadata": {
+                        "name": "not-srws",
+                        "namespace": self.ids,
+                        "labels": {GATE_LABEL: self.gate_id},
+                    },
+                    "type": "Opaque",
+                }
+            ]
+        )
+        as_minter = [f"--as=system:serviceaccount:{self.ids}:{MINTER_SA}"]
+        empty = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": "srw-mint-" + "0" * 32,
+                "namespace": self.ids,
+                "labels": {"app.kubernetes.io/managed-by": "srw"},
+            },
+            "type": "Opaque",
+            "immutable": True,
+        }
+        with_data = {
+            **empty,
+            "metadata": {**empty["metadata"], "name": "srw-mint-" + "1" * 32},
+            "stringData": {"a": "b"},
+        }
+
+        def dry_create(body: dict) -> int:
+            rc, _out, _err = run(
+                KUBE + ["create", "--dry-run=server", "-f", "-"] + as_minter,
+                data=json.dumps(body),
+                timeout=60,
+            )
+            return rc
+
+        def policy_served() -> bool:
+            # The policy takes a moment to reach the API server's admission.
+            return dry_create(with_data) != 0
+
+        try:
+            wait_for("the admission policy in force", policy_served, timeout=60)
+        except GateError:
+            pass
+        rc_delete, _out, _err = run(
+            KUBE
+            + ["-n", self.ids, "delete", "secret", "not-srws", "--dry-run=server"]
+            + as_minter,
+            timeout=60,
+        )
+        answers = {
+            "an empty, immutable srw-mint- Secret": dry_create(empty) == 0,
+            "a srw-mint- Secret with data": dry_create(with_data) != 0,
+            "deleting a Secret that is not SRW's": rc_delete != 0,
+        }
+        self.report.check(
+            "fixture: the admission policy lets the minter create an empty, "
+            "immutable srw-mint- Secret, and refuses one with data and the "
+            "delete of a Secret that is not SRW's",
+            answers["an empty, immutable srw-mint- Secret"]
+            and answers["a srw-mint- Secret with data"]
+            and answers["deleting a Secret that is not SRW's"],
+            json.dumps(answers),
+        )
 
     def bound_secrets(self) -> list[str]:
         out = command(
@@ -1073,7 +1432,7 @@ class ProviderMintedGate:
         )
         scans = {
             "workspace": in_pod(
-                self.workspace_pod(self.threads["kube"]),
+                self.workspace_pod("kube"),
                 WORKSPACE_CONTAINER,
                 swap._SCAN_PROGRAM,
                 {
@@ -1153,50 +1512,173 @@ class ProviderMintedGate:
         )
         self.second = new
 
-    def end_checks(self) -> None:
-        tokens = [self.first["token"], self.second.get("token", "")]
-        thread = self.threads["kube"]
-        self.owner.ok("DELETE", f"/api/persistent/threads/{thread}?force=true")
-        budget = max(120, int(3 * self.sweep_seconds))
-
-        def all_revoked() -> list[dict] | None:
-            rows = self.minted("kube", "kube")
-            return (
-                rows if rows and all(r["status"] == "revoked" for r in rows) else None
-            )
-
-        try:
-            rows = wait_for(
-                "End revokes the minted credentials", all_revoked, timeout=budget
-            )
-        except GateError:
-            rows = self.minted("kube", "kube")
-        reasons = {row["revoke_reason"] for row in rows}
+    def detach_checks(self) -> None:
+        """A live detach of ``kube`` from the stateless session (its config
+        PATCHed without it) revokes both of its credentials."""
+        tokens = [self.first.get("token", ""), self.second.get("token", "")]
+        self.owner.ok(
+            "PATCH",
+            f"/api/persistent/threads/{self.threads['kube']}/config",
+            {"datasource_ids": []},
+        )
+        self.expect_revoked("detach", "kube", "kube", "connector_detached", tokens)
         self.report.check(
-            "end: End revokes every minted credential of the session",
-            bool(rows) and all(row["status"] == "revoked" for row in rows),
-            str([(row["status"], row["revoke_reason"]) for row in rows]),
+            "detach: the bound Secrets are deleted", not self.bound_secrets(), ""
+        )
+
+    def job_checks(self) -> None:
+        """Two stateless worker jobs: each workspace holds the job's own
+        minted token; a cancel revokes one, a delete the other."""
+        for label, ending, reason in (
+            ("job-cancel", "cancel", "job_cancelled"),
+            ("job-delete", "delete", "job_deleted"),
+        ):
+            self.create_job(label, ["kube"])
+            self.open_egress(label)
+            row = self.wait_live(label, "kube")
+            found = self.ws_kube(label)
+            problems = workspace_problems(
+                found,
+                digest=hashlib.sha256(row["token"].encode()).hexdigest(),
+                ids=self.ids,
+                marker=self.marker,
+            )
+            self.report.check(
+                f"{label}: the stateless worker's workspace holds the job's own "
+                "minted token only, and kubectl reads the marker",
+                not problems,
+                "; ".join(problems),
+            )
+            status = self.job_status(label)
+            if status in JOB_TERMINAL:
+                self.report.check(
+                    f"{label}: the job still runs or rests before its {ending}",
+                    False,
+                    f"status {status}: its own end revoked the token first",
+                )
+                continue
+            job = self.jobs[label]
+            if ending == "cancel":
+                self.owner.ok("PUT", f"/api/jobs/{job}/cancel")
+            else:
+                self.owner.ok("DELETE", f"/api/jobs/{job}")
+            self.expect_revoked(label, label, "kube", reason, [row["token"]])
+
+    def pooled_pinned_pods(self) -> list[str]:
+        pods = json.loads(command(K + ["get", "pods", "-o", "json"]))["items"]
+        return sorted(
+            pod["metadata"]["name"]
+            for pod in pods
+            if pod["metadata"]["name"].startswith(POOLED_PINNED_PREFIX)
+            and not pod["metadata"].get("deletionTimestamp")
+            and pod.get("status", {}).get("phase") == "Running"
+        )
+
+    def pinned_checks(self) -> None:
+        """A pinned session's attach delivers its own minted token; End
+        revokes it. Pooled pinned pods keep their image after a Tilt
+        rebuild, so every one is checked first."""
+        stale = [
+            name
+            for name in self.pooled_pinned_pods()
+            if self.served_problems(name, PINNED_SERVED)
+        ]
+        self.report.check(
+            "pinned: every pooled pinned agent pod serves this checkout's "
+            "connector modules",
+            not stale,
+            (
+                f"stale: {stale}; delete the idle ones and rerun: kubectl "
+                f"--context={LOCAL_CONTEXT} -n {LOCAL_NAMESPACE} delete pod "
+                + " ".join(stale)
+            )
+            if stale
+            else "",
+        )
+        if stale:
+            raise GateError("a pooled pinned agent pod serves stale connector code")
+        self.create_session("pinned", ["kube"], pinned=True)
+        self.open_egress("pinned")
+        row = self.wait_live("pinned", "kube")
+        found = self.ws_kube("pinned")
+        problems = workspace_problems(
+            found,
+            digest=hashlib.sha256(row["token"].encode()).hexdigest(),
+            ids=self.ids,
+            marker=self.marker,
         )
         self.report.check(
-            "end: the revoke reason is the session's end (the superseded token too)",
-            "session_end" in reasons,
-            str(sorted(str(reason) for reason in reasons)),
+            "pinned: the attach delivered a kubeconfig with the session's own "
+            "minted token only; kubectl reads the marker",
+            not problems,
+            "; ".join(problems),
         )
-        left = self.bound_secrets()
-        self.report.check("end: the bound Secrets are deleted", not left, str(left))
-        try:
-            statuses = wait_for(
-                "both tokens refused",
-                lambda: (s if (s := self.bearer(tokens)) == [401, 401] else None),
-                timeout=90,
-                interval=5,
-            )
-        except GateError:
-            statuses = self.bearer(tokens)
+        self.owner.ok(
+            "DELETE", f"/api/persistent/threads/{self.threads['pinned']}?force=true"
+        )
+        self.expect_revoked(
+            "pinned end", "pinned", "kube", "session_end", [row["token"]]
+        )
+
+    def edit_checks(self) -> None:
+        """A connector edit revokes that connector's credentials only; a
+        connector delete revokes its own; the next turn mints afresh; End
+        revokes the rest."""
+        self.create_session("edit", ["kube", "kube-del"])
+        self.open_egress("edit")
+        self.turn("edit", "Reply with the single word ready.")
+        kube = self.wait_live("edit", "kube")
+        kept = self.wait_live("edit", "kube-del")
+        token_request = {
+            **self.kube_body["config"]["token_request"],
+            "expiration_seconds": 900,
+        }
+        self.owner.ok(
+            "PUT",
+            f"/api/datasources/{self.connectors['kube']}",
+            {"config": {"token_request": token_request}},
+        )
+        self.expect_revoked(
+            "connector edit", "edit", "kube", "connector_changed", [kube["token"]]
+        )
+        untouched = [
+            r for r in self.minted("edit", "kube-del") if r["status"] == "live"
+        ]
         self.report.check(
-            "end: both tokens get 401 from the API server",
-            statuses == [401, 401],
-            str(statuses),
+            "connector edit: the other connector's credential stays live",
+            [r["id"] for r in untouched] == [kept["id"]],
+            str([(r["status"], r["revoke_reason"]) for r in untouched]),
+        )
+        status, _body = self.owner.call(
+            "DELETE", f"/api/datasources/{self.connectors['kube-del']}"
+        )
+        self.report.check(
+            "connector delete: kube-del is deleted while attached",
+            status in (200, 204),
+            f"HTTP {status}",
+        )
+        self.expect_revoked(
+            "connector delete", "edit", "kube-del", "connector_deleted", [kept["token"]]
+        )
+        self.turn("edit", "Reply with the single word again.")
+        renewed = self.wait_live("edit", "kube")
+        lifetime = renewed["expires"] - renewed["minted"]
+        found = self.ws_kube("edit")
+        self.report.check(
+            "connector edit: the next turn mints kube afresh with the edited "
+            "lifetime (900 s) and delivers it",
+            renewed["id"] != kube["id"]
+            and 895 <= lifetime <= 905
+            and found.get("digest")
+            == hashlib.sha256(renewed["token"].encode()).hexdigest(),
+            f"lifetime {lifetime:.0f}",
+        )
+        self.owner.ok(
+            "DELETE", f"/api/persistent/threads/{self.threads['edit']}?force=true"
+        )
+        self.expect_revoked("end", "edit", "kube", "session_end", [renewed["token"]])
+        self.report.check(
+            "end: the bound Secrets are deleted", not self.bound_secrets(), ""
         )
 
     # -- GitHub ----------------------------------------------------------------
@@ -1332,9 +1814,31 @@ class ProviderMintedGate:
             ),
             "",
         )
+        self.app_key_line = secret(key_line) if key_line else ""
+        for token in (rw_token, ro_token):
+            if token not in self.seen_tokens:
+                self.seen_tokens.append(token)
+        agents = {}
+        for pod in self.release_pods(
+            f"{swap._SELECTOR},app.kubernetes.io/component=agent-stateless"
+        ):
+            name = pod["metadata"]["name"]
+            agents[name] = in_pod(
+                name,
+                "agent",
+                swap._SCAN_PROGRAM,
+                {"secrets": [key_line], "roots": ["/tmp", "/home"]},
+                timeout=300,
+            )["found"]
+        self.report.check(
+            "github: no stateless agent pod holds the App's key (files, "
+            "environments, command lines)",
+            not any(agents.values()),
+            json.dumps({name: found for name, found in agents.items() if found})[:300],
+        )
         needles = [key_line] + ([rw_token, ro_token] if through_swap else [])
         scan = in_pod(
-            self.workspace_pod(self.threads["gh"]),
+            self.workspace_pod("gh"),
             WORKSPACE_CONTAINER,
             swap._SCAN_PROGRAM,
             {
@@ -1377,6 +1881,75 @@ class ProviderMintedGate:
             str(statuses),
         )
 
+    # -- logs and records ------------------------------------------------------
+    def raw_logs(self, pod: str, container: str) -> str:
+        """A pod's log since the gate started, in memory only: never printed,
+        never scrubbed (the scan looks for the very values the scrubber
+        hides)."""
+        import subprocess
+
+        try:
+            done = subprocess.run(
+                K + ["logs", pod, "-c", container, f"--since-time={self.started}"],
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        except subprocess.TimeoutExpired:
+            return ""
+        return done.stdout if done.returncode == 0 else ""
+
+    def log_checks(self) -> None:
+        needles = [self.minting_token, *self.seen_tokens]
+        if self.app_key_line:
+            needles.append(self.app_key_line)
+        targets = [
+            (pod["metadata"]["name"], ORCHESTRATOR_CONTAINER)
+            for pod in self.release_pods(
+                f"{swap._SELECTOR},app.kubernetes.io/component=orchestrator"
+            )
+        ] + [
+            (pod["metadata"]["name"], "agent")
+            for pod in self.release_pods(
+                f"{swap._SELECTOR},app.kubernetes.io/component=agent-stateless"
+            )
+        ]
+        targets += [(name, "agent") for name in self.pooled_pinned_pods()]
+        hits = {
+            f"{pod}/{container}": count
+            for pod, container in targets
+            if (count := log_hits(self.raw_logs(pod, container), needles))
+        }
+        self.report.check(
+            f"logs: {len(targets)} orchestrator and agent logs hold none of the "
+            f"{len(needles)} secrets (the minting token, every minted token, the "
+            "App key)",
+            bool(targets) and not hits,
+            json.dumps(hits),
+        )
+
+    def record_checks(self) -> None:
+        ids = [value for value in self.connectors.values() if _UUID_RE.fullmatch(value)]
+        found = in_pod(
+            ORCHESTRATOR,
+            ORCHESTRATOR_CONTAINER,
+            _DONE_ROWS_PROGRAM,
+            {"connectors": ids},
+        )
+        self.report.check(
+            "records: every revoked record keeps no token and no minting credential",
+            found["done"] > 0
+            and found["with_token"] == 0
+            and found["with_minting_credential"] == 0
+            and found["unreadable"] == 0,
+            json.dumps(found),
+        )
+        self.report.check(
+            "records: no credential was abandoned (a revoke SRW gave up)",
+            found["abandoned"] == 0,
+            json.dumps(found),
+        )
+
     # -- cleanup ---------------------------------------------------------------
     def titled_threads(self) -> list[str]:
         out = sql(
@@ -1413,6 +1986,21 @@ class ProviderMintedGate:
                 return bool(wait_for("session deleted", gone, timeout=300, interval=5))
 
             step(f"delete session {thread}", delete_thread)
+        for label, job in list(self.jobs.items()):
+
+            def delete_job(job=job) -> bool:
+                def gone() -> bool:
+                    self.owner.call("PUT", f"/api/jobs/{job}/cancel")
+                    status, _body = self.owner.call("DELETE", f"/api/jobs/{job}")
+                    if status == 404:
+                        return True
+                    return (
+                        sql(f"SELECT count(*) FROM jobs WHERE id = {lit(job)}") == "0"
+                    )
+
+                return bool(wait_for("job deleted", gone, timeout=300, interval=5))
+
+            step(f"delete job {label}", delete_job)
         for label, datasource_id in list(self.connectors.items()):
 
             def delete(datasource_id=datasource_id) -> bool:
@@ -1463,6 +2051,19 @@ class ProviderMintedGate:
                     )
                 ),
             )
+        if self.admission_started:
+            name = f"srw-gate-{self.gate_id}-minted-secrets"
+            for kind in (
+                "validatingadmissionpolicybinding",
+                "validatingadmissionpolicy",
+            ):
+                step(
+                    f"delete {kind} {name}",
+                    lambda kind=kind: command(
+                        KUBE + ["delete", kind, name, "--ignore-not-found"]
+                    )
+                    is not None,
+                )
         for name in self.policies:
             step(
                 f"delete NetworkPolicy {name}",
@@ -1497,6 +2098,24 @@ class ProviderMintedGate:
         titled = self.titled_threads()
         if titled:
             left.append(f"sessions titled with the gate id: {titled}")
+        jobs = sql(
+            "SELECT count(*) FROM jobs WHERE "
+            f"position({lit(self.gate_id)} in coalesce(description, '')) > 0"
+        )
+        if jobs != "0":
+            left.append(f"{jobs} jobs")
+        if self.admission_started:
+            for kind in (
+                "validatingadmissionpolicy",
+                "validatingadmissionpolicybinding",
+            ):
+                listing = command(
+                    KUBE
+                    + ["get", kind, "-l", f"{GATE_LABEL}={self.gate_id}"]
+                    + ["-o", "name"]
+                )
+                if listing:
+                    left.append(f"{kind} {listing.split()}")
         prefix = self.gate_id + " %"
         count = sql(f"SELECT count(*) FROM datasources WHERE name LIKE {lit(prefix)}")
         if count != "0":
@@ -1549,6 +2168,20 @@ class ProviderMintedGate:
                     left.append(f"Keycloak residue {counts}")
             except GateError as exc:
                 left.append(f"Keycloak residue unknown ({exc})")
+        for job in self.jobs.values():
+            try:
+                wait_for(
+                    f"pods of job {job} gone",
+                    lambda job=job: not json.loads(
+                        command(
+                            K + ["get", "pods", "-l", f"srw/job-id={job}", "-o", "json"]
+                        )
+                    )["items"],
+                    timeout=180,
+                    interval=10,
+                )
+            except GateError:
+                left.append(f"pods of job {job}")
         for thread in self.threads.values():
             try:
                 wait_for(
@@ -1580,7 +2213,16 @@ class ProviderMintedGate:
             self.accounts()
             self.fixture()
             self.mint_checks()
-            for phase in (self.renewal_checks, self.end_checks, self.github_checks):
+            for phase in (
+                self.renewal_checks,
+                self.detach_checks,
+                self.job_checks,
+                self.pinned_checks,
+                self.edit_checks,
+                self.github_checks,
+                self.log_checks,
+                self.record_checks,
+            ):
                 try:
                     phase()
                 except GateError as exc:
@@ -1597,6 +2239,7 @@ class ProviderMintedGate:
                         {
                             "connectors": self.connectors,
                             "threads": self.threads,
+                            "jobs": self.jobs,
                             "project": self.project,
                             "namespaces": [self.ids, self.work],
                         }

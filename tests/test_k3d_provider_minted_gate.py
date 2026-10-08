@@ -95,12 +95,22 @@ def test_dry_run_prints_the_plan_and_touches_nothing(no_cluster, capsys):
     for phase in (
         "preflight",
         "serviceaccounts/token",
+        "ValidatingAdmissionPolicy",
         "NetworkPolicy",
         "renewal",
+        "detach",
+        "cancel",
+        "pinned",
+        "connector edit",
+        "connector delete",
+        "logs",
+        "records",
         "401",
         "github: skipped",
         "cleanup",
         "sweepIntervalSeconds",
+        "connectors.providerMinting.privateHosts",
+        '["kubernetes.default.svc"]',
     ):
         assert phase in out
     assert gate.main([*GITHUB, "--github-key-file", "k"]) == 0
@@ -112,7 +122,10 @@ def test_every_kubectl_targets_the_local_context():
     assert gate.K[:4] == ["kubectl", "--context=k3d-srw", "-n", "srw"]
 
 
-@pytest.mark.parametrize("name", ["_MINTED_PROGRAM", "_BEARER_PROGRAM", "_WS_PROGRAM"])
+@pytest.mark.parametrize(
+    "name",
+    ["_MINTED_PROGRAM", "_BEARER_PROGRAM", "_WS_PROGRAM", "_DONE_ROWS_PROGRAM"],
+)
 def test_embedded_programs_compile_and_cap_their_memory(name):
     program = getattr(gate, name).replace("REQUEST", "'{}'")
     compile(program, name, "exec")
@@ -319,3 +332,46 @@ def test_without_github_arguments_the_phase_is_skipped_with_a_note(capsys):
     runner.github_checks()
     out = capsys.readouterr().out
     assert "NOTE github: SKIPPED" in out and runner.report.results == []
+
+
+def test_the_admission_policy_is_the_recommended_one_named_for_the_run():
+    from shared.connectors.token_request import admission_policy
+
+    policy, binding = gate.gate_admission_policy(IDS, GATE_ID)
+    name = f"srw-gate-{GATE_ID}-minted-secrets"
+    assert policy["metadata"] == {"name": name, "labels": {gate.GATE_LABEL: GATE_ID}}
+    assert binding["metadata"]["name"] == name
+    assert binding["spec"]["policyName"] == name
+    recommended, _ = admission_policy(IDS, gate.MINTER_SA)
+    assert policy["spec"] == recommended["spec"]
+    assert f"system:serviceaccount:{IDS}:minter" in json.dumps(policy["spec"])
+    assert binding["spec"]["matchResources"]["namespaceSelector"] == {
+        "matchLabels": {"kubernetes.io/metadata.name": IDS}
+    }
+
+
+def test_the_log_scan_counts_without_naming():
+    assert gate.log_hits("a token-1 b", ["token-1", "token-2", ""]) == 1
+    assert gate.log_hits("", ["token-1"]) == 0
+
+
+@pytest.mark.parametrize(
+    ("enabled", "hosts", "ok"),
+    [
+        ("true", "kubernetes.default.svc", True),
+        ("", "Kubernetes.Default.Svc, ghe.corp", True),
+        ("true", "kubernetes.default.svc:443", True),
+        ("false", "kubernetes.default.svc", False),
+        ("true", "", False),
+        ("true", "kubernetes.default", False),
+    ],
+)
+def test_the_preflight_needs_minting_on_and_the_api_server_listed(enabled, hosts, ok):
+    assert (gate.private_hosts_problem(enabled, hosts) == "") is ok
+
+
+def test_the_pinned_served_set_exists():
+    for directory in gate.PINNED_SERVED.dirs:
+        assert (_ROOT / directory).is_dir(), directory
+    for path in gate.PINNED_SERVED.files:
+        assert (_ROOT / path).is_file(), path
