@@ -297,7 +297,7 @@ def test_a_backend_swap_installs_the_environment_on_the_new_backend():
     assert installed == [{"K": "v"}]
 
 
-def test_a_live_change_rewrites_the_whole_environment():
+def test_a_live_change_installs_the_new_set():
     installed: list = []
     old = deliveries_from_payload(
         [{"type": "generic", "credentials": {"env_vars": {"OLD": "1"}}}]

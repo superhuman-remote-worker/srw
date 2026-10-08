@@ -66,8 +66,11 @@ class EnvFileMaterializer:
         new: Sequence[Delivery],
         rt: RuntimeContext,
     ) -> None:
-        # The file is rewritten whole: a detached connector's variables go
-        # with it.
+        # The current set is installed again. The workspace program merges
+        # it into what earlier installs left: a detached connector's values
+        # stay in the session workspace, as agreed for v1
+        # (shared.runtime.core.credential_env), and a ``credentials``
+        # connector cannot be detached live at all.
         self.materialize(new, rt)
 
     def on_backend_swap(self, deliveries: Sequence[Delivery], backend: Any) -> None:
