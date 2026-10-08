@@ -1,0 +1,56 @@
+{
+  "name": "example.env/v1",
+  "title": "Example environment driver",
+  "protocol_version": "1.0",
+  "plane": "bind_time",
+  "delivery_forms": ["env_file", "credential_file"],
+  "config_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["variable"],
+    "properties": {
+      "variable": {
+        "type": "string",
+        "pattern": "^[A-Z][A-Z0-9_]{0,63}$",
+        "description": "The environment variable the workspace receives the credential in",
+        "x-srw-order": 1
+      },
+      "file": {
+        "type": "string",
+        "description": "Also write the credential to this file (for example ~/.srw-files/example/token)",
+        "x-srw-order": 2
+      }
+    }
+  },
+  "credential_slots": [
+    {
+      "name": "token",
+      "kind": "secret_string",
+      "schema": {
+        "type": "object",
+        "properties": {"token": {"type": "string", "writeOnly": true}}
+      },
+      "required": true,
+      "update": "replace"
+    }
+  ],
+  "access_levels": [
+    {
+      "id": "ReadOnly",
+      "rank": 0,
+      "enforced_by": "Told to the agent only; the same credential is delivered either way.",
+      "advisory": true
+    },
+    {
+      "id": "ReadWrite",
+      "rank": 1,
+      "enforced_by": "The upstream credential decides what is allowed."
+    }
+  ],
+  "default_access": "ReadWrite",
+  "supported_backends": ["sandbox", "vm"],
+  "workspace_requirements": "A shell workspace: the variable is sourced for every command.",
+  "operations": ["gc"],
+  "egress": [],
+  "holds_upstream_credentials": true
+}

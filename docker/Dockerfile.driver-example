@@ -1,0 +1,24 @@
+# =============================================================================
+# srw-driver-example — the example bind-time driver (connector drivers D6)
+# =============================================================================
+# example.env/v1: the driver docs/connector-drivers.md walks through, the one
+# scripts/srw-driver-test.py checks in CI, and the image
+# scripts/k3d-custom-driver-gate.py registers. Not an SRW driver: its name is
+# outside srw.*, like any driver someone registers.
+#
+# Its spec is the io.srw.driver.spec label, given at build time from the
+# spec file (a JSON label is safest on the command line):
+#   docker build -f docker/Dockerfile.driver-example \
+#     --label "io.srw.driver.spec=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), separators=(",", ":")))' drivers/example/spec.json)" \
+#     -t registry.example/you/example-driver:1 .
+# Built without the label, SRW asks the image for its spec instead (its spec
+# operation, in a sandboxed pod).
+# =============================================================================
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+COPY drivers/example/srw_example_driver.py drivers/example/spec.json /driver/
+# Any user works (root included, under SRW's namespace baseline); this one
+# shows a driver need not be root.
+USER 10001:10001
+ENTRYPOINT ["python3", "/driver/srw_example_driver.py"]
