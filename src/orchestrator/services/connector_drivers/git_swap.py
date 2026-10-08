@@ -5,20 +5,27 @@ type, found by name, that serves the rows of token repositories on HTTPS.
 The connector stays a ``repository`` connector (its form, its create and
 update, its Test are ``srw.repository/v1``'s); what changes is delivery:
 
-* :func:`route_token_repository` decides, at bind, what a token repository's
-  payload entry becomes. Through the swap: the clean upstream URL as its
-  remote, a ``git_swap`` block the lease step fills with the driver's
+* :func:`route_token_repository` decides, at bind, whether a token
+  repository's payload entry is a swap candidate: the driver is installed
+  and the URL is HTTPS on port 443. A candidate keeps its URL as stored and
+  its forge token and gains an empty ``git_swap`` block; the lease step decides
+  per entry whether the driver serves it now (the workspace, the
+  connector's pods, the upstream, the image:
+  :mod:`orchestrator.services.connector_git_swap_delivery`) and turns it
+  into the driver's entry (the clean upstream URL, a lease, the driver's
   endpoint and SRW's certificate authority, and only the forge token the
-  agent process keeps for the pull-request tools (the lease step adds the
-  lease). Where the swap cannot serve it (the driver is not installed, or
-  the URL is not HTTPS on port 443) the installation's fallback applies,
-  explicitly and logged: the token in the clone URL as before C3
-  (``token-in-url``, the default), or no delivery with the reason
-  (``refuse``);
+  agent process keeps for the pull-request tools) or puts it on the
+  installation's fallback. Where the driver is installed but cannot serve
+  the URL (not HTTPS on port 443), the fallback applies at once, explicitly
+  and logged: the token in the clone URL as before C3 (``token-in-url``,
+  the default), or no delivery (``refuse``); either way the entry says
+  why. An installation without the driver sends what it always sent (or
+  refuses, where its fallback says so);
 * :meth:`GitSwapDriver.lease_upstream` answers the lease exchange: the forge
   token and the one upstream the driver may reach;
 * :meth:`GitSwapDriver.service_connector` is the connector its pods are built
-  from: the clean upstream URL and its host, which the pod's egress pins.
+  from: the clean upstream URL and its host, which the pod's egress pins,
+  and the connector's ``upstream_ca`` (a forge behind a private CA).
 
 Installed only when the chart turns it on (``connectors.drivers.gitSwap``)
 with service-pod hosting and SRW's driver certificate authority.
@@ -41,13 +48,8 @@ from shared.connectors.git_swap import (
 
 logger = logging.getLogger(__name__)
 
-#: Fallbacks already logged, by (connector, reason): every bind of a long
-#: session would repeat the line.
-_NOTED: set[tuple[str, str]] = set()
-_NOTED_MAX = 1024
 
-
-def _token_auth(entry: Mapping[str, Any], credentials: Mapping[str, Any]) -> bool:
+def token_auth(entry: Mapping[str, Any], credentials: Mapping[str, Any]) -> bool:
     """Whether a repository entry clones with a token (the agent's
     ``checkout_auth`` rule: an explicit method, else an SSH identity or key
     means SSH, a token means token)."""
@@ -71,7 +73,7 @@ class GitSwapDriver(DatasourceDriver):
 
     def lease_upstream(self, row: Mapping[str, Any]) -> dict[str, Any]:
         credentials = stored_json_object(row.get("credentials"))
-        if not _token_auth(row, credentials):
+        if not token_auth(row, credentials):
             raise ValueError("The repository connector holds no token")
         upstream = swap_upstream(row.get("connection_url"))
         return {
@@ -80,13 +82,21 @@ class GitSwapDriver(DatasourceDriver):
         }
 
     def service_connector(self, row: Mapping[str, Any]) -> Mapping[str, Any]:
+        from orchestrator.services.connector_git_swap_delivery import upstream_ca_of
+
         try:
             upstream = swap_upstream(row.get("connection_url"))
         except UnservedUpstream:
             # No host to pin: the pod is refused at launch (and a running one
             # stops: its declared egress no longer holds).
             return {**row, "config": {}}
-        return {**row, "config": {"upstream": upstream.url, "host": upstream.host}}
+        config = {"upstream": upstream.url, "host": upstream.host}
+        ca = upstream_ca_of(row.get("config"))
+        if ca is not None:
+            # The only roots the pod trusts its upstream with (a private CA);
+            # a change starts a new pod (the credential generation).
+            config["upstream_ca"] = ca
+        return {**row, "config": config}
 
 
 def route_token_repository(
@@ -98,48 +108,35 @@ def route_token_repository(
     """Route a repository payload entry, in place (see the module docstring).
 
     ``git_swap`` is the installed :class:`GitSwapDriver` or ``None``. An entry
-    that does not clone with a token is left alone. A fallback is logged on
-    this module's logger once per connector and reason (every claim of a
-    session binds again); the ``token-in-url`` entry is the one SRW sent
-    before C3, byte for byte.
+    that does not clone with a token is left alone. A fallback is logged
+    once per connector and reason (every claim of a session binds again);
+    the ``token-in-url`` entry is the one SRW sent before C3 plus the block
+    that says why.
     """
+    from orchestrator.services.connector_git_swap_delivery import apply_fallback
+
     credentials = entry.get("credentials")
-    if not isinstance(credentials, Mapping) or not _token_auth(entry, credentials):
+    if not isinstance(credentials, Mapping) or not token_auth(entry, credentials):
         return
-    reason = None
     if git_swap is None:
-        reason = "the git swap driver is not installed (connectors.drivers.gitSwap)"
-    else:
-        try:
-            upstream = swap_upstream(entry.get("connection_url"))
-        except UnservedUpstream as exc:
-            reason = f"the git swap driver cannot serve it: {exc}"
-    if reason is None:
-        entry["connection_url"] = upstream.url
-        entry["credentials"] = {"auth_method": "token", "token": credentials["token"]}
-        entry["git_swap"] = {}
-        return
-    connector = str(entry.get("datasource_id") or entry.get("name") or "?")
-    refused = fallback == FALLBACK_REFUSE
-    note = (connector, reason)
-    if note not in _NOTED:
-        if len(_NOTED) >= _NOTED_MAX:
-            _NOTED.clear()
-        _NOTED.add(note)
-        logger.warning(
-            "Repository connector %s %s: %s (connectors.drivers.gitSwap.fallback=%s)",
-            connector,
-            "is not delivered" if refused else "delivers its token in the clone URL",
-            reason,
-            fallback,
-        )
-    if refused:
-        entry["credentials"] = {}
-        entry["git_swap"] = {
-            "unavailable": (
-                f"{reason}; this installation refuses token-in-URL delivery"
+        # An installation without the driver: the entry SRW always sent,
+        # untouched (or refused, where the installation says so).
+        if fallback == FALLBACK_REFUSE:
+            apply_fallback(
+                entry,
+                "the git swap driver is not installed (connectors.drivers.gitSwap)",
+                fallback=fallback,
             )
-        }
+        return
+    try:
+        swap_upstream(entry.get("connection_url"))
+    except UnservedUpstream as exc:
+        apply_fallback(
+            entry, f"the git swap driver cannot serve it: {exc}", fallback=fallback
+        )
+        return
+    # A candidate: the lease step decides per delivery.
+    entry["git_swap"] = {}
 
 
-__all__ = ["GitSwapDriver", "route_token_repository"]
+__all__ = ["GitSwapDriver", "route_token_repository", "token_auth"]

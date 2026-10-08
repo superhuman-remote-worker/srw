@@ -2878,6 +2878,8 @@
       "sshHostHint": "Optional. Mit einem Host verwendet ein einfaches `ssh <host>` im Arbeitsbereich diesen Schlüssel; ohne Host über den IdentityAgent, den die README des Arbeitsbereichs nennt.",
       "sshKnownHostsLabel": "Fixierter Host-Schlüssel",
       "sshKnownHostsHint": "Optional. Fügen Sie den Host-Schlüssel ein (oder testen Sie den Konnektor und fixieren Sie den gemeldeten Schlüssel), damit ein Server mit einem anderen Schlüssel abgelehnt wird. Nicht fixierten Hosts wird beim ersten Kontakt vertraut.",
+      "upstreamCaLabel": "Upstream-CA (optional)",
+      "upstreamCaHint": "Nur für eine Forge hinter einer privaten Zertifizierungsstelle: Fügen Sie deren CA-Zertifikat(e) im PEM-Format ein. Der Git-Swap-Treiber von SRW vertraut der Forge dann nur mit diesen; ohne CA prüft er öffentliche Stammzertifikate. Der Test zeigt, wie das Token zugestellt wird.",
       "sshPinHostKey": "Diesen Host-Schlüssel fixieren",
       "sshAgentNoticeTitle": "Nutzbar, nicht lesbar",
       "sshAgentNotice": "Der Agent kann mit diesem Schlüssel signieren, ihn aber nicht lesen. In einem VM-Arbeitsbereich kann root (nach genehmigtem sudo) es. Verwenden Sie einen eng zugeschnittenen Schlüssel.",

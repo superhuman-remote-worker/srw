@@ -2234,6 +2234,10 @@ spec:
         - name: connector-driver-ca
           secret:
             secretName: {{ include "srw.connectorDriverCaSecretName" . }}
+            # A missing Secret means "the git swap driver is not installed;
+            # token repositories take the fallback", never a pod that cannot
+            # start (the orchestrator logs it).
+            optional: true
             defaultMode: 0444
             items:
               - key: tls.crt

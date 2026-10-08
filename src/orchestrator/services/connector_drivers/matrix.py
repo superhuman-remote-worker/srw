@@ -362,6 +362,7 @@ def _service(service: ServiceSpec | None) -> dict[str, Any] | None:
         "port": service.port,
         "callers": list(service.callers),
         "tls": service.tls,
+        "idle_seconds": service.idle_seconds,
     }
 
 

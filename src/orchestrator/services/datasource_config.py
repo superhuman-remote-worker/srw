@@ -179,6 +179,19 @@ def normalize_repository_config(
         )
 
     out["forge"] = forge
+    # The git swap driver's roots for a forge behind a private CA (C3).
+    from orchestrator.services.connector_git_swap_delivery import (  # noqa: PLC0415
+        validate_upstream_ca,
+    )
+
+    try:
+        upstream_ca = validate_upstream_ca(out.get("upstream_ca"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    if upstream_ca is None:
+        out.pop("upstream_ca", None)
+    else:
+        out["upstream_ca"] = upstream_ca
     return out
 
 

@@ -297,6 +297,9 @@ REPOSITORY_SPEC = DriverSpec(
         "properties": {
             "forge": {"enum": list(FORGES)},
             "known_hosts": {"type": "string", "x-srw-multiline": True},
+            # PEM certificates the git swap driver alone trusts the upstream
+            # with (a forge behind a private CA); not a secret.
+            "upstream_ca": {"type": "string", "x-srw-multiline": True},
             "endpoint": _ENDPOINT,
             "default_branch": _MIRROR,
             "auth_method": _AUTH_METHOD,
@@ -1104,6 +1107,7 @@ GIT_SWAP_SPEC = DriverSpec(
             "endpoint": _ENDPOINT,
             "default_branch": _MIRROR,
             "auth_method": _AUTH_METHOD,
+            "upstream_ca": {"type": "string", "x-srw-multiline": True},
             "upstream": _MIRROR,
             "host": _MIRROR,
         },
@@ -1167,6 +1171,9 @@ GIT_SWAP_SPEC = DriverSpec(
         tls=True,
         resources={"limits": {"cpu": "1", "memory": "128Mi"}},
         start_seconds=20,
+        # A first clone waits for a cold pod: keep one an hour after its
+        # last binding ends (C3 review S1).
+        idle_seconds=3600,
     ),
 )
 #: Service drivers SRW ships as its own images (each off until the chart
@@ -1266,13 +1273,19 @@ def mcp_spec_for(credentials: Any) -> DriverSpec:
 def git_swap_entry(row: Any) -> bool:
     """Whether a payload entry is a token repository bound through the git
     swap driver (C3): its ``git_swap`` block, empty until the lease step
-    fills in the driver's endpoint, and without an ``unavailable`` reason
-    (a token repository the installation refuses instead)."""
+    decides it can be served and fills in the driver's endpoint, and
+    without an ``unavailable`` reason (a token repository the installation
+    refuses instead) or a ``fallback`` one (a token repository the lease
+    step put on the installation's token-in-URL fallback)."""
     get = getattr(row, "get", None)
     if not callable(get) or get("type") != REPOSITORY_SPEC.legacy_type:
         return False
     block = get("git_swap")
-    return isinstance(block, Mapping) and "unavailable" not in block
+    return (
+        isinstance(block, Mapping)
+        and "unavailable" not in block
+        and "fallback" not in block
+    )
 
 
 def driver_spec_for_row(row: Any) -> DriverSpec | None:

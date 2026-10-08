@@ -486,11 +486,14 @@ async def deliver_connector_leases(
     token}}`` and nothing else but the driver's ``harness_credentials``
     (the git swap's forge token, for the agent process), so no other
     upstream secret can ride along; an entry SRW cannot lease delivers no
-    token. A git swap entry's ``git_swap`` block gets the driver's URL and
-    SRW's certificate authority. The access level is the one the agent binds
-    the entry at (``effective_access``). Returns how many entries carry a
-    lease. The caller holds the connection (and the transaction the delivery
-    belongs to).
+    token. A git swap candidate is decided here, per entry
+    (:func:`connector_git_swap_delivery.git_swap_problem`, then its image):
+    served, it gets the driver's URL and SRW's certificate authority in its
+    ``git_swap`` block; not, it takes the installation's fallback and says
+    why, and never fails the delivery. The access level is the one the
+    agent binds the entry at (``effective_access``). Returns how many
+    entries carry a lease. The caller holds the connection (and the
+    transaction the delivery belongs to).
 
     Entries are issued in connector-id order (the payload keeps its own
     order), so every transaction that takes several connectors' rows takes
@@ -508,19 +511,37 @@ async def deliver_connector_leases(
         spec = lease_spec(entry)
         if spec is None:
             continue
-        kept = harness_credentials(entry, spec)
-        entry["credentials"] = dict(kept)
         connector_id = str(entry.get("datasource_id") or "")
+        swap = git_swap_entry(entry)
+        if swap:
+            # Decided per entry, before any credential is touched: a
+            # candidate the driver cannot serve keeps its pre-C3 entry.
+            from orchestrator.services import connector_git_swap_delivery as swaps
+
+            try:
+                UUID(connector_id)
+            except ValueError:
+                swaps.apply_fallback(entry, "the entry names no connector id")
+                continue
+            problem = await swaps.git_swap_problem(
+                conn, entry, connector_id=connector_id, owner=owner
+            )
+            if problem is not None:
+                swaps.apply_fallback(entry, problem)
+                continue
+        kept = harness_credentials(entry, spec)
         access = effective_access(entry, spec)
         try:
             UUID(connector_id)
         except ValueError:
+            entry["credentials"] = dict(kept)
             logger.warning(
                 "A %s connector entry names no connector id; no lease delivered",
                 spec.name,
             )
             continue
         if access is None:
+            entry["credentials"] = dict(kept)
             logger.warning(
                 "Driver %s has no access levels; no lease delivered", spec.name
             )
@@ -533,9 +554,23 @@ async def deliver_connector_leases(
                 bind_service_image,
             )
 
-            image_digest = await bind_service_image(
-                conn, spec=spec, connector_id=connector_id, owner=owner
-            )
+            try:
+                image_digest = await bind_service_image(
+                    conn, spec=spec, connector_id=connector_id, owner=owner
+                )
+            except LeaseDeliveryError as exc:
+                if not swap:
+                    entry["credentials"] = dict(kept)
+                    raise
+                from orchestrator.services import connector_git_swap_delivery as swaps
+
+                swaps.apply_fallback(entry, f"its driver's image is not usable ({exc})")
+                continue
+        if swap:
+            from orchestrator.services import connector_git_swap_delivery as swaps
+
+            swaps.serve_through_swap(entry)
+        entry["credentials"] = dict(kept)
         lease = await issue_or_redeliver(
             conn,
             owner=owner,
@@ -559,9 +594,26 @@ async def deliver_connector_leases(
             entry["connection_url"] = _managed_mcp_url(spec, connector_id, image_digest)
         elif git_swap_entry(entry):
             # The workspace's git reaches the driver at this digest (C3).
-            entry["git_swap"] = _git_swap_block(
-                spec, connector_id, image_digest, entry.get("connection_url")
+            try:
+                entry["git_swap"] = _git_swap_block(
+                    spec, connector_id, image_digest, entry.get("connection_url")
+                )
+            except LeaseDeliveryError as exc:
+                # Checked before the lease; a late failure still falls back
+                # (the lease goes unused and ends with its execution).
+                from orchestrator.services import connector_git_swap_delivery as swaps
+
+                entry["credentials"] = dict(kept)
+                swaps.apply_fallback(entry, str(exc))
+                continue
+        if getattr(lease, "issued", False) and spec.plane == "service":
+            # A new binding: its pod starts on the reconciler's next pass;
+            # ask for that pass now rather than at the interval (S1).
+            from orchestrator.services.connector_service_hosting import (
+                request_reconcile,
             )
+
+            request_reconcile()
         delivered += 1
     return delivered
 
@@ -642,8 +694,10 @@ async def prepare_lease_delivery(
     A new binding of a service-plane driver runs on an image digest the
     registry answers (D5): the lookup, the image row and a refusal audit
     happen here, on ``db``'s own connections, so the delivery inside the
-    caller's transaction does no network and no write of its own. No-op
-    without such an entry; never raises (the delivery applies the outcome).
+    caller's transaction does no network and no write of its own. A git
+    swap candidate's upstream is checked here too (its egress and its TLS,
+    C3). No-op without such an entry; never raises (the delivery applies
+    the outcome).
     """
     if not any(
         isinstance(entry, Mapping)
@@ -652,11 +706,15 @@ async def prepare_lease_delivery(
         for entry in entries or ()
     ):
         return
+    from orchestrator.services.connector_git_swap_delivery import (
+        prepare_git_swap_delivery,
+    )
     from orchestrator.services.connector_service_images import (
         prepare_service_images,
     )
 
     await prepare_service_images(entries, owner=owner, store=db)
+    await prepare_git_swap_delivery(db, entries)
 
 
 async def deliver_connector_leases_with(

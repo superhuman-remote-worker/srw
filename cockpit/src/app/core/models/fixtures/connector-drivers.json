@@ -479,6 +479,10 @@
             "type": "string",
             "x-srw-multiline": true
           },
+          "upstream_ca": {
+            "type": "string",
+            "x-srw-multiline": true
+          },
           "endpoint": {
             "type": "string",
             "readOnly": true

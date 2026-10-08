@@ -839,9 +839,37 @@ describe('DatasourceListComponent SSH connector host keys', () => {
     expect(api.createDatasource.mock.calls[0][0].config).toEqual(config);
   });
 
+  it('keeps a token repository\'s upstream CA across an edit, and only for a token', () => {
+    const ca = '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----';
+    const {api, component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      type: 'repository',
+      connection_url: 'https://git.corp.example/acme/widget.git',
+      config: {forge: 'gitlab', upstream_ca: ca},
+    });
+    expect(component.repoUpstreamCa).toBe(ca);
+    component.doSave();
+    expect(api.updateDatasource.mock.calls[0][1].config).toEqual({forge: 'gitlab', upstream_ca: ca});
+
+    component.openCreateForm();
+    expect(component.repoUpstreamCa).toBe('');
+    component.onScopeModeChange('all');
+    component.formData.name = 'Widget';
+    component.formData.type = 'repository';
+    component.onConnectionUrlChange('https://github.com/acme/widget');
+    component.repoUpstreamCa = ca;
+    component.gitAuthMethod = 'ssh';
+    component.gitSshKey = 'key';
+    component.doSave();
+    expect(api.createDatasource.mock.calls[0][0].config).toEqual({forge: 'github'});
+  });
+
   it('names every new string in the catalogue', () => {
     const form = (en as {datasources: {form: Record<string, string>}}).datasources.form;
     for (const key of [
+      'upstreamCaLabel',
+      'upstreamCaHint',
       'sshHostLabel',
       'sshUserLabel',
       'sshPortLabel',

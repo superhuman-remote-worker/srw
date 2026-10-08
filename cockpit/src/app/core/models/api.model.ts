@@ -402,6 +402,9 @@ export interface DatasourceConfig {
   /** ssh_key and SSH-key repository: pinned host keys (``<type> <base64>``
    *  or known_hosts lines). Unpinned hosts are trusted on first use. */
   known_hosts?: string;
+  /** Token repository: PEM certificates SRW's git swap driver alone trusts
+   *  the forge with (a forge behind a private CA). Not a secret. */
+  upstream_ca?: string;
 }
 
 export type DatasourceIndexState =

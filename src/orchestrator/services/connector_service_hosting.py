@@ -125,8 +125,35 @@ CLUSTER_STRIKES = 2
 EGRESS_WITHDRAWN = "egress_withdrawn"
 #: A pinned host resolved to other addresses: a replacement serves now.
 EGRESS_REPINNED = "egress_repinned"
+#: The driver reported at start that its upstream is unreachable or does not
+#: verify (exit code :data:`UPSTREAM_EXIT_CODE` and a termination message):
+#: the git swap driver (C3).
+UPSTREAM_UNREACHABLE = "upstream_unreachable"
+UPSTREAM_EXIT_CODE = 78
 #: Stops that back the key off before the next start.
-_BACKOFF_REASONS = (LAUNCH_REFUSED, LAUNCH_FAILED, START_TIMEOUT, CAPACITY)
+_BACKOFF_REASONS = (
+    LAUNCH_REFUSED,
+    LAUNCH_FAILED,
+    START_TIMEOUT,
+    CAPACITY,
+    UPSTREAM_UNREACHABLE,
+)
+#: The running reconciler loop's wake-up (one per process): a delivery that
+#: issues a new service binding asks for a pass now (C3 review S1).
+_WAKE: dict[str, asyncio.Event] = {}
+#: How long a woken pass waits first: the delivery's transaction commits the
+#: binding the pass must see.
+WAKE_SETTLE_SECONDS = 1.0
+
+
+def request_reconcile() -> None:
+    """Ask this process's reconciler loop for a pass now (no-op where the
+    loop does not run: another replica leads, or hosting is off)."""
+    event = _WAKE.get("event")
+    if event is not None:
+        event.set()
+
+
 _CAPACITY_LOCK = "srw-connector-service-capacity"
 
 
@@ -172,6 +199,9 @@ class PodState:
     reason: str | None = None
     unready_since: datetime | None = None
     message: str | None = None
+    #: The driver container's report that its upstream is unreachable or
+    #: untrusted (it exited with :data:`UPSTREAM_EXIT_CODE`), else ``None``.
+    upstream: str | None = None
 
     @property
     def absent(self) -> bool:
@@ -214,6 +244,24 @@ def _init_failure(status: Any, limit: int = 300) -> str | None:
             text = lines[-1] if lines else f"exit {_field(terminated, 'exitCode')}"
             text = f"{_field(item, 'name')}: {text}"
             return text if len(text) <= limit else text[: limit - 3] + "..."
+    return None
+
+
+def _upstream_failure(driver_status: Any, limit: int = 300) -> str | None:
+    """The driver container's own report that it cannot use its upstream:
+    it exited with :data:`UPSTREAM_EXIT_CODE` (now or last time), and its
+    termination message says why. Any other exit is the start timeout's."""
+    for key in ("state", "lastState"):
+        terminated = _field(_field(driver_status, key), "terminated")
+        if terminated is None or _field(terminated, "exitCode") != UPSTREAM_EXIT_CODE:
+            continue
+        lines = [
+            line.strip()
+            for line in str(_field(terminated, "message") or "").splitlines()
+            if line.strip()
+        ]
+        text = lines[-1] if lines else "the driver cannot use its upstream"
+        return text if len(text) <= limit else text[: limit - 3] + "..."
     return None
 
 
@@ -390,6 +438,7 @@ class ServicePodRuntime:
                 else _timestamp(_field(condition, "lastTransitionTime"))
             ),
             message=_init_failure(status),
+            upstream=_upstream_failure(driver),
         )
 
     async def _delete(self, delete: Callable[..., Any], name: str) -> None:
@@ -1252,6 +1301,17 @@ class ServiceHostingReconciler:
             # pod while bindings need one.
             await self._stop(row, POD_LOST, report)
             return False
+        if not state.ready and state.upstream is not None:
+            # The driver said at start that it cannot reach or trust its
+            # upstream: stop now, back the key off, and let deliveries fall
+            # back instead of waiting out the start timeout.
+            logger.warning(
+                "Driver pod %s cannot use its upstream (%s); stopping it",
+                identity.pod_name,
+                state.upstream,
+            )
+            await self._stop(row, UPSTREAM_UNREACHABLE, report, error=state.upstream)
+            return False
         timeout = self.settings.start_timeout_seconds
         if state.ready:
             if row["ready_at"] is None:
@@ -1309,10 +1369,19 @@ class ServiceHostingReconciler:
                     identity_id,
                 )
                 return True
-        if (self.clock() - idle_since).total_seconds() >= self.settings.idle_seconds:
+        if (self.clock() - idle_since).total_seconds() >= self._idle_seconds(row):
             await self._stop(row, IDLE, report)
             return False
         return True
+
+    def _idle_seconds(self, row: Mapping[str, Any]) -> float:
+        """How long a pod of this driver stays without bindings: the
+        installation's idle time, or the driver's own when longer (the git
+        swap driver: a first clone otherwise waits for a cold pod again after
+        every idle stretch)."""
+        spec = self._service_specs().get(str(row["driver"]))
+        own = spec.service.idle_seconds if spec is not None else None
+        return max(float(self.settings.idle_seconds), float(own or 0))
 
     async def reconcile_once(self) -> ReconcileReport:
         report = ReconcileReport()
@@ -1762,7 +1831,9 @@ async def connector_service_reconciler(
     build: Callable[[], ServiceHostingReconciler | None],
     interval_seconds: float,
 ) -> None:
-    """Leader-gated loop: reconcile service pods every ``interval_seconds``.
+    """Leader-gated loop: reconcile service pods every ``interval_seconds``,
+    and soon after :func:`request_reconcile` (a new binding's delivery on
+    this process).
 
     ``build`` returns ``None`` while Kubernetes is unavailable. A failed pass
     is logged and the next one runs on time; every step re-reads durable
@@ -1770,8 +1841,25 @@ async def connector_service_reconciler(
     leader.
     """
     logger.info("Connector service reconciler started (every %.0fs)", interval_seconds)
+    wake = asyncio.Event()
+    _WAKE["event"] = wake
+    try:
+        await _reconcile_loop(shutdown_event, build, interval_seconds, wake)
+    finally:
+        if _WAKE.get("event") is wake:
+            _WAKE.pop("event", None)
+    logger.info("Connector service reconciler stopped")
+
+
+async def _reconcile_loop(
+    shutdown_event: asyncio.Event,
+    build: Callable[[], ServiceHostingReconciler | None],
+    interval_seconds: float,
+    wake: asyncio.Event,
+) -> None:
     while not shutdown_event.is_set():
         started = time.monotonic()
+        wake.clear()
         try:
             reconciler = build()
             if reconciler is not None:
@@ -1791,12 +1879,26 @@ async def connector_service_reconciler(
         except Exception as exc:
             logger.warning("connector service reconcile error (non-fatal): %s", exc)
         wait = max(1.0, interval_seconds - (time.monotonic() - started))
+        stop = asyncio.ensure_future(shutdown_event.wait())
+        woken = asyncio.ensure_future(wake.wait())
         try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=wait)
+            done, _ = await asyncio.wait(
+                {stop, woken}, timeout=wait, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            for waiter in (stop, woken):
+                waiter.cancel()
+        if stop in done or shutdown_event.is_set():
             break
-        except asyncio.TimeoutError:
-            pass
-    logger.info("Connector service reconciler stopped")
+        if woken in done:
+            # A delivery asked: let its transaction commit the binding.
+            try:
+                await asyncio.wait_for(
+                    shutdown_event.wait(), timeout=WAKE_SETTLE_SECONDS
+                )
+                break
+            except asyncio.TimeoutError:
+                pass
 
 
 async def revoke_unhosted_identities(store: Any) -> list[str]:

@@ -23,7 +23,10 @@ from typing import Any
 from fastapi import HTTPException
 
 from orchestrator.services.connector_drivers import knowledge_note
-from orchestrator.services.connector_drivers.git_swap import route_token_repository
+from orchestrator.services.connector_drivers.git_swap import (
+    token_auth,
+    route_token_repository,
+)
 from orchestrator.services.connector_drivers.base import (
     BindContext,
     CheckContext,
@@ -117,7 +120,21 @@ class RepositoryDriver(WorkspaceSshDriver):
     async def check(
         self, row: Mapping[str, Any], credentials: dict[str, Any], *, ctx: CheckContext
     ) -> dict[str, Any]:
-        return await probe_repository(dict(row), row["connection_url"], credentials)
+        result = await probe_repository(dict(row), row["connection_url"], credentials)
+        if not token_auth(row, credentials):
+            return result
+        # Where the git swap driver is installed, Test says how the token is
+        # delivered now (through the driver, or the fallback and why) and
+        # probes the upstream's TLS without a credential (C3).
+        from orchestrator.services import connector_git_swap_delivery as swaps
+
+        report = await swaps.delivery_report(row)
+        if report is None:
+            return result
+        result = dict(result)
+        result["message"] = f"{result.get('message') or ''}; {swaps.describe(report)}"
+        result["details"] = {**(result.get("details") or {}), "delivery": report}
+        return result
 
     def bind(
         self, row: Mapping[str, Any], credentials: Any, *, ctx: BindContext

@@ -33,6 +33,7 @@ from orchestrator.application.settings import (
 from orchestrator.services import agent_datasource_payload as payloads
 from orchestrator.services import connector_credential_leases as leases
 from orchestrator.services import connector_driver_ca as driver_ca_module
+from orchestrator.services import connector_git_swap_delivery as swaps
 from orchestrator.services import connector_service_hosting as hosting
 from orchestrator.services import connector_service_images as images
 from orchestrator.services.connector_driver_ca import (
@@ -41,7 +42,6 @@ from orchestrator.services.connector_driver_ca import (
     load_driver_ca,
 )
 from orchestrator.services.connector_drivers import builtin_connector_drivers
-from orchestrator.services.connector_drivers import git_swap as swap_module
 from orchestrator.services.connector_drivers.base import (
     BindContext,
     DeploymentGates,
@@ -201,31 +201,31 @@ def _entry(url: str = "https://GitHub.com/o/r.git/", **credentials: Any) -> dict
 
 @pytest.fixture(autouse=True)
 def _fresh_notes():
-    swap_module._NOTED.clear()
+    swaps.configure_git_swap_delivery(swaps.GitSwapDeliverySettings())
     yield
-    swap_module._NOTED.clear()
+    swaps.configure_git_swap_delivery(swaps.GitSwapDeliverySettings())
 
 
 class TestRouting:
-    def test_a_token_repository_goes_through_the_driver(self):
-        entry = _entry()
-        route_token_repository(entry, git_swap=GitSwapDriver(IMAGE), fallback="refuse")
-        assert entry["connection_url"] == "https://github.com/o/r.git"
-        assert entry["git_swap"] == {}
-        assert entry["credentials"] == {"auth_method": "token", "token": TOKEN}
-
-    def test_without_the_driver_the_token_stays_in_the_url_and_is_logged(self, caplog):
+    def test_a_token_repository_is_a_candidate_until_delivery(self):
+        # The lease step decides per delivery; until then the entry is the
+        # one SRW sent before C3, plus the empty block.
         entry = _entry()
         before = json.loads(json.dumps(entry))
-        with caplog.at_level(logging.WARNING, logger=swap_module.__name__):
+        route_token_repository(entry, git_swap=GitSwapDriver(IMAGE), fallback="refuse")
+        assert entry["git_swap"] == {}
+        assert {k: v for k, v in entry.items() if k != "git_swap"} == before
+        assert leases.lease_spec(entry) is GIT_SWAP_SPEC
+
+    def test_without_the_driver_the_entry_is_what_it_was(self, caplog):
+        entry = _entry()
+        before = json.loads(json.dumps(entry))
+        with caplog.at_level(logging.WARNING):
             route_token_repository(entry, git_swap=None, fallback="token-in-url")
-            route_token_repository(entry, git_swap=None, fallback="token-in-url")
-        # The entry SRW sent before C3, byte for byte; logged once.
+        # The entry SRW sent before C3, byte for byte: nothing to say on an
+        # installation without the driver.
         assert entry == before
-        lines = [r.getMessage() for r in caplog.records]
-        assert len(lines) == 1
-        assert "delivers its token in the clone URL" in lines[0]
-        assert "not installed" in lines[0] and "fallback=token-in-url" in lines[0]
+        assert not caplog.records
 
     @pytest.mark.parametrize(
         ("url", "why"),
@@ -237,12 +237,18 @@ class TestRouting:
     )
     def test_a_url_the_driver_cannot_serve_takes_the_fallback(self, url, why, caplog):
         entry = _entry(url)
-        with caplog.at_level(logging.WARNING, logger=swap_module.__name__):
+        with caplog.at_level(logging.WARNING, logger=swaps.__name__):
             route_token_repository(
                 entry, git_swap=GitSwapDriver(IMAGE), fallback="token-in-url"
             )
-        assert "git_swap" not in entry and entry["credentials"]["token"] == TOKEN
-        assert why in caplog.text
+            route_token_repository(
+                entry, git_swap=GitSwapDriver(IMAGE), fallback="token-in-url"
+            )
+        # Visible: the entry says why (the README states it), logged once.
+        assert why in entry["git_swap"]["fallback"]
+        assert entry["credentials"]["token"] == TOKEN
+        assert leases.lease_spec(entry) is None
+        assert caplog.text.count("delivers its token in the clone URL") == 1
 
     def test_refuse_delivers_no_token_and_says_why(self):
         entry = _entry("http://gitea.srw.svc:3000/o/r.git")
@@ -305,14 +311,14 @@ def _row(url="https://github.com/o/r.git"):
 
 
 class TestPayload:
-    def test_the_binding_keeps_the_forge_token_for_the_agent_process_only(self):
+    def test_a_token_repository_is_a_swap_candidate(self):
         registry = builtin_connector_drivers(git_swap_image=IMAGE)
         [entry] = payloads.build_datasources_payload(
             [_row()], dependencies=_dependencies(registry)
         )
         assert entry["git_swap"] == {}
-        assert entry["connection_url"] == "https://github.com/o/r.git"
-        # No auth_method, no URL token: the workspace never gets the token.
+        # A lease driver's entry carries only what its driver keeps for the
+        # agent process: the forge token (a fallback clones with it).
         assert entry["credentials"] == {"token": TOKEN}
         assert leases.lease_spec(entry) is GIT_SWAP_SPEC
 
@@ -372,8 +378,12 @@ async def test_a_binding_gets_a_lease_the_drivers_url_and_the_authority(
         seen["issue"] = (driver, access, image_digest)
         return MagicMock(id="l1", connector_id=connector_id, token="scl_x")
 
+    async def servable(conn, entry, *, connector_id, owner):
+        return None
+
     monkeypatch.setattr(images, "bind_service_image", bind)
     monkeypatch.setattr(leases, "issue_or_redeliver", issue)
+    monkeypatch.setattr(swaps, "git_swap_problem", servable)
     images.configure_service_images(
         images.ServiceImageSettings(
             service_namespace=NAMESPACE, service_start_seconds=195
@@ -383,12 +393,13 @@ async def test_a_binding_gets_a_lease_the_drivers_url_and_the_authority(
     try:
         registry = builtin_connector_drivers(git_swap_image=IMAGE)
         [entry] = payloads.build_datasources_payload(
-            [{**_row(), "project_read_only": True}],
+            [{**_row("https://GitHub.com/o/r.git/"), "project_read_only": True}],
             dependencies=_dependencies(registry),
         )
         owner = leases.LeaseOwner.job("00000000-0000-4000-8000-000000000001")
         assert await leases.deliver_connector_leases(object(), [entry], owner=owner)
         assert seen["issue"] == ("srw.git-swap/v1", "ReadOnly", DIGEST)
+        # No auth_method, no URL token: the workspace never gets the token.
         assert entry["credentials"] == {
             "token": TOKEN,
             "lease": {"id": "l1", "connector_id": CONNECTOR, "token": "scl_x"},
@@ -401,17 +412,8 @@ async def test_a_binding_gets_a_lease_the_drivers_url_and_the_authority(
             "ca": ca.certificate_pem,
             "wait_seconds": 195,
         }
-        # The remote stays the clean upstream URL.
+        # The remote is the clean upstream URL.
         assert entry["connection_url"] == "https://github.com/o/r.git"
-        # Without the authority there is no TLS endpoint: the delivery fails.
-        driver_ca_module.configure_driver_ca(None)
-        entry["git_swap"] = {}
-        with pytest.raises(leases.LeaseDeliveryError, match="certificate authority"):
-            await leases.deliver_connector_leases(object(), [entry], owner=owner)
-        driver_ca_module.configure_driver_ca(ca)
-        images.configure_service_images(images.ServiceImageSettings())
-        with pytest.raises(leases.LeaseDeliveryError, match="hosting is off"):
-            await leases.deliver_connector_leases(object(), [entry], owner=owner)
     finally:
         images.configure_service_images(images.ServiceImageSettings())
         driver_ca_module.configure_driver_ca(None)

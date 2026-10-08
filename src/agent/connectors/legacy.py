@@ -139,11 +139,14 @@ def checkout_auth(entry: Mapping[str, Any]) -> str:
 
     A ``git_swap`` block means the git swap driver (C3): the workspace's git
     reaches it with a lease, or the installation refused the repository and
-    the block says why. Otherwise an explicit ``auth_method`` wins; a
-    delivered SSH identity or a stored key means SSH, and a token means a
-    token in the clone URL.
+    the block says why. A block that names a ``fallback`` is a token
+    repository the driver could not serve, delivered as before C3 (the
+    block only says why, for the README). Otherwise an explicit
+    ``auth_method`` wins; a delivered SSH identity or a stored key means
+    SSH, and a token means a token in the clone URL.
     """
-    if isinstance(entry.get("git_swap"), Mapping):
+    block = entry.get("git_swap")
+    if isinstance(block, Mapping) and "fallback" not in block:
         return "swap"
     credentials = _credentials(entry)
     method = credentials.get("auth_method")

@@ -665,6 +665,20 @@ type KeyValueRow = {key: string; value: string};
                     <div>{{ 'datasources.form.forgeTokenHintGitea' | transloco }}</div>
                   </div>
                 }
+                @if (formData.type === 'repository') {
+                  <app-form-field [label]="'datasources.form.upstreamCaLabel' | transloco">
+                    <app-textarea
+                      size="sm"
+                      class="mono"
+                      [value]="repoUpstreamCa"
+                      (valueChange)="repoUpstreamCa = $event"
+                      placeholder="-----BEGIN CERTIFICATE-----"
+                      [rows]="2"
+                      [disabled]="isSaving()"
+                    />
+                  </app-form-field>
+                  <div class="form-hint">{{ 'datasources.form.upstreamCaHint' | transloco }}</div>
+                }
               }
               @if (gitAuthMethod === 'ssh') {
                 <app-form-field [label]="'datasources.form.sshKeyLabel' | transloco">
@@ -3167,6 +3181,8 @@ export class DatasourceListComponent implements OnInit {
   sshUser = '';
   sshPort = '';
   sshKnownHosts = '';
+  /** A token repository's upstream CA (PEM) for SRW's git swap driver. */
+  repoUpstreamCa = '';
 
   /** An SSH connector with an endpoint: Test reaches it and reports its key. */
   isSshEndpointForm(): boolean {
@@ -3527,6 +3543,7 @@ export class DatasourceListComponent implements OnInit {
     this.sshUser = ds.config?.user ?? '';
     this.sshPort = ds.config?.port ? String(ds.config.port) : '';
     this.sshKnownHosts = ds.config?.known_hosts ?? '';
+    this.repoUpstreamCa = ds.config?.upstream_ca ?? '';
     // ENV names can round-trip; blank values preserve the saved credentials.
     this.envVars = ds.type === 'credentials'
       ? (ds.env_var_names ?? []).map(key => ({key, value: ''}))
@@ -4460,6 +4477,11 @@ export class DatasourceListComponent implements OnInit {
       if (this.gitAuthMethod === 'ssh' && this.sshKnownHosts.trim()) {
         config.known_hosts = this.sshKnownHosts.trim();
       }
+      // The config is replaced as a whole on update: a CA the form did not
+      // send would be dropped.
+      if (this.gitAuthMethod === 'token' && this.repoUpstreamCa.trim()) {
+        config.upstream_ca = this.repoUpstreamCa.trim();
+      }
       return config;
     }
     if (this.formData.type === 'ssh_key') {
@@ -4671,6 +4693,7 @@ export class DatasourceListComponent implements OnInit {
     this.sshUser = '';
     this.sshPort = '';
     this.sshKnownHosts = '';
+    this.repoUpstreamCa = '';
     this.envVars = [];
     this.mcpTransportDirty = false;
     this.forgeDirty = false;

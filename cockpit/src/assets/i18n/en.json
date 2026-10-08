@@ -2879,6 +2879,8 @@
       "sshKnownHostsLabel": "Pinned host key",
       "sshKnownHostsHint": "Optional. Paste the host key (or Test the connector and pin the key it reports) to refuse a server that presents another key. Unpinned hosts are trusted on first use.",
       "sshPinHostKey": "Pin this host key",
+      "upstreamCaLabel": "Upstream CA (optional)",
+      "upstreamCaHint": "Only for a forge behind a private certificate authority: paste its CA certificate(s) in PEM. SRW's git swap driver then trusts the forge with these alone; without one it checks public roots. Test shows how the token is delivered.",
       "sshAgentNoticeTitle": "Usable, not readable",
       "sshAgentNotice": "The agent can sign with this key but cannot read it. On a VM workspace, root (after an approved sudo) can. Use a scoped, least-privilege key.",
       "uploadFile": "Upload file",

@@ -33,6 +33,7 @@ from fastapi.responses import JSONResponse
 from orchestrator.application.resources import ApplicationResources
 from orchestrator.routers import connector_lease_exchange as exchange_routes
 from orchestrator.services.connector_driver_ca import driver_ca
+from orchestrator.services.connector_git_swap_delivery import GitSwapDeliverySettings
 from orchestrator.services.connector_lease_exchange import (
     NO_STORE,
     ConnectorLeaseExchange,
@@ -172,6 +173,32 @@ def git_swap_image(settings: Any, ca: Any) -> str | None:
         return None
     logger.info("The git swap driver is installed with image %s", image)
     return image
+
+
+def git_swap_delivery_settings(
+    resources: ApplicationResources,
+) -> GitSwapDeliverySettings:
+    """What the per-delivery git swap decision reads (C3): whether the
+    driver is installed, the fallback, and the reconciler's own egress rule,
+    cap and back-off."""
+    from orchestrator.security.access import vm_workspaces_on_pod_network
+    from shared.connectors.builtin import GIT_SWAP_SPEC
+
+    settings = resources.settings
+    return GitSwapDeliverySettings(
+        installed=any(
+            driver.spec.name == GIT_SWAP_SPEC.name
+            for driver in resources.connector_drivers.drivers()
+        ),
+        fallback=settings.connector_git_swap_fallback,
+        store=resources.postgres_db,
+        max_installation=settings.connector_service_max_installation,
+        cluster_cidrs=tuple(settings.connector_service_cluster_cidrs),
+        refused_cidrs=tuple(settings.connector_service_refused_cidrs),
+        private_tiers=frozenset(settings.connector_service_private_tiers),
+        ipv6=settings.connector_service_ipv6,
+        vm_on_pod_network=vm_workspaces_on_pod_network,
+    )
 
 
 def service_image_settings(resources: ApplicationResources) -> ServiceImageSettings:
@@ -480,6 +507,7 @@ __all__ = [
     "connector_lease_exchange",
     "connector_lease_exchange_app",
     "connector_service_reconciler_builder",
+    "git_swap_delivery_settings",
     "git_swap_image",
     "service_hosting_settings",
     "exchange_server_config",

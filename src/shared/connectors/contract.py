@@ -190,6 +190,9 @@ class ServiceSpec:
     ``tls``: the pod serves its port over TLS with a certificate SRW's
     driver certificate authority signs for its Service names (the git swap
     driver, C3); its callers trust that authority for the driver's URL only.
+    ``idle_seconds``: how long a pod without bindings keeps running at
+    least, where the installation's idle time is shorter (a driver whose
+    first use waits for a cold pod).
     """
 
     instancing: Literal["shared", "per_execution"] = "shared"
@@ -199,6 +202,7 @@ class ServiceSpec:
     port: int = 8080
     callers: tuple[ServiceCaller, ...] = ("workspace",)
     tls: bool = False
+    idle_seconds: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,6 +404,12 @@ def validate_spec(spec: DriverSpec) -> list[str]:
             )
         if not isinstance(service.tls, bool):
             problems.append("service tls is a boolean")
+        if service.idle_seconds is not None and (
+            isinstance(service.idle_seconds, bool)
+            or not isinstance(service.idle_seconds, int)
+            or service.idle_seconds < 1
+        ):
+            problems.append("service idle_seconds is a positive number of seconds")
         if service.mcp is not None:
             problems += _managed_mcp_problems(spec)
     for rule in spec.egress:

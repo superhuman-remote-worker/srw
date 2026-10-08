@@ -44,6 +44,7 @@ from orchestrator.security.auth import set_provisioning_backends
 from orchestrator.services import (
     connector_credential_leases,
     connector_driver_ca,
+    connector_git_swap_delivery,
     connector_service_images,
 )
 from orchestrator.services import ssh_access as ssh_access_operations
@@ -221,6 +222,11 @@ def build_application_resources(
     # how a bind resolves it, process-wide like the lease window.
     connector_service_images.configure_service_images(
         connectors_composition.service_image_settings(resources)
+    )
+    # The git swap driver's per-delivery decision (C3): whether it serves a
+    # token repository now, else the installation's fallback.
+    connector_git_swap_delivery.configure_git_swap_delivery(
+        connectors_composition.git_swap_delivery_settings(resources)
     )
     if settings.connector_lease_probe_enabled:
         logger.warning(
