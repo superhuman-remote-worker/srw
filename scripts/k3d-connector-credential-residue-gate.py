@@ -10,13 +10,18 @@ use) that attaches all of them:
 - a token repository connector (``https://c0-gate.invalid/...``; the clone
   fails on DNS, so the token never lands in a ``.git/config``, but it is
   typed into the agent's git tab),
-- an SSH repository connector (its key is written to ``~/.ssh/repo_<slug>``),
-- an ``ssh_key`` credential-file connector,
+- an SSH repository connector (also on ``c0-gate.invalid``),
+- an ``ssh_key`` connector whose host is the in-cluster Gitea SSH endpoint,
+  so it is delivered (a host-less one is not, since C1),
 - an env (``generic``) connector (written to ``~/.srw-credentials/``).
 
-The gate hashes the code of the pod that runs the job before any scan, proves
-the runtime received the credentials (the env file and the SSH key are on the
-workspace), then fails if any secret appears in:
+Since C1 both SSH keys are loaded into per-identity ``ssh-agent`` processes
+(``~/.ssh/srw-managed/sockets/<32hex>.sock``) and never written to disk. The
+gate hashes the code of the pod that runs the job before any scan, proves the
+runtime received the credentials (the env file holds the env value, and an
+agent socket holds each SSH key's fingerprint, one key per socket), checks
+the C1 promise that no ``~/.ssh/repo_*`` file and no ``PRIVATE KEY`` exists
+under the workspace home, then fails if any secret appears in:
 
 - the LangGraph checkpoint tables in the app database (``checkpoints``,
   ``checkpoint_blobs``, ``checkpoint_writes``; every row, not only this job's),
@@ -39,6 +44,7 @@ Child-process output is never printed.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import re
@@ -139,6 +145,9 @@ class GateSecrets:
     env_value: str
     ssh_repo_key: str
     ssh_file_key: str
+    # Public SHA256 fingerprints: what ``ssh-add -l`` reports for each key.
+    ssh_repo_fingerprint: str
+    ssh_file_fingerprint: str
 
     def markers(self) -> dict[str, str]:
         """Label -> needle. Labels are safe to print; needles are not."""
@@ -169,7 +178,15 @@ def _key_markers(label: str, private_key: str) -> dict[str, str]:
     return {f"{label}:{index}": line for index, line in enumerate(lines, 1)}
 
 
-def _generate_ssh_key() -> str:
+def ssh_fingerprint(public_key: str) -> str:
+    """The ``SHA256:`` fingerprint ``ssh-add -l`` prints for a public key."""
+    blob = base64.b64decode(public_key.split()[1])
+    digest = base64.b64encode(hashlib.sha256(blob).digest()).decode()
+    return "SHA256:" + digest.rstrip("=")
+
+
+def _generate_ssh_key() -> tuple[str, str]:
+    """A fresh unencrypted ed25519 key and its public fingerprint."""
     with tempfile.TemporaryDirectory(prefix="srw-c0-gate-") as directory:
         path = Path(directory) / "key"
         completed = subprocess.run(
@@ -180,22 +197,38 @@ def _generate_ssh_key() -> str:
         )
         if completed.returncode != 0:
             raise GateFailure("ssh-keygen failed")
-        return path.read_text(encoding="utf-8")
+        return (
+            path.read_text(encoding="utf-8"),
+            ssh_fingerprint(path.with_suffix(".pub").read_text(encoding="utf-8")),
+        )
 
 
 def generate_secrets(gate_id: str) -> GateSecrets:
     suffix = gate_id.rsplit("-", 1)[-1]
+    repo_key, repo_fingerprint = _generate_ssh_key()
+    file_key, file_fingerprint = _generate_ssh_key()
     return GateSecrets(
         token=f"srwc0tok{secrets.token_hex(12)}",
         env_name=f"C0_GATE_{suffix.upper()}",
         env_value=f"srwc0env{secrets.token_hex(12)}",
-        ssh_repo_key=_generate_ssh_key(),
-        ssh_file_key=_generate_ssh_key(),
+        ssh_repo_key=repo_key,
+        ssh_file_key=file_key,
+        ssh_repo_fingerprint=repo_fingerprint,
+        ssh_file_fingerprint=file_fingerprint,
     )
 
 
-def connector_bodies(gate_id: str, values: GateSecrets) -> list[dict[str, Any]]:
-    """The four connectors; the repository hosts never resolve."""
+def connector_bodies(
+    gate_id: str, values: GateSecrets, *, ssh_host: str, ssh_port: int
+) -> list[dict[str, Any]]:
+    """The four connectors; the repository hosts never resolve.
+
+    The ``ssh_key`` connector names a host (the in-cluster Gitea SSH endpoint,
+    as the C1 gate uses) because since C1 only an ``ssh_key`` with a host is
+    delivered to the workspace ``ssh-agent``; without one it is unsupported.
+    """
+    if not _HOST_RE.fullmatch(ssh_host) or not 0 < int(ssh_port) < 65536:
+        raise GateFailure("Gitea SSH endpoint is malformed")
     return [
         {
             "name": f"{gate_id}-token",
@@ -216,6 +249,7 @@ def connector_bodies(gate_id: str, values: GateSecrets) -> list[dict[str, Any]]:
         {
             "name": f"{gate_id}-ssh-key",
             "type": "ssh_key",
+            "config": {"host": ssh_host, "user": "git", "port": int(ssh_port)},
             "credentials": {"files": [{"contents": values.ssh_file_key}]},
             "description": "C0 gate SSH key file (disposable)",
         },
@@ -300,6 +334,38 @@ def _markers_literal(markers: dict[str, str]) -> str:
     return repr(dict(markers))
 
 
+# The in-cluster Gitea SSH endpoint, as the orchestrator proves deploy keys
+# against it (and as scripts/k3d-ssh-agent-connectors-gate.py uses it).
+GITEA_SSH_ENDPOINT_PROGRAM = _POD_MEMORY_CAP + (
+    "import json\n"
+    "from orchestrator.services.gitea import GiteaClient\n"
+    "cap_memory()\n"
+    "host, port = GiteaClient()._ssh_internal_endpoint()\n"
+    'print(json.dumps({"host": host, "port": port}))\n'
+)
+
+# Run as agent-host in the workspace: one line per agent socket, its name and
+# the fingerprints ssh-add lists for it.
+AGENT_SOCKETS_SCRIPT = (
+    "for socket in ~/.ssh/srw-managed/sockets/*.sock; do\n"
+    '  test -S "$socket" || continue\n'
+    "  printf '%s %s\\n' \"${socket##*/}\" "
+    '"$(SSH_AUTH_SOCK="$socket" ssh-add -l 2>/dev/null | '
+    'awk \'NF { printf "%s,", $2 }\')"\n'
+    "done\n"
+)
+
+
+def parse_agent_sockets(listing: str) -> dict[str, list[str]]:
+    """``{socket: [fingerprint, ...]}`` from :data:`AGENT_SOCKETS_SCRIPT`."""
+    held: dict[str, list[str]] = {}
+    for line in listing.splitlines():
+        name, _, prints = line.strip().partition(" ")
+        if name:
+            held[name] = [value for value in prints.split(",") if value]
+    return held
+
+
 def file_scan_script(markers: dict[str, str], roots: Sequence[str]) -> str:
     """Scan every regular file under ``roots`` (pinned SQLite checkpoints)."""
     return (
@@ -355,8 +421,11 @@ def scan_archive_stream(stream):
             history = history or name.endswith("agent-host/.bash_history")
             data = archive.extractfile(member)
             if name.endswith("agent-host/.ssh/config"):
+                # Since C1 the user's own ~/.ssh/config carries the managed
+                # Include line; the config.d it names is excluded.
                 seen = scan_stream(
-                    data.read, found, name, extra={{"kept": b"c0-gate.invalid"}}
+                    data.read, found, name,
+                    extra={{"kept": b"srw-managed/config.d/*.conf"}},
                 )
                 ssh_config = "kept" in seen
             else:
@@ -830,8 +899,20 @@ class Gate:
 
     # -- setup -----------------------------------------------------------
 
+    def gitea_ssh_endpoint(self) -> tuple[str, int]:
+        result = self.kube.python(
+            ORCHESTRATOR,
+            "orchestrator",
+            GITEA_SSH_ENDPOINT_PROGRAM,
+            operation="Gitea SSH endpoint",
+        )
+        return str(result["host"]), int(result["port"])
+
     def create(self, api: Api, values: GateSecrets) -> None:
-        for body in connector_bodies(self.config.gate_id, values):
+        ssh_host, ssh_port = self.gitea_ssh_endpoint()
+        for body in connector_bodies(
+            self.config.gate_id, values, ssh_host=ssh_host, ssh_port=ssh_port
+        ):
             created = api.call(
                 "POST", "/api/datasources", body, operation="create connector"
             )
@@ -933,37 +1014,80 @@ class Gate:
         self.report.record("agent_pod_code_matches", "pass", pod=pod)
         return pod
 
-    def runtime_received_credentials(self, pod: str, markers: dict[str, str]):
-        """The env file and the SSH repository key are on the workspace."""
+    def runtime_received_credentials(
+        self, pod: str, markers: dict[str, str], values: GateSecrets
+    ) -> None:
+        """The env file holds the env value, and an agent socket each SSH key.
 
-        def grep(labels: Sequence[str]) -> list[str]:
-            return self.workspace_grep(
-                pod,
-                [markers[label] for label in labels],
-                ["/home/agent-host/.srw-credentials", "/home/agent-host/.ssh"],
-            )
-
-        ssh_labels = [label for label in markers if label.startswith("ssh_repo_key")]
+        Since C1 an SSH key is never written to the workspace: it is loaded
+        into its own ``ssh-agent``. The proof is its fingerprint in
+        ``ssh-add -l`` of one socket, which holds that key alone.
+        """
+        wanted = {
+            "ssh_repo_key": values.ssh_repo_fingerprint,
+            "ssh_key_connector": values.ssh_file_fingerprint,
+        }
 
         def materialized():
             self.alive()
-            env = grep(["env"])
-            ssh = grep(ssh_labels)
-            if any("/.srw-credentials/" in p for p in env) and any(
-                "/.ssh/repo_" in p for p in ssh
-            ):
-                return env + ssh
+            env = self.workspace_grep(
+                pod, [markers["env"]], ["/home/agent-host/.srw-credentials"]
+            )
+            held = parse_agent_sockets(self.as_agent_host(pod, AGENT_SOCKETS_SCRIPT))
+            holding = {
+                prints[0]: name for name, prints in held.items() if len(prints) == 1
+            }
+            if any("/.srw-credentials/" in p for p in env) and set(
+                wanted.values()
+            ) <= set(holding):
+                return env, held
             return None
 
-        paths = wait_for(
+        env, held = wait_for(
             materialized,
             timeout=self.config.timeout_seconds,
             operation="credentials materialized on the workspace",
         )
+        shared = sorted(name for name, prints in held.items() if len(prints) != 1)
         self.report.record(
             "runtime_received_credentials",
-            "pass",
-            paths=sorted(p.replace("/home/agent-host/", "~/") for p in paths),
+            "fail" if shared else "pass",
+            env_files=sorted(p.replace("/home/agent-host/", "~/") for p in env),
+            agent_sockets=len(held),
+            ssh_keys_held=sorted(wanted),
+            sockets_not_holding_one_key=shared,
+        )
+        if shared:
+            raise GateFailure("an ssh-agent socket does not hold exactly one key")
+
+    def no_key_on_disk(self, pod: str, markers: dict[str, str]) -> None:
+        """C1: no ``~/.ssh/repo_*`` file and no ``PRIVATE KEY`` under the home."""
+        needles = ["PRIVATE KEY"] + [
+            needle for label, needle in markers.items() if label.startswith("ssh_")
+        ]
+        found = self.workspace_grep(pod, needles, ["/home/agent-host"])
+        legacy = self.kube.run(
+            ["exec", pod, "-c", "workspace", "--", "find", "/home/agent-host/.ssh"]
+            + ["-maxdepth", "1", "-name", "repo_*"],
+            operation="legacy key probe",
+            ok_codes=(0, 1),
+        ).splitlines()
+        paths = sorted(
+            {p.replace("/home/agent-host/", "~/") for p in [*found, *legacy] if p}
+        )
+        self.report.record(
+            "workspace_holds_no_key_file", "fail" if paths else "pass", paths=paths
+        )
+        if paths:
+            raise GateFailure("a private key or ~/.ssh/repo_* file is on the workspace")
+
+    def as_agent_host(self, pod: str, script: str) -> str:
+        """Run ``script`` as agent-host in the workspace (stdin, never argv)."""
+        return self.kube.run(
+            ["exec", "-i", pod, "-c", "workspace", "--"]
+            + ["su", "-s", "/bin/bash", "agent-host", "-c", "bash -s"],
+            operation="workspace shell",
+            data="set -u\ncd ~\n" + script,
         )
 
     def workspace_grep(
@@ -971,7 +1095,8 @@ class Gate:
     ) -> list[str]:
         """Files under ``paths`` on the workspace holding any needle."""
         output = self.kube.run(
-            ["exec", "-i", pod, "-c", "workspace", "--", "grep", "-rlF", "-f", "-"]
+            ["exec", "-i", pod, "-c", "workspace", "--", "grep", "-rlF"]
+            + ["-D", "skip", "--binary-files=text", "-f", "-"]
             + list(paths),
             operation="workspace grep",
             data="\n".join(needles) + "\n",
@@ -1220,7 +1345,8 @@ class Gate:
             container = self.workspace()
             agent_pod = self.agent_pod()
             workspace_pod = str(container["pod_name"])
-            self.runtime_received_credentials(workspace_pod, markers)
+            self.runtime_received_credentials(workspace_pod, markers, values)
+            self.no_key_on_disk(workspace_pod, markers)
             self.scan_checkpoints(markers, phase="checkpoint_scan_running")
             if self.config.lane == "pinned":
                 self.scan_pinned_sqlite(agent_pod, markers)
@@ -1318,6 +1444,7 @@ def plan_report(config: GateConfig) -> SafeReport:
         "workspace_ready",
         "agent_pod_code_matches",
         "runtime_received_credentials",
+        "workspace_holds_no_key_file",
         "checkpoint_scan_running",
         *(["pinned_sqlite_scan"] if config.lane == "pinned" else []),
         "snapshot_running_non_strict",

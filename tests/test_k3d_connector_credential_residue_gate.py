@@ -126,11 +126,31 @@ def test_markers_are_unique_per_key_and_labels_carry_no_secret() -> None:
         assert all(needle not in label for needle in markers.values())
 
 
+def test_fingerprints_are_what_ssh_keygen_reports(tmp_path) -> None:
+    _needs("ssh-keygen")
+    values = gate.generate_secrets(GATE_ID)
+    for private_key, fingerprint in (
+        (values.ssh_repo_key, values.ssh_repo_fingerprint),
+        (values.ssh_file_key, values.ssh_file_fingerprint),
+    ):
+        path = tmp_path / "key"
+        path.write_text(private_key)
+        path.chmod(0o600)
+        listed = subprocess.run(
+            ["ssh-keygen", "-l", "-f", str(path)],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        assert listed[1] == fingerprint
+    assert values.ssh_repo_fingerprint != values.ssh_file_fingerprint
+
+
 def test_connector_secrets_live_only_in_credentials() -> None:
     _needs("ssh-keygen")
     values = gate.generate_secrets(GATE_ID)
     markers = values.markers()
-    bodies = gate.connector_bodies(GATE_ID, values)
+    bodies = gate.connector_bodies(GATE_ID, values, ssh_host="srw-gitea", ssh_port=2222)
 
     assert [body["type"] for body in bodies] == [
         "repository",
@@ -142,6 +162,10 @@ def test_connector_secrets_live_only_in_credentials() -> None:
         outside = json.dumps({k: v for k, v in body.items() if k != "credentials"})
         assert all(needle not in outside for needle in markers.values())
         assert body["name"].startswith(GATE_ID)
+    # Since C1 a host-less ssh_key is not delivered; the gate's has a host.
+    assert bodies[2]["config"] == {"host": "srw-gitea", "user": "git", "port": 2222}
+    with pytest.raises(gate.GateFailure, match="endpoint"):
+        gate.connector_bodies(GATE_ID, values, ssh_host="bad host", ssh_port=22)
 
 
 class _FakeKube:
@@ -164,6 +188,11 @@ class _FakeKube:
         row = self.rows.pop(0) if len(self.rows) > 1 else self.rows[0]
         return json.dumps(row)
 
+    def python(self, target, container, script, *, operation):
+        self.calls.append((["python", target, container], script))
+        assert operation == "Gitea SSH endpoint"
+        return {"host": "srw-gitea", "port": 2222}
+
 
 def test_job_carries_the_model_override() -> None:
     _needs("ssh-keygen")
@@ -172,7 +201,14 @@ def test_job_carries_the_model_override() -> None:
 
     runner.create(gate.Api(kube, runner.password), gate.generate_secrets(GATE_ID))
 
-    job_body = json.loads(json.loads(kube.calls[-1][1].split("data-binary = ")[1]))
+    bodies = [
+        json.loads(json.loads(data.split("data-binary = ")[1]))
+        for _arguments, data in kube.calls
+        if data and "data-binary = " in data
+    ]
+    ssh_key = next(body for body in bodies if body.get("type") == "ssh_key")
+    assert ssh_key["config"] == {"host": "srw-gitea", "user": "git", "port": 2222}
+    job_body = bodies[-1]
     assert job_body["config_override"] == {
         "llm": {"model": "muse-spark-1.3-contributor"}
     }
@@ -268,6 +304,180 @@ def test_pinned_lane_without_an_agent_pod_fails(monkeypatch) -> None:
     )
     with pytest.raises(gate.GateFailure, match="no pinned agent pod"):
         runner.agent_pod()
+
+
+class _WorkspaceKube(_FakeKube):
+    """Answers the workspace probes: grep, the socket listing and find."""
+
+    def __init__(self, *, env, sockets, keys_on_disk=(), legacy=()) -> None:
+        super().__init__([{"status": "processing"}])
+        self.env, self.sockets = env, sockets
+        self.keys_on_disk, self.legacy = keys_on_disk, legacy
+
+    def run(self, arguments, *, operation, data=None, timeout=None, ok_codes=(0,)):
+        self.calls.append((list(arguments), data))
+        if operation == "workspace shell":
+            assert "agent-host" in arguments
+            return "\n".join(self.sockets)
+        if operation == "workspace grep":
+            if arguments[-1] == "/home/agent-host":
+                return "\n".join(self.keys_on_disk)
+            return "\n".join(self.env)
+        if operation == "legacy key probe":
+            return "\n".join(self.legacy)
+        raise AssertionError(operation)
+
+
+def _keys():
+    return gate.GateSecrets(
+        token="t",
+        env_name="C0_GATE_X",
+        env_value="v",
+        ssh_repo_key="",
+        ssh_file_key="",
+        ssh_repo_fingerprint="SHA256:repo",
+        ssh_file_fingerprint="SHA256:file",
+    )
+
+
+def _materialize(kube, monkeypatch):
+    runner = gate.Gate(gate.validate_config(_args()), kube, "pw")
+    runner.job_id = str(uuid4())
+    monkeypatch.setattr(
+        gate,
+        "wait_for",
+        lambda check, **kwargs: check()
+        or (_ for _ in ()).throw(gate.GateFailure("timed out: credentials")),
+    )
+    runner.runtime_received_credentials("workspace-1", MARKERS, _keys())
+    return runner
+
+
+def test_ssh_keys_are_proven_by_agent_socket_fingerprints(monkeypatch) -> None:
+    kube = _WorkspaceKube(
+        env=["/home/agent-host/.srw-credentials/abc.sh"],
+        sockets=[
+            "0123.sock SHA256:repo,",
+            "4567.sock SHA256:file,",
+            "89ab.sock SHA256:managed,",
+        ],
+    )
+    runner = _materialize(kube, monkeypatch)
+
+    phase = runner.report.phases[-1]
+    assert phase["name"] == "runtime_received_credentials"
+    assert phase["result"] == "pass"
+    assert phase["agent_sockets"] == 3
+    assert phase["env_files"] == ["~/.srw-credentials/abc.sh"]
+    # The listing ran as agent-host with the script on stdin, never argv.
+    shell = [c for c in kube.calls if c[0][-1] == "bash -s"]
+    assert shell and "ssh-add -l" in shell[0][1]
+    assert "agent-host" in shell[0][0]
+
+
+@pytest.mark.parametrize(
+    "sockets",
+    [
+        ["0123.sock SHA256:repo,"],  # the ssh_key connector was not delivered
+        ["0123.sock SHA256:repo,SHA256:file,"],  # two keys behind one socket
+        [],
+    ],
+)
+def test_missing_or_shared_identities_never_pass(monkeypatch, sockets) -> None:
+    kube = _WorkspaceKube(
+        env=["/home/agent-host/.srw-credentials/abc.sh"], sockets=sockets
+    )
+    with pytest.raises(gate.GateFailure, match="timed out"):
+        _materialize(kube, monkeypatch)
+
+
+def test_a_socket_holding_two_keys_fails_once_both_are_held(monkeypatch) -> None:
+    kube = _WorkspaceKube(
+        env=["/home/agent-host/.srw-credentials/abc.sh"],
+        sockets=[
+            "0123.sock SHA256:repo,",
+            "4567.sock SHA256:file,",
+            "89ab.sock SHA256:a,SHA256:b,",
+        ],
+    )
+    with pytest.raises(gate.GateFailure, match="exactly one key"):
+        _materialize(kube, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    ("found", "legacy"),
+    [
+        (["/home/agent-host/workspace/key.pem"], []),
+        ([], ["/home/agent-host/.ssh/repo_c0"]),
+        ([], []),
+    ],
+)
+def test_no_private_key_or_legacy_key_file_on_the_workspace(found, legacy) -> None:
+    kube = _WorkspaceKube(env=[], sockets=[], keys_on_disk=found, legacy=legacy)
+    runner = gate.Gate(gate.validate_config(_args()), kube, "pw")
+    runner.job_id = str(uuid4())
+    if found or legacy:
+        with pytest.raises(gate.GateFailure, match="private key"):
+            runner.no_key_on_disk("workspace-1", MARKERS)
+    else:
+        runner.no_key_on_disk("workspace-1", MARKERS)
+    phase = runner.report.phases[-1]
+    assert phase["name"] == "workspace_holds_no_key_file"
+    assert phase["paths"] == sorted(
+        p.replace("/home/agent-host/", "~/") for p in found + legacy
+    )
+    grep = next(c for c in kube.calls if "grep" in c[0])
+    assert grep[1].splitlines()[0] == "PRIVATE KEY"
+    assert MARKERS["ssh_repo_key:1"] in grep[1]
+    assert all(needle not in " ".join(grep[0]) for needle in MARKERS.values())
+
+
+def test_the_socket_listing_reads_a_real_ssh_agent() -> None:
+    """The listing script and parser against a real ssh-agent and key."""
+    _needs("ssh-agent", "ssh-add", "ssh-keygen", "bash")
+    import tempfile
+    import time
+
+    values = gate.generate_secrets(GATE_ID)
+    # A short home: AF_UNIX socket paths are limited to ~108 bytes.
+    with tempfile.TemporaryDirectory(prefix="c0a") as home:
+        sockets = Path(home) / ".ssh" / "srw-managed" / "sockets"
+        sockets.mkdir(parents=True)
+        socket = sockets / ("a" * 32 + ".sock")
+        env = dict(os.environ, HOME=home)
+        agent = subprocess.Popen(
+            ["ssh-agent", "-D", "-a", str(socket)],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            for _ in range(200):
+                if socket.exists():
+                    break
+                time.sleep(0.01)
+            subprocess.run(
+                ["ssh-add", "-"],
+                input=values.ssh_repo_key,
+                env=dict(env, SSH_AUTH_SOCK=str(socket)),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            listing = subprocess.run(
+                ["bash", "-c", gate.AGENT_SOCKETS_SCRIPT],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+        finally:
+            agent.terminate()
+            agent.wait(timeout=10)
+
+    assert gate.parse_agent_sockets(listing) == {
+        socket.name: [values.ssh_repo_fingerprint]
+    }
 
 
 def test_api_reports_http_status_without_the_body() -> None:
@@ -405,7 +615,9 @@ def _fixture_home(tmp_path: Path, leak: bool) -> Path:
     home_root = tmp_path / "fixture"
     home = home_root / "home" / "agent-host"
     (home / ".ssh").mkdir(parents=True)
-    (home / ".ssh" / "config").write_text("Host c0-gate.invalid\n")
+    (home / ".ssh" / "config").write_text(
+        "Match all\nInclude /home/agent-host/.ssh/srw-managed/config.d/*.conf\n"
+    )
     (home / "workspace").mkdir()
     (home / "workspace" / "notes.md").write_text("kept\n")
     if leak:
