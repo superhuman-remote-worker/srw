@@ -361,6 +361,7 @@ def _settings(**over: Any) -> DeploymentSettings:
         connector_service_resources={"limits": {"memory": "128Mi"}},
         connector_service_refused_cidrs=("10.0.50.0/24",),
         connector_service_pod_ip="10.42.0.9",
+        connector_service_node_ip="10.0.50.11",
     )
     values.update(over)
     return DeploymentSettings(**values)
@@ -447,9 +448,45 @@ def test_hosting_settings_come_from_the_deployment():
     assert settings.canary_port == 8089 and policy.canary_port == 8089
     assert settings.refused_cidrs == ("10.0.50.0/24",)
     assert settings.pod_ip == "10.42.0.9"
+    assert settings.node_ip == "10.0.50.11"
     assert settings.cluster_problem("10.43.0.20") is None
     assert "10.43.0.20" not in (settings.cluster_problem("10.96.0.10") or "")
     assert "Service address 10.96.0.10" in settings.cluster_problem("10.96.0.10")
+
+
+@pytest.mark.parametrize(
+    ("node_ip", "private", "refused", "fragment"),
+    [
+        ("10.0.50.11", True, ("10.0.50.0/24",), None),
+        ("172.18.0.2", True, ("10.0.50.0/24",), "node address 172.18.0.2"),
+        ("", True, ("10.0.50.0/24",), "node address is unknown"),
+        ("not-an-ip", True, (), "is not an address"),
+        # No private tier: a private node is refused to every pod anyway...
+        ("172.18.0.2", False, (), None),
+        # ...but a public one must be listed.
+        ("203.0.113.7", False, (), "node address 203.0.113.7"),
+        ("203.0.113.7", False, ("203.0.113.0/24",), None),
+        # The cluster ranges and link-local count as refused too.
+        ("10.42.0.1", True, (), None),
+    ],
+)
+def test_the_node_must_be_refused_to_every_driver_pod(
+    node_ip, private, refused, fragment
+):
+    import dataclasses
+
+    resources = SimpleNamespace(settings=_settings())
+    settings = dataclasses.replace(
+        connectors_composition.service_hosting_settings(resources),
+        node_ip=node_ip,
+        private_tiers=frozenset({"home-allowed"}) if private else frozenset(),
+        refused_cidrs=refused,
+    )
+    found = settings.cluster_problem("10.43.0.20")
+    if fragment is None:
+        assert found is None
+    else:
+        assert found is not None and fragment in found
 
 
 @pytest.mark.parametrize(

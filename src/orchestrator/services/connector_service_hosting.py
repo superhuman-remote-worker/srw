@@ -454,6 +454,8 @@ class ServiceHostingSettings:
     refused_cidrs: tuple[str, ...] = ()
     #: This orchestrator's pod address (the downward API's status.podIP).
     pod_ip: str = ""
+    #: The address of the node it runs on (status.hostIP).
+    node_ip: str = ""
 
     def cluster_problem(self, exchange_address: str) -> str | None:
         """Why this cluster's ranges are not the configured ``clusterCidrs``.
@@ -488,6 +490,44 @@ class ServiceHostingSettings:
                     f"clusterCidrs ({named}); set them to the cluster's real pod "
                     "and service ranges"
                 )
+        return self._node_problem()
+
+    def _node_problem(self) -> str | None:
+        """Why a driver pod could reach this cluster's nodes (kubelet,
+        kube-apiserver, etcd), or ``None``.
+
+        The node this orchestrator runs on is one known node address: every
+        connector's egress policy must refuse it. Where private tiers exist
+        that takes ``refusedCidrs`` covering it (the default is one
+        installation's node and load-balancer ranges, not every cluster's);
+        without, a private node address is refused anyway and a public one
+        must be listed.
+        """
+        from orchestrator.services.connector_egress import EgressPolicy, refusal
+
+        if not self.node_ip:
+            return "this orchestrator's node address is unknown"
+        try:
+            address = ipaddress.ip_address(self.node_ip)
+        except ValueError:
+            return (
+                f"this orchestrator's node address {self.node_ip!r} is not an address"
+            )
+        try:
+            widest = EgressPolicy.build(
+                self.cluster_cidrs,
+                allow_private=bool(self.private_tiers),
+                ipv6=self.ipv6,
+                refused_cidrs=self.refused_cidrs,
+            )
+        except ValueError as exc:
+            return f"the egress ranges are not networks ({exc})"
+        if refusal(address, widest) is None:
+            return (
+                f"this orchestrator's node address {address} is not refused to "
+                "driver pods; add the cluster's node (and load balancer) ranges "
+                "to connectors.servicePods.refusedCidrs"
+            )
         return None
 
     def launch_policy(self, exchange_address: str) -> ServiceLaunchPolicy:

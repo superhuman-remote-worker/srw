@@ -1937,6 +1937,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            # Hosting is refused unless driver pods are refused this node.
+            - name: CONNECTOR_SERVICE_NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
             - name: CONNECTOR_SERVICE_IPV6
               value: {{ .ipv6 | quote }}
             - name: CONNECTOR_SERVICE_NAMESPACE

@@ -821,6 +821,7 @@ def reconciler(db):
             start_timeout_seconds=120,
             refused_cidrs=("10.0.50.0/24", "10.0.51.0/24"),
             pod_ip="10.42.0.9",
+            node_ip="10.0.50.11",
         ),
         resolver=resolver,
         clock=lambda: datetime.now(timezone.utc) + offset[0],
@@ -1135,6 +1136,27 @@ async def test_a_cluster_with_other_ranges_refuses_to_host(db, reconciler):
     report = await reconciler.reconcile_once()
     assert report.started == []
     assert len(await _pods(db)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_node_driver_pods_could_reach_refuses_to_host(db, reconciler):
+    """The refused ranges default to one installation's: on a cluster whose
+    nodes sit elsewhere (k3d's docker network), a home-allowed driver pod
+    could reach kubelet and kube-apiserver. Hosting fails closed."""
+    reconciler.settings = dataclasses.replace(reconciler.settings, node_ip="172.18.0.2")
+    connector = await _echo_connector(db)
+    await _echo_image(db)
+    await _bind_echo(db, connector, await _thread(db))
+    report = await reconciler.reconcile_once()
+    assert report.started == []
+    assert "node address 172.18.0.2" in report.refused[0][1]
+    assert "refusedCidrs" in report.refused[0][1]
+    # Listing the node range lets it host.
+    reconciler.settings = dataclasses.replace(
+        reconciler.settings,
+        refused_cidrs=(*reconciler.settings.refused_cidrs, "172.16.0.0/12"),
+    )
+    assert len((await reconciler.reconcile_once()).started) == 1
 
 
 @pytest.mark.parametrize(

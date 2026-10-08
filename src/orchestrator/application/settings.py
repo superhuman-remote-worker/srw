@@ -265,6 +265,7 @@ class DeploymentSettings:
     #: address: hosting is refused unless it lies inside the cluster ranges.
     connector_service_refused_cidrs: tuple[str, ...] = ()
     connector_service_pod_ip: str = ""
+    connector_service_node_ip: str = ""
     #: SRW's static driver shim image (``connectors.drivers.shim.image``):
     #: the canary wait, the shim install and every driver's command.
     connector_driver_shim_image: str = ""
@@ -383,6 +384,9 @@ class DeploymentSettings:
             ),
             connector_service_pod_ip=os.environ.get(
                 "CONNECTOR_SERVICE_POD_IP", ""
+            ).strip(),
+            connector_service_node_ip=os.environ.get(
+                "CONNECTOR_SERVICE_NODE_IP", ""
             ).strip(),
             connector_driver_shim_image=os.environ.get(
                 "CONNECTOR_DRIVER_SHIM_IMAGE", ""

@@ -307,6 +307,14 @@ connectors:
     # be revoked.
     idleSeconds: 60
     reconcileIntervalSeconds: 5
+    # The k3d node is a container on a docker network (172.x): a home-allowed
+    # driver pod must never reach it (kubelet, apiserver). The orchestrator
+    # refuses to host while its node is reachable to driver pods.
+    refusedCidrs:
+      - 172.16.0.0/12      # docker networks: the k3d node and load balancer
+      - 10.42.0.0/16
+      - 10.43.0.0/16
+      - 169.254.0.0/16
   drivers:
     registry:
       # The k3d registry Tilt pushes driver images to; the orchestrator pod

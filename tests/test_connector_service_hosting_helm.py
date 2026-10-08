@@ -285,8 +285,30 @@ def test_refused_ranges_default_to_the_private_tiers_except_lists():
 
 
 def test_the_orchestrator_knows_its_own_pod_address():
-    item = _orchestrator_env_items(render(EXCHANGE, ON))["CONNECTOR_SERVICE_POD_IP"]
-    assert item["valueFrom"] == {"fieldRef": {"fieldPath": "status.podIP"}}
+    items = _orchestrator_env_items(render(EXCHANGE, ON))
+    assert items["CONNECTOR_SERVICE_POD_IP"]["valueFrom"] == {
+        "fieldRef": {"fieldPath": "status.podIP"}
+    }
+    assert items["CONNECTOR_SERVICE_NODE_IP"]["valueFrom"] == {
+        "fieldRef": {"fieldPath": "status.hostIP"}
+    }
+
+
+def test_the_k3d_profile_refuses_its_docker_network_to_driver_pods():
+    """k3d nodes are docker containers (172.x): the profile lists that range
+    so the node check lets it host and no driver pod reaches the node."""
+    import ipaddress
+
+    example = yaml.safe_load(
+        (ROOT / "deployment/values-local.yaml.example").read_text()
+    )
+    refused = example["connectors"]["servicePods"]["refusedCidrs"]
+    node = ipaddress.ip_address("172.18.0.2")
+    assert any(node in ipaddress.ip_network(cidr) for cidr in refused)
+    env = orchestrator_env(
+        render(values=(ROOT / "deployment/values-local.yaml.example",))
+    )
+    assert "172.16.0.0/12" in env["CONNECTOR_SERVICE_REFUSED_CIDRS"].split(",")
 
 
 DRIVER_RULE = {

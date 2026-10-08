@@ -206,7 +206,10 @@ connectors:
     # allowed: the cluster's nodes (kube-apiserver, kubelet, etcd) and its
     # load balancers. Empty uses the `except` lists of the workspace tiers
     # named in privateTiers (workspace.networkPolicy.tiers), so a driver pod
-    # reaches no more than that tier's workspaces do.
+    # reaches no more than that tier's workspaces do. Those defaults are one
+    # installation's ranges: the orchestrator refuses to host unless its own
+    # node's address is refused to driver pods, so set the cluster's node
+    # ranges here (k3d: the docker network) when they differ.
     refusedCidrs: []
     # -- Pin AAAA answers too (dual-stack clusters only).
     ipv6: false

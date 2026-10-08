@@ -215,6 +215,7 @@ def service_hosting_settings(
         resources=dict(settings.connector_service_resources),
         refused_cidrs=tuple(settings.connector_service_refused_cidrs),
         pod_ip=settings.connector_service_pod_ip,
+        node_ip=settings.connector_service_node_ip,
     )
 
 
