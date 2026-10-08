@@ -132,14 +132,17 @@ async def _joined_blocking_call(func, /, *args, **kwargs):
     return await joined_blocking_call(func, *args, **kwargs)
 
 
-# Credentials materialized in the workspace home: env connector files, the
-# managed-repository ssh-agent namespace, the legacy external-repository key
-# files, and each cloud mount's rclone config (obscured, reversible password)
-# and bearer token files. Every attach or mount start writes them again from
-# the dispatch payload, so no restore needs them, and a snapshot must never
-# become a second copy of them. The rest of ``.ssh/``, the mount's helper
-# script and its VFS cache stay. GNU tar matches these unanchored, after any
-# ``/`` of the member name, and ``*`` also matches ``/``.
+# Credentials materialized in the workspace home: env connector files and
+# credential-file connector contents (both under ``.srw-credentials``; a
+# credential file's target path holds only a symlink into it, which a
+# snapshot keeps without the bytes), the managed-repository ssh-agent
+# namespace, the legacy external-repository key files, and each cloud
+# mount's rclone config (obscured, reversible password) and bearer token
+# files. Every attach or mount start writes them again from the dispatch
+# payload, so no restore needs them, and a snapshot must never become a
+# second copy of them. The rest of ``.ssh/``, the mount's helper script and
+# its VFS cache stay. GNU tar matches these unanchored, after any ``/`` of
+# the member name, and ``*`` also matches ``/``.
 CREDENTIAL_EXCLUDE_PATTERNS = (
     "--exclude=.srw-credentials",
     "--exclude=.ssh/srw-managed",

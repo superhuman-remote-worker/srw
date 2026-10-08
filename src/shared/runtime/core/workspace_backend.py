@@ -8,6 +8,7 @@ See knowledge-base/knowledge/features/vm_backend.md for the full design.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping, Sequence
 from fnmatch import fnmatchcase
 from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
@@ -325,6 +326,14 @@ class WorkspaceBackend(ABC):
     def install_credential_environment(self, values: Dict[str, str]) -> None:
         """Make connector ENV values available to this work item's commands."""
         raise ValueError("Credential connectors require a sandbox or VM workspace")
+
+    def install_credential_files(self, files: Sequence[Mapping[str, Any]]) -> str:
+        """Sync this work item's credential files into the workspace home.
+
+        Returns the private store the files are written to. Backends without
+        a shell workspace refuse.
+        """
+        raise ValueError("Credential files require a sandbox or VM workspace")
 
     def execute_with_secret_stdin(
         self, command: str, secret: str | bytes, *, timeout: int = 30

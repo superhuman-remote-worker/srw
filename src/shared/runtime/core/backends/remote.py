@@ -25,6 +25,7 @@ import time
 import uuid
 import weakref
 from collections import OrderedDict
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -1418,7 +1419,6 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         Existing processes keep their environment. Removed field names remain
         in the workspace; this method intentionally does not promise scrubbing.
         """
-        import hashlib
         import json
 
         from shared.credential_connectors import normalize_credential_env
@@ -1428,10 +1428,9 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         if not values:
             return
         self._init_shell()
-        identity = hashlib.sha256(
-            (self._job_id or self._session_name).encode("utf-8")
-        ).hexdigest()
-        path = self._resolve_home_path(f".srw-credentials/{identity}.sh")
+        path = self._resolve_home_path(
+            f".srw-credentials/{self._credential_identity()}.sh"
+        )
         command = (
             f"python3 -c {shlex.quote(INSTALL_CREDENTIAL_ENV)} {shlex.quote(path)}"
         )
@@ -1440,6 +1439,52 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         ):
             raise WorkspaceUnavailableError("Could not install workspace credentials")
         self._credential_env_path = path
+
+    def _credential_identity(self) -> str:
+        """The work item's name under ``~/.srw-credentials`` (job or session)."""
+        return hashlib.sha256(
+            (self._job_id or self._session_name).encode("utf-8")
+        ).hexdigest()
+
+    def install_credential_files(self, files: Sequence[Mapping[str, Any]]) -> str:
+        """Sync this work item's credential files into the workspace home.
+
+        ``files`` is the whole current set, each ``{"name", "content",
+        "mode", "link"}``: the contents go into a private store under
+        ``~/.srw-credentials/`` (which a snapshot never captures) with their
+        mode, and ``link`` (home-relative, optional) becomes a symlink to
+        the file. Contents travel on the secret stdin channel, never tmux or
+        argv. What an earlier sync placed and ``files`` no longer holds is
+        removed; an empty list removes everything. Returns the store's
+        absolute path, under which each file keeps its ``name``.
+        """
+        import json
+
+        from shared.runtime.core.credential_env import INSTALL_CREDENTIAL_FILES
+
+        self._init_shell()
+        home = self._get_home_dir()
+        store = f"files-{self._credential_identity()}"
+        command = (
+            f"python3 -c {shlex.quote(INSTALL_CREDENTIAL_FILES)} "
+            f"{shlex.quote(home)} {shlex.quote(store)}"
+        )
+        payload = [
+            {
+                "name": str(item["name"]),
+                "content": str(item["content"]),
+                "mode": int(item.get("mode", 0o600)),
+                "link": item.get("link") or None,
+            }
+            for item in files
+        ]
+        if not self.execute_claim_resource_with_secret_stdin(
+            command, json.dumps(payload), timeout=30
+        ):
+            raise WorkspaceUnavailableError(
+                "Could not install workspace credential files"
+            )
+        return posixpath.join(home, ".srw-credentials", store)
 
     def open_forward_channel(self, dest_host: str = "127.0.0.1", dest_port: int = 8080):
         """Open a ``direct-tcpip`` channel to a loopback port on the workspace.
