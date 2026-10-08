@@ -1575,8 +1575,12 @@ class TestReconciler:
 
         async def evict(row, reason, report, *, bound_ok):
             evicted.append((row["pod_name"], reason, bound_ok))
-            # A delivery bound the first victim's key since the pass read it.
-            return row["pod_name"] != "bound-since"
+            # A delivery bound the first victim's key since the pass read
+            # it; another pass stopped "taken" first.
+            return {
+                "bound-since": hosting._SPARED,
+                "taken": hosting._ALREADY_STOPPED,
+            }.get(row["pod_name"], hosting._EVICTED)
 
         monkeypatch.setattr(reconciler, "_claim", claim)
         monkeypatch.setattr(reconciler, "_evict", evict)
@@ -1629,23 +1633,62 @@ class TestReconciler:
         claims.clear()
         await start()
         assert evicted == [] and report.capacity == 2
+        # A victim another pass stopped first (two replicas during a
+        # leadership change): this start waits for its slot and stops no
+        # other pod (the reconciler review's fix 4).
+        reconciler._evictable = [_pod_row(pod_name="taken"), newer]
+        evicted.clear()
+        claims.clear()
+        await start()
+        assert evicted == [("taken", hosting.IDLE_EVICTED, False)]
+        assert reconciler._evictable == [newer] and report.capacity == 3
 
     @pytest.mark.asyncio
-    async def test_an_eviction_rechecks_the_binding_under_the_capacity_lock(self):
+    async def test_an_eviction_locks_its_victim_then_rechecks_the_binding(self):
         """The pass read the victim unbound; a delivery may have bound its
-        key since. The revoke is conditional, under the capacity lock."""
+        key since, or be binding it now. Under the capacity lock the
+        victim's row is locked FOR UPDATE (which waits for a delivery
+        holding it FOR KEY SHARE) before the key's leases are read; a
+        victim already stopped by another pass is left to that pass."""
         reconciler = _reconciler(PodState("Running"))
-        conn = TxConn(values=[1])
+        conn = TxConn({"FOR UPDATE": {"revoked_at": None}}, values=[1])
         reconciler.store = _store(conn)
         report = hosting.ReconcileReport()
         victim = _pod_row(pod_name="victim")
-        assert not await reconciler._evict(
+        outcome = await reconciler._evict(
             victim, hosting.IDLE_EVICTED, report, bound_ok=False
         )
+        assert outcome == hosting._SPARED
         assert "pg_advisory_xact_lock" in conn.executed[0][0]
         assert conn.executed[0][1] == hosting._CAPACITY_LOCK
-        assert "connector_credential_leases" in conn.queries[-1]
+        locked, bound = conn.queries[-2:]
+        assert "FOR UPDATE" in locked and bound == hosting._KEY_BOUND
         assert report.stopped == []
+        stopped = TxConn({"FOR UPDATE": {"revoked_at": dt.datetime.now()}})
+        reconciler.store = _store(stopped)
+        outcome = await reconciler._evict(
+            victim, hosting.IDLE_EVICTED, report, bound_ok=False
+        )
+        assert outcome == hosting._ALREADY_STOPPED
+        assert not any(q == hosting._KEY_BOUND for q in stopped.queries)
+
+    def test_a_delivery_holds_the_pods_it_counts_on(self):
+        """The other half of the lock: a service binding's lease issue, and
+        a git swap delivery's serving check, hold the key's live pods FOR
+        KEY SHARE until they commit."""
+        issue = (
+            ROOT / "src/orchestrator/services/connector_credential_leases.py"
+        ).read_text()
+        issue = issue[issue.index("async def issue_or_redeliver(") :]
+        issue = issue[: issue.index("\nasync def ")]
+        held = issue.index("FOR KEY SHARE\n")
+        assert "connector_driver_identities" in issue[held - 300 : held]
+        assert held < issue.index("INSERT INTO connector_credential_leases")
+        serving = (
+            ROOT / "src/orchestrator/services/connector_git_swap_delivery.py"
+        ).read_text()
+        serving = serving[serving.index("async def _serving(") :]
+        assert "FOR KEY SHARE" in serving[: serving.index("\nasync def ")]
 
     @pytest.mark.asyncio
     async def test_eviction_spares_a_pod_bound_since_the_pass_read_the_bindings(
@@ -1656,7 +1699,7 @@ class TestReconciler:
         # spares its pod; the next candidate makes room instead. The
         # candidate's key is read again under the capacity lock.
         reconciler = _reconciler(PodState("Running"), max_installation=1)
-        conn = TxConn(values=[True, False])
+        conn = TxConn({"FOR UPDATE": {"revoked_at": None}}, values=[True, False])
         reconciler.store = _store(conn)
         revoked: list[str] = []
 
@@ -1714,6 +1757,112 @@ class TestReconciler:
             report=report,
         )
         assert revoked == [] and report.capacity == 1
+
+    @pytest.mark.asyncio
+    async def test_a_half_open_listen_connection_is_found_by_its_keepalive(
+        self, monkeypatch
+    ):
+        """No termination listener fires for a half-open connection (a node
+        or a NAT gone): only the keepalive's timeout finds it; the LISTEN is
+        opened again on another connection."""
+        monkeypatch.setattr(hosting, "LISTEN_CHECK_SECONDS", 0.01)
+        monkeypatch.setattr(hosting, "LISTEN_CHECK_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(hosting, "LISTEN_RETRY_SECONDS", 0.01)
+        listening: list[int] = []
+
+        class Conn:
+            def __init__(self, number):
+                self.number = number
+
+            async def add_listener(self, channel, callback):
+                listening.append(self.number)
+
+            async def remove_listener(self, channel, callback):
+                pass
+
+            async def fetchval(self, query):
+                if self.number == 1:
+                    await asyncio.Event().wait()  # never answers
+                return 1
+
+        conns = iter(range(1, 100))
+
+        class Store:
+            def acquire(self):
+                conn = Conn(next(conns))
+
+                class Context:
+                    async def __aenter__(self_inner):
+                        return conn
+
+                    async def __aexit__(self_inner, *exc):
+                        return False
+
+                return Context()
+
+        wake, shutdown = asyncio.Event(), asyncio.Event()
+        task = asyncio.create_task(hosting._listen(Store(), wake, shutdown))
+        for _ in range(200):
+            if len(listening) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        shutdown.set()
+        await asyncio.wait_for(task, 5)
+        assert listening[:2] == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_the_listen_backoff_starts_again_after_an_open(self, monkeypatch):
+        """A LISTEN that opened and was lost later is opened again after the
+        first retry wait, not after the doubled one its earlier failure
+        left."""
+        waits: list[float] = []
+        shutdown = asyncio.Event()
+
+        async def until(events, timeout):
+            events = tuple(events)
+            if len(events) == 1:  # the retry wait
+                waits.append(timeout)
+                if len(waits) >= 2:
+                    shutdown.set()
+            else:  # the liveness wait: the server ends the connection
+                events[1].set()
+
+        monkeypatch.setattr(hosting, "_until", until)
+        opened: list[int] = []
+
+        class Conn:
+            async def add_listener(self, channel, callback):
+                opened.append(1)
+
+            async def remove_listener(self, channel, callback):
+                pass
+
+            def add_termination_listener(self, callback):
+                pass
+
+            def remove_termination_listener(self, callback):
+                pass
+
+        attempts = iter(range(100))
+
+        class Store:
+            def acquire(self):
+                attempt = next(attempts)
+
+                class Context:
+                    async def __aenter__(self_inner):
+                        if attempt == 0:
+                            raise OSError("the database is restarting")
+                        return Conn()
+
+                    async def __aexit__(self_inner, *exc):
+                        return False
+
+                return Context()
+
+        await asyncio.wait_for(hosting._listen(Store(), asyncio.Event(), shutdown), 5)
+        assert opened == [1]
+        assert waits == [hosting.LISTEN_RETRY_SECONDS, hosting.LISTEN_RETRY_SECONDS]
 
     @pytest.mark.asyncio
     async def test_a_committed_delivery_wakes_the_leaders_loop(self, monkeypatch):

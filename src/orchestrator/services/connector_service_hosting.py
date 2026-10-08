@@ -146,11 +146,23 @@ IDLE_EVICTED = "idle_evicted"
 #: after the successor turned ready and the endpoint Service names it, or at
 #: once when the installation's cap leaves its successor no other room.
 SUPERSEDED = "superseded"
+#: How long a stopped pod's row counts as freeing its slot: the pods'
+#: termination grace (``ServiceLaunchPolicy.termination_grace_seconds``,
+#: 30 s) and a margin for the kubelet.
+FREEING_SECONDS = 90.0
+#: What an eviction did (``ServiceHostingReconciler._evict``).
+_EVICTED = "evicted"
+_SPARED = "spared"
+_ALREADY_STOPPED = "already_stopped"
 #: The reconciler's LISTEN connection: a liveness check this often, and the
 #: wait before opening it again after it was lost (doubling up to the most).
 LISTEN_CHECK_SECONDS = 5.0
 LISTEN_RETRY_SECONDS = 1.0
 LISTEN_RETRY_MAX_SECONDS = 30.0
+#: How long the liveness check may take: a half-open connection (no FIN, no
+#: RST: a node or a NAT gone) never answers, and no termination listener
+#: fires for it.
+LISTEN_CHECK_TIMEOUT_SECONDS = 10.0
 #: The running reconciler loop's wake-up (one per process): a delivery that
 #: issues a new service binding asks for a pass now (C3 review S1).
 _WAKE: dict[str, asyncio.Event] = {}
@@ -1175,10 +1187,14 @@ class ServiceHostingReconciler:
         *,
         error: str | None = None,
     ) -> None:
-        """Revoke first (the exchange refuses the pod at once), then delete."""
+        """Revoke first (the exchange refuses the pod at once), then delete.
+        A pod still terminating frees its slot soon: a start at the cap later
+        in this pass waits for it (:meth:`_make_room`)."""
         await self._revoke(row, reason, error=error)
         report.stopped.append((str(row["id"]), reason))
         await self._remove(row, report)
+        if str(row["id"]) not in report.removed:
+            self._freeing += 1
 
     async def _remove(self, row: Mapping[str, Any], report: ReconcileReport) -> None:
         try:
@@ -1295,12 +1311,15 @@ class ServiceHostingReconciler:
         """At the installation's cap: stop one pod for a new pod of
         ``binding``'s key. Whether one stopped.
 
-        A pod stopped earlier and still terminating frees its slot soon:
-        this start waits for it rather than stopping another (counting a
-        terminating pod as gone only once its objects are, every pass would
-        evict one more). Else the key's own pod of an earlier generation
-        gives way to its successor (its bindings move to the successor with
-        the endpoint Service), else the longest-idle pod no binding uses.
+        A pod stopped lately and still terminating frees its slot soon
+        (:data:`FREEING_SECONDS`): this start waits for it rather than
+        stopping another (counting a terminating pod as gone only once its
+        objects are, every pass would evict one more). So does a victim
+        another pass stopped first (two replicas during a leadership
+        change). Else the key's own pod of an earlier generation gives way
+        to its successor (its bindings move to the successor with the
+        endpoint Service, cut for the successor's start), else the
+        longest-idle pod no binding uses.
         """
         if self._freeing > 0:
             self._freeing -= 1
@@ -1311,13 +1330,25 @@ class ServiceHostingReconciler:
             )
             return False
         key = (binding.connector_id, binding.digest)
-        for victim in self._superseded.pop(key, []):
-            if await self._evict(victim, SUPERSEDED, report, bound_ok=True):
+        candidates = [
+            (victim, SUPERSEDED, True) for victim in self._superseded.pop(key, [])
+        ]
+        while candidates or self._evictable:
+            if candidates:
+                victim, reason, bound_ok = candidates.pop(0)
+            else:
+                victim, reason, bound_ok = self._evictable.pop(0), IDLE_EVICTED, False
+            outcome = await self._evict(victim, reason, report, bound_ok=bound_ok)
+            if outcome == _EVICTED:
                 return True
-        while self._evictable:
-            victim = self._evictable.pop(0)
-            if await self._evict(victim, IDLE_EVICTED, report, bound_ok=False):
-                return True
+            if outcome == _ALREADY_STOPPED:
+                logger.info(
+                    "At the installation's cap: driver pod %s was stopped by "
+                    "another pass; connector %s waits for its slot",
+                    victim["pod_name"],
+                    binding.connector_id,
+                )
+                return False
         return False
 
     async def _evict(
@@ -1327,32 +1358,41 @@ class ServiceHostingReconciler:
         report: ReconcileReport,
         *,
         bound_ok: bool,
-    ) -> bool:
-        """Stop ``row`` to make room, under the capacity lock: the pass read
-        it unbound, but a delivery may have bound its key since, so the
-        revoke happens only while no live lease binds its connector and
-        digest (``bound_ok``: a superseded pod giving way to its successor,
-        whose key is bound by definition). Whether it stopped."""
+    ) -> str:
+        """Stop ``row`` to make room, under the capacity lock.
+
+        The pass read it unbound, but a delivery may have bound its key
+        since, or be binding it now: the victim's identity row is locked
+        first (``FOR UPDATE``), which waits for a delivery that found the
+        pod (its lease issue holds the row ``FOR KEY SHARE`` until it
+        commits), and only then are the key's live leases read. A pod bound
+        meanwhile is spared (``_SPARED``: for a stdio managed MCP server,
+        D5b, the pod the binding's process starts in). A superseded pod
+        giving way to its successor (``bound_ok``) is bound by definition.
+        A victim another pass stopped first is ``_ALREADY_STOPPED``.
+        """
         async with self.store.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                     _CAPACITY_LOCK,
                 )
+                locked = await conn.fetchrow(
+                    "SELECT revoked_at FROM connector_driver_identities "
+                    "WHERE id = $1 FOR UPDATE",
+                    UUID(str(row["id"])),
+                )
+                if locked is None or locked["revoked_at"] is not None:
+                    return _ALREADY_STOPPED
                 if not bound_ok and await conn.fetchval(
                     _KEY_BOUND,
                     UUID(str(row["connector_id"])),
                     str(row["image_digest"]),
                 ):
-                    # Bound since the pass read it (for a stdio managed MCP
-                    # server, D5b, the pod the binding's process starts in):
-                    # spared, the next candidate makes room.
-                    return False
-                revoked = await revoke_driver_identity(
+                    return _SPARED
+                await revoke_driver_identity(
                     conn, identity_id=str(row["id"]), reason=reason
                 )
-                if not revoked:
-                    return False  # stopped meanwhile
                 await conn.execute(
                     "UPDATE connector_driver_identities SET idle_since = NULL "
                     "WHERE id = $1",
@@ -1365,7 +1405,7 @@ class ServiceHostingReconciler:
         )
         report.stopped.append((str(row["id"]), reason))
         await self._remove(row, report)
-        return True
+        return _EVICTED
 
     async def _start(
         self,
@@ -1648,10 +1688,16 @@ class ServiceHostingReconciler:
         for row in rows:
             if row["revoked_at"] is not None:
                 await self._remove(row, report)
+        # Each stopped pod still terminating frees its slot soon; one stopped
+        # longer ago than FREEING_SECONDS is stuck (a node gone, a
+        # finalizer): its slot is lost, and a start at the cap stops
+        # another pod as before rather than wait for it forever.
         self._freeing = sum(
             1
             for row in rows
-            if row["revoked_at"] is not None and str(row["id"]) not in report.removed
+            if row["revoked_at"] is not None
+            and str(row["id"]) not in report.removed
+            and (self.clock() - row["revoked_at"]).total_seconds() < FREEING_SECONDS
         )
         live = [row for row in rows if row["revoked_at"] is None]
 
@@ -2207,7 +2253,10 @@ async def _listen(
                         await _until((shutdown_event, lost), LISTEN_CHECK_SECONDS)
                         if shutdown_event.is_set() or lost.is_set():
                             break
-                        await asyncio.wait_for(conn.fetchval("SELECT 1"), timeout=10)
+                        await asyncio.wait_for(
+                            conn.fetchval("SELECT 1"),
+                            timeout=LISTEN_CHECK_TIMEOUT_SECONDS,
+                        )
                 finally:
                     try:
                         await asyncio.wait_for(

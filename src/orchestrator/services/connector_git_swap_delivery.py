@@ -444,6 +444,7 @@ async def _serving(conn: Any, connector_id: str, generation: str | None = None) 
                AND credential_generation = $3
                AND revoked_at IS NULL AND ready_at IS NOT NULL
              LIMIT 1
+               FOR KEY SHARE
             """,
             UUID(connector_id),
             GIT_SWAP_SPEC.name,
@@ -566,18 +567,18 @@ def _stop_problem(reason: str, error: Any) -> Problem:
 
 
 #: The pods that hold a slot a new pod of the connector ($1, whose current
-#: generation is $2) cannot take: live, and neither idle without a binding
-#: (the reconciler stops the longest-idle such pod at the cap) nor the
-#: connector's own pod of an earlier generation (it gives way to its
-#: successor). A stopped pod still terminating holds no slot here: the
-#: reconciler waits for it rather than stopping another. The reconciler's
-#: eviction (``connector_service_hosting``) decides the same way.
+#: generation is $2) cannot take: every pod not removed yet, except a live
+#: one idle without a binding (the reconciler stops the longest-idle such
+#: pod at the cap) and the connector's own pods of an earlier generation
+#: (they give way to its successor). A stopped pod still terminating holds
+#: its slot: another key's start may be waiting for it, so a delivery never
+#: counts on it. The reconciler's eviction (``connector_service_hosting``)
+#: decides the same way.
 _BUSY_PODS = """
 SELECT count(*) FROM connector_driver_identities AS pod
- WHERE pod.credential_generation IS NOT NULL
-   AND pod.removed_at IS NULL AND pod.revoked_at IS NULL
+ WHERE pod.credential_generation IS NOT NULL AND pod.removed_at IS NULL
    AND NOT (
-        (pod.idle_since IS NOT NULL AND NOT EXISTS (
+        (pod.revoked_at IS NULL AND pod.idle_since IS NOT NULL AND NOT EXISTS (
             SELECT 1 FROM connector_credential_leases AS lease
              WHERE lease.connector_id = pod.connector_id
                AND lease.image_digest = pod.image_digest

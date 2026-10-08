@@ -171,10 +171,19 @@ connectors:
     # -- Installation cap on live service pods (one per connector, image
     # digest and credential generation). The orchestrator refuses past it
     # with a capacity error; the namespace's NotTerminating pod quota is the
-    # backstop.
+    # backstop. At the cap a new pod takes the place of the longest-idle pod
+    # no binding uses, waiting first for a stopped pod still terminating
+    # (for 90 s at most). A connector whose config or tier changed takes
+    # its own superseded pod's place at once, live bindings and all: those
+    # bindings (a managed MCP session, a git swap transfer) are cut for the
+    # successor's start time, without the repinDrainSeconds drain. A
+    # successor that fails to start shows on the connector's driver pods
+    # (stopped reason and launch error, the egress view; for a git swap
+    # repository, its Test too).
     maxInstallation: 10
     # -- Seconds a pod stays up after its last binding ended (or after a
-    # newer generation of its connector superseded it, while it drains).
+    # newer generation of its connector superseded it, until that
+    # generation's pod is ready: then it drains for repinDrainSeconds).
     idleSeconds: 600
     # -- Seconds a new pod may take to become ready (canary wait included)
     # before it is stopped and its key backed off.
@@ -194,8 +203,11 @@ connectors:
     # intervals. 0 never re-resolves (a pod keeps its addresses until it
     # idles).
     reresolveSeconds: 300
-    # -- Seconds a pod replaced after a re-pin keeps running once its
-    # replacement serves, so requests in flight on it can finish.
+    # -- Seconds a pod replaced after a re-pin, or superseded by its
+    # connector's new generation (a config or tier change), keeps running
+    # once its successor is ready and the endpoint Service names it, so
+    # requests in flight on it can finish. Not at the installation's cap:
+    # there a superseded pod stops at once for its successor (maxInstallation).
     repinDrainSeconds: 30
     # -- The lease exchange server's second listener: every driver pod's
     # start-up wait must find it refused while the exchange answers. The same

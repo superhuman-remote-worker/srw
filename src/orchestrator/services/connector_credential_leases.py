@@ -371,6 +371,21 @@ async def issue_or_redeliver(
             is None
         ):
             raise LeaseDeliveryError("The connector no longer exists")
+        if image_digest is not None:
+            # A service binding: its key's live pods are held until this
+            # delivery commits. An eviction at the installation's cap locks
+            # its victim FOR UPDATE before it reads the key's leases, so it
+            # waits for this lease and spares the pod (C3 reconciler review).
+            await conn.execute(
+                """
+                SELECT 1 FROM connector_driver_identities
+                 WHERE connector_id = $1 AND image_digest = $2
+                   AND credential_generation IS NOT NULL AND revoked_at IS NULL
+                   FOR KEY SHARE
+                """,
+                connector_uuid,
+                image_digest,
+            )
         await conn.execute(
             f"""
             UPDATE connector_credential_leases

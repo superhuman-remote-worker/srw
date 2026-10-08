@@ -24,6 +24,8 @@ from testcontainers.postgres import PostgresContainer
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.security.crypto import encrypt
 from orchestrator.services import connector_credential_leases as leases
+from orchestrator.services import connector_service_hosting as hosting
+from orchestrator.services.connector_driver_identities import revoke_driver_identity
 from orchestrator.services import connector_service_images as images
 from orchestrator.services.connector_egress import private_addresses_allowed
 from orchestrator.services.connector_drivers import builtin_connector_drivers
@@ -2315,6 +2317,17 @@ async def test_at_the_cap_a_superseded_pod_gives_way_to_its_successor(db, reconc
     assert len(report.started) == 1 and report.capacity == 0
     pods = {str(pod["id"]): pod for pod in await _pods(db)}
     assert pods[str(bystander["id"])]["revoked_at"] is None
+    # Its bindings are cut until the successor serves; a successor that
+    # never does is visible on the connector, beside the stop that made
+    # room for it.
+    (successor,) = report.started
+    reconciler.offset[0] = timedelta(seconds=121)
+    report = await reconciler.reconcile_once()
+    assert (successor, "start_timeout") in report.stopped
+    view = await connector_egress_view(db, connector, spec=None)
+    stops = {pod["identity_id"]: pod["stopped_reason"] for pod in view["pods"]}
+    assert stops[successor] == "start_timeout"
+    assert stops[str(old["id"])] == "superseded"
 
 
 @pytest.mark.asyncio
@@ -2325,13 +2338,18 @@ async def test_an_eviction_rechecks_the_binding_under_the_capacity_lock(db, reco
     thread = await _thread(db)
     await _bind_echo(db, str(pod["connector_id"]), thread)
     report = ReconcileReport()
-    assert not await reconciler._evict(pod, "idle_evicted", report, bound_ok=False)
+    spared = await reconciler._evict(pod, "idle_evicted", report, bound_ok=False)
+    assert spared == hosting._SPARED
     (row,) = [p for p in await _pods(db) if p["id"] == pod["id"]]
     assert row["revoked_at"] is None and report.stopped == []
     await _end(db, thread)
-    assert await reconciler._evict(pod, "idle_evicted", report, bound_ok=False)
+    evicted = await reconciler._evict(pod, "idle_evicted", report, bound_ok=False)
+    assert evicted == hosting._EVICTED
     (row,) = [p for p in await _pods(db) if p["id"] == pod["id"]]
     assert row["revoke_reason"] == "idle_evicted"
+    # Another pass reaching the same victim leaves it to the first.
+    again = await reconciler._evict(pod, "idle_evicted", report, bound_ok=False)
+    assert again == hosting._ALREADY_STOPPED
 
 
 @pytest.mark.asyncio
@@ -2371,3 +2389,133 @@ async def test_a_terminating_victim_is_waited_for_not_doubled(db, reconciler):
     assert len(report.started) == 1
     assert await revoked() == [victim]
     assert str(second["id"]) not in {identity for identity, _ in report.stopped}
+
+
+# =============================================================================
+# The C3 reconciler review: the installation's cap
+# =============================================================================
+
+
+async def _revoked(db) -> list[str]:
+    return [str(pod["id"]) for pod in await _pods(db) if pod["revoked_at"] is not None]
+
+
+@pytest.mark.asyncio
+async def test_a_pod_stuck_terminating_is_waited_for_only_so_long(db, reconciler):
+    """The review's fix 1: a stopped pod that never finishes terminating (a
+    node gone) frees its slot for FREEING_SECONDS at most; then a start at
+    the cap stops an idle pod as before instead of waiting forever."""
+    reconciler.settings = dataclasses.replace(reconciler.settings, idle_seconds=3600)
+    await _echo_image(db)
+    stuck = await _idle_pod(db, reconciler)
+    idle = await _idle_pod(db, reconciler)
+    async with db.acquire() as conn:
+        await revoke_driver_identity(
+            conn, identity_id=str(stuck["id"]), reason="not_ready"
+        )
+    remove = reconciler.fake.remove
+
+    async def never(identity):
+        if identity.identity_id == str(stuck["id"]):
+            return False
+        return await remove(identity)
+
+    reconciler.fake.remove = never
+    waiting = await _echo_connector(db)
+    await _bind_echo(db, waiting, await _thread(db))
+    for _ in range(3):
+        report = await reconciler.reconcile_once()
+        assert report.started == [] and report.capacity == 1
+    assert await _revoked(db) == [str(stuck["id"])]
+    reconciler.offset[0] = timedelta(seconds=hosting.FREEING_SECONDS + 1)
+    report = await reconciler.reconcile_once()
+    assert (str(idle["id"]), "idle_evicted") in report.stopped
+    assert len(report.started) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_pod_stopped_in_the_same_pass_frees_its_slot(db, reconciler):
+    """A nit of the review: an idle pod that times out in the pass a start
+    hits the cap frees a slot for it; a second idle pod is not evicted."""
+    await _echo_image(db)
+    old = await _idle_pod(db, reconciler)
+    young = await _idle_pod(db, reconciler)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE connector_driver_identities "
+            "SET idle_since = now() - interval '600 seconds' WHERE id = $1",
+            old["id"],
+        )
+
+    async def terminating(identity):
+        return False
+
+    reconciler.fake.remove = terminating
+    await _bind_echo(db, await _echo_connector(db), await _thread(db))
+    report = await reconciler.reconcile_once()
+    assert report.stopped == [(str(old["id"]), "idle")]
+    assert report.capacity == 1 and report.started == []
+    assert str(young["id"]) not in await _revoked(db)
+
+
+@pytest.mark.asyncio
+async def test_an_eviction_waits_for_a_delivery_that_has_not_committed(db, reconciler):
+    """The review's fix 3: a delivery with an open transaction issues a
+    lease on the longest-idle pod's key while a pass at the cap evicts. The
+    lease issue holds the pod FOR KEY SHARE; the eviction locks it FOR
+    UPDATE, waits for the commit, sees the lease and spares the pod."""
+    await _echo_image(db)
+    victim = await _idle_pod(db, reconciler)
+    other = await _idle_pod(db, reconciler)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE connector_driver_identities "
+            "SET idle_since = now() - interval '50 seconds' WHERE id = $1",
+            victim["id"],
+        )
+    await _bind_echo(db, await _echo_connector(db), await _thread(db))
+    thread = await _thread(db)
+    async with db.acquire() as conn:
+        delivery = conn.transaction()
+        await delivery.start()
+        await leases.issue_or_redeliver(
+            conn,
+            owner=leases.LeaseOwner.thread(thread),
+            connector_id=str(victim["connector_id"]),
+            driver=ECHO,
+            access="ReadWrite",
+            image_digest=D1,
+        )
+        passing = asyncio.create_task(reconciler.reconcile_once())
+        await asyncio.sleep(1.0)
+        # The eviction waits on the victim's row while the delivery is open.
+        assert not passing.done()
+        await delivery.commit()
+    report = await asyncio.wait_for(passing, 20)
+    revoked = await _revoked(db)
+    assert str(victim["id"]) not in revoked
+    assert (str(other["id"]), "idle_evicted") in report.stopped
+
+
+@pytest.mark.asyncio
+async def test_two_overlapping_passes_evict_one_pod_for_one_start(db, reconciler):
+    """The review's fix 4: two passes (two replicas during a leadership
+    change) at the cap for one start stop one pod: the second finds its
+    victim stopped and waits for that slot."""
+    import copy
+
+    await _echo_image(db)
+    await _idle_pod(db, reconciler)
+    await _idle_pod(db, reconciler)
+
+    async def terminating(identity):
+        return False
+
+    reconciler.fake.remove = terminating
+    await _bind_echo(db, await _echo_connector(db), await _thread(db))
+    other = copy.copy(reconciler)
+    first, second = await asyncio.gather(
+        reconciler.reconcile_once(), other.reconcile_once()
+    )
+    assert len(await _revoked(db)) == 1
+    assert [reason for _, reason in first.stopped + second.stopped] == ["idle_evicted"]

@@ -164,13 +164,14 @@ async def test_a_live_pod_serves_and_a_full_installation_refuses(db):
         generation = await swaps.current_generation(conn, serving)
     live = await _pod(db, serving, generation=generation)
     await _set(db, live, "ready_at = now()")
-    # A newer failed pod does not hide the live one.
-    await _pod(db, serving, stop="start_timeout", generation="g2")
+    # A newer failed pod does not hide the live one; its objects are gone.
+    failed = await _pod(db, serving, stop="start_timeout", generation="g2")
+    await _set(db, failed, "removed_at = now()")
     async with db.acquire() as conn:
         assert await swaps.launch_problem(conn, serving) is None
         waiting = await _connector(db)
         problem = await swaps.launch_problem(conn, waiting)
-        # The live pod is busy; the stopped one holds no slot.
+        # The live pod is busy; the removed one holds no slot.
         assert problem.reason == "no_room"
         # Idle pods make room: the reconciler evicts the longest-idle one.
         await conn.execute(
@@ -313,11 +314,15 @@ async def test_the_busy_count_is_what_the_reconciler_would_not_stop(db):
         )
     assert for_own == 2  # draining and busy
     assert for_another == 3  # and own's old pod, which drains its binding
-    # A stopped pod still terminating holds no slot here (the reconciler
-    # waits for it rather than stopping another).
-    await _set(db, draining_pod, "revoked_at = now(), revoke_reason = 'idle'")
+    # A stopped pod still terminating holds its slot: another key's start
+    # may be waiting for it (the reconciler review's fix 2), even one that
+    # was idle without a binding; it is free once its objects are gone.
+    await _set(db, idle_pod, "revoked_at = now(), revoke_reason = 'idle_evicted'")
     async with db.acquire() as conn:
-        assert await conn.fetchval(swaps._BUSY_PODS, UUID(stranger), "x") == 2
+        assert await conn.fetchval(swaps._BUSY_PODS, UUID(stranger), "x") == 4
+    await _set(db, idle_pod, "removed_at = now()")
+    async with db.acquire() as conn:
+        assert await conn.fetchval(swaps._BUSY_PODS, UUID(stranger), "x") == 3
 
 
 @pytest.mark.asyncio
