@@ -1813,6 +1813,39 @@ async def test_assembly_refusal_is_generic_409(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_an_unavailable_model_refusal_names_the_model(monkeypatch):
+    """Unlike the generic refusal, an unavailable model is the owner's to fix:
+    the 409 carries the object detail the agent parks with
+    (unavailable_model_handling.md §5). The flat fallback copy is injected
+    non-strictly; the assembly's resolved config is what refuses."""
+    from orchestrator import main as orch_main
+    from orchestrator.services.model_availability import (
+        ModelUnavailable,
+        UnavailableModel,
+    )
+
+    db = FakeDB(run_queue_row=dict(LEASED_ROW), thread=_thread())
+    inject, assembly = _patch(monkeypatch, orch_main, db)
+    assembly.side_effect = ModelUnavailable(
+        [UnavailableModel("llm", "MiniMax-M3", "disabled")]
+    )
+    with pytest.raises(HTTPException) as exc:
+        await unit_claim_bundle.claim_bundle_for_unit(
+            UNIT_ID,
+            lease_token=7,
+            pod_name=POD_NAME,
+            pod_uid=POD_UID,
+            dependencies=sessions_composition.unit_claim_bundle_dependencies(
+                orch_main.app.state.resources
+            ),
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "model.unavailable"
+    assert "`MiniMax-M3` (main model)" in exc.value.detail["message"]
+    assert inject.await_args.kwargs["strict"] is False
+
+
+@pytest.mark.asyncio
 async def test_internal_auth_failure_is_401_before_any_lookup(monkeypatch):
     """With the REAL require_internal and no/wrong X-Internal-Key the endpoint
     401s before touching the queue or the thread."""

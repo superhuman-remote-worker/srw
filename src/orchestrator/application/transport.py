@@ -43,6 +43,7 @@ from orchestrator.services import (
     stateless_workspace_scheduler,
     workspace_suspension,
 )
+from shared.runtime.core import model_registry
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +147,7 @@ def stateless_input_dependencies(
             preparation_composition.stateless_workspace_schedule_dependencies,
             resources,
         ),
+        resolve_model=model_registry.resolve_model,
     )
 
 

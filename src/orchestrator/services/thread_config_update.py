@@ -68,6 +68,11 @@ from orchestrator.security.access import redact_config_override
 from orchestrator.services import connector_bind_time, connector_credential_leases
 from orchestrator.services.config_overrides import deep_merge_dicts
 from orchestrator.services.manifest_runtime_ownership import require_srw_runtime
+from orchestrator.services.model_availability import (
+    WHERE_SESSION,
+    ModelUnavailable,
+    UnavailableModel,
+)
 from orchestrator.services.session_class_policy import (
     require_stateless_workspace,
     session_class_pinned_refusal,
@@ -604,12 +609,25 @@ async def apply_thread_config_update_locked(
                 user_id=user_id, project_id=project_id
             )
             llm_section = dict(llm_section)
-            await dependencies.inject_model_credentials(
+            reason = await dependencies.inject_model_credentials(
                 section=llm_section,
                 model_id=llm_section["model"],
                 user_id=user_id,
                 resolved_keys=resolved_keys,
             )
+            if reason:
+                # An explicit pin: refused, never swapped for another model
+                # (unavailable_model_handling.md D2). Nothing is persisted.
+                refusal = ModelUnavailable(
+                    [
+                        UnavailableModel(
+                            slot="llm", model=str(llm_section["model"]), reason=reason
+                        )
+                    ]
+                )
+                raise HTTPException(
+                    status_code=409, detail=refusal.detail(where=WHERE_SESSION)
+                )
             # A model swap must fully determine its transport. Any field
             # resolution didn't set becomes an explicit None so the
             # agent-side deep_merge CLEARS the previous model's value

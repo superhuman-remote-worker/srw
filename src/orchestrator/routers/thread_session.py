@@ -27,6 +27,7 @@ from orchestrator.security.access import log_security_event
 from orchestrator.services import session_tool_view
 from orchestrator.services.deployment_gates import require_pinned_status_identity
 from orchestrator.services.grant_enforcement import GrantDenied
+from orchestrator.services.model_availability import ModelUnavailable
 from orchestrator.services.session_class_policy import require_stateless_workspace
 from orchestrator.services.session_resolved_config import read_session_resolved_config
 from orchestrator.services.session_runtime_admission import (
@@ -193,6 +194,15 @@ async def get_thread_session_state(
                 "Session-state config resolve denied for thread %s; using stored "
                 "display fields",
                 thread_id,
+            )
+            return None
+        except ModelUnavailable as unavailable:
+            # The session must still load so its owner can switch the model.
+            logger.warning(
+                "Session-state config resolve for thread %s: %s; using stored "
+                "display fields",
+                thread_id,
+                unavailable,
             )
             return None
         finally:

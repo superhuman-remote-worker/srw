@@ -59,6 +59,7 @@ from orchestrator.services.job_workspace_runtime import (
     inject_vm_workspace_config,
     stateless_worker_workspace_owner,
 )
+from orchestrator.services.model_availability import WHERE_SESSION, ModelUnavailable
 from orchestrator.services.session_class_policy import require_stateless_workspace
 from orchestrator.services.stateless_workspace_gate import (
     stateless_session_workspace_check,
@@ -987,6 +988,8 @@ async def _assemble_claim_bundle(
         user_id=str(thread["user_id"]) if thread.get("user_id") else None,
         project_id=str(thread["project_id"]) if thread.get("project_id") else None,
         include_kb_profile=include_kb_profile,
+        # The fallback copy; the assembly below checks the resolved config.
+        strict=False,
         dependencies=dependencies.dispatch_credential_dependencies(),
     )
     config_name = canonical_config_name(thread.get("config_name") or "session_base")
@@ -995,12 +998,19 @@ async def _assemble_claim_bundle(
     # Same serialization the pinned sender takes (_send_session_attach): the
     # assembly must not race a live connector-selection update.
     async with dependencies.db.thread_datasource_lock(unit_id):
-        attach = await session_attach_payload.assemble_session_attach_payload(
-            unit_id,
-            config_override=co,
-            config_name=config_name,
-            dependencies=dependencies.session_attach_payload_dependencies(),
-        )
+        try:
+            attach = await session_attach_payload.assemble_session_attach_payload(
+                unit_id,
+                config_override=co,
+                config_name=config_name,
+                dependencies=dependencies.session_attach_payload_dependencies(),
+            )
+        except ModelUnavailable as unavailable:
+            # Not generic: the agent parks the unit at once with this message
+            # instead of retrying (unavailable_model_handling.md §5).
+            raise HTTPException(
+                status_code=409, detail=unavailable.detail(where=WHERE_SESSION)
+            ) from unavailable
     if attach is None:
         # Generic by design — refusal reasons live in the server log only.
         raise HTTPException(status_code=409, detail="Attach assembly refused")

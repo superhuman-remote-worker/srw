@@ -153,12 +153,36 @@ class ClaimBundleError(Exception):
         *,
         code: WorkspaceRecoveryCode | None = None,
         recovery: WorkspaceRecoveryDisposition | None = None,
+        model_unavailable_message: str | None = None,
     ) -> None:
         self.status_code = status_code
         self.detail = detail
         self.code = code
         self.recovery = recovery
+        # The orchestrator refused the turn because a configured model cannot
+        # run; the user-facing text (unavailable_model_handling.md §5).
+        self.model_unavailable_message = model_unavailable_message
         super().__init__(f"claim-bundle {status_code}: {detail[:200]}")
+
+
+MODEL_UNAVAILABLE_CODE = "model.unavailable"
+
+
+def _model_unavailable_message(response: httpx.Response) -> str | None:
+    """The refusal text of a 409 ``{detail: {code: "model.unavailable",
+    message}}``, else ``None``."""
+    try:
+        detail = response.json().get("detail")
+        if (
+            isinstance(detail, dict)
+            and detail.get("code") == MODEL_UNAVAILABLE_CODE
+            and isinstance(detail.get("message"), str)
+            and detail["message"]
+        ):
+            return detail["message"]
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return None
 
 
 def _workspace_recovery_receipt(
@@ -1900,6 +1924,11 @@ class OrchestratorClient:
             detail,
             code=recovery.code if recovery else None,
             recovery=recovery,
+            model_unavailable_message=(
+                _model_unavailable_message(response)
+                if response.status_code == 409 and recovery is None
+                else None
+            ),
         )
 
     async def report_workspace_recovery(

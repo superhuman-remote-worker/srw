@@ -74,6 +74,11 @@ from orchestrator.services.grant_enforcement import (
     GrantDenied,
     strip_acknowledged_grants,
 )
+from orchestrator.services.model_availability import (
+    WHERE_SESSION,
+    ModelUnavailable,
+    stale_account_model_reason,
+)
 from orchestrator.services.session_class_policy import protected_cloud_officer_active
 from orchestrator.services.session_runtime_admission import (
     protected_cloud_marker_state,
@@ -127,8 +132,59 @@ class SessionConfigDependencies:
     thread_has_knowledge_scope: Callable[..., Awaitable[bool]]
 
 
+async def _account_model_or_fallback(
+    stored: str | None,
+    *,
+    user_id: str | None,
+    capability: str,
+    slot: str,
+    source: str,
+    store: Any,
+    notices: list[dict[str, Any]] | None,
+) -> str | None:
+    """A stored account preference if it can run, else the system default for
+    the capability, with a notice (unavailable_model_handling.md D2).
+
+    The preference is kept when there is no enabled system default to fall
+    back to: the delivery refusal then names the model the user chose, not
+    the base config's placeholder.
+    """
+    system = None
+    if stored:
+        reason = await stale_account_model_reason(
+            str(stored), user_id=user_id, capability=capability, store=store
+        )
+        if reason is None:
+            return stored
+        system = await store.resolve_default_for_capability(capability)
+        if not system:
+            return stored
+        logger.info(
+            "Account preference %s=%r cannot run (%s); using system default %r",
+            source,
+            stored,
+            reason,
+            system,
+        )
+        if notices is not None:
+            notices.append(
+                {
+                    "slot": slot,
+                    "skipped": str(stored),
+                    "reason": reason,
+                    "used": system,
+                    "source": source,
+                }
+            )
+        return system
+    return await store.resolve_default_for_capability(capability)
+
+
 async def resolve_default_models(
-    user_id: str | None, *, dependencies: "SessionConfigDependencies"
+    user_id: str | None,
+    *,
+    dependencies: "SessionConfigDependencies",
+    notices: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Effective default chat + auxiliary MODEL NAMES for a user (no transport).
 
@@ -139,17 +195,34 @@ async def resolve_default_models(
     ``resolve_config`` applies above the base config's placeholder model and below
     the expert. base_url/api_key for the chosen models are injected into the
     delivery blob, not here. Reused by job dispatch AND session attach.
+
+    A pinned default that can no longer run falls back to the system default
+    instead of being admitted (unavailable_model_handling.md D2); each such
+    fallback is appended to ``notices`` when the caller passes a list, so the
+    returned layer keeps its shape.
     """
     out: dict[str, Any] = {}
     user_settings: dict[str, Any] = {}
     if user_id:
         user_settings = await dependencies.store.get_user_settings(str(user_id)) or {}
-    chat = user_settings.get(
-        "default_model"
-    ) or await dependencies.store.resolve_default_for_capability("chat")
-    aux = user_settings.get(
-        "default_auxiliary_model"
-    ) or await dependencies.store.resolve_default_for_capability("auxiliary")
+    chat = await _account_model_or_fallback(
+        user_settings.get("default_model"),
+        user_id=str(user_id) if user_id else None,
+        capability="chat",
+        slot="llm",
+        source="account.default_model",
+        store=dependencies.store,
+        notices=notices,
+    )
+    aux = await _account_model_or_fallback(
+        user_settings.get("default_auxiliary_model"),
+        user_id=str(user_id) if user_id else None,
+        capability="auxiliary",
+        slot="auxiliary",
+        source="account.default_auxiliary_model",
+        store=dependencies.store,
+        notices=notices,
+    )
     if chat:
         out.setdefault("llm", {})["model"] = chat
     reasoning = user_settings.get("default_reasoning_level")
@@ -267,9 +340,16 @@ async def resolve_session_account_defaults(
     all_user_settings: dict[str, Any] | None = None,
     *,
     dependencies: "SessionConfigDependencies",
+    notices: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Account-level session fallbacks, always below the selected expert."""
-    out = await resolve_default_models(user_id, dependencies=dependencies)
+    """Account-level session fallbacks, always below the selected expert.
+
+    ``persistent_agent.model`` that can no longer run is dropped in favour of
+    the default chat model, with a notice (see :func:`resolve_default_models`).
+    """
+    out = await resolve_default_models(
+        user_id, dependencies=dependencies, notices=notices
+    )
     if not user_id:
         return out
     settings = (
@@ -279,8 +359,36 @@ async def resolve_session_account_defaults(
     )
     persistent = (settings or {}).get("persistent_agent") or {}
     layer: dict[str, Any] = {}
-    if persistent.get("model"):
-        layer["llm"] = {"model": persistent["model"]}
+    session_model = persistent.get("model")
+    if session_model:
+        reason = await stale_account_model_reason(
+            str(session_model),
+            user_id=str(user_id),
+            capability="chat",
+            store=dependencies.store,
+        )
+        fallback = (out.get("llm") or {}).get("model")
+        if reason is not None and fallback:
+            logger.info(
+                "Account preference persistent_agent.model=%r cannot run (%s); "
+                "using %r",
+                session_model,
+                reason,
+                fallback,
+            )
+            if notices is not None:
+                notices.append(
+                    {
+                        "slot": "llm",
+                        "skipped": str(session_model),
+                        "reason": reason,
+                        "used": fallback,
+                        "source": "account.persistent_agent.model",
+                    }
+                )
+            session_model = None
+    if session_model:
+        layer["llm"] = {"model": session_model}
     interactive: dict[str, Any] = {}
     for key in ("permission_mode", "idle_timeout_minutes"):
         if persistent.get(key) is not None:
@@ -445,6 +553,13 @@ async def resolve_session_config(
         except GrantDenied as denied:
             if status is not None:
                 status.update(state="denied", grant_violations=list(denied.violations))
+            raise
+        except ModelUnavailable as unavailable:
+            if status is not None:
+                status.update(
+                    state="model_unavailable",
+                    unavailable_models=[e.as_dict() for e in unavailable.entries],
+                )
             raise
         except Exception:
             if status is not None:
@@ -641,6 +756,15 @@ async def resolve_session_config(
             # something different from what attach enforces.
             status["grant_violations"] = list(gd.violations)
         raise
+    except ModelUnavailable as unavailable:
+        # Fail closed like a grant denial: falling back to config_name would
+        # run the base YAML model, which has no route either.
+        if status is not None:
+            status.update(
+                state="model_unavailable",
+                unavailable_models=[e.as_dict() for e in unavailable.entries],
+            )
+        raise
     except Exception:
         logger.exception(
             "Session resolve failed for thread %s; falling back to config_name",
@@ -689,6 +813,10 @@ async def require_supported_protected_session_class(
             )
     except HTTPException:
         raise
+    except ModelUnavailable as unavailable:
+        raise HTTPException(
+            status_code=409, detail=unavailable.detail(where=WHERE_SESSION)
+        ) from unavailable
     except Exception as exc:
         raise HTTPException(
             status_code=409,
@@ -753,6 +881,9 @@ async def session_grant_violations(
         return []
     except GrantDenied as gd:
         return list(gd.violations)
+    except ModelUnavailable:
+        # Not a grant matter: session_endpoint_violations reports it.
+        return []
 
 
 async def session_endpoint_violations(
@@ -789,6 +920,8 @@ async def session_endpoint_violations(
     except GrantDenied:
         # The grant pre-flight owns this rejection; don't double-report.
         return []
+    except ModelUnavailable as unavailable:
+        return [unavailable.message(where=WHERE_SESSION)]
     except Exception:
         # Resolve failure → agent falls back to config_name (fail-open), same as
         # session_grant_violations.

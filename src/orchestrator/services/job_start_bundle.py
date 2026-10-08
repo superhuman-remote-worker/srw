@@ -57,6 +57,7 @@ from orchestrator.services.manifest_execution_snapshot import (
 )
 from shared.backend_kinds import LITE_BACKENDS
 from shared.connectors.builtin import needs_knowledge_profile
+from orchestrator.services.model_availability import WHERE_JOB, ModelUnavailable
 from orchestrator.services.job_mutation_target import (
     FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS,
     FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S,
@@ -260,6 +261,28 @@ async def prepare_job_repository_before_claim(
             type(exc).__name__,
         )
         return False
+
+
+async def _fail_unavailable_model(
+    job_id: str,
+    unavailable: ModelUnavailable,
+    postgres_db: Any,
+    persist_dispatch_state: bool,
+    logger: logging.Logger,
+) -> None:
+    """Fail a job whose configured model cannot run, naming it
+    (unavailable_model_handling.md §5)."""
+    logger.error(
+        "Dispatch: job %s refused, unavailable model slot(s): %s",
+        job_id,
+        [entry.as_dict() for entry in unavailable.entries],
+    )
+    if persist_dispatch_state:
+        await postgres_db.update_job_status(
+            job_id,
+            status="failed",
+            error_message=unavailable.message(where=WHERE_JOB),
+        )
 
 
 async def build_job_start_request(
@@ -588,6 +611,11 @@ async def build_job_start_request(
                         ),
                     )
                 return None
+            except ModelUnavailable as unavailable:
+                await _fail_unavailable_model(
+                    job_id, unavailable, postgres_db, persist_dispatch_state, logger
+                )
+                return None
         elif dependencies.is_experts_db_enabled():
             try:
                 expert_row = None
@@ -682,6 +710,12 @@ async def build_job_start_request(
                         ),
                     )
                 return None
+            except ModelUnavailable as unavailable:
+                # Fail closed: the flat fallback would run the same model.
+                await _fail_unavailable_model(
+                    job_id, unavailable, postgres_db, persist_dispatch_state, logger
+                )
+                return None
             except Exception:
                 logger.exception(
                     "Dispatch: resolve_config failed for job %s; falling back "
@@ -694,11 +728,20 @@ async def build_job_start_request(
         # Same helper drives both first-dispatch and resume so an orphaned
         # job re-dispatched to a fresh agent doesn't lose its credentials.
         # (Still injected into config_override for the no-blob fallback path.)
-        config_override = await dependencies.inject_dispatch_credentials(
-            job,
-            config_override,
-            include_kb_profile=has_knowledge_scope,
-        )
+        try:
+            config_override = await dependencies.inject_dispatch_credentials(
+                job,
+                config_override,
+                include_kb_profile=has_knowledge_scope,
+                # Only the config the agent runs refuses: with a delivered blob
+                # this flat copy is not sent.
+                strict=resolved_config is None,
+            )
+        except ModelUnavailable as unavailable:
+            await _fail_unavailable_model(
+                job_id, unavailable, postgres_db, persist_dispatch_state, logger
+            )
+            return None
         # Log injected env-key NAMES (never values) so a missing credential —
         # e.g. EMBEDDING_API_KEY, which silently disables memory + KB — is
         # greppable at dispatch (embedding_key_missing_silently_disables_memory_and_kb.md).

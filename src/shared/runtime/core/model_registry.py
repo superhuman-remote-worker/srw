@@ -285,6 +285,18 @@ def register_system_lookup(fn: Optional[SystemLookup]) -> None:
     _system_lookup = fn
 
 
+def lookups_registered() -> bool:
+    """Whether any registry source is installed — i.e. whether
+    :func:`resolve_model` can answer at all. ``False`` before orchestrator
+    startup registers them (and in unit tests that never do): a caller judging
+    a stored preference must not read "no source" as "unavailable"."""
+    return (
+        _custom_lookup is not None
+        or _system_lookup is not None
+        or _catalog_lookup is not None
+    )
+
+
 def register_catalog_lookup(fn: Optional[CatalogLookup]) -> None:
     """Install (or clear) the DB-backed catalog lookup callable.
 

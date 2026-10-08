@@ -680,6 +680,9 @@ def _classify_llm_error(error: Exception) -> str:
         if cls_name in (
             "AuthenticationError",
             "PermissionDeniedError",
+            # No route at all (transport_resolution.ModelRouteMissing): no
+            # retry can produce one.
+            "ModelRouteMissing",
         ):
             return "permanent"
         if cls_name == "RateLimitError":

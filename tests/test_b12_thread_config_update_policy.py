@@ -1242,6 +1242,31 @@ def _inject_transport(*, section, model_id, user_id, resolved_keys):
 
 
 class TestModelEnrichment:
+    async def test_a_swap_to_an_unavailable_model_is_refused_and_not_persisted(
+        self, apply, fakes
+    ):
+        """An explicit pin is refused with the model named, never swapped for
+        another (unavailable_model_handling.md D2); nothing is persisted."""
+        fakes.effects["inject_model_credentials"] = lambda **_kwargs: "disabled"
+        with pytest.raises(HTTPException) as exc:
+            await apply(
+                THREAD,
+                pinned_row(user_id=uuid.UUID(OWNER), project_id=uuid.UUID(PROJECT)),
+                {"llm": {"model": "MiniMax-M3"}},
+                None,
+                request=REQUEST,
+                actor=ACTOR,
+            )
+        assert exc.value.status_code == 409
+        assert exc.value.detail["code"] == "model.unavailable"
+        assert (
+            "`MiniMax-M3` (main model) is no longer available"
+            in (exc.value.detail["message"])
+        )
+        assert fakes.names()[-1] == "inject_model_credentials"
+        for effect in PERSIST_AND_AUDIT:
+            assert effect not in fakes.names()
+
     async def test_a_model_swap_resolves_and_injects_its_transport(self, apply, fakes):
         fakes.effects["inject_model_credentials"] = _inject_transport
         caller_llm = {"model": "m-1", "temperature": 0.2}

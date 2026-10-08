@@ -79,6 +79,7 @@ from orchestrator.services.connector_refs import (
     resolve_execution_connectors,
 )
 from orchestrator.services.config_resolver import resolve_config
+from orchestrator.services.model_availability import render_fallback_notice
 from orchestrator.services.default_experts import (
     DefaultExpertUnavailable,
     ExpertSelectionError,
@@ -291,6 +292,10 @@ class ThreadCreationPlan:
     use_k8s: bool
     create_kwargs: dict[str, Any]
     ignored_override_keys: list[str] = field(default_factory=list)
+    # Account model preferences that could no longer run and were replaced by
+    # the system default (unavailable_model_handling.md D2), rendered for the
+    # owner. Additive in the create response.
+    model_notices: list[str] = field(default_factory=list)
     officer_requested: bool = False
     explicit_officer_commission: bool = False
 
@@ -532,8 +537,12 @@ async def resolve_thread_creation_plan(
     # and every later attach. Fetch them only after scope authorization so
     # an invalid project request fails before any unrelated account work.
     all_user_settings = await dependencies.store.get_user_settings(str(user["id"]))
+    account_notices: list[dict[str, Any]] = []
     account_defaults = await dependencies.resolve_session_account_defaults(
-        str(user["id"]), all_user_settings or {}
+        str(user["id"]), all_user_settings or {}, notices=account_notices
+    )
+    model_notices = list(
+        dict.fromkeys(render_fallback_notice(notice) for notice in account_notices)
     )
 
     # `expert` supersedes the deprecated aliases. A string goes through the
@@ -1003,6 +1012,7 @@ async def resolve_thread_creation_plan(
         use_k8s=use_k8s,
         create_kwargs=create_kwargs,
         ignored_override_keys=ignored_override_keys,
+        model_notices=model_notices,
         officer_requested=_officer_requested,
         explicit_officer_commission=_explicit_officer_commission,
     )
@@ -1585,6 +1595,8 @@ async def create_thread(
             # create rebuild did not carry. Additive — clients that do not
             # read it are unaffected; the Strict phase turns this into a 400.
             response["ignored_config_keys"] = plan.ignored_override_keys
+        if plan.model_notices:
+            response["notices"] = plan.model_notices
         return response
     except DatasourceMaterializationAuthorizationError as exc:
         raise HTTPException(

@@ -33,6 +33,7 @@ from orchestrator.services import (
 from orchestrator.services import (
     session_config_resolution as session_config_resolution_module,
 )
+from orchestrator.services.model_availability import ModelUnavailable
 from shared.runtime.core import model_registry as model_registry_module
 
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
@@ -75,6 +76,9 @@ def _job(*, job_id: str = "00000000-0000-0000-0000-000000000001") -> dict:
 
 
 CODEX_ENDPOINT_ID = "11111111-1111-1111-1111-111111111111"
+# The system default layer dispatch puts under every blob (resolve_default_models):
+# without it the base YAML's placeholder auxiliary model has no route.
+_SYSTEM_AUX_DEFAULT = {"auxiliary": {"model": "gpt-5.3-codex-spark"}}
 CODEX_BASE_URL = "http://srw-codex-proxy:8317/v1"
 CODEX_API_KEY = "sk-codex-test"
 
@@ -203,6 +207,10 @@ class TestPhaseOverrideCredentialInjection:
                 }
             },
             expert_type="worker",
+            # Dispatch always layers the system defaults under the request; the
+            # base YAML's placeholder auxiliary model has no route and would be
+            # refused (unavailable_model_handling.md).
+            base_defaults=_SYSTEM_AUX_DEFAULT,
         )
         # The pin IS the model now; no phase block remains to carry a None leaf.
         assert blob["agent"]["llm"]["model"] == "gpt-5.3-codex-spark"
@@ -271,16 +279,14 @@ class TestPhaseOverrideCredentialInjection:
         assert result["llm"]["tactical"]["api_key"] == CODEX_API_KEY
 
     @pytest.mark.asyncio
-    async def test_unknown_phase_model_logs_warning_no_crash(
-        self, patched_main, caplog
-    ):
-        """A phase pin for a model the registry doesn't know must not crash —
-        it should log a warning and leave the section unmodified for the
-        downstream agent to surface a clear error."""
+    async def test_unknown_phase_model_is_refused_naming_the_slot(self, patched_main):
+        """A phase pin for a model the registry doesn't know is refused before
+        delivery, naming the slot — not shipped without a route for the agent
+        to 401 on (unavailable_model_handling.md)."""
         override = {"llm": {"tactical": {"model": "does-not-exist"}}}
 
-        with caplog.at_level("WARNING", logger=preparation_composition.logger.name):
-            result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+        with pytest.raises(ModelUnavailable) as raised:
+            await job_dispatch_credentials_module.inject_dispatch_credentials(
                 _job(),
                 override,
                 dependencies=preparation_composition.job_dispatch_credential_dependencies(
@@ -288,12 +294,10 @@ class TestPhaseOverrideCredentialInjection:
                 ),
             )
 
-        assert result["llm"]["tactical"]["model"] == "does-not-exist"
-        assert "base_url" not in result["llm"]["tactical"]
-        assert any(
-            "does-not-exist" in rec.message and "tactical" in rec.message
-            for rec in caplog.records
-        )
+        assert [entry.as_dict() for entry in raised.value.entries] == [
+            {"slot": "llm.tactical", "model": "does-not-exist", "reason": "unknown"}
+        ]
+        assert override["llm"]["tactical"] == {"model": "does-not-exist"}
 
     @pytest.mark.asyncio
     async def test_empty_override_is_a_noop(self, patched_main):
@@ -1177,14 +1181,12 @@ class TestModelSlotCredentialInjection:
         assert result["llm"]["summarization"]["api_key"] == CODEX_API_KEY
 
     @pytest.mark.asyncio
-    async def test_unknown_roster_model_warns_naming_the_entry(
-        self, patched_main, caplog
-    ):
+    async def test_unknown_roster_model_is_refused_naming_the_entry(self, patched_main):
         override = {
             "subagents": {"roster": {"reviewer": {"llm": {"model": "does-not-exist"}}}}
         }
-        with caplog.at_level("WARNING", logger=preparation_composition.logger.name):
-            result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+        with pytest.raises(ModelUnavailable) as raised:
+            await job_dispatch_credentials_module.inject_dispatch_credentials(
                 _job(),
                 override,
                 dependencies=preparation_composition.job_dispatch_credential_dependencies(
@@ -1192,14 +1194,38 @@ class TestModelSlotCredentialInjection:
                 ),
             )
 
-        entry = result["subagents"]["roster"]["reviewer"]["llm"]
-        assert entry["model"] == "does-not-exist"
-        assert "base_url" not in entry
-        assert any(
-            "does-not-exist" in rec.message
-            and "subagents.roster.reviewer" in rec.message
-            for rec in caplog.records
+        assert [entry.as_dict() for entry in raised.value.entries] == [
+            {
+                "slot": "subagents.roster.reviewer.llm",
+                "model": "does-not-exist",
+                "reason": "unknown",
+            }
+        ]
+        assert "helper agent reviewer" in raised.value.message()
+
+    @pytest.mark.asyncio
+    async def test_inheriting_roster_entry_with_a_stale_name_is_not_refused(
+        self, patched_main
+    ):
+        """An inheriting entry runs on its parent's live LLM, so a stale copied
+        model name must not refuse a delivery whose main model works (D5)."""
+        override = {
+            "llm": {"model": "gpt-5.3-codex-spark"},
+            "subagents": {
+                "roster": {
+                    "reader": {"llm": {"model": "MiniMax-M3", "_inherit_llm": True}}
+                }
+            },
+        }
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            override,
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
+        assert result["llm"]["base_url"] == CODEX_BASE_URL
+        assert "base_url" not in result["subagents"]["roster"]["reader"]["llm"]
 
     @pytest.mark.asyncio
     async def test_blob_delivery_credentials_every_roster_entry(self, patched_main):
@@ -1230,7 +1256,10 @@ class TestModelSlotCredentialInjection:
             "prompts": {},
         }
         blob = resolve_config(
-            base_config_name="worker_base", expert_row=parent, expert_type="worker"
+            base_config_name="worker_base",
+            expert_row=parent,
+            expert_type="worker",
+            base_defaults=_SYSTEM_AUX_DEFAULT,
         )
         roster = blob["agent"]["subagents"]["roster"]
         assert set(roster) == {"explorer", "pinned", "inline"}

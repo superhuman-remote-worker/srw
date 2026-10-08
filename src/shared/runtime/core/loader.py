@@ -4784,6 +4784,20 @@ def _create_openai_llm(
     if claude_via_proxy:
         llm_kwargs["anthropic_cache_breakpoints"] = True
 
+    # Backstop (unavailable_model_handling.md D6): OpenAI's endpoint with only
+    # the `not-needed` sentinel is never a route. Build the client (the boot
+    # auxiliary is legitimately built this way) but make every call refuse
+    # with the model named instead of sending a request that 401s.
+    from shared.runtime.core.transport_resolution import openai_route_missing
+
+    if openai_route_missing(base_url, keys):
+        llm_kwargs["route_missing_model"] = config.model
+        logger.warning(
+            "OpenAI LLM for model=%s has no route (no base_url, no key); its "
+            "calls will be refused",
+            config.model,
+        )
+
     llm = ReasoningChatOpenAI(**llm_kwargs)
 
     key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"

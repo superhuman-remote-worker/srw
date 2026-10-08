@@ -43,6 +43,7 @@ from shared.runtime.core.srw_manifest_config import (
 )
 
 from orchestrator.services.expert_catalog_contracts import ExpertCatalogDependencies
+from orchestrator.services.model_availability import stale_account_model_reason
 
 logger = logging.getLogger(__name__)
 
@@ -530,9 +531,28 @@ class ExpertCatalogService:
             settings = await self.store.get_user_settings(str(user_id)) or {}
             account_default = settings.get("default_model")
         system_default = await self.store.resolve_default_for_capability("chat")
-        return effective_models_from_layers(
+        # Same rule as dispatch (resolve_default_models): a stored default that
+        # can no longer run gives way to the system default, so the form shows
+        # what will actually run — and which preference was skipped.
+        skipped: dict[str, str] | None = None
+        if account_default and system_default:
+            reason = await stale_account_model_reason(
+                str(account_default),
+                user_id=str(user_id) if user_id else None,
+                capability="chat",
+                store=self.store,
+            )
+            if reason is not None:
+                skipped = {"model": str(account_default), "reason": reason}
+                account_default = None
+        effective = effective_models_from_layers(
             expert_llm, account_default, system_default, expert_subagents
         )
+        if skipped:
+            for slot in effective.values():
+                if slot.get("source") == "system_default":
+                    slot["skipped_account_default"] = dict(skipped)
+        return effective
 
     async def load_expert_detail(
         self,

@@ -125,6 +125,8 @@ async def test_queue_state_returns_the_block_for_the_owner(owner, monkeypatch):
     assert body["queue"] == {
         "state": "parked",
         "park_reason": PARK_REASON_ATTACH_FAILED,
+        # Only a model_unavailable park carries owner-facing text.
+        "park_message": None,
         "parked_at": NOW.isoformat(),
         "retryable": True,
         "attempts": 3,

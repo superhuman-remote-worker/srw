@@ -177,6 +177,38 @@ def endpoint_origin(url: Optional[str]) -> Optional[tuple[str, str, int]]:
     return scheme, host, port if port is not None else _DEFAULT_PORTS.get(scheme, 0)
 
 
+OPENAI_CANONICAL_BASE_URL = "https://api.openai.com/v1"
+NO_KEY_SENTINEL = "not-needed"
+
+
+class ModelRouteMissing(RuntimeError):
+    """An OpenAI-factory client was asked to call a model it has no route for.
+
+    The client was built with no ``base_url`` (or OpenAI's own) and only the
+    ``not-needed`` key sentinel — a request would go to api.openai.com and be
+    refused with an opaque 401. The orchestrator refuses such a model before
+    delivery (unavailable_model_handling.md); this is the agent-side backstop
+    (D6), raised when the client is *called*, never when it is built (the
+    boot-time auxiliary client is legitimately built from the base YAML's
+    placeholder). The retry layer treats it as permanent by class name.
+    """
+
+    def __init__(self, model: str):
+        self.model = model
+        super().__init__(
+            f"Model `{model}` has no configured endpoint. Choose another "
+            "model, or ask your administrator to check Admin → Models."
+        )
+
+
+def openai_route_missing(base_url: Optional[str], keys: list[str]) -> bool:
+    """Whether an OpenAI-factory client with ``base_url`` and ``keys`` can
+    never be served: it targets OpenAI's own endpoint with no real key."""
+    if base_url and not same_endpoint(base_url, OPENAI_CANONICAL_BASE_URL):
+        return False
+    return all(key == NO_KEY_SENTINEL for key in keys)
+
+
 def same_endpoint(a: Optional[str], b: Optional[str]) -> bool:
     """True when two URLs name the same origin (scheme + host + port).
 

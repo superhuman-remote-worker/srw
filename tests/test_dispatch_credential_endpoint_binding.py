@@ -560,7 +560,9 @@ class TestEnvKeyByoPair:
             **{**deps.__dict__, "inject_env_key_credentials": env_creds}
         )
         override = {
-            "llm": {"model": "anything"},
+            # An explicit provider keeps this unknown placeholder model routable;
+            # without one it would be refused (unavailable_model_handling.md).
+            "llm": {"model": "anything", "provider": "openai"},
             "env_keys": {"EMBEDDING_MODEL": "pin"},
         }
         await jdc.inject_dispatch_credentials(_job(), override, dependencies=deps)

@@ -25,6 +25,7 @@ from orchestrator.services.config_resolver import (
 from orchestrator.services.container_provisioner import WorkspaceRuntimeAuthorityError
 from orchestrator.services.datasource_policy import SHELL_WORKSPACE_DETAIL
 from orchestrator.services.grant_enforcement import GrantDenied
+from orchestrator.services.model_availability import WHERE_JOB, ModelUnavailable
 from orchestrator.services.managed_repository_authority import (
     ManagedRepositoryAuthorityError,
 )
@@ -360,6 +361,25 @@ async def dispatch_job_to_agent(
         dependencies.reset_log_context(_log_token)
 
 
+async def _refuse_unavailable_model_resume(
+    job: dict[str, Any], unavailable: ModelUnavailable, dependencies: Any
+) -> None:
+    """Refuse a resume whose configured model cannot run, naming it
+    (unavailable_model_handling.md §5). Mirrors the grant-denial branch: the
+    job fails with the message unless completion commands own job status."""
+    dependencies.logger.warning(
+        "Resume refused for job %s: unavailable model slot(s) %s",
+        job.get("id"),
+        [entry.as_dict() for entry in unavailable.entries],
+    )
+    if not dependencies.completion_commands_enabled():
+        await dependencies.store.update_job_status(
+            str(job["id"]),
+            status="failed",
+            error_message=unavailable.message(where=WHERE_JOB),
+        )
+
+
 async def resume_job_on_agent(
     job: dict[str, Any], agent: dict[str, Any], *, dependencies: JobDeliveryDependencies
 ) -> bool:
@@ -681,6 +701,9 @@ async def resume_job_on_agent(
             except GrantDenied as gd:
                 dependencies.logger.warning("Resume denied for job %s: %s", job_id, gd)
                 return False
+            except ModelUnavailable as unavailable:
+                await _refuse_unavailable_model_resume(job, unavailable, dependencies)
+                return False
         elif resolved_resume_supported or user_experts_enabled:
             try:
                 _rbase = canonical_config_name(job.get("config_name") or "worker_base")
@@ -758,17 +781,24 @@ async def resume_job_on_agent(
                         ),
                     )
                 return False
+            except ModelUnavailable as unavailable:
+                await _refuse_unavailable_model_resume(job, unavailable, dependencies)
+                return False
 
         # The blob and flat fallback are mutually exclusive on the wire. Inject
         # credentials once into whichever representation will actually be sent:
         # inject_blob_credentials for the preferred path, the legacy flat
         # override only when resolved-config delivery is disabled.
         if resolved_config is None:
-            config_override = await dependencies.inject_dispatch_credentials(
-                job,
-                config_override,
-                include_kb_profile=has_knowledge_scope,
-            )
+            try:
+                config_override = await dependencies.inject_dispatch_credentials(
+                    job,
+                    config_override,
+                    include_kb_profile=has_knowledge_scope,
+                )
+            except ModelUnavailable as unavailable:
+                await _refuse_unavailable_model_resume(job, unavailable, dependencies)
+                return False
             injected_env_keys = (config_override.get("env_keys") or {}).keys()
         else:
             injected_env_keys = (

@@ -25,6 +25,7 @@ from shared.run_queue import (
     PARK_REASON_ATTACH_FAILED,
     PARK_REASON_CLAIM_LOSS_HOLD,
     PARK_REASON_COMPLETION_CAS_FAILED,
+    PARK_REASON_MODEL_UNAVAILABLE,
     PARK_REASON_REAPER_MAX_ATTEMPTS,
     PARK_REASON_RETRY_EXHAUSTED,
     PARK_REASON_SHUTDOWN_CANCELLED,
@@ -113,9 +114,13 @@ def test_retryable_set_and_refusal_order():
         PARK_REASON_COMPLETION_CAS_FAILED,
         PARK_REASON_REAPER_MAX_ATTEMPTS,
         PARK_REASON_RETRY_EXHAUSTED,
+        PARK_REASON_MODEL_UNAVAILABLE,
     }
     assert sqs.park_retry_refusal(PARK_REASON_ATTACH_FAILED, {}) is None
     assert sqs.park_retry_refusal(PARK_REASON_RETRY_EXHAUSTED, {}) is None
+    # Refused at claim for an unavailable model: pre-effect, owner-retryable
+    # once the model is switched (unavailable_model_handling.md §5).
+    assert sqs.park_retry_refusal(PARK_REASON_MODEL_UNAVAILABLE, {}) is None
     assert sqs.park_retry_refusal(PARK_REASON_ATTACH_FAILED, None) is None
     assert (
         sqs.park_retry_refusal("some_executor_reason", {})
@@ -156,15 +161,29 @@ def test_queue_block_shapes_parked_and_idle():
         "attempts": 3,
         "pending_input": True,
     }
-    block = sqs.queue_block(parked, {})
+    block = sqs.queue_block({**parked, "last_error": "internal trace"}, {})
     assert block == {
         "state": "parked",
         "park_reason": PARK_REASON_ATTACH_FAILED,
+        # Internal error text is never shown for an ordinary park.
+        "park_message": None,
         "parked_at": NOW.isoformat(),
         "retryable": True,
         "attempts": 3,
         "pending_input": True,
     }
+    refused = sqs.queue_block(
+        {
+            **parked,
+            "park_reason": PARK_REASON_MODEL_UNAVAILABLE,
+            "last_error": "The model `MiniMax-M3` (main model) is no longer available.",
+        },
+        {},
+    )
+    assert refused["park_message"] == (
+        "The model `MiniMax-M3` (main model) is no longer available."
+    )
+    assert refused["retryable"] is True
     held = sqs.queue_block(parked, {CLAIM_LOSS_HOLD_KEY: {}})
     assert held["retryable"] is False
     idle = sqs.queue_block({"state": "done", "park_reason": "stale", "attempts": 0}, {})
@@ -596,6 +615,34 @@ async def test_exhausted_error_release_parks_and_journals_retry_exhausted(
     assert executor.test_conn.transactions == 1
     assert executor.test_conn.bumped == 1
     executor._ack_terminal_claim_loss.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_model_unavailable_parks_at_once_with_the_message(executor, monkeypatch):
+    """A claim refused because a configured model cannot run parks on its
+    first attempt — no retry budget spent — with the refusal as last_error,
+    journalled like every park (unavailable_model_handling.md §5)."""
+    park = AsyncMock(return_value="parked")
+    release = AsyncMock()
+    journal = AsyncMock(return_value=(0, 1))
+    monkeypatch.setattr(te, "park_unit", park)
+    monkeypatch.setattr(te, "release_unit", release)
+    monkeypatch.setattr(te, "append_system_frame", journal)
+    message = "The model `MiniMax-M3` (main model) is no longer available."
+
+    await executor._park_model_unavailable(_claim(attempts=1), message)
+
+    release.assert_not_awaited()
+    kwargs = park.await_args.kwargs
+    assert kwargs["reason"] == PARK_REASON_MODEL_UNAVAILABLE
+    assert kwargs["last_error"] == message
+    assert kwargs["lease_token"] == 7
+    payload = journal.await_args.kwargs["payload"]
+    assert payload["reason"] == PARK_REASON_MODEL_UNAVAILABLE
+    assert payload["retryable"] is True
+    assert payload["error"] == message
+    assert executor.test_conn.transactions == 1
+    executor._clear_claim_tool_effect.assert_called_once()
 
 
 @pytest.mark.asyncio

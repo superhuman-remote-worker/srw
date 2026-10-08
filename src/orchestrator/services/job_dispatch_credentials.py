@@ -27,7 +27,14 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 
-from shared.runtime.core.loader import INHERIT_MODEL
+from orchestrator.services.model_availability import (
+    ModelUnavailable,
+    UnavailableModel,
+    keeps_explicit_transport,
+    stale_account_model_reason,
+    unresolved_model_reason,
+)
+from shared.runtime.core.loader import INHERIT_MODEL, ROSTER_INHERIT_MARKER
 from shared.runtime.core.model_registry import UnknownModelError
 from shared.runtime.core.transport_resolution import env_endpoint_names
 from shared.subscription_routing import subscription_request_headers
@@ -66,11 +73,45 @@ class DispatchCredentialDependencies:
     nested_model_slots: Callable[[dict[str, Any]], list[tuple[str, Any, str]]]
 
 
+async def _usable_account_default(
+    stored: str | None,
+    capability: str,
+    *,
+    job_id: str,
+    user_id: str | None,
+    store: Any,
+    logger: logging.Logger,
+) -> str | None:
+    """A stored account model preference, or ``None`` when it can no longer
+    run and an enabled system default exists to take its place
+    (unavailable_model_handling.md D2). With no system default it is kept, so
+    the refusal names the model the user chose."""
+    if not stored:
+        return None
+    reason = await stale_account_model_reason(
+        str(stored), user_id=user_id, capability=capability, store=store
+    )
+    if reason is None:
+        return stored
+    if not await store.resolve_default_for_capability(capability):
+        return stored
+    logger.warning(
+        "Dispatch: job %s account default %s model %r cannot run (%s); using "
+        "the system default instead",
+        job_id,
+        capability,
+        stored,
+        reason,
+    )
+    return None
+
+
 async def inject_dispatch_credentials(
     job: dict[str, Any],
     config_override: dict[str, Any] | None,
     *,
     include_kb_profile: bool = False,
+    strict: bool = True,
     dependencies: DispatchCredentialDependencies,
 ) -> dict[str, Any]:
     """Resolve and inject API keys, model routing, and capability defaults.
@@ -91,6 +132,13 @@ async def inject_dispatch_credentials(
 
     Returns the (mutated) ``config_override`` dict so callers can rebind
     locals when the input was None.
+
+    Raises :class:`ModelUnavailable` naming every model slot whose model cannot
+    run once all slots are injected (a roster entry inheriting its parent's
+    model excepted). A model the registry cannot resolve is never routed by a
+    provider guessed from its name (unavailable_model_handling.md D1).
+    ``strict=False`` only logs them: for the flat override built next to a
+    delivered blob, which is not what the agent runs.
     """
     postgres_db = dependencies.store
     logger = dependencies.logger
@@ -111,11 +159,24 @@ async def inject_dispatch_credentials(
     llm_over = config_override.setdefault("llm", {})
     model_id = llm_over.get("model")
     meta = None
+    unavailable: list[UnavailableModel] = []
+    main_unavailable = False
     if model_id:
         try:
             meta = await dependencies.resolve_model(model_id, user_id=user_id_str)
         except UnknownModelError:
             meta = None
+        if meta is None:
+            reason = await unresolved_model_reason(postgres_db, model_id)
+            if not keeps_explicit_transport(llm_over, reason):
+                main_unavailable = True
+                unavailable.append(
+                    UnavailableModel(slot="llm", model=str(model_id), reason=reason)
+                )
+    # What the no-model branch below pre-set on the main section, so a model
+    # chosen later (account or system default) does not inherit it as if the
+    # caller had named that route.
+    no_model_route: dict[str, Any] = {}
 
     if (
         meta is not None
@@ -140,13 +201,18 @@ async def inject_dispatch_credentials(
                 f"Dispatch: routed {model_id} to {meta.origin} endpoint "
                 f"{endpoint_row.get('label') or meta.endpoint_id}"
             )
-    elif resolved_keys:
+    elif resolved_keys and not main_unavailable:
         if meta is not None and meta.api_key_ref:
             provider_for_key: str | None = meta.api_key_ref
+        elif model_id:
+            # An unresolved model kept for its explicit route: only the
+            # provider the caller named, never one inferred from the name.
+            provider_for_key = llm_over.get("provider")
         else:
             provider_for_key = dependencies.dispatch_llm_provider_fallback(
                 job, config_override
             )
+        _before = {key: llm_over.get(key) for key in ("provider", "api_key")}
         # Route to the right agent-side LLM factory. System-anchored catalog
         # rows carry no endpoint base_url, so without an explicit provider the
         # agent's create_llm defaults to the OpenAI factory (api.openai.com)
@@ -185,6 +251,12 @@ async def inject_dispatch_credentials(
                 model_id,
                 provider_for_key,
             )
+        if not model_id:
+            no_model_route = {
+                key: llm_over[key]
+                for key in ("provider", "api_key")
+                if key in llm_over and _before[key] is None
+            }
 
     # Per-model context window: drive the agent's working window from the
     # catalog/admin value. Lands in llm.model_max_context_tokens (a flat llm
@@ -246,14 +318,20 @@ async def inject_dispatch_credentials(
         _section_model = _section.get("model")
         if not _section_model or _section_model == INHERIT_MODEL:
             continue
-        await dependencies.inject_model_credentials(
+        _reason = await dependencies.inject_model_credentials(
             section=_section,
             model_id=_section_model,
             user_id=user_id_str,
             resolved_keys=resolved_keys,
             capability=_capability,
         )
-        if "api_key" not in _section and "base_url" not in _section:
+        if _reason and not _section.get(ROSTER_INHERIT_MARKER):
+            unavailable.append(
+                UnavailableModel(
+                    slot=_section_name, model=str(_section_model), reason=_reason
+                )
+            )
+        elif "api_key" not in _section and "base_url" not in _section:
             logger.warning(
                 f"Dispatch: job {job_id} pinned {_section_name} model "
                 f"{_section_model!r} but no endpoint or provider key was "
@@ -267,33 +345,63 @@ async def inject_dispatch_credentials(
             )
 
     if job.get("user_id"):
-        aux_model = user_settings.get("default_auxiliary_model")
+        aux_model = await _usable_account_default(
+            user_settings.get("default_auxiliary_model"),
+            "auxiliary",
+            job_id=job_id,
+            user_id=user_id_str,
+            store=postgres_db,
+            logger=logger,
+        )
         if not aux_model:
             aux_model = await postgres_db.resolve_default_for_capability("auxiliary")
         if aux_model:
             aux_override = config_override.setdefault("auxiliary", {})
             if "model" not in aux_override:
                 aux_override["model"] = aux_model
-                await dependencies.inject_model_credentials(
+                _reason = await dependencies.inject_model_credentials(
                     section=aux_override,
                     model_id=aux_model,
                     user_id=user_id_str,
                     resolved_keys=resolved_keys,
                     capability="auxiliary",
                 )
+                if _reason:
+                    unavailable.append(
+                        UnavailableModel(
+                            slot="auxiliary", model=str(aux_model), reason=_reason
+                        )
+                    )
                 logger.info(f"Dispatch: injected auxiliary model override: {aux_model}")
 
-        default_model = user_settings.get("default_model")
+        default_model = await _usable_account_default(
+            user_settings.get("default_model"),
+            "chat",
+            job_id=job_id,
+            user_id=user_id_str,
+            store=postgres_db,
+            logger=logger,
+        )
         if default_model:
             llm_override = config_override.setdefault("llm", {})
             if "model" not in llm_override:
                 llm_override["model"] = default_model
-                await dependencies.inject_model_credentials(
+                for _key, _value in no_model_route.items():
+                    if llm_override.get(_key) == _value:
+                        del llm_override[_key]
+                no_model_route = {}
+                _reason = await dependencies.inject_model_credentials(
                     section=llm_override,
                     model_id=default_model,
                     user_id=user_id_str,
                     resolved_keys=resolved_keys,
                 )
+                if _reason:
+                    unavailable.append(
+                        UnavailableModel(
+                            slot="llm", model=str(default_model), reason=_reason
+                        )
+                    )
                 logger.info(f"Dispatch: injected user default_model: {default_model}")
 
         # Per-phase account model defaults (default_strategic_model /
@@ -412,12 +520,22 @@ async def inject_dispatch_credentials(
         if system_chat_model:
             llm_override = config_override.setdefault("llm", {})
             llm_override["model"] = system_chat_model
-            await dependencies.inject_model_credentials(
+            for _key, _value in no_model_route.items():
+                if llm_override.get(_key) == _value:
+                    del llm_override[_key]
+            no_model_route = {}
+            _reason = await dependencies.inject_model_credentials(
                 section=llm_override,
                 model_id=system_chat_model,
                 user_id=user_id_str,
                 resolved_keys=resolved_keys,
             )
+            if _reason:
+                unavailable.append(
+                    UnavailableModel(
+                        slot="llm", model=str(system_chat_model), reason=_reason
+                    )
+                )
             logger.info(
                 f"Dispatch: injected system default chat model: {system_chat_model} "
                 f"(job {job_id})"
@@ -483,4 +601,12 @@ async def inject_dispatch_credentials(
         resolved_keys=resolved_keys,
     )
 
+    if unavailable:
+        if strict:
+            raise ModelUnavailable(unavailable)
+        logger.warning(
+            "Dispatch: job %s flat override names unavailable model slot(s): %s",
+            job_id,
+            [entry.as_dict() for entry in unavailable],
+        )
     return config_override

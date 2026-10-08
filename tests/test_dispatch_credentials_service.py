@@ -914,28 +914,51 @@ class TestProviderFallbackIsNotADefault:
         assert section["api_key"] == USER_OPENROUTER_KEY
 
     @pytest.mark.asyncio
-    async def test_registry_miss_does_consult_the_prefix_heuristic(
+    async def test_registry_miss_is_reported_not_guessed(
         self, patched_main, monkeypatch
     ):
-        """Proves the tripwire above is watching a path that really exists."""
-        seen: list[str] = []
+        """A model the registry cannot resolve gets no route and is reported
+        (unavailable_model_handling.md D1) — the prefix map that once sent a
+        disabled ``gpt-*`` model to OpenAI is never consulted."""
 
-        def spy(model):
-            seen.append(model)
-            return "openai"
+        def tripwire(model):  # pragma: no cover - must never run
+            raise AssertionError(f"prefix heuristic consulted for {model!r}")
 
-        monkeypatch.setattr(dc, "provider_of_model", spy)
+        monkeypatch.setattr(dc, "provider_of_model", tripwire)
         section: dict = {}
-        await dc.inject_model_credentials(
+        reason = await dc.inject_model_credentials(
             section=section,
-            model_id="unknown-model",
+            model_id="gpt-unknown-model",
             user_id="u",
             resolved_keys=dict(USER_KEYS),
             dependencies=_deps(),
         )
-        assert seen == ["unknown-model"]
-        assert section["api_key"] == USER_OPENAI_KEY
+        assert reason == "unknown"
+        assert section == {}
+
+    @pytest.mark.asyncio
+    async def test_registry_miss_keeps_a_route_the_section_names(
+        self, patched_main, monkeypatch
+    ):
+        """An explicit ``provider`` on an unknown model is the caller's route:
+        it keeps it and gets that provider's stored key, still without the
+        prefix map."""
+
+        def tripwire(model):  # pragma: no cover - must never run
+            raise AssertionError(f"prefix heuristic consulted for {model!r}")
+
+        monkeypatch.setattr(dc, "provider_of_model", tripwire)
+        section: dict = {"provider": "openai"}
+        reason = await dc.inject_model_credentials(
+            section=section,
+            model_id="self-hosted-model",
+            user_id="u",
+            resolved_keys=dict(USER_KEYS),
+            dependencies=_deps(),
+        )
+        assert reason is None
         assert section["provider"] == "openai"
+        assert section["api_key"] == USER_OPENAI_KEY
 
     @pytest.mark.asyncio
     async def test_job_dispatch_does_not_fall_back_when_the_registry_resolved(

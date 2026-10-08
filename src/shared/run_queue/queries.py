@@ -136,6 +136,11 @@ PARK_REASON_REAPER_MAX_ATTEMPTS = "reaper_max_attempts"
 # failures park fail-closed instead), so an owner retry replays nothing.
 PARK_REASON_RETRY_EXHAUSTED = "retry_exhausted"
 PARK_REASON_CLAIM_LOSS_HOLD = "claim_loss_hold"
+# The claim bundle refused the turn because a configured model cannot run
+# (unavailable_model_handling.md §5). Parked at once — a retry cannot help
+# until the owner switches the model — with the user-facing refusal as
+# ``last_error``. Pre-effect, so an owner retry replays nothing.
+PARK_REASON_MODEL_UNAVAILABLE = "model_unavailable"
 RETRYABLE_PARK_REASONS = frozenset(
     {
         PARK_REASON_ATTACH_FAILED,
@@ -143,6 +148,7 @@ RETRYABLE_PARK_REASONS = frozenset(
         PARK_REASON_COMPLETION_CAS_FAILED,
         PARK_REASON_REAPER_MAX_ATTEMPTS,
         PARK_REASON_RETRY_EXHAUSTED,
+        PARK_REASON_MODEL_UNAVAILABLE,
     }
 )
 # Attach-failure backoff: indexed by the claim's own attempt count (the claim
@@ -614,6 +620,7 @@ _PARK_SQL = """
 UPDATE run_queue SET
     state = 'parked',
     park_reason = COALESCE($3::text, park_reason),
+    last_error = COALESCE($4::text, last_error),
     parked_at = now(),
     leased_by = NULL,
     last_leased_by = NULL,
@@ -1326,6 +1333,7 @@ async def park_unit(
     unit_id: UUID | str,
     lease_token: int,
     reason: str | None = None,
+    last_error: str | None = None,
 ) -> str | None:
     """Fail closed: exact leased claim -> ``'parked'`` without consumption.
 
@@ -1341,8 +1349,11 @@ async def park_unit(
 
     ``reason`` is recorded as ``park_reason`` (with ``parked_at``) so an owner
     or operator can see why; ``None`` keeps whatever reason the row carries.
+    ``last_error`` likewise (``None`` keeps the row's).
     """
-    return await conn.fetchval(_PARK_SQL, _uuid(unit_id), lease_token, reason)
+    return await conn.fetchval(
+        _PARK_SQL, _uuid(unit_id), lease_token, reason, last_error
+    )
 
 
 async def record_attach_failure(

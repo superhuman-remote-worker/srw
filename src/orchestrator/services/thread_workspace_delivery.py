@@ -45,6 +45,7 @@ from uuid import UUID
 
 from fastapi import HTTPException
 from shared.session_attach_cleanup_identity import PreSetupWorkspaceIdentity
+from orchestrator.services.model_availability import WHERE_SESSION, ModelUnavailable
 from orchestrator.services.session_workspace_policy import preparation_wait_budget
 
 from orchestrator.security.access import externalize_gitea_url
@@ -999,6 +1000,8 @@ async def agent_get_thread_workspace_locked(
             user_id=str(thread["user_id"]) if thread.get("user_id") else None,
             project_id=str(thread["project_id"]) if thread.get("project_id") else None,
             include_kb_profile=include_kb_profile,
+            # The fallback copy; the resolved config below is checked strictly.
+            strict=False,
         )
     # Orchestrator-resolved config for cold/dedicated attach: the agent prefers
     # this fully-resolved, credential-injected blob over the config_override
@@ -1028,6 +1031,12 @@ async def agent_get_thread_workspace_locked(
             detail=_grant_violations_detail(gd.violations),
             headers=denied_cleanup_headers,
         )
+    except ModelUnavailable as unavailable:
+        raise HTTPException(
+            status_code=409,
+            detail=unavailable.detail(where=WHERE_SESSION),
+            headers=denied_cleanup_headers,
+        ) from unavailable
     if _sess_status.get("state") == "error":
         raise HTTPException(
             status_code=403,

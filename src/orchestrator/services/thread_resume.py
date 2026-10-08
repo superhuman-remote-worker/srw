@@ -26,6 +26,7 @@ from orchestrator.services.config_drift import (
 )
 from orchestrator.services.datasource_policy import classify_datasource_selection
 from orchestrator.services.grant_enforcement import GrantDenied
+from orchestrator.services.model_availability import ModelUnavailable
 from orchestrator.services.manifest_runtime_ownership import require_srw_runtime
 from orchestrator.services.session_provisioner import ensure_session_workspace
 from orchestrator.services.session_runtime_admission import (
@@ -214,6 +215,11 @@ async def thread_config_drift(
         await _resolve_session_config(thread, metadata, status=status)
     except GrantDenied:
         # Expected: this is exactly the signal we came here to harvest.
+        pass
+    except ModelUnavailable:
+        # Not grant drift. Resume proceeds so the owner can switch the model;
+        # input admission refuses a turn with the model named until then
+        # (unavailable_model_handling.md §5).
         pass
     except Exception as exc:
         # We could not determine whether grants drifted. Reporting "no drift"
@@ -831,6 +837,9 @@ async def resume_thread(
                             if cur.get("project_id")
                             else None,
                             include_kb_profile=include_kb_profile,
+                            # The fallback copy; the attach checks the
+                            # resolved config strictly.
+                            strict=False,
                         )
                         # The attach boundary owns the authoritative datasource
                         # re-read. Passing a pre-resolved payload here recreated

@@ -35,6 +35,7 @@ from uuid import UUID
 from fastapi import HTTPException
 
 from orchestrator.services.config_overrides import deep_merge_dicts as _deep_merge_dicts
+from orchestrator.services.model_availability import ModelUnavailable
 from orchestrator.services.container_provisioner import (
     WORKSPACE_RUNTIME_INCARNATION_KEY,
 )
@@ -256,6 +257,13 @@ async def assemble_session_attach_payload(
     except GrantDenied as gd:
         logger.warning("Session attach denied for thread %s: %s", thread_id, gd)
         return None
+    except ModelUnavailable as unavailable:
+        # Not a fallback case: the caller turns it into a refusal that names
+        # the model (unavailable_model_handling.md §5).
+        logger.warning(
+            "Session attach refused for thread %s: %s", thread_id, unavailable
+        )
+        raise
     except Exception:
         logger.exception(
             "Session attach: resolve failed for thread %s; using fallback", thread_id

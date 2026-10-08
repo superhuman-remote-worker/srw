@@ -9,9 +9,33 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, field_validator
 
 from orchestrator.security.auth import require_approved_user
+from orchestrator.services.model_availability import (
+    MODEL_UNAVAILABLE_CODE,
+    WHERE_ACCOUNT,
+    UnavailableModel,
+    render_unavailable_message,
+    stale_account_model_reason,
+)
 from orchestrator.services.preference_defaults import resolve_preference_defaults
 
 router = APIRouter(prefix="/api/settings/preferences")
+
+# The account model preferences checked against the registry
+# (unavailable_model_handling.md §7): (path, slot, capability).
+_MODEL_PREFERENCES = (
+    (("default_model",), "llm", "chat"),
+    (("default_auxiliary_model",), "auxiliary", "auxiliary"),
+    (("persistent_agent", "model"), "llm", "chat"),
+)
+
+
+def _preference_value(settings: Mapping[str, Any] | None, path: tuple[str, ...]) -> Any:
+    value: Any = settings or {}
+    for key in path:
+        if not isinstance(value, Mapping):
+            return None
+        value = value.get(key)
+    return value
 
 
 @dataclass
@@ -243,6 +267,19 @@ async def get_user_preferences(
     prefs["_resolved"] = await resolve_preference_defaults(
         dependencies.db, role_base=dependencies.role_base, environ=dependencies.environ
     )
+    # A stored model preference that can no longer run, keyed by its dotted
+    # path, so the page can show it as unavailable instead of a blank select.
+    unavailable: dict[str, str] = {}
+    for path, _slot, capability in _MODEL_PREFERENCES:
+        model = _preference_value(prefs, path)
+        if not model or not isinstance(model, str):
+            continue
+        reason = await stale_account_model_reason(
+            model, user_id=str(user["id"]), capability=capability, store=dependencies.db
+        )
+        if reason is not None:
+            unavailable[".".join(path)] = reason
+    prefs["_unavailable"] = unavailable
     return prefs
 
 
@@ -262,5 +299,52 @@ async def update_user_preferences(
     }
     if not settings:
         raise HTTPException(status_code=400, detail="No settings provided")
+    await _refuse_unavailable_model_preferences(user, settings, dependencies)
     await dependencies.db.update_user_settings(str(user["id"]), settings)
     return {"status": "updated"}
+
+
+async def _refuse_unavailable_model_preferences(
+    user: Mapping[str, Any],
+    settings: Mapping[str, Any],
+    dependencies: PreferencesDependencies,
+) -> None:
+    """Refuse saving a model preference that cannot run (400, the model named).
+
+    Only a value that differs from the stored one is checked: the page saves
+    every field together, and an already-stale stored default must not block
+    an unrelated change. Clearing (``null``) is always allowed.
+    """
+    candidates = [
+        (path, slot, capability, model)
+        for path, slot, capability in _MODEL_PREFERENCES
+        if path[0] in settings
+        and isinstance(model := _preference_value(settings, path), str)
+        and model
+    ]
+    stored: Mapping[str, Any] | None = None
+    entries: list[UnavailableModel] = []
+    for path, slot, capability, model in candidates:
+        reason = await stale_account_model_reason(
+            model, user_id=str(user["id"]), capability=capability, store=dependencies.db
+        )
+        if reason is None:
+            continue
+        if stored is None:
+            stored = await dependencies.db.get_user_settings(str(user["id"])) or {}
+        if model == _preference_value(stored, path):
+            continue
+        entries.append(UnavailableModel(slot=slot, model=model, reason=reason))
+    if entries:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": MODEL_UNAVAILABLE_CODE,
+                "message": render_unavailable_message(
+                    entries,
+                    where=WHERE_ACCOUNT,
+                    is_admin=bool(user.get("is_admin")),
+                ),
+                "entries": [entry.as_dict() for entry in entries],
+            },
+        )

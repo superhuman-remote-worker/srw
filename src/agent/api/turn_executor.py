@@ -106,6 +106,7 @@ from shared.run_queue import (
     LANE_STATELESS,
     PARK_REASON_ATTACH_FAILED,
     PARK_REASON_COMPLETION_CAS_FAILED,
+    PARK_REASON_MODEL_UNAVAILABLE,
     PARK_REASON_RETRY_EXHAUSTED,
     PARK_REASON_SHUTDOWN_CANCELLED,
     RETRYABLE_PARK_REASONS,
@@ -4217,6 +4218,11 @@ class StatelessTurnExecutor:
                     unit_id,
                 )
                 return
+            if e.model_unavailable_message:
+                # Retrying cannot help until the owner switches the model:
+                # park now with the refusal the cockpit shows.
+                await self._park_model_unavailable(claim, e.model_unavailable_message)
+                return
             logger.warning(
                 "claim bundle %d for unit %s — releasing (token-guarded: a "
                 "genuinely lost lease makes this a no-op): %s",
@@ -6098,6 +6104,78 @@ class StatelessTurnExecutor:
                 " (retry budget exhausted)" if outcome.state == STATE_PARKED else "",
             )
             self._clear_claim_tool_effect(pa, claim)
+
+    async def _park_model_unavailable(self, claim: ClaimedUnit, message: str) -> None:
+        """Park a claim the orchestrator refused because a configured model
+        cannot run (unavailable_model_handling.md §5).
+
+        Parks at once — no retry budget is spent — as
+        ``park_reason='model_unavailable'`` with the refusal text as
+        ``last_error``; the queue view shows it to the owner, and an owner
+        retry after a model switch replays nothing (pre-effect). Journals
+        ``turn.parked`` in the same commit like every other park.
+        """
+        pa = _pa()
+        await self._quiesce_claim_before_transition(
+            pa,
+            reason="release_model_unavailable",
+            claim=claim,
+        )
+        if self._lease.lost.is_set():
+            logger.info(
+                "run_queue release: unit=%s token=%d reason=model_unavailable "
+                "skipped after local ownership loss",
+                claim.unit_id,
+                claim.lease_token,
+            )
+            if self._exact_claim_handle_lost(claim):
+                await self._ack_terminal_claim_loss(claim)
+            return
+        error_text = message[:_LAST_ERROR_CHARS]
+
+        async def model_unavailable_park(conn: Any) -> Optional[str]:
+            return await park_unit(
+                conn,
+                unit_id=claim.unit_id,
+                lease_token=claim.lease_token,
+                reason=PARK_REASON_MODEL_UNAVAILABLE,
+                last_error=error_text,
+            )
+
+        try:
+            outcome = await self._settle_release(
+                claim,
+                cas=model_unavailable_park,
+                park_reason=PARK_REASON_MODEL_UNAVAILABLE,
+                release_reason="model_unavailable",
+                error=error_text,
+            )
+        except Exception:
+            logger.warning(
+                "run_queue model-unavailable park failed for unit %s — the "
+                "lease will expire instead",
+                claim.unit_id,
+                exc_info=True,
+            )
+            return
+        if outcome is None:
+            logger.info(
+                "run_queue release: unit=%s token=%d reason=model_unavailable "
+                "(already fenced out — nothing to park)",
+                claim.unit_id,
+                claim.lease_token,
+            )
+            await self._ack_terminal_claim_loss(claim)
+            self._clear_claim_tool_effect(pa, claim)
+            return
+        self._clear_claim_tool_effect(pa, claim)
+        logger.warning(
+            "run_queue release: unit=%s token=%d reason=model_unavailable state=%s: %s",
+            claim.unit_id,
+            claim.lease_token,
+            outcome.state,
+            error_text,
+        )
 
     async def _release_attach_failure(
         self, claim: ClaimedUnit, exc: BaseException

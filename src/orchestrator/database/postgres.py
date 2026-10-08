@@ -55614,6 +55614,24 @@ class PostgresDB:
             result.pop("system_api_key", None)
         return result
 
+    async def catalog_model_states(self, model_id: str) -> List[Dict[str, Any]]:
+        """Every catalog row naming ``model_id``, enabled or not:
+        ``[{"enabled": bool, "capabilities": [...]}]``.
+
+        Only for wording a refusal (``services/model_availability.py``): it
+        tells a disabled model from an unknown one after ``resolve_model``
+        could not resolve it. Never a routing source.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT enabled, capabilities FROM models WHERE model_id = $1",
+                model_id,
+            )
+        return [
+            {"enabled": bool(r["enabled"]), "capabilities": list(r["capabilities"])}
+            for r in rows
+        ]
+
     async def list_models_by_capability_alphabetical(
         self, capability: str
     ) -> List[Dict[str, Any]]:

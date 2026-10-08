@@ -2569,6 +2569,77 @@ class TestJobStartBundle:
         assert "capability grants" in message and "tools.shell" in message
 
     @pytest.mark.asyncio
+    async def test_an_unavailable_model_fails_the_job_naming_it(
+        self, bundle_env, monkeypatch
+    ):
+        """A ModelUnavailable from the delivery seam fails the job with the
+        model named — never downgraded to the flat override, which would run
+        the same model (unavailable_model_handling.md §4)."""
+        from orchestrator.services.model_availability import (
+            ModelUnavailable,
+            UnavailableModel,
+        )
+
+        monkeypatch.setattr(
+            deployment_gates_module, "is_experts_db_enabled", lambda: True
+        )
+        monkeypatch.setattr(
+            grant_enforcement_module,
+            "user_experts_enabled",
+            AsyncMock(return_value=False),
+        )
+        monkeypatch.setattr(
+            session_config_resolution_module,
+            "resolve_default_models",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
+            catalogue_composition,
+            "expert_catalog_service",
+            lambda _resources: SimpleNamespace(
+                gather_in_scope_skills=AsyncMock(return_value=[])
+            ),
+        )
+        monkeypatch.setattr(
+            dispatch_credentials_module,
+            "seed_registry_model_overrides",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
+            session_config_resolution_module,
+            "prefetch_roster_refs",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
+            config_resolver_module,
+            "resolve_config",
+            lambda **kwargs: (kwargs["capture"].__setitem__("merged_fragment", {}))
+            or {"llm": {"model": "MiniMax-M3"}},
+        )
+        monkeypatch.setattr(
+            config_resolver_module,
+            "inject_blob_credentials",
+            AsyncMock(
+                side_effect=ModelUnavailable(
+                    [UnavailableModel("llm", "MiniMax-M3", "disabled")]
+                )
+            ),
+        )
+        assert (
+            await job_start_bundle.build_job_start_request(
+                _bundle_job(), dependencies=_start_bundle_deps()
+            )
+            is None
+        )
+        status, fields = bundle_env.status_writes[0]
+        assert fields["status"] == "failed"
+        assert (
+            "`MiniMax-M3` (main model) is no longer available"
+            in (fields["error_message"])
+        )
+        assert "the job's configuration" in fields["error_message"]
+
+    @pytest.mark.asyncio
     async def test_an_unroutable_pinned_model_fails_the_job(
         self, bundle_env, monkeypatch
     ):

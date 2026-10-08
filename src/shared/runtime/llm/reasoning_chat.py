@@ -1060,6 +1060,12 @@ class ReasoningChatOpenAI(ChatOpenAI):
     # explicit cache breakpoints — see mark_anthropic_cache_breakpoints.
     anthropic_cache_breakpoints: bool = False
 
+    # Set by the factory when this client has no route (OpenAI's endpoint with
+    # only the ``not-needed`` key): every call raises ModelRouteMissing naming
+    # this model instead of sending a request that 401s
+    # (unavailable_model_handling.md D6).
+    route_missing_model: Optional[str] = None
+
     # Use PrivateAttr for Pydantic compatibility
     _reasoning_client: ReasoningCapturingClient = PrivateAttr(default=None)
     _async_reasoning_client: AsyncReasoningCapturingClient = PrivateAttr(default=None)
@@ -1183,11 +1189,19 @@ class ReasoningChatOpenAI(ChatOpenAI):
 
         return result
 
+    def _refuse_missing_route(self) -> None:
+        if self.route_missing_model:
+            from shared.runtime.core.transport_resolution import ModelRouteMissing
+
+            raise ModelRouteMissing(self.route_missing_model)
+
     def _generate(self, *args, **kwargs):
+        self._refuse_missing_route()
         result = super()._generate(*args, **kwargs)
         return self._post_process_result(result)
 
     async def _agenerate(self, *args, **kwargs):
+        self._refuse_missing_route()
         result = await super()._agenerate(*args, **kwargs)
         return self._post_process_result(result)
 
@@ -1202,6 +1216,7 @@ class ReasoningChatOpenAI(ChatOpenAI):
         merged AIMessage carries ``additional_kwargs.reasoning_content``,
         matching the non-streaming code path's contract.
         """
+        self._refuse_missing_route()
         for chunk in super()._stream(*args, **kwargs):
             yield chunk
         rc = (
@@ -1220,6 +1235,7 @@ class ReasoningChatOpenAI(ChatOpenAI):
 
     async def _astream(self, *args, **kwargs):
         """Async counterpart of :meth:`_stream`."""
+        self._refuse_missing_route()
         async for chunk in super()._astream(*args, **kwargs):
             yield chunk
         rc = (

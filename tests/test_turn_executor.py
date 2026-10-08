@@ -374,6 +374,7 @@ class Harness:
         self.disposition_order: List[str] = []
         self.park_reasons: List[Any] = []
         self.release_budget: List[Dict[str, Any]] = []
+        self.park_errors: List[Optional[str]] = []
         self.attach_failure_state = "queued"
 
         pa._agent = SimpleNamespace(postgres_conn=self.db)
@@ -429,7 +430,7 @@ class Harness:
             )
             return "queued"
 
-        async def fake_park(db, *, unit_id, lease_token, reason=None):
+        async def fake_park(db, *, unit_id, lease_token, reason=None, last_error=None):
             harness.disposition_order.append("park")
             harness.calls["park"].append(
                 {
@@ -438,6 +439,7 @@ class Harness:
                 }
             )
             harness.park_reasons.append(reason)
+            harness.park_errors.append(last_error)
             return "parked"
 
         async def fake_record_attach_failure(
@@ -2722,6 +2724,25 @@ class TestShutdownCancellation:
         ]
         assert harness.db.transactions == 1
         assert not harness.calls["journal"]  # re-queued: nothing to tell yet
+
+    @pytest.mark.asyncio
+    async def test_bundle_model_refusal_parks_at_once_with_the_message(self, harness):
+        # unavailable_model_handling.md §5: a refusal naming an unavailable
+        # model parks on its first claim with the message the cockpit shows,
+        # instead of spending five backed-off attempts on "kept failing".
+        message = "The model `MiniMax-M3` (main model) is no longer available."
+        harness.bundle_error = ClaimBundleError(
+            409, "refused", model_unavailable_message=message
+        )
+        claim = make_claim(token=5)
+
+        await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        assert not harness.calls["release"]
+        assert harness.calls["park"] == [{"unit_id": claim.unit_id, "lease_token": 5}]
+        assert harness.park_reasons == ["model_unavailable"]
+        assert harness.park_errors == [message]
 
     @pytest.mark.asyncio
     async def test_bundle_5xx_release_is_transient_with_exponential_backoff(

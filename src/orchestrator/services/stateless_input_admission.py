@@ -15,6 +15,11 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
+from orchestrator.services.model_availability import (
+    WHERE_SESSION,
+    ModelUnavailable,
+    unavailable_slots,
+)
 from orchestrator.services.session_class_policy import require_stateless_workspace
 
 logger = logging.getLogger(__name__)
@@ -22,10 +27,80 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class StatelessInputDependencies:
-    """Application-owned collaborators for stateless input admission."""
+    """Application-owned collaborators for stateless input admission.
+
+    ``resolve_model`` is the registry resolver the model check asks
+    (``shared.runtime.core.model_registry.resolve_model`` when unset).
+    """
 
     store: Any
     schedule_stateless_workspace_ensure: Callable[[str], Any]
+    resolve_model: Callable[..., Any] | None = None
+
+
+async def refuse_unavailable_session_models(
+    thread: dict, *, dependencies: StatelessInputDependencies
+) -> None:
+    """Refuse a turn whose session generation names a model that cannot run,
+    before the message is stored (unavailable_model_handling.md §5).
+
+    Reads the models of the thread's current execution generation and asks the
+    registry about each slot that does not inherit its parent's model — no
+    credential resolution. Raises 409 ``{code: "model.unavailable", message,
+    entries}``; the chat banner shows ``message`` and the message stays in the
+    outbox for a retry after a model switch. A failure of the check itself lets
+    the turn through: the claim-time refusal is the backstop.
+    """
+    from orchestrator.services.manifest_execution_snapshot import (
+        read_execution,
+        srw_snapshot_config,
+    )
+
+    user_id = str(thread["user_id"]) if thread.get("user_id") else None
+    try:
+        execution = await read_execution(
+            dependencies.store, "Session", str(thread["id"])
+        )
+        if execution is None:
+            return
+        resolved, _policy = srw_snapshot_config(execution)
+        resolve_model = dependencies.resolve_model
+        if resolve_model is None:
+            from shared.runtime.core import model_registry
+
+            resolve_model = model_registry.resolve_model
+        found = await unavailable_slots(
+            resolved.get("agent") if isinstance(resolved, dict) else None,
+            user_id=user_id,
+            store=dependencies.store,
+            resolve_model=resolve_model,
+        )
+    except Exception:  # noqa: BLE001 — the claim-time refusal is the backstop
+        logger.warning(
+            "Stateless admission: model check failed for thread %s; admitting",
+            thread.get("id"),
+            exc_info=True,
+        )
+        return
+    if not found:
+        return
+    is_admin = False
+    if user_id:
+        try:
+            user = await dependencies.store.get_user(user_id)
+            is_admin = bool((user or {}).get("is_admin"))
+        except Exception:  # noqa: BLE001 — only selects the admin hint
+            is_admin = False
+    refusal = ModelUnavailable(found)
+    logger.info(
+        "Stateless admission refused for thread %s: %s",
+        thread.get("id"),
+        [entry.as_dict() for entry in found],
+    )
+    raise HTTPException(
+        status_code=409,
+        detail=refusal.detail(where=WHERE_SESSION, is_admin=is_admin),
+    )
 
 
 async def admit_stateless_input(
@@ -68,6 +143,7 @@ async def admit_stateless_input(
     # The unlocked preflight provides a fast refusal. The locked copy below is
     # authoritative against lane/tier/lifecycle changes before message commit.
     require_stateless_workspace(thread)
+    await refuse_unavailable_session_models(thread, dependencies=dependencies)
 
     thread_id = str(thread["id"])
     # Mirror the agent's accept-time mint exactly; the row id is the same
