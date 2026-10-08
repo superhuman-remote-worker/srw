@@ -20,8 +20,9 @@ Three properties are load-bearing and moved unchanged:
   project a Session belongs to (single_project_sessions.md), so the project
   list that gates datasource access is the same with or without the thread's
   ``thread_mounts`` rows and whether or not the cloud is up. Only a legacy
-  multi-project Session, whose column is NULL, still reads its list from the
-  legacy places (main_cloud_as_connectors.md, slice 1).
+  multi-project Session (a NULL column, or rows naming other projects than
+  its column) still reads its list from the legacy places
+  (main_cloud_as_connectors.md, slice 1).
 * **``project_default`` rows count as project attachments** of such a legacy
   Session. They mount the owner's cloud home at the workspace root rather
   than under ``projects/``. The shape excluded from the project scope is
@@ -135,19 +136,31 @@ def durable_project_ids(
     A Session belongs to one project at most, and that project is
     ``threads.project_id`` (single_project_sessions.md): every create path
     writes it, so the column is the whole answer for every Session that has a
-    project. A NULL column means no project, except on a **legacy
-    multi-project Session** created before that rule (the column was NULL for
-    two or more projects). Its list lives only in the legacy places, read in
-    their historical order: the ``project`` and ``project_default`` rows of
-    ``thread_mounts`` (``legacy_mounts``), else ``metadata.project_ids``
-    (before Phase 1 of the cloud collaboration model). Those Sessions keep
-    working exactly as before; nothing else reads the mount rows for scope.
+    project. The rest are **legacy multi-project Sessions**, created before
+    that rule, whose list lives in the legacy places; they keep working
+    exactly as before, so the ``project`` and ``project_default`` rows of
+    ``thread_mounts`` (``legacy_mounts``) still answer for them, in their
+    historical order:
+
+    * a NULL column (two or more projects): the rows, else
+      ``metadata.project_ids`` (before Phase 1 of the cloud collaboration
+      model);
+    * a set column with rows naming other projects too (``project_id`` plus
+      ``project_ids`` before 2026-10-06): the rows and the column, so such a
+      Session's scope is not narrowed to the column.
+
+    For a Session whose rows name only its own project, or none, the rows
+    change nothing: its eligibility is the same with them emptied.
     """
     if not thread:
         return []
-    if thread.get("project_id"):
-        return [str(thread["project_id"])]
-    legacy = project_ids_from_mounts(legacy_mounts or [])
+    column = str(thread["project_id"]) if thread.get("project_id") else None
+    rows = project_ids_from_mounts(legacy_mounts or [])
+    if column is not None:
+        if any(project != column for project in rows):
+            return list(dict.fromkeys([*rows, column]))
+        return [column]
+    legacy = rows
     if not legacy:
         metadata = thread.get("metadata") or {}
         if isinstance(metadata, str):

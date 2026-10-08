@@ -205,16 +205,9 @@ def _exact_live_pinned_runtime(thread: Any) -> bool:
 
 
 async def _thread_project_ids(db: Any, thread: dict[str, Any]) -> list[str]:
-    """The same project scope as the attach boundary (``thread_project_ids``).
-
-    Mount rows are read only for a legacy multi-project Session, whose
-    ``threads.project_id`` is NULL.
-    """
-    legacy_mounts = (
-        None
-        if thread.get("project_id")
-        else await db.list_thread_mounts(str(thread["id"]))
-    )
+    """The same project scope as the attach boundary (``thread_project_ids``):
+    the column, or a legacy multi-project Session's mount rows."""
+    legacy_mounts = await db.list_thread_mounts(str(thread["id"]))
     return durable_project_ids(thread, legacy_mounts=legacy_mounts)
 
 

@@ -140,7 +140,15 @@ async def _eligibility(store: _Store) -> list[tuple[str, bool, str | None]]:
 class TestDurableProjectIds:
     def test_the_column_is_the_whole_answer(self):
         thread = _thread(P, project_ids=[Q])
-        assert durable_project_ids(thread, legacy_mounts=[_mount(Q)]) == [P]
+        assert durable_project_ids(thread, legacy_mounts=[_mount(P)]) == [P]
+        assert durable_project_ids(thread, legacy_mounts=[]) == [P]
+
+    def test_a_set_column_with_rows_for_other_projects_is_legacy(self):
+        """``project_id`` plus ``project_ids`` before 2026-10-06: the rows and
+        the column, never narrowed to the column."""
+        mounts = [_mount(Q), _mount(P)]
+        assert durable_project_ids(_thread(P), legacy_mounts=mounts) == [Q, P]
+        assert durable_project_ids(_thread(P), legacy_mounts=[_mount(Q)]) == [Q, P]
 
     def test_no_project_is_an_empty_scope(self):
         assert durable_project_ids(_thread(None), legacy_mounts=[]) == []
@@ -180,11 +188,13 @@ class TestThreadProjectIds:
         assert await scope(dependencies=_mount_dependencies(emptied)) == [P]
 
     @pytest.mark.asyncio
-    async def test_mount_rows_for_another_project_never_widen_the_scope(self):
+    async def test_rows_for_another_project_keep_a_legacy_session_wide(self):
+        """The pre-2026-10-06 shape (column P, rows for P and Q) answers as it
+        did: narrowing it to P would drop Q's connectors from a live session."""
         store = _Store(_thread(P), [_mount(P), _mount(Q)])
         assert await thread_mount_rows.thread_project_ids(
             THREAD, dependencies=_mount_dependencies(store)
-        ) == [P]
+        ) == [P, Q]
 
     @pytest.mark.asyncio
     async def test_the_delivery_backfill_runs_but_never_answers(self, monkeypatch):
@@ -301,10 +311,17 @@ class TestConnectorEligibilityWithoutMountRows:
 
 class TestRuntimeActorScope:
     @pytest.mark.asyncio
-    async def test_the_runtime_actor_reads_the_column_not_the_rows(self):
-        db = SimpleNamespace(list_thread_mounts=AsyncMock(return_value=[_mount(Q)]))
-        assert await runtime_actor._thread_project_ids(db, _thread(P)) == [P]
-        db.list_thread_mounts.assert_not_awaited()
+    async def test_the_runtime_actor_reads_the_column(self):
+        for mounts in ([_mount(P)], []):
+            db = SimpleNamespace(list_thread_mounts=AsyncMock(return_value=mounts))
+            assert await runtime_actor._thread_project_ids(db, _thread(P)) == [P]
+
+    @pytest.mark.asyncio
+    async def test_the_runtime_actor_keeps_a_legacy_set_column_wide(self):
+        db = SimpleNamespace(
+            list_thread_mounts=AsyncMock(return_value=[_mount(P), _mount(Q)])
+        )
+        assert await runtime_actor._thread_project_ids(db, _thread(P)) == [P, Q]
 
     @pytest.mark.asyncio
     async def test_a_legacy_session_still_orders_by_its_rows(self):
