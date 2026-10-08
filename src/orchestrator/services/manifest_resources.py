@@ -252,6 +252,14 @@ class ManifestResourceService:
                         dependency["uid"] = str(identities[dependency["key"]])
                     if dependency not in dependencies:
                         dependencies.append(dependency)
+                if doc["kind"] == "Project":
+                    # What this person applied (slice D3c): later refreshes
+                    # tell their entries from it, the next apply compares to it.
+                    from orchestrator.services.project_connectors import (
+                        applied_dependency,
+                    )
+
+                    dependencies.append(applied_dependency(doc, user["id"]))
                 prepared["dependencies"] = dependencies
                 expected = expected_versions.get(key)
                 if manager_key and old:

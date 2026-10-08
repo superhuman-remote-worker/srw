@@ -176,7 +176,12 @@ def _ref_scope(ref, *, project_id, account_id) -> dict[str, str] | None:
 
 
 async def entry_datasource_id(
-    store: ManifestStore, entry: Mapping[str, Any], *, project_id, account_id
+    store: ManifestStore,
+    entry: Mapping[str, Any],
+    *,
+    project_id,
+    account_id,
+    include_retired: bool = False,
 ) -> str | None:
     """The connector id a ``resources.connectors`` entry names, or ``None``
     when it does not name a datasource's connector (an inline env or files
@@ -184,7 +189,8 @@ async def entry_datasource_id(
 
     An inline ``srw.datasource/v1`` entry names its ``config.datasourceId``;
     a ref names its resource's linked datasource.  An omitted ref scope is
-    the Project's; ``me`` is ``account_id``.
+    the Project's; ``me`` is ``account_id``.  With ``include_retired``, a ref
+    whose Connector is retired (its connector was deleted) still names it.
     """
     if "inline" in entry:
         spec = entry.get("inline") or {}
@@ -199,40 +205,83 @@ async def entry_datasource_id(
     if scope is None or not ref.get("name"):
         return None
     row = await store.by_name(KIND, scope, ref["name"])
+    if row is None and include_retired:
+        row = await store.db.fetchrow(
+            """SELECT linked_id FROM srw_resources
+               WHERE kind=$1 AND scope_kind=$2 AND scope_name=$3 AND name=$4
+                 AND deleted_at IS NOT NULL AND linked_id IS NOT NULL
+               ORDER BY deleted_at DESC LIMIT 1""",
+            KIND,
+            scope["kind"],
+            scope["name"],
+            ref["name"],
+        )
     return str(row["linked_id"]) if row and row.get("linked_id") else None
 
 
 async def entry_datasource_ids(
-    db, connectors: Mapping[str, Any], *, project_id, account_id
+    db,
+    connectors: Mapping[str, Any],
+    *,
+    project_id,
+    account_id,
+    include_retired: bool = False,
 ) -> dict[str, str | None]:
     """``entry_datasource_id`` for every alias of a connector map."""
     store = ManifestStore(db)
     return {
         alias: await entry_datasource_id(
-            store, entry, project_id=project_id, account_id=account_id
+            store,
+            entry,
+            project_id=project_id,
+            account_id=account_id,
+            include_retired=include_retired,
         )
         for alias, entry in (connectors or {}).items()
     }
 
 
-async def document_author(db, resource: Mapping[str, Any] | None) -> str | None:
-    """Who ``me`` meant in a Project document: whoever last applied it.
+#: The dependency entry that records what a person last applied to a natively
+#: authored Project: its connector entries and its author. It tells the
+#: entries the author wrote from those a refresh added, and an apply compares
+#: against it, never against what refreshes saved since.
+APPLIED_FORMAT = "srw/project-applied-v1"
 
-    A server write (a refresh, a legacy rebuild) never adds a ``me`` ref, so
-    the latest manifest operation that saved this resource is the author;
-    without one, the Account the document lives in.
-    """
+
+def connectors_of(document: Mapping[str, Any] | None) -> dict[str, Any]:
+    """A Project document's ``resources.connectors``."""
+    if not document:
+        return {}
+    return (document["spec"].get("resources") or {}).get("connectors") or {}
+
+
+def applied_record(resource: Mapping[str, Any] | None) -> dict | None:
+    """The record of the last apply a person made (``APPLIED_FORMAT``)."""
+    for item in (resource or {}).get("dependencies") or ():
+        if isinstance(item, dict) and item.get("format") == APPLIED_FORMAT:
+            return item
+    return None
+
+
+def applied_dependency(document: Mapping[str, Any], author: Any) -> dict:
+    """The record of ``author`` applying ``document``, kept with the revision."""
+    return {
+        "format": APPLIED_FORMAT,
+        "author": str(author) if author else None,
+        "connectors": deepcopy(connectors_of(document)),
+    }
+
+
+def document_author(resource: Mapping[str, Any] | None) -> str | None:
+    """Who ``me`` means in a stored Project document: the person who last
+    applied it (its applied record), else the Account it lives in."""
     if not resource:
         return None
-    author = await db.fetchval(
-        """SELECT owner_id FROM srw_manifest_operations
-           WHERE result->'resources' @> jsonb_build_array(
-                     jsonb_build_object('uid', $1::text))
-           ORDER BY created_at DESC LIMIT 1""",
-        str(resource["id"]),
-    )
-    author = author or resource.get("owner_id")
-    return str(author) if author else None
+    record = applied_record(resource)
+    if record and record.get("author"):
+        return str(record["author"])
+    owner = resource.get("owner_id")
+    return str(owner) if owner else None
 
 
 async def stale_connector_children(db, manager_id, keep: Iterable[str]) -> list[dict]:
@@ -322,14 +371,17 @@ async def refresh_project_connectors(
     project_ids: Iterable[Any],
     *,
     unlinked: Mapping[str, Iterable[str]] | None = None,
+    deleted: Iterable[str] = (),
     heal: bool = False,
 ) -> dict[str, str]:
     """Bring each Project's connector entries in step with its links.
 
     Called by the datasource store's write-through inside its transaction,
-    with ``unlinked``: the connectors the write unlinked, by project. Each
-    Project gets a savepoint: a failure is logged as ``deferred`` and left
-    for the startup heal, never raised into the write.
+    with ``unlinked``, the connectors the write unlinked, by project, and
+    ``deleted``, the connector it deleted. Each Project gets a savepoint: a
+    failure is logged as ``deferred`` and never raised into the write. The
+    startup heal rebuilds a legacy-authored Project left behind; a natively
+    authored one is only reported, and catches up at its next link write.
     """
     outcomes: dict[str, str] = {}
     if _REFRESH_SUSPENDED.get():
@@ -341,12 +393,14 @@ async def refresh_project_connectors(
                     db,
                     project_id,
                     unlinked=(unlinked or {}).get(project_id, ()),
+                    deleted=deleted,
                     heal=heal,
                 )
         except Exception:
             logger.exception(
-                "Project %s connector entries not refreshed; the startup heal "
-                "brings them in step",
+                "Project %s connector entries not refreshed; a legacy-authored "
+                "Project is rebuilt by the startup heal, a natively authored "
+                "one at its next link write",
                 project_id,
             )
             outcome = "deferred"
@@ -359,16 +413,21 @@ async def refresh_project(
     project_id,
     *,
     unlinked: Iterable[str] = (),
+    deleted: Iterable[str] = (),
     heal: bool = False,
     author: str | None = None,
 ) -> tuple[str, dict | None]:
     """Refresh one Project's entries; return the outcome and the saved row.
 
     ``unlinked``: the connectors the triggering write unlinked from this
-    Project, the only entries a natively authored Project may lose. ``heal``:
-    the startup pass, which never edits a natively authored Project and only
-    reports whether its entries differ from its links. ``author``: who ``me``
-    means in the document (the applier during an apply).
+    Project; a natively authored Project loses the entries a refresh added
+    for them, never the ones its author wrote. ``deleted``: a connector the
+    write deleted; every entry naming it goes, since a ref to it can no
+    longer be applied. ``heal``: the startup pass, which never edits a
+    natively authored Project: it only reports whether its entries differ
+    from its links and writes the manifest's connector defaults row when the
+    Project has none. ``author``: who ``me`` means in the document (the
+    applier during an apply).
 
     Outcomes: ``none`` (no active Project manifest yet; it is built from the
     links when it is), ``unchanged``, ``rebuilt`` (legacy-authored),
@@ -404,6 +463,7 @@ async def refresh_project(
         # None: the project row is gone (a delete racing this refresh).
         return ("rebuilt", saved) if saved else ("none", None)
     if heal:
+        await _backfill_manifest_connector_defaults(db, project_id)
         drift = await _authored_drift(db, resource, desired)
         return ("native-drift" if drift else "native"), None
     saved = await _refresh_authored(
@@ -412,7 +472,8 @@ async def refresh_project(
         resource,
         desired,
         set(unlinked),
-        author=author or await document_author(db, resource),
+        set(deleted),
+        author=author or document_author(resource),
     )
     return ("updated", saved) if saved else ("unchanged", None)
 
@@ -427,18 +488,52 @@ async def _authored_drift(db, resource, desired) -> bool:
         db,
         authored,
         project_id=str(resource["linked_id"]),
-        account_id=await document_author(db, resource),
+        account_id=document_author(resource),
     )
     listed = {value for value in named.values() if value}
     return listed != {datasource_id for datasource_id, _ in desired.values()}
 
 
+async def _backfill_manifest_connector_defaults(db, project_id) -> None:
+    """A natively authored Project whose manifest sets ``defaults.connectors``
+    owns its connector defaults row; one written before the table existed
+    gets it here, so the Settings API shows it as managed by the manifest and
+    a Settings save cannot be overwritten by its next activation unseen. A
+    Settings row is never taken over (as ``workspace_defaults_backfill``)."""
+    from orchestrator.services.manifest_projects import active_project_resource
+    from orchestrator.services.project_connector_defaults import (
+        read_project_connector_defaults,
+        sync_manifest_connector_defaults,
+    )
+
+    current = await read_project_connector_defaults(db, project_id)
+    if current is not None and current.source != "manifest":
+        return
+    active = await active_project_resource(db, project_id)
+    if active is None or "connectors" not in (
+        active["document"]["spec"].get("defaults") or {}
+    ):
+        return
+    if current is None or current.manifest_revision != active["revision"]:
+        await sync_manifest_connector_defaults(
+            db, {**active, "linked_id": str(project_id)}
+        )
+
+
 async def _refresh_authored(
-    db, store, resource, desired, unlinked: set[str], *, author: str | None
+    db,
+    store,
+    resource,
+    desired,
+    unlinked: set[str],
+    deleted: set[str],
+    *,
+    author: str | None,
 ):
-    """A natively authored Project: drop the entries naming a connector the
-    triggering write unlinked, add entries for links it does not list, keep
-    everything else as written. Returns the saved row, or None when nothing
+    """A natively authored Project: drop the entries a refresh added for a
+    connector the triggering write unlinked, and every entry naming a
+    connector it deleted; add entries for links it does not list; keep
+    everything its author wrote. Returns the saved row, or None when nothing
     changed."""
     from orchestrator.services.project_connector_defaults import (
         sync_manifest_connector_defaults,
@@ -452,16 +547,25 @@ async def _refresh_authored(
     authored = (resource["document"]["spec"].get("resources") or {}).get(
         "connectors", {}
     )
+    # A deleted connector's Connector is retired before this runs: its ref
+    # still names it.
     named = await entry_datasource_ids(
-        db, authored, project_id=project_id, account_id=owner
+        db, authored, project_id=project_id, account_id=owner, include_retired=True
     )
+    # What the author wrote: their last apply, or, before any refresh added
+    # an entry, everything the document holds.
+    record = applied_record(resource)
+    written = (record.get("connectors") or {}) if record else authored
     linked = {datasource_id: alias for alias, (datasource_id, _) in desired.items()}
-    # Only the link this write removed: an entry naming a connector that was
-    # never linked is the author's own (before D3c an apply linked nothing).
     removed = [
         alias
         for alias, value in named.items()
-        if value and value in unlinked and value not in linked
+        if value
+        and value not in linked
+        and (
+            value in deleted
+            or (value in unlinked and written.get(alias) != authored[alias])
+        )
     ]
     covered = {value for value in named.values() if value}
     added = [
@@ -474,6 +578,10 @@ async def _refresh_authored(
 
     document, resolved = deepcopy(resource["document"]), deepcopy(resource["resolved"])
     dependencies = deepcopy(resource["dependencies"])
+    if record is None:
+        # The first server edit of this document: record what the author
+        # wrote, so the entries added from now on stay told apart.
+        dependencies.append(applied_dependency(resource["document"], owner))
     child_scope = {"kind": "Project", "name": project_id}
     gone_keys: set[str] = set()
     gone_uids = {named[alias] for alias in removed}
@@ -563,9 +671,16 @@ async def _refresh_authored(
 
 async def sync_project_connector_links(db, project_row, user, *, previous=None) -> None:
     """Make an applied Project manifest's links: link every connector it newly
-    names, unlink those ``previous`` (its prior revision) named and it drops.
-    Entries it carries over are left as they are, linked or not: before D3c an
-    apply linked nothing, and re-applying such a document changes no link.
+    names, unlink those the person's last apply named and it drops.
+
+    "Last apply" is the applied record ``previous`` (the Project as saved
+    before this apply) carries: what a person applied, never what refreshes
+    added since, so re-applying an older copy never unlinks a link made in
+    the meantime. Without a record, a natively authored document is its own
+    (before D3c an apply linked nothing and refreshes added nothing); a
+    legacy-authored one was written by the server, so nothing counts as
+    named before. Entries carried over are left as they are, linked or not:
+    re-applying a pre-D3c document changes no link.
 
     The link API's authority applies, checked by the store under its locks:
     adding a link needs the Project's owner and the connector's owner (or a
@@ -583,22 +698,28 @@ async def sync_project_connector_links(db, project_row, user, *, previous=None) 
     account = str(user["id"])
     admin = bool(user.get("is_admin"))
 
-    def connectors_of(row):
-        return (row["document"]["spec"].get("resources") or {}).get("connectors", {})
+    from orchestrator.services.manifest_projects import source_recipe
 
     named = await entry_datasource_ids(
-        db, connectors_of(project_row), project_id=project_id, account_id=account
+        db,
+        connectors_of(project_row["document"]),
+        project_id=project_id,
+        account_id=account,
     )
     wanted = [value for value in dict.fromkeys(named.values()) if value]
-    before = (
-        await entry_datasource_ids(
-            db,
-            connectors_of(previous),
-            project_id=project_id,
-            account_id=await document_author(db, previous),
-        )
-        if previous
-        else {}
+    record = applied_record(previous)
+    if record is not None:
+        last_applied = record.get("connectors") or {}
+    elif previous is not None and source_recipe(previous) is None:
+        last_applied = connectors_of(previous["document"])
+    else:
+        last_applied = {}
+    before = await entry_datasource_ids(
+        db,
+        last_applied,
+        project_id=project_id,
+        account_id=document_author(previous),
+        include_retired=True,
     )
     named_before = {value for value in before.values() if value}
     dropped = named_before - set(wanted)
@@ -705,7 +826,7 @@ async def require_connector_defaults_authority(
             db,
             previous["document"],
             project_id=project_id,
-            account_id=await document_author(db, previous),
+            account_id=document_author(previous),
         )
         if previous
         else None

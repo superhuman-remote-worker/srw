@@ -259,7 +259,7 @@ async def sync_manifest_connector_defaults(
         db,
         resource["document"],
         project_id=project_id,
-        account_id=author or await document_author(db, resource),
+        account_id=author or document_author(resource),
     )
     if named is None:
         await release_manifest_connector_defaults(db, project_id)

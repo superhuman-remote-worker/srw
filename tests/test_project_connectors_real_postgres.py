@@ -409,12 +409,14 @@ async def test_native_project_refresh_keeps_authored_entries(database):
     assert entries["db"] == document["spec"]["resources"]["connectors"]["db"]
     assert set(entries) == {"db", (await _ref_of(db, second))["name"]}
 
+    # An unlink takes back what a refresh added...
+    assert await db.unlink_datasource_from_project(project, second)
+    assert set(await _entries(db, project)) == {"db"}
+    # ...never what the author wrote: their entry and default stay.
     assert await db.unlink_datasource_from_project(project, first)
     resource = await _project_resource(db, project)
-    assert "db" not in resource["document"]["spec"]["resources"]["connectors"]
-    assert "db" not in resource["resolved"]["spec"]["resources"]["connectors"]
-    assert resource["document"]["spec"]["defaults"]["connectors"] == []
-    assert (await read_project_connector_defaults(db, project)).connector_ids == []
+    assert resource["document"]["spec"] == document["spec"]
+    assert (await read_project_connector_defaults(db, project)).connector_ids == [first]
 
 
 @pytest.mark.asyncio

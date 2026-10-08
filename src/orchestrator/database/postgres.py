@@ -50443,7 +50443,9 @@ class PostgresDB:
     ) -> None:
         """Refresh the Project manifests of the projects the connector was
         linked to before the write and is linked to after it; a project it is
-        no longer linked to may lose the entries naming it, and only those."""
+        no longer linked to may lose the entries naming it, and only those
+        (``project_connectors``: a refresh's own entries on an unlink, every
+        entry when the connector is deleted)."""
         from orchestrator.services.project_connectors import (
             refresh_project_connectors,
         )
@@ -50452,10 +50454,14 @@ class PostgresDB:
         if not before | after:
             return
         connector = str(UUID(str(datasource_id)))
+        deleted = not await self.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM datasources WHERE id=$1)", UUID(connector)
+        )
         await refresh_project_connectors(
             self,
             before | after,
             unlinked={project: {connector} for project in before - after},
+            deleted={connector} if deleted else (),
         )
 
     async def get_datasource_tombstones(self, ids: list[str]) -> dict[str, str]:

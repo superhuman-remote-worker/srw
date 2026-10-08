@@ -34,6 +34,7 @@ from orchestrator.services.manifest_resources import ManifestResourceService
 from orchestrator.services.manifest_store import ManifestStore
 from orchestrator.services.project_connector_defaults import (
     read_project_connector_defaults,
+    read_view,
     save_settings_connector_defaults,
 )
 from orchestrator.services.project_connectors import DEFAULTS_AUTHORITY_DETAIL
@@ -184,6 +185,247 @@ async def test_a_native_project_in_step_is_counted_native(database, monkeypatch)
     )
     assert result["resources"][0]["resource"]["spec"]["resources"]["connectors"]
     assert await project_connectors.heal_project_connectors(db) == {"native": 1}
+
+
+@pytest.mark.asyncio
+async def test_link_then_unlink_never_strips_what_the_author_wrote(
+    database, monkeypatch
+):
+    """The dev shape through a link and an unlink of its own connector, the
+    unlink made by the connector's creator, who is not a project member."""
+    db = database
+    owner = await _user(db, "Owner")
+    creator = await _user(db, "Creator")
+    source = await _connector(
+        db, "Source", creator, is_global=True, read_only=True, scope_mode="all"
+    )
+    project = await _native_project(
+        db,
+        owner,
+        {"source": _inline(source)},
+        monkeypatch,
+        defaults={"connectors": ["source"]},
+    )
+    authored = await _project_resource(db, project)
+    child = await ManifestStore(db).by_name(
+        "Connector", {"kind": "Project", "name": project}, "source"
+    )
+
+    assert await db.link_datasource_to_project(
+        project, source, authority_user_id=owner["id"]
+    )
+    assert (await _project_resource(db, project))["document"] == authored["document"]
+    assert await db.unlink_datasource_from_project(
+        project, source, authority_user_id=creator["id"]
+    )
+    after = await _project_resource(db, project)
+    assert after["document"] == authored["document"]
+    assert (await read_project_connector_defaults(db, project)).connector_ids == [
+        source
+    ]
+    assert await ManifestStore(db).by_id(child["id"]) is not None
+
+    # Applied by a person (an applied record), the same holds; an entry a
+    # refresh added goes with its unlink.
+    added = await _connector(db, "Added", owner)
+    assert await db.link_datasource_to_project(project, added)
+    with_added = await _project_resource(db, project)
+    assert project_connectors.applied_record(with_added)["connectors"] == {
+        "source": _inline(source)
+    }
+    assert await db.unlink_datasource_from_project(project, added)
+    assert (await _project_resource(db, project))["document"]["spec"] == authored[
+        "document"
+    ]["spec"]
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_linked_connector_drops_its_entries_from_a_native_project(
+    database,
+):
+    """A ref to a deleted connector can no longer be applied: the delete drops
+    every entry naming it (the author's included) and its default, though
+    its Connector is retired before the refresh runs."""
+    db = database
+    owner = await _user(db, "Owner")
+    editor = await _user(db, "Editor")
+    admin = await _user(db, "Admin", admin=True)
+    doomed = await _connector(db, "Doomed", owner)
+    kept = await _connector(db, "Kept", owner)
+    document = _project_document(
+        "native-team",
+        owner,
+        {
+            "doomed": {"ref": await _ref_of(db, doomed)},
+            "kept": {"ref": await _ref_of(db, kept)},
+        },
+        defaults={"connectors": ["doomed", "kept"]},
+    )
+    result = await _apply(db, document, owner)
+    project = str(
+        (await ManifestStore(db).by_id(result["resources"][0]["uid"]))["linked_id"]
+    )
+    await db.execute(
+        "INSERT INTO project_members(project_id,user_id,role) VALUES($1,$2,'editor')",
+        UUID(project),
+        UUID(editor["id"]),
+    )
+    added = await _connector(db, "Added", owner, project_ids=[project])
+    assert set(await _entries(db, project)) == {
+        "doomed",
+        "kept",
+        (await _ref_of(db, added))["name"],
+    }
+
+    assert await db.delete_datasource(doomed)
+    assert await db.delete_datasource(added)
+    resource = await _project_resource(db, project)
+    assert set(resource["document"]["spec"]["resources"]["connectors"]) == {"kept"}
+    assert resource["document"]["spec"]["defaults"] == {"connectors": ["kept"]}
+    assert (await read_project_connector_defaults(db, project)).connector_ids == [kept]
+    # The stored document applies again, for the owner, an editor and an admin.
+    for actor in (owner, editor, admin):
+        resource = await _project_resource(db, project)
+        await _apply(
+            db, resource["document"], actor, expected=_expected(owner, resource)
+        )
+        assert await _links(db, project) == {kept}
+
+
+@pytest.mark.asyncio
+async def test_reapplying_an_older_copy_keeps_links_made_since(database):
+    db = database
+    owner = await _user(db, "Owner")
+    first = await _connector(db, "First", owner)
+    later = await _connector(db, "Later", owner)
+    original = _project_document(
+        "native-team", owner, {"first": {"ref": await _ref_of(db, first)}}
+    )
+    result = await _apply(db, original, owner)
+    project = str(
+        (await ManifestStore(db).by_id(result["resources"][0]["uid"]))["linked_id"]
+    )
+    assert await db.link_datasource_to_project(project, later)
+
+    # The older copy again: the link made since stays, and is listed again.
+    resource = await _project_resource(db, project)
+    result = await _apply(db, original, owner, expected=_expected(owner, resource))
+    assert await _links(db, project) == {first, later}
+    assert set(
+        result["resources"][0]["resource"]["spec"]["resources"]["connectors"]
+    ) == {"first", (await _ref_of(db, later))["name"]}
+
+    # What the author drops from what they applied is unlinked; nothing else.
+    resource = await _project_resource(db, project)
+    dropped = _project_document("native-team", owner, {})
+    await _apply(db, dropped, owner, expected=_expected(owner, resource))
+    assert await _links(db, project) == {later}
+
+
+@pytest.mark.asyncio
+async def test_me_in_a_stored_document_is_its_last_applier(database):
+    """An editor's ``me`` ref names the editor's connector at every later
+    refresh: the applier is stored on the revision."""
+    db = database
+    owner = await _user(db, "Owner")
+    editor = await _user(db, "Editor")
+    owned = await _connector(db, "Owned", owner)
+    result = await _apply(db, _project_document("native-team", owner, {}), owner)
+    project = str(
+        (await ManifestStore(db).by_id(result["resources"][0]["uid"]))["linked_id"]
+    )
+    await db.execute(
+        "INSERT INTO project_members(project_id,user_id,role) VALUES($1,$2,'owner')",
+        UUID(project),
+        UUID(editor["id"]),
+    )
+    mine = await _connector(db, "Mine", editor)
+    resource = await _project_resource(db, project)
+    document = json.loads(json.dumps(resource["document"]))
+    document["spec"]["resources"]["connectors"] = {
+        "mine": {
+            "ref": {
+                "name": (await _ref_of(db, mine))["name"],
+                "scope": {"kind": "Account", "name": "me"},
+            }
+        }
+    }
+    await _apply(db, document, editor, expected=_expected(owner, resource))
+    assert await _links(db, project) == {mine}
+    assert (
+        project_connectors.document_author(await _project_resource(db, project))
+        == editor["id"]
+    )
+    # A link write refreshes the Project: "mine" still names the editor's
+    # connector, so no second entry for it appears.
+    assert await db.link_datasource_to_project(project, owned)
+    assert set(await _entries(db, project)) == {
+        "mine",
+        (await _ref_of(db, owned))["name"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_the_heal_writes_a_native_projects_missing_defaults_row(
+    database, monkeypatch
+):
+    db = database
+    owner = await _user(db, "Owner")
+    connector = await _connector(db, "Prod DB", owner)
+    project = await _native_project(
+        db,
+        owner,
+        {"db": _inline(connector)},
+        monkeypatch,
+        defaults={"connectors": ["db"]},
+    )
+    # As a Project applied before the table existed.
+    await db.execute(
+        "DELETE FROM project_connector_defaults WHERE project_id=$1", UUID(project)
+    )
+    authored = await _project_resource(db, project)
+    assert await project_connectors.heal_project_connectors(db) == {"native-drift": 1}
+    stored = await read_project_connector_defaults(db, project)
+    assert stored.source == "manifest" and stored.connector_ids == [connector]
+    assert stored.manifest_revision == authored["active_revision"]
+    view = await read_view(db, await db.get_project(project), owner)
+    assert view["managed_by_manifest"] is True and view["can_edit"] is False
+    # The document itself is untouched.
+    resource = await _project_resource(db, project)
+    assert resource["resource_version"] == authored["resource_version"]
+    # A Settings row is never taken over.
+    other = await _native_project_named(db, owner, "second-team", monkeypatch)
+    await db.execute(
+        "DELETE FROM project_connector_defaults WHERE project_id=$1", UUID(other)
+    )
+    await save_settings_connector_defaults(db, other, [], actor_id=owner["id"])
+    await project_connectors.heal_project_connectors(db)
+    assert (await read_project_connector_defaults(db, other)).source == "settings"
+
+
+async def _native_project_named(db, owner, name, monkeypatch) -> str:
+    async def link_nothing(*_args, **_kwargs):
+        return None
+
+    async def refresh_nothing(*_args, **_kwargs):
+        return "none", None
+
+    connector = await _connector(db, f"{name} db", owner)
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            project_connectors, "sync_project_connector_links", link_nothing
+        )
+        patched.setattr(project_connectors, "refresh_project", refresh_nothing)
+        result = await _apply(
+            db,
+            _project_document(
+                name, owner, {"db": _inline(connector)}, defaults={"connectors": ["db"]}
+            ),
+            owner,
+        )
+    return str(
+        (await ManifestStore(db).by_id(result["resources"][0]["uid"]))["linked_id"]
+    )
 
 
 # =============================================================================
