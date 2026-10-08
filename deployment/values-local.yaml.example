@@ -275,6 +275,14 @@ orchestrator:
   # "" (off), "stateless" (the chart default) or "stateless,pinned".
   # Uncomment to turn it off for this cluster:
   # sessionSubagentFanoutLanes: ""
+  # Connector credential leases (connector drivers C2): the k3d profile
+  # installs the development lease probe driver and shortens the lease window
+  # so scripts/k3d-credential-lease-gate.py can watch a paused Job's lease
+  # lapse and an idle session's lease outlive it in minutes, not 15.
+  connectorLeases:
+    probeDriver: true
+    ttlSeconds: 120
+    sweepIntervalSeconds: 15
   resources:
     requests:
       memory: "256Mi"

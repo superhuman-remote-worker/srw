@@ -113,6 +113,12 @@ spec:
           imagePullPolicy: {{ .Values.image.orchestrator.pullPolicy }}
           ports:
             - containerPort: 8085
+            {{- with .Values.orchestrator.connectorLeases.exchangePort }}
+            # The credential lease exchange (connector drivers C2): its own
+            # port, served by a second minimal ASGI app. No ingress routes it.
+            - name: lease-exchange
+              containerPort: {{ . }}
+            {{- end }}
           env:
             # Migration 0185 is intentionally not rolling-compatible.  An
             # existing database accepts it only after the operator drains old
@@ -1871,6 +1877,15 @@ spec:
             - name: WORKSPACE_SSH_KNOWN_HOSTS
               value: {{ . | quote }}
             {{- end }}
+            # Connector credential leases (connector drivers C2).
+            - name: CONNECTOR_LEASE_EXCHANGE_PORT
+              value: {{ .Values.orchestrator.connectorLeases.exchangePort | default 0 | quote }}
+            - name: CONNECTOR_LEASE_TTL_SECONDS
+              value: {{ .Values.orchestrator.connectorLeases.ttlSeconds | quote }}
+            - name: CONNECTOR_LEASE_SWEEP_INTERVAL_SECONDS
+              value: {{ .Values.orchestrator.connectorLeases.sweepIntervalSeconds | quote }}
+            - name: CONNECTOR_LEASE_PROBE_ENABLED
+              value: {{ .Values.orchestrator.connectorLeases.probeDriver | quote }}
             - name: KB_EXTERNAL_REINDEX_CONCURRENCY
               value: {{ .Values.orchestrator.kbExternalReindexConcurrency | quote }}
             - name: KB_REINDEX_SWEEP_SECONDS

@@ -1,0 +1,35 @@
+{{- $leases := .Values.orchestrator.connectorLeases }}
+{{- if and $leases.exchangePort $leases.networkPolicy.enabled }}
+{{- $driverNamespace := $leases.networkPolicy.driverNamespace | default (printf "%s-connectors" (include "srw.fullname" .)) }}
+# Orchestrator ingress (connector drivers C2, "Reachability").
+#
+# The API port stays open to every source, exactly as before this policy
+# existed: once a NetworkPolicy selects a pod, every ingress it does not allow
+# is denied, so 8085 is listed with no `from` (ingress controller, agents,
+# MCP, collectors, kubelet probes). The credential lease exchange port admits
+# only pods in the connector driver namespace, so a driver reaches the
+# exchange and nothing else of the API, and no other pod reaches the exchange.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "srw.fullname" . }}-orchestrator-ingress
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8085
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $driverNamespace | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ $leases.exchangePort }}
+{{- end }}

@@ -7,7 +7,16 @@ metadata:
 spec:
   type: ClusterIP
   ports:
-    - port: 8085
+    # A Service with two ports names both; the API port stays 8085.
+    - name: http
+      port: 8085
       targetPort: 8085
+    {{- with .Values.orchestrator.connectorLeases.exchangePort }}
+    # The credential lease exchange (connector drivers C2). Drivers reach it
+    # by this Service; no Ingress names this port.
+    - name: lease-exchange
+      port: {{ . }}
+      targetPort: lease-exchange
+    {{- end }}
   selector:
     {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}

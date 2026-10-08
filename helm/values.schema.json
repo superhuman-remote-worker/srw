@@ -1594,6 +1594,34 @@
           "type": "string",
           "description": "OpenSSH known_hosts lines pinning external SSH hosts for workspace connector identities (connector drivers C1)."
         },
+        "connectorLeases": {
+          "type": "object",
+          "description": "Connector credential leases and their dedicated exchange port (connector drivers C2).",
+          "additionalProperties": false,
+          "properties": {
+            "exchangePort": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535,
+              "not": {"const": 8085},
+              "description": "The lease exchange's own port; 0 turns it off. Never the API port."
+            },
+            "ttlSeconds": {"type": "integer", "minimum": 60},
+            "sweepIntervalSeconds": {"type": "integer", "minimum": 5},
+            "probeDriver": {
+              "type": "boolean",
+              "description": "Development only: install the srw.lease-probe/v1 driver."
+            },
+            "networkPolicy": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "driverNamespace": {"type": "string"}
+              }
+            }
+          }
+        },
         "containerStartupStageAuthority": {
           "type": "object",
           "required": ["enabled"],
