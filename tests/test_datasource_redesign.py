@@ -11,6 +11,8 @@ replicated here (the original lives in the connector drivers now).
 
 import json
 
+import pytest
+
 from orchestrator.services.knowledge_projection import (
     build_datasource_note_content as _build_datasource_note_content,
     build_generic_note as _build_generic_note,
@@ -404,25 +406,60 @@ class TestBuildDatasourcesPayload:
 
 
 class TestRenderInstructionContentNoCliMode:
-    """The CLI-mode template variables are gone; a stored template that still
-    guards a block with them renders it as it always did at runtime, where
-    the list was always empty."""
+    """The CLI mode is gone. For one release the loader still offers its
+    template names, always empty, so a stored template that guards a block
+    with them (an admin override on a self-hosted install) renders it exactly
+    as it always did at runtime: not at all."""
 
-    def test_a_cli_datasources_block_never_renders(self):
+    #: The block the bundled prompts carried, in the same shape.
+    DEAD_BLOCK = (
+        "</constraints>\n\n"
+        "{% if cli_datasources and has_shell -%}\n"
+        "<datasource_access>\n"
+        "Use `run_command`.\n"
+        '{% if has_cli_datasource("postgresql") -%}\n'
+        "- PostgreSQL: `psql`\n"
+        "{% endif -%}\n"
+        '{% if has_cli_datasource("neo4j") -%}\n'
+        "- Neo4j: `cypher-shell`\n"
+        "{% endif -%}\n"
+        "</datasource_access>\n"
+        "{% endif -%}\n\n"
+        "<phase_model>\n"
+    )
+
+    @pytest.mark.parametrize("tools", [["run_command"], ["read_file"]])
+    def test_the_dead_block_renders_nothing(self, tools):
         from shared.runtime.core.loader import render_instruction_content
 
-        template = "A{% if cli_datasources and has_shell %}HAS_CLI{% endif %}B"
-        assert render_instruction_content(template, ["run_command"]) == "AB"
+        assert (
+            render_instruction_content(self.DEAD_BLOCK, tools)
+            == "</constraints>\n\n<phase_model>\n"
+        )
 
-    def test_bundled_prompts_no_longer_mention_it(self):
+    def test_the_names_are_empty_even_outside_the_guard(self):
+        from shared.runtime.core.loader import render_instruction_content
+
+        template = (
+            '{% if has_cli_datasource("postgresql") %}PG{% endif %}'
+            "[{{ cli_datasources | length }}]"
+        )
+        assert render_instruction_content(template, ["run_command"]) == "[0]"
+
+    def test_bundled_config_no_longer_mentions_it(self):
         from pathlib import Path
 
         config = Path(__file__).parents[1] / "config"
-        offenders = [
-            str(path.relative_to(config))
-            for path in config.rglob("*.txt")
-            if "cli_datasource" in path.read_text()
-        ]
+        offenders = []
+        for path in config.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text()
+            except UnicodeDecodeError:
+                continue
+            if "cli_datasource" in text:
+                offenders.append(str(path.relative_to(config)))
         assert offenders == []
 
 

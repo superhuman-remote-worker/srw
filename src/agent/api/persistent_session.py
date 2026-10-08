@@ -3049,7 +3049,8 @@ class PersistentSession:
         Slice B).
 
         Runs the connector registry's live update (``agent.connectors``): the
-        environment file is rewritten, detached SSH connectors (repository or
+        current env connectors are installed again (merged into what earlier
+        installs left, which v1 keeps), detached SSH connectors (repository or
         ``ssh_key``) have exactly their own workspace ssh-agent retired (the
         session owns its workspace, so nothing else can still be using that
         identity) and the rest are re-proven or loaded from

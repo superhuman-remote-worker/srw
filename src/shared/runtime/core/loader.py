@@ -1615,6 +1615,12 @@ def render_instruction_content(
         tools=tool_names,
         has_tool=lambda name: name in tool_set,
         has_shell=_has_shell_tools(tool_set),
+        # Compatibility shim for the deleted CLI mode (D1b, connector drivers):
+        # an admin-authored prompt on a self-hosted install may still guard a
+        # block with these names. Always empty/False, as they were at runtime.
+        # Remove in the release after the one that ships D1b.
+        cli_datasources=[],
+        has_cli_datasource=lambda ds_type: False,
         protected_cloud=protected_cloud,
         # Shadows the environment global for THIS render only, so the deadline
         # closure is per-call and the shared cached environment stays stateless.
