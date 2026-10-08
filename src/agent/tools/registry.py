@@ -562,7 +562,7 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
 
     # Graph tools
     if "graph" in tools_by_category:
-        if not context.has_datasource("neo4j"):
+        if not context.has_connection_for("graph"):
             logger.warning("Graph tools require a neo4j datasource in ToolContext")
         else:
             try:
@@ -577,7 +577,7 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
 
     # SQL tools
     if "sql" in tools_by_category:
-        if not context.has_datasource("postgresql"):
+        if not context.has_connection_for("sql"):
             logger.warning("SQL tools require a postgresql datasource in ToolContext")
         else:
             try:
@@ -592,7 +592,7 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
 
     # MongoDB tools
     if "mongodb" in tools_by_category:
-        if not context.has_datasource("mongodb"):
+        if not context.has_connection_for("mongodb"):
             logger.warning("MongoDB tools require a mongodb datasource in ToolContext")
         else:
             try:
@@ -607,7 +607,7 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
 
     # WebDAV datasource tools
     if "webdav" in tools_by_category:
-        if not context.has_datasource("webdav"):
+        if not context.has_connection_for("webdav"):
             logger.warning("WebDAV tools require a webdav datasource in ToolContext")
         else:
             try:
@@ -621,7 +621,7 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                 logger.warning(f"Could not load webdav tools: {e}")
 
     # Repository datasource write tools. NOTE: unlike the other datasource
-    # toolkits this cannot use context.has_datasource() — repository
+    # toolkits this cannot use context.has_connection_for() — repository
     # datasources never enter context.datasources (they deliver a checkout, not
     # a managed connection); the clones live on workspace_manager instead.
     if "repo" in tools_by_category:
@@ -642,13 +642,13 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
     # MCP datasource tools are already-live LangChain tools owned by the
     # per-job/session MCPManager. Missing or failed servers degrade cleanly.
     if "mcp" in tools_by_category:
-        if not context.has_datasource("mcp"):
+        if not context.has_connection_for("mcp"):
             logger.warning(
                 "MCP tools require an mcp datasource connection in ToolContext"
             )
         else:
             try:
-                manager = context.get_datasource("mcp")
+                manager = context.connection_for("mcp")
                 requested = set(tools_by_category["mcp"])
                 for tool in manager.get_langchain_tools():
                     if tool.name in requested:
@@ -659,7 +659,7 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
 
     # Email datasource tools
     if "email" in tools_by_category:
-        if not context.has_datasource("email"):
+        if not context.has_connection_for("email"):
             logger.warning("Email tools require an email datasource in ToolContext")
         else:
             try:

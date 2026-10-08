@@ -40,7 +40,7 @@ def create_postgresql_tools(context: ToolContext) -> List[Any]:
     Raises:
         ValueError: If a PostgreSQL connector is not available in context
     """
-    conn = context.get_datasource("postgresql")
+    conn = context.connection_for("sql")
     if not conn:
         raise ValueError("PostgreSQL connector not available in context")
 

@@ -6,18 +6,3 @@
 #
 # <file>  <qualname>  <kind>  <type ids>  <fingerprint>  #<ordinal>
 
-src/agent/api/persistent_session.py  PersistentSession._refresh_runtime_facts  compare  email  0bf903dadf2a  #1
-src/agent/api/turn_executor.py  StatelessTurnExecutor._worker_mcp_attached  compare  mcp  8b2036a87573  #1
-src/agent/tools/email/tools.py  create_email_tools  registry-slot  email  77c512d4f6ae  #1
-src/agent/tools/email/tools.py  create_email_tools._binding_refusal  registry-slot  email  77c512d4f6ae  #1
-src/agent/tools/graph/neo4j.py  create_neo4j_tools  registry-slot  neo4j  0e43d7decd2f  #1
-src/agent/tools/mongodb/mongo.py  create_mongo_tools  registry-slot  mongodb  0fc0de088303  #1
-src/agent/tools/registry.py  load_tools  registry-slot  email  e52bcebfeaf4  #1
-src/agent/tools/registry.py  load_tools  registry-slot  mcp  615e3cacc5e3  #1
-src/agent/tools/registry.py  load_tools  registry-slot  mcp  abadb4f91060  #1
-src/agent/tools/registry.py  load_tools  registry-slot  mongodb  ec888a628dca  #1
-src/agent/tools/registry.py  load_tools  registry-slot  neo4j  cf5ea66585c7  #1
-src/agent/tools/registry.py  load_tools  registry-slot  postgresql  2bd4cf6c228b  #1
-src/agent/tools/registry.py  load_tools  registry-slot  webdav  5e933d241a1c  #1
-src/agent/tools/sql/postgresql.py  create_postgresql_tools  registry-slot  postgresql  03e18ffc14fe  #1
-src/agent/tools/webdav/tools.py  create_webdav_tools  registry-slot  webdav  e72ff2f3619b  #1

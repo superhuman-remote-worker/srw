@@ -15,11 +15,13 @@ import logging
 from collections.abc import Sequence
 
 from agent.connectors.base import Delivery, FactsLines, RuntimeContext
+from agent.connectors.slots import connection_slot
+from shared.connectors.builtin import MCP_SPEC
 
 logger = logging.getLogger(__name__)
 
 #: The harness slot the MCP manager takes.
-MCP_SLOT = "mcp"
+MCP_SLOT = connection_slot(MCP_SPEC) or ""
 
 
 class McpClientMaterializer:

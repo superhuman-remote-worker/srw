@@ -4,7 +4,7 @@
 non-secret scoping config (access tier, folder allowlist, drafts folder,
 recipient allowlist, unattended-send flag). It is created by the email
 connection factory (``agent.connectors.connections``) and reached by the tools
-via ``ToolContext.get_datasource("email")``.
+via ``ToolContext.connection_for("email")``.
 
 Connections are strictly per-operation: every tool call opens a fresh IMAP
 (or SMTP) connection with an explicit socket timeout and closes it when the

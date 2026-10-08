@@ -567,3 +567,73 @@ def test_checkouts_without_a_workspace(execution, clones, caplog):
         )
     assert clone.called is clones
     assert caplog.text == ""
+
+
+# =============================================================================
+# Harness slots: the tools ask by tool category
+# =============================================================================
+
+
+def test_every_connection_driver_has_one_slot_for_its_tool_category():
+    from agent.connectors.slots import SLOT_BY_CATEGORY, connection_slot
+
+    expected = {
+        spec.tool_category: connection_slot(spec)
+        for spec in DATASOURCE_SPECS
+        if connection_slot(spec) and spec.tool_category
+    }
+    assert SLOT_BY_CATEGORY == expected
+    assert set(SLOT_BY_CATEGORY) == {
+        "graph",
+        "sql",
+        "mongodb",
+        "webdav",
+        "email",
+        "mcp",
+    }
+    # The slot is where the materializers put the connection.
+    for spec in DATASOURCE_SPECS:
+        if "managed_connection" in spec.delivery_forms:
+            assert connection_slot(spec) in CONNECTION_FACTORIES
+    assert connection_slot(spec_for_type("repository")) is None
+
+
+def test_a_tool_finds_its_connection_by_category():
+    from agent.tools.context import ToolContext
+
+    pg, mcp = object(), object()
+    context = ToolContext(datasources={"postgresql": pg, "mcp": mcp})
+    assert context.connection_for("sql") is pg
+    assert context.connection_for("mcp") is mcp
+    assert context.has_connection_for("sql")
+    assert not context.has_connection_for("graph")
+    assert context.connection_for("repo") is None
+    assert not hasattr(context, "get_datasource")
+
+
+def test_load_tools_binds_a_category_only_with_its_connection():
+    from agent.tools.context import ToolContext
+    from agent.tools.registry import load_tools
+
+    bound = load_tools(
+        ["sql_query", "sql_schema"],
+        ToolContext(datasources={"postgresql": MagicMock()}),
+    )
+    assert sorted(tool.name for tool in bound) == ["sql_query", "sql_schema"]
+    assert load_tools(["sql_query"], ToolContext(datasources={})) == []
+
+
+@pytest.mark.parametrize(
+    ("datasources", "attached"),
+    [
+        ([{"type": "mcp", "name": "M"}], True),
+        ([{"type": "postgresql"}, {"type": "kb"}], False),
+        ([{"type": "MCP"}, "junk"], False),
+        (None, False),
+    ],
+)
+def test_a_worker_counts_mcp_by_delivery_form(datasources, attached):
+    from agent.api.turn_executor import StatelessTurnExecutor
+
+    request = SimpleNamespace(datasources=datasources)
+    assert StatelessTurnExecutor._worker_mcp_attached(request) is attached

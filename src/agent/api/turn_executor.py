@@ -1666,9 +1666,10 @@ class StatelessTurnExecutor:
     @staticmethod
     def _worker_mcp_attached(request: JobStartRequest) -> bool:
         """Whether resolved claim inputs will construct an MCP manager."""
+        from shared.connectors.builtin import delivers_in
 
         return any(
-            isinstance(datasource, dict) and datasource.get("type") == "mcp"
+            isinstance(datasource, dict) and delivers_in(datasource, "mcp_client")
             for datasource in (request.datasources or ())
         )
 

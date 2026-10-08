@@ -22,23 +22,8 @@
 # <file>  <qualname>  <kind>  <type ids>  <fingerprint>  #<ordinal>  <classification>  [<reason>]
 
 src/agent/api/persistent_session.py  PersistentSession._protected_cloud_config_valid  compare  webdav  dfe8cd429615  #1  not-a-connector-type  a cloud mount's rclone source.type, not a connector
-src/agent/api/persistent_session.py  PersistentSession._refresh_runtime_facts  compare  email  0bf903dadf2a  #1  legacy-pending
 src/agent/api/session_workspace.py  validate_protected_cloud_mount  compare  webdav  5490bf991804  #1  not-a-connector-type  a cloud mount's rclone source.type, not a connector
-src/agent/api/turn_executor.py  StatelessTurnExecutor._worker_mcp_attached  compare  mcp  8b2036a87573  #1  legacy-pending
 src/agent/database/postgres_db.py  JobsNamespace.record_pull_request  sql-literal  repository  c6e491f05375  #1  sql  PR record insert checks the attachment is a repository connector in SQL; type stays a mirror column (D3)
-src/agent/tools/email/tools.py  create_email_tools  registry-slot  email  77c512d4f6ae  #1  legacy-pending
-src/agent/tools/email/tools.py  create_email_tools._binding_refusal  registry-slot  email  77c512d4f6ae  #1  legacy-pending
-src/agent/tools/graph/neo4j.py  create_neo4j_tools  registry-slot  neo4j  0e43d7decd2f  #1  legacy-pending
-src/agent/tools/mongodb/mongo.py  create_mongo_tools  registry-slot  mongodb  0fc0de088303  #1  legacy-pending
-src/agent/tools/registry.py  load_tools  registry-slot  email  e52bcebfeaf4  #1  legacy-pending
-src/agent/tools/registry.py  load_tools  registry-slot  mcp  615e3cacc5e3  #1  legacy-pending
-src/agent/tools/registry.py  load_tools  registry-slot  mcp  abadb4f91060  #1  legacy-pending
-src/agent/tools/registry.py  load_tools  registry-slot  mongodb  ec888a628dca  #1  legacy-pending
-src/agent/tools/registry.py  load_tools  registry-slot  neo4j  cf5ea66585c7  #1  legacy-pending
-src/agent/tools/registry.py  load_tools  registry-slot  postgresql  2bd4cf6c228b  #1  legacy-pending
-src/agent/tools/registry.py  load_tools  registry-slot  webdav  5e933d241a1c  #1  legacy-pending
-src/agent/tools/sql/postgresql.py  create_postgresql_tools  registry-slot  postgresql  03e18ffc14fe  #1  legacy-pending
-src/agent/tools/webdav/tools.py  create_webdav_tools  registry-slot  webdav  e72ff2f3619b  #1  legacy-pending
 src/mcp_server/server.py  _get_mcp_caller_ctx  type-keyword  mcp  0665ab3128f9  #1  not-a-connector-type  the MCP server's caller kind (an MCP token principal), not a connector
 src/mcp_server/server.py  _get_mcp_caller_ctx  type-keyword  mcp  0665ab3128f9  #2  not-a-connector-type  the MCP server's caller kind (an MCP token principal), not a connector
 src/mcp_server/server.py  _get_mcp_caller_ctx  type-keyword  mcp  0665ab3128f9  #3  not-a-connector-type  the MCP server's caller kind (an MCP token principal), not a connector

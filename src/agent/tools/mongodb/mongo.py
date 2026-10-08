@@ -62,7 +62,7 @@ def create_mongo_tools(context: ToolContext) -> List[Any]:
     Raises:
         ValueError: If a MongoDB connector is not available in context
     """
-    db = context.get_datasource("mongodb")
+    db = context.connection_for("mongodb")
     if not db:
         raise ValueError("MongoDB connector not available in context")
 

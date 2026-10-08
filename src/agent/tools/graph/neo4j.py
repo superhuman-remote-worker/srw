@@ -52,7 +52,7 @@ def create_neo4j_tools(context: ToolContext) -> List[Any]:
     Raises:
         ValueError: If Neo4j database not available in context
     """
-    neo4j = context.get_datasource("neo4j")
+    neo4j = context.connection_for("graph")
     if not neo4j:
         raise ValueError("Neo4j connector not available in context")
 

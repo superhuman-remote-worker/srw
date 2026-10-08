@@ -6,7 +6,7 @@ Write tools (write, delete) are only injected when the datasource is not
 marked read-only.
 
 Connection is established by the WebDAV connection factory (agent.connectors.connections)
-and injected via ToolContext.get_datasource("webdav").
+and reached via ToolContext.connection_for("webdav").
 """
 
 import asyncio
@@ -38,7 +38,7 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
     Returns:
         List of LangChain tool functions
     """
-    client = context.get_datasource("webdav")
+    client = context.connection_for("webdav")
     if not client:
         raise ValueError("WebDAV connector not available in context")
 

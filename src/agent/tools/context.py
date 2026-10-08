@@ -517,27 +517,25 @@ class ToolContext:
         """Check if PostgreSQL connection is available."""
         return self.postgres_db is not None
 
-    def has_datasource(self, ds_type: str) -> bool:
-        """Check if a datasource of the given type is available.
+    def connection_for(self, category: str) -> Optional[Any]:
+        """The connection a tool category's tools use, or ``None``.
+
+        A managed connection (or the MCP manager) sits in ``datasources``
+        under the slot its driver's spec ties to the category
+        (``agent.connectors.slots``); a tool asks by its own category and
+        never names a connector type.
 
         Args:
-            ds_type: Datasource type (e.g. "neo4j", "postgresql", "mongodb")
-
-        Returns:
-            True if datasource is available
+            category: The tool category (e.g. "sql", "graph", "email")
         """
-        return ds_type in self.datasources and self.datasources[ds_type] is not None
+        from agent.connectors.slots import slot_for_category
 
-    def get_datasource(self, ds_type: str) -> Optional[Any]:
-        """Get a datasource connection by type.
+        slot = slot_for_category(category)
+        return self.datasources.get(slot) if slot else None
 
-        Args:
-            ds_type: Datasource type (e.g. "neo4j", "postgresql", "mongodb")
-
-        Returns:
-            Datasource connection object, or None if not available
-        """
-        return self.datasources.get(ds_type)
+    def has_connection_for(self, category: str) -> bool:
+        """Whether a tool category's connection is available."""
+        return self.connection_for(category) is not None
 
     def next_graph_progress(self) -> int:
         """Advance and return the graph-progress marker.

@@ -2482,28 +2482,32 @@ class PersistentSession:
                 }
             )
         )
+        # The mailbox facts describe the email tool category's connector:
+        # its tier is the binding's access level, ranked by the driver spec.
+        from agent.connectors import deliveries_from_payload
+        from agent.connectors.slots import slot_for_category
+
         email_configs = [
-            item
-            for item in self.datasource_configs
-            if isinstance(item, dict) and item.get("type") == "email"
+            delivery
+            for delivery in deliveries_from_payload(self.datasource_configs)
+            if delivery.spec is not None and delivery.spec.tool_category == "email"
         ]
+        email_connection = (
+            self.datasources.get(slot_for_category("email")) if email_configs else None
+        )
         email_tier = None
         if email_configs:
-            from agent.core.datasource_setup import (
-                EMAIL_TIER_ORDER,
-                email_effective_access,
-            )
-
+            tier_order = email_configs[0].spec.ranked_access_ids()
             email_tier = max(
-                (email_effective_access(item) for item in email_configs),
-                key=EMAIL_TIER_ORDER.index,
+                (
+                    delivery.binding.access
+                    for delivery in email_configs
+                    if delivery.binding is not None
+                ),
+                key=tier_order.index,
             )
-            live_email_tier = getattr(
-                self.datasources.get("email"),
-                "access",
-                None,
-            )
-            if live_email_tier in EMAIL_TIER_ORDER:
+            live_email_tier = getattr(email_connection, "access", None)
+            if live_email_tier in tier_order:
                 email_tier = live_email_tier
 
         backend = getattr(self.workspace_manager, "backend", None)
@@ -2592,15 +2596,11 @@ class PersistentSession:
                 attached_datasource_types=datasource_types,
                 email_access_tier=email_tier,
                 email_connection_failed=bool(
-                    email_configs and self.datasources.get("email") is None
+                    email_configs and email_connection is None
                 ),
                 email_direct_send_enabled=bool(
                     email_configs
-                    and getattr(
-                        self.datasources.get("email"),
-                        "unattended_send",
-                        False,
-                    )
+                    and getattr(email_connection, "unattended_send", False)
                 ),
                 knowledge_binding_available=bool(self.knowledge_bindings),
                 knowledge_store_available=self.knowledge_store is not None,

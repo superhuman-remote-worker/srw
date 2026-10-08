@@ -29,6 +29,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from agent.connectors.base import Delivery
+from agent.connectors.slots import connection_slot
 from shared.connectors.binding import BindingDescriptor, BindingEntry
 from shared.connectors.builtin import spec_for_type
 from shared.connectors.contract import DriverSpec
@@ -188,7 +189,7 @@ def _connection_entries(
             form="managed_connection",
             value={
                 # The harness slot the built-in tools read.
-                "kind": spec.legacy_type or "",
+                "kind": connection_slot(spec) or "",
                 "url": str(url) if url is not None else None,
                 "credentials": dict(_credentials(entry)),
                 "config": dict(_mapping(entry.get("config"))),
