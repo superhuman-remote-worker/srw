@@ -12,6 +12,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"io"
@@ -310,10 +311,30 @@ func TestTheConnectorsUpstreamCAIsTheOnlyRoots(t *testing.T) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
-	// The re-review's cases file, where present.
-	if raw, err := os.ReadFile("/tmp/claude-1000/-home-ghost-Repositories-Superhuman-Remote-Worker/c79113c0-f9fe-4a88-ab5b-c9b13ff59caa/scratchpad/c3-rereview/ca_cases.txt"); err == nil {
-		if _, err := upstreamRoots(string(raw)); !errors.Is(err, errBadUpstreamCA) {
-			t.Errorf("the re-review's cases: %v", err)
+	// The re-review's cases, inlined: indented blocks are whitespace
+	// between blocks; a block of another kind, a certificate block with PEM
+	// headers (RFC 1421's Proc-Type and DEK-Info) and text around the
+	// blocks are not.
+	if _, err := upstreamRoots(" " + certificate + "\n " + certificate); err != nil {
+		t.Fatalf("indented certificates: %v", err)
+	}
+	lines := strings.SplitN(strings.TrimSpace(certificate), "\n", 2)
+	withHeaders := lines[0] + "\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n\n" + lines[1] + "\n"
+	if block, _ := pem.Decode([]byte(withHeaders)); block == nil || len(block.Headers) != 2 {
+		t.Fatal("the case must be a certificate block with headers")
+	}
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	keyDER, _ := x509.MarshalECPrivateKey(key)
+	secret := string(pem.EncodeToMemory(&pem.Block{Type: "SECRET", Bytes: keyDER}))
+	for name, text := range map[string]string{
+		"pem headers":        withHeaders,
+		"headers after one":  certificate + withHeaders,
+		"a secret block":     certificate + secret,
+		"text between":       certificate + " hello world\n" + certificate,
+		"trailing junk here": certificate + "trailing junk here\n",
+	} {
+		if _, err := upstreamRoots(text); !errors.Is(err, errBadUpstreamCA) {
+			t.Errorf("%s: %v", name, err)
 		}
 	}
 	// Through the request file: the driver's client verifies against it.
@@ -330,6 +351,47 @@ func TestTheConnectorsUpstreamCAIsTheOnlyRoots(t *testing.T) {
 	}
 	if !strings.HasPrefix(badCAReport, "upstream CA unusable") {
 		t.Fatal("the reconciler reads the report's prefix")
+	}
+}
+
+// The driver's own entry point: a bad upstream CA in the request file
+// exits 78 with the fixed report, as an upstream it cannot trust does, so
+// SRW stops the pod at once instead of watching it crash-loop.
+func TestABadUpstreamCAExits78(t *testing.T) {
+	dir := t.TempDir()
+	server := httptest.NewTLSServer(http.NotFoundHandler())
+	server.Close()
+	certificate := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}))
+	write := func(name string, value any) string {
+		path := filepath.Join(dir, name)
+		raw, ok := value.([]byte)
+		if !ok {
+			var err error
+			if raw, err = json.Marshal(value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(path, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	t.Setenv("SRW_REQUEST_FILE", write("request.json", requestWithCA(certificate+"junk")))
+	t.Setenv("SRW_DRIVER_IDENTITY_FILE", write("identity", []byte("sdi_"+repeat("A", 49))))
+	log := filepath.Join(dir, "termination-log")
+	saved := terminationLog
+	terminationLog = log
+	defer func() { terminationLog = saved }()
+	if code := dispatch([]string{"serve"}); code != upstreamExitCode {
+		t.Fatalf("exit code %d", code)
+	}
+	if raw, _ := os.ReadFile(log); strings.TrimSpace(string(raw)) != badCAReport {
+		t.Fatalf("termination message %q", raw)
+	}
+	// Any other configuration error is no upstream verdict: exit 2.
+	t.Setenv("SRW_REQUEST_FILE", write("broken.json", []byte("{")))
+	if code := dispatch([]string{"serve"}); code != 2 {
+		t.Fatalf("a broken request file exits %d", code)
 	}
 }
 

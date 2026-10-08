@@ -21,11 +21,9 @@ const (
 	// its upstream (connector_service_hosting.UPSTREAM_EXIT_CODE): it stops
 	// the pod at once and deliveries take the installation's fallback.
 	upstreamExitCode = 78
-	// The container's termination message: why, in one line.
-	terminationLog = "/dev/termination-log"
-	probeAttempts  = 4
-	probePause     = 5 * time.Second
-	maxProbeReport = 300
+	probeAttempts    = 4
+	probePause       = 5 * time.Second
+	maxProbeReport   = 300
 	// The termination message's classes (connector_git_swap_delivery reads
 	// the prefix): only these words, never the upstream's own text (a
 	// certificate's names, an error string), which may say anything.
@@ -33,6 +31,10 @@ const (
 	unreachablePrefix = "unreachable: "
 	badCAReport       = "upstream CA unusable: the connector's upstream CA is not PEM certificates"
 )
+
+// terminationLog is the container's termination message: why, in one line
+// (a variable so a test can point it elsewhere).
+var terminationLog = "/dev/termination-log"
 
 // probeUpstream checks, before the driver serves, that the configured
 // upstream answers HTTPS with a certificate the driver trusts: a GET of its
