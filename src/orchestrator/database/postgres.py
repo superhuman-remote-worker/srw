@@ -5185,14 +5185,12 @@ class PostgresDB:
                 # Revoke before the row goes (connector drivers C2): the
                 # lease rows cascade with the Job below, so the audited
                 # revocation is written first, in this same transaction. The
-                # Job row is locked first, as every lease issue locks it.
+                # Job row is already locked FOR UPDATE above, before any lease
+                # row, the order every lease issue takes.
                 from orchestrator.services.connector_credential_leases import (
                     revoke_execution_leases,
                 )
 
-                await conn.fetchval(
-                    "SELECT 1 FROM jobs WHERE id = $1 FOR UPDATE", uuid_val
-                )
                 await revoke_execution_leases(
                     conn, job_id=uuid_val, reason="job_deleted"
                 )
