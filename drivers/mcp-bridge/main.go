@@ -7,6 +7,7 @@
 //	srw-mcp-bridge install DIR                     copy itself into DIR
 //	srw-mcp-bridge serve [flags] -- PROGRAM [ARG...]
 //	srw-mcp-bridge status --socket PATH            print the processes it runs
+//	srw-mcp-bridge launch [limits] -- PROGRAM      (internal) start a process
 //	srw-mcp-bridge version
 //
 // It serves streamable HTTP to SRW's front on a unix socket in a directory
@@ -33,7 +34,12 @@
 //     capability and can gain none), with a private directory (0700) as
 //     HOME and TMPDIR (${binding.home} in its environment or arguments) and
 //     private files (umask 077): a binding's process cannot read another's
-//     environment or files, signal it, or reach the bridge's socket;
+//     environment or files, signal it, or reach the bridge's socket; its
+//     user may have at most --process-limit processes and threads
+//     (RLIMIT_NPROC, per user: per binding), no core dump and, when
+//     --address-space-mb asks, a capped address space: the bridge starts
+//     itself as that user in launch mode, which sets them and becomes the
+//     program;
 //   - the process lives with its binding and serves the binding's later
 //     sessions too (SRW's agent opens one per attach), one at a time: a new
 //     session takes over, its initialize is answered with the process's own
@@ -71,6 +77,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -80,9 +87,11 @@ const usage = `usage:
   srw-mcp-bridge install DIR
   srw-mcp-bridge serve --socket PATH [--socket-group GID] [--path /mcp]
       --home-root DIR [--uid-base UID] [--sweep-dir DIR ...]
+      [--process-limit 256] [--address-space-mb MB]
       [--credential-env NAME] [--max-processes N] [--idle 10m] [--stop-grace 5s]
       -- PROGRAM [ARG...]
   srw-mcp-bridge status --socket PATH
+  srw-mcp-bridge launch --process-limit N [--address-space-mb MB] -- PROGRAM [ARG...]
   srw-mcp-bridge version
 `
 
@@ -121,6 +130,15 @@ func dispatch(args []string, stdout, stderr io.Writer) int {
 		return 0
 	case "status":
 		return status(args[1:], stdout, stderr)
+	case "launch":
+		limits, program, err := parseLaunch(args[1:])
+		if err != nil {
+			fmt.Fprintf(stderr, "srw-mcp-bridge: launch: %v\n", err)
+			return 2
+		}
+		// It returns only when the program did not start.
+		fmt.Fprintf(stderr, "srw-mcp-bridge: launch: %v\n", launch(limits, program))
+		return 127
 	case "serve":
 		opts, err := parseServe(args[1:])
 		if err != nil {
@@ -170,6 +188,8 @@ func parseServe(args []string) (options, error) {
 	set.IntVar(&opts.uidBase, "uid-base", 0, "the first user the processes run as (0: as the bridge, for tests only)")
 	set.StringVar(&opts.homeRoot, "home-root", "", "where each process's private directory is made")
 	set.Var(&sweep, "sweep-dir", "a shared writable directory swept of a user's files (default /tmp and /dev/shm)")
+	set.IntVar(&opts.processLimit, "process-limit", 256, "the processes and threads each binding's user may have")
+	set.IntVar(&opts.addressSpaceMB, "address-space-mb", 0, "each binding's process's address space in MiB (0: none)")
 	if err := set.Parse(args[:split]); err != nil {
 		return options{}, err
 	}
@@ -221,6 +241,9 @@ func (o options) validate() error {
 			return fmt.Errorf("--sweep-dir %q must be an absolute directory", dir)
 		}
 	}
+	if err := checkLimits(o.limits()); err != nil {
+		return err
+	}
 	if o.uidBase != 0 {
 		last := o.uidBase + poolSize(o.maxProcesses) - 1
 		switch {
@@ -250,6 +273,13 @@ func serve(opts options) int {
 			logger.Printf("%v", err)
 			return 1
 		}
+		// Every process starts as the bridge itself, in launch mode.
+		launcher, err := os.Executable()
+		if err != nil {
+			logger.Printf("the bridge's own binary: %v", err)
+			return 1
+		}
+		opts.launcher = launcher
 	} else {
 		if err := os.MkdirAll(opts.homeRoot, 0o700); err != nil {
 			logger.Printf("%v", err)
@@ -315,4 +345,38 @@ func status(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// checkLimits refuses limits a binding's process could not run under.
+func checkLimits(limits launchLimits) error {
+	if limits.processes < 16 || limits.processes > 4096 {
+		return errors.New("--process-limit must be between 16 and 4096")
+	}
+	if limits.addressSpace != 0 && (limits.addressSpace < 64<<20 || limits.addressSpace > 1<<40) {
+		return errors.New("--address-space-mb must be 0 or between 64 and 1048576")
+	}
+	return nil
+}
+
+// parseLaunch reads launch's limits and the program after "--".
+func parseLaunch(args []string) (launchLimits, []string, error) {
+	split := slices.Index(args, "--")
+	if split < 0 || split == len(args)-1 {
+		return launchLimits{}, nil, errors.New("launch needs the program after --")
+	}
+	set := flag.NewFlagSet("launch", flag.ContinueOnError)
+	set.SetOutput(io.Discard)
+	processes := set.Int("process-limit", 0, "the processes and threads the user may have")
+	megabytes := set.Int("address-space-mb", 0, "the address space in MiB (0: none)")
+	if err := set.Parse(args[:split]); err != nil {
+		return launchLimits{}, nil, err
+	}
+	if set.NArg() != 0 {
+		return launchLimits{}, nil, fmt.Errorf("unexpected arguments before --: %q", set.Args())
+	}
+	limits := launchLimits{processes: *processes, addressSpace: int64(*megabytes) << 20}
+	if err := checkLimits(limits); err != nil {
+		return launchLimits{}, nil, err
+	}
+	return limits, args[split+1:], nil
 }

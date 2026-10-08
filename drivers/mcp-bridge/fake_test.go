@@ -35,6 +35,9 @@ const (
 
 func TestMain(m *testing.M) {
 	switch {
+	case len(os.Args) > 1 && os.Args[1] == "launch":
+		// The bridge starts itself in launch mode as a binding's user.
+		os.Exit(dispatch(os.Args[1:], os.Stdout, os.Stderr))
 	case os.Getenv(sleeperEnv) == "1":
 		time.Sleep(time.Hour)
 		os.Exit(0)

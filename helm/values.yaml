@@ -375,6 +375,13 @@ connectors:
     # one process per binding. It needs no external account;
     # scripts/k3d-managed-mcp-stdio-gate.py drives it. Pulled from Docker
     # Hub at the pinned digest. Never in production.
+    # Blast radius of every stdio server's pod: each binding's process runs
+    # as a user of its own with its processes capped, but all of them share
+    # the server container's one memory limit (the spec's resources), so
+    # one binding's process outgrowing it OOM-kills every binding's process
+    # and the bridge, and the pod restarts. This server holds each Node
+    # heap to 64 MiB under a 640 MiB limit; a spec can cap a process's
+    # address space (address_space_mb, opt-in: it breaks Node and Go).
     mcpStdioTest:
       enabled: false
       image:

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -150,38 +151,89 @@ func procUser(pid int) (int, string, bool) {
 	return uid, state, found == 2
 }
 
+// userProcesses lists a user's processes that are not zombies, and how many
+// of them still run (are not stopped).
+func userProcesses(uid int) (pids []int, running int) {
+	entries, _ := os.ReadDir("/proc")
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		owner, state, ok := procUser(pid)
+		if !ok || owner != uid || state == "Z" || state == "X" {
+			continue
+		}
+		pids = append(pids, pid)
+		if state != "T" && state != "t" {
+			running++
+		}
+	}
+	return pids, running
+}
+
 // killUser kills every process of a user (a process that left its group or
 // its session included) and reaps the ones the bridge adopted, until none
-// is left or the time runs out; it reports whether none is left.
+// is left or the time runs out; it reports whether none is left. It first
+// stops them all (SIGSTOP, which nothing ignores: a stopped process forks
+// no more, so a fork burst cannot outrun it), then kills them.
 func killUser(uid int, mains map[int]bool, within time.Duration) bool {
 	if uid <= 0 {
 		return true
 	}
 	deadline := time.Now().Add(within)
 	for {
-		alive := 0
-		entries, _ := os.ReadDir("/proc")
-		for _, entry := range entries {
-			pid, err := strconv.Atoi(entry.Name())
-			if err != nil {
-				continue
-			}
-			owner, state, ok := procUser(pid)
-			if !ok || owner != uid || state == "Z" {
-				continue
-			}
-			alive++
-			syscall.Kill(pid, syscall.SIGKILL)
-		}
-		reapOrphans(mains)
-		if alive == 0 {
+		pids, running := userProcesses(uid)
+		if len(pids) == 0 {
+			reapOrphans(mains)
 			return true
 		}
+		signal := syscall.SIGKILL
+		if running > 0 {
+			signal = syscall.SIGSTOP
+		}
+		for _, pid := range pids {
+			syscall.Kill(pid, signal)
+		}
+		reapOrphans(mains)
 		if time.Now().After(deadline) {
 			return false
 		}
-		time.Sleep(10 * time.Millisecond)
+		if running == 0 {
+			// The killed ones go; their adopted zombies are reaped above.
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
+}
+
+// rlimitNproc is RLIMIT_NPROC on Linux (amd64 and arm64).
+const rlimitNproc = 6
+
+// launch is the start of a binding's process, already running as the
+// binding's user: it caps the user's processes (RLIMIT_NPROC counts every
+// process and thread of a real user, so of this binding alone), takes core
+// dumps away and, when asked, caps the address space, then becomes the
+// server's program. Go cannot run code between fork and exec, so the
+// bridge starts itself in this mode.
+func launch(limits launchLimits, program []string) error {
+	nproc := uint64(limits.processes)
+	if err := syscall.Setrlimit(rlimitNproc, &syscall.Rlimit{Cur: nproc, Max: nproc}); err != nil {
+		return fmt.Errorf("the process limit: %w", err)
+	}
+	if err := syscall.Setrlimit(syscall.RLIMIT_CORE, &syscall.Rlimit{}); err != nil {
+		return fmt.Errorf("the core limit: %w", err)
+	}
+	if limits.addressSpace > 0 {
+		bytes := uint64(limits.addressSpace)
+		if err := syscall.Setrlimit(syscall.RLIMIT_AS, &syscall.Rlimit{Cur: bytes, Max: bytes}); err != nil {
+			return fmt.Errorf("the address space limit: %w", err)
+		}
+	}
+	path, err := exec.LookPath(program[0])
+	if err != nil {
+		return err
+	}
+	return syscall.Exec(path, program, os.Environ())
 }
 
 // sweepUser removes what a user left in the shared writable directories.

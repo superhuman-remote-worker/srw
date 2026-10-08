@@ -92,7 +92,7 @@ func TestOnStdioItTakesItsCredentialFromItsEnvironmentAndListsTheProbes(t *testi
 	digest := sha256.Sum256([]byte("secret-1"))
 	for i, want := range []string{
 		`"serverInfo"`, `"probe_socket"`, hex.EncodeToString(digest[:]),
-		`"allowed"`, `refused: dial unix`, `env_names`,
+		`"allowed"`, `refused: dial unix`, `max_processes`,
 	} {
 		if !strings.Contains(lines[i], want) {
 			t.Fatalf("answer %d lacks %s: %s", i+1, want, lines[i])

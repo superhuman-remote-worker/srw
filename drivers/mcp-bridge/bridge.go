@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -74,7 +75,18 @@ type options struct {
 	// The writable directories the processes share, swept of a user's
 	// files before the user is handed out again.
 	sweepDirs []string
-	program   []string
+	// With users of their own: the processes and threads each binding's
+	// user may have (RLIMIT_NPROC), its address space in MiB (RLIMIT_AS,
+	// 0 for none), and the bridge's own binary, which sets them as that
+	// user before it becomes the program.
+	processLimit   int
+	addressSpaceMB int
+	launcher       string
+	program        []string
+}
+
+func (o options) limits() launchLimits {
+	return launchLimits{processes: o.processLimit, addressSpace: int64(o.addressSpaceMB) << 20}
 }
 
 // bridge serves the front and runs one process per binding.
@@ -97,6 +109,9 @@ type bridge struct {
 	// last private directory's number when they do not.
 	users    *userPool
 	sequence uint64
+	// Users whose processes outlived their kill (with the directory each
+	// leaves): held back from the pool, killed again until none is left.
+	held map[int]string
 }
 
 func newBridge(opts options, env []string, logf func(string, ...any), now func() time.Time) *bridge {
@@ -108,6 +123,7 @@ func newBridge(opts options, env []string, logf func(string, ...any), now func()
 		processes: map[string]*process{},
 		sessions:  map[string]*session{},
 		mains:     map[int]bool{},
+		held:      map[int]string{},
 	}
 	if opts.uidBase > 0 {
 		b.users = newUserPool(opts.uidBase, poolSize(opts.maxProcesses))
@@ -495,6 +511,11 @@ func (b *bridge) start(binding, credential string) (*process, error) {
 		return nil, fmt.Errorf("its directory: %w", err)
 	}
 	program := homeArgs(b.opts.program, home)
+	if uid > 0 && b.opts.launcher != "" {
+		// As its user, the bridge's launcher caps the user's processes
+		// (and core dumps) and becomes the program, keeping its pid.
+		program = launchProgram(b.opts.launcher, b.opts.limits(), program)
+	}
 	cmd := exec.Command(program[0], program[1:]...)
 	cmd.Env = homeEnv(childEnv(b.env, b.opts.credentialEnv, credential), home)
 	if binding == "" {
@@ -552,28 +573,56 @@ func (b *bridge) unused(uid int, home string) {
 }
 
 // release returns a stopped process's user to the pool once none of its
-// processes or files is left; a user with a process that survived SIGKILL
-// is never handed out again.
+// processes or files is left; a user with a process left after killWithin
+// is held back, and housekeeping kills it again until none is left.
 func (b *bridge) release(uid int, home string) {
-	gone := true
-	if uid > 0 {
-		b.mu.Lock()
-		mains := maps.Clone(b.mains)
-		b.mu.Unlock()
-		gone = killUser(uid, mains, reapWithin)
+	if uid <= 0 {
+		if err := os.RemoveAll(home); err != nil {
+			b.logf("the directory %s was not removed: %v", home, err)
+		}
+		return
 	}
+	if !b.free(uid, home, killWithin) {
+		b.mu.Lock()
+		b.held[uid] = home
+		b.mu.Unlock()
+		b.logf("user %d keeps a process: held back until housekeeping kills it", uid)
+	}
+}
+
+// free kills every process of a user and, once none is left, removes its
+// files and gives the user back to the pool; it reports whether it did.
+func (b *bridge) free(uid int, home string, within time.Duration) bool {
+	b.mu.Lock()
+	mains := maps.Clone(b.mains)
+	b.mu.Unlock()
+	gone := killUser(uid, mains, within)
 	if err := os.RemoveAll(home); err != nil {
 		b.logf("the directory %s was not removed: %v", home, err)
 	}
-	if uid <= 0 {
-		return
-	}
 	if !gone {
-		b.logf("user %d keeps a process: it is not handed out again", uid)
-		return
+		return false
 	}
 	sweepUser(b.opts.sweepDirs, uid)
 	b.users.give(uid)
+	return true
+}
+
+// retryHeld kills the held users' processes again; each user whose last
+// process is gone goes back to the pool.
+func (b *bridge) retryHeld() {
+	b.mu.Lock()
+	held := maps.Clone(b.held)
+	b.mu.Unlock()
+	for uid, home := range held {
+		if !b.free(uid, home, retryWithin) {
+			continue
+		}
+		b.mu.Lock()
+		delete(b.held, uid)
+		b.mu.Unlock()
+		b.logf("user %d has no process left: back in the pool", uid)
+	}
 }
 
 // toProcess copies the session's messages to its process's stdin. Each was
@@ -786,6 +835,7 @@ func (b *bridge) housekeep(ctx context.Context) {
 			return
 		case <-ticker.C:
 			b.stopIdle()
+			b.retryHeld()
 			b.reapOrphans()
 		}
 	}
@@ -854,6 +904,8 @@ type bridgeStatus struct {
 	MaxProcesses  int             `json:"max_processes"`
 	CredentialEnv string          `json:"credential_env"`
 	IdleSeconds   int             `json:"idle_seconds"`
+	// Users held back until housekeeping kills their last process.
+	HeldUsers []int `json:"held_users,omitempty"`
 }
 
 // status lists the processes: their binding, process id, whether a session
@@ -865,12 +917,14 @@ func (b *bridge) status() bridgeStatus {
 	for _, p := range b.processes {
 		processes = append(processes, p)
 	}
+	held := slices.Sorted(maps.Keys(b.held))
 	b.mu.Unlock()
 	out := bridgeStatus{
 		Processes:     []processStatus{},
 		MaxProcesses:  b.opts.maxProcesses,
 		CredentialEnv: b.opts.credentialEnv,
 		IdleSeconds:   int(b.opts.idle / time.Second),
+		HeldUsers:     held,
 	}
 	for _, p := range processes {
 		p.mu.Lock()

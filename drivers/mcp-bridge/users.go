@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Bindings in one pod share its network, its /tmp and its image, so the
@@ -16,11 +17,16 @@ import (
 // or open its files, and it cannot reach the bridge, whose socket only the
 // front's group may open. Each process gets a private directory (0700, its
 // own) as HOME and TMPDIR, its files are private by default (umask 077),
-// and it can gain no privilege (no capability, no_new_privs). A user goes
-// back to the pool only once no process of it is left (every one is
+// and it can gain no privilege (no capability, no_new_privs). Its user may
+// have at most --process-limit processes and threads (RLIMIT_NPROC, which
+// counts per real user: per binding here), so a fork burst can neither
+// exhaust the pod's process ids nor outgrow the kill. A user goes back to
+// the pool only once no process of it is left (every one is stopped, then
 // killed, whatever group or session it left for) and none of its files
 // (its directory, and what it left in /tmp and /dev/shm), so the next
-// process of that user finds nothing of the last one.
+// process of that user finds nothing of the last one; a user whose kill
+// did not converge in time is held back and killed again by housekeeping
+// until it does.
 
 // homeToken in a value of the program's environment or arguments is the
 // process's private directory (shared/connectors/mcp.py BINDING_HOME).
@@ -28,6 +34,33 @@ const homeToken = "${binding.home}"
 
 // errNoUser: every user of the pool is taken (by processes still stopping).
 var errNoUser = errors.New("every user of this pod is in use")
+
+// How long a stopping process's user may take to lose every process before
+// it is held back and retried by housekeeping, and how long each retry
+// takes at most (variables for the tests).
+var (
+	killWithin  = reapWithin
+	retryWithin = time.Second
+)
+
+// launchLimits are what a binding's process starts under.
+type launchLimits struct {
+	// RLIMIT_NPROC: the processes and threads its user may have.
+	processes int
+	// RLIMIT_AS in bytes, 0 for none (opt-in: it breaks Node and other
+	// runtimes that reserve address space up front).
+	addressSpace int64
+}
+
+// launchProgram is the argv the bridge starts as a binding's user: itself
+// in launch mode, which sets the limits and becomes the program.
+func launchProgram(launcher string, limits launchLimits, program []string) []string {
+	argv := []string{launcher, "launch", "--process-limit", strconv.Itoa(limits.processes)}
+	if limits.addressSpace > 0 {
+		argv = append(argv, "--address-space-mb", strconv.FormatInt(limits.addressSpace>>20, 10))
+	}
+	return append(append(argv, "--"), program...)
+}
 
 // poolSize is how many users a bridge needs: one per binding process and
 // the probe's, twice over, since a process may still be stopping while the

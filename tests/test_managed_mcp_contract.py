@@ -379,6 +379,8 @@ def test_the_bridge_is_the_command_and_the_servers_program_follows_it():
         "3",
         "--idle",
         "120s",
+        "--process-limit",
+        "256",
         "--credential-env",
         "SERVICE_TOKEN",
         "--",
@@ -394,6 +396,40 @@ def test_the_bridge_is_the_command_and_the_servers_program_follows_it():
     config = {"store": "graph", "root": "/data", "mode": "strict"}
     assert mcp.server_env(config) == {"DATA": "/tmp/graph.json"}
     assert mcp.server_args(config) == ["--root=/data", "strict"]
+
+
+def test_each_bindings_processes_are_capped_and_its_address_space_is_opt_in():
+    """process_limit is RLIMIT_NPROC of each binding's user (default 256);
+    address_space_mb is RLIMIT_AS, opt-in (it breaks Node)."""
+    default = ManagedMcp.parse(_stdio(), access_levels=LEVELS)
+    assert (default.process_limit, default.address_space_mb) == (256, None)
+    command = default.bridge_command(["srv"])
+    assert command[command.index("--process-limit") + 1] == "256"
+    assert "--address-space-mb" not in command
+    capped = ManagedMcp.parse(
+        _stdio(process_limit=64, address_space_mb=512), access_levels=LEVELS
+    )
+    command = capped.bridge_command(["srv"])
+    assert command[command.index("--process-limit") + 1] == "64"
+    assert command[command.index("--address-space-mb") + 1] == "512"
+    assert command[-2:] == ["--", "srv"]
+    # Each bound the bridge refuses is refused here first.
+    for over in (
+        {"process_limit": 8},
+        {"process_limit": 5000},
+        {"process_limit": True},
+        {"address_space_mb": 10},
+        {"address_space_mb": "512"},
+    ):
+        assert mcp_problems(_stdio(**over), access_levels=LEVELS), over
+    # stdio servers only.
+    for key in ("process_limit", "address_space_mb"):
+        problems = mcp_problems(_block(**{key: 64}), access_levels=LEVELS)
+        assert any("stdio servers only" in p for p in problems), key
+    # The bridge's own bounds are the same.
+    source = (ROOT / "drivers/mcp-bridge/main.go").read_text()
+    assert "limits.processes < 16 || limits.processes > 4096" in source
+    assert "limits.addressSpace < 64<<20 || limits.addressSpace > 1<<40" in source
 
 
 def test_a_stdio_server_may_name_its_private_directory():

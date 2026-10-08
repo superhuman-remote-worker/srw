@@ -24,6 +24,7 @@ import (
 //	write path    writes a file
 //	escape        starts a sleeper in a session of its own (as browsers are
 //	              started): outside its process group
+//	fork_burst    starts a shell of its own that forks sleepers without end
 func isolationTool(name string, args map[string]string) (string, bool) {
 	outcome := func(err error) string {
 		if err != nil {
@@ -59,6 +60,15 @@ func isolationTool(name string, args map[string]string) (string, bool) {
 			return outcome(err), true
 		}
 		return fmt.Sprint(sleeper.Process.Pid), true
+	case "fork_burst":
+		// A shell in a session of its own that forks sleepers without end
+		// (each fork it is refused, it tries again): a sustained burst.
+		burst := exec.Command("sh", "-c", "trap '' TERM; while :; do sleep 60 & done")
+		burst.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		if err := burst.Start(); err != nil {
+			return outcome(err), true
+		}
+		return fmt.Sprint(burst.Process.Pid), true
 	}
 	return "", false
 }

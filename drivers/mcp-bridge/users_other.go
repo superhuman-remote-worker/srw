@@ -17,3 +17,4 @@ func runAs(*syscall.SysProcAttr, int)                {}
 func prepareUsers(options) error                     { return errors.New("--uid-base needs Linux") }
 func killUser(int, map[int]bool, time.Duration) bool { return true }
 func sweepUser([]string, int)                        {}
+func launch(launchLimits, []string) error            { return errors.New("launch needs Linux") }

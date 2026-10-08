@@ -579,6 +579,8 @@ def test_the_stock_image_runs_its_own_program_behind_the_bridge():
         "4",
         "--idle",
         "600s",
+        "--process-limit",
+        "256",
         "--credential-env",
         "MCP_STDIO_TEST_TOKEN",
         "--",

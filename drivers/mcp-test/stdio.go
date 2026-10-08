@@ -22,8 +22,8 @@ import (
 // refused), and need no credential.
 //
 //	self_status   this process's pid, user, group, HOME and TMPDIR, its
-//	              capabilities and no_new_privs, and its variables' names
-//	              (never a value)
+//	              capabilities, no_new_privs and process and core limits,
+//	              and its variables' names (never a value)
 //	probe_path    reads a file, or lists a directory ({"path"})
 //	probe_socket  connects to a unix socket ({"path"})
 //	probe_signal  sends signal 0 to a process ({"pid"})
@@ -129,6 +129,17 @@ func selfStatus() string {
 		case "CapPrm", "CapEff", "CapAmb", "NoNewPrivs":
 			if ok {
 				status[key] = strings.TrimSpace(value)
+			}
+		}
+	}
+	// Its soft limits on processes and core dumps (/proc/self/limits).
+	raw, _ = os.ReadFile("/proc/self/limits")
+	for _, line := range strings.Split(string(raw), "\n") {
+		for prefix, key := range map[string]string{"Max processes": "max_processes", "Max core file size": "max_core"} {
+			if rest, ok := strings.CutPrefix(line, prefix); ok {
+				if fields := strings.Fields(rest); len(fields) > 0 {
+					status[key] = fields[0]
+				}
 			}
 		}
 	}

@@ -27,7 +27,22 @@ its own (from ``BINDING_UID_BASE``) with no capability, no way to gain one,
 a private directory as HOME and TMPDIR and private files, so a process can
 read neither another binding's environment nor its files, signal it, nor
 reach the bridge, which serves the front only on a unix socket in a
-directory the front's group alone may enter.
+directory the front's group alone may enter. Each binding's user may have
+at most ``process_limit`` processes and threads (RLIMIT_NPROC), so a fork
+burst cannot exhaust the pod's process ids, and the bridge stops and kills
+every process of a binding's user, retrying until none is left, before the
+user serves another binding.
+
+What the bindings of one pod still share, by design, is its memory: the
+server container is one cgroup with one limit (the spec's
+``service.resources``), so a server that outgrows it (a runtime without a
+heap cap, native memory, a leak) is OOM-killed with every other binding's
+process and the bridge, and the pod restarts: one binding's memory is every
+binding's blast radius. A Node server's heap can be capped per process
+(``NODE_OPTIONS=--max-old-space-size``); ``address_space_mb`` caps a
+process's address space (RLIMIT_AS) for a runtime that does not reserve
+address space up front. It is opt-in: Node, Go and the JVM reserve far
+more than they use and fail under it.
 
 The block, ``ServiceSpec.mcp``, is plain JSON, so it can ride an image label:
 
@@ -106,6 +121,10 @@ The block, ``ServiceSpec.mcp``, is plain JSON, so it can ride an image label:
     many binding processes the pod runs at once (the bridge answers 503
     past it), and how long a binding's process may go without a request or
     an open stream before it stops.
+``process_limit``, ``address_space_mb``
+    ``stdio`` only: the processes and threads each binding's user may have
+    (RLIMIT_NPROC, 16 to 4096, default 256), and, opt-in, each binding's
+    process's address space in MiB (RLIMIT_AS, 64 to 1048576): see above.
 
 Design: knowledge-base/knowledge/features/connector_drivers.md, "MCP".
 """
@@ -434,7 +453,15 @@ _ARG_TEMPLATE = re.compile(
 #: Environment names the server may not be given: SRW's own, and the
 #: loader's, which would run code before the image's program.
 _RESERVED_ENV = re.compile(r"(SRW_|LD_|DYLD_).*", re.IGNORECASE)
-_STDIO_KEYS = frozenset({"stdio_mode", "max_bindings_per_pod", "idle_seconds"})
+_STDIO_KEYS = frozenset(
+    {
+        "stdio_mode",
+        "max_bindings_per_pod",
+        "idle_seconds",
+        "process_limit",
+        "address_space_mb",
+    }
+)
 _KEYS = frozenset(
     {
         "transport",
@@ -570,6 +597,10 @@ class ManagedMcp:
     stdio_mode: str = "process-per-binding"
     max_bindings_per_pod: int = 8
     idle_seconds: int = 600
+    #: ``stdio``: RLIMIT_NPROC of each binding's user, and its process's
+    #: RLIMIT_AS in MiB (``None``: none, the default).
+    process_limit: int = 256
+    address_space_mb: int | None = None
 
     @classmethod
     def parse(
@@ -622,6 +653,12 @@ class ManagedMcp:
             stdio_mode=str(block.get("stdio_mode", "process-per-binding")),
             max_bindings_per_pod=int(block.get("max_bindings_per_pod", 8)),
             idle_seconds=int(block.get("idle_seconds", 600)),
+            process_limit=int(block.get("process_limit", 256)),
+            address_space_mb=(
+                int(block["address_space_mb"])
+                if block.get("address_space_mb") is not None
+                else None
+            ),
         )
 
     @property
@@ -703,7 +740,11 @@ class ManagedMcp:
             str(self.max_bindings_per_pod),
             "--idle",
             f"{self.idle_seconds}s",
+            "--process-limit",
+            str(self.process_limit),
         ]
+        if self.address_space_mb is not None:
+            command += ["--address-space-mb", str(self.address_space_mb)]
         if self.credential_env:
             command += ["--credential-env", self.credential_env]
         return [*command, "--", *program]
@@ -987,6 +1028,11 @@ def mcp_problems(
             problems.append("mcp max_bindings_per_pod must be between 1 and 64")
         if not _bounded(block.get("idle_seconds", 600), 60, 86400):
             problems.append("mcp idle_seconds must be between 60 and 86400")
+        if not _bounded(block.get("process_limit", 256), 16, 4096):
+            problems.append("mcp process_limit must be between 16 and 4096")
+        address_space = block.get("address_space_mb")
+        if address_space is not None and not _bounded(address_space, 64, 1048576):
+            problems.append("mcp address_space_mb must be between 64 and 1048576 (MiB)")
     return problems
 
 

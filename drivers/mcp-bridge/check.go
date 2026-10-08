@@ -29,7 +29,12 @@ import (
 // the processes still share is the pod: its network (a loopback port is
 // open to every one of them, and the front's needs a lease), the image's
 // read-only filesystem, /tmp and /dev/shm (sticky; their files are private
-// by umask 077 and removed with their user), and the pod's CPU and memory.
+// by umask 077 and removed with their user), its CPU, and its memory. The
+// processes of each binding's user are capped (--process-limit), but the
+// server container is one cgroup with one memory limit: a process that
+// outgrows it is OOM-killed with every other binding's process and the
+// bridge (the explicit blast radius; --address-space-mb caps one process's
+// address space, opt-in, for a runtime that does not reserve it up front).
 
 var (
 	errEmpty        = errors.New("the body is empty")

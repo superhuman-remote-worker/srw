@@ -83,7 +83,8 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               has its own private directory)
   isolation   in the probe pod, from inside session one's process: it runs as
               a pool user (not root, not session two's), with no capability
-              (permitted, effective, ambient) and no_new_privs, its private
+              (permitted, effective, ambient) and no_new_privs, its user's
+              process limit (256) and no core dump, its private
               directory as HOME and TMPDIR, the probe connector's token in its
               environment (whoami's digest) and no SRW_ variable; it may not
               read session two's process environment or list its directory,
@@ -196,6 +197,9 @@ BRIDGE_SOCKET = "/srw/bridge/bridge.sock"
 #: The processes' users and directories (BINDING_UID_BASE, BINDING_HOME_ROOT).
 UID_BASE = 20000
 HOME_ROOT = "/srw/home"
+#: The processes and threads each binding's user may have (the specs'
+#: default process_limit).
+PROCESS_LIMIT = 256
 BRIDGE_CAPABILITIES = ["CHOWN", "DAC_OVERRIDE", "FOWNER", "KILL", "SETGID", "SETUID"]
 TOKEN_ENV = "MCP_STDIO_TEST_TOKEN"
 READ_TOOLS = ("read_graph", "search_nodes", "open_nodes")
@@ -429,6 +433,10 @@ def isolation_verdict(
             problems.append(f"{capability}={one.get(capability)}")
     if one.get("NoNewPrivs") != "1":
         problems.append(f"NoNewPrivs={one.get('NoNewPrivs')}")
+    if one.get("max_processes") != str(PROCESS_LIMIT) or one.get("max_core") != "0":
+        problems.append(
+            f"limits processes={one.get('max_processes')} core={one.get('max_core')}"
+        )
     if one.get("home") != home or one.get("tmpdir") != home:
         problems.append(f"home={one.get('home')} tmpdir={one.get('tmpdir')}")
     if any(name.upper().startswith("SRW_") for name in names):
@@ -493,6 +501,8 @@ def stdio_layout_problems(
         or "--listen" in command_
     ):
         problems.append("the bridge does not serve its socket with users of its own")
+    if _flag(command_, "--process-limit") != str(PROCESS_LIMIT):
+        problems.append("the bridge caps no binding's processes")
     mounts = {m.get("name"): m for m in server.get("volumeMounts") or []}
     if not (mounts.get("srw-bin") or {}).get("readOnly"):
         problems.append("the bridge is not mounted read-only")
@@ -549,7 +559,8 @@ PLAN = [
     "session of a binding keeps its process; session two's graph does not "
     "hold what session one wrote",
     "isolation: from inside session one's probe process: a pool user, no "
-    "capability, no_new_privs, a private HOME and TMPDIR, its binding's token "
+    "capability, no_new_privs, its user's process limit and no core dump, a "
+    "private HOME and TMPDIR, its binding's token "
     "and no SRW_ variable; session two's environment, directory and process "
     "and the bridge's socket are refused to it",
     "credential: the agent pod and session one's workspace hold no token; the "
@@ -1391,8 +1402,10 @@ class StdioGate(base.ManagedMcpGate):
             ended
             and gone
             and bindings.get(lease_one) == pids.get("one")
-            and revoked != "",
-            f"revoke={revoked} processes={bindings} two={pids.get('two')} gone={gone}",
+            and revoked != ""
+            and not status.get("held_users"),
+            f"revoke={revoked} processes={bindings} two={pids.get('two')} "
+            f"gone={gone} held={status.get('held_users')}",
         )
 
     def cleanup(self) -> list[str]:

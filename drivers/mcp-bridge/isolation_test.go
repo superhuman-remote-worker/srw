@@ -70,6 +70,8 @@ func newIsolatedHarness(t *testing.T, mutate func(*options)) *isolated {
 		o.socket = filepath.Join(sockets, "bridge.sock")
 		o.socketGroup = frontUser
 		o.program = []string{binary, "--data=" + homeToken + "/data"}
+		// The bridge starts itself as the user: the copy every user may run.
+		o.launcher = binary
 		if mutate != nil {
 			mutate(o)
 		}

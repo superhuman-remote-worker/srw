@@ -197,6 +197,8 @@ def _isolated():
         "CapEff": "0000000000000000",
         "CapAmb": "0000000000000000",
         "NoNewPrivs": "1",
+        "max_processes": "256",
+        "max_core": "0",
         "env_names": ["HOME", "MCP_TEST_TOKEN", "PATH", "TMPDIR"],
     }
     two = {"pid": 42, "uid": 20002, "home": "/srw/home/20002"}
@@ -225,6 +227,8 @@ def test_isolation_verdict():
         {"CapPrm": "0000000000000080"},
         {"CapAmb": "0000000000000001"},
         {"NoNewPrivs": "0"},
+        {"max_processes": "unlimited"},
+        {"max_core": "unlimited"},
         {"home": "/root"},
         {"tmpdir": "/tmp"},
         {"env_names": ["HOME", "MCP_TEST_TOKEN", "SRW_REQUEST_FILE"]},
@@ -423,6 +427,12 @@ def test_the_layout_checks_name_a_bridge_that_isolates_nothing():
     for mutate, fragment in (
         (lambda s, f: s["command"].__setitem__(3, "/tmp/b.sock"), "socket"),
         (lambda s, f: s["command"].__setitem__(7, "0"), "socket"),
+        (
+            lambda s, f: s["command"].__setitem__(
+                s["command"].index("--process-limit") + 1, "4096"
+            ),
+            "caps no",
+        ),
         (
             lambda s, f: s["securityContext"].__setitem__("runAsUser", 1000),
             "securityContext",

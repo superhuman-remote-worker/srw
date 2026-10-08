@@ -90,6 +90,7 @@ func newHarnessEnv(t *testing.T, mutate func(*options), extra ...string) *harnes
 		idle:          time.Minute,
 		stopGrace:     2 * time.Second,
 		homeRoot:      t.TempDir(),
+		processLimit:  256,
 		program:       []string{os.Args[0]},
 	}
 	if mutate != nil {
@@ -895,7 +896,7 @@ func TestServeRefusesWhatWouldExposeTheBridge(t *testing.T) {
 	base := []string{"--socket", "/srw/bridge/bridge.sock", "--home-root", "/srw/home"}
 	good := append(append([]string(nil), base...), "--socket-group", "65532", "--uid-base", "20000", "--credential-env", "GITHUB_TOKEN", "--", "node", "dist/index.js")
 	opts, err := parseServe(good)
-	if err != nil || opts.program[1] != "dist/index.js" || opts.maxProcesses != 8 || opts.uidBase != 20000 || opts.socketGroup != 65532 {
+	if err != nil || opts.program[1] != "dist/index.js" || opts.maxProcesses != 8 || opts.uidBase != 20000 || opts.socketGroup != 65532 || opts.processLimit != 256 || opts.addressSpaceMB != 0 {
 		t.Fatalf("%+v %v", opts, err)
 	}
 	if strings.Join(opts.sweepDirs, ",") != "/tmp,/dev/shm" {
@@ -922,6 +923,9 @@ func TestServeRefusesWhatWouldExposeTheBridge(t *testing.T) {
 		with("--uid-base", "65520", "--", "x"),
 		with("--uid-base", "20000", "--socket-group", "20003", "--", "x"),
 		with("--sweep-dir", "tmp", "--", "x"),
+		with("--process-limit", "8", "--", "x"),
+		with("--process-limit", "5000", "--", "x"),
+		with("--address-space-mb", "10", "--", "x"),
 		with("stray", "--", "x"),
 		with("--", ""),
 	} {
