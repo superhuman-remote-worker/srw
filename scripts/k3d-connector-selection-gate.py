@@ -12,11 +12,24 @@ touches only what this run created, followed by a residue check by gate id.
 
 Fixtures (all disposable, all named after the gate id):
 
+  client      ``<gate id>-oauth``, a public Keycloak client of the srw realm
+              with direct access grants and the profile, email and roles
+              scopes, which both accounts log in with: an admin-cli token
+              carries no roles, and the JIT path then records the owner as no
+              administrator (the D3a gate's fixture)
+  account     the second account: a Keycloak user of the srw realm named the
+              gate id (``<gate id>@example.invalid``), created inside the
+              orchestrator pod with the pod's own Keycloak admin credentials
+              (they never leave the pod; the user's password goes over stdin),
+              and its app row admitted before its first login -- so the login
+              takes the existing-account path and no cloud or Gitea account is
+              provisioned for it. ``--other-user``/``--other-password`` name an
+              existing approved non-administrator instead
   postgres    a database and a login role on srw-postgres (SELECT on one
               marker table) that the gate's Postgres connectors point at
   project     one project owned by the owner account (``--user``), with its
               native knowledge base when Gitea provisions one, and the second
-              account (``--other-user``) added as an editor
+              account added as an editor
   connectors  of the owner: ``public`` (published), ``linked`` (linked to the
               project), ``private`` (neither) and ``extra``/``doomed`` for the
               link checks; of the other account: ``own``
@@ -25,8 +38,9 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
 
   preflight   Tilt reports the srw resource ``ok``; every orchestrator pod
               serves this checkout's D3c modules byte for byte; the ledger
-              holds 0380 as applied; both accounts are approved, the other is
-              not an administrator, the owner may publish
+              holds 0380 as applied
+  account     both accounts are approved, the second is not an
+              administrator, the owner may publish
   manifest    the project's manifest lists exactly its links, each a ref to
               the connector's Connector resource (name and scope), after the
               fixture, after a link, an unlink, a connector created linked and
@@ -60,12 +74,16 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
   cleanup     nothing this run created is left: sessions titled and jobs
               described with the gate id (and their pods), connectors (live
               rows and live Connector resources by gate id), the project, the
+              second account (its app row through the user API, then its
+              Keycloak user, found by the gate id), the OAuth client, the
               database and the role
 
 Run with the repository venv on the k3d-srw cluster, alone: this is a
 mutating gate. The owner must be able to publish (an administrator or the
-``public_datasources`` grant); the other account must be an approved
-non-administrator.
+``public_datasources`` grant) and, for the disposable second account, be an
+administrator (it deletes that account's app row); an account named with
+``--other-user`` must be an approved non-administrator. The second account's
+sessions ask for ``auto_accept``, the most an ungranted user may pick.
 
   .venv/bin/python scripts/k3d-connector-selection-gate.py           # plan
   .venv/bin/python scripts/k3d-connector-selection-gate.py \\
@@ -136,6 +154,11 @@ SERVED = (
     *(f"src/orchestrator/database/migrations/app/{name}" for name in MIGRATIONS),
 )
 DATASOURCE_DRIVER = "srw.datasource/v1"
+#: The disposable second account's email domain (RFC 2606, never delivered).
+ACCOUNT_DOMAIN = "example.invalid"
+#: The second account's sessions: the most an approved user without grants
+#: may pick (``shared.runtime.core.capability_grants.CATALOG``).
+SESSION_PERMISSION_MODE = "auto_accept"
 GENERIC_UNAVAILABLE_DETAIL = "One or more selected connectors are unavailable"
 #: The start of every selector-conflict 400 (``connector_refs``).
 SELECTOR_CONFLICT_PREFIX = "execution.connectors and "
@@ -265,7 +288,7 @@ cap_memory()
 envelope = json.loads(sys.stdin.readline())
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 form = urllib.parse.urlencode({
-    "grant_type": "password", "client_id": "admin-cli", "scope": "openid",
+    "grant_type": "password", "client_id": envelope["client_id"], "scope": "openid",
     "username": envelope["username"], "password": envelope["password"],
 }).encode()
 with opener.open(envelope["token_url"], data=form, timeout=30) as response:
@@ -387,6 +410,147 @@ asyncio.run(main())
 """
 )
 
+# The run's Keycloak fixtures (the D3a gate's program, unchanged but for the
+# account's first name), through the orchestrator's own admin
+# credentials (KEYCLOAK_ADMIN_*, the KeycloakGroupSync ones): they stay in the
+# pod and are never printed.
+#
+#   client  ``<gate id>-oauth``: a public client with direct access grants and
+#           the profile, email and roles scopes, so a gate login carries the
+#           claims a cockpit login does. (admin-cli carries none: its tokens
+#           have no realm_access, and every such login makes the JIT path
+#           record the account as no administrator.) Marked with the gate id.
+#   user    the disposable second account, named the gate id. The local
+#           realm's user profile may drop custom attributes, so its ownership
+#           is the gate id in username and email, not a marker.
+#
+# Every action finds both by exact name; delete removes only what carries this
+# run's marker or email (and its recorded id, once known).
+_KEYCLOAK_PROGRAM = (
+    _POD_MEMORY_CAP
+    + r"""
+import json, os, sys, urllib.error, urllib.parse, urllib.request
+cap_memory()
+request = json.loads(sys.stdin.readline())
+base = os.environ.get("KEYCLOAK_URL", "").rstrip("/")
+realm = os.environ.get("KEYCLOAK_REALM", "") or "srw"
+admin = os.environ.get("KEYCLOAK_ADMIN_USER", "")
+admin_password = os.environ.get("KEYCLOAK_ADMIN_PASSWORD", "")
+if not (base and admin and admin_password):
+    print(json.dumps({"error": "the orchestrator has no Keycloak admin credentials"}))
+    raise SystemExit(0)
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+form = urllib.parse.urlencode({
+    "grant_type": "password", "client_id": "admin-cli",
+    "username": admin, "password": admin_password,
+}).encode()
+with opener.open(
+    base + "/realms/master/protocol/openid-connect/token", data=form, timeout=30
+) as response:
+    token = json.load(response)["access_token"]
+admin_api = base + "/admin/realms/" + urllib.parse.quote(realm, safe="")
+def call(method, url, body=None):
+    message = urllib.request.Request(
+        url,
+        data=None if body is None else json.dumps(body).encode(),
+        method=method,
+        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+    )
+    try:
+        with opener.open(message, timeout=30) as response:
+            text = response.read().decode("utf-8", "replace")
+            return response.status, text, response.headers.get("Location") or ""
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode("utf-8", "replace"), ""
+def listing(path, query):
+    status, text, _location = call(
+        "GET", admin_api + path + "?" + urllib.parse.urlencode(query)
+    )
+    if status != 200:
+        raise SystemExit("%s lookup answered HTTP %d" % (path, status))
+    return json.loads(text)
+def users():
+    name = request["username"]
+    found = listing("/users", {"username": name, "exact": "true"})
+    return [u for u in found if u.get("username") == name]
+def clients():
+    name = request["client"]
+    return [c for c in listing("/clients", {"clientId": name}) if c.get("clientId") == name]
+def user_owned(user):
+    return user.get("email") == request["email"] and (
+        not request.get("user_id") or user.get("id") == request["user_id"]
+    )
+def client_owned(client):
+    return (client.get("attributes") or {}).get("srw-gate") == request["marker"] and (
+        not request.get("client_uuid") or client.get("id") == request["client_uuid"]
+    )
+def create(path, body, existing, owned):
+    if existing():
+        return {"exists": True}
+    status, text, location = call("POST", admin_api + path, body)
+    if status != 201:
+        return {"error": "%s create answered HTTP %d: %s" % (path, status, text[:200])}
+    return {
+        "id": location.rstrip("/").rsplit("/", 1)[-1] if location else "",
+        "found": [item["id"] for item in existing() if owned(item)],
+    }
+def counts():
+    return {
+        "users": len(users()) if request.get("user_started") else 0,
+        "clients": len(clients()) if request.get("client_started") else 0,
+    }
+action = request["action"]
+if action == "create-client":
+    print(json.dumps(create("/clients", {
+        "clientId": request["client"],
+        "name": request["client"],
+        "enabled": True,
+        "protocol": "openid-connect",
+        "publicClient": True,
+        "standardFlowEnabled": False,
+        "directAccessGrantsEnabled": True,
+        "serviceAccountsEnabled": False,
+        "fullScopeAllowed": True,
+        "defaultClientScopes": ["profile", "email", "roles"],
+        "optionalClientScopes": [],
+        "attributes": {"srw-gate": request["marker"]},
+    }, clients, client_owned)))
+elif action == "create-user":
+    print(json.dumps(create("/users", {
+        "username": request["username"],
+        "email": request["email"],
+        "emailVerified": True,
+        "enabled": True,
+        "firstName": "D3c",
+        "lastName": "Gate",
+        "requiredActions": [],
+        "credentials": [
+            {"type": "password", "value": request["password"], "temporary": False}
+        ],
+    }, users, user_owned)))
+elif action == "delete":
+    # The user first: the client is how the gate still logs in until the end.
+    deleted, refused = [], []
+    for path, found, owned in (
+        ("/users/", users() if request.get("user_started") else [], user_owned),
+        ("/clients/", clients() if request.get("client_started") else [], client_owned),
+    ):
+        for item in found:
+            if not owned(item):
+                refused.append(item.get("id"))
+                continue
+            status, _text, _location = call("DELETE", admin_api + path + item["id"])
+            if status not in (204, 404):
+                raise SystemExit("%s delete answered HTTP %d" % (path, status))
+            deleted.append(item["id"])
+    print(json.dumps({"deleted": deleted, "refused": refused, **counts()}))
+elif action == "count":
+    print(json.dumps(counts()))
+else:
+    print(json.dumps({"error": "unknown action"}))
+"""
+)
+
 _HASH_PROGRAM = (
     _POD_MEMORY_CAP
     + r"""
@@ -422,13 +586,18 @@ class Api:
     def __init__(self, username: str, password: str) -> None:
         self.username = username
         self.password = secret(password)
+        # The run's own OAuth client, once it exists (see _KEYCLOAK_PROGRAM).
+        self.client_id: str | None = None
 
     def call(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        if not self.client_id:
+            raise GateError("no OAuth client to log in with")
         result = in_orchestrator(
             _API_PROGRAM,
             {
                 "username": self.username,
                 "password": self.password,
+                "client_id": self.client_id,
                 "token_url": KEYCLOAK_TOKEN_URL,
                 "method": method,
                 "path": path,
@@ -557,16 +726,21 @@ class Report:
 
 PLAN = [
     "preflight: Tilt srw ok; every orchestrator pod serves this checkout's D3c "
-    "modules and migration; the ledger holds 0380; both accounts approved, "
-    "--other-user no administrator, the owner may publish",
+    "modules and migration; the ledger holds 0380",
+    "account: in the orchestrator pod, with its Keycloak admin credentials, "
+    "an OAuth client <gate id>-oauth (roles in the token) for both logins and "
+    "the second account -- a Keycloak user named the gate id, its app row "
+    "admitted before its first login (no cloud or Gitea account), or the "
+    "existing --other-user; both accounts approved, the second no admin, the "
+    "owner may publish",
     "fixture: Postgres database + SELECT-only role, a project (with its native "
-    "KB when Gitea provisions it) owned by --user with --other-user as editor, "
-    "the owner's public, project-linked and private connectors, the other "
-    "account's own connector",
+    "KB when Gitea provisions it) owned by --user with the second account as "
+    "editor, the owner's public, project-linked and private connectors, the "
+    "second account's own connector",
     "manifest: the project's manifest lists exactly its links as Connector "
     "refs after the fixture, a link, an unlink, a connector created linked and "
     "its delete; no inline srw.datasource/v1 child is live",
-    "sessions: --other-user creates a session through execution.connectors "
+    "sessions: the second account creates a session through execution.connectors "
     "(name + me, uid, name in the owner's Account, name with the project's "
     "scope) and one through datasource_ids: the same selection record, and the "
     "deployed attach path and payload builder deliver the same connectors, "
@@ -584,7 +758,9 @@ PLAN = [
     "first; an editor cannot write them; an unlinked connector is a 422; a "
     "linked default reaches a member's defaults preview until cleared",
     "cleanup: sessions titled and jobs described with the gate id (and their "
-    "pods), connectors, project, database and role; residue check by gate id",
+    "pods), connectors, project, the disposable account (app row, then "
+    "Keycloak user), the OAuth client, database and role; residue check by "
+    "gate id (rows, live Connectors, sessions, jobs, pods, account, client)",
 ]
 
 
@@ -595,8 +771,20 @@ class ConnectorSelectionGate:
         self.suffix = self.gate_id.split("-", 1)[1]
         self.report = Report(self.gate_id)
         self.owner = Api(args.user, args.password)
-        self.other = Api(args.other_user, args.other_password)
+        # The second account: disposable (named the gate id) unless named.
+        self.disposable = args.other_user is None
+        self.other_email = f"{self.gate_id}@{ACCOUNT_DOMAIN}"
+        self.other = Api(
+            args.other_user or self.gate_id,
+            args.other_password or secrets.token_urlsafe(24),
+        )
         # Everything this run creates, recorded before it is checked.
+        self.oauth_client = f"{self.gate_id}-oauth"
+        self.client_started = False  # the run's Keycloak OAuth client
+        self.client_uuid: str | None = None
+        self.account_started = False  # the disposable Keycloak user
+        self.account_keycloak_id: str | None = None
+        self.account_row = False  # its app row (id = self.other_id)
         self.connectors: dict[str, str] = {}  # label -> datasource id
         self.connector_api: dict[str, str] = {}  # label -> "owner" | "other"
         self.project: str | None = None
@@ -753,11 +941,95 @@ class ConnectorSelectionGate:
         )
         if problems:
             raise GateError("the deployment does not serve this checkout")
+
+    def keycloak(self, action: str) -> dict[str, Any]:
+        """Run one action of the in-pod Keycloak program on this run's
+        OAuth client and disposable user."""
+        payload: dict[str, Any] = {
+            "action": action,
+            "client": self.oauth_client,
+            "marker": self.gate_id,
+            "client_started": self.client_started,
+            "username": self.other.username,
+            "email": self.other_email,
+            "user_started": self.account_started,
+        }
+        if action == "create-user":
+            payload["password"] = self.other.password
+        if self.client_uuid:
+            payload["client_uuid"] = self.client_uuid
+        if self.account_keycloak_id:
+            payload["user_id"] = self.account_keycloak_id
+        result = in_orchestrator(_KEYCLOAK_PROGRAM, payload, timeout=120)
+        if result.get("error"):
+            raise GateError(f"Keycloak {action}: {result['error']}")
+        return result
+
+    @staticmethod
+    def receipt(created: dict[str, Any], what: str) -> str:
+        """The created object's id: its Location, and the one owned match."""
+        found = created.get("found") or []
+        made = created.get("id") or (found[0] if len(found) == 1 else "")
+        if not _UUID_RE.fullmatch(made or "") or found != [made]:
+            raise GateError(f"no Keycloak receipt for the {what}: {created}")
+        return made
+
+    def mint_client(self) -> None:
+        """The run's OAuth client: its logins carry the claims a cockpit login
+        does, so the JIT path keeps the owner an administrator."""
+        self.client_started = True
+        created = self.keycloak("create-client")
+        if created.get("exists"):
+            # Not this run's: never adopted, never cleaned up.
+            self.client_started = False
+            raise GateError(f"a Keycloak client {self.oauth_client} already exists")
+        self.client_uuid = self.receipt(created, "OAuth client")
+        self.owner.client_id = self.other.client_id = self.oauth_client
+
+    def mint_account(self) -> None:
+        """The disposable second account: its Keycloak user, then its app row,
+        admitted by the owner before the first login, so the login takes the
+        existing-account path and provisions no cloud or Gitea account."""
+        self.account_started = True
+        created = self.keycloak("create-user")
+        if created.get("exists"):
+            # Not this run's: never adopted, never cleaned up.
+            self.account_started = False
+            raise GateError(f"a Keycloak user {self.other.username} already exists")
+        keycloak_id = self.receipt(created, "account")
+        self.account_keycloak_id = keycloak_id
+        app_id = sql("SELECT gen_random_uuid()")
+        if not _UUID_RE.fullmatch(app_id):
+            raise GateError(f"no fresh id: {app_id!r}")
+        self.other_id = app_id
+        self.account_row = True
+        sql_script(
+            "INSERT INTO users (id, display_name, email, keycloak_sub, "
+            "preferred_username, is_approved, approved_at, approved_by) VALUES ("
+            f"{lit(app_id)}, {lit(self.other.username)}, {lit(self.other_email)}, "
+            f"{lit(keycloak_id)}, {lit(self.other.username)}, true, now(), "
+            f"{lit(self.owner_id)});\n"
+        )
+
+    def accounts(self) -> None:
+        self.mint_client()
         owner = self.owner.ok("GET", "/api/auth/me")["user"]
-        other = self.other.ok("GET", "/api/auth/me")["user"]
-        self.owner_id, self.other_id = str(owner["id"]), str(other["id"])
+        self.owner_id = str(owner["id"])
         capabilities = self.owner.ok("GET", "/api/users/me/capabilities")
         can_publish = can_publish_connectors(capabilities)
+        if self.disposable:
+            if not owner.get("is_admin"):
+                raise GateError(
+                    "the disposable second account needs an administrator owner"
+                )
+            self.mint_account()
+        other = self.other.ok("GET", "/api/auth/me")["user"]
+        if self.disposable and str(other["id"]) != self.other_id:
+            raise GateError(
+                f"the second account logged in as {other['id']}, not the admitted "
+                f"row {self.other_id}"
+            )
+        self.other_id = str(other["id"])
         accounts_ok = (
             owner.get("is_approved")
             and other.get("is_approved")
@@ -766,11 +1038,12 @@ class ConnectorSelectionGate:
             and can_publish
         )
         self.report.check(
-            "preflight: both accounts are approved, the other is not an "
+            "account: both accounts are approved, the second is not an "
             "administrator, the owner may publish connectors",
             bool(accounts_ok),
             f"owner admin={owner.get('is_admin')} publish={can_publish}, "
-            f"other admin={other.get('is_admin')}",
+            f"second {'disposable' if self.disposable else 'named'} "
+            f"admin={other.get('is_admin')}",
         )
         if not accounts_ok:
             raise GateError("the two accounts cannot run this gate")
@@ -906,7 +1179,9 @@ class ConnectorSelectionGate:
     def session_body(self, label: str, **selection: Any) -> dict[str, Any]:
         return {
             "title": self.title(label),
-            "permission_mode": "autonomous",
+            # The ceiling of an approved user without grants (capability
+            # grants' default): autonomous needs a permission_mode grant.
+            "permission_mode": SESSION_PERMISSION_MODE,
             "project_id": self.project,
             "config_override": {"workspace": {"backend": "sandbox"}},
             "model": self.args.model,
@@ -1255,6 +1530,36 @@ class ConnectorSelectionGate:
                     )
                 ),
             )
+        if self.account_row:
+
+            def account_row_deleted() -> bool:
+                status, body = self.owner.call("DELETE", f"/api/users/{self.other_id}")
+                if status in (200, 204, 404):
+                    return True
+                if status == 409:  # its sessions' workspaces are still releasing
+                    return False
+                raise GateError(f"HTTP {status}: {str(body)[:200]}")
+
+            step(
+                "delete the second account's app row",
+                lambda: bool(
+                    wait_for(
+                        "account row deleted",
+                        account_row_deleted,
+                        timeout=180,
+                        interval=10,
+                    )
+                ),
+            )
+        if self.account_started or self.client_started:
+            # Last of the API users: the client is how the gate logs in.
+            def keycloak_deleted() -> bool:
+                result = self.keycloak("delete")
+                return not result.get("refused") and not (
+                    result.get("users") or result.get("clients")
+                )
+
+            step("delete the Keycloak user and OAuth client", keycloak_deleted)
         if self.pg_started:
             step(
                 "drop database and role",
@@ -1309,6 +1614,23 @@ class ConnectorSelectionGate:
                 )
             except GateError:
                 left.append(f"pods {selector}")
+        if self.account_row or self.account_started:
+            conditions = [f"lower(email) = lower({lit(self.other_email)})"]
+            if self.account_row:
+                conditions.append(f"id = {lit(self.other_id)}")
+            if self.account_keycloak_id:
+                conditions.append(f"keycloak_sub = {lit(self.account_keycloak_id)}")
+            if (
+                sql(f"SELECT count(*) FROM users WHERE {' OR '.join(conditions)}")
+                != "0"
+            ):
+                left.append(f"the second account's app row {self.other_id}")
+        if self.account_started or self.client_started:
+            counts = self.keycloak("count")
+            if counts.get("users"):
+                left.append(f"the Keycloak user {self.other.username}")
+            if counts.get("clients"):
+                left.append(f"the Keycloak client {self.oauth_client}")
         if (
             self.pg_started
             and sql(
@@ -1325,6 +1647,7 @@ class ConnectorSelectionGate:
     def run(self) -> int:
         try:
             self.preflight()
+            self.accounts()
             self.fixture()
             self.manifest()
             self.sessions()
@@ -1344,6 +1667,18 @@ class ConnectorSelectionGate:
                             "project": self.project,
                             "threads": self.threads,
                             "jobs": self.jobs,
+                            "account": (
+                                {
+                                    "username": self.other.username,
+                                    "keycloak_id": self.account_keycloak_id,
+                                    "app_id": self.other_id or None,
+                                }
+                                if self.account_started or self.account_row
+                                else None
+                            ),
+                            "oauth_client": (
+                                self.oauth_client if self.client_started else None
+                            ),
                             "database": self.pg_name if self.pg_started else None,
                         }
                     )
@@ -1379,8 +1714,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gate-id")
     parser.add_argument("--user", default="test")
     parser.add_argument("--password", default="srw-k3d-dev-test")
-    parser.add_argument("--other-user", default="dev-user-1")
-    parser.add_argument("--other-password", default="srw-k3d-dev-usr1")
+    parser.add_argument(
+        "--other-user",
+        help="an existing approved non-administrator as the second account "
+        "(default: a disposable account named the gate id)",
+    )
+    parser.add_argument("--other-password")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--keep", action="store_true", help="skip cleanup")
     return parser
@@ -1397,8 +1736,10 @@ def validate(args: argparse.Namespace) -> None:
         raise SafetyError("--gate-id must be d3c- followed by 10 hex digits")
     if not _MODEL_RE.fullmatch(args.model):
         raise SafetyError("model id is malformed")
+    if (args.other_user is None) != (args.other_password is None):
+        raise SafetyError("--other-user and --other-password go together")
     for user in (args.user, args.other_user):
-        if not _USER_RE.fullmatch(user):
+        if user is not None and not _USER_RE.fullmatch(user):
             raise SafetyError("user name is malformed")
     if args.user == args.other_user:
         raise SafetyError("--other-user must be a second account")
