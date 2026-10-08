@@ -858,9 +858,16 @@ class CheckoutMaterializer:
             )
             skipped = _skip_reason(rt.workspace_manager, clone_name)
             if skipped is not None:
+                block = ds.get("git_swap")
                 line = (
                     f"- **{ds.get('name')}** — repository NOT cloned "
                     f"(`./repos/{clone_name}/` is not usable): {skipped}"
+                    # How it was to be reached says why it may have failed.
+                    + (
+                        swap_note(ds)
+                        if isinstance(block, dict) and "fallback" in block
+                        else ""
+                    )
                 )
                 out.append(FactsLines("Repositories", delivery.index, [line]))
                 continue

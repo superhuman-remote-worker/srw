@@ -530,3 +530,34 @@ def test_the_scan_finds_a_secret_and_names_only_its_path(tmp_path):
     result = json.loads(out.splitlines()[-1])
     assert result["found"] == [str(tmp_path / "nested" / "config")]
     assert TOKEN not in out
+
+
+def test_the_clean_remote_is_the_agents():
+    from shared.connectors.git_swap import swap_upstream
+
+    for url in (UPSTREAM, UPSTREAM.removesuffix(".git"), "https://github.com/o/r"):
+        assert gate.clean_remote(url) == swap_upstream(url).remote
+
+
+def test_the_private_url_must_be_served_by_shape_and_falls_back(token_file):
+    from shared.connectors.git_swap import swap_upstream
+
+    args = _args(token_file)
+    assert args.private_url == gate.DEFAULT_PRIVATE_URL
+    # The driver would serve its shape: only the per-delivery egress check
+    # (a cluster service address) can put it on the fallback.
+    assert swap_upstream(args.private_url).host.endswith(".svc.cluster.local")
+    with pytest.raises(gate.SafetyError):
+        _args(token_file, "--private-url", "https://git.corp/o/../r")
+
+
+def test_the_gate_proves_the_fallback_and_measures_the_cold_start():
+    assert any(line.startswith("fallback:") for line in gate.PLAN)
+    assert "S1" in next(line for line in gate.PLAN if line.startswith("startup:"))
+    # Below the agent's own wait for a first clone (reconcile + start timeout).
+    assert gate.COLD_START_BUDGET < 15 + 180
+    orchestrator, agent = gate.SERVED_SETS
+    assert "src/orchestrator/services/connector_git_swap_delivery.py" in (
+        orchestrator.files
+    )
+    assert "src/agent/managers/git_manager.py" in agent.files

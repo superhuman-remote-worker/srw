@@ -785,6 +785,24 @@ def test_install_wiring_resolves_the_home_from_the_backend():
     )
 
 
+def test_a_fallback_repository_that_did_not_clone_still_says_how_it_was_reached():
+    entry = {
+        **_entry(),
+        "credentials": {"token": TOKEN},
+        "git_swap": {"fallback": "its driver may not reach the upstream"},
+    }
+    assert checkout_auth(entry) == "token_in_url"
+    [delivery] = deliveries_from_payload([entry])
+    assert delivery.spec is REPOSITORY_SPEC
+    ws = _workspace()
+    ws.source_repo_skipped = {"r": "the clone failed"}
+    rt = RuntimeContext(execution="session", workspace_manager=ws)
+    [facts] = CheckoutMaterializer().facts([delivery], rt)
+    assert "NOT cloned" in facts.lines[0] and "the clone failed" in facts.lines[0]
+    assert "NOT through SRW's git swap driver" in facts.lines[0]
+    assert "may not reach the upstream" in facts.lines[0]
+
+
 class TestRemoteBackend:
     def _backend(self):
         from shared.runtime.core.backends.remote import RemoteBackend

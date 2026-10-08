@@ -33,10 +33,12 @@ Fixtures (all disposable, named after the gate id):
   project     one project of the owner
   connectors  of the owner, repository connectors with token auth, all on
               the operator's token: ``rw`` (--upstream-url, linked ReadWrite),
-              ``ro`` (the same URL, linked read-only, so it binds ReadOnly)
-              and ``redirect`` (--redirect-url, a repository whose forge
-              answers git with a redirect)
-  sessions    ``one`` (rw and ro) and ``two`` (rw and redirect), stateless
+              ``ro`` (the same URL, linked read-only, so it binds ReadOnly),
+              ``redirect`` (--redirect-url, a repository whose forge answers
+              git with a redirect) and ``private`` (--private-url, a host
+              inside the cluster's service range, with a fake token)
+  sessions    ``one`` (rw and ro) and ``two`` (rw, redirect and private),
+              stateless
 
 Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
 
@@ -52,7 +54,9 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
               runs the pinned swap image with every capability dropped and no
               ServiceAccount token; its Secret holds its TLS certificate and
               key, the clean upstream URL, and no token; each binding's
-              workspace has its own ingress policy
+              workspace has its own ingress policy; each connector's first
+              binding has a serving pod within COLD_START_BUDGET seconds
+              (measured and printed: the C3 review's cold start)
   push        session one cloned rw through the driver: its remote is the
               clean URL (``git remote -v`` shows the driver's, neither with a
               token), .git/config holds no token or lease and refuses
@@ -69,16 +73,22 @@ Checks (each printed PASS/FAIL; the exit status is 0 only if all pass):
   refs        on rw, a tag push and a branch delete are refused with their
               reasons (git shows "! [remote rejected] ... (reason)"); the
               upstream still has the branch and no tag
-  leases      session one's two connectors each use their own lease: the
-              credential helper answers each driver URL with its own lease
-              (by digest) and each driver pod logs its own lease id
+  leases      session one's two connectors each use their own lease: inside
+              each checkout (rw and ro name one upstream; each binding's rules
+              apply in its own checkout only) the credential helper answers
+              its driver URL with its own lease (by digest) and each driver
+              pod logs its own lease id
   lfs         a Git LFS batch request to the driver gets 501 and the message
   ide         git outside the agent's tmux (an IDE terminal's bare
-              environment, an ssh-gateway session's login shell) goes through
-              the driver too
+              environment, an ssh-gateway session's login shell) run in the
+              checkout goes through the driver too
   redirect    session two's redirect connector: the forge's redirect is not
               followed with the credential (git shows the driver's 502 and
-              its message; the driver logs the redirect)
+              its message; the driver logs the redirect); the README says
+              the repository was not cloned and why
+  fallback    session two's private connector falls back visibly: no lease,
+              its README line says the token goes in the clone URL and why
+              (the driver may not reach the upstream), and so does its Test
   reused      a pre-C3 checkout (an oauth2:<token>@ origin, no
               credentialsInUrl) loses its token URL on session two's next
               attach and refuses credentials in URLs again
@@ -151,6 +161,14 @@ _UPSTREAM_RE = re.compile(
     r"https://[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?:/[A-Za-z0-9._~-]{1,128}){1,16}\Z"
 )
 _IPV4_RE = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}\Z")
+#: A token repository on a host inside the cluster's service range: the
+#: driver's egress refuses it, so it must fall back (C3 review B1).
+DEFAULT_PRIVATE_URL = (
+    "https://traefik.kube-system.svc.cluster.local/srw-gate/private.git"
+)
+#: Seconds from a connector's first binding to its serving pod the gate
+#: accepts (the agent's first clone waits for at most ~195 s).
+COLD_START_BUDGET = 120
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 #: Forges the repository connector accepts (shared.connectors.builtin.FORGES).
 FORGES = ("gitea", "github", "gitlab")
@@ -195,7 +213,9 @@ SERVED_SETS = (
             "src/orchestrator/services/agent_datasource_payload.py",
             "src/orchestrator/services/connector_credential_leases.py",
             "src/orchestrator/services/connector_driver_ca.py",
+            "src/orchestrator/services/connector_git_swap_delivery.py",
             "src/orchestrator/services/connector_lease_exchange.py",
+            "src/orchestrator/services/datasource_config.py",
             "src/orchestrator/services/connector_service_hosting.py",
             "src/orchestrator/services/connector_service_images.py",
             "src/orchestrator/services/connector_service_launch.py",
@@ -215,6 +235,8 @@ SERVED_SETS = (
             "src/shared/runtime/core/credential_env.py",
             "src/shared/runtime/core/workspace_backend.py",
             "src/shared/runtime/core/backends/remote.py",
+            "src/agent/managers/git_manager.py",
+            "src/agent/core/workspace.py",
         ),
     ),
 )
@@ -783,6 +805,12 @@ def swap_pod_problems(
     return problems
 
 
+def clean_remote(url: str) -> str:
+    """The one form a swap checkout's origin keeps: ``<repository>.git``
+    (shared.connectors.git_swap.SwapUpstream.remote)."""
+    return url.rstrip("/").removesuffix(".git") + ".git"
+
+
 def config_problems(config: str, *, clean_url: str, tokens: list[str]) -> list[str]:
     """How a swap checkout's .git/config differs from what C3 requires."""
     problems: list[str] = []
@@ -904,7 +932,8 @@ PLAN = [
     "startup: each swap pod's canary wait ran first; the pinned swap image, "
     "capabilities dropped, no ServiceAccount token; its Secret holds its TLS "
     "certificate, the clean upstream and no token; each binding's workspace has "
-    "its own ingress policy",
+    "its own ingress policy; first binding to a serving pod within the budget "
+    "(measured, S1)",
     "push: rw cloned through the driver; remote is the clean URL, git remote -v "
     "and .git/config hold no token, credentialsInUrl=die, ~/.gitconfig includes "
     "SRW's wiring once; a branch push lands upstream through the driver; no "
@@ -914,13 +943,15 @@ PLAN = [
     "get 403; nothing reached the upstream; no write exchange for the lease",
     "refs: a tag push and a branch delete on rw are refused with their reasons; "
     "the upstream keeps the branch and has no tag",
-    "leases: rw and ro in session one each use their own lease (helper answers, "
-    "driver logs)",
+    "leases: rw and ro in session one (one upstream) each use their own lease "
+    "inside their own checkout (helper answers, driver logs)",
     "lfs: a Git LFS batch request gets 501 and the message",
     "ide: git in an IDE terminal's bare environment and an ssh-gateway login "
-    "shell goes through the driver too",
+    "shell, run in the checkout, goes through the driver too",
     "redirect: the forge's redirect is not followed with the credential (502 "
-    "and the driver's message)",
+    "and the driver's message); the README says it was not cloned and why",
+    "fallback: a private-host token repository (--private-url) gets no lease; "
+    "the README and Test say its token goes in the clone URL and why",
     "reused: a pre-C3 checkout loses its oauth2:<token>@ origin on the next "
     "attach and refuses credentials in URLs again",
     "revoked: detaching rw from session one revokes its lease; that token gets "
@@ -963,11 +994,15 @@ class GitSwapGate:
             else ""
         )
         self.fake = secret(f"srw-gate-fake-{secrets.token_hex(16)}")
+        self.private = args.private_url
         self.urls = {
             "rw": self.upstream,
             "ro": self.upstream,
             "redirect": self.redirect,
+            "private": self.private,
         }
+        #: Seconds from a connector's first binding to its pod serving (S1).
+        self.cold_start: dict[str, float] = {}
 
     # -- naming and helpers ------------------------------------------------
     def name(self, label: str) -> str:
@@ -1457,7 +1492,11 @@ class GitSwapGate:
                 "scope_mode": "all",
                 "type": REPOSITORY_TYPE,
                 "connection_url": self.urls[label],
-                "credentials": {"auth_method": "token", "token": self.token},
+                # The private-host one never reaches a forge: a fake token.
+                "credentials": {
+                    "auth_method": "token",
+                    "token": self.fake if label == "private" else self.token,
+                },
                 "config": {"forge": self.args.forge},
             },
         )
@@ -1478,7 +1517,7 @@ class GitSwapGate:
             },
         )
         self.project = str(created["id"])
-        for label in ("rw", "ro", "redirect"):
+        for label in ("rw", "ro", "redirect", "private"):
             self.create_connector(label)
             self.owner.ok(
                 "POST",
@@ -1487,7 +1526,9 @@ class GitSwapGate:
             )
         print(f"fixture: project {self.project}, connectors {self.connectors}")
 
-    def create_session(self, label: str, connectors: list[str]) -> str:
+    def create_session(
+        self, label: str, connectors: list[str], *, fallback: tuple[str, ...] = ()
+    ) -> str:
         created = self.owner.ok(
             "POST",
             "/api/persistent/threads",
@@ -1508,6 +1549,8 @@ class GitSwapGate:
             raise GateError(f"session lane is {lane!r}, not stateless")
         self.say(label, "Reply with the single word ready.")
         for connector in connectors:
+            if connector in fallback:
+                continue  # never served: no lease to wait for
             lease = wait_for(
                 f"a swap lease for {connector} on {label}",
                 lambda connector=connector: (
@@ -1558,8 +1601,26 @@ class GitSwapGate:
 
     def startup_checks(self) -> None:
         self.create_session("one", ["rw", "ro"])
-        self.create_session("two", ["rw", "redirect"])
-        rows = {label: self.wait_ready_pod(label) for label in self.connectors}
+        self.create_session("two", ["rw", "redirect", "private"], fallback=("private",))
+        served = [label for label in self.connectors if label != "private"]
+        rows = {label: self.wait_ready_pod(label) for label in served}
+        for label in served:
+            self.cold_start[label] = float(
+                sql(
+                    "SELECT round(EXTRACT(EPOCH FROM (min(i.ready_at) - "
+                    "min(l.issued_at)))::numeric, 1) FROM connector_driver_identities i "
+                    "JOIN connector_credential_leases l ON l.connector_id = "
+                    f"i.connector_id WHERE i.connector_id = {lit(self.connectors[label])}"
+                )
+                or "nan"
+            )
+        print(f"cold start (first binding to a serving pod): {self.cold_start}")
+        self.report.check(
+            "startup: each connector's first binding has a serving pod within "
+            f"{COLD_START_BUDGET}s (a new binding wakes the reconciler; S1)",
+            all(value <= COLD_START_BUDGET for value in self.cold_start.values()),
+            json.dumps(self.cold_start),
+        )
         for label, row in rows.items():
             pod = self.driver_pod(row) or {}
             _rc, canary_log, _err = run(
@@ -1609,7 +1670,9 @@ class GitSwapGate:
         repo = shlex_quote(self.wait_clone("one", "rw"))
         _rc, config = self.ws("one", f"cat {repo}/.git/config\n")
         tokens = [self.token, self.lease_token("rw", "one")]
-        problems = config_problems(config, clean_url=self.upstream, tokens=tokens)
+        problems = config_problems(
+            config, clean_url=clean_remote(self.upstream), tokens=tokens
+        )
         _rc, shown = self.ws("one", f"git -C {repo} remote -v\n")
         origin, url = self.driver("rw", "one")
         self.report.check(
@@ -1784,8 +1847,12 @@ class GitSwapGate:
             origin, url = self.driver(label, "one")
             host = origin.removeprefix("https://")
             path = url.split(host, 1)[1].lstrip("/") + ".git"
+            # Each binding's rules apply in its own checkout (rw and ro name
+            # one upstream): the helper answers there.
+            repo = shlex_quote(self.wait_clone("one", label))
             _rc, out = self.ws(
                 "one",
+                f"cd {repo}\n"
                 "printf 'protocol=https\\nhost=%s\\npath=%s\\n\\n' "
                 f"{shlex_quote(host)} {shlex_quote(path)} | git credential fill "
                 "| sed -n 's/^password=//p' | tr -d '\\n' | sha256sum\n",
@@ -1864,20 +1931,64 @@ class GitSwapGate:
         )
 
     def redirect_checks(self) -> None:
+        # No checkout exists (its clone got the driver's 502): name the
+        # binding's rules, as the agent's own wait for the driver does.
+        rules = (
+            f"~/.srw-credentials/git/bindings/{self.connectors['redirect']}.gitconfig"
+        )
         _rc, out = self.ws(
             "two",
-            f"git ls-remote {shlex_quote(self.redirect)} 2>&1\necho listed=$?\n",
+            f"git -c include.path={rules} ls-remote "
+            f"{shlex_quote(clean_remote(self.redirect))} 2>&1\necho listed=$?\n",
             timeout=120,
         )
         log = self.driver_log("redirect")
+        _rc, readme = self.ws("two", "cat ~/workspace/README.md 2>/dev/null\n")
+        line = next(
+            (row for row in readme.splitlines() if self.name("redirect") in row), ""
+        )
         self.report.check(
             "redirect: the forge's redirect is not followed with the credential "
-            "(git shows the driver's 502 and message; the driver logs it)",
+            "(git shows the driver's 502 and message; the driver logs it; the "
+            "README says the repository was not cloned and why)",
             "listed=0" not in out
             and "never follows a redirect" in out
-            and "the upstream redirected to" in log,
-            f"{out[-200:]!r}; if the forge answered without a redirect, pass "
-            "--redirect-url",
+            and "the upstream redirected to" in log
+            and "NOT cloned" in line
+            and "redirect" in line,
+            f"{out[-200:]!r} readme={line[-200:]!r}; if the forge answered without "
+            "a redirect, pass --redirect-url",
+        )
+
+    def fallback_checks(self) -> None:
+        """A token repository on a host the driver may not reach (inside the
+        cluster's service range) falls back to the token in its clone URL,
+        visibly: no lease, the README says so and why, Test says so too."""
+        lease = self.lease_row("private", "two", live=False)
+        _rc, readme = self.ws("two", "cat ~/workspace/README.md 2>/dev/null\n")
+        line = next(
+            (row for row in readme.splitlines() if self.name("private") in row), ""
+        )
+        self.report.check(
+            "fallback: a private-host token repository gets no lease, and session "
+            "two's README says it is NOT reached through the driver, and why",
+            lease is None
+            and "NOT through SRW's git swap driver" in line
+            and "may not reach the upstream" in line,
+            line[-300:] or "no README line",
+        )
+        status, result = self.owner.call(
+            "POST", f"/api/datasources/{self.connectors['private']}/test", {}
+        )
+        delivery = ((result or {}).get("details") or {}).get("delivery") or {}
+        self.report.check(
+            "fallback: Test of the private-host repository says its token goes in "
+            "the clone URL, not through the driver, and why",
+            status == 200
+            and delivery.get("mode") == "token-in-url"
+            and "may not reach the upstream" in (delivery.get("reason") or "")
+            and "NOT through SRW's git swap driver" in str(result.get("message")),
+            json.dumps(delivery)[:300],
         )
 
     def reused_checks(self) -> None:
@@ -1909,7 +2020,9 @@ class GitSwapGate:
             config = ""
         problems = (
             config_problems(
-                config, clean_url=self.upstream, tokens=[self.fake, self.token]
+                config,
+                clean_url=clean_remote(self.upstream),
+                tokens=[self.fake, self.token],
             )
             if config
             else ["the oauth2: origin stayed"]
@@ -2197,6 +2310,7 @@ class GitSwapGate:
                 self.lfs_checks,
                 self.ide_checks,
                 self.redirect_checks,
+                self.fallback_checks,
                 self.reused_checks,
                 self.revoked_checks,
             ):
@@ -2303,6 +2417,15 @@ def build_parser() -> argparse.ArgumentParser:
             "renamed repository's old URL; docker/docker is moby/moby on GitHub)"
         ),
     )
+    parser.add_argument(
+        "--private-url",
+        default=DEFAULT_PRIVATE_URL,
+        help=(
+            "a token repository URL on a host the driver may not reach (inside "
+            "the cluster's service range, or a private address the project tier "
+            "refuses): it must fall back visibly; it gets a fake token"
+        ),
+    )
     parser.add_argument("--forge", choices=FORGES, help="defaults from the host")
     parser.add_argument("--keep", action="store_true", help="skip cleanup")
     return parser
@@ -2321,7 +2444,7 @@ def validate(args: argparse.Namespace) -> None:
         raise SafetyError("model id is malformed")
     if not re.fullmatch(r"[a-z][a-z0-9._-]{0,63}", args.user):
         raise SafetyError("user name is malformed")
-    for name in ("upstream_url", "redirect_url"):
+    for name in ("upstream_url", "redirect_url", "private_url"):
         value = getattr(args, name)
         if value is not None and (
             not _UPSTREAM_RE.fullmatch(value)
