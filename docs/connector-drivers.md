@@ -172,21 +172,34 @@ The rules SRW applies when you register:
   [what a binding may hold](#what-a-binding-may-hold)).
 - **`config_schema`** is a JSON Schema (2020-12) for the connector's config.
   SRW validates every connector against it when it is saved, on its own
-  servers, so a registered schema holds no regular expression anywhere in
-  the document (`pattern`, `patternProperties`, `format: regex`, whatever key
-  holds them), a `$ref` points only at `#/$defs/<name>` or
-  `#/definitions/<name>` of the same document, no `$id`, `$anchor`,
-  `$dynamicAnchor`, `$dynamicRef` or `$recursiveRef` appears, `$schema` is
-  2020-12 or absent, and it stays under 32 KiB and 12 levels deep. What one
-  validation costs is bounded too: no `$ref` loops (a definition reaching
-  itself), no `allOf`, `anyOf`, `oneOf` or `prefixItems` holds more than 64
-  schemas, at most 256 schemas apply (32 levels deep) once every `$ref` is
-  followed (a definition referenced twice counts twice), and no
-  `uniqueItems`, `unevaluatedProperties` or `unevaluatedItems` (their cost
-  grows faster than the document; use `additionalProperties`). A stored
-  config is at most 64 KiB and 512 values, and SRW validates it off its
-  event loop for at most 5 seconds. Check a pattern, uniqueness or anything
-  larger in your `check`.
+  servers, so a registered schema uses only a small set of cheap keywords,
+  in every schema of the document:
+
+  | Keywords | Allowed shape |
+  | --- | --- |
+  | `type` | a JSON type, or a list of them |
+  | `properties`, `required` | schemas by name; names |
+  | `items` | one schema (never a list) |
+  | `enum`, `const` | strings, numbers, booleans or null; `enum` lists at most 256 |
+  | `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum` | numbers |
+  | `minLength`, `maxLength`, `minItems`, `maxItems`, `minProperties`, `maxProperties` | non-negative integers |
+  | `additionalProperties` | `true` or `false` (never a schema) |
+  | `format` | `uri`, `uri-reference`, `hostname`, `email`, `ipv4`, `ipv6`, `date-time`, `date`, `time` or `uuid`: a hint for forms and for your driver; SRW does not check formats |
+  | `allOf`, `anyOf`, `oneOf` | at most 64 schemas each |
+  | `$defs` (root only), `$ref` | `$ref` only to an existing `#/$defs/<name>` |
+  | `$schema` (root only) | `https://json-schema.org/draft/2020-12/schema` |
+  | `title`, `description`, `default`, `examples`, `readOnly`, `writeOnly`, `deprecated`, `$comment`, `x-srw-widget`, `x-srw-order`, `x-srw-group`, `x-srw-multiline` | annotations: any value |
+
+  Anything else (`pattern`, `patternProperties`, `multipleOf`, `not`,
+  `if`/`then`/`else`, `dependentRequired`, `dependentSchemas`, `contains`,
+  `propertyNames`, `uniqueItems`, `unevaluatedProperties`, `prefixItems`,
+  `$id`, `$anchor`, `definitions`…) is refused at registration: **validate
+  anything richer in your own `check`.** The document stays under 32 KiB
+  and 12 levels deep, a `$ref` never loops, and at most 256 schemas apply
+  (32 levels deep) once every `$ref` is followed (a definition referenced
+  twice counts twice). A stored config is at most 64 KiB and 512 values.
+  SRW validates in a small pool of its own threads, a few at once, for at
+  most 5 seconds; when all are busy a save answers 503, to retry.
 - **`credential_slots`** name the parts of the connector's credentials. Each
   slot's `schema` lists the keys it owns (the same schema rules apply); mark
   secrets `writeOnly`. A connector may only store keys some slot owns, and
@@ -500,7 +513,8 @@ registrations.
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | Registration answers "The image has no io.srw.driver.spec label, and this installation runs no driver pod…" | No label, and driver pods are off. | Build with the label (step 4), or ask your operator to turn on `connectors.servicePods.enabled`. |
-| "The driver image's spec is refused: …" | The spec breaks a rule of step 1 (an undeclared or forbidden variable name, a `pattern` in a schema…). | Fix what it names; run the test kit. |
+| "The driver image's spec is refused: …" | The spec breaks a rule of step 1 (an undeclared or forbidden variable name, a schema keyword outside the allowed set…). | Fix what it names; run the test kit. |
+| A save answers 503 "… could not be validated: SRW is busy validating …" | Every validation slot is taken. | Retry in a moment. |
 | "driver names under srw. are SRW's own" | The name uses SRW's namespace. | Use your own namespace. |
 | 409 "The shared Catalog has a driver named …" | The name exists in the Catalog. | Use the Catalog's driver, or another name. |
 | 409 "Ambiguous driver name …" | Your Account and the project both register the name. | Pass `driver_registration_id`. |

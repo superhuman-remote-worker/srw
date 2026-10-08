@@ -22,11 +22,11 @@ someone registers must follow on top of :func:`~.contract.validate_spec`:
   tools read to run code, redirect traffic or loosen TLS). The list is a
   best-effort lint, not a sandbox: the image's author is the trust
   boundary, as a workspace image's is.
-* **Schemas.** A registered schema is validated on SRW's event loop, so it
-  may not hold a regular expression (``pattern``, ``patternProperties``,
-  ``format: regex``) or a reference outside itself, and it is bounded in
-  size and depth (:func:`schema_problems`). A driver checks a pattern in its
-  own ``check``.
+* **Schemas.** A registered schema is validated on SRW's servers, so it
+  uses only a small allowlist of cheap keywords (:data:`SCHEMA_KEYWORDS`),
+  references only its own ``$defs``, and its size and the cost of one
+  validation are bounded (:func:`schema_problems`). A driver checks
+  anything richer (a pattern, a uniqueness...) in its own ``check``.
 
 What one ``bind`` of a bind-time image returns is checked by
 :func:`image_binding_problems` (the one check SRW and the author test kit
@@ -416,111 +416,186 @@ def canonical_spec(value: Mapping[str, Any]) -> str:
 # =============================================================================
 
 
-_SUBSCHEMA_MAPS = frozenset(
-    {"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"}
+#: The JSON Schema types a registered schema may name.
+_JSON_TYPES = frozenset(
+    {"string", "number", "integer", "boolean", "object", "array", "null"}
 )
-_SUBSCHEMA_LISTS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
-_SUBSCHEMAS = frozenset(
+#: The formats a registered schema may name. SRW's validator asserts no
+#: format (it runs without a format checker): a format is an annotation
+#: for forms and for the driver, never a check SRW makes.
+SCHEMA_FORMATS = frozenset(
     {
-        "items",
-        "additionalItems",
-        "additionalProperties",
-        "unevaluatedItems",
-        "unevaluatedProperties",
-        "propertyNames",
-        "contains",
-        "contentSchema",
-        "not",
-        "if",
-        "then",
-        "else",
+        "uri",
+        "uri-reference",
+        "hostname",
+        "email",
+        "ipv4",
+        "ipv6",
+        "date-time",
+        "date",
+        "time",
+        "uuid",
     }
 )
-#: Keywords that name a schema resource or an anchor a ``$ref`` could reach
-#: from anywhere in the document, or a reference resolved at run time:
-#: a registered schema uses none, so every reference is one SRW can read.
-_RESOLUTION_KEYWORDS = (
-    "$id",
-    "$anchor",
-    "$dynamicAnchor",
-    "$dynamicRef",
-    "$recursiveAnchor",
-    "$recursiveRef",
-    "$vocabulary",
+#: Keywords that only annotate (never validate): any JSON value.
+_ANNOTATIONS = frozenset(
+    {
+        "title",
+        "description",
+        "default",
+        "examples",
+        "readOnly",
+        "writeOnly",
+        "deprecated",
+        "$comment",
+        # SRW's form hints (connector-driver.model.ts).
+        "x-srw-widget",
+        "x-srw-order",
+        "x-srw-group",
+        "x-srw-multiline",
+    }
 )
+_BOUNDS = frozenset({"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"})
+_COUNTS = frozenset(
+    {
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "minProperties",
+        "maxProperties",
+    }
+)
+_COMBINATORS = ("allOf", "anyOf", "oneOf")
+#: Every keyword a registered schema may use: each is cheap and bounded on
+#: SRW's own servers. Anything richer (``pattern``, ``multipleOf``, ``not``,
+#: ``if``/``then``/``else``, ``dependent*``, ``contains``,
+#: ``propertyNames``, ``patternProperties``, ``uniqueItems``,
+#: ``unevaluated*``, ``prefixItems``...) is the driver's to check in its own
+#: ``check``.
+SCHEMA_KEYWORDS = frozenset(
+    {
+        "type",
+        "properties",
+        "required",
+        "items",
+        "enum",
+        "const",
+        "additionalProperties",
+        "format",
+        "$ref",
+        "$defs",
+        "$schema",
+        *_BOUNDS,
+        *_COUNTS,
+        *_COMBINATORS,
+        *_ANNOTATIONS,
+    }
+)
+#: The most values an ``enum`` may list.
+MAX_ENUM = 256
 #: The one dialect a registered schema is validated as.
 _DIALECT = "https://json-schema.org/draft/2020-12/schema"
-#: The only references a registered schema may hold: into its own ``$defs``
-#: or ``definitions``, by a plain name.
-_LOCAL_REF = re.compile(r"#/(\$defs|definitions)/([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})\Z")
-#: Keywords whose cost grows faster than the document it validates: SRW
-#: refuses them in a registered schema (a driver checks them in ``check``).
-_COSTLY_KEYWORDS = ("unevaluatedProperties", "unevaluatedItems")
-#: How deeply JSON containers (a default's, an enum's) may nest at all.
-_MAX_CONTAINER_DEPTH = 64
+#: The only references a registered schema may hold: into its own root
+#: ``$defs``, by a plain name.
+_LOCAL_REF = re.compile(r"#/\$defs/([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})\Z")
 
 
-def _regex_problems(schema: Mapping[str, Any], where: str) -> list[str]:
-    """Every mapping anywhere in ``schema`` that holds a regular expression
-    or a resolution keyword, whatever key it sits under: a value no keyword
-    names is never reached by a validator, but a ``$ref`` could make it one,
-    so nothing is left to the structure (belt and braces)."""
-    problems: list[str] = []
-    stack: list[tuple[Any, str, int]] = [(schema, where, 0)]
-    while stack:
-        node, path, depth = stack.pop()
-        if depth > _MAX_CONTAINER_DEPTH:
-            problems.append(f"{where} nests JSON deeper than {_MAX_CONTAINER_DEPTH}")
-            break
-        if isinstance(node, list):
-            for index, child in enumerate(node):
-                if isinstance(child, (Mapping, list)):
-                    stack.append((child, f"{path}[{index}]", depth + 1))
-            continue
-        if not isinstance(node, Mapping):
-            continue
-        if isinstance(node.get("pattern"), str):
-            problems.append(
-                f"{path} uses pattern: a registered schema runs no regular "
-                "expression (check it in the driver's check)"
-            )
-        if isinstance(node.get("patternProperties"), Mapping):
-            problems.append(
-                f"{path} uses patternProperties: a registered schema runs no "
-                "regular expression (check it in the driver's check)"
-            )
-        if node.get("format") == "regex":
-            problems.append(f"{path} uses format regex")
-        for keyword in _RESOLUTION_KEYWORDS:
-            if keyword in node:
-                problems.append(
-                    f"{path} uses {keyword}: a registered schema refers only to "
-                    "its own $defs"
-                )
-        for key, child in node.items():
-            if isinstance(child, (Mapping, list)):
-                stack.append((child, f"{path}.{key}", depth + 1))
-    return problems
+def _scalar(value: Any) -> bool:
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def _number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _keyword_problem(
+    keyword: str, value: Any, at: str, *, root: bool, definitions: Mapping[str, Any]
+) -> str | None:
+    """Why one keyword's value is refused (``None``: it is fine); a
+    subschema is walked by the caller."""
+    if keyword not in SCHEMA_KEYWORDS:
+        return (
+            f"{at} is not a keyword a registered schema may use (validate it "
+            "in the driver's check)"
+        )
+    if keyword == "$schema":
+        if not root:
+            return f"{at} is the root's only"
+        if value != _DIALECT:
+            return f"{at} is {_DIALECT} or absent"
+    elif keyword == "$defs":
+        if not root:
+            return f"{at} is the root's only"
+        if not isinstance(value, Mapping):
+            return f"{at} maps names to schemas"
+    elif keyword == "$ref":
+        match = _LOCAL_REF.fullmatch(value) if isinstance(value, str) else None
+        if match is None:
+            return f"{at} must point inside the schema, at #/$defs/<name>"
+        if match.group(1) not in definitions:
+            return f"{at} names {value}, which the schema lacks"
+    elif keyword == "type":
+        types = [value] if isinstance(value, str) else value
+        if (
+            not isinstance(types, list)
+            or not types
+            or not all(isinstance(item, str) and item in _JSON_TYPES for item in types)
+        ):
+            return f"{at} names JSON types"
+    elif keyword == "properties":
+        if not isinstance(value, Mapping):
+            return f"{at} maps names to schemas"
+    elif keyword == "required":
+        if not isinstance(value, list) or not all(isinstance(i, str) for i in value):
+            return f"{at} lists property names"
+    elif keyword == "items":
+        if not isinstance(value, (Mapping, bool)):
+            return f"{at} is one schema"
+    elif keyword == "enum":
+        if not isinstance(value, list) or not all(_scalar(item) for item in value):
+            return f"{at} lists strings, numbers, booleans or null"
+        if len(value) > MAX_ENUM:
+            return f"{at} lists more than {MAX_ENUM} values"
+    elif keyword == "const":
+        if not _scalar(value):
+            return f"{at} is a string, a number, a boolean or null"
+    elif keyword in _BOUNDS:
+        if not _number(value):
+            return f"{at} is a number"
+    elif keyword in _COUNTS:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return f"{at} is a non-negative integer"
+    elif keyword == "additionalProperties":
+        if not isinstance(value, bool):
+            return f"{at} is true or false"
+    elif keyword == "format":
+        if value not in SCHEMA_FORMATS:
+            return f"{at} is one of {sorted(SCHEMA_FORMATS)}"
+    elif keyword in _COMBINATORS:
+        if not isinstance(value, list) or not value:
+            return f"{at} lists schemas"
+        if len(value) > MAX_SCHEMA_WIDTH:
+            return f"{at} holds more than {MAX_SCHEMA_WIDTH} schemas"
+    return None
 
 
 def schema_problems(schema: Any, where: str) -> list[str]:
-    """Why a registered JSON Schema cannot be validated on SRW's own loop.
+    """Why a registered JSON Schema cannot be validated on SRW's servers.
 
-    A regular expression (``pattern``, ``patternProperties``, a ``regex``
-    format) can take time exponential in its input, so none may appear in
-    any mapping of the document, whatever key holds it. A ``$ref`` may point
-    only at ``#/$defs/<name>`` or ``#/definitions/<name>`` that exists, and
-    no ``$id``, ``$anchor``, ``$dynamicAnchor``, ``$dynamicRef`` or
-    ``$recursiveRef`` may name another target: a reference can reach
-    nothing the structural walk did not check, and never fetches. Size and
-    depth bound the document (:data:`MAX_SCHEMA_BYTES`,
-    :data:`MAX_SCHEMA_DEPTH`), and the cost of one validation is bounded
-    too: no ``$ref`` loops, no combinator is wider than
-    :data:`MAX_SCHEMA_WIDTH`, at most :data:`MAX_SCHEMA_NODES` schemas apply
-    (:data:`MAX_EXPANDED_DEPTH` deep) once every ``$ref`` is followed, and
-    no ``uniqueItems``, ``unevaluatedProperties`` or ``unevaluatedItems``
-    (their cost grows faster than the document). What is validated is
-    bounded by :func:`instance_problem`.
+    An allowlist: a registered schema uses only :data:`SCHEMA_KEYWORDS`,
+    each cheap and bounded (``enum`` and ``const`` of scalars,
+    ``additionalProperties`` a boolean, ``items`` one schema, a ``format``
+    from :data:`SCHEMA_FORMATS`, ``$defs`` and ``$schema`` at the root
+    only, a ``$ref`` only to an existing ``#/$defs/<name>``), in every
+    schema of the document; anything richer is the driver's to check in
+    its own ``check``. Size and depth bound the document
+    (:data:`MAX_SCHEMA_BYTES`, :data:`MAX_SCHEMA_DEPTH`), and one
+    validation's cost is bounded too: no ``$ref`` loops, no combinator is
+    wider than :data:`MAX_SCHEMA_WIDTH`, and at most
+    :data:`MAX_SCHEMA_NODES` schemas apply (:data:`MAX_EXPANDED_DEPTH`
+    deep) once every ``$ref`` is followed. What is validated is bounded by
+    :func:`instance_problem`.
     """
     if not isinstance(schema, Mapping):
         return [f"{where} must be an object"]
@@ -528,85 +603,55 @@ def schema_problems(schema: Any, where: str) -> list[str]:
         size = len(canonical_spec(schema).encode("utf-8"))
     except (TypeError, ValueError, RecursionError):
         return [f"{where} is not plain JSON"]
-    problems: list[str] = []
     if size > MAX_SCHEMA_BYTES:
-        problems.append(f"{where} exceeds {MAX_SCHEMA_BYTES // 1024} KiB")
-        return problems
-    problems += _regex_problems(schema, where)
-    dialect = schema.get("$schema")
-    if dialect is not None and dialect != _DIALECT:
-        problems.append(f"{where}.$schema is {_DIALECT} or absent")
-    definitions = {
-        keyword: schema.get(keyword)
-        for keyword in ("$defs", "definitions")
-        if isinstance(schema.get(keyword), Mapping)
-    }
-
-    def walk(node: Any, path: str, depth: int) -> None:
+        return [f"{where} exceeds {MAX_SCHEMA_BYTES // 1024} KiB"]
+    definitions = (
+        schema.get("$defs") if isinstance(schema.get("$defs"), Mapping) else {}
+    )
+    problems: list[str] = []
+    stack: list[tuple[Any, str, int]] = [(schema, where, 1)]
+    while stack:
+        node, path, depth = stack.pop()
         if isinstance(node, bool):
-            return
+            continue
         if not isinstance(node, Mapping):
             problems.append(f"{path} is not a schema")
-            return
+            continue
         if depth > MAX_SCHEMA_DEPTH:
             problems.append(f"{where} nests deeper than {MAX_SCHEMA_DEPTH} levels")
-            return
-        if "$schema" in node and depth > 1:
-            problems.append(f"{path}.$schema is the root's only")
-        for keyword in _COSTLY_KEYWORDS:
-            if keyword in node:
-                problems.append(
-                    f"{path} uses {keyword}: its cost grows faster than the "
-                    "document (use additionalProperties or items)"
-                )
-        if node.get("uniqueItems") is True:
-            problems.append(
-                f"{path} uses uniqueItems: its cost is quadratic in the array "
-                "(check it in the driver's check)"
-            )
-        if "$ref" in node:
-            ref = node["$ref"]
-            match = _LOCAL_REF.fullmatch(ref) if isinstance(ref, str) else None
-            if match is None:
-                problems.append(
-                    f"{path}.$ref must point inside the schema, at "
-                    "#/$defs/<name> or #/definitions/<name>"
-                )
-            elif match.group(2) not in definitions.get(match.group(1), {}):
-                problems.append(f"{path}.$ref names {ref}, which the schema lacks")
+            continue
         for keyword, value in node.items():
             at = f"{path}.{keyword}"
-            if keyword in _SUBSCHEMA_MAPS and isinstance(value, Mapping):
-                for name, child in value.items():
-                    walk(child, f"{at}.{name}", depth + 1)
-            elif keyword in _SUBSCHEMA_LISTS and isinstance(value, list):
-                for index, child in enumerate(value):
-                    walk(child, f"{at}[{index}]", depth + 1)
-            elif keyword in _SUBSCHEMAS:
-                if isinstance(value, list):
-                    for index, child in enumerate(value):
-                        walk(child, f"{at}[{index}]", depth + 1)
-                else:
-                    walk(value, at, depth + 1)
-
-    walk(schema, where, 1)
+            problem = _keyword_problem(
+                str(keyword), value, at, root=depth == 1, definitions=definitions
+            )
+            if problem is not None:
+                problems.append(problem)
+                continue
+            if keyword in ("properties", "$defs"):
+                stack.extend(
+                    (child, f"{at}.{name}", depth + 1) for name, child in value.items()
+                )
+            elif keyword in _COMBINATORS:
+                stack.extend(
+                    (child, f"{at}[{index}]", depth + 1)
+                    for index, child in enumerate(value)
+                )
+            elif keyword == "items":
+                stack.append((value, at, depth + 1))
     if not problems:
         problems += _cost_problems(schema, where)
     return list(dict.fromkeys(problems))
 
 
-def _applied(
-    node: Any,
-) -> tuple[int, int, list[tuple[tuple[str, str], int]], list[str]]:
+def _applied(node: Any) -> tuple[int, int, list[tuple[str, int]]]:
     """What validating against ``node`` applies without following a
-    ``$ref``: its schema nodes, how deep they nest, the references it makes
-    (each with the depth it is made at) and the keywords wider than
-    :data:`MAX_SCHEMA_WIDTH`. A nested ``$defs`` is applied only by
-    reference, so it is not counted here."""
+    ``$ref``: its schema nodes, how deep they nest, and the definitions it
+    references (each with the depth it is referenced at). ``$defs`` is
+    applied only by reference, so it is not counted here."""
     count = 0
     deepest = 0
-    refs: list[tuple[tuple[str, str], int]] = []
-    wide: list[str] = []
+    refs: list[tuple[str, int]] = []
     stack: list[tuple[Any, int]] = [(node, 1)]
     while stack:
         current, depth = stack.pop()
@@ -619,77 +664,58 @@ def _applied(
         ref = current.get("$ref")
         match = _LOCAL_REF.fullmatch(ref) if isinstance(ref, str) else None
         if match is not None:
-            refs.append(((match.group(1), match.group(2)), depth))
-        for keyword, value in current.items():
-            if keyword in ("$defs", "definitions"):
-                continue
-            if keyword in _SUBSCHEMA_MAPS and isinstance(value, Mapping):
-                stack.extend((child, depth + 1) for child in value.values())
-            elif keyword in _SUBSCHEMA_LISTS or (
-                keyword in _SUBSCHEMAS and isinstance(value, list)
-            ):
-                if isinstance(value, list):
-                    if len(value) > MAX_SCHEMA_WIDTH:
-                        wide.append(keyword)
-                    stack.extend((child, depth + 1) for child in value)
-            elif keyword in _SUBSCHEMAS:
-                stack.append((value, depth + 1))
-    return count, deepest, refs, wide
+            refs.append((match.group(1), depth))
+        properties = current.get("properties")
+        if isinstance(properties, Mapping):
+            stack.extend((child, depth + 1) for child in properties.values())
+        for keyword in _COMBINATORS:
+            if isinstance(current.get(keyword), list):
+                stack.extend((child, depth + 1) for child in current[keyword])
+        if "items" in current:
+            stack.append((current["items"], depth + 1))
+    return count, deepest, refs
 
 
 def _cost_problems(schema: Mapping[str, Any], where: str) -> list[str]:
-    """Why validating against ``schema`` could cost more than SRW allows:
-    a ``$ref`` that loops (a definition reaching itself), a combinator
-    wider than :data:`MAX_SCHEMA_WIDTH`, or more than
+    """Why validating against ``schema`` could cost more than SRW allows: a
+    ``$ref`` that loops (a definition reaching itself), or more than
     :data:`MAX_SCHEMA_NODES` schema nodes (or deeper than
     :data:`MAX_EXPANDED_DEPTH`) once every reference is followed, each
     definition's cost computed once."""
-    definitions = {
-        (keyword, str(name)): child
-        for keyword in ("$defs", "definitions")
-        if isinstance(schema.get(keyword), Mapping)
-        for name, child in schema[keyword].items()
-    }
-    local = {key: _applied(child) for key, child in definitions.items()}
-    root = _applied(schema)
-    problems = [
-        f"{where}: a {keyword} holds more than {MAX_SCHEMA_WIDTH} schemas"
-        for keyword in sorted(
-            set(root[3]).union(*(entry[3] for entry in local.values()))
-        )
-    ]
+    definitions = (
+        schema.get("$defs") if isinstance(schema.get("$defs"), Mapping) else {}
+    )
+    local = {str(name): _applied(child) for name, child in definitions.items()}
     # Each definition's cost once every reference is followed, computed in
     # dependency order (Kahn): one that never becomes computable loops.
-    cost: dict[tuple[str, str], tuple[int, int]] = {}
+    cost: dict[str, tuple[int, int]] = {}
     waiting = {
-        key: {target for target, _depth in entry[2] if target in local}
-        for key, entry in local.items()
+        name: {target for target, _depth in entry[2] if target in local}
+        for name, entry in local.items()
     }
-    users: dict[tuple[str, str], set[tuple[str, str]]] = {key: set() for key in local}
-    for key, targets in waiting.items():
+    users: dict[str, set[str]] = {name: set() for name in local}
+    for name, targets in waiting.items():
         for target in targets:
-            users[target].add(key)
-    ready = [key for key, targets in waiting.items() if not targets]
+            users[target].add(name)
+    ready = [name for name, targets in waiting.items() if not targets]
     cap = MAX_SCHEMA_NODES + 1
     while ready:
-        key = ready.pop()
-        count, deepest, refs, _wide = local[key]
+        name = ready.pop()
+        count, deepest, refs = local[name]
         for target, depth in refs:
             if target in cost:
                 count = min(cap, count + cost[target][0])
                 deepest = max(deepest, depth + cost[target][1])
-        cost[key] = (count, min(deepest, MAX_EXPANDED_DEPTH + 1))
-        for user in users[key]:
-            waiting[user].discard(key)
+        cost[name] = (count, min(deepest, MAX_EXPANDED_DEPTH + 1))
+        for user in users[name]:
+            waiting[user].discard(name)
             if not waiting[user]:
                 ready.append(user)
-    looping = sorted(f"#/{kind}/{name}" for kind, name in set(local) - set(cost))
+    looping = sorted(f"#/$defs/{name}" for name in set(local) - set(cost))
     if looping:
-        problems.append(
-            f"{where} has a $ref that loops (through {', '.join(looping[:5])})"
-        )
-        return problems
-    count, deepest, refs, _wide = root
+        return [f"{where} has a $ref that loops (through {', '.join(looping[:5])})"]
+    problems: list[str] = []
+    count, deepest, refs = _applied(schema)
     for target, depth in refs:
         if target in cost:
             count = min(cap, count + cost[target][0])
@@ -1130,6 +1156,7 @@ __all__ = [
     "MAX_BINDING_ENTRIES",
     "MAX_ENV_NAMES",
     "MAX_CONFIG_BYTES",
+    "MAX_ENUM",
     "MAX_EXPANDED_DEPTH",
     "MAX_IMAGE_FILE_PATH",
     "MAX_INSTANCE_NODES",
@@ -1138,6 +1165,8 @@ __all__ = [
     "MAX_SCHEMA_NODES",
     "MAX_SCHEMA_WIDTH",
     "RESERVED_NAMESPACE",
+    "SCHEMA_FORMATS",
+    "SCHEMA_KEYWORDS",
     "SPEC_KEYS",
     "canonical_spec",
     "custom_driver_problems",

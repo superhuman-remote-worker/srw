@@ -147,6 +147,7 @@ from orchestrator.services.connector_service_images import (
     ensure_image,
     resolve_driver_image,
 )
+from orchestrator.services.connector_schema_validation import ValidationUnavailable
 from orchestrator.services.connector_service_launch import ServiceLaunchError
 from orchestrator.services.pinned_k8s_effect import (
     run_bounded_k8s_call,
@@ -1193,18 +1194,19 @@ class CheckedImage:
 async def bounded_config_errors(schema: Mapping[str, Any], config: Any) -> list[str]:
     """:func:`config_errors` for a schema :func:`schema_problems` accepts:
     the config's size is bounded first (``instance_problem``), and the
-    validation runs off the event loop for at most ``VALIDATION_SECONDS``
-    (the thread cannot be stopped; the budgets keep it short)."""
+    validation runs in a validation thread
+    (``connector_schema_validation.run_validation``: a few at once, for at
+    most ``VALIDATION_SECONDS``). Raises ``ValidationUnavailable`` when no
+    slot frees in time or the validation outlasts its deadline: the caller
+    retries (a transient failure), never refuses the image for it."""
+    from orchestrator.services.connector_schema_validation import run_validation
+
     problem = instance_problem(config, "the config", max_bytes=MAX_CONFIG_BYTES)
     if problem is not None:
         return [problem]
-    try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(config_errors, schema, config),
-            timeout=VALIDATION_SECONDS,
-        )
-    except (TimeoutError, asyncio.TimeoutError):
-        return [f"validating it took longer than {VALIDATION_SECONDS:g} s"]
+    return await run_validation(
+        config_errors, schema, config, timeout=VALIDATION_SECONDS
+    )
 
 
 async def check_image(
@@ -1400,7 +1402,7 @@ async def _run_bind(
     except ServiceImageRefused as exc:
         await fail("config", str(exc))
         return
-    except ServiceImageUnavailable as exc:
+    except (ServiceImageUnavailable, ValidationUnavailable) as exc:
         await fail("transient", str(exc))
         return
     if checked.problems or checked.spec is None:
@@ -2195,7 +2197,7 @@ async def run_check(
         checked = await check_image(runtime, registration, str(row["id"]))
     except ServiceImageRefused as exc:
         return {"status": "error", "message": str(exc), "error_class": "config"}
-    except ServiceImageUnavailable as exc:
+    except (ServiceImageUnavailable, ValidationUnavailable) as exc:
         return {"status": "error", "message": str(exc), "error_class": "transient"}
     if checked.problems or checked.spec is None:
         return {

@@ -435,7 +435,7 @@ class TestRegistration:
                         "properties": {"a": {"type": "string", "pattern": "^(a+)+$"}},
                     }
                 },
-                "regular expression",
+                "not a keyword a registered schema may use",
             ),
         ],
     )
@@ -2751,6 +2751,10 @@ class TestTheReReview2Nits:
             {"type": "object"}, {"a": [1] * MAX_INSTANCE_NODES}
         )
         assert errors and "more than" in errors[0]
+        from orchestrator.services.connector_schema_validation import (
+            ValidationTimeout,
+        )
+
         with (
             mock.patch.object(bind_time, "VALIDATION_SECONDS", 0.05),
             mock.patch.object(
@@ -2758,6 +2762,27 @@ class TestTheReReview2Nits:
                 "config_errors",
                 side_effect=lambda schema, config: __import__("time").sleep(0.3) or [],
             ),
+            pytest.raises(ValidationTimeout),
         ):
-            errors = await bind_time.bounded_config_errors({"type": "object"}, {})
-        assert errors == ["validating it took longer than 0.05 s"]
+            await bind_time.bounded_config_errors({"type": "object"}, {})
+
+    async def test_a_busy_validation_retries_the_bind_never_refuses_it(
+        self, db, registry
+    ):
+        from orchestrator.services.connector_schema_validation import ValidationBusy
+
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        operations = FakeOperations({"bind": _bound(ENV)})
+        _runtime(db, operations)
+        job = await _job(db, "created", connector=connector)
+        with mock.patch.object(
+            bind_time, "check_image", side_effect=ValidationBusy("busy; retry")
+        ):
+            await bind_time.job_bind_gate({"id": job})
+            await _settled()
+        row = await _binding(db)
+        assert row["status"] == "failed"
+        assert row["error_class"] == "transient" and row["retry_at"] is not None
+        assert operations.calls == []

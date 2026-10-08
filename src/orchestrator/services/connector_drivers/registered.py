@@ -20,7 +20,6 @@ so by capability.
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from typing import Any, Protocol, runtime_checkable
@@ -168,9 +167,12 @@ class RegisteredImageDriver(RegisteredDriverHost):
         max_bytes: int | None = None,
     ) -> None:
         """Refuse ``value`` that ``schema`` refuses. The validation is
-        bounded before it runs (the schema's cost, :func:`schema_problems`;
-        the value's size, :func:`instance_problem`) and runs off the event
-        loop, for at most :data:`VALIDATION_SECONDS`."""
+        bounded before it runs (the schema's keywords and cost,
+        :func:`schema_problems`; the value's size, :func:`instance_problem`)
+        and runs in a validation thread
+        (``connector_schema_validation.run_validation``: a few at once, for
+        at most :data:`VALIDATION_SECONDS`); a busy or slow one is a 503 to
+        retry."""
         # Registration refused these; a stored schema is never run unread.
         if schema_problems(schema, what):
             raise HTTPException(
@@ -181,16 +183,18 @@ class RegisteredImageDriver(RegisteredDriverHost):
         problem = instance_problem(value, f"The {what}", max_bytes=max_bytes)
         if problem is not None:
             raise HTTPException(status_code=400, detail=problem)
+        from orchestrator.services.connector_schema_validation import (
+            ValidationUnavailable,
+            run_validation,
+        )
+
         try:
-            error = await asyncio.wait_for(
-                asyncio.to_thread(_first_error, schema, value),
-                timeout=VALIDATION_SECONDS,
+            error = await run_validation(
+                _first_error, schema, value, timeout=VALIDATION_SECONDS
             )
-        except (TimeoutError, asyncio.TimeoutError):
+        except ValidationUnavailable as exc:
             raise HTTPException(
-                status_code=400,
-                detail=f"Validating the {what} took longer than "
-                f"{VALIDATION_SECONDS:g} s",
+                status_code=503, detail=f"The {what} could not be validated: {exc}"
             ) from None
         except _InvalidSchema:
             raise HTTPException(

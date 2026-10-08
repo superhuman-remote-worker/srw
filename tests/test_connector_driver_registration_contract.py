@@ -554,10 +554,16 @@ class TestRegisteredSchemas:
         }
         assert schema_problems(schema, "s") == []
 
-    def test_a_regex_string_anywhere_is_refused_belt_and_braces(self):
-        """Whatever key holds it: a ``$ref`` could make any mapping a schema."""
-        schema = {"type": "object", "default": {"pattern": "^(a+)+$"}}
-        assert any("pattern" in p for p in schema_problems(schema, "s"))
+    def test_an_annotation_s_value_is_data(self):
+        """With the allowlist a ``$ref`` reaches only ``$defs``, every one of
+        them checked: what ``default`` or ``examples`` holds is never a
+        schema, whatever keys it has."""
+        schema = {
+            "type": "object",
+            "default": {"pattern": "^(a+)+$"},
+            "examples": [{"$ref": "#/elsewhere"}],
+        }
+        assert schema_problems(schema, "s") == []
 
     def test_a_reference_stays_inside_the_schema(self):
         assert schema_problems({"$ref": "#/$defs/x", "$defs": {"x": {}}}, "s") == []
@@ -916,13 +922,17 @@ class TestAReferenceReachesOnlyWhatWasChecked:
             "type": "object",
             "properties": {
                 "a": {"$ref": "#/$defs/host"},
-                "b": {"$ref": "#/definitions/port"},
+                "b": {"$ref": "#/$defs/port"},
             },
-            "$defs": {"host": {"type": "string", "maxLength": 253}},
-            "definitions": {"port": {"type": "integer"}},
+            "$defs": {
+                "host": {"type": "string", "maxLength": 253},
+                "port": {"type": "integer"},
+            },
         }
         assert schema_problems(schema, "s") == []
         assert _problems(config_schema=schema) == []
+        legacy = {**schema, "definitions": {"port": {"type": "integer"}}}
+        assert any("definitions" in p for p in schema_problems(legacy, "s"))
 
     @pytest.mark.asyncio
     async def test_the_registered_driver_never_runs_an_unsafe_stored_schema(self):
@@ -937,7 +947,7 @@ class TestAReferenceReachesOnlyWhatWasChecked:
         )
 
         value = _json(config_schema=REF_ESCAPES["ref_to_unknown_key"])
-        assert any("pattern" in p for p in _problems(**value))
+        assert _problems(**value)
 
         class Registration:
             spec = spec_from_json(value)
@@ -1247,7 +1257,8 @@ class TestAValidationsCostIsBounded:
                 await driver._refuse_invalid({"type": "object"}, {}, "config")
         finally:
             running.cancel()
-        assert caught.value.status_code == 400
+        # Too slow is SRW's trouble, never the caller's mistake: retry.
+        assert caught.value.status_code == 503
         assert "took longer than" in caught.value.detail
         assert seen and seen[0] != loop_thread
         # The loop kept running while the validation did.
@@ -1414,3 +1425,306 @@ class TestTheListsReach:
         doc = " ".join(env_names.__doc__.split())
         assert "credential-shaped" in doc
         assert "CODE_ENV" in doc
+
+
+# =============================================================================
+# The allowlist (D6 schema round)
+# =============================================================================
+
+#: Every keyword the allowlist refuses, with a value of its own shape.
+REFUSED_KEYWORDS = {
+    "pattern": "^a$",
+    "patternProperties": {"^a": {"type": "string"}},
+    "multipleOf": 3,
+    "not": {"type": "string"},
+    "if": {"type": "string"},
+    "then": {"type": "string"},
+    "else": {"type": "string"},
+    "dependentSchemas": {"a": {"required": ["b"]}},
+    "dependentRequired": {"a": ["b"]},
+    "dependencies": {"a": ["b"]},
+    "contains": {"type": "string"},
+    "minContains": 1,
+    "maxContains": 2,
+    "propertyNames": {"maxLength": 3},
+    "uniqueItems": True,
+    "unevaluatedProperties": False,
+    "unevaluatedItems": False,
+    "prefixItems": [{"type": "string"}],
+    "additionalItems": False,
+    "contentSchema": {"type": "string"},
+    "contentMediaType": "application/json",
+    "contentEncoding": "base64",
+    "definitions": {"a": {"type": "string"}},
+    "$id": "https://example.com/s",
+    "$anchor": "a",
+    "$dynamicAnchor": "a",
+    "$dynamicRef": "#a",
+    "$recursiveAnchor": True,
+    "$recursiveRef": "#",
+    "$vocabulary": {"https://example.com": True},
+    "x-anything": 1,
+}
+
+
+def _placed(where: str, keyword: str, value) -> dict:
+    """A schema holding ``keyword`` at ``where``: the root, a property, an
+    array's items, a combinator's branch, or a referenced definition."""
+    inner = {"type": "string", keyword: value}
+    if where == "root":
+        return {"type": "object", keyword: value}
+    if where == "property":
+        return {"type": "object", "properties": {"a": inner}}
+    if where == "items":
+        return {
+            "type": "object",
+            "properties": {"a": {"type": "array", "items": inner}},
+        }
+    if where == "combinator":
+        return {
+            "type": "object",
+            "properties": {"a": {"anyOf": [{"type": "integer"}, inner]}},
+        }
+    return {
+        "type": "object",
+        "properties": {"a": {"$ref": "#/$defs/d"}},
+        "$defs": {"d": inner},
+    }
+
+
+PLACES = ("root", "property", "items", "combinator", "definition")
+
+
+class TestTheKeywordAllowlist:
+    @pytest.mark.parametrize("place", PLACES)
+    @pytest.mark.parametrize("keyword", sorted(REFUSED_KEYWORDS))
+    def test_every_refused_keyword_is_refused_anywhere(self, keyword, place):
+        schema = _placed(place, keyword, REFUSED_KEYWORDS[keyword])
+        problems = schema_problems(schema, "s")
+        assert any(keyword in p for p in problems), problems
+        # In a config schema and a credential slot alike.
+        assert _problems(config_schema=schema)
+        slot = copy.deepcopy(EXAMPLE["credential_slots"][0])
+        slot["schema"] = copy.deepcopy(schema)
+        assert _problems(credential_slots=[slot])
+
+    def test_every_allowed_keyword_together_is_fine(self):
+        from shared.connectors.registration import SCHEMA_KEYWORDS
+
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$comment": "every allowed keyword",
+            "title": "Config",
+            "description": "d",
+            "type": "object",
+            "additionalProperties": False,
+            "minProperties": 0,
+            "maxProperties": 10,
+            "required": ["host"],
+            "default": {},
+            "examples": [{"host": "h"}],
+            "properties": {
+                "host": {
+                    "type": "string",
+                    "format": "hostname",
+                    "minLength": 1,
+                    "maxLength": 253,
+                    "x-srw-order": 1,
+                    "x-srw-group": "Server",
+                },
+                "port": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65535,
+                    "exclusiveMinimum": 0,
+                    "exclusiveMaximum": 65536,
+                },
+                "mode": {"enum": ["a", "b", None, 1, True]},
+                "fixed": {"const": "x", "readOnly": True, "deprecated": True},
+                "token": {
+                    "type": "string",
+                    "writeOnly": True,
+                    "x-srw-widget": "password",
+                },
+                "notes": {"type": "string", "x-srw-multiline": True},
+                "tags": {
+                    "type": "array",
+                    "minItems": 0,
+                    "maxItems": 5,
+                    "items": {"$ref": "#/$defs/tag"},
+                },
+                "either": {"oneOf": [{"type": "string"}, {"type": "integer"}]},
+                "both": {"allOf": [{"type": "string"}, {"maxLength": 9}]},
+                "any": {"anyOf": [{"type": "null"}, {"type": "boolean"}]},
+            },
+            "$defs": {"tag": {"type": "string", "maxLength": 32}},
+        }
+        assert schema_problems(schema, "s") == []
+        used = set()
+        stack = [schema]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                used.update(key for key in node if key in SCHEMA_KEYWORDS)
+                for key in ("properties", "$defs"):
+                    stack.extend((node.get(key) or {}).values())
+                stack.extend(node.get(key) for key in ("items",) if key in node)
+                for key in ("allOf", "anyOf", "oneOf"):
+                    stack.extend(node.get(key) or [])
+        assert used == set(SCHEMA_KEYWORDS)
+
+    @pytest.mark.parametrize(
+        ("schema", "needle"),
+        [
+            (
+                {"type": "object", "additionalProperties": {"type": "string"}},
+                "true or false",
+            ),
+            ({"type": "array", "items": [{"type": "string"}]}, "one schema"),
+            ({"enum": [{"a": 1}]}, "strings, numbers"),
+            ({"enum": list(range(257))}, "more than 256"),
+            ({"const": {"a": 1}}, "a string, a number"),
+            ({"format": "regex"}, "is one of"),
+            ({"format": "idn-email"}, "is one of"),
+            ({"type": "decimal"}, "JSON types"),
+            ({"minLength": -1}, "non-negative"),
+            ({"maxLength": True}, "non-negative"),
+            ({"minimum": "1"}, "a number"),
+            ({"required": "a"}, "property names"),
+            ({"anyOf": []}, "lists schemas"),
+            (
+                {"properties": {"a": {"$defs": {"b": {}}, "type": "string"}}},
+                "the root's only",
+            ),
+            (
+                {
+                    "properties": {
+                        "a": {"$schema": "https://json-schema.org/draft/2020-12/schema"}
+                    }
+                },
+                "the root's only",
+            ),
+        ],
+    )
+    def test_an_allowed_keyword_takes_only_its_cheap_shape(self, schema, needle):
+        problems = schema_problems(schema, "s")
+        assert any(needle in p for p in problems), problems
+
+    def test_formats_are_annotations_srw_never_asserts(self):
+        """SRW's validator runs without a format checker: an allowed format
+        costs nothing, and refuses nothing."""
+        from jsonschema import Draft202012Validator
+
+        from shared.connectors.registration import SCHEMA_FORMATS
+
+        for name in SCHEMA_FORMATS:
+            validator = Draft202012Validator({"type": "string", "format": name})
+            assert validator.format_checker is None
+            assert list(validator.iter_errors("not a " + name)) == []
+
+
+class TestValidationsRunInABoundedPool:
+    @pytest.mark.asyncio
+    async def test_concurrent_slow_validations_never_exceed_the_cap(self, monkeypatch):
+        import asyncio
+        import threading
+        import time
+
+        from orchestrator.services import connector_schema_validation as pool
+
+        monkeypatch.setattr(pool, "SLOT_WAIT_SECONDS", 5.0)
+        lock = threading.Lock()
+        active = 0
+        peak = 0
+
+        def slow():
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.15)
+            with lock:
+                active -= 1
+            return "ok"
+
+        results = await asyncio.gather(
+            *(pool.run_validation(slow, timeout=5.0) for _ in range(7))
+        )
+        assert results == ["ok"] * 7
+        assert peak <= pool.SLOTS
+
+    @pytest.mark.asyncio
+    async def test_no_free_slot_in_time_is_busy(self, monkeypatch):
+        import asyncio
+        import time
+
+        from orchestrator.services import connector_schema_validation as pool
+
+        monkeypatch.setattr(pool, "SLOT_WAIT_SECONDS", 0.05)
+        outcomes = await asyncio.gather(
+            *(
+                pool.run_validation(lambda: time.sleep(0.4), timeout=5.0)
+                for _ in range(pool.SLOTS + 1)
+            ),
+            return_exceptions=True,
+        )
+        busy = [o for o in outcomes if isinstance(o, pool.ValidationBusy)]
+        assert len(busy) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_timed_out_validation_keeps_its_slot_until_its_thread_ends(
+        self, monkeypatch
+    ):
+        import asyncio
+        import threading
+        import time
+
+        from orchestrator.services import connector_schema_validation as pool
+
+        monkeypatch.setattr(pool, "SLOT_WAIT_SECONDS", 0.05)
+        release = threading.Event()
+        stuck = [
+            asyncio.create_task(pool.run_validation(release.wait, timeout=0.05))
+            for _ in range(pool.SLOTS)
+        ]
+        for task in stuck:
+            with pytest.raises(pool.ValidationTimeout):
+                await task
+        # The callers gave up; their threads still run, so every slot is
+        # still taken: no third validation starts beside them.
+        with pytest.raises(pool.ValidationBusy):
+            await pool.run_validation(lambda: "never", timeout=1.0)
+        release.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                assert await pool.run_validation(lambda: "ran", timeout=1.0) == "ran"
+                break
+            except pool.ValidationBusy:
+                continue
+        else:
+            raise AssertionError("the slots were never released")
+
+    @pytest.mark.asyncio
+    async def test_a_busy_registered_validation_is_a_503(self, monkeypatch):
+        from fastapi import HTTPException
+
+        from orchestrator.services import connector_schema_validation as pool
+        from orchestrator.services.connector_drivers.registered import (
+            RegisteredImageDriver,
+        )
+
+        async def busy(*_args, **_kwargs):
+            raise pool.ValidationBusy("SRW is busy validating; retry shortly")
+
+        monkeypatch.setattr(pool, "run_validation", busy)
+
+        class Registration:
+            spec = _spec()
+            image_reference = "ghcr.io/acme/driver:1"
+
+        driver = RegisteredImageDriver(Registration())
+        with pytest.raises(HTTPException) as caught:
+            await driver._refuse_invalid({"type": "object"}, {}, "config")
+        assert caught.value.status_code == 503
+        assert "retry" in caught.value.detail
