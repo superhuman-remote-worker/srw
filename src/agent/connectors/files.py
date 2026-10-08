@@ -2,28 +2,31 @@
 
 The files go to the workspace the shell runs in, for jobs and sessions
 alike, and never to the agent pod. Each file's contents go, with the mode
-its connector names, into a private store under ``~/.srw-credentials/``
-over the backend's secret stdin channel
+its connector names (never an execute bit), into a private store under
+``~/.srw-credentials/`` over the backend's secret stdin channel
 (``RemoteBackend.install_credential_files``); its target path becomes a
 symlink to it. A snapshot never captures the store, only the links.
 
-The orchestrator stores each target resolved against ``/home/srw``
-(:data:`AGENT_HOME`); here it becomes the same path under the workspace
-home. A target outside the home, inside SRW's own credential namespaces, or
-on a file the shell or sshd runs is refused, and a target that already
-exists is left alone (the contents still reach the store).
+The orchestrator stores each target resolved against ``/home/srw``; here it
+becomes the same path under the workspace home, if the credential-file
+allowlist (:mod:`shared.connectors.file_targets`) permits it. The
+orchestrator refuses anything else when a connector is saved; a row saved
+before that rule is skipped here and the README says why. A target that
+already holds a file of the user's is left alone (the contents still reach
+the store).
 
-Every delivery syncs the whole current set: a live detach removes a file,
-and a backend swap writes the set again on the new host before the old one
-retires. The files live as long as the workspace does, as the environment
-file does; an ended execution does not reach back into a workspace whose
-shell it has already torn down.
+Every delivery on a shell workspace syncs the whole current set, empty or
+not: a detach, live or between attaches, removes the file and empties the
+variable that named it, and a backend swap writes the set again on the new
+host before the old one retires. The terminal shell retirement removes them
+with the work item (``RemoteBackend.shell_cleanup``).
 
 An entry's ``transform`` and ``merge_group`` carry what used to be a
 kubeconfig type check: kubeconfig names are prefixed with the connector's
 slug, and every kubeconfig is merged into one config that ``KUBECONFIG``
-names and ``~/.kube/config`` links to (unless the home has its own). An
-entry's ``env_var`` names the file in the shell's environment.
+names (ahead of the user's own ``~/.kube/config``, if there is one) and
+``~/.kube/config`` links to otherwise. An entry's ``env_var`` names the file
+in the shell's environment, unless another connector already set it.
 """
 
 from __future__ import annotations
@@ -32,39 +35,22 @@ import hashlib
 import logging
 import posixpath
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from agent.connectors.base import AGENT_HOME, Delivery, FactsLines, RuntimeContext
+from agent.connectors.base import Delivery, FactsLines, RuntimeContext
 from agent.connectors.legacy import unreadable_file_modes
+from shared.connectors.file_targets import mode_problem, safe_mode, target_problem
 from shared.credential_connectors import normalize_credential_env
 
 logger = logging.getLogger(__name__)
 
-#: Home-relative targets a connector never links: shell and sshd start-up
-#: files, and the tmux configuration SRW's shell runs with.
-REFUSED_TARGETS: frozenset[str] = frozenset(
-    {
-        ".bashrc",
-        ".bash_profile",
-        ".bash_login",
-        ".bash_logout",
-        ".profile",
-        ".tmux.conf",
-        ".ssh/rc",
-        ".ssh/environment",
-        ".ssh/authorized_keys",
-        ".ssh/authorized_keys2",
-    }
-)
-#: Home-relative directories SRW owns: the credential store and the
-#: managed repositories' ssh-agent namespace.
-REFUSED_ROOTS: tuple[str, ...] = (".srw-credentials", ".ssh/srw-managed")
-
 #: The merged kubeconfig, in the store and at its link.
 MERGED_KUBECONFIG = "kubeconfig"
 MERGED_KUBECONFIG_LINK = ".kube/config"
+#: The variable the kubeconfig merge owns.
+KUBECONFIG_VAR = "KUBECONFIG"
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -81,20 +67,7 @@ def _ds_slug_hyphen(name: str) -> str:
 
 def home_target(path: str) -> tuple[str | None, str | None]:
     """``(home-relative target, None)``, or ``(None, why it is refused)``."""
-    if path.startswith("~/"):
-        relative = path[2:]
-    elif path.startswith(AGENT_HOME + "/"):
-        relative = path[len(AGENT_HOME) + 1 :]
-    else:
-        return None, "outside the home"
-    relative = posixpath.normpath(relative)
-    if relative in ("", ".") or relative == ".." or relative.startswith("../"):
-        return None, "outside the home"
-    if relative in REFUSED_TARGETS or any(
-        relative == root or relative.startswith(root + "/") for root in REFUSED_ROOTS
-    ):
-        return None, "reserved by the workspace"
-    return relative, None
+    return target_problem(path)
 
 
 def _store_name(relative: str) -> str:
@@ -198,15 +171,23 @@ class CredentialFilePlan:
     """What one sync sends to the workspace.
 
     ``files`` is the backend's list (``name``, ``content``, ``mode``,
-    ``link``); ``env`` maps a variable to the store names it lists (a
-    ``KUBECONFIG`` that could not merge lists every kubeconfig).
+    ``link``); ``env`` its variables (``name``, ``files``: the store names
+    the variable lists, ``append``: a home path listed after them if it holds
+    a file of the user's). A ``KUBECONFIG`` whose kubeconfigs could not merge
+    lists every kubeconfig.
     """
 
     files: list[dict[str, Any]] = field(default_factory=list)
-    env: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    env: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def env_names(self) -> list[str]:
+        return [item["name"] for item in self.env]
 
 
 def _usable_env_name(name: str) -> bool:
+    if name == KUBECONFIG_VAR:
+        return False
     try:
         normalize_credential_env({name: ""})
     except ValueError:
@@ -225,6 +206,7 @@ def plan_credential_files(
 
     plan = CredentialFilePlan()
     targets: set[str] = set()
+    named: set[str] = set()
     groups: dict[str, list[tuple[str, str]]] = {}
     for delivery in deliveries:
         name = delivery.name
@@ -253,12 +235,20 @@ def plan_credential_files(
             bad_mode = bad_modes[index] if index < len(bad_modes) else None
             if bad_mode is not None:
                 warn("Bad mode %r on '%s'; using 0600", bad_mode, name)
+            mode = int(value.get("mode", 0o600))
+            if mode_problem(mode) is not None:
+                warn(
+                    "Mode %04o on '%s' grants more than read and write; using %04o",
+                    mode,
+                    name,
+                    safe_mode(mode),
+                )
             stored = _store_name(relative)
             plan.files.append(
                 {
                     "name": stored,
                     "content": contents,
-                    "mode": int(value.get("mode", 0o600)),
+                    "mode": safe_mode(mode),
                     "link": relative,
                 }
             )
@@ -266,10 +256,11 @@ def plan_credential_files(
             if env_var:
                 if not _usable_env_name(env_var):
                     warn("Skipping %s for '%s': the name is reserved", env_var, name)
-                elif env_var in plan.env:
+                elif env_var in named:
                     warn("Skipping %s for '%s': already set", env_var, name)
                 else:
-                    plan.env[env_var] = (stored,)
+                    named.add(env_var)
+                    plan.env.append({"name": env_var, "files": [stored]})
             group = value.get("merge_group")
             if group:
                 groups.setdefault(group, []).append((stored, contents))
@@ -277,11 +268,9 @@ def plan_credential_files(
     kubeconfigs = groups.get("kubeconfig")
     if kubeconfigs:
         merged = merge_kubeconfigs([contents for _stored, contents in kubeconfigs])
-        if "KUBECONFIG" in plan.env:
-            warn("KUBECONFIG names the merged kubeconfig, not a connector file")
         if merged is None:
             warn("Kubeconfigs could not be merged; KUBECONFIG lists each file")
-            plan.env["KUBECONFIG"] = tuple(stored for stored, _ in kubeconfigs)
+            files = [stored for stored, _ in kubeconfigs]
         else:
             plan.files.append(
                 {
@@ -291,44 +280,48 @@ def plan_credential_files(
                     "link": MERGED_KUBECONFIG_LINK,
                 }
             )
-            plan.env["KUBECONFIG"] = (MERGED_KUBECONFIG,)
+            files = [MERGED_KUBECONFIG]
+        # The user's own ~/.kube/config, if the merged one could not take its
+        # place, stays visible after the connectors' contexts.
+        plan.env.append(
+            {"name": KUBECONFIG_VAR, "files": files, "append": MERGED_KUBECONFIG_LINK}
+        )
     return plan
 
 
 def sync_credential_files(
-    deliveries: Sequence[Delivery],
-    backend: Any,
-    *,
-    retired_env: Sequence[str] = (),
-) -> None:
+    deliveries: Sequence[Delivery], backend: Any
+) -> dict[str, Any] | None:
     """Make the workspace hold exactly the deliveries' files.
 
-    ``retired_env`` names variables an earlier delivery set and this one no
-    longer does: they are emptied, since the environment file only merges.
+    The workspace program empties a variable an earlier sync set and this
+    one does not, from its own record, and never overwrites one another
+    connector set. Returns its report.
     """
     plan = plan_credential_files(deliveries)
-    store = backend.install_credential_files(plan.files)
-    env = {
-        name: ":".join(posixpath.join(store, stored) for stored in names)
-        for name, names in plan.env.items()
-    }
-    env.update({name: "" for name in retired_env if name not in env})
-    if env:
-        backend.install_credential_environment(env)
+    report = backend.install_credential_files(plan.files, plan.env)
+    report = report if isinstance(report, Mapping) else {}
+    skipped = report.get("skipped") or {}
+    env_skipped = report.get("env_skipped") or {}
+    for link, reason in skipped.items():
+        logger.warning("Credential file not linked at ~/%s: %s", link, reason)
+    for name, reason in env_skipped.items():
+        logger.warning("Credential file variable %s not set: %s", name, reason)
     logger.info(
-        "Credential files in the workspace: %d file(s), variables %s",
+        "Credential files in the workspace: %d file(s), %d linked, variables %s",
         len(plan.files),
-        sorted(plan.env) or "none",
+        len(report.get("linked") or ()),
+        sorted(report.get("env") or ()) or "none",
     )
+    return dict(report)
 
 
-def _deliver(
-    deliveries: Sequence[Delivery],
-    backend: Any,
-    *,
-    retired_env: Sequence[str] = (),
-) -> None:
-    """Best effort: a file that cannot be delivered never fails the work."""
+def _deliver(deliveries: Sequence[Delivery], backend: Any) -> None:
+    """Best effort: a file that cannot be delivered never fails the work.
+
+    Runs on every shell workspace, with or without deliveries, so what an
+    earlier attach left behind goes once its connector is gone.
+    """
     if backend is None or not getattr(backend, "supports_shell", False):
         if deliveries:
             logger.warning(
@@ -337,7 +330,7 @@ def _deliver(
             )
         return
     try:
-        sync_credential_files(deliveries, backend, retired_env=retired_env)
+        sync_credential_files(deliveries, backend)
     except Exception as e:
         logger.warning("Failed to deliver credential files to the workspace: %s", e)
 
@@ -346,8 +339,7 @@ class CredentialFileMaterializer:
     form = "credential_file"
 
     def materialize(self, deliveries: Sequence[Delivery], rt: RuntimeContext) -> None:
-        if deliveries:
-            _deliver(deliveries, rt.workspace_backend)
+        _deliver(deliveries, rt.workspace_backend)
 
     def replace(
         self,
@@ -355,38 +347,34 @@ class CredentialFileMaterializer:
         new: Sequence[Delivery],
         rt: RuntimeContext,
     ) -> None:
-        if not old and not new:
-            return
-        before = plan_credential_files(old, quiet=True).env
-        after = plan_credential_files(new, quiet=True).env
-        _deliver(
-            new,
-            rt.workspace_backend,
-            retired_env=[name for name in before if name not in after],
-        )
+        _deliver(new, rt.workspace_backend)
 
     def on_backend_swap(self, deliveries: Sequence[Delivery], backend: Any) -> None:
-        if deliveries:
-            _deliver(deliveries, backend)
+        _deliver(deliveries, backend)
 
     def facts(
         self, deliveries: Sequence[Delivery], rt: RuntimeContext
     ) -> list[FactsLines]:
+        report = _report(rt)
         out: list[FactsLines] = []
         for delivery in deliveries:
             name = delivery.name
             values = delivery.values("credential_file")
             if _files_slot_kind(delivery) == "kubeconfig":
-                slug = _ds_slug_hyphen(name)
-                line = (
-                    f"- **{name}** (kubeconfig) — merged into `~/.kube/config`; "
-                    f"contexts prefixed `{slug}-*`. Try `kubectl config get-contexts`."
-                )
+                line = _kubeconfig_line(name, values, report)
             else:
-                paths = ", ".join(_fact_path(value) for value in values) or "<none>"
+                paths = (
+                    ", ".join(_fact_path(value, report) for value in values) or "<none>"
+                )
                 line = f"- **{name}** (file) — {paths}"
             out.append(FactsLines("Credential Files", delivery.index, [line]))
         return out
+
+
+def _report(rt: RuntimeContext) -> Mapping[str, Any]:
+    """The last sync's report on this workspace (empty before any sync)."""
+    report = getattr(rt.workspace_backend, "credential_files_report", None)
+    return report if isinstance(report, Mapping) else {}
 
 
 def _files_slot_kind(delivery: Delivery) -> str | None:
@@ -398,11 +386,51 @@ def _files_slot_kind(delivery: Delivery) -> str | None:
     )
 
 
-def _fact_path(value: Any) -> str:
+def _kubeconfig_line(
+    name: str, values: Sequence[Mapping[str, Any]], report: Mapping[str, Any]
+) -> str:
+    refused = [
+        (str(value.get("path") or ""), problem)
+        for value in values
+        for _relative, problem in [home_target(str(value.get("path") or ""))]
+        if problem is not None
+    ]
+    if values and len(refused) == len(values):
+        path, problem = refused[0]
+        return f"- **{name}** (kubeconfig) — `{path}` not delivered: {problem}"
+    skipped = report.get("skipped") or {}
+    env_skipped = report.get("env_skipped") or {}
+    if KUBECONFIG_VAR in env_skipped:
+        where = (
+            "merged into `~/.kube/config` (`$KUBECONFIG` is another connector's)"
+            if MERGED_KUBECONFIG_LINK not in skipped
+            else "merged, but `~/.kube/config` and `$KUBECONFIG` are taken"
+        )
+    elif MERGED_KUBECONFIG_LINK in skipped:
+        where = "merged into `$KUBECONFIG`, ahead of your own `~/.kube/config`"
+    else:
+        where = "merged into `~/.kube/config`"
+    slug = _ds_slug_hyphen(name)
+    return (
+        f"- **{name}** (kubeconfig) — {where}; contexts prefixed `{slug}-*`. "
+        "Try `kubectl config get-contexts`."
+    )
+
+
+def _fact_path(value: Mapping[str, Any], report: Mapping[str, Any]) -> str:
     path = str(value.get("path") or "")
     relative, refused = home_target(path)
     if relative is None:
         return f"`{path}` (not delivered: {refused})"
     env_var = value.get("env_var")
     named = bool(env_var) and _usable_env_name(env_var)
-    return f"`~/{relative}`" + (f" (`${env_var}`)" if named else "")
+    taken = named and env_var in (report.get("env_skipped") or {})
+    skipped = (report.get("skipped") or {}).get(relative)
+    notes: list[str] = []
+    if skipped:
+        notes.append(f"not linked: {skipped}")
+    if named and not taken:
+        notes.append(f"`${env_var}`")
+    elif taken:
+        notes.append(f"`${env_var}` is another connector's")
+    return f"`~/{relative}`" + (f" ({'; '.join(notes)})" if notes else "")

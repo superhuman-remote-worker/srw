@@ -2,17 +2,17 @@
 
 The validator (``orchestrator/security/credential_files.py``, separately
 tested) resolves and stores each ``target_path`` against ``/home/srw``. The
-materializer maps it to the same path under the workspace home, plans the
-store names, the kubeconfig merge and the environment variables, and hands
-the whole set to the workspace backend (slice D1d). The workspace program
-itself is pinned in ``tests/test_workspace_credential_files.py``; the end to
-end tests here drive it through a ``RemoteBackend`` whose secret stdin
-channel is a local shell, with synthetic values only.
+materializer maps it to the same path under the workspace home if the
+credential-file allowlist permits it, plans the store names, the kubeconfig
+merge and the variables, and hands the whole set to the workspace backend
+on every delivery (slice D1d). The workspace program itself is pinned in
+``tests/test_workspace_credential_files.py``; the end to end tests here
+drive it through a ``RemoteBackend`` whose secret stdin channel is a local
+shell, with synthetic values only.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import shlex
@@ -27,7 +27,6 @@ import yaml
 from agent.connectors import RuntimeContext, deliveries_from_payload
 from agent.connectors.files import (
     MERGED_KUBECONFIG,
-    REFUSED_TARGETS,
     CredentialFileMaterializer,
     _prefix_kubeconfig_yaml,
     home_target,
@@ -35,6 +34,7 @@ from agent.connectors.files import (
     plan_credential_files,
 )
 from shared.runtime.core.backends.remote import RemoteBackend
+from shared.runtime.core.credential_env import WORKSPACE_PYTHON
 from tests._connector_goldens import resolved_row
 
 
@@ -71,40 +71,48 @@ def _file_row(name: str, *files: dict) -> dict:
     return {"type": "generic_file", "name": name, "credentials": {"files": list(files)}}
 
 
+def _env(plan) -> dict[str, list[str]]:
+    return {item["name"]: list(item["files"]) for item in plan.env}
+
+
 # =============================================================================
 # Targets
 # =============================================================================
 
 
 class TestHomeTarget:
+    """The shared allowlist decides (``tests/test_credential_file_targets.py``)."""
+
     @pytest.mark.parametrize(
         ("path", "relative"),
         [
             ("/home/srw/.kube/configs/a.yaml", ".kube/configs/a.yaml"),
             ("~/.config/gcloud/sa.json", ".config/gcloud/sa.json"),
-            ("/home/srw/./x/../y", "y"),
+            ("/home/srw/./.srw-files/x/../y", ".srw-files/y"),
         ],
     )
-    def test_a_home_path_maps_under_the_workspace_home(self, path, relative):
+    def test_an_allowed_home_path_maps_under_the_workspace_home(self, path, relative):
         assert home_target(path) == (relative, None)
 
     @pytest.mark.parametrize(
-        "path",
-        ["/tmp/x", "/workspace/x", "/run/x", "/home/srw", "/home/srw/../x", ""],
+        "path", ["/tmp/x", "/workspace/x", "/run/x", "/home/srw", "/home/srw/../x"]
     )
     def test_a_path_outside_the_home_is_refused(self, path):
         assert home_target(path) == (None, "outside the home")
 
     @pytest.mark.parametrize(
-        "relative",
-        sorted(REFUSED_TARGETS)
-        + [".srw-credentials/x.sh", ".srw-credentials", ".ssh/srw-managed/config"],
+        "path",
+        [
+            "/home/srw/.ssh/config",
+            "/home/srw/.ssh/srw-managed/config",
+            "/home/srw/.bashrc",
+            "/home/srw/.local/bin/git",
+            "/home/srw/.srw-credentials/x.sh",
+            "/home/srw/workspace/x",
+        ],
     )
-    def test_srw_and_start_up_files_are_reserved(self, relative):
-        assert home_target(f"/home/srw/{relative}") == (
-            None,
-            "reserved by the workspace",
-        )
+    def test_anything_off_the_allowlist_is_refused(self, path):
+        assert home_target(path) == (None, "not a credential-file location")
 
 
 # =============================================================================
@@ -157,7 +165,6 @@ class TestMergeKubeconfigs:
 
 # =============================================================================
 # The plan
-# =============================================================================
 
 
 class TestPlan:
@@ -173,7 +180,7 @@ class TestPlan:
         assert len(set(names)) == 2
         assert all(not name.startswith(".") and "/" not in name for name in names)
         assert names[0].endswith("-sa.json")
-        assert plan.env == {"GOOGLE_APPLICATION_CREDENTIALS": (names[0],)}
+        assert _env(plan) == {"GOOGLE_APPLICATION_CREDENTIALS": [names[0]]}
 
     def test_store_names_are_stable_per_target(self):
         rows = [resolved_row("generic_file")]
@@ -197,7 +204,14 @@ class TestPlan:
         assert (merged["name"], merged["mode"]) == (MERGED_KUBECONFIG, 0o600)
         contexts = [c["name"] for c in yaml.safe_load(merged["content"])["contexts"]]
         assert contexts == ["prod-eu-default", "staging-default"]
-        assert plan.env == {"KUBECONFIG": (MERGED_KUBECONFIG,)}
+        # The user's own ~/.kube/config stays visible after the merged one.
+        assert plan.env == [
+            {
+                "name": "KUBECONFIG",
+                "files": [MERGED_KUBECONFIG],
+                "append": ".kube/config",
+            }
+        ]
 
     def test_kubeconfigs_that_cannot_merge_are_each_listed(self, caplog):
         broken = _kube_row("Broken", "x", "t")
@@ -210,15 +224,20 @@ class TestPlan:
             ".kube/configs/good.yaml",
             ".kube/configs/broken.yaml",
         ]
-        assert plan.env == {"KUBECONFIG": tuple(f["name"] for f in plan.files)}
+        assert _env(plan) == {"KUBECONFIG": [f["name"] for f in plan.files]}
         assert "could not be merged" in caplog.text
 
     def test_refused_and_duplicate_targets_are_skipped(self, caplog):
+        """Rows saved before the allowlist: skipped, never delivered."""
         rows = [
             _file_row(
                 "Mixed",
                 {"contents": "a", "target_path": "/tmp/outside", "mode": "0600"},
-                {"contents": "b", "target_path": "/home/srw/.bashrc", "mode": "0600"},
+                {
+                    "contents": "b",
+                    "target_path": "/home/srw/.ssh/config",
+                    "mode": "0600",
+                },
                 {"contents": "c", "target_path": "/home/srw/.netrc", "mode": "0600"},
             ),
             _file_row(
@@ -230,38 +249,34 @@ class TestPlan:
             plan = plan_credential_files(deliveries_from_payload(rows))
         assert [(f["link"], f["content"]) for f in plan.files] == [(".netrc", "c")]
         assert "outside the home" in caplog.text
-        assert "reserved by the workspace" in caplog.text
+        assert "not a credential-file location" in caplog.text
         assert "already delivers ~/.netrc" in caplog.text
 
-    def test_a_reserved_or_repeated_variable_is_skipped(self, caplog):
+    def test_a_reserved_repeated_or_kubeconfig_variable_is_skipped(self, caplog):
         rows = [
             _file_row(
                 "Vars",
-                {
-                    "contents": "a",
-                    "target_path": "/home/srw/a",
-                    "mode": "0600",
-                    "env_var": "PATH",
-                },
-                {
-                    "contents": "b",
-                    "target_path": "/home/srw/b",
-                    "mode": "0600",
-                    "env_var": "TOOL_CONFIG",
-                },
-                {
-                    "contents": "c",
-                    "target_path": "/home/srw/c",
-                    "mode": "0600",
-                    "env_var": "TOOL_CONFIG",
-                },
+                *(
+                    {
+                        "contents": letter,
+                        "target_path": f"/home/srw/.srw-files/{letter}",
+                        "mode": "0600",
+                        "env_var": name,
+                    }
+                    for letter, name in (
+                        ("a", "PATH"),
+                        ("b", "TOOL_CONFIG"),
+                        ("c", "TOOL_CONFIG"),
+                        ("d", "KUBECONFIG"),
+                    )
+                ),
             )
         ]
         with caplog.at_level(logging.WARNING):
             plan = plan_credential_files(deliveries_from_payload(rows))
-        assert list(plan.env) == ["TOOL_CONFIG"]
-        assert plan.env["TOOL_CONFIG"] == (plan.files[1]["name"],)
+        assert _env(plan) == {"TOOL_CONFIG": [plan.files[1]["name"]]}
         assert "PATH" in caplog.text and "reserved" in caplog.text
+        assert "KUBECONFIG for 'Vars': the name is reserved" in caplog.text
 
     def test_a_bad_file_mode_warns_and_falls_back_to_0600(self, caplog):
         """The warning the agent always gave for an unreadable mode."""
@@ -272,9 +287,17 @@ class TestPlan:
         assert "Bad mode '0999'" in caplog.text
         assert plan.files[0]["mode"] == 0o600
 
+    def test_an_execute_bit_saved_before_the_rule_is_dropped(self, caplog):
+        row = resolved_row("generic_file")
+        row["credentials"]["files"][0]["mode"] = "0755"
+        with caplog.at_level(logging.WARNING):
+            plan = plan_credential_files(deliveries_from_payload([row]))
+        assert plan.files[0]["mode"] == 0o644
+        assert "grants more than read and write" in caplog.text
+
     def test_an_ssh_key_is_never_a_credential_file(self):
         plan = plan_credential_files(deliveries_from_payload([resolved_row("ssh_key")]))
-        assert plan.files == [] and plan.env == {}
+        assert plan.files == [] and plan.env == []
 
 
 # =============================================================================
@@ -284,20 +307,20 @@ class TestPlan:
 
 class _Backend:
     supports_shell = True
+    store = "/home/agent-host/.srw-credentials/files-x"
 
-    def __init__(self, *, fail: bool = False):
-        self.files: list[list[dict]] = []
-        self.env: list[dict[str, str]] = []
+    def __init__(self, *, fail: bool = False, report: dict | None = None):
+        self.calls: list[tuple[list[dict], list[dict]]] = []
         self.fail = fail
+        self.report = report or {}
+        self.credential_files_report: dict | None = None
 
-    def install_credential_files(self, files):
+    def install_credential_files(self, files, env=()):
         if self.fail:
             raise RuntimeError("workspace gone")
-        self.files.append(list(files))
-        return "/home/agent-host/.srw-credentials/files-x"
-
-    def install_credential_environment(self, values):
-        self.env.append(dict(values))
+        self.calls.append((list(files), list(env)))
+        self.credential_files_report = {"store": self.store, **self.report}
+        return self.credential_files_report
 
 
 def _rt(backend: Any) -> RuntimeContext:
@@ -307,7 +330,7 @@ def _rt(backend: Any) -> RuntimeContext:
 
 
 class TestMaterializer:
-    def test_materialize_syncs_the_set_and_points_variables_at_the_store(self):
+    def test_materialize_syncs_the_files_and_their_variables(self):
         backend = _Backend()
         CredentialFileMaterializer().materialize(
             deliveries_from_payload(
@@ -315,19 +338,20 @@ class TestMaterializer:
             ),
             _rt(backend),
         )
-        (files,) = backend.files
+        ((files, env),) = backend.calls
         assert len(files) == 4
-        (env,) = backend.env
-        store = "/home/agent-host/.srw-credentials/files-x"
-        assert env["KUBECONFIG"] == f"{store}/{MERGED_KUBECONFIG}"
-        assert env["GOOGLE_APPLICATION_CREDENTIALS"] == f"{store}/{files[0]['name']}"
+        assert [item["name"] for item in env] == [
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "KUBECONFIG",
+        ]
 
-    def test_nothing_to_deliver_touches_no_workspace(self):
+    def test_every_entry_point_syncs_a_shell_workspace_even_with_nothing(self):
+        """A connector removed between attaches leaves nothing behind."""
         backend = _Backend()
         CredentialFileMaterializer().materialize([], _rt(backend))
         CredentialFileMaterializer().replace([], [], _rt(backend))
         CredentialFileMaterializer().on_backend_swap([], backend)
-        assert backend.files == [] and backend.env == []
+        assert backend.calls == [([], [])] * 3
 
     @pytest.mark.parametrize(
         "backend",
@@ -339,7 +363,8 @@ class TestMaterializer:
             CredentialFileMaterializer().materialize(
                 deliveries_from_payload([resolved_row("generic_file")]), _rt(backend)
             )
-        assert "need a sandbox or VM workspace" in caplog.text
+            CredentialFileMaterializer().materialize([], _rt(backend))
+        assert caplog.text.count("need a sandbox or VM workspace") == 1
 
     def test_a_failed_delivery_never_fails_the_work(self, caplog):
         with caplog.at_level(logging.WARNING):
@@ -349,35 +374,53 @@ class TestMaterializer:
             )
         assert "Failed to deliver credential files" in caplog.text
 
-    def test_a_live_detach_syncs_the_rest_and_empties_retired_variables(self):
+    def test_a_live_detach_syncs_what_remains(self):
         backend = _Backend()
         old = deliveries_from_payload(
             [resolved_row("generic_file"), _kube_row("Kube", "a", "t")]
         )
         new = deliveries_from_payload([resolved_row("generic_file")])
         CredentialFileMaterializer().replace(old, new, _rt(backend))
-        (files,) = backend.files
+        ((files, env),) = backend.calls
         assert [f["link"] for f in files] == [
             ".config/gcloud/sa.json",
             ".config/gcloud/ca.pem",
         ]
-        (env,) = backend.env
-        assert env["KUBECONFIG"] == ""
-        assert env["GOOGLE_APPLICATION_CREDENTIALS"].endswith("-sa.json")
-
-    def test_detaching_the_last_file_empties_the_store(self):
-        backend = _Backend()
-        old = deliveries_from_payload([_kube_row("Kube", "a", "t")])
-        CredentialFileMaterializer().replace(old, [], _rt(backend))
-        assert backend.files == [[]]
-        assert backend.env == [{"KUBECONFIG": ""}]
+        assert [item["name"] for item in env] == ["GOOGLE_APPLICATION_CREDENTIALS"]
 
     def test_a_backend_swap_delivers_onto_the_new_backend(self):
         backend = _Backend()
         CredentialFileMaterializer().on_backend_swap(
             deliveries_from_payload([_kube_row("Kube", "a", "t")]), backend
         )
-        assert len(backend.files) == 1 and backend.env
+        assert len(backend.calls) == 1 and backend.calls[0][1]
+
+    def test_skipped_links_and_variables_are_logged(self, caplog):
+        backend = _Backend(
+            report={
+                "skipped": {".kube/config": "a file of the user is there"},
+                "env_skipped": {"KUBECONFIG": "set by another connector"},
+            }
+        )
+        with caplog.at_level(logging.WARNING):
+            CredentialFileMaterializer().materialize(
+                deliveries_from_payload([_kube_row("Kube", "a", "t")]), _rt(backend)
+            )
+        assert "not linked at ~/.kube/config: a file of the user is there" in (
+            caplog.text
+        )
+        assert "KUBECONFIG not set: set by another connector" in caplog.text
+
+
+class TestFacts:
+    def _facts(self, rows, backend=None):
+        return [
+            line
+            for fact in CredentialFileMaterializer().facts(
+                deliveries_from_payload(rows), _rt(backend)
+            )
+            for line in fact.lines
+        ]
 
     def test_the_readme_names_home_paths_and_what_is_not_delivered(self):
         """The workspace home is not /home/srw: the README says ``~``."""
@@ -390,24 +433,80 @@ class TestMaterializer:
                 "env_var": "NETRC",
             },
             {"contents": "b", "target_path": "/tmp/outside", "mode": "0600"},
+            {"contents": "c", "target_path": "/home/srw/.ssh/config", "mode": "0600"},
             {
-                "contents": "c",
-                "target_path": "/home/srw/x",
+                "contents": "d",
+                "target_path": "/home/srw/.srw-files/x",
                 "mode": "0600",
                 "env_var": "PATH",
             },
         )
-        (fact,) = CredentialFileMaterializer().facts(
-            deliveries_from_payload([row]), _rt(None)
-        )
-        assert fact.lines == [
+        assert self._facts([row]) == [
             "- **Mixed** (file) — `~/.netrc` (`$NETRC`), "
-            "`/tmp/outside` (not delivered: outside the home), `~/x`"
+            "`/tmp/outside` (not delivered: outside the home), "
+            "`/home/srw/.ssh/config` (not delivered: not a credential-file "
+            "location), `~/.srw-files/x`"
+        ]
+
+    def test_the_readme_says_what_the_last_sync_could_not_place(self):
+        backend = _Backend(
+            report={
+                "skipped": {".netrc": "a file of the user is there"},
+                "env_skipped": {"TOOL": "set by another connector"},
+            }
+        )
+        row = _file_row(
+            "Logins",
+            {
+                "contents": "a",
+                "target_path": "/home/srw/.netrc",
+                "mode": "0600",
+                "env_var": "NETRC",
+            },
+            {
+                "contents": "b",
+                "target_path": "/home/srw/.pgpass",
+                "mode": "0600",
+                "env_var": "TOOL",
+            },
+        )
+        backend.credential_files_report = {"store": backend.store, **backend.report}
+        assert self._facts([row], backend) == [
+            "- **Logins** (file) — `~/.netrc` (not linked: a file of the user is "
+            "there; `$NETRC`), `~/.pgpass` (`$TOOL` is another connector's)"
+        ]
+
+    @pytest.mark.parametrize(
+        ("report", "where"),
+        [
+            ({}, "merged into `~/.kube/config`"),
+            (
+                {"skipped": {".kube/config": "a file of the user is there"}},
+                "merged into `$KUBECONFIG`, ahead of your own `~/.kube/config`",
+            ),
+            (
+                {"env_skipped": {"KUBECONFIG": "set by another connector"}},
+                "merged into `~/.kube/config` (`$KUBECONFIG` is another connector's)",
+            ),
+        ],
+    )
+    def test_the_kubeconfig_line_follows_the_last_sync(self, report, where):
+        backend = _Backend()
+        backend.credential_files_report = report
+        assert self._facts([_kube_row("Kube", "a", "t")], backend) == [
+            f"- **Kube** (kubeconfig) — {where}; contexts prefixed `kube-*`. "
+            "Try `kubectl config get-contexts`."
+        ]
+
+    def test_a_kubeconfig_saved_off_the_allowlist_is_not_delivered(self):
+        row = _kube_row("Kube", "a", "t", target_path="/tmp/kube.yaml")
+        assert self._facts([row]) == [
+            "- **Kube** (kubeconfig) — `/tmp/kube.yaml` not delivered: outside the home"
         ]
 
 
 # =============================================================================
-# End to end: the real workspace programs behind a RemoteBackend
+# End to end: the real workspace program behind a RemoteBackend
 # =============================================================================
 
 
@@ -418,21 +517,21 @@ def workspace(tmp_path: Path, monkeypatch):
     backend = RemoteBackend(host="unused", job_id="job-d1d")
     monkeypatch.setattr(backend, "_init_shell", lambda: None)
     monkeypatch.setattr(backend, "_get_home_dir", lambda: str(home))
-    monkeypatch.setattr(
-        backend, "_resolve_home_path", lambda relative: str(home / relative)
-    )
     sent: list[tuple[str, str]] = []
 
     def send(command, secret, **kwargs):
         sent.append((command, secret))
-        return (
-            subprocess.run(
-                ["bash", "-c", command], input=secret, text=True, capture_output=True
-            ).returncode
-            == 0
+        completed = subprocess.run(
+            ["bash", "-c", command.replace(WORKSPACE_PYTHON, "python3 -I")],
+            input=secret,
+            text=True,
+            capture_output=True,
         )
+        return completed.returncode, completed.stdout
 
-    monkeypatch.setattr(backend, "execute_claim_resource_with_secret_stdin", send)
+    monkeypatch.setattr(
+        backend, "execute_claim_resource_with_secret_stdin_output", send
+    )
     return SimpleNamespace(home=home, backend=backend, sent=sent)
 
 
@@ -460,7 +559,6 @@ def test_a_job_and_a_session_find_their_files_through_the_shell(workspace):
     contexts = [c["name"] for c in yaml.safe_load(kubeconfig)["contexts"]]
     assert contexts == ["prod-eu-default", "staging-default"]
     assert (home / ".kube/config").is_symlink()
-    assert yaml.safe_load((home / ".kube/config").read_text())["contexts"]
     staging = yaml.safe_load((home / ".kube/configs/staging.yaml").read_text())
     assert staging["current-context"] == "staging-default"
     assert _shell(workspace, 'cat "$GOOGLE_APPLICATION_CREDENTIALS"') == (
@@ -471,14 +569,30 @@ def test_a_job_and_a_session_find_their_files_through_the_shell(workspace):
     assert all(
         (path.stat().st_mode & 0o777) in (0o600, 0o644)
         for path in store.rglob("*")
-        if path.is_file() and path.suffix != ".sh"
+        if path.is_file()
     )
     # Contents travel on stdin, never in a command.
     for command, _secret in workspace.sent:
         assert "token-a" not in command and "service_account" not in command
 
 
-def test_a_live_detach_removes_the_files_and_the_variable(workspace):
+def test_the_users_own_kubeconfig_stays_in_kubeconfig(workspace):
+    (workspace.home / ".kube").mkdir()
+    (workspace.home / ".kube/config").write_text("the user's own\n")
+    CredentialFileMaterializer().materialize(
+        deliveries_from_payload([_kube_row("Kube", "a", "t")]),
+        _rt(workspace.backend),
+    )
+    value = _shell(workspace, 'printf %s "$KUBECONFIG"')
+    merged, own = value.split(":")
+    assert merged.endswith("/kubeconfig") and own == str(
+        workspace.home / ".kube/config"
+    )
+    assert (workspace.home / ".kube/config").read_text() == "the user's own\n"
+
+
+def test_a_detach_between_attaches_removes_the_files_and_the_variable(workspace):
+    """No live diff: the next attach's sync, from the workspace's own record."""
     kube = _kube_row("Kube", "a", "t")
     files = resolved_row("generic_file")
     materializer = CredentialFileMaterializer()
@@ -487,16 +601,15 @@ def test_a_live_detach_removes_the_files_and_the_variable(workspace):
     )
     assert (workspace.home / ".kube/config").exists()
 
-    materializer.replace(
-        deliveries_from_payload([kube, files]),
-        deliveries_from_payload([files]),
-        _rt(workspace.backend),
-    )
+    # The kubeconfig connector was removed while the session was idle.
+    materializer.materialize(deliveries_from_payload([files]), _rt(workspace.backend))
     assert not os.path.lexists(workspace.home / ".kube/config")
     assert not (workspace.home / ".kube").exists()
     assert _shell(workspace, 'printf %s "${KUBECONFIG-unset}"') == ""
     assert (workspace.home / ".config/gcloud/sa.json").exists()
 
-    materializer.replace(deliveries_from_payload([files]), [], _rt(workspace.backend))
+    materializer.materialize([], _rt(workspace.backend))
     assert not os.path.lexists(workspace.home / ".config/gcloud/sa.json")
-    assert json.loads(workspace.sent[-2][1]) == []
+    assert (
+        _shell(workspace, 'printf %s "${GOOGLE_APPLICATION_CREDENTIALS-unset}"') == ""
+    )

@@ -356,7 +356,7 @@ step by step.
 | sshd on port 30022 with SRW's key, certificate and principals settings; `ssh-keygen`; the sftp server | readiness, file tools, host identity |
 | An entrypoint that installs the key from `/tmp/ssh-pubkey`, generates host keys and starts sshd | readiness |
 | `tmux`, `bash`, `flock`, `timeout`, `mktemp`, `grep`, `awk`, `sed` | shell tools and attach |
-| `python3` | ending a workspace, installing credentials, restoring snapshots |
+| `python3`, also at `/usr/bin/python3` | ending a workspace, installing credentials (always `/usr/bin/python3`), restoring snapshots |
 | `tar`, `zstd` | suspend and restore |
 | `git`, `ssh-agent`, `ssh-add` | git versioning and repository datasources |
 | code-server on port 38080 with `auth: password` and the `HASHED_PASSWORD` value SRW injects; without that value it must not start | the Session IDE, and recovery after an aborted attach |

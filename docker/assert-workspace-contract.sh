@@ -88,8 +88,10 @@ for binary in "tmux" "bash" "flock" "timeout" "mktemp" "grep" "awk" "sed"; do
     _check "$binary"               _on_path "$binary"
 done
 
-# End and cleanup proofs, credential install, snapshot restore.
+# End and cleanup proofs, credential install, snapshot restore. Credential
+# installs run the absolute interpreter, never one found on PATH.
 _check "python3"                   _on_path "python3"
+_check "/usr/bin/python3"          test -x /usr/bin/python3
 
 # Suspend, restore and IDE state.
 _check "tar"                       _on_path "tar"

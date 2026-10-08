@@ -3,18 +3,25 @@
 Only the program and destination paths appear in the command. Values travel
 in stdin. Environment values are retained in the session workspace as
 explicitly agreed for v1; credential files are synced (removed once no
-longer delivered).
+longer delivered) and retired with the work item.
 
-Everything both programs write lives under ``~/.srw-credentials/``, which a
-workspace snapshot never captures (``CREDENTIAL_EXCLUDE_PATTERNS`` in
-``orchestrator.services.snapshot_service``).
+Everything both programs write lives under ``~/.srw-credentials/`` (0700),
+which a workspace snapshot never captures (``CREDENTIAL_EXCLUDE_PATTERNS`` in
+``orchestrator.services.snapshot_service``). Both run as
+``/usr/bin/python3 -I`` (:data:`WORKSPACE_PYTHON`), never a ``python3`` found
+on the workspace's ``PATH`` or a site directory the workspace can write: the
+secrets on their stdin must not reach a planted interpreter or ``.pth`` file.
 """
+
+#: The interpreter the programs run with: absolute, in isolated mode.
+WORKSPACE_PYTHON = "/usr/bin/python3 -I"
 
 INSTALL_CREDENTIAL_ENV = r"""
 import json, os, pathlib, shlex, sys, tempfile
 
 target = pathlib.Path(sys.argv[1])
 target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+os.chmod(target.parent, 0o700)
 state = target.with_suffix('.json')
 values = json.loads(state.read_text()) if state.exists() else {}
 values.update(json.load(sys.stdin))
@@ -33,33 +40,54 @@ for path, contents in (
             os.unlink(temporary)
 """
 
-#: Sync one work item's credential files into the workspace home.
+#: Sync, or retire, one work item's credential files in the workspace home.
 #:
-#: ``argv``: the home directory and the store's name. ``stdin``: a JSON list
-#: of ``{"name", "content", "mode", "link"}``. Each file is written, with its
-#: mode, into ``~/.srw-credentials/<store>/`` (0700). ``link``, if given, is
-#: a home-relative path that becomes a symlink to the file. A link replaces
-#: nothing but a link into this store or a stale link into another one (a
-#: restored snapshot keeps links, never the store), and never lands outside
-#: the home or inside ``~/.srw-credentials``. What an earlier sync of the
-#: same store placed and this one does not is removed, with the directories
-#: it created once they are empty; an empty list removes the store.
+#: ``argv``: the home, the store's name (``files-<identity>``) and ``sync``
+#: or ``retire``. ``sync`` reads ``{"files": [...], "env": [...]}`` on stdin.
+#: Each file (``name``, ``content``, ``mode``, ``link``) is written into
+#: ``~/.srw-credentials/<store>/`` with its mode, never an execute bit;
+#: ``link``, if given, is a home-relative path that becomes a symlink to it.
+#: A link replaces nothing but a link into this store or a stale link into
+#: another (a restored snapshot keeps links, never the store), never lands
+#: outside the home or inside ``~/.srw-credentials``, and never passes
+#: through a symlinked directory. A link that cannot be placed is skipped
+#: with its reason; the others still are.
+#:
+#: Each ``env`` item (``name``, ``files``, ``append``) sets a variable in the
+#: work item's environment file (``~/.srw-credentials/<identity>.sh``) to its
+#: stored files, colon-separated, then ``append`` (a home-relative path) if
+#: that path exists and is not this store's link. A variable belongs to the
+#: sync only while that file holds what the sync last wrote: one another
+#: connector set is skipped, never overwritten. A variable an earlier sync
+#: set and this one does not is emptied.
+#:
+#: What an earlier sync placed and this one does not is removed, with the
+#: directories it created once they are empty. The state (links, directories,
+#: variables) is ``<store>/.links.json``, always written. ``retire`` removes
+#: the links, the store and the work item's environment file. Both print one
+#: JSON line naming paths and variables only, never contents.
 INSTALL_CREDENTIAL_FILES = r"""
-import json, os, sys, tempfile
+import json, os, shlex, shutil, sys, tempfile
 
 home = os.path.normpath(sys.argv[1])
+store_name = sys.argv[2]
+action = sys.argv[3]
+if not store_name.startswith('files-') or '/' in store_name or action not in ('sync', 'retire'):
+    sys.exit(3)
 root = os.path.join(home, '.srw-credentials')
-store = os.path.join(root, sys.argv[2])
+store = os.path.join(root, store_name)
 prefix = store + '/'
-files = json.load(sys.stdin)
+real_prefix = os.path.join(os.path.realpath(root), store_name) + '/'
+env_sh = os.path.join(root, store_name[len('files-'):] + '.sh')
+env_json = env_sh[:-3] + '.json'
 
 
 def inside(path, base):
     return path == base or path.startswith(base + '/')
 
 
-def write(path, contents, mode):
-    fd, temporary = tempfile.mkstemp(dir=store, prefix='.write-')
+def write(directory, path, contents, mode):
+    fd, temporary = tempfile.mkstemp(dir=directory, prefix='.write-')
     try:
         os.fchmod(fd, mode)
         with os.fdopen(fd, 'w', encoding='utf-8') as output:
@@ -71,7 +99,10 @@ def write(path, contents, mode):
 
 
 def ours(path):
-    return os.path.islink(path) and os.readlink(path).startswith(prefix)
+    if not os.path.islink(path):
+        return False
+    target = os.readlink(path)
+    return target.startswith(prefix) or target.startswith(real_prefix)
 
 
 def stale(path):
@@ -82,17 +113,70 @@ def stale(path):
     )
 
 
+def load(path, default):
+    try:
+        with open(path, encoding='utf-8') as handle:
+            value = json.load(handle)
+        return value if isinstance(value, type(default)) else default
+    except (OSError, ValueError):
+        return default
+
+
+def unlink_ours(links):
+    for link in links:
+        path = os.path.join(home, link)
+        try:
+            if ours(path):
+                os.unlink(path)
+        except OSError:
+            pass
+
+
+def prune(directories):
+    left = []
+    for directory in sorted(set(directories), key=len, reverse=True):
+        path = os.path.join(home, directory)
+        try:
+            os.rmdir(path)
+        except OSError:
+            if os.path.isdir(path):
+                left.append(directory)
+    return left
+
+
+placed = load(os.path.join(store, '.links.json'), {})
+previous_links = [link for link in placed.get('links', []) if isinstance(link, str)]
+previous_env = {
+    name: value
+    for name, value in (placed.get('env') or {}).items()
+    if isinstance(name, str) and isinstance(value, str)
+}
+
+if action == 'retire':
+    unlink_ours(previous_links)
+    prune(placed.get('dirs', []))
+    shutil.rmtree(store, ignore_errors=True)
+    for path in (env_sh, env_json):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    print(json.dumps({'retired': True, 'links': sorted(previous_links)}))
+    sys.exit(0)
+
+request = json.load(sys.stdin)
+files = request.get('files') or []
+wanted_env = request.get('env') or []
+if not files and not wanted_env and not os.path.isdir(store):
+    print(json.dumps({'store': store, 'linked': [], 'skipped': {}, 'env': [],
+                      'env_skipped': {}, 'env_retired': [],
+                      'env_file': os.path.exists(env_sh)}))
+    sys.exit(0)
+
 os.makedirs(root, mode=0o700, exist_ok=True)
+os.chmod(root, 0o700)
 os.makedirs(store, mode=0o700, exist_ok=True)
 os.chmod(store, 0o700)
-real_home = os.path.realpath(home)
-real_root = os.path.realpath(root)
-state = os.path.join(store, '.links.json')
-try:
-    with open(state, encoding='utf-8') as handle:
-        placed = json.load(handle)
-except (OSError, ValueError):
-    placed = {}
 
 names, links = set(), {}
 for item in files:
@@ -100,62 +184,114 @@ for item in files:
     if not name or '/' in name or name.startswith('.'):
         sys.exit(3)
     names.add(name)
-    write(os.path.join(store, name), item['content'], item['mode'] & 0o777)
+    write(store, os.path.join(store, name), item['content'], item['mode'] & 0o666)
     if item.get('link'):
         links[item['link']] = os.path.join(store, name)
 
-for link in placed.get('links', []):
-    path = os.path.join(home, link)
-    if link not in links and ours(path):
-        os.unlink(path)
+unlink_ours(link for link in previous_links if link not in links)
 for entry in os.listdir(store):
     if entry in names or (entry.startswith('.') and not entry.startswith('.write-')):
         continue
-    os.unlink(os.path.join(store, entry))
+    try:
+        os.unlink(os.path.join(store, entry))
+    except OSError:
+        pass
 
-kept, made = [], list(placed.get('dirs', []))
-for link, target in links.items():
+
+def place(link, target, made):
     if os.path.isabs(link):
-        continue
+        return 'outside the home'
     path = os.path.normpath(os.path.join(home, link))
     if path == home or not inside(path, home):
-        continue
+        return 'outside the home'
+    if inside(path, root):
+        return 'inside the credential store'
     parent = os.path.dirname(path)
-    missing, probe = [], parent
-    while not os.path.lexists(probe):
-        missing.append(probe)
-        probe = os.path.dirname(probe)
-    real = os.path.realpath(probe)
-    if not inside(real, real_home) or inside(real, real_root):
-        continue
-    for directory in reversed(missing):
+    # Every existing component between the home and the link must be a real
+    # directory: a symlinked one could lead anywhere.
+    probe, missing = home, []
+    for part in os.path.relpath(parent, home).split('/'):
+        if part in ('', '.'):
+            continue
+        probe = os.path.join(probe, part)
+        if os.path.islink(probe):
+            return 'a directory on the way is a symlink'
+        if not os.path.lexists(probe):
+            missing.append(probe)
+        elif not os.path.isdir(probe):
+            return 'a file is in the way'
+    for directory in missing:
         os.mkdir(directory, 0o700)
         made.append(os.path.relpath(directory, home))
-    real = os.path.realpath(parent)
-    if not inside(real, real_home) or inside(real, real_root):
-        continue
     if os.path.lexists(path) and not ours(path) and not stale(path):
-        continue
+        return 'a file of the user is there'
     temporary = os.path.join(parent, '.srw-link-' + os.urandom(8).hex())
     os.symlink(target, temporary)
-    os.replace(temporary, path)
-    kept.append(link)
-
-left = []
-for directory in sorted(set(made), key=len, reverse=True):
     try:
-        os.rmdir(os.path.join(home, directory))
+        os.replace(temporary, path)
     except OSError:
-        if os.path.isdir(os.path.join(home, directory)):
-            left.append(directory)
+        os.unlink(temporary)
+        raise
+    return None
 
-if names:
-    write(state, json.dumps({'links': kept, 'dirs': left}), 0o600)
+
+kept, skipped, made = [], {}, list(placed.get('dirs', []))
+for link, target in links.items():
+    try:
+        reason = place(link, target, made)
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+    if reason is None:
+        kept.append(link)
+    else:
+        skipped[link] = reason
+left = prune(made)
+
+values = load(env_json, {})
+env, env_skipped, env_set = {}, {}, []
+for item in wanted_env:
+    name = item['name']
+    current = values.get(name)
+    # An empty variable is nobody's (a sync empties what it retires).
+    if current and previous_env.get(name) != current:
+        env_skipped[name] = 'set by another connector'
+        continue
+    parts = [os.path.join(store, stored) for stored in item.get('files') or []]
+    extra = item.get('append')
+    if extra:
+        path = os.path.join(home, extra)
+        if os.path.lexists(path) and not ours(path):
+            parts.append(path)
+    env[name] = ':'.join(parts)
+    env_set.append(name)
+retired = []
+for name, value in previous_env.items():
+    if name in env:
+        continue
+    if values.get(name) == value:
+        env[name] = ''
+        if value:
+            retired.append(name)
+values.update(env)
+if env or os.path.exists(env_json):
+    write(root, env_json, json.dumps(values), 0o600)
+    write(root, env_sh, ''.join('export ' + key + '=' + shlex.quote(value) + '\n'
+                                for key, value in values.items()), 0o600)
+
+state = {'links': kept, 'dirs': left, 'env': env}
+if names or kept or any(env.values()):
+    write(store, os.path.join(store, '.links.json'), json.dumps(state), 0o600)
 else:
-    if os.path.exists(state):
-        os.unlink(state)
+    try:
+        os.unlink(os.path.join(store, '.links.json'))
+    except OSError:
+        pass
     try:
         os.rmdir(store)
     except OSError:
-        pass
+        write(store, os.path.join(store, '.links.json'), json.dumps(state), 0o600)
+print(json.dumps({'store': store, 'linked': sorted(kept), 'skipped': skipped,
+                  'env': sorted(env_set), 'env_skipped': env_skipped,
+                  'env_retired': sorted(retired),
+                  'env_file': os.path.exists(env_sh)}))
 """

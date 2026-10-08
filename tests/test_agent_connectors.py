@@ -329,8 +329,7 @@ def test_credential_files_go_to_the_workspace_backend():
     synced: list = []
     backend = SimpleNamespace(
         supports_shell=True,
-        install_credential_files=lambda files: synced.append(files) or "/s",
-        install_credential_environment=lambda values: None,
+        install_credential_files=lambda files, env: synced.append(files) or {},
     )
     rt = RuntimeContext(
         execution="session", workspace_manager=SimpleNamespace(backend=backend)

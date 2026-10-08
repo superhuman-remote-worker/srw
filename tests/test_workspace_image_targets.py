@@ -198,6 +198,8 @@ def test_the_contract_script_is_installed_and_checks_the_contract():
     ):
         assert setting in script, setting
     assert "1.70.0" in script and "1.13" in script
+    # Credential installs run /usr/bin/python3 -I, never PATH's python3.
+    assert "test -x /usr/bin/python3" in script
 
 
 def test_tilt_sends_the_contract_script_to_the_build():

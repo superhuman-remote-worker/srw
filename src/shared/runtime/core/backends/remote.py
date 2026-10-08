@@ -463,6 +463,8 @@ class RemoteBackend(WorkspaceBackend):
         self._remote_root = workspace_path.rstrip("/")
         self._job_id = job_id
         self._credential_env_path: str | None = None
+        #: The last credential-file sync's report (paths and names only).
+        self.credential_files_report: dict[str, Any] | None = None
         self._scrollback_limit = scrollback_limit
         self._default_timeout = default_timeout
         self._no_change_timeout = no_change_timeout
@@ -1254,8 +1256,48 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         """
 
         del operation  # retained for call-site audit symmetry
+        returncode, _output = self._claim_resource_secret_stdin_exec(
+            command, secret, timeout=timeout, keep_stdout=False
+        )
+        return returncode == 0
+
+    def execute_claim_resource_with_secret_stdin_output(
+        self,
+        command: str,
+        secret: str | bytes | bytearray,
+        *,
+        timeout: int = 30,
+        operation: str = "workspace secret resource mutation",
+    ) -> tuple[int, str]:
+        """The claim-fenced secret-stdin run, returning ``(exit code, stdout)``.
+
+        Only for a server-authored program whose stdout is a credential-free
+        report; stderr is still discarded.
+        """
+
+        del operation  # retained for call-site audit symmetry
+        return self._claim_resource_secret_stdin_exec(
+            command, secret, timeout=timeout, keep_stdout=True
+        )
+
+    def _claim_resource_secret_stdin_exec(
+        self,
+        command: str,
+        secret: str | bytes | bytearray,
+        *,
+        timeout: int,
+        keep_stdout: bool,
+    ) -> tuple[int, str]:
+        def run(text: str) -> tuple[int, str]:
+            if keep_stdout:
+                return self.execute_with_secret_stdin_output(
+                    text, secret, timeout=timeout
+                )
+            ok = self.execute_with_secret_stdin(text, secret, timeout=timeout)
+            return (0 if ok else 1), ""
+
         if self._shell_owner_token is None:
-            return self.execute_with_secret_stdin(command, secret, timeout=timeout)
+            return run(command)
         with self._claim_resource_io_lock:
             if self._claim_resource_retired:
                 raise WorkspaceUnavailableError(
@@ -1271,11 +1313,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 + (process_tag + "\n" if process_tag else "")
                 + command
             )
-            return self.execute_with_secret_stdin(
-                self._tmux_lock_command(inner, shell="bash"),
-                secret,
-                timeout=timeout,
-            )
+            return run(self._tmux_lock_command(inner, shell="bash"))
 
     def exec_terminal_claim_resource(
         self,
@@ -1422,7 +1460,10 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         import json
 
         from shared.credential_connectors import normalize_credential_env
-        from shared.runtime.core.credential_env import INSTALL_CREDENTIAL_ENV
+        from shared.runtime.core.credential_env import (
+            INSTALL_CREDENTIAL_ENV,
+            WORKSPACE_PYTHON,
+        )
 
         values = normalize_credential_env(values)
         if not values:
@@ -1432,7 +1473,8 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             f".srw-credentials/{self._credential_identity()}.sh"
         )
         command = (
-            f"python3 -c {shlex.quote(INSTALL_CREDENTIAL_ENV)} {shlex.quote(path)}"
+            f"{WORKSPACE_PYTHON} -c {shlex.quote(INSTALL_CREDENTIAL_ENV)} "
+            f"{shlex.quote(path)}"
         )
         if not self.execute_claim_resource_with_secret_stdin(
             command, json.dumps(values), timeout=30
@@ -1446,45 +1488,107 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             (self._job_id or self._session_name).encode("utf-8")
         ).hexdigest()
 
-    def install_credential_files(self, files: Sequence[Mapping[str, Any]]) -> str:
+    def install_credential_files(
+        self,
+        files: Sequence[Mapping[str, Any]],
+        env: Sequence[Mapping[str, Any]] = (),
+    ) -> dict[str, Any]:
         """Sync this work item's credential files into the workspace home.
 
         ``files`` is the whole current set, each ``{"name", "content",
         "mode", "link"}``: the contents go into a private store under
         ``~/.srw-credentials/`` (which a snapshot never captures) with their
-        mode, and ``link`` (home-relative, optional) becomes a symlink to
-        the file. Contents travel on the secret stdin channel, never tmux or
-        argv. What an earlier sync placed and ``files`` no longer holds is
-        removed; an empty list removes everything. Returns the store's
-        absolute path, under which each file keeps its ``name``.
+        mode (never an execute bit), and ``link`` (home-relative, optional)
+        becomes a symlink to the file. ``env`` names the variables that
+        point at stored files (``{"name", "files", "append"}``); they go into
+        the work item's environment file, which every command sources.
+        Contents travel on the secret stdin channel, never tmux or argv.
+        What an earlier sync placed or set and this one does not is removed
+        or emptied; an empty set removes everything.
+
+        Returns the program's credential-free report (``store``, ``linked``,
+        ``skipped``, ``env``, ``env_skipped``, ``env_retired``), which is
+        also kept as :attr:`credential_files_report` for the README.
         """
         import json
 
-        from shared.runtime.core.credential_env import INSTALL_CREDENTIAL_FILES
+        from shared.runtime.core.credential_env import (
+            INSTALL_CREDENTIAL_FILES,
+            WORKSPACE_PYTHON,
+        )
 
         self._init_shell()
         home = self._get_home_dir()
-        store = f"files-{self._credential_identity()}"
+        identity = self._credential_identity()
         command = (
-            f"python3 -c {shlex.quote(INSTALL_CREDENTIAL_FILES)} "
-            f"{shlex.quote(home)} {shlex.quote(store)}"
+            f"{WORKSPACE_PYTHON} -c {shlex.quote(INSTALL_CREDENTIAL_FILES)} "
+            f"{shlex.quote(home)} {shlex.quote(f'files-{identity}')} sync"
         )
-        payload = [
-            {
-                "name": str(item["name"]),
-                "content": str(item["content"]),
-                "mode": int(item.get("mode", 0o600)),
-                "link": item.get("link") or None,
-            }
-            for item in files
-        ]
-        if not self.execute_claim_resource_with_secret_stdin(
+        payload = {
+            "files": [
+                {
+                    "name": str(item["name"]),
+                    "content": str(item["content"]),
+                    "mode": int(item.get("mode", 0o600)),
+                    "link": item.get("link") or None,
+                }
+                for item in files
+            ],
+            "env": [
+                {
+                    "name": str(item["name"]),
+                    "files": [str(name) for name in item.get("files") or ()],
+                    "append": item.get("append") or None,
+                }
+                for item in env
+            ],
+        }
+        returncode, output = self.execute_claim_resource_with_secret_stdin_output(
             command, json.dumps(payload), timeout=30
-        ):
+        )
+        if returncode != 0:
             raise WorkspaceUnavailableError(
                 "Could not install workspace credential files"
             )
-        return posixpath.join(home, ".srw-credentials", store)
+        try:
+            report = json.loads(output.strip().splitlines()[-1])
+        except (IndexError, ValueError) as exc:
+            raise WorkspaceUnavailableError(
+                "The workspace credential-file sync gave no report"
+            ) from exc
+        if not isinstance(report, dict):
+            raise WorkspaceUnavailableError(
+                "The workspace credential-file sync gave no report"
+            )
+        if report.get("env_file"):
+            self._credential_env_path = posixpath.join(
+                home, ".srw-credentials", f"{identity}.sh"
+            )
+        self.credential_files_report = report
+        return report
+
+    def _credential_files_retirement_shell(self) -> str:
+        """Remove this work item's credential files and environment file.
+
+        Appended to the terminal shell retirement (:meth:`shell_cleanup`),
+        after every check of that script has passed: a genuine session End,
+        a job's terminal status, or the retired side of a tier swap. Every
+        attach delivers again, so nothing needs them afterwards. It never
+        changes the script's exit status.
+        """
+        from shared.runtime.core.credential_env import (
+            INSTALL_CREDENTIAL_FILES,
+            WORKSPACE_PYTHON,
+        )
+
+        store = f"files-{self._credential_identity()}"
+        return (
+            "_srw_files_rc=$?\n"
+            f"{WORKSPACE_PYTHON} -c {shlex.quote(INSTALL_CREDENTIAL_FILES)} "
+            f'"$HOME" {shlex.quote(store)} retire </dev/null >/dev/null 2>&1 '
+            "|| true\n"
+            '(exit "$_srw_files_rc")\n'
+        )
 
     def open_forward_channel(self, dest_host: str = "127.0.0.1", dest_port: int = 8080):
         """Open a ``direct-tcpip`` channel to a loopback port on the workspace.
@@ -1920,8 +2024,14 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         *,
         retain_tail: bool = False,
         sensitive: bool = False,
+        keep_stdout: bool = False,
     ) -> tuple[str, int]:
-        """Drain stdout/stderr until exit under a wall-clock deadline."""
+        """Drain stdout/stderr until exit under a wall-clock deadline.
+
+        ``sensitive`` drops everything the command prints; with
+        ``keep_stdout`` its stdout is kept (stderr never is), for a program
+        whose stdout is a credential-free report.
+        """
         out_chunks: list[bytes] = []
         err_chunks: list[bytes] = []
         out_size = 0
@@ -1936,7 +2046,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             # BOTH buffers went momentarily empty.
             while chan.recv_ready() and time.monotonic() <= deadline:
                 chunk = chan.recv(65536)
-                if sensitive:
+                if sensitive and not keep_stdout:
                     pass
                 elif retain_tail:
                     out_chunks.append(chunk)
@@ -1977,7 +2087,9 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             time.sleep(_EXEC_POLL_SECONDS)
         exit_code = chan.recv_exit_status()  # ready — returns immediately
         output = (
-            "" if sensitive else b"".join(out_chunks).decode("utf-8", errors="replace")
+            ""
+            if sensitive and not keep_stdout
+            else b"".join(out_chunks).decode("utf-8", errors="replace")
         )
         if truncated:
             notice = "[output truncated at 5 MiB]"
@@ -2163,6 +2275,32 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         must never interpolate the secret into it.
         """
 
+        returncode, _output = self._secret_stdin_exec(
+            command, secret, timeout=timeout, keep_stdout=False
+        )
+        return returncode == 0
+
+    def execute_with_secret_stdin_output(
+        self, command: str, secret: str | bytes | bytearray, *, timeout: int = 30
+    ) -> tuple[int, str]:
+        """:meth:`execute_with_secret_stdin`, returning ``(exit code, stdout)``.
+
+        Only for a server-authored program whose stdout is a credential-free
+        report; stderr is still discarded.
+        """
+
+        return self._secret_stdin_exec(
+            command, secret, timeout=timeout, keep_stdout=True
+        )
+
+    def _secret_stdin_exec(
+        self,
+        command: str,
+        secret: str | bytes | bytearray,
+        *,
+        timeout: int,
+        keep_stdout: bool,
+    ) -> tuple[int, str]:
         self._ensure_connected()
         if isinstance(secret, bytearray):
             payload = secret
@@ -2183,14 +2321,15 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 stdin.flush()
                 stdin.channel.shutdown_write()
                 payload[:] = b"\x00" * len(payload)
-                _output, returncode = self._drain_exec_channel(
+                output, returncode = self._drain_exec_channel(
                     stdout.channel,
                     command,
                     timeout,
                     retain_tail=False,
                     sensitive=True,
+                    keep_stdout=keep_stdout,
                 )
-                return returncode == 0
+                return returncode, output
             except (paramiko.SSHException, socket.error, EOFError, OSError) as exc:
                 raise WorkspaceUnavailableError(
                     "Remote secret bootstrap transport failed"
@@ -4920,6 +5059,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                         if self.workspace_incarnation_fenced
                         else ""
                     )
+                    + self._credential_files_retirement_shell()
                 )
                 self._tmux_exec_checked(
                     self._tmux_lock_command(inner),
@@ -4999,6 +5139,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 + f"  tmux kill-session -t {self._tmux_target()} || exit 77\n"
                 + "fi\n"
                 + process_zero
+                + self._credential_files_retirement_shell()
             )
             self._tmux_exec_checked(
                 self._tmux_lock_command(inner),

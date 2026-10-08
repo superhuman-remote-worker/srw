@@ -327,11 +327,15 @@ class WorkspaceBackend(ABC):
         """Make connector ENV values available to this work item's commands."""
         raise ValueError("Credential connectors require a sandbox or VM workspace")
 
-    def install_credential_files(self, files: Sequence[Mapping[str, Any]]) -> str:
+    def install_credential_files(
+        self,
+        files: Sequence[Mapping[str, Any]],
+        env: Sequence[Mapping[str, Any]] = (),
+    ) -> dict[str, Any]:
         """Sync this work item's credential files into the workspace home.
 
-        Returns the private store the files are written to. Backends without
-        a shell workspace refuse.
+        Returns the sync's credential-free report. Backends without a shell
+        workspace refuse.
         """
         raise ValueError("Credential files require a sandbox or VM workspace")
 
