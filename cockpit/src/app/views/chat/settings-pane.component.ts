@@ -494,8 +494,8 @@ export class SettingsPaneComponent {
                 if (match) this.expertLabel.set(match.display_name);
             });
         }
-        // `project_ids` is the derived list view and can be empty for a
-        // single-project session; the `project_id` column is the source.
+        // `project_ids` is the session's authorized project scope (the
+        // `project_id` column, or a legacy multi-project session's list).
         const projectId = projectIds[0] ?? (thread?.['project_id'] as string | undefined) ?? null;
         if (projectId) {
             this.api.getProject(projectId).subscribe((project) => {

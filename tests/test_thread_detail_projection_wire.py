@@ -198,6 +198,40 @@ def test_detail_route_still_reads_a_legacy_two_project_session() -> None:
     assert response.json()["project_ids"] == [PROJECT_ID, other_project]
 
 
+def test_project_ids_is_the_scope_eligibility_is_authorized_for() -> None:
+    """The settings pane asks for eligible connectors with ``project_ids``: it
+    is the column, with or without mount rows (main_cloud_as_connectors.md,
+    slice 1), so the picker never disagrees with the attach-time check."""
+    for mounts in ([], None):
+        store = _Store()
+        if mounts is not None:
+            store.list_thread_mounts.return_value = mounts
+        row = {**_raw_row(), "project_id": PROJECT_ID}
+        assert _client(store, row).get(f"/api/persistent/threads/{THREAD_ID}").json()[
+            "project_ids"
+        ] == [PROJECT_ID]
+
+
+def test_a_legacy_session_lists_its_default_project_mount_too() -> None:
+    """Its default-project row is part of the authorized scope (the all-match
+    rule counts it), so the picker must count it as well."""
+    default_project = "44444444-5555-4666-8777-888888888888"
+    store = _Store()
+    store.list_thread_mounts.return_value = [
+        {
+            "id": 3,
+            "mount_kind": "project_default",
+            "target_path": "",
+            "source_kind": "user_home",
+            "source_ref": default_project,
+            "backend_id": None,
+        },
+        *store.list_thread_mounts.return_value,
+    ]
+    body = _client(store).get(f"/api/persistent/threads/{THREAD_ID}").json()
+    assert body["project_ids"] == [default_project, PROJECT_ID]
+
+
 def test_detail_route_reads_one_allowlisted_startup_view_after_owner_gate() -> None:
     store = _Store()
     view = {

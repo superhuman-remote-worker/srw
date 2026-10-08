@@ -40,6 +40,7 @@ from orchestrator.services.thread_control_inbox import (
     admit_thread_control,
     find_existing_thread_control,
 )
+from orchestrator.services.thread_mount_rows import durable_project_ids
 from orchestrator.services.thread_projection import redact_thread_metadata
 from orchestrator.services.vm_idle_public import read_vm_idle_states
 
@@ -140,11 +141,10 @@ async def get_thread(
         }
         for m in mounts
     ]
-    result["project_ids"] = [
-        str(m["source_ref"])
-        for m in mounts
-        if m.get("mount_kind") == "project" and m.get("source_ref")
-    ]
+    # The scope connector eligibility is authorized for (the column, or a
+    # legacy multi-project session's list), so the cockpit's picker asks for
+    # the same projects the attach path re-authorizes against.
+    result["project_ids"] = durable_project_ids(thread, legacy_mounts=mounts)
     return result
 
 
