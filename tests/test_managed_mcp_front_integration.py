@@ -380,7 +380,9 @@ async def test_the_gates_bypass_bodies_are_refused_by_the_real_front(pod):
     spec = importlib.util.spec_from_file_location(
         "k3d_managed_mcp_gate", ROOT / "scripts" / "k3d-managed-mcp-gate.py"
     )
-    gate = importlib.util.module_from_spec(spec)
+    gate = sys.modules.get(spec.name) or importlib.util.module_from_spec(spec)
+    # Its dataclasses look their module up while it loads.
+    sys.modules[spec.name] = gate
     spec.loader.exec_module(gate)
     payload = {
         "url": pod.url,
