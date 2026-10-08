@@ -169,11 +169,14 @@ class McpDriver(DatasourceDriver):
         leaves += string_leaves(
             credentials.get("args"), ("args",), lambda n: f"arg.{n}"
         )
-        leaves += string_leaves(credentials.get("env"), ("env",), lambda n: f"env.{n}")
+        leaves += string_leaves(
+            credentials.get("env"), ("env",), lambda n: f"env.{n}", named=True
+        )
         auth = credentials.get("auth")
         if isinstance(auth, Mapping):
             if isinstance(auth.get("token"), str):
                 leaves.append((("auth", "token"), "token"))
+            # A header's name is already config (header_names).
             leaves += string_leaves(
                 auth.get("headers"), ("auth", "headers"), lambda n: f"header.{n}"
             )

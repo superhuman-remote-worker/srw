@@ -30,6 +30,7 @@ row and bind an inline manifest connector instead; they are
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
@@ -39,6 +40,7 @@ from fastapi import HTTPException
 
 from orchestrator.services import datasource_config
 from orchestrator.services.connector_drivers import knowledge_note
+from orchestrator.services.connector_secrets import RESERVED_KEYS
 from shared.connectors.binding import BindingDescriptor
 from shared.connectors.contract import DriverSpec
 from shared.connectors.envelope import unsupported_check
@@ -55,6 +57,14 @@ _FILE_TARGET_KEYS = ("name", "target_path", "mode", "env_var")
 #: object keys and list indexes) and the key it is kept under in the
 #: Connector's resource secret.
 SecretLeaf = tuple[tuple[str | int, ...], str]
+_KEY_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
+#: The Connector's secret keeps its own keys under these names
+#: (``connector_secrets``): no stored credentials object may use them as
+#: top-level fields.
+RESERVED_FIELDS_DETAIL = (
+    "Connector credentials cannot have a top-level url or shape field; "
+    "those names are reserved"
+)
 
 
 @dataclass(frozen=True)
@@ -150,11 +160,29 @@ class BindContext:
     default_known_hosts: str
 
 
+def key_name(name: Any) -> bool:
+    """Whether a stored name may become part of a secret key.
+
+    Key names are plaintext in the Connector's resource and its revisions,
+    so only a POSIX environment name of at most 128 characters does (an
+    environment variable's name, a credential field's).  Anything else (a
+    pasted ``KEY=VALUE`` line, a URL, a token with dashes or dots) stays in
+    the secret's ``shape``, encrypted with its value.
+    """
+    return isinstance(name, str) and bool(_KEY_NAME.fullmatch(name))
+
+
 def string_leaves(
-    value: Any, path: tuple[str | int, ...], key: Callable[[str | int], str]
+    value: Any,
+    path: tuple[str | int, ...],
+    key: Callable[[str | int], str],
+    *,
+    named: bool = False,
 ) -> list[SecretLeaf]:
     """The string members of an object or a list at ``path``, each kept
-    under ``key(member)``; anything else there is skipped."""
+    under ``key(member)``; anything else there is skipped.  ``named``: an
+    object's member names become key names, so only a :func:`key_name`
+    does."""
     if isinstance(value, Mapping):
         members: Any = value.items()
     elif isinstance(value, list):
@@ -164,7 +192,7 @@ def string_leaves(
     return [
         ((*path, member), key(member))
         for member, item in members
-        if isinstance(item, str)
+        if isinstance(item, str) and (not named or key_name(member))
     ]
 
 
@@ -172,11 +200,13 @@ def top_level_leaves(
     credentials: Mapping[str, Any], names: tuple[str, ...] | None = None
 ) -> list[SecretLeaf]:
     """Top-level string fields kept under their own names: ``names`` only,
-    or every one when ``names`` is ``None``."""
+    or every one whose name is a :func:`key_name` when ``names`` is
+    ``None``."""
     return [
         ((name,), name)
         for name, value in credentials.items()
-        if isinstance(value, str) and (names is None or name in names)
+        if isinstance(value, str)
+        and (key_name(name) if names is None else name in names)
     ]
 
 
@@ -415,8 +445,14 @@ class DatasourceDriver:
         """The credentials to store; on an update a blank value keeps them.
 
         The cockpit's edit form sends an empty dict when the user did not
-        re-enter a secret; storing it would clobber the secret.
+        re-enter a secret; storing it would clobber the secret.  A top-level
+        ``url`` or ``shape`` field is refused: the Connector's secret keeps
+        its own keys under those names (``connector_secrets``).
         """
+        if isinstance(draft.credentials, Mapping) and (
+            RESERVED_KEYS & set(draft.credentials)
+        ):
+            raise HTTPException(status_code=400, detail=RESERVED_FIELDS_DETAIL)
         credentials = datasource_config.normalize_datasource_credentials(
             draft.credentials
         )

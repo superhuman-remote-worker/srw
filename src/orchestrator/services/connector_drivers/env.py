@@ -40,9 +40,14 @@ class EnvironmentDriver(DatasourceDriver):
 
     def secret_leaves(self, credentials: Mapping[str, Any]) -> list[SecretLeaf]:
         """Each variable as ``env.<NAME>``; any other top-level string a
-        ``generic`` row stores under its own name."""
+        ``generic`` row stores under its own name.  A ``generic`` row's names
+        are not validated when it is written (the API goldens pin that), so
+        a name that is not an environment name stays in the ``shape``."""
         return string_leaves(
-            credentials.get("env_vars"), ("env_vars",), lambda name: f"env.{name}"
+            credentials.get("env_vars"),
+            ("env_vars",),
+            lambda name: f"env.{name}",
+            named=True,
         ) + top_level_leaves(credentials)
 
 

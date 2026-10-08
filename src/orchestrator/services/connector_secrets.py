@@ -25,9 +25,26 @@ The keys, flattened per driver credential slot (each driver's
   any value no driver names a key for, so the stored object is rebuilt
   exactly, key order included, whatever its shape (``stored_credentials``).
 
+**``shape`` is secret material.**  It holds every value no driver names a
+key for: an extra field a repository row stored (a password, a passphrase),
+a nested object (``{"tls": {"client_key": ...}}``), a value that is not a
+string (a numeric Neo4j password, a non-string MCP token), a file entry's
+``content`` where the driver reads ``contents``, an environment variable
+whose name cannot be a key name, a legacy row's top-level ``url`` or
+``shape`` field.  It is encrypted with the rest and is read by
+:func:`stored_credentials` only, to rebuild the row's object for the row's
+own driver.  **Nothing may forward ``shape``**: no per-key consumer (a lease
+driver, a materializer, a manifest binding of the Connector's slots) may
+deliver it, or any key it does not know, to a process; a consumer takes the
+slot keys it names and leaves the rest.
+
 A connector with nothing secret (no credentials, no URL) has no secret row
 and an empty ``spec.credentials``.  Only string values move into keys; a
-value a driver names but that is not a string stays in ``shape``.
+value a driver names but that is not a string stays in ``shape``.  Key names
+are plaintext in the Connector's revisions, so a stored name becomes part of
+a key only when it is an environment name (``connector_drivers.base.
+key_name``), and new credentials may not use ``url`` or ``shape`` as
+top-level fields.
 
 The secret is written by the datasource write-through, in the transaction
 that writes the row and the resource (``manifest_connectors``), from the row
@@ -76,8 +93,10 @@ logger = logging.getLogger(__name__)
 #: A Connector's resource secret is named after its uid.
 SECRET_PREFIX = "connector-"
 URL_KEY = "url"
+#: Secret material (see the module docstring): never forwarded to a process.
 SHAPE_KEY = "shape"
-#: Keys no driver slot may use.
+#: Keys no driver slot may use, and no stored credentials object as a
+#: top-level field.
 RESERVED_KEYS = frozenset({URL_KEY, SHAPE_KEY})
 CATALOG_SECRET_DETAIL = (
     "Shared catalog definitions cannot distribute catalog credentials."

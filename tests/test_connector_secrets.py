@@ -439,6 +439,75 @@ class TestOddShapes:
         assert secret_values(_driver(row), row) == {}
         assert stored_credentials({}) == ({}, None)
 
+    @pytest.mark.parametrize(
+        ("ds_type", "credentials", "keys"),
+        [
+            # A generic row's names are not validated on write: a pasted line,
+            # a URL or a token with dashes never becomes a key name.
+            (
+                "generic",
+                {
+                    "env_vars": {
+                        "API_KEY": "v1",
+                        "API_KEY=s3cret-pasted": "v2",
+                        "https://s3cret-host/x": "v3",
+                        "sk-s3cret-dashed": "v4",
+                        "X" * 129: "v5",
+                    },
+                    "s3cret field": "v6",
+                    "api_token": "v7",
+                },
+                {"env.API_KEY", "api_token", SHAPE_KEY},
+            ),
+            (
+                "mcp",
+                {
+                    "transport": "stdio",
+                    "command": "npx",
+                    "env": {"TOKEN": "v1", "s3cret name": "v2"},
+                },
+                {"command", "env.TOKEN", SHAPE_KEY},
+            ),
+        ],
+        ids=["generic", "mcp_stdio"],
+    )
+    def test_only_environment_names_become_key_names(self, ds_type, credentials, keys):
+        row = _row(ds_type, credentials=copy.deepcopy(credentials))
+        values = secret_values(_driver(row), row)
+        assert set(values) == keys
+        assert "s3cret" not in " ".join(values)
+        rebuilt, _url = stored_credentials(json.loads(json.dumps(values)))
+        assert json.dumps(rebuilt) == json.dumps(credentials)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["url", "shape"])
+@pytest.mark.parametrize("ds_type", ["generic", "neo4j", "repository"])
+async def test_new_credentials_cannot_use_a_reserved_top_level_field(ds_type, field):
+    from orchestrator.services.connector_drivers.base import (
+        RESERVED_FIELDS_DETAIL,
+        ConnectorDraft,
+    )
+
+    driver = REGISTRY.for_type(ds_type)
+    draft = ConnectorDraft(
+        name="x",
+        connection_url=None,
+        credentials={field: "v", "token": "t"},
+        config=None,
+        read_only=None,
+        is_global=None,
+        default_branch=None,
+        supplied=frozenset({"credentials"}),
+    )
+    for existing in (None, _row(ds_type)):
+        with pytest.raises(HTTPException) as refused:
+            driver.stored_credentials(draft, existing)
+        assert (refused.value.status_code, refused.value.detail) == (
+            400,
+            RESERVED_FIELDS_DETAIL,
+        )
+
 
 def test_secret_names():
     uid = UUID("12345678-1234-4234-8234-123456789abc")
