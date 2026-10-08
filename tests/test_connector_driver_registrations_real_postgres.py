@@ -290,7 +290,15 @@ async def _connector(
     return str(created["id"])
 
 
-async def _job(db, status: str = "processing", *, connector: str | None = None) -> str:
+async def _job(
+    db,
+    status: str = "processing",
+    *,
+    connector: str | None = None,
+    connectors: tuple[str, ...] = (),
+) -> str:
+    """A job that selects ``connector`` (and ``connectors``): a bind checks
+    the execution still selects what it binds."""
     job_id = uuid4()
     await db.execute(
         "INSERT INTO jobs (id, description, status, context, config_override) "
@@ -299,8 +307,8 @@ async def _job(db, status: str = "processing", *, connector: str | None = None) 
         job_id,
         status,
     )
-    if connector is not None:
-        await db.link_datasource_to_job(str(job_id), connector)
+    for linked in ([connector] if connector is not None else []) + list(connectors):
+        await db.link_datasource_to_job(str(job_id), linked)
     return str(job_id)
 
 
@@ -604,7 +612,7 @@ class TestDisableAndDelete:
             {"bind": _bound(ENV), "revoke": DriverOutcome(result={})}
         )
         runtime = _runtime(db, operations)
-        job = await _job(db)
+        job = await _job(db, connector=connector)
         await prepare_lease_delivery(db, [_entry(connector)], owner=LeaseOwner.job(job))
         await registrations.set_registration_disabled(
             db, user, registration.id, disabled=True
@@ -840,7 +848,7 @@ class TestBinding:
         user = await _user(db, "user")
         registration = await _register(db, user, registry)
         connector = await _connector(db, user, registration_id=registration.id)
-        job = await _job(db)
+        job = await _job(db, connector=connector)
         operations = FakeOperations({"bind": _bound(ENV)})
         _runtime(db, operations)
         owner = LeaseOwner.job(job)
@@ -949,7 +957,7 @@ class TestBinding:
         )
         operations = FakeOperations({"bind": failing})
         _runtime(db, operations)
-        owner = LeaseOwner.job(await _job(db))
+        owner = LeaseOwner.job(await _job(db, connector=connector))
         entries = [_entry(connector)]
         await prepare_lease_delivery(db, entries, owner=owner)
         await prepare_lease_delivery(db, entries, owner=owner)
@@ -978,7 +986,7 @@ class TestBinding:
             {"bind": DriverOutcome(error=DriverError("transient", "upstream busy"))}
         )
         _runtime(db, operations)
-        owner = LeaseOwner.job(await _job(db))
+        owner = LeaseOwner.job(await _job(db, connector=connector))
         entries = [_entry(connector)]
         await prepare_lease_delivery(db, entries, owner=owner)
         first = await _binding(db)
@@ -1007,7 +1015,7 @@ class TestBinding:
         connector = await _connector(db, user, registration_id=registration.id)
         operations = FakeOperations({"bind": _bound(ENV)})
         _runtime(db, operations)
-        owner = LeaseOwner.job(await _job(db))
+        owner = LeaseOwner.job(await _job(db, connector=connector))
         entries = [_entry(connector)]
         with pytest.raises(bind_time.BindTimePending):
             await _deliver(db, entries, owner)
@@ -1020,7 +1028,7 @@ class TestBinding:
         connector = await _connector(db, user, registration_id=registration.id)
         operations = FakeOperations({"bind": _bound(ENV)})
         _runtime(db, operations)
-        owner = LeaseOwner.job(await _job(db))
+        owner = LeaseOwner.job(await _job(db, connector=connector))
         await prepare_lease_delivery(db, [_entry(connector)], owner=owner)
         # The project link turned read-only: the ReadWrite binding is revoked
         # (on its own connection: the delivery's transaction rolls back) and
@@ -1041,7 +1049,7 @@ class TestBinding:
         registration = await _register(db, user, registry)
         connector = await _connector(db, user, registration_id=registration.id)
         bind_time.configure_bind_time(None)
-        owner = LeaseOwner.job(await _job(db))
+        owner = LeaseOwner.job(await _job(db, connector=connector))
         with pytest.raises(bind_time.BindTimeRefused, match="no driver pods"):
             await _deliver(db, [_entry(connector)], owner)
         thread = await _thread(db, user, connectors=[connector])
@@ -1058,10 +1066,12 @@ class TestBinding:
         operations = FakeOperations({"bind": _bound(ENV)})
         _runtime(db, operations)
         await prepare_lease_delivery(
-            db, [_entry(connector)], owner=LeaseOwner.job(await _job(db))
+            db,
+            [_entry(connector)],
+            owner=LeaseOwner.job(await _job(db, connector=connector)),
         )
         registry.down = True
-        job = await _job(db)
+        job = await _job(db, connector=connector)
         await prepare_lease_delivery(db, [_entry(connector)], owner=LeaseOwner.job(job))
         row = await _binding(db, owner_id=job)
         assert row["status"] == "bound" and row["image_digest"] == D1
@@ -1194,7 +1204,7 @@ class TestSessions:
 
         operations.before["bind"] = orphaned
         _runtime(db, operations)
-        owner = LeaseOwner.job(await _job(db))
+        owner = LeaseOwner.job(await _job(db, connector=connector))
         await prepare_lease_delivery(db, [_entry(connector)], owner=owner)
         row = await _binding(db)
         assert row["status"] == "revoking"
@@ -1206,7 +1216,7 @@ class TestSessions:
         registration = await _register(db, user, registry)
         connector = await _connector(db, user, registration_id=registration.id)
         runtime = _runtime(db, FakeOperations({}))
-        job = await _job(db)
+        job = await _job(db, connector=connector)
         binding = await db.fetchval(
             "INSERT INTO connector_bind_time_bindings "
             "(owner_kind, owner_id, connector_id, driver, status, failed_at, "
@@ -1304,7 +1314,7 @@ class TestJobs:
         connector = await _connector(db, user, registration_id=registration.id)
         operations = FakeOperations({"bind": _bound(ENV)})
         _runtime(db, operations)
-        job = await _job(db)
+        job = await _job(db, connector=connector)
         await prepare_lease_delivery(db, [_entry(connector)], owner=LeaseOwner.job(job))
         existing = await db.get_datasource(connector)
 
@@ -1346,7 +1356,9 @@ class TestMovedTags:
         operations = FakeOperations({"bind": _bound(ENV)})
         _runtime(db, operations)
         await prepare_lease_delivery(
-            db, [_entry(connector)], owner=LeaseOwner.job(await _job(db))
+            db,
+            [_entry(connector)],
+            owner=LeaseOwner.job(await _job(db, connector=connector)),
         )
         return registration, connector, operations
 
@@ -1357,7 +1369,7 @@ class TestMovedTags:
         incompatible["credential_slots"] = []
         incompatible["config_schema"]["required"] = ["variable", "region"]
         registry.push(REFERENCE, D2, _labelled(incompatible))
-        owner = LeaseOwner.job(await _job(db))
+        owner = LeaseOwner.job(await _job(db, connector=connector))
         entries = [_entry(connector)]
         await prepare_lease_delivery(db, entries, owner=owner)
         assert len(operations.calls) == 1  # no pod runs
@@ -1380,7 +1392,9 @@ class TestMovedTags:
             "WHERE event_type='connector_driver_image_refused'"
         )
         assert audit == 1
-        await prepare_lease_delivery(db, entries, owner=LeaseOwner.job(await _job(db)))
+        await prepare_lease_delivery(
+            db, entries, owner=LeaseOwner.job(await _job(db, connector=connector))
+        )
         assert len(operations.calls) == 1  # still refused, still no pod
 
     @pytest.mark.parametrize(
@@ -1432,7 +1446,9 @@ class TestMovedTags:
         )
         registry.push(REFERENCE, D2, labels)
         await prepare_lease_delivery(
-            db, [_entry(connector)], owner=LeaseOwner.job(await _job(db))
+            db,
+            [_entry(connector)],
+            owner=LeaseOwner.job(await _job(db, connector=connector)),
         )
         assert len(operations.calls) == 1
         status = await registrations.connector_driver_status(db, connector)
@@ -1445,7 +1461,9 @@ class TestMovedTags:
         )
         registry.push(REFERENCE, D2, _labelled({**SPEC, "title": "Acme 1.1"}))
         await prepare_lease_delivery(
-            db, [_entry(connector)], owner=LeaseOwner.job(await _job(db))
+            db,
+            [_entry(connector)],
+            owner=LeaseOwner.job(await _job(db, connector=connector)),
         )
         assert operations.calls[-1]["image"].digest == D2
 
@@ -1970,7 +1988,7 @@ class TestTheBindPathNeverStalls:
         user = await _user(db, "user")
         registration = await _register(db, user, registry)
         connector = await _connector(db, user, registration_id=registration.id)
-        job = await _job(db)
+        job = await _job(db, connector=connector)
         binding = str(
             await db.fetchval(
                 "INSERT INTO connector_bind_time_bindings "
@@ -2041,7 +2059,7 @@ class TestTheBindPathNeverStalls:
             {"bind": _bound(ENV), "revoke": DriverOutcome(result={})}
         )
         runtime = _runtime(db, operations)
-        job = await _job(db)
+        job = await _job(db, connectors=(first, second))
         await prepare_lease_delivery(
             db, [_entry(first), _entry(second)], owner=LeaseOwner.job(job)
         )
@@ -2468,3 +2486,278 @@ class TestALiveSelectionBindsWhatItAdds:
         bind_time.start_thread_bindings(thread, [connector.upper()])
         await _settled()
         assert len(operations.calls) == 1
+
+
+# =============================================================================
+# The D6 re-review 2 (scratchpad d6-rereview2/)
+# =============================================================================
+
+
+async def _member_left(db, registry, operations):
+    """A project connector of the owner's, and a member's session that
+    selects it; the member then leaves the project."""
+    owner = await _user(db, "owner")
+    member = await _user(db, "member")
+    project = await _project(
+        db, {str(owner["id"]): "owner", str(member["id"]): "editor"}
+    )
+    registration = await _register(db, owner, registry)
+    connector = await _connector(
+        db, owner, registration_id=registration.id, project_ids=[project]
+    )
+    runtime = _runtime(db, operations)
+    return owner, member, project, connector, runtime
+
+
+class TestNothingBindsBeforeAuthorization:
+    async def test_the_attach_prepare_binds_nothing_for_a_member_who_left(
+        self, db, registry
+    ):
+        """test_zz_d6rr2_scratch: every entry point starts its binds through
+        ensure_binding, which checks access before any pod mints."""
+        operations = FakeOperations(
+            {"bind": _bound(ENV), "revoke": DriverOutcome(result={})}
+        )
+        _owner, member, project, connector, _runtime_ = await _member_left(
+            db, registry, operations
+        )
+        thread = await _project_thread(db, member, project, [connector])
+        await db.execute("DELETE FROM project_members WHERE user_id = $1", member["id"])
+        await bind_time.prepare_thread_bindings(db, thread)
+        await _settled()
+        assert [c for c in operations.calls if c["operation"] == "bind"] == []
+        row = await _binding(db, owner_id=thread)
+        assert row["status"] == "revoked"
+        assert row["revoke_reason"] == "access_lost"
+        assert row["image_digest"] is None
+        # Asked again (the next attach), it is recorded once.
+        await bind_time.prepare_thread_bindings(db, thread)
+        await _settled()
+        count = await db.fetchval(
+            "SELECT count(*) FROM connector_bind_time_bindings WHERE owner_id = $1",
+            UUID(thread),
+        )
+        assert count == 1 and operations.calls == []
+
+    async def test_a_job_whose_owner_left_is_dispatched_for_the_claim_to_refuse(
+        self, db, registry
+    ):
+        operations = FakeOperations({"bind": _bound(ENV)})
+        _owner, member, project, connector, _runtime_ = await _member_left(
+            db, registry, operations
+        )
+        job = await _owned_job(db, member, project, connector, status="created")
+        await db.execute("DELETE FROM project_members WHERE user_id = $1", member["id"])
+        # No bind waits for a job that may not use it: the claim's own
+        # authorization refuses it, as for any connector.
+        assert await bind_time.job_bind_gate({"id": job}) == ("dispatch", None)
+        await _settled()
+        assert operations.calls == []
+
+    async def test_regaining_access_binds_again(self, db, registry):
+        operations = FakeOperations({"bind": _bound(ENV)})
+        _owner, member, project, connector, _runtime_ = await _member_left(
+            db, registry, operations
+        )
+        thread = await _project_thread(db, member, project, [connector])
+        await db.execute("DELETE FROM project_members WHERE user_id = $1", member["id"])
+        await bind_time.prepare_thread_bindings(db, thread)
+        await db.execute(
+            "INSERT INTO project_members(project_id,user_id,role) VALUES($1,$2,'editor')",
+            UUID(project),
+            member["id"],
+        )
+        await bind_time.prepare_thread_bindings(db, thread)
+        await _settled()
+        assert len(operations.calls) == 1
+        assert (await _binding(db, owner_id=thread))["status"] == "bound"
+
+
+class TestTheLeadersStartsRotate:
+    async def test_a_lost_pair_never_starves_the_starts(self, db, registry):
+        """test_zz_d6rr2_scratch: the lost pair kept coming back first and
+        used the pass's only start."""
+        operations = FakeOperations(
+            {"bind": _bound(ENV), "revoke": DriverOutcome(result={})}
+        )
+        owner, member, project, connector, runtime = await _member_left(
+            db, registry, operations
+        )
+        lost = await _project_thread(db, member, project, [connector])
+        await bind_time.prepare_thread_bindings(db, lost)
+        await db.execute("DELETE FROM project_members WHERE user_id = $1", member["id"])
+        assert (await _pass(runtime)).access_lost == 1
+        await _settled()
+        legit = await _project_thread(db, owner, project, [connector])
+        with mock.patch.object(bind_time, "STARTS_PER_PASS", 1):
+            report = await _pass(runtime)
+            await _settled()
+        assert report.started == 1
+        assert (await _binding(db, owner_id=legit))["status"] == "bound"
+        # The lost pair is not tried again by the leader.
+        binds = [c for c in operations.calls if c["operation"] == "bind"]
+        assert len(binds) == 2
+
+    async def test_a_never_authorized_pair_is_recorded_once(self, db, registry):
+        owner = await _user(db, "owner")
+        stranger = await _user(db, "stranger")
+        registration = await _register(db, owner, registry)
+        connector = await _connector(db, owner, registration_id=registration.id)
+        operations = FakeOperations({"bind": _bound(ENV)})
+        runtime = _runtime(db, operations)
+        stray = await _thread(db, stranger, connectors=[connector])
+        legit = await _thread(db, owner, connectors=[connector])
+        with mock.patch.object(bind_time, "STARTS_PER_PASS", 1):
+            for _ in range(3):
+                await _pass(runtime)
+                await _settled()
+        assert (await _binding(db, owner_id=stray))["revoke_reason"] == "access_lost"
+        assert (await _binding(db, owner_id=legit))["status"] == "bound"
+        assert len(operations.calls) == 1
+
+
+class TestAClashFailsTheJobOnEveryLane:
+    async def test_the_gate_fails_a_job_whose_connectors_set_one_name(
+        self, db, registry
+    ):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+
+        async def approve():
+            return user
+
+        async def owns(_project):
+            return None
+
+        plain = await datasource_operations.create_datasource(
+            body=DatasourceCreate(
+                name="plain",
+                type="credentials",
+                credentials={"env_vars": {"ACME_TOKEN": "ordinary"}},
+            ),
+            require_approved_user=approve,
+            require_project_owner=owns,
+            dependencies=_dependencies(db),
+        )
+        _runtime(db, FakeOperations({"bind": _bound(ENV)}))
+        job = await _job(db, "created", connectors=(connector, str(plain["id"])))
+        assert (await bind_time.job_bind_gate({"id": job}))[0] == "wait"
+        await _settled()
+        action, reason = await bind_time.job_bind_gate({"id": job})
+        assert action == "fail"
+        assert reason == (
+            "Connector acme: it sets ACME_TOKEN, which connector plain sets too"
+        )
+
+    async def test_no_clash_dispatches(self, db, registry):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        _runtime(db, FakeOperations({"bind": _bound(ENV)}))
+        job = await _job(db, "created", connector=connector)
+        await bind_time.job_bind_gate({"id": job})
+        await _settled()
+        assert await bind_time.job_bind_gate({"id": job}) == ("dispatch", None)
+
+
+class TestTheReReview2Nits:
+    async def test_a_bind_that_broke_after_its_driver_posted_keeps_its_inputs(
+        self, db, registry
+    ):
+        """The catch-all keeps the revoke's inputs when a result was posted:
+        the leader moves the binding to revoking and revokes with them."""
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        operations = FakeOperations(
+            {"bind": _bound(ENV), "revoke": DriverOutcome(result={})}
+        )
+        runtime = _runtime(db, operations)
+
+        async def posted_then_broke(call):
+            await db.execute(
+                "INSERT INTO connector_driver_operations "
+                "(token_hash, token_last_four, operation, binding_id, "
+                " image_reference, image_digest, pod_namespace, pod_name, "
+                " status, deadline_at, finished_at, outcome_ciphertext) "
+                "VALUES ($1, 'abcd', 'bind', $2, $3, $4, 'ns', 'pod', 'finished', "
+                "        now(), now() - interval '10 minutes', $5)",
+                b"y" * 32,
+                UUID(call["binding_id"]),
+                REFERENCE,
+                D1,
+                bind_time._encrypt(
+                    {
+                        "exit_code": 0,
+                        "lines": [
+                            {"type": "result", "result": {}, "driver_state": "kept"}
+                        ],
+                    }
+                ),
+            )
+            raise RuntimeError("a bug after the post")
+
+        operations.before["bind"] = posted_then_broke
+        job = await _job(db, "created", connector=connector)
+        await bind_time.job_bind_gate({"id": job})
+        await _settled()
+        row = await _binding(db)
+        assert row["status"] == "failed" and row["error_class"] == "system"
+        assert row["inputs_ciphertext"] is not None
+        await _pass(runtime)
+        row = await _binding(db)
+        assert row["status"] == "revoked"
+        revoke = operations.calls[-1]["request"]
+        assert revoke.operation == "revoke"
+        assert revoke.credentials == {"token": "upstream-secret"}
+        assert revoke.driver_state == "kept"
+
+    async def test_a_bind_that_minted_nothing_drops_its_inputs(self, db, registry):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        operations = FakeOperations({"bind": _bound(ENV)})
+
+        async def boom(_call):
+            raise RuntimeError("a bug")
+
+        operations.before["bind"] = boom
+        _runtime(db, operations)
+        job = await _job(db, "created", connector=connector)
+        await bind_time.job_bind_gate({"id": job})
+        await _settled()
+        assert (await _binding(db))["inputs_ciphertext"] is None
+
+    async def test_a_failing_access_check_goes_to_the_back_of_the_queue(
+        self, db, registry
+    ):
+        user = await _user(db, "user")
+        registration = await _register(db, user, registry)
+        connector = await _connector(db, user, registration_id=registration.id)
+        runtime = _runtime(db, FakeOperations({"bind": _bound(ENV)}))
+        thread = await _thread(db, user, connectors=[connector])
+        await bind_time.prepare_thread_bindings(db, thread)
+        with mock.patch.object(
+            bind_time, "_lost_connectors", side_effect=RuntimeError("down")
+        ):
+            await bind_time._access_lost(runtime)
+        assert (await _binding(db, owner_id=thread))["access_checked_at"] is not None
+
+    async def test_a_moved_tag_s_config_check_is_bounded(self):
+        from shared.connectors.registration import MAX_INSTANCE_NODES
+
+        errors = await bind_time.bounded_config_errors(
+            {"type": "object"}, {"a": [1] * MAX_INSTANCE_NODES}
+        )
+        assert errors and "more than" in errors[0]
+        with (
+            mock.patch.object(bind_time, "VALIDATION_SECONDS", 0.05),
+            mock.patch.object(
+                bind_time,
+                "config_errors",
+                side_effect=lambda schema, config: __import__("time").sleep(0.3) or [],
+            ),
+        ):
+            errors = await bind_time.bounded_config_errors({"type": "object"}, {})
+        assert errors == ["validating it took longer than 0.05 s"]

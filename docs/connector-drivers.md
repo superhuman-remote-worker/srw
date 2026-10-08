@@ -177,8 +177,16 @@ The rules SRW applies when you register:
   holds them), a `$ref` points only at `#/$defs/<name>` or
   `#/definitions/<name>` of the same document, no `$id`, `$anchor`,
   `$dynamicAnchor`, `$dynamicRef` or `$recursiveRef` appears, `$schema` is
-  2020-12 or absent, and it stays under 32 KiB and 12 levels deep. Check a
-  pattern in your `check`.
+  2020-12 or absent, and it stays under 32 KiB and 12 levels deep. What one
+  validation costs is bounded too: no `$ref` loops (a definition reaching
+  itself), no `allOf`, `anyOf`, `oneOf` or `prefixItems` holds more than 64
+  schemas, at most 256 schemas apply (32 levels deep) once every `$ref` is
+  followed (a definition referenced twice counts twice), and no
+  `uniqueItems`, `unevaluatedProperties` or `unevaluatedItems` (their cost
+  grows faster than the document; use `additionalProperties`). A stored
+  config is at most 64 KiB and 512 values, and SRW validates it off its
+  event loop for at most 5 seconds. Check a pattern, uniqueness or anything
+  larger in your `check`.
 - **`credential_slots`** name the parts of the connector's credentials. Each
   slot's `schema` lists the keys it owns (the same schema rules apply); mark
   secrets `writeOnly`. A connector may only store keys some slot owns, and
@@ -231,21 +239,32 @@ def bind(request):
   TLS variables (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`,
   `NODE_EXTRA_CA_CERTS`…), `KUBECONFIG`, `DOCKER_*`, `XDG_*`, `TMPDIR`,
   `HISTFILE`, shell prompts, editors and pagers (`PS1`, `EDITOR`, `*PAGER`,
-  `*EDITOR`, `LESSOPEN`, `*BROWSER`), `*ASKPASS`, every name ending in
-  `_OPTS`, `_OPTIONS`, `FLAGS`, `_COMMAND`, `_ARGS`, `RC`, `RCPATH`,
-  `_CONFIG`, `_CONFIG_FILE`, `_CONFIG_PATH`, `_CONFIG_DIR` or `_HOME`, and the
-  settings of the common runtimes, build tools and package managers
-  (`NODE_*`, `NPM_CONFIG_*`, `PIP_*`, `UV_*`, `CARGO_*`, `GRADLE_*`,
-  `MAVEN_*`, `YARN_*`, `COREPACK_*`, `ERL_*`, `ELIXIR_*`, `CMAKE_*`, `TF_*`,
+  `*EDITOR`, `LESSOPEN`, `*BROWSER`), `*ASKPASS`, rc files (`INPUTRC`,
+  `CONDARC`, `WGETRC`, `PSQLRC`, `NETRC`…), remote shells and merge tools
+  (`RSYNC_RSH`, `CVS_RSH`, `SVN_SSH`, `HGMERGE`, `FCEDIT`), libpq's TLS
+  settings (`PGSSLMODE`, `PGSSLROOTCERT`), `GODEBUG`, every name ending in
+  `_OPTS`, `_OPTIONS`, `FLAGS`, `_COMMAND`, `_ARGS`, `RCPATH`, `_CONFIG`,
+  `_CONFIG_FILE`, `_CONFIG_PATH`, `_CONFIG_DIR` or `_HOME`, and the settings
+  of the common runtimes, build tools and package managers (`NODE_*`,
+  `NPM_CONFIG_*`, `PIP_*`, `UV_*`, `CARGO_*`, `GRADLE_*`, `MAVEN_*`,
+  `YARN_*`, `COREPACK_*`, `ERL_*`, `ELIXIR_*`, `CMAKE_*`, `TF_*`,
   `ANSIBLE_*`, `CLOUDSDK_*`, `JULIA_*`, `JUPYTER_*`, `DENO_*`, `BASH_*`,
-  `PERL5*`, `RUBY*`, `DOTNET_*`, `BUN_*`, `JAVA_HOME`, `CC`, `GOPROXY`…). The
-  full list is [`env_names.py`](../src/shared/connectors/env_names.py), the
-  one SRW's managed MCP servers are checked against too. It is a
+  `PERL5*`, `RUBY*`, `DOTNET_*`, `BUN_*`, `JAVA_HOME`, `CC`, `GOPROXY`…).
+  Within those prefix families a credential-shaped name, one ending in
+  `_TOKEN`, `_API_KEY`, `_PASSWORD`, `_SECRET`, `_ACCESS_KEY` or
+  `_SECRET_KEY` (`NODE_AUTH_TOKEN`, `CARGO_REGISTRY_TOKEN`,
+  `UV_PUBLISH_TOKEN`, `GEM_HOST_API_KEY`), is yours to set; a name the list
+  spells out, and the workspace's own families (`SRW_*`, `LD_*`, `PYTHON*`),
+  never are. The full list is
+  [`env_names.py`](../src/shared/connectors/env_names.py). It is a
   best-effort lint against known hooks, not a sandbox: a tool it does not
-  know may read a name it does not list. Credential-shaped names
+  know may read a name it does not list. Other credential-shaped names
   (`AWS_ACCESS_KEY_ID`, `PGPASSWORD`, `DATABASE_URL`, `GITHUB_TOKEN`,
-  `OPENAI_API_KEY`…) are yours to set. A value is a string of at most 64 KiB
-  without NUL bytes.
+  `OPENAI_API_KEY`…) are yours to set too. A value is a string of at most
+  64 KiB without NUL bytes. (A managed MCP server's own process, which never
+  reaches a workspace, is checked against the shorter list its bridge
+  refuses: `NODE_OPTIONS`, `PYTHONPATH`, `GIT_*`, `PIP_*`… A `server.json`'s
+  `NODE_ENV` or `JAVA_HOME` is the server's own.)
 - `credential_file` entries: `{"path": ..., "content": ..., "mode": 384,
   "env_var": ...}`. The path is `~/.srw-files/…`, `~/.netrc` or `~/.pgpass`,
   at most 255 characters, and one binding writes each path once. The other
@@ -261,8 +280,8 @@ A variable two connectors of one Job or Session would set is never
 delivered twice: when your binding sets a name an environment connector, a
 credential file's `env_var` or another registered driver's connector (the
 one with the lower connector id) already sets, a Session goes on without
-your connector and its README says which name and which connector; a Job is
-refused before it starts with the same reason.
+your connector and its README says which name and which connector; a Job
+fails before it is dispatched with the same reason, on either lane.
 
 SRW checks the binding before anything reaches the workspace. A binding it
 won't deliver fails the bind with the reason on the connector, and SRW revokes
@@ -436,8 +455,10 @@ Change its config or credentials and every binding of it is revoked; the next
 delivery binds again. A Job or Session that no longer selects the connector,
 or may no longer use it (its owner left the project, the connector's project
 link was removed), has its binding revoked within a reconciler pass
-(`access_lost`), a paused Job's included. **Test connection** runs your
-`check`.
+(`access_lost`), a paused Job's included, and SRW starts no bind for one:
+every bind checks first that its Job or Session still selects the connector
+and may use it, so your driver never mints for an execution that would be
+refused. **Test connection** runs your `check`.
 `GET /api/datasources/<id>` shows the registration and how the last bind went
 in `driver_status`.
 
