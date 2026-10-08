@@ -3067,7 +3067,12 @@
     "needsDns": "Needs DNS: {{reason}}",
     "egressReason": {
       "runs_in_srw_process": "Not applicable: runs in the SRW process",
-      "driver_hosting_not_available": "Not enforced: SRW does not host driver pods yet"
+      "driver_hosting_not_available": "Not enforced: SRW does not host driver pods yet",
+      "service_hosting_disabled": "Not enforced: this installation hosts no service driver pods",
+      "pinned_per_pod": "Each driver pod's NetworkPolicy pins the declared hosts to the addresses resolved when it started (IP level); no DNS",
+      "pinned_per_pod_with_dns": "Each driver pod's NetworkPolicy pins the declared hosts to the addresses resolved when it started (IP level); the pod may use the cluster resolver, so names are unrestricted",
+      "start_up_wait_verified": "Namespace default deny and a start-up wait; the operator verified this cluster enforces them",
+      "start_up_wait_unverified": "Namespace default deny and a start-up wait; not verified on this cluster"
     }
   },
   "contacts": {

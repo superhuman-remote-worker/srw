@@ -44,7 +44,10 @@ from orchestrator.security.access import (
 )
 from orchestrator.security.auth import require_approved_user
 from orchestrator.services import datasources
-from orchestrator.services.connector_drivers.matrix import capability_matrix
+from orchestrator.services.connector_drivers.matrix import (
+    HostingStatus,
+    capability_matrix,
+)
 
 router = APIRouter()
 
@@ -59,6 +62,9 @@ class DatasourcesDependencies:
     require_datasource_access: Callable[..., Awaitable[Any]] = require_datasource_access
     require_datasource_owner: Callable[..., Awaitable[Any]] = require_datasource_owner
     require_job_access: Callable[..., Awaitable[Any]] = require_job_access
+    #: Service-plane driver hosting on this installation (D5), for the
+    #: matrix's egress columns.
+    service_hosting: HostingStatus = HostingStatus()
 
 
 def get_datasources_dependencies(request: Request) -> DatasourcesDependencies:
@@ -216,7 +222,10 @@ async def list_connector_drivers(
     can see (the shared Catalog, their Account, their Projects).
     """
     await dependencies.require_approved_user(request, dependencies.store)
-    return capability_matrix(dependencies.operations.connector_drivers)
+    return capability_matrix(
+        dependencies.operations.connector_drivers,
+        hosting=dependencies.service_hosting,
+    )
 
 
 @router.get("/api/datasources/{datasource_id}")

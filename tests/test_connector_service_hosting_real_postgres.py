@@ -20,6 +20,7 @@ from orchestrator.database.postgres import PostgresDB
 from orchestrator.security.crypto import encrypt
 from orchestrator.services import connector_credential_leases as leases
 from orchestrator.services import connector_service_images as images
+from orchestrator.services.connector_egress import private_addresses_allowed
 from shared.connectors.contract import (
     AccessLevel,
     CredentialSlot,
@@ -356,6 +357,72 @@ async def test_ensure_image_resolves_a_digest_no_row_holds(db, registry):
             await images.ensure_image(
                 conn, driver=DRIVER, reference=REFERENCE, digest=D2
             )
+
+
+# =============================================================================
+# The project tier decides private addresses
+# =============================================================================
+
+
+async def _project(db, tier: str) -> str:
+    project_id = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO projects (id, name, network_tier) VALUES ($1, $2, $3)",
+            project_id,
+            f"p-{str(project_id)[:8]}",
+            tier,
+        )
+    return str(project_id)
+
+
+async def _link(db, project: str, connector: str) -> None:
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO project_datasources (project_id, datasource_id) "
+            "VALUES ($1, $2)",
+            UUID(project),
+            UUID(connector),
+        )
+
+
+async def _private_allowed(db, connector: str) -> bool:
+    async with db.acquire() as conn:
+        return await private_addresses_allowed(
+            conn, connector, private_tiers={"home-allowed"}
+        )
+
+
+@pytest.mark.asyncio
+async def test_private_addresses_need_every_project_on_a_private_tier(db):
+    connector = await _connector(db)
+    # No project at all: the strictest tier.
+    assert await _private_allowed(db, connector) is False
+    home = await _project(db, "home-allowed")
+    await _link(db, home, connector)
+    assert await _private_allowed(db, connector) is True
+    # One more project on the internet-only tier: the strictest decides.
+    await _link(db, await _project(db, "internet-only"), connector)
+    assert await _private_allowed(db, connector) is False
+
+
+@pytest.mark.asyncio
+async def test_the_owning_project_counts_and_a_public_connector_never_qualifies(db):
+    connector = await _connector(db)
+    home = await _project(db, "home-allowed")
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE datasources SET project_id = $2 WHERE id = $1",
+            UUID(connector),
+            UUID(home),
+        )
+    assert await _private_allowed(db, connector) is True
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE datasources SET is_global = true WHERE id = $1", UUID(connector)
+        )
+    assert await _private_allowed(db, connector) is False
+    assert await _private_allowed(db, str(uuid4())) is False
 
 
 def test_resolved_at_is_a_timestamp():

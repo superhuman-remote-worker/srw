@@ -39,6 +39,7 @@ from orchestrator.services import (
     session_tool_policy,
     snapshot_service as snapshot_service_module,
 )
+from orchestrator.services.connector_drivers.matrix import HostingStatus
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,12 @@ def datasources_dependencies(
         require_datasource_access=access.require_datasource_access,
         require_datasource_owner=access.require_datasource_owner,
         require_job_access=access.require_job_access,
+        service_hosting=HostingStatus(
+            enabled=resources.settings.connector_service_pods_enabled,
+            enforcement_verified=(
+                resources.settings.connector_service_enforcement_verified
+            ),
+        ),
     )
 
 

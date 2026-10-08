@@ -11,12 +11,17 @@ its own application's settings.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 from dataclasses import dataclass
 
 from orchestrator.services.connector_drivers.workspace_ssh import (
     WORKSPACE_SSH_KNOWN_HOSTS_ENV,
+)
+from orchestrator.services.connector_egress import (
+    DEFAULT_CLUSTER_CIDRS,
+    DEFAULT_PRIVATE_TIERS,
 )
 from shared.run_queue import LANE_PINNED, LANE_STATELESS
 
@@ -82,6 +87,22 @@ def parse_positive_number(
 def parse_name_list(raw: str | None) -> frozenset[str]:
     """A comma-separated list of names (hosts, CIDRs); blanks are dropped."""
     return frozenset(item.strip() for item in (raw or "").split(",") if item.strip())
+
+
+def parse_cidr_list(raw: str | None) -> tuple[str, ...]:
+    """The cluster's pod and service ranges from a comma-separated list.
+
+    Unset or empty is k3s's defaults. A malformed entry is dropped with a
+    warning; when none is left the defaults stand, so a typo never opens the
+    cluster's own ranges to driver pods.
+    """
+    cidrs: list[str] = []
+    for item in sorted(parse_name_list(raw)):
+        try:
+            cidrs.append(str(ipaddress.ip_network(item, strict=False)))
+        except ValueError:
+            logger.warning("Cluster CIDR %r is not a network; ignoring it", item)
+    return tuple(cidrs) or DEFAULT_CLUSTER_CIDRS
 
 
 def parse_session_subagent_fanout_lanes(raw: str | None) -> frozenset[str]:
@@ -183,6 +204,17 @@ class DeploymentSettings:
     connector_driver_registry_token_hosts: frozenset[str] = frozenset()
     connector_driver_resolve_cache_seconds: float = 60.0
     connector_driver_resolve_timeout_seconds: float = 10.0
+    #: Service-plane driver hosting (``connectors.servicePods``, D5): on or
+    #: off, and the operator's word that the cluster enforced the start-up
+    #: probe harness (shown in the matrix's installation column).
+    connector_service_pods_enabled: bool = False
+    connector_service_enforcement_verified: bool = False
+    #: Driver pod egress (D5, "Reachability"): the cluster's real pod and
+    #: service ranges (always refused), the project network tiers that may
+    #: reach private addresses, and whether AAAA answers are pinned too.
+    connector_service_cluster_cidrs: tuple[str, ...] = DEFAULT_CLUSTER_CIDRS
+    connector_service_private_tiers: frozenset[str] = DEFAULT_PRIVATE_TIERS
+    connector_service_ipv6: bool = False
 
     def session_subagent_fanout(self, lane: str | None) -> bool:
         """Whether a session on ``lane`` may fan out right now."""
@@ -254,6 +286,19 @@ class DeploymentSettings:
                 default=10.0,
                 minimum=1.0,
             ),
+            connector_service_pods_enabled=_enabled("CONNECTOR_SERVICE_PODS_ENABLED"),
+            connector_service_enforcement_verified=_enabled(
+                "CONNECTOR_SERVICE_ENFORCEMENT_VERIFIED"
+            ),
+            connector_service_cluster_cidrs=parse_cidr_list(
+                os.environ.get("CONNECTOR_SERVICE_CLUSTER_CIDRS")
+            ),
+            connector_service_private_tiers=(
+                parse_name_list(os.environ.get("CONNECTOR_SERVICE_PRIVATE_TIERS"))
+                if os.environ.get("CONNECTOR_SERVICE_PRIVATE_TIERS") is not None
+                else DEFAULT_PRIVATE_TIERS
+            ),
+            connector_service_ipv6=_enabled("CONNECTOR_SERVICE_IPV6"),
         )
 
 
@@ -261,6 +306,7 @@ __all__ = [
     "CONNECTOR_LEASE_EXCHANGE_PORT_ENV",
     "SESSION_SUBAGENT_FANOUT_LANES_ENV",
     "DeploymentSettings",
+    "parse_cidr_list",
     "parse_exchange_port",
     "parse_name_list",
     "parse_positive_number",

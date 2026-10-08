@@ -33,6 +33,7 @@ from orchestrator.services.connector_drivers import (
     builtin_connector_drivers,
 )
 from orchestrator.services.connector_drivers.matrix import (
+    HostingStatus,
     capability_matrix,
     public_schema,
 )
@@ -305,6 +306,77 @@ class TestDriversOutsideTheTrustedList:
         registry = ConnectorDriverRegistry([DatasourceDriver(spec)])
         (entry,) = capability_matrix(registry)["drivers"]
         assert entry["trust"]["claims_declared_by_author"] is True
+
+
+def _service_driver(*, needs_dns: str | None = None) -> _ImageDriver:
+    from dataclasses import replace
+
+    from shared.connectors.contract import ServiceSpec
+
+    driver = _ImageDriver(
+        replace(
+            _image_spec(), plane="service", service=ServiceSpec(), needs_dns=needs_dns
+        )
+    )
+    driver.image_reference = "ghcr.io/acme/ticketing:1"
+    return driver
+
+
+class TestServicePlaneEgress:
+    """D5: a hosted driver pod's egress is pinned per pod."""
+
+    def test_without_hosting_nothing_is_enforced(self):
+        registry = ConnectorDriverRegistry([_service_driver()])
+        for hosting in (None, HostingStatus(enabled=False)):
+            (entry,) = capability_matrix(registry, hosting=hosting)["drivers"]
+            assert entry["egress"]["enforced"] == {
+                "status": "not_enforced",
+                "reason": "service_hosting_disabled",
+            }
+            assert entry["egress"]["installation"] == entry["egress"]["enforced"]
+
+    def test_hosted_pods_pin_their_declared_hosts(self):
+        registry = ConnectorDriverRegistry([_service_driver()])
+        (entry,) = capability_matrix(registry, hosting=HostingStatus(enabled=True))[
+            "drivers"
+        ]
+        assert entry["egress"]["enforced"] == {
+            "status": "enforced",
+            "reason": "pinned_per_pod",
+            "mechanism": "networkpolicy_ipblock",
+            "dns": "none",
+        }
+        assert entry["egress"]["installation"] == {
+            "status": "unverified",
+            "reason": "start_up_wait_unverified",
+            "namespace_default_deny": True,
+            "start_up_wait": True,
+        }
+        # The pods' image, never a connector's pinned addresses: this matrix
+        # reads no connector.
+        assert entry["trust"]["image"] == "ghcr.io/acme/ticketing:1"
+
+    def test_a_driver_that_needs_dns_says_names_are_unrestricted(self):
+        registry = ConnectorDriverRegistry([_service_driver(needs_dns="SRV records")])
+        (entry,) = capability_matrix(
+            registry, hosting=HostingStatus(enabled=True, enforcement_verified=True)
+        )["drivers"]
+        assert entry["egress"]["enforced"]["reason"] == "pinned_per_pod_with_dns"
+        assert entry["egress"]["enforced"]["dns"] == "cluster_resolver"
+        assert entry["egress"]["installation"]["status"] == "verified"
+
+    def test_built_ins_stay_in_process_with_hosting_on(self):
+        matrix = capability_matrix(
+            builtin_connector_drivers(), hosting=HostingStatus(enabled=True)
+        )
+        assert matrix == capability_matrix(builtin_connector_drivers())
+
+    def test_the_route_passes_this_installations_hosting(self):
+        from orchestrator.routers.datasources import DatasourcesDependencies
+
+        assert DatasourcesDependencies.__dataclass_fields__[
+            "service_hosting"
+        ].default == HostingStatus(enabled=False)
 
 
 class TestNoCredentialValue:

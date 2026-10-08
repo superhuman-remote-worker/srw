@@ -10,7 +10,15 @@ import {AppInputComponent} from '../../ui/input';
 import {AppSpinnerComponent} from '../../ui/spinner';
 
 /** Egress reasons the matrix reports; anything newer shows its raw status. */
-const EGRESS_REASONS = new Set(['runs_in_srw_process', 'driver_hosting_not_available']);
+const EGRESS_REASONS = new Set([
+  'runs_in_srw_process',
+  'driver_hosting_not_available',
+  'service_hosting_disabled',
+  'pinned_per_pod',
+  'pinned_per_pod_with_dns',
+  'start_up_wait_verified',
+  'start_up_wait_unverified',
+]);
 const PLANES = new Set(['harness', 'bind_time', 'service', 'in_pod']);
 
 /** A stable element id for a driver, so a link can open the page at it. */

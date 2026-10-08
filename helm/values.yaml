@@ -164,6 +164,24 @@ connectors:
     # with a capacity error; the namespace's NotTerminating pod quota is the
     # backstop.
     maxInstallation: 10
+    # -- Driver pod egress is pinned per pod: each declared host is resolved
+    # once and written into the pod's NetworkPolicy ipBlocks and hostAliases.
+    # These are the cluster's REAL pod and service ranges (k3s defaults
+    # below), always refused as egress targets.
+    clusterCidrs:
+      - 10.42.0.0/16
+      - 10.43.0.0/16
+    # -- Project network tiers whose connectors' pods may reach private and
+    # home addresses (RFC 1918, CGNAT, IPv6 ULA). A connector qualifies only
+    # when every project it belongs to is on one of these tiers.
+    privateTiers:
+      - home-allowed
+    # -- Pin AAAA answers too (dual-stack clusters only).
+    ipv6: false
+    # -- Set only after the cluster's CNI enforced the 12-probe start-up
+    # harness against a driver pod. Shown in the capability matrix's
+    # installation column; it gates nothing (the start-up wait always runs).
+    networkEnforcementVerified: false
     # -- Driver container defaults (LimitRange defaultRequest/default) and
     # ceilings (max). A driver's spec may ask for less or more, up to max.
     driverResources:

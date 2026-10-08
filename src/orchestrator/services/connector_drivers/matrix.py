@@ -25,16 +25,21 @@ outside the trusted list (registration arrives in D6) is marked
 as for workspace images.
 
 Egress has three columns.  ``declared`` is the spec's.  ``enforced`` (the
-pinned addresses and the mechanism) and ``installation`` (whether this
-cluster's enforcement is verified) need driver pods with their own
-NetworkPolicy, which service-plane hosting (D5) builds.  A driver that runs
-inside the SRW process has neither; the matrix says so instead of inventing
-a value.
+mechanism and the DNS status) and ``installation`` (whether this cluster's
+enforcement is verified, and the start-up wait) are filled for service-plane
+drivers when this installation hosts driver pods (D5): each pod's own
+NetworkPolicy pins the declared hosts to the addresses resolved when it was
+created. The pinned addresses and their resolution time belong to one
+connector's pod, so they are shown per connector
+(``GET /api/datasources/{id}/egress``), never here: this matrix reads no
+connector. A driver that runs inside the SRW process has neither column; the
+matrix says so instead of inventing a value.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from orchestrator.services.connector_drivers.base import (
@@ -85,20 +90,76 @@ _SCHEMA_VALUES = frozenset(
 _DEFINITIONS = frozenset({"$defs", "definitions"})
 #: Why a column has no value for a driver that runs in SRW's own process.
 IN_PROCESS = {"status": "not_applicable", "reason": "runs_in_srw_process"}
+#: How a hosted driver pod's egress is enforced (lane 8 §1).
+ENFORCEMENT_MECHANISM = "networkpolicy_ipblock"
 
 
-def capability_matrix(registry: ConnectorDriverRegistry) -> dict[str, Any]:
+@dataclass(frozen=True)
+class HostingStatus:
+    """This installation's service-plane hosting, for the egress columns.
+
+    ``enforcement_verified`` is the operator's word that the cluster's CNI
+    enforced the start-up probe harness
+    (``connectors.servicePods.networkEnforcementVerified``); SRW cannot see
+    that a NetworkPolicy object is enforced.
+    """
+
+    enabled: bool = False
+    enforcement_verified: bool = False
+
+
+def capability_matrix(
+    registry: ConnectorDriverRegistry, *, hosting: HostingStatus | None = None
+) -> dict[str, Any]:
     """The matrix of every installed driver, in registration order."""
     return {
         "protocol_version": PROTOCOL_VERSION,
-        "drivers": [driver_entry(driver) for driver in registry.drivers()],
+        "drivers": [
+            driver_entry(driver, hosting=hosting) for driver in registry.drivers()
+        ],
     }
 
 
-def driver_entry(driver: ConnectorDriver) -> dict[str, Any]:
+def _egress_columns(
+    spec: DriverSpec, *, in_process: bool, hosting: HostingStatus | None
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The ``enforced`` and ``installation`` columns of one driver."""
+    if spec.plane == "service":
+        if hosting is None or not hosting.enabled:
+            reason = {"status": "not_enforced", "reason": "service_hosting_disabled"}
+            return dict(reason), dict(reason)
+        dns = spec.needs_dns is not None
+        enforced = {
+            "status": "enforced",
+            "reason": "pinned_per_pod_with_dns" if dns else "pinned_per_pod",
+            "mechanism": ENFORCEMENT_MECHANISM,
+            # A pod that may resolve names may also leak data through them.
+            "dns": "cluster_resolver" if dns else "none",
+        }
+        verified = hosting.enforcement_verified
+        installation = {
+            "status": "verified" if verified else "unverified",
+            "reason": (
+                "start_up_wait_verified" if verified else "start_up_wait_unverified"
+            ),
+            "namespace_default_deny": True,
+            "start_up_wait": True,
+        }
+        return enforced, installation
+    if in_process:
+        return dict(IN_PROCESS), dict(IN_PROCESS)
+    return _not_hosted(), _not_hosted()
+
+
+def driver_entry(
+    driver: ConnectorDriver, *, hosting: HostingStatus | None = None
+) -> dict[str, Any]:
     """One driver's row: its spec, its trust and its egress columns."""
     spec = driver.spec
     in_process = isinstance(driver, (DatasourceDriver, ManifestDeliveryDriver))
+    enforced, installation = _egress_columns(
+        spec, in_process=in_process, hosting=hosting
+    )
     return {
         "name": spec.name,
         "title": spec.title,
@@ -131,8 +192,8 @@ def driver_entry(driver: ConnectorDriver) -> dict[str, Any]:
                 "rules": [_egress_rule(rule) for rule in spec.egress],
                 "needs_dns": spec.needs_dns,
             },
-            "enforced": dict(IN_PROCESS) if in_process else _not_hosted(),
-            "installation": dict(IN_PROCESS) if in_process else _not_hosted(),
+            "enforced": enforced,
+            "installation": installation,
         },
         "publishable": spec.publishable,
         "live_attach": spec.live_attach,
@@ -142,7 +203,11 @@ def driver_entry(driver: ConnectorDriver) -> dict[str, Any]:
         "needs_knowledge_profile": spec.needs_knowledge_profile,
         "deployment_gate": spec.deployment_gate,
         "service": _service(spec.service),
-        "trust": _trust(spec, in_process=in_process),
+        "trust": _trust(
+            spec,
+            in_process=in_process,
+            image=getattr(driver, "image_reference", None) or None,
+        ),
     }
 
 
@@ -289,8 +354,13 @@ def _service(service: ServiceSpec | None) -> dict[str, Any] | None:
     }
 
 
-def _trust(spec: DriverSpec, *, in_process: bool) -> dict[str, Any]:
-    """Built-in drivers are SRW's; anything else is its author's word."""
+def _trust(
+    spec: DriverSpec, *, in_process: bool, image: str | None = None
+) -> dict[str, Any]:
+    """Built-in drivers are SRW's; anything else is its author's word.
+
+    A service driver shows the image reference its pods run.
+    """
     if in_process and spec.name in _BUILTIN_NAMES:
         return {
             "tier": "builtin",
@@ -313,6 +383,6 @@ def _trust(spec: DriverSpec, *, in_process: bool) -> dict[str, Any]:
     return {
         "tier": "custom",
         "trusted": False,
-        "image": None,
+        "image": image,
         "claims_declared_by_author": True,
     }

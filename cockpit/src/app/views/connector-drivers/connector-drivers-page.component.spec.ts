@@ -142,6 +142,27 @@ describe('ConnectorDriversPageComponent', () => {
     );
   });
 
+  it('shows how a hosted service driver pod is pinned, and the installation status', () => {
+    const service: ConnectorDriver = {
+      ...CUSTOM,
+      name: 'srw.echo-service/v1',
+      plane: 'service',
+      egress: {
+        declared: {rules: [{host: '${config.host}', ports: [443], protocol: 'tcp'}], needs_dns: null},
+        enforced: {status: 'enforced', reason: 'pinned_per_pod'},
+        installation: {status: 'unverified', reason: 'start_up_wait_unverified'},
+      },
+    };
+    const {host} = mount([service]);
+    const hosted = card(host, service.name);
+    expect(text(hosted.querySelector('[data-egress="enforced"]'))).toContain(
+      page.egressReason.pinned_per_pod,
+    );
+    expect(text(hosted.querySelector('[data-egress="installation"]'))).toContain(
+      page.egressReason.start_up_wait_unverified,
+    );
+  });
+
   it('filters by title, name or stored type', () => {
     const {fixture, host} = mount(matrix.drivers);
     fixture.componentInstance.query.set('ssh_key');

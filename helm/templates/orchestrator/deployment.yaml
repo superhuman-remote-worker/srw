@@ -1897,6 +1897,19 @@ spec:
             - name: CONNECTOR_DRIVER_RESOLVE_TIMEOUT_SECONDS
               value: {{ .resolveTimeoutSeconds | quote }}
             {{- end }}
+            # Service-plane driver hosting (connector drivers D5).
+            {{- with .Values.connectors.servicePods }}
+            - name: CONNECTOR_SERVICE_PODS_ENABLED
+              value: {{ .enabled | quote }}
+            - name: CONNECTOR_SERVICE_ENFORCEMENT_VERIFIED
+              value: {{ .networkEnforcementVerified | quote }}
+            - name: CONNECTOR_SERVICE_CLUSTER_CIDRS
+              value: {{ join "," .clusterCidrs | quote }}
+            - name: CONNECTOR_SERVICE_PRIVATE_TIERS
+              value: {{ join "," .privateTiers | quote }}
+            - name: CONNECTOR_SERVICE_IPV6
+              value: {{ .ipv6 | quote }}
+            {{- end }}
             - name: KB_EXTERNAL_REINDEX_CONCURRENCY
               value: {{ .Values.orchestrator.kbExternalReindexConcurrency | quote }}
             - name: KB_REINDEX_SWEEP_SECONDS

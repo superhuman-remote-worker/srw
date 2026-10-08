@@ -225,6 +225,17 @@ def test_driver_image_resolution_settings_reach_the_orchestrator():
     assert env["CONNECTOR_DRIVER_REGISTRY_TOKEN_HOSTS"] == "tokens.example"
 
 
+def test_egress_settings_reach_the_orchestrator():
+    env = orchestrator_env(render())
+    assert env["CONNECTOR_SERVICE_PODS_ENABLED"] == "false"
+    assert env["CONNECTOR_SERVICE_ENFORCEMENT_VERIFIED"] == "false"
+    assert env["CONNECTOR_SERVICE_CLUSTER_CIDRS"] == "10.42.0.0/16,10.43.0.0/16"
+    assert env["CONNECTOR_SERVICE_PRIVATE_TIERS"] == "home-allowed"
+    assert env["CONNECTOR_SERVICE_IPV6"] == "false"
+    env = orchestrator_env(render(EXCHANGE, ON))
+    assert env["CONNECTOR_SERVICE_PODS_ENABLED"] == "true"
+
+
 def test_the_k3d_profile_resolves_from_the_k3d_registry_over_http():
     example = ROOT / "deployment/values-local.yaml.example"
     registry = yaml.safe_load(example.read_text())["connectors"]["drivers"]["registry"]
