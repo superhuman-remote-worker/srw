@@ -35,13 +35,10 @@ and ``src/agent/connectors/``.
 (TypeScript) and prompts (Jinja templates under ``config/prompts/``). The AST
 cannot see them; D2 replaces the cockpit's copies with the server's answer.
 
-**Classifications**:
+**Classifications** (``legacy-pending``, "still to convert", reached zero
+with slice D1 and is retired: a branch is converted to a spec flag or a
+driver capability, or it is one of these, with a reason):
 
-* ``legacy-pending``: still to convert to a spec flag or a capability. Must
-  reach zero by the end of slice D1, and can only go down: a site may carry
-  it only if its key is in the frozen baseline
-  (``policy/connector_type_branches_baseline.txt``), which ``--write``
-  shrinks as sites go and never grows;
 * ``not-a-connector-type``: the literal names something else (a cloud mount's
   ``source.type``, an MCP token kind, a tool category);
 * ``sql``: a type test in SQL text, listed for D3's platform-owned marker;
@@ -75,7 +72,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC = REPO_ROOT / "src"
 MANIFEST = REPO_ROOT / "policy" / "connector_type_branches.txt"
-BASELINE = REPO_ROOT / "policy" / "connector_type_branches_baseline.txt"
 
 #: Driver packages: deciding by type inside them is their job.
 ALLOWLIST: tuple[str, ...] = (
@@ -84,11 +80,11 @@ ALLOWLIST: tuple[str, ...] = (
     "src/agent/connectors/",
 )
 
+#: Retired with slice D1: no site may be left "to convert" again.
 LEGACY_PENDING = "legacy-pending"
 UNCLASSIFIED = "unclassified"
 ALLOWED_CLASSIFICATIONS = frozenset(
     {
-        LEGACY_PENDING,
         "not-a-connector-type",
         "sql",
         "kb-domain",
@@ -525,16 +521,14 @@ HEADER = """\
 # a new site is marked `unclassified` until reviewed, and fails the tests.
 #
 # Convert a branch to a spec flag or a driver capability rather than
-# classifying it. `legacy-pending` must reach zero at the end of slice D1.
-# Every other classification needs a reason:
+# classifying it. `legacy-pending` reached zero with slice D1 and is retired:
+# no site may carry it again. Every classification needs a reason:
 #   not-a-connector-type  the literal names something else
 #   sql                   a type test in SQL text (D3's platform-owned marker)
 #   kb-domain             OKF knowledge-base indexing, outside the driver
 #   platform-owned        a connector SRW provisions itself (D3's managed_key)
 #   pending-d3-d4         needs a marker D3 or D4 brings; not convertible in D1
 #   driver-internal       a helper only drivers call, with their own type
-# `legacy-pending` is allowed only on a key in the frozen baseline,
-# policy/connector_type_branches_baseline.txt, which --write only shrinks.
 # SQL files, the cockpit and prompts are outside this gate.
 #
 # A site is identified by what it is, not where it is: reordering code keeps
@@ -556,63 +550,13 @@ def render_manifest(
     return HEADER + "\n".join(lines) + ("\n" if lines else "")
 
 
-BASELINE_HEADER = """\
-# The frozen `legacy-pending` connector-type sites: maintained by
-# scripts/check_connector_type_branches.py. A site may be `legacy-pending`
-# only while its key is listed here, so the count can only go down: --write
-# drops a key once its site is converted, reshaped or reclassified, and never
-# adds one. Never add a line by hand; convert or classify the new branch.
-#
-# <file>  <qualname>  <kind>  <type ids>  <fingerprint>  #<ordinal>
-
-"""
-
-
-def read_baseline(text: str | None = None) -> set[Key]:
-    """The frozen ``legacy-pending`` keys."""
-    if text is None:
-        if not BASELINE.exists():
-            raise RuntimeError(f"The legacy-pending baseline is missing: {BASELINE}")
-        text = BASELINE.read_text()
-    keys: set[Key] = set()
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = re.split(r"\s{2,}", line)
-        if len(parts) != 6 or not parts[5].startswith("#"):
-            raise ValueError(f"malformed connector-type baseline line: {raw_line}")
-        keys.add((*parts[:5], int(parts[5][1:])))
-    return keys
-
-
-def shrink_baseline(
-    baseline: set[Key],
-    sites: list[Site],
-    classifications: dict[Key, tuple[str, str]],
-) -> set[Key]:
-    """The baseline keys still ``legacy-pending``: it never grows."""
-    pending = {
-        site.key
-        for site in sites
-        if classifications.get(site.key, (UNCLASSIFIED, ""))[0] == LEGACY_PENDING
-    }
-    return baseline & pending
-
-
-def render_baseline(keys: set[Key]) -> str:
-    lines = ["  ".join((*key[:5], f"#{key[5]}")) for key in sorted(keys)]
-    return BASELINE_HEADER + "\n".join(lines) + ("\n" if lines else "")
-
-
 def problems(
-    sites: list[Site],
-    classifications: dict[Key, tuple[str, str]],
-    baseline: set[Key] | None = None,
+    sites: list[Site], classifications: dict[Key, tuple[str, str]]
 ) -> list[str]:
     """Why the inventory fails review, one line per problem.
 
-    With ``baseline``, a ``legacy-pending`` site outside it is a problem too.
+    ``legacy-pending`` is retired: a site that carries it is a problem, as
+    an unclassified one is. Convert the branch instead.
     """
     found: list[str] = []
     for site in sites:
@@ -620,16 +564,12 @@ def problems(
         where = f"{site.file} {site.qualname} ({site.kind} {site.ids})"
         if classification == UNCLASSIFIED:
             found.append(f"unclassified: {where}")
+        elif classification == LEGACY_PENDING:
+            found.append(f"legacy-pending is retired (convert the branch): {where}")
         elif classification not in ALLOWED_CLASSIFICATIONS:
             found.append(f"unknown classification {classification!r}: {where}")
-        elif classification != LEGACY_PENDING and not reason:
+        elif not reason:
             found.append(f"{classification} without a reason: {where}")
-        elif (
-            classification == LEGACY_PENDING
-            and baseline is not None
-            and site.key not in baseline
-        ):
-            found.append(f"legacy-pending outside the frozen baseline: {where}")
     return found
 
 
@@ -641,23 +581,15 @@ def main() -> int:
     sites = collect_sites()
     classifications = read_classifications()
     rendered = render_manifest(sites, classifications)
-    baseline = read_baseline()
-    rendered_baseline = render_baseline(
-        shrink_baseline(baseline, sites, classifications)
-    )
     if args.write:
         MANIFEST.write_text(rendered)
-        BASELINE.write_text(rendered_baseline)
         print(f"wrote {len(sites)} connector-type sites")
         return 0
     if args.check:
         if not MANIFEST.exists() or MANIFEST.read_text() != rendered:
             print("ERROR: connector-type manifest is stale", file=sys.stderr)
             return 1
-        if BASELINE.read_text() != rendered_baseline:
-            print("ERROR: legacy-pending baseline is stale", file=sys.stderr)
-            return 1
-        failures = problems(sites, classifications, baseline)
+        failures = problems(sites, classifications)
         for failure in failures:
             print(f"ERROR: {failure}", file=sys.stderr)
         if failures:

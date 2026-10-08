@@ -4,7 +4,8 @@
 driver package that still decides by comparing a connector type;
 ``policy/connector_type_branches.txt`` is the reviewed inventory. A new site
 fails here as ``unclassified``; a converted one drops out when the manifest is
-regenerated. Slice D1's gate is that ``legacy-pending`` is empty.
+regenerated. Slice D1's gate was that ``legacy-pending`` is empty; it is,
+and the classification is retired, so no branch can be parked there again.
 """
 
 from __future__ import annotations
@@ -27,21 +28,9 @@ from shared.connectors.builtin import BUILTIN_SPECS, DATASOURCE_SPECS, GENERIC_S
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "check_connector_type_branches.py"
 MANIFEST = REPO_ROOT / "policy" / "connector_type_branches.txt"
+#: The frozen baseline that let ``legacy-pending`` shrink (63 sites on
+#: 2026-10-08, 24 after D1b, none after D1c). It is gone with the class.
 BASELINE = REPO_ROOT / "policy" / "connector_type_branches_baseline.txt"
-
-#: Where ``legacy-pending`` may still sit once the orchestrator and shared half
-#: of slice D1c is done: the agent (its materializers arrive in D1b) and the
-#: KB projection notes D1b rewrites. The agent-side half of D1c empties these;
-#: the gate is then that no ``legacy-pending`` site remains at all. Within
-#: this scope, the frozen baseline decides which sites may stay pending.
-LEGACY_PENDING_SCOPE = (
-    "src/agent/",
-    "src/orchestrator/services/knowledge_projection.py",
-)
-#: How many sites the baseline froze (2026-10-08: 63; 24 after D1b's
-#: materializers). Lower it when --write shrinks the baseline; never raise
-#: it. It stops a hand-added baseline line.
-LEGACY_PENDING_CEILING = 24
 
 
 def _load_script():
@@ -102,49 +91,23 @@ def test_connector_type_inventory_matches_manifest(script, inventory):
 
 def test_every_site_has_a_reviewed_classification(script, inventory):
     sites, classifications = inventory
-    assert script.problems(sites, classifications, script.read_baseline()) == []
+    assert script.problems(sites, classifications) == []
     assert set(classifications) == {site.key for site in sites}
 
 
-def test_the_legacy_pending_baseline_only_goes_down(script, inventory):
-    """The baseline on disk is exactly the pending sites it still covers:
-    --write drops a converted site's key, and a new key never enters."""
-    sites, classifications = inventory
-    baseline = script.read_baseline()
-    shrunk = script.shrink_baseline(baseline, sites, classifications)
-    if script.render_baseline(shrunk) != BASELINE.read_text():
-        gone = sorted(baseline - shrunk)
-        pytest.fail(
-            "The legacy-pending baseline is stale: run `python "
-            "scripts/check_connector_type_branches.py --write` to drop "
-            f"{len(gone)} converted site(s): {gone}"
-        )
-    pending = {
-        site.key
-        for site in sites
-        if classifications[site.key][0] == script.LEGACY_PENDING
-    }
-    assert pending == baseline
-    assert len(baseline) <= LEGACY_PENDING_CEILING, (
-        "The legacy-pending baseline grew; convert or classify the new "
-        "branch instead of adding it to the baseline"
-    )
-
-
-def test_legacy_pending_remains_only_on_the_agent_side(script, inventory):
+def test_no_site_is_legacy_pending_any_more(script, inventory):
+    """The D1 gate: every branch outside the drivers is converted or is
+    something the remaining classifications explain."""
     sites, classifications = inventory
     pending = [
-        site for site in sites if classifications[site.key][0] == script.LEGACY_PENDING
-    ]
-    outside = [
         f"{site.file} {site.qualname} ({site.kind} {site.ids})"
-        for site in pending
-        if not site.file.startswith(LEGACY_PENDING_SCOPE)
+        for site in sites
+        if classifications[site.key][0] == script.LEGACY_PENDING
     ]
-    assert outside == [], (
-        "Orchestrator and shared code must ask a spec flag or a driver "
-        "capability instead of comparing a connector type"
-    )
+    assert pending == []
+    assert script.LEGACY_PENDING not in script.ALLOWED_CLASSIFICATIONS
+    assert not BASELINE.exists()
+    assert not hasattr(script, "BASELINE")
 
 
 def test_collect_sites_is_deterministic(script):
@@ -403,63 +366,33 @@ def test_the_manifest_round_trips_with_reasons(script):
     sites = _scan(script, _TWO_BRANCHES)
     classifications = {
         sites[0].key: ("kb-domain", "the  KB indexer   decides"),
-        sites[1].key: ("legacy-pending", ""),
+        sites[1].key: ("sql", "a type test in SQL"),
     }
     rendered = script.render_manifest(sites, classifications)
     assert script.read_classifications(rendered) == {
         sites[0].key: ("kb-domain", "the KB indexer decides"),
-        sites[1].key: ("legacy-pending", ""),
+        sites[1].key: ("sql", "a type test in SQL"),
     }
 
 
 def test_malformed_and_duplicate_manifest_lines_are_refused(script):
     with pytest.raises(ValueError, match="malformed"):
         script.read_classifications("src/x.py  f  compare\n")
-    line = "src/x.py  f  compare  kb  abc123abc123  #1  legacy-pending\n"
+    line = "src/x.py  f  compare  kb  abc123abc123  #1  sql  why\n"
     with pytest.raises(ValueError, match="duplicate"):
         script.read_classifications(line + line)
 
 
-def test_a_new_legacy_pending_site_outside_the_baseline_fails(script):
-    """Hand-classifying a new branch legacy-pending does not get it past."""
+def test_a_legacy_pending_site_fails_with_or_without_a_reason(script):
+    """Hand-classifying a new branch legacy-pending never gets it past."""
     sites = _scan(script, _TWO_BRANCHES)
-    pending = {site.key: ("legacy-pending", "") for site in sites}
-    frozen = {sites[0].key}
-    assert script.problems(sites, pending, frozen) == [
-        f"legacy-pending outside the frozen baseline: synthetic.py deliver "
-        f"(compare {sites[1].ids})"
-    ]
-    assert script.problems(sites, pending, {site.key for site in sites}) == []
-
-
-def test_write_shrinks_the_baseline_and_never_grows_it(script):
-    sites = _scan(script, _TWO_BRANCHES)
-    pending = {site.key: ("legacy-pending", "") for site in sites}
-    stale = ("src/gone.py", "f", "compare", "kb", "000000000000", 1)
-    # A converted site's key leaves; a new pending site's key never enters.
-    assert script.shrink_baseline({sites[0].key, stale}, sites, pending) == {
-        sites[0].key
-    }
-    assert script.shrink_baseline(set(), sites, pending) == set()
-    # Reclassifying a site out of legacy-pending drops it for good.
-    reclassified = {**pending, sites[0].key: ("kb-domain", "reviewed")}
-    assert script.shrink_baseline(
-        {sites[0].key, sites[1].key}, sites, reclassified
-    ) == {sites[1].key}
-
-
-def test_the_baseline_round_trips(script):
-    sites = _scan(script, _TWO_BRANCHES)
-    keys = {site.key for site in sites}
-    assert script.read_baseline(script.render_baseline(keys)) == keys
-    with pytest.raises(ValueError, match="malformed"):
-        script.read_baseline("src/x.py  f  compare  kb\n")
-
-
-def test_a_missing_baseline_is_an_error(script, monkeypatch, tmp_path):
-    monkeypatch.setattr(script, "BASELINE", tmp_path / "absent.txt")
-    with pytest.raises(RuntimeError, match="baseline is missing"):
-        script.read_baseline()
+    for reason in ("", "later"):
+        pending = {site.key: ("legacy-pending", reason) for site in sites}
+        assert script.problems(sites, pending) == [
+            "legacy-pending is retired (convert the branch): synthetic.py "
+            f"deliver (compare {site.ids})"
+            for site in sites
+        ]
 
 
 def test_review_problems_are_reported(script):
@@ -475,15 +408,11 @@ def test_review_problems_are_reported(script):
         "sql without a reason: synthetic.py deliver (compare repository)",
         "unknown classification 'pending': synthetic.py deliver (compare kb)",
     ]
-    assert (
-        script.problems(sites, {site.key: ("legacy-pending", "") for site in sites})
-        == []
-    )
 
 
 def test_every_classification_is_explained_in_the_manifest_header(script):
     header = MANIFEST.read_text().split("\n\n", 1)[0]
-    for classification in script.ALLOWED_CLASSIFICATIONS - {script.LEGACY_PENDING}:
+    for classification in script.ALLOWED_CLASSIFICATIONS:
         assert re.search(rf"#\s+{re.escape(classification)}\s", header), classification
 
 

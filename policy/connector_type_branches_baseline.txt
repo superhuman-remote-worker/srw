@@ -1,8 +1,0 @@
-# The frozen `legacy-pending` connector-type sites: maintained by
-# scripts/check_connector_type_branches.py. A site may be `legacy-pending`
-# only while its key is listed here, so the count can only go down: --write
-# drops a key once its site is converted, reshaped or reclassified, and never
-# adds one. Never add a line by hand; convert or classify the new branch.
-#
-# <file>  <qualname>  <kind>  <type ids>  <fingerprint>  #<ordinal>
-

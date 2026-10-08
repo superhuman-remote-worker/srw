@@ -4,16 +4,14 @@
 # a new site is marked `unclassified` until reviewed, and fails the tests.
 #
 # Convert a branch to a spec flag or a driver capability rather than
-# classifying it. `legacy-pending` must reach zero at the end of slice D1.
-# Every other classification needs a reason:
+# classifying it. `legacy-pending` reached zero with slice D1 and is retired:
+# no site may carry it again. Every classification needs a reason:
 #   not-a-connector-type  the literal names something else
 #   sql                   a type test in SQL text (D3's platform-owned marker)
 #   kb-domain             OKF knowledge-base indexing, outside the driver
 #   platform-owned        a connector SRW provisions itself (D3's managed_key)
 #   pending-d3-d4         needs a marker D3 or D4 brings; not convertible in D1
 #   driver-internal       a helper only drivers call, with their own type
-# `legacy-pending` is allowed only on a key in the frozen baseline,
-# policy/connector_type_branches_baseline.txt, which --write only shrinks.
 # SQL files, the cockpit and prompts are outside this gate.
 #
 # A site is identified by what it is, not where it is: reordering code keeps
