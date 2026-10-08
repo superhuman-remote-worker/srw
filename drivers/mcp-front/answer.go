@@ -117,6 +117,8 @@ func rewriteAnswers(data []byte, allowed func(string) bool) ([]byte, bool, error
 }
 
 func rewriteAnswer(data []byte, allowed func(string) bool) ([]byte, bool, error) {
+	// An exact duplicate top-level key resolves last-wins here, as it does
+	// in the Go SDK's client (encoding/json), so both read the same member.
 	var answer map[string]json.RawMessage
 	if json.Unmarshal(data, &answer) != nil {
 		if json.Valid(data) {
