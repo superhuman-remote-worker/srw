@@ -61,8 +61,16 @@ from orchestrator.services.manifest_resources import ManifestResourceService
 from orchestrator.services.manifest_store import LINKED_CONNECTOR_MESSAGE, ManifestStore
 from orchestrator.services.thread_datasource_authorization import (
     ThreadDatasourceAuthorizationDependencies,
+    authorize_thread_datasource_selection,
     resolve_authorized_thread_datasources,
 )
+from orchestrator.services.datasource_policy import authorize_datasource_selection
+from orchestrator.services.job_datasource_selection import (
+    JobDatasourceSelectionDependencies,
+    resolve_authorized_job_datasources,
+    revalidate_job_datasource_selection,
+)
+from orchestrator.services.workspace_tier_policy import backend_from_override
 from tests import test_manifest_native_full_schema as full_schema
 
 database = full_schema.database
@@ -817,13 +825,9 @@ def _payload(rows):
     )
 
 
-@pytest.mark.asyncio
-async def test_a_non_owners_session_gets_the_shared_connectors_secrets(database):
-    db = database
-    world = await _shared_connectors(db)
-    selected = [world.ids["public"], world.ids["linked"]]
-    # Mark each secret, keeping its resource in step, to see that delivery
-    # read it rather than the row.
+async def _mark_secrets(db, world, selected) -> None:
+    """Mark each secret's URL, keeping its resource in step with its row, so a
+    delivery that carries the mark read the secret, not the row."""
     for datasource_id in selected:
         resource = await _resource(db, datasource_id)
         secret = await _secret(db, datasource_id)
@@ -837,6 +841,85 @@ async def test_a_non_owners_session_gets_the_shared_connectors_secrets(database)
                 owner_id=world.owner["id"],
                 values=values,
             )
+
+
+def _job_dependencies(db):
+    """The job delivery's collaborators over the real store and policy, as
+    the application composes them."""
+    dependencies = None
+
+    async def revalidate(job):
+        return await revalidate_job_datasource_selection(job, dependencies=dependencies)
+
+    dependencies = JobDatasourceSelectionDependencies(
+        store=db,
+        authorize_thread_datasource_selection=functools.partial(
+            authorize_thread_datasource_selection,
+            dependencies=_thread_dependencies(db, []),
+        ),
+        backend_from_override=backend_from_override,
+        revalidate_selection=revalidate,
+        connector_credentials=functools.partial(
+            read_connector_credentials, dependencies=SimpleNamespace(store=db)
+        ),
+    )
+    return dependencies
+
+
+@pytest.mark.asyncio
+async def test_a_non_owners_job_gets_the_shared_connectors_secrets(database):
+    db = database
+    world = await _shared_connectors(db)
+    member_id = str(world.member["id"])
+    selected, revisions = await authorize_datasource_selection(
+        db,
+        world.member,
+        member_id,
+        [world.ids["public"], world.ids["linked"]],
+        [world.project],
+        "sandbox",
+    )
+    created = await db.create_job(
+        "D3b delivery",
+        user_id=member_id,
+        project_id=world.project,
+        datasource_ids=selected,
+        datasource_policy_revisions=revisions,
+        datasource_selection_provenance={"origin": "user"},
+        authority_user_id=member_id,
+        authority_project_ids=[world.project],
+    )
+    await _mark_secrets(db, world, selected)
+    job = await db.get_job(str(created["id"]))
+
+    rows = await resolve_authorized_job_datasources(
+        job, dependencies=_job_dependencies(db)
+    )
+    assert sorted(str(row["id"]) for row in rows) == sorted(selected)
+    assert {row["connection_url"].endswith("?from=secret") for row in rows} == {True}
+    payload = _payload(rows)
+    assert len(payload) == 2
+    assert all(entry["connection_url"].endswith("?from=secret") for entry in payload)
+
+    # The member leaves the project: the job's next delivery is refused.
+    await db.execute(
+        "DELETE FROM project_members WHERE project_id=$1 AND user_id=$2",
+        UUID(world.project),
+        world.member["id"],
+    )
+    with pytest.raises(HTTPException) as refused:
+        await resolve_authorized_job_datasources(
+            job, dependencies=_job_dependencies(db)
+        )
+    assert refused.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_a_non_owners_session_gets_the_shared_connectors_secrets(database):
+    db = database
+    world = await _shared_connectors(db)
+    selected = [world.ids["public"], world.ids["linked"]]
+    await _mark_secrets(db, world, selected)
 
     thread = {"id": str(uuid4()), "user_id": str(world.member["id"]), "metadata": {}}
     rows = await resolve_authorized_thread_datasources(
