@@ -61,11 +61,20 @@ def _store(**over):
     return store
 
 
-def _wire(*, store=None, user=None, admin_gate=None, backend=None, features=None):
+def _wire(
+    *,
+    store=None,
+    user=None,
+    admin_gate=None,
+    backend=None,
+    features=None,
+    drivers=None,
+):
     from orchestrator.routers.user_administration import (
         UserAdministrationDependencies as RouteDeps,
     )
     from orchestrator.routers.user_administration import router
+    from orchestrator.services.connector_drivers import builtin_connector_drivers
     from orchestrator.services.user_administration import (
         UserAdministrationDependencies as OpDeps,
     )
@@ -102,6 +111,7 @@ def _wire(*, store=None, user=None, admin_gate=None, backend=None, features=None
         is_protected_cloud_mode_enabled=lambda: flags.get("protected_cloud", False),
         datasource_scope_auto_attach_v1_enabled=lambda: flags.get("auto_attach", False),
         datasource_defaults_on_omission=lambda: flags.get("defaults", False),
+        connector_drivers=drivers or builtin_connector_drivers(),
     )
     deps = RouteDeps(
         store=db,
@@ -379,6 +389,28 @@ def test_create_user_provisions_personal_cloud_storage():
     assert kwargs["connection_url"] == "https://cloud/dav/a"
     assert kwargs["project_ids"] == [PROJECT_ID]
     assert kwargs["auto_attach"] is False
+    assert kwargs["credentials"] == {"user": "u", "password": "p"}
+
+
+def test_personal_cloud_storage_goes_through_its_driver():
+    """A platform row is validated by its driver like any create; one the
+    driver refuses is logged and not stored, and the user is still created."""
+    from orchestrator.services.connector_drivers import ConnectorDriverRegistry
+
+    backend = SimpleNamespace(
+        is_initialized=True,
+        webdav_credentials={"user": "u", "password": "p"},
+        get_user_home=AsyncMock(
+            return_value=SimpleNamespace(webdav_url="https://cloud/dav/a")
+        ),
+    )
+    wire = _wire(backend=backend, drivers=ConnectorDriverRegistry([]))
+    resp = wire.client.post(
+        "/api/users", json={"display_name": "Ada", "email": "a@test"}
+    )
+    assert resp.status_code == 200
+    wire.store.create_datasource.assert_not_awaited()
+    wire.ops.logger.warning.assert_called_once()
 
 
 def test_a_cloud_provisioning_failure_does_not_fail_user_creation():

@@ -26,6 +26,10 @@ from typing import Any, Optional, Protocol
 
 from fastapi import HTTPException
 
+from orchestrator.services.connector_drivers import ConnectorDriverRegistry
+from orchestrator.services.connector_drivers.platform import (
+    validate_platform_connector,
+)
 from shared.runtime.core import capability_grants
 
 from orchestrator.schemas.users import (
@@ -107,6 +111,9 @@ class UserAdministrationDependencies:
     is_protected_cloud_mode_enabled: Callable[[], bool]
     datasource_scope_auto_attach_v1_enabled: Callable[[], bool]
     datasource_defaults_on_omission: Callable[[], bool]
+    #: The application's installed connector drivers; they validate the
+    #: personal cloud storage connector a new user gets.
+    connector_drivers: ConnectorDriverRegistry
 
 
 def _actor(admin: Mapping[str, Any]) -> str:
@@ -340,12 +347,21 @@ async def create_user(
                 )
                 webdav_url = home.webdav_url if home else None
                 if webdav_url:
+                    # Validated by its driver like any create; a refusal is
+                    # logged below and the user is still created.
+                    normalized = await validate_platform_connector(
+                        dependencies.connector_drivers,
+                        "webdav",
+                        name="Cloud Storage (Personal)",
+                        connection_url=webdav_url,
+                        credentials=backend.webdav_credentials,
+                    )
                     await store.create_datasource(
                         name="Cloud Storage (Personal)",
                         ds_type="webdav",
-                        connection_url=webdav_url,
+                        connection_url=normalized.connection_url,
                         description="Personal cloud storage",
-                        credentials=backend.webdav_credentials,
+                        credentials=normalized.credentials,
                         scope_mode="projects",
                         auto_attach=False,
                         project_ids=[str(project["id"])],

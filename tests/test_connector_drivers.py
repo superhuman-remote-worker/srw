@@ -7,6 +7,7 @@ payload do end to end; these tests pin the driver seams themselves.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import replace
 
 import pytest
@@ -291,11 +292,15 @@ def test_no_seam_falls_back_to_a_registry_of_its_own():
     )
     from orchestrator.services.datasources import DatasourceDependencies
     from orchestrator.services.manifest_execution import ManifestExecutionService
+    from orchestrator.services.user_administration import (
+        UserAdministrationDependencies,
+    )
 
     required = [
         (DatasourceDependencies, "connector_drivers"),
         (DatasourcePayloadDependencies, "connector_drivers"),
         (DatasourcePayloadDependencies, "workspace_ssh_known_hosts"),
+        (UserAdministrationDependencies, "connector_drivers"),
     ]
     for dependencies, name in required:
         declared = {f.name: f for f in dataclasses.fields(dependencies)}[name]
@@ -305,6 +310,104 @@ def test_no_seam_falls_back_to_a_registry_of_its_own():
         "connector_drivers"
     ]
     assert parameter.default is inspect.Parameter.empty
+
+
+# =============================================================================
+# Platform rows: what SRW creates itself goes through validate too
+# =============================================================================
+
+
+class TestPlatformConnectors:
+    @pytest.mark.asyncio
+    async def test_a_managed_row_is_normalized_as_a_create_would(self):
+        from orchestrator.services.connector_drivers.platform import (
+            validate_platform_connector,
+        )
+
+        normalized = await validate_platform_connector(
+            builtin_connector_drivers(),
+            "neo4j",
+            name="Default Neo4j",
+            connection_url="bolt://graph:7687",
+            credentials={"username": "neo4j", "password": "pw"},
+        )
+        assert normalized.connection_url == "bolt://graph:7687"
+        assert normalized.credentials == {"username": "neo4j", "password": "pw"}
+        assert normalized.config == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("ds_type", "kwargs", "message"),
+        [
+            ("ftp", {}, "No connector driver serves type 'ftp'"),
+            ("postgresql", {"config": {"x": 1}}, "Connector config is only supported"),
+            # No deployment gate is open for a platform row.
+            ("mcp", {}, "disabled on this deployment"),
+        ],
+    )
+    async def test_a_refusal_is_a_value_error_with_the_api_detail(
+        self, ds_type, kwargs, message
+    ):
+        from orchestrator.services.connector_drivers.platform import (
+            validate_platform_connector,
+        )
+
+        with pytest.raises(ValueError, match=message):
+            await validate_platform_connector(
+                builtin_connector_drivers(),
+                ds_type,
+                name="Seeded",
+                connection_url="https://example.invalid/",
+                **kwargs,
+            )
+
+    @pytest.mark.asyncio
+    async def test_init_seeds_default_rows_through_their_drivers(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from orchestrator import init
+
+        for name in list(os.environ):
+            if name.startswith("DEFAULT_DS_"):
+                monkeypatch.delenv(name)
+        monkeypatch.setenv("DEFAULT_DS_POSTGRESQL_URL", "postgresql://db/app")
+        monkeypatch.setenv("DEFAULT_DS_WEBDAV_URL", "https://cloud/dav")
+        monkeypatch.setenv("DEFAULT_DS_WEBDAV_USERNAME", "srw")
+        db = AsyncMock()
+
+        await init._seed_default_datasources(db)
+
+        calls = [call.kwargs for call in db.upsert_default_datasource.await_args_list]
+        assert calls == [
+            {
+                "name": "Default PostgreSQL",
+                "ds_type": "postgresql",
+                "connection_url": "postgresql://db/app",
+                "credentials": None,
+            },
+            {
+                "name": "Default WebDAV",
+                "ds_type": "webdav",
+                "connection_url": "https://cloud/dav",
+                "credentials": {"username": "srw"},
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_init_skips_a_row_its_driver_refuses(self):
+        from unittest.mock import AsyncMock
+
+        from orchestrator import init
+
+        db = AsyncMock()
+        assert not await init._upsert_seeded_datasource(
+            db,
+            builtin_connector_drivers(),
+            name="Seeded MCP",
+            ds_type="mcp",
+            connection_url="https://mcp.invalid/",
+        )
+        db.upsert_default_datasource.assert_not_awaited()
 
 
 def test_connector_writes_see_the_real_stdio_gate():
